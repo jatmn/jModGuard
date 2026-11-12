@@ -18,6 +18,8 @@ const appearanceSource = fs.readFileSync(new URL('../frontend/appearance.js', im
 const chartsSource = fs.readFileSync(new URL("../frontend/charts.js", import.meta.url), "utf8")
   .replace(/^import .*;$/gm, "").replace(/^const h = React\.createElement;$/m, "")
   .replaceAll("export const", "const").replaceAll("export function", "function");
+const iconsSource = fs.readFileSync(new URL("../frontend/icons.js", import.meta.url), "utf8")
+  .replace(/^import .*;$/gm, "").replaceAll("export const", "const").replaceAll("export function", "function");
 const source = fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration.js"), "utf8")
   .replace(/^import .*;$/gm, "");
 const NOW_SECONDS = 1800000000;
@@ -57,7 +59,7 @@ function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = 
     Date: { now },
   });
   pages.push({ dom, roots });
-  vm.runInContext(stateSource + "\n" + appearanceSource + "\n" + chartsSource + "\n" + source, context);
+  vm.runInContext(stateSource + "\n" + appearanceSource + "\n" + chartsSource + "\n" + iconsSource + "\n" + source, context);
   return { context, elements: { get: id => document.getElementById(id) }, timers };
 }
 
@@ -113,11 +115,16 @@ function updateButton(pageState, component, launcher = false) {
   return find(card, (item) => item.localName === "button" && item.textContent === (launcher ? "Update launcher" : component === "webui" ? "Update WebUI" : "Update"));
 }
 
-// The card's status badge, its primary information, and its technical details.
+// The card's status badge (its SVG icon name, then its text), primary information, and technical details.
+function badgeParts(badge) {
+  const icon = find(badge, (item) => item.localName === "svg");
+  assert.equal(icon?.getAttribute("aria-hidden"), "true", "status badge icons are decorative SVGs");
+  return `${icon.getAttribute("data-icon")} ${textOf(badge)}`;
+}
 function cardParts(pageState, component) {
   const card = componentCard(pageState, component);
   return {
-    badge: textOf(find(card, (item) => item.classList?.contains("administration-badge"))),
+    badge: badgeParts(find(card, (item) => item.classList?.contains("administration-badge"))),
     content: textOf(find(card, (item) => item.classList?.contains("administration-info"))),
     details: textOf(find(card, (item) => item.localName === "details")),
   };
@@ -254,7 +261,7 @@ test("a directly deployed bot or API on the available source is up to date and c
     item.candidate.source_sha = item.observed.source_sha;
     render(view, item);
     const { badge, content, details } = cardParts(view, component);
-    assert.equal(badge, "✓Up to date", component);
+    assert.equal(badge, "check-circle Up to date", component);
     assert.match(content, /Availability: up to date/, component);
     assert.doesNotMatch(content, /unverified/, component);
     assert.match(details, /Image digest: unverified/, component);
@@ -271,14 +278,14 @@ test("a directly deployed bot or API on the available source stays updatable whi
     queued.state = "queued";
     queued.desired = { ...queued.candidate, digest: "sha256:" + "e".repeat(64) };
     render(view, queued);
-    assert.equal(cardParts(view, component).badge, "↻Update pending", component);
+    assert.equal(cardParts(view, component).badge, "refresh Update pending", component);
     assert.equal(updateButton(view, component).disabled, false, component);
 
     const failed = record(component);
     failed.candidate.source_sha = failed.observed.source_sha;
     failed.state = "failed";
     render(view, failed);
-    assert.equal(cardParts(view, component).badge, "!Needs attention", component);
+    assert.equal(cardParts(view, component).badge, "alert-circle Needs attention", component);
     assert.equal(updateButton(view, component).disabled, false, component);
   }
 });
@@ -290,14 +297,14 @@ test("owner update badges keep real and unknown service updates distinct from cu
   bot.installed = { ...bot.candidate };
   bot.observed.source_sha = bot.candidate.source_sha;
   render(view, bot);
-  assert.equal(cardParts(view, "bot").badge, "✓Up to date");
+  assert.equal(cardParts(view, "bot").badge, "check-circle Up to date");
   assert.doesNotMatch(cardParts(view, "bot").details, /Image digest/);
   assert.equal(updateButton(view, "bot").disabled, true);
 
   // Direct deploy of an older source: a real update.
   const direct = record("bot");
   render(view, direct);
-  assert.equal(cardParts(view, "bot").badge, "↑Update available");
+  assert.equal(cardParts(view, "bot").badge, "arrow-up-circle Update available");
   assert.doesNotMatch(cardParts(view, "bot").details, /Image digest/);
   assert.equal(updateButton(view, "bot").disabled, false);
 
@@ -306,19 +313,19 @@ test("owner update badges keep real and unknown service updates distinct from cu
   unobserved.candidate.source_sha = unobserved.observed.source_sha;
   unobserved.observed_at = NOW_SECONDS - 7201;
   render(view, unobserved);
-  assert.equal(cardParts(view, "bot").badge, "↑Check status");
+  assert.equal(cardParts(view, "bot").badge, "arrow-up-circle Check status");
   assert.match(cardParts(view, "bot").content, /Availability: unknown/);
   assert.equal(updateButton(view, "bot").disabled, true);
   const unchecked = record("bot");
   unchecked.candidate.source_sha = unchecked.observed.source_sha;
   unchecked.checked_at = NOW_SECONDS - 7201;
   render(view, unchecked);
-  assert.equal(cardParts(view, "bot").badge, "↑Check status");
+  assert.equal(cardParts(view, "bot").badge, "arrow-up-circle Check status");
   assert.equal(updateButton(view, "bot").disabled, true);
   const missing = record("bot");
   missing.candidate = null;
   render(view, missing);
-  assert.equal(cardParts(view, "bot").badge, "↑Check status");
+  assert.equal(cardParts(view, "bot").badge, "arrow-up-circle Check status");
   assert.equal(updateButton(view, "bot").hidden, true);
 });
 
@@ -328,14 +335,14 @@ test("Update WebUI is disabled only while the WebUI card is up to date", () => {
   webui.installed = { ...webui.candidate };
   webui.observed.source_sha = webui.candidate.source_sha;
   render(view, webui);
-  assert.equal(cardParts(view, "webui").badge, "✓Up to date");
+  assert.equal(cardParts(view, "webui").badge, "check-circle Up to date");
   assert.equal(updateButton(view, "webui").disabled, true);
 
   // #578: Storage still serves an older release than the candidate.
   const stale = record("webui");
   stale.installed = { source_sha: stale.observed.source_sha, digest: "sha256:" + "d".repeat(64) };
   render(view, stale);
-  assert.equal(cardParts(view, "webui").badge, "↑Update available");
+  assert.equal(cardParts(view, "webui").badge, "arrow-up-circle Update available");
   assert.equal(updateButton(view, "webui").disabled, false);
 });
 
@@ -1130,4 +1137,24 @@ test("owner saves the boot repair alert channel as a string ID through the API",
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(saved.at(-1), { channel_id: "" });
   assert.ok(view.elements.get("alert-channel-unset"));
+});
+
+// #588: the Administration navigation and page controls draw the shared SVG icon set.
+test("Administration pages and controls show colored SVG icons, never glyphs", async () => {
+  const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([record()])));
+  for (const [id, label, icon, intent] of [
+    ["show-updates", "Updates", "arrow-up-circle", "info"],
+    ["show-database-usage", "Database Usage", "database", "neutral"],
+    ["show-analytics", "Analytics", "bar-chart", "analytics"],
+    ["refresh-status", "Refresh status", "refresh", "info"],
+  ]) {
+    const control = view.elements.get(id);
+    assert.equal(textOf(control), label, `${id} keeps its label without a glyph`);
+    const svg = find(control, (item) => item.localName === "svg");
+    assert.equal(svg?.getAttribute("aria-hidden"), "true", id);
+    assert.equal(svg.getAttribute("data-icon"), icon, id);
+    assert.ok(svg.classList.contains(`icon-${intent}`), `${id} is drawn in its ${intent} color`);
+  }
+  const back = find(view.elements.get("refresh-status").parentElement, (item) => item.localName === "a" && textOf(item) === "Back to workspace");
+  assert.equal(find(back, (item) => item.localName === "svg")?.getAttribute("data-icon"), "arrow-left");
 });

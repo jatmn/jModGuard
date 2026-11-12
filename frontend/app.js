@@ -1,6 +1,7 @@
 import { createState, useStore } from "./state.js";
 import { Appearance, useAppearance } from "./appearance.js";
 import { TrendChart, TrendMetricPicker, TREND_METRICS, sumSeries, useTrendMetric } from "./charts.js";
+import { ACTION_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import React, { useState, useEffect, useRef, createContext, useContext } from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -52,42 +53,16 @@ function ActionButton({ onClick, savedFields, disabled, ...props }) {
   });
 }
 
-// Hand-authored 24×24 stroke icons for row actions (no icon-library dependency;
-// sized by the .btn-icon rules in frontend/style.css). The accessible name and
-// hover tooltip come from the IconButton label.
-const ICON_PATHS = {
-  edit: ["M17 3l4 4L8 20l-5 1 1-5L17 3z", "M14 6l4 4"],
-  remove: [
-    "M4 7h16",
-    "M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2",
-    "M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13",
-    "M10 11v7",
-    "M14 11v7",
-  ],
-  unban: ["M7 11V7a5 5 0 0 1 9.9-1", "M5 11h14a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2z", "M12 15v2"],
-  cancel: ["M6 6l12 12", "M18 6L6 18"],
-};
-function Icon({ name }) {
-  return h(
-    "svg",
-    {
-      viewBox: "0 0 24 24",
-      fill: "none",
-      stroke: "currentColor",
-      strokeWidth: 2,
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-      "aria-hidden": "true",
-      focusable: "false",
-    },
-    ICON_PATHS[name].map((d, index) => h("path", { key: index, d })),
-  );
-}
-function IconButton({ icon, label, className = "btn btn-sm btn-square", ...props }) {
+// Row and record actions are compact icon buttons (#582, #588): the shared icon set in
+// frontend/icons.js gives each action one icon and one fixed color, sized by the .btn-icon
+// rules in frontend/style.css. The accessible name and hover tooltip come from the label,
+// and ActionButton keeps the shared busy/disabled path.
+function IconButton({ action, label, className = "btn btn-sm btn-square", ...props }) {
+  const { icon, intent } = ACTION_ICONS[action];
   return h(
     ActionButton,
     { className: `${className} btn-icon`, "aria-label": label, title: label, ...props },
-    h(Icon, { name: icon }),
+    h(Icon, { name: icon, intent }),
   );
 }
 function useDraftControl({ draftKey, defaultValue, onChange, ...props }) {
@@ -421,15 +396,12 @@ function TabOwnerServers() {
                 "td",
                 null,
                 server.active &&
-                  h(
-                    ActionButton,
-                    {
-                      className: "btn btn-sm btn-error",
-                      disabled: Boolean(receipts[server.guild_id]),
-                      onClick: () => requestRemoval(server),
-                    },
-                    "Remove",
-                  ),
+                  h(IconButton, {
+                    action: "leave",
+                    label: "Remove",
+                    disabled: Boolean(receipts[server.guild_id]),
+                    onClick: () => requestRemoval(server),
+                  }),
               ),
             );
           }),
@@ -451,27 +423,28 @@ function App() {
     window.addEventListener("beforeunload", beforeUnload);
     return () => window.removeEventListener("beforeunload", beforeUnload);
   }, []);
+  // Each item's icon and its fixed meaning color come from NAV_ICONS (frontend/icons.js).
   const navigationBase = [
-    ["dashboard", "◈", "Dashboard"],
-    ["rules", "◇", "Automod Rules"],
-    ["badwords", "⊘", "Badwords"],
-    ["known-spam", "⊗", "Known spam"],
-    ["known-bad-images", "▧", "Known-bad images"],
-    ["commands", "⌘", "Commands"],
-    ["templates", "≡", "Templates"],
-    ["logchannels", "#", "Log Channels"],
-    ["analytics", "≣", "Analytics"],
-    ["events", "≋", "Audit Log"],
-    ["members", "♙", "Members"],
-    ["bans", "⊖", "Bans"],
-    ["actions", "↻", "Bot actions"],
-    ["cases", "▣", "Cases"],
-    ["settings", "⚙", "Settings"],
+    ["dashboard", "Dashboard"],
+    ["rules", "Automod Rules"],
+    ["badwords", "Badwords"],
+    ["known-spam", "Known spam"],
+    ["known-bad-images", "Known-bad images"],
+    ["commands", "Commands"],
+    ["templates", "Templates"],
+    ["logchannels", "Log Channels"],
+    ["analytics", "Analytics"],
+    ["events", "Audit Log"],
+    ["members", "Members"],
+    ["bans", "Bans"],
+    ["actions", "Bot actions"],
+    ["cases", "Cases"],
+    ["settings", "Settings"],
   ];
   // The owner directory is a main-interface sub-section, not part of the
   // separate /administration page. It appears only for the bot owner.
   const navigation = isBotOwner()
-    ? [...navigationBase, ["servers", "⌂", "Bot servers"]]
+    ? [...navigationBase, ["servers", "Bot servers"]]
     : navigationBase;
   return h(
     BusyContext.Provider,
@@ -535,7 +508,7 @@ function App() {
               h(
                 "ul",
                 { id: "tabs", className: "menu w-full" },
-                ...navigation.flatMap(([tab, icon, label], i) => [
+                ...navigation.flatMap(([tab, label], i) => [
                   (i === 0 || i === 6 || i === navigationBase.length) &&
                     h(
                       "li",
@@ -554,8 +527,8 @@ function App() {
                         "aria-current": state.tab === tab ? "page" : undefined,
                         onClick: () => navigate(tab),
                       },
-                      h("span", { "aria-hidden": true }, icon),
-                      " " + label,
+                      h(Icon, { name: NAV_ICONS[tab].icon, intent: NAV_ICONS[tab].intent, className: "nav-icon" }),
+                      label,
                     ),
                   ),
                 ]),
@@ -652,8 +625,8 @@ function App() {
                     h(
                       "a",
                       { id: "login-link", className: "btn btn-primary", href: authUrl("/login") },
-                      "Continue with Discord ",
-                      h("span", { "aria-hidden": true }, "↗"),
+                      "Continue with Discord",
+                      h(Icon, { name: "external-link" }),
                     ),
                     h("small", null, "For server managers and community builders."),
                   )
@@ -2325,7 +2298,7 @@ function ruleCard(r) {
         h(
           "div",
           { className: "card-actions" },
-          h(IconButton, { icon: "edit", label: "Edit", onClick: () => editRule(r) }),
+          h(IconButton, { action: "edit", label: "Edit", onClick: () => editRule(r) }),
         ),
       ),
       h("p", {}, r.description),
@@ -3162,19 +3135,16 @@ function tabBadwords() {
                     "td",
                     {},
                     canDelete
-                      ? h(
-                          ActionButton,
-                          {
-                            className: "btn btn-sm btn-error",
-                            onClick: async () => {
-                              await reloadAfter(
-                                () => api(`/api/guilds/${state.guildId}/badwords/${w.id}`, "DELETE"),
-                                () => toast("Removed", "success"),
-                              );
-                            },
+                      ? h(IconButton, {
+                          action: "remove",
+                          label: "Remove",
+                          onClick: async () => {
+                            await reloadAfter(
+                              () => api(`/api/guilds/${state.guildId}/badwords/${w.id}`, "DELETE"),
+                              () => toast("Removed", "success"),
+                            );
                           },
-                          "✕",
-                        )
+                        })
                       : h("span", { className: "muted" }, "owner only"),
                   ),
                 );
@@ -3256,7 +3226,7 @@ function tabCommands() {
           h(
             "td",
             {},
-            canManageServer() && h(IconButton, { icon: "edit", label: "Edit", onClick: () => editCommand(c) }),
+            canManageServer() && h(IconButton, { action: "edit", label: "Edit", onClick: () => editCommand(c) }),
           ),
         );
       }),
@@ -4788,15 +4758,11 @@ function tabMembers() {
               {},
               h("code", {}, member.user_id),
               " ",
-              h(
-                ActionButton,
-                {
-                  className: "btn btn-sm",
-                  "aria-label": `Copy user ID ${member.user_id}`,
-                  onClick: () => navigator.clipboard.writeText(member.user_id),
-                },
-                "Copy",
-              ),
+              h(IconButton, {
+                action: "copy",
+                label: `Copy user ID ${member.user_id}`,
+                onClick: () => navigator.clipboard.writeText(member.user_id),
+              }),
             ),
             h("td", {}, asDate(member.joined_at_ms)),
             h(
@@ -4816,11 +4782,11 @@ function tabMembers() {
             h(
               "td",
               {},
-              h(
-                ActionButton,
-                { className: "btn btn-sm", onClick: () => openMember(member.user_id, member.display_name) },
-                "View history",
-              ),
+              h(IconButton, {
+                action: "view",
+                label: "View history",
+                onClick: () => openMember(member.user_id, member.display_name),
+              }),
             ),
           ),
         );
@@ -4891,16 +4857,18 @@ function tabMembers() {
               h("strong", {}, `${visibleLabel} · ${asDate(event.occurred_at_ms)}`),
               event.case_id
                 ? h(
-                    ActionButton,
-                    {
-                      className: "btn btn-sm",
+                    React.Fragment,
+                    null,
+                    ` · Case ${event.case_id} `,
+                    h(IconButton, {
+                      action: "view",
+                      label: `Open case ${event.case_id}`,
                       onClick: () => {
                         if (!aliveHere()) return;
                         pendingCase = { guildId, caseId: event.case_id };
                         if (!navigate("cases")) pendingCase = null;
                       },
-                    },
-                    `Case ${event.case_id}`,
+                    }),
                   )
                 : null,
               h(
@@ -5146,9 +5114,11 @@ function tabCases() {
           ),
           payload.can_delete
             ? h(
-                ActionButton,
+                IconButton,
                 {
-                  className: "btn btn-sm standalone-action",
+                  action: "remove",
+                  label: "Remove case record",
+                  className: "btn btn-sm btn-square standalone-action",
                   onClick: async () => {
                     if (!confirm("Remove this case record? This does not undo the Discord action.")) return;
                     const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
@@ -5161,7 +5131,6 @@ function tabCases() {
                     renderTab();
                   },
                 },
-                "Remove case record",
               )
             : null,
           h("h3", { className: "card-title" }, "History"),
@@ -5215,17 +5184,16 @@ function tabCases() {
             h(
               "p",
               {},
-              h(
-                ActionButton,
-                {
-                  className: "btn btn-sm",
-                  type: "button",
-                  onClick: async () => {
-                    await downloadPrivate(`/api/guilds/${guildId}/cases/${id}/evidence/${item.id}`, item.id);
-                  },
+              h("span", { className: "mono" }, item.id),
+              " ",
+              h(IconButton, {
+                action: "download",
+                label: `Download ${item.id}`,
+                type: "button",
+                onClick: async () => {
+                  await downloadPrivate(`/api/guilds/${guildId}/cases/${id}/evidence/${item.id}`, item.id);
                 },
-                `Download ${item.id}`,
-              ),
+              }),
             ),
           ),
         ]);
@@ -5281,9 +5249,10 @@ function tabCases() {
                   "td",
                   { colSpan: 4 },
                   h(
-                    ActionButton,
+                    IconButton,
                     {
-                      className: "btn btn-sm",
+                      action: "retry",
+                      label: "Retry cleanup",
                       onClick: async () => {
                         const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
                         toast(
@@ -5294,7 +5263,6 @@ function tabCases() {
                         );
                       },
                     },
-                    "Retry cleanup",
                   ),
                 ),
               ),
@@ -5309,7 +5277,9 @@ function tabCases() {
               h(
                 "td",
                 {},
-                h(ActionButton, { className: "btn btn-sm", onClick: () => openCase(id) }, id.slice(0, 8)),
+                h("span", { className: "mono" }, id.slice(0, 8)),
+                " ",
+                h(IconButton, { action: "view", label: `Open case ${id}`, onClick: () => openCase(id) }),
               ),
               h("td", {}, c?.action || "Summary unavailable"),
               h("td", {}, c?.outcome || ""),
@@ -5889,17 +5859,14 @@ function AccessRolesCard({ revision, generation }) {
                     ACCESS_LEVELS.map(([value, label]) => h("option", { key: value, value }, label)),
                   ),
                 ),
-                h(
-                  ActionButton,
-                  {
-                    className: "btn btn-sm",
-                    type: "button",
-                    onClick: () => {
-                      changeRows(rows.filter((item) => item.key !== row.key));
-                    },
+                h(IconButton, {
+                  action: "remove",
+                  label: "Remove role",
+                  type: "button",
+                  onClick: () => {
+                    changeRows(rows.filter((item) => item.key !== row.key));
                   },
-                  "Remove",
-                ),
+                }),
               ),
             ),
             h(
@@ -5994,7 +5961,7 @@ function RuleAction({ action, index, remove }) {
       h("strong", null, `Action ${index + 1}`),
       h(
         IconButton,
-        { icon: "remove", label: `Remove action ${index + 1}`, onClick: remove },
+        { action: "remove", label: `Remove action ${index + 1}`, onClick: remove },
       ),
     ),
     h(
@@ -6128,7 +6095,7 @@ function CommandStep({ step, placeholder, onChange, remove }) {
           onChange();
         },
       }),
-      h(ActionButton, { className: "btn btn-sm btn-error", onClick: remove }, "✕"),
+      h(IconButton, { action: "remove", label: "Remove step", onClick: remove }),
     ),
   );
 }
@@ -6339,7 +6306,7 @@ function tabKnownSpam() {
         h("td", null, row.kind === "url" ? "URL" : "Sample"),
         h("td", { style: { whiteSpace: "pre-wrap", overflowWrap: "anywhere" } }, row.value),
         h("td", null, row.note || "—"), h("td", null, row.guild_id === "0" ? "Global" : "This server"),
-        h("td", null, row.guild_id !== "0" || isBotOwner() ? h(IconButton, { icon: "remove", label: "Remove",
+        h("td", null, row.guild_id !== "0" || isBotOwner() ? h(IconButton, { action: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm("Remove this known spam entry?")) return;
             await api(`/api/guilds/${guildId}/known-spam/${row.id}`, "DELETE");
@@ -6398,7 +6365,7 @@ function tabKnownBadImages() {
         h("td", { style: { overflowWrap: "anywhere" } }, row.hash),
         h("td", null, row.added_at), h("td", null, row.added_via),
         h("td", null, row.actor), h("td", null, row.note || "—"),
-        h("td", null, h(IconButton, { icon: "remove", label: "Remove",
+        h("td", null, h(IconButton, { action: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm(`Remove SHA-256 ${row.hash}?`)) return;
             await api(`/api/guilds/${guildId}/known-bad-images/${row.hash}`, "DELETE");
@@ -6471,7 +6438,7 @@ function tabBans() {
                   h(
                     IconButton,
                     {
-                      icon: "unban",
+                      action: "unban",
                       label: "Unban",
                       onClick: async () => {
                         if (confirm(`Unban ${record.user_id}?`))
@@ -6542,7 +6509,7 @@ function tabActions() {
                   h(
                     IconButton,
                     {
-                      icon: "cancel",
+                      action: "cancel",
                       label: actionCancelLabel(job),
                       onClick: async () => {
                         if (

@@ -1,6 +1,7 @@
 import { createState, useStore } from "./state.js";
 import { Appearance, useAppearance } from "./appearance.js";
 import { TrendChart, TrendMetricPicker, sumSeries, useTrendMetric } from "./charts.js";
+import { ACTION_ICONS, Icon, NAV_ICONS } from "./icons.js";
 /* Owner Administration. React owns rendering; the API remains authoritative. */
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -179,9 +180,15 @@ function action(label, component, callback, props = {}) {
       () => callback(ui.getSnapshot().snapshot.components.find(item => item.component === component))) }, label);
 }
 
-function badge(text, tone, icon) {
+// Status badges and page controls draw the shared SVG icon set (frontend/icons.js), never glyphs.
+function badge(text, tone, meaning) {
+  const { icon, intent } = ACTION_ICONS[meaning];
   return h("span", { className: `badge badge-soft administration-badge badge-${{ good: "success", warn: "warning", bad: "error", neutral: "neutral" }[tone]}` },
-    h("span", { "aria-hidden": "true" }, icon), h("span", null, text));
+    h(Icon, { name: icon, intent }), h("span", null, text));
+}
+function navButton(id, view, label, activeView) {
+  return h("button", { id, className: "btn btn-sm", type: "button", "aria-current": activeView === view ? "page" : undefined, onClick: () => selectView(view) },
+    h(Icon, { name: NAV_ICONS[view].icon, intent: NAV_ICONS[view].intent }), label);
 }
 
 function releaseText(release) {
@@ -195,7 +202,7 @@ function ComponentCard({ record, revision }) {
   const content = [], details = [], heading = [];
   const mismatch = ui.getSnapshot().snapshot.boot_mismatches?.[record.component];
   if (mismatch) {
-    heading.push(badge("Boot mismatch", "warn", "!"));
+    heading.push(badge("Boot mismatch", "warn", "warn"));
     line(content, "Startup problem", mismatch.reason);
     line(content, "Expected release", `${mismatch.expected.release_id} · ${mismatch.expected.source_sha}`);
     line(content, "Startup executable", mismatch.running || "Application stopped");
@@ -250,7 +257,7 @@ function ComponentCard({ record, revision }) {
   const problem = record.check_error || record.last_error || purgePending || record.state === "failed" || record.state === "drift";
   heading.push(badge((ui.getSnapshot().freshness === "stale") ? "Status unavailable" : inProgress ? "Update pending" : problem ? "Needs attention" : availability === "up to date" ? "Up to date" : availability === "update available" ? "Update available" : "Check status",
     (ui.getSnapshot().freshness === "stale") || problem ? "bad" : inProgress || availability === "update available" ? "warn" : availability === "up to date" ? "good" : "neutral",
-    (ui.getSnapshot().freshness === "stale") || problem ? "!" : inProgress ? "↻" : availability === "up to date" ? "✓" : "↑"));
+    (ui.getSnapshot().freshness === "stale") || problem ? "attention" : inProgress ? "retry" : availability === "up to date" ? "approve" : "update"));
   line(content, "Availability", availability);
   if (record.desired_launcher && record.desired_launcher.digest !== record.installed_launcher?.digest) {
     line(content, "Launcher", "Update pending — waiting for the launcher to report its result");
@@ -618,19 +625,19 @@ function Administration() {
     h("header", { className: "administration-header" },
       h("div", null, h("span", { className: "eyebrow" }, "OWNER ADMINISTRATION"), h("h1", { id: "admin-title" }, display.activeView === "usage" ? "Database Usage" : display.activeView === "analytics" ? "Analytics" : "Updates")),
       h("div", { className: "administration-tools" }, h("button", { id: "refresh-status", type: "button", className: "btn btn-sm", disabled: (display.activity === "busy"),
-        onClick: () => { if (ui.getSnapshot().activity !== "busy") { ui.set({ actionMessage: "" }); return refresh(); } } }, "↻ Refresh status"), h(Appearance, appearance), h("a", { className: "btn btn-sm", href: "/" }, "← Back to workspace"))),
+        onClick: () => { if (ui.getSnapshot().activity !== "busy") { ui.set({ actionMessage: "" }); return refresh(); } } }, h(Icon, { name: ACTION_ICONS.retry.icon, intent: ACTION_ICONS.retry.intent }), "Refresh status"), h(Appearance, appearance), h("a", { className: "btn btn-sm", href: "/" }, h(Icon, { name: ACTION_ICONS.back.icon, intent: ACTION_ICONS.back.intent }), "Back to workspace"))),
     h("p", { id: "update-status", className: `alert alert-soft administration-notice ${{ good: "alert-success", warn: "alert-warning", bad: "alert-error", neutral: "" }[display.status.tone]}`, role: "status", "aria-live": "polite" }, display.status.message),
     h("div", { id: "sign-in", className: (display.signIn === "required") ? "" : "hidden" }, h("a", { id: "sign-in-link", className: "btn btn-primary", href: login }, "Sign in with Discord")),
     h("nav", { className: "administration-nav", "aria-label": "Administration pages" },
-      h("button", { id: "show-updates", className: "btn btn-sm", type: "button", "aria-current": display.activeView === "updates" ? "page" : undefined, onClick: () => selectView("updates") }, "Updates"),
-      h("button", { id: "show-database-usage", className: "btn btn-sm", type: "button", "aria-current": display.activeView === "usage" ? "page" : undefined, onClick: () => selectView("usage") }, "Database Usage"),
-      h("button", { id: "show-analytics", className: "btn btn-sm", type: "button", "aria-current": display.activeView === "analytics" ? "page" : undefined, onClick: () => selectView("analytics") }, "Analytics")),
+      navButton("show-updates", "updates", "Updates", display.activeView),
+      navButton("show-database-usage", "usage", "Database Usage", display.activeView),
+      navButton("show-analytics", "analytics", "Analytics", display.activeView)),
     h("div", { id: "updates", className: display.access === "allowed" && display.activeView === "updates" ? "" : "hidden" },
       h("div", { className: "administration-overview" }, h("div", null, h("h2", null, "Component updates"), h("p", { className: "muted" }, "Check releases and manage the API, bot, and WebUI independently. Release discovery runs hourly."))),
       h("p", { id: "automatic-state", className: "muted" }, display.snapshot?.unattended_enabled ? "Automatic installation policies are available." : "Automatic installation is disabled for this deployment. Hourly checks and Check now still work."),
       h("div", { id: "browser-version", className: "administration-browser" }, display.snapshot && h(React.Fragment, null,
         h("details", null, h("summary", null, "Browser version"), h("div", null, details)),
-        differentWeb && badge("A different WebUI version is installed. Reload this page to load it.", "warn", "↻"),
+        differentWeb && badge("A different WebUI version is installed. Reload this page to load it.", "warn", "retry"),
         differentWeb && h("button", { className: "btn btn-sm", type: "button", disabled: (display.activity === "busy"), onClick: () => window.location.reload() }, "Reload page"))),
       h("div", { id: "update-cards", className: "administration-grid" }, display.snapshot?.components.map(record => h(ComponentCard, { key: record.component, record, revision: ui.getSnapshot().policyRevision }))),
       display.snapshot && h(AlertChannelCard, { revision: ui.getSnapshot().policyRevision })),
