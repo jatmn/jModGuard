@@ -162,12 +162,13 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .preview-banner { position: sticky; top: 0; z-index: 30; }
 .owner-tools { display: flex; flex-direction: column; gap: 8px; margin: 12px 8px 0; }
 /* Desktop: pin the sidebar to the viewport so its footer controls stay visible while the
-   workspace scrolls; a tall nav scrolls inside it. The fixed banner height lets the sidebar
-   sit below the sticky preview banner instead of under it. */
+   workspace scrolls; a tall nav scrolls inside it. The nav keeps a minimum height, so a screen
+   too short for it and the other sidebar parts scrolls the sidebar itself instead of hiding the
+   nav or footer. The fixed banner height lets the sidebar sit below the sticky preview banner. */
 @media (min-width: 721px) {
   :root { --preview-banner-height: 3rem; }
-  .sidebar { position: sticky; top: 0; height: 100dvh; min-height: 0; align-self: flex-start; }
-  .sidebar nav { overflow-y: auto; }
+  .sidebar { position: sticky; top: 0; height: 100dvh; min-height: 0; align-self: flex-start; overflow-y: auto; }
+  .sidebar nav { overflow-y: auto; min-height: 3rem; }
   .preview-banner { height: var(--preview-banner-height); }
   .preview-banner + #main-view .sidebar { top: var(--preview-banner-height); height: calc(100dvh - var(--preview-banner-height)); }
 }
