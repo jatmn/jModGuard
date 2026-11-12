@@ -59,7 +59,12 @@ pub async fn put_access_roles(
     let auth = authorize_manage_guild(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
-    let mut roles = Vec::with_capacity(body.roles.len());
+    if body.roles.len() > 32 {
+        return Err(ApiError(anyhow::anyhow!(
+            "at most 32 access roles are allowed"
+        )));
+    }
+    let mut roles = Vec::new();
     for role in body.roles {
         let role_id = role
             .role_id

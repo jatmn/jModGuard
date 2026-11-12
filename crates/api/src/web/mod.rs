@@ -1422,7 +1422,8 @@ async fn api_me(
     session: Session,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = require_auth(&state, &session).await?;
-    let (role_guilds, role_scope_missing) = role_access_guilds(&state, &session, &auth).await;
+    let (role_guilds, role_scope_missing, role_discovery_incomplete) =
+        role_access_guilds(&state, &session, &auth).await;
     let guilds: Vec<serde_json::Value> = auth
         .guilds
         .iter()
@@ -1451,6 +1452,7 @@ async fn api_me(
         },
         "guilds": guilds,
         "role_scope_missing": role_scope_missing,
+        "role_discovery_incomplete": role_discovery_incomplete,
         "is_bot_owner": is_bot_owner(&state, &auth),
         "preview": preview::current().map(|preview| serde_json::json!({
             "guild_id": preview.guild_id.to_string(),
@@ -2135,6 +2137,7 @@ impl std::error::Error for MemberScopeMissing {}
 /// access after at most this long.
 pub const MEMBER_ROLES_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const MEMBER_ROLES_MAX_ENTRIES: usize = 10_000;
+const ROLE_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Highest mapped level the user's current roles grant in this enrollment.
 /// `None` when nothing is mapped or no held role is mapped.
@@ -2178,20 +2181,25 @@ async fn member_roles(
     user_id: u64,
     guild_id: u64,
 ) -> ApiResult<Vec<u64>> {
-    if app.member_roles.len() > MEMBER_ROLES_MAX_ENTRIES {
-        app.member_roles.retain(|_, slot| {
-            slot.try_lock().map_or(true, |slot| {
-                slot.as_ref()
-                    .is_some_and(|(at, _)| at.elapsed() < MEMBER_ROLES_TTL)
-            })
-        });
-    }
-    let slot = Arc::clone(
-        app.member_roles
-            .entry((user_id, guild_id))
-            .or_default()
-            .value(),
-    );
+    let slot = {
+        // Serialize admission/eviction, never network I/O. Do not evict slots
+        // held by another request, including requests waiting on the same key.
+        let mut cache = app.member_roles.lock().unwrap();
+        if let Some(slot) = cache.get(&(user_id, guild_id)) {
+            Arc::clone(slot)
+        } else {
+            if cache.len() >= MEMBER_ROLES_MAX_ENTRIES {
+                let idle = cache
+                    .iter()
+                    .find_map(|(key, slot)| (Arc::strong_count(slot) == 1).then_some(*key));
+                let Some(idle) = idle else {
+                    return Err(ApiError(GuildAccessError::Unverified.into()));
+                };
+                cache.remove(&idle);
+            }
+            Arc::clone(cache.entry((user_id, guild_id)).or_default())
+        }
+    };
     let mut slot = slot.lock().await;
     if let Some((at, roles)) = slot.as_ref()
         && at.elapsed() < MEMBER_ROLES_TTL
@@ -2226,37 +2234,50 @@ async fn role_access_guilds(
     app: &Arc<ApiState>,
     session: &Session,
     auth: &AuthCtx,
-) -> (Vec<(String, AccessLevel)>, bool) {
+) -> (Vec<(String, AccessLevel)>, bool, bool) {
     let mut scope_missing = false;
-    if preview::current().is_some() {
-        return (Vec::new(), scope_missing);
-    }
-    let candidates = auth
-        .guilds
-        .iter()
-        .filter(|g| !g.manage_permission())
-        .filter_map(|g| g.id.parse::<i64>().ok().filter(|id| *id > 0))
-        .collect::<Vec<_>>();
-    let enrollments = match crate::db::active_guild_enrollments(&app.db, candidates).await {
-        Ok(enrollments) => enrollments,
-        Err(error) => {
-            tracing::warn!("role access listing unavailable: {error:#}");
-            return (Vec::new(), scope_missing);
-        }
-    };
+    let mut incomplete = false;
     let mut granted = Vec::new();
-    for enrollment in enrollments {
-        let guild_id = enrollment.guild_id.to_string();
-        match guild_role_level(app, session, auth, &enrollment).await {
-            Ok(Some(level)) => granted.push((guild_id, level)),
-            Ok(None) => {}
-            Err(error) if error.0.is::<MemberScopeMissing>() => scope_missing = true,
+    if preview::current().is_some() {
+        return (granted, scope_missing, incomplete);
+    }
+    // One budget covers catalog reads, tenant reads and all Discord lookups.
+    // Dropping an unfinished lookup releases its slot; no background work stays.
+    let discovery = async {
+        let candidates = auth
+            .guilds
+            .iter()
+            .filter(|g| !g.manage_permission())
+            .filter_map(|g| g.id.parse::<i64>().ok().filter(|id| *id > 0))
+            .collect::<Vec<_>>();
+        let enrollments = match crate::db::active_guild_enrollments(&app.db, candidates).await {
+            Ok(enrollments) => enrollments,
             Err(error) => {
-                tracing::debug!(guild_id, "role access not listed: {:#}", error.0);
+                tracing::warn!("role access listing unavailable: {error:#}");
+                incomplete = true;
+                return;
+            }
+        };
+        for enrollment in enrollments {
+            let guild_id = enrollment.guild_id.to_string();
+            match guild_role_level(app, session, auth, &enrollment).await {
+                Ok(Some(level)) => granted.push((guild_id, level)),
+                Ok(None) => {}
+                Err(error) if error.0.is::<MemberScopeMissing>() => scope_missing = true,
+                Err(error) => {
+                    tracing::debug!(guild_id, "role access not listed: {:#}", error.0);
+                    incomplete = true;
+                }
             }
         }
+    };
+    if tokio::time::timeout(ROLE_DISCOVERY_TIMEOUT, discovery)
+        .await
+        .is_err()
+    {
+        incomplete = true;
     }
-    (granted, scope_missing)
+    (granted, scope_missing, incomplete)
 }
 
 pub(super) async fn manage_guild_from_auth(

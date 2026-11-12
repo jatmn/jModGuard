@@ -5570,3 +5570,83 @@ test('access-role and case-removal saves share the server role revision', async 
   const puts = calls.filter((c) => c.method === 'PUT');
   assert.deepEqual(puts.map((c) => c.body.revision), ['revision-1', 'revision-2']);
 });
+
+test('access-role drafts survive another Settings save including empty mappings', async () => {
+  for (const removeAll of [false, true]) {
+    const cfg = { enrollment_id: 'membership', settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
+    const calls = [];
+    const h = harness(async (url, options) => {
+      const body = options.body ? JSON.parse(options.body) : null;
+      calls.push({ url, method: options.method, body });
+      if (url.endsWith('/access-roles') && options.method === 'POST') return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], revision: 'r1' });
+      if (url.endsWith('/access-roles') && options.method === 'PUT') return response({ roles: body.roles, revision: 'r2' });
+      if (url.endsWith('/case-delete-roles')) return response({ roles: [], revision: 'r1' });
+      if (url.endsWith('/settings') && options.method === 'PUT') {
+        cfg.settings.prefix = body.prefix;
+        return response({ ok: true, config_patch: { kind: 'settings', scope: 'guild', settings: cfg.settings, prefix_present: true, prefix: body.prefix } });
+      }
+      return response(cfg);
+    });
+    h.app.state.config = cfg;
+    h.app.state.tab = 'settings';
+    h.app.renderTab();
+    await settle();
+    const rows = () => Array.from(h.document.querySelectorAll('.access-role-row'));
+    if (removeAll) {
+      await fire(rows()[0].querySelector('button'), 'click');
+    } else {
+      const input = rows()[0].querySelector('input');
+      input.value = '222222222222222222'; await fire(input, 'input');
+      const level = rows()[0].querySelector('select');
+      level.value = 'settings'; await fire(level, 'change');
+      await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Add role'), 'click');
+      const added = rows()[1].querySelector('input');
+      added.value = '333333333333333333'; await fire(added, 'input');
+    }
+    assert.equal(h.app.isDirty(), true, 'all mapping edits mark the shared draft dirty');
+    const prefix = h.elements.find(n => n.localName === 'input' && n.value === '!');
+    prefix.value = '?'; await fire(prefix, 'input');
+    await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+    assert.deepEqual(rows().map(row => [row.querySelector('input').value, row.querySelector('select').value]), removeAll ? [] : [
+      ['222222222222222222', 'settings'], ['333333333333333333', 'dashboard'],
+    ]);
+    assert.equal(h.app.isDirty(), true, 'unrelated save retains mapping dirty state');
+    await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save access roles'), 'click');
+    const saved = calls.find(c => c.method === 'PUT' && c.url.endsWith('/access-roles'));
+    assert.deepEqual(saved.body.roles, removeAll ? [] : [
+      { role_id: '222222222222222222', level: 'settings' }, { role_id: '333333333333333333', level: 'dashboard' },
+    ]);
+    assert.equal(h.app.isDirty(), false, 'acknowledged mapping save clears its own draft');
+  }
+});
+
+test('log action cancel controls match dashboard and settings access', async () => {
+  for (const access of ['dashboard', 'settings', 'manage']) {
+    const jobs = ['pending', 'claimed', 'running', 'uncertain'].map((state, index) => ({ ...queuedAction(state), id: `log-${index}`, action: { kind: 'set_log_channel', event: 'member_join', channel_id: '1' } }));
+    const h = harness(async () => response(jobs));
+    h.app.state.guilds[0].access = access;
+    h.app.state.config = { enrollment_id: 'membership' };
+    h.app.tabActions(); await settle();
+    const cancel = h.elements.filter(n => n.localName === 'button' && /^(Force cancel|Cancel)$/.test(n.textContent));
+    assert.equal(cancel.length, access === 'dashboard' ? 0 : 4, access);
+  }
+});
+
+test('incomplete server discovery offers retry and recovers the server list', async () => {
+  let attempts = 0;
+  const guild = { id: '987654321098765432', name: 'First', access: 'dashboard' };
+  const cfg = { enrollment_id: 'membership', settings: { prefix: '!' }, rules: [], commands: [], log_channels: [], badwords: [] };
+  const h = harness(async (url) => {
+    if (url.endsWith('/api/me')) return response({ user: { id: '123456789012345678' }, guilds: attempts++ === 0 ? [] : [guild], role_discovery_incomplete: attempts === 1 });
+    if (url.endsWith('/config')) return response(cfg);
+    return response({});
+  });
+  await h.app.init(); h.app.renderTab(); await settle();
+  assert.match(h.document.querySelector('#content').textContent, /Server discovery incomplete/);
+  assert.doesNotMatch(h.document.querySelector('#content').textContent, /No servers to manage yet/);
+  await fire(Array.from(h.document.querySelectorAll('button')).find(n => n.textContent === 'Retry server discovery'), 'click');
+  assert.equal(attempts, 2);
+  assert.equal(h.app.state.guildId, guild.id);
+  assert.equal(h.document.querySelector('#guild-select').value, guild.id);
+  assert.ok(!h.document.body.textContent.includes('Some server access checks could not finish'));
+});

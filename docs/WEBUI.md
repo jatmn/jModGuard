@@ -187,7 +187,11 @@ and sign in again before role access works. The bot rechecks the actor's roles
 from its own Discord data before applying a settings edit or a log-channel
 change. Hidden controls are presentation only; the API refuses every request the
 level does not include (`403` `guild_access_denied`). Role list changes are
-written to the API log with the acting user.
+written to the API log with the acting user. Server discovery has a five-second
+budget for role checks. If a dependency fails or that budget expires, the WebUI
+marks the server list incomplete and offers **Retry server discovery**; it does
+not grant access to any unverified server. Successful role reads are cached in a
+bounded 10,000-entry cache. Unsaved role-mapping edits survive other Settings saves.
 The **Members** tab searches saved member IDs and names without a browser-side
 Discord roster request. It shows current status, known join dates, linked
 moderation cases and the [durable import state](MEMBERS.md). All its reads

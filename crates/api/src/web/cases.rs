@@ -319,10 +319,20 @@ pub async fn get_case_delete_roles(
         scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
     let (store, scope) = live(&app, enrollment).await?;
     let settings = store.tenant_settings(scope).await?;
+    let can_delete = can_delete_cases(&auth, guild_id);
+    let roles: Vec<_> = if can_delete {
+        settings
+            .case_delete_roles
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(Json(serde_json::json!({
-        "roles": settings.case_delete_roles.into_iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "roles": roles,
         "revision": settings.revision,
-        "can_delete": can_delete_cases(&auth, guild_id),
+        "can_delete": can_delete,
         "delegated_roles_require_member_scope": true,
     })))
 }

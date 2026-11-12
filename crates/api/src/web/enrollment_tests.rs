@@ -33,6 +33,8 @@ struct DiscordStub {
     /// `/users/@me/guilds/{id}/member` role IDs; a missing guild is HTTP 404.
     member_roles: std::sync::Mutex<std::collections::HashMap<u64, Vec<String>>>,
     member_unauthorized: AtomicBool,
+    member_failed: AtomicBool,
+    member_delay: std::sync::atomic::AtomicU64,
     member_calls: AtomicUsize,
 }
 #[derive(Clone, Copy)]
@@ -96,6 +98,8 @@ impl Fixture {
             replace_destination_during_lookup: std::sync::Mutex::new(None),
             member_roles: std::sync::Mutex::new(std::collections::HashMap::new()),
             member_unauthorized: AtomicBool::new(false),
+            member_failed: AtomicBool::new(false),
+            member_delay: std::sync::atomic::AtomicU64::new(0),
             member_calls: AtomicUsize::new(0),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -111,6 +115,10 @@ impl Fixture {
                     let handler = Arc::clone(&member_handler);
                     async move {
                         handler.member_calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(handler.member_delay.load(Ordering::SeqCst))).await;
+                        if handler.member_failed.load(Ordering::SeqCst) {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
                         if handler.member_unauthorized.load(Ordering::SeqCst) {
                             return StatusCode::UNAUTHORIZED.into_response();
                         }
@@ -5909,8 +5917,10 @@ async fn demote_to_member(f: &Fixture) {
 async fn expire_member_roles(app: &ApiState) {
     let slots: Vec<_> = app
         .member_roles
-        .iter()
-        .map(|entry| Arc::clone(entry.value()))
+        .lock()
+        .unwrap()
+        .values()
+        .map(Arc::clone)
         .collect();
     for slot in slots {
         if let Some((at, _)) = &mut *slot.lock().await {
@@ -6138,10 +6148,212 @@ async fn role_access_fails_closed_without_the_member_scope() {
 #[tokio::test]
 async fn ban_members_moderator_with_a_settings_role_sees_its_log_channel_work() {
     use db::guild_data::{AccessLevel, AccessRole};
+    for can_ban in [false, true] {
+        let f = Fixture::new(false).await;
+        f.enroll(10).await;
+        let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+        f.app.tenant.activate(enrollment).await.unwrap().unwrap();
+        set_access_roles(
+            &f,
+            10,
+            vec![AccessRole {
+                role_id: 555,
+                level: AccessLevel::Settings,
+            }],
+        )
+        .await;
+        let mut moderator = member_guild(10);
+        moderator.permissions = Some(oauth::PermissionsField::Number(if can_ban {
+            1 << 2
+        } else {
+            0
+        }));
+        expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+        *f.discord.guilds.lock().unwrap() = vec![moderator.clone()];
+        tests::seed_auth_caches(&f.app, 42, vec![moderator]);
+        f.discord
+            .member_roles
+            .lock()
+            .unwrap()
+            .insert(10, vec!["555".to_owned()]);
+        let body = serde_json::json!({"request_id": action_key("log"), "channel_id": "123"});
+        let (status, log) = f
+            .request(
+                "PUT",
+                "/api/guilds/10/logchannels/message_edit",
+                &body.to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{log}");
+        let (status, history) = f.request("POST", "/api/guilds/10/actions", "").await;
+        assert_eq!(status, StatusCode::OK, "{history}");
+        assert_eq!(history.as_array().unwrap().len(), 1);
+        assert_eq!(history[0]["id"], log["id"]);
+        let path = format!("/api/guilds/10/actions/{}", log["id"].as_str().unwrap());
+        if can_ban {
+            // Ban Members alone must neither disclose nor cancel log-channel work.
+            set_access_roles(&f, 10, Vec::new()).await;
+            let (status, history) = f.request("POST", "/api/guilds/10/actions", "").await;
+            assert_eq!(status, StatusCode::OK, "{history}");
+            assert_eq!(history, serde_json::json!([]));
+            let (status, denied) = f.request("DELETE", &path, "").await;
+            assert!(status.is_client_error(), "{denied}");
+            set_access_roles(
+                &f,
+                10,
+                vec![AccessRole {
+                    role_id: 555,
+                    level: AccessLevel::Settings,
+                }],
+            )
+            .await;
+        }
+        let (status, body) = f.request("DELETE", &path, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn role_cache_stays_bounded_with_live_entries() {
     let f = Fixture::new(false).await;
     f.enroll(10).await;
     let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
     f.app.tenant.activate(enrollment).await.unwrap().unwrap();
+    set_access_roles(
+        &f,
+        10,
+        vec![db::guild_data::AccessRole {
+            role_id: 555,
+            level: db::guild_data::AccessLevel::Dashboard,
+        }],
+    )
+    .await;
+    demote_to_member(&f).await;
+    f.discord
+        .member_roles
+        .lock()
+        .unwrap()
+        .insert(10, vec!["555".into()]);
+    for i in 0..MEMBER_ROLES_MAX_ENTRIES {
+        f.app.member_roles.lock().unwrap().insert(
+            (1000 + i as u64, 10),
+            Arc::new(tokio::sync::Mutex::new(Some((
+                std::time::Instant::now(),
+                vec![555],
+            )))),
+        );
+    }
+    let (status, body) = f.request("POST", "/api/guilds/10/stats", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(f.app.member_roles.lock().unwrap().len() <= MEMBER_ROLES_MAX_ENTRIES);
+}
+
+#[tokio::test]
+async fn role_discovery_reports_failure_and_recovers_without_signing_out() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app.tenant.activate(enrollment).await.unwrap().unwrap();
+    set_access_roles(
+        &f,
+        10,
+        vec![db::guild_data::AccessRole {
+            role_id: 555,
+            level: db::guild_data::AccessLevel::Dashboard,
+        }],
+    )
+    .await;
+    demote_to_member(&f).await;
+    f.discord
+        .member_roles
+        .lock()
+        .unwrap()
+        .insert(10, vec!["555".into()]);
+    f.discord.member_failed.store(true, Ordering::SeqCst);
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["role_discovery_incomplete"], true);
+    assert_eq!(me["guilds"], serde_json::json!([]));
+    f.discord.member_failed.store(false, Ordering::SeqCst);
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["role_discovery_incomplete"], false);
+    assert_eq!(me["guilds"][0]["id"], "10");
+}
+
+#[tokio::test]
+async fn role_discovery_has_one_total_deadline() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app.tenant.activate(enrollment).await.unwrap().unwrap();
+    set_access_roles(
+        &f,
+        10,
+        vec![db::guild_data::AccessRole {
+            role_id: 555,
+            level: db::guild_data::AccessLevel::Dashboard,
+        }],
+    )
+    .await;
+    demote_to_member(&f).await;
+    f.discord.member_delay.store(15_000, Ordering::SeqCst);
+    let (status, me) = tokio::time::timeout(
+        std::time::Duration::from_secs(7),
+        f.request("POST", "/api/me", ""),
+    )
+    .await
+    .expect("discovery must not wait for each OAuth request timeout");
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["role_discovery_incomplete"], true);
+    assert_eq!(me["guilds"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn access_role_limit_rejects_oversized_requests_without_changing_mappings() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app.tenant.activate(enrollment).await.unwrap().unwrap();
+    let (_, loaded) = f.request("POST", "/api/guilds/10/access-roles", "").await;
+    let roles: Vec<_> = (100..133)
+        .map(|id| serde_json::json!({"role_id":id.to_string(), "level":"dashboard"}))
+        .collect();
+    let body = serde_json::json!({"roles":roles,"revision":loaded["revision"]});
+    let (status, _) = f
+        .request("PUT", "/api/guilds/10/access-roles", &body.to_string())
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        f.request("POST", "/api/guilds/10/access-roles", "").await.1,
+        loaded
+    );
+    let body = serde_json::json!({"roles":&roles[..32],"revision":loaded["revision"]});
+    let (status, saved) = f
+        .request("PUT", "/api/guilds/10/access-roles", &body.to_string())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["roles"].as_array().unwrap().len(), 32);
+}
+
+#[tokio::test]
+async fn case_removal_role_ids_require_administrator_or_server_owner() {
+    use db::guild_data::{AccessLevel, AccessRole};
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    let revision = store.tenant_settings(scope.clone()).await.unwrap().revision;
+    store
+        .set_case_delete_roles(scope, &revision, vec![777])
+        .await
+        .unwrap();
     set_access_roles(
         &f,
         10,
@@ -6151,30 +6363,49 @@ async fn ban_members_moderator_with_a_settings_role_sees_its_log_channel_work() 
         }],
     )
     .await;
-    let mut moderator = member_guild(10);
-    moderator.permissions = Some(oauth::PermissionsField::Number(1 << 2));
-    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
-    *f.discord.guilds.lock().unwrap() = vec![moderator.clone()];
-    tests::seed_auth_caches(&f.app, 42, vec![moderator]);
     f.discord
         .member_roles
         .lock()
         .unwrap()
-        .insert(10, vec!["555".to_owned()]);
-    let body = serde_json::json!({"request_id": action_key("log"), "channel_id": "123"});
-    let (status, log) = f
-        .request(
-            "PUT",
-            "/api/guilds/10/logchannels/message_edit",
-            &body.to_string(),
-        )
-        .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{log}");
-    let (status, history) = f.request("POST", "/api/guilds/10/actions", "").await;
-    assert_eq!(status, StatusCode::OK, "{history}");
-    assert_eq!(history.as_array().unwrap().len(), 1);
-    assert_eq!(history[0]["id"], log["id"]);
-    let path = format!("/api/guilds/10/actions/{}", log["id"].as_str().unwrap());
-    let (status, body) = f.request("DELETE", &path, "").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+        .insert(10, vec!["555".into()]);
+    for kind in ["administrator", "owner", "manage", "settings", "dashboard"] {
+        if kind == "dashboard" {
+            set_access_roles(
+                &f,
+                10,
+                vec![AccessRole {
+                    role_id: 555,
+                    level: AccessLevel::Dashboard,
+                }],
+            )
+            .await;
+        }
+        let mut guild = member_guild(10);
+        guild.owner = kind == "owner";
+        guild.permissions = Some(oauth::PermissionsField::Number(match kind {
+            "administrator" => 1 << 3,
+            "manage" => 1 << 5,
+            _ => 0,
+        }));
+        expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+        *f.discord.guilds.lock().unwrap() = vec![guild.clone()];
+        tests::seed_auth_caches(&f.app, 42, vec![guild]);
+        for method in ["GET", "POST"] {
+            let (status, body) = f
+                .request(method, "/api/guilds/10/case-delete-roles", "")
+                .await;
+            assert_eq!(status, StatusCode::OK, "{kind}: {body}");
+            let privileged = matches!(kind, "administrator" | "owner");
+            assert_eq!(body["can_delete"], privileged);
+            assert_eq!(
+                body["roles"],
+                if privileged {
+                    serde_json::json!(["777"])
+                } else {
+                    serde_json::json!([])
+                },
+                "{kind}"
+            );
+        }
+    }
 }

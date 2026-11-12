@@ -206,6 +206,12 @@ function App() {
                   ? state.guilds.map((guild) => h("option", { key: guild.id, value: guild.id }, guild.name))
                   : h("option", { value: "" }, "No manageable servers"),
               ),
+              state.me?.role_discovery_incomplete && h("p", { className: "muted", role: "status" },
+                "Some server access checks could not finish. ",
+                h(ActionButton, { className: "btn btn-xs", onClick: async () => {
+                  if (canLeave()) await init();
+                } }, "Retry server discovery"),
+              ),
             ),
             h(
               "nav",
@@ -415,8 +421,10 @@ function Content() {
   };
   if (!state.guildId)
     return emptyPanel(
-      "No servers to manage yet",
-      state.me?.role_scope_missing
+      state.me?.role_discovery_incomplete ? "Server discovery incomplete" : "No servers to manage yet",
+      state.me?.role_discovery_incomplete
+        ? "Some server access checks could not finish. Retry to check your servers again."
+        : state.me?.role_scope_missing
         ? "Sign out and sign in again so jModGuard can check your server roles."
         : "Sign in with an account that has Manage Server permission, or a role a server admin granted Web UI access, in a server using jModGuard.",
     );
@@ -3549,7 +3557,7 @@ function actionIsLogChannel(job) {
 }
 
 function actionCanCancel(job) {
-  if (!job) return false;
+  if (!job || (actionIsLogChannel(job) && !canEditSettings())) return false;
   if (job.state === "pending" || job.state === "claimed") return true;
   return actionIsLogChannel(job) && (job.state === "running" || job.state === "uncertain");
 }
@@ -5271,10 +5279,19 @@ const ACCESS_LEVELS = [
 // the same revision and write-generation refs from the Settings tab.
 function AccessRolesCard({ revision, generation }) {
   const guildId = state.guildId;
-  const [rows, setRows] = useState(null);
+  const [baselineRows, setBaselineRows] = useState(null);
   const [ttl, setTtl] = useState(30);
-  const nextKey = useRef(0);
-  const withKeys = (roles) => roles.map((role) => ({ ...role, key: nextKey.current++ }));
+  const { drafts } = useStore(ui);
+  const draftKey = "settings:access-roles";
+  const rows = baselineRows === null ? null : drafts[draftKey]?.value ?? baselineRows;
+  const withKeys = (roles) => roles.map((role) => ({ ...role, key: crypto.randomUUID() }));
+  const changeRows = (next) => {
+    const values = (items) => JSON.stringify(items.map(({ role_id, level }) => ({ role_id, level })));
+    const nextDrafts = { ...currentDrafts() };
+    if (baselineRows !== null && values(next) === values(baselineRows)) delete nextDrafts[draftKey];
+    else nextDrafts[draftKey] = { value: next, group: "access-roles" };
+    ui.set({ drafts: nextDrafts, edits: Object.keys(nextDrafts).length > 0 ? "dirty" : "clean" });
+  };
   useEffect(() => {
     let active = true;
     const initialGeneration = generation.current;
@@ -5283,7 +5300,7 @@ function AccessRolesCard({ revision, generation }) {
         if (!active) return;
         if (initialGeneration === generation.current) revision.current = loaded.revision || "";
         setTtl(loaded.ttl_secs || 30);
-        setRows(withKeys(loaded.roles || []));
+        setBaselineRows(withKeys(loaded.roles || []));
       })
       .catch((e) => {
         if (active && !isUnauthenticated(e)) reportApiError(e);
@@ -5293,12 +5310,11 @@ function AccessRolesCard({ revision, generation }) {
     };
   }, []);
   const update = (key, patch) => {
-    setRows((current) => current.map((row) => (row.key === key ? { ...row, ...patch } : row)));
-    markDirty();
+    changeRows(rows.map((row) => (row.key === key ? { ...row, ...patch } : row)));
   };
   return h(
-    "div",
-    { className: "card bg-base-100 card-border" },
+    DraftCard,
+    { group: "access-roles", className: "card bg-base-100 card-border" },
     h(
       "div",
       { className: "card-body" },
@@ -5346,8 +5362,7 @@ function AccessRolesCard({ revision, generation }) {
                     className: "btn btn-sm",
                     type: "button",
                     onClick: () => {
-                      setRows((current) => current.filter((item) => item.key !== row.key));
-                      markDirty();
+                      changeRows(rows.filter((item) => item.key !== row.key));
                     },
                   },
                   "Remove",
@@ -5363,7 +5378,7 @@ function AccessRolesCard({ revision, generation }) {
                   className: "btn",
                   type: "button",
                   disabled: rows.length >= 32,
-                  onClick: () => setRows((current) => [...current, ...withKeys([{ role_id: "", level: "dashboard" }])]),
+                  onClick: () => changeRows([...rows, ...withKeys([{ role_id: "", level: "dashboard" }])]),
                 },
                 "Add role",
               ),
@@ -5383,8 +5398,10 @@ function AccessRolesCard({ revision, generation }) {
                     }, undefined, () => apiRead(`/api/guilds/${guildId}/access-roles`));
                     generation.current++;
                     revision.current = saved.revision;
-                    if (saved.roles) setRows(withKeys(saved.roles));
-                    ui.set({ edits: Object.keys(currentDrafts()).length > 0 ? "dirty" : "clean" });
+                    setBaselineRows(withKeys(saved.roles || roles));
+                    const nextDrafts = { ...currentDrafts() };
+                    delete nextDrafts[draftKey];
+                    ui.set({ drafts: nextDrafts, edits: Object.keys(nextDrafts).length > 0 ? "dirty" : "clean" });
                     toast("Web UI access roles saved", "success");
                   },
                 },
