@@ -35,6 +35,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// exactly that long for the local bot control link (issue #552).
 const STARTUP_RECEIPT_WARN_AFTER: Duration =
     Duration::from_millis(db::LAUNCHER_FENCE_TTL_MS as u64 + 10_000);
+/// How long the API launcher waits quietly for the bot to migrate an older core
+/// schema before it warns again, well past a launcher fence handoff.
+const CORE_MIGRATION_WAIT: Duration = Duration::from_secs(300);
 /// Durable reason stored while the built-in binary is covering an unreachable registry.
 const REGISTRY_OUTAGE_BOOT_MISMATCH: &str = "registry unreachable";
 /// Durable reasons stored when an outage fallback refuses the built-in binary's
@@ -898,6 +901,11 @@ struct Supervisor {
     startup_link_down_since: Option<Instant>,
     readiness_receipt: ReadinessReceipt,
     last_observed: Option<Instant>,
+    /// Set while the last API restore was waiting for the bot to migrate the
+    /// core schema up to the built-in one; holds when that wait began. A poll
+    /// whose control reads fail keeps it, so the wait logs once and its bound
+    /// does not restart.
+    core_migration_wait: Option<Instant>,
 }
 
 impl Supervisor {
@@ -1753,7 +1761,7 @@ impl Supervisor {
                 let state = self.control.component(&self.role).await?;
                 if baked_restore && !baked_fallback {
                     ensure!(
-                        self.baked_restore_fits(&state, schema).await?,
+                        self.baked_restore_fits(&self.role, &state, schema).await?,
                         "baked application cannot open database; use owner recovery"
                     );
                 } else {
@@ -2204,7 +2212,14 @@ impl Supervisor {
 
     /// Preserve the legacy baseline and uninstalled bot migration exceptions.
     /// Re-evaluate them with fresh state before a built-in restore spawns.
-    async fn baked_restore_fits(&self, state: &db::ComponentUpdate, schema: i64) -> Result<bool> {
+    /// `role` and `state` name the launcher whose built-in restore is judged;
+    /// the API also asks it of the bot's state before waiting for a migration.
+    async fn baked_restore_fits(
+        &self,
+        role: &str,
+        state: &db::ComponentUpdate,
+        schema: i64,
+    ) -> Result<bool> {
         let legacy_baseline = state
             .observed
             .as_ref()
@@ -2215,7 +2230,7 @@ impl Supervisor {
                 .is_none_or(|release| release.upgrade.is_none())
             && self.control.upgrade().await?.is_none();
         if legacy_baseline
-            && ((self.role == "bot" && schema <= self.baked_compatibility.core)
+            && ((role == "bot" && schema <= self.baked_compatibility.core)
                 || schema == self.baked_compatibility.core)
         {
             return Ok(true);
@@ -2225,7 +2240,7 @@ impl Supervisor {
         }
         // A baked bot owns migrations only without managed history or a
         // durable paired operation. The API still requires its exact schema.
-        let baked_migration = self.role == "bot"
+        let baked_migration = role == "bot"
             && (15..=self.baked_compatibility.core).contains(&schema)
             && state.previous.is_none()
             && (state.desired.is_none() || state.state == "queued")
@@ -2239,10 +2254,26 @@ impl Supervisor {
 
     async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
         if let Some(PendingRollback { failed, error }) = self.rollback.clone() {
+            self.core_migration_wait = None;
             return self.rollback_independent(state, failed, error).await;
         }
         let schema = self.control.schema_version().await?;
-        if self.baked_restore_fits(state, schema).await? {
+        let baked_fits = self.baked_restore_fits(&self.role, state, schema).await?;
+        // An API with nothing installed waits only while the bot launcher's
+        // built-in restore (same base image) would migrate this older schema.
+        // Any other database keeps the owner recovery refusal below.
+        let bot_migrates = !baked_fits
+            && self.role == "api"
+            && state.installed.is_none()
+            && schema < self.baked_compatibility.core
+            && {
+                let bot = self.control.component("bot").await?;
+                self.baked_restore_fits("bot", &bot, schema).await?
+            };
+        // A failed read above keeps the migration wait and its start. Any
+        // decision below ends it unless it is still that wait.
+        let waiting_since = self.core_migration_wait.take();
+        if baked_fits {
             let path = self.baked.clone();
             let sha = self.base_sha.clone();
             return self.start(&path, &sha, None).await;
@@ -2278,6 +2309,21 @@ impl Supervisor {
             );
             self.start(&path, &release.source_sha, Some(release.clone()))
                 .await?;
+        } else if bot_migrates {
+            // The bot launcher migrates first during an ordinary rollout. Keep
+            // the maintenance API up and wait without a per-poll warning.
+            let core = self.baked_compatibility.core;
+            let since = waiting_since.unwrap_or_else(|| {
+                tracing::info!("waiting for the bot to migrate core schema {schema} -> {core}");
+                Instant::now()
+            });
+            self.core_migration_wait = Some(since);
+            ensure!(
+                since.elapsed() < CORE_MIGRATION_WAIT,
+                "core schema {schema} is still older than the built-in API schema {core} after {}s; check the bot launcher",
+                CORE_MIGRATION_WAIT.as_secs()
+            );
+            self.idle().await?;
         } else {
             anyhow::bail!("baked application cannot open database; use owner recovery");
         }
@@ -2567,6 +2613,9 @@ impl Supervisor {
                     }
                 }
                 self.restore(&state).await?;
+                if self.core_migration_wait.is_some() {
+                    return Ok(ControlStep::Defer);
+                }
                 Ok::<_, anyhow::Error>(ControlStep::Proceed)
             }
             .await;
@@ -3489,6 +3538,7 @@ async fn main() -> Result<()> {
         startup_link_down_since: None,
         readiness_receipt: ReadinessReceipt::Pending,
         last_observed: None,
+        core_migration_wait: None,
     };
     supervisor.load_boot_mismatch_handoff().await?;
     loop {
