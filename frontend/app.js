@@ -3770,8 +3770,11 @@ function tabMembers() {
         verify: sync.verify_processed,
         audit: sync.audit_processed,
       };
+      // Local case history records only completion, never a committed count.
+      const phaseNotCounted = (phase) => phase === "local_history";
       const processed = Number(sync.processed ?? sync.committed_count ?? sync.committed ?? 0);
-      const phaseProcessed = phaseCounts[sync.phase] == null ? null : Number(phaseCounts[sync.phase]);
+      const currentPhaseKey = phases[currentPhase];
+      const phaseProcessed = phaseCounts[currentPhaseKey] == null ? null : Number(phaseCounts[currentPhaseKey]);
       const total = sync.total_estimate == null ? null : Number(sync.total_estimate);
       const percent =
         sync.status === "complete"
@@ -3788,7 +3791,9 @@ function tabMembers() {
           sync.status === "complete"
             ? "Complete"
             : percent === null
-              ? `${phaseProcessed == null ? "Unknown number of" : phaseProcessed} records committed in current phase; total unknown`
+              ? phaseNotCounted(currentPhaseKey)
+                ? `${phaseLabels[currentPhaseKey]} stage; records not counted`
+                : `${phaseProcessed == null ? "Unknown number of" : phaseProcessed} records committed in current phase; total unknown`
               : `${Math.round(percent)} percent of ${totalKind} member stage`,
       });
       parts.push(bar);
@@ -3825,8 +3830,7 @@ function tabMembers() {
               h(
                 "td",
                 null,
-                // Local case history records only completion, never a committed count.
-                phase === "local_history"
+                phaseNotCounted(phase)
                   ? "Not counted"
                   : phaseCounts[phase] == null
                     ? "Unknown"

@@ -836,6 +836,7 @@ test('Members keeps completed phases done while local case history finishes and 
   assert.doesNotMatch(copy, /100% complete/);
   const bar = findNode(panel, n => n.localName === 'progress');
   assert.equal(bar.getAttribute("value"), null);
+  assert.equal(bar.getAttribute('aria-valuetext'), 'Local case history stage; records not counted');
 });
 
 test('Members shows an unknown ETA without calling an unconfirmed paced worker offline', async () => {
@@ -851,6 +852,8 @@ test('Members shows an unknown ETA without calling an unconfirmed paced worker o
   assert.match(copy, /80 members counted/);
   const bans = [...panel.querySelectorAll('tbody tr')].find(row => textOf(row.cells[0]) === 'Current bans');
   assert.deepEqual([...bans.cells].map(cell => textOf(cell)), ['Current bans', 'Queued', 'Unknown']);
+  assert.equal(findNode(panel, n => n.localName === 'progress').getAttribute('aria-valuetext'),
+    'Unknown number of records committed in current phase; total unknown');
   assert.match(copy, /Remaining: Unknown until worker activity is confirmed · Expected finish: Unknown/);
   assert.match(copy, /bot may be between paced pages/);
   assert.doesNotMatch(copy, /worker is offline/i);
