@@ -1291,6 +1291,11 @@ publish_component_build() {
   }
   trap cleanup_publish EXIT
   redact_tokens "$token" "$source_token" "" ""
+  # docker login writes the GHCR token base64-encoded to $DOCKER_CONFIG/config.json and
+  # warns that credentials are stored unencrypted. That warning is expected: the later
+  # docker/buildx and cosign registry calls read auth from this config, which lives only
+  # in this run's scratch directory (mode 700) and is deleted by cleanup_publish on EXIT,
+  # so the token does not outlive this shell on the ephemeral runner.
   export DOCKER_CONFIG="${scratch}/docker"
   mkdir -m 700 "$DOCKER_CONFIG"
   printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin >/dev/null
@@ -1409,6 +1414,11 @@ publish_component_sign() {
   trap cleanup_promotion_scratch EXIT
   validate_signing_key_pair
   redact_tokens "$token" "$source_token" "$_JMG_SIGNING_KEY" "$_JMG_SIGNING_PASSWORD"
+  # docker login writes the GHCR token base64-encoded to $DOCKER_CONFIG/config.json and
+  # warns that credentials are stored unencrypted. That warning is expected: the later
+  # docker/buildx and cosign registry calls read auth from this config, which lives only
+  # in this run's scratch directory (mode 700) and is deleted by cleanup_promotion_scratch
+  # on EXIT, so the token does not outlive this shell on the ephemeral runner.
   export DOCKER_CONFIG="${scratch}/docker"
   mkdir -m 700 "$DOCKER_CONFIG"
   printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin >/dev/null
