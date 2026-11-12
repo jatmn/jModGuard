@@ -111,7 +111,10 @@ jobs:
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.cache/jmodguard-ci
-          key: ci-tools-${{ runner.os }}-${{ runner.arch }}-${{ matrix.lane }}-${{ hashFiles('rust-toolchain.toml', 'dylint.toml', 'scripts/dylint.sh', 'scripts/ci-ensure-cargo-tool.sh') }}
+          # scripts/ci-dylint-libs.sh publishes the pinned dylint tools and
+          # prebuilt lint libraries into this cache; hash it so a change to
+          # the published layout produces a fresh key and a new save.
+          key: ci-tools-${{ runner.os }}-${{ runner.arch }}-${{ matrix.lane }}-${{ hashFiles('rust-toolchain.toml', 'dylint.toml', 'scripts/dylint.sh', 'scripts/ci-ensure-cargo-tool.sh', 'scripts/ci-dylint-libs.sh') }}
       - name: Cache Rust compiler outputs
         if: startsWith(matrix.lane, 'rust-')
         timeout-minutes: 3
