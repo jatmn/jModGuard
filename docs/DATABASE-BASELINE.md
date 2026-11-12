@@ -159,7 +159,7 @@ Migration 0015 adds `guild_local_write_fence` so a member-sync status read can s
 ## Known spam configuration extension
 
 Migration0024 adds the empty scoped known-spam sample/URL collection. The core
-schema is 24 and the guild schema remains 17. Deploy matching bot/API builds using
+schema becomes 24; it does not change the guild schema. Deploy matching bot/API builds using
 the existing paired update protocol; older binaries reject schema24. Rollback
 requires the pre-upgrade database backup. Existing Badwords and repeated-text
 configuration is preserved. See [Known spam](KNOWN-SPAM.md).

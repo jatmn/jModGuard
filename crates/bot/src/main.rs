@@ -620,15 +620,17 @@ async fn main() -> Result<()> {
         jmodguard::set_process_ready(false);
         // Date the planned stop now, before the notice drain cuts off recording, and
         // only when every shard that reached Ready still has a connected session.
-        let runners = shard_manager
-            .runners
-            .lock()
-            .await
-            .iter()
-            .map(|(shard, runner)| (shard.0, runner.stage))
-            .collect();
-        let covered_until = gateway_covered(&runners, &shutdown_app.ready_shard_ids())
-            .then(|| chrono::Utc::now().timestamp_millis());
+        // The runners lock also guards stage updates, so the time is taken while
+        // the checked stages cannot change and never postdates them.
+        let ready_shards = shutdown_app.ready_shard_ids();
+        let covered_until = {
+            let runners = shard_manager.runners.lock().await;
+            let stages = runners
+                .iter()
+                .map(|(shard, runner)| (shard.0, runner.stage))
+                .collect();
+            gateway_covered(&stages, &ready_shards).then(|| chrono::Utc::now().timestamp_millis())
+        };
         let content = logging::shutdown_notice_content(shutdown_app.start.elapsed().as_secs());
         let guild_ids = shutdown_cache.guilds();
         let attempted = guild_ids.len();

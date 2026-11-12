@@ -46,11 +46,22 @@ impl ReadyObservation {
     }
 
     /// The gap to record. Only this process's first Ready after a short planned
-    /// stop may clear itself when audit recovery completes. A crash only proves
-    /// lease liveness, not Gateway coverage. A stop time ahead of this host's
-    /// clock gives no usable downtime. Anything else still needs Reconcile.
-    fn gap_mark(self, previous: Option<db::PreviousBotStop>, now_ms: i64) -> CoverageGap<'static> {
+    /// stop, with no session replaced since startup, may clear itself when audit
+    /// recovery completes. `ready_generation` counts replaced sessions in this
+    /// process; a first acknowledgement after one also covers that in-process
+    /// gap. A crash only proves lease liveness, not Gateway coverage. A stop
+    /// time ahead of this host's clock gives no usable downtime. Anything else
+    /// still needs Reconcile.
+    fn gap_mark(
+        self,
+        previous: Option<db::PreviousBotStop>,
+        ready_generation: u64,
+        now_ms: i64,
+    ) -> CoverageGap<'static> {
         match (self, previous) {
+            (Self::First, _) if ready_generation > 0 => {
+                CoverageGap::Observed("gateway continuity interrupted")
+            }
             (Self::First, Some(stop)) if stop.planned => {
                 let downtime = now_ms.checked_sub(stop.last_alive_ms);
                 if downtime.is_some_and(|ms| (0..=SHORT_RESTART_GAP_MS).contains(&ms)) {
@@ -1145,7 +1156,7 @@ async fn run_loop(
                 } else {
                     None
                 };
-                let gap = observation.gap_mark(previous, now_ms);
+                let gap = observation.gap_mark(previous, ready_generation, now_ms);
                 if let Err(error) = store
                     .mark_member_reconciliation_needed(scope.clone(), gap, now_ms)
                     .await
@@ -2107,30 +2118,35 @@ mod tests {
         let first = ReadyObservation::First;
         let restarted = CoverageGap::Observed("bot restarted");
         assert_eq!(
-            first.gap_mark(stop(short, true), now),
+            first.gap_mark(stop(short, true), 0, now),
             CoverageGap::ShortPlannedRestart
         );
         assert_eq!(
-            first.gap_mark(stop(now, true), now),
+            first.gap_mark(stop(now, true), 0, now),
             CoverageGap::ShortPlannedRestart
         );
-        assert_eq!(first.gap_mark(stop(short - 1, true), now), restarted);
+        assert_eq!(first.gap_mark(stop(short - 1, true), 0, now), restarted);
         assert_eq!(
-            first.gap_mark(stop(now + 1, true), now),
+            first.gap_mark(stop(now + 1, true), 0, now),
             restarted,
             "a stop time ahead of this clock is not a measured downtime"
         );
         assert_eq!(
-            first.gap_mark(stop(now, false), now),
+            first.gap_mark(stop(now, false), 0, now),
             CoverageGap::Observed("bot stopped unexpectedly"),
             "a crash proves only lease liveness"
         );
         assert_eq!(
-            first.gap_mark(None, now),
+            first.gap_mark(stop(now, true), 1, now),
+            CoverageGap::Observed("gateway continuity interrupted"),
+            "a session replaced before this guild's first acknowledgement is an in-process gap"
+        );
+        assert_eq!(
+            first.gap_mark(None, 0, now),
             CoverageGap::Observed("gateway continuity interrupted")
         );
         assert_eq!(
-            ReadyObservation::Replaced.gap_mark(stop(now, true), now),
+            ReadyObservation::Replaced.gap_mark(stop(now, true), 0, now),
             CoverageGap::Observed("gateway continuity interrupted")
         );
     }
