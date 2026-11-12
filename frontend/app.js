@@ -50,6 +50,45 @@ function ActionButton({ onClick, savedFields, disabled, ...props }) {
     onClick: onClick && ((event) => handleEvent(onClick, event, savedFields, group)),
   });
 }
+
+// Hand-authored 24×24 stroke icons for row actions (no icon-library dependency;
+// sized by the .btn-icon rules in frontend/style.css). The accessible name and
+// hover tooltip come from the IconButton label.
+const ICON_PATHS = {
+  edit: ["M17 3l4 4L8 20l-5 1 1-5L17 3z", "M14 6l4 4"],
+  remove: [
+    "M4 7h16",
+    "M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2",
+    "M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13",
+    "M10 11v7",
+    "M14 11v7",
+  ],
+  unban: ["M7 11V7a5 5 0 0 1 9.9-1", "M5 11h14a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2z", "M12 15v2"],
+  cancel: ["M6 6l12 12", "M18 6L6 18"],
+};
+function Icon({ name }) {
+  return h(
+    "svg",
+    {
+      viewBox: "0 0 24 24",
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: 2,
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+      "aria-hidden": "true",
+      focusable: "false",
+    },
+    ICON_PATHS[name].map((d, index) => h("path", { key: index, d })),
+  );
+}
+function IconButton({ icon, label, className = "btn btn-sm btn-square", ...props }) {
+  return h(
+    ActionButton,
+    { className: `${className} btn-icon`, "aria-label": label, title: label, ...props },
+    h(Icon, { name: icon }),
+  );
+}
 function useDraftControl({ draftKey, defaultValue, onChange, ...props }) {
   const group = useContext(DraftGroup);
   const working = useContext(BusyContext);
@@ -1888,7 +1927,7 @@ function ruleCard(r) {
         h(
           "div",
           { className: "card-actions" },
-          h(ActionButton, { className: "btn btn-sm", onClick: () => editRule(r) }, "Edit"),
+          h(IconButton, { icon: "edit", label: "Edit", onClick: () => editRule(r) }),
         ),
       ),
       h("p", {}, r.description),
@@ -2819,7 +2858,7 @@ function tabCommands() {
           h(
             "td",
             {},
-            canManageServer() && h(ActionButton, { className: "btn btn-sm", onClick: () => editCommand(c) }, "Edit"),
+            canManageServer() && h(IconButton, { icon: "edit", label: "Edit", onClick: () => editCommand(c) }),
           ),
         );
       }),
@@ -3809,8 +3848,11 @@ function tabMembers() {
         verify: sync.verify_processed,
         audit: sync.audit_processed,
       };
+      // Local case history records only completion, never a committed count.
+      const phaseNotCounted = (phase) => phase === "local_history";
       const processed = Number(sync.processed ?? sync.committed_count ?? sync.committed ?? 0);
-      const phaseProcessed = phaseCounts[sync.phase] == null ? null : Number(phaseCounts[sync.phase]);
+      const currentPhaseKey = phases[currentPhase];
+      const phaseProcessed = phaseCounts[currentPhaseKey] == null ? null : Number(phaseCounts[currentPhaseKey]);
       const total = sync.total_estimate == null ? null : Number(sync.total_estimate);
       const percent =
         sync.status === "complete"
@@ -3827,7 +3869,9 @@ function tabMembers() {
           sync.status === "complete"
             ? "Complete"
             : percent === null
-              ? `${phaseProcessed == null ? "Unknown number of" : phaseProcessed} records committed in current phase; total unknown`
+              ? phaseNotCounted(currentPhaseKey)
+                ? `${phaseLabels[currentPhaseKey]} stage; records not counted`
+                : `${phaseProcessed == null ? "Unknown number of" : phaseProcessed} records committed in current phase; total unknown`
               : `${Math.round(percent)} percent of ${totalKind} member stage`,
       });
       parts.push(bar);
@@ -3861,7 +3905,15 @@ function tabMembers() {
                     ? statusLabel
                     : "Pending",
               ),
-              h("td", null, phaseCounts[phase] == null ? "Unknown" : Number(phaseCounts[phase]).toLocaleString()),
+              h(
+                "td",
+                null,
+                phaseNotCounted(phase)
+                  ? "Not counted"
+                  : phaseCounts[phase] == null
+                    ? "Unknown"
+                    : Number(phaseCounts[phase]).toLocaleString(),
+              ),
             ),
           ),
           h(
@@ -5460,9 +5512,8 @@ function RuleAction({ action, index, remove }) {
       { className: "row title-row" },
       h("strong", null, `Action ${index + 1}`),
       h(
-        ActionButton,
-        { className: "btn btn-sm btn-outline", "aria-label": `Remove action ${index + 1}`, onClick: remove },
-        "Remove",
+        IconButton,
+        { icon: "remove", label: `Remove action ${index + 1}`, onClick: remove },
       ),
     ),
     h(
@@ -5807,13 +5858,13 @@ function tabKnownSpam() {
         h("td", null, row.kind === "url" ? "URL" : "Sample"),
         h("td", { style: { whiteSpace: "pre-wrap", overflowWrap: "anywhere" } }, row.value),
         h("td", null, row.note || "—"), h("td", null, row.guild_id === "0" ? "Global" : "This server"),
-        h("td", null, row.guild_id !== "0" || isBotOwner() ? h(ActionButton, { className: "btn btn-sm",
+        h("td", null, row.guild_id !== "0" || isBotOwner() ? h(IconButton, { icon: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm("Remove this known spam entry?")) return;
             await api(`/api/guilds/${guildId}/known-spam/${row.id}`, "DELETE");
             if (state.guildId === guildId && await loadConfig()) renderTab();
           },
-        }, "Remove") : "Owner only"),
+        }) : "Owner only"),
       )) : h("tr", null, h("td", { colSpan: 5, className: "muted" }, "No known spam entries.")),
     ),
   );
@@ -5866,13 +5917,13 @@ function tabKnownBadImages() {
         h("td", { style: { overflowWrap: "anywhere" } }, row.hash),
         h("td", null, row.added_at), h("td", null, row.added_via),
         h("td", null, row.actor), h("td", null, row.note || "—"),
-        h("td", null, h(ActionButton, { className: "btn btn-sm",
+        h("td", null, h(IconButton, { icon: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm(`Remove SHA-256 ${row.hash}?`)) return;
             await api(`/api/guilds/${guildId}/known-bad-images/${row.hash}`, "DELETE");
             if (state.guildId === guildId && await loadConfig()) renderTab();
           },
-        }, "Remove")),
+        })),
       )) : h("tr", null, h("td", { colSpan: 6, className: "muted" }, "No matching hashes.")),
     ),
   );
@@ -5937,9 +5988,10 @@ function tabBans() {
                 null,
                 record.active &&
                   h(
-                    ActionButton,
+                    IconButton,
                     {
-                      className: "btn btn-sm",
+                      icon: "unban",
+                      label: "Unban",
                       onClick: async () => {
                         if (confirm(`Unban ${record.user_id}?`))
                           await submitBotAction(`/api/guilds/${guildId}/unban`, "POST", {
@@ -5948,7 +6000,6 @@ function tabBans() {
                           });
                       },
                     },
-                    "Unban",
                   ),
               ),
             ),
@@ -6008,9 +6059,10 @@ function tabActions() {
                 null,
                 actionCanCancel(job) &&
                   h(
-                    ActionButton,
+                    IconButton,
                     {
-                      className: "btn btn-sm",
+                      icon: "cancel",
+                      label: actionCancelLabel(job),
                       onClick: async () => {
                         if (
                           actionCancelNeedsConfirm(job) &&
@@ -6023,7 +6075,6 @@ function tabActions() {
                         result.refresh();
                       },
                     },
-                    actionCancelLabel(job),
                   ),
               ),
             ),

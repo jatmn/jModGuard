@@ -37,7 +37,9 @@ may be unknown, so those phases use indeterminate progress. Existing version10
 runs keep their old aggregate count and known member total, but cannot
 reconstruct earlier ban, check, or audit counts after migration; the card
 marks those counts unknown. Local case history
-may still be finishing after the Discord phases are done.
+may still be finishing after the Discord phases are done. That stage records
+only whether it finished, so its row and the progress bar's screen-reader text
+say **Not counted** instead of giving a count.
 For a known Discord rate limit, the card counts down to the next attempt and
 uses a recent count and pace anchor to revise the member-stage finish time.
 Paused, offline, stale or unpredictable work has no finish forecast. The card

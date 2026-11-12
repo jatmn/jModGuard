@@ -829,13 +829,14 @@ test('Members keeps completed phases done while local case history finishes and 
     ['Current bans', 'Done', '3'],
     ['Candidate checks', 'Done', '1'],
     ['Available audit history', 'Done', '2'],
-    ['Local case history', 'Waiting', 'Unknown'],
+    ['Local case history', 'Waiting', 'Not counted'],
     ['Total', '24 records committed in this run · 20 members counted'],
   ]);
   assert.equal(textOf(findNode(card, n => n.getAttribute?.('role') === 'status')), 'WaitingStage: Local case historyfinishing local case history');
   assert.doesNotMatch(copy, /100% complete/);
   const bar = findNode(panel, n => n.localName === 'progress');
   assert.equal(bar.getAttribute("value"), null);
+  assert.equal(bar.getAttribute('aria-valuetext'), 'Local case history stage; records not counted');
 });
 
 test('Members shows an unknown ETA without calling an unconfirmed paced worker offline', async () => {
@@ -851,6 +852,8 @@ test('Members shows an unknown ETA without calling an unconfirmed paced worker o
   assert.match(copy, /80 members counted/);
   const bans = [...panel.querySelectorAll('tbody tr')].find(row => textOf(row.cells[0]) === 'Current bans');
   assert.deepEqual([...bans.cells].map(cell => textOf(cell)), ['Current bans', 'Queued', 'Unknown']);
+  assert.equal(findNode(panel, n => n.localName === 'progress').getAttribute('aria-valuetext'),
+    'Unknown number of records committed in current phase; total unknown');
   assert.match(copy, /Remaining: Unknown until worker activity is confirmed · Expected finish: Unknown/);
   assert.match(copy, /bot may be between paced pages/);
   assert.doesNotMatch(copy, /worker is offline/i);
@@ -968,7 +971,7 @@ test('Members lays out a finished import with one status, phase rows, a fixed du
     ['Current bans', 'Done', '192'],
     ['Candidate checks', 'Done', '0'],
     ['Available audit history', 'Done', '18'],
-    ['Local case history', 'Done', 'Unknown'],
+    ['Local case history', 'Done', 'Not counted'],
     ['Total', '10,749 records committed in this run · 10,539 members counted · 100% complete'],
   ]);
   assert.match(copy, /Took 120 minutes/);
@@ -2310,7 +2313,7 @@ test('actions refresh only on demand and cancellation includes membership', asyn
   assert.equal(calls[0].opts.method,'POST');
   assert.equal(calls[0].opts.headers['x-jmodguard-enrollment'],'membership');
   assert.match(textOf(h.elements.find(n=>n.localName==='p')),/Force-cancel a stuck log-channel request/);
-  const cancel=h.elements.find(n=>n.localName==='button'&&n.textContent==='Cancel');
+  const cancel=h.elements.find(n=>n.localName==='button'&&n.getAttribute('aria-label')==='Cancel');
   await fire(cancel, 'click', {});
   assert.equal(calls[1].opts.method,'DELETE');
   assert.equal(calls[1].opts.headers['x-jmodguard-enrollment'],'membership');
@@ -2339,8 +2342,8 @@ test('claimed and stuck log-channel actions expose recovery cancel', async () =>
   h.app.state.config = { enrollment_id: 'membership' };
   h.app.tabActions();
   await new Promise((resolve) => setImmediate(resolve));
-  const controls = h.elements.filter((n) => n.localName === 'button' && (n.textContent === 'Cancel' || n.textContent === 'Force cancel'));
-  assert.deepEqual(controls.map((n) => n.textContent), ['Cancel', 'Force cancel', 'Force cancel']);
+  const controls = h.elements.filter((n) => n.localName === 'button' && (n.getAttribute('aria-label') === 'Cancel' || n.getAttribute('aria-label') === 'Force cancel'));
+  assert.deepEqual(controls.map((n) => n.getAttribute('aria-label')), ['Cancel', 'Force cancel', 'Force cancel']);
   await fire(controls[0], 'click', {});
   assert.equal(confirms, 0);
   assert.equal(calls[1].opts.method, 'DELETE');
@@ -3843,7 +3846,7 @@ test('custom rule rename updates the card heading after save without reloading',
   h.app.navigate('rules');
   const heading = () => h.document.querySelector('#content .rule-heading h3').textContent;
   assert.equal(heading(), 'Original name');
-  await fire(findNode(h.nodes.get('#content'), n => n.localName === 'button' && n.textContent === 'Edit'), 'click');
+  await fire(findNode(h.nodes.get('#content'), n => n.localName === 'button' && n.getAttribute('aria-label') === 'Edit'), 'click');
   const modal = h.document.querySelector('.modal-overlay');
   const nameField = [...modal.querySelectorAll('.field')].find(n => n.querySelector('label')?.textContent === 'Name');
   const name = nameField.querySelector('input');
@@ -3858,7 +3861,7 @@ test('custom rule rename updates the card heading after save without reloading',
   assert.equal(h.document.querySelector('.modal-overlay'), null);
   assert.equal(heading(), 'Renamed rule');
   assert.equal(calls.length, 1, 'the acknowledged patch must not need a configuration reload');
-  await fire(findNode(h.nodes.get('#content'), n => n.localName === 'button' && n.textContent === 'Edit'), 'click');
+  await fire(findNode(h.nodes.get('#content'), n => n.localName === 'button' && n.getAttribute('aria-label') === 'Edit'), 'click');
   assert.equal(h.document.querySelector('.modal-overlay h3').textContent, 'Edit custom rule: Renamed rule');
 });
 
@@ -4014,7 +4017,7 @@ test('known-bad image add and remove buttons save then reload the coherent list'
   assert.equal(h.app.state.config.known_bad_images.length, 1);
   assert.equal(requests[0].options.headers['x-jmodguard-enrollment'], 'fixture-membership');
   panel = h.app.tabKnownBadImages();
-  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
   await settle();
   assert.equal(h.app.state.config.known_bad_images.length, 0);
   const removal = requests.find(r => r.options.method === 'DELETE');
@@ -4039,7 +4042,7 @@ test('known-bad image remove keeps unrelated add drafts', async () => {
   inputs[1].value = draftHash; await fire(inputs[1], 'input');
   inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
   assert.equal(h.app.isDirty(), true);
-  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
   await settle();
   panel = h.app.tabKnownBadImages();
   await settle();
@@ -4094,7 +4097,7 @@ test('known-bad image delete 429 keeps draft and listed row', async () => {
   const inputs = panel.querySelectorAll('input');
   inputs[1].value = draftHash; await fire(inputs[1], 'input');
   inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
-  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
   await settle();
   assert.equal(h.app.state.config.known_bad_images.length, 1);
   assert.equal(h.app.isDirty(), true);
@@ -4122,10 +4125,10 @@ test('known-bad image delete succeeds after 429 without losing unrelated draft',
   const inputs = panel.querySelectorAll('input');
   inputs[1].value = draftHash; await fire(inputs[1], 'input');
   inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
-  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
   await settle();
   panel = h.app.tabKnownBadImages();
-  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
   await settle();
   assert.equal(h.app.state.config.known_bad_images.length, 0);
   const after = panel.querySelectorAll('input');
@@ -5248,7 +5251,7 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   assert.equal(JSON.parse(requests[1].options.body).kind, 'url');
   panel = h.app.tabKnownSpam(); await settle();
   assert.match(panel.textContent, /tinyurl.com/);
-  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Remove'), 'click');
+  await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
   assert.equal(requests[2].options.method, 'DELETE');
   assert.equal(h.app.state.config.known_spam.length, 1);
  });
@@ -5388,9 +5391,11 @@ test('known spam inherited globals are visible and removal is owner only', async
   const h = harness();
   h.app.state.config = {rules: [], known_spam: [{id:'7',guild_id:'0',kind:'url',value:'tinyurl.com/*',note:null}]};
   const panel = h.app.tabKnownSpam(); await settle();
-  assert.match(panel.textContent,/tinyurl.com/);
-  assert.match(panel.textContent,/Owner only/);
-  assert.equal([...panel.querySelectorAll('button')].some(b=>b.textContent === 'Remove'),false);
+  const row = [...panel.querySelectorAll('tr')].find(r=>[...r.querySelectorAll('td')].some(c=>c.textContent === 'tinyurl.com/*'));
+  assert.ok(row, 'the inherited global entry is listed');
+  assert.match(row.textContent,/Owner only/);
+  // No control of any rendering (icon with aria-label or text) may remove it.
+  assert.equal(row.querySelectorAll('button').length,0);
 });
 
 test('template preview shows embed color, title and fields, then live custom description', async () => {
@@ -5538,7 +5543,7 @@ test('settings role access shows commands without edit controls', async () => {
   const text = h.document.querySelector('#content').textContent;
   assert.match(text, /ping/);
   assert.match(text, /Editing commands needs Manage Server/);
-  const buttons = Array.from(h.document.querySelectorAll('#content button')).map((b) => b.textContent);
+  const buttons = Array.from(h.document.querySelectorAll('#content button')).map((b) => b.getAttribute('aria-label') || b.textContent);
   assert.ok(!buttons.includes('Edit'), buttons.join(','));
   assert.ok(!buttons.includes('+ New custom command'), buttons.join(','));
 });
@@ -5627,7 +5632,7 @@ test('log action cancel controls match dashboard and settings access', async () 
     h.app.state.guilds[0].access = access;
     h.app.state.config = { enrollment_id: 'membership' };
     h.app.tabActions(); await settle();
-    const cancel = h.elements.filter(n => n.localName === 'button' && /^(Force cancel|Cancel)$/.test(n.textContent));
+    const cancel = h.elements.filter(n => n.localName === 'button' && /^(Force cancel|Cancel)$/.test(n.getAttribute('aria-label')));
     assert.equal(cancel.length, access === 'dashboard' ? 0 : 4, access);
   }
 });
