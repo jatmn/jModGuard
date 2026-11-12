@@ -3822,7 +3822,16 @@ function tabMembers() {
                     ? statusLabel
                     : "Pending",
               ),
-              h("td", null, phaseCounts[phase] == null ? "Unknown" : Number(phaseCounts[phase]).toLocaleString()),
+              h(
+                "td",
+                null,
+                // Local case history records only completion, never a committed count.
+                phase === "local_history"
+                  ? "Not counted"
+                  : phaseCounts[phase] == null
+                    ? "Unknown"
+                    : Number(phaseCounts[phase]).toLocaleString(),
+              ),
             ),
           ),
           h(

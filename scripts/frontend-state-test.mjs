@@ -829,7 +829,7 @@ test('Members keeps completed phases done while local case history finishes and 
     ['Current bans', 'Done', '3'],
     ['Candidate checks', 'Done', '1'],
     ['Available audit history', 'Done', '2'],
-    ['Local case history', 'Waiting', 'Unknown'],
+    ['Local case history', 'Waiting', 'Not counted'],
     ['Total', '24 records committed in this run · 20 members counted'],
   ]);
   assert.equal(textOf(findNode(card, n => n.getAttribute?.('role') === 'status')), 'WaitingStage: Local case historyfinishing local case history');
@@ -968,7 +968,7 @@ test('Members lays out a finished import with one status, phase rows, a fixed du
     ['Current bans', 'Done', '192'],
     ['Candidate checks', 'Done', '0'],
     ['Available audit history', 'Done', '18'],
-    ['Local case history', 'Done', 'Unknown'],
+    ['Local case history', 'Done', 'Not counted'],
     ['Total', '10,749 records committed in this run · 10,539 members counted · 100% complete'],
   ]);
   assert.match(copy, /Took 120 minutes/);
