@@ -24,6 +24,14 @@ const KEY_MEMORY_FILES: [&str; 5] = [
     "memory.usage_in_bytes",
     "memory.limit_in_bytes",
 ];
+const KEY_CPU_FILES: [&str; 5] = [
+    "cpu.stat",
+    "cpu.max",
+    "cpuacct.usage",
+    "cpu.cfs_quota_us",
+    "cpu.cfs_period_us",
+];
+const LAYOUT_LINE_BYTES: usize = 2048;
 
 static LATEST: Mutex<ContainerSample> = Mutex::new(ContainerSample::unavailable());
 
@@ -220,14 +228,7 @@ fn observe_process() -> Observation {
     static LAYOUT: Once = Once::new();
     LAYOUT.call_once(|| {
         let layout = memory_layout(Path::new("/proc"), Path::new("/sys/fs/cgroup"));
-        tracing::info!(
-            proc_self_cgroup = ?layout.proc_cgroup,
-            cgroup_mounts = ?layout.mounts,
-            cgroup_dir = ?layout.dir,
-            memory_files = ?layout.files,
-            key_files = ?layout.key_files,
-            "cgroup memory layout"
-        );
+        tracing::info!("{}", layout.line());
     });
     let reading = read_process_cgroup();
     report_memory_source(reading.memory);
@@ -313,9 +314,22 @@ struct CgroupEntry {
 fn read_mounted_cgroup(cgroup_text: &str, mountinfo: &str) -> CgroupReading {
     let (memory_dirs, cpu_dirs) = cgroup_dirs(cgroup_text, mountinfo);
     CgroupReading {
-        memory: memory_dirs.iter().find_map(|dir| read_memory(dir)),
-        cpu: cpu_dirs.iter().find_map(|dir| read_cpu(dir)),
+        memory: first_reading(&memory_dirs, read_memory).map(|(_, memory)| memory),
+        cpu: first_reading(&cpu_dirs, read_cpu).map(|(_, cpu)| cpu),
     }
+}
+
+// The first candidate that yields a reading, shared by the reader and the layout line.
+fn first_reading<T>(dirs: &[PathBuf], read: fn(&Path) -> Option<T>) -> Option<(&PathBuf, T)> {
+    dirs.iter().find_map(|dir| Some((dir, read(dir)?)))
+}
+
+// The directory supplying the reading, or the first candidate when none does.
+fn supplying_dir<T>(dirs: &[PathBuf], read: fn(&Path) -> Option<T>) -> Option<PathBuf> {
+    first_reading(dirs, read)
+        .map(|(dir, _)| dir)
+        .or(dirs.first())
+        .cloned()
 }
 
 /// Candidate memory and CPU directories, in reading order.
@@ -652,15 +666,18 @@ fn parse_v2_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
 fn parse_v1_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
     let current = memory_input(parse_u64_token(current_text), "memory.usage_in_bytes")?;
     let Some(stat) = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat") else {
-        return usage_only(current, read_memory_limit(dir, "memory.limit_in_bytes")?);
+        return usage_only(current, read_v1_memory_limit(dir)?);
     };
     let fallback = stat_value(&stat, "total_inactive_file");
-    memory_use(
-        current,
-        &stat,
-        read_memory_limit(dir, "memory.limit_in_bytes")?,
-        fallback,
-    )
+    memory_use(current, &stat, read_v1_memory_limit(dir)?, fallback)
+}
+
+// Only v1 reports "no limit" as a huge page-rounded number; v2 uses `max`.
+fn read_v1_memory_limit(dir: &Path) -> Option<MemoryLimit> {
+    match read_memory_limit(dir, "memory.limit_in_bytes")? {
+        MemoryLimit::Bytes(bytes) if bytes >= V1_UNLIMITED_BYTES => Some(MemoryLimit::Unlimited),
+        limit => Some(limit),
+    }
 }
 
 // Without memory.stat there is no inactive file counter; report labeled raw usage.
@@ -731,12 +748,7 @@ fn parse_memory_max(text: &str) -> Option<MemoryLimit> {
     if token == "max" {
         return Some(MemoryLimit::Unlimited);
     }
-    let bytes: u64 = token.parse().ok()?;
-    if bytes >= V1_UNLIMITED_BYTES {
-        Some(MemoryLimit::Unlimited)
-    } else {
-        Some(MemoryLimit::Bytes(bytes))
-    }
+    Some(MemoryLimit::Bytes(token.parse().ok()?))
 }
 
 fn stat_value(text: &str, key: &str) -> Option<u64> {
@@ -752,22 +764,56 @@ fn stat_value(text: &str, key: &str) -> Option<u64> {
     None
 }
 
-/// Startup diagnostic fields: one line each, at most 2 KiB together.
+/// Startup diagnostic fields, logged by [`MemoryLayout::line`] as one line.
 struct MemoryLayout {
     proc_cgroup: String,
     mounts: String,
     dir: String,
     files: String,
     key_files: String,
+    cpu_dir: String,
+    cpu_files: String,
+    cpu_key_files: String,
+}
+
+impl MemoryLayout {
+    // At most 2 KiB including names and separators. The raw /proc text comes
+    // last, so truncation removes it before the resolved directories and files.
+    fn line(&self) -> String {
+        let line = format!(
+            "cgroup memory layout cgroup_dir={:?} memory_files={:?} key_files={:?} \
+             cpu_dir={:?} cpu_files={:?} cpu_key_files={:?} proc_self_cgroup={:?} cgroup_mounts={:?}",
+            self.dir,
+            self.files,
+            self.key_files,
+            self.cpu_dir,
+            self.cpu_files,
+            self.cpu_key_files,
+            self.proc_cgroup,
+            self.mounts,
+        );
+        one_line(&line, LAYOUT_LINE_BYTES)
+    }
 }
 
 fn memory_layout(proc: &Path, mount_root: &Path) -> MemoryLayout {
     let cgroup = read_limited(&proc.join("self/cgroup"));
     let mountinfo = read_limited(&proc.join("self/mountinfo"));
-    let dir = match (&cgroup, &mountinfo) {
-        (None, _) => Some(mount_root.to_path_buf()),
-        (Some(text), Some(info)) => cgroup_dirs(text, info).0.into_iter().next(),
-        (Some(_), None) => None,
+    // Name the directories read_process_cgroup reads from. Reading the
+    // candidates here records the same first missing input as that read.
+    let (dir, cpu_dir) = match (&cgroup, &mountinfo) {
+        (None, _) => (
+            Some(mount_root.to_path_buf()),
+            Some(mount_root.to_path_buf()),
+        ),
+        (Some(text), Some(info)) => {
+            let (memory_dirs, cpu_dirs) = cgroup_dirs(text, info);
+            (
+                supplying_dir(&memory_dirs, read_memory),
+                supplying_dir(&cpu_dirs, read_cpu),
+            )
+        }
+        (Some(_), None) => (None, None),
     };
     let mounts = mountinfo.as_deref().map_or("unreadable".into(), |info| {
         let lines = info.lines().filter(|line| {
@@ -781,40 +827,70 @@ fn memory_layout(proc: &Path, mount_root: &Path) -> MemoryLayout {
         });
         lines.collect::<Vec<_>>().join("\n")
     });
+    let none = || ("none".to_string(), "none".to_string());
     let (files, key_files) = dir
         .as_deref()
-        .map_or(("none".into(), "none".into()), dir_files);
-    let dir = dir.map_or("none".into(), |dir| dir.display().to_string());
+        .map_or_else(none, |dir| dir_files(dir, &["memory"], &KEY_MEMORY_FILES));
+    let (cpu_files, cpu_key_files) = cpu_dir.as_deref().map_or_else(none, |dir| {
+        dir_files(dir, &["cpu.", "cpuacct."], &KEY_CPU_FILES)
+    });
+    let shown = |dir: Option<PathBuf>| dir.map_or("none".into(), |dir| dir.display().to_string());
     MemoryLayout {
         proc_cgroup: one_line(cgroup.as_deref().unwrap_or("unreadable"), 512),
         mounts: one_line(&mounts, 768),
-        dir: one_line(&dir, 256),
+        dir: one_line(&shown(dir), 256),
         files: one_line(&files, 320),
-        key_files: one_line(&key_files, 192),
+        key_files: one_line(&key_files, 320),
+        cpu_dir: one_line(&shown(cpu_dir), 256),
+        cpu_files: one_line(&cpu_files, 320),
+        cpu_key_files: one_line(&cpu_key_files, 256),
     }
 }
 
-// Sorted memory* names, and whether each key file is readable, missing or unreadable.
-fn dir_files(dir: &Path) -> (String, String) {
+// Sorted names with a listed prefix, and each key file's state: missing,
+// unreadable, or readable with its counter value.
+fn dir_files(dir: &Path, prefixes: &[&str], keys: &[&'static str]) -> (String, String) {
     let names = std::fs::read_dir(dir).map(|entries| {
         let names = entries.filter_map(|entry| entry.ok()?.file_name().into_string().ok());
-        let mut names: Vec<String> = names.filter(|name| name.starts_with("memory")).collect();
+        let mut names: Vec<String> = names
+            .filter(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
+            .collect();
         names.sort();
         names.join(",")
     });
-    let states = KEY_MEMORY_FILES.map(|name| {
+    let states = keys.iter().map(|name| {
         let path = dir.join(name);
         let state = match (read_limited(&path), path.try_exists()) {
-            (Some(_), _) => "readable",
-            (None, Ok(false)) => "missing",
-            (None, _) => "unreadable",
+            (Some(text), _) => key_value(name, &text)
+                .filter(|value| !value.is_empty())
+                .map_or("readable".into(), |value| format!("readable:{value}")),
+            (None, Ok(false)) => "missing".into(),
+            (None, _) => "unreadable".into(),
         };
         format!("{name}={state}")
     });
     (
         names.unwrap_or_else(|_| "unreadable".into()),
-        states.join(" "),
+        states.collect::<Vec<_>>().join(" "),
     )
+}
+
+// The counters the readers use from stat files; other files' leading tokens.
+fn key_value(name: &str, text: &str) -> Option<String> {
+    let key = match name {
+        "cpu.stat" => "usage_usec",
+        "memory.stat" if stat_value(text, "inactive_file").is_some() => "inactive_file",
+        "memory.stat" => "total_inactive_file",
+        _ => {
+            return Some(
+                text.split_whitespace()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+    };
+    stat_value(text, key).map(|value| format!("{key}={value}"))
 }
 
 // Joins lines with " | ", blanks other control characters and caps the byte length.
@@ -971,6 +1047,25 @@ mod tests {
             read_cgroup(Some(&limited.path), None).memory.unwrap().limit,
             MemoryLimit::Bytes(V1_UNLIMITED_BYTES - 1)
         );
+    }
+
+    #[test]
+    fn v2_numeric_limit_at_the_v1_sentinel_is_a_real_limit() {
+        for stat in [Some("inactive_file 1\n"), None] {
+            let tree = temp_tree();
+            let mut files = vec![
+                ("memory.current", "10\n"),
+                ("memory.max", "9223372036854771712\n"),
+            ];
+            files.extend(stat.map(|stat| ("memory.stat", stat)));
+            write_files(&tree.path, &files);
+            assert_eq!(
+                read_cgroup(Some(&tree.path), None).memory.unwrap().limit,
+                MemoryLimit::Bytes(9_223_372_036_854_771_712),
+                "memory.stat present: {}",
+                stat.is_some()
+            );
+        }
     }
 
     #[test]
@@ -1778,7 +1873,7 @@ mod tests {
         let layout = memory_layout(&proc.path, &cgroup.path);
         assert_eq!(layout.dir, cgroup.path.display().to_string());
         assert_eq!(layout.files, "memory.current,memory.max,memory.stat");
-        let states = "memory.stat=unreadable memory.current=readable memory.max=readable";
+        let states = "memory.stat=unreadable memory.current=readable:1 memory.max=readable:max";
         assert!(layout.key_files.starts_with(states), "{}", layout.key_files);
         assert!(layout.key_files.ends_with("memory.limit_in_bytes=missing"));
         assert_eq!(layout.proc_cgroup, "0::/");
@@ -1792,7 +1887,163 @@ mod tests {
         let layout = memory_layout(&proc.path, &cgroup.path);
         assert!(layout.proc_cgroup.ends_with(TRUNCATED) && layout.proc_cgroup.len() == 512);
         assert!(!layout.proc_cgroup.contains('\n'));
-        assert_eq!([layout.mounts, layout.dir], ["unreadable", "none"]);
+        assert_eq!(
+            [layout.mounts, layout.dir, layout.cpu_dir],
+            ["unreadable", "none", "none"]
+        );
         assert!(one_line(&"é\n".repeat(2000), 2048).len() <= 2048);
+    }
+
+    #[test]
+    fn memory_layout_names_the_candidate_that_supplies_memory() {
+        let (unreadable, used, proc) = (temp_tree(), temp_tree(), temp_tree());
+        write_files(
+            &used.path,
+            &[
+                ("memory.current", "7\n"),
+                ("memory.stat", "inactive_file 2\n"),
+                ("memory.max", "max\n"),
+            ],
+        );
+        let info = format!(
+            "{}\n{}\n",
+            v2_mount_line("/", &unreadable.path),
+            v2_mount_line("/", &used.path)
+        );
+        write_files(
+            &proc.path,
+            &[("self/cgroup", "0::/\n"), ("self/mountinfo", &info)],
+        );
+        let memory = read_mounted_cgroup("0::/\n", &info).memory;
+        assert!(memory.is_some());
+        assert_eq!(memory, read_cgroup(Some(&used.path), None).memory);
+        let layout = memory_layout(&proc.path, &unreadable.path);
+        assert_eq!(layout.dir, used.path.display().to_string());
+        assert_eq!(layout.files, "memory.current,memory.max,memory.stat");
+
+        // When no candidate yields memory, the first candidate is reported.
+        std::fs::remove_file(used.path.join("memory.current")).unwrap();
+        assert_eq!(read_mounted_cgroup("0::/\n", &info).memory, None);
+        let layout = memory_layout(&proc.path, &unreadable.path);
+        assert_eq!(layout.dir, unreadable.path.display().to_string());
+    }
+
+    #[test]
+    fn memory_layout_line_reports_cpu_files_and_counters() {
+        let cgroup = temp_tree();
+        write_files(
+            &cgroup.path,
+            &[
+                ("memory.current", "4096\n"),
+                ("memory.max", "8192\n"),
+                ("memory.stat", "inactive_file 1\n"),
+                ("cpu.stat", "usage_usec 5000\nuser_usec 4000\n"),
+                ("cpu.max", "max 100000\n"),
+                ("cpu.weight", "100\n"),
+            ],
+        );
+        let proc = proc_fixture(&cgroup.path);
+        let line = memory_layout(&proc.path, &cgroup.path).line();
+        let dir = format!("cpu_dir={:?}", cgroup.path.display().to_string());
+        for want in [
+            dir.as_str(),
+            "cpu_files=\"cpu.max,cpu.stat,cpu.weight\"",
+            "cpu.stat=readable:usage_usec=5000",
+            "cpu.max=readable:max,100000",
+            "cpuacct.usage=missing",
+            "memory.current=readable:4096",
+            "memory.max=readable:8192",
+        ] {
+            assert!(line.contains(want), "{want}: {line}");
+        }
+
+        let (memory, cpu) = (temp_tree(), temp_tree());
+        write_files(
+            &memory.path,
+            &[
+                ("app/memory.usage_in_bytes", "3000\n"),
+                ("app/memory.limit_in_bytes", "9223372036854771712\n"),
+                ("app/memory.stat", "total_inactive_file 5\n"),
+            ],
+        );
+        write_files(
+            &cpu.path,
+            &[
+                ("app/cpuacct.usage", "1500000\n"),
+                ("app/cpu.cfs_quota_us", "-1\n"),
+                ("app/cpu.cfs_period_us", "100000\n"),
+            ],
+        );
+        let info = format!(
+            "{}\n{}\n",
+            v1_mount_line("/", &memory.path, "memory"),
+            v1_mount_line("/", &cpu.path, "cpu,cpuacct")
+        );
+        write_files(
+            &proc.path,
+            &[
+                ("self/cgroup", "2:cpu,cpuacct:/app\n1:memory:/app\n"),
+                ("self/mountinfo", &info),
+            ],
+        );
+        let line = memory_layout(&proc.path, &cgroup.path).line();
+        let memory_dir = format!(
+            "cgroup_dir={:?}",
+            memory.path.join("app").display().to_string()
+        );
+        let cpu_dir = format!("cpu_dir={:?}", cpu.path.join("app").display().to_string());
+        for want in [
+            memory_dir.as_str(),
+            cpu_dir.as_str(),
+            "cpu_files=\"cpu.cfs_period_us,cpu.cfs_quota_us,cpuacct.usage\"",
+            "cpuacct.usage=readable:1500000",
+            "cpu.cfs_quota_us=readable:-1",
+            "cpu.cfs_period_us=readable:100000",
+            "cpu.stat=missing",
+            "memory.usage_in_bytes=readable:3000",
+            "memory.limit_in_bytes=readable:9223372036854771712",
+        ] {
+            assert!(line.contains(want), "{want}: {line}");
+        }
+    }
+
+    #[test]
+    fn memory_layout_line_caps_the_whole_line_on_a_char_boundary() {
+        let deep = format!("{}/{}", "é".repeat(100), "ü".repeat(100));
+        for pad in 0..4 {
+            let cgroup = temp_tree();
+            let mut files = vec![(format!("{deep}/memory.current"), "1\n".to_string())];
+            for index in 0..20 {
+                let name = format!("{deep}/memory.{}{index}", "ß".repeat(100));
+                files.push((name, "1\n".to_string()));
+            }
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(n, b)| (n.as_str(), b.as_str()))
+                .collect();
+            write_files(&cgroup.path, &files);
+            let mut proc_cgroup = format!("0::/{deep}\n{}", "x".repeat(pad));
+            proc_cgroup.push_str(&format!("1:name=systemd:/{}\n", "é".repeat(50)).repeat(20));
+            let mut info = format!("{}\n", v2_mount_line("/", &cgroup.path));
+            for index in 0..30 {
+                let point = format!("/{}/{index}", "ü".repeat(40));
+                info.push_str(&format!("30 1 0:30 /zz {point} rw - cgroup2 cgroup rw\n"));
+            }
+            let proc = temp_tree();
+            write_files(
+                &proc.path,
+                &[("self/cgroup", &proc_cgroup), ("self/mountinfo", &info)],
+            );
+            let line = memory_layout(&proc.path, &cgroup.path).line();
+            assert!(line.len() <= 2048, "{} bytes: {line}", line.len());
+            assert!(std::str::from_utf8(line.as_bytes()).is_ok());
+            assert!(!line.contains(['\n', '\r']), "{line}");
+            assert!(line.starts_with("cgroup memory layout "), "{line}");
+            assert!(line.ends_with(TRUNCATED), "{line}");
+            assert!(
+                line.contains(" cgroup_dir=\"") && line.contains(" cpu_dir=\""),
+                "{line}"
+            );
+        }
     }
 }
