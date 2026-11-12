@@ -1684,6 +1684,10 @@ grep -Fq ' -a io.jmodguard.not-after=' "$COSIGN_TRACE" \
   || grep -Fq -- '-a io.jmodguard.not-after=' "$COSIGN_TRACE" \
   || fail 'cosign sign must pass -a for the expiry annotation'
 grep -Fq 'cosign verify' "$COSIGN_TRACE" || fail 'production signing must invoke cosign verify'
+grep -Fq -- '--tlog-upload=false' "$COSIGN_TRACE" \
+  && fail 'production signing must upload signatures to the Rekor transparency log'
+grep -Fq -- '--insecure-ignore-tlog' "$COSIGN_TRACE" \
+  && fail 'production verification must check the Rekor transparency log entry'
 grep -Fq -- "--key ${SIGNING_PUBLIC_KEY}" "$COSIGN_TRACE" \
   || grep -Fq -- "--key $root/deploy/update-signing.pub" "$COSIGN_TRACE" \
   || fail 'production verification must use the committed cosign public key'
@@ -1977,6 +1981,13 @@ image_published_at() { printf '%s' '2026-10-01T00:00:00Z'; }
 not_after_from_published_at() { printf '%s' '2027-12-31T00:00:00Z'; }
 published_signature_still_valid "$signature_skip_image" \
   && fail 'unsigned registry image must fail signature revalidation with cosign available'
+cosign() { printf 'cosign %s\n' "$*" >"$COSIGN_TRACE"; }
+published_signature_still_valid "$signature_skip_image" \
+  || fail 'a verified unexpired signature must allow the unchanged-image skip'
+grep -Fq 'cosign verify' "$COSIGN_TRACE" || fail 'signature revalidation must invoke cosign verify'
+grep -Fq -- '--insecure-ignore-tlog' "$COSIGN_TRACE" \
+  && fail 'signature revalidation must check the Rekor transparency log entry'
+unset -f cosign
 missing_cosign_path="$(mktemp -d "${TMPDIR:-/tmp}/publish-no-cosign-XXXXXX")"
 if (
   export SIGNING_PUBLIC_KEY="$TEST_SIGNING_PUBLIC_KEY"
