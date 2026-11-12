@@ -209,15 +209,19 @@ Generated assets and third-party source must not be committed. Local preflight
 and publication build these assets automatically.
 
 For ordinary PRs, run the regression and checks relevant to the changed behavior
-locally; see the selection examples in `development.md`. Record commands, results,
+locally: `bash scripts/ci-preflight.sh --affected` runs the groups CI selects for
+this checkout's changes, including uncommitted and untracked files; see
+`development.md` for narrower examples. Record commands, results,
 and simulated boundaries in the PR. GitHub Actions runs affected check groups and
 **CI passed** remains required before merge; a local focused pass is not a merge gate.
 Do not repeat full validation for each edit, commit, and push. After a follow-up
 edit, rerun affected checks and retain evidence for unchanged inputs.
 Run the full Linux preflight (`bash scripts/ci-preflight.sh`, no `--only`) before
 submitting changes to CI orchestration, toolchains, workspace-wide dependency/build
-configuration, or when affected scope cannot be established. It also remains
-available for an explicit complete check; see `docs/CI.md`.
+configuration, or when affected scope cannot be established; `--affected` selects
+it by itself for CI orchestration and unclassified paths. It also remains
+available for an explicit complete check; see `docs/CI.md`. Do not run it for an
+ordinary change.
 The Publish workflow calls the same checks before publishing verified images. Pullfrog
 retains its owner-command workflow (`docs/PULLFROG.md`); Socket Security remains
 a separate manifest scan (`.github/workflows/socket.yml`). Set the
@@ -228,9 +232,10 @@ A new blocking alert can fail this check only when Socket compares a pull reques
 After enabling the key, let a scan run on `main` before relying on pull request comparisons; without a main baseline, Socket may treat existing dependencies as newly added.
 
 ```bash
-bash scripts/ci-preflight.sh
+bash scripts/ci-preflight.sh --affected   # ordinary change: what CI will select
+bash scripts/ci-preflight.sh              # full suite
 # For a PR whose base is not main:
-# bash scripts/ci-preflight.sh --base origin/<base-branch>
+# bash scripts/ci-preflight.sh --affected --base origin/<base-branch>
 # Optional local hooks: staged whitespace at commit, contracts at push.
 # Worktree-local core.hooksPath (.githooks); does not chain previous hook dirs:
 # bash scripts/install-git-hooks.sh

@@ -40,9 +40,9 @@ done
 [ -n "$mode" ] || { usage >&2; exit 2; }
 
 groups=(
-  contracts frontend fmt dylint api bot runtime updater core
-  integration boundaries publish-tests bootstrap pullfrog supply-chain
-  remote-database
+  contracts frontend fmt dylint api api-embed bot runtime updater core
+  integration boundaries publish-tests bootstrap pullfrog runner-tests
+  supply-chain remote-database
 )
 selected=""
 full=0
@@ -123,7 +123,13 @@ classify() {
       add frontend; add publish-tests
       return
       ;;
-    Cargo.lock|rust-toolchain.toml|deny.toml|Cargo.toml)
+    rust-toolchain.toml)
+      # The runner regression suites drive this real Cargo and rustc.
+      all_rust
+      add runner-tests
+      return
+      ;;
+    Cargo.lock|deny.toml|Cargo.toml)
       all_rust
       return
       ;;
@@ -132,8 +138,14 @@ classify() {
       add dylint
       return
       ;;
-    scripts/ci-cargo-log.sh|scripts/ci-ensure-cargo-tool.sh|scripts/ci-preflight-test.sh|scripts/ci-run-timed-cargo-test.sh|scripts/ci-timed-cargo-test.sh)
+    scripts/ci-ensure-cargo-tool.sh)
+      # Installs the pinned cargo-deny and cargo-audit the supply-chain gate runs.
+      add runner-tests
       add supply-chain
+      return
+      ;;
+    scripts/ci-cargo-log.sh|scripts/ci-preflight-test.sh|scripts/ci-run-timed-cargo-test.sh|scripts/ci-timed-cargo-test.sh)
+      add runner-tests
       return
       ;;
     crates/api/Cargo.toml)
@@ -159,7 +171,7 @@ classify() {
       return
       ;;
     tools/webui/*)
-      add frontend; add api; add publish-tests
+      add frontend; add api-embed; add publish-tests
       return
       ;;
     Dockerfile.webui)
@@ -218,9 +230,10 @@ classify() {
       core_consumers
       ;;
     frontend)
-      # Default API embed-ui compiles these files with include_str!.
+      # Default API embed-ui compiles these files with include_str!. The API
+      # built without that feature cannot observe them.
       add frontend
-      add api
+      add api-embed
       ;;
     docs)
       add contracts
@@ -288,10 +301,15 @@ if [ "$full" -eq 0 ]; then
   fi
 fi
 
+# api is the embedded-UI checks plus the API built without them.
+case " ${selected} " in
+  *" api "*) selected="${selected// api-embed/}" ;;
+esac
+
 # cargo deny / cargo audit stay on every plan that compiles or publishes Rust.
 ensure_supply_chain() {
   local group
-  for group in fmt dylint api bot runtime updater core integration boundaries remote-database publish-tests bootstrap; do
+  for group in fmt dylint api api-embed bot runtime updater core integration boundaries remote-database publish-tests bootstrap; do
     case " ${selected} " in
       *" ${group} "*) add supply-chain; return ;;
     esac
@@ -351,9 +369,9 @@ fi
 SELECTED="$selected" LINT_PACKAGES="$dylint_packages" node --input-type=module - <<'JS'
 const selected = new Set(process.env.SELECTED.trim().split(/\s+/));
 const lanes = {
-  quick: ["contracts", "fmt", "publish-tests", "bootstrap", "pullfrog"],
+  quick: ["contracts", "fmt", "publish-tests", "bootstrap", "pullfrog", "runner-tests"],
   frontend: ["frontend"],
-  "rust-api": ["api", "boundaries"],
+  "rust-api": ["api", "api-embed", "boundaries"],
   "rust-bot": ["bot", "integration"],
   "rust-core": ["runtime", "updater", "core"],
   dylint: ["dylint"],

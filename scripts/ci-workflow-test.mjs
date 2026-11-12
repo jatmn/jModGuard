@@ -286,6 +286,23 @@ try {
   }
   assert.ok(!fs.existsSync(githubPath), "failed setup must not publish nextest");
 
+  // Rust setup must free the Android SDK space without waiting for the delete,
+  // which holds a hosted job for one to two minutes. sudo and rustup are
+  // stand-ins here; the slow delete is a delayed marker, not a hosted runner.
+  const rustBin = path.join(scratch, "rust-bin"), freed = path.join(scratch, "freed");
+  fs.mkdirSync(rustBin);
+  fs.writeFileSync(path.join(rustBin, "sudo"), '#!/bin/sh\nsleep 2\nprintf "%s\\n" "$*" > "$FREED"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(rustBin, "rustup"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  run("bash", [setupScript, "true"], { cwd: root, env: {
+    ...process.env, PATH: `${rustBin}:${process.env.PATH}`, FREED: freed,
+    GITHUB_ACTIONS: "true", RUNNER_ENVIRONMENT: "github-hosted", RUNNER_TEMP: scratch, GITHUB_ENV: envFile,
+  } });
+  assert.ok(!fs.existsSync(freed), "Rust setup must not wait for the Android SDK delete");
+  for (let waited = 0; !fs.existsSync(freed) && waited < 100; waited++) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  }
+  assert.equal(fs.readFileSync(freed, "utf8").trim(), "rm -rf /usr/local/lib/android", "Rust setup must still free the Android SDK space");
+
   const selectScan = socketSteps.find(step => step.startsWith("name: Select dependency scan"));
   const selectRun = selectScan?.match(/^        run: \|\n([\s\S]*)/m)?.[1];
   assert.ok(selectRun);
@@ -1052,5 +1069,68 @@ try {
   assert.equal(run("git", ["--git-dir", remote, "rev-parse", "main"]), remoteBefore);
 } finally {
   fs.rmSync(hookDir, { recursive: true, force: true });
+}
+// --affected must run what the hosted selector picks for this checkout's own
+// changes: commits, uncommitted edits and untracked files. The real preflight
+// and selector run in a fixture repository whose gates are recording stand-ins,
+// so this proves the selection, not that the selected gates pass.
+const affectedDir = fs.mkdtempSync(path.join(os.tmpdir(), "jmodguard-affected-"));
+try {
+  const repo = path.join(affectedDir, "repo"), calls = path.join(affectedDir, "calls");
+  fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
+  for (const file of ["ci-preflight.sh", "select-checks.sh", "ci-ensure-cargo-tool.sh", "ci-run-timed-cargo-test.sh", "ci-cargo-log.sh"]) {
+    fs.copyFileSync(path.join(root, "scripts", file), path.join(repo, "scripts", file));
+  }
+  const record = name => `printf '%s\\n' ${name} >>"$AFFECTED_CALLS"\n`;
+  const contractGates = ["select-checks-test.sh", "public-install-acceptance-test.sh", "dependabot-config-test.sh"];
+  for (const gate of contractGates) fs.writeFileSync(path.join(repo, "scripts", gate), record(gate));
+  fs.writeFileSync(path.join(repo, "scripts/ci-workflow-test.mjs"),
+    'import fs from "node:fs";\nfs.appendFileSync(process.env.AFFECTED_CALLS, "ci-workflow-test.mjs\\n");\n');
+  // The first browser gate stops the run once the selection has been reported.
+  fs.writeFileSync(path.join(repo, "scripts/require-host-eslint-node.sh"), record("require-host-eslint-node.sh") + "exit 7\n");
+  fs.mkdirSync(path.join(repo, "docs"));
+  fs.writeFileSync(path.join(repo, "docs/SETUP.md"), "base\n");
+  fs.writeFileSync(path.join(repo, "README.md"), "base\n");
+  const git = (...args) => run("git", ["-C", repo, ...args]);
+  run("git", ["init", "-q", "--initial-branch=main", repo]);
+  git("config", "user.name", "Affected test");
+  git("config", "user.email", "affected@example.invalid");
+  git("config", "commit.gpgsign", "false");
+  git("add", ".");
+  git("commit", "-qm", "base");
+  git("switch", "-qc", "work");
+  const preflight = (...args) => {
+    fs.rmSync(calls, { force: true });
+    const result = spawnSync("bash", ["scripts/ci-preflight.sh", ...args], {
+      cwd: repo, encoding: "utf8", env: { ...process.env, AFFECTED_CALLS: calls },
+    });
+    assert.ifError(result.error);
+    return { ...result, calls: fs.existsSync(calls) ? fs.readFileSync(calls, "utf8").trim().split("\n") : [] };
+  };
+  // A committed and an uncommitted documentation edit select contracts alone.
+  fs.writeFileSync(path.join(repo, "docs/SETUP.md"), "committed\n");
+  git("commit", "-qam", "docs");
+  fs.writeFileSync(path.join(repo, "README.md"), "uncommitted\n");
+  const docsOnly = preflight("--affected", "--base", "main");
+  assert.equal(docsOnly.status, 0, docsOnly.stderr);
+  assert.match(docsOnly.stdout, /^ci-preflight: affected groups: contracts$/m);
+  assert.deepEqual(docsOnly.calls, ["ci-workflow-test.mjs", ...contractGates]);
+  // An untracked browser file adds its gates, without the API built without the UI.
+  fs.mkdirSync(path.join(repo, "frontend"));
+  fs.writeFileSync(path.join(repo, "frontend/app.js"), "// new\n");
+  const browser = preflight("--affected", "--base", "main");
+  assert.equal(browser.status, 7, browser.stderr);
+  assert.match(browser.stdout, /^ci-preflight: affected groups: contracts frontend api-embed supply-chain$/m);
+  assert.ok(browser.calls.includes("require-host-eslint-node.sh"), "browser changes must reach the browser gates");
+  // A path the selector cannot classify needs the full suite, as it does on GitHub Actions.
+  fs.writeFileSync(path.join(repo, "mystery.bin"), "?\n");
+  const unknown = preflight("--affected", "--base", "main");
+  assert.notEqual(unknown.status, 0);
+  assert.match(unknown.stdout, /^ci-preflight: affected: every group; running the full suite$/m);
+  const mixed = preflight("--affected", "--only", "contracts");
+  assert.equal(mixed.status, 2);
+  assert.deepEqual(mixed.calls, [], "conflicting selections must not run gates");
+} finally {
+  fs.rmSync(affectedDir, { recursive: true, force: true });
 }
 console.log("ci-workflow-test: ok");

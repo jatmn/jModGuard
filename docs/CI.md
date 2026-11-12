@@ -23,12 +23,13 @@ commit's checks. New commits and reopened PRs still run affected checks.
 | Touched surface | Checks |
 |---|---|
 | Documentation or sample configuration | Contracts only |
-| Frontend | Frontend and API (the default API embeds the generated UI) |
+| Frontend | Frontend and the default-feature API that embeds the generated UI (`api-embed`); the API built without the UI cannot observe these files |
 | API or bot | That service, integration, boundaries, formatting, scoped Dylint and supply chain |
 | Shared root source or migrations | Core plus bot/API/updater/integration consumers and remote databases |
 | Runtime | Runtime and its core/integration consumers, boundaries, formatting, Dylint and supply chain |
 | Updater | Updater plus bot/API consumers and boundaries, formatting, Dylint and supply chain |
 | Cargo manifests/lockfile, toolchain or vendor | Relevant Rust gates, with global inputs selecting all Rust gates |
+| CI runner scripts or the Rust toolchain pin | The runner regression suites (`runner-tests`), plus all Rust gates for the toolchain |
 | Unknown paths or CI orchestration | All checks |
 
 Selected groups run in up to eight jobs: quick contracts/shell checks/formatting,
@@ -41,7 +42,9 @@ and use pinned sccache 0.18.0 to share compiler outputs through GitHub's cache.
 Source, feature, compiler and embedded-file changes invalidate compiler entries;
 cache hits never skip tests. Linking and check-only compiler calls still run,
 and simultaneous cold misses can compile the same input before either saves it.
-A Rust toolchain is not installed for documentation-only contracts. PR runs cancel
+A Rust toolchain is not installed for documentation-only contracts. Rust jobs
+free the runner's unused Android SDK space in the background: the delete takes
+one to two minutes, and no job waits for it. PR runs cancel
 superseded runs; trusted publication runs queue without replacement or cancellation
 (up to GitHub’s limit of 100 waiting runs). npm and
 Rust caches reduce repeated downloads/compilation. PRs do not save the shared
@@ -77,10 +80,17 @@ which the tool cache key hashes. The local complete gate is:
 bash scripts/ci-preflight.sh
 ```
 
+`bash scripts/ci-preflight.sh --affected` instead runs the groups this selector
+picks for the checkout's commits since the base plus its uncommitted and
+untracked files, and the full suite when every group is selected. Preflight
+builds without debug info unless the caller sets `CARGO_PROFILE_DEV_DEBUG` or
+`CARGO_PROFILE_TEST_DEBUG`, matching the hosted jobs.
+
 The hosted Rust jobs install checksum-pinned cargo-nextest 0.9.148. Preflight uses
 it to run tests in parallel, in a separate process per test, without launching
-Cargo for every test. Its concurrency follows the runner's available CPUs; the
-existing 180-second per-test limit remains. Doctests still use the timed Cargo
+Cargo for every test. It runs two tests per available CPU, because the slow
+cases wait on timers and deadlines rather than the CPU; set
+`NEXTEST_TEST_THREADS` to override. The existing 180-second per-test limit remains. Doctests still use the timed Cargo
 path, and the ignored two-process smoke still runs after building both services.
 Local preflight uses nextest when installed, with the existing GNU timeout
 fallback for unavailable nextest or unsupported arguments.
@@ -90,9 +100,11 @@ run relevant local checks and rely on **CI passed** for complete affected valida
 see [Local validation](../development.md#local-validation). CI/build-control changes
 still require a full local preflight. Optional hooks check staged whitespace at
 commit and lightweight contracts at push, without repeating the full suite.
-The real-Cargo timeout-runner regression suite belongs to `supply-chain`, which
-already runs for runner changes and Rust plans; documentation-only contracts do
-not compile its fixture workspace. The ordinary integration suite runs the two
+The real-Cargo timeout-runner and tool-installer regression suites are the
+`runner-tests` group in the quick job. Their inputs are the runner scripts and the
+Rust toolchain pin, so they run for those changes and for full plans, not for
+application changes; documentation-only contracts do not compile their fixture
+workspace. The ordinary integration suite runs the two
 in-process smoke cases; the post-build smoke invocation runs only the ignored
 executable case, so each case runs once. Separate `bash scripts/ci-remote-database.sh` starts disposable
 loopback-only libSQL containers for the existing remote database, guild store,

@@ -425,6 +425,12 @@ fi
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
+# These gates never attach a debugger. Debug info multiplies compiler memory and
+# link I/O across the test binaries until a 16 GB machine stalls on the build.
+# GitHub Actions sets the same values; an explicit caller setting still wins.
+export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
+export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
+
 if [ -z "${JMODGUARD_CI_PREFIX:-}" ]; then
   if [ -n "${HOME:-}" ]; then
     JMODGUARD_CI_PREFIX="$HOME/.cache/jmodguard-ci"
@@ -439,13 +445,16 @@ source "$root/scripts/ci-run-timed-cargo-test.sh"
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/ci-preflight.sh [--base <git-revision>] [--only <group>]
+Usage: bash scripts/ci-preflight.sh [--base <git-revision>] [--affected | --only <group>]...
 
 Run the CI gates locally or on an ephemeral GitHub-hosted Linux runner.
-With no --only, run the full suite (CI/build-control changes or a complete check).
+--affected runs the groups GitHub Actions selects for this checkout's changes
+since the base, including uncommitted and untracked files, and the full suite
+when the change needs it. With neither flag, run the full suite.
 GitHub Actions groups affected checks into jobs. Known groups: contracts,
-frontend, fmt, dylint, api, bot, runtime, updater, core, integration,
-boundaries, publish-tests, bootstrap, pullfrog, supply-chain.
+frontend, fmt, dylint, api, api-embed, bot, runtime, updater, core,
+integration, boundaries, publish-tests, bootstrap, pullfrog, runner-tests,
+supply-chain.
 By default the whitespace diff base is origin/main. Pass --base origin/<branch>
 for a PR whose base is not main. Scheduled builds set
 JMODGUARD_AUDIT_FAIL_CLOSED=1 so cargo-audit fails the job.
@@ -454,7 +463,8 @@ EOF
 
 base_ref="${JMODGUARD_PREFLIGHT_BASE:-origin/main}"
 only_names=""
-known_only="contracts frontend fmt dylint api bot runtime updater core integration boundaries publish-tests bootstrap pullfrog supply-chain"
+affected=0
+known_only="contracts frontend fmt dylint api api-embed bot runtime updater core integration boundaries publish-tests bootstrap pullfrog runner-tests supply-chain"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --base)
@@ -471,6 +481,10 @@ while [ "$#" -gt 0 ]; do
       only_names="${only_names} $2"
       shift 2
       ;;
+    --affected)
+      affected=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -481,6 +495,46 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ "$affected" -eq 1 ]; then
+  if [ -n "$only_names" ]; then
+    echo 'ci-preflight: --affected selects the groups; do not combine it with --only' >&2
+    exit 2
+  fi
+  if ! affected_base="$(git merge-base "$base_ref" HEAD)"; then
+    echo "ci-preflight: --affected cannot find base $base_ref; fetch it or pass --base <git-revision>" >&2
+    exit 2
+  fi
+  # Everything this checkout changed since it left the base: commits, staged
+  # and unstaged edits, and untracked files. Renames count as delete + add.
+  affected_list="$(mktemp)"
+  git diff --no-renames --name-only -z "$affected_base" >"$affected_list"
+  git ls-files --others --exclude-standard -z >>"$affected_list"
+  mapfile -d '' -t affected_paths <"$affected_list"
+  rm -f "$affected_list"
+  affected_groups=contracts
+  if [ "${#affected_paths[@]}" -gt 0 ]; then
+    affected_groups="$(bash scripts/select-checks.sh plan --files "${affected_paths[@]}" | tr '\n' ' ')"
+  fi
+  # A plan with every group is the full suite; api stands in for api-embed.
+  affected_full=1
+  for group in $known_only; do
+    case " $affected_groups " in
+      *" $group "*) only_names="${only_names} $group" ;;
+      *) [ "$group" = api-embed ] || affected_full=0 ;;
+    esac
+  done
+  if [ "$affected_full" -eq 1 ]; then
+    echo 'ci-preflight: affected: every group; running the full suite'
+    only_names=""
+  else
+    echo "ci-preflight: affected groups:${only_names}"
+  fi
+  case " $affected_groups " in
+    *" remote-database "*)
+      echo 'ci-preflight: remote-database is also affected; GitHub Actions runs it, or run bash scripts/ci-remote-database.sh (needs Docker)' ;;
+  esac
+fi
 
 should_run() {
   if [ -z "${only_names}" ]; then
@@ -601,7 +655,10 @@ run_timed_cargo_test() {
 period = "60s"
 terminate-after = 3
 EOF
-    nextest_args+=(--config-file "$cfg" --failure-output immediate)
+    # The slow cases wait on timers, leases and deadlines, not the CPU: they
+    # take the same time at any concurrency, so two per core finishes sooner.
+    nextest_args+=(--config-file "$cfg" --failure-output immediate
+      --test-threads "${NEXTEST_TEST_THREADS:-$(($(nproc) * 2))}")
     local i=0
     while [ "$i" -lt "${#cargo_args[@]}" ]; do
       arg="${cargo_args[$i]}"
@@ -759,14 +816,14 @@ whitespace_check() {
 }
 
 run_cargo() {
-  if should_run fmt || should_run dylint || should_run api || should_run bot || should_run runtime || should_run updater || should_run core || should_run integration || should_run boundaries || should_run supply-chain; then
+  if should_run fmt || should_run dylint || should_run api || should_run api-embed || should_run bot || should_run runtime || should_run updater || should_run core || should_run integration || should_run boundaries || should_run supply-chain; then
     return 0
   fi
   return 1
 }
 
 # Rust's default embed-ui and the publication tests consume the same built assets.
-if should_run api || should_run integration || should_run dylint || should_run frontend || should_run publish-tests; then
+if should_run api || should_run api-embed || should_run integration || should_run dylint || should_run frontend || should_run publish-tests; then
   bash scripts/require-host-eslint-node.sh
   npm ci --ignore-scripts --prefix tools/webui
   npm audit --prefix tools/webui --audit-level=high
@@ -830,19 +887,27 @@ if [ -z "${only_names}" ]; then
   echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
   run_timed_cargo_test cargo test --locked -p jmodguard-api --no-default-features --lib || exit $?
 else
-  if should_run api; then
+  # api-embed is the default-feature half of api: browser files reach Rust only
+  # through embed-ui, so the API built without it cannot observe them.
+  if should_run api || should_run api-embed; then
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --all-targets -- -D warnings'
     cargo clippy --locked -p jmodguard-api --all-targets -- -D warnings
-    echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings'
-    cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings
+    if should_run api; then
+      echo 'ci-preflight: cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings'
+      cargo clippy --locked -p jmodguard-api --no-default-features --all-targets -- -D warnings
+    fi
     echo 'ci-preflight: cargo test --locked -p jmodguard-api'
     run_timed_cargo_test cargo test --locked -p jmodguard-api || exit $?
-    echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
-    run_timed_cargo_test cargo test --locked -p jmodguard-api --no-default-features --lib || exit $?
+    if should_run api; then
+      echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
+      run_timed_cargo_test cargo test --locked -p jmodguard-api --no-default-features --lib || exit $?
+    fi
     echo 'ci-preflight: cargo build --locked -p jmodguard-api'
     cargo build --locked -p jmodguard-api
-    echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
-    cargo build --locked -p jmodguard-api --no-default-features
+    if should_run api; then
+      echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
+      cargo build --locked -p jmodguard-api --no-default-features
+    fi
   fi
   if should_run bot; then
     echo 'ci-preflight: cargo clippy --locked -p jmodguard-bot --all-targets -- -D warnings'
@@ -945,14 +1010,17 @@ if [ -z "${only_names}" ]; then
   cargo build --locked -p jmodguard-api --no-default-features
 fi
 
-if should_run supply-chain; then
-  # This uses real Cargo/rustc. Keep docs-only contracts free of Rust setup.
+if should_run runner-tests; then
+  # Regression suites for the CI runner scripts themselves, on real Cargo/rustc.
+  # Application changes cannot affect them; their own inputs select this group.
   echo 'ci-preflight: bash scripts/ci-timed-cargo-test.sh'
   bash scripts/ci-timed-cargo-test.sh
 
   echo 'ci-preflight: bash scripts/ci-preflight-test.sh'
   bash scripts/ci-preflight-test.sh
+fi
 
+if should_run supply-chain; then
   ensure_cargo_tool cargo-deny cargo-deny "$cargo_deny_version"
   ensure_cargo_tool cargo-audit cargo-audit "$cargo_audit_version"
 
