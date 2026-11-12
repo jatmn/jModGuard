@@ -458,6 +458,35 @@ pub struct MemberPage {
     pub next_cursor: Option<String>,
 }
 
+/// Bounded directory counts for the analytics views. `known` includes
+/// departed members still retained by ban history.
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectoryTotals {
+    pub current: i64,
+    pub banned: i64,
+    pub known: i64,
+    pub coverage: DirectoryCoverage,
+}
+
+/// Whether the counts describe the whole server, using the same import and
+/// coverage-gap state the Members status card reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryCoverage {
+    /// The initial import finished and no coverage gap awaits reconciliation.
+    Complete,
+    /// The initial import for this membership has not finished.
+    Importing,
+    /// A recorded coverage gap still awaits reconciliation.
+    Uncertain,
+}
+
+impl DirectoryCoverage {
+    pub fn is_complete(self) -> bool {
+        self == Self::Complete
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MemberHistoryEntry {
     pub kind: String,
@@ -3582,6 +3611,67 @@ impl GuildDataStore {
             let sql=format!("SELECT {PROFILE_SQL} FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3");
             let found=tx.query_row(&sql,params![scope.guild_id(),scope.enrollment.id.as_str(),user_id],profile).optional()?; tx.finish_read()?; Ok(found)
         }).await
+    }
+
+    /// Bounded directory counts for the analytics views: current members,
+    /// members with confirmed ban history, and all known rows for this scope,
+    /// with the coverage those counts have.
+    pub async fn directory_totals(&self, scope: GuildDataScope) -> Result<DirectoryTotals> {
+        checked_scope(self, &scope)?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                // One statement: a remote snapshot cannot afford a round trip
+                // per count after scope verification.
+                let (current, banned, known, seed_present, completed, reconcile): (
+                    i64,
+                    i64,
+                    i64,
+                    bool,
+                    bool,
+                    bool,
+                ) = tx.query_row(
+                    "SELECT \
+                       (SELECT COUNT(*) FROM guild_member_directory \
+                        WHERE guild_id=?1 AND enrollment_id=?2 AND is_current=1), \
+                       (SELECT COUNT(*) FROM guild_member_directory \
+                        WHERE guild_id=?1 AND enrollment_id=?2 AND is_banned=1), \
+                       (SELECT COUNT(*) FROM guild_member_directory \
+                        WHERE guild_id=?1 AND enrollment_id=?2), \
+                       EXISTS(SELECT 1 FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2), \
+                       COALESCE((SELECT initial_completed_at_ms IS NOT NULL FROM guild_member_seed \
+                        WHERE guild_id=?1 AND enrollment_id=?2), 0), \
+                       COALESCE((SELECT reconciliation_needed FROM guild_member_seed \
+                        WHERE guild_id=?1 AND enrollment_id=?2), 0)",
+                    params![scope.guild_id(), scope.enrollment.id.as_str()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )?;
+                let seed = seed_present.then_some((completed, reconcile));
+                tx.finish_read()?;
+                let coverage = match seed {
+                    Some((true, false)) => DirectoryCoverage::Complete,
+                    Some((true, true)) => DirectoryCoverage::Uncertain,
+                    Some((false, _)) | None => DirectoryCoverage::Importing,
+                };
+                Ok(DirectoryTotals {
+                    current,
+                    banned,
+                    known,
+                    coverage,
+                })
+            })
+            .await
     }
 
     pub async fn member_history(

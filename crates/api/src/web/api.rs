@@ -1321,6 +1321,34 @@ pub async fn stats(
     Ok(Json(value))
 }
 
+/// Daily analytics trends for this guild, in the captured active membership.
+/// Server size comes from the guild's member directory; when the directory is
+/// unavailable (for example during a bot outage) the field is null and the
+/// series still answers.
+pub async fn analytics(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path(guild_id): Path<u64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Dashboard).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let enrollment = super::authorized_enrollment(&auth, guild_id)?;
+    let result = db::enrolled_guild_analytics(
+        &app.db,
+        enrollment.clone(),
+        db::ANALYTICS_DEFAULT_WINDOW_DAYS,
+    )
+    .await?;
+    let mut value = serde_json::json!(result);
+    let members = match app.tenant.live(enrollment).await {
+        Ok((store, scope)) => store.directory_totals(scope).await.ok(),
+        Err(_) => None,
+    };
+    value["members"] = serde_json::json!(members);
+    Ok(Json(value))
+}
+
 pub(super) async fn enqueue_action(
     app: &Arc<ApiState>,
     guild: u64,

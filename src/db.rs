@@ -53,6 +53,8 @@ mod gateway_ban_deliveries;
 pub use gateway_ban_deliveries::*;
 mod moderation;
 pub use moderation::*;
+mod analytics;
+pub use analytics::*;
 pub mod guild_data;
 pub mod guild_stores;
 mod tenant_lifecycle;
@@ -94,7 +96,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0022_clear_userinfo_command_rows.sql"),
     include_str!("../migrations/0023_ban_expiry.sql"),
     include_str!("../migrations/0024_known_spam.sql"),
-    include_str!("../migrations/0025_guild_join_info.sql"),
+    include_str!("../migrations/0025_analytics_member_daily.sql"),
+    include_str!("../migrations/0026_guild_join_info.sql"),
 ];
 
 /// Completed core schema required by service startup and release observations.

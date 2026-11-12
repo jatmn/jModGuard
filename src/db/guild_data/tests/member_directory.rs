@@ -682,6 +682,49 @@ async fn complete_for_checks(store: &GuildDataStore, scope: &GuildDataScope) {
 }
 
 #[tokio::test]
+async fn directory_totals_report_import_and_gap_coverage() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store
+        .observe_member(scope.clone(), observed(77, Some(900), 1_500))
+        .await
+        .unwrap();
+    let importing = store.directory_totals(scope.clone()).await.unwrap();
+    assert_eq!((importing.current, importing.known), (1, 1));
+    assert_eq!(importing.coverage, DirectoryCoverage::Importing);
+    store
+        .db
+        .with_conn(|conn| {
+            let mut tx = conn.transaction_primary_write()?;
+            tx.ensure_mutation_receipt()?;
+            tx.member_execute(
+                "UPDATE guild_member_seed SET initial_completed_at_ms=2000 WHERE guild_id=10",
+                (),
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+    let complete = store.directory_totals(scope.clone()).await.unwrap();
+    assert_eq!(complete.current, 1);
+    assert_eq!(complete.coverage, DirectoryCoverage::Complete);
+    store
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_000,
+        )
+        .await
+        .unwrap();
+    let gap = store.directory_totals(scope).await.unwrap();
+    assert_eq!(gap.current, 1);
+    assert_eq!(gap.coverage, DirectoryCoverage::Uncertain);
+}
+
+#[tokio::test]
 async fn first_profile_insert_creates_pending_rejoin_receipt() {
     let (_f, store, scope) = ready().await;
     store

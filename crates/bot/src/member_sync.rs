@@ -870,6 +870,7 @@ async fn settle_target_check(
     check: db::guild_data::MemberTargetCheck,
     verification: MemberVerification,
 ) -> anyhow::Result<()> {
+    let enrollment = scope.enrollment().clone();
     let suppressed_remove_absent = check.kind == MemberVerifyKind::Member
         && check.reason == "mismatched_departure"
         && !verification.present;
@@ -920,6 +921,11 @@ async fn settle_target_check(
         profile.as_ref(),
     )
     .await;
+    // Count in the checked membership; never rebind to a later enrollment.
+    crate::logging::log_persistence_result(
+        "verified member leave counter",
+        db::bump_member_daily(&app.db, enrollment, departure.departed_at_ms, 0, 1).await,
+    );
     Ok(())
 }
 
