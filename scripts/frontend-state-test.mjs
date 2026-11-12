@@ -5388,9 +5388,11 @@ test('known spam inherited globals are visible and removal is owner only', async
   const h = harness();
   h.app.state.config = {rules: [], known_spam: [{id:'7',guild_id:'0',kind:'url',value:'tinyurl.com/*',note:null}]};
   const panel = h.app.tabKnownSpam(); await settle();
-  assert.match(panel.textContent,/tinyurl.com/);
-  assert.match(panel.textContent,/Owner only/);
-  assert.equal([...panel.querySelectorAll('button')].some(b=>b.getAttribute('aria-label') === 'Remove'),false);
+  const row = [...panel.querySelectorAll('tr')].find(r=>r.textContent.includes('tinyurl.com'));
+  assert.ok(row, 'the inherited global entry is listed');
+  assert.match(row.textContent,/Owner only/);
+  // No control of any rendering (icon with aria-label or text) may remove it.
+  assert.equal(row.querySelectorAll('button').length,0);
 });
 
 test('template preview shows embed color, title and fields, then live custom description', async () => {
