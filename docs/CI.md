@@ -139,10 +139,13 @@ a deliberate new selection. For each rebuilt component the publisher pushes only
 staging reference at build time, records the digest from the build output metadata,
 verifies the image contents, signs that digest with the pinned update key, and
 verifies the signature with the committed public key at `deploy/update-signing.pub`
-before promoting the immutable source-SHA tag, any planned version label, and
-`latest`, `stable`, or `nightly`. The private signing key is stored only as a GitHub
+and its entry in the public Sigstore Rekor transparency log before promoting the
+immutable source-SHA tag, any planned version label, and `latest`, `stable`, or
+`nightly`. The private signing key is stored only as a GitHub
 Actions secret and is removed from the workflow environment before build steps; an
 empty signing secret fails publication before any moving tag is updated.
+If Rekor is unreachable, signing or verification fails publication instead of
+skipping the log; rerun the failed job once Rekor is available.
 Nightly tags never move `latest`. An explicit rerun republishes its pinned source.
 
 If **Promote images** fails or is cancelled after signing but before
