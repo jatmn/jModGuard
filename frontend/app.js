@@ -928,6 +928,8 @@ async function submitSave(path, method, body, signal, reconcileRecovered) {
     // current configuration instead of applying a historical patch again.
     return saveMode === "lookup" ? { ...result, config_patch: null } : result;
   } catch (error) {
+    // Lets a page explain that this retry only checked the earlier identical request.
+    if (saveMode === "lookup" && error && typeof error === "object") error.saveLookup = true;
     if (saveFailureState(error) === "expired") {
       try { window.sessionStorage.removeItem(key); } catch (_) { /* Keep lookup-only behavior if storage fails. */ }
     }
@@ -5504,6 +5506,8 @@ const AI_SPAM_EXAMPLE = "I used to work as Full Stack AI developer at several so
 function tabKnownSpam() {
   const { drafts } = useStore(ui);
   const scopeRef = useRef(null);
+  // A toast disappears; keep the reason a save failed beside its button.
+  const [addError, setAddError] = useState(null);
   const guildId = state.guildId;
   const rows = state.config.known_spam || [];
   const rule = (state.config.rules || []).find((r) => r.rule_id === "known_spam");
@@ -5511,10 +5515,19 @@ function tabKnownSpam() {
     const key = kind === "sample" ? "known-spam:sample" : "known-spam:url";
     const value = drafts[key]?.value || "";
     if (!value.trim()) return toast("Enter a full sample or URL pattern", "error");
-    await reloadAfter(() => api(`/api/guilds/${guildId}/known-spam`, "POST", {
-      scope: scopeRef.current.value, kind, value, note: drafts["known-spam:note"]?.value || null,
-    }), () => toast("Known spam entry added", "success"));
+    setAddError(null);
+    try {
+      await reloadAfter(() => api(`/api/guilds/${guildId}/known-spam`, "POST", {
+        scope: scopeRef.current.value, kind, value, note: drafts["known-spam:note"]?.value || null,
+      }), () => toast("Known spam entry added", "success"));
+    } catch (error) {
+      const label = kind === "sample" ? "Sample" : "URL pattern";
+      const lookup = error?.saveLookup ? " This retry checked the earlier identical request; no new save was submitted." : "";
+      setAddError({ kind, message: `${label} save did not complete: ${error?.message || error}${lookup}` });
+      throw error;
+    }
   };
+  const addErrorFor = (kind) => addError?.kind === kind ? h("p", { className: "error", role: "alert" }, addError.message) : null;
   return h("div", null,
     h("h2", null, "Known spam"),
     h("p", { className: "muted" }, "Save full confirmed spam messages or URL wildcards. First match bans and purges Discord’s Previous Hour (3600 seconds). Dry-run only logs. The list uses the rule’s enable, skip lists and skip-moderators settings below. Global entries apply to every server; only the bot owner can edit them."),
@@ -5525,10 +5538,12 @@ function tabKnownSpam() {
         field("Applies to", scopeSelect(scopeRef, "This server", "Global", true, "known-spam:scope")),
         field("Optional note (up to 512 bytes)", h(Input, { className: "input w-full", draftKey: "known-spam:note", "data-note": true, maxLength: 512 })),
         field("Full sample message (up to 4096 bytes)", h(Textarea, { className: "textarea w-full", draftKey: "known-spam:sample", rows: 7, maxLength: 4096, placeholder: "Paste the entire confirmed spam message. No regex needed." })),
-        h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:sample", "known-spam:note"], onClick: () => add("sample") }, "Add sample"),
+        h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:sample", "known-spam:note", "known-spam:scope"], onClick: () => add("sample") }, "Add sample"),
+        addErrorFor("sample"),
         field("URL wildcard (up to 512 bytes)", h(Input, { className: "input w-full", draftKey: "known-spam:url", "data-url": true, maxLength: 512, placeholder: "tinyurl.com/*" })),
         h("p", { className: "field-help" }, "HTTP/HTTPS scheme is optional and ignored. Hosts ignore case; tinyurl.com/* matches that exact host, not subdomains. *.example.com/* matches subdomains only. Omitted path means /*. Paths are case-sensitive; * matches zero or more characters, including /. Query and fragment are ignored in links and forbidden in patterns. No regex, credentials or ports in patterns. Bare domain links also match. Up to 1024 entries per scope; normalized duplicates are rejected."),
-        h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:url", "known-spam:note"], onClick: () => add("url") }, "Add URL pattern"),
+        h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:url", "known-spam:note", "known-spam:scope"], onClick: () => add("url") }, "Add URL pattern"),
+        addErrorFor("url"),
       ),
     ),
     h("details", { className: "card bg-base-100 card-border" },

@@ -5024,6 +5024,63 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   assert.equal(h.app.state.config.known_spam.length, 1);
  });
 
+test('known spam Global add leaves no unsaved scope draft and keeps the other unsaved entry', async () => {
+  const rows = [];
+  const posts = [];
+  const config = () => ({ enrollment_id: 'fixture-membership', known_spam: structuredClone(rows), rules: [], log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response(config());
+    const body = JSON.parse(options.body);
+    posts.push(body);
+    rows.push({ id: String(rows.length + 1), guild_id: body.scope === 'global' ? '0' : h.app.state.guildId, ...body });
+    return response({ ok: true, id: rows.length });
+  });
+  h.app.state.me.is_bot_owner = true;
+  h.app.state.config = config();
+  h.app.navigate('known-spam');
+  const content = () => h.document.querySelector('#app');
+  const scopeSelect = () => [...content().querySelectorAll('select')].find(s => [...s.options].some(o => o.textContent === 'This server'));
+  await chooseOption(scopeSelect(), 'Global');
+  const url = content().querySelector('input[data-url]');
+  url.value = 'tinyurl.com/*'; await fire(url, 'input');
+  const sample = content().querySelector('textarea');
+  sample.value = 'Join our stocks community'; await fire(sample, 'input');
+  await fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Add sample'), 'click');
+  assert.equal(posts[0].scope, 'global');
+  assert.deepEqual(Object.keys(h.app.currentDrafts()), ['known-spam:url'], 'only the unsaved URL remains a draft');
+  assert.equal(h.app.isDirty(), true);
+  await chooseOption(scopeSelect(), 'Global');
+  await fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Add URL pattern'), 'click');
+  assert.equal(posts[1].scope, 'global');
+  assert.equal(posts[1].kind, 'url');
+  assert.deepEqual(Object.keys(h.app.currentDrafts()), []);
+  assert.equal(h.app.isDirty(), false, 'a successful Global add must not prompt to discard changes');
+  assert.match(content().textContent, /Join our stocks community/);
+});
+
+test('known spam add failure stays visible on the card and names a lookup-only retry', async () => {
+  const lookups = [];
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response({ enrollment_id: 'fixture-membership', known_spam: [], rules: [], log_channels: [] });
+    lookups.push(options.headers['x-jmodguard-save-lookup']);
+    return { ok: false, status: 400, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'known spam entry already exists' }) };
+  });
+  h.app.state.config = { enrollment_id: 'fixture-membership', known_spam: [], rules: [], log_channels: [] };
+  h.app.navigate('known-spam');
+  const content = () => h.document.querySelector('#app');
+  const sample = content().querySelector('textarea');
+  sample.value = 'Join our stocks community'; await fire(sample, 'input');
+  const add = () => fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Add sample'), 'click');
+  await add();
+  const alert = () => content().querySelector('.card [role="alert"]');
+  assert.match(alert()?.textContent || '', /^Sample save did not complete: known spam entry already exists$/);
+  assert.equal(h.app.currentDrafts()['known-spam:sample'].value, 'Join our stocks community');
+  await add();
+  assert.deepEqual(lookups, ['0', '1']);
+  assert.match(alert()?.textContent || '', /known spam entry already exists/);
+  assert.match(alert().textContent, /checked the earlier identical request.*no new save was submitted/i);
+});
+
 test('known spam settings reuse exemptions and dry-run with a fixed action', async () => {
   const calls = [];
   const h = harness(async (_url, options) => {
