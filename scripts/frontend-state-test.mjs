@@ -697,11 +697,71 @@ test('Members accepts a later primary restore status but rejects an older in-fli
   await settle();
   assert.equal(statusReads, 3);
   assert.match(textOf(panel), /3 records committed in this run/);
-  assert.match(textOf(panel), /Coverage may be stale after an outage, restore, bot restart, or Gateway session replacement/);
+  assert.match(textOf(panel), /Member list may be out of date/);
   resolveOldRequest(response({ status: 'complete', phase: 'complete', run_id: 'before-restore', progress_revision: 21, processed: 777 }));
   await settle();
   assert.match(textOf(panel), /3 records committed in this run/);
   assert.doesNotMatch(textOf(panel), /777 records committed/);
+});
+
+test('Members explains a coverage gap and offers Reconcile inside the notice only when it is needed', async () => {
+  const actions = [];
+  let sync;
+  const h = harness(async (url, init) => {
+    if (url.endsWith('/member-sync/actions')) { actions.push(JSON.parse(init.body).operation); return response({ id: 'action', state: 'pending' }); }
+    if (url.endsWith('/member-sync')) return response(sync);
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const base = { status: 'complete', phase: 'complete', run_id: 'done', progress_revision: 3, initial_completed_at: 1790000000000,
+    reconciliation_needed: true, gap_at: 1790000000000 };
+  const reconcileButtons = (panel) => [...panel.querySelectorAll('button')].filter(n => textOf(n) === 'Reconcile from Discord');
+  const notice = (panel) => findNode(panel, n => n.id === 'member-coverage-notice');
+
+  sync = { ...base, reconciliation_reason: 'guild gateway unavailable', gap_auto_clear: false };
+  let panel = h.app.tabMembers();
+  await settle();
+  assert.equal(notice(panel).className, 'alert alert-soft alert-warning');
+  assert.match(textOf(notice(panel)), /^Member list may be out of date/);
+  assert.match(textOf(notice(panel)), /reconnected at .+ \(Discord reported the server as unavailable\), so it may have missed some joins, leaves, or bans/);
+  assert.equal(reconcileButtons(panel).length, 1, 'Reconcile moves into the notice instead of repeating in the controls row');
+  assert.ok(findNode(notice(panel), n => n.localName === 'button' && textOf(n) === 'Reconcile from Discord'));
+  await fire(reconcileButtons(panel)[0], 'click');
+  await settle();
+  assert.deepEqual(actions, ['reconcile']);
+
+  sync = { ...base, reconciliation_reason: 'bot restarted', gap_auto_clear: true };
+  panel = h.app.tabMembers();
+  await settle();
+  assert.equal(notice(panel).className, 'muted');
+  assert.match(textOf(notice(panel)), /The bot restarted at .+ caught up automatically; no action is needed/);
+  assert.equal(findNode(panel, n => /\balert-warning\b/.test(String(n.className))), null);
+  assert.equal(findNode(notice(panel), n => n.localName === 'button'), null);
+  assert.equal(reconcileButtons(panel).length, 1, 'Reconcile stays available in the controls row');
+
+  sync = { ...base, reconciliation_reason: 'bot restarted', gap_auto_clear: true, audit_recovery_status: 'needs_attention', audit_recovery_reason: 'pagination_stalled' };
+  panel = h.app.tabMembers();
+  await settle();
+  assert.equal(notice(panel).className, 'alert alert-soft alert-warning', 'stalled recovery cannot clear the gap');
+  assert.match(textOf(notice(panel)), /\(planned bot restart\)/);
+  assert.equal(reconcileButtons(panel).length, 1);
+
+  sync = { ...base, reconciliation_reason: 'ban audit case persistence unavailable', gap_auto_clear: false };
+  panel = h.app.tabMembers();
+  await settle();
+  assert.match(textOf(notice(panel)), /The bot could not save a member or ban change at .+, so it may have missed/);
+  assert.doesNotMatch(textOf(notice(panel)), /offline/);
+
+  h.app.state.me = { ...(h.app.state.me || {}), preview: true };
+  sync = { ...base, reconciliation_reason: 'gateway continuity interrupted', gap_auto_clear: false };
+  panel = h.app.tabMembers();
+  await settle();
+  assert.match(textOf(notice(panel)), /Discord connection was interrupted/);
+  assert.equal(reconcileButtons(panel).length, 0, 'a read-only preview cannot request Reconcile');
+  h.app.renderTab();
+  await settle();
+  assert.equal(h.nodes.get('#preview-banner').className, 'preview-banner alert alert-soft alert-warning');
 });
 
 test('Members keeps a restore-interrupted control unconfirmed rather than claiming it applied', async () => {
@@ -824,6 +884,8 @@ test('Members keeps controls unavailable until a real first job exists and after
   fire(refresh, 'click');
   await settle();
   assert.match(textOf(panel), /Import metadata is unavailable. Controls are disabled/);
+  const metadataNotice = findNode(panel, n => n.localName === 'p' && /^Import metadata is unavailable/.test(textOf(n)));
+  assert.equal(metadataNotice.className, 'alert alert-soft alert-warning');
   assert.deepEqual(controls().map(button => [textOf(button), button.disabled]), [['Retry', true]]);
   await fire(controls()[0], 'click');
   assert.equal(actionPosts, 0);

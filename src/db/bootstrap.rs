@@ -476,7 +476,102 @@ fn take_starting_state_failure(path: &std::path::Path) -> bool {
 
 const ACTIVE_BOT_LEASE: &str = "active_bot_lease";
 const ACTIVE_BOT_GENERATION: &str = "active_bot_generation";
+/// `{generation} {ms}` written by an owner when a shutdown signal begins while
+/// its Gateway is connected; `ms` is the last time that coverage was confirmed.
+const ACTIVE_BOT_PLANNED_STOP: &str = "active_bot_planned_stop";
+/// `{last_alive_ms} planned|unplanned` or `unknown`, written by each fresh claim
+/// for the owner it replaced.
+const ACTIVE_BOT_PREVIOUS_STOP: &str = "active_bot_previous_stop";
 pub const ACTIVE_BOT_LEASE_TTL_MS: i64 = 20_000;
+
+/// How the previous active bot stopped before this process claimed the lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreviousBotStop {
+    /// Planned: last confirmed Gateway coverage. Unplanned: last lease renewal,
+    /// which does not prove the Gateway was connected.
+    pub last_alive_ms: i64,
+    /// The previous owner stopped on a shutdown signal with its Gateway connected.
+    pub planned: bool,
+}
+
+/// Describe the owner a fresh claim replaces. A planned stop needs both a
+/// confirmed release (no lease row left) and a planned-stop marker from that
+/// same lease generation. An expired row means the owner never confirmed its
+/// release, even after writing a marker, so it is unplanned and dated by its
+/// last renewal (one TTL before expiry).
+fn previous_bot_stop_value(lease: Option<&str>, marker: Option<&str>, generation: i64) -> String {
+    if let Some(value) = lease {
+        return value
+            .rsplit_once(' ')
+            .and_then(|(_, expires)| expires.parse::<i64>().ok())
+            .map_or_else(
+                || "unknown".to_owned(),
+                |expires| {
+                    format!(
+                        "{} unplanned",
+                        expires.saturating_sub(ACTIVE_BOT_LEASE_TTL_MS)
+                    )
+                },
+            );
+    }
+    marker
+        .and_then(|value| value.split_once(' '))
+        .filter(|(marked, _)| marked.parse::<i64>().ok() == Some(generation))
+        .and_then(|(_, at)| at.parse::<i64>().ok())
+        .map_or_else(|| "unknown".to_owned(), |at| format!("{at} planned"))
+}
+
+/// The previous owner's stop as recorded by this process's fresh claim.
+pub async fn previous_active_bot_stop(db: &Db) -> Result<Option<PreviousBotStop>> {
+    let value = db
+        .with_conn(|conn| meta_string_conn(conn, ACTIVE_BOT_PREVIOUS_STOP))
+        .await?;
+    Ok(value.as_deref().and_then(|value| {
+        let (at, kind) = value.split_once(' ')?;
+        let planned = match kind {
+            "planned" => true,
+            "unplanned" => false,
+            _ => return None,
+        };
+        Some(PreviousBotStop {
+            last_alive_ms: at.parse().ok().filter(|at| *at > 0)?,
+            planned,
+        })
+    }))
+}
+
+/// Mark that the current owner stopped on a shutdown signal with Gateway coverage
+/// until `covered_until_ms`. It is separate from the lease release so a failed
+/// marker write never blocks the release.
+pub async fn record_planned_active_bot_stop(
+    db: &Db,
+    instance: &str,
+    covered_until_ms: i64,
+) -> Result<()> {
+    anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
+    let instance = instance.to_owned();
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_write()?;
+        let current = meta_string_conn(&tx, ACTIVE_BOT_LEASE)?;
+        if !current
+            .as_deref()
+            .is_some_and(|value| value.starts_with(&format!("{instance} ")))
+        {
+            tx.finish_read()?;
+            return Ok(());
+        }
+        let generation =
+            generation_value(meta_string_conn(&tx, ACTIVE_BOT_GENERATION)?.as_deref())?;
+        tx.ensure_mutation_receipt()?;
+        write_meta_string_conn(
+            &tx,
+            ACTIVE_BOT_PLANNED_STOP,
+            &format!("{generation} {covered_until_ms}"),
+        )?;
+        tx.commit()
+    })
+    .await
+}
 
 fn valid_bot_instance(instance: &str) -> bool {
     instance.len() == 32 && instance.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -572,10 +667,23 @@ pub async fn claim_active_bot(
                 let (_, previous) = current.as_deref().unwrap().rsplit_once(' ').unwrap();
                 expires = expires.max(previous.parse::<i64>()?);
             }
+            let previous_stop = if renewal {
+                None
+            } else {
+                let marker = meta_string_conn(&tx, ACTIVE_BOT_PLANNED_STOP)?;
+                Some(previous_bot_stop_value(
+                    current.as_deref(),
+                    marker.as_deref(),
+                    stored,
+                ))
+            };
             tx.ensure_mutation_receipt()?;
             write_meta_string_conn(&tx, ACTIVE_BOT_LEASE, &format!("{instance} {expires}"))?;
             if !renewal || stored == 0 {
                 write_meta_string_conn(&tx, ACTIVE_BOT_GENERATION, &generation.to_string())?;
+            }
+            if let Some(previous_stop) = previous_stop {
+                write_meta_string_conn(&tx, ACTIVE_BOT_PREVIOUS_STOP, &previous_stop)?;
             }
             tx.commit()?;
             Ok(Some(generation))

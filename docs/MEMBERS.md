@@ -62,9 +62,23 @@ succeeds as a no-op with a `member_sync_already_completed` receipt. After
 completion, a full current-member and current-ban scan runs only when a guild
 administrator explicitly selects **Reconcile from Discord**. An outage,
 restore, bot restart or redeploy, or a replaced Gateway session on an already
-progressed import can leave coverage uncertain; the card reports that gap until
-a requested reconciliation finishes. Live events and bounded checks for affected
-users continue while coverage is uncertain. The bot separately catches up
+progressed import can leave coverage uncertain; the card reports that gap, with
+its time and reason, until a requested reconciliation finishes or, after a
+short planned restart, audit recovery completes. Live events and
+bounded checks for affected users continue while coverage is uncertain.
+A bot process's first Gateway Ready is a restart gap. When a shutdown signal
+stops the previous process while every Ready shard is still connected, it
+records that time as a planned stop; the stop counts only if that process then
+released its lease. If the new process reaches Ready within 10 minutes of it
+and the initial import is complete, the gap shows only a muted note and the
+completed audit recovery below clears it on its own. Joins and leaves missed in those minutes
+are accepted until the next live event or Reconcile; departure cleanup still
+checks membership since the gap. A crash, a stop without a connected Gateway
+or a confirmed release, a restart during the initial import, a longer or
+unknown downtime (including a stop time ahead of the new host's clock), a replaced Gateway session inside one process, an
+unavailable guild, or a failed per-user save still needs Reconcile, and any
+such gap keeps a later short restart from clearing itself. Audit recovery that
+stops for attention also leaves the warning until Retry or Reconcile. The bot separately catches up
 available ban and unban audit actions after a Gateway gap using the same paced
 request budget; this audit-only recovery does not list all members or current
 bans and does not change the original initial-import completion time. The card

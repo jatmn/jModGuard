@@ -210,7 +210,11 @@ async fn long_request_lease_commits_member_and_audit_pages_after_ninety_seconds(
         .await
         .unwrap();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            122_000,
+        )
         .await
         .unwrap();
     let audit = store
@@ -1445,7 +1449,11 @@ async fn verified_absence_has_unknown_event_time_and_gap_cleanup_is_targeted() {
         .unwrap();
     store.depart_member(scope.clone(), 14, 3_000).await.unwrap();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_100)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_100,
+        )
         .await
         .unwrap();
     assert!(
@@ -1831,7 +1839,11 @@ async fn foreign_audit_recovery_commit_survives_modest_capacity_headroom() {
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
     store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 6_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            6_000,
+        )
         .await
         .unwrap();
     store
@@ -1931,7 +1943,11 @@ async fn retry_clears_only_permission_deadline_and_audit_only_keeps_completion()
     );
     store.db.with_conn(|conn|{let mut tx=conn.transaction_primary_write()?;tx.ensure_mutation_receipt()?;tx.member_execute("UPDATE guild_member_seed SET initial_completed_at_ms=5000 WHERE guild_id=10",())?;tx.member_execute("UPDATE guild_member_sync SET phase='complete',status='complete',lease_owner=NULL,lease_until_ms=NULL WHERE guild_id=10",())?;tx.commit()}).await.unwrap();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 6_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            6_000,
+        )
         .await
         .unwrap();
     let status = store
@@ -1957,7 +1973,11 @@ async fn retry_clears_only_permission_deadline_and_audit_only_keeps_completion()
         .unwrap();
     assert_eq!(unban.cursor.as_deref(), Some("unban:"));
     store
-        .mark_member_reconciliation_needed(scope.clone(), "another_gateway_gap", 21_001)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("another_gateway_gap"),
+            21_001,
+        )
         .await
         .unwrap();
     store
@@ -3293,7 +3313,7 @@ async fn newer_gap_survives_reconcile_final_and_last_summary_survives_next_run()
         .await
         .unwrap();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "first_gap", 3_000)
+        .mark_member_reconciliation_needed(scope.clone(), CoverageGap::Observed("first_gap"), 3_000)
         .await
         .unwrap();
     store
@@ -3335,7 +3355,11 @@ async fn newer_gap_survives_reconcile_final_and_last_summary_survives_next_run()
         .await
         .unwrap();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "newer_gap", 18_004)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("newer_gap"),
+            18_004,
+        )
         .await
         .unwrap();
     for (index, phase) in [
@@ -3417,7 +3441,7 @@ async fn delayed_case_backfill_finishes_run_but_cannot_clear_newer_gap() {
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
     store
-        .mark_member_reconciliation_needed(scope.clone(), "first_gap", 3_000)
+        .mark_member_reconciliation_needed(scope.clone(), CoverageGap::Observed("first_gap"), 3_000)
         .await
         .unwrap();
     store
@@ -3459,7 +3483,11 @@ async fn delayed_case_backfill_finishes_run_but_cannot_clear_newer_gap() {
         .await
         .unwrap();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "newer_gap", 18_004)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("newer_gap"),
+            18_004,
+        )
         .await
         .unwrap();
     for (index, phase) in [
@@ -4177,6 +4205,136 @@ async fn phase_counts_and_local_history_wait_reflect_committed_work() {
     );
 }
 
+async fn finish_audit_recovery(store: &GuildDataStore, scope: &GuildDataScope, now_ms: i64) {
+    // One terminal ban page, then one terminal unban page.
+    for step in 0..2 {
+        let at = now_ms + step * 20_000;
+        let claim = store
+            .claim_member_audit_recovery(scope.clone(), 42, "worker".into(), at, 90_000)
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .commit_member_audit_recovery_page(
+                scope.clone(),
+                claim,
+                vec![],
+                (None, true),
+                at + 1,
+                15_000,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn completed_audit_recovery_clears_only_a_short_restart_gap() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    store
+        .mark_member_reconciliation_needed(scope.clone(), CoverageGap::ShortPlannedRestart, 3_000)
+        .await
+        .unwrap();
+    let status = store
+        .member_sync_status(scope.clone(), 42, 3_001)
+        .await
+        .unwrap();
+    assert!(status.reconciliation_needed && status.gap_auto_clear);
+    assert_eq!(status.gap_at, Some(3_000));
+    assert_eq!(
+        status.reconciliation_reason.as_deref(),
+        Some("bot restarted")
+    );
+    finish_audit_recovery(&store, &scope, 3_001).await;
+    let status = store
+        .member_sync_status(scope.clone(), 42, 50_000)
+        .await
+        .unwrap();
+    assert_eq!(status.audit_recovery_status.as_deref(), Some("complete"));
+    assert!(!status.reconciliation_needed && !status.gap_auto_clear);
+    assert_eq!((status.gap_at, status.reconciliation_reason), (None, None));
+    // Cleanup keeps its membership-check boundary across the cleared gap.
+    let gap_at: Option<i64> = store
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT gap_at_ms FROM guild_member_seed WHERE guild_id=10",
+                (),
+                |r| Ok(r.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(gap_at, Some(3_000));
+
+    // Any other pending gap keeps the warning, in either order.
+    let restart = CoverageGap::ShortPlannedRestart;
+    for (first, second) in [
+        (restart, CoverageGap::Observed("second_gap")),
+        (CoverageGap::Observed("first_gap"), restart),
+    ] {
+        store
+            .mark_member_reconciliation_needed(scope.clone(), first, 100_000)
+            .await
+            .unwrap();
+        store
+            .mark_member_reconciliation_needed(scope.clone(), second, 100_001)
+            .await
+            .unwrap();
+        let status = store
+            .member_sync_status(scope.clone(), 42, 100_002)
+            .await
+            .unwrap();
+        assert!(status.reconciliation_needed && !status.gap_auto_clear);
+        finish_audit_recovery(&store, &scope, 100_002).await;
+        let status = store
+            .member_sync_status(scope.clone(), 42, 200_000)
+            .await
+            .unwrap();
+        assert_eq!(status.audit_recovery_status.as_deref(), Some("complete"));
+        assert!(
+            status.reconciliation_needed,
+            "{first:?} then {second:?} must need Reconcile"
+        );
+        store
+            .db
+            .with_conn(|conn| {
+                let mut tx = conn.transaction_primary_write()?;
+                tx.ensure_mutation_receipt()?;
+                tx.member_execute(
+                    "UPDATE guild_member_seed SET reconciliation_needed=0,reconciliation_reason=NULL,gap_at_ms=NULL WHERE guild_id=10",
+                    (),
+                )?;
+                tx.commit()
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn short_restart_during_initial_import_still_needs_reconcile() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store
+        .mark_member_reconciliation_needed(scope.clone(), CoverageGap::ShortPlannedRestart, 3_000)
+        .await
+        .unwrap();
+    // No audit recovery is queued before the initial import completes, so
+    // nothing in this mark can clear the gap on its own.
+    let status = store
+        .member_sync_status(scope.clone(), 42, 3_001)
+        .await
+        .unwrap();
+    assert!(status.initial_completed_at.is_none());
+    assert!(status.reconciliation_needed && !status.gap_auto_clear);
+    assert_eq!(status.audit_recovery_status, None);
+}
+
 #[tokio::test]
 async fn pending_audit_gap_blocks_cleanup_then_preserves_recovered_ban_history() {
     let (_f, store, scope) = ready().await;
@@ -4203,7 +4361,11 @@ async fn pending_audit_gap_blocks_cleanup_then_preserves_recovered_ban_history()
         .unwrap()
         .unwrap();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 301_101)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            301_101,
+        )
         .await
         .unwrap();
     assert!(
@@ -4357,7 +4519,11 @@ async fn own_audit_stages_until_exact_link_then_replay_keeps_distinct_actions() 
         .await
         .unwrap();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_000,
+        )
         .await
         .unwrap();
     let claim = store
@@ -4520,7 +4686,11 @@ async fn own_audit_stages_until_exact_link_then_replay_keeps_distinct_actions() 
         .await
         .unwrap();
     reopened
-        .mark_member_reconciliation_needed(scope.clone(), "another_gap", 20_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("another_gap"),
+            20_000,
+        )
         .await
         .unwrap();
     let replay = reopened
@@ -4654,7 +4824,11 @@ async fn removed_application_case_consumes_exact_staged_audit_as_tombstone() {
         .await
         .unwrap();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_000,
+        )
         .await
         .unwrap();
     let claim = store
@@ -5052,7 +5226,11 @@ async fn recovery_before_alias_and_attempted_unban_keep_retention_rules() {
     let (_f, store, scope) = ready().await;
     departed_member(&store, &scope, 62).await;
     store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_000,
+        )
         .await
         .unwrap();
     let claim = store
@@ -6009,7 +6187,11 @@ async fn coverage_gap_mark_commits_with_hrana_latency_within_transaction_lifetim
     assert!(remote.db.is_remote());
 
     remote
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_000,
+        )
         .await
         .expect("coverage-gap mark must commit within the provider lifetime");
     fixture.assert_committed_within_lifetime(1);
@@ -6032,7 +6214,7 @@ async fn coverage_gap_mark_commits_with_hrana_latency_within_transaction_lifetim
     // A running recovery must see the second statement in the Hrana batch,
     // even when the first INSERT/UPSERT does not update the existing row.
     remote
-        .mark_member_reconciliation_needed(scope, "newer_gap", 4_000)
+        .mark_member_reconciliation_needed(scope, CoverageGap::Observed("newer_gap"), 4_000)
         .await
         .unwrap();
     fixture.assert_committed_within_lifetime(2);
@@ -6143,7 +6325,7 @@ async fn assert_coverage_gap_epoch_race(http: bool) {
         })),
     );
     let error = remote
-        .mark_member_reconciliation_needed(scope, "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(scope, CoverageGap::Observed("gateway_gap"), 3_000)
         .await
         .unwrap_err();
     super::super::member_directory::test_set_coverage_gap_after_writer_fence(
@@ -6187,7 +6369,11 @@ async fn coverage_gap_mark_requires_the_replacement_epoch_over_http() {
         let before = coverage_gap_persisted_mark(&local).await;
         let now = 3_000 + index as i64;
         let error = remote
-            .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", now)
+            .mark_member_reconciliation_needed(
+                scope.clone(),
+                CoverageGap::Observed("gateway_gap"),
+                now,
+            )
             .await
             .unwrap_err();
         assert!(super::lease_rejected(&error), "{error:#}");
@@ -6196,7 +6382,11 @@ async fn coverage_gap_mark_requires_the_replacement_epoch_over_http() {
         assert_eq!(generation, index as i64 + 1);
         remote.raise_writer_epoch(generation).await.unwrap();
         remote
-            .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", now)
+            .mark_member_reconciliation_needed(
+                scope.clone(),
+                CoverageGap::Observed("gateway_gap"),
+                now,
+            )
             .await
             .unwrap();
         let after = coverage_gap_persisted_mark(&local).await;
@@ -6240,7 +6430,7 @@ async fn coverage_gap_mark_rolls_back_when_the_lease_is_lost_before_commit() {
         Some(delete_active_bot_lease(f.catalog_path.clone())),
     );
     let error = remote
-        .mark_member_reconciliation_needed(scope, "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(scope, CoverageGap::Observed("gateway_gap"), 3_000)
         .await
         .unwrap_err();
     super::super::member_directory::test_set_coverage_gap_after_batch(remote.db.path(), None);
@@ -6297,7 +6487,7 @@ async fn coverage_gap_mark_rolls_back_when_the_lease_is_lost_before_commit_over_
         Some(delete_active_bot_lease(f.catalog_path.clone())),
     );
     let error = remote
-        .mark_member_reconciliation_needed(scope, "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(scope, CoverageGap::Observed("gateway_gap"), 3_000)
         .await
         .unwrap_err();
     super::super::member_directory::test_set_coverage_gap_after_batch(remote.db.path(), None);
@@ -6388,7 +6578,7 @@ async fn assert_admitted_lease_loss_rolls_back(http: bool, kind: AdmittedLeaseLo
         })),
     );
     let error = remote
-        .mark_member_reconciliation_needed(scope, "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(scope, CoverageGap::Observed("gateway_gap"), 3_000)
         .await
         .unwrap_err();
     super::super::member_directory::test_set_coverage_gap_after_batch(remote.db.path(), None);
@@ -6449,7 +6639,11 @@ async fn coverage_gap_receipt_admission_fails_before_begin() {
     );
     let immediate = probe.immediate();
     let error = store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_000,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -6501,7 +6695,7 @@ async fn assert_restore_fence_after_admission_rolls_back(
         core: None,
     };
     remote
-        .mark_member_reconciliation_needed(scope.clone(), "first_gap", 3_000)
+        .mark_member_reconciliation_needed(scope.clone(), CoverageGap::Observed("first_gap"), 3_000)
         .await
         .unwrap();
     let before = coverage_gap_persisted_mark(&local).await;
@@ -6537,7 +6731,11 @@ async fn assert_restore_fence_after_admission_rolls_back(
         })),
     );
     let error = remote
-        .mark_member_reconciliation_needed(scope.clone(), "second_gap", 4_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("second_gap"),
+            4_000,
+        )
         .await
         .unwrap_err();
     super::super::member_directory::test_set_coverage_gap_after_receipt_admission(
@@ -6662,7 +6860,11 @@ async fn coverage_gap_mark_returns_rate_limit_before_begin_without_backoff() {
     let started = Instant::now();
     let error = tokio::time::timeout(
         Duration::from_secs(1),
-        remote.mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000),
+        remote.mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_000,
+        ),
     )
     .await
     .expect("a 429 must return instead of backing off inside the mark")
@@ -6684,7 +6886,11 @@ async fn coverage_gap_mark_returns_rate_limit_before_begin_without_backoff() {
         .unwrap();
     assert!(!status.reconciliation_needed);
     remote
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_000,
+        )
         .await
         .unwrap();
     let status = local.member_sync_status(scope, 42, 3_002).await.unwrap();
@@ -6709,7 +6915,11 @@ async fn coverage_gap_mark_rolls_back_mid_batch_and_retries() {
         .await
         .unwrap();
     let error = store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_000,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -6730,7 +6940,11 @@ async fn coverage_gap_mark_rolls_back_mid_batch_and_retries() {
         .await
         .unwrap();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_000,
+        )
         .await
         .unwrap();
     let status = store.member_sync_status(scope, 42, 3_002).await.unwrap();
@@ -6753,7 +6967,11 @@ async fn coverage_gap_mark_racing_sync_completion_preserves_newer_gap() {
             .await
             .unwrap();
         store
-            .mark_member_reconciliation_needed(scope.clone(), "first_gap", 3_000)
+            .mark_member_reconciliation_needed(
+                scope.clone(),
+                CoverageGap::Observed("first_gap"),
+                3_000,
+            )
             .await
             .unwrap();
         store
@@ -6828,7 +7046,11 @@ async fn coverage_gap_mark_racing_sync_completion_preserves_newer_gap() {
         let writer = tokio::spawn(async move {
             if mark_first {
                 first
-                    .mark_member_reconciliation_needed(first_scope, "newer_gap", now + 1)
+                    .mark_member_reconciliation_needed(
+                        first_scope,
+                        CoverageGap::Observed("newer_gap"),
+                        now + 1,
+                    )
                     .await
             } else {
                 first
@@ -6849,7 +7071,11 @@ async fn coverage_gap_mark_racing_sync_completion_preserves_newer_gap() {
                     .map(|_| ())
             } else {
                 store
-                    .mark_member_reconciliation_needed(scope.clone(), "newer_gap", now + 2)
+                    .mark_member_reconciliation_needed(
+                        scope.clone(),
+                        CoverageGap::Observed("newer_gap"),
+                        now + 2,
+                    )
                     .await
             }
         };
@@ -6932,7 +7158,11 @@ async fn coverage_gap_mark_batches_writes_for_remote_transport() {
     crate::db::test_mark_connection_pool_remote(&mut store.db);
     let queries = probe.queries();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            122_000,
+        )
         .await
         .unwrap();
     let used = probe.queries() - queries;
@@ -6961,7 +7191,11 @@ async fn coverage_gap_mark_skips_audit_recovery_until_initial_completion() {
         .await
         .unwrap();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_000,
+        )
         .await
         .unwrap();
     let audit: Option<i64> = store
@@ -6995,7 +7229,11 @@ async fn coverage_gap_mark_rejects_closed_membership() {
     complete_for_checks(&store, &scope).await;
     store.close_membership(scope.clone()).await.unwrap();
     let error = store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            122_000,
+        )
         .await
         .unwrap_err();
     assert!(error.is::<TenantDataError>());
@@ -7036,7 +7274,11 @@ async fn coverage_gap_mark_rejects_membership_closed_after_scope_check() {
         })),
     );
     let error = store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            122_000,
+        )
         .await
         .unwrap_err();
     super::super::member_directory::test_set_coverage_gap_after_scope_verify(store.db.path(), None);
@@ -7088,7 +7330,11 @@ async fn coverage_gap_mark_rejects_stale_directory_revision_snapshot() {
         })),
     );
     let error = store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            122_000,
+        )
         .await
         .unwrap_err();
     super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(
@@ -7143,7 +7389,11 @@ async fn coverage_gap_mark_rejects_foreign_gap_reason_at_bumped_revision() {
         })),
     );
     let error = store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 122_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            122_000,
+        )
         .await
         .unwrap_err();
     super::super::member_directory::test_set_coverage_gap_after_revision_snapshot(
@@ -7174,7 +7424,11 @@ async fn coverage_gap_mark_rejects_nul_reason() {
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
     let error = store
-        .mark_member_reconciliation_needed(scope.clone(), "gap\0reason", 122_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gap\0reason"),
+            122_000,
+        )
         .await
         .unwrap_err();
     assert!(error.is::<MemberSyncError>());
@@ -7186,11 +7440,15 @@ async fn coverage_gap_mark_is_idempotent_across_retries() {
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
     store
-        .mark_member_reconciliation_needed(scope.clone(), "first_gap", 3_000)
+        .mark_member_reconciliation_needed(scope.clone(), CoverageGap::Observed("first_gap"), 3_000)
         .await
         .unwrap();
     store
-        .mark_member_reconciliation_needed(scope.clone(), "second_gap", 4_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("second_gap"),
+            4_000,
+        )
         .await
         .unwrap();
     let generation: i64 = store
@@ -7954,7 +8212,11 @@ async fn member_case_entries_includes_audit_import_after_backfill() {
             .unwrap()
     );
     store
-        .mark_member_reconciliation_needed(scope.clone(), "gateway_gap", 3_000)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            3_000,
+        )
         .await
         .unwrap();
     let claim = store
