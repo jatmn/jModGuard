@@ -928,7 +928,7 @@ async function submitSave(path, method, body, signal, reconcileRecovered) {
     // current configuration instead of applying a historical patch again.
     return saveMode === "lookup" ? { ...result, config_patch: null } : result;
   } catch (error) {
-    // Lets a page explain that this retry only checked the earlier identical request.
+    // A lookup-only attempt never submits a new save, whether or not the server answered it.
     if (saveMode === "lookup" && error && typeof error === "object") error.saveLookup = true;
     if (saveFailureState(error) === "expired") {
       try { window.sessionStorage.removeItem(key); } catch (_) { /* Keep lookup-only behavior if storage fails. */ }
@@ -5184,10 +5184,11 @@ function scopeSelect(
   globalLabel = "Global (all servers)",
   allowGlobal = true,
   draftKey,
+  baseline = "guild",
 ) {
   return h(
     Select,
-    { ref, className: "select", draftKey, defaultValue: "guild" },
+    { ref, className: "select", draftKey, defaultValue: baseline },
     h("option", { value: "guild" }, guildLabel),
     allowGlobal && isBotOwner() && h("option", { value: "global" }, globalLabel),
   );
@@ -5503,6 +5504,10 @@ function tabEvents() {
 const STOCKS_SPAM_EXAMPLE = "📈 **Looking for a community focused on stocks and trading?**\n\nJoin our growing community to learn from experienced investors, share market insights, discuss stock ideas, and exchange trading strategies.\nNo spam or aggressive promotion—just practical market discussions.\nWe welcome active investors and value your thoughts and feedback.\n👇 Interested? Join us here:";
 const AI_SPAM_EXAMPLE = "I used to work as Full Stack AI developer at several software companies but I’m currently available and working remotely because my last contract ended. Right now I am resting at home. If you have any AI projects or need support, I’d be happy to help, just reach out.";
 
+// The scope of the last successful add is the select's saved baseline, so a
+// remount after that add keeps the chosen scope without an unsaved draft.
+let knownSpamScope = { guildId: null, value: "guild" };
+
 function tabKnownSpam() {
   const { drafts } = useStore(ui);
   const scopeRef = useRef(null);
@@ -5511,19 +5516,26 @@ function tabKnownSpam() {
   const guildId = state.guildId;
   const rows = state.config.known_spam || [];
   const rule = (state.config.rules || []).find((r) => r.rule_id === "known_spam");
+  const scopeBaseline = knownSpamScope.guildId === guildId && knownSpamScope.value === "global" && isBotOwner() ? "global" : "guild";
   const add = async (kind) => {
     const key = kind === "sample" ? "known-spam:sample" : "known-spam:url";
     const value = drafts[key]?.value || "";
     if (!value.trim()) return toast("Enter a full sample or URL pattern", "error");
+    const scope = scopeRef.current.value;
     setAddError(null);
     try {
       await reloadAfter(() => api(`/api/guilds/${guildId}/known-spam`, "POST", {
-        scope: scopeRef.current.value, kind, value, note: drafts["known-spam:note"]?.value || null,
-      }), () => toast("Known spam entry added", "success"));
+        scope, kind, value, note: drafts["known-spam:note"]?.value || null,
+      }), () => {
+        knownSpamScope = { guildId, value: scope };
+        toast("Known spam entry added", "success");
+      });
     } catch (error) {
+      // The browser cannot tell a rejected save from one whose outcome is unknown
+      // or pending, so state only that the add was not confirmed.
       const label = kind === "sample" ? "Sample" : "URL pattern";
-      const lookup = error?.saveLookup ? " This retry checked the earlier identical request; no new save was submitted." : "";
-      setAddError({ kind, message: `${label} save did not complete: ${error?.message || error}${lookup}` });
+      const lookup = error?.saveLookup ? " Retrying the same entry, note and scope only looks up the earlier request; no new save was sent." : "";
+      setAddError({ kind, message: `${label} not confirmed as added: ${error?.message || error}${lookup}` });
       throw error;
     }
   };
@@ -5535,7 +5547,7 @@ function tabKnownSpam() {
     rule ? ruleCard(rule) : null,
     h(DraftCard, { group: "known-spam", className: "card bg-base-100 card-border" },
       h("div", { className: "card-body" },
-        field("Applies to", scopeSelect(scopeRef, "This server", "Global", true, "known-spam:scope")),
+        field("Applies to", scopeSelect(scopeRef, "This server", "Global", true, "known-spam:scope", scopeBaseline)),
         field("Optional note (up to 512 bytes)", h(Input, { className: "input w-full", draftKey: "known-spam:note", "data-note": true, maxLength: 512 })),
         field("Full sample message (up to 4096 bytes)", h(Textarea, { className: "textarea w-full", draftKey: "known-spam:sample", rows: 7, maxLength: 4096, placeholder: "Paste the entire confirmed spam message. No regex needed." })),
         h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:sample", "known-spam:note", "known-spam:scope"], onClick: () => add("sample") }, "Add sample"),

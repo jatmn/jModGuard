@@ -5024,7 +5024,7 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   assert.equal(h.app.state.config.known_spam.length, 1);
  });
 
-test('known spam Global add leaves no unsaved scope draft and keeps the other unsaved entry', async () => {
+test('known spam Global add keeps Global selected without an unsaved draft and keeps the other unsaved entry', async () => {
   const rows = [];
   const posts = [];
   const config = () => ({ enrollment_id: 'fixture-membership', known_spam: structuredClone(rows), rules: [], log_channels: [] });
@@ -5049,36 +5049,44 @@ test('known spam Global add leaves no unsaved scope draft and keeps the other un
   assert.equal(posts[0].scope, 'global');
   assert.deepEqual(Object.keys(h.app.currentDrafts()), ['known-spam:url'], 'only the unsaved URL remains a draft');
   assert.equal(h.app.isDirty(), true);
-  await chooseOption(scopeSelect(), 'Global');
+  assert.equal(scopeSelect().value, 'global', 'the saved scope stays selected for the next add');
   await fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Add URL pattern'), 'click');
   assert.equal(posts[1].scope, 'global');
   assert.equal(posts[1].kind, 'url');
   assert.deepEqual(Object.keys(h.app.currentDrafts()), []);
   assert.equal(h.app.isDirty(), false, 'a successful Global add must not prompt to discard changes');
+  assert.equal(scopeSelect().value, 'global');
   assert.match(content().textContent, /Join our stocks community/);
 });
 
-test('known spam add failure stays visible on the card and names a lookup-only retry', async () => {
+test('known spam add failure stays visible on the card without claiming an outcome the browser cannot know', async () => {
   const lookups = [];
+  const replies = [
+    () => ({ ok: false, status: 400, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'known spam entry already exists' }) }),
+    () => ({ ok: false, status: 409, headers: { get: () => null }, text: async () => JSON.stringify({ code: 'save_unknown', error: 'Save outcome unavailable. Check the current configuration before saving again.' }) }),
+    () => { throw new TypeError('Failed to fetch'); },
+  ];
   const h = harness(async (url, options) => {
     if (url.endsWith('/config')) return response({ enrollment_id: 'fixture-membership', known_spam: [], rules: [], log_channels: [] });
     lookups.push(options.headers['x-jmodguard-save-lookup']);
-    return { ok: false, status: 400, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'known spam entry already exists' }) };
-  });
+    return replies[lookups.length - 1]();
+  }, new Map(), new Map(), () => false);
   h.app.state.config = { enrollment_id: 'fixture-membership', known_spam: [], rules: [], log_channels: [] };
   h.app.navigate('known-spam');
   const content = () => h.document.querySelector('#app');
   const sample = content().querySelector('textarea');
   sample.value = 'Join our stocks community'; await fire(sample, 'input');
   const add = () => fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Add sample'), 'click');
+  const alert = () => content().querySelector('.card [role="alert"]')?.textContent || '';
   await add();
-  const alert = () => content().querySelector('.card [role="alert"]');
-  assert.match(alert()?.textContent || '', /^Sample save did not complete: known spam entry already exists$/);
+  assert.equal(alert(), 'Sample not confirmed as added: known spam entry already exists');
   assert.equal(h.app.currentDrafts()['known-spam:sample'].value, 'Join our stocks community');
   await add();
-  assert.deepEqual(lookups, ['0', '1']);
-  assert.match(alert()?.textContent || '', /known spam entry already exists/);
-  assert.match(alert().textContent, /checked the earlier identical request.*no new save was submitted/i);
+  assert.equal(alert(), 'Sample not confirmed as added: Save outcome unavailable. Check the current configuration before saving again. Retrying the same entry, note and scope only looks up the earlier request; no new save was sent.');
+  await add();
+  assert.equal(alert(), 'Sample not confirmed as added: Failed to fetch Retrying the same entry, note and scope only looks up the earlier request; no new save was sent.');
+  assert.deepEqual(lookups, ['0', '1', '1']);
+  assert.doesNotMatch(alert(), /checked|did not complete/);
 });
 
 test('known spam settings reuse exemptions and dry-run with a fixed action', async () => {
