@@ -356,6 +356,10 @@ fn memory_value(sample: &crate::cgroup::ContainerSample, copy: Option<&str>) -> 
         crate::cgroup::MemoryLimit::Unlimited => format!("{used} / no limit"),
         crate::cgroup::MemoryLimit::Bytes(limit) => format!("{used} / {}", format_bytes(limit)),
     };
+    let base = match memory.source {
+        crate::cgroup::MemorySource::CgroupStat => base,
+        crate::cgroup::MemorySource::CgroupUsage => format!("{base} (includes page cache)"),
+    };
     label_copy(base, copy)
 }
 
@@ -1191,6 +1195,7 @@ mod presentation_tests {
             memory: Some(crate::cgroup::MemoryUse {
                 program_bytes: 900,
                 limit: crate::cgroup::MemoryLimit::Unlimited,
+                source: crate::cgroup::MemorySource::CgroupStat,
             }),
             cpu_tenths: Some(250),
         };
@@ -1208,11 +1213,33 @@ mod presentation_tests {
     }
 
     #[test]
+    fn container_memory_without_memory_stat_is_labeled() {
+        let sample = crate::cgroup::ContainerSample {
+            memory: Some(crate::cgroup::MemoryUse {
+                program_bytes: 4096,
+                limit: crate::cgroup::MemoryLimit::Unlimited,
+                source: crate::cgroup::MemorySource::CgroupUsage,
+            }),
+            cpu_tenths: None,
+        };
+        let text = stats_with_container_use("stats".into(), &sample, Some(&sample), Some("api 7"));
+        assert!(
+            text.contains("`4.0 KiB / no limit (includes page cache)`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`4.0 KiB / no limit (includes page cache) (api 7)`"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn container_memory_limit_renders_without_a_cpu_sample() {
         let bot = crate::cgroup::ContainerSample {
             memory: Some(crate::cgroup::MemoryUse {
                 program_bytes: 4096,
                 limit: crate::cgroup::MemoryLimit::Bytes(8192),
+                source: crate::cgroup::MemorySource::CgroupStat,
             }),
             cpu_tenths: None,
         };

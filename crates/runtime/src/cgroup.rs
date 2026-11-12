@@ -9,21 +9,42 @@
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 const MAX_CGROUP_FILE_BYTES: usize = 64 * 1024;
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 /// cgroup v1 reports "no limit" as a page-rounded value at least this large.
 const V1_UNLIMITED_BYTES: u64 = 1 << 62;
+const TRUNCATED: &str = "…(truncated)";
+const KEY_MEMORY_FILES: [&str; 5] = [
+    "memory.stat",
+    "memory.current",
+    "memory.max",
+    "memory.usage_in_bytes",
+    "memory.limit_in_bytes",
+];
 
 static LATEST: Mutex<ContainerSample> = Mutex::new(ContainerSample::unavailable());
 
-/// Program memory: cgroup usage minus inactive file cache (or its stat fallback).
+/// Memory in use, and which input measured it (see [`MemorySource`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryUse {
     pub program_bytes: u64,
     pub limit: MemoryLimit,
+    #[serde(default)]
+    pub source: MemorySource,
+}
+
+/// Where a [`MemoryUse`] came from. Older senders omit it and mean `CgroupStat`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemorySource {
+    /// cgroup usage minus inactive file cache from `memory.stat`.
+    #[default]
+    CgroupStat,
+    /// `memory.current` or v1 `memory.usage_in_bytes` when `memory.stat` is
+    /// missing or unreadable. This includes page cache.
+    CgroupUsage,
 }
 
 /// `memory.max`. The v2 token `max`, and a v1 limit of at least 2^62 bytes,
@@ -196,7 +217,20 @@ fn publish(sample: ContainerSample) {
 }
 
 fn observe_process() -> Observation {
+    static LAYOUT: Once = Once::new();
+    LAYOUT.call_once(|| {
+        let layout = memory_layout(Path::new("/proc"), Path::new("/sys/fs/cgroup"));
+        tracing::info!(
+            proc_self_cgroup = ?layout.proc_cgroup,
+            cgroup_mounts = ?layout.mounts,
+            cgroup_dir = ?layout.dir,
+            memory_files = ?layout.files,
+            key_files = ?layout.key_files,
+            "cgroup memory layout"
+        );
+    });
     let reading = read_process_cgroup();
+    report_memory_source(reading.memory);
     Observation {
         reading,
         at: Instant::now(),
@@ -277,6 +311,15 @@ struct CgroupEntry {
 }
 
 fn read_mounted_cgroup(cgroup_text: &str, mountinfo: &str) -> CgroupReading {
+    let (memory_dirs, cpu_dirs) = cgroup_dirs(cgroup_text, mountinfo);
+    CgroupReading {
+        memory: memory_dirs.iter().find_map(|dir| read_memory(dir)),
+        cpu: cpu_dirs.iter().find_map(|dir| read_cpu(dir)),
+    }
+}
+
+/// Candidate memory and CPU directories, in reading order.
+fn cgroup_dirs(cgroup_text: &str, mountinfo: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mounts = parse_mountinfo(mountinfo);
     let mut memory_dirs = Vec::new();
     let mut cpu_dirs = Vec::new();
@@ -301,10 +344,7 @@ fn read_mounted_cgroup(cgroup_text: &str, mountinfo: &str) -> CgroupReading {
             cpu_dirs.extend(mount_dirs(&ordered, &entry.path));
         }
     }
-    CgroupReading {
-        memory: memory_dirs.iter().find_map(|dir| read_memory(dir)),
-        cpu: cpu_dirs.iter().find_map(|dir| read_cpu(dir)),
-    }
+    (memory_dirs, cpu_dirs)
 }
 
 fn parse_mountinfo(text: &str) -> Vec<MountedCgroup> {
@@ -558,18 +598,31 @@ fn missing_memory_usage_name(
     }
 }
 
-// Report only a fixed file/key name, never the resolved cgroup path or contents.
+static FIRST_MISSING: OnceLock<&'static str> = OnceLock::new();
+
+// Remember only a fixed file/key name, never the resolved cgroup path or contents.
 fn memory_input<T>(value: Option<T>, name: &'static str) -> Option<T> {
-    static REPORTED: Once = Once::new();
     if value.is_none() {
+        let _ = FIRST_MISSING.set(name);
+    }
+    value
+}
+
+// Warn once, the first time memory is unavailable or needed a fallback source.
+fn report_memory_source(memory: Option<MemoryUse>) {
+    static REPORTED: Once = Once::new();
+    let source = memory.map(|memory| memory.source);
+    if source != Some(MemorySource::CgroupStat) {
         REPORTED.call_once(|| {
+            let name = FIRST_MISSING.get().copied().unwrap_or("none");
+            let outcome = source.map_or("unavailable", |_| "fallback");
             tracing::warn!(
                 name,
-                "container memory unavailable: cgroup file or key missing, unreadable, or invalid"
+                ?source,
+                "container memory {outcome}: cgroup file or key missing, unreadable, or invalid"
             );
         });
     }
-    value
 }
 
 fn read_memory_limit(dir: &Path, name: &'static str) -> Option<MemoryLimit> {
@@ -586,7 +639,9 @@ fn read_memory_limit(dir: &Path, name: &'static str) -> Option<MemoryLimit> {
 
 fn parse_v2_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
     let current = memory_input(parse_u64_token(current_text), "memory.current")?;
-    let stat = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat")?;
+    let Some(stat) = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat") else {
+        return usage_only(current, read_memory_limit(dir, "memory.max")?);
+    };
     // Type-based file/shmem counters cannot reconstruct the inactive file list:
     // file-backed unevictable pages are in file but not active/inactive_file,
     // and the combined unevictable counter does not identify their share.
@@ -596,7 +651,9 @@ fn parse_v2_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
 
 fn parse_v1_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
     let current = memory_input(parse_u64_token(current_text), "memory.usage_in_bytes")?;
-    let stat = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat")?;
+    let Some(stat) = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat") else {
+        return usage_only(current, read_memory_limit(dir, "memory.limit_in_bytes")?);
+    };
     let fallback = stat_value(&stat, "total_inactive_file");
     memory_use(
         current,
@@ -604,6 +661,15 @@ fn parse_v1_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
         read_memory_limit(dir, "memory.limit_in_bytes")?,
         fallback,
     )
+}
+
+// Without memory.stat there is no inactive file counter; report labeled raw usage.
+fn usage_only(current: u64, limit: MemoryLimit) -> Option<MemoryUse> {
+    Some(MemoryUse {
+        program_bytes: current,
+        limit,
+        source: MemorySource::CgroupUsage,
+    })
 }
 
 fn memory_use(
@@ -625,6 +691,7 @@ fn memory_use(
     Some(MemoryUse {
         program_bytes: current.saturating_sub(inactive),
         limit,
+        source: MemorySource::CgroupStat,
     })
 }
 
@@ -683,6 +750,87 @@ fn stat_value(text: &str, key: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// Startup diagnostic fields: one line each, at most 2 KiB together.
+struct MemoryLayout {
+    proc_cgroup: String,
+    mounts: String,
+    dir: String,
+    files: String,
+    key_files: String,
+}
+
+fn memory_layout(proc: &Path, mount_root: &Path) -> MemoryLayout {
+    let cgroup = read_limited(&proc.join("self/cgroup"));
+    let mountinfo = read_limited(&proc.join("self/mountinfo"));
+    let dir = match (&cgroup, &mountinfo) {
+        (None, _) => Some(mount_root.to_path_buf()),
+        (Some(text), Some(info)) => cgroup_dirs(text, info).0.into_iter().next(),
+        (Some(_), None) => None,
+    };
+    let mounts = mountinfo.as_deref().map_or("unreadable".into(), |info| {
+        let lines = info.lines().filter(|line| {
+            let fstype = line
+                .split(" - ")
+                .nth(1)
+                .unwrap_or("")
+                .split_whitespace()
+                .next();
+            matches!(fstype, Some("cgroup" | "cgroup2"))
+        });
+        lines.collect::<Vec<_>>().join("\n")
+    });
+    let (files, key_files) = dir
+        .as_deref()
+        .map_or(("none".into(), "none".into()), dir_files);
+    let dir = dir.map_or("none".into(), |dir| dir.display().to_string());
+    MemoryLayout {
+        proc_cgroup: one_line(cgroup.as_deref().unwrap_or("unreadable"), 512),
+        mounts: one_line(&mounts, 768),
+        dir: one_line(&dir, 256),
+        files: one_line(&files, 320),
+        key_files: one_line(&key_files, 192),
+    }
+}
+
+// Sorted memory* names, and whether each key file is readable, missing or unreadable.
+fn dir_files(dir: &Path) -> (String, String) {
+    let names = std::fs::read_dir(dir).map(|entries| {
+        let names = entries.filter_map(|entry| entry.ok()?.file_name().into_string().ok());
+        let mut names: Vec<String> = names.filter(|name| name.starts_with("memory")).collect();
+        names.sort();
+        names.join(",")
+    });
+    let states = KEY_MEMORY_FILES.map(|name| {
+        let path = dir.join(name);
+        let state = match (read_limited(&path), path.try_exists()) {
+            (Some(_), _) => "readable",
+            (None, Ok(false)) => "missing",
+            (None, _) => "unreadable",
+        };
+        format!("{name}={state}")
+    });
+    (
+        names.unwrap_or_else(|_| "unreadable".into()),
+        states.join(" "),
+    )
+}
+
+// Joins lines with " | ", blanks other control characters and caps the byte length.
+fn one_line(text: &str, cap: usize) -> String {
+    let line = text
+        .trim()
+        .replace('\n', " | ")
+        .replace(char::is_control, " ");
+    if line.len() <= cap {
+        return line;
+    }
+    let mut end = cap.saturating_sub(TRUNCATED.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{TRUNCATED}", &line[..end])
 }
 
 #[cfg(test)]
@@ -751,6 +899,7 @@ mod tests {
         let memory = reading.memory.unwrap();
         assert_eq!(memory.program_bytes, 900);
         assert_eq!(memory.limit, MemoryLimit::Unlimited);
+        assert_eq!(memory.source, MemorySource::CgroupStat);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(5_000));
     }
 
@@ -861,7 +1010,8 @@ mod tests {
             read_cgroup(Some(&tree.path), None).memory,
             Some(MemoryUse {
                 program_bytes: 900,
-                limit: MemoryLimit::Unlimited
+                limit: MemoryLimit::Unlimited,
+                source: MemorySource::CgroupStat,
             })
         );
     }
@@ -885,7 +1035,8 @@ mod tests {
             read_cgroup(Some(&tree.path), None).memory,
             Some(MemoryUse {
                 program_bytes: 1000,
-                limit: MemoryLimit::Bytes(2048)
+                limit: MemoryLimit::Bytes(2048),
+                source: MemorySource::CgroupStat,
             })
         );
         // The 50 file-backed unevictable bytes are in file, but are neither
@@ -980,7 +1131,8 @@ mod tests {
             read_cgroup(Some(&tree.path), None).memory,
             Some(MemoryUse {
                 program_bytes: 900,
-                limit: MemoryLimit::Unlimited
+                limit: MemoryLimit::Unlimited,
+                source: MemorySource::CgroupStat,
             })
         );
     }
@@ -1000,7 +1152,8 @@ mod tests {
             read_cgroup(Some(&tree.path), None).memory,
             Some(MemoryUse {
                 program_bytes: 750,
-                limit: MemoryLimit::Bytes(2048)
+                limit: MemoryLimit::Bytes(2048),
+                source: MemorySource::CgroupStat,
             })
         );
     }
@@ -1155,6 +1308,7 @@ mod tests {
             memory: Some(MemoryUse {
                 program_bytes: 900,
                 limit: MemoryLimit::Unlimited,
+                source: MemorySource::CgroupStat,
             }),
             cpu: Some(CpuCounter {
                 usage: Duration::from_millis(1_000),
@@ -1580,5 +1734,65 @@ mod tests {
         let reading = read_mounted_cgroup("1:memory:/app\n2:cpuacct:/app\n", &info);
         assert!(reading.memory.is_none());
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_nanos(2_000));
+    }
+
+    #[test]
+    fn missing_memory_stat_uses_usage_and_limit_files() {
+        let (v1_usage, v1_limit) = ("memory.usage_in_bytes", "memory.limit_in_bytes");
+        for (usage, limit, text, bytes) in [
+            ("memory.current", "memory.max", "4096", Some(4096)),
+            ("memory.current", "memory.max", "max", None),
+            (v1_usage, v1_limit, "4096", Some(4096)),
+            (v1_usage, v1_limit, "9223372036854771712", None),
+        ] {
+            let tree = temp_tree();
+            write_files(&tree.path, &[(usage, "1000\n"), (limit, text)]);
+            let memory = read_cgroup(Some(&tree.path), None).memory.unwrap();
+            let want = bytes.map_or(MemoryLimit::Unlimited, MemoryLimit::Bytes);
+            assert_eq!((memory.program_bytes, memory.limit), (1000, want));
+            assert_eq!(memory.source, MemorySource::CgroupUsage);
+            write_files(&tree.path, &[(limit, "invalid\n")]);
+            assert_eq!(read_cgroup(Some(&tree.path), None).memory, None);
+        }
+    }
+
+    fn proc_fixture(cgroup_dir: &Path) -> TempTree {
+        let proc = temp_tree();
+        let info = format!("{}\n", v2_mount_line("/", cgroup_dir));
+        write_files(
+            &proc.path,
+            &[("self/cgroup", "0::/\n"), ("self/mountinfo", &info)],
+        );
+        proc
+    }
+
+    #[test]
+    fn memory_layout_is_one_capped_line_naming_the_dir_and_files() {
+        let cgroup = temp_tree();
+        write_files(
+            &cgroup.path,
+            &[("memory.current", "1\n"), ("memory.max", "max\n")],
+        );
+        std::fs::create_dir(cgroup.path.join("memory.stat")).unwrap();
+        let proc = proc_fixture(&cgroup.path);
+        let layout = memory_layout(&proc.path, &cgroup.path);
+        assert_eq!(layout.dir, cgroup.path.display().to_string());
+        assert_eq!(layout.files, "memory.current,memory.max,memory.stat");
+        let states = "memory.stat=unreadable memory.current=readable memory.max=readable";
+        assert!(layout.key_files.starts_with(states), "{}", layout.key_files);
+        assert!(layout.key_files.ends_with("memory.limit_in_bytes=missing"));
+        assert_eq!(layout.proc_cgroup, "0::/");
+        assert!(layout.mounts.contains(" - cgroup2 "), "{}", layout.mounts);
+
+        write_files(
+            &proc.path,
+            &[("self/cgroup", "0::/x\n".repeat(500).as_str())],
+        );
+        std::fs::remove_file(proc.path.join("self/mountinfo")).unwrap();
+        let layout = memory_layout(&proc.path, &cgroup.path);
+        assert!(layout.proc_cgroup.ends_with(TRUNCATED) && layout.proc_cgroup.len() == 512);
+        assert!(!layout.proc_cgroup.contains('\n'));
+        assert_eq!([layout.mounts, layout.dir], ["unreadable", "none"]);
+        assert!(one_line(&"é\n".repeat(2000), 2048).len() <= 2048);
     }
 }

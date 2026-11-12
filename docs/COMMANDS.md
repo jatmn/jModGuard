@@ -134,8 +134,10 @@ availability is an icon: ✅ up to date, ⬆️ update available, ⚠️ source 
 but the image digest is unverified, ❓ unknown. A component with no cached
 release row is `❓` and has no SHA or age. Container use is this bot
 process's own cgroup. Memory is real program use (`memory.current` minus
-`inactive_file`) shown against `memory.max` (`max` means no limit). CPU is the
-latest background sample. `!status` does not wait for one; until a sample
+`inactive_file`) shown against `memory.max` (`max` means no limit). When
+`memory.stat` is missing or unreadable, it is raw `memory.current` (or v1
+`memory.usage_in_bytes`) marked `(includes page cache)`. CPU is the latest
+background sample. `!status` does not wait for one; until a sample
 exists that row is `unavailable`. When `JMODGUARD_READ_TARGET` points at the
 API loopback read listener (for example `127.0.0.1:8083`) and
 `JMODGUARD_CONTROL_SECRET` matches, the bot fetches
