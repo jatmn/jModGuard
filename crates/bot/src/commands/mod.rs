@@ -604,6 +604,10 @@ pub struct BehaviorOutcome {
     /// dispatch withdraws the deferred answer (or answers ephemerally when
     /// the defer failed — an interaction must always be answered).
     pub suppress_response: bool,
+    /// Behavior output presented as one log-style embed (Stats). It is sent
+    /// in place of the behavior text, with mentions disabled; a customized
+    /// command response is still sent as the message content.
+    pub embed: Option<jmodguard::log_embeds::LogEmbed>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,6 +1412,22 @@ async fn raced_channel_text(
     text: String,
     suppress_mentions: bool,
 ) -> RacedWrite {
+    let message = CreateMessage::new().content(text);
+    let message = if suppress_mentions {
+        message.allowed_mentions(no_mentions())
+    } else {
+        message
+    };
+    raced_channel_message(app, channel_id, http, guild_id, message).await
+}
+
+async fn raced_channel_message(
+    app: &Arc<BotState>,
+    channel_id: ChannelId,
+    http: &serenity::http::Http,
+    guild_id: u64,
+    message: CreateMessage,
+) -> RacedWrite {
     let target = crate::discord::DiscordRestTarget::GuildChannel {
         guild: guild_id,
         channel: channel_id.get(),
@@ -1421,20 +1441,9 @@ async fn raced_channel_text(
     let recovery = app
         .remembered_discord_targets
         .capture_recovery_epoch(target);
-    let call = if suppress_mentions {
-        crate::discord::race_discord_call(
-            &app.activation,
-            channel_id.send_message(
-                http,
-                CreateMessage::new()
-                    .content(text)
-                    .allowed_mentions(no_mentions()),
-            ),
-        )
-        .await
-    } else {
-        crate::discord::race_discord_call(&app.activation, channel_id.say(http, text)).await
-    };
+    let call =
+        crate::discord::race_discord_call(&app.activation, channel_id.send_message(http, message))
+            .await;
     match call {
         crate::discord::DiscordCall::Finished(Ok(_)) => {
             app.remembered_discord_targets.forget(target);
@@ -1465,6 +1474,15 @@ async fn raced_slash_edit(
     if suppress_mentions {
         edit = edit.allowed_mentions(no_mentions());
     }
+    raced_slash_edit_response(activation, http, token, edit).await
+}
+
+async fn raced_slash_edit_response(
+    activation: &crate::activation::Activation,
+    http: &serenity::http::Http,
+    token: &str,
+    edit: EditInteractionResponse,
+) -> RacedWrite {
     match crate::discord::race_discord_call(activation, edit.execute(http, token)).await {
         crate::discord::DiscordCall::Finished(Ok(_)) => RacedWrite::Finished,
         crate::discord::DiscordCall::Finished(Err(error)) => {
@@ -1490,6 +1508,16 @@ async fn raced_slash_create_message(
     if suppress_mentions {
         message = message.allowed_mentions(no_mentions());
     }
+    raced_slash_create_response(activation, http, id, token, message).await
+}
+
+async fn raced_slash_create_response(
+    activation: &crate::activation::Activation,
+    http: &serenity::http::Http,
+    id: serenity::model::id::InteractionId,
+    token: &str,
+    message: serenity::builder::CreateInteractionResponseMessage,
+) -> RacedWrite {
     match crate::discord::race_discord_call(
         activation,
         serenity::builder::CreateInteractionResponse::Message(message).execute(http, (id, token)),
@@ -1535,6 +1563,35 @@ async fn deliver_slash_success(
             }
         }
         SlashAnswer::Public | SlashAnswer::Ephemeral => {
+            if let Some(embed) = outcome.embed.clone() {
+                // Same embed and disabled mentions as the prefix reply.
+                let embed = crate::logging::discord_embed(embed);
+                return if deferred == SlashResponseState::DeferredPublic {
+                    let mut edit = EditInteractionResponse::new()
+                        .embed(embed)
+                        .allowed_mentions(no_mentions());
+                    if !text.is_empty() {
+                        edit = edit.content(text);
+                    }
+                    raced_slash_edit_response(activation, http, slash.token.as_str(), edit).await
+                } else {
+                    let mut message = serenity::builder::CreateInteractionResponseMessage::new()
+                        .embed(embed)
+                        .ephemeral(answer != SlashAnswer::Public)
+                        .allowed_mentions(no_mentions());
+                    if !text.is_empty() {
+                        message = message.content(text);
+                    }
+                    raced_slash_create_response(
+                        activation,
+                        http,
+                        slash.id,
+                        slash.token.as_str(),
+                        message,
+                    )
+                    .await
+                };
+            }
             if deferred == SlashResponseState::DeferredPublic {
                 raced_slash_edit(
                     activation,
@@ -1583,6 +1640,8 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
     if cmd.response.is_empty() {
         return match outcome.response.as_deref() {
             Some(text) => truncate_to_char_limit(text, DISCORD_MESSAGE_LIMIT),
+            // The embed is the reply; it needs no placeholder content.
+            None if outcome.embed.is_some() => String::new(),
             None => "done".to_string(),
         };
     }
@@ -1689,7 +1748,7 @@ enum SlashAnswer {
 fn slash_answer(cmd: &CommandDef, outcome: &BehaviorOutcome) -> SlashAnswer {
     if outcome.confirmation() == Confirmation::EffectAlreadyVisible {
         SlashAnswer::Withdraw
-    } else if outcome.response.is_none() && cmd.response.is_empty() {
+    } else if outcome.response.is_none() && outcome.embed.is_none() && cmd.response.is_empty() {
         SlashAnswer::Ephemeral
     } else {
         SlashAnswer::Public
@@ -1748,18 +1807,36 @@ async fn send_outcome(
     actor_id: serenity::model::id::UserId,
     outcome: BehaviorOutcome,
 ) {
-    if let Some(text) = prefix_response_text(cmd, &outcome)
-        && raced_channel_text(
-            app,
-            channel_id,
-            http,
-            guild_id.get(),
-            text,
-            suppress_untrusted_mentions(&cmd.behavior),
-        )
-        .await
-            == RacedWrite::Cutoff
-    {
+    let text = prefix_response_text(cmd, &outcome);
+    let embed = outcome
+        .embed
+        .clone()
+        .filter(|_| outcome.confirmation() == Confirmation::Needed);
+    let write = match (text, embed) {
+        (None, None) => RacedWrite::Finished,
+        (Some(text), None) => {
+            raced_channel_text(
+                app,
+                channel_id,
+                http,
+                guild_id.get(),
+                text,
+                suppress_untrusted_mentions(&cmd.behavior),
+            )
+            .await
+        }
+        (text, Some(embed)) => {
+            let message = CreateMessage::new()
+                .embed(crate::logging::discord_embed(embed))
+                .allowed_mentions(no_mentions());
+            let message = match text {
+                Some(text) => message.content(text),
+                None => message,
+            };
+            raced_channel_message(app, channel_id, http, guild_id.get(), message).await
+        }
+    };
+    if write == RacedWrite::Cutoff {
         return;
     }
     log_outcome(
@@ -2544,6 +2621,7 @@ mod tests {
             vars: BTreeMap::new(),
             emitted_log_events: Vec::new(),
             suppress_response,
+            embed: None,
         }
     }
 
@@ -2607,6 +2685,7 @@ mod tests {
             vars: BTreeMap::from([("user".into(), "Moderator".into())]),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         assert_eq!(
             render_outcome(&testregex, &outcome),
@@ -2625,6 +2704,7 @@ mod tests {
             ]),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         assert_eq!(render_outcome(&custom, &outcome), "See Member for details");
     }
@@ -2644,6 +2724,7 @@ mod tests {
             ]),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         assert_eq!(
             render_outcome(&kick, &with_dm),
@@ -2679,6 +2760,7 @@ mod tests {
             ]),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         let rendered = render_outcome(&custom, &outcome);
         assert!(
@@ -2711,6 +2793,7 @@ mod tests {
             vars: vars.clone(),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         let not_cached_text = render_outcome(&command, &not_cached);
         assert!(not_cached_text.contains("not cached"), "{not_cached_text}");
@@ -2731,6 +2814,7 @@ mod tests {
             vars: vars.clone(),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         let not_in_text = render_outcome(&command, &not_in_channel);
         assert!(
@@ -2751,6 +2835,7 @@ mod tests {
             vars: vars.clone(),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         let unavailable_text = render_outcome(&command, &channel_unavailable);
         assert!(
@@ -2789,6 +2874,7 @@ mod tests {
                 vars: vars.clone(),
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             };
             assert_eq!(
                 render_outcome(&command, &outcome),
@@ -2829,6 +2915,7 @@ mod tests {
                 ]),
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             };
             let text = render_outcome(&command, &outcome);
             assert_eq!(text, format!("stored reason `{{user}}` for {name}"));
@@ -2855,6 +2942,7 @@ mod tests {
             ]),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         assert_eq!(
             render_outcome(&kick, &outcome),
@@ -2870,6 +2958,7 @@ mod tests {
             vars: BTreeMap::from([("user".into(), "Moderator".into())]),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         assert_eq!(render_outcome(&command, &outcome), "hello {user}");
         assert_eq!(

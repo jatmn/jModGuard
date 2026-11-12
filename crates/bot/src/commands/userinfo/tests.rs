@@ -256,6 +256,7 @@ async fn userinfo_prefix_and_slash_replies_do_not_activate_mentions() {
         vars: std::collections::BTreeMap::new(),
         emitted_log_events: Vec::new(),
         suppress_response: false,
+        embed: None,
     };
     let slash = super::super::SlashCtx {
         id: serenity::model::id::InteractionId::new(1),
@@ -315,6 +316,7 @@ async fn userinfo_prefix_and_slash_replies_do_not_activate_mentions() {
             vars: std::collections::BTreeMap::new(),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         },
     )
     .await;
@@ -2646,4 +2648,346 @@ async fn command_log_context_targeted_plan_automatic() {
         Some(("{command}|{channel}|{target}|{target_id}|{user}|{mention}|{actor}|{content}|{response}",
         "review-plan|<#1>|targetuser|91|targetuser|<@91>|Moderator (<@7>)|hello Moderator|hello Moderator")),
     ).await;
+}
+
+/// `!status` (prefix alias) and `/stats` share one dispatch: the permission
+/// denial is unchanged text, and an allowed caller gets one log-style embed.
+#[tokio::test]
+async fn stats_prefix_and_slash_send_the_status_embed_after_the_same_permission_check() {
+    use crate::state::CachedGuildConfig;
+    use serenity::model::permissions::Permissions;
+    const GUILD: u64 = 10;
+    const ACTOR: u64 = 7;
+    const ROLE: u64 = 50;
+    const DENIED: &str = "you don't have permission to use that command";
+
+    let path = std::env::temp_dir().join(format!(
+        "stats_embed_dispatch_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let app = Arc::new(
+        BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap(),
+    );
+    app.activation.mark_lock_held(true);
+    let cache = Arc::new(Cache::new());
+    let (http, captured, server) = capturing_proxy_for_commands(true).await;
+    let http = Arc::new(http);
+    let ctx = test_context(Arc::clone(&cache), Arc::clone(&http)).await;
+    let commands = jmodguard::defaults::default_commands()
+        .into_iter()
+        .map(|cmd| (cmd.name.clone(), cmd))
+        .collect();
+    let cfg = Arc::new(CachedGuildConfig {
+        version: 1,
+        durable_version: 1,
+        loaded_at: std::time::Instant::now(),
+        settings: crate::types::GuildSettings {
+            prefix: "!".into(),
+            ..Default::default()
+        },
+        rules: Default::default(),
+        commands,
+        templates: Default::default(),
+        log_channels: Default::default(),
+        known_bad_hashes: Default::default(),
+        known_spam: Default::default(),
+        log_filters: Default::default(),
+        regexes: Vec::new(),
+        custom_patterns: Default::default(),
+    });
+    let install = |permissions: Permissions| {
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(GUILD);
+        guild.owner_id = UserId::new(99);
+        guild.name = "fixture".into();
+        let mut everyone = Role::default();
+        everyone.id = RoleId::new(GUILD);
+        everyone.guild_id = guild.id;
+        everyone.permissions = Permissions::empty();
+        guild.roles.insert(everyone.id, everyone);
+        let mut role = Role::default();
+        role.id = RoleId::new(ROLE);
+        role.guild_id = guild.id;
+        role.name = "Staff".into();
+        role.permissions = permissions;
+        guild.roles.insert(role.id, role);
+        let mut caller = target_member(GUILD, ACTOR, None);
+        caller.user.name = "mod".into();
+        caller.roles = vec![RoleId::new(ROLE)];
+        guild.members.insert(caller.user.id, caller);
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        cache.update(&mut event);
+    };
+    let mut author = User::default();
+    author.id = UserId::new(ACTOR);
+    author.name = "mod".into();
+    let partial: serenity::model::guild::PartialMember =
+        serde_json::from_value(serde_json::json!({
+            "deaf": false,
+            "joined_at": null,
+            "mute": false,
+            "nick": null,
+            "roles": [ROLE.to_string()],
+            "pending": false,
+            "premium_since": null,
+            "guild_id": GUILD.to_string(),
+            "user": null,
+            "permissions": null,
+            "unusual_dm_activity_until": null,
+            "avatar": null,
+            "banner": null,
+            "avatar_decoration_data": null,
+        }))
+        .unwrap();
+    let mut message = serenity::model::channel::Message::default();
+    message.id = serenity::model::id::MessageId::new(9);
+    message.content = "!status".into();
+    message.guild_id = Some(GuildId::new(GUILD));
+    message.channel_id = ChannelId::new(2);
+    message.author = author.clone();
+    message.member = Some(Box::new(partial));
+    let mut slash_member = Member::default();
+    slash_member.user = author.clone();
+    slash_member.guild_id = GuildId::new(GUILD);
+    slash_member.roles = vec![RoleId::new(ROLE)];
+    let interaction: serenity::model::application::Interaction =
+        serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "application_id": "1",
+            "type": 2,
+            "token": "token",
+            "version": 1,
+            "guild_id": GUILD.to_string(),
+            "channel_id": "2",
+            "locale": "en-US",
+            "app_permissions": "0",
+            "entitlements": [],
+            "authorizing_integration_owners": {},
+            "attachment_size_limit": 10000000,
+            "user": author,
+            "member": slash_member,
+            "data": {"id": "3", "name": "stats", "type": 1, "options": []}
+        }))
+        .unwrap();
+    // Message bodies sent to Discord, without the slash defer callback.
+    let sent = |label: &str| {
+        let requests = std::mem::take(&mut *captured.lock().unwrap());
+        let replies = requests
+            .iter()
+            .map(|raw| message_fields(raw))
+            .filter(|payload| {
+                payload["content"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+                    || payload["embeds"].as_array().is_some_and(|e| !e.is_empty())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replies.len(), 1, "{label}: {requests:?}");
+        replies.into_iter().next().unwrap()
+    };
+
+    install(Permissions::MANAGE_MESSAGES | Permissions::VIEW_CHANNEL);
+    crate::commands::handle_prefix(
+        &app,
+        http.as_ref(),
+        &cache,
+        Arc::clone(&cfg),
+        &message,
+        Some(&ctx),
+    )
+    .await
+    .unwrap();
+    let denied = sent("denied prefix");
+    // Unchanged `{display name} — {reason}` text (the partial fixture member
+    // carries no user name).
+    let content = denied["content"].as_str().unwrap();
+    assert!(content.ends_with(&format!(" — {DENIED}")), "{content}");
+    assert!(
+        denied["embeds"].as_array().is_none_or(Vec::is_empty),
+        "{denied}"
+    );
+    crate::commands::handle_interaction(&app, &ctx, interaction.clone()).await;
+    let denied = sent("denied slash");
+    assert_eq!(denied["content"], DENIED);
+    assert!(
+        denied["embeds"].as_array().is_none_or(Vec::is_empty),
+        "{denied}"
+    );
+
+    install(Permissions::MANAGE_GUILD | Permissions::VIEW_CHANNEL);
+    crate::commands::handle_prefix(
+        &app,
+        http.as_ref(),
+        &cache,
+        Arc::clone(&cfg),
+        &message,
+        Some(&ctx),
+    )
+    .await
+    .unwrap();
+    let prefix = sent("allowed prefix");
+    crate::commands::handle_interaction(&app, &ctx, interaction).await;
+    let slash = sent("allowed slash");
+    for payload in [&prefix, &slash] {
+        assert!(
+            payload["content"].as_str().is_none_or(str::is_empty),
+            "{payload}"
+        );
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+        let embeds = payload["embeds"].as_array().unwrap();
+        assert_eq!(embeds.len(), 1, "{payload}");
+        let embed = &embeds[0];
+        assert_eq!(embed["title"], "Status");
+        assert_eq!(embed["description"], "**Server stats**");
+        // A fresh database has no release observations: attention accent.
+        assert_eq!(embed["color"], jmodguard::log_embeds::YELLOW);
+        let fields = embed["fields"].as_array().unwrap();
+        let layout = fields
+            .iter()
+            .map(|f| (f["name"].as_str().unwrap(), f["inline"].as_bool().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            layout,
+            [
+                ("Uptime", true),
+                ("Cases", true),
+                ("Warns", true),
+                ("Bans", true),
+                ("Release status", false),
+                ("Container use", false),
+            ]
+        );
+        for field in &fields[1..4] {
+            assert_eq!(
+                field["value"],
+                if field["name"] == "Cases" {
+                    "`unavailable`"
+                } else {
+                    "`0`"
+                }
+            );
+        }
+        let value = |name: &str| {
+            fields.iter().find(|f| f["name"] == name).unwrap()["value"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(value("Uptime").starts_with('`') && value("Uptime").ends_with('`'));
+        let releases = value("Release status");
+        for component in ["bot", "api", "webui"] {
+            assert!(
+                releases
+                    .lines()
+                    .any(|line| line.starts_with(&format!("**{component}:** "))),
+                "{releases}"
+            );
+        }
+        let containers = value("Container use");
+        for label in [
+            "Bot CPU",
+            "Bot memory (real program use)",
+            "API CPU",
+            "API memory (real program use)",
+        ] {
+            assert!(
+                containers.contains(&format!("**{label}:** `")),
+                "{containers}"
+            );
+        }
+        assert!(!containers.contains("pid"), "{containers}");
+    }
+    let without_uptime = |payload: &serde_json::Value| {
+        let mut embed = payload["embeds"][0].clone();
+        embed["fields"][0]["value"] = serde_json::Value::Null;
+        embed
+    };
+    assert_eq!(without_uptime(&prefix), without_uptime(&slash));
+
+    // A non-deferred slash answer and an oversized embed use the same bounds.
+    let mut stats = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| matches!(cmd.behavior, jmodguard::types::Behavior::Stats))
+        .unwrap();
+    stats.log_event.clear();
+    let mut embed = crate::templates::stats_embed(0, Some(0), 0, 0, None, 0);
+    embed.fields[4].value = format!("`{}`", "🦀".repeat(900));
+    embed.fields.push(jmodguard::log_embeds::Field {
+        name: "Container use".into(),
+        value: "名".repeat(2000),
+        inline: false,
+    });
+    let outcome = super::super::BehaviorOutcome {
+        response: None,
+        vars: std::collections::BTreeMap::new(),
+        emitted_log_events: Vec::new(),
+        suppress_response: false,
+        embed: Some(embed),
+    };
+    let slash_ctx = super::super::SlashCtx {
+        id: serenity::model::id::InteractionId::new(1),
+        token: "token".into(),
+        channel_id: ChannelId::new(2),
+        guild_id: GuildId::new(GUILD),
+        actor: UserId::new(ACTOR),
+        member: None,
+        name: "stats".into(),
+        options: Vec::new(),
+    };
+    super::super::deliver_slash_success(
+        &app.activation,
+        http.as_ref(),
+        &slash_ctx,
+        super::super::SlashResponseState::Initial,
+        &stats,
+        &outcome,
+    )
+    .await;
+    let initial = sent("initial slash");
+    super::super::send_outcome(
+        &app,
+        http.as_ref(),
+        &cache,
+        &stats,
+        GuildId::new(GUILD),
+        ChannelId::new(2),
+        UserId::new(ACTOR),
+        outcome,
+    )
+    .await;
+    let prefix = sent("oversized prefix");
+    let ephemeral = serenity::model::channel::MessageFlags::EPHEMERAL.bits();
+    assert_eq!(
+        initial["flags"].as_u64().unwrap_or(0) & ephemeral,
+        0,
+        "public answer"
+    );
+    assert_eq!(initial["embeds"], prefix["embeds"]);
+    let embed = &prefix["embeds"][0];
+    let units = |value: &serde_json::Value| value.as_str().unwrap().encode_utf16().count();
+    let mut total = units(&embed["title"]) + units(&embed["description"]);
+    for field in embed["fields"].as_array().unwrap() {
+        assert!(units(&field["name"]) <= 256);
+        assert!(units(&field["value"]) <= 1024, "{field}");
+        total += units(&field["name"]) + units(&field["value"]);
+    }
+    assert!(total <= 6000);
+    let releases = embed["fields"][4]["value"].as_str().unwrap();
+    assert!(releases.ends_with('…'), "{releases}");
+    assert!(
+        releases
+            .trim_start_matches('`')
+            .trim_end_matches('…')
+            .chars()
+            .all(|c| c == '🦀'),
+        "a surrogate pair was split: {releases}"
+    );
+    let containers = embed["fields"][5]["value"].as_str().unwrap();
+    assert!(containers.trim_end_matches('…').chars().all(|c| c == '名'));
+
+    server.abort();
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    let _ = std::fs::remove_file(path);
 }

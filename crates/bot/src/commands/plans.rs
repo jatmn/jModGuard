@@ -157,6 +157,7 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
         vars,
         emitted_log_events,
         suppress_response: false,
+        embed: None,
     })
 }
 

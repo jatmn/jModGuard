@@ -714,6 +714,7 @@ pub(crate) async fn run(
         vars: vars.clone(),
         emitted_log_events: Vec::new(),
         suppress_response: false,
+        embed: None,
     })
 }
 

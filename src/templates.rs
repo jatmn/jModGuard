@@ -98,9 +98,9 @@ fn release_status_line(
     tail: String,
 ) -> String {
     match (short_sha, age_clause) {
-        (Some(sha), Some(age)) => format!("**{component}:** `{sha}` · {age} · {tail}"),
+        (Some(sha), Some(age)) => format!("**{component}:** `{sha}` · `{age}` · {tail}"),
         (Some(sha), None) => format!("**{component}:** `{sha}` · {tail}"),
-        (None, Some(age)) => format!("**{component}:** {age} · {tail}"),
+        (None, Some(age)) => format!("**{component}:** `{age}` · {tail}"),
         (None, None) => format!("**{component}:** {tail}"),
     }
 }
@@ -122,65 +122,81 @@ pub fn format_log_timestamps(vars: &mut BTreeMap<String, String>) {
     }
 }
 
-/// Default stats response, rendered through the same template engine as logs.
-/// A missing case count means the guild store or membership is unavailable.
-pub fn stats_response(uptime_seconds: u64, cases: Option<i64>, warns: i64, bans: i64) -> String {
-    render(
-        "**📊 Stats (this server)**\n\n**⏱️ Uptime:** `{uptime}`\n**📋 Cases:** `{cases}`\n**⚠️ Warns:** `{warns}`\n**🔨 Bans:** `{bans}`",
-        &BTreeMap::from([
-            ("uptime".into(), format_compact_duration(uptime_seconds)),
-            (
-                "cases".into(),
-                cases.map_or_else(|| "unavailable".into(), |count| count.to_string()),
-            ),
-            ("warns".into(), warns.to_string()),
-            ("bans".into(), bans.to_string()),
-        ]),
-    )
+/// Title of the `!stats` / `!status` embed.
+pub const STATS_TITLE: &str = "Status";
+/// Section headings, in display order. Server stats is the description so its
+/// counts can stay separate inline fields.
+pub const STATS_SERVER_SECTION: &str = "Server stats";
+pub const STATS_RELEASE_SECTION: &str = "Release status";
+pub const STATS_CONTAINER_SECTION: &str = "Container use";
+
+/// Memory row text when the host's cgroup does not report program memory.
+pub const MEMORY_NOT_REPORTED: &str = "not reported by host";
+
+fn inline_code(value: &str) -> String {
+    format!("`{value}`")
 }
 
-/// Append cached release observations without making a network request from
-/// a Discord command. Release lines name missing, stale, or failed checks.
+/// Stats reply as one log-notice embed, using the log embed type and limits.
+/// Release status comes from cached observations; this makes no network request
+/// from a Discord command. A missing case count means the guild store or
+/// membership is unavailable; `updates: None` means the release lookup failed.
+/// Release lines name missing, stale, or failed checks. The accent is green when
+/// every component is current (an unmanaged WebUI included) and yellow when any
+/// release needs attention.
 ///
 /// ```
-/// let response: String = jmodguard::templates::stats_response_with_updates(
-///     20, Some(1), 2, 3, &[], 1_000,
-/// );
+/// let embed = jmodguard::templates::stats_embed(20, Some(1), 2, 3, Some(&[]), 1_000);
+/// assert_eq!(embed.title, jmodguard::templates::STATS_TITLE);
 /// ```
-pub fn stats_response_with_updates(
-    uptime_seconds: u64,
-    cases: Option<i64>,
-    warns: i64,
-    bans: i64,
-    updates: &[crate::db::ComponentUpdate],
-    now: i64,
-) -> String {
-    stats_response_with_update_availability(uptime_seconds, cases, warns, bans, Some(updates), now)
-}
-
-/// Render release lookup availability alongside moderation stats. None means
-/// the lookup failed; successful reads name why a check is missing or stale.
-pub fn stats_response_with_update_availability(
+pub fn stats_embed(
     uptime_seconds: u64,
     cases: Option<i64>,
     warns: i64,
     bans: i64,
     updates: Option<&[crate::db::ComponentUpdate]>,
     now: i64,
-) -> String {
-    let Some(updates) = updates else {
-        return render(
-            "{moderation}\n\n**Release status**\nunavailable",
-            &BTreeMap::from([(
-                "moderation".into(),
-                stats_response(uptime_seconds, cases, warns, bans),
-            )]),
-        );
+) -> crate::log_embeds::LogEmbed {
+    use crate::log_embeds::{Field, GREEN, LogEmbed, YELLOW};
+    let (releases, attention) = match updates {
+        Some(updates) => release_status_lines(updates, now),
+        None => (inline_code("unavailable"), true),
     };
+    let stat = |name: &str, value: String| Field {
+        name: name.into(),
+        value: inline_code(&value),
+        inline: true,
+    };
+    LogEmbed {
+        title: STATS_TITLE.into(),
+        color: if attention { YELLOW } else { GREEN },
+        description: format!("**{STATS_SERVER_SECTION}**"),
+        fields: vec![
+            stat("Uptime", format_compact_duration(uptime_seconds)),
+            stat(
+                "Cases",
+                cases.map_or_else(|| "unavailable".into(), |count| count.to_string()),
+            ),
+            stat("Warns", warns.to_string()),
+            stat("Bans", bans.to_string()),
+            Field {
+                name: STATS_RELEASE_SECTION.into(),
+                value: releases,
+                inline: false,
+            },
+        ],
+    }
+    .bounded()
+}
+
+/// One line per component and whether any component needs attention.
+fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (String, bool) {
     let mut lines = Vec::new();
+    let mut attention = false;
     for component in ["bot", "api", "webui"] {
         let Some(item) = updates.iter().find(|item| item.component == component) else {
             lines.push(format!("**{component}:** not checked"));
+            attention = true;
             continue;
         };
         let observation_fresh = item
@@ -209,6 +225,7 @@ pub fn stats_response_with_update_availability(
         });
         if let Some(reason) = release_status_reason(item, component, now) {
             let webui_unmanaged = reason == "webui not managed by updater";
+            attention |= !webui_unmanaged;
             let sha_for_line = if webui_unmanaged {
                 None
             } else {
@@ -233,6 +250,7 @@ pub fn stats_response_with_update_availability(
                     .unwrap_or(0);
                 format!("observation stale ({hours}h)")
             };
+            attention = true;
             lines.push(release_status_line(component, None, None, reason));
             continue;
         }
@@ -266,6 +284,7 @@ pub fn stats_response_with_update_availability(
         } else {
             "not checked"
         };
+        attention |= availability != "up to date";
         let tail = if availability == "not checked" {
             "not checked".to_string()
         } else {
@@ -278,98 +297,72 @@ pub fn stats_response_with_update_availability(
             tail,
         ));
     }
-    render(
-        "{moderation}\n\n**Release status**\n{releases}",
-        &BTreeMap::from([
-            (
-                "moderation".into(),
-                stats_response(uptime_seconds, cases, warns, bans),
-            ),
-            ("releases".into(), lines.join("\n")),
-        ]),
-    )
+    (lines.join("\n"), attention)
 }
 
 const CONTAINER_USE_TEMPLATE: &str = "\
-**Container use**\n\
 **Bot CPU:** `{bot_cpu}`\n\
 **Bot memory (real program use):** `{bot_memory}`\n\
 **API CPU:** `{api_cpu}`\n\
 **API memory (real program use):** `{api_memory}`";
 
-/// Append this process's container sample to a stats reply.
+/// Append the Container use section to a stats embed.
 ///
 /// `api` stays `None` when no private reading arrived. Those rows then render
-/// as `unavailable`, not zero. `api_copy` labels whichever API copy answered.
-/// The bot sample is a cache copy;
+/// as `unavailable`, not zero. Which API copy answered is not shown. Memory a
+/// host does not report is named as such. The bot sample is a cache copy;
 /// this function does not read cgroup files or wait for a CPU sample.
 pub fn stats_with_container_use(
-    moderation: String,
+    mut embed: crate::log_embeds::LogEmbed,
     bot: &crate::cgroup::ContainerSample,
     api: Option<&crate::cgroup::ContainerSample>,
-    api_copy: Option<&str>,
-) -> String {
-    render(
-        "{moderation}\n\n{containers}",
-        &BTreeMap::from([
-            ("moderation".into(), moderation),
-            (
-                "containers".into(),
-                container_use_section(bot, api, api_copy),
-            ),
-        ]),
-    )
+) -> crate::log_embeds::LogEmbed {
+    embed.fields.push(crate::log_embeds::Field {
+        name: STATS_CONTAINER_SECTION.into(),
+        value: container_use_section(bot, api),
+        inline: false,
+    });
+    embed.bounded()
 }
 
 fn container_use_section(
     bot: &crate::cgroup::ContainerSample,
     api: Option<&crate::cgroup::ContainerSample>,
-    api_copy: Option<&str>,
 ) -> String {
-    let unavailable = crate::cgroup::ContainerSample::unavailable();
-    let api = api.unwrap_or(&unavailable);
+    let (api_cpu, api_memory) = match api {
+        Some(api) => (cpu_value(api), memory_value(api)),
+        None => ("unavailable".to_string(), "unavailable".to_string()),
+    };
     render(
         CONTAINER_USE_TEMPLATE,
         &BTreeMap::from([
-            ("bot_cpu".into(), cpu_value(bot, None)),
-            ("bot_memory".into(), memory_value(bot, None)),
-            ("api_cpu".into(), cpu_value(api, api_copy)),
-            ("api_memory".into(), memory_value(api, api_copy)),
+            ("bot_cpu".into(), cpu_value(bot)),
+            ("bot_memory".into(), memory_value(bot)),
+            ("api_cpu".into(), api_cpu),
+            ("api_memory".into(), api_memory),
         ]),
     )
 }
 
-fn cpu_value(sample: &crate::cgroup::ContainerSample, copy: Option<&str>) -> String {
-    let base = sample
+fn cpu_value(sample: &crate::cgroup::ContainerSample) -> String {
+    sample
         .cpu_tenths
         .map(format_cpu_tenths)
-        .unwrap_or_else(|| "unavailable".to_string());
-    label_copy(base, copy)
+        .unwrap_or_else(|| "unavailable".to_string())
 }
 
-fn memory_value(sample: &crate::cgroup::ContainerSample, copy: Option<&str>) -> String {
+fn memory_value(sample: &crate::cgroup::ContainerSample) -> String {
     let Some(memory) = sample.memory else {
-        return label_copy("unavailable".to_string(), None);
+        return MEMORY_NOT_REPORTED.to_string();
     };
     let used = format_bytes(memory.program_bytes);
     let base = match memory.limit {
         crate::cgroup::MemoryLimit::Unlimited => format!("{used} / no limit"),
         crate::cgroup::MemoryLimit::Bytes(limit) => format!("{used} / {}", format_bytes(limit)),
     };
-    let base = match memory.source {
+    match memory.source {
         crate::cgroup::MemorySource::CgroupStat => base,
         crate::cgroup::MemorySource::CgroupUsage => format!("{base} (includes page cache)"),
-    };
-    label_copy(base, copy)
-}
-
-fn label_copy(value: String, copy: Option<&str>) -> String {
-    if value == "unavailable" {
-        return value;
-    }
-    match copy {
-        Some(label) if !label.is_empty() => format!("{value} ({label})"),
-        _ => value,
     }
 }
 
@@ -580,33 +573,242 @@ mod presentation_tests {
         }
     }
 
+    /// Release status field value, with the line layout the stats embed shows.
+    fn release_text(updates: &[crate::db::ComponentUpdate], now: i64) -> String {
+        let embed = stats_embed(20, Some(1), 2, 3, Some(updates), now);
+        field(&embed, STATS_RELEASE_SECTION).value.clone()
+    }
+
+    fn field<'a>(
+        embed: &'a crate::log_embeds::LogEmbed,
+        name: &str,
+    ) -> &'a crate::log_embeds::Field {
+        embed
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from {embed:?}"))
+    }
+
+    fn container_text(
+        bot: &crate::cgroup::ContainerSample,
+        api: Option<&crate::cgroup::ContainerSample>,
+    ) -> String {
+        let embed = stats_with_container_use(stats_embed(0, Some(0), 0, 0, None, 0), bot, api);
+        field(&embed, STATS_CONTAINER_SECTION).value.clone()
+    }
+
     #[test]
     fn screenshot_stats_preview() {
-        assert_eq!(
-            stats_response(
-                std::time::Duration::from_secs_f64(1361.499531819).as_secs(),
-                Some(0),
-                0,
-                1
-            ),
-            "**📊 Stats (this server)**\n\n**⏱️ Uptime:** `22m 41s`\n**📋 Cases:** `0`\n**⚠️ Warns:** `0`\n**🔨 Bans:** `1`"
+        use crate::log_embeds::Field;
+        let embed = stats_embed(
+            std::time::Duration::from_secs_f64(1361.499531819).as_secs(),
+            Some(0),
+            0,
+            1,
+            Some(&[]),
+            1_000,
         );
+        assert_eq!(embed.title, "Status");
+        assert_eq!(embed.description, "**Server stats**");
+        let stat = |name: &str, value: &str| Field {
+            name: name.into(),
+            value: value.into(),
+            inline: true,
+        };
+        assert_eq!(
+            embed.fields[..4],
+            [
+                stat("Uptime", "`22m 41s`"),
+                stat("Cases", "`0`"),
+                stat("Warns", "`0`"),
+                stat("Bans", "`1`"),
+            ]
+        );
+        assert_eq!(embed.fields[4].name, "Release status");
+        assert!(!embed.fields[4].inline);
+        assert_eq!(embed.fields.len(), 5);
     }
 
     #[test]
     fn stats_distinguishes_zero_cases_from_unavailable() {
         for (cases, expected) in [(Some(0), "0"), (Some(2), "2"), (None, "unavailable")] {
             for updates in [Some(&[][..]), None] {
-                let out = stats_response_with_update_availability(20, cases, 3, 4, updates, 1100);
+                let embed = stats_embed(20, cases, 3, 4, updates, 1100);
+                assert_eq!(field(&embed, "Cases").value, format!("`{expected}`"));
+                assert_eq!(field(&embed, "Warns").value, "`3`");
+                assert_eq!(field(&embed, "Bans").value, "`4`");
                 assert!(
-                    out.contains(&format!("**📋 Cases:** `{expected}`")),
-                    "{out}"
+                    !embed.fields.iter().any(|f| f.name == "Moderation records"),
+                    "{embed:?}"
                 );
-                assert!(out.contains("**⚠️ Warns:** `3`"), "{out}");
-                assert!(out.contains("**🔨 Bans:** `4`"), "{out}");
-                assert!(!out.contains("Moderation records"), "{out}");
             }
         }
+    }
+
+    #[test]
+    fn stats_embed_sections_values_and_attention_accent() {
+        use crate::log_embeds::{GREEN, YELLOW};
+        let source = "abcdef0123456789abcdef0123456789abcdef01";
+        let current = |component: &str| {
+            let candidate = sample_candidate("latest", source, &"b".repeat(64));
+            let mut row = sample_api_update_row(
+                Some(candidate.clone()),
+                Some(1_100),
+                None,
+                Some(sample_observed(source)),
+                Some(1_000),
+                "latest",
+            );
+            row.component = component.into();
+            row.installed = Some(candidate);
+            row.installed_at = Some(950);
+            row
+        };
+        let all_current = [current("bot"), current("api"), current("webui")];
+        let bot = crate::cgroup::ContainerSample {
+            memory: Some(crate::cgroup::MemoryUse {
+                program_bytes: 2048,
+                limit: crate::cgroup::MemoryLimit::Unlimited,
+                source: crate::cgroup::MemorySource::CgroupStat,
+            }),
+            cpu_tenths: Some(12),
+        };
+        let embed = stats_with_container_use(
+            stats_embed(61, Some(5), 2, 1, Some(&all_current), 1_200),
+            &bot,
+            Some(&bot),
+        );
+        assert_eq!(embed.color, GREEN, "{embed:?}");
+        assert_eq!(embed.title, STATS_TITLE);
+        assert_eq!(embed.description, "**Server stats**");
+        let names = embed
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "Uptime",
+                "Cases",
+                "Warns",
+                "Bans",
+                "Release status",
+                "Container use"
+            ]
+        );
+        let inline = embed.fields.iter().map(|f| f.inline).collect::<Vec<_>>();
+        assert_eq!(inline, [true, true, true, true, false, false]);
+        assert_eq!(field(&embed, "Uptime").value, "`1m 1s`");
+        let releases = field(&embed, "Release status")
+            .value
+            .lines()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            releases,
+            [
+                "**bot:** `abcdef0` · `installed 4m 10s` · ✅",
+                "**api:** `abcdef0` · `installed 4m 10s` · ✅",
+                "**webui:** `abcdef0` · `installed 4m 10s` · ✅",
+            ]
+        );
+        assert_eq!(
+            field(&embed, "Container use").value,
+            "**Bot CPU:** `1.2%`\n**Bot memory (real program use):** `2.0 KiB / no limit`\n**API CPU:** `1.2%`\n**API memory (real program use):** `2.0 KiB / no limit`"
+        );
+
+        // An unmanaged WebUI is not an attention state.
+        let mut unmanaged = all_current.clone();
+        unmanaged[2].installed = None;
+        unmanaged[2].installed_at = None;
+        unmanaged[2].desired = None;
+        let embed = stats_embed(0, Some(0), 0, 0, Some(&unmanaged), 1_200);
+        assert!(
+            field(&embed, "Release status")
+                .value
+                .contains("**webui:** webui not managed by updater"),
+            "{embed:?}"
+        );
+        assert_eq!(embed.color, GREEN);
+
+        // Each stale, unknown, unverified, outdated or missing state needs attention.
+        let mut variants: Vec<Vec<crate::db::ComponentUpdate>> = Vec::new();
+        let mut stale_check = all_current.to_vec();
+        stale_check[0].checked_at = Some(1_200 - 3 * 3_600);
+        variants.push(stale_check);
+        let mut unknown = all_current.to_vec();
+        unknown[1].observed_at = None;
+        variants.push(unknown);
+        let mut unverified = all_current.to_vec();
+        unverified[1].installed = None;
+        unverified[1].installed_at = None;
+        unverified[1].observed.as_mut().unwrap().base_image_sha = source.into();
+        variants.push(unverified);
+        let mut outdated = all_current.to_vec();
+        outdated[0].candidate.as_mut().unwrap().source_sha = "c".repeat(40);
+        variants.push(outdated);
+        let mut failed = all_current.to_vec();
+        failed[2].check_error = Some("registry error".into());
+        variants.push(failed);
+        variants.push(all_current[..2].to_vec());
+        variants.push(Vec::new());
+        for updates in &variants {
+            let embed = stats_embed(0, Some(0), 0, 0, Some(updates), 1_200);
+            assert_eq!(embed.color, YELLOW, "{embed:?}");
+            assert_eq!(
+                field(&embed, "Release status").value.lines().count(),
+                3,
+                "{embed:?}"
+            );
+        }
+        let lookup_failed = stats_embed(0, Some(0), 0, 0, None, 1_200);
+        assert_eq!(lookup_failed.color, YELLOW);
+        assert_eq!(
+            field(&lookup_failed, "Release status").value,
+            "`unavailable`"
+        );
+    }
+
+    #[test]
+    fn stats_embed_stays_within_log_embed_limits_without_splitting_characters() {
+        let mut embed = stats_with_container_use(
+            stats_embed(u64::MAX, Some(i64::MAX), i64::MAX, i64::MIN, None, i64::MAX),
+            &crate::cgroup::ContainerSample::unavailable(),
+            None,
+        );
+        assert_eq!(embed.clone().bounded(), embed, "already bounded");
+        embed.title = "🦀".repeat(300);
+        for field in &mut embed.fields {
+            field.name = "名".repeat(300);
+            field.value = format!("`{}`", "🌕".repeat(900));
+        }
+        let bounded = embed.bounded();
+        assert!(bounded.title.encode_utf16().count() <= 256);
+        assert!(
+            bounded
+                .title
+                .trim_end_matches('…')
+                .chars()
+                .all(|c| c == '🦀')
+        );
+        let mut total =
+            bounded.title.encode_utf16().count() + bounded.description.encode_utf16().count();
+        for field in &bounded.fields {
+            assert!(field.name.encode_utf16().count() <= 256);
+            assert!(field.value.encode_utf16().count() <= 1024);
+            assert!(
+                field
+                    .value
+                    .trim_start_matches('`')
+                    .trim_end_matches('…')
+                    .chars()
+                    .all(|c| c == '🌕')
+            );
+            total += field.name.encode_utf16().count() + field.value.encode_utf16().count();
+        }
+        assert!(total <= 6000);
+        assert!(bounded.fields.len() <= 25);
     }
 
     #[test]
@@ -669,12 +871,12 @@ mod presentation_tests {
             state: "running".into(),
             last_error: None,
         };
-        let fresh = stats_response_with_updates(20, Some(1), 2, 3, &[row.clone()], 1100);
+        let fresh = release_text(&[row.clone()], 1100);
         assert!(fresh.contains("`aaaaaaa`"));
         assert!(fresh.contains("⬆️"));
         assert!(!fresh.contains("update available"));
         row.channel = "nightly".into();
-        let wrong_channel = stats_response_with_updates(20, Some(1), 2, 3, &[row.clone()], 1100);
+        let wrong_channel = release_text(&[row.clone()], 1100);
         assert!(!wrong_channel.contains("update available"));
         let wrong_api = wrong_channel
             .lines()
@@ -688,7 +890,7 @@ mod presentation_tests {
         row.channel = "stable".into();
         row.candidate.as_mut().unwrap().source_sha = "a".repeat(40);
         row.observed.as_mut().unwrap().base_image_sha = "a".repeat(40);
-        let baked_current = stats_response_with_updates(20, Some(1), 2, 3, &[row.clone()], 1100);
+        let baked_current = release_text(&[row.clone()], 1100);
         let api_line = baked_current
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -696,14 +898,13 @@ mod presentation_tests {
         assert!(api_line.ends_with("⚠️"), "{api_line}");
         assert!(!baked_current.contains("no source update"));
         row.channel = "nightly".into();
-        let wrong_channel_current =
-            stats_response_with_updates(20, Some(1), 2, 3, &[row.clone()], 1100);
+        let wrong_channel_current = release_text(&[row.clone()], 1100);
         assert!(!wrong_channel_current.contains("no source update"));
         row.channel = "stable".into();
         // Source comparisons still use the full SHA, even when prefixes match.
         let mut same_prefix = row.clone();
         same_prefix.candidate.as_mut().unwrap().source_sha = format!("aaaaaaa{}", "b".repeat(33));
-        let out = stats_response_with_updates(20, Some(1), 2, 3, &[same_prefix], 1100);
+        let out = release_text(&[same_prefix], 1100);
         assert!(
             out.lines()
                 .any(|line| line.starts_with("**api:**") && line.ends_with("⬆️"))
@@ -719,7 +920,7 @@ mod presentation_tests {
                 display.observed.as_mut().unwrap().source_sha = source.into();
                 display.candidate.as_mut().unwrap().source_sha = source.into();
                 display.installed = display.candidate.clone();
-                let out = stats_response_with_updates(20, Some(1), 2, 3, &[display], 1100);
+                let out = release_text(&[display], 1100);
                 let line = out
                     .lines()
                     .find(|line| line.starts_with(&format!("**{component}:**")))
@@ -729,7 +930,7 @@ mod presentation_tests {
             }
         }
         row.observed_at = Some(1);
-        let stale = stats_response_with_updates(20, Some(1), 2, 3, &[row], 9000);
+        let stale = release_text(&[row], 9000);
         assert!(!stale.contains(&"a".repeat(40)));
         let stale_api = stale
             .lines()
@@ -743,7 +944,7 @@ mod presentation_tests {
 
     #[test]
     fn missing_release_rows_use_the_unknown_icon() {
-        let out = stats_response_with_updates(0, Some(0), 0, 0, &[], 1_000);
+        let out = release_text(&[], 1_000);
         for component in ["bot", "api", "webui"] {
             assert_eq!(
                 out.lines()
@@ -838,7 +1039,7 @@ mod presentation_tests {
         let source = "abcdef0123456789abcdef0123456789abcdef01";
         let observed = sample_observed(source);
         let row = sample_api_update_row(None, None, None, Some(observed), Some(1_000), "latest");
-        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 1_100);
+        let out = release_text(&[row], 1_100);
         let api = out
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -856,7 +1057,7 @@ mod presentation_tests {
             Some(1_000),
             "latest",
         );
-        let mismatch = stats_response_with_updates(0, Some(0), 0, 0, &[row], 1_200);
+        let mismatch = release_text(&[row], 1_200);
         let api = mismatch
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -865,7 +1066,7 @@ mod presentation_tests {
         assert!(!api.contains("⬆️"), "{api}");
         assert!(!api.contains("update available"), "{api}");
 
-        let missing = stats_response_with_updates(0, Some(0), 0, 0, &[], 1_000);
+        let missing = release_text(&[], 1_000);
         for component in ["bot", "api", "webui"] {
             assert_eq!(
                 missing
@@ -890,7 +1091,7 @@ mod presentation_tests {
             "latest",
         );
         let now = 14_402;
-        let out = stats_response_with_updates(0, Some(0), 0, 0, std::slice::from_ref(&row), now);
+        let out = release_text(std::slice::from_ref(&row), now);
         let api = out
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -908,7 +1109,7 @@ mod presentation_tests {
             "latest",
         );
         fresh_boundary.installed = fresh_boundary.candidate.clone();
-        let out = stats_response_with_updates(0, Some(0), 0, 0, &[fresh_boundary], now);
+        let out = release_text(&[fresh_boundary], now);
         let api = out
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -924,7 +1125,7 @@ mod presentation_tests {
             Some(1_000),
             "latest",
         );
-        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], now);
+        let out = release_text(&[row], now);
         let api = out
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -942,7 +1143,7 @@ mod presentation_tests {
         );
         fresh.installed = fresh.candidate.clone();
         fresh.observed_at = Some(boundary_now - 3_600);
-        let out = stats_response_with_updates(0, Some(0), 0, 0, &[fresh], boundary_now);
+        let out = release_text(&[fresh], boundary_now);
         let api = out
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -959,7 +1160,7 @@ mod presentation_tests {
             "latest",
         );
         future_checked.installed = future_checked.candidate.clone();
-        let out = stats_response_with_updates(0, Some(0), 0, 0, &[future_checked], boundary_now);
+        let out = release_text(&[future_checked], boundary_now);
         let api = out
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -980,7 +1181,7 @@ mod presentation_tests {
             Some(1_000),
             "latest",
         );
-        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 1_200);
+        let out = release_text(&[row], 1_200);
         let api = out
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -1035,7 +1236,7 @@ mod presentation_tests {
                 state: "running".into(),
                 last_error: None,
             };
-            let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 1_200);
+            let out = release_text(&[row], 1_200);
             let webui = out
                 .lines()
                 .find(|line| line.starts_with("**webui:**"))
@@ -1067,7 +1268,7 @@ mod presentation_tests {
             last_error: None,
         };
         queued.candidate.as_mut().unwrap().source_sha = "c".repeat(40);
-        let out = stats_response_with_updates(0, Some(0), 0, 0, &[queued], 1_200);
+        let out = release_text(&[queued], 1_200);
         let webui = out
             .lines()
             .find(|line| line.starts_with("**webui:**"))
@@ -1088,7 +1289,7 @@ mod presentation_tests {
             "latest",
         );
         api.component = "api".into();
-        let out = stats_response_with_updates(0, Some(0), 0, 0, &[api], 1_200);
+        let out = release_text(&[api], 1_200);
         let api_line = out
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -1111,7 +1312,7 @@ mod presentation_tests {
         );
         row.installed = Some(candidate);
         row.observed.as_mut().unwrap().source_sha = candidate_source;
-        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 9_000);
+        let out = release_text(&[row], 9_000);
         let api = out
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -1134,7 +1335,7 @@ mod presentation_tests {
             "latest",
         );
         row.installed = Some(candidate);
-        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 1_200);
+        let out = release_text(&[row], 1_200);
         let api = out
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -1155,7 +1356,7 @@ mod presentation_tests {
             Some(1_000),
             "latest",
         );
-        let out = stats_response_with_updates(0, Some(0), 0, 0, &[row], 1_200);
+        let out = release_text(&[row], 1_200);
         let api = out
             .lines()
             .find(|line| line.starts_with("**api:**"))
@@ -1168,16 +1369,11 @@ mod presentation_tests {
     #[test]
     fn status_does_not_wait_for_a_cpu_sample() {
         let started = std::time::Instant::now();
-        let text = stats_with_container_use(
-            "**📊 Stats (this server)**".into(),
-            &crate::cgroup::ContainerSample::unavailable(),
-            None,
-            None,
-        );
+        let text = container_text(&crate::cgroup::ContainerSample::unavailable(), None);
         assert!(started.elapsed() < std::time::Duration::from_millis(200));
         assert!(text.contains("**Bot CPU:** `unavailable`"), "{text}");
         assert!(
-            text.contains("**Bot memory (real program use):** `unavailable`"),
+            text.contains("**Bot memory (real program use):** `not reported by host`"),
             "{text}"
         );
         assert!(text.contains("**API CPU:** `unavailable`"), "{text}");
@@ -1199,7 +1395,7 @@ mod presentation_tests {
             }),
             cpu_tenths: Some(250),
         };
-        let text = stats_with_container_use("stats".into(), &bot, None, None);
+        let text = container_text(&bot, None);
         assert!(text.contains("**Bot CPU:** `25.0%`"), "{text}");
         assert!(
             text.contains("**Bot memory (real program use):** `900 B / no limit`"),
@@ -1222,15 +1418,40 @@ mod presentation_tests {
             }),
             cpu_tenths: None,
         };
-        let text = stats_with_container_use("stats".into(), &sample, Some(&sample), Some("api 7"));
+        let text = container_text(&sample, Some(&sample));
         assert!(
-            text.contains("`4.0 KiB / no limit (includes page cache)`"),
+            text.contains(
+                "**Bot memory (real program use):** `4.0 KiB / no limit (includes page cache)`"
+            ),
             "{text}"
         );
         assert!(
-            text.contains("`4.0 KiB / no limit (includes page cache) (api 7)`"),
+            text.contains(
+                "**API memory (real program use):** `4.0 KiB / no limit (includes page cache)`"
+            ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn unreported_memory_is_named_and_the_api_copy_is_not_shown() {
+        let no_memory = crate::cgroup::ContainerSample {
+            memory: None,
+            cpu_tenths: Some(3),
+        };
+        let embed = stats_with_container_use(
+            stats_embed(0, Some(0), 0, 0, Some(&[]), 0),
+            &no_memory,
+            Some(&no_memory),
+        );
+        let text = field(&embed, "Container use").value.clone();
+        assert_eq!(
+            text,
+            "**Bot CPU:** `0.3%`\n**Bot memory (real program use):** `not reported by host`\n**API CPU:** `0.3%`\n**API memory (real program use):** `not reported by host`"
+        );
+        let all = format!("{embed:?}");
+        assert!(!all.contains("unavailable"), "{all}");
+        assert!(!all.contains("pid"), "{all}");
     }
 
     #[test]
@@ -1243,7 +1464,7 @@ mod presentation_tests {
             }),
             cpu_tenths: None,
         };
-        let text = stats_with_container_use("stats".into(), &bot, None, None);
+        let text = container_text(&bot, None);
         assert!(text.contains("**Bot CPU:** `unavailable`"), "{text}");
         assert!(
             text.contains("**Bot memory (real program use):** `4.0 KiB / 8.0 KiB`"),
@@ -1272,10 +1493,10 @@ mod presentation_tests {
             memory: reading.memory,
             cpu_tenths: None,
         };
-        let text = stats_with_container_use("stats".into(), &sample, None, None);
+        let text = container_text(&sample, None);
         assert!(text.contains("**Bot CPU:** `unavailable`"), "{text}");
         assert!(
-            text.contains("**Bot memory (real program use):** `unavailable`"),
+            text.contains("**Bot memory (real program use):** `not reported by host`"),
             "{text}"
         );
         assert!(!text.contains("0.0%"), "{text}");
