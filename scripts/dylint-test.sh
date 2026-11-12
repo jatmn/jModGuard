@@ -145,6 +145,13 @@ set -euo pipefail
 case "$*" in
   'component list --toolchain nightly-2026-08-20')
     state="${DYLINT_TEST_TOOLCHAIN_STATE:-}"
+    # Like rustup, auto-install a missing toolchain without the requested
+    # components unless RUSTUP_AUTO_INSTALL=0 disables it.
+    if [ -n "$state" ] && [ ! -f "$state" ] && [ "${RUSTUP_AUTO_INSTALL:-1}" != 0 ]; then
+      echo 'warn: the missing active toolchain has been auto-installed' >&2
+      echo auto-installed >"$state"
+      exit 0
+    fi
     [ -n "$state" ] && [ -f "$state" ] || exit 1
     if [ "${DYLINT_TEST_PARTIAL_COMPONENTS:-0}" = 1 ]; then
       printf '%s\n' 'llvm-tools-x86_64-unknown-linux-gnu (installed)'
@@ -376,6 +383,8 @@ sed '/^mapfile -t library_tags/,$d' "$fixture/project/scripts/dylint.sh" > "$fix
   # shellcheck source=/dev/null
   source "$fixture/setup-functions.sh"
   ensure_dylint_toolchain
+  ! grep -Fxq auto-installed "$DYLINT_TEST_TOOLCHAIN_STATE" \
+    || fail 'component check auto-installed the missing nightly'
   jmodguard_dylint_lib_key dylint.toml "$fixture/provisioned-key"
   grep -Fq 'toolchain=nightly-2026-08-20 abcdefabcdefabcdefabcdefabcdefabcdefabcd' "$fixture/provisioned-key" \
     || fail 'provisioning did not produce the installed compiler identity'
