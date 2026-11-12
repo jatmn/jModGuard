@@ -4,7 +4,7 @@ use crate::{
     bot_actions::Action,
     db::{self, BotAction, Db},
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use serenity::model::{
     id::{ChannelId, GuildId, UserId},
     permissions::Permissions,
@@ -116,6 +116,11 @@ pub trait DiscordActions: Send + Sync {
         Ok(None)
     }
     async fn authorized(&self, job: &BotAction) -> Result<bool>;
+    /// The actor's current Discord role IDs, empty while timed out. Only used
+    /// when [`Self::authorized`] denies a log-channel change.
+    async fn actor_roles(&self, _job: &BotAction) -> Result<Vec<i64>> {
+        Ok(Vec::new())
+    }
     async fn valid_log_channel(&self, guild: i64, channel: i64) -> Result<bool>;
     async fn unban(&self, guild: i64, user: i64, reason: &str) -> Outcome;
 }
@@ -161,6 +166,26 @@ impl DiscordActions for LiveDiscord<'_> {
             .get_member(guild.id, UserId::new(job.actor_id as u64))
             .await?;
         Ok(actor_authorized(&guild, &member, &job.action))
+    }
+    async fn actor_roles(&self, job: &BotAction) -> Result<Vec<i64>> {
+        let member = self
+            .http
+            .get_member(
+                GuildId::new(job.guild_id as u64),
+                UserId::new(job.actor_id as u64),
+            )
+            .await?;
+        if member
+            .communication_disabled_until
+            .is_some_and(|until| until > serenity::model::Timestamp::now())
+        {
+            return Ok(Vec::new());
+        }
+        Ok(member
+            .roles
+            .iter()
+            .filter_map(|role| i64::try_from(role.get()).ok())
+            .collect())
     }
     async fn valid_log_channel(&self, guild: i64, channel: i64) -> Result<bool> {
         let channel = self
@@ -215,6 +240,35 @@ fn actor_authorized(
         return false;
     }
     permissions.contains(needed)
+}
+
+/// A Web UI access role mapped to the settings level may change log channels.
+/// Unban and member sync keep their Discord permission requirement.
+async fn settings_role_authorized(
+    tenant: Option<&crate::tenant::TenantRuntime>,
+    discord: &impl DiscordActions,
+    job: &BotAction,
+) -> Result<bool> {
+    if !matches!(job.action, Action::SetLogChannel { .. }) {
+        return Ok(false);
+    }
+    let Some(tenant) = tenant else {
+        return Ok(false);
+    };
+    let roles = discord.actor_roles(job).await?;
+    if roles.is_empty() {
+        return Ok(false);
+    }
+    let enrollment = db::GuildEnrollment {
+        guild_id: job.guild_id,
+        id: job
+            .enrollment_id
+            .clone()
+            .context("action has no enrollment")?,
+        joined_at_ns: job.joined_at_ns.context("action has no enrollment")?,
+    };
+    let mapped = db::settings_access_roles(tenant, enrollment).await?;
+    Ok(roles.iter().any(|role| mapped.contains(role)))
 }
 
 fn classify_unban_response(status: u16, code: isize) -> Outcome {
@@ -349,7 +403,11 @@ async fn execute_inner(
         }
         match discord.authorized(job).await {
             Ok(true) => {}
-            Ok(false) => return Outcome::failed("permission_revoked"),
+            Ok(false) => match settings_role_authorized(tenant, discord, job).await {
+                Ok(true) => {}
+                Ok(false) => return Outcome::failed("permission_revoked"),
+                Err(_) => return Outcome::failed("permission_check_unavailable"),
+            },
             Err(_) => return Outcome::failed("permission_check_unavailable"),
         }
         if chrono::Utc::now().timestamp() >= job.expires_at {

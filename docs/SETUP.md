@@ -233,8 +233,9 @@ journalctl -u jmodguard-bot -u jmodguard-api -f    # logs
 
 1. Browse to `http://localhost:8080` (or your remote host).
 2. **Login with Discord** → authorize.
-3. Only servers where you have **Manage Server** permission appear in the
-   dropdown.
+3. Servers where you have **Manage Server** permission appear in the
+   dropdown, plus any server whose admins gave one of your roles
+   [Web UI access](WEBUI.md#access-by-discord-role).
 
 > **Security:** the WebUI binds to `127.0.0.1` by default. If you expose it
 > over the internet, put a reverse proxy (nginx/Caddy) in front with HTTPS,

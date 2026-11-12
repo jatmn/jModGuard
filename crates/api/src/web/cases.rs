@@ -1,6 +1,6 @@
 //! Private selected-case and evidence administration for an enrolled guild.
 use super::state::ApiState;
-use super::{ApiError, ApiResult, AuthCtx, authorize_manage_guild};
+use super::{ApiError, ApiResult, AuthCtx, GuildAccess, authorize_guild};
 use crate::db::guild_data::CaseId;
 use crate::tenant::{self, TenantError};
 use axum::Json;
@@ -37,8 +37,9 @@ async fn scoped(
     session: &Session,
     headers: &HeaderMap,
     guild_id: u64,
+    need: GuildAccess,
 ) -> ApiResult<(AuthCtx, crate::db::GuildEnrollment)> {
-    let auth = authorize_manage_guild(app, session, guild_id).await?;
+    let auth = authorize_guild(app, session, guild_id, need).await?;
     super::check_page_enrollment(&auth, guild_id, headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
     Ok((auth, enrollment))
@@ -93,7 +94,8 @@ async fn list_cases_inner(
     guild_id: u64,
     page: CasePage,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (auth, enrollment) = scoped(app, session, headers, guild_id).await?;
+    let (auth, enrollment) =
+        scoped(app, session, headers, guild_id, GuildAccess::Dashboard).await?;
     let (store, scope) = live(app, enrollment).await?;
     let after = match page.after.as_deref() {
         Some(id) => Some(parse_case_id(id)?),
@@ -139,7 +141,8 @@ pub async fn get_case(
     headers: HeaderMap,
     Path((guild_id, case_id)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (auth, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (auth, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
     let (store, scope) = live(&app, enrollment).await?;
     let id = parse_case_id(&case_id)?;
     let Some(data) = store
@@ -162,7 +165,8 @@ pub async fn list_history(
     Path((guild_id, case_id)): Path<(u64, String)>,
     Query(page): Query<CasePage>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (_, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (_, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
     let (store, scope) = live(&app, enrollment).await?;
     let case = parse_case_id(&case_id)?;
     let after = page.after.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
@@ -207,7 +211,8 @@ pub async fn add_note(
     Path((guild_id, case_id)): Path<(u64, String)>,
     Json(body): Json<NoteBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (auth, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (auth, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Manage).await?;
     let scope = crate::db::ConfigurationScope::Guild(enrollment.clone()).to_wire();
     let _ = live(&app, enrollment).await?;
     let text = body.text.trim();
@@ -237,7 +242,8 @@ pub async fn delete_case(
     headers: HeaderMap,
     Path((guild_id, case_id)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (auth, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (auth, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Manage).await?;
     if !can_delete_cases(&auth, guild_id) {
         return Err(ApiError(anyhow::anyhow!(
             "you cannot remove cases in this server (needs Administrator permission or server ownership)"
@@ -258,7 +264,8 @@ pub async fn list_evidence(
     headers: HeaderMap,
     Path((guild_id, case_id)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (_, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (_, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
     let (store, scope) = live(&app, enrollment).await?;
     let items = store
         .case_evidence_index(scope, parse_case_id(&case_id)?, tenant::evidence_limits())
@@ -281,7 +288,8 @@ pub async fn get_evidence(
     headers: HeaderMap,
     Path((guild_id, case_id, evidence_id)): Path<(u64, String, String)>,
 ) -> ApiResult<Response> {
-    let (_, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (_, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
     let Some((_, bytes)) = app
         .tenant
         .read_available_evidence(
@@ -307,7 +315,8 @@ pub async fn get_case_delete_roles(
     headers: HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (auth, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (auth, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
     let (store, scope) = live(&app, enrollment).await?;
     let settings = store.tenant_settings(scope).await?;
     Ok(Json(serde_json::json!({
@@ -325,7 +334,8 @@ pub async fn put_case_delete_roles(
     Path(guild_id): Path<u64>,
     Json(body): Json<CaseDeleteRolesBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (auth, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (auth, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Manage).await?;
     if !can_delete_cases(&auth, guild_id) {
         return Err(ApiError(anyhow::anyhow!(
             "you cannot change case-removal roles (needs Administrator permission or server ownership)"

@@ -1,7 +1,7 @@
 //! Captured-enrollment member directory reads and administrator sync controls.
 use super::api;
 use super::state::ApiState;
-use super::{ApiError, ApiResult, AuthCtx, authorize_manage_guild};
+use super::{ApiError, ApiResult, AuthCtx, GuildAccess, authorize_guild};
 use crate::bot_actions::{Action, MemberSyncOperation};
 use crate::db;
 use crate::db::guild_data::{
@@ -45,8 +45,9 @@ async fn scoped(
     session: &Session,
     headers: &HeaderMap,
     guild_id: u64,
+    need: GuildAccess,
 ) -> ApiResult<(AuthCtx, db::GuildEnrollment)> {
-    let auth = authorize_manage_guild(app, session, guild_id).await?;
+    let auth = authorize_guild(app, session, guild_id, need).await?;
     super::check_page_enrollment(&auth, guild_id, headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
     Ok((auth, enrollment))
@@ -126,7 +127,8 @@ pub async fn list_members(
     Path(guild_id): Path<u64>,
     Query(query): Query<MembersQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (_, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (_, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
     let (store, scope) = app.tenant.live(enrollment).await?;
     let q = query.q.map(|value| value.trim().to_owned());
     if q.as_ref()
@@ -172,7 +174,8 @@ pub async fn get_member(
     headers: HeaderMap,
     Path((guild_id, user_id)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (_, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (_, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
     let (store, scope) = app.tenant.live(enrollment).await?;
     let member = store
         .get_member(scope, parse_user_id(&user_id)?)
@@ -188,7 +191,8 @@ pub async fn member_history(
     Path((guild_id, user_id)): Path<(u64, String)>,
     Query(query): Query<HistoryQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (_, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (_, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
     if query.after.as_ref().is_some_and(|value| value.len() > 128) {
         return Err(ApiError(anyhow::anyhow!("cursor is too long")));
     }
@@ -210,7 +214,8 @@ pub async fn sync_status(
     headers: HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (_, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (_, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
     let (store, scope) = app.tenant.live(enrollment).await?;
     let bot_id = member_sync_bot_id(&store, scope.clone()).await?;
     let status = store
@@ -226,7 +231,8 @@ pub async fn sync_action(
     Path(guild_id): Path<u64>,
     Json(body): Json<SyncActionBody>,
 ) -> ApiResult<Response> {
-    let (auth, enrollment) = scoped(&app, &session, &headers, guild_id).await?;
+    let (auth, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Manage).await?;
     let (store, scope) = app.tenant.live(enrollment).await?;
     let bot_id = member_sync_bot_id(&store, scope.clone()).await?;
     let status = store

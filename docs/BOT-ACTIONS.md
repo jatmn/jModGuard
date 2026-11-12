@@ -121,7 +121,8 @@ persist that receipt.
 After that check, the executor consumes the immutable claim on the primary before any
 dispatch-capable operation. A copied/stale/modified claim cannot begin again. It then
 fetches the acting user's member record and guild roles. Unban requires BAN_MEMBERS; log
-configuration requires MANAGE_GUILD. Guild owner and administrator
+configuration requires MANAGE_GUILD or a role the guild mapped to the `settings`
+[access level](WEBUI.md#access-by-discord-role). Guild owner and administrator
 permissions are honored; installation-owner status grants no dispatch bypass. An active
 member timeout denies either action for non-owner, non-administrator actors, even when
 their roles retain the required permission; authorization resumes after expiry. No OAuth,
