@@ -3054,6 +3054,67 @@ async fn api_migration_wait_keeps_its_start_across_a_failed_control_read() {
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
+/// The API waits only for a migration the bot launcher's built-in restore
+/// would run. A database the bot will not migrate keeps the immediate owner
+/// recovery refusal, without a wait line or a wait start.
+#[tokio::test]
+async fn api_waits_only_for_a_migration_the_bot_would_run() {
+    let root = std::env::temp_dir().join(format!("api-wait-bot-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let stamp = 1_700_000_000;
+    // Recorded update control: the bot is not a legacy baseline.
+    control
+        .running("bot", None, fresh_observation(stamp), stamp)
+        .await
+        .unwrap();
+    let mut api = controller(
+        "api",
+        baked,
+        Registry::ghcr().unwrap(),
+        control.clone(),
+        &root,
+    );
+    let waiting = format!(
+        "INFO waiting for the bot to migrate core schema {} -> {}",
+        db::CORE_SCHEMA_VERSION - 1,
+        db::CORE_SCHEMA_VERSION
+    );
+    for (case, schema, install_bot) in [
+        ("below the bot's migration range", 14, false),
+        ("bot would migrate", db::CORE_SCHEMA_VERSION - 1, false),
+        ("installed bot release", db::CORE_SCHEMA_VERSION - 1, true),
+    ] {
+        if install_bot {
+            set_core_schema(&db, db::CORE_SCHEMA_VERSION).await;
+            let release = release_at("bot", 'c', db::CORE_SCHEMA_VERSION);
+            install_for_outage(&db, &control, &release, stamp).await;
+        }
+        set_core_schema(&db, schema).await;
+        let state = control.component("api").await.unwrap();
+        assert!(state.installed.is_none(), "{case}");
+        let (result, logs) = with_every_warning(api.restore(&state)).await;
+        if case == "bot would migrate" {
+            result.unwrap();
+            assert!(api.core_migration_wait.is_some(), "{case}");
+            assert_eq!(logs, std::slice::from_ref(&waiting), "{case}");
+        } else {
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains("baked application cannot open database; use owner recovery"),
+                "{case}: {error}"
+            );
+            assert!(api.core_migration_wait.is_none(), "{case}");
+            assert!(logs.is_empty(), "{case}: {logs:?}");
+        }
+        assert!(api.running.is_none(), "{case}");
+    }
+    api.stop_application().await.unwrap();
+    drop((api, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
 /// Historical desired rows omit `upgrade`. Migration keeps them queued; the
 /// next updater pass must refuse each one and later passes must leave it.
 #[tokio::test]

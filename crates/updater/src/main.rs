@@ -1706,7 +1706,7 @@ impl Supervisor {
                 let state = self.control.component(&self.role).await?;
                 if baked_restore && !baked_fallback {
                     ensure!(
-                        self.baked_restore_fits(&state, schema).await?,
+                        self.baked_restore_fits(&self.role, &state, schema).await?,
                         "baked application cannot open database; use owner recovery"
                     );
                 } else {
@@ -2157,7 +2157,14 @@ impl Supervisor {
 
     /// Preserve the legacy baseline and uninstalled bot migration exceptions.
     /// Re-evaluate them with fresh state before a built-in restore spawns.
-    async fn baked_restore_fits(&self, state: &db::ComponentUpdate, schema: i64) -> Result<bool> {
+    /// `role` and `state` name the launcher whose built-in restore is judged;
+    /// the API also asks it of the bot's state before waiting for a migration.
+    async fn baked_restore_fits(
+        &self,
+        role: &str,
+        state: &db::ComponentUpdate,
+        schema: i64,
+    ) -> Result<bool> {
         let legacy_baseline = state
             .observed
             .as_ref()
@@ -2168,7 +2175,7 @@ impl Supervisor {
                 .is_none_or(|release| release.upgrade.is_none())
             && self.control.upgrade().await?.is_none();
         if legacy_baseline
-            && ((self.role == "bot" && schema <= self.baked_compatibility.core)
+            && ((role == "bot" && schema <= self.baked_compatibility.core)
                 || schema == self.baked_compatibility.core)
         {
             return Ok(true);
@@ -2178,7 +2185,7 @@ impl Supervisor {
         }
         // A baked bot owns migrations only without managed history or a
         // durable paired operation. The API still requires its exact schema.
-        let baked_migration = self.role == "bot"
+        let baked_migration = role == "bot"
             && (15..=self.baked_compatibility.core).contains(&schema)
             && state.previous.is_none()
             && (state.desired.is_none() || state.state == "queued")
@@ -2196,7 +2203,18 @@ impl Supervisor {
             return self.rollback_independent(state, failed, error).await;
         }
         let schema = self.control.schema_version().await?;
-        let baked_fits = self.baked_restore_fits(state, schema).await?;
+        let baked_fits = self.baked_restore_fits(&self.role, state, schema).await?;
+        // An API with nothing installed waits only while the bot launcher's
+        // built-in restore (same base image) would migrate this older schema.
+        // Any other database keeps the owner recovery refusal below.
+        let bot_migrates = !baked_fits
+            && self.role == "api"
+            && state.installed.is_none()
+            && schema < self.baked_compatibility.core
+            && {
+                let bot = self.control.component("bot").await?;
+                self.baked_restore_fits("bot", &bot, schema).await?
+            };
         // A failed read above keeps the migration wait and its start. Any
         // decision below ends it unless it is still that wait.
         let waiting_since = self.core_migration_wait.take();
@@ -2236,7 +2254,7 @@ impl Supervisor {
             );
             self.start(&path, &release.source_sha, Some(release.clone()))
                 .await?;
-        } else if self.role == "api" && schema < self.baked_compatibility.core {
+        } else if bot_migrates {
             // The bot launcher migrates first during an ordinary rollout. Keep
             // the maintenance API up and wait without a per-poll warning.
             let core = self.baked_compatibility.core;
