@@ -288,7 +288,6 @@ published_signature_still_valid() {
   fi
   if ! cosign verify \
       --key "$SIGNING_PUBLIC_KEY" \
-      --insecure-ignore-tlog=true \
       "${image}@${digest}" >/dev/null 2>&1; then
     return 1
   fi
@@ -1154,13 +1153,11 @@ sign_published_digest() {
     run_cosign sign \
       --yes \
       --key "$_JMG_SIGNING_KEY_FILE" \
-      --tlog-upload=false \
       -a "io.jmodguard.not-after=${not_after}" \
       "${image}@${digest}"
   ) || publish_fail 'cosign sign failed'
   run_cosign verify \
     --key "$SIGNING_PUBLIC_KEY" \
-    --insecure-ignore-tlog=true \
     "${image}@${digest}" \
     || publish_fail 'cosign verify failed'
 }
