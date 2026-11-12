@@ -230,6 +230,6 @@ restart and rollback recovery, paired incarnation and irreversible-fence tests,
 lease expiry/owner replacement, publication restoration and purge failure,
 alert deduplication, stale usage fallback, command partial effects and persisted
 write-fence assertions. Fixture adapters preserve expected behavior. Serialized
-proofs and lease/alert states remain booleans; launcher capability is 41 while
+proofs and lease/alert states remain booleans; launcher capability is 42 while
 the application minimum remains 7. Provider fixtures do not prove live Bunny or
 Discord behavior.
