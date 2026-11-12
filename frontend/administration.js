@@ -263,8 +263,10 @@ function ComponentCard({ record, revision }) {
   const canApply = !pairActive && ui.getSnapshot().snapshot.apply_enabled && candidateCurrent && !webuiRepacked && compatibility?.installable && (record.component === "webui" ? ui.getSnapshot().snapshot.webui_storage_configured : Boolean(observed?.self_update_enabled));
   const candidatePending = applicationPending(record) && record.desired?.digest === record.candidate?.digest;
   // WebUI keeps a same-digest publication available to repair Storage unless its card shows Up to date.
+  // A service with a problem or a pending request for another digest stays updatable so the owner can retry or supersede it.
+  const supersedable = applicationPending(record) && record.desired?.digest !== record.candidate?.digest;
   const applicationCurrent = record.component === "webui" ? availability === "up to date" && !problem
-    : record.installed?.digest === record.candidate?.digest || availability === "up to date";
+    : record.installed?.digest === record.candidate?.digest || (availability === "up to date" && !problem && !supersedable);
   const help = !ui.getSnapshot().snapshot.apply_enabled ? "On-demand installation is disabled for this deployment."
     : record.component === "webui" ? !ui.getSnapshot().snapshot.webui_storage_configured ? "Configure WebUI Storage to enable installation." : ""
     : !observed?.self_update_enabled ? "Self-update is not enabled or the running component could not be verified." : "";

@@ -262,6 +262,27 @@ test("a directly deployed bot or API on the available source is up to date and c
   }
 });
 
+test("a directly deployed bot or API on the available source stays updatable while pending or failed", () => {
+  for (const component of ["bot", "api"]) {
+    const view = page();
+    const queued = record(component);
+    queued.candidate.source_sha = queued.observed.source_sha;
+    // The owner can supersede a queued request for another digest.
+    queued.state = "queued";
+    queued.desired = { ...queued.candidate, digest: "sha256:" + "e".repeat(64) };
+    render(view, queued);
+    assert.equal(cardParts(view, component).badge, "↻Update pending", component);
+    assert.equal(updateButton(view, component).disabled, false, component);
+
+    const failed = record(component);
+    failed.candidate.source_sha = failed.observed.source_sha;
+    failed.state = "failed";
+    render(view, failed);
+    assert.equal(cardParts(view, component).badge, "!Needs attention", component);
+    assert.equal(updateButton(view, component).disabled, false, component);
+  }
+});
+
 test("owner update badges keep real and unknown service updates distinct from current releases", () => {
   const view = page();
   const bot = record("bot");
