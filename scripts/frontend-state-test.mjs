@@ -293,7 +293,7 @@ for (const completed of [false, true]) test(`Members reads status after success 
   syncReads()[0].resolve(response({ run_id: 'run', status: 'running', phase: 'members', progress_revision: 10 }));
   requests.find(r => r.url.includes('/members?')).resolve(response({ members: [] }));
   await flushMembers();
-  const click = fire(findNode(panel, n => n.textContent === 'Pause'), 'click', {});
+  const click = fire(findNode(panel, n => n.localName === 'button' && n.textContent === 'Pause'), 'click', {});
   requests.find(r => r.url.endsWith('/member-sync/actions')).resolve(response(queuedAction('pending')));
   await click;
   // This primary read began before the worker completed; its old status is legitimate.
@@ -303,13 +303,13 @@ for (const completed of [false, true]) test(`Members reads status after success 
   await flushMembers();
   assert.equal(syncReads().length, 3, 'success must issue a fresh status request');
   assert.match(textOf(panel), /Waiting for the import status to reflect it/);
-  assert.equal(findNode(panel, n => n.textContent === 'Pause').disabled, true);
+  assert.equal(findNode(panel, n => n.localName === 'button' && n.textContent === 'Pause').disabled, true);
   assert.equal([...timers.active.values()].filter(t => t.delay === 10000).length, 0, 'the causal status read is already in flight; no parallel poll');
   // A completed-import no-op succeeds without incrementing progress_revision.
   syncReads()[2].resolve(response({ run_id: 'run', status: completed ? 'complete' : 'paused', phase: completed ? 'complete' : 'members', progress_revision: completed ? 10 : 11 }));
   await flushMembers();
   assert.doesNotMatch(textOf(panel), /Waiting for the import status to reflect it/);
-  assert.match(textOf(panel), completed ? /complete · complete/ : /members · paused/);
+  assert.equal(textOf(findNode(panel, n => n.getAttribute?.('role') === 'status')), completed ? 'Complete' : 'PausedStage: Members');
   assert.equal([...timers.active.values()].filter(t => t.delay === 10000).length, 0);
   for (const request of requests) assert.equal(request.opts.headers['x-jmodguard-enrollment'], 'membership');
 });
@@ -327,10 +327,10 @@ for (const code of ['member_sync_missing_job', 'member_sync_invalid_operation'])
   });
   const panel = memberView(h);
   await flushMembers();
-  await fire(findNode(panel, n => n.textContent === 'Pause'), 'click', {});
+  await fire(findNode(panel, n => n.localName === 'button' && n.textContent === 'Pause'), 'click', {});
   await flushMembers();
   assert.ok(textOf(panel).includes(message), `expected panel text to include: ${message}`);
-  assert.equal(findNode(panel, n => n.textContent === 'Pause').disabled, true);
+  assert.equal(findNode(panel, n => n.localName === 'button' && n.textContent === 'Pause'), null, 'the refreshed state no longer offers Pause');
   assert.equal(calls.filter(c => c.url.endsWith('/member-sync')).length, 2);
   assert.equal(calls.filter(c => c.url.endsWith('/member-sync/actions')).length, 1);
   assert.equal(h.session.size, 1, 'denial must preserve the submitted request identity');
@@ -373,15 +373,16 @@ test('Members empty copy follows status completion without refetching the direct
   const h = harness(async url => { calls.push(url); return response(url.endsWith('/member-sync') ? sync : { members: [] }); }, new Map(), new Map(), undefined, timers);
   const panel = memberView(h);
   await flushMembers();
-  assert.match(textOf(panel.querySelector('tbody')), /Import may still be incomplete/);
+  const membersBody = () => [...panel.querySelectorAll('tbody')].at(-1);
+  assert.match(textOf(membersBody()), /Import may still be incomplete/);
   const [id, poll] = [...timers.active].find(([, timer]) => timer.delay === 10000);
   timers.active.delete(id);
   sync = { run_id: 'run', status: 'complete', phase: 'complete', progress_revision: 2 };
   h.advanceTime(poll.delay);
   await poll.fn();
   await settle();
-  assert.match(textOf(panel), /complete · complete/);
-  assert.equal(textOf(panel.querySelector('tbody')), 'No members match these filters.');
+  assert.equal(textOf(findNode(panel, n => n.getAttribute?.('role') === 'status')), 'Complete');
+  assert.equal(textOf(membersBody()), 'No members match these filters.');
   assert.equal(calls.filter(url => url.includes('/members?')).length, 1);
 });
 
@@ -756,11 +757,16 @@ test('Members keeps completed phases done while local case history finishes and 
   const panel = h.app.tabMembers();
   await settle();
   const copy = textOf(panel);
-  assert.match(copy, /Members: done · 20 committed/);
-  assert.match(copy, /Current bans: done · 3 committed/);
-  assert.match(copy, /Candidate checks: done · 1 committed/);
-  assert.match(copy, /Available audit history: done · 2 committed/);
-  assert.match(copy, /Local case history: waiting/);
+  const card = findNode(panel, n => n.getAttribute?.('aria-label') === 'Member import status');
+  assert.deepEqual([...card.querySelectorAll('tbody tr')].map(row => [...row.cells].map(cell => textOf(cell))), [
+    ['Members', 'Done', '20'],
+    ['Current bans', 'Done', '3'],
+    ['Candidate checks', 'Done', '1'],
+    ['Available audit history', 'Done', '2'],
+    ['Local case history', 'Waiting', 'Unknown'],
+    ['Total', '24 records committed in this run · 20 members counted'],
+  ]);
+  assert.equal(textOf(findNode(card, n => n.getAttribute?.('role') === 'status')), 'WaitingStage: Local case historyfinishing local case history');
   assert.doesNotMatch(copy, /100% complete/);
   const bar = findNode(panel, n => n.localName === 'progress');
   assert.equal(bar.getAttribute("value"), null);
@@ -777,7 +783,8 @@ test('Members shows an unknown ETA without calling an unconfirmed paced worker o
   await settle();
   const copy = textOf(panel);
   assert.match(copy, /80 members counted/);
-  assert.match(copy, /Current bans: queued · committed count unknown/);
+  const bans = [...panel.querySelectorAll('tbody tr')].find(row => textOf(row.cells[0]) === 'Current bans');
+  assert.deepEqual([...bans.cells].map(cell => textOf(cell)), ['Current bans', 'Queued', 'Unknown']);
   assert.match(copy, /Remaining: Unknown until worker activity is confirmed · Expected finish: Unknown/);
   assert.match(copy, /bot may be between paced pages/);
   assert.doesNotMatch(copy, /worker is offline/i);
@@ -802,21 +809,22 @@ test('Members keeps controls unavailable until a real first job exists and after
   const panel = h.app.tabMembers();
   await settle();
   const controls = () => ['Pause', 'Resume', 'Retry', 'Reconcile from Discord']
-    .map(label => findNode(panel, n => n.localName === 'button' && textOf(n) === label));
+    .map(label => findNode(panel, n => n.localName === 'button' && textOf(n) === label)).filter(Boolean);
   assert.match(textOf(panel), /bot will create the first import job when it is online/);
-  assert(controls().every(button => button.disabled));
+  assert.deepEqual(controls().map(button => [textOf(button), button.disabled]), [['Pause', true]]);
   await fire(controls()[0], 'click');
   assert.equal(actionPosts, 0, 'even a stale programmatic click cannot submit without a job');
   const refresh = findNode(panel, n => n.localName === 'button' && textOf(n) === 'Refresh');
   fire(refresh, 'click');
   await settle();
   assert.match(textOf(panel), /Import metadata is unavailable. Controls are disabled/);
-  assert(controls().every(button => button.disabled));
-  await fire(controls()[2], 'click');
+  assert.deepEqual(controls().map(button => [textOf(button), button.disabled]), [['Retry', true]]);
+  await fire(controls()[0], 'click');
   assert.equal(actionPosts, 0);
   fire(refresh, 'click');
   await settle();
-  assert.equal(controls()[0].disabled, false, 'Pause becomes available once the first run exists');
+  assert.deepEqual(controls().map(button => [textOf(button), button.disabled]), [['Pause', false]],
+    'Pause becomes available once the first run exists');
 });
 
 test('Members enables Retry when audit recovery pagination stalls after initial complete', async () => {
@@ -841,7 +849,7 @@ test('Members enables Retry when audit recovery pagination stalls after initial 
   assert.equal(reconcile.disabled, false);
 });
 
-test('Members keeps Retry disabled after initial complete when audit recovery is healthy', async () => {
+test('Members omits Retry after initial complete when audit recovery is healthy', async () => {
   const h = harness(async (url) => url.endsWith('/member-sync')
     ? response({
       status: 'complete',
@@ -856,8 +864,65 @@ test('Members keeps Retry disabled after initial complete when audit recovery is
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
   await settle();
-  const retry = findNode(panel, n => n.localName === 'button' && textOf(n) === 'Retry');
-  assert.equal(retry.disabled, true);
+  assert.equal(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Retry'), null);
+  assert.equal(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Reconcile from Discord').disabled, false);
+});
+
+test('Members lays out a finished import with one status, phase rows, a fixed duration, and only valid controls', async () => {
+  const asOf = 1790000000000;
+  const finishedAt = asOf - 41 * 86400000;
+  const statusReadsAsOf = [asOf, asOf + 86400000];
+  let statusReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) return response({
+      status: 'complete', phase: 'complete', run_kind: 'initial', run_id: 'initial-done', progress_revision: 40,
+      processed: 10749, member_processed: 10539, ban_processed: 192, verify_processed: 0, audit_processed: 18,
+      local_history_complete: true, total_estimate: 10539, total_is_estimated: false, percent: 100,
+      started_at: finishedAt - 2 * 3600000, initial_completed_at: finishedAt, last_success_at: finishedAt,
+      last_success_processed: 10749, last_progress_at: finishedAt, as_of: statusReadsAsOf[statusReads++],
+    });
+    if (url.includes('/history')) return response({ entries: [], next_cursor: null });
+    return response({ members: [{ user_id: '10002', display_name: 'Test Member 1', is_current: true }], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const panel = h.app.tabMembers();
+  await settle();
+  const card = findNode(panel, n => n.getAttribute?.('aria-label') === 'Member import status');
+  const body = [...card.children];
+  assert.deepEqual(body.map(n => n.className), ['card-body'], 'status content sits inside card-body');
+  const copy = textOf(card);
+  assert.equal(textOf(findNode(card, n => n.getAttribute?.('role') === 'status')), 'Complete');
+  assert.doesNotMatch(copy, /complete · complete/i);
+  const rows = [...card.querySelectorAll('tbody tr')].map(row => [...row.cells].map(cell => textOf(cell)));
+  assert.deepEqual(rows, [
+    ['Members', 'Done', '10,539'],
+    ['Current bans', 'Done', '192'],
+    ['Candidate checks', 'Done', '0'],
+    ['Available audit history', 'Done', '18'],
+    ['Local case history', 'Done', 'Unknown'],
+    ['Total', '10,749 records committed in this run · 10,539 members counted · 100% complete'],
+  ]);
+  assert.match(copy, /Took 120 minutes/);
+  assert.doesNotMatch(copy, /Elapsed|Remaining|Expected finish/);
+  assert.deepEqual([...card.querySelectorAll('dt')].map(textOf),
+    ['Initial import completed', 'Last successful run', 'Last committed progress', 'Status read at']);
+  const buttons = () => [...card.querySelectorAll('button')].map(textOf);
+  assert.deepEqual(buttons(), ['Reconcile from Discord']);
+  const statusCard = () => findNode(panel, n => n.getAttribute?.('aria-label') === 'Member import status');
+  const readAt = () => textOf(findNode(statusCard(), n => n.localName === 'dt' && textOf(n) === 'Status read at').nextElementSibling);
+  const firstReadAt = readAt();
+  h.advanceTime(86400000);
+  fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Refresh'), 'click');
+  await settle();
+  assert.equal(statusReads, 2, 'Refresh reads the status again');
+  assert.notEqual(readAt(), firstReadAt, 'the card renders the later server read');
+  assert.match(textOf(statusCard()), /Took 120 minutes/, 'a finished run keeps its duration');
+  assert.equal(findNode(panel, n => n.getAttribute?.('aria-label') === 'Member history'), null, 'no empty history card');
+  fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'View history'), 'click');
+  await settle();
+  const history = findNode(panel, n => n.getAttribute?.('aria-label') === 'Member history');
+  assert.deepEqual([...history.children].map(n => n.className), ['card-body']);
 });
 
 test('Members shows a live rate-limit countdown, separate progress time, and a prior successful run', async () => {
@@ -888,8 +953,8 @@ test('Members shows a live rate-limit countdown, separate progress time, and a p
   assert.match(copy, /Rate limit: retry in 1m 30s/);
   assert.match(copy, /Remaining: about 4 minutes for this phase · Expected finish: (?!Unknown)/);
   assert.match(copy, /0 records committed in this run/);
-  assert.match(copy, /Last successful run: .*11,000 processed · 10,900 inserted · 50 updated · 50 unchanged/);
-  assert.match(copy, /Last committed progress:/);
+  assert.match(copy, /Last successful run.*11,000 processed · 10,900 inserted · 50 updated · 50 unchanged/);
+  assert.match(copy, /Last committed progress/);
   assert.match(copy, /Status read at/);
   assert.doesNotMatch(copy, /Status updated/);
   const countdown = [...h.timers].find(([, timer]) => timer.delay === 1000);
@@ -4558,7 +4623,7 @@ for (const status of ['paused', 'complete', 'needs_attention']) test(`Members di
   assert.equal(reads, 2, 'visibility performs one fresh read without duplicating an in-flight read');
   finish(response({status: 'running', progress_revision: 2}));
   await settle();
-  assert.match(textOf(panel), /running/);
+  assert.match(textOf(panel), /Running/);
   assert.ok([...h.timers.values()].some(timer => timer.delay === 10000));
 });
 
@@ -4641,7 +4706,7 @@ for (const failure of [503, 429]) test(`Members visibility refresh recovers from
   assert.equal(reads, 2);
   await runMemberPoll(h, failure === 429 ? 115000 : 5000);
   assert.equal(reads, 3);
-  assert.match(textOf(panel), /running/);
+  assert.match(textOf(panel), /Running/);
 });
 
 for (const exit of ['navigation', 'auth loss', 'logout']) test(`Members visibility read ignores a late response after ${exit}`, async () => {
@@ -4666,7 +4731,7 @@ for (const exit of ['navigation', 'auth loss', 'logout']) test(`Members visibili
   visibility(h, 'hidden'); visibility(h, 'visible');
   assert.equal(reads, 2);
   assert.equal([...h.timers.values()].filter(timer => timer.delay >= 10000).length, 0);
-  assert.doesNotMatch(h.nodes.get('#content')?.textContent || '', /running/);
+  assert.doesNotMatch(h.nodes.get('#content')?.textContent || '', /running/i);
 });
 
 for (const failure of [false, true]) test(`Members preserves a ${failure ? 'rate limit' : 'worker deadline'} received while hidden`, async () => {
@@ -4730,7 +4795,7 @@ test('Members refreshes on visibility after a rejected control leaves an idle st
   assert.equal([...h.timers.values()].filter(timer => timer.delay >= 10000).length, 0);
   visibility(h, 'hidden'); visibility(h, 'visible'); await settle();
   assert.equal(reads, 3, 'an inactive status must not retain an obsolete poll deadline');
-  assert.match(textOf(panel), /running/);
+  assert.match(textOf(panel), /Running/);
 });
 
 
