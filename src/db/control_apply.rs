@@ -298,6 +298,11 @@ pub enum ControlOp {
         revision: String,
         roles: Vec<i64>,
     },
+    SetAccessRoles {
+        scope: ScopeWire,
+        revision: String,
+        roles: Vec<crate::db::guild_data::AccessRole>,
+    },
     CleanupEvidence {
         scope: ScopeWire,
     },
@@ -395,7 +400,9 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         | ControlOp::DeleteTemplate { target, .. }
         | ControlOp::PutLogFilter { target, .. } => scope_actor_need(target),
         ControlOp::CopyGuildConfig { destination, .. } => scope_actor_need(destination),
-        ControlOp::AppendCaseNote { scope, .. } => ControlActorNeed::ManageGuild(scope.guild_id),
+        ControlOp::AppendCaseNote { scope, .. } | ControlOp::SetAccessRoles { scope, .. } => {
+            ControlActorNeed::ManageGuild(scope.guild_id)
+        }
         ControlOp::RemoveCase { scope, .. }
         | ControlOp::SetCaseDeleteRoles { scope, .. }
         | ControlOp::CleanupEvidence { scope } => ControlActorNeed::GuildAdmin(scope.guild_id),
@@ -490,6 +497,82 @@ pub fn control_actor_needs(op: &ControlOp) -> Vec<ControlActorNeed> {
         } => pair_needs(scope_actor_need(request), scope_actor_need(target)),
         other => vec![control_actor_need(other)],
     }
+}
+
+/// The single guild scope of a configuration op that a Web UI access role
+/// mapped to the settings level may also perform. Command, copy, case,
+/// access-role and queue ops never qualify, and neither does any op that touches global scope
+/// or a second guild.
+pub fn settings_role_scope(op: &ControlOp) -> Option<&ScopeWire> {
+    let (request, target) = match op {
+        ControlOp::PatchSettings { scope, .. }
+        | ControlOp::AddKnownBadImage { scope, .. }
+        | ControlOp::RemoveKnownBadImage { scope, .. } => (scope, scope),
+        ControlOp::UpsertRule {
+            request, target, ..
+        }
+        | ControlOp::DeleteRule {
+            request, target, ..
+        }
+        | ControlOp::AddKnownSpam {
+            request, target, ..
+        }
+        | ControlOp::DeleteKnownSpam {
+            request, target, ..
+        }
+        | ControlOp::AddBadword {
+            request, target, ..
+        }
+        | ControlOp::AddBadwords {
+            request, target, ..
+        }
+        | ControlOp::DeleteBadword {
+            request, target, ..
+        }
+        | ControlOp::UpsertTemplate {
+            request, target, ..
+        }
+        | ControlOp::DeleteTemplate {
+            request, target, ..
+        }
+        | ControlOp::PutLogFilter {
+            request, target, ..
+        } => (request, target),
+        // Command plans can grant roles and run moderation actions through the
+        // bot, so command edits stay with Manage Server.
+        _ => return None,
+    };
+    let same = request.guild_id == target.guild_id
+        && request.enrollment_id == target.enrollment_id
+        && request.joined_at_ns == target.joined_at_ns;
+    (!request.global && !target.global && request.guild_id > 0 && same).then_some(target)
+}
+
+/// Discord role IDs this captured guild membership maps to the settings level.
+pub async fn settings_access_roles(
+    tenant: &TenantRuntime,
+    enrollment: GuildEnrollment,
+) -> Result<Vec<i64>> {
+    let scope = tenant.scope(enrollment).await?;
+    let store = tenant.store(&scope).await?;
+    let settings = store.tenant_settings(scope).await?;
+    Ok(settings
+        .access_roles
+        .into_iter()
+        .filter(|role| role.level >= crate::db::guild_data::AccessLevel::Settings)
+        .map(|role| role.role_id)
+        .collect())
+}
+
+/// [`settings_access_roles`] for the scope returned by [`settings_role_scope`].
+pub async fn settings_access_roles_for(
+    tenant: &TenantRuntime,
+    scope: &ScopeWire,
+) -> Result<Vec<i64>> {
+    let ConfigurationScope::Guild(enrollment) = scope_of(scope.clone())? else {
+        return Err(EnrollmentChanged.into());
+    };
+    settings_access_roles(tenant, enrollment).await
 }
 
 fn pair_needs(first: ControlActorNeed, second: ControlActorNeed) -> Vec<ControlActorNeed> {
@@ -1050,6 +1133,19 @@ async fn apply_control_inner(
             saved_value(
                 store
                     .set_case_delete_roles(scope, &revision, roles)
+                    .await
+                    .map_err(as_enrollment)?,
+            )
+        }
+        ControlOp::SetAccessRoles {
+            scope,
+            revision,
+            roles,
+        } => {
+            let (store, scope) = captured_guild(tenant, scope).await.map_err(as_enrollment)?;
+            saved_value(
+                store
+                    .set_access_roles(scope, &revision, roles)
                     .await
                     .map_err(as_enrollment)?,
             )

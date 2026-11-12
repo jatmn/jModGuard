@@ -265,6 +265,7 @@ fn is_preview_post_read(path: &str) -> bool {
             Some(
                 "config"
                     | "case-delete-roles"
+                    | "access-roles"
                     | "actions"
                     | "events"
                     | "bans"
@@ -321,6 +322,7 @@ mod tests {
             "/api/me",
             "/api/guilds/10/config",
             "/api/guilds/10/case-delete-roles",
+            "/api/guilds/10/access-roles",
             "/api/guilds/10/actions",
             "/api/guilds/10/events",
             "/api/guilds/10/bans",

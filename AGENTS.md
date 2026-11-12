@@ -109,7 +109,7 @@ entire configuration bundle. Complete tenant isolation and replica coordination 
 The guild-store catalog and `TenantRuntime` now route live isolated tenant data for the
 bot and API; see `docs/TENANT-RUNTIME.md` and `docs/GUILD-STORES.md`. Catalog rows remain
 nonsecret. Credentials stay in process configuration. Never run core migrations/defaults on a guild
-store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 18. Ban recovery uses immutable opaque attempt tags,
+store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 19. Ban recovery uses immutable opaque attempt tags,
 never reason-text equality. Keep tags out of case API JSON and human reasons. Identity,
 placement and membership checks share the data transaction. A successful snapshot check
 never authorizes a later write.
@@ -370,6 +370,14 @@ authorize live provider calls or require a Codex skill to contribute.
   list. Any secondary Discord guild check (e.g. `copy_config` source) must use
   `authorize_manage_guild` / `require_auth_fresh` — never `auth.can_manage`
   on that context.
+- WebUI access roles (`guild_tenant_settings.access_roles`) map Discord roles to
+  `dashboard` (read-only) or `settings` for one guild. `guild_scope` stays Manage
+  Server; a route opts a lower level in with `guild_scope_at` / `authorize_guild`.
+  Command edits (plans can grant roles), copy, member-sync actions, case notes,
+  case removal, role mappings, global and owner routes never accept a role level. Roles come from the user's OAuth token
+  (`guilds.members.read`), reused at most `MEMBER_ROLES_TTL`, and fail closed. The
+  bot independently accepts a settings role only for single-guild configuration
+  ops (`settings_role_scope`) and log-channel actions, from its own member data.
 - Badword delete is exact-scope: guild admins delete only their guild's rows;
   global rows require owner. All denials return the same `"badword not found"`
   (never distinguish missing / cross-guild / non-owner global).

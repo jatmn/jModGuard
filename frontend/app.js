@@ -51,6 +51,45 @@ function ActionButton({ onClick, savedFields, disabled, ...props }) {
     onClick: onClick && ((event) => handleEvent(onClick, event, savedFields, group)),
   });
 }
+
+// Hand-authored 24×24 stroke icons for row actions (no icon-library dependency;
+// sized by the .btn-icon rules in frontend/style.css). The accessible name and
+// hover tooltip come from the IconButton label.
+const ICON_PATHS = {
+  edit: ["M17 3l4 4L8 20l-5 1 1-5L17 3z", "M14 6l4 4"],
+  remove: [
+    "M4 7h16",
+    "M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2",
+    "M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13",
+    "M10 11v7",
+    "M14 11v7",
+  ],
+  unban: ["M7 11V7a5 5 0 0 1 9.9-1", "M5 11h14a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2z", "M12 15v2"],
+  cancel: ["M6 6l12 12", "M18 6L6 18"],
+};
+function Icon({ name }) {
+  return h(
+    "svg",
+    {
+      viewBox: "0 0 24 24",
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: 2,
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+      "aria-hidden": "true",
+      focusable: "false",
+    },
+    ICON_PATHS[name].map((d, index) => h("path", { key: index, d })),
+  );
+}
+function IconButton({ icon, label, className = "btn btn-sm btn-square", ...props }) {
+  return h(
+    ActionButton,
+    { className: `${className} btn-icon`, "aria-label": label, title: label, ...props },
+    h(Icon, { name: icon }),
+  );
+}
 function useDraftControl({ draftKey, defaultValue, onChange, ...props }) {
   const group = useContext(DraftGroup);
   const working = useContext(BusyContext);
@@ -197,6 +236,7 @@ function App() {
                     ui.set({ pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
                     pendingCase = null;
                     state.guildId = event.target.value;
+                    if (!tabAllowed(state.tab)) state.tab = "dashboard";
                     state.config = null;
                     ui.set({ edits: "clean" });
                     persistWorkspace();
@@ -206,6 +246,12 @@ function App() {
                 state.guilds.length
                   ? state.guilds.map((guild) => h("option", { key: guild.id, value: guild.id }, guild.name))
                   : h("option", { value: "" }, "No manageable servers"),
+              ),
+              state.me?.role_discovery_incomplete && h("p", { className: "muted", role: "status" },
+                "Some server access checks could not finish. ",
+                h(ActionButton, { className: "btn btn-xs", onClick: async () => {
+                  if (canLeave()) await init();
+                } }, "Retry server discovery"),
               ),
             ),
             h(
@@ -221,6 +267,7 @@ function App() {
                       { key: `group-${i}`, className: "nav-label menu-title" },
                       i === 0 ? "Workspace" : "Community",
                     ),
+                  tabAllowed(tab) &&
                   h(
                     "li",
                     { key: tab },
@@ -277,6 +324,8 @@ function App() {
                 { id: "workspace-status" },
                 isPreview()
                   ? "Preview — changes disabled"
+                  : guildAccess() === "dashboard"
+                    ? "Read-only access"
                   : (display.activity === "busy")
                     ? "Working…"
                     : (display.edits === "dirty")
@@ -414,8 +463,12 @@ function Content() {
   };
   if (!state.guildId)
     return emptyPanel(
-      "No servers to manage yet",
-      "Sign in with an account that has Manage Server permission in a server using jModGuard.",
+      state.me?.role_discovery_incomplete ? "Server discovery incomplete" : "No servers to manage yet",
+      state.me?.role_discovery_incomplete
+        ? "Some server access checks could not finish. Retry to check your servers again."
+        : state.me?.role_scope_missing
+        ? "Sign out and sign in again so jModGuard can check your server roles."
+        : "Sign in with an account that has Manage Server permission, or a role a server admin granted Web UI access, in a server using jModGuard.",
     );
   if (!state.config)
     return emptyPanel(
@@ -434,7 +487,7 @@ function Content() {
         ),
       { role: "status" },
     );
-  return h(components[state.tab] || tabDashboard);
+  return h((tabAllowed(state.tab) && components[state.tab]) || tabDashboard);
 }
 function renderTab() {
   const pending = ui.getSnapshot().pendingDrafts;
@@ -576,7 +629,7 @@ function restoreWorkspace() {
     /* Storage may be unavailable. */
   }
   state.guildId = state.guilds.find((g) => g.id === saved.guildId)?.id || state.guilds[0]?.id || null;
-  state.tab = tabs.includes(saved.tab) ? saved.tab : "dashboard";
+  state.tab = tabs.includes(saved.tab) && tabAllowed(saved.tab) ? saved.tab : "dashboard";
 }
 
 function persistWorkspace() {
@@ -633,7 +686,7 @@ async function handleEvent(handler, event, savedFields, group) {
 function navigate(tab) {
   if (!canLeave()) return false;
   ui.set({ view: "main-view", pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
-  state.tab = tabs.includes(tab) ? tab : "dashboard";
+  state.tab = tabs.includes(tab) && tabAllowed(tab) ? tab : "dashboard";
   persistWorkspace();
   renderTab();
   return true;
@@ -641,6 +694,27 @@ function navigate(tab) {
 
 function isBotOwner() {
   return !!(state.me && state.me.is_bot_owner);
+}
+
+// Web UI access in the selected server: "manage" (owner or Manage Server),
+// or a level a server admin mapped to one of the user's Discord roles. The API
+// enforces every level; hiding controls here is only presentation.
+function guildAccess() {
+  return selectedGuild()?.access || "manage";
+}
+
+function canEditSettings() {
+  return guildAccess() !== "dashboard";
+}
+
+function canManageServer() {
+  return guildAccess() === "manage";
+}
+
+const settingsTabs = ["rules", "badwords", "known-spam", "known-bad-images", "commands", "templates", "logchannels", "settings"];
+
+function tabAllowed(tab) {
+  return canEditSettings() || !settingsTabs.includes(tab);
 }
 
 let previewCapability = { kind: "absent" };
@@ -806,7 +880,7 @@ function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
   const edit = path.match(
-    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|analytics|cases|case-delete-roles)(?:\/|\?|$)/,
+    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|analytics|cases|case-delete-roles|access-roles)(?:\/|\?|$)/,
   );
   if (
     edit &&
@@ -828,6 +902,7 @@ function pageEnrollment(path, method = "GET") {
         "analytics",
         "cases",
         "case-delete-roles",
+        "access-roles",
       ].includes(edit[2])) &&
     edit[1] !== "0" &&
     edit[1] === state.guildId &&
@@ -859,7 +934,7 @@ function throwApiFailure(data, status, retryAfterMs) {
 
 async function api(path, method = "GET", body = null, signal, reconcileRecovered) {
   const save = ["POST", "PUT"].includes(method) &&
-    /^\/api\/guilds\/\d+\/(settings|rules|badwords|known-spam|known-bad-images|commands|templates|copy|logfilters|case-delete-roles)(?:\/|$)/.test(path) &&
+    /^\/api\/guilds\/\d+\/(settings|rules|badwords|known-spam|known-bad-images|commands|templates|copy|logfilters|case-delete-roles|access-roles)(?:\/|$)/.test(path) &&
     (method !== "POST" || body !== null);
   if (save) return submitSave(path, method, body, signal, reconcileRecovered);
   return apiRequest(path, method, body, signal);
@@ -885,7 +960,7 @@ function saveFailureState(error) {
 async function submitSave(path, method, body, signal, reconcileRecovered) {
   // A remount reads the current role revision while retaining an unresolved
   // role draft. Match that intent by its roles, then look up the captured revision.
-  const roleSave = method === "PUT" && /^\/api\/guilds\/\d+\/case-delete-roles$/.test(path);
+  const roleSave = method === "PUT" && /^\/api\/guilds\/\d+\/(case-delete-roles|access-roles)$/.test(path);
   const canonical = canonicalSaveBody(roleSave ? { roles: body.roles } : body);
   const key = `${workspaceKey()}:save:${method}:${path}:${JSON.stringify(canonical)}`;
   const enrollment = pageEnrollment(path, method);
@@ -901,7 +976,7 @@ async function submitSave(path, method, body, signal, reconcileRecovered) {
   // Only a new save needs the initial read. An unresolved save already owns
   // its original revision and must remain lookup-only while that read is pending.
   if (roleSave && saveMode === "submit" && !body.revision) {
-    throw new Error("Case-removal roles have not loaded yet. Wait for them to load before saving.");
+    throw new Error("Roles have not loaded yet. Wait for them to load before saving.");
   }
   try {
     saved = raw ? JSON.parse(raw) : {
@@ -1971,7 +2046,7 @@ function ruleCard(r) {
         h(
           "div",
           { className: "card-actions" },
-          h(ActionButton, { className: "btn btn-sm", onClick: () => editRule(r) }, "Edit"),
+          h(IconButton, { icon: "edit", label: "Edit", onClick: () => editRule(r) }),
         ),
       ),
       h("p", {}, r.description),
@@ -2840,12 +2915,15 @@ function tabCommands() {
       "div",
       { className: "row title-row" },
       h("h2", {}, "Commands"),
-      h(
-        ActionButton,
-        { className: "btn btn-primary", onClick: () => editCommand(null) },
-        "+ New custom command",
-      ),
+      canManageServer() &&
+        h(
+          ActionButton,
+          { className: "btn btn-primary", onClick: () => editCommand(null) },
+          "+ New custom command",
+        ),
     ),
+    !canManageServer() &&
+      h("p", { className: "muted" }, "Editing commands needs Manage Server: command plans can grant roles and run moderation actions."),
     h(
       "p",
       { className: "muted", style: { margin: "6px 0 14px" } },
@@ -2899,7 +2977,7 @@ function tabCommands() {
           h(
             "td",
             {},
-            h(ActionButton, { className: "btn btn-sm", onClick: () => editCommand(c) }, "Edit"),
+            canManageServer() && h(IconButton, { icon: "edit", label: "Edit", onClick: () => editCommand(c) }),
           ),
         );
       }),
@@ -3637,7 +3715,7 @@ function actionIsLogChannel(job) {
 }
 
 function actionCanCancel(job) {
-  if (!job) return false;
+  if (!job || (actionIsLogChannel(job) && !canEditSettings())) return false;
   if (job.state === "pending" || job.state === "claimed") return true;
   return actionIsLogChannel(job) && (job.state === "running" || job.state === "uncertain");
 }
@@ -3889,8 +3967,11 @@ function tabMembers() {
         verify: sync.verify_processed,
         audit: sync.audit_processed,
       };
+      // Local case history records only completion, never a committed count.
+      const phaseNotCounted = (phase) => phase === "local_history";
       const processed = Number(sync.processed ?? sync.committed_count ?? sync.committed ?? 0);
-      const phaseProcessed = phaseCounts[sync.phase] == null ? null : Number(phaseCounts[sync.phase]);
+      const currentPhaseKey = phases[currentPhase];
+      const phaseProcessed = phaseCounts[currentPhaseKey] == null ? null : Number(phaseCounts[currentPhaseKey]);
       const total = sync.total_estimate == null ? null : Number(sync.total_estimate);
       const percent =
         sync.status === "complete"
@@ -3907,7 +3988,9 @@ function tabMembers() {
           sync.status === "complete"
             ? "Complete"
             : percent === null
-              ? `${phaseProcessed == null ? "Unknown number of" : phaseProcessed} records committed in current phase; total unknown`
+              ? phaseNotCounted(currentPhaseKey)
+                ? `${phaseLabels[currentPhaseKey]} stage; records not counted`
+                : `${phaseProcessed == null ? "Unknown number of" : phaseProcessed} records committed in current phase; total unknown`
               : `${Math.round(percent)} percent of ${totalKind} member stage`,
       });
       parts.push(bar);
@@ -3941,7 +4024,15 @@ function tabMembers() {
                     ? statusLabel
                     : "Pending",
               ),
-              h("td", null, phaseCounts[phase] == null ? "Unknown" : Number(phaseCounts[phase]).toLocaleString()),
+              h(
+                "td",
+                null,
+                phaseNotCounted(phase)
+                  ? "Not counted"
+                  : phaseCounts[phase] == null
+                    ? "Unknown"
+                    : Number(phaseCounts[phase]).toLocaleString(),
+              ),
             ),
           ),
           h(
@@ -4130,7 +4221,7 @@ function tabMembers() {
       // A short planned restart clears itself when audit recovery finishes, unless
       // that recovery stopped for attention. Anything else needs Reconcile.
       const autoClearing = sync.gap_auto_clear && sync.audit_recovery_status !== "needs_attention";
-      const reconcileInNotice = sync.reconciliation_needed && !autoClearing && !isPreview();
+      const reconcileInNotice = sync.reconciliation_needed && !autoClearing && !isPreview() && canManageServer();
       const reconcileButton = reconcileInNotice && syncControlButton("reconcile", "Reconcile from Discord");
       if (sync.reconciliation_needed) {
         const when = sync.gap_at ? ` at ${asDate(sync.gap_at)}` : "";
@@ -4225,7 +4316,7 @@ function tabMembers() {
         );
       if (syncActionOutcome) parts.push(h("p", { className: "err", role: "status" }, syncActionOutcome));
       const controls = [];
-      if (!isPreview()) {
+      if (!isPreview() && canManageServer()) {
         for (const [operation, label] of [
           ["pause", "Pause"],
           ["resume", "Resume"],
@@ -4715,6 +4806,7 @@ function tabCases() {
           ...(history.history || []).map((entry) =>
             h("p", { className: "muted" }, JSON.stringify(entry.entry.body)),
           ),
+          canManageServer() &&
           field(
             "Note",
             note,
@@ -5013,7 +5105,9 @@ function tabSettings() {
         ),
     },
     h("option", { value: "" }, "Select a source server"),
-    ...state.guilds.filter((g) => g.id !== state.guildId).map((g) => h("option", { value: g.id }, g.name)),
+    ...state.guilds
+      .filter((g) => g.id !== state.guildId && (g.access || "manage") === "manage")
+      .map((g) => h("option", { value: g.id }, g.name)),
   );
   const sectionSelRef = useRef(null);
   const sectionSel = h(
@@ -5180,6 +5274,7 @@ function tabSettings() {
   const roleRevision = useRef("");
   const roleWriteGeneration = useRef(0);
   useEffect(() => {
+    if (!canManageServer()) return undefined;
     let active = true;
     const initialRoleGeneration = roleWriteGeneration.current;
     apiRead(`/api/guilds/${state.guildId}/case-delete-roles`)
@@ -5196,7 +5291,8 @@ function tabSettings() {
       active = false;
     };
   }, []);
-  cards.push(
+  if (canManageServer()) cards.push(
+    h(AccessRolesCard, { key: "access-roles", revision: roleRevision, generation: roleWriteGeneration }),
     h(
       DraftCard,
       { group: "roles", className: "card bg-base-100 card-border" },
@@ -5207,7 +5303,7 @@ function tabSettings() {
         h(
           "p",
           { className: "muted" },
-          "Server owners and Administrators can remove case records. Stored role IDs are remembered for a later member-role check; Discord OAuth currently cannot apply them. Removal never undoes a Discord action.",
+          "Server owners and Administrators can remove case records. Stored role IDs are remembered for a later member-role check and are not applied yet. Removal never undoes a Discord action.",
         ),
         field("Delegated case-removal role IDs", roleInput),
         h(
@@ -5281,7 +5377,7 @@ function tabSettings() {
     );
   }
 
-  cards.push(
+  if (canManageServer()) cards.push(
     h(
       DraftCard,
       { group: "copy", className: "card bg-base-100 card-border" },
@@ -5343,6 +5439,151 @@ function tabSettings() {
   return h("div", {}, h("h2", {}, "Settings"), ...cards);
 }
 
+const ACCESS_LEVELS = [
+  ["dashboard", "Dashboard (read-only)"],
+  ["settings", "Dashboard and settings"],
+];
+
+// Role -> access mappings for this server. Only Manage Server sees this card;
+// the API refuses the read and the save for everyone else.
+// Access and case-removal roles share one server revision, so both cards use
+// the same revision and write-generation refs from the Settings tab.
+function AccessRolesCard({ revision, generation }) {
+  const guildId = state.guildId;
+  const [baselineRows, setBaselineRows] = useState(null);
+  const [ttl, setTtl] = useState(30);
+  const { drafts } = useStore(ui);
+  const draftKey = "settings:access-roles";
+  const rows = baselineRows === null ? null : drafts[draftKey]?.value ?? baselineRows;
+  const withKeys = (roles) => roles.map((role) => ({ ...role, key: crypto.randomUUID() }));
+  const changeRows = (next) => {
+    const values = (items) => JSON.stringify(items.map(({ role_id, level }) => ({ role_id, level })));
+    const nextDrafts = { ...currentDrafts() };
+    if (baselineRows !== null && values(next) === values(baselineRows)) delete nextDrafts[draftKey];
+    else nextDrafts[draftKey] = { value: next, group: "access-roles" };
+    ui.set({ drafts: nextDrafts, edits: Object.keys(nextDrafts).length > 0 ? "dirty" : "clean" });
+  };
+  useEffect(() => {
+    let active = true;
+    const initialGeneration = generation.current;
+    apiRead(`/api/guilds/${guildId}/access-roles`)
+      .then((loaded) => {
+        if (!active) return;
+        if (initialGeneration === generation.current) revision.current = loaded.revision || "";
+        setTtl(loaded.ttl_secs || 30);
+        setBaselineRows(withKeys(loaded.roles || []));
+      })
+      .catch((e) => {
+        if (active && !isUnauthenticated(e)) reportApiError(e);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+  const update = (key, patch) => {
+    changeRows(rows.map((row) => (row.key === key ? { ...row, ...patch } : row)));
+  };
+  return h(
+    DraftCard,
+    { group: "access-roles", className: "card bg-base-100 card-border" },
+    h(
+      "div",
+      { className: "card-body" },
+      h("h3", { className: "card-title" }, "Web UI access by role"),
+      h(
+        "p",
+        { className: "muted" },
+        `Members with a listed Discord role can sign in and open this server only. Dashboard access is read-only. Settings access can also edit rules, badwords, known spam and images, templates, log channels and bot settings. Commands, copying configuration, member import controls, case notes, case removal and this list stay with Manage Server. Roles are checked with Discord; a removed role stops working within ${ttl} seconds.`,
+      ),
+      rows === null
+        ? h("p", { className: "muted", role: "status" }, "Loading roles…")
+        : h(
+            React.Fragment,
+            null,
+            rows.length === 0 && h("p", { className: "muted" }, "No roles have Web UI access."),
+            ...rows.map((row) =>
+              h(
+                "div",
+                { key: row.key, className: "row form-row access-role-row" },
+                field(
+                  "Role ID",
+                  h(Input, {
+                    type: "text",
+                    className: "input",
+                    value: row.role_id,
+                    placeholder: "Discord role (ID or <@&id> mention)",
+                    onChange: (event) => update(row.key, { role_id: event.target.value }),
+                  }),
+                ),
+                field(
+                  "Access",
+                  h(
+                    Select,
+                    {
+                      className: "select",
+                      value: row.level,
+                      onChange: (event) => update(row.key, { level: event.target.value }),
+                    },
+                    ACCESS_LEVELS.map(([value, label]) => h("option", { key: value, value }, label)),
+                  ),
+                ),
+                h(
+                  ActionButton,
+                  {
+                    className: "btn btn-sm",
+                    type: "button",
+                    onClick: () => {
+                      changeRows(rows.filter((item) => item.key !== row.key));
+                    },
+                  },
+                  "Remove",
+                ),
+              ),
+            ),
+            h(
+              "div",
+              { className: "card-actions" },
+              h(
+                ActionButton,
+                {
+                  className: "btn",
+                  type: "button",
+                  disabled: rows.length >= 32,
+                  onClick: () => changeRows([...rows, ...withKeys([{ role_id: "", level: "dashboard" }])]),
+                },
+                "Add role",
+              ),
+              h(
+                ActionButton,
+                {
+                  className: "btn btn-primary",
+                  onClick: async () => {
+                    const roles = rows.map((row) => {
+                      const id = parseSnowflake(String(row.role_id).trim());
+                      if (!id) throw new Error("Enter each role as a Discord role ID or <@&id> mention");
+                      return { role_id: id, level: row.level };
+                    });
+                    const saved = await api(`/api/guilds/${guildId}/access-roles`, "PUT", {
+                      roles,
+                      revision: revision.current,
+                    }, undefined, () => apiRead(`/api/guilds/${guildId}/access-roles`));
+                    generation.current++;
+                    revision.current = saved.revision;
+                    setBaselineRows(withKeys(saved.roles || roles));
+                    const nextDrafts = { ...currentDrafts() };
+                    delete nextDrafts[draftKey];
+                    ui.set({ drafts: nextDrafts, edits: Object.keys(nextDrafts).length > 0 ? "dirty" : "clean" });
+                    toast("Web UI access roles saved", "success");
+                  },
+                },
+                "Save access roles",
+              ),
+            ),
+          ),
+    ),
+  );
+}
+
 function scopeSelect(
   ref,
   guildLabel = "This server only",
@@ -5390,9 +5631,8 @@ function RuleAction({ action, index, remove }) {
       { className: "row title-row" },
       h("strong", null, `Action ${index + 1}`),
       h(
-        ActionButton,
-        { className: "btn btn-sm btn-outline", "aria-label": `Remove action ${index + 1}`, onClick: remove },
-        "Remove",
+        IconButton,
+        { icon: "remove", label: `Remove action ${index + 1}`, onClick: remove },
       ),
     ),
     h(
@@ -5737,13 +5977,13 @@ function tabKnownSpam() {
         h("td", null, row.kind === "url" ? "URL" : "Sample"),
         h("td", { style: { whiteSpace: "pre-wrap", overflowWrap: "anywhere" } }, row.value),
         h("td", null, row.note || "—"), h("td", null, row.guild_id === "0" ? "Global" : "This server"),
-        h("td", null, row.guild_id !== "0" || isBotOwner() ? h(ActionButton, { className: "btn btn-sm",
+        h("td", null, row.guild_id !== "0" || isBotOwner() ? h(IconButton, { icon: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm("Remove this known spam entry?")) return;
             await api(`/api/guilds/${guildId}/known-spam/${row.id}`, "DELETE");
             if (state.guildId === guildId && await loadConfig()) renderTab();
           },
-        }, "Remove") : "Owner only"),
+        }) : "Owner only"),
       )) : h("tr", null, h("td", { colSpan: 5, className: "muted" }, "No known spam entries.")),
     ),
   );
@@ -5796,13 +6036,13 @@ function tabKnownBadImages() {
         h("td", { style: { overflowWrap: "anywhere" } }, row.hash),
         h("td", null, row.added_at), h("td", null, row.added_via),
         h("td", null, row.actor), h("td", null, row.note || "—"),
-        h("td", null, h(ActionButton, { className: "btn btn-sm",
+        h("td", null, h(IconButton, { icon: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm(`Remove SHA-256 ${row.hash}?`)) return;
             await api(`/api/guilds/${guildId}/known-bad-images/${row.hash}`, "DELETE");
             if (state.guildId === guildId && await loadConfig()) renderTab();
           },
-        }, "Remove")),
+        })),
       )) : h("tr", null, h("td", { colSpan: 6, className: "muted" }, "No matching hashes.")),
     ),
   );
@@ -5867,9 +6107,10 @@ function tabBans() {
                 null,
                 record.active &&
                   h(
-                    ActionButton,
+                    IconButton,
                     {
-                      className: "btn btn-sm",
+                      icon: "unban",
+                      label: "Unban",
                       onClick: async () => {
                         if (confirm(`Unban ${record.user_id}?`))
                           await submitBotAction(`/api/guilds/${guildId}/unban`, "POST", {
@@ -5878,7 +6119,6 @@ function tabBans() {
                           });
                       },
                     },
-                    "Unban",
                   ),
               ),
             ),
@@ -5938,9 +6178,10 @@ function tabActions() {
                 null,
                 actionCanCancel(job) &&
                   h(
-                    ActionButton,
+                    IconButton,
                     {
-                      className: "btn btn-sm",
+                      icon: "cancel",
+                      label: actionCancelLabel(job),
                       onClick: async () => {
                         if (
                           actionCancelNeedsConfirm(job) &&
@@ -5953,7 +6194,6 @@ function tabActions() {
                         result.refresh();
                       },
                     },
-                    actionCancelLabel(job),
                   ),
               ),
             ),

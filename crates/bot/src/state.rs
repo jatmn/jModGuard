@@ -1296,6 +1296,65 @@ impl BotState {
         op: &db::ControlOp,
         actor_user_id: i64,
     ) -> Result<(), &'static str> {
+        let decision = self.authorize_control_permissions(op, actor_user_id).await;
+        if decision.is_err()
+            && let Some(scope) = db::settings_role_scope(op)
+            && self.holds_settings_role(scope, actor_user_id).await
+        {
+            return Ok(());
+        }
+        decision
+    }
+
+    /// A configuration edit from a Web UI access role mapped to the settings
+    /// level. Uses this process's Discord member data, never the API's claim.
+    async fn holds_settings_role(&self, scope: &db::ScopeWire, actor_user_id: i64) -> bool {
+        let (Ok(guild_id), Ok(actor)) =
+            (u64::try_from(scope.guild_id), u64::try_from(actor_user_id))
+        else {
+            return false;
+        };
+        if guild_id == 0 || actor == 0 {
+            return false;
+        }
+        let Some(roles) = self.control_member_roles(guild_id, actor).await else {
+            return false;
+        };
+        if roles.is_empty() {
+            return false;
+        }
+        match db::settings_access_roles_for(&self.tenant, scope).await {
+            Ok(mapped) => roles.iter().any(|role| mapped.contains(role)),
+            Err(error) => {
+                tracing::warn!(guild_id, "settings access roles unavailable: {error:#}");
+                false
+            }
+        }
+    }
+
+    async fn control_member_roles(&self, guild_id: u64, actor: u64) -> Option<Vec<i64>> {
+        let cached = self.discord_cache.lock().clone().and_then(|cache| {
+            let guild = cache.guild(serenity::model::id::GuildId::new(guild_id))?;
+            let member = guild
+                .members
+                .get(&serenity::model::id::UserId::new(actor))?;
+            Some(member_role_ids(member))
+        });
+        if cached.is_some() {
+            return cached;
+        }
+        let lookup = self.member_lookup.lock().clone()?;
+        match tokio::time::timeout(Duration::from_secs(2), lookup(guild_id, actor)).await {
+            Ok(ControlMemberFetch::Found(member)) => Some(member_role_ids(&member)),
+            _ => None,
+        }
+    }
+
+    async fn authorize_control_permissions(
+        &self,
+        op: &db::ControlOp,
+        actor_user_id: i64,
+    ) -> Result<(), &'static str> {
         if self.control_actor_lookup.lock().is_some() {
             let cached = self.cached_control_actor(actor_user_id, op);
             for need in db::control_actor_needs(op) {
@@ -1454,6 +1513,14 @@ fn cached_actor_from_discord(
         guild_owner_id: owner,
         permissions: bits,
     })
+}
+
+fn member_role_ids(member: &serenity::model::guild::Member) -> Vec<i64> {
+    member
+        .roles
+        .iter()
+        .filter_map(|role| i64::try_from(role.get()).ok())
+        .collect()
 }
 
 fn permission_bits(permissions: serenity::model::permissions::Permissions) -> u64 {

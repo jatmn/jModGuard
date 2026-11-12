@@ -1,5 +1,6 @@
 //! REST API handlers for the WebUI. Every guild-scoped endpoint verifies the
-//! session can manage that guild. Writes bump durable `config_version` in the
+//! session can manage that guild, or holds a role mapped to the access level
+//! that endpoint names. Writes bump durable `config_version` in the
 //! DB and invalidate this process's cache; the bot (and API) poll
 //! `config_version` to pick up cross-process changes within `config_poll_secs`.
 
@@ -11,7 +12,9 @@ use std::sync::Arc;
 use tower_sessions::Session;
 
 use super::state::ApiState;
-use super::{ApiError, ApiResult, AuthCtx, guild_scope, is_bot_owner, require_bot_owner};
+use super::{
+    ApiError, ApiResult, AuthCtx, GuildAccess, guild_scope_at, is_bot_owner, require_bot_owner,
+};
 use crate::bot_actions::Action;
 use crate::db;
 use crate::types::{CommandDef, GLOBAL_SCOPE, RuleDef};
@@ -27,13 +30,14 @@ async fn real_guild_scope(
     app: &Arc<ApiState>,
     session: &Session,
     guild_id: u64,
+    need: GuildAccess,
 ) -> ApiResult<AuthCtx> {
     if guild_id == 0 {
         return Err(ApiError(anyhow::anyhow!(
             "this operation requires a Discord server"
         )));
     }
-    guild_scope(app, session, guild_id).await
+    guild_scope_at(app, session, guild_id, need).await
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +59,7 @@ pub async fn guild_config(
     session: Session,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     let snapshot = db::load_enrolled_web_config_snapshot(
         &app.db,
         super::configuration_scope(&app, &auth, guild_id)?,
@@ -179,7 +183,7 @@ pub async fn update_settings(
     Path(guild_id): Path<u64>,
     Json(body): Json<SettingsBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     if guild_id == 0 && body.bot_name.is_some() {
         return Err(ApiError(anyhow::anyhow!(
@@ -257,7 +261,7 @@ pub async fn get_rule(
     headers: axum::http::HeaderMap,
     Path((guild_id, rule_id)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     if !jmodguard::custom_rules::known_rule_id(&rule_id) {
@@ -296,7 +300,7 @@ pub async fn put_rule(
     Path((guild_id, rule_id)): Path<(u64, String)>,
     Json(body): Json<RuleBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     if !jmodguard::custom_rules::known_rule_id(&rule_id) {
         return Err(ApiError(anyhow::anyhow!("unknown rule `{rule_id}`")));
@@ -359,7 +363,7 @@ pub async fn delete_rule(
     Path((guild_id, rule_id)): Path<(u64, String)>,
     Json(body): Json<ScopeBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     if !jmodguard::custom_rules::known_rule_id(&rule_id) {
         return Err(ApiError(anyhow::anyhow!("unknown rule `{rule_id}`")));
@@ -426,7 +430,7 @@ pub async fn list_badwords(
     headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let words = db::list_enrolled_badwords(&app.db, scope).await?;
@@ -441,7 +445,7 @@ pub async fn add_badword(
     Path(guild_id): Path<u64>,
     Json(body): Json<BadwordBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
@@ -502,7 +506,7 @@ pub async fn delete_badword(
     headers: axum::http::HeaderMap,
     Path((guild_id, word_id)): Path<(u64, i64)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     // Uniform "not found" for missing / wrong-guild / non-owner global — never
     // distinguish existence across scopes (error-oracle / IDOR probe).
@@ -562,7 +566,7 @@ pub async fn list_commands(
     headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let layers = db::list_enrolled_commands(&app.db, scope).await?;
@@ -625,7 +629,7 @@ pub async fn get_command(
     headers: axum::http::HeaderMap,
     Path((guild_id, name)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let name = name.to_lowercase();
@@ -682,7 +686,7 @@ pub async fn put_command(
     Path((guild_id, name)): Path<(u64, String)>,
     Json(body): Json<CommandBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Manage).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let name = name.to_lowercase();
@@ -719,7 +723,7 @@ pub async fn create_command(
     Path(guild_id): Path<u64>,
     Json(body): Json<CommandBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Manage).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let name = body.data.name.to_lowercase();
@@ -757,7 +761,7 @@ pub async fn delete_command(
     Path((guild_id, name)): Path<(u64, String)>,
     Json(body): Json<ScopeBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Manage).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
@@ -790,7 +794,7 @@ pub async fn list_templates(
     headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let layers = db::list_enrolled_templates(&app.db, scope).await?;
@@ -804,7 +808,7 @@ pub async fn get_template(
     headers: axum::http::HeaderMap,
     Path((guild_id, event)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let layers = db::get_enrolled_template(&app.db, scope, &event).await?;
@@ -828,7 +832,7 @@ pub async fn put_template(
     Path((guild_id, event)): Path<(u64, String)>,
     Json(body): Json<TemplateBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     if !crate::types::is_log_event(&event) {
@@ -864,7 +868,7 @@ pub async fn delete_template(
     Path((guild_id, event)): Path<(u64, String)>,
     Json(body): Json<ScopeBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
@@ -900,7 +904,7 @@ pub async fn put_log_filter(
     Path((guild_id, event)): Path<(u64, String)>,
     Json(filter): Json<db::LogFilter>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = real_guild_scope(&app, &session, guild_id).await?;
+    let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_write_scope(&app, &auth, guild_id, guild_id as i64)?;
     let (request, target) = scope.to_wires();
@@ -946,7 +950,7 @@ pub async fn list_logchannels(
     headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let g = db::list_enrolled_log_channels(&app.db, scope).await?;
@@ -962,7 +966,7 @@ pub async fn get_logchannel(
     headers: axum::http::HeaderMap,
     Path((guild_id, event)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let guild_override = db::list_enrolled_log_channels(&app.db, scope)
@@ -986,7 +990,7 @@ pub async fn put_logchannel(
     Path((guild_id, event)): Path<(u64, String)>,
     Json(body): Json<LogChannelBody>,
 ) -> ApiResult<(StatusCode, Json<db::BotAction>)> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     if scope == GLOBAL_SCOPE {
@@ -1024,7 +1028,7 @@ pub async fn delete_logchannel(
     Path((guild_id, event)): Path<(u64, String)>,
     Json(body): Json<ClearLogChannelBody>,
 ) -> ApiResult<(StatusCode, Json<db::BotAction>)> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     if scope == GLOBAL_SCOPE {
@@ -1136,7 +1140,7 @@ pub async fn test_badwords(
     Path(guild_id): Path<u64>,
     Json(body): Json<TestBadwordsBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     if body.sample.len() > crate::normalize::USER_REGEX_MAX_SAMPLE_BYTES {
@@ -1198,7 +1202,7 @@ pub async fn test_regex(
     Path(guild_id): Path<u64>,
     Json(body): Json<TestRegexBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let _auth = real_guild_scope(&app, &session, guild_id).await?;
+    let _auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Settings).await?;
     if body.sample.len() > crate::normalize::USER_REGEX_MAX_SAMPLE_BYTES {
         return Err(ApiError(anyhow::anyhow!(
             "sample too long (max {} bytes)",
@@ -1235,7 +1239,7 @@ pub async fn events(
     Path(guild_id): Path<u64>,
     Query(query): Query<EventsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = real_guild_scope(&app, &session, guild_id).await?;
+    let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
     let rows = db::query_enrolled_events(
@@ -1260,7 +1264,7 @@ pub async fn bans(
     Path(guild_id): Path<u64>,
     Query(query): Query<SearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = real_guild_scope(&app, &session, guild_id).await?;
+    let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
     let rows = db::list_enrolled_bans(&app.db, enrollment, query.limit.unwrap_or(100)).await?;
@@ -1305,7 +1309,7 @@ pub async fn stats(
     headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = real_guild_scope(&app, &session, guild_id).await?;
+    let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
     // Guild-scoped only — never expose cross-guild aggregates to a guild admin.
@@ -1327,7 +1331,7 @@ pub async fn analytics(
     headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = real_guild_scope(&app, &session, guild_id).await?;
+    let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
     let result = db::enrolled_guild_analytics(
@@ -1384,10 +1388,14 @@ pub(super) async fn enqueue_action(
     Ok((StatusCode::ACCEPTED, Json(job)))
 }
 
-fn can_access_action(auth: &AuthCtx, guild: u64, action: &Action) -> bool {
+/// Log-channel work follows the guild's settings: a role-mapped dashboard
+/// level may see it and a settings level may also cancel it.
+fn can_access_action(auth: &AuthCtx, guild: u64, action: &Action, need: GuildAccess) -> bool {
     match action {
         Action::Unban { .. } => auth.can_ban_members(guild),
-        Action::SetLogChannel { .. } => auth.can_manage(guild),
+        Action::SetLogChannel { .. } => auth
+            .guild_access(guild)
+            .is_some_and(|access| access >= need),
         Action::MemberSync { .. } => auth.can_manage(guild),
     }
 }
@@ -1398,15 +1406,11 @@ pub async fn actions(
     headers: axum::http::HeaderMap,
     Path(guild): Path<u64>,
 ) -> ApiResult<Json<Vec<db::BotAction>>> {
-    let mut auth = super::require_auth_fresh(&app, &session).await?;
-    if guild == 0 || (!auth.can_manage(guild) && !auth.can_ban_members(guild)) {
-        return Err(ApiError(anyhow::anyhow!("actions not available")));
-    }
-    let enrollment = super::require_active_enrollment(&app, guild).await?;
-    auth.enrollment = Some(enrollment.clone());
+    let auth = super::authorize_actions(&app, &session, guild, "actions not available").await?;
+    let enrollment = super::authorized_enrollment(&auth, guild)?;
     super::check_page_enrollment(&auth, guild, &headers)?;
     let mut jobs = db::recent_enrolled_bot_actions(&app.db, &enrollment).await?;
-    jobs.retain(|j| can_access_action(&auth, guild, &j.action));
+    jobs.retain(|j| can_access_action(&auth, guild, &j.action, GuildAccess::Dashboard));
     Ok(Json(jobs))
 }
 
@@ -1416,17 +1420,13 @@ pub async fn cancel_action(
     headers: axum::http::HeaderMap,
     Path((guild, id)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let mut auth = super::require_auth_fresh(&app, &session).await?;
-    if guild == 0 || (!auth.can_manage(guild) && !auth.can_ban_members(guild)) {
-        return Err(ApiError(anyhow::anyhow!("action not available")));
-    }
-    let enrollment = super::require_active_enrollment(&app, guild).await?;
-    auth.enrollment = Some(enrollment.clone());
+    let auth = super::authorize_actions(&app, &session, guild, "action not available").await?;
+    let enrollment = super::authorized_enrollment(&auth, guild)?;
     super::check_page_enrollment(&auth, guild, &headers)?;
     let job = db::enrolled_bot_action(&app.db, &enrollment, &id)
         .await?
         .ok_or_else(|| ApiError(anyhow::anyhow!("action not available")))?;
-    if !can_access_action(&auth, guild, &job.action) {
+    if !can_access_action(&auth, guild, &job.action, GuildAccess::Settings) {
         return Err(ApiError(anyhow::anyhow!("action not available")));
     }
     let (_, cancelled) = app
@@ -1507,7 +1507,7 @@ pub async fn add_known_bad_image(
     Path(guild_id): Path<u64>,
     Json(body): Json<KnownBadImageBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let hash = db::canonical_image_hash(&body.hash)?;
@@ -1533,7 +1533,7 @@ pub async fn remove_known_bad_image(
     headers: axum::http::HeaderMap,
     Path((guild_id, hash)): Path<(u64, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let hash = db::canonical_image_hash(&hash)?;
@@ -1567,7 +1567,7 @@ pub async fn add_known_spam(
     Path(guild_id): Path<u64>,
     Json(body): Json<KnownSpamBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let target = scope_from(&app, &auth, &body.scope, guild_id)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, target)?;
@@ -1594,7 +1594,7 @@ pub async fn delete_known_spam(
     headers: axum::http::HeaderMap,
     Path((guild_id, id)): Path<(u64, i64)>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = guild_scope(&app, &session, guild_id).await?;
+    let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Settings).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let not_found = || ApiError(anyhow::anyhow!("known spam entry not found"));
     let Some(entry) = db::get_known_spam_primary(&app.db, id).await? else {
