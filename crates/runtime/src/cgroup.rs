@@ -652,15 +652,18 @@ fn parse_v2_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
 fn parse_v1_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
     let current = memory_input(parse_u64_token(current_text), "memory.usage_in_bytes")?;
     let Some(stat) = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat") else {
-        return usage_only(current, read_memory_limit(dir, "memory.limit_in_bytes")?);
+        return usage_only(current, read_v1_memory_limit(dir)?);
     };
     let fallback = stat_value(&stat, "total_inactive_file");
-    memory_use(
-        current,
-        &stat,
-        read_memory_limit(dir, "memory.limit_in_bytes")?,
-        fallback,
-    )
+    memory_use(current, &stat, read_v1_memory_limit(dir)?, fallback)
+}
+
+// Only v1 reports "no limit" as a huge page-rounded number; v2 uses `max`.
+fn read_v1_memory_limit(dir: &Path) -> Option<MemoryLimit> {
+    match read_memory_limit(dir, "memory.limit_in_bytes")? {
+        MemoryLimit::Bytes(bytes) if bytes >= V1_UNLIMITED_BYTES => Some(MemoryLimit::Unlimited),
+        limit => Some(limit),
+    }
 }
 
 // Without memory.stat there is no inactive file counter; report labeled raw usage.
@@ -731,12 +734,7 @@ fn parse_memory_max(text: &str) -> Option<MemoryLimit> {
     if token == "max" {
         return Some(MemoryLimit::Unlimited);
     }
-    let bytes: u64 = token.parse().ok()?;
-    if bytes >= V1_UNLIMITED_BYTES {
-        Some(MemoryLimit::Unlimited)
-    } else {
-        Some(MemoryLimit::Bytes(bytes))
-    }
+    Some(MemoryLimit::Bytes(token.parse().ok()?))
 }
 
 fn stat_value(text: &str, key: &str) -> Option<u64> {
@@ -971,6 +969,25 @@ mod tests {
             read_cgroup(Some(&limited.path), None).memory.unwrap().limit,
             MemoryLimit::Bytes(V1_UNLIMITED_BYTES - 1)
         );
+    }
+
+    #[test]
+    fn v2_numeric_limit_at_the_v1_sentinel_is_a_real_limit() {
+        for stat in [Some("inactive_file 1\n"), None] {
+            let tree = temp_tree();
+            let mut files = vec![
+                ("memory.current", "10\n"),
+                ("memory.max", "9223372036854771712\n"),
+            ];
+            files.extend(stat.map(|stat| ("memory.stat", stat)));
+            write_files(&tree.path, &files);
+            assert_eq!(
+                read_cgroup(Some(&tree.path), None).memory.unwrap().limit,
+                MemoryLimit::Bytes(9_223_372_036_854_771_712),
+                "memory.stat present: {}",
+                stat.is_some()
+            );
+        }
     }
 
     #[test]

@@ -1224,7 +1224,9 @@ mod presentation_tests {
         };
         let text = stats_with_container_use("stats".into(), &sample, Some(&sample), Some("api 7"));
         assert!(
-            text.contains("`4.0 KiB / no limit (includes page cache)`"),
+            text.contains(
+                "**Bot memory (real program use):** `4.0 KiB / no limit (includes page cache)`"
+            ),
             "{text}"
         );
         assert!(
