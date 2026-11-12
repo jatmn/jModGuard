@@ -638,6 +638,7 @@ mod tests {
                 memory: Some(crate::cgroup::MemoryUse {
                     program_bytes: 4096,
                     limit: crate::cgroup::MemoryLimit::Bytes(8192),
+                    source: crate::cgroup::MemorySource::CgroupStat,
                 }),
                 cpu_tenths: Some(124),
             },
