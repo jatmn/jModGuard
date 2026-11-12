@@ -3533,6 +3533,15 @@ function memberTime(value) {
   return Number.isNaN(date.getTime()) ? "Unknown" : date.toLocaleString(undefined, { timeZoneName: "short" });
 }
 
+const memberSyncStatusLabels = {
+  queued: "Queued",
+  running: "Running",
+  waiting: "Waiting",
+  paused: "Paused",
+  needs_attention: "Needs attention",
+  complete: "Complete",
+};
+
 function tabMembers() {
   const guildId = state.guildId;
   const enrollmentId = state.config?.enrollment_id;
@@ -3690,9 +3699,33 @@ function tabMembers() {
       const parts = [];
       const title = sync.run_kind === "reconcile" ? "Reconcile from Discord" : "Initial member import";
       parts.push(h("h3", { className: "card-title" }, title));
-      const stage = [sync.phase || "pending", sync.status || "needs attention"].join(" · ");
+      const phases = ["members", "bans", "verify", "audit", "local_history"];
+      const phaseLabels = {
+        members: "Members",
+        bans: "Current bans",
+        verify: "Candidate checks",
+        audit: "Available audit history",
+        local_history: "Local case history",
+      };
+      const currentPhase =
+        sync.phase === "complete" && sync.status !== "complete" && sync.local_history_complete === false
+          ? phases.indexOf("local_history")
+          : phases.indexOf(String(sync.phase || ""));
+      const statusLabel = memberSyncStatusLabels[sync.status || "needs_attention"] || String(sync.status);
+      const statusTone =
+        { complete: "badge-success", needs_attention: "badge-error", paused: "badge-warning", waiting: "badge-warning" }[
+          sync.status
+        ] || "badge-info";
       parts.push(
-        h("p", { role: "status" }, `${stage}${sync.status_reason ? ` — ${sync.status_reason}` : ""}`),
+        h(
+          "p",
+          { role: "status", className: "row" },
+          h("span", { className: `badge badge-soft ${statusTone}` }, statusLabel),
+          sync.status !== "complete" && currentPhase >= 0
+            ? h("span", null, `Stage: ${phaseLabels[phases[currentPhase]]}`)
+            : null,
+          sync.status_reason ? h("span", { className: "muted" }, sync.status_reason) : null,
+        ),
       );
       if (!sync.run_id && sync.status === "queued") {
         parts.push(
@@ -3758,37 +3791,27 @@ function tabMembers() {
           `${Number.isFinite(processed) ? processed.toLocaleString() : "0"} records committed in this run · ${totalDescription}${progressText}`,
         ),
       );
-      const phases = ["members", "bans", "verify", "audit", "local_history"];
-      const phaseLabels = {
-        members: "Members",
-        bans: "Current bans",
-        verify: "Candidate checks",
-        audit: "Available audit history",
-        local_history: "Local case history",
-      };
-      const currentPhase =
-        sync.phase === "complete" && sync.status !== "complete" && sync.local_history_complete === false
-          ? phases.indexOf("local_history")
-          : phases.indexOf(String(sync.phase || ""));
       parts.push(
         h(
-          "p",
-          { className: "muted" },
-          phases
-            .map((phase, index) => {
-              const state =
+          DataTable,
+          { headings: ["Phase", "State", "Committed"], className: "table table-sm" },
+          phases.map((phase, index) =>
+            h(
+              "tr",
+              { key: phase },
+              h("td", null, phaseLabels[phase]),
+              h(
+                "td",
+                null,
                 sync.status === "complete" || (currentPhase >= 0 && index < currentPhase)
-                  ? "done"
+                  ? "Done"
                   : index === currentPhase
-                    ? sync.status
-                    : "pending";
-              const count =
-                phaseCounts[phase] == null
-                  ? " · committed count unknown"
-                  : ` · ${Number(phaseCounts[phase]).toLocaleString()} committed`;
-              return `${phaseLabels[phase]}: ${state}${count}`;
-            })
-            .join(" · "),
+                    ? statusLabel
+                    : "Pending",
+              ),
+              h("td", null, phaseCounts[phase] == null ? "Unknown" : Number(phaseCounts[phase]).toLocaleString()),
+            ),
+          ),
         ),
       );
       const serverReadAt = Number(sync.as_of ?? sync.as_of_ms);
@@ -3825,13 +3848,19 @@ function tabMembers() {
               : sync.phase_finish_at,
           )
         : "Unknown";
-      parts.push(
-        h(
-          "p",
-          { className: "muted" },
-          `Elapsed: ${elapsed == null ? "Unknown" : `${Math.round(Number(elapsed) / 60)} minutes`} · Remaining: ${remaining} · Expected finish: ${finish}`,
-        ),
-      );
+      if (sync.status !== "complete") {
+        parts.push(
+          h(
+            "p",
+            { className: "muted" },
+            `Elapsed: ${elapsed == null ? "Unknown" : `${Math.round(Number(elapsed) / 60)} minutes`} · Remaining: ${remaining} · Expected finish: ${finish}`,
+          ),
+        );
+      } else if (sync.started_at && Number(sync.last_success_at) >= Number(sync.started_at)) {
+        // A completed run records its finish as last_success_at; never measure it against now.
+        const took = (Number(sync.last_success_at) - Number(sync.started_at)) / 60000;
+        parts.push(h("p", { className: "muted" }, `Took ${Math.round(took)} minutes`));
+      }
       if (
         sync.phase === "members" &&
         sync.phase_finish_at != null &&
@@ -3881,14 +3910,9 @@ function tabMembers() {
         }
         parts.push(h("p", { className: "muted" }, retryText));
       }
+      const details = [];
       if (sync.initial_completed_at_ms || sync.initial_completed_at)
-        parts.push(
-          h(
-            "p",
-            {},
-            `Initial import completed: ${asDate(sync.initial_completed_at_ms ?? sync.initial_completed_at)}`,
-          ),
-        );
+        details.push(["Initial import completed", asDate(sync.initial_completed_at_ms ?? sync.initial_completed_at)]);
       if (sync.last_success_at) {
         const counts = [
           ["processed", "processed"],
@@ -3898,14 +3922,13 @@ function tabMembers() {
         ]
           .filter(([field]) => sync[`last_success_${field}`] != null)
           .map(([field, label]) => `${Number(sync[`last_success_${field}`]).toLocaleString()} ${label}`);
-        parts.push(
-          h(
-            "p",
-            { className: "muted" },
-            `Last successful run: ${asDate(sync.last_success_at)}${counts.length ? ` · ${counts.join(" · ")}` : ""}`,
-          ),
-        );
+        details.push([
+          "Last successful run",
+          `${asDate(sync.last_success_at)}${counts.length ? ` · ${counts.join(" · ")}` : ""}`,
+        ]);
       }
+      details.push(["Last committed progress", asDate(sync.last_progress_at)]);
+      if (sync.as_of_ms || sync.as_of) details.push(["Status read at", asDate(sync.as_of_ms ?? sync.as_of)]);
       if (sync.reconciliation_needed)
         parts.push(
           h(
@@ -3961,9 +3984,13 @@ function tabMembers() {
             "Results are partial while import is incomplete. Older join or ban dates may be unavailable.",
           ),
         );
-      parts.push(h("p", { className: "muted" }, `Last committed progress: ${asDate(sync.last_progress_at)}`));
-      if (sync.as_of_ms || sync.as_of)
-        parts.push(h("p", { className: "muted" }, `Status read at ${asDate(sync.as_of_ms ?? sync.as_of)}`));
+      parts.push(
+        h(
+          "dl",
+          { className: "member-sync-details" },
+          ...details.flatMap(([label, value]) => [h("dt", { key: `${label}-t` }, label), h("dd", { key: `${label}-d` }, value)]),
+        ),
+      );
       if (controlPending())
         parts.push(
           h(
@@ -3981,13 +4008,15 @@ function tabMembers() {
           ["retry", "Retry"],
           ["reconcile", "Reconcile from Discord"],
         ]) {
-          const disabled =
-            !sync.run_id ||
-            controlPending() ||
-            (operation === "pause" && !["queued", "running", "waiting"].includes(sync.status)) ||
-            (operation === "resume" && sync.status !== "paused") ||
-            (operation === "retry" && !memberSyncRetryEnabled(sync)) ||
-            (operation === "reconcile" && (sync.status !== "complete" || !sync.initial_completed_at));
+          // Mirror the API's validate_member_sync_operation: omit controls this state can never accept.
+          const valid = {
+            pause: ["queued", "running", "waiting"].includes(sync.status),
+            resume: sync.status === "paused",
+            retry: memberSyncRetryEnabled(sync),
+            reconcile: sync.status === "complete" && !!sync.initial_completed_at,
+          }[operation];
+          if (!valid) continue;
+          const disabled = !sync.run_id || controlPending();
           controls.push(
             h(
               ActionButton,
@@ -4037,7 +4066,7 @@ function tabMembers() {
           );
         }
       }
-      parts.push(h("div", { className: "row" }, ...controls));
+      if (controls.length) parts.push(h("div", { className: "row" }, ...controls));
       setSyncParts(parts);
     };
     const loadStatus = async () => {
@@ -4391,7 +4420,7 @@ function tabMembers() {
     h(
       "section",
       { className: "card bg-base-100 card-border", "aria-label": "Member import status" },
-      ...syncParts,
+      h("div", { className: "card-body" }, ...syncParts),
     ),
     h(
       "section",
@@ -4418,11 +4447,13 @@ function tabMembers() {
         h(DataTable, { headings: ["Member", "User ID", "Joined", "Status", "History"] }, memberRows),
       ),
     ),
-    h(
-      "section",
-      { className: "card bg-base-100 card-border", "aria-label": "Member history" },
-      ...detailParts,
-    ),
+    detailParts.length
+      ? h(
+          "section",
+          { className: "card bg-base-100 card-border", "aria-label": "Member history" },
+          h("div", { className: "card-body" }, ...detailParts),
+        )
+      : null,
   );
 }
 
