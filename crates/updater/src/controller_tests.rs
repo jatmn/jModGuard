@@ -1453,7 +1453,12 @@ async fn ready_failure_of_another_release_leaves_complete_upgrade() {
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
 
-struct ContractWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+/// Records the contract log lines below. With `every_warning`, it also records
+/// every WARN or ERROR, and prefixes each line with its level.
+struct ContractWarnings {
+    logs: Arc<std::sync::Mutex<Vec<String>>>,
+    every_warning: bool,
+}
 
 impl tracing::Subscriber for ContractWarnings {
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
@@ -1471,16 +1476,21 @@ impl tracing::Subscriber for ContractWarnings {
     fn event(&self, event: &tracing::Event<'_>) {
         let mut message = String::new();
         event.record(&mut MessageVisit(&mut message));
+        let level = *event.metadata().level();
         if message.contains("no capability contract")
             || message.contains("registry unreachable at boot; starting the built-in application")
-            || (event.metadata().level() == &tracing::Level::INFO
+            || (level == tracing::Level::INFO
                 && message.starts_with("waiting for the bot to migrate core schema"))
-            || (event.metadata().level() == &tracing::Level::ERROR
+            || (level == tracing::Level::ERROR
                 && message == "discord token rejected; bot held, fix token and restart container")
-            || (event.metadata().level() == &tracing::Level::WARN
+            || (level == tracing::Level::WARN
                 && message == "retrying bot after discord token rejection hold")
+            || (self.every_warning && level <= tracing::Level::WARN)
         {
-            self.0.lock().expect("warning log").push(message);
+            if self.every_warning {
+                message = format!("{level} {message}");
+            }
+            self.logs.lock().expect("warning log").push(message);
         }
     }
 
@@ -1509,8 +1519,23 @@ impl tracing::field::Visit for MessageVisit<'_> {
 async fn with_contract_warnings<T>(
     future: impl std::future::Future<Output = T>,
 ) -> (T, Vec<String>) {
+    capture_logs(false, future).await
+}
+
+/// Like `with_contract_warnings`, but every WARN or ERROR is recorded too.
+async fn with_every_warning<T>(future: impl std::future::Future<Output = T>) -> (T, Vec<String>) {
+    capture_logs(true, future).await
+}
+
+async fn capture_logs<T>(
+    every_warning: bool,
+    future: impl std::future::Future<Output = T>,
+) -> (T, Vec<String>) {
     let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let guard = tracing::subscriber::set_default(ContractWarnings(Arc::clone(&logs)));
+    let guard = tracing::subscriber::set_default(ContractWarnings {
+        logs: Arc::clone(&logs),
+        every_warning,
+    });
     let value = future.await;
     drop(guard);
     (value, logs.lock().expect("warning log").clone())
@@ -2876,18 +2901,29 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
             control.clone(),
             &root,
         );
+        // The fixture's maintenance child serves health on a real socket.
+        let reserved_health = bind_reclaimable_health_port().await;
+        let addr = reserved_health.local_addr().unwrap();
+        drop(reserved_health);
+        tokio::fs::write(root.join("bind-maintenance-baked-bot"), addr.to_string())
+            .await
+            .unwrap();
         // Until the bot migrates, the API waits without a tick error: the main
-        // loop would log one at WARN every poll. It logs the wait once at INFO.
+        // loop would log one at WARN every poll. It logs the wait once at INFO,
+        // and nothing at WARN or above.
         let (ticks, logs) =
-            with_contract_warnings(async { (api.tick().await, api.tick().await) }).await;
+            with_every_warning(async { (api.tick().await, api.tick().await) }).await;
         assert!(!ticks.0.unwrap() && !ticks.1.unwrap());
         assert!(api.running.is_none());
-        assert!(
-            api.maintenance.is_some(),
-            "the maintenance API keeps health up while waiting"
-        );
+        tokio::time::timeout(POLL, async {
+            while !launcher_health_responds(addr).await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the maintenance API keeps health up while waiting");
         let waiting = format!(
-            "waiting for the bot to migrate core schema 16 -> {}",
+            "INFO waiting for the bot to migrate core schema 16 -> {}",
             db::CORE_SCHEMA_VERSION
         );
         assert_eq!(logs, [waiting], "stale_meta={stale_meta}");
@@ -2952,6 +2988,70 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
         drop((api, bot, control, migrated));
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
+}
+
+/// A failed control read during the API migration wait keeps the wait's
+/// start: the next poll neither logs the wait again nor restarts its bound.
+#[tokio::test]
+async fn api_migration_wait_keeps_its_start_across_a_failed_control_read() {
+    let root = std::env::temp_dir().join(format!("api-wait-read-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let set_schema = |version: i64| {
+        db.with_conn(move |conn| {
+            conn.pragma_update(None, "user_version", version)?;
+            Ok(())
+        })
+    };
+    let set_upgrade = |sql: &'static str| {
+        db.with_conn_sync(move |conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_bounded(sql, (), 64 * 1024)?;
+            tx.commit()
+        })
+    };
+    set_schema(db::CORE_SCHEMA_VERSION - 1).await.unwrap();
+    let state = control.component("api").await.unwrap();
+    assert!(state.installed.is_none() && state.observed.is_none());
+    let mut api = controller(
+        "api",
+        baked,
+        Registry::ghcr().unwrap(),
+        control.clone(),
+        &root,
+    );
+    let ((), logs) = with_every_warning(async {
+        api.restore(&state).await.unwrap();
+        let since = api.core_migration_wait.expect("API waits for the bot");
+        // The API restore reads the upgrade record; an unreadable one fails
+        // this poll without ending the wait.
+        set_upgrade(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('component_upgrade_v1','invalid')",
+        )
+        .unwrap();
+        let error = api.restore(&state).await.unwrap_err();
+        assert!(error.to_string().contains("expected value"), "{error:#}");
+        assert_eq!(api.core_migration_wait, Some(since));
+        set_upgrade("DELETE FROM meta WHERE key='component_upgrade_v1'").unwrap();
+        api.restore(&state).await.unwrap();
+        assert_eq!(api.core_migration_wait, Some(since));
+    })
+    .await;
+    let waiting = format!(
+        "INFO waiting for the bot to migrate core schema {} -> {}",
+        db::CORE_SCHEMA_VERSION - 1,
+        db::CORE_SCHEMA_VERSION
+    );
+    assert_eq!(logs, [waiting]);
+    assert!(api.running.is_none());
+    // Once the bot has migrated, the built-in API starts and the wait ends.
+    set_schema(db::CORE_SCHEMA_VERSION).await.unwrap();
+    api.restore(&state).await.unwrap();
+    assert!(api.running.is_some() && api.core_migration_wait.is_none());
+    api.stop_application().await.unwrap();
+    drop((api, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
 /// Historical desired rows omit `upgrade`. Migration keeps them queued; the
@@ -6688,7 +6788,10 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     bot.idle().await.unwrap();
     assert!(bot.health.is_none());
     let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let guard = tracing::subscriber::set_default(ContractWarnings(Arc::clone(&logs)));
+    let guard = tracing::subscriber::set_default(ContractWarnings {
+        logs: Arc::clone(&logs),
+        every_warning: false,
+    });
     // Exactly one production poll must reap the child and bind the same socket.
     assert!(!bot.tick().await.unwrap());
     assert!(bot.running.is_none());

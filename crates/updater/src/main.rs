@@ -894,7 +894,9 @@ struct Supervisor {
     readiness_receipt: ReadinessReceipt,
     last_observed: Option<Instant>,
     /// Set while the last API restore was waiting for the bot to migrate the
-    /// core schema up to the built-in one; holds when that wait began.
+    /// core schema up to the built-in one; holds when that wait began. A poll
+    /// whose control reads fail keeps it, so the wait logs once and its bound
+    /// does not restart.
     core_migration_wait: Option<Instant>,
 }
 
@@ -2189,12 +2191,16 @@ impl Supervisor {
     }
 
     async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
-        let waiting_since = self.core_migration_wait.take();
         if let Some(PendingRollback { failed, error }) = self.rollback.clone() {
+            self.core_migration_wait = None;
             return self.rollback_independent(state, failed, error).await;
         }
         let schema = self.control.schema_version().await?;
-        if self.baked_restore_fits(state, schema).await? {
+        let baked_fits = self.baked_restore_fits(state, schema).await?;
+        // A failed read above keeps the migration wait and its start. Any
+        // decision below ends it unless it is still that wait.
+        let waiting_since = self.core_migration_wait.take();
+        if baked_fits {
             let path = self.baked.clone();
             let sha = self.base_sha.clone();
             return self.start(&path, &sha, None).await;
