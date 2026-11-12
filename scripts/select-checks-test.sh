@@ -91,6 +91,10 @@ expect "$all" .github/workflows/ci.yml
 expect "$all" .github/workflows/publish.yml
 expect "contracts frontend publish-tests supply-chain" LICENSE.md
 expect "$all" mystery.bin
+# After --files --, a path named like an option is still a path.
+expect "$all" -- --odd.bin
+expect "contracts" -- docs/INSTALL.md
+expect "contracts frontend api-embed supply-chain" -- frontend/app.js --odd.md
 expect "contracts publish-tests supply-chain" scripts/publish-image.sh
 expect "contracts frontend publish-tests supply-chain" Dockerfile.webui
 

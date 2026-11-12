@@ -15,9 +15,18 @@ mkdir -p "$RUNNER_TEMP/jmodguard" "$HOME/.cache/jmodguard-ci/dylint-drivers"
 } >>"$GITHUB_ENV"
 if [[ "$1" == true ]]; then
   # Rust service/linker outputs need room; these Android SDKs are unused here.
-  # Deleting them is one to two minutes of metadata I/O. Free the space while
-  # the job works instead of holding every Rust lane until the delete returns.
-  sudo rm -rf /usr/local/lib/android </dev/null >/dev/null 2>&1 &
+  # Deleting them is one to two minutes of metadata I/O, so pay for it only on
+  # a runner without that room, and then before any Rust work starts. The
+  # heaviest job writes about 7 GiB of toolchains, crate sources and outputs.
+  need_kb=$((12 * 1024 * 1024))
+  free_kb="$(df --output=avail -k . | tail -n 1 | tr -d '[:space:]')"
+  [[ "$free_kb" =~ ^[0-9]+$ ]] || { echo 'ci-setup: cannot read free disk space' >&2; exit 1; }
+  if (( free_kb < need_kb )); then
+    echo "ci-setup: $((free_kb / 1048576)) GiB free, below the $((need_kb / 1048576)) GiB threshold; deleting the unused Android SDKs"
+    sudo rm -rf /usr/local/lib/android
+  else
+    echo "ci-setup: $((free_kb / 1048576)) GiB free; keeping the unused Android SDKs"
+  fi
   toolchain="$(awk -F '\"' '/^channel = / {print $2; exit}' rust-toolchain.toml)"
   [[ -n "$toolchain" ]] || exit 1
   rustup toolchain install "$toolchain" --profile minimal --component clippy,rustfmt

@@ -286,22 +286,36 @@ try {
   }
   assert.ok(!fs.existsSync(githubPath), "failed setup must not publish nextest");
 
-  // Rust setup must free the Android SDK space without waiting for the delete,
-  // which holds a hosted job for one to two minutes. sudo and rustup are
-  // stand-ins here; the slow delete is a delayed marker, not a hosted runner.
-  const rustBin = path.join(scratch, "rust-bin"), freed = path.join(scratch, "freed");
+  // Rust setup reclaims the Android SDK space only when the runner is short of
+  // room, and then before any Rust work, failing with the delete. df, sudo and
+  // rustup are stand-ins that record their order; this is not a hosted runner.
+  const rustBin = path.join(scratch, "rust-bin"), setupCalls = path.join(scratch, "setup-calls");
   fs.mkdirSync(rustBin);
-  fs.writeFileSync(path.join(rustBin, "sudo"), '#!/bin/sh\nsleep 2\nprintf "%s\\n" "$*" > "$FREED"\n', { mode: 0o755 });
-  fs.writeFileSync(path.join(rustBin, "rustup"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-  run("bash", [setupScript, "true"], { cwd: root, env: {
-    ...process.env, PATH: `${rustBin}:${process.env.PATH}`, FREED: freed,
-    GITHUB_ACTIONS: "true", RUNNER_ENVIRONMENT: "github-hosted", RUNNER_TEMP: scratch, GITHUB_ENV: envFile,
-  } });
-  assert.ok(!fs.existsSync(freed), "Rust setup must not wait for the Android SDK delete");
-  for (let waited = 0; !fs.existsSync(freed) && waited < 100; waited++) {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
-  }
-  assert.equal(fs.readFileSync(freed, "utf8").trim(), "rm -rf /usr/local/lib/android", "Rust setup must still free the Android SDK space");
+  fs.writeFileSync(path.join(rustBin, "df"), '#!/bin/sh\nprintf "    Avail\\n%s\\n" "$FREE_KB"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(rustBin, "sudo"), '#!/bin/sh\nprintf "sudo %s\\n" "$*" >>"$SETUP_CALLS"\nexit "${SUDO_RESULT:-0}"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(rustBin, "rustup"), '#!/bin/sh\necho rustup >>"$SETUP_CALLS"\n', { mode: 0o755 });
+  const rustSetup = (freeKb, extra = {}) => {
+    fs.rmSync(setupCalls, { force: true });
+    const result = spawnSync("bash", [setupScript, "true"], { cwd: root, encoding: "utf8", env: {
+      ...process.env, PATH: `${rustBin}:${process.env.PATH}`, FREE_KB: freeKb, SETUP_CALLS: setupCalls,
+      GITHUB_ACTIONS: "true", RUNNER_ENVIRONMENT: "github-hosted", RUNNER_TEMP: scratch, GITHUB_ENV: envFile, ...extra,
+    } });
+    assert.ifError(result.error);
+    return { ...result, calls: fs.existsSync(setupCalls) ? fs.readFileSync(setupCalls, "utf8").trim().split("\n") : [] };
+  };
+  // Free space is reported in KiB: one terabyte, then one megabyte.
+  const roomy = rustSetup("1073741824");
+  assert.equal(roomy.status, 0, roomy.stderr);
+  assert.deepEqual(roomy.calls, ["rustup"], "a runner with room must not pay for the Android SDK delete");
+  const short = rustSetup("1024");
+  assert.equal(short.status, 0, short.stderr);
+  assert.deepEqual(short.calls, ["sudo rm -rf /usr/local/lib/android", "rustup"], "a short runner must free the space before Rust work");
+  const failedDelete = rustSetup("1024", { SUDO_RESULT: "5" });
+  assert.notEqual(failedDelete.status, 0, "a failed delete must fail setup");
+  assert.deepEqual(failedDelete.calls, ["sudo rm -rf /usr/local/lib/android"], "Rust work must not start after a failed delete");
+  const unreadable = rustSetup("unknown");
+  assert.notEqual(unreadable.status, 0, "unreadable free space must fail setup, not skip the delete");
+  assert.deepEqual(unreadable.calls, []);
 
   const selectScan = socketSteps.find(step => step.startsWith("name: Select dependency scan"));
   const selectRun = selectScan?.match(/^        run: \|\n([\s\S]*)/m)?.[1];
@@ -1122,8 +1136,9 @@ try {
   assert.equal(browser.status, 7, browser.stderr);
   assert.match(browser.stdout, /^ci-preflight: affected groups: contracts frontend api-embed supply-chain$/m);
   assert.ok(browser.calls.includes("require-host-eslint-node.sh"), "browser changes must reach the browser gates");
-  // A path the selector cannot classify needs the full suite, as it does on GitHub Actions.
-  fs.writeFileSync(path.join(repo, "mystery.bin"), "?\n");
+  // A path the selector cannot classify needs the full suite, as it does on
+  // GitHub Actions. Its option-like name must reach the selector as a path.
+  fs.writeFileSync(path.join(repo, "--odd.bin"), "?\n");
   const unknown = preflight("--affected", "--base", "main");
   assert.notEqual(unknown.status, 0);
   assert.match(unknown.stdout, /^ci-preflight: affected: every group; running the full suite$/m);

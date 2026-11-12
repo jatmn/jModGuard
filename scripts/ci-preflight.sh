@@ -514,7 +514,7 @@ if [ "$affected" -eq 1 ]; then
   rm -f "$affected_list"
   affected_groups=contracts
   if [ "${#affected_paths[@]}" -gt 0 ]; then
-    affected_groups="$(bash scripts/select-checks.sh plan --files "${affected_paths[@]}" | tr '\n' ' ')"
+    affected_groups="$(bash scripts/select-checks.sh plan --files -- "${affected_paths[@]}" | tr '\n' ' ')"
   fi
   # A plan with every group is the full suite; api stands in for api-embed.
   affected_full=1

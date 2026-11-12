@@ -8,12 +8,13 @@ cd "$root"
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/select-checks.sh plan [--files PATH]...
-       bash scripts/select-checks.sh matrix [--files PATH]...
-       bash scripts/select-checks.sh socket [--files PATH]...
+Usage: bash scripts/select-checks.sh plan [--files [--] PATH...]
+       bash scripts/select-checks.sh matrix [--files [--] PATH...]
+       bash scripts/select-checks.sh socket [--files [--] PATH...]
 
 plan prints selected check groups. matrix emits GitHub Actions job entries.
 socket prints whether dependency inputs require a Socket scan.
+After --files --, every remaining argument is a path, whatever it looks like.
 PRs compare the event base/head with merge-base semantics. Pushes compare
 all commits in the event before/after range. Missing history selects all checks.
 Selection reasons go to stderr; stdout is machine-readable.
@@ -28,6 +29,12 @@ while [ "$#" -gt 0 ]; do
     --files)
       shift
       [ "$#" -ge 1 ] || { usage >&2; exit 2; }
+      if [ "$1" = -- ]; then
+        # Machine-supplied paths: a file may be named like an option.
+        shift
+        files+=("$@")
+        set --
+      fi
       while [ "$#" -gt 0 ] && [ "${1#--}" = "$1" ]; do
         files+=("$1")
         shift

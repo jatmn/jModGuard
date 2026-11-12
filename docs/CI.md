@@ -43,8 +43,10 @@ Source, feature, compiler and embedded-file changes invalidate compiler entries;
 cache hits never skip tests. Linking and check-only compiler calls still run,
 and simultaneous cold misses can compile the same input before either saves it.
 A Rust toolchain is not installed for documentation-only contracts. Rust jobs
-free the runner's unused Android SDK space in the background: the delete takes
-one to two minutes, and no job waits for it. PR runs cancel
+delete the runner's unused Android SDKs only when less than 12 GiB is free. The
+delete takes one to two minutes and then finishes before any Rust work, failing
+setup if it fails; the heaviest job writes about 7 GiB. Each job logs its free
+space and which path it took. PR runs cancel
 superseded runs; trusted publication runs queue without replacement or cancellation
 (up to GitHub’s limit of 100 waiting runs). npm and
 Rust caches reduce repeated downloads/compilation. PRs do not save the shared
