@@ -111,12 +111,14 @@ across guilds ([MEMBERS.md](MEMBERS.md)).
 
 ## Separate guild-store family
 
-The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version17,
-using `migrations/guild/0001_identity.sql` through `0016_member_pending_rejoin_notes.sql`. Version 16
+The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version18,
+using `migrations/guild/0001_identity.sql` through `0017_member_gap_auto_clear.sql`. Version 16
 adds optional immutable ban attempt tags to case payloads without changing tables or
 rewriting legacy cases. Version 17 adds durable `guild_member_pending_rejoin_notes` so
 member-rejoin log delivery can survive restarts and member-sync ahead of gateway joins.
-Earlier binaries must not read version16+ case tags or version17 pending receipts. This separate
+Version 18 adds `guild_member_seed.gap_auto_clear`; existing coverage gaps keep 0
+and still need an explicit Reconcile.
+Earlier binaries must not read version16+ case tags, version17 pending receipts, or version18 gap flags. This separate
 database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings, bounded latest-message snapshots and the bounded

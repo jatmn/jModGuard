@@ -1857,6 +1857,11 @@ impl BotState {
         }
     }
 
+    /// Shards that reached Ready at least once in this process.
+    pub fn ready_shard_ids(&self) -> Vec<u32> {
+        self.ready_shards.lock().ready.iter().copied().collect()
+    }
+
     /// A shard's first READY is startup. A later READY from that same shard is
     /// a replaced session and advances the coverage-gap generation.
     pub(crate) fn note_shard_ready(&self, shard_id: u32) {

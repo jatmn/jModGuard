@@ -161,7 +161,7 @@ function App() {
     isPreview() &&
       h(
         "div",
-        { id: "preview-banner", className: "preview-banner alert alert-warning", role: "status" },
+        { id: "preview-banner", className: "preview-banner alert alert-soft alert-warning", role: "status" },
         "Preview — changes disabled",
       ),
     display.view === "main-view"
@@ -3527,6 +3527,22 @@ function actionCancelNeedsConfirm(job) {
   return actionIsLogChannel(job) && (job.state === "running" || job.state === "uncertain");
 }
 
+// Gap reasons are stored by the bot. Connection reasons get a label; anything
+// else is a member or ban change the bot could not save.
+const MEMBER_CONNECTION_GAPS = {
+  "bot restarted": "planned bot restart",
+  "bot stopped unexpectedly": "the bot stopped unexpectedly",
+  "gateway continuity interrupted": "Discord connection was interrupted",
+  "guild gateway unavailable": "Discord reported the server as unavailable",
+};
+
+function memberGapCause(reason, when) {
+  const label = Object.hasOwn(MEMBER_CONNECTION_GAPS, reason || "") ? MEMBER_CONNECTION_GAPS[reason] : null;
+  return label
+    ? `The bot was offline or reconnected${when} (${label})`
+    : `The bot could not save a member or ban change${when}`;
+}
+
 function memberTime(value) {
   if (value === null || value === undefined || value === "") return "Unknown";
   const date = new Date(typeof value === "string" && !/^\d+$/.test(value) ? value : Number(value));
@@ -3739,7 +3755,7 @@ function tabMembers() {
         parts.push(
           h(
             "p",
-            { className: "alert alert-warning" },
+            { className: "alert alert-soft alert-warning" },
             "Import metadata is unavailable. Controls are disabled until the saved job is restored or repaired.",
           ),
         );
@@ -3932,14 +3948,96 @@ function tabMembers() {
       }
       details.push(["Last committed progress", asDate(sync.last_progress_at)]);
       if (sync.as_of_ms || sync.as_of) details.push(["Status read at", asDate(sync.as_of_ms ?? sync.as_of)]);
-      if (sync.reconciliation_needed)
-        parts.push(
-          h(
-            "p",
-            { className: "alert alert-warning" },
-            "Coverage may be stale after an outage, restore, bot restart, or Gateway session replacement. A full current-member and current-ban check needs an administrator to select Reconcile from Discord.",
-          ),
+      function syncControlButton(operation, label) {
+        // Mirror the API's validate_member_sync_operation: omit controls this state can never accept.
+        const valid = {
+          pause: ["queued", "running", "waiting"].includes(sync.status),
+          resume: sync.status === "paused",
+          retry: memberSyncRetryEnabled(sync),
+          reconcile: sync.status === "complete" && !!sync.initial_completed_at,
+        }[operation];
+        if (!valid) return null;
+        const disabled = !sync.run_id || controlPending();
+        return h(
+          ActionButton,
+          {
+            className: "btn btn-sm",
+            disabled: disabled,
+            onClick: async () => {
+              if (!latestStatus?.run_id) return;
+              if (
+                operation === "reconcile" &&
+                !confirm(
+                  "Request a full current-member and current-ban reconciliation from Discord? This can take a while.",
+                )
+              )
+                return;
+              let job;
+              try {
+                job = await submitBotAction(`/api/guilds/${guildId}/member-sync/actions`, "POST", {
+                  operation,
+                });
+              } catch (error) {
+                if (
+                  error.status !== 409 ||
+                  !["member_sync_missing_job", "member_sync_invalid_operation"].includes(error.code)
+                )
+                  throw error;
+                if (!aliveHere()) return;
+                syncActionOutcome = error.message;
+                renderStatus(latestStatus);
+                loadStatus();
+                return;
+              }
+              if (!aliveHere()) return;
+              syncActionOutcome = null;
+              if (["pending", "claimed", "running", "succeeded"].includes(job.state)) {
+                observeControl(job, operation);
+              } else {
+                syncActionOutcome = `${label} action ${job.state}. Check Bot actions for details.`;
+              }
+              renderStatus(latestStatus);
+              schedulePoll();
+              loadStatus();
+            },
+          },
+          label,
         );
+      }
+      // A short planned restart clears itself when audit recovery finishes, unless
+      // that recovery stopped for attention. Anything else needs Reconcile.
+      const autoClearing = sync.gap_auto_clear && sync.audit_recovery_status !== "needs_attention";
+      const reconcileInNotice = sync.reconciliation_needed && !autoClearing && !isPreview();
+      const reconcileButton = reconcileInNotice && syncControlButton("reconcile", "Reconcile from Discord");
+      if (sync.reconciliation_needed) {
+        const when = sync.gap_at ? ` at ${asDate(sync.gap_at)}` : "";
+        if (autoClearing)
+          parts.push(
+            h(
+              "p",
+              { id: "member-coverage-notice", className: "muted", role: "status" },
+              `The bot restarted${when}. Ban and unban actions from the restart are being caught up automatically; no action is needed.`,
+            ),
+          );
+        else
+          parts.push(
+            h(
+              "div",
+              { id: "member-coverage-notice", className: "alert alert-soft alert-warning", role: "status" },
+              h(
+                "div",
+                {},
+                h("strong", {}, "Member list may be out of date"),
+                h(
+                  "p",
+                  {},
+                  `${memberGapCause(sync.reconciliation_reason, when)}, so it may have missed some joins, leaves, or bans. Select Reconcile from Discord to re-check the full member and ban lists. This can take a while on large servers.`,
+                ),
+              ),
+              reconcileButton && h("div", { className: "row" }, reconcileButton),
+            ),
+          );
+      }
       if (sync.audit_recovery_status && sync.audit_recovery_status !== "complete") {
         const phase =
           sync.audit_recovery_phase === "ban"
@@ -4011,62 +4109,8 @@ function tabMembers() {
           ["retry", "Retry"],
           ["reconcile", "Reconcile from Discord"],
         ]) {
-          // Mirror the API's validate_member_sync_operation: omit controls this state can never accept.
-          const valid = {
-            pause: ["queued", "running", "waiting"].includes(sync.status),
-            resume: sync.status === "paused",
-            retry: memberSyncRetryEnabled(sync),
-            reconcile: sync.status === "complete" && !!sync.initial_completed_at,
-          }[operation];
-          if (!valid) continue;
-          const disabled = !sync.run_id || controlPending();
-          controls.push(
-            h(
-              ActionButton,
-              {
-                className: "btn btn-sm",
-                disabled: disabled,
-                onClick: async () => {
-                  if (!latestStatus?.run_id) return;
-                  if (
-                    operation === "reconcile" &&
-                    !confirm(
-                      "Request a full current-member and current-ban reconciliation from Discord? This can take a while.",
-                    )
-                  )
-                    return;
-                  let job;
-                  try {
-                    job = await submitBotAction(`/api/guilds/${guildId}/member-sync/actions`, "POST", {
-                      operation,
-                    });
-                  } catch (error) {
-                    if (
-                      error.status !== 409 ||
-                      !["member_sync_missing_job", "member_sync_invalid_operation"].includes(error.code)
-                    )
-                      throw error;
-                    if (!aliveHere()) return;
-                    syncActionOutcome = error.message;
-                    renderStatus(latestStatus);
-                    loadStatus();
-                    return;
-                  }
-                  if (!aliveHere()) return;
-                  syncActionOutcome = null;
-                  if (["pending", "claimed", "running", "succeeded"].includes(job.state)) {
-                    observeControl(job, operation);
-                  } else {
-                    syncActionOutcome = `${label} action ${job.state}. Check Bot actions for details.`;
-                  }
-                  renderStatus(latestStatus);
-                  schedulePoll();
-                  loadStatus();
-                },
-              },
-              label,
-            ),
-          );
+          const control = operation === "reconcile" && reconcileInNotice ? null : syncControlButton(operation, label);
+          if (control) controls.push(control);
         }
       }
       if (controls.length) parts.push(h("div", { className: "row" }, ...controls));

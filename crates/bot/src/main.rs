@@ -98,6 +98,35 @@ async fn idle_until_shutdown() {
     tracing::info!("bot process stopped");
 }
 
+/// The Gateway covered this process until shutdown only when every shard that
+/// reached Ready still has its own runner and that runner is connected. A
+/// restarting shard has no runner until it reconnects, and another shard's
+/// runner never stands in for it.
+fn gateway_covered(
+    runners: &std::collections::HashMap<u32, serenity::gateway::ConnectionStage>,
+    ready_shards: &[u32],
+) -> bool {
+    !ready_shards.is_empty()
+        && ready_shards
+            .iter()
+            .all(|shard| runners.get(shard) == Some(&serenity::gateway::ConnectionStage::Connected))
+}
+
+/// A shutdown signal with a connected Gateway is a planned stop. The next bot
+/// uses its time to measure downtime; release proceeds even when this write fails.
+async fn record_planned_stop(
+    db: &db::Db,
+    activation: &jmodguard_bot::activation::Activation,
+    covered_until_ms: i64,
+) {
+    let record = db::record_planned_active_bot_stop(db, activation.instance(), covered_until_ms);
+    match tokio::time::timeout(Duration::from_secs(2), record).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!("planned bot stop could not be recorded: {error:#}"),
+        Err(_) => tracing::warn!("planned bot stop record timed out"),
+    }
+}
+
 /// Release the writer lease before an already-fatal authentication exit or hold.
 /// Running REST workers keep their existing parked behavior; only startup
 /// discovery and the gateway's fatal 4004 return use this process boundary.
@@ -589,6 +618,17 @@ async fn main() -> Result<()> {
         shutdown_signal().await;
         shutdown_activation.begin_shutdown();
         jmodguard::set_process_ready(false);
+        // Date the planned stop now, before the notice drain cuts off recording, and
+        // only when every shard that reached Ready still has a connected session.
+        let runners = shard_manager
+            .runners
+            .lock()
+            .await
+            .iter()
+            .map(|(shard, runner)| (shard.0, runner.stage))
+            .collect();
+        let covered_until = gateway_covered(&runners, &shutdown_app.ready_shard_ids())
+            .then(|| chrono::Utc::now().timestamp_millis());
         let content = logging::shutdown_notice_content(shutdown_app.start.elapsed().as_secs());
         let guild_ids = shutdown_cache.guilds();
         let attempted = guild_ids.len();
@@ -600,6 +640,9 @@ async fn main() -> Result<()> {
             tracing::info!(sent, attempted, "shutdown notice phase complete");
         })
         .await;
+        if let Some(at) = covered_until {
+            record_planned_stop(&shutdown_db, &shutdown_activation, at).await;
+        }
         if let Err(error) =
             db::release_active_bot(&shutdown_db, shutdown_activation.instance()).await
         {
@@ -627,6 +670,39 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn planned_stop_needs_every_ready_shard_connected() {
+        use serenity::gateway::ConnectionStage::{Connected, Connecting, Resuming};
+        let runners = |stages: &[(u32, serenity::gateway::ConnectionStage)]| {
+            stages
+                .iter()
+                .copied()
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        assert!(super::gateway_covered(&runners(&[(0, Connected)]), &[0]));
+        assert!(
+            !super::gateway_covered(&runners(&[(0, Connected)]), &[]),
+            "never reached Ready"
+        );
+        assert!(
+            !super::gateway_covered(&runners(&[]), &[0]),
+            "restarting shard has no runner"
+        );
+        assert!(!super::gateway_covered(&runners(&[(0, Resuming)]), &[0]));
+        assert!(!super::gateway_covered(
+            &runners(&[(0, Connected), (1, Connecting)]),
+            &[0, 1]
+        ));
+        assert!(
+            !super::gateway_covered(&runners(&[(1, Connected)]), &[0]),
+            "another shard's runner cannot stand in for a Ready shard"
+        );
+        assert!(super::gateway_covered(
+            &runners(&[(0, Connected), (1, Connecting)]),
+            &[0]
+        ));
+    }
+
     use super::*;
 
     #[tokio::test]

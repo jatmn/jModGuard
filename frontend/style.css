@@ -37,7 +37,7 @@
   --color-secondary: var(--selected); --color-secondary-content: var(--selected-text);
   --color-accent: var(--focus); --color-accent-content: var(--accent-text);
   --color-neutral: var(--text); --color-neutral-content: var(--panel);
-  --color-info: var(--focus); --color-info-content: var(--accent-text);
+  --color-info: var(--accent); --color-info-content: var(--accent-text);
   --color-success: var(--good); --color-success-content: var(--accent-text);
   --color-warning: var(--warn); --color-warning-content: var(--text);
   --color-error: var(--bad); --color-error-content: var(--accent-text);
@@ -50,7 +50,7 @@
   --color-secondary: var(--selected); --color-secondary-content: var(--selected-text);
   --color-accent: var(--focus); --color-accent-content: var(--accent-text);
   --color-neutral: var(--text); --color-neutral-content: var(--panel);
-  --color-info: var(--focus); --color-info-content: var(--accent-text);
+  --color-info: var(--accent); --color-info-content: var(--accent-text);
   --color-success: var(--good); --color-success-content: var(--accent-text);
   --color-warning: var(--warn); --color-warning-content: var(--text);
   --color-error: var(--bad); --color-error-content: var(--accent-text);
