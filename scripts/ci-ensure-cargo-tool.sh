@@ -54,20 +54,44 @@ ensure_cargo_tool() {
     echo "ci-preflight: pinned $pinned absent; checking PATH"
   fi
 
+  local path_seen="" path_ver=""
   if command -v "$bin" >/dev/null 2>&1; then
     path_bin="$(command -v "$bin")"
-    got_ver="$(cargo_tool_version_last_field "$path_bin")"
+    path_seen="$path_bin"
+    path_ver="$(cargo_tool_version_last_field "$path_bin")"
+    got_ver="$path_ver"
     if [ "$got_ver" = "$version" ]; then
       out="$("$path_bin" --version 2>&1 || true)"
       echo "ci-preflight: using $bin at $path_bin ($out)"
       return 0
     fi
-    echo "ci-preflight: $bin at $path_bin is version $got_ver, need $version; installing $crate $version"
+  fi
+
+  # Hosted CI restores previously installed tools under the job-local tool
+  # root (inside the actions/cache path) without putting them on PATH. Reuse
+  # a matching binary instead of rerunning `cargo install`, which refreshes
+  # the crates.io index and re-downloads the crate before no-op'ing with
+  # "already installed".
+  tool_root="$(jmodguard_preflight_cargo_tool_root)"
+  if [ -x "$tool_root/bin/$bin" ]; then
+    path_bin="$tool_root/bin/$bin"
+    got_ver="$(cargo_tool_version_last_field "$path_bin")"
+    if [ "$got_ver" = "$version" ]; then
+      PATH="$tool_root/bin:$PATH"
+      export PATH
+      out="$("$path_bin" --version 2>&1 || true)"
+      echo "ci-preflight: using cached $bin at $path_bin ($out)"
+      return 0
+    fi
+    echo "ci-preflight: cached $path_bin is version $got_ver, need $version"
+  fi
+
+  if [ -n "$path_seen" ]; then
+    echo "ci-preflight: $bin at $path_seen is version $path_ver, need $version; installing $crate $version"
   else
     echo "ci-preflight: installing $crate $version"
   fi
 
-  tool_root="$(jmodguard_preflight_cargo_tool_root)"
   install_target_dir="$tool_root/cargo-install-target"
   mkdir -p "$install_target_dir"
   if ! cargo install --locked --root "$tool_root" --target-dir "$install_target_dir" --version "$version" "$crate"; then

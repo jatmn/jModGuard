@@ -793,6 +793,11 @@ if should_run dylint; then
   else
     bash scripts/dylint.sh
   fi
+  # Publish the pinned dylint tools and prebuilt libraries this run produced
+  # into $JMODGUARD_CI_PREFIX so the next run restores them from the CI tool
+  # cache instead of reinstalling and rebuilding.
+  echo 'ci-preflight: bash scripts/ci-dylint-libs.sh'
+  bash scripts/ci-dylint-libs.sh
 fi
 
 if should_run contracts; then
