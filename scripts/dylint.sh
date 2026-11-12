@@ -85,11 +85,15 @@ dylint_lib_names=(
 # Capture a command's whole listing before matching it. Piping the command into
 # a reader that exits at the first match can kill the writer with SIGPIPE, and
 # pipefail then turns a found entry into a failure (exit 141).
+# Without RUSTUP_AUTO_INSTALL=0, rustup auto-installs a missing toolchain to
+# answer `component list`, which it deprecates. A missing toolchain must fail
+# the check instead, so ensure_dylint_toolchain installs it explicitly. The
+# "not installed" error is the expected cold-runner state, so it is not shown.
 toolchain_components_installed() {
   local channel="$1"
   shift
   local comp needle components missing=0
-  components="$(rustup component list --toolchain "$channel")" || return 1
+  components="$(RUSTUP_AUTO_INSTALL=0 rustup component list --toolchain "$channel" 2>/dev/null)" || return 1
   for comp in "$@"; do
     needle=$comp
     if [ "$comp" = llvm-tools-preview ]; then
