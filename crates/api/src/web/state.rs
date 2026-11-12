@@ -30,6 +30,11 @@ impl ConfigObservation {
     }
 }
 
+/// One user's role IDs in one guild and when Discord returned them.
+pub(super) type MemberRolesSlot = Option<(Instant, Vec<u64>)>;
+type MemberRolesCache =
+    std::collections::HashMap<(u64, u64), Arc<tokio::sync::Mutex<MemberRolesSlot>>>;
+
 /// Dashboard state cannot run the moderation engine.
 /// ```compile_fail
 /// fn moderation(state: &jmodguard_api::web::state::ApiState) {
@@ -52,6 +57,9 @@ pub struct ApiState {
     pub(super) retired_auth_sessions: DashMap<tower_sessions::session::Id, Instant>,
     pub(super) auth_sessions_swept_at: std::sync::Mutex<Option<Instant>>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
+    /// Discord role IDs per (user, guild) for Web UI access roles. Each slot is
+    /// filled by one request at a time and expires after a short TTL.
+    pub(super) member_roles: std::sync::Mutex<MemberRolesCache>,
     pub preview: DashMap<String, crate::web::preview::PreviewGrant>,
     pub usage_cache: crate::web::usage::UsageCache,
     config_observation: tokio::sync::Mutex<ConfigObservation>,
@@ -100,6 +108,7 @@ impl ApiState {
             retired_auth_sessions: DashMap::new(),
             auth_sessions_swept_at: std::sync::Mutex::new(None),
             user_cache: DashMap::new(),
+            member_roles: std::sync::Mutex::new(std::collections::HashMap::new()),
             preview: DashMap::new(),
             usage_cache: crate::web::usage::UsageCache::default(),
             config_observation: tokio::sync::Mutex::new(ConfigObservation::from_primary(primed)),

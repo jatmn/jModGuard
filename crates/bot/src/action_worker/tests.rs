@@ -99,6 +99,7 @@ struct MockDiscord {
     slow_unban: bool,
     check_error: Option<&'static str>,
     live_joined_at_ns: Option<i64>,
+    actor_roles: Vec<i64>,
 }
 impl Default for MockDiscord {
     fn default() -> Self {
@@ -115,6 +116,7 @@ impl Default for MockDiscord {
             slow_unban: false,
             check_error: None,
             live_joined_at_ns: Some(1),
+            actor_roles: Vec::new(),
         }
     }
 }
@@ -147,6 +149,9 @@ impl DiscordActions for MockDiscord {
             "permission unavailable"
         );
         Ok(self.authorized)
+    }
+    async fn actor_roles(&self, _: &BotAction) -> Result<Vec<i64>> {
+        Ok(self.actor_roles.clone())
     }
     async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
         anyhow::ensure!(self.check_error != Some("channel"), "channel unavailable");
@@ -695,6 +700,74 @@ async fn revoked_permissions_never_dispatch() {
     let result = f.status(&job).await;
     assert_eq!(result.state, "failed");
     assert_eq!(result.outcome.as_deref(), Some("permission_revoked"));
+}
+
+#[tokio::test]
+async fn settings_access_role_may_change_log_channels_only() {
+    use crate::db::guild_data::{AccessLevel, AccessRole};
+    let f = Fixture::new();
+    db::enroll_guild(&f.db, 10, 1).await.unwrap();
+    let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+    let tenant = crate::tenant::TenantRuntime::open(
+        &f.db,
+        &crate::config::DbConfig {
+            path: f.path.clone(),
+            pool_size: 2,
+            ..Default::default()
+        },
+        &crate::config::GuildStoresConfig::default(),
+        &crate::config::EvidenceConfig {
+            backend: "none".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    tenant.activate(enrollment.clone()).await.unwrap().unwrap();
+    let map = |level| {
+        let tenant = &tenant;
+        let enrollment = enrollment.clone();
+        async move {
+            let (store, scope) = tenant.live(enrollment).await.unwrap();
+            let revision = store.tenant_settings(scope.clone()).await.unwrap().revision;
+            store
+                .set_access_roles(scope, &revision, vec![AccessRole { role_id: 30, level }])
+                .await
+                .unwrap();
+        }
+    };
+    let moderator = || MockDiscord {
+        authorized: false,
+        actor_roles: vec![30],
+        ..Default::default()
+    };
+
+    map(AccessLevel::Dashboard).await;
+    let read_only = f.enqueue(10, "dashboard", log_channel(Some(456))).await;
+    drain_with_tenant(&f.db, &tenant, &moderator(), &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.status(&read_only).await.outcome.as_deref(),
+        Some("permission_revoked")
+    );
+
+    map(AccessLevel::Settings).await;
+    let settings = f.enqueue(10, "settings", log_channel(Some(456))).await;
+    let unbanning = f.enqueue(10, "unban", unban(99)).await;
+    let mock = moderator();
+    drain_with_tenant(&f.db, &tenant, &mock, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(f.status(&settings).await.state, "succeeded");
+    assert_eq!(
+        db::list_log_channels(&f.db, 10).await.unwrap(),
+        vec![("message_edit".into(), 456)]
+    );
+    assert_eq!(
+        f.status(&unbanning).await.outcome.as_deref(),
+        Some("permission_revoked")
+    );
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

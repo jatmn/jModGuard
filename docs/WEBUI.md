@@ -155,9 +155,43 @@ Never put a database URL or token in these files.
 
 ## Access
 
-`http://localhost:8080` → **Login with Discord** → pick a server. Only servers
-where your account has **Manage Server** permission are shown, so one WebUI
-instance manages all your servers.
+`http://localhost:8080` → **Login with Discord** → pick a server. Servers
+where your account has **Manage Server** permission (or owns the server) are
+shown, so one WebUI instance manages all your servers.
+
+### Access by Discord role
+
+A Manage Server admin can let moderators use the WebUI without Manage Server:
+**Settings → Web UI access by role** maps Discord role IDs to a level for that
+server only. Every grant is per server; a role in one server never opens another.
+
+| Level | Includes |
+|---|---|
+| `dashboard` | Read-only Dashboard, Audit Log, Members, Bans, Bot actions and Cases (including evidence downloads). Settings tabs are hidden. |
+| `settings` | Everything in `dashboard`, plus edits to automod rules, badwords, known spam, known-bad images, templates, log channels and filters, and bot settings for that server. Commands are visible but read-only. |
+
+Manage Server stays required for commands (a command plan can grant roles and run
+bans, kicks and timeouts through the bot), copying configuration, member import controls
+(Pause, Resume, Retry, **Reconcile from Discord**), case notes and the role list
+itself. Case removal, the Removed records view and case-removal role IDs stay with
+Administrators and the server owner. Global configuration, Administration, Updates,
+database usage and **View as…** stay with the configured bot owner. Unban keeps
+its own Discord **Ban Members** requirement.
+
+The API checks the user's current roles with Discord on every guild request
+(`guilds.members.read`, `GET /users/@me/guilds/{id}/member` with the user's own
+OAuth token) and reuses an answer for at most 30 seconds, so a removed role stops
+working within 30 seconds. If Discord cannot confirm the roles, the request is
+refused. Accounts that signed in before this scope was requested must sign out
+and sign in again before role access works. The bot rechecks the actor's roles
+from its own Discord data before applying a settings edit or a log-channel
+change. Hidden controls are presentation only; the API refuses every request the
+level does not include (`403` `guild_access_denied`). Role list changes are
+written to the API log with the acting user. Server discovery has a five-second
+budget for role checks. If a dependency fails or that budget expires, the WebUI
+marks the server list incomplete and offers **Retry server discovery**; it does
+not grant access to any unverified server. Successful role reads are cached in a
+bounded 10,000-entry cache. Unsaved role-mapping edits survive other Settings saves.
 The **Members** tab searches saved member IDs and names without a browser-side
 Discord roster request. It shows current status, known join dates, linked
 moderation cases and the [durable import state](MEMBERS.md). All its reads
@@ -318,6 +352,9 @@ GET    /api/guilds/{id}/cases/{case}/history   # POST on this path adds a note
 GET    /api/guilds/{id}/case-delete-roles
 POST   /api/guilds/{id}/case-delete-roles  # same body as GET; SPA settings load
 PUT    /api/guilds/{id}/case-delete-roles
+GET    /api/guilds/{id}/access-roles       # Manage Server only
+POST   /api/guilds/{id}/access-roles       # same body as GET; SPA settings load
+PUT    /api/guilds/{id}/access-roles       # {roles:[{role_id,level}], revision}
 ```
 
 Scopes in request bodies: `"scope": "guild" | "global"` (`global` requires
@@ -325,7 +362,7 @@ bot owner).
 
 ## Auth & sessions
 
-- Discord OAuth2 (scopes `identify guilds`), sessions last 7 days of
+- Discord OAuth2 (scopes `identify guilds guilds.members.read`), sessions last 7 days of
   inactivity. Sessions use an **in-memory store on the single API process**
   (`jmodguard_session` cookie): re-login after an API restart. A shared
   session store is required only if you run multiple API replicas.
@@ -353,7 +390,8 @@ bot owner).
 
 Known-bad images are managed per server under **Known-bad images**. Search by
 hash or note; add a confirmed SHA-256 digest and optional safe label, or remove it.
-Saves require Manage Server permission and an online bot writer. See
+Saves require Manage Server permission (or a `settings` access role) and an
+online bot writer. See
 [exact-image detection](IMAGE-SPAM.md#known-bad-image-management) for first-post
 matching, dry-run/enforcement behavior and hash-only retention.
 

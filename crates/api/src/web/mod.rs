@@ -1,5 +1,6 @@
 //! WebUI: Discord OAuth2 login, session handling, and the REST API.
 
+pub mod access_roles;
 pub mod api;
 pub mod cases;
 mod discord_retry;
@@ -25,6 +26,7 @@ use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer};
 
 use self::oauth::{DiscordGuild, DiscordUser};
 use self::state::ApiState;
+use crate::db::guild_data::AccessLevel;
 
 const SESSION_USER: &str = "discord_user_id";
 const SESSION_TOKEN: &str = "access_token";
@@ -138,6 +140,24 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
 
+        if let Some(error) = self.0.downcast_ref::<GuildAccessDenied>() {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    serde_json::json!({"error": error.to_string(), "code": "guild_access_denied"}),
+                ),
+            )
+                .into_response();
+        }
+        if self.0.is::<MemberScopeMissing>() {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": MemberScopeMissing.to_string(), "code": "member_scope_missing"
+                })),
+            )
+                .into_response();
+        }
         if self.0.is::<preview::PreviewDenied>() {
             return (
                 StatusCode::FORBIDDEN,
@@ -202,14 +222,55 @@ pub type ApiResult<T> = std::result::Result<T, ApiError>;
 // session helpers
 // ---------------------------------------------------------------------------
 
+/// Web UI access a request needs in one guild, ordered by reach.
+///
+/// `Dashboard` and `Settings` may come from a Discord role a guild admin
+/// mapped to that level; `Manage` is the guild owner or Manage Server only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GuildAccess {
+    Dashboard,
+    Settings,
+    Manage,
+}
+
+impl GuildAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dashboard => "dashboard",
+            Self::Settings => "settings",
+            Self::Manage => "manage",
+        }
+    }
+
+    fn from_level(level: AccessLevel) -> Self {
+        match level {
+            AccessLevel::Dashboard => Self::Dashboard,
+            AccessLevel::Settings => Self::Settings,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AuthCtx {
     pub user: DiscordUser,
     pub guilds: Vec<DiscordGuild>,
     enrollment: Option<crate::db::GuildEnrollment>,
+    /// Role-mapped access verified for one guild during this request.
+    role_access: Option<(u64, AccessLevel)>,
 }
 
 impl AuthCtx {
+    /// Manage Server, or the role-mapped level verified for this guild in this
+    /// request. Same freshness invariant as [`Self::can_manage`].
+    pub fn guild_access(&self, guild_id: u64) -> Option<GuildAccess> {
+        if self.can_manage(guild_id) {
+            return Some(GuildAccess::Manage);
+        }
+        self.role_access
+            .filter(|(guild, _)| *guild == guild_id)
+            .map(|(_, level)| GuildAccess::from_level(level))
+    }
+
     pub fn manageable_guilds(&self) -> Vec<&DiscordGuild> {
         self.guilds
             .iter()
@@ -305,6 +366,7 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
         },
         guilds: Vec::new(),
         enrollment: None,
+        role_access: None,
     })
 }
 
@@ -649,6 +711,7 @@ async fn require_auth_with(
                 user,
                 guilds,
                 enrollment: None,
+                role_access: None,
             };
             preview::apply_overlay(&mut auth)?;
             return Ok(auth);
@@ -753,6 +816,7 @@ async fn load_auth(
             user,
             guilds,
             enrollment: None,
+            role_access: None,
         };
         preview::apply_overlay(&mut auth)?;
         return Ok(auth);
@@ -793,6 +857,7 @@ async fn load_auth(
         user,
         guilds,
         enrollment: None,
+        role_access: None,
     };
     preview::apply_overlay(&mut auth)?;
     Ok(auth)
@@ -846,6 +911,7 @@ async fn cached_display_during_limit(
         user,
         guilds,
         enrollment: None,
+        role_access: None,
     };
     preview::apply_overlay(&mut auth)?;
     Ok(Some(auth))
@@ -1356,17 +1422,25 @@ async fn api_me(
     session: Session,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = require_auth(&state, &session).await?;
+    let (role_guilds, role_scope_missing, role_discovery_incomplete) =
+        role_access_guilds(&state, &session, &auth).await;
     let guilds: Vec<serde_json::Value> = auth
         .guilds
         .iter()
-        .filter(|g| g.manage_permission())
-        .map(|g| {
-            serde_json::json!({
+        .filter_map(|g| {
+            let access = if g.manage_permission() {
+                GuildAccess::Manage
+            } else {
+                let (_, level) = role_guilds.iter().find(|(id, _)| *id == g.id)?;
+                GuildAccess::from_level(*level)
+            };
+            Some(serde_json::json!({
                 "id": g.id,
                 "name": g.name,
                 "icon": g.icon,
                 "manage": g.manage_permission(),
-            })
+                "access": access.as_str(),
+            }))
         })
         .collect();
     Ok(Json(serde_json::json!({
@@ -1377,6 +1451,8 @@ async fn api_me(
             "avatar_url": auth.user.avatar_url(),
         },
         "guilds": guilds,
+        "role_scope_missing": role_scope_missing,
+        "role_discovery_incomplete": role_discovery_incomplete,
         "is_bot_owner": is_bot_owner(&state, &auth),
         "preview": preview::current().map(|preview| serde_json::json!({
             "guild_id": preview.guild_id.to_string(),
@@ -1740,6 +1816,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             "/api/guilds/{guild_id}/case-delete-roles",
             get_post(cases::get_case_delete_roles).put(cases::put_case_delete_roles),
         )
+        .route(
+            "/api/guilds/{guild_id}/access-roles",
+            get_post(access_roles::get_access_roles).put(access_roles::put_access_roles),
+        )
         .merge(recovery::routes(Arc::new(recovery::RecoveryState {
             cfg: Arc::clone(&app.cfg),
             oauth: Arc::clone(&app.oauth),
@@ -1910,6 +1990,21 @@ pub async fn authorize_manage_guild(
     session: &Session,
     guild_id: u64,
 ) -> ApiResult<AuthCtx> {
+    authorize_guild(app, session, guild_id, GuildAccess::Manage).await
+}
+
+/// Authorize `need` in a real guild with a **fresh** guild list.
+///
+/// Manage Server (or ownership) satisfies every level. Otherwise a member who
+/// currently holds a Discord role the guild mapped to at least `need` is
+/// admitted to that guild only. Roles are read live with the user's OAuth
+/// token and reused for at most [`MEMBER_ROLES_TTL`]; failures deny.
+pub async fn authorize_guild(
+    app: &Arc<ApiState>,
+    session: &Session,
+    guild_id: u64,
+    need: GuildAccess,
+) -> ApiResult<AuthCtx> {
     if guild_id == 0 {
         return Err(ApiError(anyhow::anyhow!(
             "you cannot manage this server (needs MANAGE_GUILD permission)"
@@ -1923,13 +2018,266 @@ pub async fn authorize_manage_guild(
         require_active_enrollment(app, guild_id)
     );
     let mut auth = auth?;
-    if !auth.can_manage(guild_id) {
+    if auth.can_manage(guild_id) {
+        auth.enrollment = Some(enrollment?);
+        return Ok(auth);
+    }
+    if need == GuildAccess::Manage || !role_access_possible(&auth, guild_id) {
         return Err(ApiError(anyhow::anyhow!(
             "you cannot manage this server (needs MANAGE_GUILD permission)"
         )));
     }
-    auth.enrollment = Some(enrollment?);
+    let enrollment = enrollment?;
+    let level = guild_role_level(app, session, &auth, &enrollment).await?;
+    admit_role_level(auth, guild_id, enrollment, level, need)
+}
+
+/// Bot-action receipts: Manage Server, Ban Members, or a role-mapped level.
+/// Callers still filter each job by its own action authority.
+pub(super) async fn authorize_actions(
+    app: &Arc<ApiState>,
+    session: &Session,
+    guild: u64,
+    denied: &'static str,
+) -> ApiResult<AuthCtx> {
+    let mut auth = require_auth_fresh(app, session).await?;
+    if guild == 0 {
+        return Err(ApiError(anyhow::anyhow!(denied)));
+    }
+    if auth.can_manage(guild) {
+        auth.enrollment = Some(require_active_enrollment(app, guild).await?);
+        return Ok(auth);
+    }
+    let can_ban = auth.can_ban_members(guild);
+    if !can_ban && !role_access_possible(&auth, guild) {
+        return Err(ApiError(anyhow::anyhow!(denied)));
+    }
+    let enrollment = require_active_enrollment(app, guild).await?;
+    // Ban Members alone still opens its own unban receipts; a role level adds
+    // log-channel receipts and must not take that away when it cannot be read.
+    let level = if role_access_possible(&auth, guild) {
+        match guild_role_level(app, session, &auth, &enrollment).await {
+            Ok(level) => level,
+            Err(_) if can_ban => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    if !can_ban && level.is_none() {
+        return Err(ApiError(anyhow::anyhow!(denied)));
+    }
+    auth.role_access = level.map(|level| (guild, level));
+    auth.enrollment = Some(enrollment);
     Ok(auth)
+}
+
+/// Role-based admission needs a live (non-preview) member of that guild.
+fn role_access_possible(auth: &AuthCtx, guild_id: u64) -> bool {
+    preview::current().is_none() && auth.guilds.iter().any(|g| g.id == guild_id.to_string())
+}
+
+fn admit_role_level(
+    mut auth: AuthCtx,
+    guild_id: u64,
+    enrollment: crate::db::GuildEnrollment,
+    level: Option<AccessLevel>,
+    need: GuildAccess,
+) -> ApiResult<AuthCtx> {
+    let Some(level) = level else {
+        return Err(ApiError(anyhow::anyhow!(
+            "you cannot manage this server (needs MANAGE_GUILD permission)"
+        )));
+    };
+    if GuildAccess::from_level(level) < need {
+        return Err(ApiError(GuildAccessDenied { have: level, need }.into()));
+    }
+    auth.role_access = Some((guild_id, level));
+    auth.enrollment = Some(enrollment);
+    Ok(auth)
+}
+
+/// A role-mapped user asked for more than their level allows.
+#[derive(Debug)]
+pub struct GuildAccessDenied {
+    have: AccessLevel,
+    need: GuildAccess,
+}
+impl std::fmt::Display for GuildAccessDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let have = match self.have {
+            AccessLevel::Dashboard => "read-only",
+            AccessLevel::Settings => "settings",
+        };
+        let need = match self.need {
+            GuildAccess::Dashboard => "dashboard",
+            GuildAccess::Settings => "settings",
+            GuildAccess::Manage => "Manage Server",
+        };
+        write!(
+            f,
+            "your role grants {have} access to this server; this needs {need} access"
+        )
+    }
+}
+impl std::error::Error for GuildAccessDenied {}
+
+/// The session's OAuth token cannot read guild roles (signed in before
+/// `guilds.members.read` was requested).
+#[derive(Debug)]
+pub struct MemberScopeMissing;
+impl std::fmt::Display for MemberScopeMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("sign out and sign in again so jModGuard can check your server roles")
+    }
+}
+impl std::error::Error for MemberScopeMissing {}
+
+/// How long a user's guild roles are reused. Removing a mapped role ends
+/// access after at most this long.
+pub const MEMBER_ROLES_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const MEMBER_ROLES_MAX_ENTRIES: usize = 10_000;
+const ROLE_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Highest mapped level the user's current roles grant in this enrollment.
+/// `None` when nothing is mapped or no held role is mapped.
+async fn guild_role_level(
+    app: &Arc<ApiState>,
+    session: &Session,
+    auth: &AuthCtx,
+    enrollment: &crate::db::GuildEnrollment,
+) -> ApiResult<Option<AccessLevel>> {
+    let mappings = match app.tenant.live(enrollment.clone()).await {
+        Ok((store, scope)) => store.tenant_settings(scope).await.map(|s| s.access_roles),
+        Err(error) => Err(error),
+    };
+    let mappings = match mappings {
+        Ok(mappings) => mappings,
+        Err(error) => {
+            tracing::warn!(
+                guild_id = enrollment.guild_id,
+                "access roles unavailable: {error:#}"
+            );
+            return Err(ApiError(GuildAccessError::Unverified.into()));
+        }
+    };
+    if mappings.is_empty() {
+        return Ok(None);
+    }
+    let guild_id = u64::try_from(enrollment.guild_id).unwrap_or(0);
+    let roles = member_roles(app, session, auth.discord_user_id(), guild_id).await?;
+    let roles = roles
+        .iter()
+        .filter_map(|role| i64::try_from(*role).ok())
+        .collect::<Vec<_>>();
+    Ok(crate::db::guild_data::access_level_for_roles(
+        &mappings, &roles,
+    ))
+}
+
+async fn member_roles(
+    app: &Arc<ApiState>,
+    session: &Session,
+    user_id: u64,
+    guild_id: u64,
+) -> ApiResult<Vec<u64>> {
+    let slot = {
+        // Serialize admission/eviction, never network I/O. Do not evict slots
+        // held by another request, including requests waiting on the same key.
+        let mut cache = app.member_roles.lock().unwrap();
+        if let Some(slot) = cache.get(&(user_id, guild_id)) {
+            Arc::clone(slot)
+        } else {
+            if cache.len() >= MEMBER_ROLES_MAX_ENTRIES {
+                let idle = cache
+                    .iter()
+                    .find_map(|(key, slot)| (Arc::strong_count(slot) == 1).then_some(*key));
+                let Some(idle) = idle else {
+                    return Err(ApiError(GuildAccessError::Unverified.into()));
+                };
+                cache.remove(&idle);
+            }
+            Arc::clone(cache.entry((user_id, guild_id)).or_default())
+        }
+    };
+    let mut slot = slot.lock().await;
+    if let Some((at, roles)) = slot.as_ref()
+        && at.elapsed() < MEMBER_ROLES_TTL
+    {
+        return Ok(roles.clone());
+    }
+    *slot = None;
+    let token = session
+        .get::<String>(SESSION_TOKEN)
+        .await
+        .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?
+        .ok_or_else(|| ApiError(anyhow::Error::new(NotAuthenticated)))?;
+    match app.oauth.member_roles(user_id, guild_id, &token).await {
+        Ok(roles) => {
+            *slot = Some((std::time::Instant::now(), roles.clone()));
+            Ok(roles)
+        }
+        Err(oauth::MemberRolesError::MissingScope) => Err(ApiError(MemberScopeMissing.into())),
+        Err(oauth::MemberRolesError::RateLimited { retry_after }) => {
+            Err(ApiError(oauth::DiscordRateLimit { retry_after }.into()))
+        }
+        Err(oauth::MemberRolesError::Failed(error)) => {
+            tracing::warn!(guild_id, "discord member roles unavailable: {error:#}");
+            Err(ApiError(GuildAccessError::Unverified.into()))
+        }
+    }
+}
+
+/// Guilds a signed-in user without Manage Server may open through a mapped
+/// role, with that level. Display only; every route admits again.
+async fn role_access_guilds(
+    app: &Arc<ApiState>,
+    session: &Session,
+    auth: &AuthCtx,
+) -> (Vec<(String, AccessLevel)>, bool, bool) {
+    let mut scope_missing = false;
+    let mut incomplete = false;
+    let mut granted = Vec::new();
+    if preview::current().is_some() {
+        return (granted, scope_missing, incomplete);
+    }
+    // One budget covers catalog reads, tenant reads and all Discord lookups.
+    // Dropping an unfinished lookup releases its slot; no background work stays.
+    let discovery = async {
+        let candidates = auth
+            .guilds
+            .iter()
+            .filter(|g| !g.manage_permission())
+            .filter_map(|g| g.id.parse::<i64>().ok().filter(|id| *id > 0))
+            .collect::<Vec<_>>();
+        let enrollments = match crate::db::active_guild_enrollments(&app.db, candidates).await {
+            Ok(enrollments) => enrollments,
+            Err(error) => {
+                tracing::warn!("role access listing unavailable: {error:#}");
+                incomplete = true;
+                return;
+            }
+        };
+        for enrollment in enrollments {
+            let guild_id = enrollment.guild_id.to_string();
+            match guild_role_level(app, session, auth, &enrollment).await {
+                Ok(Some(level)) => granted.push((guild_id, level)),
+                Ok(None) => {}
+                Err(error) if error.0.is::<MemberScopeMissing>() => scope_missing = true,
+                Err(error) => {
+                    tracing::debug!(guild_id, "role access not listed: {:#}", error.0);
+                    incomplete = true;
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(ROLE_DISCOVERY_TIMEOUT, discovery)
+        .await
+        .is_err()
+    {
+        incomplete = true;
+    }
+    (granted, scope_missing, incomplete)
 }
 
 pub(super) async fn manage_guild_from_auth(
@@ -1989,10 +2337,21 @@ pub async fn guild_scope(
 ) -> ApiResult<AuthCtx> {
     // guild_id 0 is GLOBAL_SCOPE — only the configured bot owner may edit it.
     // Owner identity does not depend on Discord guild membership.
+    guild_scope_at(app, session, guild_id, GuildAccess::Manage).await
+}
+
+/// [`guild_scope`] for a route that a role-mapped `need` level may also use.
+/// Global scope stays owner-only.
+pub async fn guild_scope_at(
+    app: &Arc<ApiState>,
+    session: &Session,
+    guild_id: u64,
+    need: GuildAccess,
+) -> ApiResult<AuthCtx> {
     if guild_id == 0 {
         return session_owner(app, session).await;
     }
-    authorize_manage_guild(app, session, guild_id).await
+    authorize_guild(app, session, guild_id, need).await
 }
 
 #[cfg(test)]
@@ -2774,6 +3133,7 @@ mod tests {
     fn auth_user(discord_id: u64) -> AuthCtx {
         AuthCtx {
             enrollment: None,
+            role_access: None,
             user: crate::web::oauth::DiscordUser {
                 id: discord_id.to_string(),
                 username: "tester".into(),
@@ -2983,6 +3343,7 @@ mod tests {
         // owner-only destination AuthCtx for the source.
         let stale = AuthCtx {
             enrollment: None,
+            role_access: None,
             user: crate::web::oauth::DiscordUser {
                 id: "99".into(),
                 username: "owner".into(),

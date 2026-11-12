@@ -219,7 +219,11 @@ operations now use API admission and bot dispatch.
 
 - Discord OAuth2; sessions in `MemoryStore` (single API process; cookie
   `jmodguard_session`; lost on API restart).
-- Guild admins need Discord `MANAGE_GUILD`.
+- Guild admins need Discord `MANAGE_GUILD`. A guild may map Discord roles to a
+  read-only `dashboard` or `settings` level for that guild only; the API reads
+  the user's roles with their OAuth token (30 s reuse, fail closed) and the bot
+  rechecks settings edits from its own member data
+  ([WEBUI.md](WEBUI.md#access-by-discord-role)).
 - Global edits (`guild_id=0` or body `scope: "global"`) require `bot.owner_id`.
   That check uses the session user id and does not fetch the guild list.
 - Guild-scoped authorization always re-fetches Discord guild membership

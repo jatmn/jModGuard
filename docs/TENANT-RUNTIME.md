@@ -67,9 +67,9 @@ could not finish in the same request. The administrator-only
 Removed records view pages through retained removal identities (`cases?removed=true`)
 and allows explicit cleanup retry, including after a reload. It never restores private
 payloads. Repeating DELETE retries owned-evidence cleanup. There is no automatic active-guild retry worker. Server owners and
-Administrators may delete. Delegated case-removal role IDs can be stored, but current
-Discord OAuth (`identify guilds`) does not supply member roles, so those IDs are not applied
-yet.
+Administrators may delete. Delegated case-removal role IDs can be stored, but they are
+not applied yet. The WebUI now reads member roles for [access roles](WEBUI.md#access-by-discord-role);
+case removal does not use them.
 
 Local Unix evidence serving reads verified private objects after the journal confirms
 they are available. Bunny serving is opt-in and proxies a GET after the same journal

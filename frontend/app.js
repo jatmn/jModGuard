@@ -234,6 +234,7 @@ function App() {
                     ui.set({ pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
                     pendingCase = null;
                     state.guildId = event.target.value;
+                    if (!tabAllowed(state.tab)) state.tab = "dashboard";
                     state.config = null;
                     ui.set({ edits: "clean" });
                     persistWorkspace();
@@ -243,6 +244,12 @@ function App() {
                 state.guilds.length
                   ? state.guilds.map((guild) => h("option", { key: guild.id, value: guild.id }, guild.name))
                   : h("option", { value: "" }, "No manageable servers"),
+              ),
+              state.me?.role_discovery_incomplete && h("p", { className: "muted", role: "status" },
+                "Some server access checks could not finish. ",
+                h(ActionButton, { className: "btn btn-xs", onClick: async () => {
+                  if (canLeave()) await init();
+                } }, "Retry server discovery"),
               ),
             ),
             h(
@@ -258,6 +265,7 @@ function App() {
                       { key: `group-${i}`, className: "nav-label menu-title" },
                       i === 0 ? "Workspace" : "Community",
                     ),
+                  tabAllowed(tab) &&
                   h(
                     "li",
                     { key: tab },
@@ -314,6 +322,8 @@ function App() {
                 { id: "workspace-status" },
                 isPreview()
                   ? "Preview — changes disabled"
+                  : guildAccess() === "dashboard"
+                    ? "Read-only access"
                   : (display.activity === "busy")
                     ? "Working…"
                     : (display.edits === "dirty")
@@ -450,8 +460,12 @@ function Content() {
   };
   if (!state.guildId)
     return emptyPanel(
-      "No servers to manage yet",
-      "Sign in with an account that has Manage Server permission in a server using jModGuard.",
+      state.me?.role_discovery_incomplete ? "Server discovery incomplete" : "No servers to manage yet",
+      state.me?.role_discovery_incomplete
+        ? "Some server access checks could not finish. Retry to check your servers again."
+        : state.me?.role_scope_missing
+        ? "Sign out and sign in again so jModGuard can check your server roles."
+        : "Sign in with an account that has Manage Server permission, or a role a server admin granted Web UI access, in a server using jModGuard.",
     );
   if (!state.config)
     return emptyPanel(
@@ -470,7 +484,7 @@ function Content() {
         ),
       { role: "status" },
     );
-  return h(components[state.tab] || tabDashboard);
+  return h((tabAllowed(state.tab) && components[state.tab]) || tabDashboard);
 }
 function renderTab() {
   const pending = ui.getSnapshot().pendingDrafts;
@@ -611,7 +625,7 @@ function restoreWorkspace() {
     /* Storage may be unavailable. */
   }
   state.guildId = state.guilds.find((g) => g.id === saved.guildId)?.id || state.guilds[0]?.id || null;
-  state.tab = tabs.includes(saved.tab) ? saved.tab : "dashboard";
+  state.tab = tabs.includes(saved.tab) && tabAllowed(saved.tab) ? saved.tab : "dashboard";
 }
 
 function persistWorkspace() {
@@ -668,7 +682,7 @@ async function handleEvent(handler, event, savedFields, group) {
 function navigate(tab) {
   if (!canLeave()) return false;
   ui.set({ view: "main-view", pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
-  state.tab = tabs.includes(tab) ? tab : "dashboard";
+  state.tab = tabs.includes(tab) && tabAllowed(tab) ? tab : "dashboard";
   persistWorkspace();
   renderTab();
   return true;
@@ -676,6 +690,27 @@ function navigate(tab) {
 
 function isBotOwner() {
   return !!(state.me && state.me.is_bot_owner);
+}
+
+// Web UI access in the selected server: "manage" (owner or Manage Server),
+// or a level a server admin mapped to one of the user's Discord roles. The API
+// enforces every level; hiding controls here is only presentation.
+function guildAccess() {
+  return selectedGuild()?.access || "manage";
+}
+
+function canEditSettings() {
+  return guildAccess() !== "dashboard";
+}
+
+function canManageServer() {
+  return guildAccess() === "manage";
+}
+
+const settingsTabs = ["rules", "badwords", "known-spam", "known-bad-images", "commands", "templates", "logchannels", "settings"];
+
+function tabAllowed(tab) {
+  return canEditSettings() || !settingsTabs.includes(tab);
 }
 
 let previewCapability = { kind: "absent" };
@@ -841,7 +876,7 @@ function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
   const edit = path.match(
-    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/,
+    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|cases|case-delete-roles|access-roles)(?:\/|\?|$)/,
   );
   if (
     edit &&
@@ -862,6 +897,7 @@ function pageEnrollment(path, method = "GET") {
         "stats",
         "cases",
         "case-delete-roles",
+        "access-roles",
       ].includes(edit[2])) &&
     edit[1] !== "0" &&
     edit[1] === state.guildId &&
@@ -893,7 +929,7 @@ function throwApiFailure(data, status, retryAfterMs) {
 
 async function api(path, method = "GET", body = null, signal, reconcileRecovered) {
   const save = ["POST", "PUT"].includes(method) &&
-    /^\/api\/guilds\/\d+\/(settings|rules|badwords|known-spam|known-bad-images|commands|templates|copy|logfilters|case-delete-roles)(?:\/|$)/.test(path) &&
+    /^\/api\/guilds\/\d+\/(settings|rules|badwords|known-spam|known-bad-images|commands|templates|copy|logfilters|case-delete-roles|access-roles)(?:\/|$)/.test(path) &&
     (method !== "POST" || body !== null);
   if (save) return submitSave(path, method, body, signal, reconcileRecovered);
   return apiRequest(path, method, body, signal);
@@ -919,7 +955,7 @@ function saveFailureState(error) {
 async function submitSave(path, method, body, signal, reconcileRecovered) {
   // A remount reads the current role revision while retaining an unresolved
   // role draft. Match that intent by its roles, then look up the captured revision.
-  const roleSave = method === "PUT" && /^\/api\/guilds\/\d+\/case-delete-roles$/.test(path);
+  const roleSave = method === "PUT" && /^\/api\/guilds\/\d+\/(case-delete-roles|access-roles)$/.test(path);
   const canonical = canonicalSaveBody(roleSave ? { roles: body.roles } : body);
   const key = `${workspaceKey()}:save:${method}:${path}:${JSON.stringify(canonical)}`;
   const enrollment = pageEnrollment(path, method);
@@ -935,7 +971,7 @@ async function submitSave(path, method, body, signal, reconcileRecovered) {
   // Only a new save needs the initial read. An unresolved save already owns
   // its original revision and must remain lookup-only while that read is pending.
   if (roleSave && saveMode === "submit" && !body.revision) {
-    throw new Error("Case-removal roles have not loaded yet. Wait for them to load before saving.");
+    throw new Error("Roles have not loaded yet. Wait for them to load before saving.");
   }
   try {
     saved = raw ? JSON.parse(raw) : {
@@ -2760,12 +2796,15 @@ function tabCommands() {
       "div",
       { className: "row title-row" },
       h("h2", {}, "Commands"),
-      h(
-        ActionButton,
-        { className: "btn btn-primary", onClick: () => editCommand(null) },
-        "+ New custom command",
-      ),
+      canManageServer() &&
+        h(
+          ActionButton,
+          { className: "btn btn-primary", onClick: () => editCommand(null) },
+          "+ New custom command",
+        ),
     ),
+    !canManageServer() &&
+      h("p", { className: "muted" }, "Editing commands needs Manage Server: command plans can grant roles and run moderation actions."),
     h(
       "p",
       { className: "muted", style: { margin: "6px 0 14px" } },
@@ -2819,7 +2858,7 @@ function tabCommands() {
           h(
             "td",
             {},
-            h(IconButton, { icon: "edit", label: "Edit", onClick: () => editCommand(c) }),
+            canManageServer() && h(IconButton, { icon: "edit", label: "Edit", onClick: () => editCommand(c) }),
           ),
         );
       }),
@@ -3557,7 +3596,7 @@ function actionIsLogChannel(job) {
 }
 
 function actionCanCancel(job) {
-  if (!job) return false;
+  if (!job || (actionIsLogChannel(job) && !canEditSettings())) return false;
   if (job.state === "pending" || job.state === "claimed") return true;
   return actionIsLogChannel(job) && (job.state === "running" || job.state === "uncertain");
 }
@@ -4063,7 +4102,7 @@ function tabMembers() {
       // A short planned restart clears itself when audit recovery finishes, unless
       // that recovery stopped for attention. Anything else needs Reconcile.
       const autoClearing = sync.gap_auto_clear && sync.audit_recovery_status !== "needs_attention";
-      const reconcileInNotice = sync.reconciliation_needed && !autoClearing && !isPreview();
+      const reconcileInNotice = sync.reconciliation_needed && !autoClearing && !isPreview() && canManageServer();
       const reconcileButton = reconcileInNotice && syncControlButton("reconcile", "Reconcile from Discord");
       if (sync.reconciliation_needed) {
         const when = sync.gap_at ? ` at ${asDate(sync.gap_at)}` : "";
@@ -4158,7 +4197,7 @@ function tabMembers() {
         );
       if (syncActionOutcome) parts.push(h("p", { className: "err", role: "status" }, syncActionOutcome));
       const controls = [];
-      if (!isPreview()) {
+      if (!isPreview() && canManageServer()) {
         for (const [operation, label] of [
           ["pause", "Pause"],
           ["resume", "Resume"],
@@ -4648,6 +4687,7 @@ function tabCases() {
           ...(history.history || []).map((entry) =>
             h("p", { className: "muted" }, JSON.stringify(entry.entry.body)),
           ),
+          canManageServer() &&
           field(
             "Note",
             note,
@@ -4946,7 +4986,9 @@ function tabSettings() {
         ),
     },
     h("option", { value: "" }, "Select a source server"),
-    ...state.guilds.filter((g) => g.id !== state.guildId).map((g) => h("option", { value: g.id }, g.name)),
+    ...state.guilds
+      .filter((g) => g.id !== state.guildId && (g.access || "manage") === "manage")
+      .map((g) => h("option", { value: g.id }, g.name)),
   );
   const sectionSelRef = useRef(null);
   const sectionSel = h(
@@ -5113,6 +5155,7 @@ function tabSettings() {
   const roleRevision = useRef("");
   const roleWriteGeneration = useRef(0);
   useEffect(() => {
+    if (!canManageServer()) return undefined;
     let active = true;
     const initialRoleGeneration = roleWriteGeneration.current;
     apiRead(`/api/guilds/${state.guildId}/case-delete-roles`)
@@ -5129,7 +5172,8 @@ function tabSettings() {
       active = false;
     };
   }, []);
-  cards.push(
+  if (canManageServer()) cards.push(
+    h(AccessRolesCard, { key: "access-roles", revision: roleRevision, generation: roleWriteGeneration }),
     h(
       DraftCard,
       { group: "roles", className: "card bg-base-100 card-border" },
@@ -5140,7 +5184,7 @@ function tabSettings() {
         h(
           "p",
           { className: "muted" },
-          "Server owners and Administrators can remove case records. Stored role IDs are remembered for a later member-role check; Discord OAuth currently cannot apply them. Removal never undoes a Discord action.",
+          "Server owners and Administrators can remove case records. Stored role IDs are remembered for a later member-role check and are not applied yet. Removal never undoes a Discord action.",
         ),
         field("Delegated case-removal role IDs", roleInput),
         h(
@@ -5214,7 +5258,7 @@ function tabSettings() {
     );
   }
 
-  cards.push(
+  if (canManageServer()) cards.push(
     h(
       DraftCard,
       { group: "copy", className: "card bg-base-100 card-border" },
@@ -5274,6 +5318,151 @@ function tabSettings() {
   );
 
   return h("div", {}, h("h2", {}, "Settings"), ...cards);
+}
+
+const ACCESS_LEVELS = [
+  ["dashboard", "Dashboard (read-only)"],
+  ["settings", "Dashboard and settings"],
+];
+
+// Role -> access mappings for this server. Only Manage Server sees this card;
+// the API refuses the read and the save for everyone else.
+// Access and case-removal roles share one server revision, so both cards use
+// the same revision and write-generation refs from the Settings tab.
+function AccessRolesCard({ revision, generation }) {
+  const guildId = state.guildId;
+  const [baselineRows, setBaselineRows] = useState(null);
+  const [ttl, setTtl] = useState(30);
+  const { drafts } = useStore(ui);
+  const draftKey = "settings:access-roles";
+  const rows = baselineRows === null ? null : drafts[draftKey]?.value ?? baselineRows;
+  const withKeys = (roles) => roles.map((role) => ({ ...role, key: crypto.randomUUID() }));
+  const changeRows = (next) => {
+    const values = (items) => JSON.stringify(items.map(({ role_id, level }) => ({ role_id, level })));
+    const nextDrafts = { ...currentDrafts() };
+    if (baselineRows !== null && values(next) === values(baselineRows)) delete nextDrafts[draftKey];
+    else nextDrafts[draftKey] = { value: next, group: "access-roles" };
+    ui.set({ drafts: nextDrafts, edits: Object.keys(nextDrafts).length > 0 ? "dirty" : "clean" });
+  };
+  useEffect(() => {
+    let active = true;
+    const initialGeneration = generation.current;
+    apiRead(`/api/guilds/${guildId}/access-roles`)
+      .then((loaded) => {
+        if (!active) return;
+        if (initialGeneration === generation.current) revision.current = loaded.revision || "";
+        setTtl(loaded.ttl_secs || 30);
+        setBaselineRows(withKeys(loaded.roles || []));
+      })
+      .catch((e) => {
+        if (active && !isUnauthenticated(e)) reportApiError(e);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+  const update = (key, patch) => {
+    changeRows(rows.map((row) => (row.key === key ? { ...row, ...patch } : row)));
+  };
+  return h(
+    DraftCard,
+    { group: "access-roles", className: "card bg-base-100 card-border" },
+    h(
+      "div",
+      { className: "card-body" },
+      h("h3", { className: "card-title" }, "Web UI access by role"),
+      h(
+        "p",
+        { className: "muted" },
+        `Members with a listed Discord role can sign in and open this server only. Dashboard access is read-only. Settings access can also edit rules, badwords, known spam and images, templates, log channels and bot settings. Commands, copying configuration, member import controls, case notes, case removal and this list stay with Manage Server. Roles are checked with Discord; a removed role stops working within ${ttl} seconds.`,
+      ),
+      rows === null
+        ? h("p", { className: "muted", role: "status" }, "Loading roles…")
+        : h(
+            React.Fragment,
+            null,
+            rows.length === 0 && h("p", { className: "muted" }, "No roles have Web UI access."),
+            ...rows.map((row) =>
+              h(
+                "div",
+                { key: row.key, className: "row form-row access-role-row" },
+                field(
+                  "Role ID",
+                  h(Input, {
+                    type: "text",
+                    className: "input",
+                    value: row.role_id,
+                    placeholder: "Discord role (ID or <@&id> mention)",
+                    onChange: (event) => update(row.key, { role_id: event.target.value }),
+                  }),
+                ),
+                field(
+                  "Access",
+                  h(
+                    Select,
+                    {
+                      className: "select",
+                      value: row.level,
+                      onChange: (event) => update(row.key, { level: event.target.value }),
+                    },
+                    ACCESS_LEVELS.map(([value, label]) => h("option", { key: value, value }, label)),
+                  ),
+                ),
+                h(
+                  ActionButton,
+                  {
+                    className: "btn btn-sm",
+                    type: "button",
+                    onClick: () => {
+                      changeRows(rows.filter((item) => item.key !== row.key));
+                    },
+                  },
+                  "Remove",
+                ),
+              ),
+            ),
+            h(
+              "div",
+              { className: "card-actions" },
+              h(
+                ActionButton,
+                {
+                  className: "btn",
+                  type: "button",
+                  disabled: rows.length >= 32,
+                  onClick: () => changeRows([...rows, ...withKeys([{ role_id: "", level: "dashboard" }])]),
+                },
+                "Add role",
+              ),
+              h(
+                ActionButton,
+                {
+                  className: "btn btn-primary",
+                  onClick: async () => {
+                    const roles = rows.map((row) => {
+                      const id = parseSnowflake(String(row.role_id).trim());
+                      if (!id) throw new Error("Enter each role as a Discord role ID or <@&id> mention");
+                      return { role_id: id, level: row.level };
+                    });
+                    const saved = await api(`/api/guilds/${guildId}/access-roles`, "PUT", {
+                      roles,
+                      revision: revision.current,
+                    }, undefined, () => apiRead(`/api/guilds/${guildId}/access-roles`));
+                    generation.current++;
+                    revision.current = saved.revision;
+                    setBaselineRows(withKeys(saved.roles || roles));
+                    const nextDrafts = { ...currentDrafts() };
+                    delete nextDrafts[draftKey];
+                    ui.set({ drafts: nextDrafts, edits: Object.keys(nextDrafts).length > 0 ? "dirty" : "clean" });
+                    toast("Web UI access roles saved", "success");
+                  },
+                },
+                "Save access roles",
+              ),
+            ),
+          ),
+    ),
+  );
 }
 
 function scopeSelect(
