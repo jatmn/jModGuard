@@ -2327,8 +2327,10 @@ async fn assert_command_reports(
             continue;
         }
         let fields = embed["fields"].as_array().unwrap();
+        // Shipped labels carry their map emoji in Discord.
         let field = |name: &str| {
-            fields.iter().find(|field| field["name"] == name).unwrap()["value"]
+            let label = format!("{} {name}", jmodguard::emoji::label(name).unwrap());
+            fields.iter().find(|field| field["name"] == label).unwrap()["value"]
                 .as_str()
                 .unwrap()
         };

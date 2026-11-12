@@ -35,6 +35,7 @@ preview) or via `!template`.
 | `{time}` | event timestamp (readable UTC date and time, including seconds) |
 | `{command}` | command name (command log events) |
 | `{response}` | behavior's inline reply (command response templates) |
+| `{emoji}` | the report type's emoji from the shared map below (log templates only); opt in from a custom template, for example `{emoji} {user} joined` |
 
 Unknown variables are left untouched so template mistakes are visible.
 
@@ -113,11 +114,49 @@ with its wording and substitutions intact, using the same event accent. No custo
 emoji server or additional per-log avatar lookup is used. The Templates live preview
 shows the layout with sample data, including unsaved edits.
 
+## Emoji
+
+Discord reports from shipped default templates show one standard Unicode emoji
+before the title and one before each field label, from one shared map in
+`src/emoji.rs`. Values, reasons and observed message text never gain emoji, and
+no custom server emotes are used. The emoji are added only when the bot builds
+the Discord embed: stored templates, the WebUI editor, its live preview and the
+template names stay plain text. Saved custom templates render exactly as before;
+add `{emoji}` to one to opt in. An event without a mapped emoji leaves `{emoji}`
+visible, like any other unknown variable.
+
+| Emoji | Report type |
+| --- | --- |
+| 📥 / 📤 | `member_join` / `member_leave` |
+| 📋 | `member_rejoin` (prior cases) |
+| 🔨 / ✅ / 👢 | `member_ban` / `member_unban` / `member_kick` |
+| ⏱️ | `timeout_add`, `timeout_remove` |
+| ✏️ / 🗑️ | `message_edit` / `message_delete`, `message_bulk_delete` |
+| 🛡️ | `automod`, `automod_delete` (including exact-image and known-spam reports) |
+| ⚖️ | `mod_action`; by `{action}`: 🔨 ban/softban, ✅ unban, 👢 kick, ⏱️ timeout, ⚠️ warn/warnclear, 🗑️ purge, 🐢 slowmode |
+| ⌨️ | `plan_executed` |
+| ⚙️ | `system` (start, shutdown and other notices) |
+| 🏷️ | `member_role_update`, `role_change` |
+| 🔊 / 🔇 / 🔀 | `voice_join` / `voice_leave` / `voice_move` |
+| 📛 | `nickname_change`, `username_change` |
+| 🧵 | `thread_create`, `thread_update`, `thread_delete` |
+
+Field labels: 👤 User/Author/Owner · 🆔 User ID · 🧑‍⚖️ Moderator/Run by ·
+📝 Reason · ⏰ Time/Joined at/Left at · 📅 Account created · ⌛ Duration/Time in
+server/Account age · 📍 Channel/Parent/From/To · 📋 Cases · ℹ️ Details/Detail ·
+📢 Notice · 🔗 Message · ⏪ Before · ⏩ After · 📎 Attachments · 🔍 Coverage ·
+💬 Last observed text · 🧾 Evidence · 🔢 Unique count · 💾 Retained · ❓ Known
+missing · ❔ Storage unknown · 🧹 Filtered · ✂️ Transcript omitted · 📏 Rule ·
+⚡ Action · ⌨️ Command · ➕ Added · ➖ Removed · 🏷️ Role · 🔤 Name/Username ·
+🪪 Display name · 🧵 Thread · 🗄️ Archived · 🔒 Locked · ⏲️ Auto-archive ·
+✉️ Invitable. The map also reserves 📊 for status reports.
+
 Limits count UTF-16 units: title 256, description 4096, at most 25 fields, field
 names 256 and values 1024, total 6000. No author or footer is emitted (their Discord
 limits are 256 and 2048). Truncation preserves Unicode scalar boundaries and adds
-an ellipsis; the aggregate budget goes to the title, description, then fields in
-order. Existing evidence bounds can clip supplied text earlier. Automod proving
+an ellipsis without splitting an emoji sequence; the aggregate budget goes to the
+title, description, then fields in order. Existing evidence bounds can clip
+supplied text earlier. Automod proving
 hashes are shortened as whole digests with an omitted count before field clipping.
 Mentions are disabled with allowed_mentions; visible mentions inside embeds do not
 ping. Links remain clickable inside the explicit embed, without generating extra

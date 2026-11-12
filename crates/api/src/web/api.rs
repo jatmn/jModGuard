@@ -54,6 +54,23 @@ fn settings_wire(settings: &impl serde::Serialize) -> serde_json::Value {
     value
 }
 
+/// One Templates-page row. Stays emoji-free: the bot adds map emoji only to Discord embeds.
+fn template_wire(
+    event: &str,
+    def: &str,
+    guild_row: Option<String>,
+    global_row: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": event,
+        "shipped": def,
+        "embed_style": jmodguard::log_embeds::style(event),
+        "effective": db::resolve(&guild_row, &global_row, &def.to_string()),
+        "guild_override": guild_row,
+        "global": global_row.unwrap_or_else(|| def.to_string()),
+    })
+}
+
 pub async fn guild_config(
     State(app): State<Arc<ApiState>>,
     session: Session,
@@ -113,14 +130,7 @@ pub async fn guild_config(
     for (event, def) in crate::defaults::rendered_log_templates() {
         let guild_row = snapshot.guild_templates.get(event).cloned();
         let global_row = snapshot.global_templates.get(event).cloned();
-        templates.push(serde_json::json!({
-            "event": event,
-            "shipped": def,
-            "embed_style": jmodguard::log_embeds::style(event),
-            "effective": db::resolve(&guild_row, &global_row, &def.to_string()),
-            "guild_override": guild_row,
-            "global": global_row.unwrap_or_else(|| def.to_string()),
-        }));
+        templates.push(template_wire(event, def, guild_row, global_row));
     }
 
     let mut log_channels = Vec::new();
@@ -1492,6 +1502,42 @@ mod tests {
             serde_json::from_str(r#"{"prefix":"!x","bot_name":"Bot"}"#).unwrap();
         assert_eq!(set.prefix, Some(Some("!x".into())));
         assert_eq!(set.bot_name, Some(Some("Bot".into())));
+    }
+
+    /// The Discord emoji map must never reach WebUI chrome, sources or template defaults.
+    #[test]
+    fn webui_template_rows_and_sources_have_no_discord_emoji() {
+        let find = |text: &str| jmodguard::emoji::all().find(|emoji| text.contains(emoji));
+        let mut events = 0;
+        for (event, def) in crate::defaults::rendered_log_templates() {
+            // JSON text keeps non-ASCII unescaped: shipped, effective, global and embed_style.
+            let row = super::template_wire(event, def, None, None).to_string();
+            assert!(row.contains(def.lines().next().unwrap()), "{row}");
+            assert_eq!(find(&row), None, "{event}: {row}");
+            assert!(jmodguard::emoji::title(event, &Default::default()).is_some());
+            events += 1;
+        }
+        assert_eq!(
+            events,
+            crate::types::EVENT_TYPES.len() + crate::types::ACTIVITY_LOG_EVENTS.len()
+        );
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut pending = vec![root.join("frontend"), root.join("tools/webui")];
+        let mut scanned = 0;
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "node_modules") {
+                    continue;
+                }
+                for entry in std::fs::read_dir(&path).unwrap() {
+                    pending.push(entry.unwrap().path());
+                }
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                assert_eq!(find(&text), None, "{}", path.display());
+                scanned += 1;
+            }
+        }
+        assert!(scanned >= 10, "scanned {scanned} WebUI sources");
     }
 }
 

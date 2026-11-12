@@ -2078,7 +2078,10 @@ mod tests {
             // logging::emit supplies time at delivery, after command vars.
             vars.insert("time".into(), "2026-11-09T12:00:00Z".into());
             let embed = jmodguard::log_embeds::render(event, template, &vars);
-            let field = |name: &str| &embed.fields.iter().find(|f| f.name == name).unwrap().value;
+            let field = |name: &str| {
+                let label = format!("{} {name}", jmodguard::emoji::label(name).unwrap());
+                &embed.fields.iter().find(|f| f.name == label).unwrap().value
+            };
             assert_eq!(
                 field("User"),
                 &format!("{target_name} · <@{target}> (`{target}`)"),
