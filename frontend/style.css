@@ -124,6 +124,8 @@ body { background: var(--bg); color: var(--text); }
 .input, .select, .textarea { --input-color: var(--input-border); }
 .checkbox { --input-color: var(--accent); border-width: 2px; border-color: var(--input-border); color: var(--accent-text); }
 .btn:not(.btn-primary, .btn-secondary, .btn-accent, .btn-neutral, .btn-info, .btn-success, .btn-warning, .btn-error, .btn-ghost, .btn-link, .btn-outline) { border-color: var(--input-border); }
+/* Icon row actions: square daisyUI buttons rendering one stroke icon (see IconButton in app.js). */
+.btn-icon svg { width: 1.25rem; height: 1.25rem; display: block; }
 .standalone-action { margin-bottom: 14px; }
 .action-row > .select, .action-row > select { flex: 0 1 110px; }
 .action-row > .input, .action-row > input[type=text] { flex: 1 1 180px; }
