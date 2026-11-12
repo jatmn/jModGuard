@@ -1745,7 +1745,9 @@ async fn read_only_failure_receipt_defers_retry_and_required_reexec() {
     let control = UpdateControl::open(&opts).unwrap().unwrap();
     assert!(!control.writes_locally());
     let script = root.join("sleep-child");
-    tokio::fs::write(&script, "#!/bin/sh\nsleep 60\n")
+    // `exec` keeps the launched child a single process: killing and reaping it
+    // below leaves no grandchild holding the test's inherited output pipes.
+    tokio::fs::write(&script, "#!/bin/sh\nexec sleep 60\n")
         .await
         .unwrap();
     tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
@@ -1777,6 +1779,12 @@ async fn read_only_failure_receipt_defers_retry_and_required_reexec() {
     );
     assert!(!service.tick().await.unwrap());
     assert!(service.pending_failure.is_some());
+    // Kill and reap the running child before dropping the supervisor: the
+    // tokio child's kill_on_drop would stop the shell, but nextest flags the
+    // test LEAK if any descendant still holds its stdout/stderr pipes.
+    if let Some(mut running) = service.running.take() {
+        stop(&mut running).await.unwrap();
+    }
     drop(service);
 
     let mut objects = HashMap::new();
@@ -6294,12 +6302,16 @@ fn reservation_lock_times_out_while_another_process_holds_it() {
     std::fs::create_dir_all(&dir).unwrap();
     let lock_path = dir.join("lock");
     std::fs::File::create(&lock_path).unwrap();
+    // One process holds the lock: the shell takes it on fd 9, then `exec`s
+    // `sleep` with that open file description inherited. `flock <file> sleep`
+    // would fork a `sleep` grandchild that the kill in `KillChildren::drop`
+    // never reaches, leaving it holding the lock and the test's pipes.
     let holder = KillChildren(vec![
-        std::process::Command::new("flock")
-            .arg("-x")
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"exec 9>>"$1" && flock -x 9 && exec sleep 30"#)
+            .arg("sh")
             .arg(&lock_path)
-            .arg("sleep")
-            .arg("30")
             .spawn()
             .unwrap(),
     ]);
