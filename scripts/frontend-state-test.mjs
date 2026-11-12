@@ -2591,16 +2591,18 @@ async function launchFirefox() {
       const waiter = pending.get(message.id);
       if (!waiter) return;
       pending.delete(message.id);
-      if (message.type === 'error') waiter.reject(new Error(`${message.error}: ${message.message}`));
+      if (message.type === 'error') waiter.reject(new Error(`${waiter.method}: ${message.error}: ${message.message}`));
       else waiter.resolve(message.result);
     };
     const send = (method, params) => new Promise((resolve, reject) => {
       const id = ++nextId;
-      pending.set(id, { resolve, reject });
+      pending.set(id, { method, resolve, reject });
       socket.send(JSON.stringify({ id, method, params }));
     });
     await send('session.new', { capabilities: {} });
-    const context = (await send('browsingContext.getTree', {})).contexts[0].context;
+    // Firefox opens on privileged about:home, which current releases do not let WebDriver
+    // drive without system access; an own tab starts as an ordinary about:blank page.
+    const { context } = await send('browsingContext.create', { type: 'tab' });
     return {
       send, context,
       async close() {
