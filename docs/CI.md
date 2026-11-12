@@ -61,10 +61,17 @@ The workflow has no top-level path filters that leave required checks pending.
 
 Rust follows `rust-toolchain.toml` (1.96.0), with clippy and rustfmt. Dylint uses
 6.1.0 and nightly-2026-08-20 from `dylint.toml`; the script installs source tools
-and their driver in a dedicated cache. A cold 6.1.0 driver build wants rust-clippy
+and their driver in a dedicated cache. After a run, `scripts/ci-dylint-libs.sh`
+publishes the installed tools and the metadata-built lint libraries into the
+pinned `ci-tools-…` cache layout, under the library key `dylint.sh` recorded
+before the build, so later cache hits skip the per-run install and library
+build. It checks every source before writing and fails the job, writing
+nothing, when it cannot publish the complete layout, because a saved primary
+key is never re-saved. A cold 6.1.0 driver build wants rust-clippy
 `master`, so the script maps upstream `main` to it for `cargo dylint` only.
 Node 24 satisfies both npm projects.
-Cargo deny 0.20.2 and cargo audit 0.22.2 remain pinned. The local complete gate is:
+Cargo deny 0.20.2 and cargo audit 0.22.2 remain pinned in `scripts/ci-ensure-cargo-tool.sh`,
+which the tool cache key hashes. The local complete gate is:
 
 ```bash
 bash scripts/ci-preflight.sh

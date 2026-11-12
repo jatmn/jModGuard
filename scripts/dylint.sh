@@ -54,15 +54,22 @@ jmodguard_dylint_lib_metadata() {
   printf 'toolchain=%s\n' "$channel"
 }
 
-# Writes key.txt to $2. $1 is the repo dylint.toml. Returns 1 on lookup failure.
-jmodguard_dylint_lib_key() {
-  local metadata channel vv commit_hash
-  metadata=$(jmodguard_dylint_lib_metadata "$1") || return 1
+# Writes key.txt to $2 from $1, the output of jmodguard_dylint_lib_metadata.
+# Returns 1, writing nothing, when the lint compiler identity is unavailable.
+jmodguard_dylint_lib_key_from_metadata() {
+  local metadata=$1 channel vv commit_hash
   channel=$(printf '%s\n' "$metadata" | sed -n 's/^toolchain=//p')
   vv=$(rustc "+${channel}" -vV) || return 1
   commit_hash=$(printf '%s\n' "$vv" | awk '/^commit-hash: / {print $2; exit}')
   [ -n "$commit_hash" ] || return 1
   printf '%s %s\n' "$metadata" "$commit_hash" >"$2"
+}
+
+# Writes key.txt to $2. $1 is the repo dylint.toml. Returns 1 on lookup failure.
+jmodguard_dylint_lib_key() {
+  local metadata
+  metadata=$(jmodguard_dylint_lib_metadata "$1") || return 1
+  jmodguard_dylint_lib_key_from_metadata "$metadata" "$2"
 }
 # END dylint-lib-key
 
@@ -95,12 +102,14 @@ toolchain_components_installed() {
   [ "$missing" -eq 0 ]
 }
 
+# Sets dylint_lib_metadata for the run's library key.
 ensure_dylint_toolchain() {
   local metadata channel
   if ! metadata=$(jmodguard_dylint_lib_metadata dylint.toml); then
     echo "dylint: dylint toolchain lookup failed" >&2
     exit 1
   fi
+  dylint_lib_metadata=$metadata
   channel=$(printf '%s\n' "$metadata" | sed -n 's/^toolchain=//p')
   if toolchain_components_installed "$channel" llvm-tools-preview rustc-dev; then
     echo "toolchain-${channel}: already-present"
@@ -138,6 +147,10 @@ if [ "${#library_tags[@]}" -gt 1 ]; then
   done
 fi
 
+# The pinned tool layout for this tag. scripts/ci-dylint-libs.sh sources this
+# prefix and publishes to the same directory, so both follow a tag bump.
+dylint_pinned_root="$JMODGUARD_CI_PREFIX/dylint-${version}"
+
 # The selector supplies known workspace packages for an affected-only CI job.
 # Direct/local invocations and global changes default to the full workspace.
 package_args=(--workspace)
@@ -155,6 +168,11 @@ if [ -n "${JMODGUARD_DYLINT_PACKAGES:-}" ]; then
 fi
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target-dylint}"
+# This run's library key, recorded before any library build from the same
+# metadata lookup that selects the lint toolchain. scripts/ci-dylint-libs.sh
+# sources this prefix and publishes the build output under this key, so it
+# needs no second lookup that could fail, stall, or resolve a moved tag.
+dylint_build_key="$CARGO_TARGET_DIR/dylint/jmodguard-lib-key.txt"
 
 # Give lint-tool dependency resolution its own CARGO_HOME so it cannot race
 # ordinary Cargo dependency checkouts during local or hosted checks.
@@ -233,7 +251,7 @@ dylint_prebuilt_lib_dir_valid() {
   [ "$so_count" -eq 6 ]
 }
 
-pinned_root="$JMODGUARD_CI_PREFIX/dylint-6.1.0"
+pinned_root="$dylint_pinned_root"
 pinned_ok=0
 if [ -f "$pinned_root/.crates.toml" ] \
   && [ -x "$pinned_root/bin/cargo-dylint" ] \
@@ -302,14 +320,20 @@ clippy_master_env=(
 
 ensure_dylint_toolchain
 
+mkdir -p "$(dirname "$dylint_build_key")"
+rm -f "$dylint_build_key"
+if ! jmodguard_dylint_lib_key_from_metadata "$dylint_lib_metadata" "$dylint_build_key"; then
+  rm -f "$dylint_build_key"
+  echo "dylint: library key unavailable; this run's libraries cannot be published"
+fi
+
 use_prebuilt=0
 lib_dir=""
 if [ ! -d "$JMODGUARD_CI_PREFIX/dylint-libs" ]; then
   echo "dylint: prebuilt libs skipped: $JMODGUARD_CI_PREFIX/dylint-libs absent; using metadata build"
 else
-  key_file="$(mktemp)"
-  if ! jmodguard_dylint_lib_key dylint.toml "$key_file"; then
-    rm -f "$key_file"
+  key_file="$dylint_build_key"
+  if [ ! -s "$key_file" ]; then
     echo "dylint: prebuilt libs skipped: key lookup failed; using metadata build"
   else
     KEY=$(dylint_lib_key_digest "$key_file")
@@ -325,7 +349,6 @@ else
         echo "dylint: prebuilt libs skipped: cargo dylint --help has no --no-metadata; using metadata build"
       fi
     fi
-    rm -f "$key_file"
   fi
 fi
 
