@@ -893,9 +893,9 @@ struct Supervisor {
     baked_fallback_installed: Option<ComponentRelease>,
     pending_startup: Vec<StartupReceipt>,
     activation_receipts: ReceiptBackoff,
-    /// When the current run of unsaved startup receipts began, so an
-    /// unreachable control link can stay INFO-level for a normal swap wait.
-    startup_deferred_since: Option<Instant>,
+    /// When the current uninterrupted control-link outage for startup
+    /// receipts began, so it can stay INFO-level for a normal swap wait.
+    startup_link_down_since: Option<Instant>,
     readiness_receipt: ReadinessReceipt,
     last_observed: Option<Instant>,
 }
@@ -1080,8 +1080,10 @@ impl Supervisor {
         !self.activation_receipts.waiting()
     }
 
-    fn remember_pending(&mut self, pending: PendingFailure) {
-        tracing::warn!("launcher receipt was not saved; retrying before any new candidate");
+    fn remember_pending(&mut self, pending: PendingFailure, error: &anyhow::Error) {
+        tracing::warn!(
+            "launcher receipt was not saved; retrying before any new candidate: {error:#}"
+        );
         self.pending_failure = Some(pending);
         self.note_receipt_delay();
     }
@@ -1377,15 +1379,18 @@ impl Supervisor {
                 Ok(()) => {
                     self.pending_startup.remove(0);
                     self.reset_receipt_backoff();
-                    self.startup_deferred_since = None;
+                    self.startup_link_down_since = None;
                 }
                 Err(error) if Self::receipt_not_saved(&error) => {
                     // A rolling swap waits out the old pod's launcher fence
                     // before the local bot control link answers, so keep the
                     // normal wait at INFO and warn only past that window
                     // (issue #552). Other unsaved reasons still warn.
-                    let deferred_for = self.note_startup_deferral();
-                    if Self::startup_receipt_warns(&error, deferred_for) {
+                    if Self::startup_receipt_warns(
+                        &mut self.startup_link_down_since,
+                        &error,
+                        Instant::now(),
+                    ) {
                         tracing::warn!("launcher startup receipt was not saved: {error:#}");
                     } else {
                         tracing::info!("launcher startup receipt was not saved: {error:#}");
@@ -1393,26 +1398,33 @@ impl Supervisor {
                     self.note_receipt_delay();
                     return Ok(());
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // Anything but an unreachable link ends the outage.
+                    self.startup_link_down_since = None;
+                    return Err(error);
+                }
             }
         }
         Ok(())
     }
 
-    /// Start the deferral clock on the first unsaved startup receipt and
-    /// report how long the current run has been deferred.
-    fn note_startup_deferral(&mut self) -> Duration {
-        self.startup_deferred_since
-            .get_or_insert_with(Instant::now)
-            .elapsed()
-    }
-
     /// An unreachable control link stays INFO-level for the fence TTL plus a
     /// margin: every planned rolling swap waits that long, and only a link
     /// still down afterwards is unexpected. Any other unsaved reason warns
-    /// immediately, as before.
-    fn startup_receipt_warns(error: &anyhow::Error, deferred_for: Duration) -> bool {
-        !Self::control_link_unavailable(error) || deferred_for > STARTUP_RECEIPT_WARN_AFTER
+    /// immediately, as before. It also proves the link answered, so it ends
+    /// the outage: the bound measures one uninterrupted outage, not the age
+    /// of the queued receipt.
+    fn startup_receipt_warns(
+        link_down_since: &mut Option<Instant>,
+        error: &anyhow::Error,
+        now: Instant,
+    ) -> bool {
+        if !Self::control_link_unavailable(error) {
+            *link_down_since = None;
+            return true;
+        }
+        now.saturating_duration_since(*link_down_since.get_or_insert(now))
+            > STARTUP_RECEIPT_WARN_AFTER
     }
 
     fn control_link_unavailable(error: &anyhow::Error) -> bool {
@@ -1429,10 +1441,13 @@ impl Supervisor {
         match self.control.failed(&self.role, &release, &message).await {
             Ok(()) => self.reset_receipt_backoff(),
             Err(error) if Self::receipt_not_saved(&error) => {
-                self.remember_pending(PendingFailure {
-                    component: Some((release, message)),
-                    launcher: None,
-                });
+                self.remember_pending(
+                    PendingFailure {
+                        component: Some((release, message)),
+                        launcher: None,
+                    },
+                    &error,
+                );
             }
             Err(error) => return Err(error),
         }
@@ -2520,10 +2535,13 @@ impl Supervisor {
                         {
                             Ok(()) => {}
                             Err(save) if Self::receipt_not_saved(&save) => {
-                                self.remember_pending(PendingFailure {
-                                    component: None,
-                                    launcher: Some((release.digest.clone(), message)),
-                                });
+                                self.remember_pending(
+                                    PendingFailure {
+                                        component: None,
+                                        launcher: Some((release.digest.clone(), message)),
+                                    },
+                                    &save,
+                                );
                                 return Ok(false);
                             }
                             Err(save) => return Err(save),
@@ -2767,10 +2785,13 @@ impl Supervisor {
                     Ok(()) => {}
                     Err(save) if Self::receipt_not_saved(&save) => {
                         let digest = candidate.digest.clone();
-                        self.remember_pending(PendingFailure {
-                            component: Some((candidate, app_message)),
-                            launcher: Some((digest, launcher_message)),
-                        });
+                        self.remember_pending(
+                            PendingFailure {
+                                component: Some((candidate, app_message)),
+                                launcher: Some((digest, launcher_message)),
+                            },
+                            &save,
+                        );
                         return Ok(false);
                     }
                     Err(save) => return Err(save),
@@ -2964,14 +2985,31 @@ impl Supervisor {
             let result = self.pair(&op.id).await;
             if let Err(error) = result {
                 // An unsaved API step through the bot launcher link is retried
-                // on the next poll; it is not a failed upgrade.
-                if error.is::<db::UpgradeProgressChanged>() || Self::receipt_not_saved(&error) {
+                // on the next poll; it is not a failed upgrade. This is the one
+                // line for that attempt: a link or writer failure stays visible
+                // so a stalled pair is not silent, while the writer answering
+                // that it cannot save yet is ordinary progress.
+                // Without a launcher link at all, startup already warned once
+                // that paired upgrades cannot advance.
+                if let Some(unsaved) = error.downcast_ref::<db::ReceiptNotSaved>() {
+                    if unsaved.attempt_failed() && self.control.has_launcher_link() {
+                        tracing::warn!("paired upgrade step was not saved; retrying: {error:#}");
+                    }
                     return Ok(false);
                 }
-                let _ = self
+                if error.is::<db::UpgradeProgressChanged>() {
+                    return Ok(false);
+                }
+                // `forward` logs a hard refusal but not an unsaved attempt, so
+                // say here that the upgrade error was not stored.
+                if let Err(record) = self
                     .control
                     .upgrade_error(&op.id, &format!("{}: {error:#}", self.role))
-                    .await;
+                    .await
+                    && record.is::<db::ReceiptNotSaved>()
+                {
+                    tracing::warn!("paired-upgrade error was not recorded: {record:#}");
+                }
                 self.stop_application().await?;
                 return Err(error);
             }
@@ -3448,7 +3486,7 @@ async fn main() -> Result<()> {
         baked_fallback_installed: None,
         pending_startup,
         activation_receipts: ReceiptBackoff::default(),
-        startup_deferred_since: None,
+        startup_link_down_since: None,
         readiness_receipt: ReadinessReceipt::Pending,
         last_observed: None,
     };
@@ -4005,9 +4043,17 @@ mod tests {
         tokio::fs::remove_dir_all(&dir).await.unwrap();
     }
 
+    /// The shape `forward` returns when the link does not answer: the
+    /// transport cause with `ReceiptNotSaved` as its context.
     fn link_unavailable_error() -> anyhow::Error {
-        db::ReceiptNotSaved {
+        anyhow::anyhow!("waiting").context(db::ReceiptNotSaved {
             status: jmodguard::control::CONTROL_LINK_UNAVAILABLE.to_owned(),
+        })
+    }
+
+    fn unsaved(status: &str) -> anyhow::Error {
+        db::ReceiptNotSaved {
+            status: status.to_owned(),
         }
         .into()
     }
@@ -4018,18 +4064,26 @@ mod tests {
     #[test]
     fn unreachable_link_startup_receipts_stay_quiet_until_the_fence_bound() {
         let link = link_unavailable_error();
+        let start = Instant::now();
+        let mut since = None;
         assert!(
-            !Supervisor::startup_receipt_warns(&link, Duration::ZERO),
+            !Supervisor::startup_receipt_warns(&mut since, &link, start),
             "the first attempt must not warn"
         );
+        assert_eq!(since, Some(start), "the first attempt starts the outage");
         assert!(
-            !Supervisor::startup_receipt_warns(&link, STARTUP_RECEIPT_WARN_AFTER),
+            !Supervisor::startup_receipt_warns(
+                &mut since,
+                &link,
+                start + STARTUP_RECEIPT_WARN_AFTER
+            ),
             "the bound itself is still a normal wait"
         );
         assert!(
             Supervisor::startup_receipt_warns(
+                &mut since,
                 &link,
-                STARTUP_RECEIPT_WARN_AFTER + Duration::from_secs(1)
+                start + STARTUP_RECEIPT_WARN_AFTER + Duration::from_secs(1)
             ),
             "a link still down past the bound is unexpected"
         );
@@ -4039,15 +4093,42 @@ mod tests {
     #[test]
     fn other_unsaved_startup_receipt_reasons_still_warn() {
         for status in ["waiting", "busy", "still waiting"] {
-            let error: anyhow::Error = db::ReceiptNotSaved {
-                status: status.to_owned(),
-            }
-            .into();
             assert!(
-                Supervisor::startup_receipt_warns(&error, Duration::ZERO),
+                Supervisor::startup_receipt_warns(&mut None, &unsaved(status), Instant::now()),
                 "{status} must keep warning immediately"
             );
         }
+    }
+
+    /// A reply from the link ends the outage. A later outage gets its own
+    /// full window instead of inheriting the time of the first one.
+    #[test]
+    fn a_link_reply_restarts_the_startup_receipt_outage_window() {
+        let link = link_unavailable_error();
+        let start = Instant::now();
+        let mut since = None;
+        assert!(!Supervisor::startup_receipt_warns(&mut since, &link, start));
+        let answered = start + Duration::from_secs(10);
+        assert!(Supervisor::startup_receipt_warns(
+            &mut since,
+            &unsaved("waiting"),
+            answered
+        ));
+        assert_eq!(since, None, "the link answered, so the outage ended");
+        let again = start + STARTUP_RECEIPT_WARN_AFTER + Duration::from_secs(10);
+        assert!(
+            !Supervisor::startup_receipt_warns(&mut since, &link, again),
+            "a new outage must not inherit the first outage's start"
+        );
+        assert_eq!(since, Some(again));
+        assert!(
+            Supervisor::startup_receipt_warns(
+                &mut since,
+                &link,
+                again + STARTUP_RECEIPT_WARN_AFTER + Duration::from_secs(1)
+            ),
+            "the new outage still warns once it outlasts the bound"
+        );
     }
 }
 
