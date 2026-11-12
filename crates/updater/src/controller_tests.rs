@@ -305,6 +305,7 @@ fn controller(
         activation_receipts: ReceiptBackoff::default(),
         readiness_receipt: ReadinessReceipt::Pending,
         last_observed: None,
+        core_migration_wait: None,
     }
 }
 
@@ -1472,6 +1473,8 @@ impl tracing::Subscriber for ContractWarnings {
         event.record(&mut MessageVisit(&mut message));
         if message.contains("no capability contract")
             || message.contains("registry unreachable at boot; starting the built-in application")
+            || (event.metadata().level() == &tracing::Level::INFO
+                && message.starts_with("waiting for the bot to migrate core schema"))
             || (event.metadata().level() == &tracing::Level::ERROR
                 && message == "discord token rejected; bot held, fix token and restart container")
             || (event.metadata().level() == &tracing::Level::WARN
@@ -2873,12 +2876,34 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
             control.clone(),
             &root,
         );
-        let error = api.tick().await.unwrap_err();
+        // Until the bot migrates, the API waits without a tick error: the main
+        // loop would log one at WARN every poll. It logs the wait once at INFO.
+        let (ticks, logs) =
+            with_contract_warnings(async { (api.tick().await, api.tick().await) }).await;
+        assert!(!ticks.0.unwrap() && !ticks.1.unwrap());
+        assert!(api.running.is_none());
         assert!(
-            error
-                .to_string()
-                .contains("baked application cannot open database")
+            api.maintenance.is_some(),
+            "the maintenance API keeps health up while waiting"
         );
+        let waiting = format!(
+            "waiting for the bot to migrate core schema 16 -> {}",
+            db::CORE_SCHEMA_VERSION
+        );
+        assert_eq!(logs, [waiting], "stale_meta={stale_meta}");
+        // Past the bound the wait becomes a tick error again, without the
+        // owner recovery advice. The wait keeps its original start.
+        let overdue = Instant::now()
+            .checked_sub(CORE_MIGRATION_WAIT + Duration::from_secs(1))
+            .unwrap();
+        api.core_migration_wait = Some(overdue);
+        let error = format!("{:#}", api.tick().await.unwrap_err());
+        assert!(
+            error.contains("is still older than the built-in API schema")
+                && !error.contains("owner recovery"),
+            "{error}"
+        );
+        assert_eq!(api.core_migration_wait, Some(overdue));
         assert!(api.running.is_none());
         tokio::fs::write(root.join("hold-baked-bot-ready"), "")
             .await

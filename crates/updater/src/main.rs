@@ -30,6 +30,9 @@ use tokio::process::{Child, Command};
 
 const POLL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the API launcher waits quietly for the bot to migrate an older core
+/// schema before it warns again, well past a launcher fence handoff.
+const CORE_MIGRATION_WAIT: Duration = Duration::from_secs(300);
 /// Durable reason stored while the built-in binary is covering an unreachable registry.
 const REGISTRY_OUTAGE_BOOT_MISMATCH: &str = "registry unreachable";
 /// Durable reasons stored when an outage fallback refuses the built-in binary's
@@ -890,6 +893,9 @@ struct Supervisor {
     activation_receipts: ReceiptBackoff,
     readiness_receipt: ReadinessReceipt,
     last_observed: Option<Instant>,
+    /// Set while the last API restore was waiting for the bot to migrate the
+    /// core schema up to the built-in one; holds when that wait began.
+    core_migration_wait: Option<Instant>,
 }
 
 impl Supervisor {
@@ -2183,6 +2189,7 @@ impl Supervisor {
     }
 
     async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
+        let waiting_since = self.core_migration_wait.take();
         if let Some(PendingRollback { failed, error }) = self.rollback.clone() {
             return self.rollback_independent(state, failed, error).await;
         }
@@ -2223,6 +2230,21 @@ impl Supervisor {
             );
             self.start(&path, &release.source_sha, Some(release.clone()))
                 .await?;
+        } else if self.role == "api" && schema < self.baked_compatibility.core {
+            // The bot launcher migrates first during an ordinary rollout. Keep
+            // the maintenance API up and wait without a per-poll warning.
+            let core = self.baked_compatibility.core;
+            let since = waiting_since.unwrap_or_else(|| {
+                tracing::info!("waiting for the bot to migrate core schema {schema} -> {core}");
+                Instant::now()
+            });
+            self.core_migration_wait = Some(since);
+            ensure!(
+                since.elapsed() < CORE_MIGRATION_WAIT,
+                "core schema {schema} is still older than the built-in API schema {core} after {}s; check the bot launcher",
+                CORE_MIGRATION_WAIT.as_secs()
+            );
+            self.idle().await?;
         } else {
             anyhow::bail!("baked application cannot open database; use owner recovery");
         }
@@ -2509,6 +2531,9 @@ impl Supervisor {
                     }
                 }
                 self.restore(&state).await?;
+                if self.core_migration_wait.is_some() {
+                    return Ok(ControlStep::Defer);
+                }
                 Ok::<_, anyhow::Error>(ControlStep::Proceed)
             }
             .await;
@@ -3410,6 +3435,7 @@ async fn main() -> Result<()> {
         activation_receipts: ReceiptBackoff::default(),
         readiness_receipt: ReadinessReceipt::Pending,
         last_observed: None,
+        core_migration_wait: None,
     };
     supervisor.load_boot_mismatch_handoff().await?;
     loop {
