@@ -446,6 +446,9 @@ expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-ta
 
 run_dylint "$fixture/external" DYLINT_TEST_RUSTC_FAIL=1
 grep -Fq 'key lookup failed' "$stdout_file" || fail 'missing key lookup failed message'
+grep -Fq 'library key unavailable' "$stdout_file" || fail 'missing unrecorded library key message'
+[ ! -e "$fixture/project/target-dylint/dylint/jmodguard-lib-key.txt" ] \
+  || fail 'a failed compiler lookup must not record a library key'
 expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
 
 if run_dylint "$fixture/external" DYLINT_TEST_CURL_FAIL=1 >/dev/null 2>&1; then
@@ -472,6 +475,9 @@ printf 'cargo-dylint v6.1.0:\n    cargo-dylint\n\ndylint-link v6.1.0:\n    dylin
 for name in abs_home_path await_holding_span_guard basic_dead_store crate_wide_allow incorrect_matches_operation wrong_serialize_struct_arg; do
   printf 'x' >"$publish_target/dylint/libraries/$tc/release/lib${name}@${tc}.so"
 done
+# dylint.sh records the build's library key next to its output; the publisher
+# reads it instead of looking the key up again.
+cp "$key_body_file" "$publish_target/dylint/jmodguard-lib-key.txt"
 
 run_provision() {
   local prefix="$1" cargo_home="$2" target_dir="$3"
@@ -543,6 +549,8 @@ if [ -f "$install_capture" ]; then
 fi
 expect "$capture" argv 'dylint --all --no-metadata --fail-on-no-libraries -- --locked --all-targets --workspace'
 expect "$capture" DYLINT_LIBRARY_PATH "$publish_lib_dir"
+cmp -s "$fixture/project/target-dylint/dylint/jmodguard-lib-key.txt" "$key_body_file" \
+  || fail 'dylint must record the library key of its run for the publisher'
 
 # A dylint tag bump moves the pinned tool root for the publisher and dylint.sh
 # together: both derive dylint-<tag> from dylint.toml.
@@ -569,17 +577,36 @@ grep -Fq 'no dylint tools under' "$provision_stdout" || fail 'missing tools must
 [ ! -d "$skip_prefix/dylint-libs" ] || fail 'a failed run must not create dylint-libs'
 [ ! -d "$skip_prefix/dylint-6.1.0" ] || fail 'a failed run must not create the pinned tool root'
 
-if run_provision "$skip_prefix" "$publish_cargo" "$fixture/external"; then
+# Valid tools are not published either when the libraries cannot be.
+nolib_target="$fixture/nolib-target"
+mkdir -p "$nolib_target/dylint"
+cp "$key_body_file" "$nolib_target/dylint/jmodguard-lib-key.txt"
+if run_provision "$skip_prefix" "$publish_cargo" "$nolib_target"; then
   fail 'provisioning without metadata-built libraries must fail'
 fi
 grep -Fq 'has no lib' "$provision_stdout" || fail 'missing libraries must be reported'
 [ ! -d "$skip_prefix/dylint-libs" ] || fail 'a failed run must not create dylint-libs'
+[ ! -d "$skip_prefix/dylint-6.1.0" ] || fail 'missing libraries must not leave published tools'
 
-if run_provision "$skip_prefix" "$publish_cargo" "$publish_target" DYLINT_TEST_CURL_FAIL=1; then
-  fail 'provisioning with a failed library key lookup must fail'
+# Without the key dylint.sh recorded, the publisher fails; it never looks the
+# key up itself, so a network outage or a moved tag cannot reach it.
+nokey_target="$fixture/nokey-target"
+cp -R "$publish_target" "$nokey_target"
+rm -f "$nokey_target/dylint/jmodguard-lib-key.txt"
+if run_provision "$skip_prefix" "$publish_cargo" "$nokey_target" DYLINT_TEST_CURL_FAIL=1; then
+  fail 'provisioning without a recorded library key must fail'
 fi
-grep -Fq 'library key lookup failed' "$provision_stdout" || fail 'key lookup failure must be reported'
-[ ! -d "$skip_prefix/dylint-libs" ] || fail 'a failed key lookup must not create dylint-libs'
+grep -Fq 'no library key recorded' "$provision_stdout" || fail 'a missing recorded key must be reported'
+[ ! -d "$skip_prefix/dylint-libs" ] || fail 'a missing recorded key must not create dylint-libs'
+[ ! -d "$skip_prefix/dylint-6.1.0" ] || fail 'a missing recorded key must not leave published tools'
+
+# A network outage after the build cannot fail publishing: the recorded key
+# is used as is.
+outage_prefix="$fixture/outage-prefix"
+run_provision "$outage_prefix" "$publish_cargo" "$publish_target" DYLINT_TEST_CURL_FAIL=1 \
+  || fail 'provisioning must not depend on a network lookup'
+cmp -s "$outage_prefix/dylint-libs/$KEY/key.txt" "$key_body_file" \
+  || fail 'provisioning must publish under the recorded key'
 
 while IFS= read -r line; do
   if [[ "$line" == *dylint-libs* ]]; then
