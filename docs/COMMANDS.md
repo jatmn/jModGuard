@@ -125,8 +125,23 @@ compatible with older bots, and other custom wording is preserved.
 Prefix aliases match exactly. Slash command names must be
 `[a-z0-9_-]` — the slash sync sanitizes names automatically.
 
-Stats uses bold labels and inline-code values. Uptime, moderation records, warns,
-and bans have a leading emote. Uptime and release ages use compact years, months,
+Stats replies with one embed in the log-notice style (see
+[templates](TEMPLATES.md)): bold title **Status**, a colored side bar, and
+inline-code values. **Server stats** shows Uptime, Cases, Warns and Bans as
+inline fields; **Release status** has one bot, api and webui line with its
+short SHA, age and state; **Container use** shows bot and API CPU and memory.
+The side bar is green when every component is up to date (an unmanaged WebUI
+included) and yellow, the system-notice color, when any release is not current,
+unknown, stale, failed, unverified or the release lookup failed. Embed limits
+and truncation match log reports, and mentions are disabled. If Discord
+refuses the embed for missing permissions (Embed Links, 403/50013), the bot
+sends the reply once as plain text instead. With the default (empty) response,
+or a customized response that uses `{response}`, that plain text carries the
+stats in the earlier text layout; a customized response without `{response}`
+falls back to just its own text, as before. A customized command response is
+sent as message text above the embed; one that uses `{response}` receives
+that plain-text stats reply and no embed, so the data is not shown twice.
+Uptime and release ages use compact years, months,
 weeks, days, hours, minutes, and seconds (`13m 38s`; intermediate zeros stay, as in
 `1d 0h 0m 38s`), with fixed 360-day years, 30-day months, and 7-day weeks,
 rounded down to whole seconds; a newly started process shows `0s`. Release
@@ -134,7 +149,8 @@ availability is an icon: ✅ up to date, ⬆️ update available, ⚠️ source 
 but the image digest is unverified, ❓ unknown. A component with no cached
 release row is `❓` and has no SHA or age. Container use is this bot
 process's own cgroup. Memory is real program use (`memory.current` minus
-`inactive_file`) shown against `memory.max` (`max` means no limit). When
+`inactive_file`) shown against `memory.max` (`max` means no limit); a host that
+does not report it shows `not reported by host`. When
 `memory.stat` is missing or unreadable, it is raw `memory.current` (or v1
 `memory.usage_in_bytes`) marked `(includes page cache)`. CPU is the latest
 background sample. `!status` does not wait for one; until a sample
@@ -142,7 +158,8 @@ exists that row is `unavailable`. When `JMODGUARD_READ_TARGET` points at the
 API loopback read listener (for example `127.0.0.1:8083`) and
 `JMODGUARD_CONTROL_SECRET` matches, the bot fetches
 the API container sample in parallel with the rest of the reply (short
-timeout). The label names whichever API copy answered; it is not an aggregate.
+timeout). The values come from whichever API copy answered; they are not an
+aggregate, and the copy's process ID is not shown.
 A missing or slow reading is `unavailable`, never `0`.
 
 Prefix `!status`

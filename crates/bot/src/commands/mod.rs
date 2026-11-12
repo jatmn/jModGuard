@@ -10,7 +10,7 @@ pub mod voice_lookup;
 
 use anyhow::Result;
 use serenity::builder::{
-    Builder, CreateAllowedMentions, CreateCommand, CreateCommandOption, CreateMessage,
+    Builder, CreateAllowedMentions, CreateCommand, CreateCommandOption, CreateEmbed, CreateMessage,
     EditInteractionResponse,
 };
 use serenity::client::Context;
@@ -604,6 +604,11 @@ pub struct BehaviorOutcome {
     /// dispatch withdraws the deferred answer (or answers ephemerally when
     /// the defer failed — an interaction must always be answered).
     pub suppress_response: bool,
+    /// Behavior output presented as one log-style embed (Stats). It is sent
+    /// in place of `response`, which stays the plain-text form: a response
+    /// template using `{response}` gets that text and no embed, and it is the
+    /// fallback when Discord refuses the embed for missing permissions.
+    pub embed: Option<jmodguard::log_embeds::LogEmbed>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,6 +1413,34 @@ async fn raced_channel_text(
     text: String,
     suppress_mentions: bool,
 ) -> RacedWrite {
+    raced_channel_message(
+        app,
+        channel_id,
+        http,
+        guild_id,
+        text_message(text, suppress_mentions),
+        None,
+    )
+    .await
+}
+
+fn text_message(text: String, suppress_mentions: bool) -> CreateMessage {
+    let message = CreateMessage::new().content(text);
+    if suppress_mentions {
+        message.allowed_mentions(no_mentions())
+    } else {
+        message
+    }
+}
+
+async fn raced_channel_message(
+    app: &Arc<BotState>,
+    channel_id: ChannelId,
+    http: &serenity::http::Http,
+    guild_id: u64,
+    message: CreateMessage,
+    fallback: Option<CreateMessage>,
+) -> RacedWrite {
     let target = crate::discord::DiscordRestTarget::GuildChannel {
         guild: guild_id,
         channel: channel_id.get(),
@@ -1421,19 +1454,25 @@ async fn raced_channel_text(
     let recovery = app
         .remembered_discord_targets
         .capture_recovery_epoch(target);
-    let call = if suppress_mentions {
-        crate::discord::race_discord_call(
-            &app.activation,
-            channel_id.send_message(
-                http,
-                CreateMessage::new()
-                    .content(text)
-                    .allowed_mentions(no_mentions()),
-            ),
-        )
-        .await
-    } else {
-        crate::discord::race_discord_call(&app.activation, channel_id.say(http, text)).await
+    let call =
+        crate::discord::race_discord_call(&app.activation, channel_id.send_message(http, message))
+            .await;
+    // Only the final attempt is remembered, so a refused embed whose plain-text
+    // fallback succeeds does not park the channel.
+    let refused =
+        matches!(&call, crate::discord::DiscordCall::Finished(Err(error)) if embed_refused(error));
+    let call = match fallback {
+        Some(fallback) if refused => {
+            tracing::warn!(
+                "channel {channel_id} refused an embed reply for missing permissions; sending plain text"
+            );
+            crate::discord::race_discord_call(
+                &app.activation,
+                channel_id.send_message(http, fallback),
+            )
+            .await
+        }
+        _ => call,
     };
     match call {
         crate::discord::DiscordCall::Finished(Ok(_)) => {
@@ -1465,7 +1504,27 @@ async fn raced_slash_edit(
     if suppress_mentions {
         edit = edit.allowed_mentions(no_mentions());
     }
-    match crate::discord::race_discord_call(activation, edit.execute(http, token)).await {
+    raced_slash_edit_response(activation, http, token, edit, None).await
+}
+
+async fn raced_slash_edit_response(
+    activation: &crate::activation::Activation,
+    http: &serenity::http::Http,
+    token: &str,
+    edit: EditInteractionResponse,
+    fallback: Option<EditInteractionResponse>,
+) -> RacedWrite {
+    let call = crate::discord::race_discord_call(activation, edit.execute(http, token)).await;
+    let refused =
+        matches!(&call, crate::discord::DiscordCall::Finished(Err(error)) if embed_refused(error));
+    let call = match fallback {
+        Some(fallback) if refused => {
+            tracing::warn!("slash embed reply refused for missing permissions; sending plain text");
+            crate::discord::race_discord_call(activation, fallback.execute(http, token)).await
+        }
+        _ => call,
+    };
+    match call {
         crate::discord::DiscordCall::Finished(Ok(_)) => RacedWrite::Finished,
         crate::discord::DiscordCall::Finished(Err(error)) => {
             tracing::warn!("failed to edit slash response: {error}");
@@ -1490,12 +1549,39 @@ async fn raced_slash_create_message(
     if suppress_mentions {
         message = message.allowed_mentions(no_mentions());
     }
-    match crate::discord::race_discord_call(
+    raced_slash_create_response(activation, http, id, token, message, None).await
+}
+
+async fn raced_slash_create_response(
+    activation: &crate::activation::Activation,
+    http: &serenity::http::Http,
+    id: serenity::model::id::InteractionId,
+    token: &str,
+    message: serenity::builder::CreateInteractionResponseMessage,
+    fallback: Option<serenity::builder::CreateInteractionResponseMessage>,
+) -> RacedWrite {
+    let call = crate::discord::race_discord_call(
         activation,
         serenity::builder::CreateInteractionResponse::Message(message).execute(http, (id, token)),
     )
-    .await
-    {
+    .await;
+    let refused =
+        matches!(&call, crate::discord::DiscordCall::Finished(Err(error)) if embed_refused(error));
+    let call = match fallback {
+        Some(fallback) if refused => {
+            tracing::warn!(
+                "slash embed answer refused for missing permissions; sending plain text"
+            );
+            crate::discord::race_discord_call(
+                activation,
+                serenity::builder::CreateInteractionResponse::Message(fallback)
+                    .execute(http, (id, token)),
+            )
+            .await
+        }
+        _ => call,
+    };
+    match call {
         crate::discord::DiscordCall::Finished(Ok(())) => RacedWrite::Finished,
         crate::discord::DiscordCall::Finished(Err(error)) => {
             tracing::warn!("failed to answer slash interaction: {error}");
@@ -1535,6 +1621,54 @@ async fn deliver_slash_success(
             }
         }
         SlashAnswer::Public | SlashAnswer::Ephemeral => {
+            if let Some(embed) = reply_embed(cmd, outcome) {
+                // Same embed, disabled mentions and plain-text fallback as prefix.
+                let content = embed_reply_content(cmd, outcome);
+                return if deferred == SlashResponseState::DeferredPublic {
+                    let mut edit = EditInteractionResponse::new()
+                        .embed(embed)
+                        .allowed_mentions(no_mentions());
+                    if let Some(content) = content {
+                        edit = edit.content(content);
+                    }
+                    let mut fallback = EditInteractionResponse::new().content(text);
+                    if suppress_mentions {
+                        fallback = fallback.allowed_mentions(no_mentions());
+                    }
+                    raced_slash_edit_response(
+                        activation,
+                        http,
+                        slash.token.as_str(),
+                        edit,
+                        Some(fallback),
+                    )
+                    .await
+                } else {
+                    let public = answer == SlashAnswer::Public;
+                    let mut message = serenity::builder::CreateInteractionResponseMessage::new()
+                        .embed(embed)
+                        .ephemeral(!public)
+                        .allowed_mentions(no_mentions());
+                    if let Some(content) = content {
+                        message = message.content(content);
+                    }
+                    let mut fallback = serenity::builder::CreateInteractionResponseMessage::new()
+                        .content(text)
+                        .ephemeral(!public);
+                    if suppress_mentions {
+                        fallback = fallback.allowed_mentions(no_mentions());
+                    }
+                    raced_slash_create_response(
+                        activation,
+                        http,
+                        slash.id,
+                        slash.token.as_str(),
+                        message,
+                        Some(fallback),
+                    )
+                    .await
+                };
+            }
             if deferred == SlashResponseState::DeferredPublic {
                 raced_slash_edit(
                     activation,
@@ -1641,6 +1775,32 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
     rendered
 }
 
+/// The embed to send for a confirmed reply. A customized response that uses
+/// `{response}` already carries the plain-text form, so it gets no embed.
+fn reply_embed(cmd: &CommandDef, outcome: &BehaviorOutcome) -> Option<CreateEmbed> {
+    outcome
+        .embed
+        .clone()
+        .filter(|_| outcome.confirmation() == Confirmation::Needed)
+        .filter(|_| !cmd.response.contains("{response}"))
+        .map(crate::logging::discord_embed)
+}
+
+/// Message text sent above an embed: only a customized response.
+fn embed_reply_content(cmd: &CommandDef, outcome: &BehaviorOutcome) -> Option<String> {
+    if cmd.response.is_empty() {
+        return None;
+    }
+    let text = render_outcome(cmd, outcome);
+    (!text.is_empty()).then_some(text)
+}
+
+/// Discord refuses an embed reply without Embed Links (or Send Messages) with
+/// 403/50013. The plain-text reply is then tried once instead.
+fn embed_refused(error: &serenity::Error) -> bool {
+    crate::discord::http_error_response(error) == Some((403, 50013))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Confirmation {
     Needed,
@@ -1689,7 +1849,7 @@ enum SlashAnswer {
 fn slash_answer(cmd: &CommandDef, outcome: &BehaviorOutcome) -> SlashAnswer {
     if outcome.confirmation() == Confirmation::EffectAlreadyVisible {
         SlashAnswer::Withdraw
-    } else if outcome.response.is_none() && cmd.response.is_empty() {
+    } else if outcome.response.is_none() && outcome.embed.is_none() && cmd.response.is_empty() {
         SlashAnswer::Ephemeral
     } else {
         SlashAnswer::Public
@@ -1748,18 +1908,34 @@ async fn send_outcome(
     actor_id: serenity::model::id::UserId,
     outcome: BehaviorOutcome,
 ) {
-    if let Some(text) = prefix_response_text(cmd, &outcome)
-        && raced_channel_text(
-            app,
-            channel_id,
-            http,
-            guild_id.get(),
-            text,
-            suppress_untrusted_mentions(&cmd.behavior),
-        )
-        .await
-            == RacedWrite::Cutoff
-    {
+    let suppress_mentions = suppress_untrusted_mentions(&cmd.behavior);
+    let text = prefix_response_text(cmd, &outcome);
+    let write = match (reply_embed(cmd, &outcome), text) {
+        (Some(embed), text) => {
+            let message = CreateMessage::new()
+                .embed(embed)
+                .allowed_mentions(no_mentions());
+            let message = match embed_reply_content(cmd, &outcome) {
+                Some(content) => message.content(content),
+                None => message,
+            };
+            let fallback = text.map(|text| text_message(text, suppress_mentions));
+            raced_channel_message(app, channel_id, http, guild_id.get(), message, fallback).await
+        }
+        (None, Some(text)) => {
+            raced_channel_text(
+                app,
+                channel_id,
+                http,
+                guild_id.get(),
+                text,
+                suppress_mentions,
+            )
+            .await
+        }
+        (None, None) => RacedWrite::Finished,
+    };
+    if write == RacedWrite::Cutoff {
         return;
     }
     log_outcome(
@@ -2544,6 +2720,7 @@ mod tests {
             vars: BTreeMap::new(),
             emitted_log_events: Vec::new(),
             suppress_response,
+            embed: None,
         }
     }
 
@@ -2607,6 +2784,7 @@ mod tests {
             vars: BTreeMap::from([("user".into(), "Moderator".into())]),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         assert_eq!(
             render_outcome(&testregex, &outcome),
@@ -2625,6 +2803,7 @@ mod tests {
             ]),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         assert_eq!(render_outcome(&custom, &outcome), "See Member for details");
     }
@@ -2644,6 +2823,7 @@ mod tests {
             ]),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         assert_eq!(
             render_outcome(&kick, &with_dm),
@@ -2679,6 +2859,7 @@ mod tests {
             ]),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         let rendered = render_outcome(&custom, &outcome);
         assert!(
@@ -2711,6 +2892,7 @@ mod tests {
             vars: vars.clone(),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         let not_cached_text = render_outcome(&command, &not_cached);
         assert!(not_cached_text.contains("not cached"), "{not_cached_text}");
@@ -2731,6 +2913,7 @@ mod tests {
             vars: vars.clone(),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         let not_in_text = render_outcome(&command, &not_in_channel);
         assert!(
@@ -2751,6 +2934,7 @@ mod tests {
             vars: vars.clone(),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         let unavailable_text = render_outcome(&command, &channel_unavailable);
         assert!(
@@ -2789,6 +2973,7 @@ mod tests {
                 vars: vars.clone(),
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             };
             assert_eq!(
                 render_outcome(&command, &outcome),
@@ -2829,6 +3014,7 @@ mod tests {
                 ]),
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             };
             let text = render_outcome(&command, &outcome);
             assert_eq!(text, format!("stored reason `{{user}}` for {name}"));
@@ -2855,6 +3041,7 @@ mod tests {
             ]),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         assert_eq!(
             render_outcome(&kick, &outcome),
@@ -2870,6 +3057,7 @@ mod tests {
             vars: BTreeMap::from([("user".into(), "Moderator".into())]),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         };
         assert_eq!(render_outcome(&command, &outcome), "hello {user}");
         assert_eq!(

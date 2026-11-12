@@ -577,12 +577,17 @@ mod tests {
     /// CPU and memory from a missing reading.
     fn assert_stats_unavailable(reading: Option<ContainerReadResponse>) {
         assert!(reading.is_none());
-        let text = crate::templates::stats_with_container_use(
-            "stats".into(),
+        let embed = crate::templates::stats_with_container_use(
+            crate::templates::stats_embed(0, Some(0), 0, 0, None, 0),
             &crate::cgroup::ContainerSample::unavailable(),
             reading.as_ref().map(|response| &response.sample),
-            reading.as_ref().map(|response| response.copy.as_str()),
         );
+        let text = &embed
+            .fields
+            .iter()
+            .find(|field| field.name == crate::templates::STATS_CONTAINER_SECTION)
+            .unwrap()
+            .value;
         assert!(text.contains("**API CPU:** `unavailable`"), "{text}");
         assert!(
             text.contains("**API memory (real program use):** `unavailable`"),

@@ -403,6 +403,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     Vec::new()
                 },
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Softban { default_reason } => {
@@ -475,6 +476,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Unban { default_reason } => {
@@ -568,6 +570,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Kick { default_reason } => {
@@ -639,6 +642,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Timeout { default_minutes } => {
@@ -750,6 +754,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     },
                 ],
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Warn { default_reason } => {
@@ -816,6 +821,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Warns => {
@@ -834,6 +840,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     vars,
                     emitted_log_events: Vec::new(),
                     suppress_response: false,
+                    embed: None,
                 });
             }
             let lines: Vec<String> = warns
@@ -855,6 +862,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::UserInfo => super::userinfo::run(env, enrollment, &mut vars).await,
@@ -887,6 +895,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Voice => {
@@ -908,6 +917,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                         vars,
                         emitted_log_events: Vec::new(),
                         suppress_response: false,
+                        embed: None,
                     });
                 }
                 super::UserNameMatch::NotFound => {
@@ -959,6 +969,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Banlist => {
@@ -970,6 +981,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     vars,
                     emitted_log_events: Vec::new(),
                     suppress_response: false,
+                    embed: None,
                 });
             }
             let lines: Vec<String> = bans
@@ -988,6 +1000,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Purge { default_count } => {
@@ -1041,6 +1054,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Say => {
@@ -1067,6 +1081,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 // The posted message is already visible in the invocation
                 // channel, so a confirmation reply there would be redundant.
                 suppress_response: target == env.channel_id,
+                embed: None,
             })
         }
         Behavior::Slowmode { default_seconds } => {
@@ -1112,6 +1127,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: vec!["mod_action".into()],
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Setname => {
@@ -1147,6 +1163,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::SetPrefix => {
@@ -1172,6 +1189,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Template { action } => run_template(env, action).await,
@@ -1200,6 +1218,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Help => {
@@ -1250,6 +1269,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::About => {
@@ -1264,21 +1284,24 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         Behavior::Stats => {
             // Guild-scoped only — same contract as WebUI `/api/guilds/{id}/stats`.
-            let response = stats_response(
+            let (embed, text) = stats_response(
                 env.app,
                 env.guild_id.get() as i64,
                 env.app.start.elapsed().as_secs(),
             )
             .await?;
             Ok(BehaviorOutcome {
-                response: Some(response),
+                // Plain text for `{response}` templates and the Embed Links fallback.
+                response: Some(text),
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: Some(embed),
             })
         }
         Behavior::Plan { steps } => crate::commands::plans::run(env, steps).await,
@@ -1293,7 +1316,7 @@ async fn stats_response(
     app: &crate::state::BotState,
     guild_id: i64,
     uptime_seconds: u64,
-) -> Result<String> {
+) -> Result<(jmodguard::log_embeds::LogEmbed, String)> {
     let api_task = jmodguard::read_link::try_read_link(
         &app.cfg.bot.read_target,
         app.cfg.bot.control_secret.as_str(),
@@ -1325,22 +1348,34 @@ async fn stats_response(
             .and_then(|joined| joined.ok().flatten()),
         None => None,
     };
-    let (api_sample, api_copy) = api_reading
-        .map(|response| (Some(response.sample), Some(response.copy)))
-        .unwrap_or((None, None));
-    Ok(crate::templates::stats_with_container_use(
+    // The answering copy's label (`api pid N`) is diagnostic and not shown.
+    let api_sample = api_reading.map(|response| response.sample);
+    let now = chrono::Utc::now().timestamp();
+    let embed = crate::templates::stats_with_container_use(
+        crate::templates::stats_embed(
+            uptime_seconds,
+            cases,
+            s.warns,
+            s.bans,
+            updates.as_deref(),
+            now,
+        ),
+        &bot_use,
+        api_sample.as_ref(),
+    );
+    let text = crate::templates::stats_text_with_container_use(
         crate::templates::stats_response_with_update_availability(
             uptime_seconds,
             cases,
             s.warns,
             s.bans,
             updates.as_deref(),
-            chrono::Utc::now().timestamp(),
+            now,
         ),
         &bot_use,
         api_sample.as_ref(),
-        api_copy.as_deref(),
-    ))
+    );
+    Ok((embed, text))
 }
 
 /// Standard variables available to every command's response template.
@@ -1609,6 +1644,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         "get" => {
@@ -1620,6 +1656,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         "set" => {
@@ -1635,6 +1672,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         "reset" => {
@@ -1646,6 +1684,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         other => Err(anyhow!("unknown template action `{other}`")),
@@ -1684,6 +1723,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         "toggle" => {
@@ -1707,6 +1747,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         "dryrun" => {
@@ -1732,6 +1773,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         other => Err(anyhow!("unknown rule action `{other}`")),
@@ -1815,6 +1857,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
                     vars,
                     emitted_log_events: Vec::new(),
                     suppress_response: false,
+                    embed: None,
                 });
             }
             let response = lc
@@ -1827,6 +1870,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         "set" => {
@@ -1847,6 +1891,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         "unset" => {
@@ -1858,6 +1903,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
+                embed: None,
             })
         }
         other => Err(anyhow!("unknown logchannel action `{other}`")),
@@ -2147,9 +2193,15 @@ mod tests {
             .is_some()
         );
         assert_eq!(db::guild_stats(&app.db, 10).await.unwrap().events, 0);
-        let cases_only = stats_response(&app, 10, 20).await.unwrap();
-        assert!(cases_only.contains("**📋 Cases:** `1`"), "{cases_only}");
-        assert!(!cases_only.contains("Moderation records"), "{cases_only}");
+        let cases_only = stats_response(&app, 10, 20).await.unwrap().0;
+        assert_eq!(stats_field(&cases_only, "Cases"), "`1`", "{cases_only:?}");
+        assert!(
+            !cases_only
+                .fields
+                .iter()
+                .any(|f| f.name == "Moderation records"),
+            "{cases_only:?}"
+        );
 
         db::insert_event(
             &app.db,
@@ -2162,28 +2214,34 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(db::guild_stats(&app.db, 10).await.unwrap().events, 1);
-        let legacy_and_cases = stats_response(&app, 10, 20).await.unwrap();
-        assert!(
-            legacy_and_cases.contains("**📋 Cases:** `1`"),
-            "{legacy_and_cases}"
+        let legacy_and_cases = stats_response(&app, 10, 20).await.unwrap().0;
+        assert_eq!(
+            stats_field(&legacy_and_cases, "Cases"),
+            "`1`",
+            "{legacy_and_cases:?}"
         );
 
         let (store, scope) = app.tenant.live(enrollment).await.unwrap();
         store.close_membership(scope).await.unwrap();
-        let closed = stats_response(&app, 10, 20).await.unwrap();
-        assert!(closed.contains("**📋 Cases:** `unavailable`"), "{closed}");
+        let closed = stats_response(&app, 10, 20).await.unwrap().0;
+        assert_eq!(stats_field(&closed, "Cases"), "`unavailable`", "{closed:?}");
 
-        let missing = stats_response(&app, 20, 20).await.unwrap();
-        assert!(missing.contains("**📋 Cases:** `unavailable`"), "{missing}");
+        let missing = stats_response(&app, 20, 20).await.unwrap().0;
+        assert_eq!(
+            stats_field(&missing, "Cases"),
+            "`unavailable`",
+            "{missing:?}"
+        );
         let empty = db::enroll_guild(&app.db, 20, 100).await.unwrap().unwrap();
-        let unplaced = stats_response(&app, 20, 20).await.unwrap();
-        assert!(
-            unplaced.contains("**📋 Cases:** `unavailable`"),
-            "{unplaced}"
+        let unplaced = stats_response(&app, 20, 20).await.unwrap().0;
+        assert_eq!(
+            stats_field(&unplaced, "Cases"),
+            "`unavailable`",
+            "{unplaced:?}"
         );
         app.tenant.activate(empty).await.unwrap();
-        let zero = stats_response(&app, 20, 20).await.unwrap();
-        assert!(zero.contains("**📋 Cases:** `0`"), "{zero}");
+        let zero = stats_response(&app, 20, 20).await.unwrap().0;
+        assert_eq!(stats_field(&zero, "Cases"), "`0`", "{zero:?}");
 
         db::enroll_guild(&app.db, 30, 100).await.unwrap().unwrap();
         let offline = StoreId::new();
@@ -2193,8 +2251,12 @@ mod tests {
         assign_initial_placement(&app.db, 30, offline)
             .await
             .unwrap();
-        let offline = stats_response(&app, 30, 20).await.unwrap();
-        assert!(offline.contains("**📋 Cases:** `unavailable`"), "{offline}");
+        let offline = stats_response(&app, 30, 20).await.unwrap().0;
+        assert_eq!(
+            stats_field(&offline, "Cases"),
+            "`unavailable`",
+            "{offline:?}"
+        );
 
         drop(store);
         drop(app);
@@ -2218,19 +2280,24 @@ mod tests {
         let app =
             crate::state::BotState::new(crate::config::BotProcessConfig::default(), db.clone())
                 .unwrap();
-        let healthy = stats_response(&app, 10, 20).await.unwrap();
-        assert!(healthy.contains("**⚠️ Warns:** `1`"), "{healthy}");
-        assert!(healthy.contains("**Bot CPU:** `unavailable`"), "{healthy}");
+        let healthy = stats_response(&app, 10, 20).await.unwrap().0;
+        assert_eq!(stats_field(&healthy, "Warns"), "`1`", "{healthy:?}");
         assert!(
-            healthy.contains("**API memory (real program use):** `unavailable`"),
-            "{healthy}"
+            stats_field(&healthy, "Container use").contains("**Bot CPU:** `unavailable`"),
+            "{healthy:?}"
+        );
+        assert!(
+            stats_field(&healthy, "Container use")
+                .contains("**API memory (real program use):** `unavailable`"),
+            "{healthy:?}"
         );
         for component in ["bot", "api", "webui"] {
             let expected = format!("**{component}:** not checked");
-            let line = healthy
+            let releases = stats_field(&healthy, "Release status");
+            let line = releases
                 .lines()
                 .find(|line| line.starts_with(&format!("**{component}:**")));
-            assert_eq!(line, Some(expected.as_str()), "{healthy}");
+            assert_eq!(line, Some(expected.as_str()), "{healthy:?}");
         }
         db.with_conn(|conn| {
             conn.execute_batch_bounded("DROP TABLE component_updates", 1024 * 1024)?;
@@ -2238,30 +2305,53 @@ mod tests {
         })
         .await
         .unwrap();
-        let unavailable = stats_response(&app, 10, 20).await.unwrap();
-        assert!(
-            unavailable.contains("**Release status**\nunavailable"),
-            "{unavailable}"
+        let (unavailable, text) = stats_response(&app, 10, 20).await.unwrap();
+        // The plain-text form (custom `{response}`, Embed Links fallback) keeps
+        // the pre-embed layout and the same data.
+        for line in [
+            "**📊 Stats (this server)**",
+            "**⏱️ Uptime:** `20s`",
+            "**⚠️ Warns:** `1`",
+            "**Release status**\nunavailable",
+            "**Container use**\n**Bot CPU:** `unavailable`",
+            "**Bot memory (real program use):** `not reported by host`",
+            "**API memory (real program use):** `unavailable`",
+        ] {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
+        assert_eq!(
+            stats_field(&unavailable, "Release status"),
+            "`unavailable`",
+            "{unavailable:?}"
         );
-        assert!(!unavailable.contains('❓'), "{unavailable}");
-        assert!(unavailable.contains("**⚠️ Warns:** `1`"), "{unavailable}");
+        assert_eq!(unavailable.color, jmodguard::log_embeds::YELLOW);
         assert!(
-            unavailable.contains("**⏱️ Uptime:** `20s`"),
-            "{unavailable}"
+            !format!("{unavailable:?}").contains('❓'),
+            "{unavailable:?}"
+        );
+        assert_eq!(stats_field(&unavailable, "Warns"), "`1`", "{unavailable:?}");
+        assert_eq!(
+            stats_field(&unavailable, "Uptime"),
+            "`20s`",
+            "{unavailable:?}"
         );
         assert!(
-            unavailable.contains("**Bot CPU:** `unavailable`"),
-            "{unavailable}"
+            stats_field(&unavailable, "Container use").contains("**Bot CPU:** `unavailable`"),
+            "{unavailable:?}"
         );
         assert!(
-            unavailable.contains("**Bot memory (real program use):** `unavailable`"),
-            "{unavailable}"
+            stats_field(&unavailable, "Container use")
+                .contains("**Bot memory (real program use):** `not reported by host`"),
+            "{unavailable:?}"
         );
         assert!(
-            unavailable.contains("**API CPU:** `unavailable`"),
-            "{unavailable}"
+            stats_field(&unavailable, "Container use").contains("**API CPU:** `unavailable`"),
+            "{unavailable:?}"
         );
-        assert!(!unavailable.contains("0.0%"), "{unavailable}");
+        assert!(
+            !format!("{unavailable:?}").contains("0.0%"),
+            "{unavailable:?}"
+        );
         drop(app);
         let _ = std::fs::remove_file(path);
     }
@@ -2305,11 +2395,15 @@ mod tests {
         cfg.bot.read_target = "0.0.0.0:8083".into();
         cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
         let app = crate::state::BotState::new(cfg, db.clone()).unwrap();
-        let text = stats_response(&app, 10, 5).await.unwrap();
-        assert!(text.contains("**API CPU:** `unavailable`"), "{text}");
+        let text = stats_response(&app, 10, 5).await.unwrap().0;
         assert!(
-            text.contains("**API memory (real program use):** `unavailable`"),
-            "{text}"
+            stats_field(&text, "Container use").contains("**API CPU:** `unavailable`"),
+            "{text:?}"
+        );
+        assert!(
+            stats_field(&text, "Container use")
+                .contains("**API memory (real program use):** `unavailable`"),
+            "{text:?}"
         );
         drop(app);
         let _ = std::fs::remove_file(path);
@@ -2340,17 +2434,21 @@ mod tests {
         cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
         let app = crate::state::BotState::new(cfg, db.clone()).unwrap();
         let started = Instant::now();
-        let text = stats_response(&app, 10, 5).await.unwrap();
+        let text = stats_response(&app, 10, 5).await.unwrap().0;
         let elapsed = started.elapsed();
         assert!(
             elapsed
                 < jmodguard::read_link::STATS_FETCH_TIMEOUT + std::time::Duration::from_millis(150),
             "stats waited {elapsed:?} for a hung API read"
         );
-        assert!(text.contains("**API CPU:** `unavailable`"), "{text}");
         assert!(
-            text.contains("**API memory (real program use):** `unavailable`"),
-            "{text}"
+            stats_field(&text, "Container use").contains("**API CPU:** `unavailable`"),
+            "{text:?}"
+        );
+        assert!(
+            stats_field(&text, "Container use")
+                .contains("**API memory (real program use):** `unavailable`"),
+            "{text:?}"
         );
         drop(app);
         let _ = std::fs::remove_file(path);
@@ -2359,16 +2457,16 @@ mod tests {
     #[test]
     fn status_does_not_wait_for_a_cpu_sample() {
         let started = std::time::Instant::now();
-        let text = crate::templates::stats_with_container_use(
-            "stats".into(),
+        let embed = crate::templates::stats_with_container_use(
+            crate::templates::stats_embed(0, Some(0), 0, 0, Some(&[]), 0),
             &jmodguard::cgroup::latest_container_sample(),
-            None,
             None,
         );
         assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        let text = stats_field(&embed, "Container use");
         assert!(text.contains("**Bot CPU:** `unavailable`"), "{text}");
         assert!(
-            text.contains("**Bot memory (real program use):** `unavailable`"),
+            text.contains("**Bot memory (real program use):** `not reported by host`"),
             "{text}"
         );
         assert!(text.contains("**API CPU:** `unavailable`"), "{text}");
@@ -2378,6 +2476,16 @@ mod tests {
         );
         assert!(!text.contains("0.0%"), "{text}");
         assert!(!text.contains("0 B"), "{text}");
+    }
+
+    fn stats_field(embed: &jmodguard::log_embeds::LogEmbed, name: &str) -> String {
+        embed
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from {embed:?}"))
+            .value
+            .clone()
     }
 
     #[test]

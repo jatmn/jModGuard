@@ -256,6 +256,7 @@ async fn userinfo_prefix_and_slash_replies_do_not_activate_mentions() {
         vars: std::collections::BTreeMap::new(),
         emitted_log_events: Vec::new(),
         suppress_response: false,
+        embed: None,
     };
     let slash = super::super::SlashCtx {
         id: serenity::model::id::InteractionId::new(1),
@@ -315,6 +316,7 @@ async fn userinfo_prefix_and_slash_replies_do_not_activate_mentions() {
             vars: std::collections::BTreeMap::new(),
             emitted_log_events: Vec::new(),
             suppress_response: false,
+            embed: None,
         },
     )
     .await;
@@ -393,6 +395,19 @@ async fn capturing_proxy_for_commands(
     Arc<std::sync::Mutex<Vec<String>>>,
     tokio::task::JoinHandle<()>,
 ) {
+    capturing_proxy_with(success, false).await
+}
+
+/// `reject_embeds` answers any request carrying an embed with Discord's
+/// Missing Permissions (403/50013), as a channel without Embed Links does.
+async fn capturing_proxy_with(
+    success: bool,
+    reject_embeds: bool,
+) -> (
+    serenity::http::Http,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -435,6 +450,11 @@ async fn capturing_proxy_for_commands(
             let route = request.lines().next().unwrap_or_default();
             let (status, body) = if !success {
                 ("403 Forbidden", "{}".to_string())
+            } else if reject_embeds && request.contains("\"embeds\":[{") {
+                (
+                    "403 Forbidden",
+                    r#"{"code":50013,"message":"Missing Permissions"}"#.into(),
+                )
             } else if route.starts_with("GET ") && route.contains("/bans/") && banned {
                 ("200 OK", serde_json::json!({"user": target_member(10, 91, None).user, "reason": "test reason"}).to_string())
             } else if route.starts_with("GET ") && route.contains("/bans/") {
@@ -2646,4 +2666,551 @@ async fn command_log_context_targeted_plan_automatic() {
         Some(("{command}|{channel}|{target}|{target_id}|{user}|{mention}|{actor}|{content}|{response}",
         "review-plan|<#1>|targetuser|91|targetuser|<@91>|Moderator (<@7>)|hello Moderator|hello Moderator")),
     ).await;
+}
+
+/// One guild, one caller and the payload-capturing Discord proxy for the
+/// real prefix (`handle_prefix`) and slash (`handle_interaction`) dispatch.
+struct StatsDispatch {
+    app: Arc<BotState>,
+    path: std::path::PathBuf,
+    cache: Arc<Cache>,
+    http: Arc<serenity::http::Http>,
+    captured: Arc<std::sync::Mutex<Vec<String>>>,
+    server: tokio::task::JoinHandle<()>,
+    ctx: serenity::client::Context,
+    cfg: Arc<crate::state::CachedGuildConfig>,
+}
+
+impl StatsDispatch {
+    const GUILD: u64 = 10;
+    const ACTOR: u64 = 7;
+    const ROLE: u64 = 50;
+
+    /// `custom` adds guild commands (prefix config and stored rows for slash).
+    async fn new(reject_embeds: bool, custom: Vec<crate::types::CommandDef>) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "stats_embed_dispatch_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        app.activation.mark_lock_held(true);
+        let mut commands = jmodguard::defaults::default_commands()
+            .into_iter()
+            .map(|cmd| (cmd.name.clone(), cmd))
+            .collect::<std::collections::HashMap<_, _>>();
+        for custom in custom {
+            crate::db::upsert_command(&app.db, Self::GUILD as i64, &custom.name, &custom)
+                .await
+                .unwrap();
+            commands.insert(custom.name.clone(), custom);
+        }
+        let cache = Arc::new(Cache::new());
+        let (http, captured, server) = capturing_proxy_with(true, reject_embeds).await;
+        let http = Arc::new(http);
+        let ctx = test_context(Arc::clone(&cache), Arc::clone(&http)).await;
+        let cfg = Arc::new(crate::state::CachedGuildConfig {
+            version: 1,
+            durable_version: 1,
+            loaded_at: std::time::Instant::now(),
+            settings: crate::types::GuildSettings {
+                prefix: "!".into(),
+                ..Default::default()
+            },
+            rules: Default::default(),
+            commands,
+            templates: Default::default(),
+            log_channels: Default::default(),
+            known_bad_hashes: Default::default(),
+            known_spam: Default::default(),
+            log_filters: Default::default(),
+            regexes: Vec::new(),
+            custom_patterns: Default::default(),
+        });
+        Self {
+            app,
+            path,
+            cache,
+            http,
+            captured,
+            server,
+            ctx,
+            cfg,
+        }
+    }
+
+    fn install(&self, permissions: serenity::model::permissions::Permissions) {
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(Self::GUILD);
+        guild.owner_id = UserId::new(99);
+        guild.name = "fixture".into();
+        let mut everyone = Role::default();
+        everyone.id = RoleId::new(Self::GUILD);
+        everyone.guild_id = guild.id;
+        everyone.permissions = serenity::model::permissions::Permissions::empty();
+        guild.roles.insert(everyone.id, everyone);
+        let mut role = Role::default();
+        role.id = RoleId::new(Self::ROLE);
+        role.guild_id = guild.id;
+        role.name = "Staff".into();
+        role.permissions = permissions;
+        guild.roles.insert(role.id, role);
+        let mut caller = target_member(Self::GUILD, Self::ACTOR, None);
+        caller.user.name = "mod".into();
+        caller.roles = vec![RoleId::new(Self::ROLE)];
+        guild.members.insert(caller.user.id, caller);
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        self.cache.update(&mut event);
+    }
+
+    fn author() -> User {
+        let mut author = User::default();
+        author.id = UserId::new(Self::ACTOR);
+        author.name = "mod".into();
+        author
+    }
+
+    async fn prefix(&self, content: &str) {
+        let partial: serenity::model::guild::PartialMember =
+            serde_json::from_value(serde_json::json!({
+                "deaf": false,
+                "joined_at": null,
+                "mute": false,
+                "nick": null,
+                "roles": [Self::ROLE.to_string()],
+                "pending": false,
+                "premium_since": null,
+                "guild_id": Self::GUILD.to_string(),
+                "user": null,
+                "permissions": null,
+                "unusual_dm_activity_until": null,
+                "avatar": null,
+                "banner": null,
+                "avatar_decoration_data": null,
+            }))
+            .unwrap();
+        let mut message = serenity::model::channel::Message::default();
+        message.id = serenity::model::id::MessageId::new(9);
+        message.content = content.into();
+        message.guild_id = Some(GuildId::new(Self::GUILD));
+        message.channel_id = ChannelId::new(2);
+        message.author = Self::author();
+        message.member = Some(Box::new(partial));
+        crate::commands::handle_prefix(
+            &self.app,
+            self.http.as_ref(),
+            &self.cache,
+            Arc::clone(&self.cfg),
+            &message,
+            Some(&self.ctx),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn slash(&self, name: &str) {
+        let mut member = Member::default();
+        member.user = Self::author();
+        member.guild_id = GuildId::new(Self::GUILD);
+        member.roles = vec![RoleId::new(Self::ROLE)];
+        let interaction: serenity::model::application::Interaction =
+            serde_json::from_value(serde_json::json!({
+                "id": "1",
+                "application_id": "1",
+                "type": 2,
+                "token": "token",
+                "version": 1,
+                "guild_id": Self::GUILD.to_string(),
+                "channel_id": "2",
+                "locale": "en-US",
+                "app_permissions": "0",
+                "entitlements": [],
+                "authorizing_integration_owners": {},
+                "attachment_size_limit": 10000000,
+                "user": Self::author(),
+                "member": member,
+                "data": {"id": "3", "name": name, "type": 1, "options": []}
+            }))
+            .unwrap();
+        crate::commands::handle_interaction(&self.app, &self.ctx, interaction).await;
+    }
+
+    /// Reply bodies sent to Discord (non-empty content or embeds), in order,
+    /// with the HTTP route; the slash defer callback is left out.
+    fn replies(&self) -> Vec<(String, serde_json::Value)> {
+        std::mem::take(&mut *self.captured.lock().unwrap())
+            .iter()
+            .map(|raw| {
+                let route = raw.lines().next().unwrap_or_default().to_string();
+                (route, message_fields(raw))
+            })
+            .filter(|(_, payload)| {
+                payload["content"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+                    || payload["embeds"].as_array().is_some_and(|e| !e.is_empty())
+            })
+            .collect()
+    }
+
+    fn sent(&self, label: &str) -> serde_json::Value {
+        let replies = self.replies();
+        assert_eq!(replies.len(), 1, "{label}: {replies:?}");
+        replies.into_iter().next().unwrap().1
+    }
+
+    fn finish(self) {
+        self.server.abort();
+        drop(self.app);
+        crate::tenant::remove_sidecars(&self.path);
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// `!status` (prefix alias) and `/stats` share one dispatch: the permission
+/// denial is unchanged text, and an allowed caller gets one log-style embed.
+#[tokio::test]
+async fn stats_prefix_and_slash_send_the_status_embed_after_the_same_permission_check() {
+    use serenity::model::permissions::Permissions;
+    const DENIED: &str = "you don't have permission to use that command";
+    let fx = StatsDispatch::new(false, Vec::new()).await;
+
+    fx.install(Permissions::MANAGE_MESSAGES | Permissions::VIEW_CHANNEL);
+    fx.prefix("!status").await;
+    let denied = fx.sent("denied prefix");
+    // Unchanged `{display name} — {reason}` text (the partial fixture member
+    // carries no user name).
+    let content = denied["content"].as_str().unwrap();
+    assert!(content.ends_with(&format!(" — {DENIED}")), "{content}");
+    assert!(
+        denied["embeds"].as_array().is_none_or(Vec::is_empty),
+        "{denied}"
+    );
+    fx.slash("stats").await;
+    let denied = fx.sent("denied slash");
+    assert_eq!(denied["content"], DENIED);
+    assert!(
+        denied["embeds"].as_array().is_none_or(Vec::is_empty),
+        "{denied}"
+    );
+
+    fx.install(Permissions::MANAGE_GUILD | Permissions::VIEW_CHANNEL);
+    fx.prefix("!status").await;
+    let prefix = fx.sent("allowed prefix");
+    fx.slash("stats").await;
+    let slash = fx.sent("allowed slash");
+    for payload in [&prefix, &slash] {
+        assert!(
+            payload["content"].as_str().is_none_or(str::is_empty),
+            "{payload}"
+        );
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+        let embeds = payload["embeds"].as_array().unwrap();
+        assert_eq!(embeds.len(), 1, "{payload}");
+        let embed = &embeds[0];
+        assert_eq!(embed["title"], "Status");
+        assert_eq!(embed["description"], "**Server stats**");
+        // A fresh database has no release observations: attention accent.
+        assert_eq!(embed["color"], jmodguard::log_embeds::YELLOW);
+        let fields = embed["fields"].as_array().unwrap();
+        let layout = fields
+            .iter()
+            .map(|f| (f["name"].as_str().unwrap(), f["inline"].as_bool().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            layout,
+            [
+                ("Uptime", true),
+                ("Cases", true),
+                ("Warns", true),
+                ("Bans", true),
+                ("Release status", false),
+                ("Container use", false),
+            ]
+        );
+        for field in &fields[1..4] {
+            assert_eq!(
+                field["value"],
+                if field["name"] == "Cases" {
+                    "`unavailable`"
+                } else {
+                    "`0`"
+                }
+            );
+        }
+        let value = |name: &str| {
+            fields.iter().find(|f| f["name"] == name).unwrap()["value"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(value("Uptime").starts_with('`') && value("Uptime").ends_with('`'));
+        let releases = value("Release status");
+        for component in ["bot", "api", "webui"] {
+            assert!(
+                releases
+                    .lines()
+                    .any(|line| line.starts_with(&format!("**{component}:** "))),
+                "{releases}"
+            );
+        }
+        let containers = value("Container use");
+        for label in [
+            "Bot CPU",
+            "Bot memory (real program use)",
+            "API CPU",
+            "API memory (real program use)",
+        ] {
+            assert!(
+                containers.contains(&format!("**{label}:** `")),
+                "{containers}"
+            );
+        }
+        assert!(!containers.contains("pid"), "{containers}");
+    }
+    let without_uptime = |payload: &serde_json::Value| {
+        let mut embed = payload["embeds"][0].clone();
+        embed["fields"][0]["value"] = serde_json::Value::Null;
+        embed
+    };
+    assert_eq!(without_uptime(&prefix), without_uptime(&slash));
+
+    // A non-deferred slash answer and an oversized embed use the same bounds.
+    let mut stats = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| matches!(cmd.behavior, jmodguard::types::Behavior::Stats))
+        .unwrap();
+    stats.log_event.clear();
+    let mut embed = crate::templates::stats_embed(0, Some(0), 0, 0, None, 0);
+    embed.fields[4].value = format!("`{}`", "🦀".repeat(900));
+    embed.fields.push(jmodguard::log_embeds::Field {
+        name: "Container use".into(),
+        value: "名".repeat(2000),
+        inline: false,
+    });
+    let outcome = super::super::BehaviorOutcome {
+        response: None,
+        vars: std::collections::BTreeMap::new(),
+        emitted_log_events: Vec::new(),
+        suppress_response: false,
+        embed: Some(embed),
+    };
+    let slash_ctx = super::super::SlashCtx {
+        id: serenity::model::id::InteractionId::new(1),
+        token: "token".into(),
+        channel_id: ChannelId::new(2),
+        guild_id: GuildId::new(StatsDispatch::GUILD),
+        actor: UserId::new(StatsDispatch::ACTOR),
+        member: None,
+        name: "stats".into(),
+        options: Vec::new(),
+    };
+    super::super::deliver_slash_success(
+        &fx.app.activation,
+        fx.http.as_ref(),
+        &slash_ctx,
+        super::super::SlashResponseState::Initial,
+        &stats,
+        &outcome,
+    )
+    .await;
+    let initial = fx.sent("initial slash");
+    super::super::send_outcome(
+        &fx.app,
+        fx.http.as_ref(),
+        &fx.cache,
+        &stats,
+        GuildId::new(StatsDispatch::GUILD),
+        ChannelId::new(2),
+        UserId::new(StatsDispatch::ACTOR),
+        outcome,
+    )
+    .await;
+    let prefix = fx.sent("oversized prefix");
+    let ephemeral = serenity::model::channel::MessageFlags::EPHEMERAL.bits();
+    assert_eq!(
+        initial["flags"].as_u64().unwrap_or(0) & ephemeral,
+        0,
+        "public answer"
+    );
+    assert_eq!(initial["embeds"], prefix["embeds"]);
+    let embed = &prefix["embeds"][0];
+    let units = |value: &serde_json::Value| value.as_str().unwrap().encode_utf16().count();
+    let mut total = units(&embed["title"]) + units(&embed["description"]);
+    for field in embed["fields"].as_array().unwrap() {
+        assert!(units(&field["name"]) <= 256);
+        assert!(units(&field["value"]) <= 1024, "{field}");
+        total += units(&field["name"]) + units(&field["value"]);
+    }
+    assert!(total <= 6000);
+    let releases = embed["fields"][4]["value"].as_str().unwrap();
+    assert!(releases.ends_with('…'), "{releases}");
+    assert!(
+        releases
+            .trim_start_matches('`')
+            .trim_end_matches('…')
+            .chars()
+            .all(|c| c == '🦀'),
+        "a surrogate pair was split: {releases}"
+    );
+    let containers = embed["fields"][5]["value"].as_str().unwrap();
+    assert!(containers.trim_end_matches('…').chars().all(|c| c == '名'));
+
+    fx.finish();
+}
+
+/// A custom command with the Stats behavior.
+fn custom_stats_command(name: &str, response: &str) -> crate::types::CommandDef {
+    let mut command = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| matches!(cmd.behavior, jmodguard::types::Behavior::Stats))
+        .unwrap();
+    command.name = name.into();
+    command.aliases.clear();
+    command.usage = format!("!{name}");
+    command.response = response.into();
+    command
+}
+
+fn assert_plain_stats(text: &str) {
+    for part in [
+        "**📊 Stats (this server)**\n\n**⏱️ Uptime:** `",
+        "\n**📋 Cases:** `unavailable`\n**⚠️ Warns:** `0`\n**🔨 Bans:** `0`",
+        "\n\n**Release status**\n**bot:** ",
+        "\n**api:** ",
+        "\n**webui:** ",
+        "\n\n**Container use**\n**Bot CPU:** `",
+        "\n**Bot memory (real program use):** `",
+        "\n**API CPU:** `unavailable`",
+        "\n**API memory (real program use):** `unavailable`",
+    ] {
+        assert!(text.contains(part), "{part:?} missing from {text}");
+    }
+    assert!(!text.contains("pid"), "{text}");
+}
+
+fn has_embed(payload: &serde_json::Value) -> bool {
+    payload["embeds"].as_array().is_some_and(|e| !e.is_empty())
+}
+
+/// A customized Stats response using `{response}` gets the plain-text stats,
+/// as before the embed, and no embed; other custom text sits above the embed.
+#[tokio::test]
+async fn custom_stats_response_gets_plain_text_stats_through_prefix_and_slash() {
+    use serenity::model::permissions::Permissions;
+    let fx = StatsDispatch::new(
+        false,
+        vec![
+            custom_stats_command("report", "Server report:\n{response}"),
+            custom_stats_command("numbers", "Latest numbers:"),
+        ],
+    )
+    .await;
+    fx.install(Permissions::MANAGE_GUILD | Permissions::VIEW_CHANNEL);
+    fx.prefix("!report").await;
+    let prefix = fx.sent("prefix {response}");
+    fx.slash("report").await;
+    let slash = fx.sent("slash {response}");
+    for payload in [&prefix, &slash] {
+        let content = payload["content"].as_str().unwrap();
+        assert!(
+            content.starts_with("Server report:\n**📊 Stats (this server)**"),
+            "{content}"
+        );
+        assert_plain_stats(content);
+        assert!(!has_embed(payload), "stats shown twice: {payload}");
+    }
+
+    fx.prefix("!numbers").await;
+    let prefix = fx.sent("prefix custom text");
+    fx.slash("numbers").await;
+    let slash = fx.sent("slash custom text");
+    for payload in [&prefix, &slash] {
+        assert_eq!(payload["content"], "Latest numbers:");
+        assert_eq!(payload["embeds"][0]["title"], "Status");
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+    fx.finish();
+}
+
+/// Without Embed Links Discord refuses the embed with 403/50013; the same
+/// reply is then sent once as plain text, and the channel is not parked.
+#[tokio::test]
+async fn refused_stats_embed_falls_back_to_plain_text_for_prefix_and_slash() {
+    use serenity::model::permissions::Permissions;
+    let fx = StatsDispatch::new(true, Vec::new()).await;
+    fx.install(Permissions::MANAGE_GUILD | Permissions::VIEW_CHANNEL);
+    let assert_fallback = |label: &str, method: &str| {
+        let replies = fx.replies();
+        assert_eq!(replies.len(), 2, "{label}: {replies:?}");
+        let (embed_route, embed) = &replies[0];
+        let (text_route, text) = &replies[1];
+        assert!(has_embed(embed), "{label}: {embed}");
+        assert!(embed_route.starts_with(method), "{label}: {embed_route}");
+        assert_eq!(embed_route, text_route, "{label}");
+        assert!(!has_embed(text), "{label}: {text}");
+        let content = text["content"].as_str().unwrap();
+        assert!(
+            content.starts_with("**📊 Stats (this server)**"),
+            "{content}"
+        );
+        assert_plain_stats(content);
+        text.clone()
+    };
+    // Twice: a fallback that was delivered must not silence the next reply.
+    for round in ["first", "second"] {
+        fx.prefix("!status").await;
+        assert_fallback(&format!("{round} prefix"), "POST");
+    }
+    fx.slash("stats").await;
+    assert_fallback("deferred slash", "PATCH");
+
+    let stats = custom_stats_command("stats", "");
+    let (embed, text) = {
+        let embed = crate::templates::stats_embed(5, None, 0, 0, Some(&[]), 0);
+        let text = crate::templates::stats_text_with_container_use(
+            crate::templates::stats_response_with_update_availability(5, None, 0, 0, Some(&[]), 0),
+            &jmodguard::cgroup::ContainerSample::unavailable(),
+            None,
+        );
+        (
+            crate::templates::stats_with_container_use(
+                embed,
+                &jmodguard::cgroup::ContainerSample::unavailable(),
+                None,
+            ),
+            text,
+        )
+    };
+    let outcome = super::super::BehaviorOutcome {
+        response: Some(text),
+        vars: std::collections::BTreeMap::new(),
+        emitted_log_events: Vec::new(),
+        suppress_response: false,
+        embed: Some(embed),
+    };
+    let slash = super::super::SlashCtx {
+        id: serenity::model::id::InteractionId::new(1),
+        token: "token".into(),
+        channel_id: ChannelId::new(2),
+        guild_id: GuildId::new(StatsDispatch::GUILD),
+        actor: UserId::new(StatsDispatch::ACTOR),
+        member: None,
+        name: "stats".into(),
+        options: Vec::new(),
+    };
+    super::super::deliver_slash_success(
+        &fx.app.activation,
+        fx.http.as_ref(),
+        &slash,
+        super::super::SlashResponseState::Initial,
+        &stats,
+        &outcome,
+    )
+    .await;
+    let text = assert_fallback("initial slash", "POST");
+    let ephemeral = serenity::model::channel::MessageFlags::EPHEMERAL.bits();
+    assert_eq!(text["flags"].as_u64().unwrap_or(0) & ephemeral, 0, "public");
+    fx.finish();
 }
