@@ -2526,6 +2526,25 @@ test('checkbox labels keep primary text color', () => {
   assert.match(css, /\.checkbox-label\s*\{[^}]*color:\s*var\(--text\)/);
 });
 
+test('desktop sidebar stays in view below the preview banner while the page scrolls', async () => {
+  // jsdom has no layout: this pins the CSS contract and the DOM order its sibling selector needs.
+  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
+  const desktop = css.match(/@media \(min-width: 721px\) \{([\s\S]*?)\n\}/)?.[1];
+  assert.ok(desktop, 'missing desktop sidebar layout');
+  assert.match(desktop, /\.sidebar\s*\{[^}]*position:\s*sticky;[^}]*top:\s*0;[^}]*height:\s*100dvh;[^}]*min-height:\s*0;[^}]*align-self:\s*flex-start/);
+  assert.match(desktop, /\.sidebar nav\s*\{[^}]*overflow-y:\s*auto/);
+  assert.match(desktop, /\.preview-banner\s*\{[^}]*height:\s*var\(--preview-banner-height\)/);
+  assert.match(desktop, /\.preview-banner \+ #main-view \.sidebar\s*\{[^}]*top:\s*var\(--preview-banner-height\);[^}]*height:\s*calc\(100dvh - var\(--preview-banner-height\)\)/);
+  assert.match(css, /@media \(max-width: 720px\) \{[^@]*\.sidebar\s*\{[^}]*position:\s*static/);
+
+  const h = harness(async () => response({}));
+  h.app.state.me.preview = true;
+  h.app.renderTab();
+  await settle();
+  assert.equal(h.document.querySelector('.preview-banner')?.nextElementSibling?.id, 'main-view');
+  assert.ok(h.document.querySelector('#main-view > .sidebar > .sidebar-footer #logout-btn'));
+});
+
 test('text rule UI can save independent thresholds without generic escalation', async () => {
   const calls=[];
   const h=harness(async (url, options) => {
