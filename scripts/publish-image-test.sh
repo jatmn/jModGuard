@@ -247,13 +247,36 @@ done
 launcher_source="$(mktemp -d)"
 mkdir -p "$launcher_source/src/db" "$launcher_source/migrations/guild"
 cp src/db.rs "$launcher_source/src/db.rs"
-cp migrations/guild/current_version.rs "$launcher_source/migrations/guild/current_version.rs"
+cp migrations/guild/current_version.txt "$launcher_source/migrations/guild/current_version.txt"
 sed -e 's/^pub const LAUNCHER_REVISION: u32 = 41;$/pub const LAUNCHER_REVISION: u32 = 42;/' \
     src/db/update_control.rs >"$launcher_source/src/db/update_control.rs"
 readarray -d '' -t launcher_args < <(build_args api "$HEAD_SHA" "" "$launcher_source" "" current "$(staging_ref api)")
 for field in launcher-revision=42 min-launcher-revision=7; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "selected source lost ${field}"
 done
+
+# Historical coordinated sources keep the Rust-expression filename. Metadata
+# must come from that source, even when the publisher uses the text filename.
+mv "$launcher_source/migrations/guild/current_version.txt" "$launcher_source/migrations/guild/current_version.rs"
+printf '16\n' >"$launcher_source/migrations/guild/current_version.rs"
+for component in bot api webui; do
+  readarray -d '' -t historical_args < <(build_args "$component" "$BASE_SHA" "" "$launcher_source" "" current "$(staging_ref "$component" "$BASE_SHA")")
+  contains_arg "io.jmodguard.guild-schema=16" "${historical_args[@]}" \
+    || fail "${component} must advertise the historical source's guild schema"
+done
+printf 'invalid\n' >"$launcher_source/migrations/guild/current_version.txt"
+if (build_args bot "$HEAD_SHA" "" "$launcher_source" "" current "$(staging_ref bot)") >/dev/null 2>&1; then
+  fail 'invalid current guild schema must fail even when a historical file exists'
+fi
+rm "$launcher_source/migrations/guild/current_version.txt"
+printf 'invalid\n' >"$launcher_source/migrations/guild/current_version.rs"
+if (build_args bot "$BASE_SHA" "" "$launcher_source" "" current "$(staging_ref bot "$BASE_SHA")") >/dev/null 2>&1; then
+  fail 'invalid historical guild schema must fail'
+fi
+rm "$launcher_source/migrations/guild/current_version.rs"
+if (build_args bot "$BASE_SHA" "" "$launcher_source" "" current "$(staging_ref bot "$BASE_SHA")") >/dev/null 2>&1; then
+  fail 'missing selected guild schema must fail'
+fi
 rm -rf "$launcher_source"
 
 # Publishing an older source must keep its schema, not the publisher's schema.
