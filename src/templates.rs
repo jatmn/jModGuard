@@ -359,7 +359,6 @@ fn memory_value(sample: &crate::cgroup::ContainerSample, copy: Option<&str>) -> 
     let base = match memory.source {
         crate::cgroup::MemorySource::CgroupStat => base,
         crate::cgroup::MemorySource::CgroupUsage => format!("{base} (includes page cache)"),
-        crate::cgroup::MemorySource::HostEstimate => format!("{base} (host/sandbox estimate)"),
     };
     label_copy(base, copy)
 }
@@ -1214,27 +1213,24 @@ mod presentation_tests {
     }
 
     #[test]
-    fn container_memory_fallback_sources_are_labeled() {
-        use crate::cgroup::{ContainerSample, MemoryLimit, MemorySource, MemoryUse};
-        let sample = |source| ContainerSample {
-            memory: Some(MemoryUse {
+    fn container_memory_without_memory_stat_is_labeled() {
+        let sample = crate::cgroup::ContainerSample {
+            memory: Some(crate::cgroup::MemoryUse {
                 program_bytes: 4096,
-                limit: MemoryLimit::Unlimited,
-                source,
+                limit: crate::cgroup::MemoryLimit::Unlimited,
+                source: crate::cgroup::MemorySource::CgroupUsage,
             }),
             cpu_tenths: None,
         };
-        let (bot, api) = (
-            sample(MemorySource::CgroupUsage),
-            sample(MemorySource::HostEstimate),
-        );
-        let text = stats_with_container_use("stats".into(), &bot, Some(&api), Some("api pid 7"));
+        let text = stats_with_container_use("stats".into(), &sample, Some(&sample), Some("api 7"));
         assert!(
             text.contains("`4.0 KiB / no limit (includes page cache)`"),
             "{text}"
         );
-        let api_row = "`4.0 KiB / no limit (host/sandbox estimate) (api pid 7)`";
-        assert!(text.contains(api_row), "{text}");
+        assert!(
+            text.contains("`4.0 KiB / no limit (includes page cache) (api 7)`"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -3,10 +3,8 @@
 //! Readings come from cgroup v2 (`memory.current`, `memory.stat`,
 //! `memory.max`, `cpu.stat`) or the v1 files when those are absent.
 //! Membership is `/proc/self/cgroup` resolved with mount roots from
-//! `/proc/self/mountinfo`. Only when no cgroup memory counter is usable does
-//! memory fall back to `/proc/meminfo`, tagged [`MemorySource::HostEstimate`].
-//! Host processor totals are not consulted. Nothing here writes a database or
-//! calls a provider.
+//! `/proc/self/mountinfo`. Host-wide memory and processor totals
+//! are not consulted. Nothing here writes a database or calls a provider.
 
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -44,11 +42,9 @@ pub enum MemorySource {
     /// cgroup usage minus inactive file cache from `memory.stat`.
     #[default]
     CgroupStat,
-    /// cgroup `memory.current` or v1 `memory.usage_in_bytes` alone; includes page cache.
+    /// `memory.current` or v1 `memory.usage_in_bytes` when `memory.stat` is
+    /// missing or unreadable. This includes page cache.
     CgroupUsage,
-    /// `/proc/meminfo` `MemTotal - MemAvailable` against `MemTotal`. This is the
-    /// host or sandbox as this process sees it, not container-scoped usage.
-    HostEstimate,
 }
 
 /// `memory.max`. The v2 token `max`, and a v1 limit of at least 2^62 bytes,
@@ -100,34 +96,15 @@ pub fn read_cgroup(memory_dir: Option<&Path>, cpu_dir: Option<&Path>) -> CgroupR
     }
 }
 
-/// Read this process's cgroup, then `/proc/meminfo` if no cgroup memory
-/// counter is usable. Unreadable layouts yield an empty reading.
+/// Read this process's cgroup. Unreadable layouts yield an empty reading.
 pub fn read_process_cgroup() -> CgroupReading {
-    read_process_from(Path::new("/proc"), Path::new("/sys/fs/cgroup"))
-}
-
-fn read_process_from(proc: &Path, mount_root: &Path) -> CgroupReading {
-    let mut reading = match read_limited(&proc.join("self/cgroup")) {
-        None => read_mount_root(mount_root),
-        Some(text) => read_limited(&proc.join("self/mountinfo"))
-            .map(|mountinfo| read_mounted_cgroup(&text, &mountinfo))
-            .unwrap_or_default(),
+    let Some(text) = read_limited(Path::new("/proc/self/cgroup")) else {
+        return read_mount_root(Path::new("/sys/fs/cgroup"));
     };
-    if reading.memory.is_none() {
-        reading.memory = read_meminfo(&proc.join("meminfo"));
-    }
-    reading
-}
-
-fn read_meminfo(path: &Path) -> Option<MemoryUse> {
-    let text = read_limited(path)?;
-    let total = stat_value(&text, "MemTotal:")?.checked_mul(1024)?;
-    let available = stat_value(&text, "MemAvailable:")?.checked_mul(1024)?;
-    Some(MemoryUse {
-        program_bytes: total.saturating_sub(available),
-        limit: MemoryLimit::Bytes(total),
-        source: MemorySource::HostEstimate,
-    })
+    let Some(mountinfo) = read_limited(Path::new("/proc/self/mountinfo")) else {
+        return CgroupReading::default();
+    };
+    read_mounted_cgroup(&text, &mountinfo)
 }
 
 /// Latest sample for this process.
@@ -662,36 +639,37 @@ fn read_memory_limit(dir: &Path, name: &'static str) -> Option<MemoryLimit> {
 
 fn parse_v2_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
     let current = memory_input(parse_u64_token(current_text), "memory.current")?;
-    let limit = read_memory_limit(dir, "memory.max")?;
+    let Some(stat) = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat") else {
+        return usage_only(current, read_memory_limit(dir, "memory.max")?);
+    };
     // Type-based file/shmem counters cannot reconstruct the inactive file list:
     // file-backed unevictable pages are in file but not active/inactive_file,
     // and the combined unevictable counter does not identify their share.
-    // Without the actual inactive_file counter, report raw usage instead.
-    Some(stat_or_usage(dir, current, limit, |_| None))
+    // Keep memory unavailable when the actual inactive_file counter is absent.
+    memory_use(current, &stat, read_memory_limit(dir, "memory.max")?, None)
 }
 
 fn parse_v1_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
     let current = memory_input(parse_u64_token(current_text), "memory.usage_in_bytes")?;
-    let limit = read_memory_limit(dir, "memory.limit_in_bytes")?;
-    Some(stat_or_usage(dir, current, limit, |stat| {
-        stat_value(stat, "total_inactive_file")
-    }))
+    let Some(stat) = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat") else {
+        return usage_only(current, read_memory_limit(dir, "memory.limit_in_bytes")?);
+    };
+    let fallback = stat_value(&stat, "total_inactive_file");
+    memory_use(
+        current,
+        &stat,
+        read_memory_limit(dir, "memory.limit_in_bytes")?,
+        fallback,
+    )
 }
 
-// Usage minus inactive_file when memory.stat supports it; otherwise raw usage.
-fn stat_or_usage(
-    dir: &Path,
-    current: u64,
-    limit: MemoryLimit,
-    fallback: impl Fn(&str) -> Option<u64>,
-) -> MemoryUse {
-    memory_input(read_limited(&dir.join("memory.stat")), "memory.stat")
-        .and_then(|stat| memory_use(current, &stat, limit, fallback(&stat)))
-        .unwrap_or(MemoryUse {
-            program_bytes: current,
-            limit,
-            source: MemorySource::CgroupUsage,
-        })
+// Without memory.stat there is no inactive file counter; report labeled raw usage.
+fn usage_only(current: u64, limit: MemoryLimit) -> Option<MemoryUse> {
+    Some(MemoryUse {
+        program_bytes: current,
+        limit,
+        source: MemorySource::CgroupUsage,
+    })
 }
 
 fn memory_use(
@@ -1039,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_missing_inactive_file_with_unevictable_pages_is_raw_usage() {
+    fn v2_missing_inactive_file_with_unevictable_pages_is_unavailable() {
         let tree = temp_tree();
         write_files(
             &tree.path,
@@ -1072,16 +1050,12 @@ mod tests {
             )],
         );
         let reading = read_cgroup(Some(&tree.path), Some(&tree.path));
-        let memory = reading.memory.unwrap();
-        assert_eq!(
-            (memory.program_bytes, memory.source),
-            (1000, MemorySource::CgroupUsage)
-        );
+        assert_eq!(reading.memory, None);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(5000));
     }
 
     #[test]
-    fn missing_inactive_file_reports_labeled_raw_usage_without_estimates() {
+    fn missing_inactive_file_does_not_pretend_current_is_program_use() {
         let tree = temp_tree();
         // Neither partial nor complete type-based counters establish the list.
         for stat in [
@@ -1100,9 +1074,10 @@ mod tests {
                     ("memory.max", "max\n"),
                 ],
             );
-            let memory = read_cgroup(Some(&tree.path), None).memory.unwrap();
-            assert_eq!(memory.program_bytes, 1000, "{stat}");
-            assert_eq!(memory.source, MemorySource::CgroupUsage, "{stat}");
+            assert!(
+                read_cgroup(Some(&tree.path), None).memory.is_none(),
+                "{stat}"
+            );
         }
     }
 
@@ -1184,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_inconsistent_file_counters_do_not_invent_a_deduction() {
+    fn v2_inconsistent_file_counters_do_not_invent_memory_usage() {
         let tree = temp_tree();
         for stat in [
             "file 100\nactive_file 150\nshmem 0\n",
@@ -1199,9 +1174,7 @@ mod tests {
                     ("memory.max", "max\n"),
                 ],
             );
-            let memory = read_cgroup(Some(&tree.path), None).memory.unwrap();
-            assert_eq!(memory.program_bytes, 1000, "{stat}");
-            assert_eq!(memory.source, MemorySource::CgroupUsage, "{stat}");
+            assert_eq!(read_cgroup(Some(&tree.path), None).memory, None, "{stat}");
         }
     }
 
@@ -1384,9 +1357,14 @@ mod tests {
     }
 
     #[test]
-    fn reader_source_does_not_name_host_stat() {
+    fn reader_source_does_not_name_host_meminfo_or_stat() {
         let source = include_str!("cgroup.rs");
+        let meminfo = ["/proc/", "meminfo"].concat();
         let host_stat = ["/proc/", "stat"].concat();
+        assert!(
+            !source.contains(&meminfo),
+            "host memory file must not be read"
+        );
         assert!(
             !source.contains(&host_stat),
             "host processor file must not be read"
@@ -1770,9 +1748,11 @@ mod tests {
             let tree = temp_tree();
             write_files(&tree.path, &[(usage, "1000\n"), (limit, text)]);
             let memory = read_cgroup(Some(&tree.path), None).memory.unwrap();
-            let limit = bytes.map_or(MemoryLimit::Unlimited, MemoryLimit::Bytes);
-            assert_eq!((memory.program_bytes, memory.limit), (1000, limit));
+            let want = bytes.map_or(MemoryLimit::Unlimited, MemoryLimit::Bytes);
+            assert_eq!((memory.program_bytes, memory.limit), (1000, want));
             assert_eq!(memory.source, MemorySource::CgroupUsage);
+            write_files(&tree.path, &[(limit, "invalid\n")]);
+            assert_eq!(read_cgroup(Some(&tree.path), None).memory, None);
         }
     }
 
@@ -1784,38 +1764,6 @@ mod tests {
             &[("self/cgroup", "0::/\n"), ("self/mountinfo", &info)],
         );
         proc
-    }
-
-    #[test]
-    fn meminfo_is_a_labeled_last_resort_and_all_missing_is_unavailable() {
-        let cgroup = temp_tree();
-        write_files(&cgroup.path, &[("cpu.stat", "usage_usec 5000\n")]);
-        let proc = proc_fixture(&cgroup.path);
-        let meminfo = "MemTotal:  4 kB\nMemFree: 1 kB\nMemAvailable:  3 kB\n";
-        write_files(&proc.path, &[("meminfo", meminfo)]);
-        let reading = read_process_from(&proc.path, &cgroup.path);
-        let memory = reading.memory.unwrap();
-        assert_eq!(
-            (memory.program_bytes, memory.limit),
-            (1024, MemoryLimit::Bytes(4096))
-        );
-        assert_eq!(memory.source, MemorySource::HostEstimate);
-        assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(5000));
-        let stat = [
-            ("memory.current", "10\n"),
-            ("memory.stat", "inactive_file 4\n"),
-        ];
-        write_files(&cgroup.path, &stat);
-        let memory = read_process_from(&proc.path, &cgroup.path).memory.unwrap();
-        assert_eq!(
-            (memory.program_bytes, memory.source),
-            (6, MemorySource::CgroupStat)
-        );
-
-        let empty = temp_tree();
-        let proc = proc_fixture(&empty.path);
-        assert_eq!(read_process_from(&proc.path, &empty.path).memory, None);
-        assert_eq!(read_process_from(&empty.path, &empty.path).memory, None);
     }
 
     #[test]
