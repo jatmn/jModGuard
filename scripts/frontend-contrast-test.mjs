@@ -126,10 +126,16 @@ function rule(selector, source = css) {
   const rest = source.split("\n").slice(at).join("\n");
   return rest.slice(rest.indexOf("{") + 1, rest.indexOf("}"));
 }
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
 function declaration(body, name) {
-  const match = body.match(new RegExp(`(?:^|[;{\\s])${name.replace(/[-]/g, "\\-")}:\\s*([^;]+);`));
+  const match = body.match(new RegExp(`(?:^|[;{\\s])${escapeRegExp(name)}:\\s*([^;]+);`));
   return match?.[1].trim();
 }
+test("declaration() matches property names literally", () => {
+  assert.equal(declaration("--a.b: 1px;", "--a.b"), "1px");
+  assert.equal(declaration("--aXb: 1px;", "--a.b"), undefined);
+  assert.equal(declaration("--a\\b: 2px;", "--a\\b"), "2px");
+});
 function px(value) {
   const match = String(value).match(/^([\d.]+)(rem|px)$/);
   assert.ok(match, `expected a rem/px length, got ${value}`);
