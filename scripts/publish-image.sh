@@ -1292,10 +1292,12 @@ publish_component_build() {
   trap cleanup_publish EXIT
   redact_tokens "$token" "$source_token" "" ""
   # docker login writes the GHCR token base64-encoded to $DOCKER_CONFIG/config.json and
-  # warns that credentials are stored unencrypted. That warning is expected: the later
-  # docker/buildx and cosign registry calls read auth from this config, which lives only
-  # in this run's scratch directory (mode 700) and is deleted by cleanup_publish on EXIT,
-  # so the token does not outlive this shell on the ephemeral runner.
+  # warns that credentials are stored unencrypted. That warning is expected: the build
+  # push, `docker buildx imagetools inspect` and `docker pull` below read auth from this
+  # config. It lives only in this run's scratch directory (mode 700), which cleanup_publish
+  # deletes when this function finishes or, on failure, via the EXIT trap, so the token
+  # does not outlive this shell on the ephemeral runner. Signing happens in the separate
+  # sign phase, which logs in again with its own scratch config.
   export DOCKER_CONFIG="${scratch}/docker"
   mkdir -m 700 "$DOCKER_CONFIG"
   printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin >/dev/null
@@ -1415,10 +1417,12 @@ publish_component_sign() {
   validate_signing_key_pair
   redact_tokens "$token" "$source_token" "$_JMG_SIGNING_KEY" "$_JMG_SIGNING_PASSWORD"
   # docker login writes the GHCR token base64-encoded to $DOCKER_CONFIG/config.json and
-  # warns that credentials are stored unencrypted. That warning is expected: the later
-  # docker/buildx and cosign registry calls read auth from this config, which lives only
-  # in this run's scratch directory (mode 700) and is deleted by cleanup_promotion_scratch
-  # on EXIT, so the token does not outlive this shell on the ephemeral runner.
+  # warns that credentials are stored unencrypted. That warning is expected: the
+  # `docker buildx imagetools` digest checks and tag promotion and `cosign sign`/`verify`
+  # below read auth from this config. It lives only in this run's scratch directory
+  # (mode 700), which cleanup_promotion_scratch deletes once promotion is committed or
+  # aborted or, otherwise, via the EXIT trap, so the token does not outlive this shell on
+  # the ephemeral runner.
   export DOCKER_CONFIG="${scratch}/docker"
   mkdir -m 700 "$DOCKER_CONFIG"
   printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin >/dev/null
