@@ -22,6 +22,9 @@ pub struct OAuthClient {
     pub token_endpoint: Option<String>,
     #[cfg(test)]
     pub me_endpoint: Option<String>,
+    /// Base for `{base}/{guild_id}/member` in tests.
+    #[cfg(test)]
+    pub member_endpoint: Option<String>,
 }
 
 type GuildFlightSender = tokio::sync::watch::Sender<GuildFlightUpdate>;
@@ -231,6 +234,17 @@ impl std::fmt::Debug for TokenResponse {
     }
 }
 
+/// Why the signed-in user's guild roles could not be read.
+#[derive(Debug)]
+pub enum MemberRolesError {
+    /// The session token lacks `guilds.members.read`; signing in again grants it.
+    MissingScope,
+    RateLimited {
+        retry_after: Duration,
+    },
+    Failed(anyhow::Error),
+}
+
 // Only protocol error codes are safe diagnostics. Even an `error` field is
 // untrusted provider text and may echo credentials; never print descriptions.
 fn token_error_code(bytes: &[u8]) -> &'static str {
@@ -349,7 +363,7 @@ impl OAuthClient {
         );
         format!(
             "https://discord.com/oauth2/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}",
-            self.client_id, redirect, "identify%20guilds", state
+            self.client_id, redirect, "identify%20guilds%20guilds.members.read", state
         )
     }
 
@@ -479,6 +493,80 @@ impl OAuthClient {
             anyhow::bail!("discord me request failed with {status}");
         }
         serde_json::from_slice(&bytes).context("invalid discord user response")
+    }
+
+    /// The signed-in user's current role IDs in one guild, read with their own
+    /// OAuth token (`guilds.members.read`). Never retires the session: a token
+    /// without that scope only loses role-based access.
+    pub async fn member_roles(
+        &self,
+        user_id: u64,
+        guild_id: u64,
+        access_token: &str,
+    ) -> std::result::Result<Vec<u64>, MemberRolesError> {
+        let key = format!("r:{user_id}:{guild_id}");
+        if let Some(retry_after) = self.route_remaining(&key) {
+            return Err(MemberRolesError::RateLimited { retry_after });
+        }
+        let base = "https://discord.com/api/users/@me/guilds";
+        #[cfg(test)]
+        let base = self.member_endpoint.as_deref().unwrap_or(base);
+        let resp = self
+            .http
+            .get(format!("{base}/{guild_id}/member"))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|error| {
+                MemberRolesError::Failed(anyhow::anyhow!("discord member request failed: {error}"))
+            })?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        if matches!(status.as_u16(), 401 | 403) {
+            return Err(MemberRolesError::MissingScope);
+        }
+        if status.as_u16() == 404 {
+            return Ok(Vec::new());
+        }
+        let bytes = match self.read_limited_body(&key, status, &headers, resp).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return Err(match error.downcast_ref::<DiscordRateLimit>() {
+                    Some(limit) => MemberRolesError::RateLimited {
+                        retry_after: limit.retry_after,
+                    },
+                    None => MemberRolesError::Failed(
+                        error.context("discord member response body failed"),
+                    ),
+                });
+            }
+        };
+        self.observe_route(&key, status, &headers, &bytes).await;
+        if status.as_u16() == 429 {
+            return Err(MemberRolesError::RateLimited {
+                retry_after: discord_retry_after(header_retry_after(&headers), &bytes),
+            });
+        }
+        if !status.is_success() {
+            return Err(MemberRolesError::Failed(anyhow::anyhow!(
+                "discord member request failed with {status}"
+            )));
+        }
+        #[derive(serde::Deserialize)]
+        struct Member {
+            roles: Vec<String>,
+        }
+        let member: Member = serde_json::from_slice(&bytes).map_err(|error| {
+            MemberRolesError::Failed(anyhow::anyhow!("invalid discord member response: {error}"))
+        })?;
+        member
+            .roles
+            .iter()
+            .map(|role| role.parse::<u64>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| {
+                MemberRolesError::Failed(anyhow::anyhow!("invalid discord member role id"))
+            })
     }
 
     pub async fn my_guilds(
@@ -1087,6 +1175,8 @@ impl OAuthClient {
             token_endpoint: None,
             #[cfg(test)]
             me_endpoint: None,
+            #[cfg(test)]
+            member_endpoint: None,
         })
     }
 }
@@ -1216,6 +1306,7 @@ mod tests {
             guilds_endpoint: Some(format!("http://{address}/guilds")),
             token_endpoint: None,
             me_endpoint: None,
+            member_endpoint: None,
         });
         let slow_client = std::sync::Arc::clone(&client);
         let slow = tokio::spawn(async move { slow_client.my_guilds(1, "slow").await });
@@ -1265,6 +1356,7 @@ mod tests {
             guilds_endpoint: Some(format!("http://{address}/guilds")),
             token_endpoint: None,
             me_endpoint: None,
+            member_endpoint: None,
         };
         let first = client.my_guilds(7, "old-token").await.unwrap_err();
         assert!(matches!(first, GuildListError::RateLimited { .. }));
@@ -1322,6 +1414,7 @@ mod tests {
             guilds_endpoint: Some(format!("http://{address}/guilds")),
             token_endpoint: None,
             me_endpoint: None,
+            member_endpoint: None,
         });
         let first_client = std::sync::Arc::clone(&client);
         let first = tokio::spawn(async move { first_client.my_guilds(9, "first").await });
@@ -1409,6 +1502,7 @@ mod tests {
             guilds_endpoint,
             token_endpoint,
             me_endpoint,
+            member_endpoint: None,
         }
     }
 

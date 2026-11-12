@@ -37,6 +37,7 @@ const MEMBER_PENDING_REJOIN_NOTES_SCHEMA: &str =
     include_str!("../../migrations/guild/0016_member_pending_rejoin_notes.sql");
 const MEMBER_GAP_AUTO_CLEAR_SCHEMA: &str =
     include_str!("../../migrations/guild/0017_member_gap_auto_clear.sql");
+const ACCESS_ROLES_SCHEMA: &str = include_str!("../../migrations/guild/0018_access_roles.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -57,7 +58,7 @@ pub use member_directory::*;
 mod tenant_logs;
 pub use tenant_logs::{GuildDataScope, LogChannelSnapshot, TenantDataError};
 mod tenant_settings;
-pub use tenant_settings::TenantSettings;
+pub use tenant_settings::{AccessLevel, AccessRole, TenantSettings, access_level_for_roles};
 
 /// Trusted installation connection settings. Never accept these from a guild request.
 /// Deliberately has no Debug/Serialize implementation: token and URL may be sensitive.
@@ -529,6 +530,9 @@ fn initialize_store(
         if version < 18 {
             tx.execute_batch_bounded(MEMBER_GAP_AUTO_CLEAR_SCHEMA, 32_000_000)?;
         }
+        if version < 19 {
+            tx.execute_batch_bounded(ACCESS_ROLES_SCHEMA, 32_000_000)?;
+        }
         // Version 16 adds the optional immutable ban_attempt_tag to case JSON.
         // No DDL or rewrite of legacy cases: their absent tags must remain absent.
         tx.pragma_update(None, "user_version", VERSION)?;
@@ -556,6 +560,7 @@ fn initialize_store(
     tx.execute_batch_bounded(LOCAL_WRITE_FENCE_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_PENDING_REJOIN_NOTES_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_GAP_AUTO_CLEAR_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(ACCESS_ROLES_SCHEMA, 32_000_000)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
@@ -642,6 +647,7 @@ impl GuildDataStore {
                     (LOCAL_WRITE_FENCE_SCHEMA, 15),
                     (MEMBER_PENDING_REJOIN_NOTES_SCHEMA, 17),
                     (MEMBER_GAP_AUTO_CLEAR_SCHEMA, 18),
+                    (ACCESS_ROLES_SCHEMA, 19),
                 ];
                 for (sql, at) in batches {
                     if *at <= version {

@@ -701,6 +701,74 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn settings_access_role_may_edit_configuration_but_not_manage_server_work() {
+        use db::guild_data::{AccessLevel, AccessRole};
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        bot.tenant
+            .activate(enrollment.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut member = actor_member(10, false);
+        member.roles = vec![RoleId::new(30)];
+        let cache = Arc::new(Cache::new());
+        remember_guild(&cache, 10, Some(member));
+        bot.install_discord_cache(cache);
+        let map = |level| {
+            let bot = Arc::clone(&bot);
+            let enrollment = enrollment.clone();
+            async move {
+                let (store, scope) = bot.tenant.live(enrollment).await.unwrap();
+                let revision = store.tenant_settings(scope.clone()).await.unwrap().revision;
+                store
+                    .set_access_roles(scope, &revision, vec![AccessRole { role_id: 30, level }])
+                    .await
+                    .unwrap();
+            }
+        };
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+
+        map(AccessLevel::Dashboard).await;
+        let reply = submit(bound, seal(&patch(&enrollment, "!dashboard"), 7));
+        assert_eq!(failure_message(&reply), "actor is not allowed");
+
+        map(AccessLevel::Settings).await;
+        let reply = submit(bound, seal(&patch(&enrollment, "!settings"), 7));
+        assert!(matches!(reply, ControlReply::Saved { .. }), "{reply:?}");
+        assert_eq!(
+            db::get_settings(&bot.db, 10).await.unwrap().prefix,
+            "!settings"
+        );
+        let (store, live) = bot.tenant.live(enrollment.clone()).await.unwrap();
+        let revision = store.tenant_settings(live).await.unwrap().revision;
+        let mapping = db::ControlOp::SetAccessRoles {
+            scope: scope(&enrollment),
+            revision,
+            roles: Vec::new(),
+        };
+        let reply = submit(bound, seal(&mapping, 7));
+        assert_eq!(failure_message(&reply), "actor is not allowed");
+        // Command plans can grant roles, so command edits stay Manage Server.
+        let command: jmodguard::types::CommandDef = serde_json::from_value(serde_json::json!({
+            "name": "grant",
+            "permission": "everyone",
+            "behavior": {"kind": "plan", "params": {"steps": [{"type": "add_role", "role_id": "20"}]}},
+        }))
+        .unwrap();
+        let grant = db::ControlOp::UpsertCommand {
+            request: scope(&enrollment),
+            target: scope(&enrollment),
+            name: "grant".into(),
+            command,
+        };
+        let reply = submit(bound, seal(&grant, 7));
+        assert_eq!(failure_message(&reply), "actor is not allowed");
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn revoked_uncached_actor_is_denied_and_not_applied() {
         let (bot, path) = writer_bot().await;
         let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();

@@ -60,6 +60,36 @@ pub async fn guild_enrollment(db: &Db, guild: i64) -> Result<Option<GuildEnrollm
     .await
 }
 
+/// Active enrollments among `guilds`, in one primary read. Display only: each
+/// guild route still admits its own enrollment.
+pub async fn active_guild_enrollments(db: &Db, guilds: Vec<i64>) -> Result<Vec<GuildEnrollment>> {
+    anyhow::ensure!(guilds.iter().all(|guild| *guild > 0), "invalid guild id");
+    if guilds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let guilds = serde_json::to_string(&guilds)?;
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_snapshot()?;
+        let mut stmt = tx.prepare(
+            "SELECT guild_id,id,joined_at_ns FROM guild_enrollments
+             WHERE active=1 AND guild_id IN (SELECT value FROM json_each(?1))",
+        )?;
+        let rows = stmt
+            .query_map(params![guilds], |row| {
+                Ok(GuildEnrollment {
+                    guild_id: row.get(0)?,
+                    id: row.get(1)?,
+                    joined_at_ns: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        tx.finish_read()?;
+        Ok(rows)
+    })
+    .await
+}
+
 /// Latest trusted membership observation, including confirmed retirement.
 /// The boolean is the active state; an inactive identity cannot authorize writes.
 pub async fn guild_membership_observation(
