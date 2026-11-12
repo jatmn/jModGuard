@@ -5030,6 +5030,7 @@ test('known spam Global add keeps Global selected without an unsaved draft and k
   const config = () => ({ enrollment_id: 'fixture-membership', known_spam: structuredClone(rows), rules: [], log_channels: [] });
   const h = harness(async (url, options) => {
     if (url.endsWith('/config')) return response(config());
+    if (!url.endsWith('/known-spam')) return response({});
     const body = JSON.parse(options.body);
     posts.push(body);
     rows.push({ id: String(rows.length + 1), guild_id: body.scope === 'global' ? '0' : h.app.state.guildId, ...body });
@@ -5057,9 +5058,44 @@ test('known spam Global add keeps Global selected without an unsaved draft and k
   assert.equal(h.app.isDirty(), false, 'a successful Global add must not prompt to discard changes');
   assert.equal(scopeSelect().value, 'global');
   assert.match(content().textContent, /Join our stocks community/);
+  h.app.navigate('known-bad-images'); await settle();
+  h.app.navigate('known-spam'); await settle();
+  assert.equal(scopeSelect().value, 'guild', 'leaving the page resets the scope, as it cleared the Global draft before');
+  assert.equal(h.app.isDirty(), false);
 });
 
-test('known spam add failure stays visible on the card without claiming an outcome the browser cannot know', async () => {
+test('known spam acknowledged Global add keeps Global selected when the refresh fails', async () => {
+  let configFails = false;
+  const posts = [];
+  const config = () => ({ enrollment_id: 'fixture-membership', known_spam: [], rules: [], log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) {
+      if (configFails) { configFails = false; return { ok: false, status: 500, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'database unavailable' }) }; }
+      return response(config());
+    }
+    posts.push(JSON.parse(options.body));
+    configFails = true;
+    return response({ ok: true, id: 1 });
+  });
+  h.app.state.me.is_bot_owner = true;
+  h.app.state.config = config();
+  h.app.navigate('known-spam');
+  const content = () => h.document.querySelector('#app');
+  const scopeSelect = () => [...content().querySelectorAll('select')].find(s => [...s.options].some(o => o.textContent === 'This server'));
+  await chooseOption(scopeSelect(), 'Global');
+  const sample = content().querySelector('textarea');
+  sample.value = 'Join our stocks community'; await fire(sample, 'input');
+  await fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Add sample'), 'click');
+  assert.equal(posts[0].scope, 'global');
+  assert.match(content().textContent, /Configuration unavailable/);
+  await fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Retry'), 'click');
+  assert.equal(scopeSelect().value, 'global', 'the acknowledged scope stays selected after the refresh recovers');
+  assert.equal(content().querySelector('.card [role="alert"]'), null, 'an acknowledged add is not reported as unconfirmed');
+  assert.deepEqual(Object.keys(h.app.currentDrafts()), []);
+  assert.equal(h.app.isDirty(), false);
+});
+
+test('known spam add failure stays with its draft without claiming an outcome the browser cannot know', async () => {
   const lookups = [];
   const replies = [
     () => ({ ok: false, status: 400, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'known spam entry already exists' }) }),
@@ -5068,6 +5104,7 @@ test('known spam add failure stays visible on the card without claiming an outco
   ];
   const h = harness(async (url, options) => {
     if (url.endsWith('/config')) return response({ enrollment_id: 'fixture-membership', known_spam: [], rules: [], log_channels: [] });
+    if (JSON.parse(options.body).kind === 'url') return response({ ok: true, id: 1 });
     lookups.push(options.headers['x-jmodguard-save-lookup']);
     return replies[lookups.length - 1]();
   }, new Map(), new Map(), () => false);
@@ -5076,17 +5113,26 @@ test('known spam add failure stays visible on the card without claiming an outco
   const content = () => h.document.querySelector('#app');
   const sample = content().querySelector('textarea');
   sample.value = 'Join our stocks community'; await fire(sample, 'input');
-  const add = () => fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Add sample'), 'click');
+  const add = label => fire([...content().querySelectorAll('button')].find(b => b.textContent === label), 'click');
   const alert = () => content().querySelector('.card [role="alert"]')?.textContent || '';
-  await add();
+  await add('Add sample');
   assert.equal(alert(), 'Sample not confirmed as added: known spam entry already exists');
   assert.equal(h.app.currentDrafts()['known-spam:sample'].value, 'Join our stocks community');
-  await add();
+  await add('Add sample');
   assert.equal(alert(), 'Sample not confirmed as added: Save outcome unavailable. Check the current configuration before saving again. Retrying the same entry, note and scope only looks up the earlier request; no new save was sent.');
-  await add();
-  assert.equal(alert(), 'Sample not confirmed as added: Failed to fetch Retrying the same entry, note and scope only looks up the earlier request; no new save was sent.');
+  await add('Add sample');
+  const unconfirmed = 'Sample not confirmed as added: Failed to fetch Retrying the same entry, note and scope only looks up the earlier request; no new save was sent.';
+  assert.equal(alert(), unconfirmed);
   assert.deepEqual(lookups, ['0', '1', '1']);
   assert.doesNotMatch(alert(), /checked|did not complete/);
+  const url = content().querySelector('input[data-url]');
+  url.value = 'tinyurl.com/*'; await fire(url, 'input');
+  await add('Add URL pattern');
+  assert.deepEqual(Object.keys(h.app.currentDrafts()), ['known-spam:sample'], 'the URL add saved; the unconfirmed sample remains');
+  assert.equal(alert(), unconfirmed, 'the other entry\'s add keeps the sample warning');
+  const edited = content().querySelector('textarea');
+  edited.value = 'Join our stocks community today'; await fire(edited, 'input');
+  assert.equal(alert(), '', 'editing the sample starts a new request, so the old warning goes');
 });
 
 test('known spam settings reuse exemptions and dry-run with a fixed action', async () => {
