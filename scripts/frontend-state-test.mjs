@@ -5655,3 +5655,41 @@ test('incomplete server discovery offers retry and recovers the server list', as
   assert.equal(h.document.querySelector('#guild-select').value, guild.id);
   assert.ok(!h.document.body.textContent.includes('Some server access checks could not finish'));
 });
+
+test('access-role fields stay locked until a delayed save acknowledgement settles', async () => {
+  const cfg = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
+  let acknowledge;
+  let submitted;
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/access-roles') && options.method === 'POST') return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], revision: 'r1' });
+    if (url.endsWith('/access-roles') && options.method === 'PUT') {
+      submitted = JSON.parse(options.body);
+      return new Promise(resolve => { acknowledge = () => resolve(response({ roles: submitted.roles, revision: 'r2' })); });
+    }
+    if (url.endsWith('/case-delete-roles')) return response({ roles: [], revision: 'r1' });
+    return response(cfg);
+  });
+  h.app.state.config = cfg;
+  h.app.state.tab = 'settings';
+  h.app.renderTab(); await settle();
+  const role = () => h.document.querySelector('.access-role-row input');
+  const level = () => h.document.querySelector('.access-role-row select');
+  role().value = '222222222222222222'; await fire(role(), 'input');
+  level().value = 'settings'; await fire(level(), 'change');
+  assert.equal(h.app.isDirty(), true);
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save access roles'), 'click');
+  try {
+    assert.equal(h.app.isBusy(), true);
+    assert.equal(role().disabled, true, 'a newer role ID must not be editable while the old mapping is saving');
+    assert.equal(level().disabled, true, 'a newer access level must not be editable while the old mapping is saving');
+    assert.deepEqual(submitted.roles, [{ role_id: '222222222222222222', level: 'settings' }]);
+  } finally {
+    acknowledge(); await settle();
+  }
+  assert.equal(h.app.isBusy(), false);
+  assert.equal(role().disabled, false);
+  assert.equal(level().disabled, false);
+  assert.equal(role().value, '222222222222222222');
+  assert.equal(level().value, 'settings');
+  assert.equal(h.app.isDirty(), false, 'only the acknowledged mapping remains');
+});

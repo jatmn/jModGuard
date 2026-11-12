@@ -5388,7 +5388,7 @@ function AccessRolesCard({ revision, generation }) {
                 { key: row.key, className: "row form-row access-role-row" },
                 field(
                   "Role ID",
-                  h("input", {
+                  h(Input, {
                     type: "text",
                     className: "input",
                     value: row.role_id,
@@ -5399,7 +5399,7 @@ function AccessRolesCard({ revision, generation }) {
                 field(
                   "Access",
                   h(
-                    "select",
+                    Select,
                     {
                       className: "select",
                       value: row.level,
