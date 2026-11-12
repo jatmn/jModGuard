@@ -398,7 +398,7 @@ from the stable baseline and do not move `latest`; see [RELEASES.md](RELEASES.md
 
 The main WebUI has an owner-only "Bot servers" sub-section listing every server the
 bot is or was connected to, who added the bot (a bounded audit-log BOT_ADD lookup at
-join time, backfilled by a paced startup pass), member count and join date. The adder
+join time, backfilled by a paced pass over the memberships present at startup), member count and join date. The adder
 is stored with the membership (join time) it was captured for, so a rejoined server shows
 "Unknown" until its own capture resolves instead of the previous installer. Every active
 server is always listed; the response bound applies only to retained departed history.

@@ -3004,6 +3004,100 @@ async fn confirmed_owner_leave_retires_that_membership_after_recording_the_recei
     }
 }
 
+/// Fails every enrollment update until the trigger is dropped.
+async fn reject_enrollment_writes(db: &Db) {
+    db.with_conn(|conn| {
+        conn.execute_batch_bounded(
+            "CREATE TRIGGER reject_enrollment_write BEFORE UPDATE ON guild_enrollments
+             BEGIN SELECT RAISE(ABORT, 'injected enrollment write failure'); END;",
+            65_536,
+        )
+    })
+    .await
+    .unwrap();
+}
+
+async fn run_confirmed_owner_leave(f: &Fixture) -> (BotAction, bool) {
+    f.place_guild(10).await;
+    let job = f.enqueue(10, "leave", Action::LeaveGuild {}).await;
+    let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
+    reject_enrollment_writes(&f.db).await;
+    let release = {
+        let db = f.db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            db.with_conn(|conn| {
+                conn.execute_batch_bounded("DROP TRIGGER reject_enrollment_write;", 65_536)
+            })
+            .await
+            .unwrap();
+        })
+    };
+    let discord = OwnerLeaveDiscord {
+        membership: true,
+        leaves: std::sync::Mutex::new(Vec::new()),
+        outcome: Outcome::succeeded("left_guild"),
+        checks: AtomicUsize::new(0),
+    };
+    execute(&f.db, &discord, &claim, &WorkerLimits::default())
+        .await
+        .unwrap();
+    release.await.unwrap();
+    let (_, active) = db::guild_membership_observation(&f.db, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    (job, active)
+}
+
+#[tokio::test]
+async fn confirmed_owner_leave_retries_a_failed_retirement_after_the_receipt() {
+    let f = Fixture::new();
+    // The first retirement attempt hits an enrollment write failure; the
+    // receipt is already final, so only the bounded retry can retire the row.
+    let (job, active) = run_confirmed_owner_leave(&f).await;
+    let (state, code) = f.persisted_status(&job).await;
+    assert_eq!(
+        (state.as_str(), code.as_deref()),
+        ("succeeded", Some("left_guild"))
+    );
+    assert!(
+        !active,
+        "a transient write failure must not leave a departed server active"
+    );
+}
+
+#[tokio::test]
+async fn confirmed_owner_leave_keeps_its_receipt_when_retirement_keeps_failing() {
+    let f = Fixture::new();
+    f.place_guild(10).await;
+    let job = f.enqueue(10, "leave", Action::LeaveGuild {}).await;
+    let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
+    reject_enrollment_writes(&f.db).await;
+    let discord = OwnerLeaveDiscord {
+        membership: true,
+        leaves: std::sync::Mutex::new(Vec::new()),
+        outcome: Outcome::succeeded("left_guild"),
+        checks: AtomicUsize::new(0),
+    };
+    // Persistent failure is bounded: the worker still returns, the receipt
+    // keeps Discord's outcome, and the gateway event remains the fallback.
+    execute(&f.db, &discord, &claim, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(*discord.leaves.lock().unwrap(), vec![10]);
+    let (state, code) = f.persisted_status(&job).await;
+    assert_eq!(
+        (state.as_str(), code.as_deref()),
+        ("succeeded", Some("left_guild"))
+    );
+    let (_, active) = db::guild_membership_observation(&f.db, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(active);
+}
+
 #[tokio::test]
 async fn owner_leave_requires_the_captured_membership() {
     let f = Fixture::new();

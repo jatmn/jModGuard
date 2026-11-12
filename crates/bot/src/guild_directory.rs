@@ -1,5 +1,5 @@
 //! Owner server directory facts: capture at membership time plus a paced
-//! startup backfill. Display data only — these rows never authorize access.
+//! backfill that covers every membership observed at startup. Display data only — these rows never authorize access.
 //! The adder identity comes from one action-filtered audit-log request, so a
 //! missing VIEW_AUDIT_LOG permission leaves the adder unknown without retries
 //! beyond the next startup pass. An adder is bound to the membership (the
@@ -8,6 +8,8 @@ use crate::db;
 use crate::state::BotState;
 use serenity::model::guild::audit_log::{Action, AuditLogs, MemberAction};
 use serenity::model::id::{GuildId, UserId};
+use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -147,45 +149,139 @@ pub(crate) async fn capture_fresh_join_adder(
     }
 }
 
-/// One paced startup pass: resolve servers whose current membership has no
-/// adder yet (or no row at all) with one REST lookup per guild, paging through
-/// the unresolved servers in id order. Failures are logged and left for the
-/// next startup; shutdown ends the pass cleanly.
-pub async fn run_startup_backfill(
-    app: Arc<BotState>,
-    http: Arc<serenity::http::Http>,
+/// Coordinates the paced backfill. Startup memberships are enrolled by
+/// independent Gateway handlers, so the Ready-time scan can finish before (or
+/// pass the id of) an enrollment that commits later. Each such enrollment asks
+/// for another scan instead: a request while a pass runs makes that pass scan
+/// again, and a request while idle starts a new pass.
+#[derive(Default)]
+pub struct Backfill {
+    state: parking_lot::Mutex<BackfillState>,
+}
+
+#[derive(Default)]
+struct BackfillState {
+    running: bool,
+    rescan: bool,
+    /// (guild, membership join time) pairs this process already looked up. A
+    /// failed or empty lookup waits for the next startup rather than repeating.
+    attempted: HashSet<(i64, i64)>,
+}
+
+impl Backfill {
+    /// True when the caller must run a pass; otherwise the pass already running
+    /// is told to scan again before it ends.
+    fn begin(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.running {
+            state.rescan = true;
+            false
+        } else {
+            state.running = true;
+            state.rescan = false;
+            true
+        }
+    }
+
+    /// True when another scan was requested while this one ran; otherwise the
+    /// pass is over and a later request starts a new one.
+    fn finish_pass(&self) -> bool {
+        let mut state = self.state.lock();
+        if std::mem::take(&mut state.rescan) {
+            true
+        } else {
+            state.running = false;
+            false
+        }
+    }
+
+    fn stop(&self) {
+        self.state.lock().running = false;
+    }
+
+    fn first_attempt(&self, guild_id: i64, joined_at_ns: i64) -> bool {
+        self.state.lock().attempted.insert((guild_id, joined_at_ns))
+    }
+}
+
+/// Resolve the adder of every active server whose current membership has none,
+/// one paced REST lookup per guild. Called at Ready and after each startup
+/// enrollment (a membership recorded without a fresh-join capture).
+pub(crate) fn request_backfill(
+    app: &Arc<BotState>,
+    http: &Arc<serenity::http::Http>,
     bot_user_id: UserId,
 ) {
-    let mut after_guild_id = 0;
+    if !app.directory_backfill.begin() {
+        return;
+    }
+    let app = Arc::clone(app);
+    let http = Arc::clone(http);
+    tokio::spawn(async move {
+        let resolver_app = Arc::clone(&app);
+        run_backfill(
+            &app.db,
+            &app.directory_backfill,
+            BACKFILL_GUILD_PACE,
+            move |guild_id, joined_at_ns| {
+                let app = Arc::clone(&resolver_app);
+                let http = Arc::clone(&http);
+                async move { backfill_guild(&app, &http, bot_user_id, guild_id, joined_at_ns).await }
+            },
+        )
+        .await;
+    });
+}
+
+/// Paced passes over the unresolved servers in id order, repeated while a
+/// request arrived mid-pass. Failures are logged and left for the next
+/// startup; shutdown ends the run cleanly.
+async fn run_backfill<F, Fut>(db: &db::Db, backfill: &Backfill, pace: Duration, mut resolve: F)
+where
+    F: FnMut(i64, i64) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let mut visited = false;
     loop {
-        let candidates = match db::guild_join_info_backfill_candidates(
-            &app.db,
-            after_guild_id,
-            BACKFILL_PAGE_SIZE,
-        )
-        .await
-        {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                tracing::warn!("guild directory backfill unavailable: {error:#}");
-                return;
-            }
-        };
-        let Some(&(last_guild_id, _)) = candidates.last() else {
-            return;
-        };
-        for (guild_id, joined_at_ns) in candidates {
-            if visited {
-                tokio::select! {
-                    _ = crate::shutdown_signal() => return,
-                    _ = tokio::time::sleep(BACKFILL_GUILD_PACE) => {}
+        let mut after_guild_id = 0;
+        loop {
+            let candidates = match db::guild_join_info_backfill_candidates(
+                db,
+                after_guild_id,
+                BACKFILL_PAGE_SIZE,
+            )
+            .await
+            {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    tracing::warn!("guild directory backfill unavailable: {error:#}");
+                    break;
                 }
+            };
+            let Some(&(last_guild_id, _)) = candidates.last() else {
+                break;
+            };
+            for (guild_id, joined_at_ns) in candidates {
+                if !backfill.first_attempt(guild_id, joined_at_ns) {
+                    continue;
+                }
+                if visited {
+                    tokio::select! {
+                        _ = crate::shutdown_signal() => {
+                            backfill.stop();
+                            return;
+                        }
+                        _ = tokio::time::sleep(pace) => {}
+                    }
+                }
+                visited = true;
+                resolve(guild_id, joined_at_ns).await;
             }
-            visited = true;
-            backfill_guild(&app, &http, bot_user_id, guild_id, joined_at_ns).await;
+            after_guild_id = last_guild_id;
         }
-        after_guild_id = last_guild_id;
+        if !backfill.finish_pass() {
+            return;
+        }
     }
 }
 
@@ -330,6 +426,86 @@ mod tests {
             ]),
         );
         assert!(bot_adder_from_logs(&logs, 42, now_ms * 1_000_000).is_none());
+    }
+
+    fn backfill_db() -> db::Db {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_directory_backfill_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        db::Db::open(&path, 2).unwrap()
+    }
+
+    /// Runs the backfill with a recording resolver; `during` runs inside the
+    /// first lookup, standing in for startup handlers that commit meanwhile.
+    async fn visits<D, Fut>(db: &db::Db, backfill: &Arc<Backfill>, during: D) -> Vec<(i64, i64)>
+    where
+        D: Fn() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        run_backfill(db, backfill, Duration::ZERO, |guild_id, joined_at_ns| {
+            let first = {
+                let mut seen = recorded.lock();
+                seen.push((guild_id, joined_at_ns));
+                seen.len() == 1
+            };
+            let hook = if first { Some(during()) } else { None };
+            async move {
+                if let Some(hook) = hook {
+                    hook.await;
+                }
+            }
+        })
+        .await;
+        seen.lock().clone()
+    }
+
+    #[tokio::test]
+    async fn enrollments_committed_during_a_pass_are_visited_in_the_same_process() {
+        let db = backfill_db();
+        let backfill = Arc::new(Backfill::default());
+        db::enroll_guild(&db, 20, 100).await.unwrap();
+        assert!(backfill.begin());
+        let seen = visits(&db, &backfill, || {
+            let db = db.clone();
+            let backfill = Arc::clone(&backfill);
+            async move {
+                // Startup handlers enroll one id the cursor already passed and
+                // one beyond it, each requesting another scan once committed.
+                db::enroll_guild(&db, 10, 100).await.unwrap();
+                assert!(!backfill.begin(), "a running pass is asked to scan again");
+                db::enroll_guild(&db, 30, 100).await.unwrap();
+                assert!(!backfill.begin());
+            }
+        })
+        .await;
+        assert_eq!(
+            seen,
+            vec![(20, 100), (30, 100), (10, 100)],
+            "the id beyond the cursor joins this pass and the id behind it the \
+             requested rescan; no lookup repeats"
+        );
+        assert!(backfill.begin(), "a finished run accepts the next request");
+    }
+
+    #[tokio::test]
+    async fn an_enrollment_after_the_scan_exited_starts_a_new_pass_once() {
+        let db = backfill_db();
+        let backfill = Arc::new(Backfill::default());
+        assert!(backfill.begin());
+        // The Ready-time scan finds nothing and exits before any enrollment.
+        assert!(visits(&db, &backfill, || async {}).await.is_empty());
+        db::enroll_guild(&db, 10, 100).await.unwrap();
+        assert!(
+            backfill.begin(),
+            "the exited pass is restarted by the request"
+        );
+        assert_eq!(visits(&db, &backfill, || async {}).await, vec![(10, 100)]);
+        // The lookup left the server unresolved: this process does not repeat it.
+        assert!(backfill.begin());
+        assert!(visits(&db, &backfill, || async {}).await.is_empty());
     }
 
     #[test]

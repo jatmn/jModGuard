@@ -731,15 +731,49 @@ async fn execute_inner(
         // listed as active forever. A newer membership or an event that already
         // retired this one is ignored by the monotonic observation, and the
         // receipt above was recorded before the retirement invalidates work.
-        if let Err(error) = db::retire_guild_enrollment(db, job.guild_id, joined_at_ns).await {
-            tracing::warn!(
-                action_id = %job.id,
-                guild_id = job.guild_id,
-                "confirmed departure not retired; the gateway event remains the fallback: {error:#}"
-            );
-        }
+        retire_confirmed_departure(db, app, job, joined_at_ns).await;
     }
     Ok(())
+}
+
+const RETIRE_DEPARTURE_ATTEMPTS: u32 = 3;
+const RETIRE_DEPARTURE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Retire one confirmed owner departure. The receipt is already final and no
+/// claim is ever replayed, so nothing but this call (or the gateway event) can
+/// retire the membership: a transient write failure is retried a few times
+/// rather than left as a single warning.
+async fn retire_confirmed_departure(
+    db: &Db,
+    app: Option<&crate::state::BotState>,
+    job: &BotAction,
+    joined_at_ns: i64,
+) {
+    for attempt in 1..=RETIRE_DEPARTURE_ATTEMPTS {
+        match db::retire_guild_enrollment(db, job.guild_id, joined_at_ns).await {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::warn!(
+                    action_id = %job.id,
+                    guild_id = job.guild_id,
+                    attempt,
+                    "confirmed departure not retired{}: {error:#}",
+                    if attempt == RETIRE_DEPARTURE_ATTEMPTS {
+                        "; the gateway event remains the fallback"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        if attempt == RETIRE_DEPARTURE_ATTEMPTS {
+            return;
+        }
+        tokio::time::sleep(RETIRE_DEPARTURE_RETRY_DELAY).await;
+        if app.is_some_and(|app| !app.activation.may_record()) {
+            return;
+        }
+    }
 }
 
 pub async fn execute(

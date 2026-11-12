@@ -619,22 +619,11 @@ impl EventHandler for Handler {
                     tokio::time::sleep(delay).await;
                 }
             });
-            // One bounded directory backfill per process: servers added before
-            // this release (or whose lookup failed) resolve their adder here.
+            // Servers added before this release (or whose lookup failed)
+            // resolve their adder in a paced pass; startup enrollments that
+            // commit after this scan request another one from `guild_create`.
             // Ready-gateway context makes the audit lookups answerable.
-            {
-                let backfill_app = Arc::clone(&app);
-                let backfill_http = Arc::clone(&ctx.http);
-                let bot_user_id = ctx.cache.current_user().id;
-                tokio::spawn(async move {
-                    crate::guild_directory::run_startup_backfill(
-                        backfill_app,
-                        backfill_http,
-                        bot_user_id,
-                    )
-                    .await;
-                });
-            }
+            crate::guild_directory::request_backfill(&app, &ctx.http, ctx.cache.current_user().id);
             let startup = async move {
                 let guild_ids: Vec<GuildId> = ctx.cache.guilds();
                 tracing::info!(
@@ -724,6 +713,15 @@ impl EventHandler for Handler {
                     joined_at_ns,
                 )
                 .await;
+            } else {
+                // A membership already present at startup is not a fresh join,
+                // and its enrollment may commit after the Ready-time scan has
+                // passed it: ask the paced backfill to visit it.
+                crate::guild_directory::request_backfill(
+                    &app,
+                    &ctx.http,
+                    ctx.cache.current_user().id,
+                );
             }
         }
         if is_new.unwrap_or(false) {

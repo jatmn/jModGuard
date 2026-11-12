@@ -902,6 +902,8 @@ pub struct BotState {
     pub log_delivery_failures: AtomicU64,
     pub start: Instant,
     pub slash_synced: AtomicBool,
+    /// Owner-directory adder backfill: Ready and each startup enrollment request it.
+    pub(crate) directory_backfill: crate::guild_directory::Backfill,
     startup_notice_task: tokio::sync::Mutex<StartupNoticeTask>,
     /// Last observed durable `config_version` from the DB.
     /// Primed at construction from the live DB so the first poll has no
@@ -1022,6 +1024,7 @@ impl BotState {
             log_delivery_failures: AtomicU64::new(0),
             start: Instant::now(),
             slash_synced: AtomicBool::new(false),
+            directory_backfill: Default::default(),
             startup_notice_task: tokio::sync::Mutex::new(StartupNoticeTask::default()),
             last_config_version: AtomicU64::new(primed.config),
             last_config_revision: parking_lot::Mutex::new(primed.config_revision),
