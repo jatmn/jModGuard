@@ -35,6 +35,8 @@ const LOCAL_WRITE_FENCE_SCHEMA: &str =
     include_str!("../../migrations/guild/0015_local_write_fence.sql");
 const MEMBER_PENDING_REJOIN_NOTES_SCHEMA: &str =
     include_str!("../../migrations/guild/0016_member_pending_rejoin_notes.sql");
+const MEMBER_GAP_AUTO_CLEAR_SCHEMA: &str =
+    include_str!("../../migrations/guild/0017_member_gap_auto_clear.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -524,6 +526,9 @@ fn initialize_store(
         if version < 17 {
             tx.execute_batch_bounded(MEMBER_PENDING_REJOIN_NOTES_SCHEMA, 32_000_000)?;
         }
+        if version < 18 {
+            tx.execute_batch_bounded(MEMBER_GAP_AUTO_CLEAR_SCHEMA, 32_000_000)?;
+        }
         // Version 16 adds the optional immutable ban_attempt_tag to case JSON.
         // No DDL or rewrite of legacy cases: their absent tags must remain absent.
         tx.pragma_update(None, "user_version", VERSION)?;
@@ -550,6 +555,7 @@ fn initialize_store(
     tx.execute_batch_bounded(MEMBER_CASE_RETAIN_REVISION_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(LOCAL_WRITE_FENCE_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_PENDING_REJOIN_NOTES_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_GAP_AUTO_CLEAR_SCHEMA, 32_000_000)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
@@ -635,6 +641,7 @@ impl GuildDataStore {
                     (MEMBER_CASE_RETAIN_REVISION_SCHEMA, 14),
                     (LOCAL_WRITE_FENCE_SCHEMA, 15),
                     (MEMBER_PENDING_REJOIN_NOTES_SCHEMA, 17),
+                    (MEMBER_GAP_AUTO_CLEAR_SCHEMA, 18),
                 ];
                 for (sql, at) in batches {
                     if *at <= version {

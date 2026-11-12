@@ -96,7 +96,11 @@ async fn mark_gap(
 ) {
     let now_ms = chrono::Utc::now().timestamp_millis();
     if let Err(error) = store
-        .mark_member_reconciliation_needed(scope.clone(), reason, now_ms)
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            db::guild_data::CoverageGap::Observed(reason),
+            now_ms,
+        )
         .await
     {
         tracing::warn!("member directory coverage marker deferred: {error:#}");
@@ -170,7 +174,11 @@ pub async fn flush_pending_gaps(
         }
         let now_ms = chrono::Utc::now().timestamp_millis();
         if let Err(error) = store
-            .mark_member_reconciliation_needed(scope.clone(), &gap.reason, now_ms)
+            .mark_member_reconciliation_needed(
+                scope.clone(),
+                db::guild_data::CoverageGap::Observed(&gap.reason),
+                now_ms,
+            )
             .await
         {
             tracing::warn!(

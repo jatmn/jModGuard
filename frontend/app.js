@@ -28,6 +28,8 @@ const ui = createState({
   edits: "clean",
   copySource: null,
   drafts: {},
+  // Saved values that replace a draft control's default; cleared with drafts.
+  draftBaselines: {},
   pendingDrafts: null
 });
 const root = createRoot(document.getElementById("app"));
@@ -51,9 +53,9 @@ function ActionButton({ onClick, savedFields, disabled, ...props }) {
 function useDraftControl({ draftKey, defaultValue, onChange, ...props }) {
   const group = useContext(DraftGroup);
   const working = useContext(BusyContext);
-  const { drafts } = useStore(ui);
+  const { drafts, draftBaselines } = useStore(ui);
   if (!draftKey) return { ...props, defaultValue, onChange, disabled: working || props.disabled };
-  const baseline = String(defaultValue ?? "");
+  const baseline = String(draftBaselines[draftKey] ?? defaultValue ?? "");
   return {
     ...props,
     value: drafts[draftKey]?.value ?? baseline,
@@ -161,7 +163,7 @@ function App() {
     isPreview() &&
       h(
         "div",
-        { id: "preview-banner", className: "preview-banner alert alert-warning", role: "status" },
+        { id: "preview-banner", className: "preview-banner alert alert-soft alert-warning", role: "status" },
         "Preview — changes disabled",
       ),
     display.view === "main-view"
@@ -190,7 +192,7 @@ function App() {
                   value: state.guildId || "",
                   onChange: async (event) => {
                     if (!canLeave()) return;
-                    ui.set({ pendingDrafts: null, drafts: {}, copySource: null });
+                    ui.set({ pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
                     pendingCase = null;
                     state.guildId = event.target.value;
                     state.config = null;
@@ -626,7 +628,7 @@ async function handleEvent(handler, event, savedFields, group) {
 
 function navigate(tab) {
   if (!canLeave()) return false;
-  ui.set({ view: "main-view", pendingDrafts: null, drafts: {}, copySource: null });
+  ui.set({ view: "main-view", pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
   state.tab = tabs.includes(tab) ? tab : "dashboard";
   persistWorkspace();
   renderTab();
@@ -928,6 +930,8 @@ async function submitSave(path, method, body, signal, reconcileRecovered) {
     // current configuration instead of applying a historical patch again.
     return saveMode === "lookup" ? { ...result, config_patch: null } : result;
   } catch (error) {
+    // A lookup-only attempt never submits a new save, whether or not the server answered it.
+    if (saveMode === "lookup" && error && typeof error === "object") error.saveLookup = true;
     if (saveFailureState(error) === "expired") {
       try { window.sessionStorage.removeItem(key); } catch (_) { /* Keep lookup-only behavior if storage fails. */ }
     }
@@ -1415,7 +1419,7 @@ async function loadConfig() {
     const config = await apiRead(`/api/guilds/${guildId}/config`);
     if (!ownsConfigRead(request, guildId)) return;
     if (state.config && state.config.enrollment_id !== config.enrollment_id) {
-      ui.set({ pendingDrafts: null, drafts: {}, copySource: null, edits: "clean" });
+      ui.set({ pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null, edits: "clean" });
       for (const [key, entry] of pendingLogChannelActions) {
         if (entry.job.guild_id === guildId && entry.job.enrollment_id !== config.enrollment_id) {
           clearPendingLogChannelEntry(key);
@@ -3527,6 +3531,22 @@ function actionCancelNeedsConfirm(job) {
   return actionIsLogChannel(job) && (job.state === "running" || job.state === "uncertain");
 }
 
+// Gap reasons are stored by the bot. Connection reasons get a label; anything
+// else is a member or ban change the bot could not save.
+const MEMBER_CONNECTION_GAPS = {
+  "bot restarted": "planned bot restart",
+  "bot stopped unexpectedly": "the bot stopped unexpectedly",
+  "gateway continuity interrupted": "Discord connection was interrupted",
+  "guild gateway unavailable": "Discord reported the server as unavailable",
+};
+
+function memberGapCause(reason, when) {
+  const label = Object.hasOwn(MEMBER_CONNECTION_GAPS, reason || "") ? MEMBER_CONNECTION_GAPS[reason] : null;
+  return label
+    ? `The bot was offline or reconnected${when} (${label})`
+    : `The bot could not save a member or ban change${when}`;
+}
+
 function memberTime(value) {
   if (value === null || value === undefined || value === "") return "Unknown";
   const date = new Date(typeof value === "string" && !/^\d+$/.test(value) ? value : Number(value));
@@ -3739,7 +3759,7 @@ function tabMembers() {
         parts.push(
           h(
             "p",
-            { className: "alert alert-warning" },
+            { className: "alert alert-soft alert-warning" },
             "Import metadata is unavailable. Controls are disabled until the saved job is restored or repaired.",
           ),
         );
@@ -3932,14 +3952,96 @@ function tabMembers() {
       }
       details.push(["Last committed progress", asDate(sync.last_progress_at)]);
       if (sync.as_of_ms || sync.as_of) details.push(["Status read at", asDate(sync.as_of_ms ?? sync.as_of)]);
-      if (sync.reconciliation_needed)
-        parts.push(
-          h(
-            "p",
-            { className: "alert alert-warning" },
-            "Coverage may be stale after an outage, restore, bot restart, or Gateway session replacement. A full current-member and current-ban check needs an administrator to select Reconcile from Discord.",
-          ),
+      function syncControlButton(operation, label) {
+        // Mirror the API's validate_member_sync_operation: omit controls this state can never accept.
+        const valid = {
+          pause: ["queued", "running", "waiting"].includes(sync.status),
+          resume: sync.status === "paused",
+          retry: memberSyncRetryEnabled(sync),
+          reconcile: sync.status === "complete" && !!sync.initial_completed_at,
+        }[operation];
+        if (!valid) return null;
+        const disabled = !sync.run_id || controlPending();
+        return h(
+          ActionButton,
+          {
+            className: "btn btn-sm",
+            disabled: disabled,
+            onClick: async () => {
+              if (!latestStatus?.run_id) return;
+              if (
+                operation === "reconcile" &&
+                !confirm(
+                  "Request a full current-member and current-ban reconciliation from Discord? This can take a while.",
+                )
+              )
+                return;
+              let job;
+              try {
+                job = await submitBotAction(`/api/guilds/${guildId}/member-sync/actions`, "POST", {
+                  operation,
+                });
+              } catch (error) {
+                if (
+                  error.status !== 409 ||
+                  !["member_sync_missing_job", "member_sync_invalid_operation"].includes(error.code)
+                )
+                  throw error;
+                if (!aliveHere()) return;
+                syncActionOutcome = error.message;
+                renderStatus(latestStatus);
+                loadStatus();
+                return;
+              }
+              if (!aliveHere()) return;
+              syncActionOutcome = null;
+              if (["pending", "claimed", "running", "succeeded"].includes(job.state)) {
+                observeControl(job, operation);
+              } else {
+                syncActionOutcome = `${label} action ${job.state}. Check Bot actions for details.`;
+              }
+              renderStatus(latestStatus);
+              schedulePoll();
+              loadStatus();
+            },
+          },
+          label,
         );
+      }
+      // A short planned restart clears itself when audit recovery finishes, unless
+      // that recovery stopped for attention. Anything else needs Reconcile.
+      const autoClearing = sync.gap_auto_clear && sync.audit_recovery_status !== "needs_attention";
+      const reconcileInNotice = sync.reconciliation_needed && !autoClearing && !isPreview();
+      const reconcileButton = reconcileInNotice && syncControlButton("reconcile", "Reconcile from Discord");
+      if (sync.reconciliation_needed) {
+        const when = sync.gap_at ? ` at ${asDate(sync.gap_at)}` : "";
+        if (autoClearing)
+          parts.push(
+            h(
+              "p",
+              { id: "member-coverage-notice", className: "muted", role: "status" },
+              `The bot restarted${when}. Ban and unban actions from the restart are being caught up automatically; no action is needed.`,
+            ),
+          );
+        else
+          parts.push(
+            h(
+              "div",
+              { id: "member-coverage-notice", className: "alert alert-soft alert-warning", role: "status" },
+              h(
+                "div",
+                {},
+                h("strong", {}, "Member list may be out of date"),
+                h(
+                  "p",
+                  {},
+                  `${memberGapCause(sync.reconciliation_reason, when)}, so it may have missed some joins, leaves, or bans. Select Reconcile from Discord to re-check the full member and ban lists. This can take a while on large servers.`,
+                ),
+              ),
+              reconcileButton && h("div", { className: "row" }, reconcileButton),
+            ),
+          );
+      }
       if (sync.audit_recovery_status && sync.audit_recovery_status !== "complete") {
         const phase =
           sync.audit_recovery_phase === "ban"
@@ -4011,62 +4113,8 @@ function tabMembers() {
           ["retry", "Retry"],
           ["reconcile", "Reconcile from Discord"],
         ]) {
-          // Mirror the API's validate_member_sync_operation: omit controls this state can never accept.
-          const valid = {
-            pause: ["queued", "running", "waiting"].includes(sync.status),
-            resume: sync.status === "paused",
-            retry: memberSyncRetryEnabled(sync),
-            reconcile: sync.status === "complete" && !!sync.initial_completed_at,
-          }[operation];
-          if (!valid) continue;
-          const disabled = !sync.run_id || controlPending();
-          controls.push(
-            h(
-              ActionButton,
-              {
-                className: "btn btn-sm",
-                disabled: disabled,
-                onClick: async () => {
-                  if (!latestStatus?.run_id) return;
-                  if (
-                    operation === "reconcile" &&
-                    !confirm(
-                      "Request a full current-member and current-ban reconciliation from Discord? This can take a while.",
-                    )
-                  )
-                    return;
-                  let job;
-                  try {
-                    job = await submitBotAction(`/api/guilds/${guildId}/member-sync/actions`, "POST", {
-                      operation,
-                    });
-                  } catch (error) {
-                    if (
-                      error.status !== 409 ||
-                      !["member_sync_missing_job", "member_sync_invalid_operation"].includes(error.code)
-                    )
-                      throw error;
-                    if (!aliveHere()) return;
-                    syncActionOutcome = error.message;
-                    renderStatus(latestStatus);
-                    loadStatus();
-                    return;
-                  }
-                  if (!aliveHere()) return;
-                  syncActionOutcome = null;
-                  if (["pending", "claimed", "running", "succeeded"].includes(job.state)) {
-                    observeControl(job, operation);
-                  } else {
-                    syncActionOutcome = `${label} action ${job.state}. Check Bot actions for details.`;
-                  }
-                  renderStatus(latestStatus);
-                  schedulePoll();
-                  loadStatus();
-                },
-              },
-              label,
-            ),
-          );
+          const control = operation === "reconcile" && reconcileInNotice ? null : syncControlButton(operation, label);
+          if (control) controls.push(control);
         }
       }
       if (controls.length) parts.push(h("div", { className: "row" }, ...controls));
@@ -5501,6 +5549,15 @@ function tabEvents() {
 const STOCKS_SPAM_EXAMPLE = "📈 **Looking for a community focused on stocks and trading?**\n\nJoin our growing community to learn from experienced investors, share market insights, discuss stock ideas, and exchange trading strategies.\nNo spam or aggressive promotion—just practical market discussions.\nWe welcome active investors and value your thoughts and feedback.\n👇 Interested? Join us here:";
 const AI_SPAM_EXAMPLE = "I used to work as Full Stack AI developer at several software companies but I’m currently available and working remotely because my last contract ended. Right now I am resting at home. If you have any AI projects or need support, I’d be happy to help, just reach out.";
 
+// A failed add's reason belongs to its retained draft: it survives remounts and
+// the other entry's add, and goes away when the draft is edited or cleared.
+function setKnownSpamAddError(key, error) {
+  const drafts = ui.getSnapshot().drafts;
+  if (!drafts[key]) return;
+  const draft = { value: drafts[key].value, group: drafts[key].group };
+  ui.set({ drafts: { ...drafts, [key]: error ? { ...draft, error } : draft } });
+}
+
 function tabKnownSpam() {
   const { drafts } = useStore(ui);
   const scopeRef = useRef(null);
@@ -5511,10 +5568,27 @@ function tabKnownSpam() {
     const key = kind === "sample" ? "known-spam:sample" : "known-spam:url";
     const value = drafts[key]?.value || "";
     if (!value.trim()) return toast("Enter a full sample or URL pattern", "error");
-    await reloadAfter(() => api(`/api/guilds/${guildId}/known-spam`, "POST", {
-      scope: scopeRef.current.value, kind, value, note: drafts["known-spam:note"]?.value || null,
-    }), () => toast("Known spam entry added", "success"));
+    const scope = scopeRef.current.value;
+    setKnownSpamAddError(key, null);
+    try {
+      await reloadAfter(async () => {
+        const res = await api(`/api/guilds/${guildId}/known-spam`, "POST", {
+          scope, kind, value, note: drafts["known-spam:note"]?.value || null,
+        });
+        // Acknowledged: keep this scope selected, without a draft, even if the refresh fails.
+        ui.set({ draftBaselines: { ...ui.getSnapshot().draftBaselines, "known-spam:scope": scope } });
+        return res;
+      }, () => toast("Known spam entry added", "success"));
+    } catch (error) {
+      // The browser cannot tell a rejected save from one whose outcome is unknown
+      // or pending, so state only that the add was not confirmed.
+      const label = kind === "sample" ? "Sample" : "URL pattern";
+      const lookup = error?.saveLookup ? " Retrying the same entry, note and scope only looks up the earlier request; no new save was sent." : "";
+      setKnownSpamAddError(key, `${label} not confirmed as added: ${error?.message || error}${lookup}`);
+      throw error;
+    }
   };
+  const addErrorFor = (key) => drafts[key]?.error ? h("p", { className: "error", role: "alert" }, drafts[key].error) : null;
   return h("div", null,
     h("h2", null, "Known spam"),
     h("p", { className: "muted" }, "Save full confirmed spam messages or URL wildcards. First match bans and purges Discord’s Previous Hour (3600 seconds). Dry-run only logs. The list uses the rule’s enable, skip lists and skip-moderators settings below. Global entries apply to every server; only the bot owner can edit them."),
@@ -5525,10 +5599,12 @@ function tabKnownSpam() {
         field("Applies to", scopeSelect(scopeRef, "This server", "Global", true, "known-spam:scope")),
         field("Optional note (up to 512 bytes)", h(Input, { className: "input w-full", draftKey: "known-spam:note", "data-note": true, maxLength: 512 })),
         field("Full sample message (up to 4096 bytes)", h(Textarea, { className: "textarea w-full", draftKey: "known-spam:sample", rows: 7, maxLength: 4096, placeholder: "Paste the entire confirmed spam message. No regex needed." })),
-        h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:sample", "known-spam:note"], onClick: () => add("sample") }, "Add sample"),
+        h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:sample", "known-spam:note", "known-spam:scope"], onClick: () => add("sample") }, "Add sample"),
+        addErrorFor("known-spam:sample"),
         field("URL wildcard (up to 512 bytes)", h(Input, { className: "input w-full", draftKey: "known-spam:url", "data-url": true, maxLength: 512, placeholder: "tinyurl.com/*" })),
         h("p", { className: "field-help" }, "HTTP/HTTPS scheme is optional and ignored. Hosts ignore case; tinyurl.com/* matches that exact host, not subdomains. *.example.com/* matches subdomains only. Omitted path means /*. Paths are case-sensitive; * matches zero or more characters, including /. Query and fragment are ignored in links and forbidden in patterns. No regex, credentials or ports in patterns. Bare domain links also match. Up to 1024 entries per scope; normalized duplicates are rejected."),
-        h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:url", "known-spam:note"], onClick: () => add("url") }, "Add URL pattern"),
+        h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:url", "known-spam:note", "known-spam:scope"], onClick: () => add("url") }, "Add URL pattern"),
+        addErrorFor("known-spam:url"),
       ),
     ),
     h("details", { className: "card bg-base-100 card-border" },

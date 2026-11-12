@@ -6,11 +6,17 @@ import vm from 'node:vm';
 import { performance } from 'node:perf_hooks';
 import { renderToStaticMarkup } from '../tools/webui/node_modules/react-dom/server.node.js';
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 
 import { JSDOM } from '../tools/webui/node_modules/jsdom/lib/api.js';
 import React, { useSyncExternalStore, useState, useEffect, useRef, createContext, useContext } from '../tools/webui/node_modules/react/index.js';
 
 
+// Node's WebSocket dispatches with the global Event; keep Node's before jsdom replaces it.
+const { WebSocket: NodeWebSocket, Event: NodeEvent } = globalThis;
 const bootDom = new JSDOM('<html><body></body></html>', {pretendToBeVisual: true});
 activate(bootDom.window);
 const { createRoot: reactRoot } = await import('../tools/webui/node_modules/react-dom/client.js');
@@ -691,11 +697,71 @@ test('Members accepts a later primary restore status but rejects an older in-fli
   await settle();
   assert.equal(statusReads, 3);
   assert.match(textOf(panel), /3 records committed in this run/);
-  assert.match(textOf(panel), /Coverage may be stale after an outage, restore, bot restart, or Gateway session replacement/);
+  assert.match(textOf(panel), /Member list may be out of date/);
   resolveOldRequest(response({ status: 'complete', phase: 'complete', run_id: 'before-restore', progress_revision: 21, processed: 777 }));
   await settle();
   assert.match(textOf(panel), /3 records committed in this run/);
   assert.doesNotMatch(textOf(panel), /777 records committed/);
+});
+
+test('Members explains a coverage gap and offers Reconcile inside the notice only when it is needed', async () => {
+  const actions = [];
+  let sync;
+  const h = harness(async (url, init) => {
+    if (url.endsWith('/member-sync/actions')) { actions.push(JSON.parse(init.body).operation); return response({ id: 'action', state: 'pending' }); }
+    if (url.endsWith('/member-sync')) return response(sync);
+    return response({ members: [], next_cursor: null });
+  });
+  h.app.state.tab = 'members';
+  h.app.state.config = { enrollment_id: 'member-enrollment' };
+  const base = { status: 'complete', phase: 'complete', run_id: 'done', progress_revision: 3, initial_completed_at: 1790000000000,
+    reconciliation_needed: true, gap_at: 1790000000000 };
+  const reconcileButtons = (panel) => [...panel.querySelectorAll('button')].filter(n => textOf(n) === 'Reconcile from Discord');
+  const notice = (panel) => findNode(panel, n => n.id === 'member-coverage-notice');
+
+  sync = { ...base, reconciliation_reason: 'guild gateway unavailable', gap_auto_clear: false };
+  let panel = h.app.tabMembers();
+  await settle();
+  assert.equal(notice(panel).className, 'alert alert-soft alert-warning');
+  assert.match(textOf(notice(panel)), /^Member list may be out of date/);
+  assert.match(textOf(notice(panel)), /reconnected at .+ \(Discord reported the server as unavailable\), so it may have missed some joins, leaves, or bans/);
+  assert.equal(reconcileButtons(panel).length, 1, 'Reconcile moves into the notice instead of repeating in the controls row');
+  assert.ok(findNode(notice(panel), n => n.localName === 'button' && textOf(n) === 'Reconcile from Discord'));
+  await fire(reconcileButtons(panel)[0], 'click');
+  await settle();
+  assert.deepEqual(actions, ['reconcile']);
+
+  sync = { ...base, reconciliation_reason: 'bot restarted', gap_auto_clear: true };
+  panel = h.app.tabMembers();
+  await settle();
+  assert.equal(notice(panel).className, 'muted');
+  assert.match(textOf(notice(panel)), /The bot restarted at .+ caught up automatically; no action is needed/);
+  assert.equal(findNode(panel, n => /\balert-warning\b/.test(String(n.className))), null);
+  assert.equal(findNode(notice(panel), n => n.localName === 'button'), null);
+  assert.equal(reconcileButtons(panel).length, 1, 'Reconcile stays available in the controls row');
+
+  sync = { ...base, reconciliation_reason: 'bot restarted', gap_auto_clear: true, audit_recovery_status: 'needs_attention', audit_recovery_reason: 'pagination_stalled' };
+  panel = h.app.tabMembers();
+  await settle();
+  assert.equal(notice(panel).className, 'alert alert-soft alert-warning', 'stalled recovery cannot clear the gap');
+  assert.match(textOf(notice(panel)), /\(planned bot restart\)/);
+  assert.equal(reconcileButtons(panel).length, 1);
+
+  sync = { ...base, reconciliation_reason: 'ban audit case persistence unavailable', gap_auto_clear: false };
+  panel = h.app.tabMembers();
+  await settle();
+  assert.match(textOf(notice(panel)), /The bot could not save a member or ban change at .+, so it may have missed/);
+  assert.doesNotMatch(textOf(notice(panel)), /offline/);
+
+  h.app.state.me = { ...(h.app.state.me || {}), preview: true };
+  sync = { ...base, reconciliation_reason: 'gateway continuity interrupted', gap_auto_clear: false };
+  panel = h.app.tabMembers();
+  await settle();
+  assert.match(textOf(notice(panel)), /Discord connection was interrupted/);
+  assert.equal(reconcileButtons(panel).length, 0, 'a read-only preview cannot request Reconcile');
+  h.app.renderTab();
+  await settle();
+  assert.equal(h.nodes.get('#preview-banner').className, 'preview-banner alert alert-soft alert-warning');
 });
 
 test('Members keeps a restore-interrupted control unconfirmed rather than claiming it applied', async () => {
@@ -818,6 +884,8 @@ test('Members keeps controls unavailable until a real first job exists and after
   fire(refresh, 'click');
   await settle();
   assert.match(textOf(panel), /Import metadata is unavailable. Controls are disabled/);
+  const metadataNotice = findNode(panel, n => n.localName === 'p' && /^Import metadata is unavailable/.test(textOf(n)));
+  assert.equal(metadataNotice.className, 'alert alert-soft alert-warning');
   assert.deepEqual(controls().map(button => [textOf(button), button.disabled]), [['Retry', true]]);
   await fire(controls()[0], 'click');
   assert.equal(actionPosts, 0);
@@ -2524,6 +2592,167 @@ test('image rule UI can save test mode or delete-and-ban', async () => {
 test('checkbox labels keep primary text color', () => {
   const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
   assert.match(css, /\.checkbox-label\s*\{[^}]*color:\s*var\(--text\)/);
+});
+
+// jsdom has no layout engine, so sidebar placement (#557) is measured in headless Firefox over
+// WebDriver BiDi (no extra npm packages): the built app renders from a stub API and the test scrolls
+// a tall page. CI must run it; a local host without Firefox or a WebUI build skips it.
+const firefoxBinary = (process.env.PATH || '').split(path.delimiter).map(dir => path.join(dir, 'firefox'))
+  .find(file => { try { fs.accessSync(file, fs.constants.X_OK); return true; } catch { return false; } });
+
+async function serveBuiltApp(previewMode) {
+  const dist = new URL('../dist/frontend/', import.meta.url);
+  const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    const json = body => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (url.pathname === '/api/me') return json({
+      user: { id: '100000000000000001', username: 'moderator', global_name: 'Moderator' },
+      guilds: [{ id: '200000000000000002', name: 'Guild' }], is_bot_owner: !previewMode(), preview: previewMode(),
+    });
+    if (url.pathname.endsWith('/config')) return json({ enrollment_id: 'e1', settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
+    if (url.pathname.startsWith('/api/')) return json({});
+    const file = new URL(url.pathname === '/' ? 'index.html' : url.pathname.slice(1), dist);
+    if (!file.href.startsWith(dist.href) || !fs.existsSync(file)) { res.writeHead(404); return res.end(); }
+    res.writeHead(200, { 'content-type': types[path.extname(file.pathname)] || 'application/octet-stream' });
+    res.end(fs.readFileSync(file));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  return server;
+}
+
+async function launchFirefox() {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'jmodguard-firefox-'));
+  // Own process group: Firefox's content processes are stopped with it.
+  const child = spawn(firefoxBinary, ['--headless', '--no-remote', '--profile', profile, '--remote-debugging-port=0'],
+    { detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
+  const exited = new Promise(resolve => { child.once('exit', resolve); child.once('error', resolve); });
+  const stop = async () => {
+    try { process.kill(-child.pid, 'SIGTERM'); } catch {}
+    const timer = setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, 5000);
+    await exited; clearTimeout(timer);
+    fs.rmSync(profile, { recursive: true, force: true });
+  };
+  try {
+    const endpoint = await new Promise((resolve, reject) => {
+      let output = '';
+      const timer = setTimeout(() => reject(new Error(`Firefox did not start WebDriver BiDi:\n${output}`)), 30000);
+      child.stderr.on('data', chunk => {
+        output += chunk;
+        const match = output.match(/WebDriver BiDi listening on (ws:\/\/\S+)/);
+        if (match) { clearTimeout(timer); resolve(match[1]); }
+      });
+      exited.then(code => { clearTimeout(timer); reject(new Error(`Firefox exited (${code}):\n${output}`)); });
+    });
+    const socket = new NodeWebSocket(`${endpoint}/session`);
+    await new Promise((resolve, reject) => { socket.onopen = resolve; socket.onerror = reject; });
+    let nextId = 0;
+    const pending = new Map();
+    socket.onmessage = event => {
+      const message = JSON.parse(event.data);
+      const waiter = pending.get(message.id);
+      if (!waiter) return;
+      pending.delete(message.id);
+      if (message.type === 'error') waiter.reject(new Error(`${waiter.method}: ${message.error}: ${message.message}`));
+      else waiter.resolve(message.result);
+    };
+    const send = (method, params) => new Promise((resolve, reject) => {
+      const id = ++nextId;
+      pending.set(id, { method, resolve, reject });
+      socket.send(JSON.stringify({ id, method, params }));
+    });
+    await send('session.new', { capabilities: {} });
+    // Firefox opens on privileged about:home, which current releases do not let WebDriver
+    // drive without system access; an own tab starts as an ordinary about:blank page.
+    const { context } = await send('browsingContext.create', { type: 'tab' });
+    return {
+      send, context,
+      async close() {
+        await new Promise(resolve => { socket.onclose = resolve; socket.close(); });
+        await stop();
+      },
+    };
+  } catch (error) {
+    await stop();
+    throw error;
+  }
+}
+
+// Scrolls a tall workspace page, then records where the sidebar parts render.
+const sidebarLayoutProbe = `(async () => {
+  const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  for (let i = 0; i < 200 && !document.querySelector('#logout-btn'); i++) await new Promise(resolve => setTimeout(resolve, 50));
+  document.querySelector('#content').style.minHeight = '3000px';
+  scrollTo(0, 1200);
+  await frame();
+  const box = selector => {
+    const element = document.querySelector(selector);
+    if (!element) return null;
+    const { top, bottom } = element.getBoundingClientRect();
+    return { top, bottom };
+  };
+  const sidebar = document.querySelector('.sidebar'), nav = sidebar.querySelector('nav');
+  const result = { viewport: innerHeight, scrollY, position: getComputedStyle(sidebar).position,
+    sidebar: box('.sidebar'), banner: box('.preview-banner'), owner: box('#owner-tools'), footer: box('.sidebar-footer'),
+    nav: box('.sidebar nav'), tab: box('#tabs li:last-child button') };
+  sidebar.scrollTop = sidebar.scrollHeight;
+  nav.scrollTop = nav.scrollHeight;
+  await frame();
+  Object.assign(result, { reachedOwner: box('#owner-tools'), reachedFooter: box('.sidebar-footer'),
+    reachedNav: box('.sidebar nav'), reachedTab: box('#tabs li:last-child button') });
+  return JSON.stringify(result);
+})()`;
+
+test('desktop sidebar keeps its footer controls in view while a tall page scrolls', { timeout: 180000 }, async t => {
+  const missing = !firefoxBinary ? 'Firefox is not on PATH'
+    : !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url)) ? 'dist/frontend is not built (npm run build --prefix tools/webui)' : null;
+  if (missing) {
+    assert.ok(!process.env.CI, `${missing}; CI requires this browser layout check`);
+    t.skip(missing);
+    return;
+  }
+  const domEvent = globalThis.Event;
+  globalThis.Event = NodeEvent;
+  let preview = false, server, browser;
+  t.after(async () => {
+    await browser?.close();
+    if (server) await new Promise(resolve => server.close(resolve));
+    globalThis.Event = domEvent;
+  });
+  server = await serveBuiltApp(() => preview);
+  browser = await launchFirefox();
+  const within = (box, top, bottom, label) =>
+    assert.ok(box && box.top >= top - 0.5 && box.bottom <= bottom + 0.5, `${label} ${JSON.stringify(box)} outside ${top}-${bottom}`);
+
+  for (const [width, height, previewMode, shortScreen] of [
+    [1280, 713, false, false], [1280, 480, false, false], [1280, 713, true, false], [1280, 480, true, false],
+    [1280, 300, false, true], [1280, 300, true, true], [700, 713, false, false],
+  ]) {
+    preview = previewMode;
+    const name = `${width}x${height}${previewMode ? ' preview' : ''}`;
+    await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height } });
+    await browser.send('browsingContext.navigate', { context: browser.context, url: `http://127.0.0.1:${server.address().port}/`, wait: 'complete' });
+    const { result } = await browser.send('script.evaluate', { expression: sidebarLayoutProbe, target: { context: browser.context }, awaitPromise: true });
+    const layout = JSON.parse(result.value);
+    assert.equal(layout.scrollY, 1200, `${name}: the workspace page must scroll`);
+    if (width <= 720) {
+      assert.equal(layout.position, 'static', `${name}: the stacked layout keeps a static sidebar`);
+      continue;
+    }
+    assert.equal(layout.position, 'sticky', name);
+    const top = layout.banner ? layout.banner.bottom : 0;
+    if (layout.banner) assert.equal(layout.banner.top, 0, `${name}: the preview banner stays at the top`);
+    within(layout.sidebar, top, layout.viewport, `${name}: sidebar below the banner and inside the viewport`);
+    if (!shortScreen) {
+      within(layout.owner, top, layout.viewport, `${name}: owner tools`);
+      within(layout.footer, top, layout.viewport, `${name}: sidebar footer`);
+    }
+    // A short screen may scroll the sidebar itself; every control stays reachable inside it.
+    within(layout.reachedOwner, top, layout.viewport, `${name}: reachable owner tools`);
+    within(layout.reachedFooter, top, layout.viewport, `${name}: reachable sidebar footer`);
+    within(layout.reachedTab, layout.reachedNav.top, layout.reachedNav.bottom, `${name}: last tab inside the navigation`);
+    within(layout.reachedTab, top, layout.viewport, `${name}: last tab inside the viewport`);
+  }
 });
 
 test('text rule UI can save independent thresholds without generic escalation', async () => {
@@ -5023,6 +5252,117 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   assert.equal(requests[2].options.method, 'DELETE');
   assert.equal(h.app.state.config.known_spam.length, 1);
  });
+
+test('known spam Global add keeps Global selected without an unsaved draft and keeps the other unsaved entry', async () => {
+  const rows = [];
+  const posts = [];
+  const config = () => ({ enrollment_id: 'fixture-membership', known_spam: structuredClone(rows), rules: [], log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response(config());
+    if (!url.endsWith('/known-spam')) return response({});
+    const body = JSON.parse(options.body);
+    posts.push(body);
+    rows.push({ id: String(rows.length + 1), guild_id: body.scope === 'global' ? '0' : h.app.state.guildId, ...body });
+    return response({ ok: true, id: rows.length });
+  });
+  h.app.state.me.is_bot_owner = true;
+  h.app.state.config = config();
+  h.app.navigate('known-spam');
+  const content = () => h.document.querySelector('#app');
+  const scopeSelect = () => [...content().querySelectorAll('select')].find(s => [...s.options].some(o => o.textContent === 'This server'));
+  await chooseOption(scopeSelect(), 'Global');
+  const url = content().querySelector('input[data-url]');
+  url.value = 'tinyurl.com/*'; await fire(url, 'input');
+  const sample = content().querySelector('textarea');
+  sample.value = 'Join our stocks community'; await fire(sample, 'input');
+  await fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Add sample'), 'click');
+  assert.equal(posts[0].scope, 'global');
+  assert.deepEqual(Object.keys(h.app.currentDrafts()), ['known-spam:url'], 'only the unsaved URL remains a draft');
+  assert.equal(h.app.isDirty(), true);
+  assert.equal(scopeSelect().value, 'global', 'the saved scope stays selected for the next add');
+  await fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Add URL pattern'), 'click');
+  assert.equal(posts[1].scope, 'global');
+  assert.equal(posts[1].kind, 'url');
+  assert.deepEqual(Object.keys(h.app.currentDrafts()), []);
+  assert.equal(h.app.isDirty(), false, 'a successful Global add must not prompt to discard changes');
+  assert.equal(scopeSelect().value, 'global');
+  assert.match(content().textContent, /Join our stocks community/);
+  h.app.navigate('known-bad-images'); await settle();
+  h.app.navigate('known-spam'); await settle();
+  assert.equal(scopeSelect().value, 'guild', 'leaving the page resets the scope, as it cleared the Global draft before');
+  assert.equal(h.app.isDirty(), false);
+});
+
+test('known spam acknowledged Global add keeps Global selected when the refresh fails', async () => {
+  let configFails = false;
+  const posts = [];
+  const config = () => ({ enrollment_id: 'fixture-membership', known_spam: [], rules: [], log_channels: [] });
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) {
+      if (configFails) { configFails = false; return { ok: false, status: 500, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'database unavailable' }) }; }
+      return response(config());
+    }
+    posts.push(JSON.parse(options.body));
+    configFails = true;
+    return response({ ok: true, id: 1 });
+  });
+  h.app.state.me.is_bot_owner = true;
+  h.app.state.config = config();
+  h.app.navigate('known-spam');
+  const content = () => h.document.querySelector('#app');
+  const scopeSelect = () => [...content().querySelectorAll('select')].find(s => [...s.options].some(o => o.textContent === 'This server'));
+  await chooseOption(scopeSelect(), 'Global');
+  const sample = content().querySelector('textarea');
+  sample.value = 'Join our stocks community'; await fire(sample, 'input');
+  await fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Add sample'), 'click');
+  assert.equal(posts[0].scope, 'global');
+  assert.match(content().textContent, /Configuration unavailable/);
+  await fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Retry'), 'click');
+  assert.equal(scopeSelect().value, 'global', 'the acknowledged scope stays selected after the refresh recovers');
+  assert.equal(content().querySelector('.card [role="alert"]'), null, 'an acknowledged add is not reported as unconfirmed');
+  assert.deepEqual(Object.keys(h.app.currentDrafts()), []);
+  assert.equal(h.app.isDirty(), false);
+});
+
+test('known spam add failure stays with its draft without claiming an outcome the browser cannot know', async () => {
+  const lookups = [];
+  const replies = [
+    () => ({ ok: false, status: 400, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'known spam entry already exists' }) }),
+    () => ({ ok: false, status: 409, headers: { get: () => null }, text: async () => JSON.stringify({ code: 'save_unknown', error: 'Save outcome unavailable. Check the current configuration before saving again.' }) }),
+    () => { throw new TypeError('Failed to fetch'); },
+  ];
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/config')) return response({ enrollment_id: 'fixture-membership', known_spam: [], rules: [], log_channels: [] });
+    if (JSON.parse(options.body).kind === 'url') return response({ ok: true, id: 1 });
+    lookups.push(options.headers['x-jmodguard-save-lookup']);
+    return replies[lookups.length - 1]();
+  }, new Map(), new Map(), () => false);
+  h.app.state.config = { enrollment_id: 'fixture-membership', known_spam: [], rules: [], log_channels: [] };
+  h.app.navigate('known-spam');
+  const content = () => h.document.querySelector('#app');
+  const sample = content().querySelector('textarea');
+  sample.value = 'Join our stocks community'; await fire(sample, 'input');
+  const add = label => fire([...content().querySelectorAll('button')].find(b => b.textContent === label), 'click');
+  const alert = () => content().querySelector('.card [role="alert"]')?.textContent || '';
+  await add('Add sample');
+  assert.equal(alert(), 'Sample not confirmed as added: known spam entry already exists');
+  assert.equal(h.app.currentDrafts()['known-spam:sample'].value, 'Join our stocks community');
+  await add('Add sample');
+  assert.equal(alert(), 'Sample not confirmed as added: Save outcome unavailable. Check the current configuration before saving again. Retrying the same entry, note and scope only looks up the earlier request; no new save was sent.');
+  await add('Add sample');
+  const unconfirmed = 'Sample not confirmed as added: Failed to fetch Retrying the same entry, note and scope only looks up the earlier request; no new save was sent.';
+  assert.equal(alert(), unconfirmed);
+  assert.deepEqual(lookups, ['0', '1', '1']);
+  assert.doesNotMatch(alert(), /checked|did not complete/);
+  const url = content().querySelector('input[data-url]');
+  url.value = 'tinyurl.com/*'; await fire(url, 'input');
+  await add('Add URL pattern');
+  assert.deepEqual(Object.keys(h.app.currentDrafts()), ['known-spam:sample'], 'the URL add saved; the unconfirmed sample remains');
+  assert.equal(alert(), unconfirmed, 'the other entry\'s add keeps the sample warning');
+  const edited = content().querySelector('textarea');
+  edited.value = 'Join our stocks community today'; await fire(edited, 'input');
+  assert.equal(alert(), '', 'editing the sample starts a new request, so the old warning goes');
+});
 
 test('known spam settings reuse exemptions and dry-run with a fixed action', async () => {
   const calls = [];
