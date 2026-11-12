@@ -15,7 +15,7 @@ pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 42;
+pub const LAUNCHER_REVISION: u32 = 43;
 // Selected bots need the auth-exit hold before the readiness deadline check.
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 /// First launcher that verifies an image signature before staging.
@@ -46,6 +46,15 @@ pub struct UpgradeProgressChanged;
 #[error("launcher receipt was not saved ({status})")]
 pub struct ReceiptNotSaved {
     pub status: String,
+}
+
+impl ReceiptNotSaved {
+    /// The control link or the far writer failed this attempt. `waiting`,
+    /// `busy` and `still waiting` are the writer answering that it cannot
+    /// save yet; they are not failures of the attempt itself.
+    pub fn attempt_failed(&self) -> bool {
+        transient_receipt(&self.status)
+    }
 }
 
 fn launcher_fence_held(error: &anyhow::Error) -> bool {
@@ -529,6 +538,10 @@ pub async fn record_required_launcher(
 /// Saved or Unchanged is the only durable reply. A missing link, a refused
 /// writer, or an in-progress recovery is [`ReceiptNotSaved`]. A compare
 /// failure stays a normal error so the caller does not retry a changed selection.
+///
+/// An unsaved attempt is not logged here. Every caller logs its own
+/// [`ReceiptNotSaved`] line with its context and level, so one attempt is one
+/// line (issue #552).
 async fn forward(
     link: Option<&crate::control::WriterLink>,
     op: ControlOp,
@@ -542,7 +555,6 @@ async fn forward(
         Ok(ControlReply::Busy) => Err(receipt_not_saved("busy")),
         Ok(ControlReply::StillWaiting) => Err(receipt_not_saved("still waiting")),
         Ok(ControlReply::Failed { message, .. }) if transient_receipt(&message) => {
-            tracing::warn!("API launcher receipt was not recorded: {message}");
             Err(receipt_not_saved(message))
         }
         Ok(ControlReply::Failed { message, .. })
@@ -554,10 +566,11 @@ async fn forward(
             tracing::warn!("API launcher receipt was not recorded: {message}");
             anyhow::bail!("{message}")
         }
-        Err(error) => {
-            tracing::warn!("API launcher receipt was not recorded: {error:#}");
-            Err(receipt_not_saved(crate::control::CONTROL_LINK_UNAVAILABLE))
-        }
+        // The link did not answer. Keep the transport cause in the chain so the
+        // caller's one line still carries it.
+        Err(error) => Err(error.context(ReceiptNotSaved {
+            status: crate::control::CONTROL_LINK_UNAVAILABLE.to_owned(),
+        })),
     }
 }
 
@@ -900,7 +913,9 @@ impl UpdateControl {
                 Ok(true) => return true,
                 Ok(false) => {
                     if !warned {
-                        tracing::warn!(
+                        // Expected during every rolling swap while the old
+                        // launcher's fence is still live (issue #552).
+                        tracing::info!(
                             "another bot launcher still holds the fence and this launcher is waiting"
                         );
                         warned = true;
@@ -916,6 +931,12 @@ impl UpdateControl {
 
     pub fn writes_locally(&self) -> bool {
         !self.db.is_read_only()
+    }
+
+    /// Whether a read-only API launcher can send its paired-upgrade steps to
+    /// the bot launcher at all.
+    pub fn has_launcher_link(&self) -> bool {
+        self.launcher.is_some()
     }
 
     pub async fn schema_version(&self) -> Result<i64> {
@@ -2346,6 +2367,98 @@ mod tests {
         assert!(
             reader.upgrade().await.unwrap().unwrap().error.is_none(),
             "an API launcher must not record an upgrade error"
+        );
+    }
+
+    /// Issue #552: `forward` logs nothing for an unsaved attempt. Its caller
+    /// owns the one line for that attempt, so a refused link and a transient
+    /// writer refusal each come back as `ReceiptNotSaved` with no log here.
+    /// The refused link keeps its transport cause in the error chain.
+    #[tokio::test]
+    async fn forwarded_unsaved_receipts_are_logged_only_by_the_caller() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        // Reserve a loopback port and close the listener, so the link is
+        // refused exactly as during a rolling swap before the new bot starts.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused = listener.local_addr().unwrap();
+        drop(listener);
+        // A writer that answers with a transient refusal, as a bot that is
+        // not the writer yet does.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let refusing = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            crate::control::read_frame(&mut stream).unwrap();
+            crate::control::write_frame(
+                &mut stream,
+                &ControlReply::Failed {
+                    message: crate::control::NOT_THE_WRITER.to_owned(),
+                    code: None,
+                },
+            )
+            .unwrap();
+        });
+        let secret = "k".repeat(32);
+        let mut opts = f.opts.clone();
+        opts.read_only = true;
+        let api = |addr: std::net::SocketAddr| {
+            let link = crate::control::try_writer_link(&addr.to_string(), &secret)
+                .unwrap()
+                .unwrap();
+            UpdateControl::open(&opts)
+                .unwrap()
+                .unwrap()
+                .with_writer_link(link)
+        };
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Capture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let capture = tracing::subscriber::set_default(subscriber);
+        let link_down = api(refused)
+            .baked_launcher("api", &"a".repeat(64), 1)
+            .await
+            .unwrap_err();
+        let not_writer = api(refusing)
+            .baked_launcher("api", &"a".repeat(64), 1)
+            .await
+            .unwrap_err();
+        drop(capture);
+        server.join().unwrap();
+        for (error, status) in [
+            (&link_down, crate::control::CONTROL_LINK_UNAVAILABLE),
+            (&not_writer, crate::control::NOT_THE_WRITER),
+        ] {
+            let unsaved = error
+                .downcast_ref::<ReceiptNotSaved>()
+                .unwrap_or_else(|| panic!("the receipt must be deferred: {error:#}"));
+            assert_eq!(unsaved.status, status, "the caller must see why: {error:#}");
+            assert!(unsaved.attempt_failed(), "{status} is a failed attempt");
+        }
+        assert_eq!(
+            format!("{link_down:#}"),
+            "launcher receipt was not saved (control link unavailable): waiting",
+            "the transport cause stays in the caller's line"
+        );
+        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains("receipt was not recorded"),
+            "the forwarding layer must not log an unsaved attempt: {logs}"
         );
     }
 

@@ -26,6 +26,7 @@ tracing = "0.1"
 axum = "0.8"
 jmodguard = { path = "../..", features = ["test-support"] }
 jmodguard-bot = { path = "../bot" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bin]]
 name = "jmodguard-launcher"

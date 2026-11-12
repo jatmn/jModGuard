@@ -303,6 +303,7 @@ fn controller(
         baked_fallback_installed: None,
         pending_startup: Vec::new(),
         activation_receipts: ReceiptBackoff::default(),
+        startup_link_down_since: None,
         readiness_receipt: ReadinessReceipt::Pending,
         last_observed: None,
         core_migration_wait: None,
@@ -2179,6 +2180,220 @@ async fn api_role_serves_immediately_and_stores_startup_receipts_once_the_bot_is
     );
     service.stop_application().await.unwrap();
     drop(bot);
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+#[derive(Clone)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Every event on this thread at any level, formatted as the launcher logs
+/// it, until the guard is dropped.
+fn capture_all_logs() -> (
+    Arc<std::sync::Mutex<Vec<u8>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = LogCapture(bytes.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    (bytes, tracing::subscriber::set_default(subscriber))
+}
+
+fn captured(bytes: &std::sync::Mutex<Vec<u8>>) -> String {
+    String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+}
+
+/// Issue #552: a rolling swap leaves the local bot control link unreachable
+/// while the new bot launcher waits for the old pod's fence. Each flush
+/// attempt in that window must log one INFO line, and no WARN before the
+/// fence-TTL bound. The receipts stay queued and the application still runs.
+#[tokio::test]
+async fn api_role_startup_receipts_log_one_info_line_per_unreachable_link_attempt() {
+    let root = std::env::temp_dir().join(format!(
+        "api-startup-unreachable-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let binary = http_application(&root).await;
+    let db_path = root.join("core.db");
+    let _db = Db::open(&db_path, 2).unwrap();
+    // A configured link with no listener is the swap state from the issue.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let secret = "x".repeat(32);
+    let link = jmodguard::control::try_writer_link(&addr.to_string(), &secret)
+        .unwrap()
+        .expect("writer link");
+    let control = UpdateControl::open(&read_only_options(&db_path))
+        .unwrap()
+        .unwrap()
+        .with_writer_link(link);
+    let hash = "ab".repeat(32);
+    let planned = plan_api_startup(&control, "api", &hash, None, None)
+        .await
+        .unwrap();
+    let mut service = controller(
+        "api",
+        binary,
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control,
+        &root,
+    );
+    service.enabled = false;
+    service.pending_startup = planned;
+    let (bytes, capture) = capture_all_logs();
+    // Two attempts on consecutive polls, as every deploy produces.
+    assert!(!service.tick().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(!service.tick().await.unwrap());
+    drop(capture);
+    assert_eq!(
+        service.pending_startup.len(),
+        2,
+        "unsaved receipts must stay queued for the retry"
+    );
+    let ready = service
+        .running
+        .as_ref()
+        .expect("normal application was not started")
+        .ready_file
+        .clone();
+    let body = application_route(&ready.with_extension("port")).await;
+    assert!(body.contains("{\"ok\":true}"), "{body}");
+    let logs = captured(&bytes);
+    let lines = logs
+        .matches("launcher startup receipt was not saved")
+        .count();
+    assert_eq!(lines, 2, "exactly one line per attempt: {logs}");
+    assert!(
+        !logs.contains("WARN"),
+        "no warning before the bound: {logs}"
+    );
+    service.stop_application().await.unwrap();
+    drop(_db);
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+/// A paired-upgrade step from the API launcher that the bot launcher link
+/// does not answer is retried on the next poll, not failed. That retry must
+/// still log one WARN per attempt with the cause, so a stalled pair is
+/// visible at the default level; `forward` itself no longer logs it.
+#[tokio::test]
+async fn api_role_paired_step_over_an_unreachable_launcher_link_warns_once_per_attempt() {
+    let root = std::env::temp_dir().join(format!(
+        "api-pair-unreachable-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let stamp = now();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let writer = UpdateControl::from_application(&db);
+    let bot = release_at("bot", 'a', db::CORE_SCHEMA_VERSION);
+    let api = release_at("api", 'b', db::CORE_SCHEMA_VERSION);
+    for item in [&bot, &api] {
+        writer
+            .checked(&item.component, "latest", Some(item.clone()), None, stamp)
+            .await
+            .unwrap();
+        writer
+            .running(&item.component, None, fresh_observation(stamp), stamp)
+            .await
+            .unwrap();
+    }
+    let op = writer
+        .request_upgrade(&bot.digest, &api.digest, false, stamp)
+        .await
+        .unwrap();
+    // A configured bot launcher link with no listener: the bot launcher is
+    // re-executing or still waiting for the fence.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let link = jmodguard::control::try_writer_link(&addr.to_string(), &"x".repeat(32))
+        .unwrap()
+        .expect("launcher link");
+    let control = UpdateControl::open(&read_only_options(&root.join("core.db")))
+        .unwrap()
+        .unwrap()
+        .with_launcher_link(link);
+    let mut service = controller(
+        "api",
+        root.join("unused-api"),
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control,
+        &root,
+    );
+    let (bytes, capture) = capture_all_logs();
+    for _ in 0..2 {
+        assert!(
+            !service.tick_control().await.unwrap(),
+            "an unsaved paired step is retried, not failed"
+        );
+    }
+    drop(capture);
+    let logs = captured(&bytes);
+    let warnings: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("paired upgrade step was not saved"))
+        .collect();
+    assert_eq!(warnings.len(), 2, "one line per attempt: {logs}");
+    for line in warnings {
+        assert!(line.contains("WARN"), "a stalled pair must warn: {logs}");
+        assert!(
+            line.contains("control link unavailable"),
+            "the line must say why: {logs}"
+        );
+    }
+    assert!(
+        !logs.contains("receipt was not recorded"),
+        "the forwarding layer must not add a second line: {logs}"
+    );
+    // With no launcher link configured, startup already warned once that
+    // paired upgrades cannot advance; each poll must not repeat it.
+    let unlinked = UpdateControl::open(&read_only_options(&root.join("core.db")))
+        .unwrap()
+        .unwrap();
+    assert!(!unlinked.has_launcher_link());
+    let mut unlinked = controller(
+        "api",
+        root.join("unused-api"),
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        unlinked,
+        &root,
+    );
+    let (bytes, capture) = capture_all_logs();
+    for _ in 0..2 {
+        assert!(!unlinked.tick_control().await.unwrap());
+    }
+    drop(capture);
+    let logs = captured(&bytes);
+    assert!(
+        !logs.contains("paired upgrade step was not saved"),
+        "a missing link is reported once at startup, not every poll: {logs}"
+    );
+    let stored = writer.upgrade().await.unwrap().unwrap();
+    assert_eq!(stored.id, op.id);
+    assert_eq!(stored.phase, op.phase, "the pair did not advance");
+    assert!(
+        stored.error.is_none(),
+        "a missing link is not a failed pair"
+    );
+    drop((service, unlinked, writer, db));
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
 
