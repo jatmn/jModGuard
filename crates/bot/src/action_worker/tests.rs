@@ -2803,3 +2803,98 @@ async fn timed_ban_expiry_holds_the_command_ban_slot_through_dispatch() {
     // The slot is released after dispatch.
     drop(crate::member_directory::begin_command_ban_in_progress(&app, 10, 20).unwrap());
 }
+
+struct OwnerLeaveDiscord {
+    membership: bool,
+    leaves: std::sync::Mutex<Vec<i64>>,
+    outcome: Outcome,
+    checks: AtomicUsize,
+}
+#[serenity::async_trait]
+impl DiscordActions for OwnerLeaveDiscord {
+    async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+        Ok(self.membership)
+    }
+    async fn guild_joined_at_ns(&self, _: i64) -> Result<Option<i64>> {
+        Ok(Some(1))
+    }
+    async fn authorized(&self, _: &BotAction) -> Result<bool> {
+        // The platform owner holds no membership in an arbitrary customer
+        // guild; a lookup here would fail. Owner actions must skip it.
+        self.checks.fetch_add(1, Ordering::SeqCst);
+        Ok(false)
+    }
+    async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
+        Ok(true)
+    }
+    async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+        panic!("not an unban")
+    }
+    async fn leave_guild(&self, guild: i64) -> Outcome {
+        self.leaves.lock().unwrap().push(guild);
+        self.outcome
+    }
+}
+
+#[tokio::test]
+async fn owner_leave_dispatches_without_an_actor_membership_check() {
+    for (outcome, expected) in [
+        (
+            Outcome::succeeded("left_guild"),
+            ("succeeded", "left_guild"),
+        ),
+        (
+            Outcome::succeeded("already_left"),
+            ("succeeded", "already_left"),
+        ),
+        (
+            Outcome::failed("discord_rejected"),
+            ("failed", "discord_rejected"),
+        ),
+    ] {
+        let f = Fixture::new();
+        let job = f.enqueue(10, "leave", Action::LeaveGuild {}).await;
+        let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
+        let discord = OwnerLeaveDiscord {
+            membership: true,
+            leaves: std::sync::Mutex::new(Vec::new()),
+            outcome,
+            checks: AtomicUsize::new(0),
+        };
+        execute(&f.db, &discord, &claim, &WorkerLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(*discord.leaves.lock().unwrap(), vec![10]);
+        assert_eq!(
+            discord.checks.load(Ordering::SeqCst),
+            0,
+            "owner actions skip the actor permission check"
+        );
+        let (state, code) = f.persisted_status(&job).await;
+        assert_eq!(state, expected.0);
+        assert_eq!(code.as_deref(), Some(expected.1));
+    }
+}
+
+#[tokio::test]
+async fn owner_leave_requires_the_captured_membership() {
+    let f = Fixture::new();
+    let job = f.enqueue(10, "leave", Action::LeaveGuild {}).await;
+    let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
+    let discord = OwnerLeaveDiscord {
+        membership: false,
+        leaves: std::sync::Mutex::new(Vec::new()),
+        outcome: Outcome::succeeded("left_guild"),
+        checks: AtomicUsize::new(0),
+    };
+    execute(&f.db, &discord, &claim, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert!(
+        discord.leaves.lock().unwrap().is_empty(),
+        "a changed membership must never dispatch a departure"
+    );
+    let (state, code) = f.persisted_status(&job).await;
+    assert_eq!(state, "failed");
+    assert_eq!(code.as_deref(), Some("bot_membership_changed"));
+}

@@ -394,6 +394,16 @@ Bot, API and WebUI updates use independent GHCR images; see [BUNNY-UPDATES.md](B
 Release Please manages Stable versions. Scheduled Nightly image tags remain separate
 from the stable baseline and do not move `latest`; see [RELEASES.md](RELEASES.md).
 
+## Implemented: owner server directory
+
+The main WebUI has an owner-only "Bot servers" sub-section listing every server the
+bot is or was connected to, who added the bot (a bounded audit-log BOT_ADD lookup at
+join time, backfilled by a paced startup pass), member count and join date. The owner
+can make the bot depart a server through the durable action queue; departure retires
+the enrollment like any other membership change. Routes live under `/api/owner-servers`,
+are gated on the configured bot owner session (`bot.owner_id`) with a trusted-origin
+check, and never fetch the Discord guild list.
+
 ## Implemented: public installation
 
 Operators can install from this public repository without the private ops repo.

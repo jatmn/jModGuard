@@ -1361,6 +1361,8 @@ fn can_access_action(auth: &AuthCtx, guild: u64, action: &Action) -> bool {
         Action::Unban { .. } => auth.can_ban_members(guild),
         Action::SetLogChannel { .. } => auth.can_manage(guild),
         Action::MemberSync { .. } => auth.can_manage(guild),
+        // Owner-only platform action; never exposed through guild dashboards.
+        Action::LeaveGuild {} => false,
     }
 }
 

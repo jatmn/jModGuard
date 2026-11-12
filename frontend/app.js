@@ -127,6 +127,217 @@ function OwnerTools() {
     ),
   );
 }
+function directoryTime(joinedAtNs) {
+  if (joinedAtNs === null || joinedAtNs === undefined || joinedAtNs === "") return "Unknown";
+  const date = new Date(Number(joinedAtNs) / 1e6);
+  return Number.isNaN(date.getTime()) ? "Unknown" : date.toLocaleString(undefined, { timeZoneName: "short" });
+}
+
+function serverIconUrl(server) {
+  return server.icon_hash
+    ? `https://cdn.discordapp.com/icons/${server.guild_id}/${server.icon_hash}.png`
+    : null;
+}
+
+function directoryStatusLabel(server, receipt) {
+  if (receipt) {
+    if (botActionPhase(receipt) === "active") return ["Removing…", "badge-warning"];
+    return [`Removal ${receipt.state}`, "badge-error"];
+  }
+  if (!server.active) return ["Departed", "badge-neutral"];
+  return server.name ? ["Active", "badge-success"] : ["Active (details pending)", "badge-success"];
+}
+
+function TabOwnerServers() {
+  const result = useApiRead("/api/owner-servers");
+  const [receipts, setReceipts] = useState({});
+  const timers = useRef(new Set());
+  const mounted = useRef(true);
+  useEffect(() => () => {
+    mounted.current = false;
+    for (const timer of timers.current) clearTimeout(timer);
+    timers.current.clear();
+  }, []);
+  if (!isBotOwner()) {
+    return emptyPanel(
+      "Owner access required",
+      "This section is available only to the configured bot owner.",
+    );
+  }
+  const clearReceipt = (guildId) => {
+    setReceipts((current) => {
+      const next = { ...current };
+      delete next[guildId];
+      return next;
+    });
+  };
+  const pollRemoval = (server, job, attempt) => {
+    if (!mounted.current) return;
+    setReceipts((current) => ({ ...current, [server.guild_id]: job }));
+    if (botActionPhase(job) !== "active") {
+      clearReceipt(server.guild_id);
+      const label = server.name || `server ${server.guild_id}`;
+      if (job.state === "succeeded") {
+        toast(`The bot left ${label}. It can only return if someone adds it again.`, "success");
+      } else {
+        toast(`Removal ${job.state}: ${job.outcome || "verify the outcome in Discord."}`, "error");
+      }
+      result.refresh();
+      return;
+    }
+    if (attempt >= actionReconcileDelays.length) {
+      clearReceipt(server.guild_id);
+      toast("The removal is still running. Refresh the directory to verify the outcome.", "info");
+      return;
+    }
+    const timer = setTimeout(async () => {
+      timers.current.delete(timer);
+      try {
+        const next = await api(
+          `/api/owner-servers/${server.guild_id}/actions/${encodeURIComponent(job.id)}`,
+          "POST",
+        );
+        pollRemoval(server, next, attempt + 1);
+      } catch (error) {
+        if (handleAuthLoss(error)) return;
+        // Once the bot departs, the enrollment retirement hides the row from
+        // enrollment-bound receipt reads; the refreshed directory tells the
+        // truth.
+        if (error.status === 404 || error.status === 409) {
+          clearReceipt(server.guild_id);
+          toast("The removal receipt is no longer listed. Refresh shows the current state.", "info");
+          result.refresh();
+          return;
+        }
+        // A lost response keeps the queued identity; retry the same receipt
+        // instead of inventing an outcome.
+        if (attempt + 1 < actionReconcileDelays.length) pollRemoval(server, job, attempt + 1);
+        else {
+          clearReceipt(server.guild_id);
+          toast("Removal receipt unavailable. Refresh the directory to verify the outcome.", "error");
+        }
+      }
+    }, actionReconcileDelays[attempt] || 30000);
+    timers.current.add(timer);
+  };
+  const requestRemoval = async (server) => {
+    if (!server.active) return;
+    const label = server.name || `server ${server.guild_id}`;
+    if (
+      !confirm(
+        `Remove the bot from ${label}? It will leave immediately and stop moderating that server. Someone must add it again for the bot to return.`,
+      )
+    )
+      return;
+    let job;
+    try {
+      job = await api(`/api/owner-servers/${server.guild_id}/leave`, "POST", {
+        request_id: `${Math.floor(Date.now() / 1000)}_${crypto.randomUUID()}`,
+      });
+    } catch (error) {
+      reportApiError(error);
+      return;
+    }
+    if (botActionPhase(job) === "invalid") {
+      toast("Removal acknowledgment was invalid. Refresh the directory to verify the outcome.", "error");
+      return;
+    }
+    pollRemoval(server, job, 0);
+  };
+  const servers = result.data?.servers || [];
+  return h(
+    "div",
+    null,
+    h("h2", null, "Bot servers"),
+    h(
+      "p",
+      { className: "muted" },
+      "Every server the bot is or was connected to, who added it, and when. Removing the bot makes it depart that server immediately.",
+    ),
+    h(
+      "div",
+      { className: "row", style: { marginBottom: "12px" } },
+      h(ActionButton, { className: "btn", onClick: () => result.refresh() }, "Refresh"),
+    ),
+    h(
+      DataTable,
+      { headings: ["Server", "Server ID", "Added by", "Members", "Added", "Status", "Manage"] },
+      result.loading || result.error || !servers.length
+        ? h(
+            "tr",
+            null,
+            h(
+              "td",
+              { colSpan: 7, className: result.error ? "err" : result.loading ? "" : "muted" },
+              result.loading
+                ? "Loading…"
+                : result.error
+                  ? "Could not load the directory: " + result.error.message
+                  : "No servers yet. The bot appears here when someone adds it to a server.",
+            ),
+          )
+        : servers.map((server) => {
+            const [status, statusClass] = directoryStatusLabel(server, receipts[server.guild_id]);
+            const icon = serverIconUrl(server);
+            return h(
+              "tr",
+              { key: server.guild_id },
+              h(
+                "td",
+                null,
+                h(
+                  "div",
+                  { style: { display: "flex", alignItems: "center", gap: "8px" } },
+                  icon &&
+                    h("img", {
+                      src: icon,
+                      alt: "",
+                      width: 24,
+                      height: 24,
+                      style: { borderRadius: "50%" },
+                    }),
+                  h("span", null, server.name || "Unknown server"),
+                ),
+              ),
+              h("td", { className: "mono" }, server.guild_id),
+              h(
+                "td",
+                null,
+                server.added_by
+                  ? `${server.added_by_name || "Unknown name"} (${server.added_by})`
+                  : "Unknown",
+              ),
+              h(
+                "td",
+                null,
+                server.member_count == null ? "Unknown" : Number(server.member_count).toLocaleString(),
+              ),
+              h("td", null, directoryTime(server.joined_at_ns)),
+              h(
+                "td",
+                null,
+                h("span", { className: `badge badge-soft badge-sm ${statusClass}` }, status),
+              ),
+              h(
+                "td",
+                null,
+                server.active &&
+                  h(
+                    ActionButton,
+                    {
+                      className: "btn btn-sm btn-error",
+                      disabled: Boolean(receipts[server.guild_id]),
+                      onClick: () => requestRemoval(server),
+                    },
+                    "Remove",
+                  ),
+              ),
+            );
+          }),
+    ),
+  );
+}
+
 function App() {
   const appearance = useAppearance();
   const display = useStore(ui);
@@ -141,7 +352,7 @@ function App() {
     window.addEventListener("beforeunload", beforeUnload);
     return () => window.removeEventListener("beforeunload", beforeUnload);
   }, []);
-  const navigation = [
+  const navigationBase = [
     ["dashboard", "◈", "Dashboard"],
     ["rules", "◇", "Automod Rules"],
     ["badwords", "⊘", "Badwords"],
@@ -157,6 +368,11 @@ function App() {
     ["cases", "▣", "Cases"],
     ["settings", "⚙", "Settings"],
   ];
+  // The owner directory is a main-interface sub-section, not part of the
+  // separate /administration page. It appears only for the bot owner.
+  const navigation = isBotOwner()
+    ? [...navigationBase, ["servers", "⌂", "Bot servers"]]
+    : navigationBase;
   return h(
     BusyContext.Provider,
     { value: (display.activity === "busy") },
@@ -213,11 +429,11 @@ function App() {
                 "ul",
                 { id: "tabs", className: "menu w-full" },
                 ...navigation.flatMap(([tab, icon, label], i) => [
-                  (i === 0 || i === 6) &&
+                  (i === 0 || i === 6 || i === navigationBase.length) &&
                     h(
                       "li",
                       { key: `group-${i}`, className: "nav-label menu-title" },
-                      i === 0 ? "Workspace" : "Community",
+                      i === 0 ? "Workspace" : i === 6 ? "Community" : "Owner",
                     ),
                   h(
                     "li",
@@ -408,7 +624,11 @@ function Content() {
     actions: tabActions,
     cases: tabCases,
     settings: tabSettings,
+    servers: TabOwnerServers,
   };
+  // The owner directory lists every server the bot serves; it needs no
+  // selected guild or loaded configuration.
+  if (state.tab === "servers") return h(components.servers);
   if (!state.guildId)
     return emptyPanel(
       "No servers to manage yet",
@@ -556,6 +776,7 @@ const tabs = [
   "actions",
   "cases",
   "settings",
+  "servers",
 ];
 
 let pendingCase = null;

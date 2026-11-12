@@ -118,6 +118,12 @@ pub trait DiscordActions: Send + Sync {
     async fn authorized(&self, job: &BotAction) -> Result<bool>;
     async fn valid_log_channel(&self, guild: i64, channel: i64) -> Result<bool>;
     async fn unban(&self, guild: i64, user: i64, reason: &str) -> Outcome;
+    /// Depart one guild. Live implementations race the Discord call; test
+    /// implementations may keep the default refusal.
+    async fn leave_guild(&self, guild: i64) -> Outcome {
+        let _ = guild;
+        Outcome::failed("leave_unavailable")
+    }
 }
 pub struct LiveDiscord<'a> {
     pub http: &'a serenity::http::Http,
@@ -192,6 +198,23 @@ impl DiscordActions for LiveDiscord<'_> {
             }
         }
     }
+    async fn leave_guild(&self, guild: i64) -> Outcome {
+        match crate::discord::race_discord_call(
+            self.activation,
+            self.http.leave_guild(GuildId::new(guild as u64)),
+        )
+        .await
+        {
+            crate::discord::DiscordCall::Cancelled => Outcome::uncertain("discord_outcome_unknown"),
+            crate::discord::DiscordCall::Finished(Ok(())) => Outcome::succeeded("left_guild"),
+            crate::discord::DiscordCall::Finished(Err(serenity::Error::Http(
+                serenity::http::HttpError::UnsuccessfulRequest(r),
+            ))) => classify_leave_response(r.status_code.as_u16(), r.error.code),
+            crate::discord::DiscordCall::Finished(Err(_)) => {
+                Outcome::uncertain("discord_outcome_unknown")
+            }
+        }
+    }
 }
 fn actor_authorized(
     guild: &serenity::model::guild::PartialGuild,
@@ -201,6 +224,9 @@ fn actor_authorized(
     let needed = match action {
         Action::Unban { .. } => Permissions::BAN_MEMBERS,
         Action::SetLogChannel { .. } | Action::MemberSync { .. } => Permissions::MANAGE_GUILD,
+        // Unreachable through the worker: leave actions skip the actor check
+        // because the platform owner holds no membership in arbitrary guilds.
+        Action::LeaveGuild {} => Permissions::empty(),
     };
     let permissions = guild.member_permissions(member);
     if guild.owner_id == member.user.id || permissions.administrator() {
@@ -220,6 +246,18 @@ fn actor_authorized(
 fn classify_unban_response(status: u16, code: isize) -> Outcome {
     if status == 404 && code == 10026 {
         Outcome::succeeded("already_unbanned")
+    } else if (400..500).contains(&status) && status != 408 {
+        Outcome::failed("discord_rejected")
+    } else {
+        Outcome::uncertain("discord_outcome_unknown")
+    }
+}
+
+fn classify_leave_response(status: u16, code: isize) -> Outcome {
+    // A missing guild means the bot already departed (or was removed); the
+    // removal request succeeded as an idempotent no-op, like already_unbanned.
+    if status == 404 && code == 10004 {
+        Outcome::succeeded("already_left")
     } else if (400..500).contains(&status) && status != 408 {
         Outcome::failed("discord_rejected")
     } else {
@@ -347,10 +385,16 @@ async fn execute_inner(
         if chrono::Utc::now().timestamp() >= job.expires_at {
             return Outcome::failed("expired_before_execution");
         }
-        match discord.authorized(job).await {
-            Ok(true) => {}
-            Ok(false) => return Outcome::failed("permission_revoked"),
-            Err(_) => return Outcome::failed("permission_check_unavailable"),
+        if matches!(job.action, Action::LeaveGuild {}) {
+            // Owner-only platform action admitted by the API's owner gate. The
+            // actor is not a guild member, so there is no permission to check.
+            // Fresh bot membership above remains required to depart a guild.
+        } else {
+            match discord.authorized(job).await {
+                Ok(true) => {}
+                Ok(false) => return Outcome::failed("permission_revoked"),
+                Err(_) => return Outcome::failed("permission_check_unavailable"),
+            }
         }
         if chrono::Utc::now().timestamp() >= job.expires_at {
             return Outcome::failed("expired_before_execution");
@@ -493,6 +537,18 @@ async fn execute_inner(
                     app.release_gateway_case_suppression(suppression);
                 }
                 outcome
+            }
+            Action::LeaveGuild {} => {
+                if chrono::Utc::now().timestamp() >= job.expires_at {
+                    return Outcome::failed("expired_before_execution");
+                }
+                if app.is_some_and(|app| !app.activation.may_record()) {
+                    return Outcome::failed("writer_lease_not_held");
+                }
+                mutation.start();
+                // The subsequent departure retires the enrollment through the
+                // normal gateway path, including erasure and work invalidation.
+                discord.leave_guild(job.guild_id).await
             }
             Action::SetLogChannel {
                 channel_id: Some(channel),

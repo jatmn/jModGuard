@@ -39,6 +39,8 @@ pub use bootstrap::*;
 pub use bootstrap::{meta_string_conn, write_meta_string_conn};
 mod enrollments;
 pub use enrollments::*;
+mod guild_join_info;
+pub use guild_join_info::*;
 mod configuration;
 mod known_bad_images;
 mod known_spam;
@@ -92,6 +94,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0022_clear_userinfo_command_rows.sql"),
     include_str!("../migrations/0023_ban_expiry.sql"),
     include_str!("../migrations/0024_known_spam.sql"),
+    include_str!("../migrations/0025_guild_join_info.sql"),
 ];
 
 /// Completed core schema required by service startup and release observations.

@@ -3028,6 +3028,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
                  DROP INDEX idx_bans_one_active; ALTER TABLE bans DROP COLUMN operation_id;
                  DROP INDEX idx_bans_expiry;
                  ALTER TABLE bans DROP COLUMN expires_at; ALTER TABLE bans DROP COLUMN expiry_enrollment_id;
+                 DROP TABLE IF EXISTS guild_join_info;
                  PRAGMA user_version=16;",
                 1024 * 1024,
             )?;
@@ -3356,6 +3357,7 @@ async fn stale_schema_selections_without_upgrade_are_refused_once_after_migratio
                  DROP INDEX idx_bans_one_active; ALTER TABLE bans DROP COLUMN operation_id;
                  DROP INDEX idx_bans_expiry;
                  ALTER TABLE bans DROP COLUMN expires_at; ALTER TABLE bans DROP COLUMN expiry_enrollment_id;
+                 DROP TABLE IF EXISTS guild_join_info;
                  PRAGMA user_version=16;",
                 1024 * 1024,
             )?;
