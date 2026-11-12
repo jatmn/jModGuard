@@ -328,6 +328,57 @@ test('dashboard count explainer is an accessible, keyboard-reachable tooltip', a
   assert.equal(tip.hidden, true);
 });
 
+test('count tooltip stays open while the pointer moves from the trigger onto its text', async () => {
+  const { app } = harness(async () => response({ events: 7, warns: 2, bans: 1, cases: 4 }));
+  app.state.config = configuredDashboard();
+  const dashboard = app.tabDashboard();
+  await settle();
+  const trigger = dashboard.querySelector('.info-tip-trigger');
+  const tip = dashboard.querySelector(`#${trigger.getAttribute('aria-describedby')}`);
+  const outside = trigger.closest('.stat').querySelector('.stat-value');
+  await fire(trigger, 'mouseover', { relatedTarget: outside });
+  assert.equal(tip.hidden, false, 'hovering the trigger shows the text');
+  // The text, and the bridge drawn over the gap above it, are inside the hover area.
+  await fire(trigger, 'mouseout', { relatedTarget: tip });
+  await fire(tip, 'mouseover', { relatedTarget: trigger });
+  assert.equal(tip.hidden, false, 'moving onto the text keeps it open');
+  await fire(tip, 'mouseout', { relatedTarget: outside });
+  await fire(outside, 'mouseover', { relatedTarget: tip });
+  assert.equal(tip.hidden, true, 'leaving the text and trigger hides it');
+  // CSS: the text sits below a gap; a transparent ::before on the text covers that gap and its border.
+  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
+  const text = css.match(/^\.info-tip-text \{([^}]*)\}/m)?.[1] ?? '';
+  const gap = Number(text.match(/top:\s*calc\(100% \+ (\d+)px\)/)?.[1]);
+  const border = Number(text.match(/border:\s*(\d+)px/)?.[1] ?? 0);
+  assert.ok(gap > 0, 'the text keeps its visual spacing below the trigger');
+  const bridge = css.match(/^\.info-tip-text::before \{([^}]*)\}/m)?.[1] ?? '';
+  assert.match(bridge, /content:\s*""/, 'expected a bridge over the gap');
+  assert.match(bridge, /position:\s*absolute/);
+  assert.match(bridge, /bottom:\s*100%/);
+  assert.match(bridge, /inset-inline:\s*0/);
+  assert.doesNotMatch(bridge, /pointer-events:\s*none/);
+  assert.ok(Number(bridge.match(/height:\s*(\d+)px/)?.[1]) >= gap + border, 'the bridge spans the gap and border');
+});
+
+test('hover-opened count tooltip closes on Escape wherever focus is and drops its listener', async () => {
+  const h = harness(async () => response({ events: 7, warns: 2, bans: 1, cases: 4 }));
+  h.app.state.config = configuredDashboard();
+  const dashboard = h.app.tabDashboard();
+  await settle();
+  const trigger = dashboard.querySelector('.info-tip-trigger');
+  const tip = dashboard.querySelector(`#${trigger.getAttribute('aria-describedby')}`);
+  assert.equal(h.documentListeners.has('keydown'), false, 'no listener while closed');
+  await fire(trigger.parentElement, 'mouseover');
+  assert.equal(tip.hidden, false);
+  assert.notEqual(h.document.activeElement, trigger, 'focus stays elsewhere');
+  await fire(h.document.body, 'keydown', { key: 'a' });
+  assert.equal(tip.hidden, false, 'other keys leave it open');
+  await fire(h.document.body, 'keydown', { key: 'Escape' });
+  assert.equal(tip.hidden, true, 'Escape dismisses hover-opened text');
+  assert.equal(trigger.getAttribute('aria-expanded'), 'false');
+  assert.equal(h.documentListeners.has('keydown'), false, 'closing removes the document listener');
+});
+
 test('analytics opens with a one-line page header instead of the hero card', async () => {
   const { app } = harness(() => new Promise(() => {}));
   app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };

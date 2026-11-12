@@ -1978,9 +1978,19 @@ function pageHeader(title, detail, ...actions) {
 }
 
 // Explanatory text behind a keyboard-focusable info button. The text is the
-// button's accessible description; it shows on hover or focus and Escape hides it.
+// button's accessible description; it shows on hover or focus. The pointer can
+// move onto the text (it sits inside the hover area), and Escape hides it
+// wherever focus is, so hover-opened text is dismissible too (WCAG 1.4.13).
 function InfoTip({ id, label, children }) {
   const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!open) return undefined;
+    const dismiss = (event) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("keydown", dismiss);
+    return () => document.removeEventListener("keydown", dismiss);
+  }, [open]);
   return h(
     "span",
     {
@@ -1999,9 +2009,6 @@ function InfoTip({ id, label, children }) {
         onFocus: () => setOpen(true),
         onBlur: () => setOpen(false),
         onClick: () => setOpen(true),
-        onKeyDown: (event) => {
-          if (event.key === "Escape") setOpen(false);
-        },
       },
       h("span", { "aria-hidden": "true" }, "ⓘ"),
     ),
