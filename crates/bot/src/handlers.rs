@@ -752,6 +752,9 @@ impl EventHandler for Handler {
         app.member_joins.take(guild_id.get(), uid);
         app.automod.member_joined(guild_id.get(), uid);
         let observed_at_ms = chrono::Utc::now().timestamp_millis();
+        // Bind the counter to the membership that observed this event; a
+        // replacement enrollment during the awaits below must refuse it.
+        let enrollment = crate::cases::capture(&app, guild_id.get()).await;
         let membership_refresh =
             crate::member_directory::observe_join(&app, &new_member, observed_at_ms).await;
         logging::emit_member_event(
@@ -764,7 +767,7 @@ impl EventHandler for Handler {
             None,
         )
         .await;
-        if let Some(enrollment) = crate::cases::capture(&app, guild_id.get()).await {
+        if let Some(enrollment) = enrollment {
             crate::logging::log_persistence_result(
                 "member join counter",
                 db::bump_member_daily(&app.db, enrollment, observed_at_ms, 1, 0).await,
@@ -840,6 +843,7 @@ impl EventHandler for Handler {
         let app = Arc::clone(self.app());
         let observed_join = app.member_joins.take(guild_id.get(), user.id.get());
         let departed_at = chrono::Utc::now();
+        let enrollment = crate::cases::capture(&app, guild_id.get()).await;
         let expected_joined_at_ms = member_data
             .as_ref()
             .and_then(|member| member.joined_at)
@@ -875,8 +879,9 @@ impl EventHandler for Handler {
         let extra = logging::member_join_vars_ms(joined_at_ms, departed_at);
         logging::emit_member_event(&app, &ctx, guild_id, "member_leave", &user, extra, None).await;
         // Count every departure that emits `member_leave`, including one the
-        // member directory could not persist.
-        if let Some(enrollment) = crate::cases::capture(&app, guild_id.get()).await {
+        // member directory could not persist, in the membership captured when
+        // the event arrived.
+        if let Some(enrollment) = enrollment {
             crate::logging::log_persistence_result(
                 "member leave counter",
                 db::bump_member_daily(&app.db, enrollment, departed_at.timestamp_millis(), 0, 1)
@@ -3746,11 +3751,17 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[tokio::test]
-    async fn gateway_leave_counts_when_the_directory_cannot_persist_it() {
-        use serenity::client::EventHandler;
+    /// A bot that may record, with guild 10 enrolled and no tenant store, so
+    /// the member directory cannot persist Gateway member events.
+    async fn counter_fixture(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::sync::Arc<BotState>,
+        db::GuildEnrollment,
+    ) {
         let directory =
-            std::env::temp_dir().join(format!("leave_counter_{:032x}", rand::random::<u128>()));
+            std::env::temp_dir().join(format!("{label}_{:032x}", rand::random::<u128>()));
         std::fs::create_dir_all(&directory).unwrap();
         let app = BotState::new(
             Default::default(),
@@ -3769,12 +3780,55 @@ mod tests {
         );
         app.activation.mark_lock_held(true);
         app.activation.note_discord_connected();
-        // No tenant store is active, so the member directory cannot record the
-        // departure; the handler still emits `member_leave`.
         let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        (directory, app, enrollment)
+    }
+
+    /// Discord stub for the member log channel. With `replace`, the first log
+    /// delivery retires and re-enrolls guild 10 before answering, so the
+    /// handler resumes under a replacement membership.
+    async fn counter_context(
+        app: &std::sync::Arc<BotState>,
+        replace: bool,
+    ) -> (
+        serenity::client::Context,
+        tokio::sync::oneshot::Receiver<db::GuildEnrollment>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (replaced, replacement) = tokio::sync::oneshot::channel();
+        let app = std::sync::Arc::clone(app);
+        tokio::spawn(async move {
+            let mut replaced = Some(replaced);
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                if replace && let Some(replaced) = replaced.take() {
+                    db::retire_guild_enrollment(&app.db, 10, 100).await.unwrap();
+                    let next = db::enroll_guild(&app.db, 10, 200).await.unwrap().unwrap();
+                    let _ = replaced.send(next);
+                }
+                let body = r#"{"code":10003,"message":"Unknown Channel"}"#;
+                let response = format!(
+                    "HTTP/1.1 404 Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
         let http = std::sync::Arc::new(
             serenity::http::HttpBuilder::new("fixture")
-                .proxy("http://127.0.0.1:9")
+                .proxy(format!("http://{address}"))
                 .application_id(serenity::model::id::ApplicationId::new(1))
                 .ratelimiter_disabled(true)
                 .build(),
@@ -3784,23 +3838,77 @@ mod tests {
             std::sync::Arc::new(serenity::cache::Cache::new()),
         )
         .await;
-        let user = serde_json::from_value(serde_json::json!({
+        (ctx, replacement)
+    }
+
+    fn counter_user() -> serenity::model::user::User {
+        serde_json::from_value(serde_json::json!({
             "id": "99", "username": "member", "discriminator": "0001", "avatar": null
         }))
-        .unwrap();
+        .unwrap()
+    }
+
+    async fn member_counts(app: &BotState, enrollment: db::GuildEnrollment) -> (i64, i64) {
+        let analytics = db::enrolled_guild_analytics(&app.db, enrollment, 1)
+            .await
+            .unwrap();
+        (analytics.series[0].joins, analytics.series[0].leaves)
+    }
+
+    #[tokio::test]
+    async fn gateway_leave_counts_when_the_directory_cannot_persist_it() {
+        use serenity::client::EventHandler;
+        let (directory, app, enrollment) = counter_fixture("leave_counter").await;
+        let (ctx, _) = counter_context(&app, false).await;
         let handler = super::Handler {
             app: std::sync::Arc::clone(&app),
         };
         handler
-            .guild_member_removal(ctx, GuildId::new(10), user, None)
+            .guild_member_removal(ctx, GuildId::new(10), counter_user(), None)
             .await;
-        let analytics = db::enrolled_guild_analytics(&app.db, enrollment, 1)
-            .await
-            .unwrap();
-        assert_eq!(analytics.series[0].leaves, 1);
+        assert_eq!(member_counts(&app, enrollment).await, (0, 1));
         drop(handler);
         drop(app);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn member_counters_stay_with_the_enrollment_that_observed_the_event() {
+        use serenity::client::EventHandler;
+        for event in ["member_join", "member_leave"] {
+            let (directory, app, _) = counter_fixture("counter_rebind").await;
+            db::upsert_log_channel(&app.db, 10, event, 999)
+                .await
+                .unwrap();
+            let (ctx, replacement) = counter_context(&app, true).await;
+            let handler = super::Handler {
+                app: std::sync::Arc::clone(&app),
+            };
+            if event == "member_join" {
+                let member = serde_json::from_value(serde_json::json!({
+                    "guild_id": "10",
+                    "user": {"id": "99", "username": "member", "discriminator": "0001", "avatar": null},
+                    "roles": [],
+                    "joined_at": "2026-01-01T00:00:00Z",
+                    "deaf": false,
+                    "mute": false,
+                    "flags": 0
+                }))
+                .unwrap();
+                handler.guild_member_addition(ctx, member).await;
+            } else {
+                handler
+                    .guild_member_removal(ctx, GuildId::new(10), counter_user(), None)
+                    .await;
+            }
+            // Log delivery replaced the membership while the handler waited;
+            // the old event must not count in the new installation.
+            let replacement = replacement.await.expect("log delivery reached Discord");
+            assert_eq!(member_counts(&app, replacement).await, (0, 0), "{event}");
+            drop(handler);
+            drop(app);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 }
 
