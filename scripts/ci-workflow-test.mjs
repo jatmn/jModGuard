@@ -208,6 +208,10 @@ for (const lane of ["rust-api", "rust-bot", "rust-core", "quick", "frontend", "d
   assert.equal(evaluate("cache-targets"), rustTests || ["dylint", "remote-database"].includes(lane));
 }
 const socket = fs.readFileSync(path.join(root, ".github/workflows/socket.yml"), "utf8");
+for (const file of fs.readdirSync(path.join(root, ".github/workflows"))) {
+  const text = fs.readFileSync(path.join(root, ".github/workflows", file), "utf8");
+  assert.doesNotMatch(text, /runs-on: ubuntu-latest/, file + " must pin its runner image");
+}
 assert.match(socket, /^  push:\n    branches: \[main\]$/m);
 assert.match(socket, /JMODGUARD_DIFF_BASE: \$\{\{ github.event.pull_request.base.sha \|\| github.event.before \}\}/);
 assert.match(socket, /JMODGUARD_DIFF_HEAD: \$\{\{ github.event.pull_request.head.sha \|\| github.sha \}\}/);
