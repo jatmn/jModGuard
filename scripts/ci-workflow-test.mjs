@@ -208,6 +208,35 @@ for (const lane of ["rust-api", "rust-bot", "rust-core", "quick", "frontend", "d
   assert.equal(evaluate("cache-targets"), rustTests || ["dylint", "remote-database"].includes(lane));
 }
 const socket = fs.readFileSync(path.join(root, ".github/workflows/socket.yml"), "utf8");
+// runs-on takes the label as a scalar, list or labels group, or through a matrix/env
+// expression, so check every YAML value for the moving label. Comments are not values.
+const yamlValues = text => text.split("\n").map(line => {
+  let quote = "";
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote === '"' && ch === "\\") i++;
+    else if (quote) { if (ch === quote) quote = ""; }
+    else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === "#" && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+  }
+  return line;
+}).join("\n");
+const floatingRunner = /(?<![\w.-])ubuntu-latest(?![\w.-])/;
+const usesFloatingRunner = text => floatingRunner.test(yamlValues(text));
+for (const sample of [
+  "    runs-on: ubuntu-latest", '    runs-on: "ubuntu-latest"', "    runs-on: [self, 'ubuntu-latest']",
+  "    runs-on:\n      - ubuntu-latest", "    runs-on:\n      labels: ubuntu-latest",
+  "      matrix:\n        os: [ubuntu-latest]\n    runs-on: ${{ matrix.os }}",
+]) {
+  assert.ok(usesFloatingRunner(sample), "missed floating runner: " + sample);
+}
+for (const sample of ["    # was ubuntu-latest\n    runs-on: ubuntu-24.04", "    runs-on: ubuntu-24.04 # not ubuntu-latest"]) {
+  assert.ok(!usesFloatingRunner(sample), "comment treated as runner: " + sample);
+}
+for (const file of fs.readdirSync(path.join(root, ".github/workflows")).filter(file => /\.ya?ml$/.test(file))) {
+  const text = fs.readFileSync(path.join(root, ".github/workflows", file), "utf8");
+  assert.ok(!usesFloatingRunner(text), file + " must pin its runner image instead of ubuntu-latest");
+}
 assert.match(socket, /^  push:\n    branches: \[main\]$/m);
 assert.match(socket, /JMODGUARD_DIFF_BASE: \$\{\{ github.event.pull_request.base.sha \|\| github.event.before \}\}/);
 assert.match(socket, /JMODGUARD_DIFF_HEAD: \$\{\{ github.event.pull_request.head.sha \|\| github.sha \}\}/);
