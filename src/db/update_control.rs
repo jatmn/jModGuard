@@ -15,7 +15,7 @@ pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 41;
+pub const LAUNCHER_REVISION: u32 = 42;
 // Selected bots need the auth-exit hold before the readiness deadline check.
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 /// First launcher that verifies an image signature before staging.
@@ -554,8 +554,11 @@ async fn forward(
             tracing::warn!("API launcher receipt was not recorded: {message}");
             anyhow::bail!("{message}")
         }
+        // Transport errors mean the control link is unavailable; every caller
+        // already logs its own `ReceiptNotSaved` line, so this stays at debug
+        // to keep one failed attempt to one log line (issue #552).
         Err(error) => {
-            tracing::warn!("API launcher receipt was not recorded: {error:#}");
+            tracing::debug!("API launcher receipt was not recorded: {error:#}");
             Err(receipt_not_saved(crate::control::CONTROL_LINK_UNAVAILABLE))
         }
     }
@@ -900,7 +903,9 @@ impl UpdateControl {
                 Ok(true) => return true,
                 Ok(false) => {
                     if !warned {
-                        tracing::warn!(
+                        // Expected during every rolling swap while the old
+                        // launcher's fence is still live (issue #552).
+                        tracing::info!(
                             "another bot launcher still holds the fence and this launcher is waiting"
                         );
                         warned = true;
@@ -2346,6 +2351,72 @@ mod tests {
         assert!(
             reader.upgrade().await.unwrap().unwrap().error.is_none(),
             "an API launcher must not record an upgrade error"
+        );
+    }
+
+    /// Issue #552: one failed receipt attempt over an unreachable control link
+    /// must not warn from the forwarding layer. The API launcher's supervisor
+    /// decides the level from the returned `ReceiptNotSaved`.
+    #[tokio::test]
+    async fn forwarded_receipt_over_an_unreachable_link_does_not_warn() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        // Reserve a loopback port and close the listener, so the link is
+        // refused exactly as during a rolling swap before the new bot starts.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let secret = "k".repeat(32);
+        let link = crate::control::try_writer_link(&addr.to_string(), &secret)
+            .unwrap()
+            .unwrap();
+        let mut opts = f.opts.clone();
+        opts.read_only = true;
+        let api = UpdateControl::open(&opts)
+            .unwrap()
+            .unwrap()
+            .with_writer_link(link);
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Capture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _capture = tracing::subscriber::set_default(subscriber);
+        let error = api
+            .baked_launcher("api", &"a".repeat(64), 1)
+            .await
+            .unwrap_err();
+        drop(_capture);
+        assert!(
+            error.is::<ReceiptNotSaved>(),
+            "the refused link must defer the receipt: {error:#}"
+        );
+        assert_eq!(
+            error.downcast_ref::<ReceiptNotSaved>().unwrap().status,
+            crate::control::CONTROL_LINK_UNAVAILABLE,
+            "the caller must be able to tell the link is down"
+        );
+        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("API launcher receipt was not recorded"),
+            "the forwarding diagnostic must stay visible at debug: {logs}"
+        );
+        assert!(
+            !logs.contains("WARN"),
+            "one failed attempt must not warn from the forwarding layer: {logs}"
         );
     }
 

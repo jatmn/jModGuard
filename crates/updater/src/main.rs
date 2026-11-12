@@ -30,6 +30,11 @@ use tokio::process::{Child, Command};
 
 const POLL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long an unsaved startup receipt stays INFO-level before warning: the
+/// old pod's launcher fence TTL plus a margin, because a rolling swap waits
+/// exactly that long for the local bot control link (issue #552).
+const STARTUP_RECEIPT_WARN_AFTER: Duration =
+    Duration::from_millis(db::LAUNCHER_FENCE_TTL_MS as u64 + 10_000);
 /// Durable reason stored while the built-in binary is covering an unreachable registry.
 const REGISTRY_OUTAGE_BOOT_MISMATCH: &str = "registry unreachable";
 /// Durable reasons stored when an outage fallback refuses the built-in binary's
@@ -888,6 +893,9 @@ struct Supervisor {
     baked_fallback_installed: Option<ComponentRelease>,
     pending_startup: Vec<StartupReceipt>,
     activation_receipts: ReceiptBackoff,
+    /// When the current run of unsaved startup receipts began, so an
+    /// unreachable control link can stay INFO-level for a normal swap wait.
+    startup_deferred_since: Option<Instant>,
     readiness_receipt: ReadinessReceipt,
     last_observed: Option<Instant>,
 }
@@ -1369,9 +1377,19 @@ impl Supervisor {
                 Ok(()) => {
                     self.pending_startup.remove(0);
                     self.reset_receipt_backoff();
+                    self.startup_deferred_since = None;
                 }
                 Err(error) if Self::receipt_not_saved(&error) => {
-                    tracing::warn!("launcher startup receipt was not saved: {error:#}");
+                    // A rolling swap waits out the old pod's launcher fence
+                    // before the local bot control link answers, so keep the
+                    // normal wait at INFO and warn only past that window
+                    // (issue #552). Other unsaved reasons still warn.
+                    let deferred_for = self.note_startup_deferral();
+                    if Self::startup_receipt_warns(&error, deferred_for) {
+                        tracing::warn!("launcher startup receipt was not saved: {error:#}");
+                    } else {
+                        tracing::info!("launcher startup receipt was not saved: {error:#}");
+                    }
                     self.note_receipt_delay();
                     return Ok(());
                 }
@@ -1379,6 +1397,28 @@ impl Supervisor {
             }
         }
         Ok(())
+    }
+
+    /// Start the deferral clock on the first unsaved startup receipt and
+    /// report how long the current run has been deferred.
+    fn note_startup_deferral(&mut self) -> Duration {
+        self.startup_deferred_since
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+    }
+
+    /// An unreachable control link stays INFO-level for the fence TTL plus a
+    /// margin: every planned rolling swap waits that long, and only a link
+    /// still down afterwards is unexpected. Any other unsaved reason warns
+    /// immediately, as before.
+    fn startup_receipt_warns(error: &anyhow::Error, deferred_for: Duration) -> bool {
+        !Self::control_link_unavailable(error) || deferred_for > STARTUP_RECEIPT_WARN_AFTER
+    }
+
+    fn control_link_unavailable(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<db::ReceiptNotSaved>()
+            .is_some_and(|receipt| receipt.status == jmodguard::control::CONTROL_LINK_UNAVAILABLE)
     }
 
     async fn record_component_failure(
@@ -3408,6 +3448,7 @@ async fn main() -> Result<()> {
         baked_fallback_installed: None,
         pending_startup,
         activation_receipts: ReceiptBackoff::default(),
+        startup_deferred_since: None,
         readiness_receipt: ReadinessReceipt::Pending,
         last_observed: None,
     };
@@ -3962,6 +4003,51 @@ mod tests {
         );
         drop(db);
         tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    fn link_unavailable_error() -> anyhow::Error {
+        db::ReceiptNotSaved {
+            status: jmodguard::control::CONTROL_LINK_UNAVAILABLE.to_owned(),
+        }
+        .into()
+    }
+
+    /// Issue #552: an unreachable control link is a normal rolling-swap wait
+    /// for the launcher fence TTL plus a margin, so those attempts stay at
+    /// INFO and only warn once the wait outlasts that bound.
+    #[test]
+    fn unreachable_link_startup_receipts_stay_quiet_until_the_fence_bound() {
+        let link = link_unavailable_error();
+        assert!(
+            !Supervisor::startup_receipt_warns(&link, Duration::ZERO),
+            "the first attempt must not warn"
+        );
+        assert!(
+            !Supervisor::startup_receipt_warns(&link, STARTUP_RECEIPT_WARN_AFTER),
+            "the bound itself is still a normal wait"
+        );
+        assert!(
+            Supervisor::startup_receipt_warns(
+                &link,
+                STARTUP_RECEIPT_WARN_AFTER + Duration::from_secs(1)
+            ),
+            "a link still down past the bound is unexpected"
+        );
+    }
+
+    /// Other unsaved reasons keep warning immediately.
+    #[test]
+    fn other_unsaved_startup_receipt_reasons_still_warn() {
+        for status in ["waiting", "busy", "still waiting"] {
+            let error: anyhow::Error = db::ReceiptNotSaved {
+                status: status.to_owned(),
+            }
+            .into();
+            assert!(
+                Supervisor::startup_receipt_warns(&error, Duration::ZERO),
+                "{status} must keep warning immediately"
+            );
+        }
     }
 }
 

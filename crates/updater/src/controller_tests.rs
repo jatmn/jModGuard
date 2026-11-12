@@ -303,6 +303,7 @@ fn controller(
         baked_fallback_installed: None,
         pending_startup: Vec::new(),
         activation_receipts: ReceiptBackoff::default(),
+        startup_deferred_since: None,
         readiness_receipt: ReadinessReceipt::Pending,
         last_observed: None,
     }
@@ -2151,6 +2152,97 @@ async fn api_role_serves_immediately_and_stores_startup_receipts_once_the_bot_is
     );
     service.stop_application().await.unwrap();
     drop(bot);
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+/// Issue #552: a rolling swap leaves the local bot control link unreachable
+/// while the new bot launcher waits for the old pod's fence. Each flush
+/// attempt in that window must log one INFO line, and no WARN before the
+/// fence-TTL bound. The receipts stay queued and the application still runs.
+#[tokio::test]
+async fn api_role_startup_receipts_log_one_info_line_per_unreachable_link_attempt() {
+    let root = std::env::temp_dir().join(format!(
+        "api-startup-unreachable-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let binary = http_application(&root).await;
+    let db_path = root.join("core.db");
+    let _db = Db::open(&db_path, 2).unwrap();
+    // A configured link with no listener is the swap state from the issue.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let secret = "x".repeat(32);
+    let link = jmodguard::control::try_writer_link(&addr.to_string(), &secret)
+        .unwrap()
+        .expect("writer link");
+    let control = UpdateControl::open(&read_only_options(&db_path))
+        .unwrap()
+        .unwrap()
+        .with_writer_link(link);
+    let hash = "ab".repeat(32);
+    let planned = plan_api_startup(&control, "api", &hash, None, None)
+        .await
+        .unwrap();
+    let mut service = controller(
+        "api",
+        binary,
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control,
+        &root,
+    );
+    service.enabled = false;
+    service.pending_startup = planned;
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = Capture(bytes.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let capture = tracing::subscriber::set_default(subscriber);
+    // Two attempts on consecutive polls, as every deploy produces.
+    assert!(!service.tick().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(!service.tick().await.unwrap());
+    drop(capture);
+    assert_eq!(
+        service.pending_startup.len(),
+        2,
+        "unsaved receipts must stay queued for the retry"
+    );
+    let ready = service
+        .running
+        .as_ref()
+        .expect("normal application was not started")
+        .ready_file
+        .clone();
+    let body = application_route(&ready.with_extension("port")).await;
+    assert!(body.contains("{\"ok\":true}"), "{body}");
+    let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    let lines = logs
+        .matches("launcher startup receipt was not saved")
+        .count();
+    assert_eq!(lines, 2, "exactly one line per attempt: {logs}");
+    assert!(
+        !logs.contains("WARN"),
+        "no warning before the bound: {logs}"
+    );
+    service.stop_application().await.unwrap();
+    drop(_db);
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
 

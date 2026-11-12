@@ -1262,6 +1262,7 @@ dependencies = [
  "tar",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
