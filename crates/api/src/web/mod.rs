@@ -6,6 +6,7 @@ pub mod cases;
 mod discord_retry;
 pub mod members;
 pub mod oauth;
+pub mod platform;
 pub mod preview;
 pub mod recovery;
 mod save;
@@ -1665,6 +1666,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route("/api/updates", get_post(updates::status))
         .route("/api/database-usage", axum::routing::post(usage::overview))
         .route(
+            "/api/platform/analytics",
+            axum::routing::post(platform::analytics),
+        )
+        .route(
             "/api/database-usage/{id}",
             axum::routing::post(usage::detail),
         )
@@ -1773,6 +1778,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             axum::routing::delete(api::cancel_action),
         )
         .route("/api/guilds/{guild_id}/stats", get_post(api::stats))
+        .route("/api/guilds/{guild_id}/analytics", get_post(api::analytics))
         .route("/api/guilds/{guild_id}/cases", get_post(cases::list_cases))
         .route(
             "/api/guilds/{guild_id}/members",

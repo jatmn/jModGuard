@@ -12,6 +12,9 @@ membership and the `x-jmodguard-enrollment` value from the page's loaded configu
 - `/api/guilds/{id}/events`, including event/user/limit filters.
 - `/api/guilds/{id}/bans`, including the limit filter.
 - `/api/guilds/{id}/stats`.
+- `/api/guilds/{id}/analytics`, the daily trend read; the same captured read also
+  returns the guild's member-directory size and its import/coverage state through
+  the tenant runtime, reported as unavailable when that store cannot answer.
 
 Guild zero is not supported. Installation ownership does not bypass guild permissions.
 Missing or stale page membership returns HTTP409 `guild_enrollment_changed`; an unverifiable

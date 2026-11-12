@@ -15,6 +15,9 @@ const stateSource = fs.readFileSync(new URL("../frontend/state.js", import.meta.
   .replace(/^import .*;$/gm, "").replaceAll("export function", "function");
 const appearanceSource = fs.readFileSync(new URL('../frontend/appearance.js', import.meta.url), 'utf8')
   .replace(/^import .*;$/gm, '').replaceAll('export function', 'function');
+const chartsSource = fs.readFileSync(new URL("../frontend/charts.js", import.meta.url), "utf8")
+  .replace(/^import .*;$/gm, "").replace(/^const h = React\.createElement;$/m, "")
+  .replaceAll("export const", "const").replaceAll("export function", "function");
 const source = fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration.js"), "utf8")
   .replace(/^import .*;$/gm, "");
 const NOW_SECONDS = 1800000000;
@@ -54,7 +57,7 @@ function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = 
     Date: { now },
   });
   pages.push({ dom, roots });
-  vm.runInContext(stateSource + "\n" + appearanceSource + "\n" + source, context);
+  vm.runInContext(stateSource + "\n" + appearanceSource + "\n" + chartsSource + "\n" + source, context);
   return { context, elements: { get: id => document.getElementById(id) }, timers };
 }
 
@@ -748,6 +751,31 @@ test("Database Usage shows independent physical databases and unknown allocation
   assert.match(text, /Measurement unavailable/);
   assert.match(text, /Headroom: unavailable/);
   assert.ok(calls.includes("/api/database-usage"));
+});
+
+test("Platform analytics marks member totals partial when a counted directory is incomplete", async () => {
+  const analytics = (members) => ({ window_days: 30, servers: members.servers,
+    series: [{ day: "2026-11-12", warns: 1, bans: 0, automod: 2, mod_actions: 0, timeouts: 0, joins: 3, leaves: 1 }],
+    guilds: [], members });
+  let members = { status: "partial", servers: 2, current: 40, banned: 1, known: 45,
+    guilds_counted: 2, guilds_unavailable: 0, guilds_incomplete: 1 };
+  const view = page(async (url) => {
+    if (url === "/api/updates") return response(state([]));
+    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
+    return response(analytics(members));
+  });
+  await run('selectView("analytics")', view.context);
+  const stat = (label) => [...view.elements.get("platform-analytics").querySelectorAll(".stat")]
+    .find((el) => el.querySelector(".stat-title").textContent === label).querySelector(".stat-value").textContent;
+  assert.equal(stat("Members now"), "40 (partial)");
+  assert.match(view.elements.get("analytics-status").textContent, /Member totals are partial\./);
+  assert.match(view.elements.get("analytics-status").textContent, /1 counted server has a member directory still importing or awaiting Reconcile/);
+  members = { status: "complete", servers: 0, current: 0, banned: 0, known: 0,
+    guilds_counted: 0, guilds_unavailable: 0, guilds_incomplete: 0 };
+  await run("refreshAnalytics()", view.context);
+  assert.equal(stat("Members now"), "0");
+  assert.equal(stat("Spam hits"), "2");
+  assert.match(view.elements.get("analytics-status").textContent, /Member totals are complete\.$/);
 });
 
 test("Database Usage does not paint cards if the tab hides during the fetch", async () => {

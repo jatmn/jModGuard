@@ -40,8 +40,8 @@ The five generated files are:
 | `dist/frontend/index.html` | the page |
 | `dist/frontend/app.js` | the app |
 | `dist/frontend/style.css` | the look |
-| `dist/frontend/administration/index.html` | owner Administration and Updates page |
-| `dist/frontend/administration.js` | update controls and version display |
+| `dist/frontend/administration/index.html` | owner Administration page: Updates, Database Usage, and Analytics |
+| `dist/frontend/administration.js` | update controls, version display, database usage, and platform analytics |
 
 GitHub Actions also packages these files as an independent `jmodguard-webui` GHCR image. See [independent Bunny updates](BUNNY-UPDATES.md) for owner access, the Storage publisher, and rollout gates.
 The public source install does not upload a separate frontend to Bunny; an operator chooses the initial hosting path.
@@ -167,7 +167,7 @@ server only. Every grant is per server; a role in one server never opens another
 
 | Level | Includes |
 |---|---|
-| `dashboard` | Read-only Dashboard, Audit Log, Members, Bans, Bot actions and Cases (including evidence downloads). Settings tabs are hidden. |
+| `dashboard` | Read-only Dashboard, Analytics, Audit Log, Members, Bans, Bot actions and Cases (including evidence downloads). Settings tabs are hidden. |
 | `settings` | Everything in `dashboard`, plus edits to automod rules, badwords, known spam, known-bad images, templates, log channels and filters, and bot settings for that server. Commands are visible but read-only. |
 
 Manage Server stays required for commands (a command plan can grant roles and run
@@ -245,6 +245,7 @@ the workspace then refreshes current configuration. If that refresh fails, use
 | Tab | What it does |
 |---|---|
 | **Dashboard** | server configuration plus identified moderation records, warns and bans; unavailable counts are explicit |
+| **Analytics** | daily trend charts for the last 30 days: warnings, bans, spam (automod enforcement, including exact-image and repeated-text bans) hits, mod actions, timeouts, member joins and leaves, plus the current member directory size, marked partial while its initial import runs and unverified while a coverage gap awaits Reconcile; served from the captured membership-bound analytics read |
 | **Automod Rules** | per-rule editor: params JSON, action escalation table, whitelists, dry-run, scope, reset-to-global |
 | **Badwords** | add/remove regex patterns (server; global if bot owner), live tester; invalid legacy patterns show **not enforced** |
 | **Commands** | edit every command (name, aliases, description, permission, cooldown, roles/channels, response template); create custom commands with the **step editor**; delete custom commands |
@@ -340,6 +341,9 @@ POST   /api/guilds/{id}/bans           # same query as GET; SPA bans list
 POST   /api/guilds/{id}/unban
 GET    /api/guilds/{id}/stats          # guild-scoped aggregates only
 POST   /api/guilds/{id}/stats          # same body as GET; SPA dashboard counts
+GET    /api/guilds/{id}/analytics      # 30-day daily trends + member directory size
+POST   /api/guilds/{id}/analytics      # same body as GET; SPA analytics tab
+POST   /api/platform/analytics         # owner-only: fleet trends, server count, member directory totals
 GET    /api/guilds/{id}/actions
 POST   /api/guilds/{id}/actions        # same body as GET; SPA bot actions
 GET    /api/guilds/{id}/cases

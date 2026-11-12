@@ -1132,6 +1132,7 @@ fn require_reclaim_sql(sql: &str) -> Result<()> {
                     | "log_filters"
                     | "known_bad_images"
                     | "known_spam"
+                    | "analytics_member_daily"
                     | "gateway_ban_deliveries"
                     | "guild_case_evidence"
                     | "guild_case_history"

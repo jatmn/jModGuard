@@ -3550,11 +3550,11 @@ async fn owner_preview_cannot_write_and_does_not_inherit_owner_authority() {
     assert_eq!(denied["code"], "preview_read_only");
     let (status, me) = f.request_preview("POST", "/api/me", "", token).await;
     assert_eq!(status, StatusCode::OK, "{me}");
-    let (status, cases) = f
-        .request_preview("POST", "/api/guilds/10/cases", "", token)
-        .await;
-    assert_ne!(status, StatusCode::FORBIDDEN, "{cases}");
-    assert_ne!(cases["code"].as_str(), Some("preview_read_only"));
+    for path in ["/api/guilds/10/cases", "/api/guilds/10/analytics"] {
+        let (status, read) = f.request_preview("POST", path, "", token).await;
+        assert_ne!(status, StatusCode::FORBIDDEN, "{path}: {read}");
+        assert_ne!(read["code"].as_str(), Some("preview_read_only"), "{path}");
+    }
     let (status, note) = f
         .request_preview(
             "POST",
@@ -5900,6 +5900,30 @@ async fn known_spam_http_global_and_foreign_rows_are_owner_scoped() {
     assert!(status.is_client_error());
 }
 
+#[tokio::test]
+async fn platform_member_totals_distinguish_empty_unavailable_and_incomplete_fleets() {
+    let f = Fixture::new(true).await;
+    let empty = platform::member_totals(&f.app).await;
+    assert_eq!(empty["status"], "complete", "{empty}");
+    assert_eq!(empty["servers"], 0);
+    assert_eq!(empty["current"], 0);
+
+    f.enroll(10).await;
+    let unavailable = platform::member_totals(&f.app).await;
+    assert_eq!(unavailable["status"], "unavailable", "{unavailable}");
+    assert_eq!(unavailable["guilds_unavailable"], 1);
+
+    // A reachable store whose initial import has not finished is counted,
+    // but the totals are not complete.
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app.tenant.activate(enrollment).await.unwrap().unwrap();
+    let importing = platform::member_totals(&f.app).await;
+    assert_eq!(importing["status"], "partial", "{importing}");
+    assert_eq!(importing["guilds_counted"], 1);
+    assert_eq!(importing["guilds_unavailable"], 0);
+    assert_eq!(importing["guilds_incomplete"], 1);
+}
+
 fn member_guild(id: u64) -> oauth::DiscordGuild {
     oauth::DiscordGuild {
         permissions: Some(oauth::PermissionsField::Number(0)),
@@ -5996,6 +6020,7 @@ async fn role_mapped_moderator_reaches_only_that_guild_at_its_level() {
     for path in [
         "/api/guilds/10/config",
         "/api/guilds/10/stats",
+        "/api/guilds/10/analytics",
         "/api/guilds/10/cases",
         "/api/guilds/10/members",
         "/api/guilds/10/events",

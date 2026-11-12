@@ -1408,6 +1408,14 @@ pub(crate) mod tests {
             mirrored, 1,
             "the ban mirror must exist before capture starts"
         );
+        let analytics = crate::db::enrolled_guild_analytics(&app.db, enrollment.clone(), 1)
+            .await
+            .unwrap();
+        assert_eq!(analytics.series[0].bans, 1);
+        assert_eq!(
+            analytics.series[0].automod, 1,
+            "dedicated spam enforcement counts as a spam hit"
+        );
         HOLD_CAPTURE.store(false, Ordering::SeqCst);
         let outcome = task.await.unwrap();
         assert_eq!(outcome, Some(CaseOutcome::Succeeded));
