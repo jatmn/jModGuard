@@ -764,6 +764,7 @@ test('Members keeps completed phases done while local case history finishes and 
     ['Candidate checks', 'Done', '1'],
     ['Available audit history', 'Done', '2'],
     ['Local case history', 'Waiting', 'Unknown'],
+    ['Total', '24 records committed in this run · 20 members counted'],
   ]);
   assert.equal(textOf(findNode(card, n => n.getAttribute?.('role') === 'status')), 'WaitingStage: Local case historyfinishing local case history');
   assert.doesNotMatch(copy, /100% complete/);
@@ -870,13 +871,15 @@ test('Members omits Retry after initial complete when audit recovery is healthy'
 test('Members lays out a finished import with one status, phase rows, a fixed duration, and only valid controls', async () => {
   const asOf = 1790000000000;
   const finishedAt = asOf - 41 * 86400000;
+  const statusReadsAsOf = [asOf, asOf + 86400000];
+  let statusReads = 0;
   const h = harness(async (url) => {
     if (url.endsWith('/member-sync')) return response({
       status: 'complete', phase: 'complete', run_kind: 'initial', run_id: 'initial-done', progress_revision: 40,
       processed: 10749, member_processed: 10539, ban_processed: 192, verify_processed: 0, audit_processed: 18,
       local_history_complete: true, total_estimate: 10539, total_is_estimated: false, percent: 100,
       started_at: finishedAt - 2 * 3600000, initial_completed_at: finishedAt, last_success_at: finishedAt,
-      last_success_processed: 10749, last_progress_at: finishedAt, as_of: asOf,
+      last_success_processed: 10749, last_progress_at: finishedAt, as_of: statusReadsAsOf[statusReads++],
     });
     if (url.includes('/history')) return response({ entries: [], next_cursor: null });
     return response({ members: [{ user_id: '10002', display_name: 'Test Member 1', is_current: true }], next_cursor: null });
@@ -898,6 +901,7 @@ test('Members lays out a finished import with one status, phase rows, a fixed du
     ['Candidate checks', 'Done', '0'],
     ['Available audit history', 'Done', '18'],
     ['Local case history', 'Done', 'Unknown'],
+    ['Total', '10,749 records committed in this run · 10,539 members counted · 100% complete'],
   ]);
   assert.match(copy, /Took 120 minutes/);
   assert.doesNotMatch(copy, /Elapsed|Remaining|Expected finish/);
@@ -905,10 +909,15 @@ test('Members lays out a finished import with one status, phase rows, a fixed du
     ['Initial import completed', 'Last successful run', 'Last committed progress', 'Status read at']);
   const buttons = () => [...card.querySelectorAll('button')].map(textOf);
   assert.deepEqual(buttons(), ['Reconcile from Discord']);
+  const statusCard = () => findNode(panel, n => n.getAttribute?.('aria-label') === 'Member import status');
+  const readAt = () => textOf(findNode(statusCard(), n => n.localName === 'dt' && textOf(n) === 'Status read at').nextElementSibling);
+  const firstReadAt = readAt();
   h.advanceTime(86400000);
   fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Refresh'), 'click');
   await settle();
-  assert.match(textOf(card), /Took 120 minutes/, 'a finished run keeps its duration');
+  assert.equal(statusReads, 2, 'Refresh reads the status again');
+  assert.notEqual(readAt(), firstReadAt, 'the card renders the later server read');
+  assert.match(textOf(statusCard()), /Took 120 minutes/, 'a finished run keeps its duration');
   assert.equal(findNode(panel, n => n.getAttribute?.('aria-label') === 'Member history'), null, 'no empty history card');
   fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'View history'), 'click');
   await settle();

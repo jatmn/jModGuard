@@ -3786,13 +3786,6 @@ function tabMembers() {
             : ` · ${Math.round(percent)}% of ${totalKind} member phase`;
       parts.push(
         h(
-          "p",
-          {},
-          `${Number.isFinite(processed) ? processed.toLocaleString() : "0"} records committed in this run · ${totalDescription}${progressText}`,
-        ),
-      );
-      parts.push(
-        h(
           DataTable,
           { headings: ["Phase", "State", "Committed"], className: "table table-sm" },
           phases.map((phase, index) =>
@@ -3810,6 +3803,16 @@ function tabMembers() {
                     : "Pending",
               ),
               h("td", null, phaseCounts[phase] == null ? "Unknown" : Number(phaseCounts[phase]).toLocaleString()),
+            ),
+          ),
+          h(
+            "tr",
+            { key: "summary" },
+            h("th", { scope: "row" }, "Total"),
+            h(
+              "td",
+              { colSpan: 2 },
+              `${Number.isFinite(processed) ? processed.toLocaleString() : "0"} records committed in this run · ${totalDescription}${progressText}`,
             ),
           ),
         ),
