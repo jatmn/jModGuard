@@ -2,6 +2,9 @@
 # Check the environment passed to Dylint without installing its toolchain.
 # shellcheck disable=SC2030,SC2031
 set -euo pipefail
+# The rustup stub auto-installs unless RUSTUP_AUTO_INSTALL=0. Only dylint.sh
+# may set it, or an inherited value would hide a check that auto-installs.
+unset RUSTUP_AUTO_INSTALL
 
 root="$(git rev-parse --show-toplevel)"
 fixture="$(mktemp -d "${TMPDIR:-/tmp}/jmodguard-dylint-test.XXXXXX")"
