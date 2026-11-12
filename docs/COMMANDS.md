@@ -133,9 +133,12 @@ short SHA, age and state; **Container use** shows bot and API CPU and memory.
 The side bar is green when every component is up to date (an unmanaged WebUI
 included) and yellow, the system-notice color, when any release is not current,
 unknown, stale, failed, unverified or the release lookup failed. Embed limits
-and truncation match log reports, mentions are disabled, and the bot needs
-**Embed Links** where the command runs, as in log channels. A customized
-command response is sent as message text above the embed.
+and truncation match log reports, and mentions are disabled. If Discord
+refuses the embed for missing permissions (Embed Links, 403/50013), the bot
+sends the same reply once as plain text instead, in the earlier text layout
+with the same data. A customized command response is sent as message text
+above the embed; one that uses `{response}` receives that plain-text stats
+reply and no embed, so the data is not shown twice.
 Uptime and release ages use compact years, months,
 weeks, days, hours, minutes, and seconds (`13m 38s`; intermediate zeros stay, as in
 `1d 0h 0m 38s`), with fixed 360-day years, 30-day months, and 7-day weeks,

@@ -300,6 +300,66 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
     (lines.join("\n"), attention)
 }
 
+/// Plain-text stats header in the pre-embed layout. The plain text is used
+/// for a custom response template's `{response}` and when Discord refuses the
+/// embed for missing Embed Links. A missing case count means the guild store
+/// or membership is unavailable.
+pub fn stats_response(uptime_seconds: u64, cases: Option<i64>, warns: i64, bans: i64) -> String {
+    render(
+        "**📊 Stats (this server)**\n\n**⏱️ Uptime:** `{uptime}`\n**📋 Cases:** `{cases}`\n**⚠️ Warns:** `{warns}`\n**🔨 Bans:** `{bans}`",
+        &BTreeMap::from([
+            ("uptime".into(), format_compact_duration(uptime_seconds)),
+            (
+                "cases".into(),
+                cases.map_or_else(|| "unavailable".into(), |count| count.to_string()),
+            ),
+            ("warns".into(), warns.to_string()),
+            ("bans".into(), bans.to_string()),
+        ]),
+    )
+}
+
+/// Plain-text stats with the same release lines as the embed. None means the
+/// release lookup failed.
+pub fn stats_response_with_update_availability(
+    uptime_seconds: u64,
+    cases: Option<i64>,
+    warns: i64,
+    bans: i64,
+    updates: Option<&[crate::db::ComponentUpdate]>,
+    now: i64,
+) -> String {
+    let releases = match updates {
+        Some(updates) => release_status_lines(updates, now).0,
+        None => "unavailable".into(),
+    };
+    render(
+        "{moderation}\n\n**Release status**\n{releases}",
+        &BTreeMap::from([
+            (
+                "moderation".into(),
+                stats_response(uptime_seconds, cases, warns, bans),
+            ),
+            ("releases".into(), releases),
+        ]),
+    )
+}
+
+/// Append the plain-text Container use section, with the embed's rows.
+pub fn stats_text_with_container_use(
+    moderation: String,
+    bot: &crate::cgroup::ContainerSample,
+    api: Option<&crate::cgroup::ContainerSample>,
+) -> String {
+    render(
+        "{moderation}\n\n**Container use**\n{containers}",
+        &BTreeMap::from([
+            ("moderation".into(), moderation),
+            ("containers".into(), container_use_section(bot, api)),
+        ]),
+    )
+}
+
 const CONTAINER_USE_TEMPLATE: &str = "\
 **Bot CPU:** `{bot_cpu}`\n\
 **Bot memory (real program use):** `{bot_memory}`\n\

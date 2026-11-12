@@ -1289,14 +1289,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         }
         Behavior::Stats => {
             // Guild-scoped only — same contract as WebUI `/api/guilds/{id}/stats`.
-            let embed = stats_response(
+            let (embed, text) = stats_response(
                 env.app,
                 env.guild_id.get() as i64,
                 env.app.start.elapsed().as_secs(),
             )
             .await?;
             Ok(BehaviorOutcome {
-                response: None,
+                // Plain text for `{response}` templates and the Embed Links fallback.
+                response: Some(text),
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
@@ -1315,7 +1316,7 @@ async fn stats_response(
     app: &crate::state::BotState,
     guild_id: i64,
     uptime_seconds: u64,
-) -> Result<jmodguard::log_embeds::LogEmbed> {
+) -> Result<(jmodguard::log_embeds::LogEmbed, String)> {
     let api_task = jmodguard::read_link::try_read_link(
         &app.cfg.bot.read_target,
         app.cfg.bot.control_secret.as_str(),
@@ -1349,18 +1350,32 @@ async fn stats_response(
     };
     // The answering copy's label (`api pid N`) is diagnostic and not shown.
     let api_sample = api_reading.map(|response| response.sample);
-    Ok(crate::templates::stats_with_container_use(
+    let now = chrono::Utc::now().timestamp();
+    let embed = crate::templates::stats_with_container_use(
         crate::templates::stats_embed(
             uptime_seconds,
             cases,
             s.warns,
             s.bans,
             updates.as_deref(),
-            chrono::Utc::now().timestamp(),
+            now,
         ),
         &bot_use,
         api_sample.as_ref(),
-    ))
+    );
+    let text = crate::templates::stats_text_with_container_use(
+        crate::templates::stats_response_with_update_availability(
+            uptime_seconds,
+            cases,
+            s.warns,
+            s.bans,
+            updates.as_deref(),
+            now,
+        ),
+        &bot_use,
+        api_sample.as_ref(),
+    );
+    Ok((embed, text))
 }
 
 /// Standard variables available to every command's response template.
@@ -2178,7 +2193,7 @@ mod tests {
             .is_some()
         );
         assert_eq!(db::guild_stats(&app.db, 10).await.unwrap().events, 0);
-        let cases_only = stats_response(&app, 10, 20).await.unwrap();
+        let cases_only = stats_response(&app, 10, 20).await.unwrap().0;
         assert_eq!(stats_field(&cases_only, "Cases"), "`1`", "{cases_only:?}");
         assert!(
             !cases_only
@@ -2199,7 +2214,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(db::guild_stats(&app.db, 10).await.unwrap().events, 1);
-        let legacy_and_cases = stats_response(&app, 10, 20).await.unwrap();
+        let legacy_and_cases = stats_response(&app, 10, 20).await.unwrap().0;
         assert_eq!(
             stats_field(&legacy_and_cases, "Cases"),
             "`1`",
@@ -2208,24 +2223,24 @@ mod tests {
 
         let (store, scope) = app.tenant.live(enrollment).await.unwrap();
         store.close_membership(scope).await.unwrap();
-        let closed = stats_response(&app, 10, 20).await.unwrap();
+        let closed = stats_response(&app, 10, 20).await.unwrap().0;
         assert_eq!(stats_field(&closed, "Cases"), "`unavailable`", "{closed:?}");
 
-        let missing = stats_response(&app, 20, 20).await.unwrap();
+        let missing = stats_response(&app, 20, 20).await.unwrap().0;
         assert_eq!(
             stats_field(&missing, "Cases"),
             "`unavailable`",
             "{missing:?}"
         );
         let empty = db::enroll_guild(&app.db, 20, 100).await.unwrap().unwrap();
-        let unplaced = stats_response(&app, 20, 20).await.unwrap();
+        let unplaced = stats_response(&app, 20, 20).await.unwrap().0;
         assert_eq!(
             stats_field(&unplaced, "Cases"),
             "`unavailable`",
             "{unplaced:?}"
         );
         app.tenant.activate(empty).await.unwrap();
-        let zero = stats_response(&app, 20, 20).await.unwrap();
+        let zero = stats_response(&app, 20, 20).await.unwrap().0;
         assert_eq!(stats_field(&zero, "Cases"), "`0`", "{zero:?}");
 
         db::enroll_guild(&app.db, 30, 100).await.unwrap().unwrap();
@@ -2236,7 +2251,7 @@ mod tests {
         assign_initial_placement(&app.db, 30, offline)
             .await
             .unwrap();
-        let offline = stats_response(&app, 30, 20).await.unwrap();
+        let offline = stats_response(&app, 30, 20).await.unwrap().0;
         assert_eq!(
             stats_field(&offline, "Cases"),
             "`unavailable`",
@@ -2265,7 +2280,7 @@ mod tests {
         let app =
             crate::state::BotState::new(crate::config::BotProcessConfig::default(), db.clone())
                 .unwrap();
-        let healthy = stats_response(&app, 10, 20).await.unwrap();
+        let healthy = stats_response(&app, 10, 20).await.unwrap().0;
         assert_eq!(stats_field(&healthy, "Warns"), "`1`", "{healthy:?}");
         assert!(
             stats_field(&healthy, "Container use").contains("**Bot CPU:** `unavailable`"),
@@ -2290,7 +2305,20 @@ mod tests {
         })
         .await
         .unwrap();
-        let unavailable = stats_response(&app, 10, 20).await.unwrap();
+        let (unavailable, text) = stats_response(&app, 10, 20).await.unwrap();
+        // The plain-text form (custom `{response}`, Embed Links fallback) keeps
+        // the pre-embed layout and the same data.
+        for line in [
+            "**📊 Stats (this server)**",
+            "**⏱️ Uptime:** `20s`",
+            "**⚠️ Warns:** `1`",
+            "**Release status**\nunavailable",
+            "**Container use**\n**Bot CPU:** `unavailable`",
+            "**Bot memory (real program use):** `not reported by host`",
+            "**API memory (real program use):** `unavailable`",
+        ] {
+            assert!(text.contains(line), "{line} missing from {text}");
+        }
         assert_eq!(
             stats_field(&unavailable, "Release status"),
             "`unavailable`",
@@ -2367,7 +2395,7 @@ mod tests {
         cfg.bot.read_target = "0.0.0.0:8083".into();
         cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
         let app = crate::state::BotState::new(cfg, db.clone()).unwrap();
-        let text = stats_response(&app, 10, 5).await.unwrap();
+        let text = stats_response(&app, 10, 5).await.unwrap().0;
         assert!(
             stats_field(&text, "Container use").contains("**API CPU:** `unavailable`"),
             "{text:?}"
@@ -2406,7 +2434,7 @@ mod tests {
         cfg.bot.control_secret = jmodguard::config::ControlSecret::new("x".repeat(32));
         let app = crate::state::BotState::new(cfg, db.clone()).unwrap();
         let started = Instant::now();
-        let text = stats_response(&app, 10, 5).await.unwrap();
+        let text = stats_response(&app, 10, 5).await.unwrap().0;
         let elapsed = started.elapsed();
         assert!(
             elapsed
