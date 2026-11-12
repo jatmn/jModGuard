@@ -152,10 +152,11 @@ function directoryStatusLabel(server, receipt) {
 // across lost responses, reloads and navigation. Resubmitting with that same
 // key recovers the original queued receipt instead of superseding it with a
 // second request. It is cleared only once the outcome is known or the server
-// refuses the identity for good. The membership join time scopes it, so a
-// rejoined server starts a fresh request.
+// refuses the identity for good. The reviewed membership (its enrollment token,
+// also sent with the request so the server refuses a rejoined server) scopes
+// it, so a rejoined server starts a fresh request.
 function ownerLeaveRequestKey(server) {
-  return `${workspaceKey()}:owner-leave:${server.guild_id}:${server.joined_at_ns}`;
+  return `${workspaceKey()}:owner-leave:${server.guild_id}:${server.enrollment_id}`;
 }
 
 function ownerLeaveRequestId(server) {
@@ -263,6 +264,10 @@ function TabOwnerServers() {
       )
     )
       return;
+    if (!server.enrollment_id) {
+      toast("This server's membership is not known. Refresh the directory and try again.", "error");
+      return;
+    }
     let requestId;
     try {
       requestId = ownerLeaveRequestId(server);
@@ -272,9 +277,13 @@ function TabOwnerServers() {
     }
     let job;
     try {
-      job = await api(`/api/owner-servers/${server.guild_id}/leave`, "POST", {
-        request_id: requestId,
-      });
+      job = await apiRequest(
+        `/api/owner-servers/${server.guild_id}/leave`,
+        "POST",
+        { request_id: requestId },
+        undefined,
+        { "x-jmodguard-enrollment": server.enrollment_id },
+      );
     } catch (error) {
       // An ambiguous failure (lost response, timeout, server error) keeps the
       // saved identity so the next attempt recovers the same request. A

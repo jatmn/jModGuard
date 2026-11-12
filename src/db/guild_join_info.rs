@@ -16,6 +16,8 @@ use super::*;
 pub struct OwnerServerRow {
     #[serde(serialize_with = "crate::ids::ser_i64_str")]
     pub guild_id: i64,
+    /// The membership's identity token: owner actions are bound to it.
+    pub enrollment_id: String,
     #[serde(serialize_with = "crate::ids::ser_i64_str")]
     pub joined_at_ns: i64,
     pub active: bool,
@@ -97,7 +99,8 @@ pub async fn owner_guild_directory(db: &Db, departed_limit: i64) -> Result<Vec<O
                 "SELECT e.guild_id,e.joined_at_ns,e.active,
                         j.name,j.icon_hash,j.member_count,
                         CASE WHEN j.added_by_joined_at_ns=e.joined_at_ns THEN j.added_by END,
-                        CASE WHEN j.added_by_joined_at_ns=e.joined_at_ns THEN j.added_by_name END
+                        CASE WHEN j.added_by_joined_at_ns=e.joined_at_ns THEN j.added_by_name END,
+                        e.id
                  FROM guild_enrollments e
                  LEFT JOIN guild_join_info j ON j.guild_id=e.guild_id
                  WHERE e.active=1 OR e.guild_id IN (
@@ -115,6 +118,7 @@ pub async fn owner_guild_directory(db: &Db, departed_limit: i64) -> Result<Vec<O
                     member_count: row.get(5)?,
                     added_by: row.get(6)?,
                     added_by_name: row.get(7)?,
+                    enrollment_id: row.get(8)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

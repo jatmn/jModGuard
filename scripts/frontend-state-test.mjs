@@ -5448,6 +5448,7 @@ test('embed preview applies dynamic action/removal accents and aggregate field l
 
 const directoryServer = {
   guild_id: '111111111111111111',
+  enrollment_id: 'enrollment-a',
   name: 'Alpha',
   icon_hash: 'hash01',
   member_count: 42,
@@ -5549,13 +5550,14 @@ test('Bot servers removal refuses to continue without confirmation', async () =>
 
 test('Bot servers removal keeps its request identity across a lost admission response and a reload', async () => {
   const session = new Map();
-  const bodies = [];
+  const bodies = [], enrollments = [];
   const job = { id: 'job-1', guild_id: '111111111111111111', actor_id: '123456789012345678', state: 'pending', outcome: null };
   let admitted = false;
   const fetchImpl = async (url, opts) => {
     if (url.endsWith('/api/owner-servers')) return response({ servers: [{ ...directoryServer }] });
     if (url.endsWith('/api/owner-servers/111111111111111111/leave')) {
       bodies.push(JSON.parse(opts.body));
+      enrollments.push(opts.headers['x-jmodguard-enrollment']);
       // The first request reaches the server but its response is lost.
       if (!admitted) { admitted = true; throw new TypeError('Failed to fetch'); }
       return response(job);
@@ -5584,6 +5586,7 @@ test('Bot servers removal keeps its request identity across a lost admission res
   await settle();
   assert.equal(bodies.length, 2);
   assert.equal(bodies[1].request_id, bodies[0].request_id, 'a retry never invents a second departure');
+  assert.deepEqual(enrollments, ['enrollment-a', 'enrollment-a'], 'every attempt carries the membership the owner reviewed');
 
   // Once the receipt reaches a final outcome the saved identity is released,
   // so a later removal starts a new request.

@@ -14,9 +14,10 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tower_sessions::Session;
 
-/// Directory responses stay bounded; a deployment beyond the limit keeps
-/// every active server (sorted first) and drops the oldest departed history.
+/// Directory responses always list every active server; the bound applies only
+/// to retained departed history, whose oldest rows drop first.
 const DIRECTORY_LIMIT: i64 = 1000;
+const ENROLLMENT_HEADER: &str = "x-jmodguard-enrollment";
 
 fn error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
     (status, Json(json!({"error": message})))
@@ -82,9 +83,22 @@ pub struct LeaveBody {
     request_id: String,
 }
 
-/// Owner-only departure request. Admission captures the current active
-/// enrollment; the bot re-verifies that membership inside its write
-/// transaction before dispatching the leave.
+fn enrollment_changed() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "Server membership changed. Reload before making a new request.",
+            "code": "action_enrollment_changed",
+        })),
+    )
+}
+
+/// Owner-only departure request. Like every guild-scoped mutation, it is bound
+/// to the membership the owner reviewed: the `x-jmodguard-enrollment` token
+/// from the directory row must equal the guild's current active enrollment, so
+/// a rejoin since the directory loaded is refused instead of silently
+/// targeting the new membership. Transactional admission then verifies that
+/// enrollment, and the bot re-verifies it before dispatching the leave.
 pub async fn leave(
     State(app): State<Arc<ApiState>>,
     session: Session,
@@ -96,6 +110,13 @@ pub async fn leave(
     origin(&app, &headers)?;
     let guild = guild_id(guild)?;
     let enrollment = read_active_enrollment(&app, guild).await?;
+    if headers
+        .get(ENROLLMENT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        != Some(enrollment.id.as_str())
+    {
+        return Err(enrollment_changed());
+    }
     let actor = owner_id
         .parse::<i64>()
         .ok()
@@ -113,13 +134,7 @@ pub async fn leave(
         .await
         .map_err(|failure| {
             if failure.is::<db::EnrollmentChanged>() {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "error": "Server membership changed. Reload before making a new request.",
-                        "code": "action_enrollment_changed",
-                    })),
-                );
+                return enrollment_changed();
             }
             if let Some(key_error) = failure
                 .downcast_ref::<jmodguard::bot_actions::RequestKeyError>()

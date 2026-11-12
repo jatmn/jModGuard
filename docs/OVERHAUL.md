@@ -404,8 +404,10 @@ is stored with the membership (join time) it was captured for, so a rejoined ser
 server is always listed; the response bound applies only to retained departed history.
 The owner can make the bot depart a server through the durable action queue; a confirmed
 departure retires that exact membership like any other membership change, without waiting
-for the gateway event. The WebUI keeps a departure's request key across lost responses so
-a retry recovers the original request. Routes live under `/api/owner-servers`,
+for the gateway event. The request is bound to the membership the owner reviewed (the directory
+row's enrollment token, sent as `x-jmodguard-enrollment` like guild actions), so a server that
+rejoined since the directory loaded is refused until refreshed. The WebUI keeps a departure's
+request key across lost responses so a retry recovers the original request. Routes live under `/api/owner-servers`,
 are gated on the configured bot owner session (`bot.owner_id`) with a trusted-origin
 check, and never fetch the Discord guild list.
 
