@@ -1966,130 +1966,147 @@ function statsRow(...items) {
   return h("div", { className: "stats bg-base-100 w-full" }, ...items);
 }
 
+// One header line per page (#590): the title, an optional muted detail and actions.
+function pageHeader(title, detail, ...actions) {
+  return h(
+    "header",
+    { className: "page-header" },
+    h("h2", {}, title),
+    detail ? h("span", { className: "page-header-detail muted" }, detail) : null,
+    actions.length ? h("div", { className: "page-header-actions" }, ...actions) : null,
+  );
+}
+
+// Explanatory text behind a keyboard-focusable info button. The text is the
+// button's accessible description; it shows on hover or focus. The pointer can
+// move onto the text (it sits inside the hover area), and Escape hides it
+// wherever focus is, so hover-opened text is dismissible too (WCAG 1.4.13).
+function InfoTip({ id, label, children }) {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!open) return undefined;
+    const dismiss = (event) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("keydown", dismiss);
+    return () => document.removeEventListener("keydown", dismiss);
+  }, [open]);
+  return h(
+    "span",
+    {
+      className: "info-tip",
+      onMouseEnter: () => setOpen(true),
+      onMouseLeave: () => setOpen(false),
+    },
+    h(
+      "button",
+      {
+        type: "button",
+        className: "info-tip-trigger",
+        "aria-label": label,
+        "aria-describedby": id,
+        "aria-expanded": open,
+        onFocus: () => setOpen(true),
+        onBlur: () => setOpen(false),
+        onClick: () => setOpen(true),
+      },
+      h("span", { "aria-hidden": "true" }, "ⓘ"),
+    ),
+    h("span", { id, role: "tooltip", className: "info-tip-text", hidden: !open }, children),
+  );
+}
+
+// Getting started is complete when the loaded configuration already has at least
+// one enabled automod rule, one enabled command and one routed log channel: one
+// per setup step. Missing collections count as incomplete, so the guide stays.
+function setupComplete(cfg) {
+  const enabled = (records) => (records ?? []).some((record) => record?.effective?.enabled);
+  const routed = (cfg?.log_channels ?? []).some((entry) => entry?.effective && String(entry.effective) !== "0");
+  return enabled(cfg?.rules) && enabled(cfg?.commands) && routed;
+}
+
+const MODERATION_COUNTS_HELP =
+  "Moderation records exclude routine history and older plan summaries whose action type was not recorded. Those summaries remain in the Audit Log.";
+
 function tabDashboard() {
   const guildId = useRef(state.guildId).current;
   const g = selectedGuild();
   const cfg = state.config;
-  const rulesOn = cfg.rules.filter((r) => r.effective.enabled).length;
-  const rulesDry = cfg.rules.filter((r) => r.effective.dry_run).length;
-  const commandsOn = cfg.commands.filter((c) => c.effective.enabled).length;
-  const chans = cfg.log_channels.filter((l) => l.effective && String(l.effective) !== "0").length;
+  const rules = cfg.rules ?? [];
+  const commands = cfg.commands ?? [];
+  const rulesOn = rules.filter((r) => r.effective?.enabled).length;
+  const rulesDry = rules.filter((r) => r.effective?.dry_run).length;
+  const commandsOn = commands.filter((c) => c.effective?.enabled).length;
+  const chans = (cfg.log_channels ?? []).filter((l) => l.effective && String(l.effective) !== "0").length;
   const result = useApiRead(`/api/guilds/${guildId}/stats`);
+  const count = (key) =>
+    result.loading ? "Loading…" : result.data?.[key] == null ? "Unavailable" : String(result.data[key]);
   return h(
     "div",
     { className: "contents" },
-    h(
-      "section",
-      { className: "hero dashboard-hero" },
+    pageHeader(
+      "Dashboard",
+      g?.name,
+      h(ActionButton, { className: "btn btn-sm btn-primary", onClick: () => navigate("rules") }, "Review protection →"),
+      h(ActionButton, { className: "btn btn-sm btn-outline", onClick: () => navigate("events") }, "View audit log"),
+    ),
+    !setupComplete(cfg) &&
       h(
-        "div",
-        { className: "hero-content" },
+        "section",
+        { className: "card bg-base-100 card-border getting-started" },
         h(
           "div",
-          { className: "hero-copy" },
-          h("span", { className: "eyebrow" }, "COMMUNITY AT A GLANCE"),
-          h("h2", {}, g ? `${g.name}, under your care.` : "Your moderation workspace"),
-          h(
-            "p",
-            {},
-            "Review your server’s protection, configure your tools, and keep track of moderation activity.",
-          ),
+          { className: "card-body" },
+          h("h3", { className: "card-title" }, "Getting started"),
           h(
             "div",
-            { className: "row" },
-            h(
-              ActionButton,
-              { className: "btn btn-primary", onClick: () => navigate("rules") },
-              "Review protection →",
+            { className: "setup-links" },
+            ...[
+              ["01", "Tune automod", "Review rules and test them in dry-run.", "rules"],
+              ["02", "Configure commands", "Choose commands and moderator permissions.", "commands"],
+              ["03", "Route your logs", "Connect event reports to Discord channels.", "logchannels"],
+            ].map(([number, title, description, tab]) =>
+              h(
+                ActionButton,
+                { className: "btn setup-link", onClick: () => navigate(tab) },
+                h("span", { className: "setup-number" }, number),
+                h("span", {}, h("strong", {}, title), h("span", {}, description)),
+                h("span", { "aria-hidden": "true" }, "→"),
+              ),
             ),
-            h(
-              ActionButton,
-              { className: "btn btn-outline", onClick: () => navigate("events") },
-              "View audit log",
-            ),
+          ),
+          h(
+            "p",
+            { className: "setup-note" },
+            "Use each editor’s Save action to apply changes. The bot usually picks up configuration changes within a few seconds. " +
+              (isBotOwner()
+                ? "As bot owner, you can also edit Global defaults for all servers."
+                : "Global defaults can only be edited by the bot owner."),
           ),
         ),
       ),
-    ),
     h(
       "section",
-      { className: "card bg-base-100 card-border getting-started" },
+      { className: "dashboard-section", "aria-labelledby": "dashboard-overview" },
+      h("h3", { className: "card-title", id: "dashboard-overview" }, "Overview"),
       h(
         "div",
-        { className: "card-body" },
-        h("h3", { className: "card-title" }, "Getting started"),
-        h("p", { className: "muted" }, "Set up protection, choose your tools, then decide where reports go."),
-        h(
-          "div",
-          { className: "setup-links" },
-          ...[
-            ["01", "Tune automod", "Review rules and test them in dry-run.", "rules"],
-            ["02", "Configure commands", "Choose commands and moderator permissions.", "commands"],
-            ["03", "Route your logs", "Connect event reports to Discord channels.", "logchannels"],
-          ].map(([number, title, description, tab]) =>
-            h(
-              ActionButton,
-              { className: "btn setup-link", onClick: () => navigate(tab) },
-              h("span", { className: "setup-number" }, number),
-              h("span", {}, h("strong", {}, title), h("span", {}, description)),
-              h("span", { "aria-hidden": "true" }, "→"),
-            ),
-          ),
-        ),
-        h(
-          "p",
-          { className: "setup-note" },
-          "Use each editor’s Save action to apply changes. The bot usually picks up configuration changes within a few seconds. " +
-            (isBotOwner()
-              ? "As bot owner, you can also edit Global defaults for all servers."
-              : "Global defaults can only be edited by the bot owner."),
-        ),
-      ),
-    ),
-    h(
-      "section",
-      { className: "dashboard-section" },
-      h("h3", { className: "card-title" }, "Protection & tools"),
-      statsRow(
-        stat("Rules enabled", `${rulesOn} / ${cfg.rules.length}`),
+        { className: "stats bg-base-100 w-full dashboard-stats" },
+        // One row each for protection, moderation activity and server configuration.
+        stat("Rules enabled", `${rulesOn} / ${rules.length}`),
         stat("Rules in dry-run", rulesDry),
-        stat("Commands enabled", `${commandsOn} / ${cfg.commands.length}`),
+        stat("Commands enabled", `${commandsOn} / ${commands.length}`),
         stat("Log channels", chans),
-      ),
-    ),
-    h(
-      "section",
-      { className: "dashboard-section" },
-      h("h3", { className: "card-title" }, "Moderation activity"),
-      statsRow(
-        ...[
-          ["events", "Moderation records"],
-          ["warns", "Warns"],
-          ["bans", "Bans"],
-          ["cases", "Cases"],
-        ].map(([key, label]) =>
-          stat(label, result.loading ? "Loading…" : result.data?.[key] == null ? "Unavailable" : String(result.data[key])),
+        stat(
+          ["Moderation records", h(InfoTip, { id: "moderation-counts-help", label: "About these counts" }, MODERATION_COUNTS_HELP)],
+          count("events"),
         ),
-      ),
-      h(
-        "aside",
-        { className: "dashboard-note" },
-        h("strong", {}, "About these counts"),
-        h(
-          "p",
-          {},
-          "Moderation records exclude routine history and older plan summaries whose action type was not recorded. Those summaries remain in the Audit Log.",
-        ),
-      ),
-    ),
-    h(
-      "section",
-      { className: "dashboard-section" },
-      h("h3", { className: "card-title" }, "Server configuration"),
-      statsRow(
-        stat("Prefix", cfg.settings.prefix),
-        stat("Bot name", cfg.settings.bot_name || "default"),
-        stat("Badword patterns", cfg.badwords.length),
+        stat("Warns", count("warns")),
+        stat("Bans", count("bans")),
+        stat("Cases", count("cases")),
+        stat("Prefix", cfg.settings?.prefix),
+        stat("Bot name", cfg.settings?.bot_name || "default"),
+        stat("Badword patterns", (cfg.badwords ?? []).length),
         stat("Routine chat collection", "Off"),
       ),
     ),
@@ -2100,7 +2117,7 @@ function stat(label, value) {
   return h(
     "div",
     { className: "stat" },
-    h("div", { className: "stat-title" }, label),
+    h("div", { className: "stat-title" }, ...[label].flat()),
     h("div", { className: "stat-value" }, value),
   );
 }
@@ -2141,25 +2158,7 @@ function tabAnalytics() {
   return h(
     "div",
     { className: "contents" },
-    h(
-      "section",
-      { className: "hero dashboard-hero" },
-      h(
-        "div",
-        { className: "hero-content" },
-        h(
-          "div",
-          { className: "hero-copy" },
-          h("span", { className: "eyebrow" }, "DAILY TRENDS"),
-          h("h2", {}, g ? `Trends for ${g.name}` : "Your moderation trends"),
-          h(
-            "p",
-            {},
-            "How warnings, bans, spam enforcement, and membership changed over the last 30 days.",
-          ),
-        ),
-      ),
-    ),
+    pageHeader("Analytics", g ? `Trends for ${g.name} over the last 30 days` : "Trends over the last 30 days"),
     h(
       "section",
       { className: "dashboard-section" },

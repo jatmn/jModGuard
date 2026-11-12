@@ -213,6 +213,202 @@ test('dashboard does not show zero moderation counts when stats are unavailable'
   }
 });
 
+// Getting started is complete with one enabled rule, one enabled command and one routed log channel.
+const configuredDashboard = () => ({
+  settings: { prefix: '!', bot_name: 'Guard' },
+  rules: [{ rule_id: 'mention_spam', effective: { enabled: true, dry_run: false } }, { rule_id: 'invites', effective: { enabled: false, dry_run: true } }],
+  commands: [{ name: 'ban', effective: { enabled: true } }, { name: 'warn', effective: { enabled: false } }],
+  log_channels: [{ event: 'message_delete', effective: '123456789012345678' }, { event: 'member_join', effective: '0' }],
+  badwords: [{ pattern: 'a' }, { pattern: 'b' }, { pattern: 'c' }],
+});
+const gettingStarted = (root) => findNode(root, n => String(n.className).split(/\s+/).includes('getting-started'));
+
+test('dashboard hides Getting started only once every setup step has data', async () => {
+  const cases = [
+    ['configured server', configuredDashboard(), false],
+    ['zero rules', { ...configuredDashboard(), rules: [] }, true],
+    ['only disabled rules', { ...configuredDashboard(), rules: [{ rule_id: 'x', effective: { enabled: false, dry_run: false } }] }, true],
+    ['no enabled command', { ...configuredDashboard(), commands: [{ name: 'ban', effective: { enabled: false } }] }, true],
+    ['only cleared log channels', { ...configuredDashboard(), log_channels: [{ event: 'message_delete', effective: '0' }, { event: 'member_join', effective: null }] }, true],
+    ['missing collections', { settings: { prefix: '!', bot_name: '' } }, true],
+    ['partial records', { ...configuredDashboard(), rules: [{ rule_id: 'x' }], commands: [{ name: 'ban', effective: null }] }, true],
+  ];
+  for (const [name, config, shown] of cases) {
+    const { app } = harness(async () => response({ events: 1, warns: 0, bans: 0, cases: 0 }));
+    app.state.config = config;
+    const dashboard = app.tabDashboard();
+    await settle();
+    assert.equal(Boolean(gettingStarted(dashboard)), shown, name);
+    if (shown) {
+      assert.match(textOf(gettingStarted(dashboard)), /Tune automod[\s\S]*Configure commands[\s\S]*Route your logs/, name);
+    }
+    // The stat grid renders even when collections are missing.
+    assert.ok(Boolean(findNode(dashboard, n => String(n.className).split(/\s+/).includes('dashboard-stats'))), name);
+  }
+});
+
+test('dashboard setup state comes from configuration, not the stats read or its failure', async () => {
+  for (const fetchImpl of [() => new Promise(() => {}), async () => { throw new Error('offline'); }]) {
+    for (const [config, shown] of [[configuredDashboard(), false], [{ ...configuredDashboard(), rules: [] }, true]]) {
+      const { app } = harness(fetchImpl);
+      app.state.config = config;
+      const dashboard = app.tabDashboard();
+      await settle();
+      assert.equal(Boolean(gettingStarted(dashboard)), shown);
+      assert.match(textOf(dashboard), /Loading…|Unavailable/);
+    }
+  }
+  // Before configuration loads, the workspace shows its loading panel and no setup guide.
+  const h = harness(() => new Promise(() => {}));
+  h.app.state.config = null;
+  h.app.state.configRead = { activity: 'loading', error: null };
+  h.app.renderTab();
+  await settle();
+  assert.match(textOf(h.nodes.get('#content')), /Loading your workspace/);
+  assert.equal(Boolean(h.document.querySelector('#content .getting-started')), false, 'no setup guide while loading');
+});
+
+test('dashboard merges every previous stat into one compact grid under a one-line header', async () => {
+  const { app } = harness(async () => response({ events: 7, warns: 2, bans: 1, cases: 4 }));
+  app.state.config = configuredDashboard();
+  const dashboard = app.tabDashboard();
+  await settle();
+  const grids = Array.from(dashboard.querySelectorAll('.stats'));
+  assert.equal(grids.length, 1, 'one stat grid');
+  assert.ok(grids[0].classList.contains('dashboard-stats'));
+  const value = (label) => Array.from(grids[0].children)
+    .find((n) => n.className === 'stat' && n.querySelector('.stat-title').textContent.startsWith(label))
+    ?.querySelector('.stat-value').textContent;
+  const expected = [
+    ['Rules enabled', '1 / 2'], ['Rules in dry-run', '1'], ['Commands enabled', '1 / 2'], ['Log channels', '1'],
+    ['Moderation records', '7'], ['Warns', '2'], ['Bans', '1'], ['Cases', '4'],
+    ['Prefix', '!'], ['Bot name', 'Guard'], ['Badword patterns', '3'], ['Routine chat collection', 'Off'],
+  ];
+  assert.equal(grids[0].children.length, expected.length, 'no stat dropped or duplicated');
+  for (const [label, shown] of expected) assert.equal(value(label), shown, label);
+  // The hero, its eyebrow and the separate explainer band are gone.
+  assert.equal(dashboard.querySelector('.hero, .dashboard-hero, .eyebrow, .dashboard-note')?.className ?? null, null);
+  const header = dashboard.querySelector('.page-header');
+  assert.ok(Boolean(header), 'expected a page header');
+  assert.equal(header.querySelectorAll('h2').length, 1);
+  assert.equal(header.querySelector('h2').textContent, 'Dashboard');
+  assert.equal(Boolean(header.querySelector('p')), false, 'the header carries no paragraph copy');
+  assert.match(header.querySelector('.page-header-detail').textContent, /First/);
+  assert.deepEqual(Array.from(header.querySelectorAll('button')).map((b) => b.textContent), ['Review protection →', 'View audit log']);
+  for (const button of header.querySelectorAll('button')) assert.match(button.className, /\bbtn-sm\b/);
+});
+
+test('dashboard count explainer is an accessible, keyboard-reachable tooltip', async () => {
+  const { app } = harness(async () => response({ events: 7, warns: 2, bans: 1, cases: 4 }));
+  app.state.config = configuredDashboard();
+  const dashboard = app.tabDashboard();
+  await settle();
+  const trigger = dashboard.querySelector('.info-tip-trigger');
+  assert.ok(Boolean(trigger), 'expected an info tooltip trigger');
+  assert.equal(trigger.tagName, 'BUTTON');
+  assert.equal(trigger.getAttribute('type'), 'button');
+  assert.notEqual(trigger.tabIndex, -1, 'keyboard focusable');
+  assert.equal(trigger.getAttribute('aria-label'), 'About these counts');
+  // The trigger sits with the stat it explains.
+  assert.match(trigger.closest('.stat').querySelector('.stat-title').textContent, /^Moderation records/);
+  const tip = dashboard.querySelector(`#${trigger.getAttribute('aria-describedby')}`);
+  assert.ok(Boolean(tip), 'aria-describedby must reference the tooltip text');
+  assert.equal(tip.getAttribute('role'), 'tooltip');
+  assert.equal(tip.textContent,
+    'Moderation records exclude routine history and older plan summaries whose action type was not recorded. Those summaries remain in the Audit Log.');
+  assert.equal(tip.hidden, true, 'hidden until hover or focus');
+  await fire(trigger, 'focusin');
+  assert.equal(tip.hidden, false, 'focus shows the explainer');
+  assert.equal(trigger.getAttribute('aria-expanded'), 'true');
+  await fire(trigger, 'keydown', { key: 'Escape' });
+  assert.equal(tip.hidden, true, 'Escape dismisses the explainer');
+  await fire(trigger.parentElement, 'mouseover');
+  assert.equal(tip.hidden, false, 'hover shows the explainer');
+  await fire(trigger.parentElement, 'mouseout');
+  assert.equal(tip.hidden, true);
+});
+
+test('count tooltip stays open while the pointer moves from the trigger onto its text', async () => {
+  const { app } = harness(async () => response({ events: 7, warns: 2, bans: 1, cases: 4 }));
+  app.state.config = configuredDashboard();
+  const dashboard = app.tabDashboard();
+  await settle();
+  const trigger = dashboard.querySelector('.info-tip-trigger');
+  const tip = dashboard.querySelector(`#${trigger.getAttribute('aria-describedby')}`);
+  const outside = trigger.closest('.stat').querySelector('.stat-value');
+  await fire(trigger, 'mouseover', { relatedTarget: outside });
+  assert.equal(tip.hidden, false, 'hovering the trigger shows the text');
+  // The text, and the bridge drawn over the gap above it, are inside the hover area.
+  await fire(trigger, 'mouseout', { relatedTarget: tip });
+  await fire(tip, 'mouseover', { relatedTarget: trigger });
+  assert.equal(tip.hidden, false, 'moving onto the text keeps it open');
+  await fire(tip, 'mouseout', { relatedTarget: outside });
+  await fire(outside, 'mouseover', { relatedTarget: tip });
+  assert.equal(tip.hidden, true, 'leaving the text and trigger hides it');
+  // CSS: the text sits below a gap; a transparent ::before on the text covers that gap and its border.
+  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
+  const text = css.match(/^\.info-tip-text \{([^}]*)\}/m)?.[1] ?? '';
+  const gap = Number(text.match(/top:\s*calc\(100% \+ (\d+)px\)/)?.[1]);
+  const border = Number(text.match(/border:\s*(\d+)px/)?.[1] ?? 0);
+  assert.ok(gap > 0, 'the text keeps its visual spacing below the trigger');
+  const bridge = css.match(/^\.info-tip-text::before \{([^}]*)\}/m)?.[1] ?? '';
+  assert.match(bridge, /content:\s*""/, 'expected a bridge over the gap');
+  assert.match(bridge, /position:\s*absolute/);
+  assert.match(bridge, /bottom:\s*100%/);
+  assert.match(bridge, /inset-inline:\s*0/);
+  assert.doesNotMatch(bridge, /pointer-events:\s*none/);
+  assert.ok(Number(bridge.match(/height:\s*(\d+)px/)?.[1]) >= gap + border, 'the bridge spans the gap and border');
+});
+
+test('hover-opened count tooltip closes on Escape wherever focus is and drops its listener', async () => {
+  const h = harness(async () => response({ events: 7, warns: 2, bans: 1, cases: 4 }));
+  h.app.state.config = configuredDashboard();
+  const dashboard = h.app.tabDashboard();
+  await settle();
+  const trigger = dashboard.querySelector('.info-tip-trigger');
+  const tip = dashboard.querySelector(`#${trigger.getAttribute('aria-describedby')}`);
+  assert.equal(h.documentListeners.has('keydown'), false, 'no listener while closed');
+  await fire(trigger.parentElement, 'mouseover');
+  assert.equal(tip.hidden, false);
+  assert.notEqual(h.document.activeElement, trigger, 'focus stays elsewhere');
+  await fire(h.document.body, 'keydown', { key: 'a' });
+  assert.equal(tip.hidden, false, 'other keys leave it open');
+  await fire(h.document.body, 'keydown', { key: 'Escape' });
+  assert.equal(tip.hidden, true, 'Escape dismisses hover-opened text');
+  assert.equal(trigger.getAttribute('aria-expanded'), 'false');
+  assert.equal(h.documentListeners.has('keydown'), false, 'closing removes the document listener');
+});
+
+test('analytics opens with a one-line page header instead of the hero card', async () => {
+  const { app } = harness(() => new Promise(() => {}));
+  app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };
+  const panel = app.tabAnalytics();
+  await settle();
+  assert.equal(panel.querySelector('.hero, .dashboard-hero, .eyebrow')?.className ?? null, null);
+  const header = panel.querySelector('.page-header');
+  assert.ok(Boolean(header), 'expected a page header');
+  assert.equal(header.querySelector('h2').textContent, 'Analytics');
+  assert.match(header.querySelector('.page-header-detail').textContent, /Trends for First over the last 30 days/);
+});
+
+test('no page renders the old multi-line hero card markup', () => {
+  for (const page of ['app.js', 'administration.js']) {
+    const js = fs.readFileSync(new URL(`../frontend/${page}`, import.meta.url), 'utf8');
+    assert.doesNotMatch(js, /dashboard-hero|under your care|COMMUNITY AT A GLANCE|DAILY TRENDS/, page);
+    // The only daisyUI hero left is the empty/loading state panel, which carries no eyebrow.
+    const heroes = [...js.matchAll(/className: "hero(?: [^"]*)?"/g)];
+    assert.equal(heroes.length, page === 'app.js' ? 1 : 0, page);
+  }
+  const app = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8');
+  const emptyPanel = app.slice(app.indexOf('function emptyPanel('), app.indexOf('function field('));
+  assert.match(emptyPanel, /className: "hero /);
+  assert.doesNotMatch(emptyPanel, /eyebrow/);
+  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
+  assert.doesNotMatch(css, /\.dashboard-hero/);
+  // Owner Administration keeps its eyebrow on the title line.
+  assert.match(css, /\.administration-header > div:first-child\s*\{[^}]*display:\s*flex[^}]*align-items:\s*baseline/);
+});
+
 test('analytics tab reads the daily series as a POST with the page enrollment and renders trends', async () => {
   const pending = [];
   const { app } = harness((url, options) => new Promise(resolve => pending.push({ url, method: options.method, headers: options.headers, resolve })));
@@ -3005,6 +3201,97 @@ test('desktop sidebar keeps its footer controls in view while a tall page scroll
   }
 });
 
+// Measures the dashboard and the compact control sizes in the real layout engine (#590).
+const densityProbe = `(async () => {
+  const wait = () => new Promise(resolve => setTimeout(resolve, 50));
+  const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  for (let i = 0; i < 200 && !document.querySelector('.dashboard-stats'); i++) await wait();
+  for (let i = 0; i < 200 && /Loading/.test(document.querySelector('.dashboard-stats').textContent); i++) await wait();
+  await frame();
+  const rect = element => { const { top, bottom, width, height } = element.getBoundingClientRect(); return { top, bottom, width, height }; };
+  const result = { theme: document.documentElement.dataset.theme, viewport: innerHeight, scrollY,
+    bodyFont: parseFloat(getComputedStyle(document.body).fontSize),
+    statFont: parseFloat(getComputedStyle(document.querySelector('.stat-value')).fontSize),
+    stats: rect(document.querySelector('.dashboard-stats')), header: rect(document.querySelector('.page-header')),
+    statRows: new Set([...document.querySelectorAll('.dashboard-stats .stat')].map(stat => Math.round(stat.getBoundingClientRect().top))).size,
+    gettingStarted: Boolean(document.querySelector('.getting-started')),
+    tabs: Math.min(...[...document.querySelectorAll('#tabs button')].map(button => rect(button).height)) };
+  const probes = document.createElement('div');
+  probes.style.cssText = 'position:absolute;top:0;left:0;visibility:hidden';
+  probes.innerHTML = '<button class="btn">B</button><button class="btn btn-sm">B</button><button class="btn btn-xs">B</button>' +
+    '<button class="btn btn-sm btn-square btn-icon">B</button><input class="input"><select class="select"><option>x</option></select>' +
+    '<input type="checkbox" class="checkbox">';
+  document.body.append(probes);
+  await frame();
+  result.controls = Object.fromEntries(['btn', 'sm', 'xs', 'square', 'input', 'select', 'checkbox']
+    .map((name, index) => [name, rect(probes.children[index])]));
+  probes.remove();
+  const trigger = document.querySelector('.info-tip-trigger');
+  result.trigger = rect(trigger);
+  trigger.focus();
+  await frame();
+  const style = getComputedStyle(trigger);
+  const tip = document.getElementById(trigger.getAttribute('aria-describedby'));
+  Object.assign(result, { outline: style.outlineStyle + ' ' + style.outlineWidth, tipShown: !tip.hidden, tip: rect(tip), width: innerWidth });
+  return JSON.stringify(result);
+})()`;
+
+test('dashboard density fits 1280x800 and keeps 24px targets in both themes', { timeout: 180000 }, async t => {
+  const missing = !firefoxBinary ? 'Firefox is not on PATH'
+    : !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url)) ? 'dist/frontend is not built (npm run build --prefix tools/webui)' : null;
+  if (missing) {
+    assert.ok(!process.env.CI, `${missing}; CI requires this browser layout check`);
+    t.skip(missing);
+    return;
+  }
+  const domEvent = globalThis.Event;
+  globalThis.Event = NodeEvent;
+  let server, browser;
+  t.after(async () => {
+    await browser?.close();
+    if (server) await new Promise(resolve => server.close(resolve));
+    globalThis.Event = domEvent;
+  });
+  // The stub configuration has no rules, commands or log channels, so Getting started is shown too.
+  server = await serveBuiltApp(() => false);
+  browser = await launchFirefox();
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  for (const theme of ['light', 'dark']) {
+    for (const [width, height] of [[1280, 800], [1920, 1080], [700, 800]]) {
+      const name = `${theme} ${width}x${height}`;
+      await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height } });
+      await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
+      await browser.send('script.evaluate', { expression: `localStorage.setItem('jmodguard.theme', '${theme}')`, target: { context: browser.context }, awaitPromise: false });
+      await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
+      const { result } = await browser.send('script.evaluate', { expression: densityProbe, target: { context: browser.context }, awaitPromise: true });
+      const m = JSON.parse(result.value);
+      assert.equal(m.theme, theme, name);
+      assert.ok(m.gettingStarted, `${name}: incomplete setup shows Getting started`);
+      assert.equal(m.bodyFont, 14, `${name}: body text`);
+      assert.ok(m.statFont <= 22, `${name}: stat numeral ${m.statFont}px`);
+      for (const control of ['sm', 'xs', 'square', 'checkbox'])
+        assert.ok(m.controls[control].height >= 24 && m.controls[control].width >= 24, `${name}: ${control} ${JSON.stringify(m.controls[control])}`);
+      assert.ok(m.trigger.height >= 24 && m.trigger.width >= 24, `${name}: tooltip trigger ${JSON.stringify(m.trigger)}`);
+      assert.ok(m.tabs >= 24, `${name}: navigation targets ${m.tabs}px`);
+      assert.equal(m.outline, 'solid 2px', `${name}: focus ring`);
+      assert.ok(m.tipShown && m.tip.width > 0, `${name}: focus shows the tooltip`);
+      if (width <= 720) {
+        // Narrow screens scale fields back up to the touch size.
+        for (const control of ['btn', 'input', 'select']) assert.equal(Math.round(m.controls[control].height), 40, `${name}: ${control}`);
+        continue;
+      }
+      for (const control of ['btn', 'input', 'select'])
+        assert.ok(m.controls[control].height >= 28 && m.controls[control].height <= 32, `${name}: ${control} ${m.controls[control].height}px`);
+      assert.ok(m.header.height <= 40, `${name}: one-line page header ${m.header.height}px`);
+      // Twelve stats wrap into rows (protection, activity, configuration) instead of one squeezed row.
+      assert.equal(m.statRows, 3, `${name}: stat grid rows`);
+      // Acceptance: every stat is visible without scrolling.
+      assert.equal(m.scrollY, 0, name);
+      assert.ok(m.stats.bottom <= m.viewport, `${name}: stat grid ends at ${m.stats.bottom}px of ${m.viewport}px`);
+    }
+  }
+});
+
 test('text rule UI can save independent thresholds without generic escalation', async () => {
   const calls=[];
   const h=harness(async (url, options) => {
@@ -3787,7 +4074,9 @@ test('React WebUI retains the framework imports, styling and pale-blue tokens', 
   assert.match(js, /hero-content/);
   assert.match(js, /stat-title/);
   assert.match(js, /btn-primary/);
-  assert.match(js, /dashboard-hero/);
+  // #590 replaced the dashboard hero with a one-line page header.
+  assert.match(js, /className: "page-header"/);
+  assert.doesNotMatch(js, /dashboard-hero/);
   assert.doesNotMatch(js, /btn-neutral/);
   assert.match(js, /className: "stats /);
   assert.match(js, /btn btn-primary/);
