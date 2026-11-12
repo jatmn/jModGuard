@@ -114,3 +114,154 @@ test("component borders use the contrast-tested theme colors", () => {
   assert.doesNotMatch(checkbox, /background-color\s*:/);
   assert.match(css, /\.btn:not\([^}]*\)\s*\{\s*border-color:\s*var\(--input-border\)/);
 });
+
+// #590 desktop density: the theme alias blocks carry the shared scale tokens.
+const THEME_BLOCKS = [
+  ["light", ':root, :root[data-theme="light"], [data-theme="light"]'],
+  ["dark", ':root[data-theme="dark"], [data-theme="dark"]'],
+];
+function rule(selector, source = css) {
+  const at = source.split("\n").findIndex((line) => line.startsWith(`${selector} {`));
+  assert.ok(at >= 0, `missing rule ${selector}`);
+  const rest = source.split("\n").slice(at).join("\n");
+  return rest.slice(rest.indexOf("{") + 1, rest.indexOf("}"));
+}
+function declaration(body, name) {
+  const match = body.match(new RegExp(`(?:^|[;{\\s])${name.replace(/[-]/g, "\\-")}:\\s*([^;]+);`));
+  return match?.[1].trim();
+}
+function px(value) {
+  const match = String(value).match(/^([\d.]+)(rem|px)$/);
+  assert.ok(match, `expected a rem/px length, got ${value}`);
+  return Number(match[1]) * (match[2] === "rem" ? 16 : 1);
+}
+function mediaBlock(query) {
+  const start = css.indexOf(`@media ${query} {`);
+  assert.ok(start >= 0, `missing @media ${query}`);
+  let depth = 0;
+  for (let index = css.indexOf("{", start); index < css.length; index++) {
+    if (css[index] === "{") depth++;
+    if (css[index] === "}" && --depth === 0) return css.slice(css.indexOf("{", start) + 1, index);
+  }
+  throw new Error(`unterminated @media ${query}`);
+}
+// daisyUI 5.7: btn/input/select height = --size-field x10 (sm x8, xs x6); checkbox/badge = --size-selector x6.
+const FIELD = { md: 10, sm: 8, xs: 6 };
+
+for (const [theme, selector] of THEME_BLOCKS) {
+  test(`${theme} theme tokens set the desktop admin-console scale`, () => {
+    const body = rule(selector);
+    const value = (name) => px(declaration(body, name));
+    const font = value("--ui-font-size");
+    assert.ok(font >= 13 && font <= 14, `${theme} body text ${font}px`);
+    assert.ok(value("--ui-font-size-sm") >= 12, `${theme} secondary text must stay readable`);
+    const field = value("--size-field");
+    assert.ok(field * FIELD.md >= 28 && field * FIELD.md <= 32, `${theme} control height ${field * FIELD.md}px`);
+    assert.ok(field * FIELD.sm >= 24, `${theme} small control ${field * FIELD.sm}px`);
+    assert.ok(value("--size-selector") * 6 >= 24, `${theme} checkbox ${value("--size-selector") * 6}px`);
+    assert.equal(value("--target-min"), 24, `${theme} target floor`);
+    assert.ok(value("--card-p") <= 16, `${theme} card padding`);
+    assert.ok(value("--ui-gap") <= 12, `${theme} section gap`);
+    const stat = value("--stat-value-size");
+    assert.ok(stat >= 16 && stat <= 22, `${theme} stat numeral ${stat}px`);
+  });
+}
+
+test("the page uses the scale tokens instead of the old touch-sized values", () => {
+  assert.match(rule("body"), /font-size:\s*var\(--ui-font-size\)/);
+  assert.match(rule(".stat-value"), /font-size:\s*var\(--stat-value-size\)/);
+  assert.match(css, /#content\s*\{[^}]*gap:\s*var\(--ui-gap\)/);
+  const heading = declaration(rule("#content h2"), "font-size");
+  assert.ok(px(heading) <= 20, `page heading ${heading}`);
+  // Old scale: 2rem page headings, 36px/40px content padding, 1.875rem stat numerals.
+  assert.doesNotMatch(css, /clamp\(1\.5rem, 2\.2vw, 2rem\)|padding: 36px 40px|clamp\(1\.25rem, 2vw, 1\.875rem\)/);
+});
+
+test("compact controls keep a visible focus ring with 3:1 contrast on every surface", () => {
+  const focus = css.match(/^:is\(([^)]*)\):focus-visible\s*\{([^}]*)\}/m);
+  assert.ok(focus, "missing the shared :focus-visible rule");
+  for (const control of [".btn", ".input", ".select", ".textarea", ".checkbox", ".menu button", ".info-tip-trigger", "a", "summary"])
+    assert.ok(focus[1].split(/,\s*/).includes(control), `focus ring must cover ${control}`);
+  assert.match(focus[2], /outline:\s*2px solid var\(--accent\)/);
+  assert.match(focus[2], /outline-offset:\s*2px/);
+  // No first-party rule removes the outline from a focused control.
+  for (const [, selectors, body] of css.matchAll(/([^{}]*:focus(?:-visible|-within)?[^{}]*)\{([^}]*)\}/g))
+    assert.doesNotMatch(body, /outline(?:-style)?:\s*(?:none|0)\b/, selectors.trim());
+  for (const [theme, selector] of [["light", ":root"], ["dark", ':root[data-theme="dark"]']]) {
+    const colors = tokens(selector);
+    for (const surface of ["--bg", "--panel", "--panel2", "--input", "--hero", "--sidebar", "--side-panel", "--side-hover", "--selected"]) {
+      const ratio = contrast(colors["--accent"], colors[surface]);
+      assert.ok(ratio >= 3, `${theme} focus ring on ${surface}: ${ratio.toFixed(2)}:1`);
+    }
+  }
+});
+
+test("the smallest interactive controls keep 24px targets", () => {
+  // daisyUI btn-xs/btn-sm/btn-square and input/select heights come from --size-field; the
+  // floor covers any variant smaller than the target minimum.
+  assert.match(rule(".btn, .input, .select, .info-tip-trigger"), /min-height:\s*var\(--target-min\)/);
+  assert.match(rule(".btn-square, .btn-circle, .info-tip-trigger"), /min-width:\s*var\(--target-min\)/);
+  assert.match(rule("#tabs button"), /min-height:\s*var\(--target-min\)/);
+  assert.match(rule(".administration-badge"), /min-height:\s*var\(--target-min\)/);
+  // No first-party rule pins a control below 24px.
+  for (const [, selectors, body] of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    // Only rules whose subject (the last compound selector) is the control itself.
+    const subjects = selectors.split(",").map((part) => part.trim().split(/\s+|>/).filter(Boolean).at(-1) ?? "");
+    if (!subjects.some((subject) => /^(?:\.(?:btn|input|select|checkbox|info-tip-trigger)\b|button$)/.test(subject.replace(/^[^.]*(?=\.)/, "")))) continue;
+    for (const [, property, value] of body.matchAll(/(?:^|;)\s*((?:min-)?(?:height|width)):\s*([\d.]+(?:px|rem))/g))
+      assert.ok(px(value) >= 24, `${selectors.trim()} ${property}: ${value}`);
+  }
+  // Interactive badges, checkbox and size variants smaller than the floored ones stay unused.
+  for (const page of ["app.js", "administration.js", "charts.js", "appearance.js"]) {
+    const source = readFileSync(new URL(`../frontend/${page}`, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /\b(?:checkbox|badge|input|select)-xs\b|\bcheckbox-sm\b/, page);
+    assert.doesNotMatch(source, /h\((?:"button"|ActionButton)[^)]*className:\s*"badge/, page);
+  }
+});
+
+test("narrow and touch screens scale controls up, never below the 24px target", () => {
+  const narrow = mediaBlock("(max-width: 720px), (pointer: coarse)");
+  const desktop = px(declaration(rule(THEME_BLOCKS[0][1]), "--size-field"));
+  const field = narrow.match(/^\s*(:root[^{]*)\{\s*--size-field:\s*([\d.]+rem);\s*\}/m);
+  assert.ok(field, "narrow screens restate --size-field for both themes");
+  for (const [, selector] of THEME_BLOCKS)
+    for (const part of selector.split(/,\s*/)) assert.ok(field[1].includes(part), `narrow override covers ${part}`);
+  assert.ok(px(field[2]) >= desktop, "narrow screens never shrink controls");
+  assert.ok(px(field[2]) * FIELD.xs >= 24, `narrow xs control ${px(field[2]) * FIELD.xs}px`);
+  // No media query lowers the target floor or the shared scale.
+  for (const [, query] of css.matchAll(/@media ([^{]+)\{/g)) {
+    const body = mediaBlock(query.trim());
+    assert.doesNotMatch(body, /--target-min|--ui-font-size|--size-selector/, query);
+  }
+});
+
+for (const [theme, selector] of [["light", ":root"], ["dark", ':root[data-theme="dark"]']]) {
+  test(`${theme} compact text, header and tooltip colors keep 4.5:1`, () => {
+    const colors = tokens(selector);
+    const color = (body, property) => {
+      const name = declaration(body, property)?.match(/^var\((--[\w-]+)\)$/)?.[1];
+      assert.ok(name && colors[name], `${property} must use a theme token, got ${declaration(body, property)}`);
+      return colors[name];
+    };
+    const tip = rule(".info-tip-text");
+    const trigger = rule(".info-tip-trigger");
+    const pairs = [
+      ["tooltip text", color(tip, "color"), color(tip, "background")],
+      ["tooltip trigger", color(trigger, "color"), colors["--panel"]],
+      ["tooltip trigger hover", color(trigger, "color"), color(rule(".info-tip-trigger:hover"), "background")],
+      ["page title", colors["--text"], colors["--bg"]],
+      ["page header detail", color(rule(".muted"), "color"), colors["--bg"]],
+      ["stat label", color(rule(".stat-title"), "color"), colors["--panel"]],
+      ["setup step help", color(rule(".setup-link span span"), "color"), colors["--input"]],
+      ["setup note", color(rule(".setup-note"), "color"), colors["--panel"]],
+      ["field help", color(rule(".field-help"), "color"), colors["--panel"]],
+      ["analytics note", color(rule(".dashboard-note p"), "color"), color(rule(".dashboard-note"), "background")],
+      ["sidebar labels", colors["--side-muted"], colors["--sidebar"]],
+      ["active navigation", colors["--selected-text"], colors["--selected"]],
+    ];
+    for (const [name, text, background] of pairs) {
+      const ratio = contrast(text, background);
+      assert.ok(ratio >= 4.5, `${theme} ${name}: ${ratio.toFixed(2)}:1`);
+    }
+  });
+}

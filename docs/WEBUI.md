@@ -105,6 +105,24 @@ use daisyUI component classes mapped onto
 those tokens. First-party CSS is the workspace shell and theme, not a
 restyle of daisyUI widgets back into the previous custom controls.
 
+Both themes share one desktop admin-console density, set by tokens in
+`frontend/style.css`: 14px body text (`--ui-font-size`), daisyUI
+`--size-field` for 30px buttons, inputs and selects (24px `sm`),
+`--size-selector` for 24px checkboxes and badges, 16px card padding
+(`--card-p`), 12px section gaps (`--ui-gap`) and 20px stat numerals
+(`--stat-value-size`). `--target-min` keeps every control, including `xs`
+buttons, square icon buttons and info-tooltip triggers, at least 24px
+(WCAG 2.2 target size), and all controls share one visible focus ring.
+Narrow (720px or less) and touch screens scale fields back up to 40px.
+Pages open with a single header line instead of hero cards. The Dashboard
+hides Getting started once the loaded configuration has at least one enabled
+automod rule, one enabled command and one routed log channel (one per setup
+step); missing collections count as incomplete. Its stat explainer is an info
+tooltip: a focusable button described by the tooltip text, shown on hover or
+focus and dismissed with Escape. `scripts/frontend-contrast-test.mjs` guards
+the scale, focus ring, target sizes and colors; the browser check in
+`scripts/frontend-state-test.mjs` measures the Dashboard at 1280×800.
+
 Use the **same git tag or commit** as the bot and API when the page needs
 new endpoints. CSS-only updates can ship without a new image.
 
