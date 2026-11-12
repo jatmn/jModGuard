@@ -8,6 +8,15 @@ if [ -z "${JMODGUARD_CI_PREFIX:-}" ]; then
   fi
 fi
 
+# Pinned supply-chain tool versions. The CI tool cache key in
+# .github/workflows/ci.yml hashes this file, so a pin bump yields a new key and
+# a save of the newly installed binary; a pin kept elsewhere would restore the
+# old binary on every primary-key hit and reinstall each run.
+# shellcheck disable=SC2034  # read by scripts/ci-preflight.sh, which sources this file
+cargo_deny_version=0.20.2
+# shellcheck disable=SC2034
+cargo_audit_version=0.22.2
+
 cargo_tool_version_last_field() {
   local tool="$1"
   local vout
@@ -54,20 +63,44 @@ ensure_cargo_tool() {
     echo "ci-preflight: pinned $pinned absent; checking PATH"
   fi
 
+  local path_seen="" path_ver=""
   if command -v "$bin" >/dev/null 2>&1; then
     path_bin="$(command -v "$bin")"
-    got_ver="$(cargo_tool_version_last_field "$path_bin")"
+    path_seen="$path_bin"
+    path_ver="$(cargo_tool_version_last_field "$path_bin")"
+    got_ver="$path_ver"
     if [ "$got_ver" = "$version" ]; then
       out="$("$path_bin" --version 2>&1 || true)"
       echo "ci-preflight: using $bin at $path_bin ($out)"
       return 0
     fi
-    echo "ci-preflight: $bin at $path_bin is version $got_ver, need $version; installing $crate $version"
+  fi
+
+  # Hosted CI restores previously installed tools under the job-local tool
+  # root (inside the actions/cache path) without putting them on PATH. Reuse
+  # a matching binary instead of rerunning `cargo install`, which refreshes
+  # the crates.io index and re-downloads the crate before no-op'ing with
+  # "already installed".
+  tool_root="$(jmodguard_preflight_cargo_tool_root)"
+  if [ -x "$tool_root/bin/$bin" ]; then
+    path_bin="$tool_root/bin/$bin"
+    got_ver="$(cargo_tool_version_last_field "$path_bin")"
+    if [ "$got_ver" = "$version" ]; then
+      PATH="$tool_root/bin:$PATH"
+      export PATH
+      out="$("$path_bin" --version 2>&1 || true)"
+      echo "ci-preflight: using cached $bin at $path_bin ($out)"
+      return 0
+    fi
+    echo "ci-preflight: cached $path_bin is version $got_ver, need $version"
+  fi
+
+  if [ -n "$path_seen" ]; then
+    echo "ci-preflight: $bin at $path_seen is version $path_ver, need $version; installing $crate $version"
   else
     echo "ci-preflight: installing $crate $version"
   fi
 
-  tool_root="$(jmodguard_preflight_cargo_tool_root)"
   install_target_dir="$tool_root/cargo-install-target"
   mkdir -p "$install_target_dir"
   if ! cargo install --locked --root "$tool_root" --target-dir "$install_target_dir" --version "$version" "$crate"; then

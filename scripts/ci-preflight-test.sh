@@ -169,6 +169,44 @@ if [ -f "$install_log" ]; then
   fail 'pinned wrong: must not install when PATH is correct'
 fi
 
+# Hosted CI restores the job-local tool root (the actions/cache path) without
+# putting it on PATH: the cached binary must be reused, not reinstalled.
+empty_bin="$fixture/empty-bin"
+cargo_only_bin="$fixture/cargo-only-bin"
+mkdir -p "$empty_bin" "$cargo_only_bin"
+cp "$fixture/bin/cargo" "$cargo_only_bin/cargo"
+cached_stdout="$fixture/cached-stdout"
+resolved_file="$fixture/cached-resolved"
+(
+  export JMODGUARD_CI_PREFIX="$fixture/opt"
+  export CARGO_HOME="$fixture/cargo-home"
+  export JMODGUARD_PREFLIGHT_CARGO_TOOL_ROOT="$tool_root"
+  export CI_PREFLIGHT_TEST_INSTALL_LOG="$install_log"
+  export PATH="$cargo_only_bin:/usr/bin:/bin"
+  rm -f "$install_log"
+  ensure_cargo_tool cargo-deny cargo-deny 0.20.2
+  command -v cargo-deny >"$resolved_file"
+) >"$cached_stdout" 2>&1
+resolved="$(cat "$resolved_file")"
+grep -Fq "using cached cargo-deny at $tool_root/bin/cargo-deny" "$cached_stdout" \
+  || fail 'cached tool root: expected cached message with tool root path'
+if [ -f "$install_log" ]; then
+  fail 'cached tool root: must not install when the tool root has the pinned version'
+fi
+case "$resolved" in
+  "$tool_root/bin/cargo-deny") ;;
+  *) fail "cached tool root: expected the tool root binary on PATH, got $resolved" ;;
+esac
+
+# A wrong cached version must not be reused; the install path replaces it.
+write_cargo_deny "$tool_root/bin/cargo-deny" 9.9.9 wrong-cached
+rm -rf "$fixture/opt/cargo-deny-0.20.2"
+out="$(run_ensure "$cargo_only_bin")"
+grep -Fq "cached $tool_root/bin/cargo-deny is version 9.9.9, need 0.20.2" "$fixture/stdout" \
+  || fail 'cached wrong: expected cached version mismatch message'
+[ -f "$install_log" ] || fail 'cached wrong: expected cargo install'
+grep -Fq "$tool_root" "$install_log" || fail 'cached wrong: expected job-local root in install log'
+
 echo 'ci-preflight test: ensure_cargo_tool selection verified'
 
 bash "$root/scripts/ci-preflight.sh" --audit-expiry-self-check

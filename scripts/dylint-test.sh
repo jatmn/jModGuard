@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Check the environment passed to Dylint without installing its toolchain.
+# shellcheck disable=SC2030,SC2031
 set -euo pipefail
 
 root="$(git rev-parse --show-toplevel)"
@@ -445,6 +446,9 @@ expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-ta
 
 run_dylint "$fixture/external" DYLINT_TEST_RUSTC_FAIL=1
 grep -Fq 'key lookup failed' "$stdout_file" || fail 'missing key lookup failed message'
+grep -Fq 'library key unavailable' "$stdout_file" || fail 'missing unrecorded library key message'
+[ ! -e "$fixture/project/target-dylint/dylint/jmodguard-lib-key.txt" ] \
+  || fail 'a failed compiler lookup must not record a library key'
 expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
 
 if run_dylint "$fixture/external" DYLINT_TEST_CURL_FAIL=1 >/dev/null 2>&1; then
@@ -452,6 +456,157 @@ if run_dylint "$fixture/external" DYLINT_TEST_CURL_FAIL=1 >/dev/null 2>&1; then
 fi
 grep -Fq 'dylint toolchain lookup failed' "$stdout_file" \
   || fail 'missing dylint toolchain lookup failed message for curl'
+
+# scripts/ci-dylint-libs.sh publishes the pinned layout dylint.sh consumes on
+# hosted runners: the tools from the dylint install root and the six
+# metadata-built libraries from the dylint target directory.
+cp "$root/scripts/ci-dylint-libs.sh" "$fixture/project/scripts/ci-dylint-libs.sh"
+publish_prefix="$fixture/publish-prefix"
+publish_cargo="$fixture/publish-cargo"
+publish_target="$fixture/publish-target"
+provision_stdout="$fixture/provision-stdout"
+publish_lib_dir="$publish_prefix/dylint-libs/$KEY"
+mkdir -p "$publish_cargo/bin" "$publish_target/dylint/libraries/$tc/release"
+printf '#!/bin/sh\nexit 0\n' >"$publish_cargo/bin/cargo-dylint"
+printf '#!/bin/sh\nexit 0\n' >"$publish_cargo/bin/dylint-link"
+chmod +x "$publish_cargo/bin/cargo-dylint" "$publish_cargo/bin/dylint-link"
+printf 'cargo-dylint v6.1.0:\n    cargo-dylint\n\ndylint-link v6.1.0:\n    dylint-link\n' \
+  >"$publish_cargo/.crates.toml"
+for name in abs_home_path await_holding_span_guard basic_dead_store crate_wide_allow incorrect_matches_operation wrong_serialize_struct_arg; do
+  printf 'x' >"$publish_target/dylint/libraries/$tc/release/lib${name}@${tc}.so"
+done
+# dylint.sh records the build's library key next to its output; the publisher
+# reads it instead of looking the key up again.
+cp "$key_body_file" "$publish_target/dylint/jmodguard-lib-key.txt"
+
+run_provision() {
+  local prefix="$1" cargo_home="$2" target_dir="$3"
+  shift 3
+  (
+    cd "$fixture/project"
+    JMODGUARD_CI_PREFIX="$prefix" \
+    DYLINT_CARGO_HOME="$cargo_home" \
+    CARGO_TARGET_DIR="$target_dir" \
+    PATH="$fixture/bin:$PATH" \
+    TMPDIR="$fixture/external" \
+    env -u JMODGUARD_DYLINT_PACKAGES -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+      "$@" bash scripts/ci-dylint-libs.sh
+  ) >"$provision_stdout" 2>&1
+}
+
+run_provision "$publish_prefix" "$publish_cargo" "$publish_target"
+grep -Fq "ci-dylint-libs: published pinned dylint 6.1.0 tools to $publish_prefix/dylint-6.1.0" "$provision_stdout" \
+  || fail 'provisioning must publish the pinned tools'
+grep -Fq "ci-dylint-libs: published prebuilt lint libraries to $publish_lib_dir" "$provision_stdout" \
+  || fail 'provisioning must publish the prebuilt libs'
+[ -x "$publish_prefix/dylint-6.1.0/bin/cargo-dylint" ] || fail 'published pinned tool binary is missing'
+[ -f "$publish_prefix/dylint-6.1.0/.crates.toml" ] || fail 'published pinned crates manifest is missing'
+cmp -s "$publish_prefix/dylint-6.1.0/.crates.toml" "$publish_cargo/.crates.toml" \
+  || fail 'published pinned tools must come from the dylint install root'
+cmp -s "$publish_lib_dir/key.txt" "$key_body_file" || fail 'published libs must carry the computed key'
+[ "$(find "$publish_lib_dir" -maxdepth 1 -type f -name '*.so' | wc -l)" -eq 6 ] \
+  || fail 'published libs must contain exactly the six libraries'
+cmp -s "$publish_lib_dir/libbasic_dead_store@${tc}.so" "$publish_target/dylint/libraries/$tc/release/libbasic_dead_store@${tc}.so" \
+  || fail 'published libs must copy the metadata build output'
+
+# A stale or corrupt entry under the same key is replaced, not trusted.
+printf 'wrong\n' >"$publish_lib_dir/key.txt"
+run_provision "$publish_prefix" "$publish_cargo" "$publish_target"
+cmp -s "$publish_lib_dir/key.txt" "$key_body_file" || fail 'provisioning must replace a corrupt lib entry'
+[ -z "$(find "$publish_prefix/dylint-libs" -maxdepth 1 -name '.publish.*' -print -quit)" ] \
+  || fail 'provisioning must not leave staging directories'
+
+# Publishing is idempotent: a second run reports and keeps the layout.
+run_provision "$publish_prefix" "$publish_cargo" "$publish_target"
+grep -Fq "ci-dylint-libs: pinned tools already published at $publish_prefix/dylint-6.1.0" "$provision_stdout" \
+  || fail 'second provisioning run must report the pinned tools'
+grep -Fq "ci-dylint-libs: prebuilt libs already published at $publish_lib_dir" "$provision_stdout" \
+  || fail 'second provisioning run must report the prebuilt libs'
+
+# dylint.sh consumes the published layout: pinned tools plus prebuilt libs
+# with --no-metadata, with no per-run install and no metadata build.
+rm -f "$capture" "$install_capture"
+(
+  cd "$fixture/project"
+  JMODGUARD_CI_PREFIX="$publish_prefix" \
+  PATH="$fixture/bin:$PATH" \
+  DYLINT_TEST_CAPTURE="$capture" \
+  DYLINT_TEST_INSTALL_CAPTURE="$install_capture" \
+  DYLINT_TEST_TOOLCHAIN_STATE="$fixture/toolchain-ready" \
+  DYLINT_TEST_RECORDER="$fixture/record-git-config.sh" \
+  DYLINT_TEST_GIT_CONFIG_LOG="$git_config_log" \
+  TMPDIR="$fixture/external" \
+  env -u CARGO_TARGET_DIR -u JMODGUARD_DYLINT_PACKAGES -u DYLINT_CARGO_HOME \
+    -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
+    bash scripts/dylint.sh >"$stdout_file" 2>&1
+)
+grep -Fq "dylint: using pinned tools at $publish_prefix/dylint-6.1.0" "$stdout_file" \
+  || fail 'dylint must use the published pinned tools'
+grep -Fq "dylint: using prebuilt libs at $publish_lib_dir" "$stdout_file" \
+  || fail 'dylint must use the published prebuilt libs'
+if [ -f "$install_capture" ]; then
+  fail 'dylint must not install tools when the published pinned layout is valid'
+fi
+expect "$capture" argv 'dylint --all --no-metadata --fail-on-no-libraries -- --locked --all-targets --workspace'
+expect "$capture" DYLINT_LIBRARY_PATH "$publish_lib_dir"
+cmp -s "$fixture/project/target-dylint/dylint/jmodguard-lib-key.txt" "$key_body_file" \
+  || fail 'dylint must record the library key of its run for the publisher'
+
+# A dylint tag bump moves the pinned tool root for the publisher and dylint.sh
+# together: both derive dylint-<tag> from dylint.toml.
+cp "$fixture/project/dylint.toml" "$fixture/dylint.toml.orig"
+sed -i 's/^tag = "v6\.1\.0"$/tag = "v6.2.0"/' "$fixture/project/dylint.toml"
+bump_prefix="$fixture/bump-prefix"
+run_provision "$bump_prefix" "$publish_cargo" "$publish_target" DYLINT_TEST_ROOT_VERSION=6.2.0
+grep -Fq "ci-dylint-libs: published pinned dylint 6.2.0 tools to $bump_prefix/dylint-6.2.0" "$provision_stdout" \
+  || fail 'provisioning must publish the pinned tools for the bumped tag'
+run_dylint "$fixture/external" JMODGUARD_CI_PREFIX="$bump_prefix" \
+  DYLINT_TEST_ROOT_VERSION=6.2.0 DYLINT_TEST_LISTED_VERSION=6.2.0
+grep -Fq "dylint: using pinned tools at $bump_prefix/dylint-6.2.0" "$stdout_file" \
+  || fail 'dylint must consume the pinned tools published for the bumped tag'
+cp "$fixture/dylint.toml.orig" "$fixture/project/dylint.toml"
+
+# A run that cannot publish a complete layout fails without creating entries:
+# actions/cache saves only after a successful job and never re-saves a
+# primary-key hit, so an incomplete entry would persist for every later run.
+skip_prefix="$fixture/skip-prefix"
+if run_provision "$skip_prefix" "$fixture/external/cargo-home" "$fixture/external"; then
+  fail 'provisioning without dylint tools must fail'
+fi
+grep -Fq 'no dylint tools under' "$provision_stdout" || fail 'missing tools must be reported'
+[ ! -d "$skip_prefix/dylint-libs" ] || fail 'a failed run must not create dylint-libs'
+[ ! -d "$skip_prefix/dylint-6.1.0" ] || fail 'a failed run must not create the pinned tool root'
+
+# Valid tools are not published either when the libraries cannot be.
+nolib_target="$fixture/nolib-target"
+mkdir -p "$nolib_target/dylint"
+cp "$key_body_file" "$nolib_target/dylint/jmodguard-lib-key.txt"
+if run_provision "$skip_prefix" "$publish_cargo" "$nolib_target"; then
+  fail 'provisioning without metadata-built libraries must fail'
+fi
+grep -Fq 'has no lib' "$provision_stdout" || fail 'missing libraries must be reported'
+[ ! -d "$skip_prefix/dylint-libs" ] || fail 'a failed run must not create dylint-libs'
+[ ! -d "$skip_prefix/dylint-6.1.0" ] || fail 'missing libraries must not leave published tools'
+
+# Without the key dylint.sh recorded, the publisher fails; it never looks the
+# key up itself, so a network outage or a moved tag cannot reach it.
+nokey_target="$fixture/nokey-target"
+cp -R "$publish_target" "$nokey_target"
+rm -f "$nokey_target/dylint/jmodguard-lib-key.txt"
+if run_provision "$skip_prefix" "$publish_cargo" "$nokey_target" DYLINT_TEST_CURL_FAIL=1; then
+  fail 'provisioning without a recorded library key must fail'
+fi
+grep -Fq 'no library key recorded' "$provision_stdout" || fail 'a missing recorded key must be reported'
+[ ! -d "$skip_prefix/dylint-libs" ] || fail 'a missing recorded key must not create dylint-libs'
+[ ! -d "$skip_prefix/dylint-6.1.0" ] || fail 'a missing recorded key must not leave published tools'
+
+# A network outage after the build cannot fail publishing: the recorded key
+# is used as is.
+outage_prefix="$fixture/outage-prefix"
+run_provision "$outage_prefix" "$publish_cargo" "$publish_target" DYLINT_TEST_CURL_FAIL=1 \
+  || fail 'provisioning must not depend on a network lookup'
+cmp -s "$outage_prefix/dylint-libs/$KEY/key.txt" "$key_body_file" \
+  || fail 'provisioning must publish under the recorded key'
 
 while IFS= read -r line; do
   if [[ "$line" == *dylint-libs* ]]; then
