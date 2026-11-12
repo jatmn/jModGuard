@@ -78,7 +78,7 @@ operations; rule settings retain normal rule-copy behavior.
 
 Migration **0024** adds an empty core `known_spam` table and a scoped unique index;
 it does not alter Badwords or repeated-text data/semantics. The core schema becomes
-24; guild schema stays 17. Deploy matching bot/API builds through the existing
+24; it does not change the guild schema. Deploy matching bot/API builds through the existing
 paired update protocol. Publication labels derive the new exact core range from
 selected source. Older binaries refuse schema24; rollback requires the matching
 pre-upgrade backup. No new launcher capability is required.

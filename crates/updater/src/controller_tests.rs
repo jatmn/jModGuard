@@ -303,8 +303,10 @@ fn controller(
         baked_fallback_installed: None,
         pending_startup: Vec::new(),
         activation_receipts: ReceiptBackoff::default(),
+        startup_link_down_since: None,
         readiness_receipt: ReadinessReceipt::Pending,
         last_observed: None,
+        core_migration_wait: None,
     }
 }
 
@@ -1452,7 +1454,12 @@ async fn ready_failure_of_another_release_leaves_complete_upgrade() {
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
 
-struct ContractWarnings(Arc<std::sync::Mutex<Vec<String>>>);
+/// Records the contract log lines below. With `every_warning`, it also records
+/// every WARN or ERROR, and prefixes each line with its level.
+struct ContractWarnings {
+    logs: Arc<std::sync::Mutex<Vec<String>>>,
+    every_warning: bool,
+}
 
 impl tracing::Subscriber for ContractWarnings {
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
@@ -1470,14 +1477,21 @@ impl tracing::Subscriber for ContractWarnings {
     fn event(&self, event: &tracing::Event<'_>) {
         let mut message = String::new();
         event.record(&mut MessageVisit(&mut message));
+        let level = *event.metadata().level();
         if message.contains("no capability contract")
             || message.contains("registry unreachable at boot; starting the built-in application")
-            || (event.metadata().level() == &tracing::Level::ERROR
+            || (level == tracing::Level::INFO
+                && message.starts_with("waiting for the bot to migrate core schema"))
+            || (level == tracing::Level::ERROR
                 && message == "discord token rejected; bot held, fix token and restart container")
-            || (event.metadata().level() == &tracing::Level::WARN
+            || (level == tracing::Level::WARN
                 && message == "retrying bot after discord token rejection hold")
+            || (self.every_warning && level <= tracing::Level::WARN)
         {
-            self.0.lock().expect("warning log").push(message);
+            if self.every_warning {
+                message = format!("{level} {message}");
+            }
+            self.logs.lock().expect("warning log").push(message);
         }
     }
 
@@ -1506,8 +1520,23 @@ impl tracing::field::Visit for MessageVisit<'_> {
 async fn with_contract_warnings<T>(
     future: impl std::future::Future<Output = T>,
 ) -> (T, Vec<String>) {
+    capture_logs(false, future).await
+}
+
+/// Like `with_contract_warnings`, but every WARN or ERROR is recorded too.
+async fn with_every_warning<T>(future: impl std::future::Future<Output = T>) -> (T, Vec<String>) {
+    capture_logs(true, future).await
+}
+
+async fn capture_logs<T>(
+    every_warning: bool,
+    future: impl std::future::Future<Output = T>,
+) -> (T, Vec<String>) {
     let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let guard = tracing::subscriber::set_default(ContractWarnings(Arc::clone(&logs)));
+    let guard = tracing::subscriber::set_default(ContractWarnings {
+        logs: Arc::clone(&logs),
+        every_warning,
+    });
     let value = future.await;
     drop(guard);
     (value, logs.lock().expect("warning log").clone())
@@ -2151,6 +2180,220 @@ async fn api_role_serves_immediately_and_stores_startup_receipts_once_the_bot_is
     );
     service.stop_application().await.unwrap();
     drop(bot);
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+#[derive(Clone)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Every event on this thread at any level, formatted as the launcher logs
+/// it, until the guard is dropped.
+fn capture_all_logs() -> (
+    Arc<std::sync::Mutex<Vec<u8>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = LogCapture(bytes.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    (bytes, tracing::subscriber::set_default(subscriber))
+}
+
+fn captured(bytes: &std::sync::Mutex<Vec<u8>>) -> String {
+    String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+}
+
+/// Issue #552: a rolling swap leaves the local bot control link unreachable
+/// while the new bot launcher waits for the old pod's fence. Each flush
+/// attempt in that window must log one INFO line, and no WARN before the
+/// fence-TTL bound. The receipts stay queued and the application still runs.
+#[tokio::test]
+async fn api_role_startup_receipts_log_one_info_line_per_unreachable_link_attempt() {
+    let root = std::env::temp_dir().join(format!(
+        "api-startup-unreachable-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let binary = http_application(&root).await;
+    let db_path = root.join("core.db");
+    let _db = Db::open(&db_path, 2).unwrap();
+    // A configured link with no listener is the swap state from the issue.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let secret = "x".repeat(32);
+    let link = jmodguard::control::try_writer_link(&addr.to_string(), &secret)
+        .unwrap()
+        .expect("writer link");
+    let control = UpdateControl::open(&read_only_options(&db_path))
+        .unwrap()
+        .unwrap()
+        .with_writer_link(link);
+    let hash = "ab".repeat(32);
+    let planned = plan_api_startup(&control, "api", &hash, None, None)
+        .await
+        .unwrap();
+    let mut service = controller(
+        "api",
+        binary,
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control,
+        &root,
+    );
+    service.enabled = false;
+    service.pending_startup = planned;
+    let (bytes, capture) = capture_all_logs();
+    // Two attempts on consecutive polls, as every deploy produces.
+    assert!(!service.tick().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(!service.tick().await.unwrap());
+    drop(capture);
+    assert_eq!(
+        service.pending_startup.len(),
+        2,
+        "unsaved receipts must stay queued for the retry"
+    );
+    let ready = service
+        .running
+        .as_ref()
+        .expect("normal application was not started")
+        .ready_file
+        .clone();
+    let body = application_route(&ready.with_extension("port")).await;
+    assert!(body.contains("{\"ok\":true}"), "{body}");
+    let logs = captured(&bytes);
+    let lines = logs
+        .matches("launcher startup receipt was not saved")
+        .count();
+    assert_eq!(lines, 2, "exactly one line per attempt: {logs}");
+    assert!(
+        !logs.contains("WARN"),
+        "no warning before the bound: {logs}"
+    );
+    service.stop_application().await.unwrap();
+    drop(_db);
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+/// A paired-upgrade step from the API launcher that the bot launcher link
+/// does not answer is retried on the next poll, not failed. That retry must
+/// still log one WARN per attempt with the cause, so a stalled pair is
+/// visible at the default level; `forward` itself no longer logs it.
+#[tokio::test]
+async fn api_role_paired_step_over_an_unreachable_launcher_link_warns_once_per_attempt() {
+    let root = std::env::temp_dir().join(format!(
+        "api-pair-unreachable-{:032x}",
+        rand::random::<u128>()
+    ));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let stamp = now();
+    let db = Db::open(&root.join("core.db"), 2).unwrap();
+    let writer = UpdateControl::from_application(&db);
+    let bot = release_at("bot", 'a', db::CORE_SCHEMA_VERSION);
+    let api = release_at("api", 'b', db::CORE_SCHEMA_VERSION);
+    for item in [&bot, &api] {
+        writer
+            .checked(&item.component, "latest", Some(item.clone()), None, stamp)
+            .await
+            .unwrap();
+        writer
+            .running(&item.component, None, fresh_observation(stamp), stamp)
+            .await
+            .unwrap();
+    }
+    let op = writer
+        .request_upgrade(&bot.digest, &api.digest, false, stamp)
+        .await
+        .unwrap();
+    // A configured bot launcher link with no listener: the bot launcher is
+    // re-executing or still waiting for the fence.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let link = jmodguard::control::try_writer_link(&addr.to_string(), &"x".repeat(32))
+        .unwrap()
+        .expect("launcher link");
+    let control = UpdateControl::open(&read_only_options(&root.join("core.db")))
+        .unwrap()
+        .unwrap()
+        .with_launcher_link(link);
+    let mut service = controller(
+        "api",
+        root.join("unused-api"),
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        control,
+        &root,
+    );
+    let (bytes, capture) = capture_all_logs();
+    for _ in 0..2 {
+        assert!(
+            !service.tick_control().await.unwrap(),
+            "an unsaved paired step is retried, not failed"
+        );
+    }
+    drop(capture);
+    let logs = captured(&bytes);
+    let warnings: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("paired upgrade step was not saved"))
+        .collect();
+    assert_eq!(warnings.len(), 2, "one line per attempt: {logs}");
+    for line in warnings {
+        assert!(line.contains("WARN"), "a stalled pair must warn: {logs}");
+        assert!(
+            line.contains("control link unavailable"),
+            "the line must say why: {logs}"
+        );
+    }
+    assert!(
+        !logs.contains("receipt was not recorded"),
+        "the forwarding layer must not add a second line: {logs}"
+    );
+    // With no launcher link configured, startup already warned once that
+    // paired upgrades cannot advance; each poll must not repeat it.
+    let unlinked = UpdateControl::open(&read_only_options(&root.join("core.db")))
+        .unwrap()
+        .unwrap();
+    assert!(!unlinked.has_launcher_link());
+    let mut unlinked = controller(
+        "api",
+        root.join("unused-api"),
+        Registry::new("http://127.0.0.1:9").unwrap(),
+        unlinked,
+        &root,
+    );
+    let (bytes, capture) = capture_all_logs();
+    for _ in 0..2 {
+        assert!(!unlinked.tick_control().await.unwrap());
+    }
+    drop(capture);
+    let logs = captured(&bytes);
+    assert!(
+        !logs.contains("paired upgrade step was not saved"),
+        "a missing link is reported once at startup, not every poll: {logs}"
+    );
+    let stored = writer.upgrade().await.unwrap().unwrap();
+    assert_eq!(stored.id, op.id);
+    assert_eq!(stored.phase, op.phase, "the pair did not advance");
+    assert!(
+        stored.error.is_none(),
+        "a missing link is not a failed pair"
+    );
+    drop((service, unlinked, writer, db));
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
 
@@ -2873,12 +3116,46 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
             control.clone(),
             &root,
         );
-        let error = api.tick().await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("baked application cannot open database")
+        // The fixture stands in for the maintenance API (whose /health route is
+        // application code) and answers on a real socket while it is alive.
+        let reserved_health = bind_reclaimable_health_port().await;
+        let addr = reserved_health.local_addr().unwrap();
+        drop(reserved_health);
+        tokio::fs::write(root.join("bind-maintenance-baked-bot"), addr.to_string())
+            .await
+            .unwrap();
+        // Until the bot migrates, the API waits without a tick error: the main
+        // loop would log one at WARN every poll. It logs the wait once at INFO,
+        // and nothing at WARN or above.
+        let (ticks, logs) =
+            with_every_warning(async { (api.tick().await, api.tick().await) }).await;
+        assert!(!ticks.0.unwrap() && !ticks.1.unwrap());
+        assert!(api.running.is_none());
+        tokio::time::timeout(POLL, async {
+            while !launcher_health_responds(addr).await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the launcher keeps a live maintenance child while waiting");
+        let waiting = format!(
+            "INFO waiting for the bot to migrate core schema 16 -> {}",
+            db::CORE_SCHEMA_VERSION
         );
+        assert_eq!(logs, [waiting], "stale_meta={stale_meta}");
+        // Past the bound the wait becomes a tick error again, without the
+        // owner recovery advice. The wait keeps its original start.
+        let overdue = Instant::now()
+            .checked_sub(CORE_MIGRATION_WAIT + Duration::from_secs(1))
+            .unwrap();
+        api.core_migration_wait = Some(overdue);
+        let error = format!("{:#}", api.tick().await.unwrap_err());
+        assert!(
+            error.contains("is still older than the built-in API schema")
+                && !error.contains("owner recovery"),
+            "{error}"
+        );
+        assert_eq!(api.core_migration_wait, Some(overdue));
         assert!(api.running.is_none());
         tokio::fs::write(root.join("hold-baked-bot-ready"), "")
             .await
@@ -2927,6 +3204,131 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
         drop((api, bot, control, migrated));
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
+}
+
+/// A failed control read during the API migration wait keeps the wait's
+/// start: the next poll neither logs the wait again nor restarts its bound.
+#[tokio::test]
+async fn api_migration_wait_keeps_its_start_across_a_failed_control_read() {
+    let root = std::env::temp_dir().join(format!("api-wait-read-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let set_schema = |version: i64| {
+        db.with_conn(move |conn| {
+            conn.pragma_update(None, "user_version", version)?;
+            Ok(())
+        })
+    };
+    let set_upgrade = |sql: &'static str| {
+        db.with_conn_sync(move |conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_bounded(sql, (), 64 * 1024)?;
+            tx.commit()
+        })
+    };
+    set_schema(db::CORE_SCHEMA_VERSION - 1).await.unwrap();
+    let state = control.component("api").await.unwrap();
+    assert!(state.installed.is_none() && state.observed.is_none());
+    let mut api = controller(
+        "api",
+        baked,
+        Registry::ghcr().unwrap(),
+        control.clone(),
+        &root,
+    );
+    let ((), logs) = with_every_warning(async {
+        api.restore(&state).await.unwrap();
+        let since = api.core_migration_wait.expect("API waits for the bot");
+        // The API restore reads the upgrade record; an unreadable one fails
+        // this poll without ending the wait.
+        set_upgrade(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES('component_upgrade_v1','invalid')",
+        )
+        .unwrap();
+        let error = api.restore(&state).await.unwrap_err();
+        assert!(error.to_string().contains("expected value"), "{error:#}");
+        assert_eq!(api.core_migration_wait, Some(since));
+        set_upgrade("DELETE FROM meta WHERE key='component_upgrade_v1'").unwrap();
+        api.restore(&state).await.unwrap();
+        assert_eq!(api.core_migration_wait, Some(since));
+    })
+    .await;
+    let waiting = format!(
+        "INFO waiting for the bot to migrate core schema {} -> {}",
+        db::CORE_SCHEMA_VERSION - 1,
+        db::CORE_SCHEMA_VERSION
+    );
+    assert_eq!(logs, [waiting]);
+    assert!(api.running.is_none());
+    // Once the bot has migrated, the built-in API starts and the wait ends.
+    set_schema(db::CORE_SCHEMA_VERSION).await.unwrap();
+    api.restore(&state).await.unwrap();
+    assert!(api.running.is_some() && api.core_migration_wait.is_none());
+    api.stop_application().await.unwrap();
+    drop((api, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+/// The API waits only for a migration the bot launcher's built-in restore
+/// would run. A database the bot will not migrate keeps the immediate owner
+/// recovery refusal, without a wait line or a wait start.
+#[tokio::test]
+async fn api_waits_only_for_a_migration_the_bot_would_run() {
+    let root = std::env::temp_dir().join(format!("api-wait-bot-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let stamp = 1_700_000_000;
+    // Recorded update control: the bot is not a legacy baseline.
+    control
+        .running("bot", None, fresh_observation(stamp), stamp)
+        .await
+        .unwrap();
+    let mut api = controller(
+        "api",
+        baked,
+        Registry::ghcr().unwrap(),
+        control.clone(),
+        &root,
+    );
+    let waiting = format!(
+        "INFO waiting for the bot to migrate core schema {} -> {}",
+        db::CORE_SCHEMA_VERSION - 1,
+        db::CORE_SCHEMA_VERSION
+    );
+    for (case, schema, install_bot) in [
+        ("below the bot's migration range", 14, false),
+        ("bot would migrate", db::CORE_SCHEMA_VERSION - 1, false),
+        ("installed bot release", db::CORE_SCHEMA_VERSION - 1, true),
+    ] {
+        if install_bot {
+            set_core_schema(&db, db::CORE_SCHEMA_VERSION).await;
+            let release = release_at("bot", 'c', db::CORE_SCHEMA_VERSION);
+            install_for_outage(&db, &control, &release, stamp).await;
+        }
+        set_core_schema(&db, schema).await;
+        let state = control.component("api").await.unwrap();
+        assert!(state.installed.is_none(), "{case}");
+        let (result, logs) = with_every_warning(api.restore(&state)).await;
+        if case == "bot would migrate" {
+            result.unwrap();
+            assert!(api.core_migration_wait.is_some(), "{case}");
+            assert_eq!(logs, std::slice::from_ref(&waiting), "{case}");
+        } else {
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains("baked application cannot open database; use owner recovery"),
+                "{case}: {error}"
+            );
+            assert!(api.core_migration_wait.is_none(), "{case}");
+            assert!(logs.is_empty(), "{case}: {logs:?}");
+        }
+        assert!(api.running.is_none(), "{case}");
+    }
+    api.stop_application().await.unwrap();
+    drop((api, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
 /// Historical desired rows omit `upgrade`. Migration keeps them queued; the
@@ -6663,7 +7065,10 @@ async fn rejected_token_child_is_held_with_liveness_and_no_restart() {
     bot.idle().await.unwrap();
     assert!(bot.health.is_none());
     let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let guard = tracing::subscriber::set_default(ContractWarnings(Arc::clone(&logs)));
+    let guard = tracing::subscriber::set_default(ContractWarnings {
+        logs: Arc::clone(&logs),
+        every_warning: false,
+    });
     // Exactly one production poll must reap the child and bind the same socket.
     assert!(!bot.tick().await.unwrap());
     assert!(bot.running.is_none());

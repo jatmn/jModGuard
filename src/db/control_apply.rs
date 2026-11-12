@@ -1324,6 +1324,74 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn fresh_claim_records_how_the_previous_bot_stopped() {
+        let path =
+            std::env::temp_dir().join(format!("previous_stop_{:032x}.db", rand::random::<u128>()));
+        let db = Db::open(&path, 2).unwrap();
+        let refuse = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let [first, second, third, fourth] = ["a1", "b2", "c3", "d4"].map(|id| id.repeat(16));
+        let now = crate::control::now_ms();
+        assert!(claim_active_bot(&db, &first, now, refuse()).await.unwrap());
+        assert_eq!(previous_active_bot_stop(&db).await.unwrap(), None);
+
+        // A shutdown signal then release is a planned stop dated by the marker.
+        record_planned_active_bot_stop(&db, &first, now + 100)
+            .await
+            .unwrap();
+        release_active_bot(&db, &first).await.unwrap();
+        assert!(claim_active_bot(&db, &second, now, refuse()).await.unwrap());
+        let planned = previous_active_bot_stop(&db).await.unwrap();
+        assert_eq!(
+            planned,
+            Some(PreviousBotStop {
+                last_alive_ms: now + 100,
+                planned: true
+            })
+        );
+        // Renewal by the same owner keeps the record.
+        assert!(
+            claim_active_bot(&db, &second, now + 1, refuse())
+                .await
+                .unwrap()
+        );
+        assert_eq!(previous_active_bot_stop(&db).await.unwrap(), planned);
+
+        // An owner that never released was last alive one TTL before expiry. Its
+        // own planned-stop marker does not make that unconfirmed stop planned.
+        record_planned_active_bot_stop(&db, &second, now + 1)
+            .await
+            .unwrap();
+        let expires = now + 1 + ACTIVE_BOT_LEASE_TTL_MS;
+        let later = expires + 5_000;
+        assert!(
+            claim_active_bot(&db, &third, later, refuse())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            previous_active_bot_stop(&db).await.unwrap(),
+            Some(PreviousBotStop {
+                last_alive_ms: now + 1,
+                planned: false
+            })
+        );
+
+        // A release without a marker for its own generation has no known stop time.
+        write_lease(&db, &third, crate::control::now_ms() + 60_000).await;
+        release_active_bot(&db, &third).await.unwrap();
+        assert!(
+            claim_active_bot(&db, &fourth, crate::control::now_ms(), refuse())
+                .await
+                .unwrap()
+        );
+        assert_eq!(previous_active_bot_stop(&db).await.unwrap(), None);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
     async fn write_lease(db: &Db, owner: &str, expires: i64) {
         let value = format!("{owner} {expires}");
         db.with_conn(move |conn| {

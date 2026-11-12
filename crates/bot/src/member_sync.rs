@@ -1,8 +1,8 @@
 //! A single fair, deliberately slow Discord directory importer.
 
 use crate::db::guild_data::{
-    MemberAuditAction, MemberAuditSnapshot, MemberBanSnapshot, MemberSyncClaim, MemberSyncPage,
-    MemberSyncPhase, MemberVerification, MemberVerifyKind,
+    CoverageGap, MemberAuditAction, MemberAuditSnapshot, MemberBanSnapshot, MemberSyncClaim,
+    MemberSyncPage, MemberSyncPhase, MemberVerification, MemberVerifyKind,
 };
 use crate::{db, member_directory, state::BotState};
 use serenity::{
@@ -44,7 +44,40 @@ impl ReadyObservation {
     fn coverage_gap(self, had_progress: bool) -> bool {
         had_progress && matches!(self, Self::First | Self::Replaced)
     }
+
+    /// The gap to record. Only this process's first Ready after a short planned
+    /// stop, with no session replaced since startup, may clear itself when audit
+    /// recovery completes. `ready_generation` counts replaced sessions in this
+    /// process; a first acknowledgement after one also covers that in-process
+    /// gap. A crash only proves lease liveness, not Gateway coverage. A stop
+    /// time ahead of this host's clock gives no usable downtime. Anything else
+    /// still needs Reconcile.
+    fn gap_mark(
+        self,
+        previous: Option<db::PreviousBotStop>,
+        ready_generation: u64,
+        now_ms: i64,
+    ) -> CoverageGap<'static> {
+        match (self, previous) {
+            (Self::First, _) if ready_generation > 0 => {
+                CoverageGap::Observed("gateway continuity interrupted")
+            }
+            (Self::First, Some(stop)) if stop.planned => {
+                let downtime = now_ms.checked_sub(stop.last_alive_ms);
+                if downtime.is_some_and(|ms| (0..=SHORT_RESTART_GAP_MS).contains(&ms)) {
+                    CoverageGap::ShortPlannedRestart
+                } else {
+                    CoverageGap::Observed(CoverageGap::PLANNED_RESTART_REASON)
+                }
+            }
+            (Self::First, Some(_)) => CoverageGap::Observed("bot stopped unexpectedly"),
+            _ => CoverageGap::Observed("gateway continuity interrupted"),
+        }
+    }
 }
+
+/// Longest planned-restart downtime that completed audit recovery may clear on its own.
+const SHORT_RESTART_GAP_MS: i64 = 10 * 60 * 1_000;
 
 #[derive(Default)]
 struct ReadyCoverage {
@@ -945,6 +978,7 @@ async fn run_loop(
     // A READY generation is acknowledged per enrollment only after its
     // directory status and any required coverage gap have been recorded.
     let mut ready_coverage = ReadyCoverage::default();
+    let mut previous_stop: Option<Option<db::PreviousBotStop>> = None;
     let mut backfilled = HashSet::<(i64, String)>::new();
     let mut offset = FairCursor::default();
     let mut cleanup_offset = FairCursor::default();
@@ -1107,19 +1141,32 @@ async fn run_loop(
                 earlier_attempt(earliest_attempt_ms, status.audit_recovery_next_attempt_at);
             if observation.coverage_gap(
                 status.initial_completed_at.is_some() || status.last_progress_at.is_some(),
-            ) && let Err(error) = store
-                .mark_member_reconciliation_needed(
-                    scope.clone(),
-                    "gateway continuity interrupted",
-                    now_ms,
-                )
-                .await
-            {
-                tracing::warn!(
-                    guild_id = gid,
-                    "member directory coverage gap could not be recorded: {error:#}"
-                );
-                continue;
+            ) {
+                let previous = if observation == ReadyObservation::First {
+                    // Read once per process; a failed read is retried for the next guild.
+                    if previous_stop.is_none() {
+                        match db::previous_active_bot_stop(&app.db).await {
+                            Ok(stop) => previous_stop = Some(stop),
+                            Err(error) => {
+                                tracing::warn!("previous bot stop unavailable: {error:#}")
+                            }
+                        }
+                    }
+                    previous_stop.flatten()
+                } else {
+                    None
+                };
+                let gap = observation.gap_mark(previous, ready_generation, now_ms);
+                if let Err(error) = store
+                    .mark_member_reconciliation_needed(scope.clone(), gap, now_ms)
+                    .await
+                {
+                    tracing::warn!(
+                        guild_id = gid,
+                        "member directory coverage gap could not be recorded: {error:#}"
+                    );
+                    continue;
+                }
             }
             ready_coverage.acknowledge(key.clone(), ready_generation);
             if !backfilled.contains(&key) {
@@ -2059,6 +2106,52 @@ mod tests {
     }
 
     #[test]
+    fn only_a_short_known_restart_gap_may_clear_itself() {
+        let stop = |at, planned| {
+            Some(db::PreviousBotStop {
+                last_alive_ms: at,
+                planned,
+            })
+        };
+        let now = 10_000_000;
+        let short = now - SHORT_RESTART_GAP_MS;
+        let first = ReadyObservation::First;
+        let restarted = CoverageGap::Observed("bot restarted");
+        assert_eq!(
+            first.gap_mark(stop(short, true), 0, now),
+            CoverageGap::ShortPlannedRestart
+        );
+        assert_eq!(
+            first.gap_mark(stop(now, true), 0, now),
+            CoverageGap::ShortPlannedRestart
+        );
+        assert_eq!(first.gap_mark(stop(short - 1, true), 0, now), restarted);
+        assert_eq!(
+            first.gap_mark(stop(now + 1, true), 0, now),
+            restarted,
+            "a stop time ahead of this clock is not a measured downtime"
+        );
+        assert_eq!(
+            first.gap_mark(stop(now, false), 0, now),
+            CoverageGap::Observed("bot stopped unexpectedly"),
+            "a crash proves only lease liveness"
+        );
+        assert_eq!(
+            first.gap_mark(stop(now, true), 1, now),
+            CoverageGap::Observed("gateway continuity interrupted"),
+            "a session replaced before this guild's first acknowledgement is an in-process gap"
+        );
+        assert_eq!(
+            first.gap_mark(None, 0, now),
+            CoverageGap::Observed("gateway continuity interrupted")
+        );
+        assert_eq!(
+            ReadyObservation::Replaced.gap_mark(stop(now, true), 0, now),
+            CoverageGap::Observed("gateway continuity interrupted")
+        );
+    }
+
+    #[test]
     fn failed_guild_read_keeps_replaced_ready_pending_for_that_enrollment() {
         let mut coverage = ReadyCoverage::default();
         let first = (10, "first".to_owned());
@@ -2108,6 +2201,8 @@ mod tests {
             initial_completed_at: Some(1),
             reconciliation_needed: true,
             reconciliation_reason: Some("gateway continuity interrupted".into()),
+            gap_at: None,
+            gap_auto_clear: false,
             run_id: Some("completed".into()),
             run_kind: Some("initial".into()),
             phase: Some("complete".into()),
@@ -2188,6 +2283,8 @@ mod tests {
             initial_completed_at: Some(1),
             reconciliation_needed: false,
             reconciliation_reason: None,
+            gap_at: None,
+            gap_auto_clear: false,
             audit_recovery_pending: true,
             audit_recovery_status: Some("needs_attention".into()),
             audit_recovery_reason: Some("pagination_stalled".into()),

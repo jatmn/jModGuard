@@ -30,6 +30,14 @@ use tokio::process::{Child, Command};
 
 const POLL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long an unsaved startup receipt stays INFO-level before warning: the
+/// old pod's launcher fence TTL plus a margin, because a rolling swap waits
+/// exactly that long for the local bot control link (issue #552).
+const STARTUP_RECEIPT_WARN_AFTER: Duration =
+    Duration::from_millis(db::LAUNCHER_FENCE_TTL_MS as u64 + 10_000);
+/// How long the API launcher waits quietly for the bot to migrate an older core
+/// schema before it warns again, well past a launcher fence handoff.
+const CORE_MIGRATION_WAIT: Duration = Duration::from_secs(300);
 /// Durable reason stored while the built-in binary is covering an unreachable registry.
 const REGISTRY_OUTAGE_BOOT_MISMATCH: &str = "registry unreachable";
 /// Durable reasons stored when an outage fallback refuses the built-in binary's
@@ -888,8 +896,16 @@ struct Supervisor {
     baked_fallback_installed: Option<ComponentRelease>,
     pending_startup: Vec<StartupReceipt>,
     activation_receipts: ReceiptBackoff,
+    /// When the current uninterrupted control-link outage for startup
+    /// receipts began, so it can stay INFO-level for a normal swap wait.
+    startup_link_down_since: Option<Instant>,
     readiness_receipt: ReadinessReceipt,
     last_observed: Option<Instant>,
+    /// Set while the last API restore was waiting for the bot to migrate the
+    /// core schema up to the built-in one; holds when that wait began. A poll
+    /// whose control reads fail keeps it, so the wait logs once and its bound
+    /// does not restart.
+    core_migration_wait: Option<Instant>,
 }
 
 impl Supervisor {
@@ -1072,8 +1088,10 @@ impl Supervisor {
         !self.activation_receipts.waiting()
     }
 
-    fn remember_pending(&mut self, pending: PendingFailure) {
-        tracing::warn!("launcher receipt was not saved; retrying before any new candidate");
+    fn remember_pending(&mut self, pending: PendingFailure, error: &anyhow::Error) {
+        tracing::warn!(
+            "launcher receipt was not saved; retrying before any new candidate: {error:#}"
+        );
         self.pending_failure = Some(pending);
         self.note_receipt_delay();
     }
@@ -1369,16 +1387,58 @@ impl Supervisor {
                 Ok(()) => {
                     self.pending_startup.remove(0);
                     self.reset_receipt_backoff();
+                    self.startup_link_down_since = None;
                 }
                 Err(error) if Self::receipt_not_saved(&error) => {
-                    tracing::warn!("launcher startup receipt was not saved: {error:#}");
+                    // A rolling swap waits out the old pod's launcher fence
+                    // before the local bot control link answers, so keep the
+                    // normal wait at INFO and warn only past that window
+                    // (issue #552). Other unsaved reasons still warn.
+                    if Self::startup_receipt_warns(
+                        &mut self.startup_link_down_since,
+                        &error,
+                        Instant::now(),
+                    ) {
+                        tracing::warn!("launcher startup receipt was not saved: {error:#}");
+                    } else {
+                        tracing::info!("launcher startup receipt was not saved: {error:#}");
+                    }
                     self.note_receipt_delay();
                     return Ok(());
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // Anything but an unreachable link ends the outage.
+                    self.startup_link_down_since = None;
+                    return Err(error);
+                }
             }
         }
         Ok(())
+    }
+
+    /// An unreachable control link stays INFO-level for the fence TTL plus a
+    /// margin: every planned rolling swap waits that long, and only a link
+    /// still down afterwards is unexpected. Any other unsaved reason warns
+    /// immediately, as before. It also proves the link answered, so it ends
+    /// the outage: the bound measures one uninterrupted outage, not the age
+    /// of the queued receipt.
+    fn startup_receipt_warns(
+        link_down_since: &mut Option<Instant>,
+        error: &anyhow::Error,
+        now: Instant,
+    ) -> bool {
+        if !Self::control_link_unavailable(error) {
+            *link_down_since = None;
+            return true;
+        }
+        now.saturating_duration_since(*link_down_since.get_or_insert(now))
+            > STARTUP_RECEIPT_WARN_AFTER
+    }
+
+    fn control_link_unavailable(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<db::ReceiptNotSaved>()
+            .is_some_and(|receipt| receipt.status == jmodguard::control::CONTROL_LINK_UNAVAILABLE)
     }
 
     async fn record_component_failure(
@@ -1389,10 +1449,13 @@ impl Supervisor {
         match self.control.failed(&self.role, &release, &message).await {
             Ok(()) => self.reset_receipt_backoff(),
             Err(error) if Self::receipt_not_saved(&error) => {
-                self.remember_pending(PendingFailure {
-                    component: Some((release, message)),
-                    launcher: None,
-                });
+                self.remember_pending(
+                    PendingFailure {
+                        component: Some((release, message)),
+                        launcher: None,
+                    },
+                    &error,
+                );
             }
             Err(error) => return Err(error),
         }
@@ -1698,7 +1761,7 @@ impl Supervisor {
                 let state = self.control.component(&self.role).await?;
                 if baked_restore && !baked_fallback {
                     ensure!(
-                        self.baked_restore_fits(&state, schema).await?,
+                        self.baked_restore_fits(&self.role, &state, schema).await?,
                         "baked application cannot open database; use owner recovery"
                     );
                 } else {
@@ -2149,7 +2212,14 @@ impl Supervisor {
 
     /// Preserve the legacy baseline and uninstalled bot migration exceptions.
     /// Re-evaluate them with fresh state before a built-in restore spawns.
-    async fn baked_restore_fits(&self, state: &db::ComponentUpdate, schema: i64) -> Result<bool> {
+    /// `role` and `state` name the launcher whose built-in restore is judged;
+    /// the API also asks it of the bot's state before waiting for a migration.
+    async fn baked_restore_fits(
+        &self,
+        role: &str,
+        state: &db::ComponentUpdate,
+        schema: i64,
+    ) -> Result<bool> {
         let legacy_baseline = state
             .observed
             .as_ref()
@@ -2160,7 +2230,7 @@ impl Supervisor {
                 .is_none_or(|release| release.upgrade.is_none())
             && self.control.upgrade().await?.is_none();
         if legacy_baseline
-            && ((self.role == "bot" && schema <= self.baked_compatibility.core)
+            && ((role == "bot" && schema <= self.baked_compatibility.core)
                 || schema == self.baked_compatibility.core)
         {
             return Ok(true);
@@ -2170,7 +2240,7 @@ impl Supervisor {
         }
         // A baked bot owns migrations only without managed history or a
         // durable paired operation. The API still requires its exact schema.
-        let baked_migration = self.role == "bot"
+        let baked_migration = role == "bot"
             && (15..=self.baked_compatibility.core).contains(&schema)
             && state.previous.is_none()
             && (state.desired.is_none() || state.state == "queued")
@@ -2184,10 +2254,26 @@ impl Supervisor {
 
     async fn restore(&mut self, state: &db::ComponentUpdate) -> Result<()> {
         if let Some(PendingRollback { failed, error }) = self.rollback.clone() {
+            self.core_migration_wait = None;
             return self.rollback_independent(state, failed, error).await;
         }
         let schema = self.control.schema_version().await?;
-        if self.baked_restore_fits(state, schema).await? {
+        let baked_fits = self.baked_restore_fits(&self.role, state, schema).await?;
+        // An API with nothing installed waits only while the bot launcher's
+        // built-in restore (same base image) would migrate this older schema.
+        // Any other database keeps the owner recovery refusal below.
+        let bot_migrates = !baked_fits
+            && self.role == "api"
+            && state.installed.is_none()
+            && schema < self.baked_compatibility.core
+            && {
+                let bot = self.control.component("bot").await?;
+                self.baked_restore_fits("bot", &bot, schema).await?
+            };
+        // A failed read above keeps the migration wait and its start. Any
+        // decision below ends it unless it is still that wait.
+        let waiting_since = self.core_migration_wait.take();
+        if baked_fits {
             let path = self.baked.clone();
             let sha = self.base_sha.clone();
             return self.start(&path, &sha, None).await;
@@ -2223,6 +2309,21 @@ impl Supervisor {
             );
             self.start(&path, &release.source_sha, Some(release.clone()))
                 .await?;
+        } else if bot_migrates {
+            // The bot launcher migrates first during an ordinary rollout. Keep
+            // the maintenance API up and wait without a per-poll warning.
+            let core = self.baked_compatibility.core;
+            let since = waiting_since.unwrap_or_else(|| {
+                tracing::info!("waiting for the bot to migrate core schema {schema} -> {core}");
+                Instant::now()
+            });
+            self.core_migration_wait = Some(since);
+            ensure!(
+                since.elapsed() < CORE_MIGRATION_WAIT,
+                "core schema {schema} is still older than the built-in API schema {core} after {}s; check the bot launcher",
+                CORE_MIGRATION_WAIT.as_secs()
+            );
+            self.idle().await?;
         } else {
             anyhow::bail!("baked application cannot open database; use owner recovery");
         }
@@ -2480,10 +2581,13 @@ impl Supervisor {
                         {
                             Ok(()) => {}
                             Err(save) if Self::receipt_not_saved(&save) => {
-                                self.remember_pending(PendingFailure {
-                                    component: None,
-                                    launcher: Some((release.digest.clone(), message)),
-                                });
+                                self.remember_pending(
+                                    PendingFailure {
+                                        component: None,
+                                        launcher: Some((release.digest.clone(), message)),
+                                    },
+                                    &save,
+                                );
                                 return Ok(false);
                             }
                             Err(save) => return Err(save),
@@ -2509,6 +2613,9 @@ impl Supervisor {
                     }
                 }
                 self.restore(&state).await?;
+                if self.core_migration_wait.is_some() {
+                    return Ok(ControlStep::Defer);
+                }
                 Ok::<_, anyhow::Error>(ControlStep::Proceed)
             }
             .await;
@@ -2727,10 +2834,13 @@ impl Supervisor {
                     Ok(()) => {}
                     Err(save) if Self::receipt_not_saved(&save) => {
                         let digest = candidate.digest.clone();
-                        self.remember_pending(PendingFailure {
-                            component: Some((candidate, app_message)),
-                            launcher: Some((digest, launcher_message)),
-                        });
+                        self.remember_pending(
+                            PendingFailure {
+                                component: Some((candidate, app_message)),
+                                launcher: Some((digest, launcher_message)),
+                            },
+                            &save,
+                        );
                         return Ok(false);
                     }
                     Err(save) => return Err(save),
@@ -2924,14 +3034,31 @@ impl Supervisor {
             let result = self.pair(&op.id).await;
             if let Err(error) = result {
                 // An unsaved API step through the bot launcher link is retried
-                // on the next poll; it is not a failed upgrade.
-                if error.is::<db::UpgradeProgressChanged>() || Self::receipt_not_saved(&error) {
+                // on the next poll; it is not a failed upgrade. This is the one
+                // line for that attempt: a link or writer failure stays visible
+                // so a stalled pair is not silent, while the writer answering
+                // that it cannot save yet is ordinary progress.
+                // Without a launcher link at all, startup already warned once
+                // that paired upgrades cannot advance.
+                if let Some(unsaved) = error.downcast_ref::<db::ReceiptNotSaved>() {
+                    if unsaved.attempt_failed() && self.control.has_launcher_link() {
+                        tracing::warn!("paired upgrade step was not saved; retrying: {error:#}");
+                    }
                     return Ok(false);
                 }
-                let _ = self
+                if error.is::<db::UpgradeProgressChanged>() {
+                    return Ok(false);
+                }
+                // `forward` logs a hard refusal but not an unsaved attempt, so
+                // say here that the upgrade error was not stored.
+                if let Err(record) = self
                     .control
                     .upgrade_error(&op.id, &format!("{}: {error:#}", self.role))
-                    .await;
+                    .await
+                    && record.is::<db::ReceiptNotSaved>()
+                {
+                    tracing::warn!("paired-upgrade error was not recorded: {record:#}");
+                }
                 self.stop_application().await?;
                 return Err(error);
             }
@@ -3408,8 +3535,10 @@ async fn main() -> Result<()> {
         baked_fallback_installed: None,
         pending_startup,
         activation_receipts: ReceiptBackoff::default(),
+        startup_link_down_since: None,
         readiness_receipt: ReadinessReceipt::Pending,
         last_observed: None,
+        core_migration_wait: None,
     };
     supervisor.load_boot_mismatch_handoff().await?;
     loop {
@@ -3962,6 +4091,94 @@ mod tests {
         );
         drop(db);
         tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    /// The shape `forward` returns when the link does not answer: the
+    /// transport cause with `ReceiptNotSaved` as its context.
+    fn link_unavailable_error() -> anyhow::Error {
+        anyhow::anyhow!("waiting").context(db::ReceiptNotSaved {
+            status: jmodguard::control::CONTROL_LINK_UNAVAILABLE.to_owned(),
+        })
+    }
+
+    fn unsaved(status: &str) -> anyhow::Error {
+        db::ReceiptNotSaved {
+            status: status.to_owned(),
+        }
+        .into()
+    }
+
+    /// Issue #552: an unreachable control link is a normal rolling-swap wait
+    /// for the launcher fence TTL plus a margin, so those attempts stay at
+    /// INFO and only warn once the wait outlasts that bound.
+    #[test]
+    fn unreachable_link_startup_receipts_stay_quiet_until_the_fence_bound() {
+        let link = link_unavailable_error();
+        let start = Instant::now();
+        let mut since = None;
+        assert!(
+            !Supervisor::startup_receipt_warns(&mut since, &link, start),
+            "the first attempt must not warn"
+        );
+        assert_eq!(since, Some(start), "the first attempt starts the outage");
+        assert!(
+            !Supervisor::startup_receipt_warns(
+                &mut since,
+                &link,
+                start + STARTUP_RECEIPT_WARN_AFTER
+            ),
+            "the bound itself is still a normal wait"
+        );
+        assert!(
+            Supervisor::startup_receipt_warns(
+                &mut since,
+                &link,
+                start + STARTUP_RECEIPT_WARN_AFTER + Duration::from_secs(1)
+            ),
+            "a link still down past the bound is unexpected"
+        );
+    }
+
+    /// Other unsaved reasons keep warning immediately.
+    #[test]
+    fn other_unsaved_startup_receipt_reasons_still_warn() {
+        for status in ["waiting", "busy", "still waiting"] {
+            assert!(
+                Supervisor::startup_receipt_warns(&mut None, &unsaved(status), Instant::now()),
+                "{status} must keep warning immediately"
+            );
+        }
+    }
+
+    /// A reply from the link ends the outage. A later outage gets its own
+    /// full window instead of inheriting the time of the first one.
+    #[test]
+    fn a_link_reply_restarts_the_startup_receipt_outage_window() {
+        let link = link_unavailable_error();
+        let start = Instant::now();
+        let mut since = None;
+        assert!(!Supervisor::startup_receipt_warns(&mut since, &link, start));
+        let answered = start + Duration::from_secs(10);
+        assert!(Supervisor::startup_receipt_warns(
+            &mut since,
+            &unsaved("waiting"),
+            answered
+        ));
+        assert_eq!(since, None, "the link answered, so the outage ended");
+        let again = start + STARTUP_RECEIPT_WARN_AFTER + Duration::from_secs(10);
+        assert!(
+            !Supervisor::startup_receipt_warns(&mut since, &link, again),
+            "a new outage must not inherit the first outage's start"
+        );
+        assert_eq!(since, Some(again));
+        assert!(
+            Supervisor::startup_receipt_warns(
+                &mut since,
+                &link,
+                again + STARTUP_RECEIPT_WARN_AFTER + Duration::from_secs(1)
+            ),
+            "the new outage still warns once it outlasts the bound"
+        );
     }
 }
 

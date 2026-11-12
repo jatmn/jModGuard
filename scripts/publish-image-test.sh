@@ -235,23 +235,23 @@ for component in bot api webui; do
 done
 
 # Migration origins are distinct from exact application runtime ranges.
-for field in update-control=3 upgrade-min-core=15 upgrade-min-guild=1 guild-schema=17; do
+for field in update-control=3 upgrade-min-core=15 upgrade-min-guild=1 guild-schema=18; do
   contains_arg "io.jmodguard.${field}" "${schema_args[@]}" || fail "missing coordinated metadata ${field}"
 done
 
 # Capability labels come from the selected source, independently of SHA.
 readarray -d '' -t launcher_args < <(build_args bot "$HEAD_SHA" "" . "" current "$(staging_ref bot)")
-for field in launcher-revision=41 min-launcher-revision=7; do
+for field in launcher-revision=43 min-launcher-revision=7; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "missing launcher requirement ${field}"
 done
 launcher_source="$(mktemp -d)"
 mkdir -p "$launcher_source/src/db" "$launcher_source/migrations/guild"
 cp src/db.rs "$launcher_source/src/db.rs"
 cp migrations/guild/current_version.txt "$launcher_source/migrations/guild/current_version.txt"
-sed -e 's/^pub const LAUNCHER_REVISION: u32 = 41;$/pub const LAUNCHER_REVISION: u32 = 42;/' \
+sed -e 's/^pub const LAUNCHER_REVISION: u32 = 43;$/pub const LAUNCHER_REVISION: u32 = 44;/' \
     src/db/update_control.rs >"$launcher_source/src/db/update_control.rs"
 readarray -d '' -t launcher_args < <(build_args api "$HEAD_SHA" "" "$launcher_source" "" current "$(staging_ref api)")
-for field in launcher-revision=42 min-launcher-revision=7; do
+for field in launcher-revision=44 min-launcher-revision=7; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "selected source lost ${field}"
 done
 

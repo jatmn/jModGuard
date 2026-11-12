@@ -761,11 +761,36 @@ enum AuditAssociation {
     Foreign,
 }
 
+/// What opened a member-directory coverage gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoverageGap<'a> {
+    /// Needs an explicit Reconcile from Discord.
+    Observed(&'a str),
+    /// A short planned bot restart. Completed audit recovery may clear it, but
+    /// only when the same mark queues that recovery after a completed import.
+    ShortPlannedRestart,
+}
+
+impl CoverageGap<'_> {
+    pub const PLANNED_RESTART_REASON: &'static str = "bot restarted";
+
+    fn reason(&self) -> &str {
+        match self {
+            Self::Observed(reason) => reason,
+            Self::ShortPlannedRestart => Self::PLANNED_RESTART_REASON,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MemberSyncStatus {
     pub initial_completed_at: Option<i64>,
     pub reconciliation_needed: bool,
     pub reconciliation_reason: Option<String>,
+    /// Latest recorded coverage gap time while reconciliation is needed.
+    pub gap_at: Option<i64>,
+    /// Every pending gap was a short bot restart, so completed audit recovery clears it.
+    pub gap_auto_clear: bool,
     pub audit_recovery_pending: bool,
     pub audit_recovery_status: Option<String>,
     pub audit_recovery_reason: Option<String>,
@@ -1134,6 +1159,8 @@ fn status(
         initial_completed_at: seed.completed_at(),
         reconciliation_needed: false,
         reconciliation_reason: None,
+        gap_at: None,
+        gap_auto_clear: false,
         audit_recovery_pending: false,
         audit_recovery_status: None,
         audit_recovery_reason: None,
@@ -1188,14 +1215,16 @@ fn status(
         return Ok(out);
     }
     note_member_sync_statement(scope.guild_id());
-    let coverage: (bool, Option<String>, bool, Option<i64>) = conn.query_row(
-        "SELECT reconciliation_needed,reconciliation_reason,case_backfill_done,gap_at_ms FROM guild_member_seed WHERE guild_id=?1",
+    let coverage: (bool, Option<String>, bool, Option<i64>, bool) = conn.query_row(
+        "SELECT reconciliation_needed,reconciliation_reason,case_backfill_done,gap_at_ms,gap_auto_clear FROM guild_member_seed WHERE guild_id=?1",
         params![scope.guild_id()],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
     out.reconciliation_needed = coverage.0;
     out.reconciliation_reason = coverage.1;
     out.local_history_complete = coverage.2;
+    out.gap_at = coverage.3.filter(|_| coverage.0);
+    out.gap_auto_clear = coverage.0 && coverage.4;
     note_member_sync_statement(scope.guild_id());
     out.audit_recovery_pending = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM guild_member_audit_recovery WHERE guild_id=?1 AND enrollment_id=?2 AND status IN ('queued','running','waiting','needs_attention') AND NOT (status='needs_attention' AND status_reason='pagination_stalled') AND coalesce(next_attempt_at_ms,0)<=?3 AND coalesce(request_after_ms,0)<=?3 AND coalesce(lease_until_ms,0)<=?3)",
@@ -1627,12 +1656,16 @@ impl GuildDataStore {
         }).await
     }
 
+    /// A pending gap stays auto-clearable only while every gap since the last
+    /// clear was a short planned restart marked after initial import completion.
     pub async fn mark_member_reconciliation_needed(
         &self,
         scope: GuildDataScope,
-        reason: &str,
+        gap: CoverageGap<'_>,
         now_ms: i64,
     ) -> Result<()> {
+        let auto_clear = gap == CoverageGap::ShortPlannedRestart;
+        let reason = gap.reason();
         checked_scope(self, &scope)?;
         anyhow::ensure!(
             !reason.is_empty() && reason.len() <= 160 && now_ms > 0 && !reason.contains('\0'),
@@ -1714,11 +1747,14 @@ impl GuildDataStore {
             let joined_at_ns = scope.enrollment.joined_at_ns;
             let expected_revision = revision_before + 1;
             let fence_sql = coverage_gap_writer_fence_sql(writer_generation);
+            // Only a mark that queues audit recovery below (completed initial
+            // import) can rely on that recovery to clear it.
+            let auto_clear = i64::from(auto_clear);
             // Receipt admission, the one-row mark check, and audit recovery
             // share one batch. The 32 MiB batch bound covers the seed row that
             // the removed COUNT used to budget on its own.
             let batch = format!(
-                "{meta_check}{fence_sql}{receipt_sql}{restore_check}{receipt_prune}UPDATE guild_member_seed SET reconciliation_needed=1,reconciliation_reason={reason_sql},gap_at_ms=MAX(coalesce(gap_at_ms,0),{now_ms}),gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id={guild_id} AND enrollment_id={enrollment} AND directory_revision={revision_before} AND EXISTS (SELECT 1 FROM guild_memberships m WHERE m.guild_id={guild_id} AND m.enrollment_id={enrollment} AND m.active=1 AND m.joined_at_ns={joined_at_ns});
+                "{meta_check}{fence_sql}{receipt_sql}{restore_check}{receipt_prune}UPDATE guild_member_seed SET reconciliation_needed=1,reconciliation_reason={reason_sql},gap_at_ms=MAX(coalesce(gap_at_ms,0),{now_ms}),gap_auto_clear=CASE WHEN reconciliation_needed=1 AND gap_auto_clear=0 THEN 0 WHEN initial_completed_at_ms IS NULL THEN 0 ELSE {auto_clear} END,gap_generation=gap_generation+1,directory_revision=directory_revision+1 WHERE guild_id={guild_id} AND enrollment_id={enrollment} AND directory_revision={revision_before} AND EXISTS (SELECT 1 FROM guild_memberships m WHERE m.guild_id={guild_id} AND m.enrollment_id={enrollment} AND m.active=1 AND m.joined_at_ns={joined_at_ns});
 {mark_check}
 INSERT INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT {guild_id},{enrollment},s.bot_id,{run_id},{now_ms},'queued',{now_ms} FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.directory_revision={expected_revision} AND s.reconciliation_needed=1 AND s.reconciliation_reason={reason_sql} AND s.initial_completed_at_ms IS NOT NULL ON CONFLICT(guild_id) DO UPDATE SET run_id=excluded.run_id,started_at_ms=excluded.started_at_ms,cursor=NULL,status='queued',status_reason=NULL,processed=0,next_attempt_at_ms=excluded.next_attempt_at_ms,request_after_ms=NULL,generation=guild_member_audit_recovery.generation+1,lease_owner=NULL,lease_until_ms=NULL WHERE guild_member_audit_recovery.status='complete';
 UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(restart_requested_at_ms,0),{now_ms}) WHERE guild_id={guild_id} AND status!='complete' AND (cursor IS NOT NULL OR status='running') AND EXISTS(SELECT 1 FROM guild_member_seed s WHERE s.guild_id={guild_id} AND s.enrollment_id={enrollment} AND s.directory_revision={expected_revision} AND s.reconciliation_needed=1 AND s.reconciliation_reason={reason_sql});"
@@ -3215,6 +3251,10 @@ impl GuildDataStore {
             let completed=transition==AuditPageTransition::Complete;
             let cursor=match transition {AuditPageTransition::StartUnbans=>Some("unban:".to_string()),AuditPageTransition::Restart|AuditPageTransition::Complete=>None,AuditPageTransition::Continue=>next_cursor};
             tx.member_execute("UPDATE guild_member_audit_recovery SET cursor=?4,status=?5,status_reason=NULL,lease_owner=NULL,lease_until_ms=NULL,next_attempt_at_ms=?6,request_after_ms=?6,processed=CASE WHEN ?9 THEN 0 ELSE processed+?7 END,last_progress_at_ms=?8,run_id=CASE WHEN ?9 THEN lower(hex(randomblob(16))) ELSE run_id END,started_at_ms=CASE WHEN ?9 THEN ?8 ELSE started_at_ms END,generation=CASE WHEN ?9 THEN generation+1 ELSE generation END,restart_requested_at_ms=CASE WHEN ?9 THEN NULL ELSE restart_requested_at_ms END WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),claim.bot_id,cursor,if completed{SyncState::Complete.as_str()}else{SyncState::Queued.as_str()},if completed{None}else{Some(now_ms.saturating_add(pace_ms))},audits.len() as i64,now_ms,restart])?;
+            // Completion means no gap was marked after this run began: a newer
+            // gap requests a restart instead. Only short-restart gaps clear here.
+            // gap_at_ms stays, so departure cleanup still checks membership since the gap.
+            if completed {tx.member_execute("UPDATE guild_member_seed SET reconciliation_needed=0,reconciliation_reason=NULL,gap_auto_clear=0 WHERE guild_id=?1 AND enrollment_id=?2 AND reconciliation_needed=1 AND gap_auto_clear=1",params![scope.guild_id(),scope.enrollment.id.as_str()])?;}
             tx.commit()
         }).await
     }
