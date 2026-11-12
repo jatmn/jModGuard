@@ -161,6 +161,24 @@ assert.ok(compilerCache, "missing compiler cache setup");
 assert.match(compilerCache, /version: v0\.18\.0/);
 const compilerGuard = compilerCache.match(/^        if: (.+)$/m)?.[1];
 assert.ok(compilerGuard);
+// actions/cache never re-saves a primary-key hit, so the pinned tool cache key
+// must hash every file that decides what the cache holds, including each
+// supply-chain tool version ensure_cargo_tool installs.
+const toolCache = jobs.get("checks").match(/^      - name: Cache pinned lint and audit tools\n([\s\S]*?)(?=^      - |$(?![\s\S]))/m)?.[1];
+assert.ok(toolCache, "missing pinned tool cache");
+const toolKeyFiles = [...(toolCache.match(/hashFiles\(([^)]*)\)/)?.[1] ?? "").matchAll(/'([^']+)'/g)].map(match => match[1]);
+for (const file of ["rust-toolchain.toml", "dylint.toml", "scripts/dylint.sh", "scripts/ci-dylint-libs.sh", "scripts/ci-ensure-cargo-tool.sh"]) {
+  assert.ok(toolKeyFiles.includes(file), `pinned tool cache key must hash ${file}`);
+}
+const ensureHelper = fs.readFileSync(path.join(root, "scripts/ci-ensure-cargo-tool.sh"), "utf8");
+const toolVersions = [...fs.readFileSync(path.join(root, "scripts/ci-preflight.sh"), "utf8")
+  .matchAll(/^\s*ensure_cargo_tool \S+ \S+ (\S+)$/gm)].map(match => match[1]);
+assert.ok(toolVersions.length > 0, "missing ensure_cargo_tool calls");
+for (const version of toolVersions) {
+  const name = version.match(/^"\$([a-z_]+)"$/)?.[1];
+  assert.ok(name, `ensure_cargo_tool version ${version} must be pinned in scripts/ci-ensure-cargo-tool.sh`);
+  assert.match(ensureHelper, new RegExp(`^${name}=\\S+$`, "m"), `${name} must be pinned in scripts/ci-ensure-cargo-tool.sh`);
+}
 const selectedChecks = jobs.get("checks").match(/^      - name: Run selected checks\n([\s\S]*?)(?=^      - |$(?![\s\S]))/m)?.[1];
 assert.ok(selectedChecks);
 assert.doesNotMatch(jobs.get("checks").slice(0, jobs.get("checks").indexOf("      - name: Run selected checks")), /RUSTC_WRAPPER:/);

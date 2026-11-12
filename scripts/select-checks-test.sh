@@ -50,7 +50,7 @@ expect "contracts fmt bot updater bootstrap publish-tests supply-chain" Dockerfi
 expect "contracts fmt api updater boundaries integration bootstrap publish-tests supply-chain" Dockerfile.api
 expect "contracts fmt dylint runtime boundaries core integration supply-chain" crates/runtime/src/lib.rs
 expect "contracts fmt dylint updater api bot boundaries supply-chain" crates/updater/src/lib.rs
-expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh scripts/dylint-test.sh
+expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh scripts/dylint-test.sh scripts/ci-dylint-libs.sh
 expect "contracts supply-chain" scripts/ci-ensure-cargo-tool.sh scripts/ci-preflight-test.sh
 expect "contracts supply-chain" \
   scripts/ci-cargo-log.sh \
