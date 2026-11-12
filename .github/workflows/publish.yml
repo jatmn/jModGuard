@@ -53,7 +53,7 @@ jobs:
       sha: ${{ steps.release.outputs.sha }}
       created: ${{ steps.release.outputs.release_created }}
     steps:
-      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
         id: release
         with:
           config-file: release-please-config.json
@@ -225,7 +225,7 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: publish-build-ok-*
           path: ${{ runner.temp }}/publish-build-ok
@@ -235,7 +235,7 @@ jobs:
           for component in bot api webui; do
             test -s "${RUNNER_TEMP}/publish-build-ok/publish-build-ok-${component}/ok"
           done
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: publish-state-*
           path: ${{ runner.temp }}/publish-states
