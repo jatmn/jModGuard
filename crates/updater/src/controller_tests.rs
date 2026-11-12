@@ -6302,18 +6302,16 @@ fn reservation_lock_times_out_while_another_process_holds_it() {
     std::fs::create_dir_all(&dir).unwrap();
     let lock_path = dir.join("lock");
     std::fs::File::create(&lock_path).unwrap();
+    // One process holds the lock: the shell takes it on fd 9, then `exec`s
+    // `sleep` with that open file description inherited. `flock <file> sleep`
+    // would fork a `sleep` grandchild that the kill in `KillChildren::drop`
+    // never reaches, leaving it holding the lock and the test's pipes.
     let holder = KillChildren(vec![
-        std::process::Command::new("flock")
-            .arg("-x")
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"exec 9>>"$1" && flock -x 9 && exec sleep 30"#)
+            .arg("sh")
             .arg(&lock_path)
-            .arg("sleep")
-            .arg("30")
-            // The holder's output is never asserted: null stdio keeps the
-            // orphaned `sleep` grandchild (surviving the flock kill in Drop)
-            // from holding the test's stdout/stderr pipes open past exit.
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap(),
     ]);
