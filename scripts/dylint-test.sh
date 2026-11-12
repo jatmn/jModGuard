@@ -474,15 +474,17 @@ for name in abs_home_path await_holding_span_guard basic_dead_store crate_wide_a
 done
 
 run_provision() {
+  local prefix="$1" cargo_home="$2" target_dir="$3"
+  shift 3
   (
     cd "$fixture/project"
-    JMODGUARD_CI_PREFIX="$1" \
-    DYLINT_CARGO_HOME="$2" \
-    CARGO_TARGET_DIR="$3" \
+    JMODGUARD_CI_PREFIX="$prefix" \
+    DYLINT_CARGO_HOME="$cargo_home" \
+    CARGO_TARGET_DIR="$target_dir" \
     PATH="$fixture/bin:$PATH" \
     TMPDIR="$fixture/external" \
     env -u JMODGUARD_DYLINT_PACKAGES -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 \
-      bash scripts/ci-dylint-libs.sh
+      "$@" bash scripts/ci-dylint-libs.sh
   ) >"$provision_stdout" 2>&1
 }
 
@@ -542,14 +544,42 @@ fi
 expect "$capture" argv 'dylint --all --no-metadata --fail-on-no-libraries -- --locked --all-targets --workspace'
 expect "$capture" DYLINT_LIBRARY_PATH "$publish_lib_dir"
 
-# With no tools in the install root and no metadata build output, publishing
-# leaves the cache layout untouched instead of creating empty entries.
+# A dylint tag bump moves the pinned tool root for the publisher and dylint.sh
+# together: both derive dylint-<tag> from dylint.toml.
+cp "$fixture/project/dylint.toml" "$fixture/dylint.toml.orig"
+sed -i 's/^tag = "v6\.1\.0"$/tag = "v6.2.0"/' "$fixture/project/dylint.toml"
+bump_prefix="$fixture/bump-prefix"
+run_provision "$bump_prefix" "$publish_cargo" "$publish_target" DYLINT_TEST_ROOT_VERSION=6.2.0
+grep -Fq "ci-dylint-libs: published pinned dylint 6.2.0 tools to $bump_prefix/dylint-6.2.0" "$provision_stdout" \
+  || fail 'provisioning must publish the pinned tools for the bumped tag'
+run_dylint "$fixture/external" JMODGUARD_CI_PREFIX="$bump_prefix" \
+  DYLINT_TEST_ROOT_VERSION=6.2.0 DYLINT_TEST_LISTED_VERSION=6.2.0
+grep -Fq "dylint: using pinned tools at $bump_prefix/dylint-6.2.0" "$stdout_file" \
+  || fail 'dylint must consume the pinned tools published for the bumped tag'
+cp "$fixture/dylint.toml.orig" "$fixture/project/dylint.toml"
+
+# A run that cannot publish a complete layout fails without creating entries:
+# actions/cache saves only after a successful job and never re-saves a
+# primary-key hit, so an incomplete entry would persist for every later run.
 skip_prefix="$fixture/skip-prefix"
-run_provision "$skip_prefix" "$fixture/external/cargo-home" "$fixture/external"
+if run_provision "$skip_prefix" "$fixture/external/cargo-home" "$fixture/external"; then
+  fail 'provisioning without dylint tools must fail'
+fi
 grep -Fq 'no dylint tools under' "$provision_stdout" || fail 'missing tools must be reported'
+[ ! -d "$skip_prefix/dylint-libs" ] || fail 'a failed run must not create dylint-libs'
+[ ! -d "$skip_prefix/dylint-6.1.0" ] || fail 'a failed run must not create the pinned tool root'
+
+if run_provision "$skip_prefix" "$publish_cargo" "$fixture/external"; then
+  fail 'provisioning without metadata-built libraries must fail'
+fi
 grep -Fq 'has no lib' "$provision_stdout" || fail 'missing libraries must be reported'
-[ ! -d "$skip_prefix/dylint-libs" ] || fail 'a skipped run must not create dylint-libs'
-[ ! -d "$skip_prefix/dylint-6.1.0" ] || fail 'a skipped run must not create the pinned tool root'
+[ ! -d "$skip_prefix/dylint-libs" ] || fail 'a failed run must not create dylint-libs'
+
+if run_provision "$skip_prefix" "$publish_cargo" "$publish_target" DYLINT_TEST_CURL_FAIL=1; then
+  fail 'provisioning with a failed library key lookup must fail'
+fi
+grep -Fq 'library key lookup failed' "$provision_stdout" || fail 'key lookup failure must be reported'
+[ ! -d "$skip_prefix/dylint-libs" ] || fail 'a failed key lookup must not create dylint-libs'
 
 while IFS= read -r line; do
   if [[ "$line" == *dylint-libs* ]]; then

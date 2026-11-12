@@ -953,8 +953,8 @@ if should_run supply-chain; then
   echo 'ci-preflight: bash scripts/ci-preflight-test.sh'
   bash scripts/ci-preflight-test.sh
 
-  ensure_cargo_tool cargo-deny cargo-deny 0.20.2
-  ensure_cargo_tool cargo-audit cargo-audit 0.22.2
+  ensure_cargo_tool cargo-deny cargo-deny "$cargo_deny_version"
+  ensure_cargo_tool cargo-audit cargo-audit "$cargo_audit_version"
 
   echo 'ci-preflight: cargo deny check bans licenses sources'
   cargo deny check bans licenses sources

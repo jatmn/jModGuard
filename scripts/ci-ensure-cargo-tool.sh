@@ -8,6 +8,15 @@ if [ -z "${JMODGUARD_CI_PREFIX:-}" ]; then
   fi
 fi
 
+# Pinned supply-chain tool versions. The CI tool cache key in
+# .github/workflows/ci.yml hashes this file, so a pin bump yields a new key and
+# a save of the newly installed binary; a pin kept elsewhere would restore the
+# old binary on every primary-key hit and reinstall each run.
+# shellcheck disable=SC2034  # read by scripts/ci-preflight.sh, which sources this file
+cargo_deny_version=0.20.2
+# shellcheck disable=SC2034
+cargo_audit_version=0.22.2
+
 cargo_tool_version_last_field() {
   local tool="$1"
   local vout

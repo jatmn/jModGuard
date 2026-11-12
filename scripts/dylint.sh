@@ -138,6 +138,10 @@ if [ "${#library_tags[@]}" -gt 1 ]; then
   done
 fi
 
+# The pinned tool layout for this tag. scripts/ci-dylint-libs.sh sources this
+# prefix and publishes to the same directory, so both follow a tag bump.
+dylint_pinned_root="$JMODGUARD_CI_PREFIX/dylint-${version}"
+
 # The selector supplies known workspace packages for an affected-only CI job.
 # Direct/local invocations and global changes default to the full workspace.
 package_args=(--workspace)
@@ -233,7 +237,7 @@ dylint_prebuilt_lib_dir_valid() {
   [ "$so_count" -eq 6 ]
 }
 
-pinned_root="$JMODGUARD_CI_PREFIX/dylint-6.1.0"
+pinned_root="$dylint_pinned_root"
 pinned_ok=0
 if [ -f "$pinned_root/.crates.toml" ] \
   && [ -x "$pinned_root/bin/cargo-dylint" ] \

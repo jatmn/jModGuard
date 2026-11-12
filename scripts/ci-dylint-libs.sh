@@ -7,11 +7,15 @@
 # The tools come from the install root dylint.sh used ($DYLINT_CARGO_HOME on
 # hosted runners); the libraries come from the metadata build output under
 # $CARGO_TARGET_DIR/dylint/libraries. Run after scripts/dylint.sh; safe to
-# repeat. Absent sources or a failed key lookup leave the cache untouched.
+# repeat. Absent sources or a failed key lookup leave the cache untouched and
+# exit non-zero: actions/cache saves only after a successful job, and a saved
+# primary key is never re-saved, so an incomplete entry would otherwise stay
+# for every later run on that key.
 # dylint.sh itself never mutates this layout (contract in dylint-test.sh);
 # this script is the only writer.
-# shellcheck disable=SC2154  # version, CARGO_HOME, CARGO_TARGET_DIR and the
-# key/library helpers come from the sourced prefix of scripts/dylint.sh.
+# shellcheck disable=SC2154  # version, dylint_pinned_root, CARGO_HOME,
+# CARGO_TARGET_DIR and the key/library helpers come from the sourced prefix of
+# scripts/dylint.sh.
 set -euo pipefail
 
 root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
@@ -32,7 +36,7 @@ sed '/^pinned_root=/,$d' scripts/dylint.sh >"$dylint_setup"
 source "$dylint_setup"
 
 publish_pinned_dylint_tools() {
-  local pinned="$JMODGUARD_CI_PREFIX/dylint-${version}"
+  local pinned="$dylint_pinned_root"
   local got_cd got_dl
 
   if [ -f "$pinned/.crates.toml" ] && [ -x "$pinned/bin/cargo-dylint" ] && [ -x "$pinned/bin/dylint-link" ]; then
@@ -48,14 +52,14 @@ publish_pinned_dylint_tools() {
   if [ ! -f "$CARGO_HOME/.crates.toml" ] \
     || [ ! -x "$CARGO_HOME/bin/cargo-dylint" ] \
     || [ ! -x "$CARGO_HOME/bin/dylint-link" ]; then
-    echo "ci-dylint-libs: no dylint tools under $CARGO_HOME; pinned tools not published"
-    return 0
+    echo "ci-dylint-libs: no dylint tools under $CARGO_HOME; pinned tools not published" >&2
+    return 1
   fi
   if ! got_cd="$(installed_version_root cargo-dylint "$CARGO_HOME")" \
     || ! got_dl="$(installed_version_root dylint-link "$CARGO_HOME")" \
     || [ "$got_cd" != "$version" ] || [ "$got_dl" != "$version" ]; then
-    echo "ci-dylint-libs: tools under $CARGO_HOME are not $version; pinned tools not published"
-    return 0
+    echo "ci-dylint-libs: tools under $CARGO_HOME are not $version; pinned tools not published" >&2
+    return 1
   fi
 
   mkdir -p "$pinned/bin"
@@ -73,8 +77,8 @@ publish_prebuilt_dylint_libs() {
   key_file="$(mktemp)"
   if ! jmodguard_dylint_lib_key dylint.toml "$key_file"; then
     rm -f "$key_file"
-    echo "ci-dylint-libs: library key lookup failed; prebuilt libs not published"
-    return 0
+    echo "ci-dylint-libs: library key lookup failed; prebuilt libs not published" >&2
+    return 1
   fi
   key="$(dylint_lib_key_digest "$key_file")"
   lib_dir="$JMODGUARD_CI_PREFIX/dylint-libs/$key"
@@ -91,16 +95,16 @@ publish_prebuilt_dylint_libs() {
   # channel-host pair recorded in the key.
   if ! lib_toolchain="$(dylint_lib_toolchain_from_key "$key_file")"; then
     rm -f "$key_file"
-    echo "ci-dylint-libs: lint toolchain unavailable; prebuilt libs not published"
-    return 0
+    echo "ci-dylint-libs: lint toolchain unavailable; prebuilt libs not published" >&2
+    return 1
   fi
   src_dir="$CARGO_TARGET_DIR/dylint/libraries/$lib_toolchain/release"
   for name in "${dylint_lib_names[@]}"; do
     fname="lib${name}@${lib_toolchain}.so"
     if [ ! -s "$src_dir/$fname" ]; then
       rm -f "$key_file"
-      echo "ci-dylint-libs: $src_dir has no $fname; prebuilt libs not published"
-      return 0
+      echo "ci-dylint-libs: $src_dir has no $fname; prebuilt libs not published" >&2
+      return 1
     fi
   done
 
