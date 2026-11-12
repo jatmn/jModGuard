@@ -16,13 +16,17 @@ default page is 100 members, and requests from the new sync worker are spaced
 at least 15 seconds apart across its guilds. A guild with roughly 11,000 members
 needs about 110 populated pages plus a terminal request, so the member phase
 takes roughly 28 minutes at the default pace, plus latency, other guilds,
-current bans, retries, and any available history recovery. The Members status
-card shows committed progress and distinguishes this estimate from known totals.
-Before the bot admits a genuinely new enrollment, the card says it is awaiting
+current bans, retries, and any available history recovery. The top of the
+Members page is a short status area: one live-coverage line, then the import.
+A running, waiting, paused or failed import shows its state, reason, progress bar
+and timing in that compact view, and distinguishes this estimate from known totals.
+A finished import is one line with its member and ban counts, finish date and
+duration. Every date on the page uses one time zone label (for example PT, not
+PDT beside PST). Before the bot admits a genuinely new enrollment, the page says it is awaiting
 the first bot initialization and disables run controls. Once a saved run exists,
 its controls become available. Missing metadata for an already admitted
 enrollment instead needs attention; it never authorizes a new initial seed.
-While the page is visible, the card keeps following an acknowledged sync
+While the page is visible, the status keeps following an acknowledged sync
 control and separate audit recovery even if the initial import is complete.
 The member-stage finish time is a preliminary forecast from a recent bot
 initialization with a known guild count, then anchored to committed pages and
@@ -32,19 +36,19 @@ becomes too old to support that forecast, the remaining time and finish time
 become unknown. An unconfirmed worker is not labeled as crashed. A completed
 member stage uses the actual number traversed rather than retaining the
 starting guild estimate.
-The card shows committed counts for each phase; current-ban and audit totals
+Its collapsed **Details** show saved counts for each phase; current-ban and audit totals
 may be unknown, so those phases use indeterminate progress. Existing version10
 runs keep their old aggregate count and known member total, but cannot
-reconstruct earlier ban, check, or audit counts after migration; the card
-marks those counts unknown. Local case history
+reconstruct earlier ban, check, or audit counts after migration; Details
+mark those counts unknown. Local case history
 may still be finishing after the Discord phases are done. That stage records
 only whether it finished, so its row and the progress bar's screen-reader text
 say **Not counted** instead of giving a count.
-For a known Discord rate limit, the card counts down to the next attempt and
+For a known Discord rate limit, the status counts down to the next attempt and
 uses a recent count and pace anchor to revise the member-stage finish time.
-Paused, offline, stale or unpredictable work has no finish forecast. The card
-shows the last committed progress time separately from the time its status was
-read. A later Reconcile has its own counters; the prior successful run's time
+Paused, offline, stale or unpredictable work has no finish forecast. Details
+show the last progress time separately from the time the status was checked.
+A later Reconcile has its own counters; the prior successful run's time
 and final counts remain visible independently.
 
 An unfinished import resumes from its durable cursor after restart. A full
@@ -64,7 +68,8 @@ succeeds as a no-op with a `member_sync_already_completed` receipt. After
 completion, a full current-member and current-ban scan runs only when a guild
 administrator explicitly selects **Reconcile from Discord**. An outage,
 restore, bot restart or redeploy, or a replaced Gateway session on an already
-progressed import can leave coverage uncertain; the card reports that gap, with
+progressed import can leave coverage uncertain; a separate banner above the
+import summary reports that gap, with
 its time and reason, until a requested reconciliation finishes or, after a
 short planned restart, audit recovery completes. Live events and
 bounded checks for affected users continue while coverage is uncertain.
@@ -83,7 +88,7 @@ such gap keeps a later short restart from clearing itself. Audit recovery that
 stops for attention also leaves the warning until Retry or Reconcile. The bot separately catches up
 available ban and unban audit actions after a Gateway gap using the same paced
 request budget; this audit-only recovery does not list all members or current
-bans and does not change the original initial-import completion time. The card
+bans and does not change the original initial-import completion time. The status
 reports its ban/unban stage, checked-entry count, waiting reason, and next
 attempt separately from the completed initial import.
 An ordinary departed person's saved stay waits through a known pending audit

@@ -204,6 +204,10 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 #content p { line-height: 1.65; }
 #content .card { border: 1px solid var(--shell-border); }
 #content .card-body { gap: 1rem; }
+/* An alert with text and an action: the action wraps below long text instead of running past the box. */
+.alert-wrap { display: flex; flex-wrap: wrap; align-items: center; }
+.alert-wrap > * { min-width: 0; max-width: 100%; }
+.alert-wrap > :first-child { flex: 1 1 18rem; }
 .member-sync-details { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 16px; margin: 0; font-size: .875rem; }
 .member-sync-details dt { color: var(--muted); }
 .member-sync-details dd { margin: 0; overflow-wrap: anywhere; }
