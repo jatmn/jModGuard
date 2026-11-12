@@ -483,9 +483,11 @@ async function doRefreshAnalytics() {
     const next = await request("/api/platform/analytics", {});
     if (ui.getSnapshot().activeView !== "analytics" || document.visibilityState === "hidden") return;
     const members = next.members || {};
-    const availability = members.guilds_unavailable
+    const availability = (members.guilds_unavailable
       ? ` Member totals cover ${members.guilds_counted ?? 0} of ${members.servers ?? next.guilds?.length ?? 0} servers; the rest were unavailable.`
-      : "";
+      : "") + (members.guilds_incomplete
+      ? ` ${members.guilds_incomplete} counted ${members.guilds_incomplete === 1 ? "server has" : "servers have"} a member directory still importing or awaiting Reconcile.`
+      : "");
     ui.set({ signIn: "optional", access: "allowed", analyticsSnapshot: next, analyticsFreshness: "fresh",
       analyticsMessage: `Analytics refreshed. ${members.status === "unavailable" ? "Member totals are unavailable." : `Member totals are ${members.status || "complete"}.`}${availability}` });
   } catch (error) { ui.set({ analyticsMessage: error.message }); ui.set({ analyticsFreshness: "stale" }); }
@@ -531,6 +533,7 @@ function toTrendPoints(series) {
 function memberTotal(members) {
   if (!members || members.status === "unavailable") return "Unavailable";
   if (members.guilds_unavailable) return `${members.current ?? 0}+`;
+  if (members.guilds_incomplete) return `${members.current ?? 0} (partial)`;
   return String(members.current ?? 0);
 }
 
@@ -570,7 +573,7 @@ function AnalyticsCard({ snapshot }) {
         : h("p", { className: "muted" }, loading ? "Loading analytics…" : "No platform trend data recorded yet."),
       table,
       h("p", { className: "muted" },
-        "Per-server rows show guild IDs for the window. Days before the bot started recording — or while it was offline — show zero, not missing history. Members now is the current member directory across counted servers; known members includes departed members retained by ban history.")));
+        "Per-server rows show guild IDs with recorded activity in the window, including servers that have since left until their data is erased; Servers counts current memberships. Days before the bot started recording — or while it was offline — show zero, not missing history. Members now is the current member directory across counted servers; known members includes departed members retained by ban history.")));
 }
 
 function selectView(view) {

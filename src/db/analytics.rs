@@ -91,6 +91,14 @@ const EVENT_BUCKETS_COUNTED_SQL: &str = "(event_type IN ('mod_action','timeout_a
      AND json_extract(data,'$.action') IN ('warn','timeout','kick','ban') \
      AND COALESCE(json_extract(data,'$.dry_run'),0)=0))";
 
+/// Exact-image and repeated-text enforcement never reaches the generic
+/// executor, so it writes no `automod` event. Its only core record is the
+/// unattributed ban mirror tagged with the dedicated rule ID; count that in the
+/// spam bucket. Test mode records nothing, so it stays excluded.
+const DEDICATED_SPAM_BANS_SQL: &str = "(moderator_id IS NULL \
+     AND (instr(reason, '[automod:attachment_flood] ')=1 \
+     OR instr(reason, '[automod:repeat_text] ')=1))";
+
 fn clamp_window(window_days: i64) -> i64 {
     window_days.clamp(1, ANALYTICS_MAX_WINDOW_DAYS)
 }
@@ -195,8 +203,20 @@ fn analytics_series_conn(
     )? {
         apply_day(&mut map, day, move |point| point.bans += n);
     }
+    let spam_bans_guild = format!(
+        "SELECT substr(created_at,1,10), COUNT(*) FROM bans \
+         WHERE guild_id=?1 AND created_at>=?2 AND {DEDICATED_SPAM_BANS_SQL} GROUP BY 1"
+    );
+    let spam_bans_all = format!(
+        "SELECT substr(created_at,1,10), COUNT(*) FROM bans \
+         WHERE created_at>=?1 AND {DEDICATED_SPAM_BANS_SQL} GROUP BY 1"
+    );
+    for (day, n) in collect_pairs(conn, &spam_bans_guild, &spam_bans_all, guild_id, start_day)? {
+        apply_day(&mut map, day, move |point| point.automod += n);
+    }
     // Counted events land in one of three buckets; the automod bucket keeps
-    // the lifetime statistics definition (recorded, non-dry-run enforcement).
+    // the lifetime statistics definition (recorded, non-dry-run enforcement)
+    // and also holds the dedicated spam bans counted above.
     let events_guild = format!(
         "SELECT substr(created_at,1,10), \
          CASE WHEN event_type='automod' THEN 'automod' ELSE event_type END, COUNT(*) \
@@ -313,6 +333,20 @@ fn platform_conn(conn: &impl SqlExecutor, window_days: i64) -> Result<PlatformAn
             .entry(guild_id)
             .or_insert_with(|| GuildActivityTotals::zeroed(guild_id))
             .bans += n;
+    }
+    let spam_bans_sql = format!(
+        "SELECT guild_id, COUNT(*) FROM bans \
+         WHERE created_at>=?1 AND {DEDICATED_SPAM_BANS_SQL} GROUP BY guild_id"
+    );
+    let mut stmt = conn.prepare(&spam_bans_sql)?;
+    for row in stmt.query_map(params![start_day.clone()], |row| {
+        Ok((row.get::<i64>(0)?, row.get::<i64>(1)?))
+    })? {
+        let (guild_id, n) = row?;
+        guilds
+            .entry(guild_id)
+            .or_insert_with(|| GuildActivityTotals::zeroed(guild_id))
+            .automod += n;
     }
     let events_sql = format!(
         "SELECT guild_id, \

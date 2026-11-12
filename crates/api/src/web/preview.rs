@@ -269,6 +269,7 @@ fn is_preview_post_read(path: &str) -> bool {
                     | "events"
                     | "bans"
                     | "stats"
+                    | "analytics"
                     | "cases"
                     | "members"
                     | "member-sync"
@@ -324,6 +325,7 @@ mod tests {
             "/api/guilds/10/events",
             "/api/guilds/10/bans",
             "/api/guilds/10/stats",
+            "/api/guilds/10/analytics",
             "/api/guilds/10/cases",
             "/api/guilds/10/cases/abc",
             "/api/guilds/10/cases/abc/evidence",

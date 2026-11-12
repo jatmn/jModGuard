@@ -1,7 +1,8 @@
 //! Owner-only platform analytics: fleet-wide series plus member directory
 //! totals. Directory totals probe each active guild's store within a bounded
 //! request budget; unavailable stores are reported as unknown instead of
-//! failing the whole read.
+//! failing the whole read, and directories whose coverage is not established
+//! make the totals partial.
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -46,7 +47,7 @@ pub async fn analytics(
 
 /// Sums the member directory across active guilds. Guild IDs stay decimal
 /// strings elsewhere on the wire; these counts are aggregates only.
-async fn member_totals(app: &Arc<ApiState>) -> Value {
+pub(super) async fn member_totals(app: &Arc<ApiState>) -> Value {
     let began = Instant::now();
     let enrollments = match db::list_active_guild_enrollments(&app.db).await {
         Ok(rows) => rows,
@@ -58,12 +59,16 @@ async fn member_totals(app: &Arc<ApiState>) -> Value {
     let mut known = 0i64;
     let mut counted = 0i64;
     let mut unavailable = 0i64;
+    let mut incomplete = 0i64;
     for enrollment in enrollments {
-        if began.elapsed() >= MEMBER_BUDGET {
+        // Clamp each probe to the remaining budget so the last probe cannot
+        // run past it.
+        let remaining = MEMBER_BUDGET.saturating_sub(began.elapsed());
+        if remaining.is_zero() {
             unavailable += 1;
             continue;
         }
-        let probe = tokio::time::timeout(STORE_PROBE, async {
+        let probe = tokio::time::timeout(STORE_PROBE.min(remaining), async {
             let (store, scope) = app.tenant.live(enrollment.clone()).await?;
             store.directory_totals(scope).await
         })
@@ -74,11 +79,14 @@ async fn member_totals(app: &Arc<ApiState>) -> Value {
                 banned += totals.banned;
                 known += totals.known;
                 counted += 1;
+                if !totals.coverage.is_complete() {
+                    incomplete += 1;
+                }
             }
             _ => unavailable += 1,
         }
     }
-    if counted == 0 {
+    if counted == 0 && unavailable > 0 {
         return json!({
             "status": "unavailable",
             "servers": servers,
@@ -86,12 +94,13 @@ async fn member_totals(app: &Arc<ApiState>) -> Value {
         });
     }
     json!({
-        "status": if unavailable == 0 { "complete" } else { "partial" },
+        "status": if unavailable == 0 && incomplete == 0 { "complete" } else { "partial" },
         "servers": servers,
         "current": current,
         "banned": banned,
         "known": known,
         "guilds_counted": counted,
         "guilds_unavailable": unavailable,
+        "guilds_incomplete": incomplete,
     })
 }

@@ -1772,6 +1772,12 @@ function tabAnalytics() {
   const points = toTrendPoints(result.data?.series);
   const loading = result.loading && points.length === 0;
   const members = result.data?.members ?? null;
+  const membersNow = () => {
+    if (loading) return "Loading…";
+    if (!members) return "Unavailable";
+    const suffix = { importing: " (partial)", uncertain: " (unverified)" }[members.coverage] ?? "";
+    return `${members.current}${suffix}`;
+  };
   const statValue = (metricKey) => {
     if (loading) return "Loading…";
     if (result.error) return "Unavailable";
@@ -1804,7 +1810,7 @@ function tabAnalytics() {
       { className: "dashboard-section" },
       h("h3", { className: "card-title" }, "Last 30 days"),
       statsRow(
-        stat("Members now", loading ? "Loading…" : members ? String(members.current) : "Unavailable"),
+        stat("Members now", membersNow()),
         stat("Warnings", statValue("warns")),
         stat("Bans", statValue("bans")),
         stat("Spam hits", statValue("automod")),
@@ -1851,7 +1857,7 @@ function tabAnalytics() {
         h(
           "p",
           {},
-          "Days show counts recorded by the bot in UTC. Days before the bot started recording — or while it was offline — show zero, not missing history. Members now is the current member directory; join and leave trends accumulate from deployment onward.",
+          "Days show counts recorded by the bot in UTC. Days before the bot started recording — or while it was offline — show zero, not missing history. Members now is the current member directory: partial while its initial import runs, and unverified while a coverage gap awaits Reconcile on the Members page. Join and leave trends accumulate from deployment onward.",
         ),
       ),
     ),

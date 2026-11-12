@@ -231,7 +231,7 @@ test('analytics tab reads the daily series as a POST with the page enrollment an
       { day: '2026-01-01', warns: 0, bans: 0, automod: 0, mod_actions: 0, timeouts: 0, joins: 0, leaves: 0 },
       { day: today, warns: 3, bans: 1, automod: 5, mod_actions: 2, timeouts: 1, joins: 9, leaves: 4 },
     ],
-    members: { current: 4321, banned: 12, known: 4500 },
+    members: { current: 4321, banned: 12, known: 4500, coverage: 'complete' },
   }));
   await settle();
   const stat = (label) => Array.from(findNode(panel, n => n.className === 'stat' && textOf(n).includes(label)).children).find((c) => c.className === 'stat-value').textContent;
@@ -256,6 +256,17 @@ test('analytics tab reads the daily series as a POST with the page enrollment an
   assert.equal(pending.length, before, 'metric switching must not refetch');
   const svgAfter = findNode(panel, n => n.tagName === 'svg');
   assert.match(svgAfter.getAttribute('aria-label'), /latest day 5\./);
+});
+
+test('analytics tab marks member size partial or unverified until directory coverage is established', async () => {
+  for (const [coverage, shown] of [['importing', '120 (partial)'], ['uncertain', '120 (unverified)'], ['complete', '120']]) {
+    const { app } = harness(async () => response({ window_days: 30, series: [], members: { current: 120, banned: 0, known: 120, coverage } }));
+    app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [], enrollment_id: 'enroll-token' };
+    const panel = app.tabAnalytics();
+    await settle();
+    const card = findNode(panel, n => n.className === 'stat' && textOf(n).includes('Members now'));
+    assert.equal(Array.from(card.children).find((c) => c.className === 'stat-value').textContent, shown, coverage);
+  }
 });
 
 test('analytics tab shows unavailable counts instead of zeros when the read fails', async () => {

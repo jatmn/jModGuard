@@ -211,7 +211,7 @@ the workspace then refreshes current configuration. If that refresh fails, use
 | Tab | What it does |
 |---|---|
 | **Dashboard** | server configuration plus identified moderation records, warns and bans; unavailable counts are explicit |
-| **Analytics** | daily trend charts for the last 30 days: warnings, bans, spam (automod enforcement) hits, mod actions, timeouts, member joins and leaves, plus the current member directory size; served from the captured membership-bound analytics read |
+| **Analytics** | daily trend charts for the last 30 days: warnings, bans, spam (automod enforcement, including exact-image and repeated-text bans) hits, mod actions, timeouts, member joins and leaves, plus the current member directory size, marked partial while its initial import runs and unverified while a coverage gap awaits Reconcile; served from the captured membership-bound analytics read |
 | **Automod Rules** | per-rule editor: params JSON, action escalation table, whitelists, dry-run, scope, reset-to-global |
 | **Badwords** | add/remove regex patterns (server; global if bot owner), live tester; invalid legacy patterns show **not enforced** |
 | **Commands** | edit every command (name, aliases, description, permission, cooldown, roles/channels, response template); create custom commands with the **step editor**; delete custom commands |

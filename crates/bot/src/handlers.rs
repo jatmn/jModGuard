@@ -751,12 +751,9 @@ impl EventHandler for Handler {
         let uid = new_member.user.id.get();
         app.member_joins.take(guild_id.get(), uid);
         app.automod.member_joined(guild_id.get(), uid);
-        let membership_refresh = crate::member_directory::observe_join(
-            &app,
-            &new_member,
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .await;
+        let observed_at_ms = chrono::Utc::now().timestamp_millis();
+        let membership_refresh =
+            crate::member_directory::observe_join(&app, &new_member, observed_at_ms).await;
         logging::emit_member_event(
             &app,
             &ctx,
@@ -768,10 +765,9 @@ impl EventHandler for Handler {
         )
         .await;
         if let Some(enrollment) = crate::cases::capture(&app, guild_id.get()).await {
-            let at_ms = chrono::Utc::now().timestamp_millis();
             crate::logging::log_persistence_result(
                 "member join counter",
-                db::bump_member_daily(&app.db, enrollment, at_ms, 1, 0).await,
+                db::bump_member_daily(&app.db, enrollment, observed_at_ms, 1, 0).await,
             );
         }
         let current_stay =
@@ -870,19 +866,6 @@ impl EventHandler for Handler {
         ) {
             app.rejoin_note_deliveries
                 .clear_member(guild_id.get(), user.id.get());
-            if let Some(enrollment) = crate::cases::capture(&app, guild_id.get()).await {
-                crate::logging::log_persistence_result(
-                    "member leave counter",
-                    db::bump_member_daily(
-                        &app.db,
-                        enrollment,
-                        departed_at.timestamp_millis(),
-                        0,
-                        1,
-                    )
-                    .await,
-                );
-            }
         }
         let joined_at_ms = departure_joined_at_ms(
             departed.as_ref(),
@@ -891,6 +874,15 @@ impl EventHandler for Handler {
         );
         let extra = logging::member_join_vars_ms(joined_at_ms, departed_at);
         logging::emit_member_event(&app, &ctx, guild_id, "member_leave", &user, extra, None).await;
+        // Count every departure that emits `member_leave`, including one the
+        // member directory could not persist.
+        if let Some(enrollment) = crate::cases::capture(&app, guild_id.get()).await {
+            crate::logging::log_persistence_result(
+                "member leave counter",
+                db::bump_member_daily(&app.db, enrollment, departed_at.timestamp_millis(), 0, 1)
+                    .await,
+            );
+        }
     }
 
     async fn guild_ban_addition(&self, ctx: Context, guild_id: GuildId, banned_user: User) {
@@ -3750,6 +3742,63 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(actor, Some(42));
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_leave_counts_when_the_directory_cannot_persist_it() {
+        use serenity::client::EventHandler;
+        let directory =
+            std::env::temp_dir().join(format!("leave_counter_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        app.activation.note_discord_connected();
+        // No tenant store is active, so the member directory cannot record the
+        // departure; the handler still emits `member_leave`.
+        let enrollment = db::enroll_guild(&app.db, 10, 100).await.unwrap().unwrap();
+        let http = std::sync::Arc::new(
+            serenity::http::HttpBuilder::new("fixture")
+                .proxy("http://127.0.0.1:9")
+                .application_id(serenity::model::id::ApplicationId::new(1))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let ctx = crate::commands::mod_reason_dm::fixture_context_for_dm_order_test(
+            http,
+            std::sync::Arc::new(serenity::cache::Cache::new()),
+        )
+        .await;
+        let user = serde_json::from_value(serde_json::json!({
+            "id": "99", "username": "member", "discriminator": "0001", "avatar": null
+        }))
+        .unwrap();
+        let handler = super::Handler {
+            app: std::sync::Arc::clone(&app),
+        };
+        handler
+            .guild_member_removal(ctx, GuildId::new(10), user, None)
+            .await;
+        let analytics = db::enrolled_guild_analytics(&app.db, enrollment, 1)
+            .await
+            .unwrap();
+        assert_eq!(analytics.series[0].leaves, 1);
+        drop(handler);
         drop(app);
         std::fs::remove_dir_all(directory).unwrap();
     }

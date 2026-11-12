@@ -49,6 +49,14 @@ impl Fixture {
         );
     }
 
+    fn insert_unattributed_ban(&self, guild_id: i64, user_id: i64, reason: &str) {
+        self.insert_raw(
+            "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active) \
+             VALUES (?1, ?2, NULL, ?3, ?4, 1)",
+            crate::db::params![guild_id, user_id, reason, rfc3339_day(0)],
+        );
+    }
+
     fn insert_event(&self, guild_id: i64, event_type: &str, data: &str, day_offset: i64) {
         self.insert_raw(
             "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at) \
@@ -60,8 +68,21 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
+        }
     }
+}
+
+fn member_daily_rows(db: &Db, guild_id: i64) -> i64 {
+    db.with_conn_sync(move |conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM analytics_member_daily WHERE guild_id=?1",
+            crate::db::params![guild_id],
+            |row| Ok(row.get(0)?),
+        )
+    })
+    .unwrap()
 }
 
 fn rfc3339_day(day_offset: i64) -> String {
@@ -195,16 +216,11 @@ async fn member_daily_counters_prune_beyond_the_horizon() {
         crate::db::params![10, old_day],
     );
     bump(&f.db, &enrollment, 0, 1, 1).await;
-    let retained: i64 =
-        f.db.with_conn_sync(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM analytics_member_daily WHERE guild_id=10",
-                (),
-                |row| Ok(row.get(0)?),
-            )
-        })
-        .unwrap();
-    assert_eq!(retained, 1, "the horizon row is pruned by the next write");
+    assert_eq!(
+        member_daily_rows(&f.db, 10),
+        1,
+        "the horizon row is pruned by the next write"
+    );
     let series = enrolled_guild_analytics(&f.db, enrollment, 3)
         .await
         .unwrap();
@@ -268,4 +284,80 @@ async fn platform_analytics_aggregates_guilds_and_counts_active_servers() {
     assert_eq!(guild_twenty.mod_actions, 1);
     assert_eq!(guild_twenty.joins, 2);
     assert_eq!(guild_twenty.leaves, 3);
+}
+
+#[tokio::test]
+async fn departure_erasure_removes_member_counters_before_re_enrollment() {
+    let f = Fixture::new("erasure");
+    // Inline retirement: an unplaced guild settles directory data in the
+    // retirement transaction.
+    let first = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let kept = enroll_guild(&f.db, 20, 100).await.unwrap().unwrap();
+    bump(&f.db, &first, 0, 4, 2).await;
+    bump(&f.db, &kept, 0, 1, 0).await;
+    retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
+    assert_eq!(member_daily_rows(&f.db, 10), 0);
+    assert_eq!(
+        member_daily_rows(&f.db, 20),
+        1,
+        "other guilds keep counters"
+    );
+    let rejoined = enroll_guild(&f.db, 10, 200).await.unwrap().unwrap();
+    let series = enrolled_guild_analytics(&f.db, rejoined, 1).await.unwrap();
+    assert_eq!(series.series[0].joins, 0, "a new installation starts empty");
+    assert_eq!(series.series[0].leaves, 0);
+
+    // Deferred erasure: the active-enrollment guard still refuses, and a
+    // counter-only cleanup changes no configuration version.
+    f.insert_raw(
+        "INSERT INTO analytics_member_daily (guild_id, day, joins, leaves) VALUES (30, ?1, 3, 1)",
+        crate::db::params![chrono::Utc::now().format("%Y-%m-%d").to_string()],
+    );
+    assert!(
+        !crate::db::wipe_departed_directory_guild_data(&f.db, 20)
+            .await
+            .unwrap()
+    );
+    assert_eq!(member_daily_rows(&f.db, 20), 1);
+    let before = crate::db::get_primary_versions_sync(&f.db).unwrap();
+    assert!(
+        crate::db::wipe_departed_directory_guild_data(&f.db, 30)
+            .await
+            .unwrap()
+    );
+    assert_eq!(member_daily_rows(&f.db, 30), 0);
+    let after = crate::db::get_primary_versions_sync(&f.db).unwrap();
+    assert_eq!(before.config_revision, after.config_revision);
+    assert_eq!(before.slash_revision, after.slash_revision);
+}
+
+#[tokio::test]
+async fn spam_hits_include_dedicated_spam_bans_once() {
+    let f = Fixture::new("spam");
+    let enrollment = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    // Dedicated exact-image and repeated-text enforcement: ban mirror only.
+    f.insert_unattributed_ban(10, 21, "[automod:attachment_flood] identical image");
+    f.insert_unattributed_ban(10, 22, "[automod:repeat_text] repeated text");
+    // Generic executor ban: its automod event is the spam record.
+    f.insert_unattributed_ban(10, 23, "[automod:invite] posted a link");
+    f.insert_event(10, "automod", r#"{"action":"ban"}"#, 0);
+    // A moderator's ban is not automod enforcement, whatever its reason text.
+    f.insert_raw(
+        "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active) \
+         VALUES (10, 24, 8, '[automod:repeat_text] typed by a moderator', ?1, 1)",
+        crate::db::params![rfc3339_day(0)],
+    );
+    f.insert_unattributed_ban(20, 25, "[automod:repeat_text] other server");
+
+    let guild = enrolled_guild_analytics(&f.db, enrollment, 1)
+        .await
+        .unwrap();
+    assert_eq!(guild.series[0].bans, 4);
+    assert_eq!(guild.series[0].automod, 3);
+
+    let platform = platform_analytics(&f.db, 1).await.unwrap();
+    assert_eq!(platform.series[0].automod, 4);
+    assert_eq!(platform.guilds[0].guild_id, 10);
+    assert_eq!(platform.guilds[0].automod, 3);
+    assert_eq!(platform.guilds[1].automod, 1);
 }

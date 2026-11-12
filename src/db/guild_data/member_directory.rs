@@ -465,6 +465,26 @@ pub struct DirectoryTotals {
     pub current: i64,
     pub banned: i64,
     pub known: i64,
+    pub coverage: DirectoryCoverage,
+}
+
+/// Whether the counts describe the whole server, using the same import and
+/// coverage-gap state the Members status card reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryCoverage {
+    /// The initial import finished and no coverage gap awaits reconciliation.
+    Complete,
+    /// The initial import for this membership has not finished.
+    Importing,
+    /// A recorded coverage gap still awaits reconciliation.
+    Uncertain,
+}
+
+impl DirectoryCoverage {
+    pub fn is_complete(self) -> bool {
+        self == Self::Complete
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3594,7 +3614,8 @@ impl GuildDataStore {
     }
 
     /// Bounded directory counts for the analytics views: current members,
-    /// members with confirmed ban history, and all known rows for this scope.
+    /// members with confirmed ban history, and all known rows for this scope,
+    /// with the coverage those counts have.
     pub async fn directory_totals(&self, scope: GuildDataScope) -> Result<DirectoryTotals> {
         checked_scope(self, &scope)?;
         let expected = self.expected.clone();
@@ -3615,11 +3636,25 @@ impl GuildDataStore {
                 let current = count("is_current=1")?;
                 let banned = count("is_banned=1")?;
                 let known = count("1=1")?;
+                let seed: Option<(Option<i64>, bool)> = tx
+                    .query_row(
+                        "SELECT initial_completed_at_ms, reconciliation_needed \
+                         FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",
+                        params![scope.guild_id(), scope.enrollment.id.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
                 tx.finish_read()?;
+                let coverage = match seed {
+                    Some((Some(_), false)) => DirectoryCoverage::Complete,
+                    Some((Some(_), true)) => DirectoryCoverage::Uncertain,
+                    Some((None, _)) | None => DirectoryCoverage::Importing,
+                };
                 Ok(DirectoryTotals {
                     current,
                     banned,
                     known,
+                    coverage,
                 })
             })
             .await

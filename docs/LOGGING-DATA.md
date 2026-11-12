@@ -229,9 +229,11 @@ subsequent work.
 The bot records one analytics row per guild per UTC day (`analytics_member_daily`)
 with the observed join and leave counts. Rows carry no user IDs, message content or
 per-member history: they are totals only, so member/user activity collection stays
-retired. The bot writes a row when it observes a Gateway join or an applied or
-verified departure, matching when a `member_join`/`member_leave` report would be
-emitted. Each write prunes that guild's rows older than 92 days, keeping the table
+retired. The bot counts each Gateway join it reports as `member_join`, and each
+departure it reports as `member_leave`: a Gateway departure, including one the
+member directory could not save, or a departure confirmed by a paced member check.
+A Gateway departure that still awaits that check is counted only once it is
+confirmed. Each write prunes that guild's rows older than 92 days, keeping the table
 bounded. The WebUI Analytics views derive daily series from these counters plus the
 retained moderation records (warns, bans and counted events); days before an
 observation show zero and never reconstruct missing history. Join/leave counting
