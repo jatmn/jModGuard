@@ -145,117 +145,55 @@ fn apply_day(
     apply(point);
 }
 
-fn collect_pairs(
-    conn: &impl SqlExecutor,
-    sql_guild: &str,
-    sql_all: &str,
-    guild_id: Option<i64>,
-    start_day: &str,
-) -> Result<Vec<(String, i64)>> {
-    let mut rows = Vec::new();
-    if let Some(guild_id) = guild_id {
-        let mut stmt = conn.prepare(sql_guild)?;
-        let mapped = stmt.query_map(params![guild_id, start_day], |row| {
-            Ok((row.get::<String>(0)?, row.get::<i64>(1)?))
-        })?;
-        for row in mapped {
-            rows.push(row?);
-        }
-    } else {
-        let mut stmt = conn.prepare(sql_all)?;
-        let mapped = stmt.query_map(params![start_day], |row| {
-            Ok((row.get::<String>(0)?, row.get::<i64>(1)?))
-        })?;
-        for row in mapped {
-            rows.push(row?);
-        }
-    }
-    Ok(rows)
+/// Daily-series aggregate columns. Each column is one JSON array so the whole
+/// window reads in a single statement: a remote interactive snapshot cannot
+/// afford a prepare/query round trip per source table.
+fn series_columns(guild_filter: &str, day: &str) -> String {
+    format!(
+        "(SELECT json_group_array(json_array(d, n)) FROM \
+           (SELECT substr(created_at,1,10) AS d, COUNT(*) AS n FROM warns \
+            WHERE {guild_filter}created_at>={day} GROUP BY 1)), \
+         (SELECT json_group_array(json_array(d, n)) FROM \
+           (SELECT substr(created_at,1,10) AS d, COUNT(*) AS n FROM bans \
+            WHERE {guild_filter}created_at>={day} GROUP BY 1)), \
+         (SELECT json_group_array(json_array(d, n)) FROM \
+           (SELECT substr(created_at,1,10) AS d, COUNT(*) AS n FROM bans \
+            WHERE {guild_filter}created_at>={day} AND {DEDICATED_SPAM_BANS_SQL} GROUP BY 1)), \
+         (SELECT json_group_array(json_array(d, b, n)) FROM \
+           (SELECT substr(created_at,1,10) AS d, event_type AS b, COUNT(*) AS n FROM events \
+            WHERE {guild_filter}created_at>={day} AND {EVENT_BUCKETS_COUNTED_SQL} GROUP BY 1, 2)), \
+         (SELECT json_group_array(json_array(day, j, l)) FROM \
+           (SELECT day, SUM(joins) AS j, SUM(leaves) AS l FROM analytics_member_daily \
+            WHERE {guild_filter}day>={day} GROUP BY day))"
+    )
 }
 
-/// Accumulates the daily series from every counted source. The caller
-/// zero-fills the window; observed days outside it are harmless.
-fn analytics_series_conn(
-    conn: &impl SqlExecutor,
-    guild_id: Option<i64>,
-    start_day: &str,
-) -> Result<HashMap<String, AnalyticsPoint>> {
+fn json_rows<T: serde::de::DeserializeOwned>(raw: Option<String>, what: &str) -> Result<Vec<T>> {
+    match raw {
+        Some(raw) => serde_json::from_str(&raw)
+            .map_err(|error| anyhow::anyhow!("corrupt analytics {what} aggregate: {error}")),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Raw JSON aggregate columns, read before the row closes and parsed after.
+type SeriesColumns = [Option<String>; 5];
+
+fn series_from_columns(columns: SeriesColumns) -> Result<HashMap<String, AnalyticsPoint>> {
+    let [warns, bans, spam_bans, events, members] = columns;
     let mut map: HashMap<String, AnalyticsPoint> = HashMap::new();
-    for (day, n) in collect_pairs(
-        conn,
-        "SELECT substr(created_at,1,10), COUNT(*) FROM warns \
-         WHERE guild_id=?1 AND created_at>=?2 GROUP BY 1",
-        "SELECT substr(created_at,1,10), COUNT(*) FROM warns \
-         WHERE created_at>=?1 GROUP BY 1",
-        guild_id,
-        start_day,
-    )? {
+    for (day, n) in json_rows::<(String, i64)>(warns, "warn")? {
         apply_day(&mut map, day, move |point| point.warns += n);
     }
-    for (day, n) in collect_pairs(
-        conn,
-        "SELECT substr(created_at,1,10), COUNT(*) FROM bans \
-         WHERE guild_id=?1 AND created_at>=?2 GROUP BY 1",
-        "SELECT substr(created_at,1,10), COUNT(*) FROM bans \
-         WHERE created_at>=?1 GROUP BY 1",
-        guild_id,
-        start_day,
-    )? {
+    for (day, n) in json_rows::<(String, i64)>(bans, "ban")? {
         apply_day(&mut map, day, move |point| point.bans += n);
     }
-    let spam_bans_guild = format!(
-        "SELECT substr(created_at,1,10), COUNT(*) FROM bans \
-         WHERE guild_id=?1 AND created_at>=?2 AND {DEDICATED_SPAM_BANS_SQL} GROUP BY 1"
-    );
-    let spam_bans_all = format!(
-        "SELECT substr(created_at,1,10), COUNT(*) FROM bans \
-         WHERE created_at>=?1 AND {DEDICATED_SPAM_BANS_SQL} GROUP BY 1"
-    );
-    for (day, n) in collect_pairs(conn, &spam_bans_guild, &spam_bans_all, guild_id, start_day)? {
+    // The automod bucket keeps the lifetime statistics definition (recorded,
+    // non-dry-run enforcement) and also holds the dedicated spam bans.
+    for (day, n) in json_rows::<(String, i64)>(spam_bans, "spam ban")? {
         apply_day(&mut map, day, move |point| point.automod += n);
     }
-    // Counted events land in one of three buckets; the automod bucket keeps
-    // the lifetime statistics definition (recorded, non-dry-run enforcement)
-    // and also holds the dedicated spam bans counted above.
-    let events_guild = format!(
-        "SELECT substr(created_at,1,10), \
-         CASE WHEN event_type='automod' THEN 'automod' ELSE event_type END, COUNT(*) \
-         FROM events WHERE guild_id=?1 AND created_at>=?2 AND {EVENT_BUCKETS_COUNTED_SQL} \
-         GROUP BY 1, 2"
-    );
-    let events_all = format!(
-        "SELECT substr(created_at,1,10), \
-         CASE WHEN event_type='automod' THEN 'automod' ELSE event_type END, COUNT(*) \
-         FROM events WHERE created_at>=?1 AND {EVENT_BUCKETS_COUNTED_SQL} \
-         GROUP BY 1, 2"
-    );
-    let mut event_rows = Vec::new();
-    if let Some(guild_id) = guild_id {
-        let mut stmt = conn.prepare(&events_guild)?;
-        let mapped = stmt.query_map(params![guild_id, start_day], |row| {
-            Ok((
-                row.get::<String>(0)?,
-                row.get::<String>(1)?,
-                row.get::<i64>(2)?,
-            ))
-        })?;
-        for row in mapped {
-            event_rows.push(row?);
-        }
-    } else {
-        let mut stmt = conn.prepare(&events_all)?;
-        let mapped = stmt.query_map(params![start_day], |row| {
-            Ok((
-                row.get::<String>(0)?,
-                row.get::<String>(1)?,
-                row.get::<i64>(2)?,
-            ))
-        })?;
-        for row in mapped {
-            event_rows.push(row?);
-        }
-    }
-    for (day, bucket, n) in event_rows {
+    for (day, bucket, n) in json_rows::<(String, String, i64)>(events, "event")? {
         apply_day(&mut map, day, move |point| match bucket.as_str() {
             "automod" => point.automod += n,
             "mod_action" => point.mod_actions += n,
@@ -264,133 +202,106 @@ fn analytics_series_conn(
         });
     }
     // Daily membership counters (no user IDs; rows exist only for observed days).
-    if let Some(guild_id) = guild_id {
-        let mut stmt = conn.prepare(
-            "SELECT day, joins, leaves FROM analytics_member_daily \
-             WHERE guild_id=?1 AND day>=?2",
-        )?;
-        let mapped = stmt.query_map(params![guild_id, start_day], |row| {
-            Ok((
-                row.get::<String>(0)?,
-                row.get::<i64>(1)?,
-                row.get::<i64>(2)?,
-            ))
-        })?;
-        for row in mapped {
-            let (day, joins, leaves) = row?;
-            apply_day(&mut map, day, move |point| {
-                point.joins += joins;
-                point.leaves += leaves;
-            });
-        }
-    } else {
-        let mut stmt = conn.prepare(
-            "SELECT day, SUM(joins), SUM(leaves) FROM analytics_member_daily \
-             WHERE day>=?1 GROUP BY day",
-        )?;
-        let mapped = stmt.query_map(params![start_day], |row| {
-            Ok((
-                row.get::<String>(0)?,
-                row.get::<i64>(1)?,
-                row.get::<i64>(2)?,
-            ))
-        })?;
-        for row in mapped {
-            let (day, joins, leaves) = row?;
-            apply_day(&mut map, day, move |point| {
-                point.joins += joins;
-                point.leaves += leaves;
-            });
-        }
+    for (day, joins, leaves) in json_rows::<(String, i64, i64)>(members, "membership")? {
+        apply_day(&mut map, day, move |point| {
+            point.joins += joins;
+            point.leaves += leaves;
+        });
     }
     Ok(map)
 }
 
-/// Per-guild window totals for the platform breakdown. Counting grows with the
-/// window's retained rows; the route is owner-only.
+fn series_row(row: &crate::db_compat::Row) -> Result<SeriesColumns> {
+    Ok([
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ])
+}
+
+/// One guild's daily series in one statement. The caller zero-fills the
+/// window; observed days outside it are harmless.
+fn guild_series_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    start_day: &str,
+) -> Result<HashMap<String, AnalyticsPoint>> {
+    let sql = format!("SELECT {}", series_columns("guild_id=?1 AND ", "?2"));
+    let columns = conn.query_row(&sql, params![guild_id, start_day], series_row)?;
+    series_from_columns(columns)
+}
+
+/// Fleet series, per-guild window totals and the server count in one
+/// statement. Counting grows with the window's retained rows; the route is
+/// owner-only.
 fn platform_conn(conn: &impl SqlExecutor, window_days: i64) -> Result<PlatformAnalytics> {
     let start_day = window_start_day(window_days);
-    let series_map = analytics_series_conn(conn, None, &start_day)?;
+    let sql = format!(
+        "SELECT {}, \
+         (SELECT json_group_array(json_array(guild_id, n)) FROM \
+           (SELECT guild_id, COUNT(*) AS n FROM warns WHERE created_at>=?1 GROUP BY guild_id)), \
+         (SELECT json_group_array(json_array(guild_id, n)) FROM \
+           (SELECT guild_id, COUNT(*) AS n FROM bans WHERE created_at>=?1 GROUP BY guild_id)), \
+         (SELECT json_group_array(json_array(guild_id, n)) FROM \
+           (SELECT guild_id, COUNT(*) AS n FROM bans \
+            WHERE created_at>=?1 AND {DEDICATED_SPAM_BANS_SQL} GROUP BY guild_id)), \
+         (SELECT json_group_array(json_array(guild_id, a, m, t)) FROM \
+           (SELECT guild_id, \
+              SUM(CASE WHEN event_type='automod' THEN 1 ELSE 0 END) AS a, \
+              SUM(CASE WHEN event_type='mod_action' THEN 1 ELSE 0 END) AS m, \
+              SUM(CASE WHEN event_type='timeout_add' THEN 1 ELSE 0 END) AS t \
+            FROM events WHERE {EVENT_BUCKETS_COUNTED_SQL} AND created_at>=?1 GROUP BY guild_id)), \
+         (SELECT json_group_array(json_array(guild_id, j, l)) FROM \
+           (SELECT guild_id, SUM(joins) AS j, SUM(leaves) AS l FROM analytics_member_daily \
+            WHERE day>=?1 GROUP BY guild_id)), \
+         (SELECT COUNT(*) FROM guild_enrollments WHERE active=1)",
+        series_columns("", "?1")
+    );
+    let (series, guild_columns, servers) = conn.query_row(&sql, params![start_day], |row| {
+        let guild_columns: [Option<String>; 5] = [
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+        ];
+        Ok((series_row(row)?, guild_columns, row.get::<i64>(10)?))
+    })?;
+    let series_map = series_from_columns(series)?;
+    let [warns, bans, spam_bans, events, members] = guild_columns;
     let mut guilds: HashMap<i64, GuildActivityTotals> = HashMap::new();
-    let mut stmt = conn
-        .prepare("SELECT guild_id, COUNT(*) FROM warns WHERE created_at>=?1 GROUP BY guild_id")?;
-    for row in stmt.query_map(params![start_day.clone()], |row| {
-        Ok((row.get::<i64>(0)?, row.get::<i64>(1)?))
-    })? {
-        let (guild_id, n) = row?;
+    fn entry(
+        guilds: &mut HashMap<i64, GuildActivityTotals>,
+        guild_id: i64,
+    ) -> &mut GuildActivityTotals {
         guilds
             .entry(guild_id)
             .or_insert_with(|| GuildActivityTotals::zeroed(guild_id))
-            .warns += n;
     }
-    let mut stmt =
-        conn.prepare("SELECT guild_id, COUNT(*) FROM bans WHERE created_at>=?1 GROUP BY guild_id")?;
-    for row in stmt.query_map(params![start_day.clone()], |row| {
-        Ok((row.get::<i64>(0)?, row.get::<i64>(1)?))
-    })? {
-        let (guild_id, n) = row?;
-        guilds
-            .entry(guild_id)
-            .or_insert_with(|| GuildActivityTotals::zeroed(guild_id))
-            .bans += n;
+    for (guild_id, n) in json_rows::<(i64, i64)>(warns, "guild warn")? {
+        entry(&mut guilds, guild_id).warns += n;
     }
-    let spam_bans_sql = format!(
-        "SELECT guild_id, COUNT(*) FROM bans \
-         WHERE created_at>=?1 AND {DEDICATED_SPAM_BANS_SQL} GROUP BY guild_id"
-    );
-    let mut stmt = conn.prepare(&spam_bans_sql)?;
-    for row in stmt.query_map(params![start_day.clone()], |row| {
-        Ok((row.get::<i64>(0)?, row.get::<i64>(1)?))
-    })? {
-        let (guild_id, n) = row?;
-        guilds
-            .entry(guild_id)
-            .or_insert_with(|| GuildActivityTotals::zeroed(guild_id))
-            .automod += n;
+    for (guild_id, n) in json_rows::<(i64, i64)>(bans, "guild ban")? {
+        entry(&mut guilds, guild_id).bans += n;
     }
-    let events_sql = format!(
-        "SELECT guild_id, \
-         SUM(CASE WHEN event_type='automod' THEN 1 ELSE 0 END), \
-         SUM(CASE WHEN event_type='mod_action' THEN 1 ELSE 0 END), \
-         SUM(CASE WHEN event_type='timeout_add' THEN 1 ELSE 0 END) \
-         FROM events WHERE {EVENT_BUCKETS_COUNTED_SQL} AND created_at>=?1 GROUP BY guild_id"
-    );
-    let mut stmt = conn.prepare(&events_sql)?;
-    for row in stmt.query_map(params![start_day.clone()], |row| {
-        Ok((
-            row.get::<i64>(0)?,
-            row.get::<i64>(1)?,
-            row.get::<i64>(2)?,
-            row.get::<i64>(3)?,
-        ))
-    })? {
-        let (guild_id, automod, mod_actions, timeouts) = row?;
-        let entry = guilds
-            .entry(guild_id)
-            .or_insert_with(|| GuildActivityTotals::zeroed(guild_id));
-        entry.automod += automod;
-        entry.mod_actions += mod_actions;
-        entry.timeouts += timeouts;
+    for (guild_id, n) in json_rows::<(i64, i64)>(spam_bans, "guild spam ban")? {
+        entry(&mut guilds, guild_id).automod += n;
     }
-    let mut stmt = conn.prepare(
-        "SELECT guild_id, SUM(joins), SUM(leaves) FROM analytics_member_daily \
-         WHERE day>=?1 GROUP BY guild_id",
-    )?;
-    for row in stmt.query_map(params![start_day.clone()], |row| {
-        Ok((row.get::<i64>(0)?, row.get::<i64>(1)?, row.get::<i64>(2)?))
-    })? {
-        let (guild_id, joins, leaves) = row?;
-        let entry = guilds
-            .entry(guild_id)
-            .or_insert_with(|| GuildActivityTotals::zeroed(guild_id));
-        entry.joins += joins;
-        entry.leaves += leaves;
+    for (guild_id, automod, mod_actions, timeouts) in
+        json_rows::<(i64, i64, i64, i64)>(events, "guild event")?
+    {
+        let totals = entry(&mut guilds, guild_id);
+        totals.automod += automod;
+        totals.mod_actions += mod_actions;
+        totals.timeouts += timeouts;
     }
-    let servers: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM guild_enrollments WHERE active=1",
-        (),
-        |row| Ok(row.get(0)?),
-    )?;
+    for (guild_id, joins, leaves) in json_rows::<(i64, i64, i64)>(members, "guild membership")? {
+        let totals = entry(&mut guilds, guild_id);
+        totals.joins += joins;
+        totals.leaves += leaves;
+    }
     let mut guilds: Vec<GuildActivityTotals> = guilds.into_values().collect();
     guilds.sort_by_key(|totals| totals.guild_id);
     Ok(PlatformAnalytics {
@@ -413,7 +324,7 @@ pub async fn enrolled_guild_analytics(
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_snapshot()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
-        let map = analytics_series_conn(&tx, Some(enrollment.guild_id), &start_day)?;
+        let map = guild_series_conn(&tx, enrollment.guild_id, &start_day)?;
         tx.finish_read()?;
         Ok(GuildAnalytics {
             window_days,

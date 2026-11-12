@@ -361,3 +361,50 @@ async fn spam_hits_include_dedicated_spam_bans_once() {
     assert_eq!(platform.guilds[0].automod, 3);
     assert_eq!(platform.guilds[1].automod, 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn analytics_reads_fit_the_remote_snapshot_budget() {
+    use crate::db::tests::remote_stream::HranaFixture;
+    use std::time::Duration;
+    let f = Fixture::new("remote");
+    let enrollment = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    enroll_guild(&f.db, 20, 100).await.unwrap().unwrap();
+    f.insert_warn(10, 0);
+    f.insert_ban(20, 0);
+    f.insert_unattributed_ban(10, 21, "[automod:repeat_text] repeated text");
+    f.insert_event(10, "automod", r#"{"action":"ban"}"#, 0);
+    f.insert_event(20, "timeout_add", "{}", 0);
+    bump(&f.db, &enrollment, 0, 2, 1).await;
+    // Real libSQL HTTP against this SQLite file with the reported ~350 ms per
+    // request and the provider's five-second interactive lifetime; the
+    // production four-second snapshot budget is unchanged.
+    let (_fixture, remote) =
+        HranaFixture::delayed_database(&f.path, Duration::from_millis(350), Duration::from_secs(5))
+            .await;
+    let guild = enrolled_guild_analytics(&remote, enrollment, 2)
+        .await
+        .expect("guild analytics must finish inside the snapshot budget");
+    let today = &guild.series[1];
+    assert_eq!(
+        (
+            today.warns,
+            today.bans,
+            today.automod,
+            today.joins,
+            today.leaves
+        ),
+        (1, 1, 2, 2, 1)
+    );
+    let platform = platform_analytics(&remote, 2)
+        .await
+        .expect("platform analytics must finish inside the snapshot budget");
+    let today = &platform.series[1];
+    assert_eq!(
+        (today.warns, today.bans, today.automod, today.timeouts),
+        (1, 2, 2, 1)
+    );
+    assert_eq!(platform.servers, 2);
+    assert_eq!(platform.guilds.len(), 2);
+    assert_eq!(platform.guilds[0].automod, 2);
+    assert_eq!(platform.guilds[1].timeouts, 1);
+}

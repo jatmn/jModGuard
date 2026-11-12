@@ -3623,32 +3623,46 @@ impl GuildDataStore {
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
-                let count = |filter: &str| -> Result<i64> {
-                    tx.query_row(
-                        &format!(
-                            "SELECT COUNT(*) FROM guild_member_directory \
-                             WHERE guild_id=?1 AND enrollment_id=?2 AND {filter}"
-                        ),
-                        params![scope.guild_id(), scope.enrollment.id.as_str()],
-                        |row| Ok(row.get(0)?),
-                    )
-                };
-                let current = count("is_current=1")?;
-                let banned = count("is_banned=1")?;
-                let known = count("1=1")?;
-                let seed: Option<(Option<i64>, bool)> = tx
-                    .query_row(
-                        "SELECT initial_completed_at_ms, reconciliation_needed \
-                         FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",
-                        params![scope.guild_id(), scope.enrollment.id.as_str()],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?;
+                // One statement: a remote snapshot cannot afford a round trip
+                // per count after scope verification.
+                let (current, banned, known, seed_present, completed, reconcile): (
+                    i64,
+                    i64,
+                    i64,
+                    bool,
+                    bool,
+                    bool,
+                ) = tx.query_row(
+                    "SELECT \
+                       (SELECT COUNT(*) FROM guild_member_directory \
+                        WHERE guild_id=?1 AND enrollment_id=?2 AND is_current=1), \
+                       (SELECT COUNT(*) FROM guild_member_directory \
+                        WHERE guild_id=?1 AND enrollment_id=?2 AND is_banned=1), \
+                       (SELECT COUNT(*) FROM guild_member_directory \
+                        WHERE guild_id=?1 AND enrollment_id=?2), \
+                       EXISTS(SELECT 1 FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2), \
+                       COALESCE((SELECT initial_completed_at_ms IS NOT NULL FROM guild_member_seed \
+                        WHERE guild_id=?1 AND enrollment_id=?2), 0), \
+                       COALESCE((SELECT reconciliation_needed FROM guild_member_seed \
+                        WHERE guild_id=?1 AND enrollment_id=?2), 0)",
+                    params![scope.guild_id(), scope.enrollment.id.as_str()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )?;
+                let seed = seed_present.then_some((completed, reconcile));
                 tx.finish_read()?;
                 let coverage = match seed {
-                    Some((Some(_), false)) => DirectoryCoverage::Complete,
-                    Some((Some(_), true)) => DirectoryCoverage::Uncertain,
-                    Some((None, _)) | None => DirectoryCoverage::Importing,
+                    Some((true, false)) => DirectoryCoverage::Complete,
+                    Some((true, true)) => DirectoryCoverage::Uncertain,
+                    Some((false, _)) | None => DirectoryCoverage::Importing,
                 };
                 Ok(DirectoryTotals {
                     current,
