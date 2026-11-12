@@ -100,12 +100,27 @@ function record(component = "api") {
   };
 }
 
-function updateButton(pageState, component, launcher = false) {
+function componentCard(pageState, component) {
   const cards = pageState.elements.get("update-cards");
   const card = Array.from(cards.children).find((item) =>
     find(item, (child) => child.localName === "h2")?.textContent === component.toUpperCase());
   assert.ok(card);
+  return card;
+}
+
+function updateButton(pageState, component, launcher = false) {
+  const card = componentCard(pageState, component);
   return find(card, (item) => item.localName === "button" && item.textContent === (launcher ? "Update launcher" : component === "webui" ? "Update WebUI" : "Update"));
+}
+
+// The card's status badge, its primary information, and its technical details.
+function cardParts(pageState, component) {
+  const card = componentCard(pageState, component);
+  return {
+    badge: textOf(find(card, (item) => item.classList?.contains("administration-badge"))),
+    content: textOf(find(card, (item) => item.classList?.contains("administration-info"))),
+    details: textOf(find(card, (item) => item.localName === "details")),
+  };
 }
 
 function render(pageState, item) {
@@ -199,7 +214,8 @@ test("owner availability distinguishes baked source parity from channel mismatch
     const card = view.elements.get("update-cards").children[0];
     return textOf(find(card, (element) => element.localName === "p" && textOf(element).startsWith("Availability:")));
   };
-  assert.match(availability(), /no source update \(image digest unverified\)/);
+  assert.match(availability(), /up to date/);
+  assert.match(cardParts(view, "api").details, /Image digest: unverified/);
   api.channel = "nightly";
   render(view, api);
   assert.match(availability(), /unknown/);
@@ -214,18 +230,112 @@ test("owner cannot queue an already installed service release", () => {
   assert.equal(updateButton(view, "api").disabled, true);
   assert.equal(updateButton(view, "api", true).disabled, true);
 
-  // A baked process with the same source SHA has no verified install digest.
+  // A baked process with the same source SHA has no verified install digest,
+  // but it already runs the available source; only the optional launcher remains.
   api.installed = null;
   api.installed_launcher = null;
   api.candidate.source_sha = api.observed.source_sha;
   render(view, api);
-  assert.equal(updateButton(view, "api").disabled, false);
+  assert.equal(updateButton(view, "api").disabled, true);
   assert.equal(updateButton(view, "api", true).disabled, false);
 
   // A WebUI owner can retry a same-digest publication to repair Storage.
   const webui = record("webui");
   webui.installed = { ...webui.candidate };
   render(view, webui);
+  assert.equal(updateButton(view, "webui").disabled, false);
+});
+
+test("a directly deployed bot or API on the available source is up to date and cannot be updated again", () => {
+  for (const component of ["bot", "api"]) {
+    const view = page();
+    const item = record(component);
+    // A direct image deploy runs the base image's baked build and records no managed install.
+    item.candidate.source_sha = item.observed.source_sha;
+    render(view, item);
+    const { badge, content, details } = cardParts(view, component);
+    assert.equal(badge, "✓Up to date", component);
+    assert.match(content, /Availability: up to date/, component);
+    assert.doesNotMatch(content, /unverified/, component);
+    assert.match(details, /Image digest: unverified/, component);
+    assert.equal(updateButton(view, component).disabled, true, component);
+  }
+});
+
+test("a directly deployed bot or API on the available source stays updatable while pending or failed", () => {
+  for (const component of ["bot", "api"]) {
+    const view = page();
+    const queued = record(component);
+    queued.candidate.source_sha = queued.observed.source_sha;
+    // The owner can supersede a queued request for another digest.
+    queued.state = "queued";
+    queued.desired = { ...queued.candidate, digest: "sha256:" + "e".repeat(64) };
+    render(view, queued);
+    assert.equal(cardParts(view, component).badge, "↻Update pending", component);
+    assert.equal(updateButton(view, component).disabled, false, component);
+
+    const failed = record(component);
+    failed.candidate.source_sha = failed.observed.source_sha;
+    failed.state = "failed";
+    render(view, failed);
+    assert.equal(cardParts(view, component).badge, "!Needs attention", component);
+    assert.equal(updateButton(view, component).disabled, false, component);
+  }
+});
+
+test("owner update badges keep real and unknown service updates distinct from current releases", () => {
+  const view = page();
+  const bot = record("bot");
+  // Self-updated: the managed install digest matches the candidate.
+  bot.installed = { ...bot.candidate };
+  bot.observed.source_sha = bot.candidate.source_sha;
+  render(view, bot);
+  assert.equal(cardParts(view, "bot").badge, "✓Up to date");
+  assert.doesNotMatch(cardParts(view, "bot").details, /Image digest/);
+  assert.equal(updateButton(view, "bot").disabled, true);
+
+  // Direct deploy of an older source: a real update.
+  const direct = record("bot");
+  render(view, direct);
+  assert.equal(cardParts(view, "bot").badge, "↑Update available");
+  assert.doesNotMatch(cardParts(view, "bot").details, /Image digest/);
+  assert.equal(updateButton(view, "bot").disabled, false);
+
+  // Unknown running source or an unconfirmed candidate never claims up to date.
+  const unobserved = record("bot");
+  unobserved.candidate.source_sha = unobserved.observed.source_sha;
+  unobserved.observed_at = NOW_SECONDS - 7201;
+  render(view, unobserved);
+  assert.equal(cardParts(view, "bot").badge, "↑Check status");
+  assert.match(cardParts(view, "bot").content, /Availability: unknown/);
+  assert.equal(updateButton(view, "bot").disabled, true);
+  const unchecked = record("bot");
+  unchecked.candidate.source_sha = unchecked.observed.source_sha;
+  unchecked.checked_at = NOW_SECONDS - 7201;
+  render(view, unchecked);
+  assert.equal(cardParts(view, "bot").badge, "↑Check status");
+  assert.equal(updateButton(view, "bot").disabled, true);
+  const missing = record("bot");
+  missing.candidate = null;
+  render(view, missing);
+  assert.equal(cardParts(view, "bot").badge, "↑Check status");
+  assert.equal(updateButton(view, "bot").hidden, true);
+});
+
+test("Update WebUI is disabled only while the WebUI card is up to date", () => {
+  const view = page();
+  const webui = record("webui");
+  webui.installed = { ...webui.candidate };
+  webui.observed.source_sha = webui.candidate.source_sha;
+  render(view, webui);
+  assert.equal(cardParts(view, "webui").badge, "✓Up to date");
+  assert.equal(updateButton(view, "webui").disabled, true);
+
+  // #578: Storage still serves an older release than the candidate.
+  const stale = record("webui");
+  stale.installed = { source_sha: stale.observed.source_sha, digest: "sha256:" + "d".repeat(64) };
+  render(view, stale);
+  assert.equal(cardParts(view, "webui").badge, "↑Update available");
   assert.equal(updateButton(view, "webui").disabled, false);
 });
 
@@ -249,7 +359,7 @@ test("check applies its returned snapshot and reports failures without leaving e
   const view = await ready(async (url) => {
     if (url === "/api/me") return response({ is_bot_owner: true });
     if (url === "/api/updates/check") {
-      api.candidate.source_sha = api.observed.source_sha;
+      api.candidate = { ...api.candidate, source_sha: "d".repeat(40), release_id: "v2" };
       return response(state([api]));
     }
     if (unavailable) throw new Error("offline");
@@ -257,7 +367,7 @@ test("check applies its returned snapshot and reports failures without leaving e
   });
   const check = find(view.elements.get("update-cards"), (item) => item.localName === "button" && item.textContent === "Check now");
   await fire(check, "click");
-  assert.match(textOf(view.elements.get("update-cards")), /no source update/);
+  assert.match(textOf(view.elements.get("update-cards")), /Available release: v2/);
   unavailable = true;
   await run("refresh()", view.context);
   assert.equal(updateButton(view, "api").disabled, true);
@@ -502,10 +612,12 @@ test("a pending CDN purge keeps a reconciled WebUI release in Needs attention", 
   }) + ", freshness: 'fresh', access: 'allowed' });", view.context);
   show(null);
   assert.match(textOf(view.elements.get("update-cards")), /Up to date/);
+  assert.equal(updateButton(view, "webui").disabled, true);
   show("Bunny Pull Zone purge failed after 6 attempts");
   const text = textOf(view.elements.get("update-cards"));
   assert.match(text, /Needs attention/);
   assert.match(text, /CDN purge.*Pending: Bunny Pull Zone purge failed after 6 attempts\. Check now retries the purge\./);
+  assert.equal(updateButton(view, "webui").disabled, false);
 });
 
 test("a failed policy save restores the server's channel and displays the error", async () => {

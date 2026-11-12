@@ -238,7 +238,9 @@ function ComponentCard({ record, revision }) {
     if (record.installed?.digest === record.candidate?.digest && observed.source_sha === record.candidate?.source_sha) {
     availability = "up to date";
     } else if (bakedSourceCurrent) {
-    availability = "no source update (image digest unverified)";
+    // A direct image deploy records no managed install, so only the source SHA is confirmed.
+    availability = "up to date";
+    line(details, "Image digest", "unverified; no managed install is recorded, so only the running source SHA matches the available release");
     } else if (record.candidate && observed.source_sha !== record.candidate.source_sha) {
     availability = "update available";
     }
@@ -260,7 +262,11 @@ function ComponentCard({ record, revision }) {
   const pairActive = ui.getSnapshot().snapshot.service_upgrade && !["complete", "aborted"].includes(ui.getSnapshot().snapshot.service_upgrade.phase);
   const canApply = !pairActive && ui.getSnapshot().snapshot.apply_enabled && candidateCurrent && !webuiRepacked && compatibility?.installable && (record.component === "webui" ? ui.getSnapshot().snapshot.webui_storage_configured : Boolean(observed?.self_update_enabled));
   const candidatePending = applicationPending(record) && record.desired?.digest === record.candidate?.digest;
-  const applicationCurrent = record.component !== "webui" && record.installed?.digest === record.candidate?.digest;
+  // WebUI keeps a same-digest publication available to repair Storage unless its card shows Up to date.
+  // A service with a problem or a pending request for another digest stays updatable so the owner can retry or supersede it.
+  const supersedable = applicationPending(record) && record.desired?.digest !== record.candidate?.digest;
+  const applicationCurrent = record.component === "webui" ? availability === "up to date" && !problem
+    : record.installed?.digest === record.candidate?.digest || (availability === "up to date" && !problem && !supersedable);
   const help = !ui.getSnapshot().snapshot.apply_enabled ? "On-demand installation is disabled for this deployment."
     : record.component === "webui" ? !ui.getSnapshot().snapshot.webui_storage_configured ? "Configure WebUI Storage to enable installation." : ""
     : !observed?.self_update_enabled ? "Self-update is not enabled or the running component could not be verified." : "";
