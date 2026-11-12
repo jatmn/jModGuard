@@ -17,11 +17,21 @@ regression plus the affected local checks. Record the commands and results in th
 PR. **CI passed** must succeed before merge; GitHub Actions selects all affected
 groups from the complete PR diff, including earlier code commits.
 
-These are partial local feedback examples, not complete affected-check plans.
-`--only` runs the named groups; it does not add their affected consumers or boundary
-checks. Use the selector example below to inspect the full affected group list,
-then choose local checks relevant to the changed behavior. CI runs the complete
-affected plan before merge.
+`--affected` runs the groups GitHub Actions would select for this checkout:
+its commits since the base plus uncommitted and untracked files. It is the
+complete local plan for a change, and it runs the full suite by itself when the
+change needs one (CI orchestration or an unclassified path). It leaves out only
+the Docker-based remote-database job and says so when that job is affected.
+
+```bash
+bash scripts/ci-preflight.sh --affected
+# For a PR whose base is not main:
+# bash scripts/ci-preflight.sh --affected --base origin/<base-branch>
+```
+
+The examples below are narrower partial feedback, not complete affected-check
+plans. `--only` runs the named groups; it does not add their affected consumers
+or boundary checks. CI runs the complete affected plan before merge.
 
 ```bash
 # Documentation or sample configuration:
@@ -43,7 +53,9 @@ provider. Frontend embedding and other affected consumers are also checked by CI
 A focused local run does not replace that hosted gate.
 
 Run the full preflight before submitting changes to CI orchestration, toolchains,
-workspace-wide dependency/build configuration, or when affected scope is uncertain:
+workspace-wide dependency/build configuration, or when affected scope is uncertain.
+Do not run it for an ordinary change: `--affected` already covers what CI will
+check, and selects the full suite by itself when the change needs it.
 
 ```bash
 bash scripts/ci-preflight.sh

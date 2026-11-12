@@ -30,14 +30,17 @@ expect() {
 }
 
 rust="contracts fmt dylint api bot runtime updater core integration boundaries supply-chain remote-database publish-tests bootstrap"
-all="contracts frontend fmt dylint api bot runtime updater core integration boundaries publish-tests bootstrap pullfrog supply-chain remote-database"
+all="contracts frontend fmt dylint api bot runtime updater core integration boundaries publish-tests bootstrap pullfrog runner-tests supply-chain remote-database"
 
 expect "contracts" docs/INSTALL.md
 expect "contracts" README.md
 expect "contracts" config.example.toml
-expect "contracts frontend api supply-chain" frontend/app.js frontend/administration/index.html
-expect "contracts frontend api publish-tests supply-chain" tools/webui/package-lock.json
-expect "contracts frontend api publish-tests supply-chain" tools/webui/build.mjs
+# Browser files reach Rust only through the default embed-ui feature, so they
+# skip the API built without it. A real API change still runs both halves once.
+expect "contracts frontend api-embed supply-chain" frontend/app.js frontend/administration/index.html
+expect "contracts frontend api-embed publish-tests supply-chain" tools/webui/package-lock.json
+expect "contracts frontend api-embed publish-tests supply-chain" tools/webui/build.mjs
+expect "contracts frontend fmt dylint api boundaries integration supply-chain" frontend/app.js crates/api/src/lib.rs
 expect "contracts frontend" tools/eslint/package.json
 expect "contracts frontend" tools/eslint-web-selftest.sh
 expect "contracts fmt dylint api boundaries integration supply-chain" crates/api/src/lib.rs
@@ -51,11 +54,14 @@ expect "contracts fmt api updater boundaries integration bootstrap publish-tests
 expect "contracts fmt dylint runtime boundaries core integration supply-chain" crates/runtime/src/lib.rs
 expect "contracts fmt dylint updater api bot boundaries supply-chain" crates/updater/src/lib.rs
 expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh scripts/dylint-test.sh scripts/ci-dylint-libs.sh
-expect "contracts supply-chain" scripts/ci-ensure-cargo-tool.sh scripts/ci-preflight-test.sh
-expect "contracts supply-chain" \
+# The runner regression suites follow their own inputs, not application code.
+expect "contracts runner-tests supply-chain" scripts/ci-ensure-cargo-tool.sh
+expect "contracts runner-tests" \
   scripts/ci-cargo-log.sh \
+  scripts/ci-preflight-test.sh \
   scripts/ci-run-timed-cargo-test.sh \
   scripts/ci-timed-cargo-test.sh
+expect "$rust runner-tests" rust-toolchain.toml
 # Core consumers need coverage, but independent packages and shell fixtures do not.
 core="contracts fmt dylint api bot updater core integration boundaries supply-chain remote-database"
 # all_rust groups shared src/migrations skip on purpose. A new rust group must
@@ -85,6 +91,10 @@ expect "$all" .github/workflows/ci.yml
 expect "$all" .github/workflows/publish.yml
 expect "contracts frontend publish-tests supply-chain" LICENSE.md
 expect "$all" mystery.bin
+# After --files --, a path named like an option is still a path.
+expect "$all" -- --odd.bin
+expect "contracts" -- docs/INSTALL.md
+expect "contracts frontend api-embed supply-chain" -- frontend/app.js --odd.md
 expect "contracts publish-tests supply-chain" scripts/publish-image.sh
 expect "contracts frontend publish-tests supply-chain" Dockerfile.webui
 

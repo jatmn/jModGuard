@@ -139,6 +139,7 @@ Run relevant local checks for ordinary PRs; see [Development notes](development.
 Affected GitHub Actions checks remain required before merge.
 
 ```bash
+bash scripts/ci-preflight.sh --affected      # the groups CI selects for your changes
 bash scripts/ci-preflight.sh --only contracts  # docs-only example
 bash scripts/ci-preflight.sh                 # full validation for CI/build-control changes
 # optional: bash scripts/install-git-hooks.sh  # staged whitespace + pre-push contracts
