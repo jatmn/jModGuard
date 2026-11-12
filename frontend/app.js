@@ -1,5 +1,6 @@
 import { createState, useStore } from "./state.js";
 import { Appearance, useAppearance } from "./appearance.js";
+import { TrendChart, TrendMetricPicker, TREND_METRICS, sumSeries, useTrendMetric } from "./charts.js";
 import React, { useState, useEffect, useRef, createContext, useContext } from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -150,6 +151,7 @@ function App() {
     ["commands", "⌘", "Commands"],
     ["templates", "≡", "Templates"],
     ["logchannels", "#", "Log Channels"],
+    ["analytics", "≣", "Analytics"],
     ["events", "≋", "Audit Log"],
     ["members", "♙", "Members"],
     ["bans", "⊖", "Bans"],
@@ -395,6 +397,7 @@ function trackDraft(event) {
 function Content() {
   const components = {
     dashboard: tabDashboard,
+    analytics: tabAnalytics,
     rules: tabRules,
     badwords: tabBadwords,
     "known-spam": tabKnownSpam,
@@ -543,6 +546,7 @@ const actionReconcileDelays = [1000, 1500, 2500, 5000, 10000, 20000, 40000, 8000
 
 const tabs = [
   "dashboard",
+  "analytics",
   "rules",
   "badwords",
   "known-spam",
@@ -802,7 +806,7 @@ function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
   const edit = path.match(
-    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|cases|case-delete-roles)(?:\/|\?|$)/,
+    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|analytics|cases|case-delete-roles)(?:\/|\?|$)/,
   );
   if (
     edit &&
@@ -821,6 +825,7 @@ function pageEnrollment(path, method = "GET") {
         "member-sync",
         "bans",
         "stats",
+        "analytics",
         "cases",
         "case-delete-roles",
       ].includes(edit[2])) &&
@@ -1742,6 +1747,114 @@ function stat(label, value) {
     { className: "stat" },
     h("div", { className: "stat-title" }, label),
     h("div", { className: "stat-value" }, value),
+  );
+}
+
+function toTrendPoints(series) {
+  return (series ?? []).map((point) => ({
+    day: point.day,
+    warns: point.warns,
+    bans: point.bans,
+    automod: point.automod,
+    modActions: point.mod_actions,
+    timeouts: point.timeouts,
+    joins: point.joins,
+    leaves: point.leaves,
+  }));
+}
+
+function tabAnalytics() {
+  const guildId = useRef(state.guildId).current;
+  const g = selectedGuild();
+  const result = useApiRead(`/api/guilds/${guildId}/analytics`);
+  const [metric, setMetric] = useTrendMetric("warns");
+  const trendLabels = Object.fromEntries(TREND_METRICS);
+  const points = toTrendPoints(result.data?.series);
+  const loading = result.loading && points.length === 0;
+  const members = result.data?.members ?? null;
+  const statValue = (metricKey) => {
+    if (loading) return "Loading…";
+    if (result.error) return "Unavailable";
+    return String(sumSeries(points, metricKey));
+  };
+  return h(
+    "div",
+    { className: "contents" },
+    h(
+      "section",
+      { className: "hero dashboard-hero" },
+      h(
+        "div",
+        { className: "hero-content" },
+        h(
+          "div",
+          { className: "hero-copy" },
+          h("span", { className: "eyebrow" }, "DAILY TRENDS"),
+          h("h2", {}, g ? `Trends for ${g.name}` : "Your moderation trends"),
+          h(
+            "p",
+            {},
+            "How warnings, bans, spam enforcement, and membership changed over the last 30 days.",
+          ),
+        ),
+      ),
+    ),
+    h(
+      "section",
+      { className: "dashboard-section" },
+      h("h3", { className: "card-title" }, "Last 30 days"),
+      statsRow(
+        stat("Members now", loading ? "Loading…" : members ? String(members.current) : "Unavailable"),
+        stat("Warnings", statValue("warns")),
+        stat("Bans", statValue("bans")),
+        stat("Spam hits", statValue("automod")),
+        stat("Mod actions", statValue("modActions")),
+        stat("Timeouts", statValue("timeouts")),
+        stat("Joins", statValue("joins")),
+        stat("Leaves", statValue("leaves")),
+      ),
+      result.error && points.length === 0
+        ? h(
+            "aside",
+            { className: "dashboard-note", role: "status" },
+            h("strong", {}, "Trends unavailable"),
+            h("p", {}, String(result.error?.message ?? result.error ?? "Refresh to try again.")),
+          )
+        : null,
+    ),
+    h(
+      "section",
+      { className: "dashboard-section" },
+      h("h3", { className: "card-title" }, "Daily trend"),
+      h(
+        "div",
+        { className: "card bg-base-100 card-border trend-card" },
+        h(
+          "div",
+          { className: "card-body" },
+          h(TrendMetricPicker, { metric, onChange: setMetric }),
+          loading
+            ? h("p", { className: "muted" }, "Loading trends…")
+            : points.length
+              ? h(TrendChart, {
+                  points,
+                  metric,
+                  title: trendLabels[metric],
+                })
+              : h("p", { className: "muted" }, "No trend data for this server yet."),
+        ),
+      ),
+      h(
+        "aside",
+        { className: "dashboard-note" },
+        h("strong", {}, "About these trends"),
+        h(
+          "p",
+          {},
+          "Days show counts recorded by the bot in UTC. Days before the bot started recording — or while it was offline — show zero, not missing history. Members now is the current member directory; join and leave trends accumulate from deployment onward.",
+        ),
+      ),
+    ),
   );
 }
 

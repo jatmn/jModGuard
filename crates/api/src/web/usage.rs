@@ -81,7 +81,7 @@ fn error(status: StatusCode, message: &'static str) -> (StatusCode, Json<Value>)
 
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
-async fn authorize(
+pub(super) async fn authorize(
     app: &Arc<ApiState>,
     session: &Session,
     headers: &HeaderMap,

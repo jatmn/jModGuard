@@ -767,6 +767,13 @@ impl EventHandler for Handler {
             None,
         )
         .await;
+        if let Some(enrollment) = crate::cases::capture(&app, guild_id.get()).await {
+            let at_ms = chrono::Utc::now().timestamp_millis();
+            crate::logging::log_persistence_result(
+                "member join counter",
+                db::bump_member_daily(&app.db, enrollment, at_ms, 1, 0).await,
+            );
+        }
         let current_stay =
             crate::member_directory::current_member_stay_id(&app, guild_id.get(), uid).await;
         if membership_refresh {
@@ -863,6 +870,19 @@ impl EventHandler for Handler {
         ) {
             app.rejoin_note_deliveries
                 .clear_member(guild_id.get(), user.id.get());
+            if let Some(enrollment) = crate::cases::capture(&app, guild_id.get()).await {
+                crate::logging::log_persistence_result(
+                    "member leave counter",
+                    db::bump_member_daily(
+                        &app.db,
+                        enrollment,
+                        departed_at.timestamp_millis(),
+                        0,
+                        1,
+                    )
+                    .await,
+                );
+            }
         }
         let joined_at_ms = departure_joined_at_ms(
             departed.as_ref(),

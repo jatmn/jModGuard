@@ -458,6 +458,15 @@ pub struct MemberPage {
     pub next_cursor: Option<String>,
 }
 
+/// Bounded directory counts for the analytics views. `known` includes
+/// departed members still retained by ban history.
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectoryTotals {
+    pub current: i64,
+    pub banned: i64,
+    pub known: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MemberHistoryEntry {
     pub kind: String,
@@ -3582,6 +3591,38 @@ impl GuildDataStore {
             let sql=format!("SELECT {PROFILE_SQL} FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3");
             let found=tx.query_row(&sql,params![scope.guild_id(),scope.enrollment.id.as_str(),user_id],profile).optional()?; tx.finish_read()?; Ok(found)
         }).await
+    }
+
+    /// Bounded directory counts for the analytics views: current members,
+    /// members with confirmed ban history, and all known rows for this scope.
+    pub async fn directory_totals(&self, scope: GuildDataScope) -> Result<DirectoryTotals> {
+        checked_scope(self, &scope)?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let count = |filter: &str| -> Result<i64> {
+                    tx.query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM guild_member_directory \
+                             WHERE guild_id=?1 AND enrollment_id=?2 AND {filter}"
+                        ),
+                        params![scope.guild_id(), scope.enrollment.id.as_str()],
+                        |row| Ok(row.get(0)?),
+                    )
+                };
+                let current = count("is_current=1")?;
+                let banned = count("is_banned=1")?;
+                let known = count("1=1")?;
+                tx.finish_read()?;
+                Ok(DirectoryTotals {
+                    current,
+                    banned,
+                    known,
+                })
+            })
+            .await
     }
 
     pub async fn member_history(

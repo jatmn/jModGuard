@@ -91,6 +91,31 @@ pub async fn guild_membership_observation(
     .await
 }
 
+/// Every active enrollment, for owner-scoped platform reads only.
+pub async fn list_active_guild_enrollments(db: &Db) -> Result<Vec<GuildEnrollment>> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_snapshot()?;
+        let mut stmt = tx.prepare(
+            "SELECT guild_id, id, joined_at_ns FROM guild_enrollments \
+             WHERE active=1 ORDER BY guild_id",
+        )?;
+        let mapped = stmt.query_map((), |row| {
+            Ok(GuildEnrollment {
+                guild_id: row.get(0)?,
+                id: row.get(1)?,
+                joined_at_ns: row.get(2)?,
+            })
+        })?;
+        let mut enrollments = Vec::new();
+        for row in mapped {
+            enrollments.push(row?);
+        }
+        tx.finish_read()?;
+        Ok(enrollments)
+    })
+    .await
+}
+
 /// Matching reconnects preserve identity; only a newer join replaces a retired join.
 pub async fn enroll_guild(
     db: &Db,

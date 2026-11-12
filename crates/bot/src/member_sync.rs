@@ -920,6 +920,12 @@ async fn settle_target_check(
         profile.as_ref(),
     )
     .await;
+    if let Some(enrollment) = crate::cases::capture(app, guild_id.get()).await {
+        crate::logging::log_persistence_result(
+            "verified member leave counter",
+            db::bump_member_daily(&app.db, enrollment, departure.departed_at_ms, 0, 1).await,
+        );
+    }
     Ok(())
 }
 

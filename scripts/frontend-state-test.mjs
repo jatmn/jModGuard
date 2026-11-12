@@ -27,6 +27,9 @@ const stateSource = fs.readFileSync(new URL("../frontend/state.js", import.meta.
   .replace(/^import .*;$/gm, "").replaceAll("export function", "function");
 const appearanceSource = fs.readFileSync(new URL('../frontend/appearance.js', import.meta.url), 'utf8')
   .replace(/^import .*;$/gm, '').replaceAll('export function', 'function');
+const chartsSource = fs.readFileSync(new URL('../frontend/charts.js', import.meta.url), 'utf8')
+  .replace(/^import .*;$/gm, '').replace(/^const h = React\.createElement;$/m, '')
+  .replaceAll('export const', 'const').replaceAll('export function', 'function');
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
   .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, '\n');
 const pages = [];
@@ -97,7 +100,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -107,7 +110,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     createRoot(container).render(React.createElement(Component, props));
     return container;
   }
-  for (const name of ['tabActions','tabBans','tabKnownBadImages','tabKnownSpam','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabSettings']) {
+  for (const name of ['tabActions','tabBans','tabKnownBadImages','tabKnownSpam','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabAnalytics','tabSettings']) {
     const Component = app[name];
     app[name] = () => mount(Component);
   }
@@ -208,6 +211,64 @@ test('dashboard does not show zero moderation counts when stats are unavailable'
     const card = findNode(dashboard, n => n.className === 'stat' && textOf(n).includes(label));
     assert.equal(Array.from(card.children).find((c) => c.className === 'stat-value').textContent, 'Unavailable');
   }
+});
+
+test('analytics tab reads the daily series as a POST with the page enrollment and renders trends', async () => {
+  const pending = [];
+  const { app } = harness((url, options) => new Promise(resolve => pending.push({ url, method: options.method, headers: options.headers, resolve })));
+  app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [], enrollment_id: 'enroll-token' };
+  const panel = app.tabAnalytics();
+  await settle();
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].url, `/api/guilds/${app.state.guilds[0].id}/analytics`);
+  assert.equal(pending[0].method, 'POST');
+  // The enrollment header binds the read to the loaded page membership.
+  assert.equal(pending[0].headers['x-jmodguard-enrollment'], 'enroll-token');
+  const today = new Date().toISOString().slice(0, 10);
+  pending[0].resolve(response({
+    window_days: 30,
+    series: [
+      { day: '2026-01-01', warns: 0, bans: 0, automod: 0, mod_actions: 0, timeouts: 0, joins: 0, leaves: 0 },
+      { day: today, warns: 3, bans: 1, automod: 5, mod_actions: 2, timeouts: 1, joins: 9, leaves: 4 },
+    ],
+    members: { current: 4321, banned: 12, known: 4500 },
+  }));
+  await settle();
+  const stat = (label) => Array.from(findNode(panel, n => n.className === 'stat' && textOf(n).includes(label)).children).find((c) => c.className === 'stat-value').textContent;
+  assert.equal(stat('Members now'), '4321');
+  assert.equal(stat('Warnings'), '3');
+  assert.equal(stat('Bans'), '1');
+  assert.equal(stat('Spam hits'), '5');
+  assert.equal(stat('Mod actions'), '2');
+  assert.equal(stat('Timeouts'), '1');
+  assert.equal(stat('Joins'), '9');
+  assert.equal(stat('Leaves'), '4');
+  // The chart renders real SVG with an accessible summary.
+  const svg = findNode(panel, n => n.tagName === 'svg');
+  assert(svg, 'expected a rendered trend chart');
+  assert.match(svg.getAttribute('aria-label'), /per day/);
+  assert.equal(findNode(panel, n => n.tagName === 'polyline') !== null, true);
+  // Switching the metric re-labels the chart without another request.
+  const before = pending.length;
+  const spamButton = Array.from(findNode(panel, n => n.className === 'trend-picker').children).find(b => b.textContent === 'Spam hits');
+  fire(spamButton, 'click');
+  await settle();
+  assert.equal(pending.length, before, 'metric switching must not refetch');
+  const svgAfter = findNode(panel, n => n.tagName === 'svg');
+  assert.match(svgAfter.getAttribute('aria-label'), /latest day 5\./);
+});
+
+test('analytics tab shows unavailable counts instead of zeros when the read fails', async () => {
+  const { app } = harness(async () => { throw new Error('offline'); });
+  app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };
+  const panel = app.tabAnalytics();
+  await settle();
+  const text = textOf(panel);
+  assert.match(text, /Trends unavailable/);
+  const stat = (label) => Array.from(findNode(panel, n => n.className === 'stat' && textOf(n).includes(label)).children).find((c) => c.className === 'stat-value').textContent;
+  assert.equal(stat('Members now'), 'Unavailable');
+  assert.equal(stat('Warnings'), 'Unavailable');
+  assert.equal(stat('Leaves'), 'Unavailable');
 });
 
 test('workspace survives a fresh JS context and keeps snowflakes exact', () => {

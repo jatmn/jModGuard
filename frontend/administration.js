@@ -1,5 +1,6 @@
 import { createState, useStore } from "./state.js";
 import { Appearance, useAppearance } from "./appearance.js";
+import { TrendChart, TrendMetricPicker, sumSeries, useTrendMetric } from "./charts.js";
 /* Owner Administration. React owns rendering; the API remains authoritative. */
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -15,6 +16,10 @@ const ui = createState({
   usageFreshness: "fresh",
   usageRevision: 0,
   usageMessage: "Waiting to load usage…",
+  analyticsSnapshot: null,
+  analyticsFreshness: "fresh",
+  analyticsRevision: 0,
+  analyticsMessage: "Waiting to load analytics…",
   status: { message: "Checking your access and release state…", tone: "neutral" },
   activity: "idle",
   freshness: "stale",
@@ -27,6 +32,7 @@ const root = createRoot(document.getElementById("content"));
 
 let refreshFlight = { kind: "idle" };
 let usageFlight = { kind: "idle" };
+let analyticsFlight = { kind: "idle" };
 const detailRequests = new Map();
 
 let rateLimitUntil = 0;
@@ -471,19 +477,124 @@ function refreshUsage() {
   return usageFlight.promise;
 }
 
+async function doRefreshAnalytics() {
+  if (ui.getSnapshot().activeView !== "analytics" || document.visibilityState === "hidden") return;
+  try {
+    const next = await request("/api/platform/analytics", {});
+    if (ui.getSnapshot().activeView !== "analytics" || document.visibilityState === "hidden") return;
+    const members = next.members || {};
+    const availability = members.guilds_unavailable
+      ? ` Member totals cover ${members.guilds_counted ?? 0} of ${members.servers ?? next.guilds?.length ?? 0} servers; the rest were unavailable.`
+      : "";
+    ui.set({ signIn: "optional", access: "allowed", analyticsSnapshot: next, analyticsFreshness: "fresh",
+      analyticsMessage: `Analytics refreshed. ${members.status === "unavailable" ? "Member totals are unavailable." : `Member totals are ${members.status || "complete"}.`}${availability}` });
+  } catch (error) { ui.set({ analyticsMessage: error.message }); ui.set({ analyticsFreshness: "stale" }); }
+  finally { ui.set({ analyticsRevision: ui.getSnapshot().analyticsRevision + 1 }); }
+}
+
+function refreshAnalytics() {
+  if (analyticsFlight.kind === "idle") {
+    analyticsFlight = { kind: "running", promise: doRefreshAnalytics().finally(() => { analyticsFlight = { kind: "idle" }; }) };
+  }
+  return analyticsFlight.promise;
+}
+
+function platformStat(label, value) {
+  return h("div", { className: "stat" },
+    h("div", { className: "stat-title" }, label),
+    h("div", { className: "stat-value" }, value));
+}
+
+const GUILD_COLUMNS = [
+  ["warns", "warns", "Warnings"],
+  ["bans", "bans", "Bans"],
+  ["automod", "automod", "Spam hits"],
+  ["modActions", "mod_actions", "Mod actions"],
+  ["timeouts", "timeouts", "Timeouts"],
+  ["joins", "joins", "Joins"],
+  ["leaves", "leaves", "Leaves"],
+];
+
+function toTrendPoints(series) {
+  return (series ?? []).map((point) => ({
+    day: point.day,
+    warns: point.warns,
+    bans: point.bans,
+    automod: point.automod,
+    modActions: point.mod_actions,
+    timeouts: point.timeouts,
+    joins: point.joins,
+    leaves: point.leaves,
+  }));
+}
+
+function memberTotal(members) {
+  if (!members || members.status === "unavailable") return "Unavailable";
+  if (members.guilds_unavailable) return `${members.current ?? 0}+`;
+  return String(members.current ?? 0);
+}
+
+function AnalyticsCard({ snapshot }) {
+  const [metric, setMetric] = useTrendMetric("warns");
+  const points = toTrendPoints(snapshot?.series);
+  const loading = !snapshot;
+  const total = (key) => (loading ? "Loading…" : String(sumSeries(points, key)));
+  const members = snapshot?.members;
+  const stats = h("div", { className: "stats bg-base-100 w-full administration-stats" },
+    platformStat("Servers", loading ? "Loading…" : String(snapshot?.servers ?? 0)),
+    platformStat("Members now", loading ? "Loading…" : memberTotal(members)),
+    platformStat("Known members", loading ? "Loading…" : members?.known != null ? String(members.known) : "Unavailable"),
+    platformStat("Warnings", total("warns")),
+    platformStat("Bans", total("bans")),
+    platformStat("Spam hits", total("automod")),
+    platformStat("Mod actions", total("modActions")),
+    platformStat("Timeouts", total("timeouts")),
+    platformStat("Joins", total("joins")),
+    platformStat("Leaves", total("leaves")));
+  const table = (snapshot?.guilds?.length ?? 0) > 0 && h("div", { className: "table-scroll rounded-box", tabIndex: 0 },
+    h("table", { className: "table table-zebra table-sm" },
+      h("thead", null, h("tr", null,
+        h("th", { scope: "col" }, "Server"),
+        ...GUILD_COLUMNS.map(([, , label]) => h("th", { key: label, scope: "col" }, label)))),
+      h("tbody", null, snapshot.guilds.map((guild) =>
+        h("tr", { key: guild.guild_id },
+          h("td", null, guild.guild_id),
+          ...GUILD_COLUMNS.map(([key, field]) => h("td", { key }, String(guild[field] ?? 0))))))));
+  return h("section", { className: "card bg-base-100" },
+    h("div", { className: "card-body" },
+      h("h3", { className: "card-title" }, "Last 30 days, all servers"),
+      stats,
+      h(TrendMetricPicker, { metric, onChange: setMetric }),
+      points.length
+        ? h(TrendChart, { points, metric, title: "Platform activity" })
+        : h("p", { className: "muted" }, loading ? "Loading analytics…" : "No platform trend data recorded yet."),
+      table,
+      h("p", { className: "muted" },
+        "Per-server rows show guild IDs for the window. Days before the bot started recording — or while it was offline — show zero, not missing history. Members now is the current member directory across counted servers; known members includes departed members retained by ban history.")));
+}
+
 function selectView(view) {
   ui.set({ activeView: view });
   clearTimeout(refreshTimer);
   if (view === "usage") ui.set({ usageSnapshot: null });
+  if (view === "analytics") ui.set({ analyticsSnapshot: null });
 
-  return view === "usage" ? refreshUsage() : refresh();
+  if (view === "usage") return refreshUsage();
+  if (view === "analytics") return refreshAnalytics();
+  return refresh();
 }
 
 function Administration() {
   const appearance = useAppearance();
   const display = useStore(ui);
   useEffect(() => {
-    const visible = () => { if (document.visibilityState !== "hidden") { if (ui.getSnapshot().activeView === "usage") refreshUsage(); else refresh(); } };
+    const visible = () => {
+      if (document.visibilityState !== "hidden") {
+        if (ui.getSnapshot().activeView === "usage") refreshUsage();
+        else if (ui.getSnapshot().activeView === "analytics") refreshAnalytics();
+        else refresh();
+      }
+    };
     document.addEventListener("visibilitychange", visible);
     return () => { document.removeEventListener("visibilitychange", visible); clearTimeout(refreshTimer); };
   }, []);
@@ -496,14 +607,15 @@ function Administration() {
   const login = base ? `${base}/login?return_to=${encodeURIComponent(window.location.origin)}` : "/login?return_to=%2Fadministration%2Findex.html";
   return h(React.Fragment, null,
     h("header", { className: "administration-header" },
-      h("div", null, h("span", { className: "eyebrow" }, "OWNER ADMINISTRATION"), h("h1", { id: "admin-title" }, display.activeView === "usage" ? "Database Usage" : "Updates")),
+      h("div", null, h("span", { className: "eyebrow" }, "OWNER ADMINISTRATION"), h("h1", { id: "admin-title" }, display.activeView === "usage" ? "Database Usage" : display.activeView === "analytics" ? "Analytics" : "Updates")),
       h("div", { className: "administration-tools" }, h("button", { id: "refresh-status", type: "button", className: "btn btn-sm", disabled: (display.activity === "busy"),
         onClick: () => { if (ui.getSnapshot().activity !== "busy") { ui.set({ actionMessage: "" }); return refresh(); } } }, "↻ Refresh status"), h(Appearance, appearance), h("a", { className: "btn btn-sm", href: "/" }, "← Back to workspace"))),
     h("p", { id: "update-status", className: `alert alert-soft administration-notice ${{ good: "alert-success", warn: "alert-warning", bad: "alert-error", neutral: "" }[display.status.tone]}`, role: "status", "aria-live": "polite" }, display.status.message),
     h("div", { id: "sign-in", className: (display.signIn === "required") ? "" : "hidden" }, h("a", { id: "sign-in-link", className: "btn btn-primary", href: login }, "Sign in with Discord")),
     h("nav", { className: "administration-nav", "aria-label": "Administration pages" },
       h("button", { id: "show-updates", className: "btn btn-sm", type: "button", "aria-current": display.activeView === "updates" ? "page" : undefined, onClick: () => selectView("updates") }, "Updates"),
-      h("button", { id: "show-database-usage", className: "btn btn-sm", type: "button", "aria-current": display.activeView === "usage" ? "page" : undefined, onClick: () => selectView("usage") }, "Database Usage")),
+      h("button", { id: "show-database-usage", className: "btn btn-sm", type: "button", "aria-current": display.activeView === "usage" ? "page" : undefined, onClick: () => selectView("usage") }, "Database Usage"),
+      h("button", { id: "show-analytics", className: "btn btn-sm", type: "button", "aria-current": display.activeView === "analytics" ? "page" : undefined, onClick: () => selectView("analytics") }, "Analytics")),
     h("div", { id: "updates", className: display.access === "allowed" && display.activeView === "updates" ? "" : "hidden" },
       h("div", { className: "administration-overview" }, h("div", null, h("h2", null, "Component updates"), h("p", { className: "muted" }, "Check releases and manage the API, bot, and WebUI independently. Release discovery runs hourly."))),
       h("p", { id: "automatic-state", className: "muted" }, display.snapshot?.unattended_enabled ? "Automatic installation policies are available." : "Automatic installation is disabled for this deployment. Hourly checks and Check now still work."),
@@ -517,7 +629,12 @@ function Administration() {
       h("h2", { id: "database-usage-title" }, "Database Usage"), h("p", null, "Physical allocation includes reusable pages. Each database has its own 1,000 MB limit. Category estimates are labeled when exact page attribution is unavailable."),
       h("p", { id: "usage-status", className: `alert alert-soft administration-notice ${(display.usageFreshness === "stale") ? "alert-warning" : ""}`, role: "status" }, display.usageMessage),
       h("button", { id: "refresh-usage", className: "btn btn-sm", type: "button", onClick: () => refreshUsage() }, "Refresh usage"),
-      h("div", { id: "usage-cards", className: "administration-grid" }, display.usageSnapshot?.databases.map(database => h(UsageCard, { key: database.id, database, stale: (ui.getSnapshot().usageFreshness === "stale"), revision: ui.getSnapshot().usageRevision })))));
+      h("div", { id: "usage-cards", className: "administration-grid" }, display.usageSnapshot?.databases.map(database => h(UsageCard, { key: database.id, database, stale: (ui.getSnapshot().usageFreshness === "stale"), revision: ui.getSnapshot().usageRevision })))),
+    h("section", { id: "platform-analytics", className: display.access === "allowed" && display.activeView === "analytics" ? "" : "hidden", "aria-labelledby": "platform-analytics-title" },
+      h("h2", { id: "platform-analytics-title" }, "Platform analytics"), h("p", null, "Fleet-wide moderation and membership trends over the last 30 days. Member totals come from each server's member directory; servers whose store is unavailable are reported as unknown instead of failing the view."),
+      h("p", { id: "analytics-status", className: `alert alert-soft administration-notice ${(display.analyticsFreshness === "stale") ? "alert-warning" : ""}`, role: "status" }, display.analyticsMessage),
+      h("button", { id: "refresh-analytics", className: "btn btn-sm", type: "button", onClick: () => refreshAnalytics() }, "Refresh analytics"),
+      display.analyticsSnapshot && h(AnalyticsCard, { snapshot: display.analyticsSnapshot, revision: ui.getSnapshot().analyticsRevision })));
 }
 
 root.render(h(Administration));
