@@ -2901,7 +2901,8 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
             control.clone(),
             &root,
         );
-        // The fixture's maintenance child serves health on a real socket.
+        // The fixture stands in for the maintenance API (whose /health route is
+        // application code) and answers on a real socket while it is alive.
         let reserved_health = bind_reclaimable_health_port().await;
         let addr = reserved_health.local_addr().unwrap();
         drop(reserved_health);
@@ -2921,7 +2922,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
             }
         })
         .await
-        .expect("the maintenance API keeps health up while waiting");
+        .expect("the launcher keeps a live maintenance child while waiting");
         let waiting = format!(
             "INFO waiting for the bot to migrate core schema 16 -> {}",
             db::CORE_SCHEMA_VERSION
