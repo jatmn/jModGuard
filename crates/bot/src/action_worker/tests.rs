@@ -3099,6 +3099,58 @@ async fn confirmed_owner_leave_keeps_its_receipt_when_retirement_keeps_failing()
 }
 
 #[tokio::test]
+async fn confirmed_owner_leave_retires_its_membership_when_the_receipt_fails() {
+    let f = Fixture::new();
+    f.place_guild(10).await;
+    let job = f.enqueue(10, "leave", Action::LeaveGuild {}).await;
+    let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded(
+            "CREATE TRIGGER reject_leave_receipt BEFORE UPDATE ON bot_actions
+             WHEN NEW.state='succeeded'
+             BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END;",
+            65_536,
+        )
+    })
+    .await
+    .unwrap();
+    let discord = OwnerLeaveDiscord {
+        membership: true,
+        leaves: std::sync::Mutex::new(Vec::new()),
+        outcome: Outcome::succeeded("left_guild"),
+        checks: AtomicUsize::new(0),
+    };
+    // The receipt error is still reported, but Discord already confirmed the
+    // departure: that membership retires, and its unsaved running receipt
+    // becomes uncertain like any work outliving its membership.
+    assert!(
+        execute(&f.db, &discord, &claim, &WorkerLimits::default())
+            .await
+            .is_err()
+    );
+    let (_, active) = db::guild_membership_observation(&f.db, 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !active,
+        "a lost receipt must not leave a departed server active"
+    );
+    let (state, code) = f.persisted_status(&job).await;
+    assert_eq!(
+        (state.as_str(), code.as_deref()),
+        ("uncertain", Some("enrollment_ended"))
+    );
+    assert!(
+        db::claim_bot_action(&f.db, now() + 1000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(*discord.leaves.lock().unwrap(), vec![10]);
+}
+
+#[tokio::test]
 async fn owner_leave_requires_the_captured_membership() {
     let f = Fixture::new();
     let job = f.enqueue(10, "leave", Action::LeaveGuild {}).await;

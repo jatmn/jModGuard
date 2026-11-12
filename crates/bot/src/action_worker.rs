@@ -712,7 +712,8 @@ async fn execute_inner(
     if app.is_some_and(|app| !app.activation.may_record()) {
         return Err(anyhow::anyhow!("writer lease is not held"));
     }
-    if !db::finish_dispatched_bot_action(db, job, outcome.state, outcome.code).await? {
+    let finished = db::finish_dispatched_bot_action(db, job, outcome.state, outcome.code).await;
+    if matches!(finished, Ok(false)) {
         tracing::warn!(
             action_id = %job.id,
             reported_state = outcome.state,
@@ -729,17 +730,20 @@ async fn execute_inner(
         // membership now instead of relying only on the gateway departure
         // event, which a restart in between would lose and leave the server
         // listed as active forever. A newer membership or an event that already
-        // retired this one is ignored by the monotonic observation, and the
-        // receipt above was recorded before the retirement invalidates work.
+        // retired this one is ignored by the monotonic observation. Retirement
+        // follows the receipt attempt so a recorded receipt keeps Discord's
+        // outcome; a receipt that failed to save stays running and becomes
+        // uncertain, which must not also keep the departed server active.
         retire_confirmed_departure(db, app, job, joined_at_ns).await;
     }
+    finished?;
     Ok(())
 }
 
 const RETIRE_DEPARTURE_ATTEMPTS: u32 = 3;
 const RETIRE_DEPARTURE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Retire one confirmed owner departure. The receipt is already final and no
+/// Retire one confirmed owner departure. The receipt has been attempted and no
 /// claim is ever replayed, so nothing but this call (or the gateway event) can
 /// retire the membership: a transient write failure is retried a few times
 /// rather than left as a single warning.
@@ -750,6 +754,9 @@ async fn retire_confirmed_departure(
     joined_at_ns: i64,
 ) {
     for attempt in 1..=RETIRE_DEPARTURE_ATTEMPTS {
+        if app.is_some_and(|app| !app.activation.may_record()) {
+            return;
+        }
         match db::retire_guild_enrollment(db, job.guild_id, joined_at_ns).await {
             Ok(()) => return,
             Err(error) => {
@@ -770,9 +777,6 @@ async fn retire_confirmed_departure(
             return;
         }
         tokio::time::sleep(RETIRE_DEPARTURE_RETRY_DELAY).await;
-        if app.is_some_and(|app| !app.activation.may_record()) {
-            return;
-        }
     }
 }
 
