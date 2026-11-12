@@ -546,8 +546,8 @@ async fn execute_inner(
                     return Outcome::failed("writer_lease_not_held");
                 }
                 mutation.start();
-                // The subsequent departure retires the enrollment through the
-                // normal gateway path, including erasure and work invalidation.
+                // The confirmed departure retires the membership once its
+                // receipt is recorded (below); the gateway event may do so first.
                 discord.leave_guild(job.guild_id).await
             }
             Action::SetLogChannel {
@@ -662,6 +662,24 @@ async fn execute_inner(
             mutation_started = (mutation.phase() == MutationPhase::Started),
             "bot action completion rejected; recorded state preserved; action will not be resent"
         );
+    }
+    if matches!(job.action, Action::LeaveGuild {})
+        && outcome.phase() == OutcomeState::Succeeded
+        && let Some(joined_at_ns) = job.joined_at_ns
+    {
+        // Discord confirmed this membership is gone. Retire exactly that
+        // membership now instead of relying only on the gateway departure
+        // event, which a restart in between would lose and leave the server
+        // listed as active forever. A newer membership or an event that already
+        // retired this one is ignored by the monotonic observation, and the
+        // receipt above was recorded before the retirement invalidates work.
+        if let Err(error) = db::retire_guild_enrollment(db, job.guild_id, joined_at_ns).await {
+            tracing::warn!(
+                action_id = %job.id,
+                guild_id = job.guild_id,
+                "confirmed departure not retired; the gateway event remains the fallback: {error:#}"
+            );
+        }
     }
     Ok(())
 }

@@ -700,27 +700,33 @@ impl EventHandler for Handler {
             }
         }
         // Directory facts are display-only and never gate the observation above.
-        let icon_hash = guild.icon.as_ref().map(|hash| hash.to_string());
-        crate::guild_directory::record_guild_observation(
-            &app,
-            gid.get(),
-            &guild.name,
-            icon_hash.as_deref(),
-            guild.member_count,
-            crate::guild_directory::now_ns(),
-        )
-        .await;
-        if is_new.unwrap_or(false) {
-            let bot_user_id = ctx.cache.current_user().id.get();
-            let joined_at_ns = guild.joined_at.timestamp_nanos_opt().unwrap_or_default();
-            crate::guild_directory::capture_fresh_join_adder(
+        // An unavailable-guild event carries partial metadata, so it neither
+        // refreshes facts nor identifies a membership to attribute an adder to.
+        if !guild.unavailable {
+            let icon_hash = guild.icon.as_ref().map(|hash| hash.to_string());
+            crate::guild_directory::record_guild_observation(
                 &app,
-                &ctx.http,
                 gid.get(),
-                bot_user_id,
-                joined_at_ns,
+                &guild.name,
+                icon_hash.as_deref(),
+                guild.member_count,
+                crate::guild_directory::now_ns(),
             )
             .await;
+            if is_new.unwrap_or(false) {
+                let bot_user_id = ctx.cache.current_user().id.get();
+                let joined_at_ns = guild.joined_at.timestamp_nanos_opt().unwrap_or_default();
+                crate::guild_directory::capture_fresh_join_adder(
+                    &app,
+                    &ctx.http,
+                    gid.get(),
+                    bot_user_id,
+                    joined_at_ns,
+                )
+                .await;
+            }
+        }
+        if is_new.unwrap_or(false) {
             tracing::info!("joined new guild {gid} ({})", guild.name);
         }
         // Rejoin permits another attempt for a parked guild, never for a bad token.

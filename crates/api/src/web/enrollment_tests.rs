@@ -5912,18 +5912,12 @@ fn fresh_request_key(label: &str) -> String {
 async fn owner_directory_serves_string_snowflakes_for_every_server() {
     let f = Fixture::new(true).await;
     f.enroll(55).await;
-    db::record_guild_join_info(
-        &f.app.db,
-        55,
-        "Alpha",
-        Some("icon1"),
-        Some(42),
-        Some("77"),
-        Some("Ada"),
-        5_000,
-    )
-    .await
-    .unwrap();
+    db::record_guild_join_info(&f.app.db, 55, "Alpha", Some("icon1"), Some(42), 5_000)
+        .await
+        .unwrap();
+    db::record_guild_adder(&f.app.db, 55, 100, "77", "Ada")
+        .await
+        .unwrap();
     f.enroll(56).await;
     db::retire_guild_enrollment(&f.app.db, 56, 1_000)
         .await
@@ -5977,11 +5971,12 @@ async fn owner_leave_admits_only_the_owner_against_an_active_enrollment() {
     );
 
     // Owner against the enrolled guild: admitted and bound to the actor.
+    let leave_request = fresh_request_key("c");
     let (status, job) = owner_router_request(
         &f,
         "POST",
         "/api/owner-servers/55/leave",
-        &format!(r#"{{"request_id":"{}"}}"#, fresh_request_key("c")),
+        &format!(r#"{{"request_id":"{leave_request}"}}"#),
         &f.cookie,
     )
     .await;
@@ -5997,7 +5992,7 @@ async fn owner_leave_admits_only_the_owner_against_an_active_enrollment() {
         &f,
         "POST",
         "/api/owner-servers/55/leave",
-        &format!(r#"{{"request_id":"{}"}}"#, fresh_request_key("c")),
+        &format!(r#"{{"request_id":"{leave_request}"}}"#),
         &f.cookie,
     )
     .await;

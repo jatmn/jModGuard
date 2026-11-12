@@ -398,9 +398,14 @@ from the stable baseline and do not move `latest`; see [RELEASES.md](RELEASES.md
 
 The main WebUI has an owner-only "Bot servers" sub-section listing every server the
 bot is or was connected to, who added the bot (a bounded audit-log BOT_ADD lookup at
-join time, backfilled by a paced startup pass), member count and join date. The owner
-can make the bot depart a server through the durable action queue; departure retires
-the enrollment like any other membership change. Routes live under `/api/owner-servers`,
+join time, backfilled by a paced startup pass), member count and join date. The adder
+is stored with the membership (join time) it was captured for, so a rejoined server shows
+"Unknown" until its own capture resolves instead of the previous installer. Every active
+server is always listed; the response bound applies only to retained departed history.
+The owner can make the bot depart a server through the durable action queue; a confirmed
+departure retires that exact membership like any other membership change, without waiting
+for the gateway event. The WebUI keeps a departure's request key across lost responses so
+a retry recovers the original request. Routes live under `/api/owner-servers`,
 are gated on the configured bot owner session (`bot.owner_id`) with a trusted-origin
 check, and never fetch the Discord guild list.
 

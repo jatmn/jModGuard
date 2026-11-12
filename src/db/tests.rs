@@ -5807,20 +5807,23 @@ fn embed_defaults_upgrade_only_exact_untouched_rows_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guild_join_info_upsert_refreshes_facts_and_keeps_the_stored_adder() {
+async fn guild_join_info_facts_are_monotonic_and_never_touch_the_adder() {
     let tmp = tmp_db_path("guild_join_info_upsert");
     let db = Db::open(&tmp, 2).unwrap();
 
     enroll_guild(&db, 50, 1_000).await.unwrap();
-    record_guild_join_info(&db, 50, "Alpha", Some("icon1"), Some(42), None, None, 5_000)
+    record_guild_join_info(&db, 50, "Alpha", Some("icon1"), Some(42), 5_000)
         .await
         .unwrap();
-    record_guild_adder(&db, 50, "222", "Admin Ada", 6_000)
+    record_guild_adder(&db, 50, 1_000, "222", "Admin Ada")
         .await
         .unwrap();
-    // A later observation refreshes display facts; a missing adder must never
-    // erase the stored identity.
-    record_guild_join_info(&db, 50, "Alpha Renamed", None, Some(50), None, None, 7_000)
+    // A later observation refreshes display facts without touching the adder.
+    record_guild_join_info(&db, 50, "Alpha Renamed", None, Some(50), 7_000)
+        .await
+        .unwrap();
+    // A delayed older snapshot (slow backfill, replayed event) loses.
+    record_guild_join_info(&db, 50, "Stale Name", Some("stale"), Some(1), 6_000)
         .await
         .unwrap();
 
@@ -5856,7 +5859,7 @@ async fn guild_directory_orders_active_first_and_rejects_broken_facts() {
     retire_guild_enrollment(&db, 51, 1_000).await.unwrap();
     enroll_guild(&db, 52, 2_000).await.unwrap();
     enroll_guild(&db, 53, 3_000).await.unwrap();
-    record_guild_join_info(&db, 53, "Older active", None, None, None, None, 5_000)
+    record_guild_join_info(&db, 53, "Older active", None, None, 5_000)
         .await
         .unwrap();
 
@@ -5873,21 +5876,131 @@ async fn guild_directory_orders_active_first_and_rejects_broken_facts() {
     );
 
     assert!(
-        record_guild_join_info(&db, 54, "", None, None, None, None, 5_000)
+        record_guild_join_info(&db, 54, "", None, None, 5_000)
             .await
             .is_err()
     );
     assert!(
-        record_guild_join_info(&db, 0, "no guild", None, None, None, None, 5_000)
+        record_guild_join_info(&db, 0, "no guild", None, None, 5_000)
             .await
             .is_err()
     );
     assert!(
-        record_guild_adder(&db, 53, "not-digits", "Name", 6_000)
+        record_guild_adder(&db, 53, 3_000, "not-digits", "Name")
             .await
             .is_err()
     );
     assert!(owner_guild_directory(&db, 0).await.is_err());
+
+    cleanup_db(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guild_directory_limit_bounds_departed_history_never_active_servers() {
+    let tmp = tmp_db_path("guild_directory_limit");
+    let db = Db::open(&tmp, 2).unwrap();
+
+    // Five active servers and four departed ones, more than the limit of 3.
+    for guild in 80..85 {
+        enroll_guild(&db, guild, 1_000 + guild).await.unwrap();
+    }
+    for guild in 90..94 {
+        enroll_guild(&db, guild, 1_000 + guild).await.unwrap();
+        retire_guild_enrollment(&db, guild, 1_000 + guild)
+            .await
+            .unwrap();
+    }
+
+    let rows = owner_guild_directory(&db, 3).await.unwrap();
+    let active: Vec<i64> = rows
+        .iter()
+        .filter(|row| row.active)
+        .map(|row| row.guild_id)
+        .collect();
+    assert_eq!(
+        active,
+        vec![84, 83, 82, 81, 80],
+        "every active server is listed regardless of the limit"
+    );
+    let departed: Vec<i64> = rows
+        .iter()
+        .filter(|row| !row.active)
+        .map(|row| row.guild_id)
+        .collect();
+    assert_eq!(
+        departed,
+        vec![93, 92, 91],
+        "only the oldest departed history is dropped"
+    );
+
+    cleanup_db(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guild_adder_belongs_to_one_membership_across_a_rejoin() {
+    let tmp = tmp_db_path("guild_adder_rejoin");
+    let db = Db::open(&tmp, 2).unwrap();
+
+    enroll_guild(&db, 70, 1_000).await.unwrap();
+    record_guild_join_info(&db, 70, "Rejoiner", None, Some(5), 2_000)
+        .await
+        .unwrap();
+    record_guild_adder(&db, 70, 1_000, "111", "First Admin")
+        .await
+        .unwrap();
+    assert!(
+        guild_join_info_backfill_candidates(&db, 0, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an adder captured for the current membership is resolved"
+    );
+
+    // The bot is removed and re-added: a newer membership replaces the first.
+    retire_guild_enrollment(&db, 70, 1_000).await.unwrap();
+    enroll_guild(&db, 70, 5_000).await.unwrap();
+    record_guild_join_info(&db, 70, "Rejoiner", None, Some(6), 6_000)
+        .await
+        .unwrap();
+
+    let row = owner_guild_directory(&db, 10).await.unwrap().remove(0);
+    assert_eq!(row.joined_at_ns, 5_000);
+    assert_eq!(
+        (row.added_by, row.added_by_name),
+        (None, None),
+        "the earlier membership's installer is never shown for the new one"
+    );
+    assert_eq!(
+        guild_join_info_backfill_candidates(&db, 0, 100)
+            .await
+            .unwrap(),
+        vec![(70, 5_000)],
+        "the rejoined server awaits its own adder capture"
+    );
+
+    // A lookup that was started for the earlier membership and finishes late
+    // is ignored rather than overwriting the current membership.
+    record_guild_adder(&db, 70, 1_000, "111", "First Admin")
+        .await
+        .unwrap();
+    assert!(
+        owner_guild_directory(&db, 10).await.unwrap()[0]
+            .added_by
+            .is_none()
+    );
+
+    record_guild_adder(&db, 70, 5_000, "222", "Second Admin")
+        .await
+        .unwrap();
+    let row = owner_guild_directory(&db, 10).await.unwrap().remove(0);
+    assert_eq!(row.added_by.as_deref(), Some("222"));
+    assert_eq!(row.added_by_name.as_deref(), Some("Second Admin"));
+    assert!(
+        guild_join_info_backfill_candidates(&db, 0, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     cleanup_db(&tmp);
 }
@@ -5899,30 +6012,26 @@ async fn guild_join_info_backfill_targets_only_unresolved_active_servers() {
 
     // Resolved active server: never a candidate.
     enroll_guild(&db, 60, 1_000).await.unwrap();
-    record_guild_join_info(
-        &db,
-        60,
-        "Resolved",
-        None,
-        None,
-        Some("111"),
-        Some("Admin"),
-        2_000,
-    )
-    .await
-    .unwrap();
+    record_guild_join_info(&db, 60, "Resolved", None, None, 2_000)
+        .await
+        .unwrap();
+    record_guild_adder(&db, 60, 1_000, "111", "Admin")
+        .await
+        .unwrap();
     // Active server without any row: candidate.
     enroll_guild(&db, 61, 1_000).await.unwrap();
     // Active server with facts but no adder: candidate.
     enroll_guild(&db, 62, 1_000).await.unwrap();
-    record_guild_join_info(&db, 62, "No adder", None, None, None, None, 2_000)
+    record_guild_join_info(&db, 62, "No adder", None, None, 2_000)
         .await
         .unwrap();
     // Departed server without an adder: never a candidate (no audit access).
     enroll_guild(&db, 63, 1_000).await.unwrap();
     retire_guild_enrollment(&db, 63, 1_000).await.unwrap();
 
-    let candidates = guild_join_info_backfill_candidates(&db, 100).await.unwrap();
+    let candidates = guild_join_info_backfill_candidates(&db, 0, 100)
+        .await
+        .unwrap();
     assert_eq!(
         candidates,
         vec![(61, 1_000), (62, 1_000)],
@@ -5930,7 +6039,7 @@ async fn guild_join_info_backfill_targets_only_unresolved_active_servers() {
     );
 
     // The update-only adder write keeps display facts and fills the identity.
-    record_guild_adder(&db, 62, "999", "Backfill Admin", 3_000)
+    record_guild_adder(&db, 62, 1_000, "999", "Backfill Admin")
         .await
         .unwrap();
     let rows = owner_guild_directory(&db, 100).await.unwrap();
@@ -5939,11 +6048,62 @@ async fn guild_join_info_backfill_targets_only_unresolved_active_servers() {
     assert_eq!(resolved.added_by.as_deref(), Some("999"));
     assert_eq!(resolved.added_by_name.as_deref(), Some("Backfill Admin"));
     assert!(
-        guild_join_info_backfill_candidates(&db, 100)
+        guild_join_info_backfill_candidates(&db, 0, 100)
             .await
             .unwrap()
             .iter()
             .all(|(guild, _)| *guild == 61)
+    );
+    // A row that is missing cannot take an adder; it waits for its facts.
+    record_guild_adder(&db, 61, 1_000, "123", "Nobody")
+        .await
+        .unwrap();
+    assert!(
+        owner_guild_directory(&db, 100)
+            .await
+            .unwrap()
+            .iter()
+            .find(|row| row.guild_id == 61)
+            .unwrap()
+            .added_by
+            .is_none()
+    );
+
+    cleanup_db(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guild_join_info_backfill_pages_past_unresolved_servers() {
+    let tmp = tmp_db_path("guild_join_info_backfill_pages");
+    let db = Db::open(&tmp, 2).unwrap();
+
+    for guild in 100..105 {
+        enroll_guild(&db, guild, 1_000).await.unwrap();
+    }
+    // The first page is whatever the lowest ids are; paging continues past
+    // them even though none were resolved.
+    let first = guild_join_info_backfill_candidates(&db, 0, 2)
+        .await
+        .unwrap();
+    assert_eq!(first, vec![(100, 1_000), (101, 1_000)]);
+    let second = guild_join_info_backfill_candidates(&db, 101, 2)
+        .await
+        .unwrap();
+    assert_eq!(second, vec![(102, 1_000), (103, 1_000)]);
+    let third = guild_join_info_backfill_candidates(&db, 103, 2)
+        .await
+        .unwrap();
+    assert_eq!(third, vec![(104, 1_000)]);
+    assert!(
+        guild_join_info_backfill_candidates(&db, 104, 2)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        guild_join_info_backfill_candidates(&db, -1, 2)
+            .await
+            .is_err()
     );
 
     cleanup_db(&tmp);

@@ -26,6 +26,21 @@ impl Fixture {
             request_time: now(),
         }
     }
+    /// Place the guild in a store, as every live guild is: retirement then keeps
+    /// the retired action receipt until the erasure worker runs.
+    async fn place_guild(&self, guild: i64) {
+        let store = db::guild_stores::StoreId::new();
+        db::guild_stores::register_store(
+            &self.db,
+            store.clone(),
+            db::guild_stores::StorePolicy::Shared,
+        )
+        .await
+        .unwrap();
+        db::guild_stores::assign_initial_placement(&self.db, guild, store)
+            .await
+            .unwrap();
+    }
     fn request_key(&self, label: &str) -> String {
         format!("{}_{}", self.request_time, label)
     }
@@ -2853,6 +2868,7 @@ async fn owner_leave_dispatches_without_an_actor_membership_check() {
         ),
     ] {
         let f = Fixture::new();
+        f.place_guild(10).await;
         let job = f.enqueue(10, "leave", Action::LeaveGuild {}).await;
         let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
         let discord = OwnerLeaveDiscord {
@@ -2873,6 +2889,45 @@ async fn owner_leave_dispatches_without_an_actor_membership_check() {
         let (state, code) = f.persisted_status(&job).await;
         assert_eq!(state, expected.0);
         assert_eq!(code.as_deref(), Some(expected.1));
+    }
+}
+
+#[tokio::test]
+async fn confirmed_owner_leave_retires_that_membership_after_recording_the_receipt() {
+    for (outcome, retired) in [
+        (Outcome::succeeded("left_guild"), true),
+        (Outcome::succeeded("already_left"), true),
+        (Outcome::failed("discord_rejected"), false),
+        (Outcome::uncertain("discord_outcome_unknown"), false),
+    ] {
+        let f = Fixture::new();
+        f.place_guild(10).await;
+        let job = f.enqueue(10, "leave", Action::LeaveGuild {}).await;
+        let claim = db::claim_bot_action(&f.db, now()).await.unwrap().unwrap();
+        let discord = OwnerLeaveDiscord {
+            membership: true,
+            leaves: std::sync::Mutex::new(Vec::new()),
+            outcome,
+            checks: AtomicUsize::new(0),
+        };
+        execute(&f.db, &discord, &claim, &WorkerLimits::default())
+            .await
+            .unwrap();
+        // The receipt keeps Discord's outcome: retirement follows it, so the
+        // transition that invalidates running work cannot rewrite it.
+        let (state, code) = f.persisted_status(&job).await;
+        assert_eq!(
+            (state.as_str(), code.as_deref()),
+            (outcome.state, Some(outcome.code))
+        );
+        let (_, active) = db::guild_membership_observation(&f.db, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            active, !retired,
+            "only a confirmed departure retires the exact membership without the gateway event"
+        );
     }
 }
 

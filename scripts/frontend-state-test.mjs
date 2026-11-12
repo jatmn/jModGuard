@@ -5546,3 +5546,72 @@ test('Bot servers removal refuses to continue without confirmation', async () =>
   await settle();
   assert.equal(calls.filter(url => url.endsWith('/leave')).length, 0, 'no departure is queued without confirmation');
 });
+
+test('Bot servers removal keeps its request identity across a lost admission response and a reload', async () => {
+  const session = new Map();
+  const bodies = [];
+  const job = { id: 'job-1', guild_id: '111111111111111111', actor_id: '123456789012345678', state: 'pending', outcome: null };
+  let admitted = false;
+  const fetchImpl = async (url, opts) => {
+    if (url.endsWith('/api/owner-servers')) return response({ servers: [{ ...directoryServer }] });
+    if (url.endsWith('/api/owner-servers/111111111111111111/leave')) {
+      bodies.push(JSON.parse(opts.body));
+      // The first request reaches the server but its response is lost.
+      if (!admitted) { admitted = true; throw new TypeError('Failed to fetch'); }
+      return response(job);
+    }
+    if (url.endsWith('/api/owner-servers/111111111111111111/actions/job-1')) return response({ ...job, state: 'succeeded', outcome: 'left_guild' });
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  const first = harness(fetchImpl, new Map(), session);
+  first.app.state.me.is_bot_owner = true;
+  first.app.state.config = null;
+  const panel = first.app.TabOwnerServers();
+  await settle();
+  await fire(findNode(panel, n => n.localName === 'button' && n.textContent === 'Remove'), 'click', {});
+  await settle();
+  assert.equal(bodies.length, 1);
+  assert.equal([...session.keys()].filter(key => key.includes(':owner-leave:')).length, 1, 'the identity is saved before the first submission');
+
+  // A reload mounts a fresh app over the same browser session; the next click
+  // resubmits the original identity so the server recovers its receipt.
+  const second = harness(fetchImpl, new Map(), session);
+  second.app.state.me.is_bot_owner = true;
+  second.app.state.config = null;
+  const reloaded = second.app.TabOwnerServers();
+  await settle();
+  await fire(findNode(reloaded, n => n.localName === 'button' && n.textContent === 'Remove'), 'click', {});
+  await settle();
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[1].request_id, bodies[0].request_id, 'a retry never invents a second departure');
+
+  // Once the receipt reaches a final outcome the saved identity is released,
+  // so a later removal starts a new request.
+  await runDirectoryPoll(second, 1000);
+  assert.equal([...session.keys()].filter(key => key.includes(':owner-leave:')).length, 0);
+});
+
+test('Bot servers removal releases a request identity the server refuses for good', async () => {
+  const session = new Map();
+  const bodies = [];
+  const h = harness(async (url, opts) => {
+    if (url.endsWith('/api/owner-servers')) return response({ servers: [{ ...directoryServer }] });
+    if (url.endsWith('/leave')) {
+      bodies.push(JSON.parse(opts.body));
+      return { ok: false, status: 409, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'Server membership changed.', code: 'action_enrollment_changed' }) };
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }, new Map(), session);
+  h.app.state.me.is_bot_owner = true;
+  h.app.state.config = null;
+  const panel = h.app.TabOwnerServers();
+  await settle();
+  const click = () => fire(findNode(panel, n => n.localName === 'button' && n.textContent === 'Remove'), 'click', {});
+  await click();
+  await settle();
+  assert.equal([...session.keys()].filter(key => key.includes(':owner-leave:')).length, 0);
+  await click();
+  await settle();
+  assert.equal(bodies.length, 2);
+  assert.notEqual(bodies[1].request_id, bodies[0].request_id, 'a refused identity is never reused');
+});

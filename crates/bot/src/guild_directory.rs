@@ -1,8 +1,9 @@
-//! Owner server directory facts: capture at membership time plus a bounded
+//! Owner server directory facts: capture at membership time plus a paced
 //! startup backfill. Display data only — these rows never authorize access.
 //! The adder identity comes from one action-filtered audit-log request, so a
 //! missing VIEW_AUDIT_LOG permission leaves the adder unknown without retries
-//! beyond the next startup pass.
+//! beyond the next startup pass. An adder is bound to the membership (the
+//! enrollment join time) it was captured for.
 use crate::db;
 use crate::state::BotState;
 use serenity::model::guild::audit_log::{Action, AuditLogs, MemberAction};
@@ -10,17 +11,20 @@ use serenity::model::id::{GuildId, UserId};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Bounded per pass: the busiest bot platform cannot exceed this many
-/// unresolved servers per startup, and failures simply wait for a later pass.
-const BACKFILL_PASS_LIMIT: i64 = 100;
-/// One paced audit request per guild keeps the pass far below Discord's
-/// per-route and global rate limits.
+/// Unresolved servers are read in pages this large. The startup pass visits
+/// each unresolved server once, in id order, so servers whose lookup keeps
+/// failing cannot starve later ones; failures wait for the next startup.
+const BACKFILL_PAGE_SIZE: i64 = 100;
+/// One paced lookup per guild keeps the pass far below Discord's per-route and
+/// global rate limits, however many servers are unresolved.
 const BACKFILL_GUILD_PACE: Duration = Duration::from_secs(2);
-/// An adder entry must belong to the current membership: Discord indexes new
-/// audit entries asynchronously, so a lookup right after a quick rejoin can
-/// still see the previous add. Entries older than this tolerance below the
-/// membership's join time are ignored, and the row waits for a later pass.
-const ADDER_ENTRY_TOLERANCE_NS: i64 = 5 * 60 * 1_000_000_000;
+/// An adder entry must belong to the current membership. Discord stamps the
+/// add entry and the bot's join within moments of each other, so only a small
+/// allowance below the membership's join time absorbs that skew. A lookup right
+/// after a quick rejoin can still see the previous add, which is far older than
+/// this allowance unless the earlier membership itself lasted only seconds;
+/// older entries are ignored and the row waits for a later pass.
+const ADDER_ENTRY_TOLERANCE_NS: i64 = 10 * 1_000_000_000;
 
 pub(crate) fn now_ns() -> i64 {
     chrono::Utc::now()
@@ -32,6 +36,8 @@ pub(crate) fn now_ns() -> i64 {
 /// that joined at `joined_at_ns`, as (adder id, adder display name). Entries
 /// arrive most-recent first; the first match for the bot's own identity that
 /// is not from an earlier membership is the latest addition of this bot.
+/// An entry more than `ADDER_ENTRY_TOLERANCE_NS` before the join belongs to an
+/// earlier membership.
 pub(crate) fn bot_adder_from_logs(
     logs: &AuditLogs,
     bot_user_id: u64,
@@ -84,8 +90,7 @@ pub(crate) async fn capture_bot_adder(
 }
 
 /// Record the display facts the gateway already carries for this guild.
-/// Adder capture is a separate bounded lookup; a `None` adder never erases
-/// a stored one.
+/// Adder capture is a separate bounded lookup bound to the membership.
 pub(crate) async fn record_guild_observation(
     app: &Arc<BotState>,
     guild_id: u64,
@@ -105,8 +110,6 @@ pub(crate) async fn record_guild_observation(
         name,
         icon_hash,
         member_count,
-        None,
-        None,
         recorded_at_ns,
     )
     .await
@@ -131,7 +134,8 @@ pub(crate) async fn capture_fresh_join_adder(
     match capture_bot_adder(http, guild, bot_user_id, joined_at_ns).await {
         Ok(Some((added_by, added_by_name))) => {
             if let Err(error) =
-                db::record_guild_adder(&app.db, guild, &added_by, &added_by_name, now_ns()).await
+                db::record_guild_adder(&app.db, guild, joined_at_ns, &added_by, &added_by_name)
+                    .await
             {
                 tracing::warn!(guild, "guild adder observation not recorded: {error:#}");
             }
@@ -143,30 +147,45 @@ pub(crate) async fn capture_fresh_join_adder(
     }
 }
 
-/// One bounded startup pass: resolve servers still missing their adder (or
-/// their whole row) with one paced REST lookup per guild. Failures are logged
-/// and left for a later pass; shutdown ends the pass cleanly.
+/// One paced startup pass: resolve servers whose current membership has no
+/// adder yet (or no row at all) with one REST lookup per guild, paging through
+/// the unresolved servers in id order. Failures are logged and left for the
+/// next startup; shutdown ends the pass cleanly.
 pub async fn run_startup_backfill(
     app: Arc<BotState>,
     http: Arc<serenity::http::Http>,
     bot_user_id: UserId,
 ) {
-    let candidates =
-        match db::guild_join_info_backfill_candidates(&app.db, BACKFILL_PASS_LIMIT).await {
+    let mut after_guild_id = 0;
+    let mut visited = false;
+    loop {
+        let candidates = match db::guild_join_info_backfill_candidates(
+            &app.db,
+            after_guild_id,
+            BACKFILL_PAGE_SIZE,
+        )
+        .await
+        {
             Ok(candidates) => candidates,
             Err(error) => {
                 tracing::warn!("guild directory backfill unavailable: {error:#}");
                 return;
             }
         };
-    for (index, (guild_id, joined_at_ns)) in candidates.iter().enumerate() {
-        if index > 0 {
-            tokio::select! {
-                _ = crate::shutdown_signal() => return,
-                _ = tokio::time::sleep(BACKFILL_GUILD_PACE) => {}
+        let Some(&(last_guild_id, _)) = candidates.last() else {
+            return;
+        };
+        for (guild_id, joined_at_ns) in candidates {
+            if visited {
+                tokio::select! {
+                    _ = crate::shutdown_signal() => return,
+                    _ = tokio::time::sleep(BACKFILL_GUILD_PACE) => {}
+                }
             }
+            visited = true;
+            backfill_guild(&app, &http, bot_user_id, guild_id, joined_at_ns).await;
         }
-        backfill_guild(&app, &http, bot_user_id, *guild_id, *joined_at_ns).await;
+        after_guild_id = last_guild_id;
     }
 }
 
@@ -177,6 +196,10 @@ async fn backfill_guild(
     guild_id: i64,
     joined_at_ns: i64,
 ) {
+    // Facts are stamped with the time the snapshot was requested, so a gateway
+    // observation that lands while the REST call is in flight is never replaced
+    // by this older answer.
+    let observed_at_ns = now_ns();
     let guild = match http
         .get_guild_with_counts(GuildId::new(guild_id as u64))
         .await
@@ -187,16 +210,6 @@ async fn backfill_guild(
             return;
         }
     };
-    let adder = match capture_bot_adder(http, guild_id, bot_user_id.get(), joined_at_ns).await {
-        Ok(adder) => adder,
-        Err(error) => {
-            tracing::warn!(guild_id, "guild adder lookup deferred: {error:#}");
-            None
-        }
-    };
-    let (added_by, added_by_name) = adder
-        .map(|(id, name)| (Some(id), Some(name)))
-        .unwrap_or((None, None));
     let icon_hash = guild.icon.as_ref().map(|hash| hash.to_string());
     if let Err(error) = db::record_guild_join_info(
         &app.db,
@@ -206,13 +219,26 @@ async fn backfill_guild(
         guild
             .approximate_member_count
             .and_then(|count| i64::try_from(count).ok()),
-        added_by.as_deref(),
-        added_by_name.as_deref(),
-        now_ns(),
+        observed_at_ns,
     )
     .await
     {
         tracing::warn!(guild_id, "guild directory facts not recorded: {error:#}");
+        return;
+    }
+    match capture_bot_adder(http, guild_id, bot_user_id.get(), joined_at_ns).await {
+        Ok(Some((added_by, added_by_name))) => {
+            if let Err(error) =
+                db::record_guild_adder(&app.db, guild_id, joined_at_ns, &added_by, &added_by_name)
+                    .await
+            {
+                tracing::warn!(guild_id, "guild adder observation not recorded: {error:#}");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(guild_id, "guild adder lookup deferred: {error:#}");
+        }
     }
 }
 
@@ -279,10 +305,15 @@ mod tests {
             ]),
         );
         assert!(bot_adder_from_logs(&logs, 42, joined_at_ns).is_none());
-        // An entry inside the tolerance window stays acceptable (clock skew):
-        // the same entry against a membership joined four minutes later.
+        // A rejoin a minute after a short earlier membership still ignores the
+        // earlier add: only moment-scale skew is tolerated.
+        assert!(
+            bot_adder_from_logs(&logs, 42, (joined_ms - 7_200_000 + 60_000) * 1_000_000).is_none()
+        );
+        // An entry inside the skew allowance stays acceptable: the same entry
+        // against a membership that joined five seconds later.
         let (added_by, _) =
-            bot_adder_from_logs(&logs, 42, (joined_ms - 7_200_000 + 240_000) * 1_000_000).unwrap();
+            bot_adder_from_logs(&logs, 42, (joined_ms - 7_200_000 + 5_000) * 1_000_000).unwrap();
         assert_eq!(added_by, "222");
     }
 

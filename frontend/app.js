@@ -148,6 +148,38 @@ function directoryStatusLabel(server, receipt) {
   return server.name ? ["Active", "badge-success"] : ["Active (details pending)", "badge-success"];
 }
 
+// A departure's request identity is saved before the first submission and kept
+// across lost responses, reloads and navigation. Resubmitting with that same
+// key recovers the original queued receipt instead of superseding it with a
+// second request. It is cleared only once the outcome is known or the server
+// refuses the identity for good. The membership join time scopes it, so a
+// rejoined server starts a fresh request.
+function ownerLeaveRequestKey(server) {
+  return `${workspaceKey()}:owner-leave:${server.guild_id}:${server.joined_at_ns}`;
+}
+
+function ownerLeaveRequestId(server) {
+  const key = ownerLeaveRequestKey(server);
+  try {
+    let requestId = window.sessionStorage.getItem(key);
+    if (typeof requestId !== "string" || !requestId) {
+      requestId = `${Math.floor(Date.now() / 1000)}_${crypto.randomUUID()}`;
+      window.sessionStorage.setItem(key, requestId);
+    }
+    return requestId;
+  } catch (_) {
+    throw new Error("Browser session storage must be available to safely submit a server removal.");
+  }
+}
+
+function clearOwnerLeaveRequest(server) {
+  try {
+    window.sessionStorage.removeItem(ownerLeaveRequestKey(server));
+  } catch (_) {
+    /* Storage may be unavailable; a stale key is refused by the server. */
+  }
+}
+
 function TabOwnerServers() {
   const result = useApiRead("/api/owner-servers");
   const [receipts, setReceipts] = useState({});
@@ -176,6 +208,7 @@ function TabOwnerServers() {
     setReceipts((current) => ({ ...current, [server.guild_id]: job }));
     if (botActionPhase(job) !== "active") {
       clearReceipt(server.guild_id);
+      clearOwnerLeaveRequest(server);
       const label = server.name || `server ${server.guild_id}`;
       if (job.state === "succeeded") {
         toast(`The bot left ${label}. It can only return if someone adds it again.`, "success");
@@ -205,6 +238,7 @@ function TabOwnerServers() {
         // truth.
         if (error.status === 404 || error.status === 409) {
           clearReceipt(server.guild_id);
+          clearOwnerLeaveRequest(server);
           toast("The removal receipt is no longer listed. Refresh shows the current state.", "info");
           result.refresh();
           return;
@@ -229,12 +263,28 @@ function TabOwnerServers() {
       )
     )
       return;
+    let requestId;
+    try {
+      requestId = ownerLeaveRequestId(server);
+    } catch (error) {
+      toast(error.message, "error");
+      return;
+    }
     let job;
     try {
       job = await api(`/api/owner-servers/${server.guild_id}/leave`, "POST", {
-        request_id: `${Math.floor(Date.now() / 1000)}_${crypto.randomUUID()}`,
+        request_id: requestId,
       });
     } catch (error) {
+      // An ambiguous failure (lost response, timeout, server error) keeps the
+      // saved identity so the next attempt recovers the same request. A
+      // definitive refusal can never succeed with that key, so it is released.
+      if (
+        (error.status === 410 && error.code === "action_request_expired") ||
+        (error.status === 400 && error.code === "action_request_invalid") ||
+        error.status === 409
+      )
+        clearOwnerLeaveRequest(server);
       reportApiError(error);
       return;
     }
