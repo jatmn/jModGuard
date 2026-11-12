@@ -117,7 +117,9 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
     // the following seed used to keep another write lock open across the same
     // kind of per-statement loop. Bunny closes that stream with
     // TRANSACTION_TIMEOUT.
-    {
+    // The same holds for migrations the authoritative baseline already applied:
+    // skip them instead of taking the primary write lock for each.
+    let applied = {
         let tx = conn.transaction_primary_write()?;
         let baseline = read_core_baseline(&tx)?;
         let current = matches!(baseline, CoreBaseline::Current);
@@ -125,11 +127,12 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
         if current {
             return Ok(());
         }
-    }
+        baseline.version() as usize
+    };
     // Migration selection must be authoritative. A lagging remote replica can
     // otherwise report vN-1 after vN committed and make us replay a
     // non-idempotent CREATE/ALTER migration against the primary.
-    for (i, sql) in MIGRATIONS.iter().enumerate() {
+    for (i, sql) in MIGRATIONS.iter().enumerate().skip(applied) {
         let target = (i + 1) as i64;
         let tx = conn.transaction_primary_write()?;
         // Recheck while holding the primary write lock. Separate bot
