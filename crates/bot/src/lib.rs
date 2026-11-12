@@ -17,6 +17,7 @@ pub mod control_server;
 pub mod discord;
 pub mod enrollment_repair;
 pub mod gateway_budget;
+pub mod guild_directory;
 pub mod handlers;
 pub mod image_spam;
 pub mod logging;

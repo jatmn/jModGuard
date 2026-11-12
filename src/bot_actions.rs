@@ -18,6 +18,9 @@ pub enum Action {
     MemberSync {
         operation: MemberSyncOperation,
     },
+    /// Platform-owner departure. Only the owner-gated API route admits this
+    /// variant; the actor needs no guild membership or Discord permission.
+    LeaveGuild {},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +57,7 @@ impl Action {
                 );
             }
             Self::MemberSync { .. } => {}
+            Self::LeaveGuild {} => {}
         }
         Ok(())
     }
@@ -62,6 +66,7 @@ impl Action {
             Self::Unban { user_id, .. } => format!("unban:{user_id}"),
             Self::SetLogChannel { event, .. } => format!("log:{event}"),
             Self::MemberSync { .. } => "member_sync".to_owned(),
+            Self::LeaveGuild {} => "leave".to_owned(),
         }
     }
 }

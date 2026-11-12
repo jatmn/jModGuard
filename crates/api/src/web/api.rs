@@ -1397,6 +1397,8 @@ fn can_access_action(auth: &AuthCtx, guild: u64, action: &Action, need: GuildAcc
             .guild_access(guild)
             .is_some_and(|access| access >= need),
         Action::MemberSync { .. } => auth.can_manage(guild),
+        // Owner-only platform action; never exposed through guild dashboards.
+        Action::LeaveGuild {} => false,
     }
 }
 

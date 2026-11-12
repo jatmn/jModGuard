@@ -100,7 +100,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -110,7 +110,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     createRoot(container).render(React.createElement(Component, props));
     return container;
   }
-  for (const name of ['tabActions','tabBans','tabKnownBadImages','tabKnownSpam','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabAnalytics','tabSettings']) {
+  for (const name of ['tabActions','tabBans','tabKnownBadImages','tabKnownSpam','tabMembers','tabCases','tabTemplates','tabLogChannels','tabDashboard','tabAnalytics','tabSettings','TabOwnerServers']) {
     const Component = app[name];
     app[name] = () => mount(Component);
   }
@@ -5521,6 +5521,179 @@ test('embed preview applies dynamic action/removal accents and aggregate field l
   assert.ok(total <= 6000);
   assert.equal(embed.fields[0].value.length, 1023);
   assert.equal(embed.fields[0].value.at(-1), '…');
+});
+
+const directoryServer = {
+  guild_id: '111111111111111111',
+  enrollment_id: 'enrollment-a',
+  name: 'Alpha',
+  icon_hash: 'hash01',
+  member_count: 42,
+  added_by: '222222222222222222',
+  added_by_name: 'Admin Ada',
+  joined_at_ns: '1790000000000000000',
+  active: true,
+};
+
+async function runDirectoryPoll(h, delay) {
+  const pending = [...h.timers].find(([, timer]) => timer.delay === delay);
+  assert(pending, 'expected a queued directory receipt poll');
+  h.timers.delete(pending[0]);
+  h.advanceTime(pending[1].delay);
+  await pending[1].fn();
+  await settle();
+}
+
+function ownerHarness(fetchImpl) {
+  const h = harness(fetchImpl);
+  h.app.state.me.is_bot_owner = true;
+  h.app.state.config = null;
+  return h;
+}
+
+test('Bot servers is an owner-only navigation sub-section', () => {
+  const navLabels = (h) => [...h.document.querySelectorAll('#tabs [data-tab]')].map(n => n.textContent.trim());
+  const owner = ownerHarness(async () => response({ servers: [] }));
+  owner.app.navigate('dashboard');
+  assert.ok(navLabels(owner).some(label => label.includes('Bot servers')), 'owner sees the section in the main interface');
+  const nonOwner = harness(async () => response({ servers: [] }));
+  nonOwner.app.navigate('dashboard');
+  assert.ok(!navLabels(nonOwner).some(label => label.includes('Bot servers')), 'non-owner never sees the section');
+  nonOwner.app.navigate('servers');
+  assert.equal(nonOwner.app.state.tab, 'servers');
+  assert.match(textOf(nonOwner.document.querySelector('#content')), /Owner access required/);
+});
+
+test('Bot servers directory renders server facts without guild-scoped reads', async () => {
+  const calls = [];
+  const h = ownerHarness(async url => {
+    calls.push(url);
+    if (url.endsWith('/api/owner-servers')) return response({ servers: [directoryServer, { ...directoryServer, guild_id: '333333333333333333', name: null, icon_hash: null, member_count: null, added_by: null, added_by_name: null, active: false }] });
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  const panel = h.app.TabOwnerServers();
+  await settle();
+  const text = textOf(panel);
+  assert.match(text, /Alpha/);
+  assert.match(text, /111111111111111111/);
+  assert.match(text, /Admin Ada \(222222222222222222\)/);
+  assert.match(text, /Unknown server/);
+  assert.match(text, /Departed/);
+  assert.match(text, /Active/);
+  assert.ok(calls.every(url => url.endsWith('/api/owner-servers')), 'the directory never reads guild-scoped routes');
+});
+
+test('Bot servers removal queues the leave action and follows its receipt to departure', async () => {
+  const calls = [];
+  let directory = { servers: [{ ...directoryServer }] };
+  const h = ownerHarness(async url => {
+    calls.push(url);
+    if (url.endsWith('/api/owner-servers')) return response(directory);
+    if (url.endsWith('/api/owner-servers/111111111111111111/leave')) {
+      directory = { servers: [{ ...directoryServer, active: false }] };
+      return response({ id: 'job-1', guild_id: '111111111111111111', actor_id: '123456789012345678', state: 'pending', outcome: null });
+    }
+    if (url.endsWith('/api/owner-servers/111111111111111111/actions/job-1')) return response({ id: 'job-1', guild_id: '111111111111111111', actor_id: '123456789012345678', state: 'succeeded', outcome: 'left_guild' });
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  const panel = h.app.TabOwnerServers();
+  await settle();
+  const remove = findNode(panel, n => n.localName === 'button' && n.textContent === 'Remove');
+  assert(remove, 'an active server offers removal');
+  await fire(remove, 'click', {});
+  await settle();
+  const leave = calls.filter(url => url.endsWith('/api/owner-servers/111111111111111111/leave'));
+  assert.equal(leave.length, 1, 'removal queues exactly one durable action');
+  await runDirectoryPoll(h, 1000);
+  assert.match(textOf(panel), /Departed/, 'the directory reflects the departure after the receipt');
+});
+
+test('Bot servers removal refuses to continue without confirmation', async () => {
+  const calls = [];
+  const h = harness(async url => {
+    calls.push(url);
+    if (url.endsWith('/api/owner-servers')) return response({ servers: [{ ...directoryServer }] });
+    throw new Error(`unexpected fetch ${url}`);
+  }, new Map(), new Map(), () => false);
+  h.app.state.me.is_bot_owner = true;
+  h.app.state.config = null;
+  const panel = h.app.TabOwnerServers();
+  await settle();
+  const remove = findNode(panel, n => n.localName === 'button' && n.textContent === 'Remove');
+  await fire(remove, 'click', {});
+  await settle();
+  assert.equal(calls.filter(url => url.endsWith('/leave')).length, 0, 'no departure is queued without confirmation');
+});
+
+test('Bot servers removal keeps its request identity across a lost admission response and a reload', async () => {
+  const session = new Map();
+  const bodies = [], enrollments = [];
+  const job = { id: 'job-1', guild_id: '111111111111111111', actor_id: '123456789012345678', state: 'pending', outcome: null };
+  let admitted = false;
+  const fetchImpl = async (url, opts) => {
+    if (url.endsWith('/api/owner-servers')) return response({ servers: [{ ...directoryServer }] });
+    if (url.endsWith('/api/owner-servers/111111111111111111/leave')) {
+      bodies.push(JSON.parse(opts.body));
+      enrollments.push(opts.headers['x-jmodguard-enrollment']);
+      // The first request reaches the server but its response is lost.
+      if (!admitted) { admitted = true; throw new TypeError('Failed to fetch'); }
+      return response(job);
+    }
+    if (url.endsWith('/api/owner-servers/111111111111111111/actions/job-1')) return response({ ...job, state: 'succeeded', outcome: 'left_guild' });
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  const first = harness(fetchImpl, new Map(), session);
+  first.app.state.me.is_bot_owner = true;
+  first.app.state.config = null;
+  const panel = first.app.TabOwnerServers();
+  await settle();
+  await fire(findNode(panel, n => n.localName === 'button' && n.textContent === 'Remove'), 'click', {});
+  await settle();
+  assert.equal(bodies.length, 1);
+  assert.equal([...session.keys()].filter(key => key.includes(':owner-leave:')).length, 1, 'the identity is saved before the first submission');
+
+  // A reload mounts a fresh app over the same browser session; the next click
+  // resubmits the original identity so the server recovers its receipt.
+  const second = harness(fetchImpl, new Map(), session);
+  second.app.state.me.is_bot_owner = true;
+  second.app.state.config = null;
+  const reloaded = second.app.TabOwnerServers();
+  await settle();
+  await fire(findNode(reloaded, n => n.localName === 'button' && n.textContent === 'Remove'), 'click', {});
+  await settle();
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[1].request_id, bodies[0].request_id, 'a retry never invents a second departure');
+  assert.deepEqual(enrollments, ['enrollment-a', 'enrollment-a'], 'every attempt carries the membership the owner reviewed');
+
+  // Once the receipt reaches a final outcome the saved identity is released,
+  // so a later removal starts a new request.
+  await runDirectoryPoll(second, 1000);
+  assert.equal([...session.keys()].filter(key => key.includes(':owner-leave:')).length, 0);
+});
+
+test('Bot servers removal releases a request identity the server refuses for good', async () => {
+  const session = new Map();
+  const bodies = [];
+  const h = harness(async (url, opts) => {
+    if (url.endsWith('/api/owner-servers')) return response({ servers: [{ ...directoryServer }] });
+    if (url.endsWith('/leave')) {
+      bodies.push(JSON.parse(opts.body));
+      return { ok: false, status: 409, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'Server membership changed.', code: 'action_enrollment_changed' }) };
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }, new Map(), session);
+  h.app.state.me.is_bot_owner = true;
+  h.app.state.config = null;
+  const panel = h.app.TabOwnerServers();
+  await settle();
+  const click = () => fire(findNode(panel, n => n.localName === 'button' && n.textContent === 'Remove'), 'click', {});
+  await click();
+  await settle();
+  assert.equal([...session.keys()].filter(key => key.includes(':owner-leave:')).length, 0);
+  await click();
+  await settle();
+  assert.equal(bodies.length, 2);
+  assert.notEqual(bodies[1].request_id, bodies[0].request_id, 'a refused identity is never reused');
 });
 
 test('dashboard role access hides settings tabs and keeps reads in place', async () => {

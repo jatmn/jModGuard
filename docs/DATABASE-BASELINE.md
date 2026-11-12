@@ -174,3 +174,14 @@ change the guild schema. Deploy matching bot/API builds using the existing paire
 update protocol; older binaries reject schema25. Rollback requires the pre-upgrade
 database backup. Existing moderation records are unchanged. See
 [Analytics daily counters](LOGGING-DATA.md#analytics-daily-counters).
+
+## Owner server directory extension
+
+Migration 0026 adds the `guild_join_info` table: display facts (name, icon, member
+count) and the adder of each server the bot has been enrolled in, one row per guild and
+retained after departure. The core schema becomes 26; it does not change the guild
+schema. The adder carries the join time of the membership it was captured for. These
+rows are display data only and never authorize access. Deploy matching bot/API builds
+using the existing paired update protocol; older binaries reject schema26. Rollback
+requires the pre-upgrade database backup. See
+[the owner server directory](OVERHAUL.md#implemented-owner-server-directory).

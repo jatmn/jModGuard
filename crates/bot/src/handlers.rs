@@ -619,6 +619,11 @@ impl EventHandler for Handler {
                     tokio::time::sleep(delay).await;
                 }
             });
+            // Servers added before this release (or whose lookup failed)
+            // resolve their adder in a paced pass; startup enrollments that
+            // commit after this scan request another one from `guild_create`.
+            // Ready-gateway context makes the audit lookups answerable.
+            crate::guild_directory::request_backfill(&app, &ctx.http, ctx.cache.current_user().id);
             let startup = async move {
                 let guild_ids: Vec<GuildId> = ctx.cache.guilds();
                 tracing::info!(
@@ -683,6 +688,45 @@ impl EventHandler for Handler {
                 );
             }
         }
+        // Directory facts are display-only and never gate the observation above.
+        // An unavailable-guild event carries partial metadata, so it neither
+        // refreshes facts nor identifies a membership to attribute an adder to.
+        if !guild.unavailable {
+            let icon_hash = guild.icon.as_ref().map(|hash| hash.to_string());
+            crate::guild_directory::record_guild_observation(
+                &app,
+                gid.get(),
+                &guild.name,
+                icon_hash.as_deref(),
+                guild.member_count,
+                crate::guild_directory::now_ns(),
+            )
+            .await;
+            if is_new.unwrap_or(false) {
+                let bot_user_id = ctx.cache.current_user().id.get();
+                let joined_at_ns = guild.joined_at.timestamp_nanos_opt().unwrap_or_default();
+                crate::guild_directory::capture_fresh_join_adder(
+                    &app,
+                    &ctx.http,
+                    gid.get(),
+                    bot_user_id,
+                    joined_at_ns,
+                )
+                .await;
+            } else {
+                // A membership already present at startup is not a fresh join,
+                // and its enrollment may commit after the Ready-time scan has
+                // passed it: ask the paced backfill to visit it.
+                crate::guild_directory::request_backfill(
+                    &app,
+                    &ctx.http,
+                    ctx.cache.current_user().id,
+                );
+            }
+        }
+        if is_new.unwrap_or(false) {
+            tracing::info!("joined new guild {gid} ({})", guild.name);
+        }
         // Rejoin permits another attempt for a parked guild, never for a bad token.
         app.reset_slash_guild_retry(gid.get());
         app.remembered_discord_targets.clear_guild(gid.get());
@@ -691,9 +735,6 @@ impl EventHandler for Handler {
             app.retry_slash_registry_version();
         }
 
-        if is_new.unwrap_or(false) {
-            tracing::info!("joined new guild {gid} ({})", guild.name);
-        }
         self.app.invalidate_member_sync_scope();
     }
 

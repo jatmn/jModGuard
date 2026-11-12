@@ -123,6 +123,12 @@ pub trait DiscordActions: Send + Sync {
     }
     async fn valid_log_channel(&self, guild: i64, channel: i64) -> Result<bool>;
     async fn unban(&self, guild: i64, user: i64, reason: &str) -> Outcome;
+    /// Depart one guild. Live implementations race the Discord call; test
+    /// implementations may keep the default refusal.
+    async fn leave_guild(&self, guild: i64) -> Outcome {
+        let _ = guild;
+        Outcome::failed("leave_unavailable")
+    }
 }
 pub struct LiveDiscord<'a> {
     pub http: &'a serenity::http::Http,
@@ -217,6 +223,23 @@ impl DiscordActions for LiveDiscord<'_> {
             }
         }
     }
+    async fn leave_guild(&self, guild: i64) -> Outcome {
+        match crate::discord::race_discord_call(
+            self.activation,
+            self.http.leave_guild(GuildId::new(guild as u64)),
+        )
+        .await
+        {
+            crate::discord::DiscordCall::Cancelled => Outcome::uncertain("discord_outcome_unknown"),
+            crate::discord::DiscordCall::Finished(Ok(())) => Outcome::succeeded("left_guild"),
+            crate::discord::DiscordCall::Finished(Err(serenity::Error::Http(
+                serenity::http::HttpError::UnsuccessfulRequest(r),
+            ))) => classify_leave_response(r.status_code.as_u16(), r.error.code),
+            crate::discord::DiscordCall::Finished(Err(_)) => {
+                Outcome::uncertain("discord_outcome_unknown")
+            }
+        }
+    }
 }
 fn actor_authorized(
     guild: &serenity::model::guild::PartialGuild,
@@ -226,6 +249,9 @@ fn actor_authorized(
     let needed = match action {
         Action::Unban { .. } => Permissions::BAN_MEMBERS,
         Action::SetLogChannel { .. } | Action::MemberSync { .. } => Permissions::MANAGE_GUILD,
+        // Unreachable through the worker: leave actions skip the actor check
+        // because the platform owner holds no membership in arbitrary guilds.
+        Action::LeaveGuild {} => Permissions::empty(),
     };
     let permissions = guild.member_permissions(member);
     if guild.owner_id == member.user.id || permissions.administrator() {
@@ -274,6 +300,18 @@ async fn settings_role_authorized(
 fn classify_unban_response(status: u16, code: isize) -> Outcome {
     if status == 404 && code == 10026 {
         Outcome::succeeded("already_unbanned")
+    } else if (400..500).contains(&status) && status != 408 {
+        Outcome::failed("discord_rejected")
+    } else {
+        Outcome::uncertain("discord_outcome_unknown")
+    }
+}
+
+fn classify_leave_response(status: u16, code: isize) -> Outcome {
+    // A missing guild means the bot already departed (or was removed); the
+    // removal request succeeded as an idempotent no-op, like already_unbanned.
+    if status == 404 && code == 10004 {
+        Outcome::succeeded("already_left")
     } else if (400..500).contains(&status) && status != 408 {
         Outcome::failed("discord_rejected")
     } else {
@@ -401,14 +439,20 @@ async fn execute_inner(
         if chrono::Utc::now().timestamp() >= job.expires_at {
             return Outcome::failed("expired_before_execution");
         }
-        match discord.authorized(job).await {
-            Ok(true) => {}
-            Ok(false) => match settings_role_authorized(tenant, discord, job).await {
+        if matches!(job.action, Action::LeaveGuild {}) {
+            // Owner-only platform action admitted by the API's owner gate. The
+            // actor is not a guild member, so there is no permission to check.
+            // Fresh bot membership above remains required to depart a guild.
+        } else {
+            match discord.authorized(job).await {
                 Ok(true) => {}
-                Ok(false) => return Outcome::failed("permission_revoked"),
+                Ok(false) => match settings_role_authorized(tenant, discord, job).await {
+                    Ok(true) => {}
+                    Ok(false) => return Outcome::failed("permission_revoked"),
+                    Err(_) => return Outcome::failed("permission_check_unavailable"),
+                },
                 Err(_) => return Outcome::failed("permission_check_unavailable"),
-            },
-            Err(_) => return Outcome::failed("permission_check_unavailable"),
+            }
         }
         if chrono::Utc::now().timestamp() >= job.expires_at {
             return Outcome::failed("expired_before_execution");
@@ -552,6 +596,18 @@ async fn execute_inner(
                 }
                 outcome
             }
+            Action::LeaveGuild {} => {
+                if chrono::Utc::now().timestamp() >= job.expires_at {
+                    return Outcome::failed("expired_before_execution");
+                }
+                if app.is_some_and(|app| !app.activation.may_record()) {
+                    return Outcome::failed("writer_lease_not_held");
+                }
+                mutation.start();
+                // The confirmed departure retires the membership once its
+                // receipt is recorded (below); the gateway event may do so first.
+                discord.leave_guild(job.guild_id).await
+            }
             Action::SetLogChannel {
                 channel_id: Some(channel),
                 ..
@@ -656,7 +712,8 @@ async fn execute_inner(
     if app.is_some_and(|app| !app.activation.may_record()) {
         return Err(anyhow::anyhow!("writer lease is not held"));
     }
-    if !db::finish_dispatched_bot_action(db, job, outcome.state, outcome.code).await? {
+    let finished = db::finish_dispatched_bot_action(db, job, outcome.state, outcome.code).await;
+    if matches!(finished, Ok(false)) {
         tracing::warn!(
             action_id = %job.id,
             reported_state = outcome.state,
@@ -665,7 +722,62 @@ async fn execute_inner(
             "bot action completion rejected; recorded state preserved; action will not be resent"
         );
     }
+    if matches!(job.action, Action::LeaveGuild {})
+        && outcome.phase() == OutcomeState::Succeeded
+        && let Some(joined_at_ns) = job.joined_at_ns
+    {
+        // Discord confirmed this membership is gone. Retire exactly that
+        // membership now instead of relying only on the gateway departure
+        // event, which a restart in between would lose and leave the server
+        // listed as active forever. A newer membership or an event that already
+        // retired this one is ignored by the monotonic observation. Retirement
+        // follows the receipt attempt so a recorded receipt keeps Discord's
+        // outcome; a receipt that failed to save stays running and becomes
+        // uncertain, which must not also keep the departed server active.
+        retire_confirmed_departure(db, app, job, joined_at_ns).await;
+    }
+    finished?;
     Ok(())
+}
+
+const RETIRE_DEPARTURE_ATTEMPTS: u32 = 3;
+const RETIRE_DEPARTURE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Retire one confirmed owner departure. The receipt has been attempted and no
+/// claim is ever replayed, so nothing but this call (or the gateway event) can
+/// retire the membership: a transient write failure is retried a few times
+/// rather than left as a single warning.
+async fn retire_confirmed_departure(
+    db: &Db,
+    app: Option<&crate::state::BotState>,
+    job: &BotAction,
+    joined_at_ns: i64,
+) {
+    for attempt in 1..=RETIRE_DEPARTURE_ATTEMPTS {
+        if app.is_some_and(|app| !app.activation.may_record()) {
+            return;
+        }
+        match db::retire_guild_enrollment(db, job.guild_id, joined_at_ns).await {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::warn!(
+                    action_id = %job.id,
+                    guild_id = job.guild_id,
+                    attempt,
+                    "confirmed departure not retired{}: {error:#}",
+                    if attempt == RETIRE_DEPARTURE_ATTEMPTS {
+                        "; the gateway event remains the fallback"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        if attempt == RETIRE_DEPARTURE_ATTEMPTS {
+            return;
+        }
+        tokio::time::sleep(RETIRE_DEPARTURE_RETRY_DELAY).await;
+    }
 }
 
 pub async fn execute(

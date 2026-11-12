@@ -3,6 +3,7 @@
 pub mod access_roles;
 pub mod api;
 pub mod cases;
+mod directory;
 mod discord_retry;
 pub mod members;
 pub mod oauth;
@@ -1663,6 +1664,18 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route("/logout", axum::routing::post(logout))
         .route("/oauth/callback", get(callback))
         .route("/api/me", get_post(api_me))
+        .route(
+            "/api/owner-servers",
+            axum::routing::post(directory::overview),
+        )
+        .route(
+            "/api/owner-servers/{guild_id}/leave",
+            axum::routing::post(directory::leave),
+        )
+        .route(
+            "/api/owner-servers/{guild_id}/actions/{action_id}",
+            axum::routing::post(directory::receipt),
+        )
         .route("/api/updates", get_post(updates::status))
         .route("/api/database-usage", axum::routing::post(usage::overview))
         .route(

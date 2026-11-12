@@ -243,7 +243,19 @@ async fn enqueue_bot_action_inner(
             // mapping write: occupying work for that event cannot block recovery.
             // Supersede shares this transaction with the capacity and insert below;
             // a failed admission rolls back the supersede as well.
-            supersede_log_action_with(&tx, guild, event, "superseded_by_newer_request")?;
+            supersede_resource_action_with(
+                &tx,
+                guild,
+                &format!("log:{event}"),
+                "superseded_by_newer_request",
+            )?;
+        } else if resource == "leave" {
+            // Re-departing is idempotent in Discord (an already-left guild
+            // returns unknown-guild), so a newer owner request must replace an
+            // older leave that is still queued or whose Discord outcome was
+            // lost. Otherwise one uncertain row would block removal forever.
+            // The guild's actual state stays observable in the owner directory.
+            supersede_resource_action_with(&tx, guild, &resource, "superseded_by_newer_request")?;
         }
         let count: i64 = tx.query_row(
             "SELECT count(*) FROM bot_actions WHERE guild_id=?1 AND enrollment_id=?2
@@ -549,6 +561,7 @@ async fn finish_bot_action_inner(
                     write_log_channel_conn(&tx, job.guild_id, event, *channel_id)?;
                 }
                 Action::MemberSync { .. } => {}
+                Action::LeaveGuild {} => {}
             }
         }
         tx.commit()?;
@@ -593,13 +606,18 @@ async fn cancel_bot_action_inner(db: &Db, scope: ActionScope, id: &str) -> Resul
 
 /// Direct bot/config writers supersede queued log changes in the same transaction.
 pub(super) fn supersede_log_action(conn: &impl SqlExecutor, guild: i64, event: &str) -> Result<()> {
-    supersede_log_action_with(conn, guild, event, "superseded_by_config_write")
+    supersede_resource_action_with(
+        conn,
+        guild,
+        &format!("log:{event}"),
+        "superseded_by_config_write",
+    )
 }
 
-fn supersede_log_action_with(
+fn supersede_resource_action_with(
     conn: &impl SqlExecutor,
     guild: i64,
-    event: &str,
+    resource: &str,
     outcome: &str,
 ) -> Result<()> {
     conn.execute_matching(
@@ -608,7 +626,7 @@ fn supersede_log_action_with(
          finished_at=unixepoch() WHERE guild_id=?1 AND resource=?2
          AND state IN ('pending','claimed','running','uncertain') AND {ACTIVE}"
         ),
-        params![guild, format!("log:{event}"), outcome],
+        params![guild, resource, outcome],
     )?;
     Ok(())
 }

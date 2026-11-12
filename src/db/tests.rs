@@ -321,7 +321,7 @@ fn migration_archives_legacy_global_log_channels() {
         )?;
         // Simulate an installation that had reached migration 0002 before
         // the per-guild-only log-channel migration was released.
-        conn.execute_batch_bounded("DROP TABLE known_spam; DROP TABLE gateway_ban_deliveries; DROP TABLE known_bad_images; DROP INDEX idx_bans_one_active; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id; DROP INDEX idx_bans_guild_id; DROP INDEX IF EXISTS idx_analytics_warns_time; DROP INDEX IF EXISTS idx_analytics_bans_time; DROP TABLE IF EXISTS analytics_member_daily; DROP TABLE IF EXISTS member_sync_pacing; DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; ALTER TABLE bans DROP COLUMN operation_id; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';", 64 * 1024 * 1024)?;
+        conn.execute_batch_bounded("DROP TABLE known_spam; DROP TABLE gateway_ban_deliveries; DROP TABLE known_bad_images; DROP INDEX idx_bans_one_active; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id; DROP INDEX idx_bans_guild_id; DROP INDEX IF EXISTS idx_analytics_warns_time; DROP INDEX IF EXISTS idx_analytics_bans_time; DROP TABLE IF EXISTS analytics_member_daily; DROP TABLE IF EXISTS member_sync_pacing; DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; DROP TABLE IF EXISTS guild_join_info; ALTER TABLE bans DROP COLUMN operation_id; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';", 64 * 1024 * 1024)?;
         conn.execute_batch_bounded(
             "DROP INDEX idx_bans_expiry; ALTER TABLE bans DROP COLUMN expires_at; ALTER TABLE bans DROP COLUMN expiry_enrollment_id;",
             64 * 1024 * 1024,
@@ -5803,5 +5803,507 @@ fn embed_defaults_upgrade_only_exact_untouched_rows_once() {
         version + 1
     );
     drop(db);
+    cleanup_db(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guild_join_info_facts_are_monotonic_and_never_touch_the_adder() {
+    let tmp = tmp_db_path("guild_join_info_upsert");
+    let db = Db::open(&tmp, 2).unwrap();
+
+    enroll_guild(&db, 50, 1_000).await.unwrap();
+    record_guild_join_info(&db, 50, "Alpha", Some("icon1"), Some(42), 5_000)
+        .await
+        .unwrap();
+    record_guild_adder(&db, 50, 1_000, "222", "Admin Ada")
+        .await
+        .unwrap();
+    // A later observation refreshes display facts without touching the adder.
+    record_guild_join_info(&db, 50, "Alpha Renamed", None, Some(50), 7_000)
+        .await
+        .unwrap();
+    // A delayed older snapshot (slow backfill, replayed event) loses.
+    record_guild_join_info(&db, 50, "Stale Name", Some("stale"), Some(1), 6_000)
+        .await
+        .unwrap();
+
+    let rows = owner_guild_directory(&db, 100).await.unwrap();
+    assert_eq!(rows.len(), 1, "one enrollment yields one directory row");
+    let row = &rows[0];
+    assert_eq!(row.guild_id, 50);
+    assert_eq!(row.joined_at_ns, 1_000);
+    assert!(row.active);
+    assert_eq!(row.name.as_deref(), Some("Alpha Renamed"));
+    assert_eq!(
+        row.icon_hash, None,
+        "a fresh missing icon overwrites the stale hash"
+    );
+    assert_eq!(row.member_count, Some(50));
+    assert_eq!(row.added_by.as_deref(), Some("222"));
+    assert_eq!(row.added_by_name.as_deref(), Some("Admin Ada"));
+
+    // Snowflake fields stay decimal strings on the wire.
+    let wire = serde_json::to_value(row).unwrap();
+    assert_eq!(wire["guild_id"], serde_json::json!("50"));
+    assert_eq!(wire["joined_at_ns"], serde_json::json!("1000"));
+
+    cleanup_db(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guild_directory_orders_active_first_and_rejects_broken_facts() {
+    let tmp = tmp_db_path("guild_directory_order");
+    let db = Db::open(&tmp, 2).unwrap();
+
+    enroll_guild(&db, 51, 1_000).await.unwrap();
+    retire_guild_enrollment(&db, 51, 1_000).await.unwrap();
+    enroll_guild(&db, 52, 2_000).await.unwrap();
+    enroll_guild(&db, 53, 3_000).await.unwrap();
+    record_guild_join_info(&db, 53, "Older active", None, None, 5_000)
+        .await
+        .unwrap();
+
+    let rows = owner_guild_directory(&db, 100).await.unwrap();
+    let order: Vec<(i64, bool)> = rows.iter().map(|row| (row.guild_id, row.active)).collect();
+    assert_eq!(
+        order,
+        vec![(53, true), (52, true), (51, false)],
+        "active servers first, then the most recent joins"
+    );
+    assert_eq!(
+        rows[2].name, None,
+        "a departed server without facts stays listed"
+    );
+
+    assert!(
+        record_guild_join_info(&db, 54, "", None, None, 5_000)
+            .await
+            .is_err()
+    );
+    assert!(
+        record_guild_join_info(&db, 0, "no guild", None, None, 5_000)
+            .await
+            .is_err()
+    );
+    assert!(
+        record_guild_adder(&db, 53, 3_000, "not-digits", "Name")
+            .await
+            .is_err()
+    );
+    assert!(owner_guild_directory(&db, 0).await.is_err());
+
+    cleanup_db(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guild_directory_limit_bounds_departed_history_never_active_servers() {
+    let tmp = tmp_db_path("guild_directory_limit");
+    let db = Db::open(&tmp, 2).unwrap();
+
+    // Five active servers and four departed ones, more than the limit of 3.
+    for guild in 80..85 {
+        enroll_guild(&db, guild, 1_000 + guild).await.unwrap();
+    }
+    for guild in 90..94 {
+        enroll_guild(&db, guild, 1_000 + guild).await.unwrap();
+        retire_guild_enrollment(&db, guild, 1_000 + guild)
+            .await
+            .unwrap();
+    }
+
+    let rows = owner_guild_directory(&db, 3).await.unwrap();
+    let active: Vec<i64> = rows
+        .iter()
+        .filter(|row| row.active)
+        .map(|row| row.guild_id)
+        .collect();
+    assert_eq!(
+        active,
+        vec![84, 83, 82, 81, 80],
+        "every active server is listed regardless of the limit"
+    );
+    let departed: Vec<i64> = rows
+        .iter()
+        .filter(|row| !row.active)
+        .map(|row| row.guild_id)
+        .collect();
+    assert_eq!(
+        departed,
+        vec![93, 92, 91],
+        "only the oldest departed history is dropped"
+    );
+
+    cleanup_db(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guild_adder_belongs_to_one_membership_across_a_rejoin() {
+    let tmp = tmp_db_path("guild_adder_rejoin");
+    let db = Db::open(&tmp, 2).unwrap();
+
+    enroll_guild(&db, 70, 1_000).await.unwrap();
+    record_guild_join_info(&db, 70, "Rejoiner", None, Some(5), 2_000)
+        .await
+        .unwrap();
+    record_guild_adder(&db, 70, 1_000, "111", "First Admin")
+        .await
+        .unwrap();
+    assert!(
+        guild_join_info_backfill_candidates(&db, 0, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an adder captured for the current membership is resolved"
+    );
+
+    // The bot is removed and re-added: a newer membership replaces the first.
+    retire_guild_enrollment(&db, 70, 1_000).await.unwrap();
+    enroll_guild(&db, 70, 5_000).await.unwrap();
+    record_guild_join_info(&db, 70, "Rejoiner", None, Some(6), 6_000)
+        .await
+        .unwrap();
+
+    let row = owner_guild_directory(&db, 10).await.unwrap().remove(0);
+    assert_eq!(row.joined_at_ns, 5_000);
+    assert_eq!(
+        (row.added_by, row.added_by_name),
+        (None, None),
+        "the earlier membership's installer is never shown for the new one"
+    );
+    assert_eq!(
+        guild_join_info_backfill_candidates(&db, 0, 100)
+            .await
+            .unwrap(),
+        vec![(70, 5_000)],
+        "the rejoined server awaits its own adder capture"
+    );
+
+    // A lookup that was started for the earlier membership and finishes late
+    // is ignored rather than overwriting the current membership.
+    record_guild_adder(&db, 70, 1_000, "111", "First Admin")
+        .await
+        .unwrap();
+    assert!(
+        owner_guild_directory(&db, 10).await.unwrap()[0]
+            .added_by
+            .is_none()
+    );
+
+    record_guild_adder(&db, 70, 5_000, "222", "Second Admin")
+        .await
+        .unwrap();
+    let row = owner_guild_directory(&db, 10).await.unwrap().remove(0);
+    assert_eq!(row.added_by.as_deref(), Some("222"));
+    assert_eq!(row.added_by_name.as_deref(), Some("Second Admin"));
+    assert!(
+        guild_join_info_backfill_candidates(&db, 0, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    cleanup_db(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guild_join_info_backfill_targets_only_unresolved_active_servers() {
+    let tmp = tmp_db_path("guild_join_info_backfill");
+    let db = Db::open(&tmp, 2).unwrap();
+
+    // Resolved active server: never a candidate.
+    enroll_guild(&db, 60, 1_000).await.unwrap();
+    record_guild_join_info(&db, 60, "Resolved", None, None, 2_000)
+        .await
+        .unwrap();
+    record_guild_adder(&db, 60, 1_000, "111", "Admin")
+        .await
+        .unwrap();
+    // Active server without any row: candidate.
+    enroll_guild(&db, 61, 1_000).await.unwrap();
+    // Active server with facts but no adder: candidate.
+    enroll_guild(&db, 62, 1_000).await.unwrap();
+    record_guild_join_info(&db, 62, "No adder", None, None, 2_000)
+        .await
+        .unwrap();
+    // Departed server without an adder: never a candidate (no audit access).
+    enroll_guild(&db, 63, 1_000).await.unwrap();
+    retire_guild_enrollment(&db, 63, 1_000).await.unwrap();
+
+    let candidates = guild_join_info_backfill_candidates(&db, 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates,
+        vec![(61, 1_000), (62, 1_000)],
+        "candidates carry the membership join time for the adder recency window"
+    );
+
+    // The update-only adder write keeps display facts and fills the identity.
+    record_guild_adder(&db, 62, 1_000, "999", "Backfill Admin")
+        .await
+        .unwrap();
+    let rows = owner_guild_directory(&db, 100).await.unwrap();
+    let resolved = rows.iter().find(|row| row.guild_id == 62).unwrap();
+    assert_eq!(resolved.name.as_deref(), Some("No adder"));
+    assert_eq!(resolved.added_by.as_deref(), Some("999"));
+    assert_eq!(resolved.added_by_name.as_deref(), Some("Backfill Admin"));
+    assert!(
+        guild_join_info_backfill_candidates(&db, 0, 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|(guild, _)| *guild == 61)
+    );
+    // A row that is missing cannot take an adder; it waits for its facts.
+    record_guild_adder(&db, 61, 1_000, "123", "Nobody")
+        .await
+        .unwrap();
+    assert!(
+        owner_guild_directory(&db, 100)
+            .await
+            .unwrap()
+            .iter()
+            .find(|row| row.guild_id == 61)
+            .unwrap()
+            .added_by
+            .is_none()
+    );
+
+    cleanup_db(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guild_join_info_backfill_pages_past_unresolved_servers() {
+    let tmp = tmp_db_path("guild_join_info_backfill_pages");
+    let db = Db::open(&tmp, 2).unwrap();
+
+    for guild in 100..105 {
+        enroll_guild(&db, guild, 1_000).await.unwrap();
+    }
+    // The first page is whatever the lowest ids are; paging continues past
+    // them even though none were resolved.
+    let first = guild_join_info_backfill_candidates(&db, 0, 2)
+        .await
+        .unwrap();
+    assert_eq!(first, vec![(100, 1_000), (101, 1_000)]);
+    let second = guild_join_info_backfill_candidates(&db, 101, 2)
+        .await
+        .unwrap();
+    assert_eq!(second, vec![(102, 1_000), (103, 1_000)]);
+    let third = guild_join_info_backfill_candidates(&db, 103, 2)
+        .await
+        .unwrap();
+    assert_eq!(third, vec![(104, 1_000)]);
+    assert!(
+        guild_join_info_backfill_candidates(&db, 104, 2)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        guild_join_info_backfill_candidates(&db, -1, 2)
+            .await
+            .is_err()
+    );
+
+    cleanup_db(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retire_guild_enrollment_invalidates_a_running_leave_like_any_other_work() {
+    let tmp = tmp_db_path("leave_action_retirement");
+    let db = Db::open(&tmp, 2).unwrap();
+    let limits = crate::bot_actions::Limits::default();
+    let now = 1_700_000_000;
+
+    enroll_guild(&db, 70, 1_000).await.unwrap();
+    // A placed guild keeps its action rows through retirement (erasure runs
+    // later); an unplaced guild wipes them with the rest of its data.
+    placed_before_erasure(&db, 70).await;
+    // Only the owner admission path constructs this variant; admission binds
+    // the active enrollment. Supersession of an older leave is covered by
+    // a_newer_leave_supersedes_a_blocked_older_one_….
+    let job = enqueue_bot_action(
+        &db,
+        70,
+        111,
+        "1700000000_leave-one",
+        crate::bot_actions::Action::LeaveGuild {},
+        now,
+        limits.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(job.action, crate::bot_actions::Action::LeaveGuild {});
+    assert_eq!(job.action.resource(), "leave");
+
+    let claimed = claim_bot_action(&db, now + 10).await.unwrap().unwrap();
+    assert_eq!(claimed.id, job.id);
+    assert!(begin_bot_action(&db, &claimed, now + 11).await.unwrap());
+    assert!(matches!(
+        bot_action_dispatch(&db, &claimed).await.unwrap(),
+        crate::db::BotActionDispatch::Ready
+    ));
+
+    // The departure retires the enrollment mid-flight. Queue membership
+    // changes invalidate old work atomically: the running leave becomes
+    // uncertain, the claim identity is severed, and the departure itself is
+    // the directory evidence. A failed leave keeps its enrollment, so its
+    // failed receipt still lands through the normal completion path.
+    retire_guild_enrollment(&db, 70, 1_000).await.unwrap();
+    // Guild-scoped receipt reads hide the row once the enrollment retires;
+    // the owner directory conveys the departure instead.
+    assert!(bot_action(&db, 70, &job.id).await.unwrap().is_none());
+    let job_id = job.id.clone();
+    let (mid_state, mid_outcome): (String, Option<String>) = db
+        .with_conn(move |conn| {
+            conn.query_row(
+                "SELECT state,outcome FROM bot_actions WHERE id=?1",
+                params![job_id.as_str()],
+                |r| Ok((r.get::<String>(0)?, r.get::<Option<String>>(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        mid_state, "uncertain",
+        "a missed completion stays uncertain before erasure"
+    );
+    assert_eq!(mid_outcome.as_deref(), Some("enrollment_ended"));
+    assert!(
+        !finish_dispatched_bot_action(&db, &claimed, "succeeded", "left_guild")
+            .await
+            .unwrap(),
+        "a retired enrollment cannot accept a late completion"
+    );
+
+    cleanup_db(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_leave_is_cancelled_like_any_other_work_when_the_bot_is_removed() {
+    let tmp = tmp_db_path("pending_leave_retirement");
+    let db = Db::open(&tmp, 2).unwrap();
+    let limits = crate::bot_actions::Limits::default();
+    let now = 1_700_000_000;
+
+    enroll_guild(&db, 71, 1_000).await.unwrap();
+    placed_before_erasure(&db, 71).await;
+    let job = enqueue_bot_action(
+        &db,
+        71,
+        111,
+        "1700000000_leave-pending",
+        crate::bot_actions::Action::LeaveGuild {},
+        now,
+        limits,
+    )
+    .await
+    .unwrap();
+    // The server owner kicked the bot before the worker claimed the request.
+    retire_guild_enrollment(&db, 71, 1_000).await.unwrap();
+    let job_id = job.id.clone();
+    let (cancelled_state, cancelled_outcome): (String, Option<String>) = db
+        .with_conn(move |conn| {
+            conn.query_row(
+                "SELECT state,outcome FROM bot_actions WHERE id=?1",
+                params![job_id.as_str()],
+                |r| Ok((r.get::<String>(0)?, r.get::<Option<String>>(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(cancelled_state, "cancelled");
+    assert_eq!(cancelled_outcome.as_deref(), Some("enrollment_ended"));
+
+    cleanup_db(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_newer_leave_supersedes_a_blocked_older_one_because_redeparture_is_idempotent() {
+    let tmp = tmp_db_path("leave_action_supersede");
+    let db = Db::open(&tmp, 2).unwrap();
+    let limits = crate::bot_actions::Limits::default();
+    let now = 1_700_000_000;
+
+    enroll_guild(&db, 72, 1_000).await.unwrap();
+    placed_before_erasure(&db, 72).await;
+    // An owner removal whose Discord outcome was lost: the row is uncertain,
+    // which normally occupies the resource and blocks any new admission.
+    let lost = enqueue_bot_action(
+        &db,
+        72,
+        111,
+        "1700000000_leave-lost",
+        crate::bot_actions::Action::LeaveGuild {},
+        now,
+        limits.clone(),
+    )
+    .await
+    .unwrap();
+    let claimed = claim_bot_action(&db, now + 10).await.unwrap().unwrap();
+    assert!(begin_bot_action(&db, &claimed, now + 11).await.unwrap());
+    // The worker died before finishing; housekeeping marks it uncertain.
+    let job_id = lost.id.clone();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        tx.execute_matching(
+            "UPDATE bot_actions SET state='uncertain',outcome='worker_outcome_unknown' WHERE id=?1",
+            params![job_id.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    // The same request id is still idempotent: it returns the uncertain row
+    // without superseding it.
+    let same = enqueue_bot_action(
+        &db,
+        72,
+        111,
+        "1700000000_leave-lost",
+        crate::bot_actions::Action::LeaveGuild {},
+        now + 20,
+        limits.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(same.id, lost.id);
+    assert_eq!(same.state, "uncertain");
+
+    // A deliberate new request supersedes the lost row and admits cleanly.
+    let fresh = enqueue_bot_action(
+        &db,
+        72,
+        111,
+        "1700000000_leave-fresh",
+        crate::bot_actions::Action::LeaveGuild {},
+        now + 30,
+        limits.clone(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(fresh.id, lost.id);
+    let lost_id = lost.id.clone();
+    let (lost_state, lost_outcome): (String, Option<String>) = db
+        .with_conn(move |conn| {
+            conn.query_row(
+                "SELECT state,outcome FROM bot_actions WHERE id=?1",
+                params![lost_id.as_str()],
+                |r| Ok((r.get::<String>(0)?, r.get::<Option<String>>(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        lost_state, "cancelled",
+        "the superseded row must free the resource"
+    );
+    assert_eq!(lost_outcome.as_deref(), Some("superseded_by_newer_request"));
+    let fresh_row = bot_action(&db, 72, &fresh.id).await.unwrap().unwrap();
+    assert_eq!(fresh_row.state, "pending");
+
     cleanup_db(&tmp);
 }

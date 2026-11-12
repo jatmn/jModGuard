@@ -5900,6 +5900,289 @@ async fn known_spam_http_global_and_foreign_rows_are_owner_scoped() {
     assert!(status.is_client_error());
 }
 
+// --- Owner server directory routes -----------------------------------------
+
+async fn owner_router_request(
+    f: &Fixture,
+    method: &str,
+    path: &str,
+    body: &str,
+    cookie: &str,
+) -> (StatusCode, serde_json::Value) {
+    owner_router_request_for(f, method, path, body, cookie, None).await
+}
+
+/// `enrollment` is the membership token the owner reviewed in the directory.
+async fn owner_router_request_for(
+    f: &Fixture,
+    method: &str,
+    path: &str,
+    body: &str,
+    cookie: &str,
+    enrollment: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let origin = reqwest::Url::parse(&f.app.cfg.web.base_url)
+        .unwrap()
+        .origin()
+        .ascii_serialization();
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("cookie", cookie)
+        .header("content-type", "application/json")
+        .header("origin", origin);
+    if let Some(enrollment) = enrollment {
+        request = request.header("x-jmodguard-enrollment", enrollment);
+    }
+    let response = f
+        .router
+        .clone()
+        .oneshot(request.body(Body::from(body.to_owned())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&bytes).to_string())
+        }),
+    )
+}
+
+fn fresh_request_key(label: &str) -> String {
+    format!("{}_{}", chrono::Utc::now().timestamp(), label)
+}
+
+#[tokio::test]
+async fn owner_directory_serves_string_snowflakes_for_every_server() {
+    let f = Fixture::new(true).await;
+    f.enroll(55).await;
+    db::record_guild_join_info(&f.app.db, 55, "Alpha", Some("icon1"), Some(42), 5_000)
+        .await
+        .unwrap();
+    db::record_guild_adder(&f.app.db, 55, 100, "77", "Ada")
+        .await
+        .unwrap();
+    f.enroll(56).await;
+    db::retire_guild_enrollment(&f.app.db, 56, 1_000)
+        .await
+        .unwrap();
+
+    let (status, body) =
+        owner_router_request(&f, "POST", "/api/owner-servers", "", &f.cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let servers = body["servers"].as_array().unwrap();
+    assert_eq!(servers.len(), 2);
+    let active = servers.iter().find(|row| row["active"] == true).unwrap();
+    assert_eq!(active["guild_id"], serde_json::json!("55"));
+    assert_eq!(active["name"], "Alpha");
+    assert_eq!(active["icon_hash"], "icon1");
+    assert_eq!(active["added_by"], serde_json::json!("77"));
+    assert_eq!(active["added_by_name"], "Ada");
+    assert_eq!(active["member_count"], 42);
+    let enrollment = db::guild_enrollment(&f.app.db, 55).await.unwrap().unwrap();
+    assert_eq!(active["enrollment_id"], enrollment.id.as_str());
+    assert_eq!(active["joined_at_ns"], serde_json::json!("100"));
+    let departed = servers.iter().find(|row| row["active"] == false).unwrap();
+    assert_eq!(departed["guild_id"], serde_json::json!("56"));
+    assert_eq!(departed["name"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn owner_directory_rejects_non_owner_sessions() {
+    let f = Fixture::new(false).await;
+    let (status, body) =
+        owner_router_request(&f, "POST", "/api/owner-servers", "", &f.cookie).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "bot owner required");
+}
+
+#[tokio::test]
+async fn owner_leave_admits_only_the_owner_against_an_active_enrollment() {
+    let f = Fixture::new(true).await;
+    f.enroll(55).await;
+    let token = db::guild_enrollment(&f.app.db, 55)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    // Owner against an unknown guild: the enrollment gate fires first.
+    let (status, body) = owner_router_request_for(
+        &f,
+        "POST",
+        "/api/owner-servers/56/leave",
+        &format!(r#"{{"request_id":"{}"}}"#, fresh_request_key("b")),
+        &f.cookie,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"],
+        "The bot has no active enrollment in this server."
+    );
+
+    // Owner against the enrolled guild: admitted and bound to the actor.
+    let leave_request = fresh_request_key("c");
+    let (status, job) = owner_router_request_for(
+        &f,
+        "POST",
+        "/api/owner-servers/55/leave",
+        &format!(r#"{{"request_id":"{leave_request}"}}"#),
+        &f.cookie,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+    assert_eq!(job["state"], "pending");
+    assert_eq!(job["actor_id"], serde_json::json!("42"));
+    assert_eq!(job["action"]["kind"], "leave_guild");
+    assert_eq!(job["guild_id"], serde_json::json!("55"));
+    let action_id = job["id"].as_str().unwrap().to_owned();
+
+    // A retry with the same request id is idempotent, not a duplicate.
+    let (status, retry) = owner_router_request_for(
+        &f,
+        "POST",
+        "/api/owner-servers/55/leave",
+        &format!(r#"{{"request_id":"{leave_request}"}}"#),
+        &f.cookie,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{retry}");
+    assert_eq!(retry["id"], job["id"]);
+
+    // The owner reads the queued receipt through the enrollment-bound read.
+    let (status, found) = owner_router_request(
+        &f,
+        "POST",
+        &format!("/api/owner-servers/55/actions/{action_id}"),
+        "",
+        &f.cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    assert_eq!(found["id"], job["id"]);
+
+    // The directory receipt surface serves departures only: an admin's unban
+    // receipt is not readable through it even with its exact id.
+    let unban = db::enqueue_bot_action(
+        &f.app.db,
+        55,
+        42,
+        &fresh_request_key("unban-row"),
+        jmodguard::bot_actions::Action::Unban {
+            user_id: 500,
+            reason: "dashboard unban".into(),
+        },
+        chrono::Utc::now().timestamp(),
+        f.app.cfg.actions.clone(),
+    )
+    .await
+    .unwrap();
+    let (status, hidden) = owner_router_request(
+        &f,
+        "POST",
+        &format!("/api/owner-servers/55/actions/{}", unban.id),
+        "",
+        &f.cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{hidden}");
+
+    // Another guild cannot read the row through its own path.
+    f.enroll(56).await;
+    let (status, missing) = owner_router_request(
+        &f,
+        "POST",
+        &format!("/api/owner-servers/56/actions/{action_id}"),
+        "",
+        &f.cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+
+    // A malformed request key never reaches the queue.
+    let (status, invalid) = owner_router_request_for(
+        &f,
+        "POST",
+        "/api/owner-servers/55/leave",
+        r#"{"request_id":"bogus"}"#,
+        &f.cookie,
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+    assert_eq!(invalid["code"], "action_request_invalid");
+}
+
+#[tokio::test]
+async fn owner_leave_is_bound_to_the_membership_the_directory_showed() {
+    let f = Fixture::new(true).await;
+    f.enroll(55).await;
+    let shown = db::guild_enrollment(&f.app.db, 55)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let body = format!(r#"{{"request_id":"{}"}}"#, fresh_request_key("stale"));
+    let path = "/api/owner-servers/55/leave";
+
+    // No membership token: the request is refused before it can bind to
+    // whichever enrollment happens to be active.
+    let (status, refused) =
+        owner_router_request_for(&f, "POST", path, &body, &f.cookie, None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], "action_enrollment_changed");
+
+    // The owner loaded membership A; the bot then left and rejoined as B.
+    db::retire_guild_enrollment(&f.app.db, 55, 100)
+        .await
+        .unwrap();
+    db::enroll_guild(&f.app.db, 55, 200).await.unwrap();
+    let current = db::guild_enrollment(&f.app.db, 55).await.unwrap().unwrap();
+    assert_ne!(current.id, shown);
+    let (status, stale) =
+        owner_router_request_for(&f, "POST", path, &body, &f.cookie, Some(&shown)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    assert_eq!(stale["code"], "action_enrollment_changed");
+    assert!(
+        db::claim_bot_action(&f.app.db, chrono::Utc::now().timestamp())
+            .await
+            .unwrap()
+            .is_none(),
+        "a stale intent never queues a departure for the new membership"
+    );
+
+    // After a refresh the owner's deliberate request for B is admitted.
+    let (status, admitted) =
+        owner_router_request_for(&f, "POST", path, &body, &f.cookie, Some(&current.id)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{admitted}");
+}
+
+#[tokio::test]
+async fn owner_leave_and_receipt_reject_non_owner_sessions() {
+    let f = Fixture::new(false).await;
+    f.enroll(55).await;
+    for (method, path, body) in [
+        (
+            "POST",
+            "/api/owner-servers/55/leave",
+            r#"{"request_id":"1700000000_x"}"#,
+        ),
+        ("POST", "/api/owner-servers/55/actions/anything", ""),
+    ] {
+        let (status, body_value) = owner_router_request(&f, method, path, body, &f.cookie).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body_value}");
+        assert_eq!(body_value["error"], "bot owner required");
+    }
+}
+
 #[tokio::test]
 async fn platform_member_totals_distinguish_empty_unavailable_and_incomplete_fleets() {
     let f = Fixture::new(true).await;
