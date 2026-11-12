@@ -191,6 +191,9 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 #content p { line-height: 1.65; }
 #content .card { border: 1px solid var(--shell-border); }
 #content .card-body { gap: 1rem; }
+.member-sync-details { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 16px; margin: 0; font-size: .875rem; }
+.member-sync-details dt { color: var(--muted); }
+.member-sync-details dd { margin: 0; overflow-wrap: anywhere; }
 #content .input, #content .select, #content .textarea { background-color: var(--input); border-color: var(--input-border); }
 .field > label > input, .field > label > select, .field > label > textarea { width: 100%; margin-top: 8px; }
 .field > label > input, .field > label > textarea { display: block; }
