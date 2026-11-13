@@ -129,7 +129,9 @@ Prefix aliases match exactly. Slash command names must be
 
 Stats replies with one embed in the log-notice style (see
 [templates](TEMPLATES.md)): bold title **Status**, a colored side bar, and
-inline-code values. **Server stats** shows Uptime, Cases, Warns and Bans as
+inline-code values. The title and all six field names carry one Unicode emoji
+from the shared map in `src/emoji.rs`, matching log titles and labels.
+**Server stats** shows Uptime, Cases, Warns and Bans as
 inline fields; **Release status** has one bot, api and webui line with its
 short SHA, age and state; **Container use** shows bot and API CPU and memory.
 The side bar is green when every component is up to date (an unmanaged WebUI

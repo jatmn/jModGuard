@@ -3,7 +3,7 @@
 //! Standard Unicode emoji only, never custom server emotes, so every guild can
 //! render them. Discord output built from a shipped template gets one emoji
 //! before its title and one before each field label: log embeds, command
-//! replies, reason DMs, `!userinfo`, `!voice` and review notices. Stored
+//! replies, reason DMs, `!userinfo`, `!voice`, `!status` and review notices. Stored
 //! templates and WebUI chrome stay emoji-free; the WebUI's Discord preview
 //! receives this map from the API. Custom templates are unchanged unless they
 //! opt in with `{emoji}`.
@@ -67,10 +67,10 @@ pub const REPLIES: &[(&str, &str)] = &[
     ("failed", "⚠️"),
 ];
 
-/// Status reports. Reserved for the `!status` embed; its rendering is not changed here.
+/// Title emoji for the `!status` embed.
 pub const STATUS: &str = "📊";
 
-/// Field label to emoji, for every label in the shipped templates.
+/// Field label to emoji, for shipped templates and the `!status` embed.
 pub const LABELS: &[(&str, &str)] = &[
     ("User", "👤"),
     ("ID", "🆔"),
@@ -100,6 +100,11 @@ pub const LABELS: &[(&str, &str)] = &[
     ("From", "📍"),
     ("To", "📍"),
     ("Cases", "📋"),
+    ("Uptime", "⏱️"),
+    ("Warns", "⚠️"),
+    ("Bans", "🔨"),
+    ("Release status", "🚀"),
+    ("Container use", "📦"),
     ("Details", "ℹ️"),
     ("Detail", "ℹ️"),
     ("Notice", "📢"),

@@ -147,7 +147,7 @@ fn inline_code(value: &str) -> String {
 ///
 /// ```
 /// let embed = jmodguard::templates::stats_embed(20, Some(1), 2, 3, Some(&[]), 1_000);
-/// assert_eq!(embed.title, jmodguard::templates::STATS_TITLE);
+/// assert_eq!(embed.title, format!("{} Status", jmodguard::emoji::STATUS));
 /// ```
 pub fn stats_embed(
     uptime_seconds: u64,
@@ -163,12 +163,12 @@ pub fn stats_embed(
         None => (inline_code("unavailable"), true),
     };
     let stat = |name: &str, value: String| Field {
-        name: name.into(),
+        name: crate::emoji::decorate(crate::emoji::label(name), name),
         value: inline_code(&value),
         inline: true,
     };
     LogEmbed {
-        title: STATS_TITLE.into(),
+        title: crate::emoji::decorate(Some(crate::emoji::STATUS), STATS_TITLE),
         color: if attention { YELLOW } else { GREEN },
         description: format!("**{STATS_SERVER_SECTION}**"),
         fields: vec![
@@ -180,7 +180,10 @@ pub fn stats_embed(
             stat("Warns", warns.to_string()),
             stat("Bans", bans.to_string()),
             Field {
-                name: STATS_RELEASE_SECTION.into(),
+                name: crate::emoji::decorate(
+                    crate::emoji::label(STATS_RELEASE_SECTION),
+                    STATS_RELEASE_SECTION,
+                ),
                 value: releases,
                 inline: false,
             },
@@ -378,7 +381,10 @@ pub fn stats_with_container_use(
     api: Option<&crate::cgroup::ContainerSample>,
 ) -> crate::log_embeds::LogEmbed {
     embed.fields.push(crate::log_embeds::Field {
-        name: STATS_CONTAINER_SECTION.into(),
+        name: crate::emoji::decorate(
+            crate::emoji::label(STATS_CONTAINER_SECTION),
+            STATS_CONTAINER_SECTION,
+        ),
         value: container_use_section(bot, api),
         inline: false,
     });
@@ -646,7 +652,7 @@ mod presentation_tests {
         embed
             .fields
             .iter()
-            .find(|field| field.name == name)
+            .find(|field| field.name == format!("{} {name}", crate::emoji::label(name).unwrap()))
             .unwrap_or_else(|| panic!("{name} missing from {embed:?}"))
     }
 
@@ -669,10 +675,10 @@ mod presentation_tests {
             Some(&[]),
             1_000,
         );
-        assert_eq!(embed.title, "Status");
+        assert_eq!(embed.title, format!("{} Status", crate::emoji::STATUS));
         assert_eq!(embed.description, "**Server stats**");
         let stat = |name: &str, value: &str| Field {
-            name: name.into(),
+            name: format!("{} {name}", crate::emoji::label(name).unwrap()),
             value: value.into(),
             inline: true,
         };
@@ -685,7 +691,13 @@ mod presentation_tests {
                 stat("Bans", "`1`"),
             ]
         );
-        assert_eq!(embed.fields[4].name, "Release status");
+        assert_eq!(
+            embed.fields[4].name,
+            format!(
+                "{} Release status",
+                crate::emoji::label("Release status").unwrap()
+            )
+        );
         assert!(!embed.fields[4].inline);
         assert_eq!(embed.fields.len(), 5);
     }
@@ -740,7 +752,10 @@ mod presentation_tests {
             Some(&bot),
         );
         assert_eq!(embed.color, GREEN, "{embed:?}");
-        assert_eq!(embed.title, STATS_TITLE);
+        assert_eq!(
+            embed.title,
+            format!("{} {STATS_TITLE}", crate::emoji::STATUS)
+        );
         assert_eq!(embed.description, "**Server stats**");
         let names = embed
             .fields
@@ -757,6 +772,7 @@ mod presentation_tests {
                 "Release status",
                 "Container use"
             ]
+            .map(|name| format!("{} {name}", crate::emoji::label(name).unwrap()))
         );
         let inline = embed.fields.iter().map(|f| f.inline).collect::<Vec<_>>();
         assert_eq!(inline, [true, true, true, true, false, false]);

@@ -2923,14 +2923,22 @@ async fn stats_prefix_and_slash_send_the_status_embed_after_the_same_permission_
         let embeds = payload["embeds"].as_array().unwrap();
         assert_eq!(embeds.len(), 1, "{payload}");
         let embed = &embeds[0];
-        assert_eq!(embed["title"], "Status");
+        assert_eq!(
+            embed["title"],
+            format!("{} Status", jmodguard::emoji::STATUS)
+        );
         assert_eq!(embed["description"], "**Server stats**");
         // A fresh database has no release observations: attention accent.
         assert_eq!(embed["color"], jmodguard::log_embeds::YELLOW);
         let fields = embed["fields"].as_array().unwrap();
         let layout = fields
             .iter()
-            .map(|f| (f["name"].as_str().unwrap(), f["inline"].as_bool().unwrap()))
+            .map(|f| {
+                (
+                    f["name"].as_str().unwrap().to_owned(),
+                    f["inline"].as_bool().unwrap(),
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             layout,
@@ -2942,11 +2950,15 @@ async fn stats_prefix_and_slash_send_the_status_embed_after_the_same_permission_
                 ("Release status", false),
                 ("Container use", false),
             ]
+            .map(|(name, inline)| (
+                format!("{} {name}", jmodguard::emoji::label(name).unwrap()),
+                inline
+            ))
         );
         for field in &fields[1..4] {
             assert_eq!(
                 field["value"],
-                if field["name"] == "Cases" {
+                if field["name"] == format!("{} Cases", jmodguard::emoji::label("Cases").unwrap()) {
                     "`unavailable`"
                 } else {
                     "`0`"
@@ -2954,7 +2966,10 @@ async fn stats_prefix_and_slash_send_the_status_embed_after_the_same_permission_
             );
         }
         let value = |name: &str| {
-            fields.iter().find(|f| f["name"] == name).unwrap()["value"]
+            fields
+                .iter()
+                .find(|f| f["name"] == format!("{} {name}", jmodguard::emoji::label(name).unwrap()))
+                .unwrap()["value"]
                 .as_str()
                 .unwrap()
                 .to_string()
@@ -3142,7 +3157,10 @@ async fn custom_stats_response_gets_plain_text_stats_through_prefix_and_slash() 
     let slash = fx.sent("slash custom text");
     for payload in [&prefix, &slash] {
         assert_eq!(payload["content"], "Latest numbers:");
-        assert_eq!(payload["embeds"][0]["title"], "Status");
+        assert_eq!(
+            payload["embeds"][0]["title"],
+            format!("{} Status", jmodguard::emoji::STATUS)
+        );
         assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
     }
     fx.finish();
