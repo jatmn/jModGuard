@@ -2260,6 +2260,8 @@ async fn api_role_startup_receipts_log_one_info_line_per_unreachable_link_attemp
     // Two attempts on consecutive polls, as every deploy produces.
     assert!(!service.tick().await.unwrap());
     tokio::time::sleep(Duration::from_millis(1_100)).await;
+    // #609: the healthy production swap was still waiting at 32s and 49s.
+    service.startup_link_down_since = Some(Instant::now() - Duration::from_secs(49));
     assert!(!service.tick().await.unwrap());
     drop(capture);
     assert_eq!(

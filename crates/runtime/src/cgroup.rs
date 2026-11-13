@@ -637,29 +637,38 @@ fn missing_memory_usage_name(
     }
 }
 
-static FIRST_MISSING: OnceLock<&'static str> = OnceLock::new();
+// The boolean distinguishes verified absence from unreadable/invalid input.
+static FIRST_MISSING: OnceLock<(&'static str, bool)> = OnceLock::new();
 
 // Remember only a fixed file/key name, never the resolved cgroup path or contents.
 fn memory_input<T>(value: Option<T>, name: &'static str) -> Option<T> {
     if value.is_none() {
-        let _ = FIRST_MISSING.set(name);
+        let _ = FIRST_MISSING.set((name, false));
     }
     value
 }
 
-// Warn once, the first time memory is unavailable or needed a fallback source.
+// Log once, the first time memory is unavailable or needed a fallback source.
 fn report_memory_source(memory: Option<MemoryUse>) {
     static REPORTED: Once = Once::new();
     let source = memory.map(|memory| memory.source);
     if source != Some(MemorySource::CgroupStat) {
         REPORTED.call_once(|| {
-            let name = FIRST_MISSING.get().copied().unwrap_or("none");
-            let outcome = source.map_or("unavailable", |_| "fallback");
-            tracing::warn!(
-                name,
-                ?source,
-                "container memory {outcome}: cgroup file or key missing, unreadable, or invalid"
-            );
+            let (name, absent) = FIRST_MISSING.get().copied().unwrap_or(("none", false));
+            if name == "memory.stat" && absent && source == Some(MemorySource::CgroupUsage) {
+                tracing::info!(
+                    name,
+                    ?source,
+                    "container memory fallback: memory.stat absent; usage includes page cache"
+                );
+            } else {
+                let outcome = source.map_or("unavailable", |_| "fallback");
+                tracing::warn!(
+                    name,
+                    ?source,
+                    "container memory {outcome}: cgroup file or key missing, unreadable, or invalid"
+                );
+            }
         });
     }
 }
@@ -676,9 +685,21 @@ fn read_memory_limit(dir: &Path, name: &'static str) -> Option<MemoryLimit> {
     memory_input(None, name)
 }
 
+// A missing optional stat file is expected on some hosts. Keep failed reads
+// distinct so an existing unreadable file still produces a warning.
+fn read_memory_stat(dir: &Path) -> Option<String> {
+    let path = dir.join("memory.stat");
+    let stat = read_limited(&path);
+    if stat.is_none() {
+        let absent = matches!(path.try_exists(), Ok(false));
+        let _ = FIRST_MISSING.set(("memory.stat", absent));
+    }
+    stat
+}
+
 fn parse_v2_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
     let current = memory_input(parse_u64_token(current_text), "memory.current")?;
-    let Some(stat) = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat") else {
+    let Some(stat) = read_memory_stat(dir) else {
         return usage_only(current, read_memory_limit(dir, "memory.max")?);
     };
     // Type-based file/shmem counters cannot reconstruct the inactive file list:
@@ -690,7 +711,7 @@ fn parse_v2_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
 
 fn parse_v1_memory(dir: &Path, current_text: &str, host_total: Option<u64>) -> Option<MemoryUse> {
     let current = memory_input(parse_u64_token(current_text), "memory.usage_in_bytes")?;
-    let Some(stat) = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat") else {
+    let Some(stat) = read_memory_stat(dir) else {
         return usage_only(current, read_v1_memory_limit(dir, host_total)?);
     };
     let fallback = stat_value(&stat, "total_inactive_file");
@@ -1874,6 +1895,94 @@ mod tests {
         let reading = read_mounted_cgroup("1:memory:/app\n2:cpuacct:/app\n", &info, None);
         assert!(reading.memory.is_none());
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_nanos(2_000));
+    }
+
+    // A fresh process isolates production's once-per-process diagnostics from
+    // other filesystem cases, even when run by the ordinary Cargo harness.
+    #[test]
+    fn memory_source_log_levels() {
+        let Ok(case) = std::env::var("JMODGUARD_MEMORY_LOG_CASE") else {
+            for case in [
+                "absent-v1",
+                "absent-v2",
+                "unreadable",
+                "invalid",
+                "unavailable",
+            ] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "cgroup::tests::memory_source_log_levels",
+                        "--nocapture",
+                    ])
+                    .env("JMODGUARD_MEMORY_LOG_CASE", case)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let tree = temp_tree();
+        let usage = if case == "absent-v1" {
+            "memory.usage_in_bytes"
+        } else {
+            "memory.current"
+        };
+        write_files(&tree.path, &[(usage, "1000\n")]);
+        match case.as_str() {
+            "unreadable" => std::fs::create_dir(tree.path.join("memory.stat")).unwrap(),
+            "invalid" => write_files(&tree.path, &[("memory.stat", "inactive_file invalid\n")]),
+            "unavailable" => write_files(&tree.path, &[(usage, "invalid\n")]),
+            _ => {}
+        }
+        let capture = LogLevels::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        for _ in 0..2 {
+            let memory = read_cgroup(Some(&tree.path), None).memory;
+            if case.starts_with("absent") || case == "unreadable" {
+                assert_eq!(memory.unwrap().source, MemorySource::CgroupUsage);
+                assert_eq!(memory.unwrap().program_bytes, 1000);
+            } else {
+                assert!(memory.is_none());
+            }
+            report_memory_source(memory);
+        }
+        let expected = if case.starts_with("absent") {
+            tracing::Level::INFO
+        } else {
+            tracing::Level::WARN
+        };
+        assert_eq!(
+            *capture.0.lock().unwrap(),
+            vec![expected],
+            "log once per process"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct LogLevels(std::sync::Arc<std::sync::Mutex<Vec<tracing::Level>>>);
+
+    impl tracing::Subscriber for LogLevels {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() == "jmodguard_runtime::cgroup" {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
     }
 
     #[test]
