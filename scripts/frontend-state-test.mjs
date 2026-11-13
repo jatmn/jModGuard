@@ -4193,24 +4193,198 @@ test('activity-log events from the config payload render template and log-channe
   assert.match(logs[1].querySelector('textarea').value, /^42$/);
 });
 
-test('native server selection restores the selected server and draft when navigation is cancelled', async () => {
+// Sidebar server switcher (#589): a listbox with server icons replaces the native select.
+const switcherGuilds = [
+  { id: '111111111111111111', name: 'Alpha', icon: 'a1b2c3', manage: true, access: 'manage' },
+  { id: '222222222222222222', name: 'Bravo', icon: null, manage: true, access: 'manage' },
+  { id: '333333333333333333', name: 'Charlie has a very long server name that cannot fit in the sidebar', icon: 'ffee00', manage: true, access: 'manage' },
+];
+async function switcherHarness(guilds, confirm = () => true) {
   const calls = [];
-  const h = harness(async url => { calls.push(url); return response({}); }, new Map(), new Map(), () => false);
+  const h = harness(async (url, options) => {
+    calls.push(`${options?.method || 'GET'} ${url}`);
+    if (url.endsWith('/api/me')) return response({ user: { id: '123456789012345678' }, guilds });
+    if (url.endsWith('/config')) return response({ enrollment_id: 'membership', settings: { prefix: '!' }, rules: [], commands: [], log_channels: [], badwords: [], templates: [] });
+    return response({});
+  }, new Map(), new Map(), confirm);
+  await h.app.init(); await settle();
+  const trigger = () => h.document.querySelector('#guild-select');
+  const list = () => h.document.getElementById(trigger().getAttribute('aria-controls'));
+  const options = () => [...h.document.querySelectorAll('#guild-select-list [role=option]')];
+  const key = (element, name) => fire(element, 'keydown', { key: name });
+  return { h, calls, trigger, list, options, key };
+}
+const iconUrl = guild => `https://cdn.discordapp.com/icons/${guild.id}/${guild.icon}.png`;
+
+test('server switcher shows each server icon or letter avatar, with the selected icon on the closed control', async () => {
+  const { h, calls, trigger, list, options } = await switcherHarness(switcherGuilds);
+  // The closed control shows the selected server's CDN icon (hash from /api/me) beside its name.
+  const closedIcon = trigger().querySelector('img.server-icon');
+  assert.ok(closedIcon, 'selected server icon on the closed control');
+  assert.equal(closedIcon.getAttribute('src'), iconUrl(switcherGuilds[0]));
+  assert.equal(closedIcon.getAttribute('alt'), '');
+  assert.equal(trigger().querySelector('.server-picker-name').textContent, 'Alpha');
+  const label = h.document.querySelector('label[for="guild-select"]');
+  assert.equal(label.textContent, 'Your server');
+  assert.equal(trigger().localName, 'button');
+  assert.deepEqual(trigger().getAttribute('aria-labelledby').split(' ').map(id => h.document.getElementById(id).textContent), ['Your server', 'Alpha']);
+  assert.equal(trigger().getAttribute('aria-haspopup'), 'listbox');
+  assert.equal(trigger().getAttribute('aria-expanded'), 'false');
+  assert.equal(list().hidden, true);
+  assert.equal(options().length, 0);
+
+  const before = calls.length;
+  await fire(trigger(), 'click');
+  assert.equal(trigger().getAttribute('aria-expanded'), 'true');
+  assert.equal(list().hidden, false);
+  assert.equal(list().getAttribute('role'), 'listbox');
+  assert.equal(h.document.getElementById(list().getAttribute('aria-labelledby')).textContent, 'Your server');
+  assert.equal(h.document.activeElement, list());
+  assert.deepEqual(options().map(option => option.querySelector('.server-picker-name').textContent), switcherGuilds.map(guild => guild.name));
+  assert.deepEqual(options().map(option => option.getAttribute('aria-selected')), ['true', 'false', 'false']);
+  assert.equal(list().getAttribute('aria-activedescendant'), options()[0].id);
+  assert.equal(options()[0].querySelector('img.server-icon').getAttribute('src'), iconUrl(switcherGuilds[0]));
+  assert.equal(options()[1].querySelector('img'), null, 'a server without an icon hash has no image');
+  assert.equal(options()[1].querySelector('.server-icon-letter').textContent, 'B');
+  assert.equal(options()[2].querySelector('img.server-icon').getAttribute('src'), iconUrl(switcherGuilds[2]));
+  // Long names keep the full name available while the visible text is truncated.
+  const longName = options()[2].querySelector('.server-picker-name');
+  assert.equal(longName.title, switcherGuilds[2].name);
+  assert.equal(longName.textContent, switcherGuilds[2].name);
+  assert.deepEqual(calls.slice(before), [], 'opening the switcher makes no API or Discord requests');
+
+  await fire(h.document.body, 'mousedown');
+  assert.equal(trigger().getAttribute('aria-expanded'), 'false', 'an outside click closes the list');
+  assert.equal(h.app.state.guildId, switcherGuilds[0].id);
+});
+
+test('server switcher name truncation reuses the compact select sizing', () => {
+  const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
+  const rule = selector => css.match(new RegExp('^' + selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\{([^}]*)\\}', 'm'))?.[1] ?? '';
+  for (const declaration of [/min-width:\s*0/, /overflow:\s*hidden/, /text-overflow:\s*ellipsis/, /white-space:\s*nowrap/])
+    assert.match(rule('.server-picker-name'), declaration);
+  assert.match(rule('.server-icon'), /width:\s*20px/);
+  assert.match(rule('.server-icon'), /border-radius:\s*50%/);
+  assert.match(rule('.server-picker > .select'), /width:\s*100%/);
+  // The trigger is the existing compact select control, not a new size scale.
+  const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8');
+  assert.match(source, /className: "select select-sm w-full server-picker-trigger"/);
+});
+
+test('server switcher keyboard moves the active option, selects with Enter and closes with Escape', async () => {
+  const { h, calls, trigger, list, options, key } = await switcherHarness(switcherGuilds);
+  const active = () => list().getAttribute('aria-activedescendant');
+  await key(trigger(), 'ArrowDown');
+  assert.equal(trigger().getAttribute('aria-expanded'), 'true');
+  assert.equal(active(), options()[0].id);
+  await key(list(), 'ArrowDown');
+  assert.equal(active(), options()[1].id);
+  assert.ok(options()[1].classList.contains('menu-focus'));
+  await key(list(), 'ArrowDown');
+  await key(list(), 'ArrowDown');
+  assert.equal(active(), options()[2].id, 'ArrowDown stops at the last option');
+  await key(list(), 'ArrowUp');
+  assert.equal(active(), options()[1].id);
+  await key(list(), 'Home');
+  assert.equal(active(), options()[0].id);
+  await key(list(), 'End');
+  assert.equal(active(), options()[2].id);
+  const before = calls.length;
+  await key(list(), 'Escape');
+  assert.equal(trigger().getAttribute('aria-expanded'), 'false');
+  assert.equal(h.document.activeElement, trigger(), 'Escape returns focus to the trigger');
+  assert.equal(h.app.state.guildId, switcherGuilds[0].id, 'Escape keeps the selection');
+  assert.deepEqual(calls.slice(before), []);
+
+  // Enter on the current server is a no-op.
+  await key(trigger(), 'ArrowDown');
+  await key(list(), 'Enter');
+  assert.equal(trigger().getAttribute('aria-expanded'), 'false');
+  assert.equal(h.app.state.guildId, switcherGuilds[0].id);
+  assert.deepEqual(calls.slice(before), [], 'selecting the current server does not reload it');
+
+  // Tab closes the list and returns focus to the trigger.
+  await fire(trigger(), 'click');
+  await key(list(), 'Tab');
+  assert.equal(trigger().getAttribute('aria-expanded'), 'false');
+  assert.equal(h.document.activeElement, trigger());
+
+  await key(trigger(), 'ArrowUp');
+  await key(list(), 'End');
+  await key(list(), 'Enter');
+  assert.equal(trigger().getAttribute('aria-expanded'), 'false');
+  assert.equal(h.document.activeElement, trigger());
+  assert.equal(h.app.state.guildId, switcherGuilds[2].id);
+  assert.ok(calls.slice(before).includes(`POST /api/guilds/${switcherGuilds[2].id}/config`), 'the new server configuration loads');
+  assert.equal(JSON.parse(h.storage.get(h.app.workspaceKey())).guildId, switcherGuilds[2].id);
+  assert.equal(trigger().querySelector('img.server-icon').getAttribute('src'), iconUrl(switcherGuilds[2]));
+  assert.equal(trigger().querySelector('.server-picker-name').title, switcherGuilds[2].name);
+
+  // Space selects too.
+  await fire(trigger(), 'click');
+  assert.equal(active(), options()[2].id, 'the list opens on the selected server');
+  await key(list(), 'ArrowUp');
+  await key(list(), ' ');
+  assert.equal(h.app.state.guildId, switcherGuilds[1].id);
+  assert.equal(trigger().querySelector('img'), null);
+  assert.equal(trigger().querySelector('.server-icon-letter').textContent, 'B');
+});
+
+test('server switcher selection runs the guarded switch and keeps drafts when leaving is cancelled', async () => {
+  let allow = false;
+  const { h, calls, trigger, options } = await switcherHarness(switcherGuilds, () => allow);
   h.app.state.config = { templates: [{event: 'member_join', effective: 'Welcome'}] };
   h.app.navigate('templates');
   await settle();
   const draft = h.document.querySelector('.template-card textarea');
   draft.value = 'Unsaved template';
   await fire(draft, 'input');
-  const select = h.document.querySelector('#guild-select');
-  assert.equal(select.localName, 'select');
-  const originalGuild = h.app.state.guildId;
-  await chooseOption(select, 'Second');
-  assert.equal(select.value, originalGuild);
-  assert.equal(h.app.state.guildId, originalGuild);
+  const before = calls.length;
+  await fire(trigger(), 'click');
+  await fire(options()[1], 'click');
+  assert.equal(h.app.state.guildId, switcherGuilds[0].id);
+  assert.equal(trigger().querySelector('.server-picker-name').textContent, 'Alpha');
   assert.equal(draft.value, 'Unsaved template');
   assert.equal(h.app.isDirty(), true);
-  assert.deepEqual(calls, []);
+  assert.deepEqual(calls.slice(before), []);
+
+  allow = true;
+  await fire(trigger(), 'click');
+  await fire(options()[1], 'click');
+  assert.equal(h.app.state.guildId, switcherGuilds[1].id);
+  assert.equal(h.app.isDirty(), false, 'switching discards the confirmed drafts');
+  assert.deepEqual(calls.slice(before), [`POST /api/guilds/${switcherGuilds[1].id}/config`]);
+});
+
+test('server switcher with one server or none', async () => {
+  const one = await switcherHarness([switcherGuilds[0]]);
+  assert.equal(one.trigger().querySelector('img.server-icon').getAttribute('src'), iconUrl(switcherGuilds[0]));
+  assert.equal(one.trigger().querySelector('.server-picker-name').textContent, 'Alpha');
+  await fire(one.trigger(), 'click');
+  assert.equal(one.options().length, 1);
+  assert.equal(one.options()[0].getAttribute('aria-selected'), 'true');
+
+  const none = await switcherHarness([]);
+  assert.equal(none.trigger().disabled, true);
+  assert.equal(none.trigger().textContent, 'No manageable servers');
+  assert.equal(none.trigger().querySelector('.server-icon'), null);
+  await fire(none.trigger(), 'click');
+  await none.key(none.trigger(), 'ArrowDown');
+  assert.equal(none.trigger().getAttribute('aria-expanded'), 'false');
+  assert.equal(none.list().hidden, true);
+  assert.equal(none.options().length, 0);
+});
+
+test('server switcher falls back to the letter avatar when an icon fails to load', async () => {
+  const { h, trigger, options } = await switcherHarness(switcherGuilds);
+  await fire(trigger().querySelector('img.server-icon'), 'error');
+  assert.equal(trigger().querySelector('img'), null);
+  assert.equal(trigger().querySelector('.server-icon-letter').textContent, 'A');
+  await fire(trigger(), 'click');
+  await fire(options()[2].querySelector('img.server-icon'), 'error');
+  assert.equal(options()[2].querySelector('img'), null);
+  assert.equal(options()[2].querySelector('.server-icon-letter').textContent, 'C');
+  assert.equal(h.app.state.guildId, switcherGuilds[0].id);
 });
 
 
@@ -6409,7 +6583,7 @@ test('incomplete server discovery offers retry and recovers the server list', as
   await fire(Array.from(h.document.querySelectorAll('button')).find(n => n.textContent === 'Retry server discovery'), 'click');
   assert.equal(attempts, 2);
   assert.equal(h.app.state.guildId, guild.id);
-  assert.equal(h.document.querySelector('#guild-select').value, guild.id);
+  assert.equal(h.document.querySelector('#guild-select .server-picker-name').textContent, guild.name);
   assert.ok(!h.document.body.textContent.includes('Some server access checks could not finish'));
 });
 

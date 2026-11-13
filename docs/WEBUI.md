@@ -87,9 +87,22 @@ The shared appearance hook retains the session preference even without storage. 
 policy remain application logic. Headless UI owns dialog focus restoration,
 Escape/outside dismissal and field label associations. Selects use native browser
 menus and keyboard selection, styled by daisyUI; inline text filtering is removed.
+The sidebar **Your server** switcher is the one exception: native options cannot
+show images, so it is a small first-party listbox in `frontend/app.js`. Its trigger
+is a button with the compact daisyUI select size and chevron; the open list is a
+daisyUI menu. Each server shows a 20px round Discord CDN icon (the same
+`serverIconUrl` source as the owner Bot servers page, using the guild `icon` hash
+`/api/me` already returns) or a letter avatar when it has no icon or the image
+fails to load; long names end in an ellipsis with the full name as a tooltip.
+Arrow keys, Home and End move the active option (`aria-activedescendant` on the
+focused `role="listbox"`), Enter or Space selects, Escape closes and returns focus
+to the trigger, and Tab or an outside click closes. Opening it makes no API or
+Discord request; choosing another server runs the same unsaved-changes check,
+draft reset and configuration reload as before.
 Headless Listbox is another installed option, but its custom popup retains the
 Floating UI stack. React Aria offers lower-level selection hooks that need custom
-rendering and state integration. Reusing Headless Select avoids both additions.
+rendering and state integration. Reusing Headless Select for form fields and the
+small custom switcher avoids both additions.
 TanStack and Floating UI are required, non-optional dependencies of the pinned
 Headless UI package. Removing their lock entries or installed directories is not
 a supported removal: the next `npm ci` must install that declared graph. Their

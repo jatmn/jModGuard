@@ -156,6 +156,155 @@ function serverIconUrl(server) {
     : null;
 }
 
+// A server's Discord CDN icon (the icon hash /api/me already returns), or a
+// letter avatar when it has none or the image fails to load.
+function ServerIcon({ guild }) {
+  const url = serverIconUrl({ guild_id: guild.id, icon_hash: guild.icon });
+  const [failed, setFailed] = useState(null);
+  if (url && failed !== url)
+    return h("img", { className: "server-icon", src: url, alt: "", width: 20, height: 20, onError: () => setFailed(url) });
+  const initial = Array.from(String(guild.name || "").trim())[0] || "?";
+  return h("span", { className: "server-icon server-icon-letter", "aria-hidden": "true" }, initial.toUpperCase());
+}
+
+// Native <option> elements cannot show images, so the sidebar switcher is a
+// small listbox: focus moves to the open list, which tracks the active option
+// with aria-activedescendant. It makes no requests; choosing a different server
+// runs the same guarded switch as before.
+function ServerPicker({ guilds, selectedId, onSelect, children }) {
+  const working = useContext(BusyContext);
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
+  const pickerRef = useRef(null);
+  const triggerRef = useRef(null);
+  const listRef = useRef(null);
+  const selectedIndex = guilds.findIndex((guild) => guild.id === selectedId);
+  const selected = guilds[selectedIndex];
+  const disabled = working || !guilds.length;
+  const optionId = (guild) => `guild-option-${guild.id}`;
+  useEffect(() => {
+    if (disabled && open) setOpen(false);
+  }, [disabled, open]);
+  useEffect(() => {
+    if (!open) return undefined;
+    listRef.current.focus();
+    const outside = (event) => {
+      if (!pickerRef.current?.contains(event.target)) setOpen(false);
+    };
+    document.addEventListener("mousedown", outside);
+    return () => document.removeEventListener("mousedown", outside);
+  }, [open]);
+  useEffect(() => {
+    if (open && guilds[active]) document.getElementById(optionId(guilds[active]))?.scrollIntoView?.({ block: "nearest" });
+  }, [open, active]);
+  const show = () => {
+    setActive(Math.max(selectedIndex, 0));
+    setOpen(true);
+  };
+  const close = (refocus) => {
+    setOpen(false);
+    if (refocus) triggerRef.current?.focus();
+  };
+  const choose = (index) => {
+    close(true);
+    if (guilds[index] && guilds[index].id !== selectedId) onSelect(guilds[index].id);
+  };
+  const onListKeyDown = (event) => {
+    const moves = { ArrowDown: Math.min(active + 1, guilds.length - 1), ArrowUp: Math.max(active - 1, 0), Home: 0, End: guilds.length - 1 };
+    if (Object.hasOwn(moves, event.key)) {
+      event.preventDefault();
+      setActive(moves[event.key]);
+    } else if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      choose(active);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      close(true);
+    } else if (event.key === "Tab") {
+      // Focus returns to the trigger, so Tab continues from there.
+      close(true);
+    }
+  };
+  return h(
+    "div",
+    { ref: pickerRef, className: "server-picker" },
+    h("label", { id: "guild-select-label", htmlFor: "guild-select" }, "Your server"),
+    h(
+      "button",
+      {
+        ref: triggerRef,
+        id: "guild-select",
+        type: "button",
+        className: "select select-sm w-full server-picker-trigger",
+        disabled,
+        "aria-haspopup": "listbox",
+        "aria-expanded": open ? "true" : "false",
+        "aria-controls": "guild-select-list",
+        "aria-labelledby": "guild-select-label guild-select-value",
+        onClick: () => (open ? close(false) : show()),
+        onKeyDown: (event) => {
+          if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+          event.preventDefault();
+          show();
+        },
+      },
+      selected && h(ServerIcon, { guild: selected }),
+      h(
+        "span",
+        { id: "guild-select-value", className: "server-picker-name", title: selected?.name },
+        selected ? selected.name : guilds.length ? "Select a server" : "No manageable servers",
+      ),
+    ),
+    h(
+      "ul",
+      {
+        ref: listRef,
+        id: "guild-select-list",
+        role: "listbox",
+        tabIndex: -1,
+        className: "menu menu-sm server-picker-list",
+        "aria-labelledby": "guild-select-label",
+        "aria-activedescendant": open && guilds[active] ? optionId(guilds[active]) : undefined,
+        hidden: !open,
+        onKeyDown: onListKeyDown,
+      },
+      open &&
+        guilds.map((guild, index) =>
+          h(
+            "li",
+            { key: guild.id, role: "none" },
+            h(
+              "div",
+              {
+                id: optionId(guild),
+                role: "option",
+                "aria-selected": guild.id === selectedId ? "true" : "false",
+                className: [guild.id === selectedId && "menu-active", index === active && "menu-focus"].filter(Boolean).join(" ") || undefined,
+                onMouseMove: () => index !== active && setActive(index),
+                onClick: () => choose(index),
+              },
+              h(ServerIcon, { guild }),
+              h("span", { className: "server-picker-name", title: guild.name }, guild.name),
+            ),
+          ),
+        ),
+    ),
+    children,
+  );
+}
+
+async function switchGuild(guildId) {
+  if (!canLeave()) return;
+  ui.set({ pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
+  pendingCase = null;
+  state.guildId = guildId;
+  if (!tabAllowed(state.tab)) state.tab = "dashboard";
+  state.config = null;
+  ui.set({ edits: "clean" });
+  persistWorkspace();
+  if (await loadConfig()) renderTab();
+}
+
 function directoryStatusLabel(server, receipt) {
   if (receipt) {
     if (botActionPhase(receipt) === "active") return ["Removing…", "badge-warning"];
@@ -471,32 +620,8 @@ function App() {
               h("span", null, "jModGuard", h("small", null, "MODERATION WORKSPACE")),
             ),
             h(
-              "div",
-              { className: "server-picker" },
-              h("label", { htmlFor: "guild-select" }, "YOUR SERVER"),
-              h(
-                Select,
-                {
-                  id: "guild-select",
-                  "aria-label": "YOUR SERVER",
-                  className: "select select-sm w-full",
-                  value: state.guildId || "",
-                  onChange: async (event) => {
-                    if (!canLeave()) return;
-                    ui.set({ pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
-                    pendingCase = null;
-                    state.guildId = event.target.value;
-                    if (!tabAllowed(state.tab)) state.tab = "dashboard";
-                    state.config = null;
-                    ui.set({ edits: "clean" });
-                    persistWorkspace();
-                    if (await loadConfig()) renderTab();
-                  },
-                },
-                state.guilds.length
-                  ? state.guilds.map((guild) => h("option", { key: guild.id, value: guild.id }, guild.name))
-                  : h("option", { value: "" }, "No manageable servers"),
-              ),
+              ServerPicker,
+              { guilds: state.guilds, selectedId: state.guildId, onSelect: switchGuild },
               state.me?.role_discovery_incomplete && h("p", { className: "muted", role: "status" },
                 "Some server access checks could not finish. ",
                 h(ActionButton, { className: "btn btn-xs", onClick: async () => {
