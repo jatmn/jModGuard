@@ -7828,6 +7828,8 @@ test('Platform analytics retains totals, chart and rows through refresh failures
   assert.match(h.nodes.get('#platform-analytics-status').textContent, /1 counted server has a member directory still importing/);
   await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
   assertRetained();
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /refresh failed: offline.*stale/i, 'retained figures remain stale while retrying');
+  assert.ok(h.nodes.get('#platform-analytics-status').classList.contains('alert-warning'));
   const timeout = [...h.timers.values()].find(timer => timer.delay === 30000);
   assert.ok(timeout);
   await timeout.fn();
@@ -7837,10 +7839,13 @@ test('Platform analytics retains totals, chart and rows through refresh failures
   assertRetained();
   assert.match(h.nodes.get('#platform-analytics-status').textContent, /timed out.*stale/i);
   await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
+  assertRetained();
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /timed out.*stale/i, 'a timeout warning also survives the pending retry');
   pending[3].resolve(response({ ...snapshot, servers: 3 }));
   await settle();
   assert.equal(totals()[0], '3');
   assert.doesNotMatch(h.nodes.get('#platform-analytics-status').textContent, /stale|failed/);
+  assert.ok(!h.nodes.get('#platform-analytics-status').classList.contains('alert-warning'));
 });
 
 test('Platform analytics initial failure reports unavailability and retry restores the view', async () => {

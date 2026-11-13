@@ -6871,7 +6871,11 @@ function useApiRead(path, { retainData = false } = {}) {
     const controller = new AbortController();
     let publication = "current";
     const timeout = setTimeout(() => controller.abort(), 30000);
-    setResult((current) => ({ kind: "loading", path, data: retainData && current.path === path ? current.data : null }));
+    setResult((current) => {
+      const retained = retainData && current.path === path && current.data != null;
+      // A pending retry does not make the retained snapshot fresh again.
+      return { kind: "loading", path, data: retained ? current.data : null, error: retained ? current.error : null };
+    });
     apiRead(path, controller.signal)
       .then((data) => {
         if (publication === "current") setResult({ kind: "loaded", path, data });
@@ -6896,7 +6900,7 @@ function useApiRead(path, { retainData = false } = {}) {
   return {
     loading: result.kind === "loading",
     data: retainData ? (result.path === path ? result.data ?? null : null) : result.kind === "loaded" ? result.data : null,
-    error: result.kind === "failed" ? result.error : null,
+    error: retainData ? (result.path === path ? result.error ?? null : null) : result.kind === "failed" ? result.error : null,
     refresh: () => setRevision((value) => value + 1),
   };
 }
