@@ -13,26 +13,51 @@ pub(crate) fn log_text(message: &serde_json::Value) -> String {
     assert_eq!(message["embeds"].as_array().unwrap().len(), 1);
     let embed = &message["embeds"][0];
     assert!(embed["color"].as_u64().is_some());
-    let mut text = embed["title"].as_str().unwrap().to_string();
+    let fields = embed["fields"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let title = embed["title"].as_str().unwrap();
+    // Shipped layouts carry one map emoji per title and label; custom text stays plain.
+    let mut text = if fields.is_empty() {
+        assert_eq!(map_emoji_prefix(title), None, "custom title: {title}");
+        title.to_string()
+    } else {
+        let emoji = map_emoji_prefix(title).expect(title);
+        assert!(
+            jmodguard::emoji::EVENTS
+                .iter()
+                .chain(jmodguard::emoji::ACTIONS)
+                .any(|(_, known)| *known == emoji),
+            "{title}"
+        );
+        title[emoji.len() + 1..].to_string()
+    };
     if let Some(description) = embed["description"].as_str() {
         text.push_str("\n\n");
         text.push_str(description);
     }
-    for (index, field) in embed["fields"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .enumerate()
-    {
+    for (index, field) in fields.iter().enumerate() {
+        let name = field["name"].as_str().unwrap();
+        let emoji = map_emoji_prefix(name).expect(name);
+        let label = &name[emoji.len() + 1..];
+        assert_eq!(jmodguard::emoji::label(label), Some(emoji), "{name}");
         text.push_str(if index == 0 { "\n\n" } else { "\n" });
         text.push_str(&format!(
             "**{}:** {}",
-            field["name"].as_str().unwrap(),
+            label,
             field["value"].as_str().unwrap()
         ));
     }
     text
+}
+
+/// The map emoji (followed by one space) that starts `text`, if any.
+pub(crate) fn map_emoji_prefix(text: &str) -> Option<&'static str> {
+    jmodguard::emoji::all().find(|emoji| {
+        text.strip_prefix(emoji)
+            .is_some_and(|rest| rest.starts_with(' '))
+    })
 }
 
 use crate::config::BotProcessConfig;
@@ -3236,23 +3261,25 @@ async fn replayed_bulk_attachment_forbidden_delivers_plain_text() {
     for (index, request) in seen.iter().enumerate() {
         let payload = request_log_payload(request);
         let embed = &payload["embeds"][0];
-        assert_eq!(embed["title"], "Messages deleted");
         assert_eq!(embed["color"], jmodguard::log_embeds::RED);
         assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
         assert!(payload.get("content").is_none());
         assert!(payload.get("flags").is_none());
         if index == 0 {
-            assert_eq!(embed["fields"][0]["name"], "Channel");
+            assert_eq!(embed["title"], "🗑️ Messages deleted");
+            assert_eq!(embed["fields"][0]["name"], "📍 Channel");
             assert_eq!(embed["fields"][0]["value"], "<#456>");
             assert!(
                 embed["fields"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|f| f["name"] == "Details"
+                    .any(|f| f["name"] == "ℹ️ Details"
                         && f["value"].as_str().unwrap() == "last observed: bulk fallback body")
             );
         } else {
+            // Transcript chunks are description text, not the shipped field layout.
+            assert_eq!(embed["title"], "Messages deleted");
             assert!(
                 embed["description"]
                     .as_str()
@@ -5318,7 +5345,7 @@ fn shipped_automod_embed_keeps_whole_proving_hashes_inside_field_limit() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["name"] == "Evidence")
+        .find(|f| f["name"] == "🧾 Evidence")
         .unwrap();
     let content = field["value"].as_str().unwrap();
     assert!(content.encode_utf16().count() <= 1024);

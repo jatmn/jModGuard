@@ -5965,7 +5965,7 @@ test('template preview shows embed color, title and fields, then live custom des
 });
 
 test('embed preview applies dynamic action/removal accents and aggregate field limits', () => {
-  const previewSource = source.slice(source.indexOf('function clipEmbedText('), source.indexOf('function logPreviewText('));
+  const previewSource = source.slice(source.indexOf('function continuesEmojiSequence('), source.indexOf('function logPreviewText('));
   const preview = vm.runInNewContext(`${previewSource}\ntemplateEmbedPreview`);
   assert.equal(preview({embed_style: {title: 'Log event', color: 0xffb347}}, 'Unknown {constructor} {__proto__} {missing}', {}).description, 'Unknown {constructor} {__proto__} {missing}');
   const record = {
@@ -5985,6 +5985,52 @@ test('embed preview applies dynamic action/removal accents and aggregate field l
   assert.ok(total <= 6000);
   assert.equal(embed.fields[0].value.length, 1023);
   assert.equal(embed.fields[0].value.at(-1), '…');
+});
+
+test('Discord preview matches the bot renderer for every template type, including emoji', () => {
+  const previewSource = source.slice(source.indexOf('function continuesEmojiSequence('), source.indexOf('function logPreviewText('));
+  const preview = vm.runInNewContext(`${previewSource}\ntemplateEmbedPreview`);
+  // Golden cases written by the API test template_preview_cases_match_the_bot_renderer.
+  const golden = JSON.parse(fs.readFileSync(new URL('../crates/api/src/web/template_preview_cases.json', import.meta.url), 'utf8'));
+  const cases = golden.cases.map(c => ({...c, vars: {...golden.vars, action: c.action}}));
+  const emoji = /\p{Extended_Pictographic}/u;
+  let decorated = 0;
+  for (const c of cases) {
+    const got = preview(c.record, c.template, c.vars);
+    // JSON round-trip drops the vm realm's prototypes before a strict comparison.
+    const actual = JSON.parse(JSON.stringify({title: got.title, color: got.color, description: got.description, fields: got.fields.map(({name, value}) => ({name, value}))}));
+    assert.deepEqual(actual, c.discord, c.name);
+    if (c.template === c.record.shipped) {
+      assert.ok(emoji.test(got.title.split(' ')[0]), `${c.name}: title emoji`);
+      assert.ok(got.fields.every(f => emoji.test(f.name.split(' ')[0])), `${c.name}: label emoji`);
+      decorated++;
+    }
+  }
+  assert.ok(decorated >= 26, 'every shipped template type is replayed');
+  const custom = cases.find(c => c.name === 'member_ban custom with emoji');
+  assert.ok(preview(custom.record, custom.template, custom.vars).description.startsWith('\u{1F528} '));
+  const plain = cases.find(c => c.name === 'member_ban custom without emoji');
+  assert.equal(preview(plain.record, plain.template, plain.vars).description, 'Plain v-user {emoji} \u{1F528} own wording');
+  // Without preview data (older API) the preview stays as before.
+  const legacy = {...custom.record, preview_emoji: undefined};
+  assert.equal(preview(legacy, legacy.shipped, custom.vars).title, legacy.embed_style.title);
+});
+
+test('Discord preview clipping never splits an emoji sequence', () => {
+  const clipSource = source.slice(source.indexOf('function continuesEmojiSequence('), source.indexOf('function renderEmbedText('));
+  const clip = vm.runInNewContext(`${clipSource}\nclipEmbedText`);
+  for (const text of ['\u{1F9D1}\u200d\u2696\ufe0f Moderator', '\u2139\ufe0f Details', '\u23f1\ufe0f Timeout added', '\u{1F5D1}\ufe0f x']) {
+    const lead = text.split(' ')[0];
+    for (let limit = 0; limit <= text.length + 1; limit++) {
+      const out = clip(text, limit);
+      assert.ok(out.length <= limit, `${limit}`);
+      const kept = out.replace(/…$/, '');
+      assert.ok(kept === '' || kept.startsWith(lead), `${JSON.stringify(text)} ${limit}: ${JSON.stringify(out)}`);
+    }
+  }
+  assert.equal(clip('\u{1F9D1}\u200d\u2696\ufe0f Moderator', 4), '…');
+  assert.equal(clip('\u{1F980}', 1), '…');
+  assert.equal(clip('abc', 3), 'abc');
 });
 
 const directoryServer = {

@@ -1752,12 +1752,26 @@ fn render_outcome(cmd: &CommandDef, outcome: &BehaviorOutcome) -> String {
         }
         _ => &cmd.response,
     };
+    // A built-in's shipped reply gets its map emoji; custom replies opt in with `{emoji}`.
+    let shipped = crate::defaults::default_commands()
+        .iter()
+        .any(|d| d.name.eq_ignore_ascii_case(&cmd.name) && d.response == cmd.response);
+    let decorated =
+        shipped.then(|| jmodguard::emoji::decorate_template(command_emoji(cmd), response));
+    if !shipped
+        && response.contains("{emoji}")
+        && !vars.contains_key("emoji")
+        && let Some(emoji) = command_emoji(cmd)
+    {
+        vars.insert("emoji".into(), emoji.into());
+    }
+    let template = decorated.as_deref().unwrap_or(response);
     if response.contains("{mod_reason_dm_clause}") {
-        return templates::render_bounded(response, &vars, DISCORD_MESSAGE_LIMIT);
+        return templates::render_bounded(template, &vars, DISCORD_MESSAGE_LIMIT);
     }
     let mut render_vars = vars.clone();
     render_vars.remove("mod_reason_dm_clause");
-    let rendered = templates::render_bounded(response, &render_vars, body_limit);
+    let rendered = templates::render_bounded(template, &render_vars, body_limit);
     if !clause.is_empty()
         && matches!(
             (&cmd.behavior, response),
@@ -1799,6 +1813,17 @@ fn embed_reply_content(cmd: &CommandDef, outcome: &BehaviorOutcome) -> Option<St
 /// 403/50013. The plain-text reply is then tried once instead.
 fn embed_refused(error: &serenity::Error) -> bool {
     crate::discord::http_error_response(error) == Some((403, 50013))
+}
+
+/// Map emoji for a command reply: the built-in command sharing this behavior,
+/// otherwise the custom-command emoji.
+fn command_emoji(cmd: &CommandDef) -> Option<&'static str> {
+    let kind = std::mem::discriminant(&cmd.behavior);
+    crate::defaults::default_commands()
+        .into_iter()
+        .find(|d| std::mem::discriminant(&d.behavior) == kind)
+        .and_then(|d| jmodguard::emoji::reply(&d.name))
+        .or_else(|| jmodguard::emoji::title("plan_executed", &BTreeMap::new()))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2827,7 +2852,7 @@ mod tests {
         };
         assert_eq!(
             render_outcome(&kick, &with_dm),
-            "Kicked Member | spam | Reason DM sent."
+            "👢 Kicked Member | spam | Reason DM sent."
         );
 
         let mut custom = kick.clone();
@@ -2835,7 +2860,7 @@ mod tests {
         assert_eq!(render_outcome(&custom, &with_dm), "Custom kick Member");
 
         with_dm.vars.remove("mod_reason_dm_clause");
-        assert_eq!(render_outcome(&kick, &with_dm), "Kicked Member | spam");
+        assert_eq!(render_outcome(&kick, &with_dm), "👢 Kicked Member | spam");
     }
 
     #[test]
@@ -3045,7 +3070,65 @@ mod tests {
         };
         assert_eq!(
             render_outcome(&kick, &outcome),
-            "Kicked Member | spam {user}"
+            "👢 Kicked Member | spam {user}"
+        );
+    }
+
+    /// Every built-in reply gets exactly its map emoji once, in front of the
+    /// unchanged plain reply; custom replies stay byte-for-byte or opt in with `{emoji}`.
+    #[test]
+    fn shipped_replies_get_one_map_emoji_and_custom_replies_opt_in() {
+        let vars = BTreeMap::from([
+            ("target".into(), "Member {emoji}".into()),
+            ("reason".into(), "spam 🔨".into()),
+            ("minutes".into(), "5".into()),
+            ("duration".into(), "5m".into()),
+            ("seconds".into(), "5".into()),
+            ("count".into(), "3".into()),
+            ("name".into(), "Bot".into()),
+            ("prefix".into(), "?".into()),
+        ]);
+        let outcome = BehaviorOutcome {
+            response: None,
+            vars: vars.clone(),
+            emitted_log_events: Vec::new(),
+            suppress_response: false,
+            embed: None,
+        };
+        let mut covered = 0;
+        for cmd in crate::defaults::default_commands() {
+            if cmd.response.is_empty() {
+                continue;
+            }
+            let emoji = jmodguard::emoji::reply(&cmd.name).unwrap();
+            let text = render_outcome(&cmd, &outcome);
+            let plain = text.strip_prefix(&format!("{emoji} ")).expect(&text);
+            assert!(
+                !jmodguard::emoji::all().any(|e| plain.starts_with(e)),
+                "{}: one emoji: {text}",
+                cmd.name
+            );
+            // Values are untouched: the reason's own emoji and literal `{emoji}` stay as typed.
+            let mut custom = cmd.clone();
+            custom.response = format!("Custom {}", cmd.response);
+            assert_eq!(
+                render_outcome(&custom, &outcome),
+                templates::render(&custom.response, &vars),
+                "custom replies render exactly as before"
+            );
+            custom.response = "{emoji} done {target}".into();
+            assert_eq!(
+                render_outcome(&custom, &outcome),
+                format!("{emoji} done Member {{emoji}}")
+            );
+            assert_eq!(render_outcome(&cmd, &outcome), text, "re-render is stable");
+            covered += 1;
+        }
+        assert!(covered >= 10);
+        assert_eq!(
+            render_outcome(&say_cmd("{emoji} said"), &outcome),
+            "⌨️ said",
+            "custom behaviors use the custom-command emoji"
         );
     }
 

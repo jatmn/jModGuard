@@ -25,6 +25,7 @@ pub use jmodguard_runtime::process_ready;
 pub use jmodguard_runtime::set_process_ready;
 pub use jmodguard_runtime::set_shutdown_context;
 pub mod attachment_burst;
+pub mod emoji;
 pub mod ids;
 pub mod image_spam;
 pub mod known_spam;

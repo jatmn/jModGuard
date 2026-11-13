@@ -1444,9 +1444,17 @@ pub(crate) async fn preview_automod(
     vars.entry("time".into())
         .or_insert_with(|| chrono::Utc::now().to_rfc3339());
     vars.insert("guild".into(), guild_id.get().to_string());
-    let mut owned = vars.clone();
+    let mut owned = jmodguard::emoji::with_var("automod", vars).unwrap_or_else(|| vars.clone());
     templates::format_log_timestamps(&mut owned);
     let rendered = render_log_template("automod", &template, &mut owned);
+    if template == default_template("automod") {
+        // The shipped body carries the embed's map emoji; vars are already bounded.
+        let decorated = jmodguard::emoji::decorate_template(
+            jmodguard::emoji::title("automod", &owned),
+            &template,
+        );
+        return templates::render_bounded(&decorated, &owned, 2000);
+    }
     // Fresh reviews use the shipped heading spelling that decision_edit promotes.
     // Canonicalize only its separator; preserve custom headings and all body bytes.
     let title = jmodguard::log_embeds::style("automod").title;

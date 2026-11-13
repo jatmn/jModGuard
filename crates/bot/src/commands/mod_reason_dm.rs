@@ -78,7 +78,14 @@ pub(crate) fn mod_reason_dm_vars(
 }
 
 pub(crate) fn render_mod_reason_dm_body(vars: &BTreeMap<String, String>) -> String {
-    jmodguard::templates::render_bounded(jmodguard::defaults::MOD_REASON_DM_TEMPLATE, vars, 2000)
+    render_shipped_dm(jmodguard::defaults::MOD_REASON_DM_TEMPLATE, vars)
+}
+
+/// Shipped DM text with its map emoji: title by `{action}` (or the failure kind), label emoji.
+fn render_shipped_dm(template: &str, vars: &BTreeMap<String, String>) -> String {
+    let kind = vars.get("action").map_or("failed", String::as_str);
+    let template = jmodguard::emoji::decorate_template(jmodguard::emoji::reply(kind), template);
+    jmodguard::templates::render_bounded(&template, vars, 2000)
 }
 
 /// Production DM text preparation: strips ban attempt tags before render.
@@ -154,10 +161,9 @@ async fn send_mod_reason_dm_moderation_failed_followup_inner(
         .unwrap_or_else(|| env.guild_id.to_string());
     let mut vars = BTreeMap::new();
     vars.insert("guild".into(), guild);
-    let text = jmodguard::templates::render_bounded(
+    let text = render_shipped_dm(
         jmodguard::defaults::MOD_REASON_DM_MODERATION_FAILED_TEMPLATE,
         &vars,
-        2000,
     );
     let channel = match crate::discord::race_discord_call(
         &env.app.activation,
@@ -247,7 +253,7 @@ async fn send_mod_reason_dm_inner(
     } else {
         let clean = jmodguard::ban_reason::without_tag(reason);
         let vars = mod_reason_dm_vars(&guild, action, clean, &actor);
-        jmodguard::templates::render_bounded(template, &vars, 2000)
+        render_shipped_dm(template, &vars)
     };
 
     let channel = match crate::discord::race_discord_call(
@@ -418,6 +424,36 @@ mod tests {
         );
         assert!(!body.contains("were banned"));
         assert!(!body.contains("You are being banned"));
+    }
+
+    #[test]
+    fn shipped_dms_get_one_map_emoji_per_title_and_label_and_plain_values() {
+        let body =
+            render_mod_reason_dm_body_for_reason("Guild", "banned", "spam 🔨 {emoji}", "Mod");
+        assert_eq!(
+            body,
+            "🔨 A moderator has requested your removal from **Guild**.\n⚡ Action: banned\n📝 Reason: spam 🔨 {emoji}\n— Mod"
+        );
+        let kicked = render_mod_reason_dm_body_for_reason("Guild", "kicked", "spam", "Mod");
+        assert!(kicked.starts_with("👢 A moderator"), "{kicked}");
+        let vars = mod_reason_dm_vars("Guild", "kicked", "spam", "Mod");
+        let removed = render_shipped_dm(
+            jmodguard::defaults::MOD_REASON_DM_ALREADY_REMOVED_TEMPLATE,
+            &vars,
+        );
+        assert_eq!(
+            removed,
+            "👢 You are already removed from **Guild**.\n⚡ Action: kicked\n📝 Reason: spam\n— Mod"
+        );
+        let failed = render_shipped_dm(
+            jmodguard::defaults::MOD_REASON_DM_MODERATION_FAILED_TEMPLATE,
+            &BTreeMap::from([("guild".into(), "Guild".into())]),
+        );
+        assert!(
+            failed.starts_with("⚠️ Update: your removal from **Guild**"),
+            "{failed}"
+        );
+        assert_eq!(failed.matches("⚠️").count(), 1);
     }
 
     #[test]

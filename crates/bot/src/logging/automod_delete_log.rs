@@ -889,7 +889,7 @@ async fn uncertain_gateway_timeout_keeps_plain_delete_and_retained_text() {
     assert!(body.contains("after uncertain REST"), "{body}");
     assert_eq!(
         sent[0].1["embeds"][0]["fields"][4]["name"],
-        "Last observed text"
+        "💬 Last observed text"
     );
 }
 

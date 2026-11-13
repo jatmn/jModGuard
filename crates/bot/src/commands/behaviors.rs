@@ -910,7 +910,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 super::UserNameMatch::NotFound if !guild_cached => {
                     vars.insert("target".into(), token);
                     return Ok(BehaviorOutcome {
-                        response: Some(crate::templates::render(
+                        response: Some(super::voice_lookup::render_reply(
                             super::voice_lookup::GUILD_NOT_CACHED_TEMPLATE,
                             &vars,
                         )),
@@ -946,19 +946,25 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 } => {
                     vars.insert("channel".into(), channel_name);
                     vars.insert("channel_id".into(), channel_id.to_string());
-                    Some(crate::templates::render(
+                    Some(super::voice_lookup::render_reply(
                         super::voice_lookup::IN_CHANNEL_TEMPLATE,
                         &vars,
                     ))
                 }
-                super::voice_lookup::VoiceLookupSnapshot::NotInChannel => Some(
-                    crate::templates::render(super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE, &vars),
-                ),
-                super::voice_lookup::VoiceLookupSnapshot::GuildNotCached => Some(
-                    crate::templates::render(super::voice_lookup::GUILD_NOT_CACHED_TEMPLATE, &vars),
-                ),
+                super::voice_lookup::VoiceLookupSnapshot::NotInChannel => {
+                    Some(super::voice_lookup::render_reply(
+                        super::voice_lookup::NOT_IN_CHANNEL_TEMPLATE,
+                        &vars,
+                    ))
+                }
+                super::voice_lookup::VoiceLookupSnapshot::GuildNotCached => {
+                    Some(super::voice_lookup::render_reply(
+                        super::voice_lookup::GUILD_NOT_CACHED_TEMPLATE,
+                        &vars,
+                    ))
+                }
                 super::voice_lookup::VoiceLookupSnapshot::ChannelUnavailable => {
-                    Some(crate::templates::render(
+                    Some(super::voice_lookup::render_reply(
                         super::voice_lookup::CHANNEL_UNAVAILABLE_TEMPLATE,
                         &vars,
                     ))
@@ -2078,7 +2084,10 @@ mod tests {
             // logging::emit supplies time at delivery, after command vars.
             vars.insert("time".into(), "2026-11-09T12:00:00Z".into());
             let embed = jmodguard::log_embeds::render(event, template, &vars);
-            let field = |name: &str| &embed.fields.iter().find(|f| f.name == name).unwrap().value;
+            let field = |name: &str| {
+                let label = format!("{} {name}", jmodguard::emoji::label(name).unwrap());
+                &embed.fields.iter().find(|f| f.name == label).unwrap().value
+            };
             assert_eq!(
                 field("User"),
                 &format!("{target_name} · <@{target}> (`{target}`)"),
