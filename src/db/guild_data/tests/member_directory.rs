@@ -725,6 +725,57 @@ async fn directory_totals_report_import_and_gap_coverage() {
 }
 
 #[tokio::test]
+async fn directory_names_come_only_from_stored_rows_in_one_bounded_lookup() {
+    let (_f, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    // A snowflake above JS MAX_SAFE_INTEGER must round-trip exactly.
+    let big = 9_007_199_254_740_993_i64;
+    for (id, username, global, nick) in [
+        (77, Some("user77"), Some("Global 77"), Some("Nick 77")),
+        (78, Some("user78"), Some("Global 78"), None),
+        (big, Some("big"), None, Some("")),
+        (79, None, None, None),
+    ] {
+        let mut member = observed(id, Some(900), 1_500);
+        member.username = Some(username.map(str::to_owned));
+        member.global_name = Some(global.map(str::to_owned));
+        member.nickname = Some(nick.map(str::to_owned));
+        store.observe_member(scope.clone(), member).await.unwrap();
+    }
+    let (totals, mut names) = store
+        .directory_totals_with_names(scope.clone(), vec![77, 78, big, 79, 80])
+        .await
+        .unwrap();
+    names.sort();
+    assert_eq!(totals.current, 4);
+    assert_eq!(
+        names,
+        vec![
+            (77, "Nick 77".to_owned()),
+            (78, "Global 78".to_owned()),
+            (big, "big".to_owned()),
+        ],
+        "nickname, then global name, then username; nameless and unknown IDs are omitted"
+    );
+    let (_, none) = store
+        .directory_totals_with_names(scope.clone(), Vec::new())
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+    let too_many = (1..=DIRECTORY_NAME_LOOKUP_LIMIT as i64 + 1).collect();
+    assert!(
+        store
+            .directory_totals_with_names(scope, too_many)
+            .await
+            .is_err(),
+        "the lookup stays bounded"
+    );
+}
+
+#[tokio::test]
 async fn first_profile_insert_creates_pending_rejoin_receipt() {
     let (_f, store, scope) = ready().await;
     store

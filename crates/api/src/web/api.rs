@@ -1333,31 +1333,68 @@ pub async fn stats(
     Ok(Json(value))
 }
 
-/// Daily analytics trends for this guild, in the captured active membership.
-/// Server size comes from the guild's member directory; when the directory is
-/// unavailable (for example during a bot outage) the field is null and the
-/// series still answers.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyticsQuery {
+    days: Option<i64>,
+}
+
+/// Every analytics panel for this guild and one range (7, 30 or 90 days), in
+/// the captured active membership. All data comes from stored records: one
+/// core aggregate statement plus one guild-store statement for the member
+/// directory size and stored moderator names. When the directory is
+/// unavailable (for example during a bot outage) `members` is null, names are
+/// absent and the rest still answers. Complete answers are cached briefly per
+/// membership and range after authorization.
 pub async fn analytics(
     State(app): State<Arc<ApiState>>,
     session: Session,
     headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
+    Query(query): Query<AnalyticsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
-    let result = db::enrolled_guild_analytics(
-        &app.db,
-        enrollment.clone(),
-        db::ANALYTICS_DEFAULT_WINDOW_DAYS,
-    )
-    .await?;
-    let mut value = serde_json::json!(result);
-    let members = match app.tenant.live(enrollment).await {
-        Ok((store, scope)) => store.directory_totals(scope).await.ok(),
+    let days = query.days.unwrap_or(db::ANALYTICS_DEFAULT_WINDOW_DAYS);
+    if !db::ANALYTICS_RANGES.contains(&days) {
+        return Err(ApiError(anyhow::anyhow!(
+            "analytics range must be 7, 30 or 90 days"
+        )));
+    }
+    let key = (enrollment.guild_id, enrollment.id.clone(), days);
+    if let Some(cached) = app.analytics_cache.get(&key, std::time::Instant::now()) {
+        return Ok(Json(cached));
+    }
+    let result = db::enrolled_guild_analytics(&app.db, enrollment.clone(), days).await?;
+    let moderator_ids = result.moderators.iter().map(|m| m.moderator_id).collect();
+    let directory = match app.tenant.live(enrollment).await {
+        Ok((store, scope)) => store
+            .directory_totals_with_names(scope, moderator_ids)
+            .await
+            .ok(),
         Err(_) => None,
     };
-    value["members"] = serde_json::json!(members);
+    let mut value = serde_json::json!(result);
+    if let Some((_, names)) = &directory {
+        let names: std::collections::HashMap<String, &str> = names
+            .iter()
+            .map(|(id, name)| (id.to_string(), name.as_str()))
+            .collect();
+        if let Some(rows) = value["moderators"].as_array_mut() {
+            for row in rows {
+                if let Some(name) = row["moderator_id"].as_str().and_then(|id| names.get(id)) {
+                    row["name"] = serde_json::json!(name);
+                }
+            }
+        }
+    }
+    let complete = directory.is_some();
+    value["members"] = serde_json::json!(directory.map(|(totals, _)| totals));
+    if complete {
+        app.analytics_cache
+            .put(key, value.clone(), std::time::Instant::now());
+    }
     Ok(Json(value))
 }
 

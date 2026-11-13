@@ -381,18 +381,6 @@ test('hover-opened count tooltip closes on Escape wherever focus is and drops it
   assert.equal(h.documentListeners.has('keydown'), false, 'closing removes the document listener');
 });
 
-test('analytics opens with a one-line page header instead of the hero card', async () => {
-  const { app } = harness(() => new Promise(() => {}));
-  app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };
-  const panel = app.tabAnalytics();
-  await settle();
-  assert.equal(panel.querySelector('.hero, .dashboard-hero, .eyebrow')?.className ?? null, null);
-  const header = panel.querySelector('.page-header');
-  assert.ok(Boolean(header), 'expected a page header');
-  assert.equal(header.querySelector('h2').textContent, 'Analytics');
-  assert.match(header.querySelector('.page-header-detail').textContent, /Trends for First over the last 30 days/);
-});
-
 test('no page renders the old multi-line hero card markup', () => {
   for (const page of ['app.js', 'administration.js']) {
     const js = fs.readFileSync(new URL(`../frontend/${page}`, import.meta.url), 'utf8');
@@ -411,73 +399,238 @@ test('no page renders the old multi-line hero card markup', () => {
   assert.match(css, /\.administration-header > div:first-child\s*\{[^}]*display:\s*flex[^}]*align-items:\s*baseline/);
 });
 
-test('analytics tab reads the daily series as a POST with the page enrollment and renders trends', async () => {
+const ANALYTICS_CONFIG = { settings: { prefix: '!', bot_name: '' }, rules: [{ rule_id: 'spam', name: 'Spam filter' }], commands: [], log_channels: [], badwords: [], enrollment_id: 'enroll-token' };
+function analyticsDays(count, fill = () => ({})) {
+  const today = new Date();
+  return Array.from({ length: count }, (_, i) => {
+    const day = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - (count - 1 - i))).toISOString().slice(0, 10);
+    return { day, warns: 0, bans: 0, automod: 0, mod_actions: 0, timeouts: 0, joins: 0, leaves: 0, ...fill(i) };
+  });
+}
+function analyticsSummary(days = 30, overrides = {}) {
+  return {
+    window_days: days,
+    series: analyticsDays(days, (i) => (i === days - 1 ? { warns: 3, bans: 1, automod: 5, mod_actions: 2, timeouts: 1, joins: 9, leaves: 4 } : {})),
+    previous: { warns: 2, bans: 1, automod: 7, mod_actions: 2, timeouts: 0, joins: 4, leaves: 4 },
+    top_rules: [{ key: 'spam', count: 4 }, { key: 'attachment_flood', count: 1 }],
+    mod_action_kinds: [{ key: 'ban', count: 2 }],
+    moderators: [{ moderator_id: '123', count: 1, name: 'Moderator One' }, { moderator_id: '9007199254740993', count: 1 }],
+    heatmap: [[1, 14, 5], [3, 2, 1]],
+    members: { current: 4321, banned: 12, known: 4500, coverage: 'complete' },
+    ...overrides,
+  };
+}
+const kpi = (panel, label) => [...panel.querySelectorAll('.an-kpi')].find((tile) => tile.querySelector('.an-kpi-label').textContent === label);
+const kpiValue = (panel, label) => kpi(panel, label).querySelector('.an-kpi-value').textContent;
+function chartHelpers() {
+  const context = vm.createContext({ React, useState, h: React.createElement });
+  return vm.runInContext(`${chartsSource}\n({ formatCount, formatExact, formatDelta, niceTicks, dayTickIndices, heatLevel, KpiTile, RangeSelector })`, context);
+}
+
+test('analytics opens with a one-line header, range selector and info tip, then fills every panel progressively', async () => {
   const pending = [];
-  const { app } = harness((url, options) => new Promise(resolve => pending.push({ url, method: options.method, headers: options.headers, resolve })));
-  app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [], enrollment_id: 'enroll-token' };
+  const { app } = harness((url, options) => new Promise(resolve => pending.push({ url, options, resolve })));
+  app.state.config = ANALYTICS_CONFIG;
   const panel = app.tabAnalytics();
   await settle();
+  assert.equal(panel.querySelector('.hero, .dashboard-hero, .eyebrow')?.className ?? null, null);
+  const header = panel.querySelector('.page-header');
+  assert.equal(header.querySelector('h2').textContent, 'Analytics');
+  assert.match(header.querySelector('.page-header-detail').textContent, /First · last 30 days \(UTC\)/);
+  // The explanation lives in the collapsible info tip, not a paragraph on the page.
+  const tip = header.querySelector('.info-tip-trigger');
+  assert.equal(tip.getAttribute('aria-label'), 'About these trends');
+  assert.match(panel.querySelector('#analytics-help').textContent, /never added up/);
+  assert.equal([...panel.querySelectorAll('.dashboard-note strong')].some((n) => n.textContent === 'About these trends'), false);
+  // Range selector: labelled group of pressed-state buttons.
+  const range = panel.querySelector('[aria-label="Analytics date range"]');
+  assert.equal(range.getAttribute('role'), 'group');
+  assert.deepEqual([...range.querySelectorAll('button')].map((b) => [b.textContent, b.getAttribute('aria-label'), b.getAttribute('aria-pressed')]),
+    [['7d', 'Last 7 days', 'false'], ['30d', 'Last 30 days', 'true'], ['90d', 'Last 90 days', 'false']]);
+  // Before data arrives the layout and KPI strip are already on screen.
+  const tiles = [...panel.querySelectorAll('.an-kpi')];
+  assert.deepEqual(tiles.map((t) => t.querySelector('.an-kpi-label').textContent),
+    ['Members', 'Net growth', 'Joins', 'Leaves', 'Warnings', 'Bans', 'Spam hits', 'Mod actions', 'Timeouts']);
+  assert(tiles.every((t) => t.getAttribute('aria-busy') === 'true' && t.querySelector('.an-kpi-value').textContent === '…'));
+  const titles = [...panel.querySelectorAll('.an-panel-title')].map((n) => n.textContent);
+  assert.deepEqual(titles, ['Enforcement per day', 'Membership per day', 'Top automod rules', 'Mod actions by type', 'Mod actions by moderator', 'Activity by weekday and hour (UTC)']);
+  assert.equal(panel.querySelectorAll('.an-panel [aria-busy="true"]').length, 6);
+  // One summary request per range, bound to the page membership.
   assert.equal(pending.length, 1);
-  assert.equal(pending[0].url, `/api/guilds/${app.state.guilds[0].id}/analytics`);
-  assert.equal(pending[0].method, 'POST');
-  // The enrollment header binds the read to the loaded page membership.
-  assert.equal(pending[0].headers['x-jmodguard-enrollment'], 'enroll-token');
-  const today = new Date().toISOString().slice(0, 10);
-  pending[0].resolve(response({
-    window_days: 30,
-    series: [
-      { day: '2026-01-01', warns: 0, bans: 0, automod: 0, mod_actions: 0, timeouts: 0, joins: 0, leaves: 0 },
-      { day: today, warns: 3, bans: 1, automod: 5, mod_actions: 2, timeouts: 1, joins: 9, leaves: 4 },
-    ],
-    members: { current: 4321, banned: 12, known: 4500, coverage: 'complete' },
-  }));
+  assert.equal(pending[0].url, `/api/guilds/${app.state.guilds[0].id}/analytics?days=30`);
+  assert.equal(pending[0].options.method, 'POST');
+  assert.equal(pending[0].options.headers['x-jmodguard-enrollment'], 'enroll-token');
+  pending[0].resolve(response(analyticsSummary()));
   await settle();
-  const stat = (label) => Array.from(findNode(panel, n => n.className === 'stat' && textOf(n).includes(label)).children).find((c) => c.className === 'stat-value').textContent;
-  assert.equal(stat('Members now'), '4321');
-  assert.equal(stat('Warnings'), '3');
-  assert.equal(stat('Bans'), '1');
-  assert.equal(stat('Spam hits'), '5');
-  assert.equal(stat('Mod actions'), '2');
-  assert.equal(stat('Timeouts'), '1');
-  assert.equal(stat('Joins'), '9');
-  assert.equal(stat('Leaves'), '4');
-  // The chart renders real SVG with an accessible summary.
-  const svg = findNode(panel, n => n.tagName === 'svg');
-  assert(svg, 'expected a rendered trend chart');
-  assert.match(svg.getAttribute('aria-label'), /per day/);
-  assert.equal(findNode(panel, n => n.tagName === 'polyline') !== null, true);
-  // Switching the metric re-labels the chart without another request.
-  const before = pending.length;
-  const spamButton = Array.from(findNode(panel, n => n.className === 'trend-picker').children).find(b => b.textContent === 'Spam hits');
-  fire(spamButton, 'click');
-  await settle();
-  assert.equal(pending.length, before, 'metric switching must not refetch');
-  const svgAfter = findNode(panel, n => n.tagName === 'svg');
-  assert.match(svgAfter.getAttribute('aria-label'), /latest day 5\./);
+  assert.equal(pending.length, 1, 'every panel renders from the one response');
+  assert.equal(kpiValue(panel, 'Members'), '4,321');
+  assert.equal(kpiValue(panel, 'Warnings'), '3');
+  assert.equal(kpi(panel, 'Warnings').querySelector('.an-delta').textContent, '+1');
+  assert.equal(kpi(panel, 'Spam hits').querySelector('.an-delta').textContent, '−2');
+  assert.equal(kpi(panel, 'Bans').querySelector('.an-delta').textContent, '±0');
+  assert.equal(kpiValue(panel, 'Net growth'), '5');
+  assert.equal(kpi(panel, 'Net growth').querySelector('.an-delta').textContent, '+5');
+  assert.equal(kpi(panel, 'Warnings').getAttribute('aria-label'), 'Warnings: 3, up 1 vs previous 30 days');
+  assert(kpi(panel, 'Joins').querySelector('svg.an-spark[aria-hidden="true"]'), 'each metric tile carries a sparkline');
+  // Several charts at once, no metric toggle.
+  assert.equal(panel.querySelector('.trend-picker'), null);
+  const charts = [...panel.querySelectorAll('svg[role="img"]')];
+  assert.equal(charts.length, 3);
+  assert.match(charts[0].getAttribute('aria-label'), /^Daily enforcement from .+: Warnings 3, Bans 1, Spam hits 5, Mod actions 2, Timeouts 1\. Use arrow keys/);
+  assert.match(charts[1].getAttribute('aria-label'), /joins 9, leaves 4, net up 5/);
+  assert.match(charts[2].getAttribute('aria-label'), /Busiest hour: Mon 14:00 UTC with 5 actions\./);
+  assert.equal(charts[0].getAttribute('tabindex'), '0');
+  // Breakdowns use stored names and keep exact snowflake strings.
+  const ranks = [...panel.querySelectorAll('ol.an-rank')];
+  assert.deepEqual(ranks.map((r) => r.getAttribute('aria-label')), ['Automod enforcement by rule', 'Mod actions by type', 'Mod actions by moderator']);
+  assert.deepEqual([...ranks[0].querySelectorAll('.an-rank-label')].map((n) => n.textContent), ['Spam filter', 'attachment_flood']);
+  assert.deepEqual([...ranks[1].querySelectorAll('.an-rank-label')].map((n) => n.textContent), ['Ban']);
+  assert.deepEqual([...ranks[2].querySelectorAll('.an-rank-label')].map((n) => n.textContent), ['Moderator One', 'User 9007199254740993']);
 });
 
-test('analytics tab marks member size partial or unverified until directory coverage is established', async () => {
-  for (const [coverage, shown] of [['importing', '120 (partial)'], ['uncertain', '120 (unverified)'], ['complete', '120']]) {
-    const { app } = harness(async () => response({ window_days: 30, series: [], members: { current: 120, banned: 0, known: 120, coverage } }));
-    app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [], enrollment_id: 'enroll-token' };
+test('analytics range switching fetches each range once and reuses loaded ranges until they expire', async () => {
+  const pending = [];
+  const h = harness((url, options) => new Promise(resolve => pending.push({ url, options, resolve })));
+  h.app.state.config = ANALYTICS_CONFIG;
+  const panel = h.app.tabAnalytics();
+  await settle();
+  const button = (label) => panel.querySelector(`[aria-label="${label}"]`);
+  pending.shift().resolve(response(analyticsSummary(30)));
+  await settle();
+  for (const [label, days] of [['Last 7 days', 7], ['Last 90 days', 90]]) {
+    await fire(button(label), 'click');
+    assert.equal(button(label).getAttribute('aria-pressed'), 'true');
+    assert.equal(pending.length, 1, label);
+    assert.equal(pending[0].url, `/api/guilds/${h.app.state.guilds[0].id}/analytics?days=${days}`);
+    // Layout stays while the new range loads.
+    assert.equal(kpiValue(panel, 'Warnings'), '…');
+    pending.shift().resolve(response(analyticsSummary(days, { members: { current: days, banned: 0, known: days, coverage: 'complete' } })));
+    await settle();
+    assert.equal(kpiValue(panel, 'Members'), String(days));
+    assert.match(panel.querySelector('.page-header-detail').textContent, new RegExp(`last ${days} days`));
+  }
+  // Already-loaded ranges switch back with no request.
+  for (const [label, members] of [['Last 30 days', '4,321'], ['Last 7 days', '7'], ['Last 90 days', '90']]) {
+    await fire(button(label), 'click');
+    assert.equal(pending.length, 0, `${label} is served from the loaded range`);
+    assert.equal(kpiValue(panel, 'Members'), members);
+  }
+  // Returning to the tab also reuses it; after the short client TTL it refetches.
+  const again = h.app.tabAnalytics();
+  await settle();
+  assert.equal(pending.length, 0);
+  assert.equal(kpiValue(again, 'Members'), '4,321');
+  h.advanceTime(61000);
+  await fire(button('Last 7 days'), 'click');
+  assert.equal(pending.length, 1, 'an expired range refetches');
+  // Signing out drops loaded summaries.
+  pending.shift().resolve(response(analyticsSummary(7)));
+  await settle();
+  const guildId = h.app.state.guildId;
+  h.app.handleAuthLoss(Object.assign(new Error('signed out'), { status: 401 }));
+  h.app.state.guildId = guildId;
+  h.app.tabAnalytics();
+  await settle();
+  assert.equal(pending.length, 1, 'no summary survives the session');
+});
+
+test('analytics tooltips show exact per-day values on hover and from the keyboard', async () => {
+  const series = analyticsDays(7, (i) => ({ warns: i === 6 ? 1234567 : i, joins: i, leaves: i === 2 ? 3 : 0 }));
+  const { app } = harness(async () => response(analyticsSummary(30, { series })));
+  app.state.config = ANALYTICS_CONFIG;
+  const panel = app.tabAnalytics();
+  await settle();
+  const [enforcement, membership] = panel.querySelectorAll('svg[role="img"]');
+  const readout = panel.querySelector('#an-enforcement-readout');
+  assert.equal(readout.getAttribute('aria-live'), 'polite');
+  assert.equal(enforcement.getAttribute('aria-describedby'), 'an-enforcement-readout');
+  assert.match(readout.textContent, /arrow keys/);
+  await fire(enforcement, 'keydown', { key: 'End' });
+  assert.match(readout.textContent, /Warnings 1,234,567/);
+  await fire(enforcement, 'keydown', { key: 'ArrowLeft' });
+  assert.match(readout.textContent, /Warnings 5Bans 0/);
+  await fire(enforcement, 'keydown', { key: 'Escape' });
+  assert.match(readout.textContent, /arrow keys/);
+  // Pointer hover over a day column, plus native titles on every column.
+  const hits = enforcement.querySelectorAll('.an-hit');
+  assert.equal(hits.length, 7);
+  await fire(hits[2], 'mouseover');
+  assert.match(readout.textContent, /Warnings 2Bans 0/);
+  assert.match(hits[6].querySelector('title').textContent, new RegExp(`^${series[6].day}: Warnings 1,234,567, Bans 0`));
+  await fire(membership, 'keydown', { key: 'ArrowRight' });
+  assert.match(panel.querySelector('#an-membership-readout').textContent, /Joins 0Leaves 0Net so far ±0/);
+  // Seven days label every day; axes use integer ticks for sparse counts.
+  assert.equal(enforcement.querySelectorAll('.an-axis-day').length, 7);
+  assert.deepEqual([...membership.querySelectorAll('.an-gridline text')].map((n) => n.textContent), ['0', '2', '2', '4', '4', '6', '6']);
+});
+
+test('analytics shows member coverage as a badge, never as wrapped inline text', async () => {
+  for (const [coverage, badge] of [['importing', 'partial'], ['uncertain', 'unverified'], ['complete', null]]) {
+    const { app } = harness(async () => response(analyticsSummary(30, { members: { current: 10417, banned: 0, known: 10417, coverage } })));
+    app.state.config = ANALYTICS_CONFIG;
     const panel = app.tabAnalytics();
     await settle();
-    const card = findNode(panel, n => n.className === 'stat' && textOf(n).includes('Members now'));
-    assert.equal(Array.from(card.children).find((c) => c.className === 'stat-value').textContent, shown, coverage);
+    assert.equal(kpiValue(panel, 'Members'), '10.4k', coverage);
+    assert.equal(kpi(panel, 'Members').querySelector('.an-kpi-value').getAttribute('title'), '10,417');
+    assert.equal(kpi(panel, 'Members').querySelector('.an-badge')?.textContent ?? null, badge, coverage);
+    assert.doesNotMatch(kpi(panel, 'Members').querySelector('.an-kpi-body').textContent, /\(/);
   }
 });
 
-test('analytics tab shows unavailable counts instead of zeros when the read fails', async () => {
+test('analytics shows unavailable instead of zeros when the read fails', async () => {
   const { app } = harness(async () => { throw new Error('offline'); });
-  app.state.config = { settings: { prefix: '!', bot_name: '' }, rules: [], commands: [], log_channels: [], badwords: [] };
+  app.state.config = ANALYTICS_CONFIG;
   const panel = app.tabAnalytics();
   await settle();
-  const text = textOf(panel);
-  assert.match(text, /Trends unavailable/);
-  const stat = (label) => Array.from(findNode(panel, n => n.className === 'stat' && textOf(n).includes(label)).children).find((c) => c.className === 'stat-value').textContent;
-  assert.equal(stat('Members now'), 'Unavailable');
-  assert.equal(stat('Warnings'), 'Unavailable');
-  assert.equal(stat('Leaves'), 'Unavailable');
+  assert.match(textOf(panel), /Trends unavailable/);
+  for (const label of ['Members', 'Warnings', 'Leaves']) assert.equal(kpiValue(panel, label), '—', label);
+  assert.equal([...panel.querySelectorAll('.an-panel .an-empty')].filter((n) => n.textContent === 'Unavailable').length, 6);
+});
+
+test('analytics renders empty and single-day data without errors or false trends', async () => {
+  const empty = harness(async () => response(analyticsSummary(30, { series: analyticsDays(30), previous: { warns: 0, bans: 0, automod: 0, mod_actions: 0, timeouts: 0, joins: null, leaves: null }, top_rules: [], mod_action_kinds: [], moderators: [], heatmap: [], members: null })));
+  empty.app.state.config = ANALYTICS_CONFIG;
+  const panel = empty.app.tabAnalytics();
+  await settle();
+  assert.equal(kpiValue(panel, 'Members'), '—', 'missing directory is not zero');
+  assert.equal(kpiValue(panel, 'Warnings'), '0');
+  assert.equal(kpi(panel, 'Joins').querySelector('.an-delta'), null, 'no comparison without a recorded previous window');
+  assert.equal(panel.querySelectorAll('svg .an-bar').length, 0);
+  assert.deepEqual([...panel.querySelectorAll('.an-panel .an-empty')].map((n) => n.textContent),
+    ['No automod enforcement in this range.', 'No mod actions in this range.', 'No attributed mod actions in this range.']);
+  assert.match(panel.querySelector('#an-heatmap-readout').textContent, /No enforcement actions in this range\./);
+  const single = harness(async () => response(analyticsSummary(30, { series: analyticsDays(1, () => ({ warns: 2, joins: 1 })) })));
+  single.app.state.config = ANALYTICS_CONFIG;
+  const one = single.app.tabAnalytics();
+  await settle();
+  const membership = one.querySelectorAll('svg[role="img"]')[1];
+  assert.equal(membership.querySelector('polyline'), null, 'one day draws a point, not a line');
+  assert.equal(membership.querySelectorAll('circle').length, 1);
+  assert.equal(one.querySelectorAll('svg[role="img"]')[0].querySelectorAll('.an-bar').length, 1);
+  assert.doesNotMatch(one.innerHTML, /NaN|Infinity|undefined/);
+});
+
+test('analytics formats very large numbers compactly and keeps exact values in labels', () => {
+  const c = chartHelpers();
+  // Values from the chart context belong to another realm; compare plain copies.
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+  assert.deepEqual([0, 7, 9999, 10000, 10417, 123456, 1234567, 2e12, -15300].map(c.formatCount),
+    ['0', '7', '9,999', '10k', '10.4k', '123k', '1.2M', '2T', '−15.3k']);
+  for (let n = 1; n < 1e15; n = n * 7 + 3) assert.ok(c.formatCount(n).length <= 5, `${n} -> ${c.formatCount(n)}`);
+  assert.equal(c.formatExact(2e12), '2,000,000,000,000');
+  assert.equal(c.formatDelta(5, null), null);
+  assert.deepEqual(plain(c.formatDelta(2e6, 1e6)), { diff: 1e6, text: '+1M', exact: 'up 1,000,000', direction: 'up' });
+  assert.deepEqual(plain(c.niceTicks(0)), [0, 1]);
+  assert.deepEqual(plain(c.niceTicks(2)), [0, 1, 2]);
+  assert.deepEqual(plain(c.niceTicks(7)), [0, 2, 4, 6, 8]);
+  assert.deepEqual(plain(c.niceTicks(1e6)), [0, 250000, 500000, 750000, 1000000]);
+  assert.equal(c.dayTickIndices(7).length, 7);
+  assert.deepEqual(plain(c.dayTickIndices(30)), [1, 8, 15, 22, 29]);
+  assert.ok(c.dayTickIndices(90).length <= 7);
+  assert.deepEqual([0, 1, 5, 10].map((v) => c.heatLevel(v, 10)), [0, 1, 2, 4]);
+  const html = renderToStaticMarkup(React.createElement(c.KpiTile, { label: 'Warnings', value: 2e12, delta: c.formatDelta(2e12, 0), values: [1, 2], rangeLabel: '7 days' }));
+  assert.match(html, /<span class="an-kpi-value" title="2,000,000,000,000">2T<\/span>/);
+  assert.match(html, /aria-label="Warnings: 2,000,000,000,000, up 2,000,000,000,000 vs previous 7 days"/);
 });
 
 test('workspace survives a fresh JS context and keeps snowflakes exact', () => {
@@ -3059,6 +3212,7 @@ async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', 
       guilds, is_bot_owner: !previewMode(), preview: previewMode(),
     });
     if (url.pathname.endsWith('/config')) return json({ enrollment_id: 'e1', settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
+    if (url.pathname.endsWith('/analytics')) return json(browserAnalytics(Number(url.searchParams.get('days')) || 30));
     if (url.pathname.startsWith('/api/')) return json({});
     const file = new URL(url.pathname === '/' ? 'index.html' : url.pathname.slice(1), dist);
     if (!file.href.startsWith(dist.href) || !fs.existsSync(file)) { res.writeHead(404); return res.end(); }
@@ -3356,6 +3510,100 @@ test('open server switcher keeps long names inside the list with an ellipsis', {
     }
     assert.ok(m.names[1].scroll <= m.names[1].client + 1, `${name}: short name ${JSON.stringify(m.names[1])}`);
   }
+});
+
+// Dense analytics data for the real-browser layout check: large and sparse counts together.
+function browserAnalytics(days) {
+  const series = Array.from({ length: days }, (_, i) => {
+    const day = new Date(Date.UTC(2026, 10, 12 - (days - 1 - i))).toISOString().slice(0, 10);
+    return { day, warns: i % 3, bans: i % 5 === 0 ? 1 : 0, automod: (i * 7) % 11, mod_actions: i % 4, timeouts: i % 6 === 0 ? 2 : 0, joins: 1234567 + i, leaves: 987654 };
+  });
+  return { window_days: days, series,
+    previous: { warns: 10, bans: 1, automod: 300, mod_actions: 20, timeouts: 3, joins: 99, leaves: 12 },
+    top_rules: [{ key: 'a_very_long_custom_rule_identifier_that_must_truncate', count: 123456 }, { key: 'spam', count: 2 }],
+    mod_action_kinds: [{ key: 'ban', count: 9 }, { key: 'warnclear', count: 1 }],
+    moderators: [{ moderator_id: '9007199254740993', count: 9876543 }],
+    heatmap: [[1, 14, 5], [3, 2, 1], [6, 23, 2]],
+    members: { current: 10417, banned: 1, known: 10500, coverage: 'uncertain' } };
+}
+
+const analyticsLayoutProbe = `(async () => {
+  const wait = () => new Promise(resolve => setTimeout(resolve, 50));
+  const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  for (let i = 0; i < 200 && !document.querySelector('#tabs'); i++) await wait();
+  const tab = [...document.querySelectorAll('#tabs button')].find(button => /Analytics/.test(button.textContent));
+  tab.click();
+  for (let i = 0; i < 200 && !document.querySelector('.an-heatmap'); i++) await wait();
+  await frame();
+  const rect = element => { const { top, bottom, left, right, width, height } = element.getBoundingClientRect(); return { top, bottom, left, right, width, height }; };
+  const values = [...document.querySelectorAll('.an-kpi-value')];
+  return JSON.stringify({
+    theme: document.documentElement.dataset.theme, viewport: innerHeight, width: innerWidth,
+    pageOverflow: document.documentElement.scrollWidth - innerWidth,
+    header: rect(document.querySelector('.page-header')),
+    kpis: rect(document.querySelector('.an-kpis')),
+    kpiRows: new Set([...document.querySelectorAll('.an-kpi')].map(tile => Math.round(tile.getBoundingClientRect().top))).size,
+    wrapped: values.filter(value => value.getBoundingClientRect().height > parseFloat(getComputedStyle(value).lineHeight) * 1.5).map(value => value.textContent),
+    clipped: [...document.querySelectorAll('.an-kpi')].filter(tile => tile.scrollWidth > tile.clientWidth + 1).map(tile => tile.textContent),
+    valueFont: parseFloat(getComputedStyle(values[0]).fontSize),
+    panels: [...document.querySelectorAll('.an-panel')].map(panel => ({ title: panel.querySelector('.an-panel-title').textContent, ...rect(panel) })),
+    bar: getComputedStyle(document.querySelector('.an-row.an-warns .an-bar')).fill,
+    rankOverflow: [...document.querySelectorAll('.an-rank-row')].some(row => row.scrollWidth > row.clientWidth + 1),
+  });
+})()`;
+
+test('analytics dashboard shows enforcement and membership above the fold in both themes without wrapping numbers', { timeout: 180000 }, async t => {
+  const missing = !firefoxBinary ? 'Firefox is not on PATH'
+    : !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url)) ? 'dist/frontend is not built (npm run build --prefix tools/webui)' : null;
+  if (missing) {
+    assert.ok(!process.env.CI, `${missing}; CI requires this browser layout check`);
+    t.skip(missing);
+    return;
+  }
+  const domEvent = globalThis.Event;
+  globalThis.Event = NodeEvent;
+  let server, browser;
+  t.after(async () => {
+    await browser?.close();
+    if (server) await new Promise(resolve => server.close(resolve));
+    globalThis.Event = domEvent;
+  });
+  server = await serveBuiltApp(() => false);
+  browser = await launchFirefox();
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  const bars = new Set();
+  for (const theme of ['light', 'dark']) {
+    for (const [width, height] of [[1280, 800], [1920, 1080], [700, 800]]) {
+      const name = `${theme} ${width}x${height}`;
+      await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height } });
+      await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
+      await browser.send('script.evaluate', { expression: `localStorage.setItem('jmodguard.theme', '${theme}')`, target: { context: browser.context }, awaitPromise: false });
+      await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
+      const { result } = await browser.send('script.evaluate', { expression: analyticsLayoutProbe, target: { context: browser.context }, awaitPromise: true });
+      const m = JSON.parse(result.value);
+      assert.equal(m.theme, theme, name);
+      bars.add(m.bar);
+      assert.ok(m.pageOverflow <= 0, `${name}: no horizontal page scroll (${m.pageOverflow}px)`);
+      assert.deepEqual(m.wrapped, [], `${name}: KPI numbers stay on one line`);
+      assert.deepEqual(m.clipped, [], `${name}: KPI tiles fit their content`);
+      assert.equal(m.rankOverflow, false, `${name}: long rule names truncate inside their row`);
+      assert.ok(m.valueFont <= 20, `${name}: no oversized headline numbers (${m.valueFont}px)`);
+      assert.equal(m.panels.length, 6, name);
+      const [enforcement, membership] = m.panels;
+      if (width <= 720) {
+        // One column: every panel starts at the same left edge, stacked.
+        assert.equal(new Set(m.panels.map(panel => Math.round(panel.left))).size, 1, `${name}: single column`);
+        continue;
+      }
+      assert.ok(m.header.height <= 40, `${name}: one-line header ${m.header.height}px`);
+      assert.ok(m.kpiRows <= 2, `${name}: compact KPI strip (${m.kpiRows} rows)`);
+      // Acceptance: enforcement and membership trends visible together without scrolling or toggling.
+      assert.equal(Math.round(enforcement.top), Math.round(membership.top), `${name}: side by side`);
+      assert.ok(enforcement.bottom <= m.viewport && membership.bottom <= m.viewport,
+        `${name}: both trend panels above the fold (${enforcement.bottom}/${membership.bottom} of ${m.viewport})`);
+    }
+  }
+  assert.equal(bars.size, 2, 'series colors follow the theme');
 });
 
 test('text rule UI can save independent thresholds without generic escalation', async () => {
