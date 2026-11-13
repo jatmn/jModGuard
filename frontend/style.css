@@ -166,9 +166,12 @@ body { background: var(--bg); color: var(--text); font-size: var(--ui-font-size)
 .server-picker-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .server-icon { flex: 0 0 auto; width: 20px; height: 20px; border-radius: 50%; object-fit: cover; }
 .server-icon-letter { display: inline-flex; align-items: center; justify-content: center; background: var(--selected); color: var(--selected-text); font-size: 11px; font-weight: 700; line-height: 1; }
-.server-picker-list { position: absolute; z-index: 20; inset-inline: 8px; width: auto; flex-wrap: nowrap; max-height: min(20rem, 60dvh); overflow-y: auto; margin-top: 2px; padding: 4px; background: var(--panel); color: var(--text); border: 1px solid var(--shell-border); border-radius: var(--radius-box); box-shadow: 0 6px 18px #0000002e; }
+.server-picker-list { position: absolute; z-index: 20; inset-inline: 8px; width: auto; flex-wrap: nowrap; max-height: min(20rem, 60dvh); overflow-y: auto; overflow-x: hidden; margin-top: 2px; padding: 4px; background: var(--panel); color: var(--text); border: 1px solid var(--shell-border); border-radius: var(--radius-box); box-shadow: 0 6px 18px #0000002e; }
 .server-picker-list:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.server-picker-list [role=option] { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: var(--target-min); }
+/* daisyUI menu items wrap (flex-flow: column wrap), which sizes each row to its full text width;
+   a single-line item stretched to the list width lets long names end in the ellipsis instead. */
+.server-picker-list > li { flex-wrap: nowrap; min-width: 0; max-width: 100%; }
+.server-picker-list [role=option] { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 100%; min-width: 0; min-height: var(--target-min); }
 /* The keyboard-active option keeps the shared focus ring while focus stays on the list. */
 .server-picker-list [role=option].menu-focus { outline: 2px solid var(--accent); outline-offset: 0; }
 

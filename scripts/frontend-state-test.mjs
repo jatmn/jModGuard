@@ -3048,7 +3048,7 @@ test('checkbox labels keep primary text color', () => {
 const firefoxBinary = (process.env.PATH || '').split(path.delimiter).map(dir => path.join(dir, 'firefox'))
   .find(file => { try { fs.accessSync(file, fs.constants.X_OK); return true; } catch { return false; } });
 
-async function serveBuiltApp(previewMode) {
+async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', name: 'Guild' }]) {
   const dist = new URL('../dist/frontend/', import.meta.url);
   const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
   const server = http.createServer((req, res) => {
@@ -3056,7 +3056,7 @@ async function serveBuiltApp(previewMode) {
     const json = body => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
     if (url.pathname === '/api/me') return json({
       user: { id: '100000000000000001', username: 'moderator', global_name: 'Moderator' },
-      guilds: [{ id: '200000000000000002', name: 'Guild' }], is_bot_owner: !previewMode(), preview: previewMode(),
+      guilds, is_bot_owner: !previewMode(), preview: previewMode(),
     });
     if (url.pathname.endsWith('/config')) return json({ enrollment_id: 'e1', settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
     if (url.pathname.startsWith('/api/')) return json({});
@@ -3291,6 +3291,70 @@ test('dashboard density fits 1280x800 and keeps 24px targets in both themes', { 
       assert.equal(m.scrollY, 0, name);
       assert.ok(m.stats.bottom <= m.viewport, `${name}: stat grid ends at ${m.stats.bottom}px of ${m.viewport}px`);
     }
+  }
+});
+
+// Opens the sidebar server switcher and measures the rendered list, rows and names (#589).
+const switcherProbe = `(async () => {
+  const wait = () => new Promise(resolve => setTimeout(resolve, 50));
+  const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  for (let i = 0; i < 200 && !document.querySelector('#guild-select:enabled'); i++) await wait();
+  const trigger = document.querySelector('#guild-select');
+  trigger.click();
+  await frame();
+  const list = document.getElementById(trigger.getAttribute('aria-controls'));
+  const size = element => ({ client: element.clientWidth, scroll: element.scrollWidth, width: element.getBoundingClientRect().width });
+  const name = element => ({ ...size(element), textOverflow: getComputedStyle(element).textOverflow, text: element.textContent });
+  const options = [...list.querySelectorAll('[role=option]')];
+  return JSON.stringify({ expanded: trigger.getAttribute('aria-expanded'), list: size(list),
+    options: options.map(size), names: options.map(option => name(option.querySelector('.server-picker-name'))),
+    icons: options.map(option => size(option.querySelector('.server-icon'))),
+    trigger: name(trigger.querySelector('.server-picker-name')) });
+})()`;
+
+test('open server switcher keeps long names inside the list with an ellipsis', { timeout: 180000 }, async t => {
+  const missing = !firefoxBinary ? 'Firefox is not on PATH'
+    : !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url)) ? 'dist/frontend is not built (npm run build --prefix tools/webui)' : null;
+  if (missing) {
+    assert.ok(!process.env.CI, `${missing}; CI requires this browser layout check`);
+    t.skip(missing);
+    return;
+  }
+  const domEvent = globalThis.Event;
+  globalThis.Event = NodeEvent;
+  let server, browser;
+  t.after(async () => {
+    await browser?.close();
+    if (server) await new Promise(resolve => server.close(resolve));
+    globalThis.Event = domEvent;
+  });
+  const longName = 'Charlie has a very long server name that cannot fit in the sidebar';
+  server = await serveBuiltApp(() => false, [
+    { id: '200000000000000002', name: longName, icon: null, manage: true, access: 'manage' },
+    { id: '200000000000000003', name: 'Bravo', icon: null, manage: true, access: 'manage' },
+  ]);
+  browser = await launchFirefox();
+  for (const [width, height] of [[1280, 800], [390, 800]]) {
+    const name = `${width}x${height}`;
+    await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height } });
+    await browser.send('browsingContext.navigate', { context: browser.context, url: `http://127.0.0.1:${server.address().port}/`, wait: 'complete' });
+    const { result } = await browser.send('script.evaluate', { expression: switcherProbe, target: { context: browser.context }, awaitPromise: true });
+    const m = JSON.parse(result.value);
+    assert.equal(m.expanded, 'true', `${name}: the switcher opens`);
+    assert.equal(m.options.length, 2, name);
+    assert.ok(m.list.scroll <= m.list.client + 1, `${name}: list scrolls horizontally ${JSON.stringify(m.list)}`);
+    for (const [index, option] of m.options.entries()) {
+      assert.ok(option.scroll <= option.client + 1, `${name}: option ${index} overflows ${JSON.stringify(option)}`);
+      assert.ok(option.width <= m.list.client + 1, `${name}: option ${index} wider than the list ${JSON.stringify(option)}`);
+      assert.ok(m.icons[index].width >= 19.5, `${name}: option ${index} icon shrank ${JSON.stringify(m.icons[index])}`);
+    }
+    // The long name is visibly truncated with an ellipsis, open and closed; the short one is not.
+    for (const [label, element] of [['open option', m.names[0]], ['closed control', m.trigger]]) {
+      assert.equal(element.text, longName, `${name}: ${label}`);
+      assert.equal(element.textOverflow, 'ellipsis', `${name}: ${label}`);
+      assert.ok(element.scroll > element.client, `${name}: ${label} is not truncated ${JSON.stringify(element)}`);
+    }
+    assert.ok(m.names[1].scroll <= m.names[1].client + 1, `${name}: short name ${JSON.stringify(m.names[1])}`);
   }
 });
 
@@ -4258,7 +4322,7 @@ test('server switcher shows each server icon or letter avatar, with the selected
   assert.equal(h.app.state.guildId, switcherGuilds[0].id);
 });
 
-test('server switcher name truncation reuses the compact select sizing', () => {
+test('server switcher name truncation keeps open rows inside the list and reuses the compact select sizing', () => {
   const css = fs.readFileSync(new URL('../frontend/style.css', import.meta.url), 'utf8');
   const rule = selector => css.match(new RegExp('^' + selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\{([^}]*)\\}', 'm'))?.[1] ?? '';
   for (const declaration of [/min-width:\s*0/, /overflow:\s*hidden/, /text-overflow:\s*ellipsis/, /white-space:\s*nowrap/])
@@ -4266,6 +4330,15 @@ test('server switcher name truncation reuses the compact select sizing', () => {
   assert.match(rule('.server-icon'), /width:\s*20px/);
   assert.match(rule('.server-icon'), /border-radius:\s*50%/);
   assert.match(rule('.server-picker > .select'), /width:\s*100%/);
+  // daisyUI menu items wrap, which sizes a row to its full text width; open rows must stay
+  // single-line and as wide as the list so the name ellipsis can apply.
+  const menu = fs.readFileSync(new URL('../tools/webui/node_modules/daisyui/components/menu.css', import.meta.url), 'utf8');
+  assert.match(menu, /\.menu :where\(li\)\{flex-flow:column wrap/);
+  assert.match(rule('.server-picker-list > li'), /flex-wrap:\s*nowrap/);
+  assert.match(rule('.server-picker-list > li'), /(?:^|;)\s*min-width:\s*0/);
+  for (const declaration of [/(?:^|;)\s*width:\s*100%/, /max-width:\s*100%/, /(?:^|;)\s*min-width:\s*0/, /display:\s*flex/])
+    assert.match(rule('.server-picker-list [role=option]'), declaration);
+  assert.match(rule('.server-icon'), /flex:\s*0 0 auto/);
   // The trigger is the existing compact select control, not a new size scale.
   const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8');
   assert.match(source, /className: "select select-sm w-full server-picker-trigger"/);
