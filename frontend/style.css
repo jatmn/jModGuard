@@ -209,7 +209,8 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 @media (min-width: 721px) {
   :root { --preview-banner-height: 3rem; }
   .sidebar { position: sticky; top: 0; height: 100dvh; min-height: 0; align-self: flex-start; overflow-y: auto; }
-  .sidebar nav { overflow-y: auto; min-height: 3rem; }
+  /* Leave room for a two-line tab and the menu's block padding. */
+  .sidebar nav { overflow-y: auto; min-height: 4rem; }
   .preview-banner { height: var(--preview-banner-height); }
   .preview-banner + #main-view .sidebar { top: var(--preview-banner-height); height: calc(100dvh - var(--preview-banner-height)); }
 }

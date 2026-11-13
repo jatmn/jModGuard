@@ -868,6 +868,8 @@ function DatabaseUsage() {
   // successful figures, marked stale, instead of clearing them.
   const refresh = () => {
     if (flight.current) return flight.current;
+    // Re-render relative sample ages even while a visibility-triggered read waits.
+    setView((current) => ({ ...current }));
     flight.current = apiRead("/api/database-usage")
       .then((snapshot) => {
         if (mounted.current) setView((current) => ({ snapshot, freshness: "fresh", revision: current.revision + 1, error: null }));
@@ -882,9 +884,25 @@ function DatabaseUsage() {
   };
   useEffect(() => {
     mounted.current = true;
-    refresh();
+    let timer;
+    const poll = () => {
+      clearTimeout(timer);
+      if (!mounted.current || document.visibilityState === "hidden") return;
+      refresh().finally(() => {
+        clearTimeout(timer);
+        if (mounted.current && document.visibilityState !== "hidden") timer = setTimeout(poll, 60000);
+      });
+    };
+    const visible = () => {
+      clearTimeout(timer);
+      if (document.visibilityState !== "hidden") poll();
+    };
+    poll();
+    document.addEventListener("visibilitychange", visible);
     return () => {
       mounted.current = false;
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", visible);
     };
   }, []);
   const snapshot = view.snapshot;
@@ -951,11 +969,11 @@ function TabPlatformAnalytics() {
 }
 
 function PlatformAnalytics() {
-  const result = useApiRead("/api/platform/analytics");
+  const result = useApiRead("/api/platform/analytics", { retainData: true });
   const [metric, setMetric] = useTrendMetric("warns");
   const snapshot = result.data;
   const points = toTrendPoints(snapshot?.series);
-  const shown = (value) => (result.loading ? "Loading…" : result.error ? "Unavailable" : value);
+  const shown = (value) => (snapshot ? value : result.loading ? "Loading…" : "Unavailable");
   const members = snapshot?.members;
   const guilds = snapshot?.guilds ?? [];
   return h(
@@ -967,7 +985,9 @@ function PlatformAnalytics() {
       h(ActionButton, { id: "refresh-platform-analytics", className: "btn btn-sm", onClick: () => result.refresh() }, "Refresh"),
     ),
     result.error
-      ? h("p", { id: "platform-analytics-status", className: "alert alert-soft alert-warning", role: "status" }, `Platform analytics unavailable: ${result.error.message}`)
+      ? h("p", { id: "platform-analytics-status", className: "alert alert-soft alert-warning", role: "status" }, snapshot
+          ? `Platform analytics refresh failed: ${result.error.message}. Showing the last successful response (stale). ${platformMemberStatus(members)}`
+          : `Platform analytics unavailable: ${result.error.message}`)
       : snapshot && h("p", { id: "platform-analytics-status", className: "muted", role: "status" }, platformMemberStatus(members)),
     h(
       "section",
@@ -986,7 +1006,7 @@ function PlatformAnalytics() {
         h(TrendMetricPicker, { metric, onChange: setMetric }),
         points.length
           ? h(TrendChart, { points, metric, title: "Platform activity" })
-          : h("p", { className: "muted" }, result.loading ? "Loading analytics…" : "No platform trend data recorded yet."),
+          : h("p", { className: "muted" }, snapshot ? "No platform trend data recorded yet." : result.loading ? "Loading analytics…" : "Platform analytics unavailable."),
         guilds.length > 0 &&
           h(
             "div",
@@ -6844,26 +6864,27 @@ function CommandStep({ step, placeholder, onChange, remove }) {
   );
 }
 
-function useApiRead(path) {
+function useApiRead(path, { retainData = false } = {}) {
   const [revision, setRevision] = useState(0);
   const [result, setResult] = useState({ kind: "loading" });
   useEffect(() => {
     const controller = new AbortController();
     let publication = "current";
     const timeout = setTimeout(() => controller.abort(), 30000);
-    setResult({ kind: "loading" });
+    setResult((current) => ({ kind: "loading", path, data: retainData && current.path === path ? current.data : null }));
     apiRead(path, controller.signal)
       .then((data) => {
-        if (publication === "current") setResult({ kind: "loaded", data });
+        if (publication === "current") setResult({ kind: "loaded", path, data });
       })
       .catch((error) => {
         if (publication === "current")
-          setResult({
+          setResult((current) => ({
+            ...current,
             kind: "failed",
             error: controller.signal.aborted
               ? apiError("Request timed out. Refresh to verify saved state before trying again.")
               : error,
-          });
+          }));
       })
       .finally(() => clearTimeout(timeout));
     return () => {
@@ -6871,10 +6892,10 @@ function useApiRead(path) {
       clearTimeout(timeout);
       controller.abort();
     };
-  }, [path, revision]);
+  }, [path, revision, retainData]);
   return {
     loading: result.kind === "loading",
-    data: result.kind === "loaded" ? result.data : null,
+    data: retainData ? (result.path === path ? result.data ?? null : null) : result.kind === "loaded" ? result.data : null,
     error: result.kind === "failed" ? result.error : null,
     refresh: () => setRevision((value) => value + 1),
   };

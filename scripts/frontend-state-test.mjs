@@ -7715,3 +7715,145 @@ test('Platform analytics marks member totals partial when a counted directory is
   assert.match(h.nodes.get('#platform-analytics-status').textContent, /Member totals are complete\.$/);
   assert.deepEqual(calls, [['/api/platform/analytics', 'POST'], ['/api/platform/analytics', 'POST']]);
 });
+
+test('Database Usage polls only while visible, ages retained samples and cleans up on exit', async () => {
+  let reads = 0, release, fail = false;
+  const h = ownerHarness(async (url) => {
+    if (url !== '/api/database-usage') return response({ servers: [] });
+    reads++;
+    if (reads > 1) await new Promise(resolve => { release = resolve; });
+    if (fail) throw new Error('offline');
+    return response(usageOverview([usageDatabase()]));
+  });
+  h.app.navigate('usage');
+  await settle();
+  const poll = () => [...h.timers].filter(([, timer]) => timer.delay === 60000);
+  assert.equal(poll().length, 1, 'one poll follows the completed overview');
+  const [id, timer] = poll()[0];
+  h.timers.delete(id);
+  h.advanceTime(60000);
+  await timer.fn();
+  assert.equal(reads, 2, 'the visible page refreshes after one minute');
+  await fire(h.nodes.get('#refresh-usage'), 'click');
+  assert.equal(reads, 2, 'manual refresh shares the pending poll');
+  assert.equal(poll().length, 0, 'no next poll while a read is pending');
+  fail = true;
+  release();
+  await settle();
+  assert.match(usageCards(h)[0].querySelector('.du-chip').textContent, /Measured 3 min ago/);
+  assert.equal(usageCards(h)[0].dataset.usageStale, '1');
+  assert.equal(poll().length, 1, 'a failed poll schedules a bounded retry');
+  h.document.visibilityState = 'hidden';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(poll().length, 0, 'hiding the page clears the timer');
+  h.advanceTime(600000);
+  h.document.visibilityState = 'visible';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(reads, 3, 'visibility restoration immediately refreshes');
+  assert.match(usageCards(h)[0].querySelector('.du-chip').textContent, /Measured 13 min ago/, 'age advances even while the new read is pending');
+  fail = false;
+  release();
+  await settle();
+  assert.equal(usageCards(h)[0].dataset.usageStale, undefined);
+  assert.equal(poll().length, 1);
+  const pendingTimer = poll()[0][1];
+  h.app.navigate('servers');
+  await settle();
+  assert.equal(poll().length, 0);
+  assert.equal(h.documentListeners.has('visibilitychange'), false);
+  await pendingTimer.fn();
+  assert.equal(reads, 3, 'an already queued callback cannot read after unmount');
+});
+
+test('a pending breakdown disables repeated clicks across overview refreshes and isolates visits', async () => {
+  const pending = [];
+  const h = ownerHarness(async (url) => {
+    if (url === '/api/database-usage/core') return new Promise(resolve => pending.push(resolve));
+    if (url === '/api/database-usage') return response(usageOverview([usageDatabase()]));
+    return response({ servers: [] });
+  });
+  const button = () => findNode(usageCards(h)[0], n => n.localName === 'button' && n.textContent === 'Show current breakdown');
+  h.app.navigate('usage');
+  await settle();
+  await fire(button(), 'click');
+  assert.equal(button().disabled, true);
+  await fire(button(), 'click');
+  await fire(h.nodes.get('#refresh-usage'), 'click');
+  await fire(button(), 'click');
+  assert.equal(pending.length, 1, 'the native disabled control excludes overlapping reads');
+  h.app.navigate('servers');
+  await settle();
+  h.app.navigate('usage');
+  await settle();
+  await fire(button(), 'click');
+  assert.equal(pending.length, 2, 'the new visit owns an independent request');
+  pending[0](response(usageDatabase({ pages: 1000 })));
+  await settle();
+  assert.equal(button().disabled, true, 'an old visit cannot clear the current loading state');
+  pending[1](response(usageDatabase({ pages: 2000 })));
+  await settle();
+  assert.equal(button().disabled, false);
+  assert.equal(usageFigures(usageCards(h)[0])[0], '8.19 MB allocated');
+});
+
+test('Platform analytics retains totals, chart and rows through refresh failures and recovers', async () => {
+  const pending = [];
+  const h = ownerHarness((url, options) => new Promise((resolve, reject) => pending.push({ resolve, reject, options })));
+  const snapshot = {
+    window_days: 30, servers: 2,
+    members: { status: 'partial', current: 40, known: 45, servers: 2, guilds_counted: 2, guilds_incomplete: 1 },
+    series: [{ day: '2026-11-12', warns: 7 }],
+    guilds: [{ guild_id: '900000000000000001', warns: 7 }],
+  };
+  h.app.navigate('platform-analytics');
+  await settle();
+  pending[0].resolve(response(snapshot));
+  await settle();
+  const panel = () => h.nodes.get('#platform-analytics');
+  const totals = () => [...panel().querySelectorAll('.stat-value')].map(el => el.textContent);
+  const originalTotals = totals();
+  const assertRetained = () => {
+    assert.deepEqual(totals(), originalTotals);
+    assert.ok(panel().querySelector('svg[role="img"]'));
+    assert.match(panel().querySelector('table').textContent, /900000000000000001/);
+  };
+  await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
+  assertRetained();
+  pending[1].reject(new Error('offline'));
+  await settle();
+  assertRetained();
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /refresh failed: offline.*stale/i);
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /1 counted server has a member directory still importing/);
+  await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
+  assertRetained();
+  const timeout = [...h.timers.values()].find(timer => timer.delay === 30000);
+  assert.ok(timeout);
+  await timeout.fn();
+  assert.equal(pending[2].options.signal.aborted, true);
+  pending[2].reject(new Error('aborted'));
+  await settle();
+  assertRetained();
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /timed out.*stale/i);
+  await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
+  pending[3].resolve(response({ ...snapshot, servers: 3 }));
+  await settle();
+  assert.equal(totals()[0], '3');
+  assert.doesNotMatch(h.nodes.get('#platform-analytics-status').textContent, /stale|failed/);
+});
+
+test('Platform analytics initial failure reports unavailability and retry restores the view', async () => {
+  let fail = true;
+  const h = ownerHarness(async () => {
+    if (fail) throw new Error('offline');
+    return response({ servers: 0, series: [], guilds: [] });
+  });
+  h.app.navigate('platform-analytics');
+  await settle();
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /Platform analytics unavailable: offline/);
+  assert.doesNotMatch(h.nodes.get('#platform-analytics').textContent, /No platform trend data recorded yet/);
+  fail = false;
+  await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
+  assert.match(h.nodes.get('#platform-analytics').textContent, /No platform trend data recorded yet/);
+});
