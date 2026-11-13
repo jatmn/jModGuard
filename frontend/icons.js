@@ -24,6 +24,7 @@ export const ICON_PATHS = {
   "x-circle": ["M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0", "M15 9l-6 6", "M9 9l6 6"],
   "check-circle": ["M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0", "M8 12l3 3l5-6"],
   "alert-circle": ["M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0", "M12 8v5", "M12 16v.01"],
+  "alert-triangle": ["M12 3L2 20h20z", "M12 9v5", "M12 17v.01"],
   "arrow-up-circle": ["M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0", "M12 16V8", "M8 12l4-4l4 4"],
   download: ["M12 4v11", "M7 10l5 5l5-5", "M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"],
   refresh: ["M20 12a8 8 0 1 1-2.34-5.66L20 8", "M20 4v4h-4"],
@@ -73,7 +74,7 @@ export const ICON_INTENTS = ["danger", "success", "info", "warning", "analytics"
 
 // One meaning per action, shared by every page: destructive red, restorative
 // green, edits and views blue, warnings amber, copy/cancel gray. Actions join the
-// set when a page uses them.
+// set when a page uses them (warn: the Dashboard's Warns count).
 export const ACTION_ICONS = {
   ban: { icon: "hammer", intent: "danger" },
   unban: { icon: "user-check", intent: "success" },
@@ -86,6 +87,7 @@ export const ACTION_ICONS = {
   copy: { icon: "copy", intent: "neutral" },
   cancel: { icon: "x-circle", intent: "neutral" },
   approve: { icon: "check-circle", intent: "success" },
+  warn: { icon: "alert-triangle", intent: "warning" },
   attention: { icon: "alert-circle", intent: "danger" },
   update: { icon: "arrow-up-circle", intent: "warning" },
   back: { icon: "arrow-left", intent: "neutral" },
@@ -117,6 +119,24 @@ export const NAV_ICONS = {
   "exit-preview": { icon: "arrow-left", intent: "neutral" },
   "sign-out": { icon: "log-out", intent: "neutral" },
   usage: { icon: "database", intent: "neutral" },
+};
+
+// Dashboard Overview tiles (#608). Each count shows the icon and color of the page or
+// action it counts, so a tile and the sidebar item it summarizes look the same. The
+// Getting started links show the sidebar icon of the page they open (NAV_ICONS).
+export const DASHBOARD_ICONS = {
+  "rules-enabled": NAV_ICONS.rules,
+  "rules-dry-run": ACTION_ICONS.view,
+  "commands-enabled": NAV_ICONS.commands,
+  "log-channels": NAV_ICONS.logchannels,
+  "moderation-records": NAV_ICONS.events,
+  warns: ACTION_ICONS.warn,
+  bans: NAV_ICONS.bans,
+  cases: NAV_ICONS.cases,
+  prefix: NAV_ICONS.settings,
+  "bot-name": NAV_ICONS.actions,
+  "badword-patterns": NAV_ICONS.badwords,
+  "routine-chat-collection": NAV_ICONS.usage,
 };
 
 // Decorative: the accessible name always comes from the surrounding control or text.

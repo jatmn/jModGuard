@@ -35,7 +35,7 @@ function scale(value, max) {
 }
 
 function dayLabel(day) {
-  // YYYY-MM-DD → "Nov 12" without locale-dependent output.
+  // YYYY-MM-DD to "Nov 12" without locale-dependent output.
   const [year, month, date] = String(day).split("-").map(Number);
   const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   if (!year || !month || !date) return String(day);

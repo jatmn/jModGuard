@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import vm from "node:vm";
 
 const css = readFileSync(new URL("../frontend/style.css", import.meta.url), "utf8");
 
@@ -382,4 +383,48 @@ test("icon buttons keep a 24px target and a visible focus ring", () => {
   const nav = iconCssRule(".sidebar svg.nav-icon");
   assert.match(nav, /background:\s*var\(--panel\)/);
   assert.ok(rem(nav.match(/width:\s*([^;]+)/)[1]) >= 1.25, "sidebar icons stay legible");
+});
+
+// #608: Dashboard Overview tiles and Getting started links draw icons from the shared map.
+// Each icon color keeps 3:1 on the background its card or link actually paints, in both themes.
+const iconMaps = vm.runInNewContext(`${readFileSync(new URL("../frontend/icons.js", import.meta.url), "utf8")
+  .replace(/^import .*;$/gm, "").replaceAll("export ", "")}\n({ DASHBOARD_ICONS, NAV_ICONS })`, { React: {} });
+const SETUP_LINK_TABS = ["rules", "commands", "logchannels"];
+for (const [theme, selector] of [["light", ":root"], ["dark", ':root[data-theme="dark"]']]) {
+  test(`${theme} dashboard card and setup link icons keep 3:1 on their backgrounds`, () => {
+    const colors = tokens(selector);
+    const icons = iconPalettes()[theme];
+    const token = (body, property) => {
+      const name = declaration(body, property)?.match(/^var\((--[\w-]+)\)$/)?.[1];
+      assert.ok(name && colors[name], `${property} must use a theme token, got ${declaration(body, property)}`);
+      return colors[name];
+    };
+    const tile = token(rule(".dashboard-section .stats"), "background");
+    const link = token(rule(".btn.setup-link"), "--btn-color");
+    // daisyUI 5 .btn:hover darkens --btn-color with 7% black in OKLab.
+    const surfaces = { "Overview tile": tile, "Getting started card": colors["--panel"], "setup link": link, "setup link hover": mixOklab("#000000", link, 0.07) };
+    const tiles = Object.entries(iconMaps.DASHBOARD_ICONS);
+    assert.equal(tiles.length, 12, "one icon per Overview tile");
+    const checks = [
+      ...tiles.map(([key, entry]) => [`tile ${key}`, entry, ["Overview tile", "Getting started card"]]),
+      ...SETUP_LINK_TABS.map((tab) => [`setup link ${tab}`, iconMaps.NAV_ICONS[tab], ["setup link", "setup link hover"]]),
+    ];
+    for (const [name, entry, on] of checks) {
+      assert.ok(icons[entry.intent], `${name} uses a palette color, got ${entry.intent}`);
+      for (const surface of on) {
+        const ratio = contrast(icons[entry.intent], surfaces[surface]);
+        assert.ok(ratio >= 3, `${theme} ${name} --icon-${entry.intent} ${icons[entry.intent]} on ${surface} ${surfaces[surface]}: ${ratio.toFixed(2)}:1`);
+      }
+    }
+  });
+}
+
+test("dashboard icons use the shared icon size, not a page-specific scale", () => {
+  assert.match(iconCssRule("svg.icon"), /width:\s*1rem;\s*height:\s*1rem/);
+  for (const [, selector, body] of css.matchAll(/([^{}]*(?:dashboard|stat|setup)[^{}]*)\{([^{}]*)\}/g)) {
+    if (!/\bsvg\b|\.icon\b/.test(selector)) continue;
+    assert.doesNotMatch(body, /(?:^|[;\s])(?:width|height|font-size|--size)\s*:/, `${selector.trim()} resizes dashboard icons`);
+  }
+  // A busy setup link still greys its icon with the label.
+  assert.match(iconCssRule('.btn:is(:disabled, [aria-disabled="true"]) svg.icon'), /color:\s*inherit/);
 });
