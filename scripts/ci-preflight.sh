@@ -989,6 +989,9 @@ if should_run frontend; then
   echo 'ci-preflight: node --test scripts/frontend-warmup-test.mjs'
   node --test scripts/frontend-warmup-test.mjs
 
+  echo 'ci-preflight: node --test scripts/frontend-sr-only-test.mjs'
+  node --test scripts/frontend-sr-only-test.mjs
+
   echo 'ci-preflight: node --test scripts/package-webui-test.mjs'
   node --test scripts/package-webui-test.mjs
 
