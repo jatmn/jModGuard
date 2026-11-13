@@ -2836,6 +2836,16 @@ function InfoTip({ id, label, children }) {
   );
 }
 
+// Short notes a moderator may want, collapsed by default (#620): one idea per line.
+function GoodToKnow({ items, summary = "Good to know" }) {
+  return h(
+    "details",
+    { className: "good-to-know" },
+    h("summary", null, summary),
+    h("ul", null, ...items.filter(Boolean).map((item, index) => h("li", { key: index }, item))),
+  );
+}
+
 // Getting started is complete when the loaded configuration already has at least
 // one enabled automod rule, one enabled command and one routed log channel: one
 // per setup step. Missing collections count as incomplete, so the guide stays.
@@ -2899,10 +2909,8 @@ function tabDashboard() {
           h(
             "p",
             { className: "setup-note" },
-            "Use each editor’s Save action to apply changes. The bot usually picks up configuration changes within a few seconds. " +
-              (isBotOwner()
-                ? "As bot owner, you can also edit Global defaults for all servers."
-                : "Global defaults can only be edited by the bot owner."),
+            "Save in each editor. The bot picks up changes within a few seconds." +
+              (isBotOwner() ? " As bot owner, you can also edit Global defaults." : ""),
           ),
         ),
       ),
@@ -3234,14 +3242,15 @@ function tabRules() {
         "Add custom rule",
       ),
     ),
-    h(
-      "p",
-      { className: "muted", style: { marginBottom: "14px" } },
-      "Each rule has its own parameters, whitelists, and an escalation table " +
-        "(`at` = strike count at which the action fires; the highest-severity fired action is executed). " +
-        "Exact image and repeated-text rules use separate matchers: dry-run logs matches only, " +
-        "while normal mode deletes matched messages and bans. Use dry-run while tuning.",
-    ),
+    h("p", { className: "muted" }, "Each rule catches one kind of abuse. Use dry-run while you tune it."),
+    h(GoodToKnow, {
+      items: [
+        "Each time a rule catches a member, they get a strike. Actions are set per strike count.",
+        "If a member has reached several steps, only the highest one runs.",
+        "Exact image spam and Repeated text delete the message and ban the member.",
+        "In dry-run, a rule only logs what it would have done.",
+      ],
+    }),
     ...rules.map((r) => ruleCard(r)),
   );
 }
@@ -3940,10 +3949,41 @@ function applyPlanStepInput(step, type, raw) {
   else if (type === "wait") step.secs = Math.max(1, Number(raw) || 1);
 }
 
+// A rule's escalation steps in plain words (#620), e.g. "Strike 1: Warn · Strike 3: Timeout 10 min".
+function describeRuleActions(rule) {
+  const name = (step) => {
+    if (step.action === "timeout") return `Timeout ${step.duration_minutes || 0} min`;
+    if (step.action === "ban")
+      return step.purge_last_hour
+        ? "Ban and delete the last hour of messages"
+        : step.delete_days
+          ? `Ban and delete ${step.delete_days} day(s) of messages`
+          : "Ban";
+    const action = String(step.action || "unknown");
+    return action[0].toUpperCase() + action.slice(1);
+  };
+  const steps = [...(rule.actions ?? [])].sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+  return steps.length ? steps.map((step) => `Strike ${step.at ?? 0}: ${name(step)}`).join(" · ") : "No actions set";
+}
+
+// Badwords splits a words paste on commas and new lines (jmodguard::normalize::badword_patterns).
+const BADWORD_MAX_ENTRIES = 32;
+const BADWORD_AUTO_HANDLED = [
+  ["Upper and lower case", "SCAM, Scam and scam all match."],
+  ["Accents", "Letters with accents match their plain letter."],
+  ["Hidden characters", "Invisible zero-width characters are ignored."],
+  ["Spacing", "Letters split up with spaces still match."],
+  ["Leetspeak", "Common swaps like 5c4m for scam still match."],
+  ["Whole words", "A word only matches on its own, not inside a longer word."],
+];
+
 function tabBadwords() {
   const words = state.config.badwords;
   const { drafts } = useStore(ui);
   const mode = drafts["badwords:mode"]?.value || "words";
+  const entryCount = String(drafts["badwords:pattern"]?.value ?? "")
+    .split(/[,\n\r]/)
+    .filter((entry) => entry.trim()).length;
   const badwordRule = state.config.rules.find((rule) => rule.rule_id === "badword");
   const patternRef = useRef(null);
   const pattern = h(Textarea, {
@@ -3953,7 +3993,7 @@ function tabBadwords() {
     maxLength: mode === "regex" ? 512 : 4096,
     "aria-label": mode === "regex" ? "Advanced regex pattern" : "Words or phrases",
     placeholder: mode === "regex" ? "Advanced regex, e.g. (scam|pump and dump)" : "Words or phrases, separated by commas or newlines",
-    style: { flex: "2" },
+    style: { width: "100%" },
     className: "textarea",
   });
   const noteRef = useRef(null);
@@ -3982,15 +4022,22 @@ function tabBadwords() {
     "div",
     {},
     h("h2", {}, "Badwords (bypass-resistant)"),
+    h("p", { className: "muted" }, "Block words and phrases in your server's messages."),
     h(
-      "p",
-      { className: "muted", style: { marginBottom: "12px" } },
-      "Add ordinary words or phrases. Whole-word matching and bypass resistance are automatic, including case, accents, zero-width characters, spacing and supported leetspeak. " +
-        "Add up to 32 entries at once, up to 200 bytes each (compiled pattern limit 512 bytes). Advanced regex keeps its own matching semantics. " +
-        (isBotOwner()
-          ? "Global patterns apply to every server."
-          : "Global patterns (shown below) are enforced for all servers; only the bot owner can edit them."),
+      "ul",
+      { className: "tag-group", "aria-label": "Handled automatically" },
+      h("li", { className: "muted" }, "Handled automatically:"),
+      ...BADWORD_AUTO_HANDLED.map(([label, title]) =>
+        h("li", { key: label, className: "badge badge-soft badge-sm badge-neutral", title }, label),
+      ),
     ),
+    h(GoodToKnow, {
+      items: [
+        isBotOwner()
+          ? "Global entries apply to every server."
+          : "Global entries apply to every server. Only the bot owner can change them.",
+      ],
+    }),
     badwordRule
       ? h(
           "div",
@@ -4001,13 +4048,27 @@ function tabBadwords() {
             h("h3", { className: "card-title" }, "What happens on match"),
             h(
               "p",
-              {},
-              `${badwordRule.effective.enabled ? "Enabled" : "Disabled"} · ${badwordRule.effective.dry_run ? "Dry-run (log only)" : "Enforcing"}`,
+              { className: "badword-action-summary" },
+              !badwordRule.effective.enabled
+                ? h("span", { className: "badge badge-soft badge-sm badge-error" }, "Off")
+                : badwordRule.effective.dry_run
+                  ? h("span", { className: "badge badge-soft badge-sm badge-warning" }, "Dry-run")
+                  : h("span", { className: "badge badge-soft badge-sm badge-success" }, "On"),
+              " ",
+              !badwordRule.effective.enabled
+                ? "Matches are ignored."
+                : badwordRule.effective.dry_run
+                  ? `Only logs matches. When on: ${describeRuleActions(badwordRule.effective)}`
+                  : describeRuleActions(badwordRule.effective),
             ),
             h(
-              ActionButton,
-              { className: "btn", onClick: () => editRule(badwordRule) },
-              "Actions and exemptions",
+              "div",
+              { className: "card-actions" },
+              h(
+                ActionButton,
+                { className: "btn btn-sm", onClick: () => editRule(badwordRule) },
+                "Edit actions & exemptions",
+              ),
             ),
           ),
         )
@@ -4029,8 +4090,26 @@ function tabBadwords() {
               h("option", { value: "words" }, "Words or phrases"),
               h("option", { value: "regex" }, "Advanced regex"),
             ),
+            h(
+              "p",
+              { className: "field-help" },
+              mode === "regex"
+                ? "Matches your pattern exactly as written. Disguises are not handled."
+                : "Matches whole words and catches common disguises.",
+            ),
           ),
-          pattern,
+          h(
+            "div",
+            { style: { flex: "2" } },
+            pattern,
+            h(
+              "p",
+              { className: "field-help", "aria-live": "polite" },
+              mode === "regex"
+                ? "One pattern, up to 512 bytes."
+                : `${entryCount}/${BADWORD_MAX_ENTRIES} entries`,
+            ),
+          ),
           note,
           scope,
           h(
@@ -4061,7 +4140,7 @@ function tabBadwords() {
         "div",
         { className: "card-body" },
         h("h3", { className: "card-title" }, "Live tester"),
-        h("p", { className: "field-help" }, "Tests the saved server and global list plus the draft above. Detection only. Enable, dry-run and exemptions determine enforcement."),
+        h("p", { className: "field-help" }, "Checks text against your list and the draft above. It doesn't take any action."),
         h(
           "div",
           { className: "row" },
@@ -4086,7 +4165,7 @@ function tabBadwords() {
             "Test",
           ),
         ),
-        h("pre", { className: "code" }, result),
+        result ? h("pre", { className: "code" }, result) : null,
       ),
     ),
     h(
@@ -4097,7 +4176,7 @@ function tabBadwords() {
         { className: "card-body" },
         h("h3", { className: "card-title" }, `Words and patterns (${words.length})`),
         words.length === 0
-          ? h("p", { className: "muted" }, "No words or patterns yet.")
+          ? h("p", { className: "muted" }, "No words yet. Add some above, for example: scam, free nitro")
           : h(
               DataTable,
               { headings: ["Scope", "Word, phrase or advanced regex", "Note", "Status", ""] },
@@ -4167,13 +4246,13 @@ function tabCommands() {
     ),
     !canManageServer() &&
       h("p", { className: "muted" }, "Editing commands needs Manage Server: command plans can grant roles and run moderation actions."),
-    h(
-      "p",
-      { className: "muted", style: { margin: "6px 0 14px" } },
-      "Every command lives in config: rename, reword responses, change permissions or cooldowns. " +
-        "Custom commands run multi-step action plans (reply, dm, log, roles, timeout, kick, ban…). " +
-        "Enabled commands are synced to Discord as slash commands.",
-    ),
+    h("p", { className: "muted" }, "Rename any command, change its replies, who can use it, and its cooldown."),
+    h(GoodToKnow, {
+      items: [
+        "Custom commands can run several steps: reply, DM, log, change roles, timeout, kick or ban.",
+        "Enabled commands also show up in Discord as slash commands.",
+      ],
+    }),
     h(
       DataTable,
       { headings: ["Command", "Category", "Description", "Permission", "State", ""], className: "commands-table table" },
@@ -7294,18 +7373,41 @@ function tabKnownSpam() {
   const addErrorFor = (key) => drafts[key]?.error ? h("p", { className: "error", role: "alert" }, drafts[key].error) : null;
   return h("div", null,
     h("h2", null, "Known spam"),
-    h("p", { className: "muted" }, "Save full confirmed spam messages or URL wildcards. First match bans and purges Discord’s Previous Hour (3600 seconds). Dry-run only logs. The list uses the rule’s enable, skip lists and skip-moderators settings below. Global entries apply to every server; only the bot owner can edit them."),
-    h("p", { className: "field-help" }, "Samples match the whole message, using the same raw, normalized and whitespace-stripped forms as Badwords (case, accents, zero-width characters and supported leetspeak). A lightly rewritten pitch may not match. Quoting or adding different text does not match a sample; URL patterns still apply."),
+    h("p", { className: "muted" }, "Ban members who post spam you've already confirmed."),
+    h(GoodToKnow, {
+      items: [
+        "The first match bans the member and deletes their messages from the last hour.",
+        "In dry-run, matches are only logged.",
+        "The rule below turns the list on or off and sets who is skipped.",
+        isBotOwner()
+          ? "Global entries apply to every server."
+          : "Global entries apply to every server. Only the bot owner can change them.",
+      ],
+    }),
     rule ? ruleCard(rule) : null,
     h(DraftCard, { group: "known-spam", className: "card bg-base-100 card-border" },
       h("div", { className: "card-body" },
         field("Applies to", scopeSelect(scopeRef, "This server", "Global", true, "known-spam:scope")),
         field("Optional note (up to 512 bytes)", h(Input, { className: "input w-full", draftKey: "known-spam:note", "data-note": true, maxLength: 512 })),
-        field("Full sample message (up to 4096 bytes)", h(Textarea, { className: "textarea w-full", draftKey: "known-spam:sample", rows: 7, maxLength: 4096, placeholder: "Paste the entire confirmed spam message. No regex needed." })),
+        field("Full sample message (up to 4096 bytes)", h(Textarea, { className: "textarea w-full", draftKey: "known-spam:sample", rows: 7, maxLength: 4096, placeholder: "Paste the entire confirmed spam message. No regex needed." }),
+          h("p", { className: "field-help" }, "Matches the same whole message, even with case, accent, spacing or leetspeak changes. A reworded copy may not match.")),
         h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:sample", "known-spam:note", "known-spam:scope"], onClick: () => add("sample") }, "Add sample"),
         addErrorFor("known-spam:sample"),
         field("URL wildcard (up to 512 bytes)", h(Input, { className: "input w-full", draftKey: "known-spam:url", "data-url": true, maxLength: 512, placeholder: "tinyurl.com/*" })),
-        h("p", { className: "field-help" }, "HTTP/HTTPS scheme is optional and ignored. Hosts ignore case; tinyurl.com/* matches that exact host, not subdomains. *.example.com/* matches subdomains only. Omitted path means /*. Paths are case-sensitive; * matches zero or more characters, including /. Query and fragment are ignored in links and forbidden in patterns. No regex, credentials or ports in patterns. Bare domain links also match. Up to 1024 entries per scope; normalized duplicates are rejected."),
+        h("p", { className: "field-help" }, "Use * as a wildcard, for example tinyurl.com/* or *.example.com/*."),
+        h(GoodToKnow, {
+          summary: "How URL patterns match",
+          items: [
+            "http:// or https:// is optional.",
+            "tinyurl.com/* matches only that site. *.example.com/* matches its subdomains, not example.com itself.",
+            "No path means the whole site. Paths are case-sensitive.",
+            "* matches anything, including /.",
+            "Links without http:// also match.",
+            "Anything after ? or # in a link is ignored.",
+            "Patterns can't contain regex, ports, logins, ? or #.",
+            "Up to 1024 patterns each for this server and global.",
+          ],
+        }),
         h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:url", "known-spam:note", "known-spam:scope"], onClick: () => add("url") }, "Add URL pattern"),
         addErrorFor("known-spam:url"),
       ),
@@ -7344,7 +7446,15 @@ function tabKnownBadImages() {
   if (guildId === "0") return h("p", { className: "muted" }, "Known-bad images are managed per server. Select a server.");
   return h("div", null,
     h("h2", null, "Known-bad images"),
-    h("p", { className: "muted" }, "Add a confirmed SHA-256 digest from an exact-image notice. A listed image matches on its first post under the exact-image rule. Dry-run logs only; normal mode deletes and bans. Up to 1024 digests per server. Only hashes and safe labels are retained."),
+    h("p", { className: "muted" }, "Ban images you've already confirmed as spam."),
+    h(GoodToKnow, {
+      items: [
+        "A listed image matches the first time it's posted.",
+        "Uses the Exact image spam rule: in dry-run it only logs, otherwise it deletes the message and bans the member.",
+        "Up to 1024 images per server.",
+        "Only the image's fingerprint (hash) and your note are kept, never the image.",
+      ],
+    }),
     field("Search hashes or notes", h(Input, {
       className: "input w-full", "data-search": true, value: query, onChange: (event) => setQuery(event.target.value),
     })),
@@ -7356,7 +7466,7 @@ function tabKnownBadImages() {
         { className: "card-body" },
         field("SHA-256 digest", h(Input, {
           className: "input w-full", draftKey: "known-bad:hash", maxLength: 64,
-        })),
+        }), h("p", { className: "field-help" }, "Copy it from an exact-image notice in your log channel.")),
         field("Optional safe note", h(Input, {
           className: "input w-full", draftKey: "known-bad:note", maxLength: 256,
         })),
