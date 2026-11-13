@@ -202,7 +202,7 @@ function ComponentCard({ record, revision }) {
   const content = [], details = [], heading = [];
   const mismatch = ui.getSnapshot().snapshot.boot_mismatches?.[record.component];
   if (mismatch) {
-    heading.push(badge("Boot mismatch", "warn", "warn"));
+    heading.push(badge("Boot mismatch", "warn", "attention"));
     line(content, "Startup problem", mismatch.reason);
     line(content, "Expected release", `${mismatch.expected.release_id} · ${mismatch.expected.source_sha}`);
     line(content, "Startup executable", mismatch.running || "Application stopped");

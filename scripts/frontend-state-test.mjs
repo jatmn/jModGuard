@@ -6430,8 +6430,7 @@ function assertIconRows(root) {
 
 test('one shared action icon map gives every action one meaning and one fixed color', () => {
   const expected = {
-    ban: ['hammer', 'danger'], unban: ['user-check', 'success'], kick: ['door', 'kick'],
-    timeout: ['clock', 'warning'], warn: ['alert-triangle', 'warning'], remove: ['trash', 'danger'],
+    ban: ['hammer', 'danger'], unban: ['user-check', 'success'], remove: ['trash', 'danger'],
     edit: ['pencil', 'info'], view: ['eye', 'info'], copy: ['copy', 'neutral'], cancel: ['x-circle', 'neutral'],
     approve: ['check-circle', 'success'],
   };
@@ -6699,4 +6698,29 @@ test('the Web UI draws SVG icons, never emoji or glyph icons', () => {
     const lines = text.split('\n').map((line, index) => [index + 1, line]).filter(([, line]) => glyph.test(line));
     assert.deepEqual(lines, [], `${file} uses emoji or glyph icons`);
   }
+});
+
+test("the sidebar's own buttons show their colored SVG icons beside unchanged labels", async () => {
+  const assertSidebarIcon = (control, key, label) => {
+    assert.ok(control, `missing ${label}`);
+    assert.equal(control.textContent, label, `${label} keeps its label and no glyph`);
+    const icons = control.querySelectorAll('svg');
+    assert.equal(icons.length, 1, `${label} has one icon`);
+    const [icon] = icons;
+    assert.equal(icon.getAttribute('aria-hidden'), 'true', `${label} icon is decorative`);
+    assert.ok(icon.classList.contains('nav-icon'), `${label} uses the sidebar icon tile`);
+    assert.equal(icon.getAttribute('data-icon'), iconSet.NAV_ICONS[key].icon, label);
+    assert.ok(icon.classList.contains(`icon-${iconSet.NAV_ICONS[key].intent}`), `${label} keeps its meaning color`);
+  };
+  const owner = ownerHarness(async () => response({ servers: [] }));
+  owner.app.navigate('dashboard');
+  const tools = owner.document.querySelector('.sidebar #owner-tools');
+  assertSidebarIcon(findNode(tools, n => n.localName === 'a' && n.getAttribute('href') === '/administration/index.html'), 'administration', 'Administration');
+  assertSidebarIcon(findNode(tools, n => n.localName === 'button' && n.textContent === 'View as…'), 'view-as', 'View as…');
+  assertSidebarIcon(owner.document.querySelector('.sidebar-footer #logout-btn'), 'sign-out', 'Sign out');
+
+  const preview = harness();
+  preview.app.state.me.preview = true;
+  preview.app.navigate('dashboard');
+  assertSidebarIcon(findNode(preview.document.querySelector('.sidebar #owner-tools'), n => n.localName === 'button'), 'exit-preview', 'Exit preview');
 });

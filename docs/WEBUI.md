@@ -439,9 +439,6 @@ Each meaning has one icon and one fixed color, the same on every page and in bot
 | Remove or delete | trash | red |
 | Remove the bot from a server | leave (door with arrow) | red |
 | Unban | person with a check mark (never a padlock) | green |
-| Kick | door | orange |
-| Timeout | clock | amber |
-| Warn | warning triangle | amber |
 | Edit | pencil | blue |
 | View, open a case or history | eye | blue |
 | Download evidence, retry cleanup | download, circular arrow | blue |
@@ -453,7 +450,9 @@ its accessible label and hover tooltip, its confirmation dialog, and the shared 
 state; form-footer buttons such as **Save** keep their text. Every sidebar item and Administration
 page link shows its icon beside its label (for example a bar chart in purple for Analytics and
 teal people for Members); in the sidebar the icon sits on a small tile so it stays readable on
-the highlighted current item.
+the highlighted current item. The sidebar's own buttons use the same set: **Administration**
+(crown, blue), **View as…** (eye, blue), **Exit preview** (back arrow, gray) and **Sign out**
+(door with arrow, gray).
 
 Icon colors are their own `--icon-*` palette in `frontend/style.css`, separate from the theme's
 primary and accent colors. Light and Dark use a lighter or darker shade of the same color, and

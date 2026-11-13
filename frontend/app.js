@@ -106,6 +106,7 @@ function OwnerTools() {
             window.location = "/";
           },
         },
+        h(Icon, { name: NAV_ICONS["exit-preview"].icon, intent: NAV_ICONS["exit-preview"].intent, className: "nav-icon" }),
         "Exit preview",
       ),
     );
@@ -113,7 +114,7 @@ function OwnerTools() {
   return h(
     "div",
     { id: "owner-tools", className: "owner-tools" },
-    h("a", { className: "btn btn-sm", href: "/administration/index.html" }, "Administration"),
+    h("a", { className: "btn btn-sm", href: "/administration/index.html" }, h(Icon, { name: NAV_ICONS["administration"].icon, intent: NAV_ICONS["administration"].intent, className: "nav-icon" }), "Administration"),
     h(
       ActionButton,
       {
@@ -131,6 +132,7 @@ function OwnerTools() {
           );
         },
       },
+      h(Icon, { name: NAV_ICONS["view-as"].icon, intent: NAV_ICONS["view-as"].intent, className: "nav-icon" }),
       "View as…",
     ),
     h(
@@ -550,6 +552,7 @@ function App() {
                 h(
                   ActionButton,
                   { id: "logout-btn", className: "btn btn-sm btn-ghost", onClick: logout },
+                  h(Icon, { name: NAV_ICONS["sign-out"].icon, intent: NAV_ICONS["sign-out"].intent, className: "nav-icon" }),
                   "Sign out",
                 ),
               ),

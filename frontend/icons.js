@@ -8,9 +8,6 @@ export const ICON_PATHS = {
   // Row and record actions.
   hammer: ["M9.5 7.5l4-4l7 7l-4 4z", "M13 11l-9 9"],
   "user-check": ["M5 7a4 4 0 1 0 8 0a4 4 0 1 0-8 0", "M3 21v-1a5 5 0 0 1 5-5h2a5 5 0 0 1 5 5v1", "M16 11l2 2l4-4"],
-  door: ["M3 21h18", "M6 21V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v17", "M14 12v.01"],
-  clock: ["M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0", "M12 7v5l3 2"],
-  "alert-triangle": ["M12 3L2 20h20z", "M12 9v5", "M12 17v.01"],
   trash: [
     "M4 7h16",
     "M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2",
@@ -63,6 +60,7 @@ export const ICON_PATHS = {
   briefcase: ["M4 8h16v11H4z", "M9 8V5h6v3", "M4 13h16"],
   sliders: ["M4 6h9", "M17 6h3", "M15 4v4", "M4 12h3", "M11 12h9", "M9 10v4", "M4 18h11", "M19 18h1", "M17 16v4"],
   server: ["M4 4h16v6H4z", "M4 14h16v6H4z", "M8 7v.01", "M8 17v.01"],
+  crown: ["M3 17l2-10l5 4l2-6l2 6l5-4l2 10z", "M3 21h18"],
   database: [
     "M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3s-3.6 3-8 3s-8-1.3-8-3z",
     "M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6",
@@ -71,16 +69,14 @@ export const ICON_PATHS = {
 };
 
 // Fixed color intents. Each has a --icon-<intent> light and dark shade in style.css.
-export const ICON_INTENTS = ["danger", "success", "info", "warning", "kick", "analytics", "members", "neutral"];
+export const ICON_INTENTS = ["danger", "success", "info", "warning", "analytics", "members", "neutral"];
 
 // One meaning per action, shared by every page: destructive red, restorative
-// green, edits and views blue, warnings amber, kicks orange, copy/cancel gray.
+// green, edits and views blue, warnings amber, copy/cancel gray. Actions join the
+// set when a page uses them.
 export const ACTION_ICONS = {
   ban: { icon: "hammer", intent: "danger" },
   unban: { icon: "user-check", intent: "success" },
-  kick: { icon: "door", intent: "kick" },
-  timeout: { icon: "clock", intent: "warning" },
-  warn: { icon: "alert-triangle", intent: "warning" },
   remove: { icon: "trash", intent: "danger" },
   leave: { icon: "log-out", intent: "danger" },
   edit: { icon: "pencil", intent: "info" },
@@ -115,6 +111,11 @@ export const NAV_ICONS = {
   settings: { icon: "sliders", intent: "neutral" },
   servers: { icon: "server", intent: "members" },
   updates: { icon: "arrow-up-circle", intent: "info" },
+  // The sidebar's own buttons: owner tools, preview exit and the account footer.
+  administration: { icon: "crown", intent: "info" },
+  "view-as": { icon: "eye", intent: "info" },
+  "exit-preview": { icon: "arrow-left", intent: "neutral" },
+  "sign-out": { icon: "log-out", intent: "neutral" },
   usage: { icon: "database", intent: "neutral" },
 };
 

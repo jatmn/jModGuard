@@ -331,7 +331,7 @@ for (const [theme, selector] of [["light", ":root"], ["dark", ':root[data-theme=
 
 test("icon colors are their own palette, the same meanings in both themes", () => {
   const { light, dark } = iconPalettes();
-  assert.ok(iconIntents.length >= 8);
+  assert.ok(iconIntents.length >= 7);
   assert.deepEqual(Object.keys(light).sort(), [...iconIntents].sort(), "light theme defines every icon color");
   assert.deepEqual(Object.keys(dark).sort(), [...iconIntents].sort(), "dark theme defines every icon color");
   for (const [theme, selector] of [["light", ":root"], ["dark", ':root[data-theme="dark"]']]) {
@@ -373,7 +373,7 @@ test("icon buttons keep a 24px target and a visible focus ring", () => {
   // Busy and disabled actions grey their icon with the control.
   assert.match(iconCssRule('.btn:is(:disabled, [aria-disabled="true"]) svg.icon'), /color:\s*inherit/);
   // Sidebar icons sit on their own --panel tile so the inverted active row keeps their color.
-  const nav = iconCssRule("#tabs svg.nav-icon");
+  const nav = iconCssRule(".sidebar svg.nav-icon");
   assert.match(nav, /background:\s*var\(--panel\)/);
   assert.ok(rem(nav.match(/width:\s*([^;]+)/)[1]) >= 1.25, "sidebar icons stay legible");
 });
