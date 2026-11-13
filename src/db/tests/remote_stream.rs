@@ -1862,8 +1862,18 @@ async fn lease_extend_only_cases(use_remote: bool) {
         ("earlier", -1, 0, true),
         ("backward clock", -30_000, 0, true),
         ("forward clock within lease", 1_000, 1_000, true),
-        ("expired at exact boundary", 21_000, 1_000, false),
-        ("forward clock beyond lease", 30_000, 1_000, false),
+        (
+            "expired at exact boundary",
+            ACTIVE_BOT_LEASE_TTL_MS + 1_000,
+            1_000,
+            false,
+        ),
+        (
+            "forward clock beyond lease",
+            ACTIVE_BOT_LEASE_TTL_MS + 10_000,
+            1_000,
+            false,
+        ),
     ] {
         assert_eq!(
             renew_active_bot(
@@ -1908,7 +1918,10 @@ async fn lease_extend_only_cases(use_remote: bool) {
     );
     assert_eq!(
         stored(),
-        (format!("{owner} {}", now + 21_000), generation.to_string())
+        (
+            format!("{owner} {}", now + ACTIVE_BOT_LEASE_TTL_MS + 1_000),
+            generation.to_string()
+        )
     );
 
     // Each ownership predicate must independently reject an otherwise valid
@@ -1943,22 +1956,29 @@ async fn lease_extend_only_cases(use_remote: bool) {
     // captures the term and submits its blocking job. Another handle writes
     // first, then the queued request must respect that new durable state.
     for (label, pending_offset, later_offset, holder, matches, expected_offset) in [
-        ("overlapping renewals", 2_000, 3_000, owner, true, 23_000),
+        (
+            "overlapping renewals",
+            2_000,
+            3_000,
+            owner,
+            true,
+            ACTIVE_BOT_LEASE_TTL_MS + 3_000,
+        ),
         (
             "late write after takeover",
-            25_000,
-            24_000,
+            ACTIVE_BOT_LEASE_TTL_MS + 5_000,
+            ACTIVE_BOT_LEASE_TTL_MS + 4_000,
             foreign,
             false,
-            44_000,
+            2 * ACTIVE_BOT_LEASE_TTL_MS + 4_000,
         ),
         (
             "late write after same-holder takeover",
-            46_000,
-            45_000,
+            2 * ACTIVE_BOT_LEASE_TTL_MS + 6_000,
+            2 * ACTIVE_BOT_LEASE_TTL_MS + 5_000,
             owner,
             false,
-            65_000,
+            3 * ACTIVE_BOT_LEASE_TTL_MS + 5_000,
         ),
     ] {
         let blocked = db.clone();
@@ -2082,7 +2102,7 @@ async fn lease_cas_fences_owner_expiry_restore_and_shutdown() {
         !renew_active_bot(
             &db,
             instance,
-            now + 30_000,
+            now + ACTIVE_BOT_LEASE_TTL_MS + 10_000,
             std::time::Instant::now() + Duration::from_secs(10),
             Arc::clone(&refuse)
         )

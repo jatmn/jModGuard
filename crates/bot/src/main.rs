@@ -215,7 +215,15 @@ async fn main() -> Result<()> {
     };
     tracing::info!("database ready (migrate=true) at {}", cfg.db.log_label());
 
-    let app = match BotState::new(cfg.clone(), db) {
+    let state = tokio::select! {
+        state = jmodguard_bot::startup::build_state(cfg.clone(), db) => state,
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown during bot state startup");
+            jmodguard::log_shutdown_finished("bot");
+            return Ok(());
+        }
+    };
+    let app = match state {
         Ok(app) => app,
         // Exiting would make the launcher restart this child into the same refusal.
         // Hold with health up and no lease, as for an unsupported launcher.

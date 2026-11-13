@@ -181,7 +181,7 @@ impl Activation {
             renewal_stall: AtomicBool::new(false),
             #[cfg(test)]
             lease_ttl: Mutex::new(Duration::from_millis(
-                u64::try_from(db::ACTIVE_BOT_LEASE_TTL_MS).unwrap_or(20_000),
+                u64::try_from(db::ACTIVE_BOT_LEASE_TTL_MS).unwrap_or(60_000),
             )),
             #[cfg(test)]
             lease_margin: Mutex::new(LEASE_SAFETY_MARGIN),
@@ -387,7 +387,7 @@ impl Activation {
         }
         #[cfg(not(test))]
         {
-            Duration::from_millis(u64::try_from(db::ACTIVE_BOT_LEASE_TTL_MS).unwrap_or(20_000))
+            Duration::from_millis(u64::try_from(db::ACTIVE_BOT_LEASE_TTL_MS).unwrap_or(60_000))
         }
     }
 
@@ -468,7 +468,12 @@ fn writer_lease_lost(error: &anyhow::Error) -> bool {
 pub async fn wait_for_writer_lock(db: &Db, activation: &Arc<Activation>) -> anyhow::Result<bool> {
     let budget = db::startup_retry_budget(db.is_remote());
     let started = Instant::now();
-    let deadline = started + budget.budget;
+    // A crashed holder can retain its full TTL. Local database-open retries
+    // alone are shorter than that; allow takeover plus a polling interval.
+    let takeover_budget =
+        Duration::from_millis(u64::try_from(db::ACTIVE_BOT_LEASE_TTL_MS).unwrap_or(60_000))
+            + RENEW_EVERY;
+    let deadline = started + budget.budget.max(takeover_budget);
     let mut attempt = 0_u32;
     loop {
         if activation.is_shutting_down() {
@@ -1199,9 +1204,10 @@ mod tests {
 
     #[tokio::test]
     async fn slow_renewal_error_retries_through_the_activation_loop() {
-        // Scale 1:1: 20s TTL, 5s margin and 5s tick leave a 10s window.
+        // Retain the shorter 20s TTL regression: 5s margin/tick leave a 10s window.
         let (path, db) = temp_db("renew-slow-error");
         let activation = Activation::new();
+        activation.set_lease_window(Duration::from_secs(20), LEASE_SAFETY_MARGIN);
         assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
         let before = activation.authority_deadline().unwrap();
         let read_lease = || {
@@ -1316,7 +1322,7 @@ mod tests {
             db::claim_active_bot(
                 &db,
                 challenger.instance(),
-                now.saturating_add(21_000),
+                now.saturating_add(db::ACTIVE_BOT_LEASE_TTL_MS + 1_000),
                 challenger.refuse_flag(),
             )
             .await
@@ -1454,7 +1460,7 @@ mod tests {
         );
         holder.mark_lock_held(true);
         let challenger = Activation::new();
-        let later = now.saturating_add(21_000);
+        let later = now.saturating_add(db::ACTIVE_BOT_LEASE_TTL_MS + 1_000);
         assert!(
             db::claim_active_bot(&db, challenger.instance(), later, challenger.refuse_flag())
                 .await
@@ -1509,8 +1515,9 @@ mod tests {
             crate::tenant::TenantRuntime::open(&db, &cfg, &Default::default(), &Default::default())
                 .unwrap();
         let activation = Activation::new();
-        // Startup work outlasts the production 15s authority window. Keep the
-        // real cadence/window so concurrent DB tests cannot exhaust a tiny TTL.
+        activation.set_lease_window(Duration::from_secs(20), LEASE_SAFETY_MARGIN);
+        // Startup work outlasts this deliberately shorter 15s authority window.
+        // Keep the real cadence so concurrent DB tests cannot exhaust a tiny TTL.
         *activation.startup_delay.lock().unwrap() = Duration::from_secs(16);
         let started = Instant::now();
         assert!(
@@ -1538,6 +1545,7 @@ mod tests {
     async fn slow_core_claim_renews_before_remaining_authority_expires() {
         let (path, db) = temp_db("slow-claim");
         let activation = Activation::new();
+        activation.set_lease_window(Duration::from_secs(20), LEASE_SAFETY_MARGIN);
         assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
         // Model a confirmed claim that spent 12s of its 15s window.
         activation.note_authority(Instant::now() - Duration::from_secs(12));
@@ -1751,6 +1759,67 @@ mod tests {
         });
         began.acquire().await.unwrap().forget();
         writer
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_replacement_waits_for_a_crashed_holders_longer_lease() {
+        let (path, db) = temp_db("long-takeover");
+        let old = Activation::new();
+        // The crashed holder still has 35s on its row: beyond the old local
+        // DB-open budget, but within the production lease TTL.
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(
+            db::claim_active_bot(
+                &db,
+                old.instance(),
+                now - db::ACTIVE_BOT_LEASE_TTL_MS + 35_000,
+                old.refuse_flag()
+            )
+            .await
+            .unwrap()
+        );
+        let replacement = Activation::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(45),
+            wait_for_writer_lock(&db, &replacement),
+        )
+        .await;
+        assert!(result.unwrap().unwrap());
+        assert!(replacement.may_record());
+        db::release_active_bot(&db, replacement.instance())
+            .await
+            .unwrap();
+        drop(db);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn production_lease_survives_a_seventeen_second_database_stall() {
+        let (path, db) = temp_db("production-stall");
+        let writer_db = Db::open(&path, 2).unwrap();
+        let activation = Activation::new();
+        assert!(wait_for_writer_lock(&db, &activation).await.unwrap());
+        let before = activation.authority_deadline().unwrap();
+        let writer = hold_core_writer(writer_db, Duration::from_secs(17)).await;
+        let renewal = spawn_renewal(db.clone(), Arc::clone(&activation), None);
+        writer.await.unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(8), async {
+            while activation.authority_deadline() == Some(before) && activation.may_record() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        activation.begin_shutdown();
+        renewal.abort();
+        let _ = renewal.await;
+        recovered.unwrap();
+        assert!(
+            activation.authority_deadline().unwrap() > before,
+            "a short primary stall must not exhaust the production lease"
+        );
+        assert!(!activation.recording_cut_off());
+        drop(db);
+        cleanup(&path);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1281,7 +1281,8 @@ mod tests {
         };
         claim(
             &successor,
-            jmodguard::control::now_ms().saturating_add(21_000),
+            jmodguard::control::now_ms()
+                .saturating_add(jmodguard::db::ACTIVE_BOT_LEASE_TTL_MS + 1_000),
         )
         .await;
         assert!(
@@ -1358,7 +1359,8 @@ mod tests {
         };
         claim(
             &successor,
-            jmodguard::control::now_ms().saturating_add(21_000),
+            jmodguard::control::now_ms()
+                .saturating_add(jmodguard::db::ACTIVE_BOT_LEASE_TTL_MS + 1_000),
         )
         .await;
         assert!(
@@ -1543,7 +1545,8 @@ mod tests {
         assert_eq!(active_bans(&original, 99).await, 1);
         claim(
             &successor,
-            jmodguard::control::now_ms().saturating_add(21_000),
+            jmodguard::control::now_ms()
+                .saturating_add(jmodguard::db::ACTIVE_BOT_LEASE_TTL_MS + 1_000),
         )
         .await;
         settle_present_application_ban(

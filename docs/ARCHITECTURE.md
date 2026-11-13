@@ -145,6 +145,28 @@ the writer lease. A replacement waits until that lease expires or the owner
 releases it, and a release cannot clear another owner's row. Use one bot
 worker for this implementation.
 
+The active-bot lease lasts 60 seconds and renews every 5 seconds. The bot stops
+acting at its locally confirmed deadline, 5 seconds before the stored expiry;
+a failed renewal never extends that deadline. Short database stalls can recover
+inside that window. An ungraceful stop can delay takeover for up to 60 seconds;
+normal shutdown and lost-lease exits still attempt an owner-checked release.
+Core database open and bot state construction (including its read database)
+use startup retry classification and bounded backoff selected by the core
+database backend. With a local core, remote guild-store transport failures
+are not retried. Authentication failures and unsupported schemas retain their
+refusal behavior.
+
+Launcher revision 45 passes one `JMODGUARD_STARTED_NOTICE_FILE` path to all its
+application children. After Discord Ready, the bot atomically claims that marker
+before its startup-notice batch. Child crash restarts and in-place application
+updates in the same launcher lifetime do not repeat “Bot started”. A new launcher
+process gets a fresh marker; standalone bots and older launchers still announce
+once per child process. Slash synchronization and readiness run on every child.
+Notice delivery is best effort: a crash after claiming may leave some guilds
+without a notice, and a marker I/O error suppresses the batch with a warning.
+The marker is a local temporary file, not database state or a readiness signal.
+
+
 Captured configuration data operations now retain the original guild membership through
 the primary write transaction, including both sides of a copy and the guild context of a
 global edit. Empty scoped settings patches verify before reading. These library operations

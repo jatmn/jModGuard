@@ -999,7 +999,7 @@ impl BotState {
         }
         read_opts.read_only = true;
         read_opts.migrate = false;
-        let reads = Db::open_with(read_opts).context("failed to open the read-only database")?;
+        let reads = Db::open_with(read_opts).context("failed to open the bot read database")?;
         Ok(Arc::new(Self {
             db,
             reads,

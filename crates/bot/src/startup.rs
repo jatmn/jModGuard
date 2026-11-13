@@ -26,6 +26,58 @@ pub async fn open_database(cfg: &BotProcessConfig) -> Result<Db> {
     Db::open_with_budget(opts, budget).await
 }
 
+/// Build state, including tenant stores and the bot's read-only DB, using the
+/// core database backend's startup retry classification and backoff budget.
+/// With a local core, remote guild-store transport failures are not retried.
+/// Never retry a schema refusal or overlap a still-running synchronous attempt.
+pub async fn build_state(cfg: BotProcessConfig, db: Db) -> Result<Arc<BotState>> {
+    let budget = db::startup_retry_budget(db.is_remote());
+    build_state_with_budget(cfg, db, budget).await
+}
+
+async fn build_state_with_budget(
+    cfg: BotProcessConfig,
+    db: Db,
+    budget: db::StartupOpenBudget,
+) -> Result<Arc<BotState>> {
+    let deadline = Instant::now() + budget.budget;
+    let mut attempt = 0_u32;
+    loop {
+        attempt = attempt.saturating_add(1);
+        let cfg = cfg.clone();
+        let connection = db.clone();
+        let result = tokio::task::spawn_blocking(move || BotState::new(cfg, connection))
+            .await
+            .context("bot state startup worker failed")?;
+        match result {
+            Ok(app) => return Ok(app),
+            Err(error) => {
+                if db::guild_data::StoreCheckError::is_schema_refusal(&error)
+                    || !db::is_startup_retryable(&error, db.is_remote())
+                {
+                    return Err(error);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let backoff =
+                    db::startup_backoff(attempt, budget.initial_backoff, budget.max_backoff)
+                        .min(remaining);
+                if backoff.is_zero() {
+                    return Err(error).context("timed out retrying bot state startup");
+                }
+                tracing::info!(
+                    attempt,
+                    backoff_ms = backoff.as_millis(),
+                    "bot state database not ready; retrying: {error:#}"
+                );
+                tokio::time::sleep(backoff).await;
+                if Instant::now() >= deadline {
+                    return Err(error).context("timed out retrying bot state startup");
+                }
+            }
+        }
+    }
+}
+
 /// Warm the guild cache, then wait until a committed cross-process settings
 /// write is visible through `poll_config_version`.
 pub async fn observe_shared_config(cfg: BotProcessConfig) -> Result<()> {
@@ -38,7 +90,7 @@ pub async fn observe_shared_config(cfg: BotProcessConfig) -> Result<()> {
     let migrate = cfg.db_open_options().migrate;
     write_probe_marker(&dir, "bot-migrate", if migrate { "true" } else { "false" })?;
     let db = open_database(&cfg).await?;
-    let app = BotState::new(cfg, db)?;
+    let app = build_state(cfg, db).await?;
     if !crate::activation::claim_writer_lease(
         app.cfg.bot.control_secret.as_str(),
         &app.db,
@@ -81,5 +133,78 @@ pub async fn observe_shared_config(cfg: BotProcessConfig) -> Result<()> {
             bail!("bot cache did not refresh to {expect:?} after config poll");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use db::SqlExecutor;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn state_startup_retries_the_real_read_database_open() {
+        let path =
+            std::env::temp_dir().join(format!("state-startup-{:032x}.db", rand::random::<u128>()));
+        let db = Db::open(&path, 2).unwrap();
+        let marker = db
+            .with_conn_sync(|conn| {
+                let marker = db::meta_string_conn(conn, "bootstrap_complete")?.unwrap();
+                conn.execute_bounded(
+                    "DELETE FROM meta WHERE key = 'bootstrap_complete'",
+                    db::params![],
+                    1024 * 1024,
+                )?;
+                Ok(marker)
+            })
+            .unwrap();
+        let error = BotState::new(BotProcessConfig::default(), db.clone())
+            .err()
+            .unwrap();
+        assert!(db::is_schema_not_ready(&error), "{error:#}");
+        let restore = db.clone();
+        let restoring = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            restore
+                .with_conn(move |conn| {
+                    conn.execute_bounded(
+                        "INSERT INTO meta(key, value) VALUES ('bootstrap_complete', ?1)",
+                        db::params![marker],
+                        1024 * 1024,
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        });
+        let result = build_state_with_budget(
+            BotProcessConfig::default(),
+            db.clone(),
+            db::StartupOpenBudget {
+                budget: Duration::from_secs(5),
+                initial_backoff: Duration::from_millis(20),
+                max_backoff: Duration::from_millis(50),
+            },
+        )
+        .await;
+        restoring.await.unwrap();
+        let app = result.unwrap();
+        assert!(app.reads.is_read_only());
+        assert!(!app.activation.allows_discord_connect());
+        drop(app);
+        drop(db);
+        crate::tenant::remove_sidecars(&path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn read_database_context_preserves_remote_timeout_classification() {
+        let timeout = db::test_database_operation_timeout_error()
+            .context("failed to open the bot read database");
+        assert!(db::is_startup_retryable(&timeout, true));
+        assert!(!db::is_startup_retryable(&timeout, false));
+        let auth = anyhow::anyhow!("unauthorized").context("failed to open the bot read database");
+        assert!(!db::is_startup_retryable(&auth, true));
     }
 }

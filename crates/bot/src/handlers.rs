@@ -633,6 +633,19 @@ impl EventHandler for Handler {
                     ctx.cache.current_user().name,
                     guild_ids.len()
                 );
+                let post_started = if guild_ids.is_empty() {
+                    false
+                } else {
+                    match jmodguard::launcher_child::claim_started_notice() {
+                        Ok(claimed) => claimed,
+                        Err(error) => {
+                            tracing::warn!(
+                                "startup notice marker unavailable; suppressing notice: {error}"
+                            );
+                            false
+                        }
+                    }
+                };
                 let mut failed = false;
                 for gid in guild_ids {
                     app.snapshots.refresh_scope(&app, gid.get()).await;
@@ -642,13 +655,15 @@ impl EventHandler for Handler {
                     if !commands::sync_slash_commands(&app, &ctx, gid).await {
                         failed = true;
                     }
-                    logging::emit_system_notice(
-                        &app,
-                        &ctx.http,
-                        gid,
-                        format!("Bot started (v{})", env!("CARGO_PKG_VERSION")),
-                    )
-                    .await;
+                    if post_started {
+                        logging::emit_system_notice(
+                            &app,
+                            &ctx.http,
+                            gid,
+                            format!("Bot started (v{})", env!("CARGO_PKG_VERSION")),
+                        )
+                        .await;
+                    }
                 }
                 if failed {
                     app.retry_slash_registry_version();

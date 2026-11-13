@@ -410,6 +410,15 @@ fn ready_path() -> PathBuf {
     std::env::temp_dir().join(format!("jmodguard-ready-{:032x}", rand::random::<u128>()))
 }
 
+// All application children, including crash restarts, share this marker.
+// A new launcher process gets a fresh path; it is not an application-ready file.
+fn started_notice_path() -> &'static Path {
+    static PATH: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        std::env::temp_dir().join(format!("jmodguard-started-{:032x}", rand::random::<u128>()))
+    });
+    &PATH
+}
+
 async fn launch(
     path: &Path,
     source_sha: &str,
@@ -440,6 +449,7 @@ async fn launch_mode_checked(
     before_spawn.await?;
     let child = Command::new(path)
         .env("JMODGUARD_READY_FILE", &ready_file)
+        .env("JMODGUARD_STARTED_NOTICE_FILE", started_notice_path())
         .env(
             "JMODGUARD_UPDATE_MAINTENANCE",
             if maintenance { "1" } else { "0" },
@@ -3571,6 +3581,34 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_restarts_share_notice_marker_but_not_readiness() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("launcher-notice-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("child");
+        let output = dir.join("markers");
+        // The executable observes the real launch environment in two OS children.
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s %s\\n' \"$JMODGUARD_STARTED_NOTICE_FILE\" \"$JMODGUARD_READY_FILE\" >> '{}'\n", output.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for _ in 0..2 {
+            let mut running = super::launch(&script, "test", None).await.unwrap();
+            assert!(running.child.wait().await.unwrap().success());
+        }
+        let text = std::fs::read_to_string(&output).unwrap();
+        let rows: Vec<_> = text
+            .lines()
+            .map(|line| line.split_once(' ').unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].0.is_empty());
+        assert_eq!(rows[0].0, rows[1].0);
+        assert_ne!(rows[0].1, rows[1].1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn launcher_fence_retries_a_transient_failure_promptly_and_stops_at_zero_rows() {
         let path =

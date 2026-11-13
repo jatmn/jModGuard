@@ -482,7 +482,9 @@ const ACTIVE_BOT_PLANNED_STOP: &str = "active_bot_planned_stop";
 /// `{last_alive_ms} planned|unplanned` or `unknown`, written by each fresh claim
 /// for the owner it replaced.
 const ACTIVE_BOT_PREVIOUS_STOP: &str = "active_bot_previous_stop";
-pub const ACTIVE_BOT_LEASE_TTL_MS: i64 = 20_000;
+// Renew every 5s; reserve 5s for clock skew. Remote primary stalls must have
+// several renewal opportunities before the bot loses confirmed authority.
+pub const ACTIVE_BOT_LEASE_TTL_MS: i64 = 60_000;
 
 /// How the previous active bot stopped before this process claimed the lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
