@@ -872,7 +872,7 @@ function DatabaseUsage() {
     setView((current) => ({ ...current }));
     flight.current = apiRead("/api/database-usage")
       .then((snapshot) => {
-        if (mounted.current) setView((current) => ({ snapshot, freshness: "fresh", revision: current.revision + 1, error: null }));
+        if (mounted.current && document.visibilityState !== "hidden") setView((current) => ({ snapshot, freshness: "fresh", revision: current.revision + 1, error: null }));
       })
       .catch((error) => {
         if (mounted.current) setView((current) => ({ ...current, freshness: "stale", revision: current.revision + 1, error }));

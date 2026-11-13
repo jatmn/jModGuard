@@ -7767,6 +7767,43 @@ test('Database Usage polls only while visible, ages retained samples and cleans 
   assert.equal(reads, 3, 'an already queued callback cannot read after unmount');
 });
 
+for (const retained of [false, true]) test(`Database Usage ignores a hidden overview completion with ${retained ? 'retained stale figures' : 'no previous sample'}`, async () => {
+  const pending = [];
+  const h = ownerHarness((url, options) => {
+    assert.equal(url, '/api/database-usage');
+    assert.equal(options.method, 'POST');
+    return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  });
+  h.app.navigate('usage');
+  await settle();
+  if (retained) {
+    pending.shift().resolve(response(usageOverview([usageDatabase()])));
+    await settle();
+    await fire(h.nodes.get('#refresh-usage'), 'click');
+    pending.shift().reject(new Error('offline'));
+    await settle();
+    assert.equal(usageCards(h)[0].dataset.usageStale, '1');
+    await fire(h.nodes.get('#refresh-usage'), 'click');
+  }
+  const previousCards = h.nodes.get('#usage-cards').textContent;
+  const previousError = h.nodes.get('#usage-status')?.textContent;
+  visibility(h, 'hidden');
+  pending.shift().resolve(response(usageOverview([usageDatabase({ pages: 200 })])));
+  await settle();
+  assert.equal(h.nodes.get('#usage-cards').textContent, previousCards, 'a hidden completion must not paint or replace cards');
+  assert.equal(h.nodes.get('#usage-status')?.textContent, previousError, 'a hidden completion must not clear a retained error');
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 60000).length, 0, 'no polling while hidden');
+  visibility(h, 'visible');
+  await settle();
+  assert.equal(pending.length, 1, 'returning to the page starts a new overview read');
+  pending.shift().resolve(response(usageOverview([usageDatabase({ pages: 300 })])));
+  await settle();
+  assert.equal(usageFigures(usageCards(h)[0])[0], '1.23 MB allocated', 'only the new visible response is applied');
+  assert.equal(usageCards(h)[0].dataset.usageStale, undefined);
+  assert.equal(h.nodes.get('#usage-status'), null);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 60000).length, 1, 'visible polling resumes');
+});
+
 test('a pending breakdown disables repeated clicks across overview refreshes and isolates visits', async () => {
   const pending = [];
   const h = ownerHarness(async (url) => {
