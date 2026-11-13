@@ -112,13 +112,13 @@ export const NAV_ICONS = {
   cases: { icon: "briefcase", intent: "warning" },
   settings: { icon: "sliders", intent: "neutral" },
   servers: { icon: "server", intent: "members" },
-  updates: { icon: "arrow-up-circle", intent: "info" },
+  usage: { icon: "database", intent: "neutral" },
+  "platform-analytics": { icon: "bar-chart", intent: "analytics" },
   // The sidebar's own buttons: owner tools, preview exit and the account footer.
   administration: { icon: "crown", intent: "info" },
   "view-as": { icon: "eye", intent: "info" },
   "exit-preview": { icon: "arrow-left", intent: "neutral" },
   "sign-out": { icon: "log-out", intent: "neutral" },
-  usage: { icon: "database", intent: "neutral" },
 };
 
 // Dashboard Overview tiles (#608). Each count shows the icon and color of the page or

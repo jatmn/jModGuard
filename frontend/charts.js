@@ -532,3 +532,45 @@ export function ActivityHeatmap({ cells }) {
     ),
   );
 }
+
+// ---------------------------------------------------------------------------
+// Database capacity (#613). Plain proportional bars: the accessible label on
+// each carries every value the bar draws, so the marks themselves stay hidden.
+// ---------------------------------------------------------------------------
+
+function sharePercent(value, total) {
+  return total > 0 ? Math.min(100, Math.max(0, (value / total) * 100)) : 0;
+}
+
+// One database from zero to its hard limit. `used` null means the allocation
+// is unknown: the bar stays empty and dashed, never drawn as free capacity.
+export function CapacityGauge({ used, limit, marks, tone, summary }) {
+  return h(
+    "div",
+    { className: "du-gauge", role: "img", "aria-label": summary },
+    h(
+      "div",
+      { className: `du-gauge-track${used == null ? " du-gauge-unknown" : ""}` },
+      used == null ? null : h("span", { className: `du-gauge-fill du-tone-${tone}`, style: { width: `${sharePercent(used, limit).toFixed(2)}%` } }),
+      ...marks.map((mark) => h("span", { key: mark.key, className: "du-gauge-mark", style: { left: `${sharePercent(mark.bytes, limit).toFixed(2)}%` } })),
+    ),
+    h(
+      "div",
+      { className: "du-gauge-scale", "aria-hidden": "true" },
+      h("span", { style: { left: "0%" } }, "0 MB"),
+      ...marks.map((mark) => h("span", { key: mark.key, style: { left: `${sharePercent(mark.bytes, limit).toFixed(2)}%` } }, mark.short)),
+    ),
+  );
+}
+
+// Parts of one whole (used and reusable pages, snapshot footprint of its budget).
+// An unknown whole draws an empty dashed bar, like an unknown gauge.
+export function ShareBar({ parts, total, summary, unknown }) {
+  return h(
+    "div",
+    { className: `du-share${unknown ? " du-share-unknown" : ""}`, role: "img", "aria-label": summary },
+    ...parts
+      .filter((part) => part.value > 0)
+      .map((part) => h("span", { key: part.key, className: `du-share-part du-tone-${part.tone}`, style: { width: `${sharePercent(part.value, total).toFixed(2)}%` } })),
+  );
+}

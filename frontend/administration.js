@@ -1,8 +1,9 @@
 import { createState, useStore } from "./state.js";
 import { Appearance, useAppearance } from "./appearance.js";
-import { TrendChart, TrendMetricPicker, sumSeries, useTrendMetric } from "./charts.js";
-import { ACTION_ICONS, Icon, NAV_ICONS } from "./icons.js";
-/* Owner Administration. React owns rendering; the API remains authoritative. */
+import { ACTION_ICONS, Icon } from "./icons.js";
+/* Owner Administration: component updates. Database Usage and Platform analytics
+   are Owner sections of the main workspace. React owns rendering; the API remains
+   authoritative. */
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 
@@ -11,16 +12,7 @@ const h = React.createElement;
 /** @typedef {"checking" | "allowed" | "denied"} OwnerAccess */
 /** @typedef {"fresh" | "stale"} SnapshotFreshness */
 const ui = createState({
-  activeView: "updates",
   snapshot: null,
-  usageSnapshot: null,
-  usageFreshness: "fresh",
-  usageRevision: 0,
-  usageMessage: "Waiting to load usage…",
-  analyticsSnapshot: null,
-  analyticsFreshness: "fresh",
-  analyticsRevision: 0,
-  analyticsMessage: "Waiting to load analytics…",
   status: { message: "Checking your access and release state…", tone: "neutral" },
   activity: "idle",
   freshness: "stale",
@@ -32,9 +24,6 @@ const ui = createState({
 const root = createRoot(document.getElementById("content"));
 
 let refreshFlight = { kind: "idle" };
-let usageFlight = { kind: "idle" };
-let analyticsFlight = { kind: "idle" };
-const detailRequests = new Map();
 
 let rateLimitUntil = 0;
 let refreshTimer;
@@ -60,10 +49,6 @@ function nextRefreshDelay(normal) {
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
   if ((ui.getSnapshot().access === "denied") || document.visibilityState === "hidden") return;
-  if (ui.getSnapshot().activeView === "usage") {
-    refreshTimer = setTimeout(() => refreshUsage(), nextRefreshDelay(60000));
-    return;
-  }
   refreshTimer = setTimeout(() => refresh(), nextRefreshDelay(ui.getSnapshot().snapshot?.components.some(pending) ? 2000 : 30000));
 }
 
@@ -185,10 +170,6 @@ function badge(text, tone, meaning) {
   const { icon, intent } = ACTION_ICONS[meaning];
   return h("span", { className: `badge badge-soft administration-badge badge-${{ good: "success", warn: "warning", bad: "error", neutral: "neutral" }[tone]}` },
     h(Icon, { name: icon, intent }), h("span", null, text));
-}
-function navButton(id, view, label, activeView) {
-  return h("button", { id, className: "btn btn-sm", type: "button", "aria-current": activeView === view ? "page" : undefined, onClick: () => selectView(view) },
-    h(Icon, { name: NAV_ICONS[view].icon, intent: NAV_ICONS[view].intent }), label);
 }
 
 function releaseText(release) {
@@ -339,14 +320,14 @@ function AlertChannelCard({ revision }) {
 }
 
 function refresh() {
-  if (ui.getSnapshot().activeView !== "updates" || document.visibilityState === "hidden") return;
+  if (document.visibilityState === "hidden") return;
   if (refreshFlight.kind === "running") return refreshFlight.promise;
   clearTimeout(refreshTimer);
 
   refreshFlight = { kind: "running", promise: (async () => {
     try {
       ui.set({ snapshot: await request("/api/updates", {}) });
-      if (ui.getSnapshot().activeView !== "updates" || document.visibilityState === "hidden") return;
+      if (document.visibilityState === "hidden") return;
       ui.set({ access: "allowed" });
       if (ui.getSnapshot().activity !== "busy") ui.set({ actionMessage: "" });
       ui.set({ freshness: "fresh", signIn: "optional" });
@@ -363,253 +344,12 @@ function refresh() {
   return refreshFlight.promise;
 }
 
-function decimalMB(value) {
-  return value == null ? "unavailable" : `${(value / 1000000).toFixed(2)} MB`;
-}
-
-function physicalPart(value, total) {
-  return value == null || !total ? "unavailable" :
-    `${decimalMB(value)} (${(value * 100 / total).toFixed(2)}% of allocated; ${(value * 100 / 1000000000).toFixed(2)}% of 1,000 MB limit)`;
-}
-
-function ageMs(value) { return value == null ? "unavailable" : age(Math.floor(value / 1000)); }
-
-function usageState(value) {
-  return ({normal: "Measured allocation below pressure threshold; cross-process guard unknown", pressure: "Pressure: cleanup accelerates at 700 MB",
-    capture_paused: "Capture pause threshold reached at 800 MB", growth_stopped: "Application growth stop threshold reached at 900 MB",
-    application_paused: "API process growth guard paused writes",
-    stale: "Stale measurement", unavailable: "Measurement unavailable"})[value] || "Unknown";
-}
-
-function UsageCard({ database: initial, stale, revision }) {
-  const [detail, setDetail] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const database = detail?.source === initial ? detail.database : initial;
-  const oldSample = stale && detail?.revision !== revision;
-  const content = [];
-  const title = database.kind === "core" ? "Core database" :
-    database.policy?.kind === "dedicated" ? `Guild database · ${database.policy.guild_id}` : "Shared guild database";
-  line(content, "Database ID", database.id);
-  line(content, "Role", database.role || "unknown");
-  line(content, "Availability", database.availability || "unknown");
-  line(content, "Allocated", decimalMB(database.usage?.allocated_bytes));
-  line(content, "Pages", database.usage ? `${database.usage.page_count ?? "unknown"} × ${database.usage.page_size ?? "unknown"} bytes` : "unavailable");
-  line(content, "Reusable free pages", database.usage?.freelist_count ?? "unavailable");
-  line(content, "Limit used", database.percent_of_limit == null ? "unavailable" : `${database.percent_of_limit.toFixed(2)}% of 1,000 MB`);
-  line(content, "Headroom", decimalMB(database.headroom_bytes));
-  line(content, "Application thresholds", "Pressure 700 MB · capture pause 800 MB · growth stop 900 MB · hard limit 1,000 MB");
-  if (database.kind === "guild") {
-    line(content, "Snapshot budget", decimalMB(database.snapshot_budget_bytes));
-    line(content, "Snapshot footprint estimate", database.snapshot_usage_estimate_bytes == null ? "unavailable" :
-      `${decimalMB(database.snapshot_usage_estimate_bytes)} (${(database.snapshot_usage_estimate_bytes * 100 / database.snapshot_budget_bytes).toFixed(2)}% of 400 MB budget; conservative logical estimate)`);
-  }
-  line(content, "Operating state", usageState(database.status));
-  line(content, "Measured", database.measurement?.sampled_at ? age(database.measurement.sampled_at) : "unavailable");
-  line(content, "Last successful sample", database.measurement?.last_success_at ? age(database.measurement.last_success_at) : "unavailable");
-  line(content, "Measurement source", database.measurement?.source || "unavailable");
-  line(content, "Measurement capability", database.measurement?.capability || "unavailable");
-  if (database.measurement?.error_code) line(content, "Probe status", database.measurement.error_code);
-  line(content, "Provider reported bytes", decimalMB(database.provider_usage?.bytes));
-  line(content, "API growth guard", database.application_admission?.api_process_growth_paused == null ? "unknown" :
-    database.application_admission.api_process_growth_paused ? "paused" : "no local pause observed");
-  line(content, "API startup", database.application_admission?.api_startup_deferred ? "deferred maintenance" : "normal or unknown");
-  line(content, "Bot growth guard", database.application_admission?.bot_cross_process_guard || "unknown");
-  line(content, "Capture", database.capture_status || "unavailable");
-  if (database.kind === "guild") {
-    const capture = database.capture || {};
-    line(content, "Capture reason", capture.reason || "unknown");
-    line(content, "Bot heartbeat age", capture.heartbeat_age_ms == null ? "unavailable" : `${Math.floor(capture.heartbeat_age_ms / 1000)} seconds`);
-    line(content, "Retention maximum", capture.configured_retention_hours == null ? "unavailable" : `${capture.configured_retention_hours} hours`);
-    line(content, "Oldest retained observation", ageMs(capture.oldest_available_snapshot_at_ms));
-    line(content, "Capture epoch / counters reset", `${capture.epoch ?? "unknown"} / ${ageMs(capture.counters_reset_at_ms)}`);
-    line(content, "Retained / lost / expired / evicted", `${capture.retained_count ?? "unknown"} / ${capture.lost_count ?? "unknown"} / ${capture.expired_count ?? "unknown"} / ${capture.evicted_count ?? "unknown"}`);
-    line(content, "Verified effective snapshot allowance", decimalMB(database.policy_limits?.effective_snapshot_allowance_bytes));
-  }
-  line(content, "Cleanup", database.cleanup_status || "unavailable");
-  const usage = database.usage;
-  if (usage?.breakdown_error_code) line(content, "Breakdown status", usage.breakdown_error_code);
-  if (usage?.breakdown_quality === "measured") {
-    line(content, "Category basis", "Measured allocated pages; categories are disjoint");
-    line(content, "Snapshot table", physicalPart(usage.categories.snapshot_data_bytes, usage.allocated_bytes));
-    line(content, "Moderation and evidence tables", physicalPart(usage.categories.moderation_evidence_data_bytes, usage.allocated_bytes));
-    line(content, "Configuration tables", physicalPart(usage.categories.configuration_data_bytes, usage.allocated_bytes));
-    line(content, "Operational tables", physicalPart(usage.categories.operational_data_bytes, usage.allocated_bytes));
-    line(content, "Indexes", physicalPart(usage.categories.index_bytes, usage.allocated_bytes));
-    line(content, "Reusable pages", physicalPart(usage.categories.reusable_bytes, usage.allocated_bytes));
-    line(content, "System / unattributed", physicalPart(usage.categories.system_unattributed_bytes, usage.allocated_bytes));
-    line(content, "Category sample", age(usage.category_sampled_at));
-  } else if (usage?.breakdown_quality === "estimated") {
-    line(content, "Category basis", "Physical category allocation unavailable; snapshot value is encoded payload estimate");
-    line(content, "Snapshot payload estimate", decimalMB(usage.snapshot_logical_bytes));
-    line(content, "Reusable pages", decimalMB(usage.reusable_bytes));
-    line(content, "Indexes and other allocation", "unavailable");
-  } else if (usage) {
-    line(content, "Category basis", "Physical category allocation unavailable");
-    line(content, "Reusable pages", decimalMB(usage.reusable_bytes));
-  }
-  if (usage?.snapshot_count != null) line(content, "Retained snapshots", usage.snapshot_count);
-  line(content, "External evidence file bytes", decimalMB(database.external_evidence_storage?.bytes));
-  if (!usage || usage.breakdown_quality === "unavailable" && usage.snapshot_count == null) {
-    line(content, "Breakdown", "unavailable");
-  }
-  return h("section", { className: "card bg-base-100", "data-usage-stale": oldSample ? "1" : undefined },
-    oldSample && h("p", { className: "text-warning" }, "Stale: the latest usage refresh failed. These figures are not a current capacity sample."),
-    h("div", { className: "card-body" }, h("h3", { className: "card-title" }, title), content,
-      h("button", { type: "button", className: "btn btn-sm", disabled: loading, onClick: async () => {
-        setLoading(true);
-        try {
-          let pending = detailRequests.get(database.id);
-          if (!pending) {
-            pending = request(`/api/database-usage/${encodeURIComponent(database.id)}`, {});
-            detailRequests.set(database.id, pending);
-            pending.finally(() => detailRequests.delete(database.id)).catch(() => {});
-          }
-          const updated = await pending;
-          if (revision === ui.getSnapshot().usageRevision && ui.getSnapshot().activeView === "usage" && (ui.getSnapshot().access === "allowed")) setDetail({ database: updated, revision, source: initial });
-        } catch (error) {
-          if (revision === ui.getSnapshot().usageRevision && ui.getSnapshot().activeView === "usage" && (ui.getSnapshot().access === "allowed")) { ui.set({ usageMessage: error.message }); }
-        }
-        finally { setLoading(false); }
-      } }, "Show current breakdown")));
-}
-
-async function doRefreshUsage() {
-  if (ui.getSnapshot().activeView !== "usage" || document.visibilityState === "hidden") return;
-  try {
-    const next = await request("/api/database-usage", {});
-    if (ui.getSnapshot().activeView !== "usage" || document.visibilityState === "hidden") return;
-    ui.set({ signIn: "optional", access: "allowed", usageSnapshot: next, usageFreshness: "fresh", usageMessage: `Usage response ${age(next.generated_at)}. Catalog ${next.catalog_status || "unknown"}. Unknown measurements are not treated as free capacity.` });
-  } catch (error) { ui.set({ usageMessage: error.message }); ui.set({ usageFreshness: "stale" }); }
-  finally { ui.set({ usageRevision: ui.getSnapshot().usageRevision + 1 }); scheduleRefresh(); }
-}
-
-function refreshUsage() {
-  if (usageFlight.kind === "idle") {
-    usageFlight = { kind: "running", promise: doRefreshUsage().finally(() => { usageFlight = { kind: "idle" }; }) };
-  }
-  return usageFlight.promise;
-}
-
-async function doRefreshAnalytics() {
-  if (ui.getSnapshot().activeView !== "analytics" || document.visibilityState === "hidden") return;
-  try {
-    const next = await request("/api/platform/analytics", {});
-    if (ui.getSnapshot().activeView !== "analytics" || document.visibilityState === "hidden") return;
-    const members = next.members || {};
-    const availability = (members.guilds_unavailable
-      ? ` Member totals cover ${members.guilds_counted ?? 0} of ${members.servers ?? next.guilds?.length ?? 0} servers; the rest were unavailable.`
-      : "") + (members.guilds_incomplete
-      ? ` ${members.guilds_incomplete} counted ${members.guilds_incomplete === 1 ? "server has" : "servers have"} a member directory still importing or awaiting Reconcile.`
-      : "");
-    ui.set({ signIn: "optional", access: "allowed", analyticsSnapshot: next, analyticsFreshness: "fresh",
-      analyticsMessage: `Analytics refreshed. ${members.status === "unavailable" ? "Member totals are unavailable." : `Member totals are ${members.status || "complete"}.`}${availability}` });
-  } catch (error) { ui.set({ analyticsMessage: error.message }); ui.set({ analyticsFreshness: "stale" }); }
-  finally { ui.set({ analyticsRevision: ui.getSnapshot().analyticsRevision + 1 }); }
-}
-
-function refreshAnalytics() {
-  if (analyticsFlight.kind === "idle") {
-    analyticsFlight = { kind: "running", promise: doRefreshAnalytics().finally(() => { analyticsFlight = { kind: "idle" }; }) };
-  }
-  return analyticsFlight.promise;
-}
-
-function platformStat(label, value) {
-  return h("div", { className: "stat" },
-    h("div", { className: "stat-title" }, label),
-    h("div", { className: "stat-value" }, value));
-}
-
-const GUILD_COLUMNS = [
-  ["warns", "warns", "Warnings"],
-  ["bans", "bans", "Bans"],
-  ["automod", "automod", "Spam hits"],
-  ["modActions", "mod_actions", "Mod actions"],
-  ["timeouts", "timeouts", "Timeouts"],
-  ["joins", "joins", "Joins"],
-  ["leaves", "leaves", "Leaves"],
-];
-
-function toTrendPoints(series) {
-  return (series ?? []).map((point) => ({
-    day: point.day,
-    warns: point.warns,
-    bans: point.bans,
-    automod: point.automod,
-    modActions: point.mod_actions,
-    timeouts: point.timeouts,
-    joins: point.joins,
-    leaves: point.leaves,
-  }));
-}
-
-function memberTotal(members) {
-  if (!members || members.status === "unavailable") return "Unavailable";
-  if (members.guilds_unavailable) return `${members.current ?? 0}+`;
-  if (members.guilds_incomplete) return `${members.current ?? 0} (partial)`;
-  return String(members.current ?? 0);
-}
-
-function AnalyticsCard({ snapshot }) {
-  const [metric, setMetric] = useTrendMetric("warns");
-  const points = toTrendPoints(snapshot?.series);
-  const loading = !snapshot;
-  const total = (key) => (loading ? "Loading…" : String(sumSeries(points, key)));
-  const members = snapshot?.members;
-  const stats = h("div", { className: "stats bg-base-100 w-full administration-stats" },
-    platformStat("Servers", loading ? "Loading…" : String(snapshot?.servers ?? 0)),
-    platformStat("Members now", loading ? "Loading…" : memberTotal(members)),
-    platformStat("Known members", loading ? "Loading…" : members?.known != null ? String(members.known) : "Unavailable"),
-    platformStat("Warnings", total("warns")),
-    platformStat("Bans", total("bans")),
-    platformStat("Spam hits", total("automod")),
-    platformStat("Mod actions", total("modActions")),
-    platformStat("Timeouts", total("timeouts")),
-    platformStat("Joins", total("joins")),
-    platformStat("Leaves", total("leaves")));
-  const table = (snapshot?.guilds?.length ?? 0) > 0 && h("div", { className: "table-scroll rounded-box", tabIndex: 0 },
-    h("table", { className: "table table-zebra table-sm" },
-      h("thead", null, h("tr", null,
-        h("th", { scope: "col" }, "Server"),
-        ...GUILD_COLUMNS.map(([, , label]) => h("th", { key: label, scope: "col" }, label)))),
-      h("tbody", null, snapshot.guilds.map((guild) =>
-        h("tr", { key: guild.guild_id },
-          h("td", null, guild.guild_id),
-          ...GUILD_COLUMNS.map(([key, field]) => h("td", { key }, String(guild[field] ?? 0))))))));
-  return h("section", { className: "card bg-base-100" },
-    h("div", { className: "card-body" },
-      h("h3", { className: "card-title" }, "Last 30 days, all servers"),
-      stats,
-      h(TrendMetricPicker, { metric, onChange: setMetric }),
-      points.length
-        ? h(TrendChart, { points, metric, title: "Platform activity" })
-        : h("p", { className: "muted" }, loading ? "Loading analytics…" : "No platform trend data recorded yet."),
-      table,
-      h("p", { className: "muted" },
-        "Per-server rows show guild IDs with recorded activity in the window, including servers that have since left until their data is erased; Servers counts current memberships. Days before the bot started recording — or while it was offline — show zero, not missing history. Members now is the current member directory across counted servers; known members includes departed members retained by ban history.")));
-}
-
-function selectView(view) {
-  ui.set({ activeView: view });
-  clearTimeout(refreshTimer);
-  if (view === "usage") ui.set({ usageSnapshot: null });
-  if (view === "analytics") ui.set({ analyticsSnapshot: null });
-
-  if (view === "usage") return refreshUsage();
-  if (view === "analytics") return refreshAnalytics();
-  return refresh();
-}
-
 function Administration() {
   const appearance = useAppearance();
   const display = useStore(ui);
   useEffect(() => {
     const visible = () => {
-      if (document.visibilityState !== "hidden") {
-        if (ui.getSnapshot().activeView === "usage") refreshUsage();
-        else if (ui.getSnapshot().activeView === "analytics") refreshAnalytics();
-        else refresh();
-      }
+      if (document.visibilityState !== "hidden") refresh();
     };
     document.addEventListener("visibilitychange", visible);
     return () => { document.removeEventListener("visibilitychange", visible); clearTimeout(refreshTimer); };
@@ -623,16 +363,12 @@ function Administration() {
   const login = base ? `${base}/login?return_to=${encodeURIComponent(window.location.origin)}` : "/login?return_to=%2Fadministration%2Findex.html";
   return h(React.Fragment, null,
     h("header", { className: "administration-header" },
-      h("div", null, h("span", { className: "eyebrow" }, "OWNER ADMINISTRATION"), h("h1", { id: "admin-title" }, display.activeView === "usage" ? "Database Usage" : display.activeView === "analytics" ? "Analytics" : "Updates")),
+      h("div", null, h("span", { className: "eyebrow" }, "OWNER ADMINISTRATION"), h("h1", { id: "admin-title" }, "Updates")),
       h("div", { className: "administration-tools" }, h("button", { id: "refresh-status", type: "button", className: "btn btn-sm", disabled: (display.activity === "busy"),
         onClick: () => { if (ui.getSnapshot().activity !== "busy") { ui.set({ actionMessage: "" }); return refresh(); } } }, h(Icon, { name: ACTION_ICONS.retry.icon, intent: ACTION_ICONS.retry.intent }), "Refresh status"), h(Appearance, appearance), h("a", { className: "btn btn-sm", href: "/" }, h(Icon, { name: ACTION_ICONS.back.icon, intent: ACTION_ICONS.back.intent }), "Back to workspace"))),
     h("p", { id: "update-status", className: `alert alert-soft administration-notice ${{ good: "alert-success", warn: "alert-warning", bad: "alert-error", neutral: "" }[display.status.tone]}`, role: "status", "aria-live": "polite" }, display.status.message),
     h("div", { id: "sign-in", className: (display.signIn === "required") ? "" : "hidden" }, h("a", { id: "sign-in-link", className: "btn btn-primary", href: login }, "Sign in with Discord")),
-    h("nav", { className: "administration-nav", "aria-label": "Administration pages" },
-      navButton("show-updates", "updates", "Updates", display.activeView),
-      navButton("show-database-usage", "usage", "Database Usage", display.activeView),
-      navButton("show-analytics", "analytics", "Analytics", display.activeView)),
-    h("div", { id: "updates", className: display.access === "allowed" && display.activeView === "updates" ? "" : "hidden" },
+    h("div", { id: "updates", className: display.access === "allowed" ? "" : "hidden" },
       h("div", { className: "administration-overview" }, h("div", null, h("h2", null, "Component updates"), h("p", { className: "muted" }, "Check releases and manage the API, bot, and WebUI independently. Release discovery runs hourly."))),
       h("p", { id: "automatic-state", className: "muted" }, display.snapshot?.unattended_enabled ? "Automatic installation policies are available." : "Automatic installation is disabled for this deployment. Hourly checks and Check now still work."),
       h("div", { id: "browser-version", className: "administration-browser" }, display.snapshot && h(React.Fragment, null,
@@ -640,17 +376,7 @@ function Administration() {
         differentWeb && badge("A different WebUI version is installed. Reload this page to load it.", "warn", "retry"),
         differentWeb && h("button", { className: "btn btn-sm", type: "button", disabled: (display.activity === "busy"), onClick: () => window.location.reload() }, "Reload page"))),
       h("div", { id: "update-cards", className: "administration-grid" }, display.snapshot?.components.map(record => h(ComponentCard, { key: record.component, record, revision: ui.getSnapshot().policyRevision }))),
-      display.snapshot && h(AlertChannelCard, { revision: ui.getSnapshot().policyRevision })),
-    h("section", { id: "database-usage", className: display.access === "allowed" && display.activeView === "usage" ? "" : "hidden", "aria-labelledby": "database-usage-title" },
-      h("h2", { id: "database-usage-title" }, "Database Usage"), h("p", null, "Physical allocation includes reusable pages. Each database has its own 1,000 MB limit. Category estimates are labeled when exact page attribution is unavailable."),
-      h("p", { id: "usage-status", className: `alert alert-soft administration-notice ${(display.usageFreshness === "stale") ? "alert-warning" : ""}`, role: "status" }, display.usageMessage),
-      h("button", { id: "refresh-usage", className: "btn btn-sm", type: "button", onClick: () => refreshUsage() }, "Refresh usage"),
-      h("div", { id: "usage-cards", className: "administration-grid" }, display.usageSnapshot?.databases.map(database => h(UsageCard, { key: database.id, database, stale: (ui.getSnapshot().usageFreshness === "stale"), revision: ui.getSnapshot().usageRevision })))),
-    h("section", { id: "platform-analytics", className: display.access === "allowed" && display.activeView === "analytics" ? "" : "hidden", "aria-labelledby": "platform-analytics-title" },
-      h("h2", { id: "platform-analytics-title" }, "Platform analytics"), h("p", null, "Fleet-wide moderation and membership trends over the last 30 days. Member totals come from each server's member directory; servers whose store is unavailable are reported as unknown instead of failing the view."),
-      h("p", { id: "analytics-status", className: `alert alert-soft administration-notice ${(display.analyticsFreshness === "stale") ? "alert-warning" : ""}`, role: "status" }, display.analyticsMessage),
-      h("button", { id: "refresh-analytics", className: "btn btn-sm", type: "button", onClick: () => refreshAnalytics() }, "Refresh analytics"),
-      display.analyticsSnapshot && h(AnalyticsCard, { snapshot: display.analyticsSnapshot, revision: ui.getSnapshot().analyticsRevision })));
+      display.snapshot && h(AlertChannelCard, { revision: ui.getSnapshot().policyRevision })));
 }
 
 root.render(h(Administration));

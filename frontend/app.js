@@ -2,14 +2,20 @@ import { createState, useStore } from "./state.js";
 import { Appearance, useAppearance } from "./appearance.js";
 import {
   ActivityHeatmap,
+  CapacityGauge,
   ENFORCEMENT_METRICS,
   EnforcementChart,
   KpiTile,
   MembershipChart,
   RangeSelector,
   RankList,
+  ShareBar,
+  TrendChart,
+  TrendMetricPicker,
   formatDelta,
+  formatExact,
   sumSeries,
+  useTrendMetric,
 } from "./charts.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import React, { useState, useEffect, useRef, createContext, useContext } from "react";
@@ -570,6 +576,444 @@ function TabOwnerServers() {
   );
 }
 
+function ownerAccessRequired() {
+  return emptyPanel("Owner access required", "This section is available only to the configured bot owner.");
+}
+
+// ---------------------------------------------------------------------------
+// Database Usage (#613): one at-a-glance card per physical database. The API
+// stays authoritative; an unknown measurement is never drawn as free capacity.
+// ---------------------------------------------------------------------------
+
+const MB = 1000000;
+// The API reports each database's policy limits; these match jmodguard::capacity
+// for a response that omits them.
+const USAGE_DEFAULT_LIMITS = { limit: 1000 * MB, pressure: 700 * MB, capture: 800 * MB, growth: 900 * MB, snapshots: 400 * MB };
+
+const USAGE_HELP =
+  "Physical allocation includes reusable pages. Each database has its own 1,000 MB limit; the application starts faster cleanup at 700 MB (pressure), pauses snapshot capture at 800 MB and stops growth at 900 MB. Unknown measurements are not treated as free capacity. Category estimates are labeled when exact page attribution is unavailable. Details lists every diagnostic value.";
+
+// One badge per operating state the API reports; `state` is the full explanation.
+const USAGE_HEALTH = {
+  normal: { label: "OK", tone: "success", state: "Measured allocation below pressure threshold; cross-process guard unknown" },
+  pressure: { label: "Pressure", tone: "warning", state: "Pressure: cleanup accelerates at 700 MB" },
+  capture_paused: { label: "Capture paused", tone: "warning", state: "Capture pause threshold reached at 800 MB" },
+  growth_stopped: { label: "Growth stopped", tone: "error", state: "Application growth stop threshold reached at 900 MB" },
+  application_paused: { label: "Writes paused", tone: "error", state: "API process growth guard paused writes" },
+  stale: { label: "Stale", tone: "neutral", state: "Stale measurement" },
+  unavailable: { label: "Unknown", tone: "neutral", state: "Measurement unavailable" },
+};
+const USAGE_FILL_TONES = { success: "ok", warning: "warn", error: "bad", neutral: "muted" };
+
+const USAGE_CATEGORIES = [
+  ["Snapshot table", "snapshot_data_bytes"],
+  ["Moderation and evidence tables", "moderation_evidence_data_bytes"],
+  ["Configuration tables", "configuration_data_bytes"],
+  ["Operational tables", "operational_data_bytes"],
+  ["Indexes", "index_bytes"],
+  ["Reusable pages", "reusable_bytes"],
+  ["System / unattributed", "system_unattributed_bytes"],
+];
+
+function usageMB(bytes) {
+  return bytes == null ? null : `${(bytes / MB).toFixed(2)} MB`;
+}
+
+function thresholdMB(bytes) {
+  return `${formatExact(Math.round(bytes / MB))} MB`;
+}
+
+function usageAge(seconds) {
+  if (!seconds) return null;
+  const elapsed = Math.max(0, Math.floor(Date.now() / 1000) - seconds);
+  if (elapsed < 60) return "just now";
+  if (elapsed < 3600) return `${Math.floor(elapsed / 60)} min ago`;
+  if (elapsed < 86400) return `${Math.floor(elapsed / 3600)} h ago`;
+  return `${Math.floor(elapsed / 86400)} d ago`;
+}
+
+function usageAgeMs(ms) {
+  return ms == null ? null : usageAge(Math.floor(ms / 1000));
+}
+
+function usageLimits(database) {
+  const policy = database.policy_limits || {};
+  const limit = database.limit_bytes ?? policy.provider_hard_limit_bytes ?? USAGE_DEFAULT_LIMITS.limit;
+  const marks = [
+    { key: "pressure", name: "pressure", bytes: policy.pressure_bytes ?? USAGE_DEFAULT_LIMITS.pressure },
+    { key: "capture", name: "capture pause", bytes: policy.capture_pause_bytes ?? USAGE_DEFAULT_LIMITS.capture },
+    { key: "growth", name: "growth stop", bytes: policy.growth_stop_bytes ?? USAGE_DEFAULT_LIMITS.growth },
+    { key: "limit", name: "hard limit", bytes: limit },
+  ].map((mark) => ({ ...mark, short: formatExact(Math.round(mark.bytes / MB)) }));
+  return { limit, marks, snapshots: database.snapshot_budget_bytes ?? policy.snapshot_budget_bytes ?? USAGE_DEFAULT_LIMITS.snapshots };
+}
+
+function usageTitle(database) {
+  if (database.kind === "core") return "Core database";
+  return database.policy?.kind === "dedicated" ? `Guild database · ${database.policy.guild_id}` : "Shared guild database";
+}
+
+// Every diagnostic value, for Details. Unknown values are listed by name only,
+// on one line, so they never read as measured zeros or free capacity.
+function usageFacts(database, health, limits) {
+  const known = [];
+  const unknown = [];
+  const fact = (label, value) => {
+    if (value == null || value === "" || value === "unknown" || value === "unavailable") unknown.push(label);
+    else known.push([label, String(value)]);
+  };
+  const usage = database.usage;
+  const measurement = database.measurement || {};
+  const admission = database.application_admission || {};
+  const physicalPart = (value, total) =>
+    value == null || !total
+      ? null
+      : `${usageMB(value)} (${((value * 100) / total).toFixed(2)}% of allocated; ${((value * 100) / limits.limit).toFixed(2)}% of ${thresholdMB(limits.limit)} limit)`;
+  fact("Database ID", database.id);
+  fact("Role", database.role);
+  fact("Availability", database.availability);
+  fact("Operating state", health.state);
+  fact("Application thresholds", limits.marks.map((mark) => `${mark.name} ${thresholdMB(mark.bytes)}`).join(" · "));
+  fact("Headroom to hard limit", usageMB(database.headroom_bytes));
+  fact("Pages", usage?.page_count != null && usage?.page_size != null ? `${formatExact(usage.page_count)} × ${formatExact(usage.page_size)} bytes` : null);
+  fact("Reusable free pages", usage?.freelist_count == null ? null : formatExact(usage.freelist_count));
+  fact("Measurement source", measurement.source);
+  fact("Measurement capability", measurement.capability);
+  if (measurement.error_code) fact("Probe status", measurement.error_code);
+  fact("Provider reported bytes", usageMB(database.provider_usage?.bytes));
+  fact("API growth guard", admission.api_process_growth_paused == null ? null : admission.api_process_growth_paused ? "paused" : "no local pause observed");
+  fact("API startup", admission.api_startup_deferred == null ? null : admission.api_startup_deferred ? "deferred maintenance" : "normal");
+  fact("Bot growth guard", admission.bot_cross_process_guard);
+  fact("Capture", database.capture_status);
+  if (database.kind === "guild") {
+    const capture = database.capture || {};
+    const counts = [capture.retained_count, capture.lost_count, capture.expired_count, capture.evicted_count];
+    fact("Capture reason", capture.reason);
+    fact("Bot heartbeat age", capture.heartbeat_age_ms == null ? null : `${Math.floor(capture.heartbeat_age_ms / 1000)} seconds`);
+    fact("Retention maximum", capture.configured_retention_hours == null ? null : `${capture.configured_retention_hours} hours`);
+    fact("Oldest retained observation", usageAgeMs(capture.oldest_available_snapshot_at_ms));
+    fact("Capture epoch / counters reset", capture.epoch == null && capture.counters_reset_at_ms == null
+      ? null : `${capture.epoch ?? "unknown"} / ${usageAgeMs(capture.counters_reset_at_ms) ?? "unknown"}`);
+    fact("Retained / lost / expired / evicted", counts.every((count) => count == null) ? null : counts.map((count) => count ?? "unknown").join(" / "));
+    fact("Verified effective snapshot allowance", usageMB(database.policy_limits?.effective_snapshot_allowance_bytes));
+  }
+  fact("Cleanup", database.cleanup_status);
+  if (usage?.breakdown_error_code) fact("Breakdown status", usage.breakdown_error_code);
+  if (usage?.breakdown_quality === "measured") {
+    fact("Category basis", "Measured allocated pages; categories are disjoint");
+    for (const [label, key] of USAGE_CATEGORIES) fact(label, physicalPart(usage.categories?.[key], usage.allocated_bytes));
+    fact("Category sample", usageAge(usage.category_sampled_at));
+  } else if (usage?.breakdown_quality === "estimated") {
+    fact("Category basis", "Physical category allocation unavailable; snapshot value is encoded payload estimate");
+    fact("Snapshot payload estimate", usageMB(usage.snapshot_logical_bytes));
+    fact("Reusable pages", usageMB(usage.reusable_bytes));
+    fact("Indexes and other allocation", null);
+  } else if (usage) {
+    fact("Category basis", "Physical category allocation unavailable");
+    fact("Reusable pages", usageMB(usage.reusable_bytes));
+  }
+  if (usage?.snapshot_count != null) fact("Retained snapshots", formatExact(usage.snapshot_count));
+  fact("External evidence file bytes", usageMB(database.external_evidence_storage?.bytes));
+  if (!usage || (usage.breakdown_quality === "unavailable" && usage.snapshot_count == null)) fact("Breakdown", null);
+  return { known, unknown };
+}
+
+function usageMetric(label, body, caption) {
+  return h(
+    "div",
+    { className: "du-metric" },
+    h("span", { className: "du-metric-label" }, label),
+    body,
+    h("span", { className: "du-metric-caption" }, caption),
+  );
+}
+
+function UsageCard({ database: initial, stale, revision }) {
+  const [detail, setDetail] = useState(null);
+  const [detailRead, setDetailRead] = useState({ kind: "idle" });
+  const currentRevision = useRef(revision);
+  currentRevision.current = revision;
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  // A detail read replaces only the aggregate sample it was requested from.
+  const database = detail?.source === initial ? detail.database : initial;
+  const oldSample = stale && detail?.revision !== revision;
+  const health = USAGE_HEALTH[database.status] || { label: "Unknown", tone: "neutral", state: "Unknown" };
+  const limits = usageLimits(database);
+  const usage = database.usage;
+  const allocated = usage?.allocated_bytes ?? null;
+  const percent = allocated == null ? null : database.percent_of_limit ?? (allocated * 100) / limits.limit;
+  const next = allocated == null ? null : limits.marks.find((mark) => allocated < mark.bytes);
+  const title = usageTitle(database);
+  const headingId = `usage-${database.id}`;
+  const figures = allocated == null
+    ? [h("strong", { key: "size", className: "du-size" }, "Allocation unknown"), h("span", { key: "note" }, "Not counted as free capacity")]
+    : [
+        h("strong", { key: "size", className: "du-size" }, `${usageMB(allocated)} allocated`),
+        h("span", { key: "percent" }, `${percent.toFixed(2)}% of ${thresholdMB(limits.limit)}`),
+        h("span", { key: "next" }, next ? `${usageMB(next.bytes - allocated)} to ${next.name} (${thresholdMB(next.bytes)})` : "At or over the hard limit"),
+      ];
+  const thresholds = limits.marks.map((mark) => `${mark.name} ${thresholdMB(mark.bytes)}`).join(", ");
+  const gaugeSummary = allocated == null
+    ? `${title}: allocation unknown, not counted as free capacity. Thresholds: ${thresholds}.`
+    : `${title}: ${usageMB(allocated)} allocated, ${percent.toFixed(2)}% of the ${thresholdMB(limits.limit)} limit. Thresholds: ${thresholds}.`;
+  const measurement = database.measurement || {};
+  const measured = usageAge(measurement.sampled_at);
+  const lastSuccess = usageAge(measurement.last_success_at);
+  const stamp = (seconds) => (seconds ? new Date(seconds * 1000).toLocaleString(undefined, { timeZoneName: "short" }) : "unavailable");
+  const freshness = measured
+    ? `Measured ${measured}${lastSuccess && measurement.last_success_at !== measurement.sampled_at ? ` · last success ${lastSuccess}` : ""}`
+    : lastSuccess ? `Last success ${lastSuccess}` : "Not measured";
+  const pages = usage?.page_count;
+  const free = usage?.freelist_count;
+  const pageMetric = pages != null && free != null
+    ? usageMetric(
+        "Pages",
+        h(ShareBar, {
+          total: pages,
+          parts: [{ key: "used", value: pages - free, tone: "accent" }, { key: "free", value: free, tone: "muted" }],
+          summary: `Pages: ${formatExact(pages - free)} in use and ${formatExact(free)} reusable of ${formatExact(pages)}.`,
+        }),
+        [
+          h("span", { key: "used", className: "du-legend du-tone-accent" }, `${formatExact(pages - free)} used`),
+          h("span", { key: "free", className: "du-legend du-tone-muted" }, `${formatExact(free)} reusable`),
+          ` of ${formatExact(pages)}${usage.page_size != null ? ` × ${formatExact(usage.page_size)} B` : ""}`,
+        ],
+      )
+    : usageMetric("Pages", h(ShareBar, { total: 1, parts: [], unknown: true, summary: "Page counts unavailable." }), "Page counts unavailable");
+  const estimate = database.snapshot_usage_estimate_bytes;
+  const snapshotMetric = database.kind === "guild" &&
+    usageMetric(
+      "Snapshots",
+      h(ShareBar, {
+        total: limits.snapshots,
+        unknown: estimate == null,
+        parts: estimate == null ? [] : [{ key: "estimate", value: estimate, tone: "accent" }],
+        summary: estimate == null
+          ? `Snapshot footprint unknown; budget ${thresholdMB(limits.snapshots)}.`
+          : `Snapshot footprint estimate ${usageMB(estimate)} of the ${thresholdMB(limits.snapshots)} budget.`,
+      }),
+      estimate == null
+        ? `Footprint unknown · ${thresholdMB(limits.snapshots)} budget`
+        : `${usageMB(estimate)} of ${thresholdMB(limits.snapshots)} budget (${((estimate * 100) / limits.snapshots).toFixed(2)}%; conservative logical estimate)`,
+    );
+  const facts = usageFacts(database, health, limits);
+  const showBreakdown = async () => {
+    const asked = revision;
+    const source = initial;
+    setDetailRead({ kind: "loading" });
+    try {
+      const updated = await apiRead(`/api/database-usage/${encodeURIComponent(database.id)}`);
+      if (!mounted.current) return;
+      if (asked === currentRevision.current) setDetail({ database: updated, revision: asked, source });
+      setDetailRead({ kind: "idle" });
+    } catch (error) {
+      if (mounted.current) setDetailRead(asked === currentRevision.current ? { kind: "failed", message: error.message } : { kind: "idle" });
+    }
+  };
+  return h(
+    "section",
+    { className: "card bg-base-100 card-border du-card", "aria-labelledby": headingId, "data-usage-stale": oldSample ? "1" : undefined },
+    h(
+      "div",
+      { className: "card-body" },
+      h(
+        "header",
+        { className: "du-head" },
+        h("h3", { id: headingId, className: "du-title" }, title),
+        h("span", { className: `badge badge-soft badge-sm badge-${health.tone} du-health`, title: health.state }, health.label),
+        h("span", { className: "du-chip", title: `Measured: ${stamp(measurement.sampled_at)}. Last successful sample: ${stamp(measurement.last_success_at)}.` }, freshness),
+      ),
+      oldSample && h("p", { className: "du-stale" }, "Stale: the latest usage refresh failed. These figures are not a current capacity sample."),
+      h("p", { className: "du-figures" }, ...figures),
+      h(CapacityGauge, { used: allocated, limit: limits.limit, marks: limits.marks, tone: USAGE_FILL_TONES[health.tone], summary: gaugeSummary }),
+      h(
+        "div",
+        { className: "du-metrics" },
+        pageMetric,
+        snapshotMetric,
+        usageMetric("Trend", h("span", { className: "du-trend-empty" }), "No usage history recorded yet"),
+      ),
+      h(
+        "details",
+        { className: "du-details" },
+        h("summary", null, "Details"),
+        h("dl", { className: "du-facts" }, ...facts.known.map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, value)))),
+        facts.unknown.length > 0 && h("p", { className: "du-unknown" }, `Not measured or unknown: ${facts.unknown.join(", ")}.`),
+        h(
+          "div",
+          { className: "du-detail-actions" },
+          h(ActionButton, { className: "btn btn-sm", disabled: detailRead.kind === "loading", onClick: () => { showBreakdown(); } }, "Show current breakdown"),
+          detailRead.kind === "failed" && h("span", { className: "err", role: "status" }, `Breakdown unavailable: ${detailRead.message}`),
+        ),
+      ),
+    ),
+  );
+}
+
+function TabDatabaseUsage() {
+  return isBotOwner() ? h(DatabaseUsage) : ownerAccessRequired();
+}
+
+function DatabaseUsage() {
+  const [view, setView] = useState({ snapshot: null, freshness: "fresh", revision: 0, error: null });
+  const flight = useRef(null);
+  const mounted = useRef(true);
+  // Overlapping refreshes share one read. A failed read keeps the last
+  // successful figures, marked stale, instead of clearing them.
+  const refresh = () => {
+    if (flight.current) return flight.current;
+    flight.current = apiRead("/api/database-usage")
+      .then((snapshot) => {
+        if (mounted.current) setView((current) => ({ snapshot, freshness: "fresh", revision: current.revision + 1, error: null }));
+      })
+      .catch((error) => {
+        if (mounted.current) setView((current) => ({ ...current, freshness: "stale", revision: current.revision + 1, error }));
+      })
+      .finally(() => {
+        flight.current = null;
+      });
+    return flight.current;
+  };
+  useEffect(() => {
+    mounted.current = true;
+    refresh();
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const snapshot = view.snapshot;
+  const databases = snapshot?.databases ?? [];
+  return h(
+    "div",
+    { className: "contents database-usage-page" },
+    pageHeader(
+      "Database Usage",
+      snapshot ? `Response ${usageAge(snapshot.generated_at) ?? "time unknown"} · catalog ${snapshot.catalog_status || "unknown"}` : "Every physical database",
+      h(ActionButton, { id: "refresh-usage", className: "btn btn-sm", onClick: () => { refresh(); } }, "Refresh"),
+      h(InfoTip, { id: "usage-help", label: "About database usage" }, USAGE_HELP),
+    ),
+    view.error &&
+      h(
+        "p",
+        { id: "usage-status", className: "alert alert-soft alert-warning", role: "status" },
+        snapshot
+          ? `Usage refresh failed: ${view.error.message}. The figures below are from the last successful response.`
+          : `Database usage unavailable: ${view.error.message}`,
+      ),
+    !snapshot && !view.error && h("p", { className: "muted", role: "status", "aria-busy": "true" }, "Loading database usage…"),
+    snapshot && !databases.length && h("p", { className: "muted" }, "No databases reported."),
+    h(
+      "div",
+      { id: "usage-cards", className: "du-grid" },
+      databases.map((database) => h(UsageCard, { key: database.id, database, stale: view.freshness === "stale", revision: view.revision })),
+    ),
+  );
+}
+
+// Platform analytics: fleet-wide trends across every server. One owner-only
+// read per visit or Refresh.
+const PLATFORM_COLUMNS = [
+  ["warns", "Warnings"],
+  ["bans", "Bans"],
+  ["automod", "Spam hits"],
+  ["mod_actions", "Mod actions"],
+  ["timeouts", "Timeouts"],
+  ["joins", "Joins"],
+  ["leaves", "Leaves"],
+];
+
+function platformMemberTotal(members) {
+  if (!members || members.status === "unavailable") return "Unavailable";
+  if (members.guilds_unavailable) return `${members.current ?? 0}+`;
+  if (members.guilds_incomplete) return `${members.current ?? 0} (partial)`;
+  return String(members.current ?? 0);
+}
+
+function platformMemberStatus(members) {
+  if (!members || members.status === "unavailable") return "Member totals are unavailable.";
+  const unavailable = members.guilds_unavailable
+    ? ` Member totals cover ${members.guilds_counted ?? 0} of ${members.servers ?? 0} servers; the rest were unavailable.`
+    : "";
+  const incomplete = members.guilds_incomplete
+    ? ` ${members.guilds_incomplete} counted ${members.guilds_incomplete === 1 ? "server has" : "servers have"} a member directory still importing or awaiting Reconcile.`
+    : "";
+  return `Member totals are ${members.status || "complete"}.${unavailable}${incomplete}`;
+}
+
+function TabPlatformAnalytics() {
+  return isBotOwner() ? h(PlatformAnalytics) : ownerAccessRequired();
+}
+
+function PlatformAnalytics() {
+  const result = useApiRead("/api/platform/analytics");
+  const [metric, setMetric] = useTrendMetric("warns");
+  const snapshot = result.data;
+  const points = toTrendPoints(snapshot?.series);
+  const shown = (value) => (result.loading ? "Loading…" : result.error ? "Unavailable" : value);
+  const members = snapshot?.members;
+  const guilds = snapshot?.guilds ?? [];
+  return h(
+    "div",
+    { className: "contents" },
+    pageHeader(
+      "Platform analytics",
+      `All servers · last ${snapshot?.window_days ?? 30} days (UTC)`,
+      h(ActionButton, { id: "refresh-platform-analytics", className: "btn btn-sm", onClick: () => result.refresh() }, "Refresh"),
+    ),
+    result.error
+      ? h("p", { id: "platform-analytics-status", className: "alert alert-soft alert-warning", role: "status" }, `Platform analytics unavailable: ${result.error.message}`)
+      : snapshot && h("p", { id: "platform-analytics-status", className: "muted", role: "status" }, platformMemberStatus(members)),
+    h(
+      "section",
+      { id: "platform-analytics", className: "card bg-base-100 card-border" },
+      h(
+        "div",
+        { className: "card-body" },
+        h(
+          "div",
+          { className: "stats bg-base-100 w-full platform-stats" },
+          stat("Servers", shown(String(snapshot?.servers ?? 0))),
+          stat("Members now", shown(platformMemberTotal(members))),
+          stat("Known members", shown(members?.known != null ? String(members.known) : "Unavailable")),
+          ...PLATFORM_COLUMNS.map(([field, label]) => stat(label, shown(String(sumSeries(points, field === "mod_actions" ? "modActions" : field))))),
+        ),
+        h(TrendMetricPicker, { metric, onChange: setMetric }),
+        points.length
+          ? h(TrendChart, { points, metric, title: "Platform activity" })
+          : h("p", { className: "muted" }, result.loading ? "Loading analytics…" : "No platform trend data recorded yet."),
+        guilds.length > 0 &&
+          h(
+            "div",
+            { className: "table-scroll rounded-box", tabIndex: 0 },
+            h(
+              "table",
+              { className: "table table-zebra table-sm" },
+              h("thead", null, h("tr", null, h("th", { scope: "col" }, "Server"), ...PLATFORM_COLUMNS.map(([, label]) => h("th", { key: label, scope: "col" }, label)))),
+              h(
+                "tbody",
+                null,
+                guilds.map((guild) =>
+                  h("tr", { key: guild.guild_id }, h("td", null, guild.guild_id), ...PLATFORM_COLUMNS.map(([field]) => h("td", { key: field }, String(guild[field] ?? 0)))),
+                ),
+              ),
+            ),
+          ),
+        h(
+          "p",
+          { className: "muted" },
+          "Fleet-wide moderation and membership trends. Member totals come from each server's member directory; servers whose store is unavailable are reported as unknown instead of failing the view. Per-server rows show guild IDs with recorded activity in the window, including servers that have since left until their data is erased; Servers counts current memberships. Days before the bot started recording — or while it was offline — show zero, not missing history. Members now is the current member directory across counted servers; known members includes departed members retained by ban history.",
+        ),
+      ),
+    ),
+  );
+}
+
 function App() {
   const appearance = useAppearance();
   const display = useStore(ui);
@@ -602,10 +1046,10 @@ function App() {
     ["cases", "Cases"],
     ["settings", "Settings"],
   ];
-  // The owner directory is a main-interface sub-section, not part of the
-  // separate /administration page. It appears only for the bot owner.
+  // Owner sections live in the main interface, not on the separate
+  // /administration page (Updates only). They appear only for the bot owner.
   const navigation = isBotOwner()
-    ? [...navigationBase, ["servers", "Bot servers"]]
+    ? [...navigationBase, ["servers", "Bot servers"], ["usage", "Database Usage"], ["platform-analytics", "Platform analytics"]]
     : navigationBase;
   return h(
     BusyContext.Provider,
@@ -846,11 +1290,11 @@ function Content() {
     actions: tabActions,
     cases: tabCases,
     settings: tabSettings,
-    servers: TabOwnerServers,
   };
-  // The owner directory lists every server the bot serves; it needs no
-  // selected guild or loaded configuration.
-  if (state.tab === "servers") return h(components.servers);
+  // Owner sections cover every server the bot serves; they need no selected
+  // guild or loaded configuration.
+  const ownerSections = { servers: TabOwnerServers, usage: TabDatabaseUsage, "platform-analytics": TabPlatformAnalytics };
+  if (Object.hasOwn(ownerSections, state.tab)) return h(ownerSections[state.tab]);
   if (!state.guildId)
     return emptyPanel(
       state.me?.role_discovery_incomplete ? "Server discovery incomplete" : "No servers to manage yet",
@@ -1004,6 +1448,8 @@ const tabs = [
   "cases",
   "settings",
   "servers",
+  "usage",
+  "platform-analytics",
 ];
 
 let pendingCase = null;

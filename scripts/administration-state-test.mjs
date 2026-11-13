@@ -849,139 +849,6 @@ test("a policy edit abandoned after a failed prior read restores the recorded se
   assert.equal(select.value, "latest");
 });
 
-test("Database Usage shows independent physical databases and unknown allocation honestly", async () => {
-  const calls = [];
-  const view = page(async (url) => {
-    calls.push(url);
-    if (url === "/api/updates") return response(state([]));
-    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
-    return { status: 200, ok: true, json: async () => ({ generated_at: NOW_SECONDS, databases: [
-      { id: "core", kind: "core", usage: { allocated_bytes: 750000000, sampled_at: NOW_SECONDS },
-        percent_of_limit: 75, headroom_bytes: 250000000, status: "pressure" },
-      { id: "a".repeat(32), kind: "guild", policy: { kind: "shared" }, usage: null,
-        percent_of_limit: null, headroom_bytes: null, status: "unavailable" },
-    ] }) };
-  });
-  await run('selectView("usage")', view.context);
-  const text = textOf(view.elements.get("usage-cards"));
-  assert.match(text, /750\.00 MB/);
-  assert.match(text, /75\.00% of 1,000 MB/);
-  assert.match(text, /Shared guild database/);
-  assert.match(text, /Measurement unavailable/);
-  assert.match(text, /Headroom: unavailable/);
-  assert.ok(calls.includes("/api/database-usage"));
-});
-
-test("Platform analytics marks member totals partial when a counted directory is incomplete", async () => {
-  const analytics = (members) => ({ window_days: 30, servers: members.servers,
-    series: [{ day: "2026-11-12", warns: 1, bans: 0, automod: 2, mod_actions: 0, timeouts: 0, joins: 3, leaves: 1 }],
-    guilds: [], members });
-  let members = { status: "partial", servers: 2, current: 40, banned: 1, known: 45,
-    guilds_counted: 2, guilds_unavailable: 0, guilds_incomplete: 1 };
-  const view = page(async (url) => {
-    if (url === "/api/updates") return response(state([]));
-    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
-    return response(analytics(members));
-  });
-  await run('selectView("analytics")', view.context);
-  const stat = (label) => [...view.elements.get("platform-analytics").querySelectorAll(".stat")]
-    .find((el) => el.querySelector(".stat-title").textContent === label).querySelector(".stat-value").textContent;
-  assert.equal(stat("Members now"), "40 (partial)");
-  assert.match(view.elements.get("analytics-status").textContent, /Member totals are partial\./);
-  assert.match(view.elements.get("analytics-status").textContent, /1 counted server has a member directory still importing or awaiting Reconcile/);
-  members = { status: "complete", servers: 0, current: 0, banned: 0, known: 0,
-    guilds_counted: 0, guilds_unavailable: 0, guilds_incomplete: 0 };
-  await run("refreshAnalytics()", view.context);
-  assert.equal(stat("Members now"), "0");
-  assert.equal(stat("Spam hits"), "2");
-  assert.match(view.elements.get("analytics-status").textContent, /Member totals are complete\.$/);
-});
-
-test("Database Usage does not paint cards if the tab hides during the fetch", async () => {
-  let release;
-  const usage = new Promise((resolve) => { release = resolve; });
-  let markStarted;
-  const started = new Promise((resolve) => { markStarted = resolve; });
-  const view = page(async (url) => {
-    if (url === "/api/updates") return response(state([]));
-    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
-    markStarted();
-    await usage;
-    return { status: 200, ok: true, json: async () => ({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1 }, percent_of_limit: 0, status: "normal" }], generated_at: 1 }) };
-  });
-  const pending = run('selectView("usage")', view.context);
-  await started;
-  view.context.document.visibilityState = "hidden";
-  release();
-  await pending;
-  assert.equal(textOf(view.elements.get("usage-cards")), "");
-});
-
-test("Database Usage marks retained cards stale when refresh fails", async () => {
-  let fail = false;
-  const view = page(async (url) => {
-    if (url === "/api/updates") return response(state([]));
-    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
-    if (fail) throw new Error("usage unavailable");
-    return { status: 200, ok: true, json: async () => ({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1000000 }, percent_of_limit: 0.1, status: "normal" }], generated_at: 1 }) };
-  });
-  await run('selectView("usage")', view.context);
-  fail = true;
-  await run('refreshUsage()', view.context);
-  const text = textOf(view.elements.get("usage-cards"));
-  assert.match(text, /Stale: the latest usage refresh failed/);
-  assert.match(view.elements.get("usage-status").textContent, /usage unavailable/);
-});
-
-test("Administration usage polling does not fetch while the tab is hidden", async () => {
-  const calls = [];
-  const view = page((url) => { calls.push(url); return new Promise(() => {}); }, { visibility: "hidden" });
-  await run('selectView("usage")', view.context);
-  assert.deepEqual(calls, []);
-});
-
-test("Database Usage coalesces overlapping visible refreshes", async () => {
-  const calls = [];
-  let release;
-  const usage = new Promise((resolve) => { release = resolve; });
-  let markStarted;
-  const started = new Promise((resolve) => { markStarted = resolve; });
-  const view = page(async (url) => {
-    calls.push(url);
-    if (url === "/api/updates") return response(state([]));
-    if (url === "/api/me") return { status: 200, ok: true, json: async () => ({ is_bot_owner: true }) };
-    markStarted();
-    await usage;
-    return { status: 200, ok: true, json: async () => ({ databases: [], generated_at: 1 }) };
-  });
-  const first = run('selectView("usage")', view.context);
-  const second = run('refreshUsage()', view.context);
-  await started;
-  assert.equal(calls.filter((url) => url === "/api/database-usage").length, 1);
-  release();
-  await Promise.all([first, second]);
-});
-
-test("Database Usage renders disjoint physical groups and unknown guard status", () => {
-  const view = page();
-  run(`ui.set({ access: "allowed", activeView: "usage", usageSnapshot: { databases: [${JSON.stringify({
-    id: "a".repeat(32), kind: "guild", role: "guild", availability: "available",
-    policy: { kind: "shared" }, status: "normal", percent_of_limit: 1,
-    usage: { allocated_bytes: 10000000, breakdown_quality: "measured", category_sampled_at: 1,
-      categories: { snapshot_data_bytes: 1000000, moderation_evidence_data_bytes: 2000000,
-        configuration_data_bytes: 1000000, operational_data_bytes: 2000000,
-        index_bytes: 1000000, reusable_bytes: 1000000, system_unattributed_bytes: 2000000 } },
-    capture: { status: "unknown", configured_retention_hours: 24 },
-    application_admission: { bot_cross_process_guard: "unknown" },
-  })}] } });`, view.context);
-  const content = textOf(view.elements.get("usage-cards"));
-  for (const label of ["Snapshot table", "Moderation and evidence tables", "Configuration tables",
-    "Operational tables", "Indexes", "Reusable pages", "System / unattributed",
-    "Bot growth guard: unknown", "External evidence file bytes: unavailable"]) {
-    assert.match(content, new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  }
-});
-
 test("schema upgrades expose the paired action and active pairs block independent installs", () => {
   const view = page();
   const api = record();
@@ -1022,71 +889,6 @@ test("normal update explains a required launcher step and separates optional lau
     reason: "Current launcher supports this application. A newer launcher is optional." }; ui.set({ ...ui.getSnapshot() });`, view.context);
   assert.equal(find(advanced, (node) => node.localName === "button").disabled, false,
     "launcher-only admission is independent of the bundled application's schema");
-});
-
-
-test("late detail response must not replace a newer aggregate usage sample", async () => {
-  let resolveDetail;
-  let allocated = 1000000;
-  const database = () => ({ id: "core", kind: "core", usage: { allocated_bytes: allocated } });
-  const view = await ready(async url => {
-    if (url === "/api/updates") return response(state([]));
-    if (url === "/api/database-usage/core") return new Promise(resolve => { resolveDetail = resolve; });
-    return response({ databases: [database()], generated_at: NOW_SECONDS });
-  });
-  await run('selectView("usage")', view.context);
-  const detail = find(view.elements.get("usage-cards"), el => el.localName === "button");
-  await fire(detail, "click");
-  allocated = 2000000;
-  await run('refreshUsage()', view.context);
-  await new Promise(resolve => setImmediate(resolve));
-  await new Promise(resolve => setImmediate(resolve));
-  assert.match(textOf(view.elements.get("usage-cards")), /Allocated: 2.00 MB/);
-  allocated = 1000000;
-  resolveDetail(response(database()));
-  await new Promise(resolve => setImmediate(resolve));
-  await new Promise(resolve => setImmediate(resolve));
-  assert.match(textOf(view.elements.get("usage-cards")), /Allocated: 2.00 MB/);
-});
-
-test("successful details refresh clears stale flag for its own card", async () => {
-  let fail = false;
-  const database = () => ({ id: "core", kind: "core", usage: { allocated_bytes: 2000000 } });
-  const view = await ready(async url => {
-    if (url === "/api/updates") return response(state([]));
-    if (url === "/api/database-usage/core") return response(database());
-    if (fail) throw new Error("offline");
-    return response({ databases: [database()], generated_at: NOW_SECONDS });
-  });
-  await run('selectView("usage")', view.context);
-  fail = true;
-  await run('refreshUsage()', view.context);
-  assert.equal(view.elements.get("usage-cards").firstElementChild.dataset.usageStale, "1");
-  const detail = find(view.elements.get("usage-cards"), el => el.localName === "button");
-  await fire(detail, "click");
-  await new Promise(resolve => setImmediate(resolve));
-  await new Promise(resolve => setImmediate(resolve));
-  assert.notEqual(view.elements.get("usage-cards").firstElementChild.dataset.usageStale, "1");
-});
-
-
-test("failed aggregate retains the last successful detail with a stale warning", async () => {
-  let fail = false;
-  const view = await ready(async url => {
-    if (url === "/api/updates") return response(state([]));
-    if (url === "/api/database-usage/core") return response({ id: "core", kind: "core", usage: { allocated_bytes: 2000000 } });
-    if (fail) throw new Error("offline");
-    return response({ databases: [{ id: "core", kind: "core", usage: { allocated_bytes: 1000000 } }], generated_at: NOW_SECONDS });
-  });
-  await run('selectView("usage")', view.context);
-  await fire(find(view.elements.get("usage-cards"), el => el.localName === "button"), "click");
-  await new Promise(resolve => setImmediate(resolve));
-  await new Promise(resolve => setImmediate(resolve));
-  assert.match(textOf(view.elements.get("usage-cards")), /Allocated: 2.00 MB/);
-  fail = true;
-  await run('refreshUsage()', view.context);
-  assert.match(textOf(view.elements.get("usage-cards")), /Allocated: 2.00 MB/);
-  assert.equal(view.elements.get("usage-cards").firstElementChild.dataset.usageStale, "1");
 });
 
 
@@ -1139,13 +941,27 @@ test("owner saves the boot repair alert channel as a string ID through the API",
   assert.ok(view.elements.get("alert-channel-unset"));
 });
 
-// #588: the Administration navigation and page controls draw the shared SVG icon set.
-test("Administration pages and controls show colored SVG icons, never glyphs", async () => {
+// #613: Administration is for update processing only. Database Usage and Platform
+// analytics moved to the workspace Owner section.
+test("Administration offers only Updates and never reads usage or platform analytics", async () => {
+  const calls = [];
+  const view = await ready(async (url) => {
+    calls.push(url);
+    return response(url === "/api/me" ? { is_bot_owner: true } : state([record()]));
+  });
+  const body = view.elements.get("content");
+  assert.equal(view.elements.get("admin-title").textContent, "Updates");
+  assert.equal(body.querySelector("nav"), null, "no Administration page navigation remains");
+  for (const id of ["show-updates", "show-database-usage", "show-analytics", "database-usage", "platform-analytics"])
+    assert.equal(view.elements.get(id), null, id);
+  assert.doesNotMatch(textOf(body), /Database Usage|Analytics/);
+  assert.deepEqual([...new Set(calls)], ["/api/updates"]);
+});
+
+// #588: the Administration page controls draw the shared SVG icon set.
+test("Administration page controls show colored SVG icons, never glyphs", async () => {
   const view = await ready(async (url) => response(url === "/api/me" ? { is_bot_owner: true } : state([record()])));
   for (const [id, label, icon, intent] of [
-    ["show-updates", "Updates", "arrow-up-circle", "info"],
-    ["show-database-usage", "Database Usage", "database", "neutral"],
-    ["show-analytics", "Analytics", "bar-chart", "analytics"],
     ["refresh-status", "Refresh status", "refresh", "info"],
   ]) {
     const control = view.elements.get(id);

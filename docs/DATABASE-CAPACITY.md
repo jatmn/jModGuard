@@ -81,8 +81,8 @@ quota as a substitute for application admission.
 
 ## Owner inspection
 
-Open **Administration → Database Usage** in the WebUI as the configured bot
-owner. Ordinary administrators and View as… preview sessions cannot inspect
+Open **Database Usage** under **Owner** in the WebUI sidebar as the configured
+bot owner. Ordinary administrators and View as… preview sessions cannot inspect
 these routes. The page includes the core database and every cataloged guild
 store, including unavailable or unconfigured stores. It does not return database
 URLs, tokens, local paths, message contents or SQL error details.

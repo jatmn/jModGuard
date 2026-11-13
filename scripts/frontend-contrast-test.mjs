@@ -491,3 +491,46 @@ test("analytics numbers never wrap and the grid collapses on narrow screens", ()
   const medium = section.slice(section.indexOf("@media (max-width: 1100px) {"));
   assert.match(medium, /\.an-span-5, \.an-span-7\s*\{\s*grid-column:\s*span 12;/);
 });
+
+// Database usage (#613): one delimited stylesheet section; gauge fills and
+// threshold marks keep 3:1 against their track, text stays readable.
+const USAGE_START = "Database usage (#613). Self-contained";
+const USAGE_END = "/* ==== end Database usage (#613) ==== */";
+function usageCss() {
+  const start = css.indexOf(USAGE_START);
+  const end = css.indexOf(USAGE_END);
+  assert.ok(start > 0 && end > start, "database usage styles live in one delimited section");
+  return css.slice(css.lastIndexOf("/*", start), end + USAGE_END.length);
+}
+
+test("database usage styles stay inside their delimited section", () => {
+  const section = usageCss();
+  assert.doesNotMatch(css.replace(section, ""), /\.du-[\w-]+|\.database-usage-page/, "no database usage selector outside the section");
+  for (const [, selectors] of section.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{[^{}]*\}/g))
+    for (const selector of selectors.trim().split(",").map((part) => part.trim()))
+      assert.match(selector, /^(?:#content )?\.(?:du-|database-usage-page)/, `scoped selector: ${selector}`);
+});
+
+for (const [theme, selector] of [["light", ":root"], ["dark", ':root[data-theme="dark"]']]) {
+  test(`${theme} database usage fills, marks and captions stay readable`, () => {
+    const colors = tokens(selector);
+    const section = usageCss();
+    const tones = Object.fromEntries([...section.matchAll(/\.du-tone-(\w+)\s*\{\s*--du-tone:\s*var\((--[\w-]+)\)/g)].map(([, tone, token]) => [tone, token]));
+    assert.deepEqual(Object.keys(tones).sort(), ["accent", "bad", "muted", "ok", "warn"]);
+    for (const [tone, token] of Object.entries(tones)) {
+      // WCAG 1.4.11: a fill must stand out from the track it is drawn on.
+      const ratio = contrast(colors[token], colors["--panel2"]);
+      assert.ok(ratio >= 3, `${theme} ${tone} fill on track: ${ratio.toFixed(2)}:1`);
+    }
+    assert.match(rule(".du-gauge-mark", section), /background:\s*var\(--text\)/);
+    assert.ok(contrast(colors["--text"], colors["--panel2"]) >= 3, `${theme} threshold marks`);
+    // The empty track keeps a visible boundary on the card.
+    assert.match(rule(".du-gauge-track, .du-share", section), /border:\s*1px solid var\(--input-border\)/);
+    assert.ok(contrast(colors["--input-border"], colors["--panel"]) >= 3, `${theme} track boundary`);
+    for (const caption of [".du-chip", ".du-metric-caption", ".du-facts dt", ".du-unknown"])
+      assert.match(rule(caption, section), /color:\s*var\(--muted\)/, caption);
+    assert.ok(contrast(colors["--muted"], colors["--panel"]) >= 4.5, `${theme} muted captions`);
+    assert.match(rule(".du-stale", section), /color:\s*var\(--warn\)/);
+    assert.ok(contrast(colors["--warn"], colors["--panel"]) >= 4.5, `${theme} stale warning`);
+  });
+}
