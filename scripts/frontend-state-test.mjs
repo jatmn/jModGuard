@@ -7199,7 +7199,8 @@ test('every sidebar item shows its colored SVG icon beside its unchanged label',
     dashboard: 'Dashboard', rules: 'Automod Rules', badwords: 'Badwords', 'known-spam': 'Known spam',
     'known-bad-images': 'Known-bad images', commands: 'Commands', templates: 'Templates', logchannels: 'Log Channels',
     analytics: 'Analytics', events: 'Audit Log', members: 'Members', bans: 'Bans', actions: 'Bot actions',
-    cases: 'Cases', settings: 'Settings', servers: 'Bot servers',
+    cases: 'Cases', settings: 'Settings', servers: 'Bot servers', usage: 'Database Usage',
+    'platform-analytics': 'Platform analytics',
   };
   const h = ownerHarness(async () => response({ servers: [] }));
   h.app.navigate('bans');
@@ -7399,4 +7400,502 @@ test("the sidebar's own buttons show their colored SVG icons beside unchanged la
   preview.app.state.me.preview = true;
   preview.app.navigate('dashboard');
   assertSidebarIcon(findNode(preview.document.querySelector('.sidebar #owner-tools'), n => n.localName === 'button'), 'exit-preview', 'Exit preview');
+});
+
+// #613: Database Usage and Platform analytics are Owner sections of the main
+// workspace. Each database reads at a glance; diagnostics stay in Details.
+const USAGE_NOW = () => Math.floor(Date.now() / 1000);
+const USAGE_POLICY = { provider_hard_limit_bytes: 1e9, pressure_bytes: 7e8, capture_pause_bytes: 8e8, growth_stop_bytes: 9e8, snapshot_budget_bytes: 4e8, effective_snapshot_allowance_bytes: null };
+function usageDatabase({ id = 'core', kind = 'core', pages = 118, free = 20, status = 'normal', ...overrides } = {}) {
+  const allocated = pages * 4096;
+  const sampled = USAGE_NOW() - 120;
+  return {
+    id, kind, role: kind, policy: kind === 'core' ? null : { kind: 'shared' }, availability: 'available', status,
+    measurement: { source: 'sqlite_primary_pragma', sampled_at: sampled, last_success_at: sampled, capability: 'available', error_code: null },
+    provider_usage: { bytes: null, source: 'unavailable' }, limit_bytes: 1e9, policy_limits: USAGE_POLICY,
+    application_admission: { api_process_growth_paused: false, api_startup_deferred: false, bot_cross_process_guard: 'unknown' },
+    snapshot_budget_bytes: 4e8, snapshot_usage_estimate_bytes: kind === 'core' ? null : 400000,
+    headroom_bytes: 1e9 - allocated, percent_of_limit: allocated * 100 / 1e9,
+    usage: { allocated_bytes: allocated, page_count: pages, page_size: 4096, freelist_count: free, sampled_at: sampled, breakdown_quality: 'unavailable', reusable_bytes: free * 4096 },
+    capture_status: kind === 'core' ? 'unavailable' : 'active', cleanup_status: 'recent',
+    capture: { status: 'active', reason: null, heartbeat_age_ms: 4000, configured_retention_hours: 24, epoch: 3, counters_reset_at_ms: null, retained_count: 12, lost_count: 0, expired_count: 5, evicted_count: 0, oldest_available_snapshot_at_ms: null },
+    external_evidence_storage: { bytes: null, source: 'unavailable' },
+    ...overrides,
+  };
+}
+const unknownDatabase = () => ({
+  ...usageDatabase({ id: 'b'.repeat(32), kind: 'guild', status: 'unavailable' }),
+  policy: { kind: 'dedicated', guild_id: '900000000000000001' }, availability: 'unavailable', usage: null,
+  measurement: { source: 'sqlite_primary_pragma', sampled_at: null, last_success_at: null, capability: 'unavailable', error_code: 'timeout' },
+  headroom_bytes: null, percent_of_limit: null, snapshot_usage_estimate_bytes: null,
+});
+const usageOverview = (databases) => ({ generated_at: USAGE_NOW() - 30, catalog_status: 'available', databases });
+const usageCards = (h) => [...h.nodes.get('#content').querySelectorAll('.du-card')];
+const usageFigures = (card) => [...card.querySelectorAll('.du-figures > *')].map(node => node.textContent);
+const usageFacts = (card) => Object.fromEntries([...card.querySelectorAll('.du-facts > div')].map(row => [row.querySelector('dt').textContent, row.querySelector('dd').textContent]));
+const metricLabels = (card) => [...card.querySelectorAll('.du-metric-label')].map(node => node.textContent);
+
+test('owner sections list Database Usage and Platform analytics; others get no read and no section', async () => {
+  const navLabels = (h) => [...h.document.querySelectorAll('#tabs li')].map(n => n.textContent.trim());
+  const owner = ownerHarness(async () => new Promise(() => {}));
+  owner.app.navigate('dashboard');
+  const labels = navLabels(owner);
+  assert.deepEqual(labels.slice(labels.indexOf('Owner')), ['Owner', 'Bot servers', 'Database Usage', 'Platform analytics']);
+  const calls = [];
+  const nonOwner = harness(async (url) => { calls.push(url); return new Promise(() => {}); });
+  nonOwner.app.navigate('dashboard');
+  assert.ok(!navLabels(nonOwner).some(label => /Owner|Database Usage|Platform analytics/.test(label)));
+  for (const tab of ['usage', 'platform-analytics']) {
+    nonOwner.app.navigate(tab);
+    await settle();
+    assert.match(textOf(nonOwner.document.querySelector('#content')), /Owner access required/, tab);
+  }
+  assert.ok(!calls.some(url => /database-usage|platform/.test(url)), 'a non-owner never requests owner data');
+});
+
+test('Database Usage shows size, limit share, next threshold, health and freshness without expanding anything', async () => {
+  const calls = [];
+  const shared = usageDatabase({ id: 'a'.repeat(32), kind: 'guild', pages: 2351, free: 24 });
+  const h = ownerHarness(async (url, options) => {
+    calls.push([url, options.method]);
+    if (url === '/api/database-usage') return response(usageOverview([usageDatabase(), shared, unknownDatabase()]));
+    throw new Error(`unexpected fetch ${url}`);
+  });
+  h.app.navigate('usage');
+  await settle();
+  assert.deepEqual(calls, [['/api/database-usage', 'POST']], 'one owner read, no guild-scoped reads');
+  const header = h.nodes.get('#content .page-header');
+  assert.equal(header.querySelector('h2').textContent, 'Database Usage');
+  assert.match(header.querySelector('.page-header-detail').textContent, /^Response just now · catalog available$/);
+  assert.match(h.nodes.get('#usage-help').textContent, /Unknown measurements are not treated as free capacity/);
+  const [core, guild, unknown] = usageCards(h);
+
+  assert.equal(core.querySelector('.du-title').textContent, 'Core database');
+  assert.equal(core.querySelector('.du-health').textContent, 'OK');
+  assert.ok(core.querySelector('.du-health').classList.contains('badge-success'));
+  assert.equal(core.querySelector('.du-chip').textContent, 'Measured 2 min ago', 'one freshness chip');
+  assert.deepEqual(usageFigures(core), ['0.48 MB allocated', '0.05% of 1,000 MB', '699.52 MB to pressure (700 MB)']);
+  const gauge = core.querySelector('.du-gauge');
+  assert.equal(gauge.getAttribute('role'), 'img');
+  assert.equal(gauge.getAttribute('aria-label'), 'Core database: 0.48 MB allocated, 0.05% of the 1,000 MB limit. Thresholds: pressure 700 MB, capture pause 800 MB, growth stop 900 MB, hard limit 1,000 MB.');
+  assert.deepEqual([...gauge.querySelectorAll('.du-gauge-mark')].map(mark => parseFloat(mark.style.left)), [70, 80, 90, 100]);
+  assert.deepEqual([...gauge.querySelectorAll('.du-gauge-scale span')].map(node => node.textContent), ['0 MB', '700', '800', '900', '1,000']);
+  const fill = gauge.querySelector('.du-gauge-fill');
+  assert.equal(parseFloat(fill.style.width), 0.05);
+  assert.ok(fill.classList.contains('du-tone-ok'));
+  assert.deepEqual(metricLabels(core), ['Pages', 'Trend'], 'the core database has no snapshot budget');
+  const pages = core.querySelector('.du-share');
+  assert.equal(pages.getAttribute('role'), 'img');
+  assert.equal(pages.getAttribute('aria-label'), 'Pages: 98 in use and 20 reusable of 118.');
+  assert.deepEqual([...pages.querySelectorAll('.du-share-part')].map(part => parseFloat(part.style.width)), [83.05, 16.95]);
+  assert.match(textOf(core.querySelector('.du-metrics')), /98 used20 reusable of 118 × 4,096 B/);
+  assert.match(textOf(core.querySelector('.du-metrics')), /No usage history recorded yet/, 'room is left for a trend');
+
+  assert.equal(guild.querySelector('.du-title').textContent, 'Shared guild database');
+  assert.deepEqual(usageFigures(guild), ['9.63 MB allocated', '0.96% of 1,000 MB', '690.37 MB to pressure (700 MB)']);
+  assert.deepEqual(metricLabels(guild), ['Pages', 'Snapshots', 'Trend']);
+  const snapshots = guild.querySelectorAll('.du-share')[1];
+  assert.equal(snapshots.getAttribute('aria-label'), 'Snapshot footprint estimate 0.40 MB of the 400 MB budget.');
+  assert.equal(parseFloat(snapshots.querySelector('.du-share-part').style.width), 0.1);
+  assert.match(textOf(guild.querySelector('.du-metrics')), /0\.40 MB of 400 MB budget \(0\.10%; conservative logical estimate\)/);
+
+  // Diagnostics are collapsed into Details; unknown values share one muted line.
+  for (const card of [core, guild, unknown]) {
+    const details = card.querySelectorAll('details');
+    assert.equal(details.length, 1);
+    assert.equal(details[0].open, false);
+    assert.equal(details[0].querySelector('summary').textContent, 'Details');
+    assert.equal(card.querySelectorAll('.du-unknown').length, 1);
+    assert.ok(details[0].contains(card.querySelector('.du-facts')) && details[0].contains(card.querySelector('.du-unknown')));
+  }
+  const facts = usageFacts(core);
+  assert.equal(facts['Database ID'], 'core');
+  assert.equal(facts['Operating state'], 'Measured allocation below pressure threshold; cross-process guard unknown');
+  assert.equal(facts['Application thresholds'], 'pressure 700 MB · capture pause 800 MB · growth stop 900 MB · hard limit 1,000 MB');
+  assert.equal(facts['Headroom to hard limit'], '999.52 MB');
+  assert.equal(facts.Pages, '118 × 4,096 bytes');
+  assert.equal(facts['Reusable free pages'], '20');
+  assert.equal(facts['Measurement source'], 'sqlite_primary_pragma');
+  assert.equal(facts['API growth guard'], 'no local pause observed');
+  assert.equal(facts['API startup'], 'normal');
+  assert.equal(facts.Cleanup, 'recent');
+  assert.equal(textOf(core.querySelector('.du-unknown')),
+    'Not measured or unknown: Provider reported bytes, Bot growth guard, Capture, External evidence file bytes, Breakdown.');
+  for (const label of ['Provider reported bytes', 'Bot growth guard', 'Capture', 'External evidence file bytes'])
+    assert.equal(facts[label], undefined, `${label} is not a row of its own`);
+  const guildFacts = usageFacts(guild);
+  assert.equal(guildFacts['Retained / lost / expired / evicted'], '12 / 0 / 5 / 0');
+  assert.equal(guildFacts['Bot heartbeat age'], '4 seconds');
+  assert.equal(guildFacts['Capture epoch / counters reset'], '3 / unknown');
+
+  // An unknown measurement is never drawn or described as free capacity.
+  assert.equal(unknown.querySelector('.du-title').textContent, 'Guild database · 900000000000000001');
+  assert.equal(unknown.querySelector('.du-health').textContent, 'Unknown');
+  assert.equal(unknown.querySelector('.du-chip').textContent, 'Not measured');
+  assert.deepEqual(usageFigures(unknown), ['Allocation unknown', 'Not counted as free capacity']);
+  assert.equal(unknown.querySelector('.du-gauge-fill'), null);
+  assert.ok(unknown.querySelector('.du-gauge-track').classList.contains('du-gauge-unknown'));
+  assert.match(unknown.querySelector('.du-gauge').getAttribute('aria-label'), /allocation unknown, not counted as free capacity/);
+  assert.equal(unknown.querySelectorAll('.du-share-part').length, 0);
+  assert.deepEqual([...unknown.querySelectorAll('.du-share')].map(bar => bar.classList.contains('du-share-unknown')), [true, true]);
+  assert.doesNotMatch(textOf(unknown), /to pressure|MB allocated/);
+  assert.equal(usageFacts(unknown)['Headroom to hard limit'], undefined);
+  assert.equal(usageFacts(unknown)['Probe status'], 'timeout');
+  assert.match(textOf(unknown.querySelector('.du-unknown')), /Headroom to hard limit, Pages, Reusable free pages/);
+});
+
+test('Database Usage health badges and next threshold follow each operating state', async () => {
+  const states = [
+    ['pressure', 750, 'Pressure', 'badge-warning', 'du-tone-warn', '50.00 MB to capture pause (800 MB)'],
+    ['capture_paused', 850, 'Capture paused', 'badge-warning', 'du-tone-warn', '50.00 MB to growth stop (900 MB)'],
+    ['growth_stopped', 950, 'Growth stopped', 'badge-error', 'du-tone-bad', '50.00 MB to hard limit (1,000 MB)'],
+    ['growth_stopped', 1000, 'Growth stopped', 'badge-error', 'du-tone-bad', 'At or over the hard limit'],
+    ['application_paused', 100, 'Writes paused', 'badge-error', 'du-tone-bad', '600.00 MB to pressure (700 MB)'],
+    ['stale', 100, 'Stale', 'badge-neutral', 'du-tone-muted', '600.00 MB to pressure (700 MB)'],
+  ];
+  const databases = states.map(([status, mb], index) => {
+    const database = usageDatabase({ id: String(index).repeat(32), kind: 'guild', status });
+    database.usage = { ...database.usage, allocated_bytes: mb * 1e6 };
+    database.percent_of_limit = mb / 10;
+    return database;
+  });
+  const h = ownerHarness(async () => response(usageOverview(databases)));
+  h.app.navigate('usage');
+  await settle();
+  for (const [index, card] of usageCards(h).entries()) {
+    const [status, , label, badge, tone, next] = states[index];
+    assert.equal(card.querySelector('.du-health').textContent, label, status);
+    assert.ok(card.querySelector('.du-health').classList.contains(badge), status);
+    assert.ok(card.querySelector('.du-gauge-fill').classList.contains(tone), status);
+    assert.equal(usageFigures(card)[2], next, status);
+  }
+});
+
+test('Database Usage keeps the last figures, marked stale, when a refresh fails, and coalesces refreshes', async () => {
+  const calls = [];
+  let release;
+  let fail = false;
+  const h = ownerHarness(async (url) => {
+    calls.push(url);
+    if (fail) throw new Error('usage unavailable');
+    await new Promise(resolve => { release = resolve; });
+    return response(usageOverview([usageDatabase()]));
+  });
+  h.app.navigate('usage');
+  await settle();
+  await fire(h.nodes.get('#refresh-usage'), 'click');
+  assert.equal(calls.length, 1, 'an overlapping refresh shares the read in flight');
+  release();
+  await settle();
+  assert.deepEqual(usageFigures(usageCards(h)[0])[0], '0.48 MB allocated');
+  assert.equal(usageCards(h)[0].dataset.usageStale, undefined);
+  fail = true;
+  await fire(h.nodes.get('#refresh-usage'), 'click');
+  const [card] = usageCards(h);
+  assert.equal(card.dataset.usageStale, '1');
+  assert.match(textOf(card), /Stale: the latest usage refresh failed/);
+  assert.equal(usageFigures(card)[0], '0.48 MB allocated', 'the last successful figures remain');
+  assert.match(h.nodes.get('#usage-status').textContent, /Usage refresh failed: usage unavailable\. The figures below are from the last successful response\./);
+});
+
+test('Database Usage Details lists disjoint physical categories and unknown guard status', async () => {
+  const database = usageDatabase({ id: 'a'.repeat(32), kind: 'guild' });
+  database.usage = { allocated_bytes: 10000000, breakdown_quality: 'measured', category_sampled_at: USAGE_NOW() - 30, snapshot_count: 7,
+    categories: { snapshot_data_bytes: 1000000, moderation_evidence_data_bytes: 2000000, configuration_data_bytes: 1000000,
+      operational_data_bytes: 2000000, index_bytes: 1000000, reusable_bytes: 1000000, system_unattributed_bytes: 2000000 } };
+  const h = ownerHarness(async () => response(usageOverview([database])));
+  h.app.navigate('usage');
+  await settle();
+  const [card] = usageCards(h);
+  const facts = usageFacts(card);
+  assert.equal(facts['Category basis'], 'Measured allocated pages; categories are disjoint');
+  assert.equal(facts['Snapshot table'], '1.00 MB (10.00% of allocated; 0.10% of 1,000 MB limit)');
+  for (const label of ['Moderation and evidence tables', 'Configuration tables', 'Operational tables', 'Indexes', 'Reusable pages', 'System / unattributed'])
+    assert.match(facts[label], /MB \(\d+\.\d{2}% of allocated; /, label);
+  assert.equal(facts['Category sample'], 'just now');
+  assert.equal(facts['Retained snapshots'], '7');
+  assert.match(textOf(card.querySelector('.du-unknown')), /Bot growth guard/);
+  assert.match(textOf(card.querySelector('.du-unknown')), /External evidence file bytes/);
+});
+
+test('a late breakdown response never replaces a newer aggregate usage sample', async () => {
+  let resolveDetail;
+  let allocated = 1000000;
+  const database = () => usageDatabase({ usage: { allocated_bytes: allocated } });
+  const h = ownerHarness(async (url) => {
+    if (url === '/api/database-usage/core') return new Promise(resolve => { resolveDetail = resolve; });
+    return response(usageOverview([database()]));
+  });
+  h.app.navigate('usage');
+  await settle();
+  await fire(findNode(usageCards(h)[0], n => n.localName === 'button' && n.textContent === 'Show current breakdown'), 'click');
+  allocated = 2000000;
+  await fire(h.nodes.get('#refresh-usage'), 'click');
+  assert.equal(usageFigures(usageCards(h)[0])[0], '2.00 MB allocated');
+  allocated = 1000000;
+  resolveDetail(response(database()));
+  await settle();
+  assert.equal(usageFigures(usageCards(h)[0])[0], '2.00 MB allocated');
+});
+
+test('a breakdown read from a previous visit cannot replace the current visit\'s sample', async () => {
+  const reads = [];
+  let allocated = 1000000;
+  const h = ownerHarness(async (url) => {
+    if (url === '/api/database-usage/core') return new Promise(resolve => { reads.push(resolve); });
+    if (url === '/api/database-usage') return response(usageOverview([usageDatabase({ usage: { allocated_bytes: allocated } })]));
+    return response({ servers: [] });
+  });
+  const breakdown = () => findNode(usageCards(h)[0], n => n.localName === 'button' && n.textContent === 'Show current breakdown');
+  h.app.navigate('usage');
+  await settle();
+  await fire(breakdown(), 'click');
+  h.app.navigate('servers');
+  await settle();
+  allocated = 2000000;
+  h.app.navigate('usage');
+  await settle();
+  await fire(breakdown(), 'click');
+  reads[0](response(usageDatabase({ usage: { allocated_bytes: 1000000 } })));
+  await settle();
+  assert.equal(usageFigures(usageCards(h)[0])[0], '2.00 MB allocated', 'the old visit cannot overwrite the current overview');
+  assert.equal(reads.length, 2, 'the new visit starts an independent detail read');
+  reads[1](response(usageDatabase({ usage: { allocated_bytes: 3000000 } })));
+  await settle();
+  assert.equal(usageFigures(usageCards(h)[0])[0], '3.00 MB allocated');
+});
+
+test('a breakdown read clears its own card\'s stale flag, and a later failed aggregate keeps that breakdown stale', async () => {
+  let fail = false;
+  let detail = 2000000;
+  const h = ownerHarness(async (url) => {
+    if (url === '/api/database-usage/core') return response(usageDatabase({ usage: { allocated_bytes: detail } }));
+    if (fail) throw new Error('offline');
+    return response(usageOverview([usageDatabase({ usage: { allocated_bytes: 1000000 } })]));
+  });
+  h.app.navigate('usage');
+  await settle();
+  const breakdown = () => findNode(usageCards(h)[0], n => n.localName === 'button' && n.textContent === 'Show current breakdown');
+  await fire(breakdown(), 'click');
+  assert.equal(usageFigures(usageCards(h)[0])[0], '2.00 MB allocated');
+  fail = true;
+  await fire(h.nodes.get('#refresh-usage'), 'click');
+  assert.equal(usageFigures(usageCards(h)[0])[0], '2.00 MB allocated');
+  assert.equal(usageCards(h)[0].dataset.usageStale, '1');
+  detail = 3000000;
+  await fire(breakdown(), 'click');
+  assert.equal(usageFigures(usageCards(h)[0])[0], '3.00 MB allocated');
+  assert.equal(usageCards(h)[0].dataset.usageStale, undefined);
+});
+
+test('Platform analytics marks member totals partial when a counted directory is incomplete', async () => {
+  const analytics = (members) => ({ window_days: 30, servers: members.servers,
+    series: [{ day: '2026-11-12', warns: 1, bans: 0, automod: 2, mod_actions: 0, timeouts: 0, joins: 3, leaves: 1 }],
+    guilds: [{ guild_id: '900000000000000001', warns: 1, bans: 0, automod: 2, mod_actions: 0, timeouts: 0, joins: 3, leaves: 1 }], members });
+  let members = { status: 'partial', servers: 2, current: 40, banned: 1, known: 45, guilds_counted: 2, guilds_unavailable: 0, guilds_incomplete: 1 };
+  const calls = [];
+  const h = ownerHarness(async (url, options) => { calls.push([url, options.method]); return response(analytics(members)); });
+  h.app.navigate('platform-analytics');
+  await settle();
+  const content = h.nodes.get('#content');
+  assert.equal(content.querySelector('.page-header h2').textContent, 'Platform analytics');
+  const stat = (label) => [...content.querySelectorAll('#platform-analytics .stat')]
+    .find((el) => el.querySelector('.stat-title').textContent === label).querySelector('.stat-value').textContent;
+  assert.equal(stat('Members now'), '40 (partial)');
+  assert.equal(stat('Known members'), '45');
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /Member totals are partial\./);
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /1 counted server has a member directory still importing or awaiting Reconcile/);
+  assert.match(content.querySelector('#platform-analytics svg[role="img"]').getAttribute('aria-label'), /^Platform activity per day/);
+  assert.match(textOf(content.querySelector('#platform-analytics table')), /900000000000000001/);
+  members = { status: 'complete', servers: 0, current: 0, banned: 0, known: 0, guilds_counted: 0, guilds_unavailable: 0, guilds_incomplete: 0 };
+  await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
+  await settle();
+  assert.equal(stat('Members now'), '0');
+  assert.equal(stat('Spam hits'), '2');
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /Member totals are complete\.$/);
+  assert.deepEqual(calls, [['/api/platform/analytics', 'POST'], ['/api/platform/analytics', 'POST']]);
+});
+
+test('Database Usage polls only while visible, ages retained samples and cleans up on exit', async () => {
+  let reads = 0, release, fail = false;
+  const h = ownerHarness(async (url) => {
+    if (url !== '/api/database-usage') return response({ servers: [] });
+    reads++;
+    if (reads > 1) await new Promise(resolve => { release = resolve; });
+    if (fail) throw new Error('offline');
+    return response(usageOverview([usageDatabase()]));
+  });
+  h.app.navigate('usage');
+  await settle();
+  const poll = () => [...h.timers].filter(([, timer]) => timer.delay === 60000);
+  assert.equal(poll().length, 1, 'one poll follows the completed overview');
+  const [id, timer] = poll()[0];
+  h.timers.delete(id);
+  h.advanceTime(60000);
+  await timer.fn();
+  assert.equal(reads, 2, 'the visible page refreshes after one minute');
+  await fire(h.nodes.get('#refresh-usage'), 'click');
+  assert.equal(reads, 2, 'manual refresh shares the pending poll');
+  assert.equal(poll().length, 0, 'no next poll while a read is pending');
+  fail = true;
+  release();
+  await settle();
+  assert.match(usageCards(h)[0].querySelector('.du-chip').textContent, /Measured 3 min ago/);
+  assert.equal(usageCards(h)[0].dataset.usageStale, '1');
+  assert.equal(poll().length, 1, 'a failed poll schedules a bounded retry');
+  h.document.visibilityState = 'hidden';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(poll().length, 0, 'hiding the page clears the timer');
+  h.advanceTime(600000);
+  h.document.visibilityState = 'visible';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(reads, 3, 'visibility restoration immediately refreshes');
+  assert.match(usageCards(h)[0].querySelector('.du-chip').textContent, /Measured 13 min ago/, 'age advances even while the new read is pending');
+  fail = false;
+  release();
+  await settle();
+  assert.equal(usageCards(h)[0].dataset.usageStale, undefined);
+  assert.equal(poll().length, 1);
+  const pendingTimer = poll()[0][1];
+  h.app.navigate('servers');
+  await settle();
+  assert.equal(poll().length, 0);
+  assert.equal(h.documentListeners.has('visibilitychange'), false);
+  await pendingTimer.fn();
+  assert.equal(reads, 3, 'an already queued callback cannot read after unmount');
+});
+
+for (const retained of [false, true]) test(`Database Usage ignores a hidden overview completion with ${retained ? 'retained stale figures' : 'no previous sample'}`, async () => {
+  const pending = [];
+  const h = ownerHarness((url, options) => {
+    assert.equal(url, '/api/database-usage');
+    assert.equal(options.method, 'POST');
+    return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  });
+  h.app.navigate('usage');
+  await settle();
+  if (retained) {
+    pending.shift().resolve(response(usageOverview([usageDatabase()])));
+    await settle();
+    await fire(h.nodes.get('#refresh-usage'), 'click');
+    pending.shift().reject(new Error('offline'));
+    await settle();
+    assert.equal(usageCards(h)[0].dataset.usageStale, '1');
+    await fire(h.nodes.get('#refresh-usage'), 'click');
+  }
+  const previousCards = h.nodes.get('#usage-cards').textContent;
+  const previousError = h.nodes.get('#usage-status')?.textContent;
+  visibility(h, 'hidden');
+  pending.shift().resolve(response(usageOverview([usageDatabase({ pages: 200 })])));
+  await settle();
+  assert.equal(h.nodes.get('#usage-cards').textContent, previousCards, 'a hidden completion must not paint or replace cards');
+  assert.equal(h.nodes.get('#usage-status')?.textContent, previousError, 'a hidden completion must not clear a retained error');
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 60000).length, 0, 'no polling while hidden');
+  visibility(h, 'visible');
+  await settle();
+  assert.equal(pending.length, 1, 'returning to the page starts a new overview read');
+  pending.shift().resolve(response(usageOverview([usageDatabase({ pages: 300 })])));
+  await settle();
+  assert.equal(usageFigures(usageCards(h)[0])[0], '1.23 MB allocated', 'only the new visible response is applied');
+  assert.equal(usageCards(h)[0].dataset.usageStale, undefined);
+  assert.equal(h.nodes.get('#usage-status'), null);
+  assert.equal([...h.timers.values()].filter(timer => timer.delay === 60000).length, 1, 'visible polling resumes');
+});
+
+test('a pending breakdown disables repeated clicks across overview refreshes and isolates visits', async () => {
+  const pending = [];
+  const h = ownerHarness(async (url) => {
+    if (url === '/api/database-usage/core') return new Promise(resolve => pending.push(resolve));
+    if (url === '/api/database-usage') return response(usageOverview([usageDatabase()]));
+    return response({ servers: [] });
+  });
+  const button = () => findNode(usageCards(h)[0], n => n.localName === 'button' && n.textContent === 'Show current breakdown');
+  h.app.navigate('usage');
+  await settle();
+  await fire(button(), 'click');
+  assert.equal(button().disabled, true);
+  await fire(button(), 'click');
+  await fire(h.nodes.get('#refresh-usage'), 'click');
+  await fire(button(), 'click');
+  assert.equal(pending.length, 1, 'the native disabled control excludes overlapping reads');
+  h.app.navigate('servers');
+  await settle();
+  h.app.navigate('usage');
+  await settle();
+  await fire(button(), 'click');
+  assert.equal(pending.length, 2, 'the new visit owns an independent request');
+  pending[0](response(usageDatabase({ pages: 1000 })));
+  await settle();
+  assert.equal(button().disabled, true, 'an old visit cannot clear the current loading state');
+  pending[1](response(usageDatabase({ pages: 2000 })));
+  await settle();
+  assert.equal(button().disabled, false);
+  assert.equal(usageFigures(usageCards(h)[0])[0], '8.19 MB allocated');
+});
+
+test('Platform analytics retains totals, chart and rows through refresh failures and recovers', async () => {
+  const pending = [];
+  const h = ownerHarness((url, options) => new Promise((resolve, reject) => pending.push({ resolve, reject, options })));
+  const snapshot = {
+    window_days: 30, servers: 2,
+    members: { status: 'partial', current: 40, known: 45, servers: 2, guilds_counted: 2, guilds_incomplete: 1 },
+    series: [{ day: '2026-11-12', warns: 7 }],
+    guilds: [{ guild_id: '900000000000000001', warns: 7 }],
+  };
+  h.app.navigate('platform-analytics');
+  await settle();
+  pending[0].resolve(response(snapshot));
+  await settle();
+  const panel = () => h.nodes.get('#platform-analytics');
+  const totals = () => [...panel().querySelectorAll('.stat-value')].map(el => el.textContent);
+  const originalTotals = totals();
+  const assertRetained = () => {
+    assert.deepEqual(totals(), originalTotals);
+    assert.ok(panel().querySelector('svg[role="img"]'));
+    assert.match(panel().querySelector('table').textContent, /900000000000000001/);
+  };
+  await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
+  assertRetained();
+  pending[1].reject(new Error('offline'));
+  await settle();
+  assertRetained();
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /refresh failed: offline.*stale/i);
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /1 counted server has a member directory still importing/);
+  await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
+  assertRetained();
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /refresh failed: offline.*stale/i, 'retained figures remain stale while retrying');
+  assert.ok(h.nodes.get('#platform-analytics-status').classList.contains('alert-warning'));
+  const timeout = [...h.timers.values()].find(timer => timer.delay === 30000);
+  assert.ok(timeout);
+  await timeout.fn();
+  assert.equal(pending[2].options.signal.aborted, true);
+  pending[2].reject(new Error('aborted'));
+  await settle();
+  assertRetained();
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /timed out.*stale/i);
+  await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
+  assertRetained();
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /timed out.*stale/i, 'a timeout warning also survives the pending retry');
+  pending[3].resolve(response({ ...snapshot, servers: 3 }));
+  await settle();
+  assert.equal(totals()[0], '3');
+  assert.doesNotMatch(h.nodes.get('#platform-analytics-status').textContent, /stale|failed/);
+  assert.ok(!h.nodes.get('#platform-analytics-status').classList.contains('alert-warning'));
+});
+
+test('Platform analytics initial failure reports unavailability and retry restores the view', async () => {
+  let fail = true;
+  const h = ownerHarness(async () => {
+    if (fail) throw new Error('offline');
+    return response({ servers: 0, series: [], guilds: [] });
+  });
+  h.app.navigate('platform-analytics');
+  await settle();
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /Platform analytics unavailable: offline/);
+  assert.doesNotMatch(h.nodes.get('#platform-analytics').textContent, /No platform trend data recorded yet/);
+  fail = false;
+  await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
+  assert.match(h.nodes.get('#platform-analytics').textContent, /No platform trend data recorded yet/);
 });

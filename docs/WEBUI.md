@@ -40,8 +40,8 @@ The five generated files are:
 | `dist/frontend/index.html` | the page |
 | `dist/frontend/app.js` | the app |
 | `dist/frontend/style.css` | the look |
-| `dist/frontend/administration/index.html` | owner Administration page: Updates, Database Usage, and Analytics |
-| `dist/frontend/administration.js` | update controls, version display, database usage, and platform analytics |
+| `dist/frontend/administration/index.html` | owner Administration page: Updates |
+| `dist/frontend/administration.js` | update controls and version display |
 
 GitHub Actions also packages these files as an independent `jmodguard-webui` GHCR image. See [independent Bunny updates](BUNNY-UPDATES.md) for owner access, the Storage publisher, and rollout gates.
 The public source install does not upload a separate frontend to Bunny; an operator chooses the initial hosting path.
@@ -208,8 +208,9 @@ Manage Server stays required for commands (a command plan can grant roles and ru
 bans, kicks and timeouts through the bot), copying configuration, member import controls
 (Pause, Resume, Retry, **Reconcile from Discord**), case notes and the role list
 itself. Case removal, the Removed records view and case-removal role IDs stay with
-Administrators and the server owner. Global configuration, Administration, Updates,
-database usage and **View as…** stay with the configured bot owner. Unban keeps
+Administrators and the server owner. Global configuration, Administration (Updates),
+the Owner sections (Bot servers, Database Usage, Platform analytics) and **View as…**
+stay with the configured bot owner. Unban keeps
 its own Discord **Ban Members** requirement.
 
 The API checks the user's current roles with Discord on every guild request
@@ -291,6 +292,20 @@ the workspace then refreshes current configuration. If that refresh fails, use
 | **Bot actions** | latest queued unban/log-channel receipts; cancel unstarted work; force-cancel a stuck log-channel request so a new save can run (does not undo Discord) |
 | **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; transient failures use persisted bounded backoff and permanent failures are shown for operator action; empty / `!setname` with no args / `/setname` without `name` all clear); global prefix (owner only); **copy config from another server** |
 
+The **Owner** sidebar group appears only for the configured bot owner and needs no
+selected server: **Bot servers** (the server directory), **Database Usage** and
+**Platform analytics**. Database Usage shows one card per physical database (core and
+each guild store): a health badge from its operating state (OK, Pressure, Capture paused,
+Growth stopped, Writes paused, Stale or Unknown), allocated size, share of the 1,000 MB
+limit and distance to the next threshold, a 0–1,000 MB bar with the 700/800/900/1,000 MB
+marks, used against reusable pages, each guild store's snapshot footprint against its
+budget, and one freshness chip. A trend slot stays empty because
+usage history is not recorded. **Details** lists every diagnostic value, names unknown
+values on one muted line, and offers **Show current breakdown**. An unknown allocation is
+drawn as an empty dashed bar, never as free capacity; a failed refresh keeps the last
+figures marked stale. Platform analytics shows fleet-wide 30-day totals, a per-metric
+daily trend and per-server rows. See [database capacity](DATABASE-CAPACITY.md).
+
 The retired general message/member activity archive and chat-retention controls remain
 removed. Saved Members selections reopen the bounded directory described above.
 Publish matching API/frontend versions; older pages submitting
@@ -332,7 +347,7 @@ and expires after one hour. Administrator, Moderator, and
 Member apply distinct synthetic permission masks to permission-dependent responses;
 the owner's live Manage Server permission is still rechecked before every guild read.
 Preview never makes `is_bot_owner` true.
-The same-origin **Administration** link appears whenever `/api/me` identifies the bot owner. It opens `/administration/index.html` and uses the existing session.
+The same-origin **Administration** link appears whenever `/api/me` identifies the bot owner. It opens `/administration/index.html` (Updates) and uses the existing session.
 
 The **Settings → Copy configuration from another server** action copies any
 subset (everything / rules / badwords / commands / templates / settings) from
@@ -461,7 +476,7 @@ Each meaning has one icon and one fixed color, the same on every page and in bot
 Row and record actions on report pages are compact 24px icon buttons. Each keeps its name as
 its accessible label and hover tooltip, its confirmation dialog, and the shared busy/disabled
 state; form-footer buttons such as **Save** keep their text. Every sidebar item and Administration
-page link shows its icon beside its label (for example a bar chart in purple for Analytics and
+page control shows its icon beside its label (for example a bar chart in purple for Analytics and
 teal people for Members); in the sidebar the icon sits on a small tile so it stays readable on
 the highlighted current item. The sidebar's own buttons use the same set: **Administration**
 (crown, blue), **View as…** (eye, blue), **Exit preview** (back arrow, gray) and **Sign out**
