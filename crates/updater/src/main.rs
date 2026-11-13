@@ -31,10 +31,10 @@ use tokio::process::{Child, Command};
 const POLL: Duration = Duration::from_secs(5);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long an unsaved startup receipt stays INFO-level before warning: the
-/// old pod's launcher fence TTL plus a margin, because a rolling swap waits
-/// exactly that long for the local bot control link (issue #552).
+/// old pod's launcher fence TTL plus 60s for old-child shutdown and the new
+/// bot's startup. The TTL alone does not bound a rolling swap (issue #609).
 const STARTUP_RECEIPT_WARN_AFTER: Duration =
-    Duration::from_millis(db::LAUNCHER_FENCE_TTL_MS as u64 + 10_000);
+    Duration::from_millis(db::LAUNCHER_FENCE_TTL_MS as u64 + 60_000);
 /// How long the API launcher waits quietly for the bot to migrate an older core
 /// schema before it warns again, well past a launcher fence handoff.
 const CORE_MIGRATION_WAIT: Duration = Duration::from_secs(300);

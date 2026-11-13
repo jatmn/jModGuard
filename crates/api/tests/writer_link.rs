@@ -1479,3 +1479,72 @@ async fn held_moderation_past_expiry_returns_request_expired_and_a_fresh_submit_
     drop(bot);
     cleanup(&path);
 }
+
+#[derive(Clone, Default)]
+struct LogLevels(Arc<std::sync::Mutex<Vec<tracing::Level>>>);
+
+impl tracing::Subscriber for LogLevels {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if event.metadata().target() == "jmodguard_api::web::updates" {
+            self.0.lock().unwrap().push(*event.metadata().level());
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+// Real read-only API, SQLite and refused/authentication-failing loopback links.
+#[tokio::test]
+async fn startup_release_check_waiting_is_info_but_failed_checks_warn() {
+    let (bot, app, path, _enrollment) = linked_writer("check-log-level").await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = closed.local_addr().unwrap().to_string();
+    drop(closed);
+    for waiting in [true, false] {
+        let mut cfg = (*app.cfg).clone();
+        if waiting {
+            cfg.bot.control_target = target.clone();
+        } else {
+            cfg.bot.control_secret = ControlSecret::new("y".repeat(32));
+        }
+        let db = Db::open_with(cfg.db_open_options()).unwrap();
+        let api = ApiState::new(cfg, db).unwrap();
+        let capture = LogLevels::default();
+        let guard = tracing::subscriber::set_default(capture.clone());
+        let batch = record_release_checks(
+            &api,
+            |_, _| panic!("a failed lease claim must not discover releases"),
+            RELEASE_LOOKUP_TIMEOUT,
+            pending_shutdown(),
+        )
+        .await;
+        drop(guard);
+        assert!(batch.finished);
+        let expected = if waiting {
+            tracing::Level::INFO
+        } else {
+            tracing::Level::WARN
+        };
+        assert_eq!(*capture.0.lock().unwrap(), vec![expected; 3]);
+        for component in ["bot", "api", "webui"] {
+            assert!(
+                db::component_update(&bot.db, component)
+                    .await
+                    .unwrap()
+                    .checked_at
+                    .is_none()
+            );
+        }
+    }
+    drop(app);
+    drop(bot);
+    cleanup(&path);
+}

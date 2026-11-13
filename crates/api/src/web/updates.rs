@@ -846,7 +846,11 @@ where
         let claimed = match claim_any(Some(app), &app.db, component, &lease, claim_now, 240).await {
             Ok(value) => value,
             Err(error) => {
-                tracing::warn!(component, "release check skipped: {error:#}");
+                if control_link_unavailable(&error) || error.root_cause().to_string() == "waiting" {
+                    tracing::info!(component, "release check skipped: {error:#}");
+                } else {
+                    tracing::warn!(component, "release check skipped: {error:#}");
+                }
                 continue;
             }
         };
