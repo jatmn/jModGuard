@@ -271,3 +271,115 @@ for (const [theme, selector] of [["light", ":root"], ["dark", ':root[data-theme=
     }
   });
 }
+
+// #588: fixed-meaning icon colors. Each --icon-* intent has one light and one dark shade,
+// separate from the daisyUI theme tokens, and every shade stays visible on each surface an
+// icon is drawn on in its theme.
+const iconIntents = JSON.parse(readFileSync(new URL("../frontend/icons.js", import.meta.url), "utf8")
+  .match(/export const ICON_INTENTS = (\[[^\]]*\]);/)[1]);
+function iconPalettes() {
+  const palettes = {};
+  for (const [, selector, body] of css.matchAll(/([^{}]+)\{([^{}]*--icon-[\w-]+\s*:[^{}]*)\}/g)) {
+    const theme = /dark/.test(selector.replace(/\/\*[\s\S]*?\*\//g, "")) ? "dark" : "light";
+    assert.equal(palettes[theme], undefined, `one ${theme} icon palette`);
+    palettes[theme] = Object.fromEntries([...body.matchAll(/--icon-([\w-]+):\s*([^;]+);/g)].map(([, name, value]) => [name, value.trim()]));
+  }
+  for (const theme of ["light", "dark"]) assert.ok(palettes[theme], `missing ${theme} --icon-* palette`);
+  return palettes;
+}
+// sRGB source-over: daisyUI menu hover paints base-content at 10% over the sidebar.
+function over(color, base, alpha) {
+  const [top, bottom] = [color, base].map((hex) => hex.slice(1).match(/../g).map((value) => parseInt(value, 16)));
+  return `#${top.map((value, index) => Math.round(value * alpha + bottom[index] * (1 - alpha)).toString(16).padStart(2, "0")).join("")}`;
+}
+function hue(hex) {
+  const [r, g, b] = hex.slice(1).match(/../g).map((value) => parseInt(value, 16) / 255);
+  const max = Math.max(r, g, b), d = max - Math.min(r, g, b);
+  if (!d) return 0;
+  const h = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return (h * 60 + 360) % 360;
+}
+function iconCssRule(selector) {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const block = css.match(new RegExp(`(?:^|\\})\\s*${escaped}\\s*\\{([^}]*)\\}`, "m"));
+  assert.ok(block, `missing ${selector} rule`);
+  return block[1];
+}
+
+for (const [theme, selector] of [["light", ":root"], ["dark", ':root[data-theme="dark"]']]) {
+  test(`${theme} icon colors keep 3:1 on every surface icons sit on`, () => {
+    const colors = tokens(selector);
+    const icons = iconPalettes()[theme];
+    const surfaces = {
+      panel: colors["--panel"], "panel2 (icon button hover)": colors["--panel2"], "hero (zebra rows)": colors["--hero"],
+      bg: colors["--bg"], input: colors["--input"], sidebar: colors["--sidebar"], "side-hover": colors["--side-hover"],
+      "selected (sidebar active)": colors["--selected"], "sidebar menu hover": over(colors["--text"], colors["--sidebar"], 0.1),
+      ...Object.fromEntries(["warning", "info", "error", "success"].map((name) =>
+        [`badge-soft ${name}`, mixOklab(colors[statusColor(name)], colors["--panel"], 0.08)])),
+    };
+    for (const intent of iconIntents) {
+      for (const [surface, color] of Object.entries(surfaces)) {
+        const ratio = contrast(icons[intent], color);
+        assert.ok(ratio >= 3, `${theme} --icon-${intent} ${icons[intent]} on ${surface} ${color}: ${ratio.toFixed(2)}:1`);
+      }
+      // Readable as text on cards too, should an icon color ever label something.
+      const text = contrast(icons[intent], colors["--panel"]);
+      assert.ok(text >= 4.5, `${theme} --icon-${intent} as text on --panel: ${text.toFixed(2)}:1`);
+    }
+    // The icon button focus ring and hover outline stay visible on the same surfaces.
+    for (const [token, floor] of [["--accent", 3], ["--text", 3]])
+      for (const surface of ["--panel", "--panel2", "--hero", "--bg"]) {
+        const ratio = contrast(colors[token], colors[surface]);
+        assert.ok(ratio >= floor, `${theme} ${token} ring on ${surface}: ${ratio.toFixed(2)}:1`);
+      }
+  });
+}
+
+test("icon colors are their own palette, the same meanings in both themes", () => {
+  const { light, dark } = iconPalettes();
+  assert.ok(iconIntents.length >= 7);
+  assert.deepEqual(Object.keys(light).sort(), [...iconIntents].sort(), "light theme defines every icon color");
+  assert.deepEqual(Object.keys(dark).sort(), [...iconIntents].sort(), "dark theme defines every icon color");
+  for (const [theme, selector] of [["light", ":root"], ["dark", ':root[data-theme="dark"]']]) {
+    const palette = { light, dark }[theme];
+    const themeColors = new Set(Object.values(tokens(selector)).map((value) => value.toLowerCase()));
+    for (const [intent, value] of Object.entries(palette)) {
+      assert.match(value, /^#[\da-f]{6}$/i, `${theme} --icon-${intent} is a fixed color, not a theme alias`);
+      assert.ok(!themeColors.has(value.toLowerCase()), `${theme} --icon-${intent} is not a theme token color`);
+    }
+    assert.equal(new Set(Object.values(palette)).size, iconIntents.length, `${theme} meanings have distinct colors`);
+  }
+  for (const intent of iconIntents) {
+    // One rule maps a meaning to its color for every theme; only the shade differs.
+    assert.equal(iconCssRule(`svg.icon-${intent}`).trim(), `color: var(--icon-${intent});`);
+    if (intent !== "neutral") {
+      const drift = Math.abs(hue(light[intent]) - hue(dark[intent]));
+      assert.ok(Math.min(drift, 360 - drift) <= 20, `--icon-${intent} keeps its hue across themes (${drift.toFixed(0)} degrees)`);
+    }
+  }
+  // Icons never take the daisyUI theme colors.
+  for (const [, selector, body] of css.matchAll(/([^{}]*(?:svg\.icon|btn-icon|nav-icon)[^{}]*)\{([^{}]*)\}/g)) {
+    assert.doesNotMatch(body, /--color-(?:primary|secondary|accent)|var\(--(?:focus|selected)\)|(?:^|[;\s])color:\s*var\(--accent\)/,
+      `${selector.trim()} uses a theme color for an icon`);
+  }
+});
+
+test("icon buttons keep a 24px target and a visible focus ring", () => {
+  const button = iconCssRule(".btn.btn-icon");
+  const rem = (value) => Number(value.match(/([\d.]+)rem/)[1]);
+  assert.ok(rem(button.match(/--size:\s*([^;]+)/)[1]) >= 1.5, "icon buttons render at least 24px square");
+  for (const property of ["min-width", "min-height"]) {
+    const value = button.match(new RegExp(`${property}:\\s*([^;]+)`))?.[1];
+    assert.ok(value, `icon buttons set ${property}`);
+    assert.ok(rem(value) >= 1.5, `${property} floor ${value} is at least 24px`);
+  }
+  assert.match(iconCssRule(".btn.btn-icon:focus-visible"), /outline:\s*2px solid var\(--accent\)/);
+  assert.match(iconCssRule(".btn.btn-icon:hover:not(:disabled)"), /--btn-bg:\s*var\(--panel2\)/);
+  assert.match(iconCssRule(".btn.btn-icon:hover:not(:disabled)"), /border-color:\s*var\(--text\)/);
+  // Busy and disabled actions grey their icon with the control.
+  assert.match(iconCssRule('.btn:is(:disabled, [aria-disabled="true"]) svg.icon'), /color:\s*inherit/);
+  // Sidebar icons sit on their own --panel tile so the inverted active row keeps their color.
+  const nav = iconCssRule(".sidebar svg.nav-icon");
+  assert.match(nav, /background:\s*var\(--panel\)/);
+  assert.ok(rem(nav.match(/width:\s*([^;]+)/)[1]) >= 1.25, "sidebar icons stay legible");
+});

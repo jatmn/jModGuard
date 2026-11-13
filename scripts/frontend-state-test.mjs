@@ -30,6 +30,8 @@ const appearanceSource = fs.readFileSync(new URL('../frontend/appearance.js', im
 const chartsSource = fs.readFileSync(new URL('../frontend/charts.js', import.meta.url), 'utf8')
   .replace(/^import .*;$/gm, '').replace(/^const h = React\.createElement;$/m, '')
   .replaceAll('export const', 'const').replaceAll('export function', 'function');
+const iconsSource = fs.readFileSync(new URL('../frontend/icons.js', import.meta.url), 'utf8')
+  .replace(/^import .*;$/gm, '').replaceAll('export const', 'const').replaceAll('export function', 'function');
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
   .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, '\n');
 const pages = [];
@@ -100,7 +102,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -634,9 +636,9 @@ for (const route of ['same guild', 'late callback', 'cancelled navigation']) tes
   const panel = memberView(h);
   const originalGuild = h.app.state.guildId;
   await flushMembers();
-  await fire(findNode(panel, n => n.localName === 'button' && n.textContent === 'View history'), 'click', {});
+  await fire(findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'View history'), 'click', {});
   await flushMembers();
-  const jump = findNode(panel, n => n.localName === 'button' && n.textContent === 'Case case-one');
+  const jump = findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Open case case-one');
   if (route === 'late callback') h.app.state.guildId = h.app.state.guilds[1].id;
   if (route === 'cancelled navigation') h.app.markDirty();
   await fire(jump, 'click', {});
@@ -703,7 +705,7 @@ test('Members separates current ban reason from an unresolved Gateway action', a
   const panel = h.app.tabMembers();
   await settle();
   assert.match(textOf(panel), /Current reason: Current rule/);
-  fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'View history'), 'click');
+  fire(findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'View history'), 'click');
   await settle();
   assert.match(textOf(panel), /Gateway observation; action time unconfirmed/);
   assert.match(textOf(panel), /Case case-1/);
@@ -723,7 +725,7 @@ test('Members renders a dated unresolved Discord audit entry, then its exact cas
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
   await settle();
-  const historyButton = findNode(panel, n => n.localName === 'button' && textOf(n) === 'View history');
+  const historyButton = findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'View history');
   fire(historyButton, 'click');
   await settle();
   assert.match(textOf(panel), /Ban audit entry · /);
@@ -732,7 +734,7 @@ test('Members renders a dated unresolved Discord audit entry, then its exact cas
   assert.match(textOf(panel), /Audit entry 123456789012345678/);
   assert.match(textOf(panel), /moderator 42/);
   assert.match(textOf(panel), /<img src=x onerror=alert\(1\)>/);
-  assert.equal(findNode(panel, n => n.localName === 'button' && textOf(n).startsWith('Case ')), null);
+  assert.equal(findNode(panel, n => n.localName === 'button' && /^(Open case|Case )/.test(n.getAttribute('aria-label') || textOf(n))), null);
   assert.equal(findNode(panel, n => n.localName === 'img'), null, 'audit reason is text, not markup');
 
   linked = true;
@@ -759,7 +761,7 @@ test('Members labels verified state changes with unknown event time and separate
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
   await settle();
-  fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'View history'), 'click');
+  fire(findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'View history'), 'click');
   await settle();
   assert.match(textOf(panel), /Membership absence · Unknown/);
   assert.match(textOf(panel), /Membership state check · Unknown/);
@@ -1284,7 +1286,7 @@ test('Members lays out a finished import as one summary line with its history be
   assert.notEqual(readAt(), firstReadAt, 'Details render the later server read');
   assert.match(textOf(memberImportStatus(panel)), /\(49 min\)$/, 'a finished run keeps its duration');
   assert.equal(findNode(panel, n => n.getAttribute?.('aria-label') === 'Member history'), null, 'no empty history card');
-  fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'View history'), 'click');
+  fire(findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'View history'), 'click');
   await settle();
   const history = findNode(panel, n => n.getAttribute?.('aria-label') === 'Member history');
   assert.deepEqual([...history.children].map(n => n.className), ['card-body']);
@@ -1543,7 +1545,7 @@ test('Members filter, date, and sort changes discard old history and list respon
   h.app.state.config = { enrollment_id: 'member-enrollment' };
   const panel = h.app.tabMembers();
   await settle();
-  fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'View history'), 'click');
+  fire(findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'View history'), 'click');
   const history = pending.find(item => item.type === 'history');
   assert(history);
   const filter = memberLabelled(panel, 'Status');
@@ -2311,7 +2313,7 @@ for (const kind of ['rule', 'command']) {
         'daisyUI only reveals editor panels that are direct children of the open modal');
       const button = action === 'add'
         ? elements.find(n => n.localName === 'button' && (n.textContent === '+ add step' || n.textContent === '+ add action'))
-        : elements.find(n => n.localName === 'button' && (n.getAttribute('aria-label') === 'Remove action 1' || n.textContent === '✕' || Array.from(n.children).some(c => c.textContent === '✕')));
+        : elements.find(n => n.localName === 'button' && /^Remove (action 1|step)$/.test(n.getAttribute('aria-label')));
       assert.ok(button);
       await fire(button, 'click', {});
       assert.equal(app.isDirty(), true);
@@ -3352,7 +3354,7 @@ test('case administration reaches later pages, all admitted history and inline e
   fire(next, 'click');
   await settle();
   assert.ok(calls.some(url => url.includes(`after=${ids[49]}`)));
-  const caseButton = findNode(root, n => n.localName === 'button' && n.textContent === ids[50].slice(0, 8));
+  const caseButton = findNode(root, n => n.localName === 'button' && n.getAttribute('aria-label') === `Open case ${ids[50]}`);
   fire(caseButton, 'click');
   await settle();
   assert.ok(textOf(root).includes('note 33'));
@@ -3376,7 +3378,7 @@ test('removed case recovery survives opening a new dashboard view and retries th
   fire(findNode(root, n => n.textContent === 'Removed records / retry cleanup'), 'click');
   await settle();
   assert.ok(textOf(root).includes(id));
-  await fire(findNode(root, n => n.localName === 'button' && n.textContent === 'Retry cleanup'), 'click');
+  await fire(findNode(root, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Retry cleanup'), 'click');
   assert.ok(calls.some(c => c.method === 'DELETE' && c.url.endsWith('/cases/' + id)));
 });
 
@@ -3397,7 +3399,7 @@ test('note retry retains intent after a lost response and blocks overlapping sub
   });
   const root = h.app.tabCases();
   await settle();
-  fire(findNode(root, n => n.localName === 'button' && n.textContent === id.slice(0,8)), 'click');
+  fire(findNode(root, n => n.localName === 'button' && n.getAttribute('aria-label') === `Open case ${id}`), 'click');
   await settle();
   const note = findNode(root, n => n.localName === 'textarea');
   const submit = findNode(root, n => n.localName === 'button' && n.textContent === 'Add note');
@@ -3427,7 +3429,7 @@ test('acknowledged case note no longer leaves a false unsaved warning', async ()
   const root = h.app.tabCases();
   h.nodes.get('#content').append(root);
   await settle();
-  fire(findNode(root, n => n.localName === 'button' && n.textContent === id.slice(0, 8)), 'click');
+  fire(findNode(root, n => n.localName === 'button' && n.getAttribute('aria-label') === `Open case ${id}`), 'click');
   await settle();
   const note = findNode(root, n => n.localName === 'textarea');
   note.value = 'saved note';
@@ -6108,7 +6110,7 @@ test('Bot servers removal queues the leave action and follows its receipt to dep
   });
   const panel = h.app.TabOwnerServers();
   await settle();
-  const remove = findNode(panel, n => n.localName === 'button' && n.textContent === 'Remove');
+  const remove = findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Remove');
   assert(remove, 'an active server offers removal');
   await fire(remove, 'click', {});
   await settle();
@@ -6129,7 +6131,7 @@ test('Bot servers removal refuses to continue without confirmation', async () =>
   h.app.state.config = null;
   const panel = h.app.TabOwnerServers();
   await settle();
-  const remove = findNode(panel, n => n.localName === 'button' && n.textContent === 'Remove');
+  const remove = findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Remove');
   await fire(remove, 'click', {});
   await settle();
   assert.equal(calls.filter(url => url.endsWith('/leave')).length, 0, 'no departure is queued without confirmation');
@@ -6157,7 +6159,7 @@ test('Bot servers removal keeps its request identity across a lost admission res
   first.app.state.config = null;
   const panel = first.app.TabOwnerServers();
   await settle();
-  await fire(findNode(panel, n => n.localName === 'button' && n.textContent === 'Remove'), 'click', {});
+  await fire(findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Remove'), 'click', {});
   await settle();
   assert.equal(bodies.length, 1);
   assert.equal([...session.keys()].filter(key => key.includes(':owner-leave:')).length, 1, 'the identity is saved before the first submission');
@@ -6169,7 +6171,7 @@ test('Bot servers removal keeps its request identity across a lost admission res
   second.app.state.config = null;
   const reloaded = second.app.TabOwnerServers();
   await settle();
-  await fire(findNode(reloaded, n => n.localName === 'button' && n.textContent === 'Remove'), 'click', {});
+  await fire(findNode(reloaded, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Remove'), 'click', {});
   await settle();
   assert.equal(bodies.length, 2);
   assert.equal(bodies[1].request_id, bodies[0].request_id, 'a retry never invents a second departure');
@@ -6196,7 +6198,7 @@ test('Bot servers removal releases a request identity the server refuses for goo
   h.app.state.config = null;
   const panel = h.app.TabOwnerServers();
   await settle();
-  const click = () => fire(findNode(panel, n => n.localName === 'button' && n.textContent === 'Remove'), 'click', {});
+  const click = () => fire(findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Remove'), 'click', {});
   await click();
   await settle();
   assert.equal([...session.keys()].filter(key => key.includes(':owner-leave:')).length, 0);
@@ -6447,4 +6449,324 @@ test('access-role fields stay locked until a delayed save acknowledgement settle
   assert.equal(role().value, '222222222222222222');
   assert.equal(level().value, 'settings');
   assert.equal(h.app.isDirty(), false, 'only the acknowledged mapping remains');
+});
+
+// #588: one shared SVG icon set, one fixed color per meaning, on every row/record action
+// and navigation item. The colors themselves are contrast-tested in frontend-contrast-test.mjs.
+const iconSet = vm.runInContext(`${iconsSource}\n({ ICON_PATHS, ICON_INTENTS, ACTION_ICONS, NAV_ICONS })`, vm.createContext({ React }));
+const iconAction = (root, label) => findNode(root, n => n.localName === 'button' && n.getAttribute('aria-label') === label);
+function assertIconAction(button, action, label) {
+  assert.ok(button, `missing ${label} action`);
+  const expected = iconSet.ACTION_ICONS[action];
+  assert.ok(button.classList.contains('btn') && button.classList.contains('btn-icon'), `${label} is a compact icon button`);
+  assert.equal(button.getAttribute('aria-label'), label, `${label} keeps its accessible name`);
+  assert.equal(button.getAttribute('title'), label, `${label} keeps its hover tooltip`);
+  assert.equal(button.textContent.trim(), '', `${label} shows an icon, not text`);
+  const svg = button.querySelector('svg');
+  assert.equal(svg?.getAttribute('aria-hidden'), 'true', `${label} icon is decorative`);
+  assert.equal(svg.getAttribute('data-icon'), expected.icon, `${label} icon`);
+  assert.ok(svg.classList.contains(`icon-${expected.intent}`), `${label} is drawn in its ${expected.intent} color`);
+}
+// Every button in a table body is an icon action: no text-only row action remains.
+function assertIconRows(root) {
+  const buttons = [...root.querySelectorAll('tbody button')];
+  for (const button of buttons) assert.ok(button.classList.contains('btn-icon'), `text-only row action: ${button.textContent}`);
+  return buttons.length;
+}
+
+test('one shared action icon map gives every action one meaning and one fixed color', () => {
+  const expected = {
+    ban: ['hammer', 'danger'], unban: ['user-check', 'success'], remove: ['trash', 'danger'],
+    edit: ['pencil', 'info'], view: ['eye', 'info'], copy: ['copy', 'neutral'], cancel: ['x-circle', 'neutral'],
+    approve: ['check-circle', 'success'],
+  };
+  for (const [action, [icon, intent]] of Object.entries(expected))
+    assert.deepEqual({ ...iconSet.ACTION_ICONS[action] }, { icon, intent }, action);
+  // Unban restores a member: never the padlock glyph #582 shipped.
+  assert.doesNotMatch(iconSet.ACTION_ICONS.unban.icon, /lock/);
+  for (const paths of Object.values(iconSet.ICON_PATHS))
+    assert.ok(!paths.includes('M7 11V7a5 5 0 0 1 9.9-1'), 'the padlock shackle is not part of the icon set');
+  for (const [name, entry] of [...Object.entries(iconSet.ACTION_ICONS), ...Object.entries(iconSet.NAV_ICONS)]) {
+    assert.ok(iconSet.ICON_PATHS[entry.icon]?.length, `${name} draws a known icon`);
+    assert.ok(iconSet.ICON_INTENTS.includes(entry.intent), `${name} uses a palette color`);
+  }
+  // Navigation meanings match the actions they lead to (#592: hammer for Bans, bar chart for Analytics).
+  assert.deepEqual({ ...iconSet.NAV_ICONS.bans }, { ...iconSet.ACTION_ICONS.ban });
+  assert.deepEqual({ ...iconSet.NAV_ICONS.analytics }, { icon: 'bar-chart', intent: 'analytics' });
+  assert.equal(iconSet.NAV_ICONS.members.intent, 'members');
+  assert.equal(iconSet.NAV_ICONS.settings.intent, 'neutral');
+  // Both pages draw from this one set instead of keeping their own paths.
+  for (const page of ['app.js', 'administration.js']) {
+    const raw = fs.readFileSync(new URL(`../frontend/${page}`, import.meta.url), 'utf8');
+    assert.match(raw, /^import \{[^}]*\bIcon\b[^}]*\} from "\.\/icons\.js";$/m, page);
+    assert.doesNotMatch(raw, /ICON_PATHS|viewBox/, `${page} defines no icons of its own`);
+  }
+});
+
+test('Members row actions are colored icons and history links open their case', async () => {
+  const copied = [];
+  const h = harness(async url => {
+    if (url.endsWith('/member-sync')) return response({ status: 'complete' });
+    if (url.includes('/members?')) return response({ members: [{ user_id: '7', display_name: 'Seven' }] });
+    if (url.includes('/members/7/history')) return response({ entries: [{ kind: 'ban', case_id: 'case-one' }] });
+    return response({ cases: [], history: [] });
+  });
+  Object.defineProperty(h.window.navigator, 'clipboard', { value: { writeText: text => copied.push(text) }, configurable: true });
+  const panel = memberView(h);
+  await flushMembers();
+  assertIconAction(iconAction(panel, 'Copy user ID 7'), 'copy', 'Copy user ID 7');
+  assertIconAction(iconAction(panel, 'View history'), 'view', 'View history');
+  assert.equal(assertIconRows(panel), 2);
+  await fire(iconAction(panel, 'View history'), 'click', {});
+  await flushMembers();
+  assertIconAction(iconAction(panel, 'Open case case-one'), 'view', 'Open case case-one');
+  assert.match(textOf(panel), /Case case-one/, 'the case ID stays visible beside its icon');
+});
+
+test('Bans unban is a green user-check icon behind the unchanged confirmation', async () => {
+  const prompts = [];
+  const h = harness(async () => response([
+    { user_id: '9007199254740993', active: true, created_at: '2020-01-01T12:00:00Z' },
+    { user_id: '9007199254740997', active: false, created_at: '2020-01-02T12:00:00Z' },
+  ]), new Map(), new Map(), message => { prompts.push(message); return false; });
+  const panel = h.app.tabBans();
+  await settle();
+  const unban = iconAction(panel, 'Unban');
+  assertIconAction(unban, 'unban', 'Unban');
+  assert.equal(assertIconRows(panel), 1, 'only the active ban offers Unban');
+  await fire(unban, 'click', {});
+  assert.deepEqual(prompts, ['Unban 9007199254740993?']);
+});
+
+test('Audit log rows carry no text-only actions', async () => {
+  const h = harness(async () => response([{ id: 1, created_at: '2020-01-01T12:00:00Z', event_type: 'member_ban', user_id: '7', actor_id: '8', data: '{}' }]));
+  h.app.state.config = { event_types: ['member_ban'] };
+  h.app.navigate('events');
+  await settle();
+  const content = h.nodes.get('#content');
+  assert.match(textOf(content), /member_ban/);
+  assert.equal(assertIconRows(content), 0);
+});
+
+test('Cases record actions are colored icons and removal stays limited to permitted roles', async () => {
+  const id = 'a'.repeat(32);
+  const fixture = (canDelete) => async (url, options) => {
+    if (options.method === 'DELETE') return response({ removed: true, cleanup_pending: false });
+    const u = new URL(url, 'https://fixture.test');
+    if (u.pathname.endsWith('/history')) return response({ history: [] });
+    if (u.pathname.endsWith('/evidence')) return response({ evidence: [{ id: 'evidence-1' }] });
+    if (u.pathname.endsWith('/cases')) return response({ cases: [id], can_delete: canDelete, summaries: { [id]: { action: 'ban' } } });
+    return response({ can_delete: canDelete, case: { action: 'ban' } });
+  };
+  const h = harness(fixture(true));
+  const root = h.app.tabCases();
+  await settle();
+  assertIconAction(iconAction(root, `Open case ${id}`), 'view', `Open case ${id}`);
+  assert.match(textOf(root), new RegExp(id.slice(0, 8)), 'the short case ID stays visible');
+  assert.equal(assertIconRows(root), 1);
+  await fire(iconAction(root, `Open case ${id}`), 'click', {});
+  await settle();
+  assertIconAction(iconAction(root, 'Remove case record'), 'remove', 'Remove case record');
+  assertIconAction(iconAction(root, 'Download evidence-1'), 'download', 'Download evidence-1');
+  fire(findNode(root, n => n.textContent === 'Removed records / retry cleanup'), 'click');
+  await settle();
+  assertIconAction(iconAction(root, 'Retry cleanup'), 'retry', 'Retry cleanup');
+  assert.equal(assertIconRows(root), 1);
+
+  const limited = harness(fixture(false));
+  const view = limited.app.tabCases();
+  await settle();
+  await fire(iconAction(view, `Open case ${id}`), 'click', {});
+  await settle();
+  assert.equal(iconAction(view, 'Remove case record'), null, 'only permitted roles see case removal');
+});
+
+test('Bot actions cancel controls are gray x-circle icons', async () => {
+  const h = harness(async () => response([queuedAction(), { ...queuedAction('running'), id: 'log-run', action: { kind: 'set_log_channel', event: 'member_join', channel_id: '1' } }]));
+  h.app.state.config = { enrollment_id: 'membership' };
+  const panel = h.app.tabActions();
+  await settle();
+  assertIconAction(iconAction(panel, 'Cancel'), 'cancel', 'Cancel');
+  assertIconAction(iconAction(panel, 'Force cancel'), 'cancel', 'Force cancel');
+  assert.equal(assertIconRows(panel), 2);
+});
+
+test('Known spam and Badwords remove icons keep owner-only global rows', () => {
+  const config = () => ({
+    rules: [],
+    known_spam: [
+      { id: 1, guild_id: '987654321098765432', kind: 'url', value: 'tinyurl.com/*' },
+      { id: 2, guild_id: '0', kind: 'sample', value: 'global sample' },
+    ],
+    badwords: [
+      { id: 3, guild_id: '987654321098765432', word: 'scam', valid: true },
+      { id: 4, guild_id: '0', word: 'global', valid: true },
+    ],
+  });
+  for (const owner of [false, true]) {
+    const h = harness();
+    h.app.state.me.is_bot_owner = owner;
+    h.app.state.config = config();
+    const spam = h.app.tabKnownSpam();
+    assert.equal(assertIconRows(spam), owner ? 2 : 1);
+    for (const button of spam.querySelectorAll('tbody button')) assertIconAction(button, 'remove', 'Remove');
+    assert.equal(/Owner only/.test(textOf(spam)), !owner);
+    h.app.state.config = config();
+    h.app.navigate('badwords');
+    const words = h.nodes.get('#content');
+    assert.equal(assertIconRows(words), owner ? 2 : 1);
+    for (const button of words.querySelectorAll('tbody button')) assertIconAction(button, 'remove', 'Remove');
+    assert.equal(/owner only/.test(textOf(words)), !owner);
+  }
+});
+
+test('Known-bad image removal is a red trash icon that keeps its confirmation and busy state', async () => {
+  const hash = 'ab'.repeat(32), prompts = [];
+  let finish;
+  const h = harness(async (url, options) => options.method === 'DELETE'
+    ? new Promise(resolve => { finish = () => resolve(response({ ok: true })); })
+    : response({ enrollment_id: 'fixture-membership', known_bad_images: [] }),
+  new Map(), new Map(), message => { prompts.push(message); return true; });
+  h.app.state.config = { enrollment_id: 'fixture-membership', known_bad_images: [{ hash, added_at: '2026-01-01', added_via: 'webui', actor: 'unknown' }] };
+  h.app.navigate('known-bad-images');
+  const panel = h.nodes.get('#content');
+  const remove = iconAction(panel, 'Remove');
+  assertIconAction(remove, 'remove', 'Remove');
+  assert.equal(assertIconRows(panel), 1);
+  assert.equal(remove.disabled, false);
+  await fire(remove, 'click', {});
+  assert.deepEqual(prompts, [`Remove SHA-256 ${hash}?`]);
+  assert.equal(h.app.isBusy(), true);
+  assert.equal(remove.disabled, true, 'the shared ActionButton busy path disables the icon action');
+  finish();
+  await settle();
+  assert.equal(h.app.isBusy(), false);
+});
+
+test('Commands and Automod rules edit with blue pencils and remove steps with red trash icons', async () => {
+  const h = harness();
+  h.app.state.config = { commands: [{ name: 'ping', scope: 'guild', effective: { name: 'ping', category: 'utility', description: 'Ping', permission: 'everyone', enabled: true } }] };
+  h.app.navigate('commands');
+  const commands = h.nodes.get('#content');
+  assertIconAction(iconAction(commands, 'Edit'), 'edit', 'Edit');
+  assert.equal(assertIconRows(commands), 1);
+  const editor = await h.app.editCommand(null);
+  const add = findNode(editor, n => n.localName === 'button' && n.textContent === '+ add step');
+  await fire(add, 'click', {});
+  assertIconAction(iconAction(editor, 'Remove step'), 'remove', 'Remove step');
+
+  const limited = harness();
+  limited.app.state.guilds[0].access = 'settings';
+  limited.app.state.config = h.app.state.config;
+  limited.app.navigate('commands');
+  assert.equal(iconAction(limited.nodes.get('#content'), 'Edit'), null, 'command edits stay with Manage Server');
+
+  const rules = harness();
+  const rule = { name: 'Flood', rule_id: 'flood', description: 'Flood', effective: { enabled: true, params: {}, actions: [{ at: 1, action: 'warn' }] } };
+  rules.app.state.config = { rules: [rule] };
+  rules.app.navigate('rules');
+  assertIconAction(iconAction(rules.nodes.get('#content'), 'Edit'), 'edit', 'Edit');
+  const ruleEditor = await rules.app.editRule(rule);
+  assertIconAction(iconAction(ruleEditor, 'Remove action 1'), 'remove', 'Remove action 1');
+});
+
+test('Templates keep only form-footer text buttons and Settings role rows remove with icons', async () => {
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/access-roles') && options.method === 'POST') return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], revision: 'r1' });
+    if (url.endsWith('/case-delete-roles')) return response({ roles: [], revision: 'r1' });
+    return response({});
+  });
+  h.app.state.config = { templates: [{ event: 'member_join', global: 'Hi {user}', guild_override: null, effective: 'Hi {user}' }] };
+  const templates = h.app.tabTemplates();
+  const buttons = [...templates.querySelectorAll('button')];
+  assert.ok(buttons.length > 0);
+  for (const button of buttons) assert.ok(button.closest('.editor-footer'), `template action outside the form footer: ${button.textContent}`);
+
+  h.app.state.config = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
+  h.app.state.tab = 'settings';
+  h.app.tabSettings();
+  await settle();
+  const row = h.document.querySelector('.access-role-row');
+  assertIconAction(iconAction(row, 'Remove role'), 'remove', 'Remove role');
+  for (const button of h.document.querySelectorAll('.access-role-row button')) assert.ok(button.classList.contains('btn-icon'));
+});
+
+test('Bot servers removal is a red leave icon', async () => {
+  const h = ownerHarness(async () => response({ servers: [directoryServer] }));
+  const panel = h.app.TabOwnerServers();
+  await settle();
+  assertIconAction(iconAction(panel, 'Remove'), 'leave', 'Remove');
+  assert.equal(assertIconRows(panel), 1);
+});
+
+test('every sidebar item shows its colored SVG icon beside its unchanged label', () => {
+  const labels = {
+    dashboard: 'Dashboard', rules: 'Automod Rules', badwords: 'Badwords', 'known-spam': 'Known spam',
+    'known-bad-images': 'Known-bad images', commands: 'Commands', templates: 'Templates', logchannels: 'Log Channels',
+    analytics: 'Analytics', events: 'Audit Log', members: 'Members', bans: 'Bans', actions: 'Bot actions',
+    cases: 'Cases', settings: 'Settings', servers: 'Bot servers',
+  };
+  const h = ownerHarness(async () => response({ servers: [] }));
+  h.app.navigate('bans');
+  const items = [...h.document.querySelectorAll('#tabs [data-tab]')];
+  assert.deepEqual(items.map(item => item.getAttribute('data-tab')), Object.keys(labels));
+  for (const item of items) {
+    const tab = item.getAttribute('data-tab');
+    assert.equal(item.textContent, labels[tab], `${tab} keeps its label and no glyph`);
+    const icons = item.querySelectorAll('svg');
+    assert.equal(icons.length, 1, `${tab} has one icon`);
+    const [icon] = icons;
+    assert.equal(icon.getAttribute('aria-hidden'), 'true');
+    assert.ok(icon.classList.contains('nav-icon'));
+    assert.equal(icon.getAttribute('data-icon'), iconSet.NAV_ICONS[tab].icon, tab);
+    assert.ok(icon.classList.contains(`icon-${iconSet.NAV_ICONS[tab].intent}`), `${tab} keeps its meaning color`);
+  }
+  const active = h.document.querySelector('#tabs [aria-current="page"]');
+  assert.equal(active.getAttribute('data-tab'), 'bans');
+  assert.equal(active.querySelector('svg.nav-icon').getAttribute('data-icon'), 'hammer', 'the active item still shows its icon');
+  assert.ok(active.querySelector('svg.nav-icon').classList.contains('icon-danger'));
+  assert.doesNotMatch(h.document.querySelector('#tabs').textContent, /[^\x20-\x7E]/, 'no emoji or glyph characters in the menu');
+});
+
+test('the Web UI draws SVG icons, never emoji or glyph icons', () => {
+  // Emoji, pictographs, and the arrow, technical, geometric, symbol and dingbat blocks the old
+  // glyph icons came from. The dashboard's text arrow (U+2192) is part of #590's dashboard rework.
+  const glyph = /[\p{Extended_Pictographic}\p{Emoji_Presentation}←↑↓-⇿∀-⋿⌀-⏿■-◿☀-➿⬀-⯿\u{1F100}-\u{1F1FF}]/u;
+  const read = file => fs.readFileSync(new URL(`../frontend/${file}`, import.meta.url), 'utf8');
+  // Sample data shown as-is (a pasteable spam example and a bypass-test placeholder) is not UI chrome.
+  const samples = [/^const STOCKS_SPAM_EXAMPLE = .*$/m, /"sample text to test, e\.g\. [^"]*"/];
+  let app = read('app.js');
+  for (const sample of samples) {
+    assert.match(app, sample, 'sample exclusion still matches its source');
+    app = app.replace(sample, '');
+  }
+  for (const [file, text] of [['app.js', app], ...['administration.js', 'icons.js', 'charts.js', 'appearance.js', 'state.js', 'index.html', 'administration/index.html'].map(file => [file, read(file)])]) {
+    const lines = text.split('\n').map((line, index) => [index + 1, line]).filter(([, line]) => glyph.test(line));
+    assert.deepEqual(lines, [], `${file} uses emoji or glyph icons`);
+  }
+});
+
+test("the sidebar's own buttons show their colored SVG icons beside unchanged labels", async () => {
+  const assertSidebarIcon = (control, key, label) => {
+    assert.ok(control, `missing ${label}`);
+    assert.equal(control.textContent, label, `${label} keeps its label and no glyph`);
+    const icons = control.querySelectorAll('svg');
+    assert.equal(icons.length, 1, `${label} has one icon`);
+    const [icon] = icons;
+    assert.equal(icon.getAttribute('aria-hidden'), 'true', `${label} icon is decorative`);
+    assert.ok(icon.classList.contains('nav-icon'), `${label} uses the sidebar icon tile`);
+    assert.equal(icon.getAttribute('data-icon'), iconSet.NAV_ICONS[key].icon, label);
+    assert.ok(icon.classList.contains(`icon-${iconSet.NAV_ICONS[key].intent}`), `${label} keeps its meaning color`);
+  };
+  const owner = ownerHarness(async () => response({ servers: [] }));
+  owner.app.navigate('dashboard');
+  const tools = owner.document.querySelector('.sidebar #owner-tools');
+  assertSidebarIcon(findNode(tools, n => n.localName === 'a' && n.getAttribute('href') === '/administration/index.html'), 'administration', 'Administration');
+  assertSidebarIcon(findNode(tools, n => n.localName === 'button' && n.textContent === 'View as…'), 'view-as', 'View as…');
+  assertSidebarIcon(owner.document.querySelector('.sidebar-footer #logout-btn'), 'sign-out', 'Sign out');
+
+  const preview = harness();
+  preview.app.state.me.preview = true;
+  preview.app.navigate('dashboard');
+  assertSidebarIcon(findNode(preview.document.querySelector('.sidebar #owner-tools'), n => n.localName === 'button'), 'exit-preview', 'Exit preview');
 });

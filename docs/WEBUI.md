@@ -423,3 +423,37 @@ matching, dry-run/enforcement behavior and hash-only retention.
 ### Appearance
 
 Choose Light, Dark, or System from the Appearance selector on the sign-in screen or sidebar. Light uses a pale blue workspace; Dark pairs it with navy surfaces and soft blue accents. The browser remembers this preference across reloads and sign-ins. System follows your device appearance, including changes while the page is open. If browser storage is unavailable, the choice still applies for the current page. daisyUI widgets reuse those same tokens: cards and stats use `--panel`, hero and tinted surfaces use `--hero`, and primary actions use `--accent`. They do not switch the workspace to daisyUI’s default palette.
+
+### Icons
+
+The Web UI draws every icon as an SVG from one shared set in `frontend/icons.js`; it never
+uses emoji or text glyphs as icons. The paths are hand-authored for this project, so the set adds
+no icon-library dependency or third-party source. Discord template previews still show what the
+bot will post, including any emoji in the template.
+
+Each meaning has one icon and one fixed color, the same on every page and in both themes:
+
+| Action | Icon | Color |
+|---|---|---|
+| Ban, Bans menu | hammer | red |
+| Remove or delete | trash | red |
+| Remove the bot from a server | leave (door with arrow) | red |
+| Unban | person with a check mark (never a padlock) | green |
+| Edit | pencil | blue |
+| View, open a case or history | eye | blue |
+| Download evidence, retry cleanup | download, circular arrow | blue |
+| Copy ID | copy | gray |
+| Cancel a queued bot action | circled x | gray |
+
+Row and record actions on report pages are compact 24px icon buttons. Each keeps its name as
+its accessible label and hover tooltip, its confirmation dialog, and the shared busy/disabled
+state; form-footer buttons such as **Save** keep their text. Every sidebar item and Administration
+page link shows its icon beside its label (for example a bar chart in purple for Analytics and
+teal people for Members); in the sidebar the icon sits on a small tile so it stays readable on
+the highlighted current item. The sidebar's own buttons use the same set: **Administration**
+(crown, blue), **View as…** (eye, blue), **Exit preview** (back arrow, gray) and **Sign out**
+(door with arrow, gray).
+
+Icon colors are their own `--icon-*` palette in `frontend/style.css`, separate from the theme's
+primary and accent colors. Light and Dark use a lighter or darker shade of the same color, and
+every shade keeps at least 3:1 contrast against the surfaces icons appear on.
