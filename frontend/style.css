@@ -321,6 +321,15 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .reference-panel { border: 1px solid var(--shell-border); border-radius: 8px; padding: 10px 14px; background: var(--panel); font-size: var(--ui-font-size-sm); }
 .reference-panel summary { cursor: pointer; font-weight: 650; }
 .reference-panel p { margin-top: 8px; }
+.template-variable-group h3 { margin: 12px 0 4px; font-size: var(--ui-font-size-sm); font-weight: 650; }
+.template-variable-group .table td:first-child, .template-variable-group .table td:last-child { overflow-wrap: anywhere; }
+.template-rendering-notes { margin-top: 12px; }
+.template-rendering-notes ul { margin: 8px 0 0; padding-left: 20px; list-style: disc; }
+.template-editor { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.template-variables { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: var(--ui-font-size-sm); }
+.template-var-chip { font-family: ui-monospace, monospace; font-weight: 400; }
+.template-var-optional { border-style: dashed; }
+.template-var-mark { font-weight: 700; }
 .event-heading { display: flex; flex-direction: column; gap: 4px; }
 .event-heading code { font-size: .75rem; }
 .template-workspace { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }

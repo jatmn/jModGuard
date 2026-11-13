@@ -4561,6 +4561,137 @@ function CommandEditor({ record: c }) {
   );
 }
 
+const TEMPLATE_VARIABLE_GROUPS = [
+  ["common", "Who, where and when"],
+  ["message", "Messages"],
+  ["moderation", "Moderation"],
+  ["role", "Roles"],
+  ["thread", "Threads"],
+  ["member", "Member details"],
+];
+
+// One row per variable: [name, group, meaning, example]. The examples are also the
+// Templates preview's sample data, so the table and the preview always agree.
+const TEMPLATE_VARIABLES = [
+  ["user", "common", "The member's display name", "Alice"],
+  ["mention", "common", "The member as an @mention (log posts never ping anyone)", "@alice"],
+  ["user_id", "common", "The member's Discord ID", "123456789012345678"],
+  ["username", "common", "The member's username", "alice"],
+  ["guild", "common", "This server's ID", "987654321098765432"],
+  ["channel", "common", "The channel it happened in", "#general"],
+  ["time", "common", "When it happened, in UTC", "Nov 09, 2026 • 22:35:54 UTC"],
+  ["emoji", "common", "The event's emoji, for your own wording", "an inbox tray for joins"],
+  ["message_id", "message", "The message's ID", "123456789012345681"],
+  ["message_url", "message", "A link to the message", "https://discord.com/channels/1/2/3"],
+  ["content", "message", "The message text, automod evidence or other details", "FREE NITRO https://example.test"],
+  ["before", "message", "The old value: earlier message text, nickname, username, thread name or voice channel", "Previous text"],
+  ["after", "message", "The new value", "Updated text"],
+  ["attachments", "message", "Files that were on the message", "none"],
+  ["coverage", "message", "How complete the bot's copy of the message is", "retained snapshot"],
+  ["count", "message", "How many messages were deleted", "3"],
+  ["retained", "message", "How many of those the bot had a copy of", "2"],
+  ["unavailable", "message", "How many the bot knows it had no copy of", "1"],
+  ["unknown", "message", "How many the bot couldn't check", "0"],
+  ["filtered", "message", "How many were left out by your ignore list", "0"],
+  ["omitted", "message", "How many were left out of the attached transcript", "0"],
+  ["details", "message", "Where to find the full list of deleted messages", "transcript attached"],
+  ["actor", "moderation", "The moderator or member who did it", "Bob (mod)"],
+  ["actor_id", "moderation", "That moderator's Discord ID", "123456789012345682"],
+  ["reason", "moderation", "The reason given", "spam"],
+  ["action", "moderation", "What was done", "ban"],
+  ["rule", "moderation", "The automod rule that acted", "mention_spam"],
+  ["rule_id", "moderation", "That rule's ID", "mention_spam"],
+  ["duration", "moderation", "How long: a timeout's length, or time spent in the server", "1d"],
+  ["command", "moderation", "The custom command that ran", "example"],
+  ["added", "role", "Roles that were added", "@Member"],
+  ["removed", "role", "Roles that were removed", "none"],
+  ["role", "role", "The role, as a mention", "@Member"],
+  ["role_id", "role", "The role's ID", "123456789012345679"],
+  ["role_name", "role", "The role's name", "Member"],
+  ["detail", "role", "What changed about the role", "Permissions updated"],
+  ["thread", "thread", "The thread, as a link", "#discussion"],
+  ["thread_id", "thread", "The thread's ID", "123456789012345680"],
+  ["thread_name", "thread", "The thread's name", "Discussion"],
+  ["notice", "thread", "A short note: whether a thread is new, or about a returning member's cases", "created"],
+  ["archived", "thread", "Whether the thread is archived", "false"],
+  ["locked", "thread", "Whether the thread is locked", "false"],
+  ["auto_archive", "thread", "How long the thread stays open after going quiet", "1d"],
+  ["invitable", "thread", "Whether members can invite others to the private thread", "true"],
+  ["account_created", "member", "When the account was created", "Nov 01, 2026 • 10:00:00 UTC"],
+  ["account_age", "member", "How old the account is", "1w 1d"],
+  ["joined", "member", "When they joined the server", "Nov 08, 2026 • 22:35:54 UTC"],
+  ["cases", "member", "Their earlier moderation cases", "Case #1: warning"],
+  ["before_global", "member", "Their display name before the change", "Alice"],
+  ["after_global", "member", "Their display name after the change", "Alice Example"],
+].map(([name, group, meaning, example]) => ({ name, group, meaning, example }));
+
+// Why a variable marked with "?" below can come out empty.
+const TEMPLATE_VARIABLE_GAPS = {
+  user: "Shows “unavailable” if the bot didn't see the original message.",
+  mention: "Shows “unavailable” if the bot didn't see the original message.",
+  user_id: "Shows “unavailable” if the bot didn't see the original message.",
+  before: "Only filled in if the bot saw the original message.",
+  content: "Only filled in if the bot saw the original message.",
+  attachments: "Only filled in if the bot saw the original message.",
+  actor: "Empty when Discord's audit log doesn't say who did it. The bot needs View Audit Log.",
+  actor_id: "Empty when Discord's audit log doesn't say who did it. The bot needs View Audit Log.",
+  reason: "Empty when Discord's audit log has no reason. The bot needs View Audit Log.",
+  joined: "Shows “Unavailable” if the bot doesn't know when they joined.",
+  duration: "Shows “Unavailable” if the bot doesn't know when they joined.",
+};
+
+// Variables each event supplies besides {guild}, {time} and {emoji}; "?" marks
+// ones that can be empty. Every variable in a shipped template is listed here.
+const TEMPLATE_EVENT_VARIABLES = {
+  member_join: "user mention user_id username account_created account_age joined",
+  member_leave: "user mention user_id username account_created account_age joined? duration?",
+  member_ban: "user mention user_id username account_created account_age actor? actor_id? reason?",
+  member_unban: "user mention user_id username account_created account_age actor? actor_id? reason?",
+  member_kick: "user mention user_id actor? reason?",
+  message_edit: "channel mention message_id message_url before? after attachments coverage",
+  message_delete: "channel mention? message_id message_url content? attachments? coverage",
+  message_bulk_delete: "channel count retained unavailable unknown filtered omitted details",
+  automod: "mention channel content rule action reason",
+  mod_action: "user mention actor reason action",
+  timeout_add: "user mention user_id actor? reason duration",
+  timeout_remove: "user mention user_id actor?",
+  plan_executed: "content actor command",
+  system: "content",
+  member_role_update: "user mention user_id added removed",
+  role_change: "action role role_id role_name detail",
+  voice_join: "user mention user_id channel",
+  voice_leave: "user mention user_id channel",
+  voice_move: "user mention user_id channel before",
+  nickname_change: "user mention user_id before after",
+  username_change: "user mention user_id before after before_global after_global",
+  thread_create: "mention channel thread thread_id thread_name notice",
+  thread_update: "channel before thread thread_id thread_name archived locked auto_archive invitable",
+  thread_delete: "channel thread thread_id thread_name",
+  automod_delete: "mention? channel message_id message_url content? attachments? coverage reason rule rule_id",
+  member_rejoin: "user mention user_id notice cases",
+};
+
+function templateEventVariables(event) {
+  const listed = (TEMPLATE_EVENT_VARIABLES[event] || "").split(" ").filter(Boolean);
+  const optional = new Set(listed.filter((name) => name.endsWith("?")).map((name) => name.slice(0, -1)));
+  const supplied = new Set([...listed.map((name) => name.replace(/\?$/, "")), "guild", "time", "emoji"]);
+  return TEMPLATE_VARIABLES.filter((v) => supplied.has(v.name)).map((v) => ({
+    ...v,
+    gap: optional.has(v.name) ? TEMPLATE_VARIABLE_GAPS[v.name] : null,
+  }));
+}
+
+const TEMPLATE_RENDERING_NOTES = [
+  "Built-in templates show up in Discord as a card with one field per line. Your own text replaces those fields and becomes the card's main text.",
+  "Edits and deletes only include the old message text if the bot saw the original message. The bot doesn't keep message history or look old messages up in Discord.",
+  "Role, voice, nickname and thread events don't include message text.",
+  "Times are shown in UTC, to the second.",
+  "If an event doesn't have a variable, it stays in the post as typed, like {reason}, so mistakes are easy to spot.",
+  "Each post's colored edge matches the event. Add {emoji} to your own text to show the event's emoji.",
+  "The preview uses sample data and Discord's length limits.",
+  "When the built-in wording improves, templates still using the old built-in text update once. Your own text is never changed.",
+];
+
 function tabTemplates() {
   return h(
     "div",
@@ -4574,14 +4705,86 @@ function tabTemplates() {
     h(
       "details",
       { className: "reference-panel" },
-      h("summary", {}, "Template variables & message data"),
+      h("summary", {}, "Template variables"),
       h(
         "p",
         { className: "muted" },
-        "Templates render into the configured log channels. Basic message reports supply {message_id} and {message_url}; updates also supply {after} and {attachments}. A single-message delete may supply {content} and author fields from a bounded recent in-process snippet when this process observed the create or content update; otherwise those values are unavailable. This is not persistent history or a Discord history lookup. Other event variables include {user} {mention} {user_id} {guild} {channel} {actor} {reason} {rule} {action} {content} {count} {account_age} {duration} {time}. Activity reports also supply {added}, {removed}, {role}, {role_id}, {role_name}, {detail}, {before_global}, {after_global}, {thread}, {thread_id}, {thread_name}, {notice}, {archived}, {locked}, {auto_archive}, and {invitable} when that event has them. They do not supply message text. Custom templates keep their wording. Log posts use colored embeds. Shipped defaults become fields; customized text fills the description. The embed upgrade updates exact previous defaults once; dates include whole seconds and UTC. The preview uses sample data and the same embed limits.",
+        "Variables are swapped for real details when the bot posts. Each template lists the ones its event has; click one to add it. A variable marked ? might be empty; point at it to see when.",
+      ),
+      ...TEMPLATE_VARIABLE_GROUPS.map(([group, label]) =>
+        h(
+          "div",
+          { key: group, className: "template-variable-group" },
+          h("h3", {}, label),
+          h(
+            "table",
+            { className: "table table-sm" },
+            h("thead", {}, h("tr", {}, h("th", {}, "Variable"), h("th", {}, "What it is"), h("th", {}, "Example"))),
+            h(
+              "tbody",
+              {},
+              ...TEMPLATE_VARIABLES.filter((v) => v.group === group).map((v) =>
+                h(
+                  "tr",
+                  { key: v.name },
+                  h("td", {}, h("code", {}, `{${v.name}}`)),
+                  h("td", {}, v.meaning),
+                  h("td", {}, h("code", {}, v.example)),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+      h(
+        "details",
+        { className: "template-rendering-notes" },
+        h("summary", {}, "How rendering works"),
+        h("ul", {}, ...TEMPLATE_RENDERING_NOTES.map((note) => h("li", { key: note }, note))),
       ),
     ),
     ...state.config.templates.map((t) => h(TemplateCard, { key: t.event, record: t })),
+  );
+}
+
+// Adds a variable at the editor's cursor through the same draft path as typing.
+function insertTemplateVariable(textarea, draftKey, group, defaultValue, name) {
+  const { drafts, draftBaselines } = ui.getSnapshot();
+  const current = textarea.value;
+  const start = textarea.selectionStart ?? current.length;
+  const end = textarea.selectionEnd ?? start;
+  const token = `{${name}}`;
+  const value = current.slice(0, start) + token + current.slice(end);
+  const baseline = String(draftBaselines[draftKey] ?? defaultValue ?? "");
+  const next = { ...drafts };
+  if (value === baseline) delete next[draftKey];
+  else next[draftKey] = { value, group };
+  ui.set({ drafts: next, edits: Object.keys(next).length > 0 ? "dirty" : "clean" });
+  textarea.focus();
+  textarea.setSelectionRange(start + token.length, start + token.length);
+}
+
+function TemplateVariableChips({ event, textRef, draftKey, group, defaultValue }) {
+  const working = useContext(BusyContext);
+  return h(
+    "div",
+    { className: "template-variables", role: "group", "aria-label": "Insert a variable" },
+    h("span", { className: "muted" }, "Insert:"),
+    ...templateEventVariables(event).map((v) =>
+      h(
+        "button",
+        {
+          key: v.name,
+          type: "button",
+          className: `btn btn-xs template-var-chip${v.gap ? " template-var-optional" : ""}`,
+          disabled: working,
+          title: v.gap ? `${v.meaning}. Might be empty: ${v.gap}` : v.meaning,
+          onClick: () => insertTemplateVariable(textRef.current, draftKey, group, defaultValue, v.name),
+        },
+        `{${v.name}}`,
+        v.gap ? h("span", { className: "template-var-mark", "aria-hidden": "true" }, "?") : null,
+      ),
+    ),
   );
 }
 
@@ -4686,20 +4889,12 @@ function TemplateCard({ record: t }) {
     defaultValue: t.effective,
   });
   const template = ui.getSnapshot().drafts[`template:${t.event}:text`]?.value ?? t.effective;
+  // {emoji} stays with the preview's own emoji rule.
+  const samples = Object.fromEntries(TEMPLATE_VARIABLES.filter((v) => v.name !== "emoji").map((v) => [v.name, v.example]));
   const preview = templateEmbedPreview(t, template, {
-    user: "Alice", user_id: "123456789012345678", mention: "@alice", channel: "#general",
-    actor: "Bob (mod)", reason: "spam", rule: "mention_spam", action: t.event === "role_change" ? "updated" : "ban",
-    content: "FREE NITRO https://example.test", count: "3", removed: "none", added: "@Member",
-    before: "Previous text", after: "Updated text", attachments: "none", coverage: "retained snapshot",
-    message_url: "https://discord.com/channels/1/2/3", time: "Nov 09, 2026 • 22:35:54 UTC",
-    account_created: "Nov 01, 2026 • 10:00:00 UTC", account_age: "1w 1d", duration: "1d",
-    joined: "Nov 08, 2026 • 22:35:54 UTC", cases: "Case #1: warning", notice: t.event === "thread_create" ? "created" : "Prior moderation",
-    retained: "2", unavailable: "1", unknown: "0", filtered: "0", omitted: "0",
-    details: "transcript attached", rule_id: "mention_spam", command: "example",
-    role: "@Member", role_id: "123456789012345679", role_name: "Member", detail: "Permissions updated",
-    before_global: "Alice", after_global: "Alice Example", thread: "#discussion",
-    thread_id: "123456789012345680", thread_name: "Discussion", archived: "false", locked: "false",
-    auto_archive: "1d", invitable: "true",
+    ...samples,
+    action: t.event === "role_change" ? "updated" : "ban",
+    notice: t.event === "thread_create" ? "created" : "Prior moderation",
   });
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef, "This server", "Global", true, `template:${t.event}:scope`);
@@ -4713,7 +4908,18 @@ function TemplateCard({ record: t }) {
       h(
         "div",
         { className: "template-workspace" },
-        field("Message template", text),
+        h(
+          "div",
+          { className: "template-editor" },
+          field("Message template", text),
+          h(TemplateVariableChips, {
+            event: t.event,
+            textRef,
+            draftKey: `template:${t.event}:text`,
+            group: `template:${t.event}`,
+            defaultValue: t.effective,
+          }),
+        ),
         h(
           "div",
           { className: "template-preview" },

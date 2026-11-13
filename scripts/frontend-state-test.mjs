@@ -659,12 +659,86 @@ test('cases is a valid navigation and restored workspace tab', () => {
 test('template help describes bounded delete snippets without claiming history', () => {
   const { app } = harness();
   app.state.config = { templates: [] };
-  const text = textOf(app.tabTemplates());
-  assert.match(text, /single-message delete may supply \{content\}/);
-  assert.match(text, /bounded recent in-process snippet/);
-  assert.match(text, /otherwise those values are unavailable/);
-  assert.match(text, /not persistent history or a Discord history lookup/);
-  assert.doesNotMatch(text, /deleted content are not retained/);
+  const panel = app.tabTemplates();
+  const notes = panel.querySelector('.reference-panel .template-rendering-notes');
+  assert.equal(notes.querySelector('summary').textContent, 'How rendering works');
+  assert.equal(notes.open, false);
+  const text = textOf(notes);
+  assert.match(text, /only include the old message text if the bot saw the original message/);
+  assert.match(text, /doesn't keep message history or look old messages up in Discord/);
+  assert.match(text, /Times are shown in UTC/);
+  assert.match(text, /Your own text replaces those fields/);
+  assert.doesNotMatch(textOf(panel), /deleted content are not retained/);
+});
+
+test('template variable help lists each variable with its meaning and an example, grouped', () => {
+  const { app } = harness();
+  app.state.config = { templates: [] };
+  const reference = app.tabTemplates().querySelector('.reference-panel');
+  const groups = [...reference.querySelectorAll('.template-variable-group h3')].map(el => el.textContent);
+  assert.deepEqual(groups, ['Who, where and when', 'Messages', 'Moderation', 'Roles', 'Threads', 'Member details']);
+  const rows = new Map([...reference.querySelectorAll('.template-variable-group tbody tr')]
+    .map(tr => [...tr.querySelectorAll('td')].map(td => td.textContent))
+    .map(([name, meaning, example]) => [name, { meaning, example }]));
+  assert.deepEqual(rows.get('{account_age}'), { meaning: 'How old the account is', example: '1w 1d' });
+  assert.deepEqual(rows.get('{time}'), { meaning: 'When it happened, in UTC', example: 'Nov 09, 2026 • 22:35:54 UTC' });
+  for (const name of ['user', 'guild', 'channel', 'time', 'message_url', 'after', 'attachments', 'content', 'mention', 'user_id', 'actor', 'reason', 'rule', 'action', 'count', 'duration', 'added', 'removed', 'role', 'role_id', 'role_name', 'detail', 'before_global', 'after_global', 'thread', 'thread_id', 'thread_name', 'notice', 'archived', 'locked', 'auto_archive', 'invitable', 'message_id']) {
+    const row = rows.get(`{${name}}`);
+    assert.ok(row?.meaning && row.example, `{${name}} has a meaning and an example`);
+  }
+  const firstGroup = [...reference.querySelectorAll('.template-variable-group')][0];
+  for (const name of ['{user}', '{guild}', '{channel}', '{time}']) assert.match(textOf(firstGroup), new RegExp(name.replace(/[{}]/g, '\\$&')));
+});
+
+test('each template editor offers only its event variables, matching the shipped templates', () => {
+  // Shipped templates as served by the API test template_preview_cases_match_the_bot_renderer.
+  const golden = JSON.parse(fs.readFileSync(new URL('../crates/api/src/web/template_preview_cases.json', import.meta.url), 'utf8'));
+  const shipped = golden.cases.filter(c => / default$/.test(c.name)).map(c => [c.name.replace(/ default$/, ''), c.record.shipped]);
+  assert.equal(shipped.length, 26);
+  const { app, document } = harness();
+  app.state.config = { templates: shipped.map(([event, text]) => ({ event, effective: text, shipped: text })) };
+  app.tabTemplates();
+  const cards = [...document.querySelectorAll('.template-card')];
+  assert.equal(cards.length, shipped.length);
+  shipped.forEach(([event, text], index) => {
+    const chips = [...cards[index].querySelectorAll('.template-var-chip')];
+    const names = chips.map(chip => chip.textContent.replace(/\?$/, ''));
+    for (const used of new Set(text.match(/\{[a-z_]+\}/g))) assert.ok(names.includes(used), `${event} offers ${used}`);
+    for (const universal of ['{guild}', '{time}', '{emoji}']) assert.ok(names.includes(universal), `${event} offers ${universal}`);
+    for (const chip of chips.filter(chip => chip.classList.contains('template-var-optional'))) {
+      assert.match(chip.title, /Might be empty: \S/, `${event} ${chip.textContent} says when it is empty`);
+    }
+  });
+  const chipsFor = event => [...cards[shipped.findIndex(([name]) => name === event)].querySelectorAll('.template-var-chip')];
+  const join = chipsFor('member_join').map(chip => chip.textContent);
+  assert.ok(join.includes('{account_age}'));
+  for (const other of ['{message_url}', '{content}', '{actor}', '{thread}', '{role}']) assert.ok(!join.includes(other), `member_join does not offer ${other}`);
+  const actor = chipsFor('member_ban').find(chip => chip.textContent.startsWith('{actor}'));
+  assert.ok(actor.classList.contains('template-var-optional'));
+  assert.match(actor.title, /audit log/);
+  const content = chipsFor('message_delete').find(chip => chip.textContent.startsWith('{content}'));
+  assert.match(content.title, /bot saw the original message/);
+  assert.ok(!chipsFor('member_join').some(chip => chip.classList.contains('template-var-optional') && chip.textContent.startsWith('{account_age}')));
+});
+
+test('a variable chip inserts at the cursor as an unsaved edit that previews and saves', async () => {
+  let saved;
+  const h = harness(async (url, options) => {
+    if (options.method === 'PUT' && url.endsWith('/templates/member_join')) saved = JSON.parse(options.body).template;
+    return response(url.endsWith('/config') ? { enrollment_id: 'e', templates: [{ event: 'member_join', effective: saved ?? 'Hi {user}!' }] } : {});
+  });
+  h.app.state.config = { enrollment_id: 'e', templates: [{ event: 'member_join', effective: 'Hi {user}!' }] };
+  h.app.navigate('templates');
+  const input = h.document.querySelector('.template-card textarea');
+  input.setSelectionRange(9, 9);
+  const chip = [...h.document.querySelectorAll('.template-var-chip')].find(node => node.textContent === '{account_age}');
+  assert.ok(chip, 'member_join offers {account_age}');
+  await fire(chip, 'click');
+  assert.equal(h.document.querySelector('.template-card textarea').value, 'Hi {user}{account_age}!');
+  assert.equal(h.app.isDirty(), true);
+  assert.equal(h.document.querySelector('.log-embed-description').textContent, 'Hi Alice1w 1d!');
+  await fire(findNode(h.document.querySelector('.template-card'), n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.equal(saved, 'Hi {user}{account_age}!');
 });
 
 test('workspace validates membership, tab, user identity and malformed storage', () => {
@@ -4485,7 +4559,7 @@ test('activity-log events from the config payload render template and log-channe
   await settle();
   const reference = h.document.querySelector('.reference-panel');
   assert.match(reference.textContent, /\{added\}/);
-  assert.match(reference.textContent, /do not supply message text/);
+  assert.match(reference.textContent, /don't include message text/);
   const cards = [...h.document.querySelectorAll('.template-card')];
   assert.equal(cards.length, 2);
   assert.match(cards[0].textContent, /Voice join/);
@@ -7173,9 +7247,11 @@ test('Templates keep only form-footer text buttons and Settings role rows remove
   });
   h.app.state.config = { templates: [{ event: 'member_join', global: 'Hi {user}', guild_override: null, effective: 'Hi {user}' }] };
   const templates = h.app.tabTemplates();
-  const buttons = [...templates.querySelectorAll('button')];
+  // Click-to-insert variable chips (#619) edit the text; they are not row actions.
+  const buttons = [...templates.querySelectorAll('button:not(.template-var-chip)')];
   assert.ok(buttons.length > 0);
   for (const button of buttons) assert.ok(button.closest('.editor-footer'), `template action outside the form footer: ${button.textContent}`);
+  for (const chip of templates.querySelectorAll('.template-var-chip')) assert.ok(chip.closest('.template-variables'));
 
   h.app.state.config = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
   h.app.state.tab = 'settings';
