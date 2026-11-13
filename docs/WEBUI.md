@@ -303,8 +303,12 @@ budget, and one freshness chip. A trend slot stays empty because
 usage history is not recorded. **Details** lists every diagnostic value, names unknown
 values on one muted line, and offers **Show current breakdown**. An unknown allocation is
 drawn as an empty dashed bar, never as free capacity; a failed refresh keeps the last
-figures marked stale. Platform analytics shows fleet-wide 30-day totals, a per-metric
-daily trend and per-server rows. See [database capacity](DATABASE-CAPACITY.md).
+figures marked stale. See [database capacity](DATABASE-CAPACITY.md). Platform analytics
+is the fleet view for a 7, 30 or 90-day range: fleet totals with the change from the
+previous range and daily sparklines, every enforcement metric and fleet membership per day
+at once, the most and least active servers, the biggest movers, each server's share of
+bans, spam hits and mod actions, and a sortable, filterable server table with names, icons,
+per-metric share bars and member directory status (importing, unverified or unavailable).
 
 The retired general message/member activity archive and chat-retention controls remain
 removed. Saved Members selections reopen the bounded directory described above.
@@ -392,7 +396,7 @@ GET    /api/guilds/{id}/stats          # guild-scoped aggregates only
 POST   /api/guilds/{id}/stats          # same body as GET; SPA dashboard counts
 GET    /api/guilds/{id}/analytics      # ?days=7|30|90 (default 30): every Analytics panel + member directory size
 POST   /api/guilds/{id}/analytics      # same body as GET; SPA analytics tab
-POST   /api/platform/analytics         # owner-only: fleet trends, server count, member directory totals
+POST   /api/platform/analytics         # owner-only, ?days=7|30|90 (default 30): fleet trends, previous-range totals, per-server rows, member directory totals
 GET    /api/guilds/{id}/actions
 POST   /api/guilds/{id}/actions        # same body as GET; SPA bot actions
 GET    /api/guilds/{id}/cases

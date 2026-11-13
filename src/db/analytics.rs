@@ -88,12 +88,17 @@ pub struct GuildAnalytics {
     pub heatmap: Vec<[i64; 3]>,
 }
 
-/// Per-guild activity totals across one analytics window. Guild IDs stay
-/// decimal strings on the wire.
+/// Per-guild activity totals across one analytics window, with the previous
+/// window of equal length. Guild IDs stay decimal strings on the wire. Name
+/// and icon are the bot's last observed display facts, `None` when unknown.
 #[derive(Debug, Clone, Serialize)]
 pub struct GuildActivityTotals {
     #[serde(serialize_with = "ser_i64_str")]
     pub guild_id: i64,
+    /// The bot currently has an active membership in this server.
+    pub active: bool,
+    pub name: Option<String>,
+    pub icon_hash: Option<String>,
     pub warns: i64,
     pub bans: i64,
     pub automod: i64,
@@ -101,12 +106,16 @@ pub struct GuildActivityTotals {
     pub timeouts: i64,
     pub joins: i64,
     pub leaves: i64,
+    pub previous: PreviousTotals,
 }
 
 impl GuildActivityTotals {
     fn zeroed(guild_id: i64) -> Self {
         Self {
             guild_id,
+            active: false,
+            name: None,
+            icon_hash: None,
             warns: 0,
             bans: 0,
             automod: 0,
@@ -114,16 +123,24 @@ impl GuildActivityTotals {
             timeouts: 0,
             joins: 0,
             leaves: 0,
+            previous: PreviousTotals {
+                joins: Some(0),
+                leaves: Some(0),
+                ..PreviousTotals::default()
+            },
         }
     }
 }
 
 /// Owner-scoped platform analytics. Series aggregate every guild; the per-guild
-/// breakdown covers the same window.
+/// breakdown covers the same window. Rows include every active server, even
+/// without activity, plus any other server with records in either window.
 #[derive(Debug, Clone, Serialize)]
 pub struct PlatformAnalytics {
     pub window_days: i64,
     pub series: Vec<AnalyticsPoint>,
+    /// Fleet totals for the previous window of equal length.
+    pub previous: PreviousTotals,
     /// Active bot enrollments (the durable server count).
     pub servers: i64,
     pub guilds: Vec<GuildActivityTotals>,
@@ -438,42 +455,64 @@ fn guild_summary_conn(
     Ok((series_from_columns(series)?, panels))
 }
 
-/// Fleet series, per-guild window totals and the server count in one
-/// statement. Counting grows with the window's retained rows; the route is
-/// owner-only.
+/// Fleet series, per-guild totals for the requested and previous windows,
+/// display facts and the server count in one statement. `?1` starts the
+/// requested window and `?2` the previous window of equal length. Counting
+/// grows with the retained rows of both windows; the route is owner-only.
 fn platform_conn(conn: &impl SqlExecutor, window_days: i64) -> Result<PlatformAnalytics> {
     let start_day = window_start_day(window_days);
+    let previous_start = window_start_day(window_days * 2);
     let sql = format!(
-        "SELECT {}, \
-         (SELECT json_group_array(json_array(guild_id, n)) FROM \
-           (SELECT guild_id, COUNT(*) AS n FROM warns WHERE created_at>=?1 GROUP BY guild_id)), \
-         (SELECT json_group_array(json_array(guild_id, n)) FROM \
-           (SELECT guild_id, COUNT(*) AS n FROM bans WHERE created_at>=?1 GROUP BY guild_id)), \
-         (SELECT json_group_array(json_array(guild_id, n)) FROM \
-           (SELECT guild_id, COUNT(*) AS n FROM bans \
-            WHERE created_at>=?1 AND {DEDICATED_SPAM_BANS_SQL} GROUP BY guild_id)), \
-         (SELECT json_group_array(json_array(guild_id, a, m, t)) FROM \
-           (SELECT guild_id, \
-              SUM(CASE WHEN event_type='automod' THEN 1 ELSE 0 END) AS a, \
-              SUM(CASE WHEN event_type='mod_action' THEN 1 ELSE 0 END) AS m, \
-              SUM(CASE WHEN event_type='timeout_add' THEN 1 ELSE 0 END) AS t \
-            FROM events WHERE {EVENT_BUCKETS_COUNTED_SQL} AND created_at>=?1 GROUP BY guild_id)), \
-         (SELECT json_group_array(json_array(guild_id, j, l)) FROM \
-           (SELECT guild_id, SUM(joins) AS j, SUM(leaves) AS l FROM analytics_member_daily \
-            WHERE day>=?1 GROUP BY guild_id)), \
-         (SELECT COUNT(*) FROM guild_enrollments WHERE active=1)",
+        "WITH w AS MATERIALIZED (SELECT guild_id, SUM(created_at>=?1) AS c, SUM(created_at<?1) AS p \
+           FROM warns WHERE created_at>=?2 GROUP BY guild_id), \
+         b AS MATERIALIZED (SELECT guild_id, SUM(created_at>=?1) AS c, SUM(created_at<?1) AS p \
+           FROM bans WHERE created_at>=?2 GROUP BY guild_id), \
+         s AS MATERIALIZED (SELECT guild_id, SUM(created_at>=?1) AS c, SUM(created_at<?1) AS p \
+           FROM bans WHERE created_at>=?2 AND {DEDICATED_SPAM_BANS_SQL} GROUP BY guild_id), \
+         ev AS MATERIALIZED (SELECT guild_id, \
+              SUM(event_type='automod' AND created_at>=?1) AS a, \
+              SUM(event_type='mod_action' AND created_at>=?1) AS m, \
+              SUM(event_type='timeout_add' AND created_at>=?1) AS t, \
+              SUM(event_type='automod' AND created_at<?1) AS pa, \
+              SUM(event_type='mod_action' AND created_at<?1) AS pm, \
+              SUM(event_type='timeout_add' AND created_at<?1) AS pt \
+            FROM events WHERE {EVENT_BUCKETS_COUNTED_SQL} AND created_at>=?2 GROUP BY guild_id), \
+         m AS MATERIALIZED (SELECT guild_id, \
+              SUM(CASE WHEN day>=?1 THEN joins ELSE 0 END) AS j, \
+              SUM(CASE WHEN day>=?1 THEN leaves ELSE 0 END) AS l, \
+              SUM(CASE WHEN day<?1 THEN joins ELSE 0 END) AS pj, \
+              SUM(CASE WHEN day<?1 THEN leaves ELSE 0 END) AS pl \
+            FROM analytics_member_daily WHERE day>=?2 GROUP BY guild_id) \
+         SELECT {}, \
+         (SELECT json_group_array(json_array(guild_id, c, p)) FROM w), \
+         (SELECT json_group_array(json_array(guild_id, c, p)) FROM b), \
+         (SELECT json_group_array(json_array(guild_id, c, p)) FROM s), \
+         (SELECT json_group_array(json_array(guild_id, a, m, t, pa, pm, pt)) FROM ev), \
+         (SELECT json_group_array(json_array(guild_id, j, l, pj, pl)) FROM m), \
+         (SELECT COUNT(*) FROM guild_enrollments WHERE active=1), \
+         (SELECT json_group_array(json_array(e.guild_id, e.active, i.name, i.icon_hash)) \
+            FROM guild_enrollments e LEFT JOIN guild_join_info i ON i.guild_id=e.guild_id \
+            WHERE e.active=1 OR e.guild_id IN \
+              (SELECT guild_id FROM w UNION SELECT guild_id FROM b \
+               UNION SELECT guild_id FROM ev UNION SELECT guild_id FROM m))",
         series_columns("", "?1")
     );
-    let (series, guild_columns, servers) = conn.query_row(&sql, params![start_day], |row| {
-        let guild_columns: [Option<String>; 5] = [
-            row.get(5)?,
-            row.get(6)?,
-            row.get(7)?,
-            row.get(8)?,
-            row.get(9)?,
-        ];
-        Ok((series_row(row)?, guild_columns, row.get::<i64>(10)?))
-    })?;
+    let (series, guild_columns, servers, info) =
+        conn.query_row(&sql, params![start_day, previous_start], |row| {
+            let guild_columns: [Option<String>; 5] = [
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            ];
+            Ok((
+                series_row(row)?,
+                guild_columns,
+                row.get::<i64>(10)?,
+                row.get::<Option<String>>(11)?,
+            ))
+        })?;
     let series_map = series_from_columns(series)?;
     let [warns, bans, spam_bans, events, members] = guild_columns;
     let mut guilds: HashMap<i64, GuildActivityTotals> = HashMap::new();
@@ -485,33 +524,78 @@ fn platform_conn(conn: &impl SqlExecutor, window_days: i64) -> Result<PlatformAn
             .entry(guild_id)
             .or_insert_with(|| GuildActivityTotals::zeroed(guild_id))
     }
-    for (guild_id, n) in json_rows::<(i64, i64)>(warns, "guild warn")? {
-        entry(&mut guilds, guild_id).warns += n;
+    for (guild_id, n, p) in json_rows::<(i64, i64, i64)>(warns, "guild warn")? {
+        let totals = entry(&mut guilds, guild_id);
+        totals.warns += n;
+        totals.previous.warns += p;
     }
-    for (guild_id, n) in json_rows::<(i64, i64)>(bans, "guild ban")? {
-        entry(&mut guilds, guild_id).bans += n;
+    for (guild_id, n, p) in json_rows::<(i64, i64, i64)>(bans, "guild ban")? {
+        let totals = entry(&mut guilds, guild_id);
+        totals.bans += n;
+        totals.previous.bans += p;
     }
-    for (guild_id, n) in json_rows::<(i64, i64)>(spam_bans, "guild spam ban")? {
-        entry(&mut guilds, guild_id).automod += n;
+    for (guild_id, n, p) in json_rows::<(i64, i64, i64)>(spam_bans, "guild spam ban")? {
+        let totals = entry(&mut guilds, guild_id);
+        totals.automod += n;
+        totals.previous.automod += p;
     }
-    for (guild_id, automod, mod_actions, timeouts) in
-        json_rows::<(i64, i64, i64, i64)>(events, "guild event")?
+    type EventRow = (i64, i64, i64, i64, i64, i64, i64);
+    for (guild_id, automod, mod_actions, timeouts, p_automod, p_mod_actions, p_timeouts) in
+        json_rows::<EventRow>(events, "guild event")?
     {
         let totals = entry(&mut guilds, guild_id);
         totals.automod += automod;
         totals.mod_actions += mod_actions;
         totals.timeouts += timeouts;
+        totals.previous.automod += p_automod;
+        totals.previous.mod_actions += p_mod_actions;
+        totals.previous.timeouts += p_timeouts;
     }
-    for (guild_id, joins, leaves) in json_rows::<(i64, i64, i64)>(members, "guild membership")? {
+    for (guild_id, joins, leaves, p_joins, p_leaves) in
+        json_rows::<(i64, i64, i64, i64, i64)>(members, "guild membership")?
+    {
         let totals = entry(&mut guilds, guild_id);
         totals.joins += joins;
         totals.leaves += leaves;
+        totals.previous.joins = Some(totals.previous.joins.unwrap_or(0) + p_joins);
+        totals.previous.leaves = Some(totals.previous.leaves.unwrap_or(0) + p_leaves);
     }
+    for (guild_id, active, name, icon_hash) in
+        json_rows::<(i64, i64, Option<String>, Option<String>)>(info, "guild display")?
+    {
+        let totals = entry(&mut guilds, guild_id);
+        totals.active = active == 1;
+        totals.name = name;
+        totals.icon_hash = icon_hash;
+    }
+    // Same rule as the guild view: the previous membership window is complete
+    // only while every day of it is still retained by the counter pruning.
+    let membership_complete = window_days * 2 - 1 <= ANALYTICS_MEMBER_DAILY_HORIZON_DAYS;
+    let mut previous = PreviousTotals {
+        joins: membership_complete.then_some(0),
+        leaves: membership_complete.then_some(0),
+        ..PreviousTotals::default()
+    };
     let mut guilds: Vec<GuildActivityTotals> = guilds.into_values().collect();
+    for totals in &mut guilds {
+        if !membership_complete {
+            totals.previous.joins = None;
+            totals.previous.leaves = None;
+        }
+        let p = &totals.previous;
+        previous.warns += p.warns;
+        previous.bans += p.bans;
+        previous.automod += p.automod;
+        previous.mod_actions += p.mod_actions;
+        previous.timeouts += p.timeouts;
+        previous.joins = previous.joins.zip(p.joins).map(|(a, b)| a + b);
+        previous.leaves = previous.leaves.zip(p.leaves).map(|(a, b)| a + b);
+    }
     guilds.sort_by_key(|totals| totals.guild_id);
     Ok(PlatformAnalytics {
         window_days,
         series: filled_series(series_map, window_days),
+        previous,
         servers,
         guilds,
     })

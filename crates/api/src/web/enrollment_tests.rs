@@ -6205,6 +6205,46 @@ async fn platform_member_totals_distinguish_empty_unavailable_and_incomplete_fle
     assert_eq!(importing["guilds_counted"], 1);
     assert_eq!(importing["guilds_unavailable"], 0);
     assert_eq!(importing["guilds_incomplete"], 1);
+    assert_eq!(
+        importing["by_guild"]["10"],
+        serde_json::json!({"current": 0, "coverage": "importing"}),
+        "each counted server reports its own directory status"
+    );
+}
+
+#[tokio::test]
+async fn platform_analytics_accepts_only_dashboard_ranges() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    for days in [7, 30, 90] {
+        let path = format!("/api/platform/analytics?days={days}");
+        let (status, body) = owner_router_request(&f, "POST", &path, "", &f.cookie).await;
+        assert_eq!(status, StatusCode::OK, "{days}: {body}");
+        assert_eq!(body["window_days"], days);
+        assert_eq!(body["series"].as_array().unwrap().len() as i64, days);
+        assert_eq!(body["guilds"][0]["guild_id"], "10", "{body}");
+        assert_eq!(body["guilds"][0]["active"], true);
+        assert!(body["previous"].is_object(), "{body}");
+    }
+    let (status, body) =
+        owner_router_request(&f, "POST", "/api/platform/analytics", "", &f.cookie).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["window_days"], 30, "the default range is 30 days");
+    let (status, body) =
+        owner_router_request(&f, "POST", "/api/platform/analytics?days=14", "", &f.cookie).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "analytics range must be 7, 30 or 90 days");
+
+    let other = Fixture::new(false).await;
+    let (status, body) = owner_router_request(
+        &other,
+        "POST",
+        "/api/platform/analytics?days=7",
+        "",
+        &other.cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }
 
 fn member_guild(id: u64) -> oauth::DiscordGuild {

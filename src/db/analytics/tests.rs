@@ -470,6 +470,94 @@ async fn platform_analytics_aggregates_guilds_and_counts_active_servers() {
 }
 
 #[tokio::test]
+async fn platform_analytics_compares_windows_and_names_every_active_server() {
+    let f = Fixture::new("platform_previous");
+    let ten = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    enroll_guild(&f.db, 20, 100).await.unwrap().unwrap();
+    enroll_guild(&f.db, 30, 100).await.unwrap().unwrap();
+    retire_guild_enrollment(&f.db, 30, 100).await.unwrap();
+    crate::db::record_guild_join_info(&f.db, 10, "Alpha", Some("hash10"), Some(5), 1)
+        .await
+        .unwrap();
+    crate::db::record_guild_join_info(&f.db, 30, "Gone", None, None, 1)
+        .await
+        .unwrap();
+
+    // Current 7-day window: offsets 0..=6; previous window: offsets 7..=13.
+    f.insert_warn(10, 0);
+    f.insert_warn(10, 8);
+    f.insert_warn(10, 13);
+    f.insert_warn(10, 14); // before both windows
+    f.insert_ban(30, 9); // departed server, previous window only
+    f.insert_event(10, "automod", r#"{"action":"ban"}"#, 10);
+    f.insert_event(10, "mod_action", "{}", 2);
+    f.insert_event(10, "timeout_add", "{}", 7);
+    bump(&f.db, &ten, 0, 4, 1).await;
+    bump(&f.db, &ten, 8, 2, 3).await;
+
+    let platform = platform_analytics(&f.db, 7).await.unwrap();
+    let ids: Vec<i64> = platform.guilds.iter().map(|g| g.guild_id).collect();
+    assert_eq!(
+        ids,
+        vec![10, 20, 30],
+        "every active server, plus a departed server with records in either window"
+    );
+    let [alpha, quiet, gone] = &platform.guilds[..] else {
+        panic!("three rows");
+    };
+    assert!(alpha.active && quiet.active && !gone.active);
+    assert_eq!(alpha.name.as_deref(), Some("Alpha"));
+    assert_eq!(alpha.icon_hash.as_deref(), Some("hash10"));
+    assert_eq!(quiet.name, None, "unobserved display facts stay unknown");
+    assert_eq!(gone.name.as_deref(), Some("Gone"));
+    assert_eq!(
+        (alpha.warns, alpha.mod_actions, alpha.joins, alpha.leaves),
+        (1, 1, 4, 1)
+    );
+    assert_eq!(
+        alpha.previous,
+        PreviousTotals {
+            warns: 2,
+            bans: 0,
+            automod: 1,
+            mod_actions: 0,
+            timeouts: 1,
+            joins: Some(2),
+            leaves: Some(3),
+        }
+    );
+    assert_eq!((quiet.warns, quiet.previous.warns), (0, 0));
+    assert_eq!((gone.bans, gone.previous.bans), (0, 1));
+    assert_eq!(
+        platform.previous,
+        PreviousTotals {
+            warns: 2,
+            bans: 1,
+            automod: 1,
+            mod_actions: 0,
+            timeouts: 1,
+            joins: Some(2),
+            leaves: Some(3),
+        },
+        "fleet previous totals sum every server"
+    );
+
+    // A 90-day previous window reaches past the membership counter horizon.
+    let long = platform_analytics(&f.db, 90).await.unwrap();
+    assert_eq!(long.series.len(), 90);
+    assert_eq!((long.previous.joins, long.previous.leaves), (None, None));
+    assert!(
+        long.guilds
+            .iter()
+            .all(|g| g.previous.joins.is_none() && g.previous.leaves.is_none())
+    );
+    assert_eq!(
+        long.guilds[0].warns, 4,
+        "every record inside 90 days counts"
+    );
+}
+
+#[tokio::test]
 async fn departure_erasure_removes_member_counters_before_re_enrollment() {
     let f = Fixture::new("erasure");
     // Inline retirement: an unplaced guild settles directory data in the
