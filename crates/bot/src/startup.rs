@@ -26,10 +26,10 @@ pub async fn open_database(cfg: &BotProcessConfig) -> Result<Db> {
     Db::open_with_budget(opts, budget).await
 }
 
-/// State construction also opens tenant stores and the bot's read-only DB.
-/// Keep those transient startup failures inside this child, with the same
-/// backoff and classification as the initial core open. Never retry a schema
-/// refusal or overlap a still-running synchronous construction attempt.
+/// Build state, including tenant stores and the bot's read-only DB, using the
+/// core database backend's startup retry classification and backoff budget.
+/// With a local core, remote guild-store transport failures are not retried.
+/// Never retry a schema refusal or overlap a still-running synchronous attempt.
 pub async fn build_state(cfg: BotProcessConfig, db: Db) -> Result<Arc<BotState>> {
     let budget = db::startup_retry_budget(db.is_remote());
     build_state_with_budget(cfg, db, budget).await

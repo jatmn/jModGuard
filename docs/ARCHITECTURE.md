@@ -151,8 +151,10 @@ a failed renewal never extends that deadline. Short database stalls can recover
 inside that window. An ungraceful stop can delay takeover for up to 60 seconds;
 normal shutdown and lost-lease exits still attempt an owner-checked release.
 Core database open and bot state construction (including its read database)
-retry transient startup failures with bounded backoff. Authentication failures
-and unsupported schemas retain their refusal behavior.
+use startup retry classification and bounded backoff selected by the core
+database backend. With a local core, remote guild-store transport failures
+are not retried. Authentication failures and unsupported schemas retain their
+refusal behavior.
 
 Launcher revision 45 passes one `JMODGUARD_STARTED_NOTICE_FILE` path to all its
 application children. After Discord Ready, the bot atomically claims that marker
