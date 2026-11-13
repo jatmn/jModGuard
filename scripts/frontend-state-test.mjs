@@ -8047,4 +8047,3 @@ test('a pending breakdown disables repeated clicks across overview refreshes and
   assert.equal(button().disabled, false);
   assert.equal(usageFigures(usageCards(h)[0])[0], '8.19 MB allocated');
 });
-
