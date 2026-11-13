@@ -151,7 +151,12 @@ server/Account age · 📍 Channel/Parent/From/To · 📋 Cases · ℹ️ Detail
 missing · ❔ Storage unknown · 🧹 Filtered · ✂️ Transcript omitted · 📏 Rule ·
 ⚡ Action · ⌨️ Command · ➕ Added · ➖ Removed · 🏷️ Role · 🔤 Name/Username ·
 🪪 Display name · 🧵 Thread · 🗄️ Archived · 🔒 Locked · ⏲️ Auto-archive ·
-✉️ Invitable. The map also reserves 📊 for status reports.
+✉️ Invitable.
+
+The `!status`/`!stats` embed uses 📊 Status with shared-map field labels:
+⏱️ Uptime · 📋 Cases · ⚠️ Warns · 🔨 Bans · 🚀 Release status · 📦 Container use.
+Its plain-text fallback and custom replies using `{response}` retain their earlier
+text layout; see the [command notes](COMMANDS.md#alias-notes).
 
 Other shipped text templates use the same map. Built-in command replies start
 with their command's emoji (for example `🔨 Banned {target} | {reason}`, 📛
@@ -163,8 +168,8 @@ starts with 👤 and labels 🆔 ID · 🔤 Username · 🪪 Global name · 📛
 📅 Account · ⏰ Joined · 🏷️ Roles · 🔊 Voice · ⚠️ Warnings · 📋 Cases. `!voice`
 replies start with 🔊. Attachment-burst review buttons answer with ⛔ (not
 allowed), ℹ️ (already handled) or ⚠️ (failed); a shipped review keeps 🛡️ and
-gains 🧑‍⚖️ Review after a decision. Error replies (`error: …`), `!status`/`!stats`,
-and lists built by commands such as `!help`, `!warns` and `!banlist` stay plain.
+gains 🧑‍⚖️ Review after a decision. Error replies (`error: …`) and lists built by
+commands such as `!help`, `!warns` and `!banlist` stay plain.
 
 Limits count UTF-16 units: title 256, description 4096, at most 25 fields, field
 names 256 and values 1024, total 6000. No author or footer is emitted (their Discord
