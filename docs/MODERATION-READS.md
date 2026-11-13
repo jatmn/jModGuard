@@ -12,9 +12,13 @@ membership and the `x-jmodguard-enrollment` value from the page's loaded configu
 - `/api/guilds/{id}/events`, including event/user/limit filters.
 - `/api/guilds/{id}/bans`, including the limit filter.
 - `/api/guilds/{id}/stats`.
-- `/api/guilds/{id}/analytics`, the daily trend read; the same captured read also
-  returns the guild's member-directory size and its import/coverage state through
-  the tenant runtime, reported as unavailable when that store cannot answer.
+- `/api/guilds/{id}/analytics?days=7|30|90`, the Analytics summary read: one core
+  statement returns the daily series, previous-period totals, rule/kind/moderator
+  breakdowns and the weekday/hour heat map; one guild-store statement then returns the
+  member-directory size, its import/coverage state and stored names for the listed
+  moderators, reported as unavailable when that store cannot answer. Complete answers
+  are cached for 30 seconds per membership and range after authorization; other ranges
+  are refused.
 
 Guild zero is not supported. Installation ownership does not bypass guild permissions.
 Missing or stale page membership returns HTTP409 `guild_enrollment_changed`; an unverifiable

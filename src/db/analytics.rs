@@ -36,11 +36,56 @@ pub struct AnalyticsPoint {
     pub leaves: i64,
 }
 
-/// Guild-scoped daily analytics series.
+/// Dashboard range choices. Every guild analytics panel follows one of these.
+pub const ANALYTICS_RANGES: [i64; 3] = [7, 30, 90];
+/// Largest number of rows in each ranked breakdown.
+pub const ANALYTICS_TOP_LIMIT: i64 = 8;
+
+/// Totals for the window of equal length just before the requested one.
+/// Membership totals are `None` when that window reaches past the daily
+/// counter horizon, so the comparison never treats pruned days as zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PreviousTotals {
+    pub warns: i64,
+    pub bans: i64,
+    pub automod: i64,
+    pub mod_actions: i64,
+    pub timeouts: i64,
+    pub joins: Option<i64>,
+    pub leaves: Option<i64>,
+}
+
+/// One ranked breakdown row, e.g. an automod rule ID or a mod-action kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RankedCount {
+    pub key: String,
+    pub count: i64,
+}
+
+/// Recorded mod-action events by acting moderator. IDs stay decimal strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModeratorCount {
+    #[serde(serialize_with = "ser_i64_str")]
+    pub moderator_id: i64,
+    pub count: i64,
+}
+
+/// Guild-scoped analytics for one range: the daily series plus every
+/// dashboard panel, aggregated in SQL from stored records only.
 #[derive(Debug, Clone, Serialize)]
 pub struct GuildAnalytics {
     pub window_days: i64,
     pub series: Vec<AnalyticsPoint>,
+    pub previous: PreviousTotals,
+    /// Counted automod enforcement by rule ID, including dedicated spam bans.
+    pub top_rules: Vec<RankedCount>,
+    /// Recorded mod-action events by command kind (warn, ban, kick, ...).
+    pub mod_action_kinds: Vec<RankedCount>,
+    /// Recorded mod-action events by acting moderator.
+    pub moderators: Vec<ModeratorCount>,
+    /// Sparse `[weekday (0 = Sunday), UTC hour, count]` cells for counted
+    /// automod enforcement, mod actions and dedicated spam bans.
+    pub heatmap: Vec<[i64; 3]>,
 }
 
 /// Per-guild activity totals across one analytics window. Guild IDs stay
@@ -149,6 +194,19 @@ fn apply_day(
 /// window reads in a single statement: a remote interactive snapshot cannot
 /// afford a prepare/query round trip per source table.
 fn series_columns(guild_filter: &str, day: &str) -> String {
+    series_columns_with_events(
+        guild_filter,
+        day,
+        &format!(
+            "SELECT substr(created_at,1,10) AS d, event_type AS b, COUNT(*) AS n FROM events \
+             WHERE {guild_filter}created_at>={day} AND {EVENT_BUCKETS_COUNTED_SQL} GROUP BY 1, 2"
+        ),
+    )
+}
+
+/// [`series_columns`] with the counted-event `(d, b, n)` rows supplied by the
+/// caller, so a guild summary can reuse its already-parsed events.
+fn series_columns_with_events(guild_filter: &str, day: &str, events: &str) -> String {
     format!(
         "(SELECT json_group_array(json_array(d, n)) FROM \
            (SELECT substr(created_at,1,10) AS d, COUNT(*) AS n FROM warns \
@@ -159,9 +217,7 @@ fn series_columns(guild_filter: &str, day: &str) -> String {
          (SELECT json_group_array(json_array(d, n)) FROM \
            (SELECT substr(created_at,1,10) AS d, COUNT(*) AS n FROM bans \
             WHERE {guild_filter}created_at>={day} AND {DEDICATED_SPAM_BANS_SQL} GROUP BY 1)), \
-         (SELECT json_group_array(json_array(d, b, n)) FROM \
-           (SELECT substr(created_at,1,10) AS d, event_type AS b, COUNT(*) AS n FROM events \
-            WHERE {guild_filter}created_at>={day} AND {EVENT_BUCKETS_COUNTED_SQL} GROUP BY 1, 2)), \
+         (SELECT json_group_array(json_array(d, b, n)) FROM ({events})), \
          (SELECT json_group_array(json_array(day, j, l)) FROM \
            (SELECT day, SUM(joins) AS j, SUM(leaves) AS l FROM analytics_member_daily \
             WHERE {guild_filter}day>={day} GROUP BY day))"
@@ -221,16 +277,165 @@ fn series_row(row: &crate::db_compat::Row) -> Result<SeriesColumns> {
     ])
 }
 
-/// One guild's daily series in one statement. The caller zero-fills the
-/// window; observed days outside it are harmless.
-fn guild_series_conn(
+/// Automod rule ID for a counted automod event, or the dedicated spam rule
+/// tag of an unattributed spam ban.
+const DEDICATED_SPAM_RULE_SQL: &str = "CASE WHEN instr(reason, '[automod:attachment_flood] ')=1 \
+     THEN 'attachment_flood' ELSE 'repeat_text' END";
+
+/// Counted events of both windows, parsed once. `?2` starts the requested
+/// window and `?3` the previous window of equal length. Materialized so every
+/// panel column below aggregates the same rows without rescanning `events` or
+/// re-parsing JSON.
+fn guild_events_cte() -> String {
+    format!(
+        "ev AS MATERIALIZED (SELECT event_type AS b, created_at>=?2 AS cur, actor_id AS actor, \
+           CASE WHEN event_type IN ('automod','mod_action') AND json_valid(data) \
+             THEN CAST(json_extract(data, CASE event_type WHEN 'automod' THEN '$.rule' \
+               ELSE '$.action' END) AS TEXT) END AS k, \
+           substr(created_at,1,10) AS d, CAST(substr(created_at,12,2) AS INTEGER) AS hr \
+         FROM events WHERE guild_id=?1 AND created_at>=?3 AND {EVENT_BUCKETS_COUNTED_SQL})"
+    )
+}
+
+/// Panel columns for one guild window; see [`guild_events_cte`] for `?2`/`?3`.
+/// Each column is one scalar or JSON array so the whole summary stays one
+/// statement.
+fn guild_panel_columns() -> String {
+    let prev = "guild_id=?1 AND created_at>=?3 AND created_at<?2";
+    let cur = "guild_id=?1 AND created_at>=?2";
+    format!(
+        "(SELECT COUNT(*) FROM warns WHERE {prev}), \
+         (SELECT COUNT(*) FROM bans WHERE {prev}), \
+         (SELECT COUNT(*) FROM bans WHERE {prev} AND {DEDICATED_SPAM_BANS_SQL}), \
+         (SELECT json_group_array(json_array(b, n)) FROM \
+           (SELECT b, COUNT(*) AS n FROM ev WHERE NOT cur GROUP BY b)), \
+         (SELECT COALESCE(SUM(joins), 0) FROM analytics_member_daily \
+            WHERE guild_id=?1 AND day>=?3 AND day<?2), \
+         (SELECT COALESCE(SUM(leaves), 0) FROM analytics_member_daily \
+            WHERE guild_id=?1 AND day>=?3 AND day<?2), \
+         (SELECT json_group_array(json_array(k, n)) FROM \
+           (SELECT k, SUM(n) AS n FROM \
+             (SELECT k, COUNT(*) AS n FROM ev WHERE cur AND b='automod' GROUP BY k \
+              UNION ALL \
+              SELECT {DEDICATED_SPAM_RULE_SQL}, COUNT(*) FROM bans \
+              WHERE {cur} AND {DEDICATED_SPAM_BANS_SQL} GROUP BY 1) \
+            WHERE k IS NOT NULL AND k<>'' GROUP BY k ORDER BY n DESC, k LIMIT ?4)), \
+         (SELECT json_group_array(json_array(k, n)) FROM \
+           (SELECT k, COUNT(*) AS n FROM ev WHERE cur AND b='mod_action' \
+              AND k IS NOT NULL AND k<>'' GROUP BY k ORDER BY n DESC, k LIMIT ?4)), \
+         (SELECT json_group_array(json_array(actor, n)) FROM \
+           (SELECT actor, COUNT(*) AS n FROM ev WHERE cur AND b='mod_action' AND actor IS NOT NULL \
+            GROUP BY actor ORDER BY n DESC, actor LIMIT ?4)), \
+         (SELECT json_group_array(json_array(w, hr, n)) FROM \
+           (SELECT CAST(strftime('%w', d) AS INTEGER) AS w, hr, SUM(n) AS n FROM \
+             (SELECT d, hr, COUNT(*) AS n FROM ev \
+              WHERE cur AND b IN ('automod','mod_action') GROUP BY d, hr \
+              UNION ALL \
+              SELECT substr(created_at,1,10), CAST(substr(created_at,12,2) AS INTEGER), COUNT(*) \
+              FROM bans WHERE {cur} AND {DEDICATED_SPAM_BANS_SQL} GROUP BY 1, 2) \
+            WHERE hr BETWEEN 0 AND 23 GROUP BY 1, 2 HAVING w BETWEEN 0 AND 6))"
+    )
+}
+
+/// Panel values read from one guild summary row (columns 5..).
+struct GuildPanels {
+    previous: PreviousTotals,
+    top_rules: Vec<RankedCount>,
+    mod_action_kinds: Vec<RankedCount>,
+    moderators: Vec<ModeratorCount>,
+    heatmap: Vec<[i64; 3]>,
+}
+
+/// One guild's daily series and dashboard panels in one statement. The
+/// caller zero-fills the window; observed days outside it are harmless.
+fn guild_summary_conn(
     conn: &impl SqlExecutor,
     guild_id: i64,
-    start_day: &str,
-) -> Result<HashMap<String, AnalyticsPoint>> {
-    let sql = format!("SELECT {}", series_columns("guild_id=?1 AND ", "?2"));
-    let columns = conn.query_row(&sql, params![guild_id, start_day], series_row)?;
-    series_from_columns(columns)
+    window_days: i64,
+) -> Result<(HashMap<String, AnalyticsPoint>, GuildPanels)> {
+    let start_day = window_start_day(window_days);
+    let previous_start = window_start_day(window_days * 2);
+    let sql = format!(
+        "WITH {} SELECT {}, {}",
+        guild_events_cte(),
+        series_columns_with_events(
+            "guild_id=?1 AND ",
+            "?2",
+            "SELECT d, b, COUNT(*) AS n FROM ev WHERE cur GROUP BY d, b"
+        ),
+        guild_panel_columns()
+    );
+    type Raw = (
+        SeriesColumns,
+        [i64; 3],
+        Option<String>,
+        [i64; 2],
+        [Option<String>; 4],
+    );
+    let (series, counts, events, members, ranked): Raw = conn.query_row(
+        &sql,
+        params![guild_id, start_day, previous_start, ANALYTICS_TOP_LIMIT],
+        |row| {
+            Ok((
+                series_row(row)?,
+                [row.get(5)?, row.get(6)?, row.get(7)?],
+                row.get(8)?,
+                [row.get(9)?, row.get(10)?],
+                [row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?],
+            ))
+        },
+    )?;
+    let [warns, bans, spam_bans] = counts;
+    // The previous membership window is complete only while every day of it
+    // is still retained by the daily counter pruning.
+    let membership_complete = window_days * 2 - 1 <= ANALYTICS_MEMBER_DAILY_HORIZON_DAYS;
+    let mut previous = PreviousTotals {
+        warns,
+        bans,
+        automod: spam_bans,
+        joins: membership_complete.then_some(members[0]),
+        leaves: membership_complete.then_some(members[1]),
+        ..PreviousTotals::default()
+    };
+    for (bucket, n) in json_rows::<(String, i64)>(events, "previous event")? {
+        match bucket.as_str() {
+            "automod" => previous.automod += n,
+            "mod_action" => previous.mod_actions += n,
+            "timeout_add" => previous.timeouts += n,
+            _ => {}
+        }
+    }
+    let [rules, kinds, moderators, heatmap] = ranked;
+    let ranked = |raw, what| -> Result<Vec<RankedCount>> {
+        let mut rows: Vec<RankedCount> = json_rows::<(String, i64)>(raw, what)?
+            .into_iter()
+            .map(|(key, count)| RankedCount { key, count })
+            .collect();
+        rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
+        Ok(rows)
+    };
+    let mut moderators: Vec<ModeratorCount> = json_rows::<(i64, i64)>(moderators, "moderator")?
+        .into_iter()
+        .map(|(moderator_id, count)| ModeratorCount {
+            moderator_id,
+            count,
+        })
+        .collect();
+    moderators.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.moderator_id.cmp(&b.moderator_id))
+    });
+    let mut heatmap = json_rows::<[i64; 3]>(heatmap, "heat map")?;
+    heatmap.sort_unstable();
+    let panels = GuildPanels {
+        previous,
+        top_rules: ranked(rules, "rule")?,
+        mod_action_kinds: ranked(kinds, "mod action kind")?,
+        moderators,
+        heatmap,
+    };
+    Ok((series_from_columns(series)?, panels))
 }
 
 /// Fleet series, per-guild window totals and the server count in one
@@ -320,15 +525,19 @@ pub async fn enrolled_guild_analytics(
     window_days: i64,
 ) -> Result<GuildAnalytics> {
     let window_days = clamp_window(window_days);
-    let start_day = window_start_day(window_days);
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_snapshot()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
-        let map = guild_series_conn(&tx, enrollment.guild_id, &start_day)?;
+        let (map, panels) = guild_summary_conn(&tx, enrollment.guild_id, window_days)?;
         tx.finish_read()?;
         Ok(GuildAnalytics {
             window_days,
             series: filled_series(map, window_days),
+            previous: panels.previous,
+            top_rules: panels.top_rules,
+            mod_action_kinds: panels.mod_action_kinds,
+            moderators: panels.moderators,
+            heatmap: panels.heatmap,
         })
     })
     .await

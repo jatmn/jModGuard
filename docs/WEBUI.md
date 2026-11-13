@@ -279,7 +279,7 @@ the workspace then refreshes current configuration. If that refresh fails, use
 | Tab | What it does |
 |---|---|
 | **Dashboard** | server configuration plus identified moderation records, warns and bans; unavailable counts are explicit |
-| **Analytics** | daily trend charts for the last 30 days: warnings, bans, spam (automod enforcement, including exact-image and repeated-text bans) hits, mod actions, timeouts, member joins and leaves, plus the current member directory size, marked partial while its initial import runs and unverified while a coverage gap awaits Reconcile; served from the captured membership-bound analytics read |
+| **Analytics** | command-center dashboard for one range (7, 30 or 90 days, one selector for every panel): a compact KPI strip (member directory size with a partial/unverified badge, net growth, joins, leaves, warnings, bans, spam hits, mod actions, timeouts), each with its change against the previous period of the same length and a daily sparkline; aligned daily enforcement bars; joins/leaves with a running net-change line; top automod rules, mod actions by type and by moderator (names from the stored member directory); and a weekday × UTC hour heat map. Hover or arrow keys show exact per-day values. One captured membership-bound summary read per range, served from stored records only; the API caches complete answers for 30 seconds per membership and range and the browser reuses loaded ranges for 60 seconds |
 | **Automod Rules** | per-rule editor: params JSON, action escalation table, whitelists, dry-run, scope, reset-to-global |
 | **Badwords** | add/remove regex patterns (server; global if bot owner), live tester; invalid legacy patterns show **not enforced** |
 | **Commands** | edit every command (name, aliases, description, permission, cooldown, roles/channels, response template); create custom commands with the **step editor**; delete custom commands |
@@ -375,7 +375,7 @@ POST   /api/guilds/{id}/bans           # same query as GET; SPA bans list
 POST   /api/guilds/{id}/unban
 GET    /api/guilds/{id}/stats          # guild-scoped aggregates only
 POST   /api/guilds/{id}/stats          # same body as GET; SPA dashboard counts
-GET    /api/guilds/{id}/analytics      # 30-day daily trends + member directory size
+GET    /api/guilds/{id}/analytics      # ?days=7|30|90 (default 30): every Analytics panel + member directory size
 POST   /api/guilds/{id}/analytics      # same body as GET; SPA analytics tab
 POST   /api/platform/analytics         # owner-only: fleet trends, server count, member directory totals
 GET    /api/guilds/{id}/actions

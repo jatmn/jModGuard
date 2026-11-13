@@ -1,5 +1,6 @@
 use super::*;
 use crate::db::{Db, GuildEnrollment, enroll_guild, retire_guild_enrollment};
+use chrono::Datelike;
 use libsql::params::IntoParams;
 
 struct Fixture {
@@ -153,6 +154,188 @@ async fn guild_series_buckets_counts_and_zero_fills_the_window() {
     for point in &analytics.series {
         assert_eq!(point.day.len(), 10);
     }
+}
+
+fn insert_mod_action(f: &Fixture, actor: Option<i64>, data: &str, day_offset: i64) {
+    f.insert_raw(
+        "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at) \
+         VALUES (10, 'mod_action', 7, ?1, ?2, ?3)",
+        crate::db::params![actor, data, rfc3339_day(day_offset)],
+    );
+}
+
+#[tokio::test]
+async fn guild_summary_is_empty_without_records() {
+    let f = Fixture::new("summary_empty");
+    let enrollment = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    for days in ANALYTICS_RANGES {
+        let summary = enrolled_guild_analytics(&f.db, enrollment.clone(), days)
+            .await
+            .unwrap();
+        assert_eq!(summary.window_days, days);
+        assert_eq!(summary.series.len(), days as usize);
+        assert!(summary.series.iter().all(|p| p.warns == 0 && p.joins == 0));
+        assert_eq!(summary.previous.warns, 0);
+        assert!(summary.top_rules.is_empty());
+        assert!(summary.mod_action_kinds.is_empty());
+        assert!(summary.moderators.is_empty());
+        assert!(summary.heatmap.is_empty());
+        let json = serde_json::to_value(&summary).unwrap();
+        for key in [
+            "previous",
+            "top_rules",
+            "mod_action_kinds",
+            "moderators",
+            "heatmap",
+        ] {
+            assert!(json.get(key).is_some(), "{key} is always present");
+        }
+    }
+}
+
+#[tokio::test]
+async fn guild_summary_ranks_breakdowns_and_buckets_the_heat_map() {
+    let f = Fixture::new("summary_panels");
+    let enrollment = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    for _ in 0..3 {
+        f.insert_event(10, "automod", r#"{"rule":"spam","action":"timeout"}"#, 0);
+    }
+    f.insert_event(10, "automod", r#"{"rule":"caps","action":"warn"}"#, 0);
+    // Not counted enforcement: dry run, a non-punishing action and corrupt data.
+    f.insert_event(
+        10,
+        "automod",
+        r#"{"rule":"caps","action":"warn","dry_run":1}"#,
+        0,
+    );
+    f.insert_event(10, "automod", r#"{"rule":"links","action":"delete"}"#, 0);
+    f.insert_event(10, "automod", "not json", 0);
+    f.insert_unattributed_ban(10, 21, "[automod:attachment_flood] same image");
+    // Outside a 7-day window.
+    f.insert_event(10, "automod", r#"{"rule":"old","action":"ban"}"#, 8);
+    let big = 9_007_199_254_740_993_i64;
+    insert_mod_action(&f, Some(big), r#"{"action":"ban"}"#, 0);
+    insert_mod_action(&f, Some(big), r#"{"action":"ban"}"#, 0);
+    insert_mod_action(&f, Some(8), r#"{"action":"warn"}"#, 0);
+    insert_mod_action(&f, None, r#"{"action":"kick"}"#, 0);
+    // Timeouts and warn rows are separate records of the same actions; the
+    // heat map counts each enforcement action once.
+    f.insert_event(10, "timeout_add", "{}", 0);
+    f.insert_warn(10, 0);
+
+    let summary = enrolled_guild_analytics(&f.db, enrollment, 7)
+        .await
+        .unwrap();
+    fn ranked(rows: &[RankedCount]) -> Vec<(&str, i64)> {
+        rows.iter().map(|r| (r.key.as_str(), r.count)).collect()
+    }
+    assert_eq!(
+        ranked(&summary.top_rules),
+        vec![("spam", 3), ("attachment_flood", 1), ("caps", 1)]
+    );
+    assert_eq!(
+        ranked(&summary.mod_action_kinds),
+        vec![("ban", 2), ("kick", 1), ("warn", 1)]
+    );
+    assert_eq!(
+        summary
+            .moderators
+            .iter()
+            .map(|m| (m.moderator_id, m.count))
+            .collect::<Vec<_>>(),
+        vec![(big, 2), (8, 1)],
+        "unattributed mod actions have no moderator row"
+    );
+    let json = serde_json::to_value(&summary).unwrap();
+    assert_eq!(json["moderators"][0]["moderator_id"], "9007199254740993");
+    let weekday = i64::from(
+        (chrono::Utc::now().date_naive())
+            .weekday()
+            .num_days_from_sunday(),
+    );
+    assert_eq!(summary.heatmap, vec![[weekday, 12, 9]]);
+}
+
+#[tokio::test]
+async fn guild_summary_compares_the_previous_window_and_keeps_large_counts_exact() {
+    let f = Fixture::new("summary_previous");
+    let enrollment = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    f.insert_warn(10, 0);
+    f.insert_warn(10, 7);
+    f.insert_warn(10, 13);
+    f.insert_warn(10, 14);
+    f.insert_event(10, "mod_action", "{}", 9);
+    f.insert_event(10, "timeout_add", "{}", 10);
+    f.insert_unattributed_ban(10, 21, "[automod:repeat_text] repeated text");
+    let huge = 2_000_000_000_000_i64;
+    for (offset, joins, leaves) in [(0, huge, 1), (1, huge, 0), (8, 3, 2)] {
+        let day = (chrono::Utc::now().date_naive() - chrono::Duration::days(offset))
+            .format("%Y-%m-%d")
+            .to_string();
+        f.insert_raw(
+            "INSERT INTO analytics_member_daily (guild_id, day, joins, leaves) VALUES (10, ?1, ?2, ?3)",
+            crate::db::params![day, joins, leaves],
+        );
+    }
+    let week = enrolled_guild_analytics(&f.db, enrollment.clone(), 7)
+        .await
+        .unwrap();
+    assert_eq!(
+        week.previous,
+        PreviousTotals {
+            warns: 2,
+            bans: 0,
+            automod: 0,
+            mod_actions: 1,
+            timeouts: 1,
+            joins: Some(3),
+            leaves: Some(2),
+        }
+    );
+    let joins: i64 = week.series.iter().map(|p| p.joins).sum();
+    assert_eq!(joins, 2 * huge, "large daily counts sum exactly");
+    assert_eq!(week.series.last().unwrap().automod, 1);
+    // A 90-day comparison window reaches past the retained daily counters,
+    // so membership has no previous total instead of a false zero.
+    let quarter = enrolled_guild_analytics(&f.db, enrollment, 90)
+        .await
+        .unwrap();
+    assert_eq!(quarter.previous.joins, None);
+    assert_eq!(quarter.previous.leaves, None);
+    assert_eq!(quarter.previous.warns, 0);
+    assert_eq!(quarter.series.len(), 90);
+}
+
+#[tokio::test]
+async fn guild_summary_breakdowns_stay_bounded() {
+    let f = Fixture::new("summary_bounded");
+    let enrollment = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    for rule in 0..(ANALYTICS_TOP_LIMIT + 4) {
+        for _ in 0..=rule {
+            f.insert_event(
+                10,
+                "automod",
+                &format!(r#"{{"rule":"r{rule:02}","action":"warn"}}"#),
+                0,
+            );
+        }
+        insert_mod_action(&f, Some(100 + rule), r#"{"action":"warn"}"#, 0);
+    }
+    let summary = enrolled_guild_analytics(&f.db, enrollment, 30)
+        .await
+        .unwrap();
+    assert_eq!(summary.top_rules.len(), ANALYTICS_TOP_LIMIT as usize);
+    assert_eq!(
+        summary.top_rules[0].key,
+        format!("r{:02}", ANALYTICS_TOP_LIMIT + 3)
+    );
+    assert!(
+        summary
+            .top_rules
+            .windows(2)
+            .all(|w| w[0].count >= w[1].count)
+    );
+    assert_eq!(summary.moderators.len(), ANALYTICS_TOP_LIMIT as usize);
 }
 
 #[tokio::test]
@@ -384,6 +567,11 @@ async fn analytics_reads_fit_the_remote_snapshot_budget() {
     let guild = enrolled_guild_analytics(&remote, enrollment, 2)
         .await
         .expect("guild analytics must finish inside the snapshot budget");
+    assert_eq!(
+        guild.top_rules.len(),
+        1,
+        "panels share the one remote statement"
+    );
     let today = &guild.series[1];
     assert_eq!(
         (

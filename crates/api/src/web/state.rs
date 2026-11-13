@@ -35,6 +35,80 @@ pub(super) type MemberRolesSlot = Option<(Instant, Vec<u64>)>;
 type MemberRolesCache =
     std::collections::HashMap<(u64, u64), Arc<tokio::sync::Mutex<MemberRolesSlot>>>;
 
+/// How long one analytics summary is served without rereading the database.
+pub const ANALYTICS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Most cached analytics summaries kept at once (memberships x ranges).
+const ANALYTICS_CACHE_MAX: usize = 256;
+/// Guild ID, membership ID and range in days.
+pub type AnalyticsCacheKey = (i64, String, i64);
+
+/// Short-lived per-membership analytics summaries. Display data only: every
+/// request still authorizes the user and captures the active membership before
+/// a lookup, and a different membership never shares an entry.
+#[derive(Default)]
+pub struct AnalyticsCache {
+    entries: std::sync::Mutex<
+        std::collections::HashMap<AnalyticsCacheKey, (Instant, serde_json::Value)>,
+    >,
+}
+
+impl AnalyticsCache {
+    pub fn get(&self, key: &AnalyticsCacheKey, now: Instant) -> Option<serde_json::Value> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .get(key)
+            .filter(|(at, _)| now.saturating_duration_since(*at) < ANALYTICS_CACHE_TTL)
+            .map(|(_, value)| value.clone())
+    }
+
+    pub fn put(&self, key: AnalyticsCacheKey, value: serde_json::Value, now: Instant) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if entries.len() >= ANALYTICS_CACHE_MAX {
+            entries.retain(|_, (at, _)| now.saturating_duration_since(*at) < ANALYTICS_CACHE_TTL);
+        }
+        if entries.len() >= ANALYTICS_CACHE_MAX {
+            entries.clear();
+        }
+        entries.insert(key, (now, value));
+    }
+}
+
+#[cfg(test)]
+mod analytics_cache_tests {
+    use super::*;
+
+    #[test]
+    fn analytics_cache_expires_and_stays_bounded() {
+        let cache = AnalyticsCache::default();
+        let start = Instant::now();
+        let key = |guild: i64, days: i64| (guild, "membership".to_owned(), days);
+        cache.put(key(1, 7), serde_json::json!(7), start);
+        assert_eq!(cache.get(&key(1, 7), start), Some(serde_json::json!(7)));
+        assert_eq!(
+            cache.get(&key(1, 30), start),
+            None,
+            "ranges never share an entry"
+        );
+        assert_eq!(cache.get(&(1, "other".to_owned(), 7), start), None);
+        let later = start + ANALYTICS_CACHE_TTL;
+        assert_eq!(
+            cache.get(&key(1, 7), later),
+            None,
+            "entries expire after the TTL"
+        );
+        // Filling past the bound drops expired entries first, then everything.
+        for guild in 0..ANALYTICS_CACHE_MAX as i64 {
+            cache.put(key(guild + 10, 30), serde_json::json!(guild), later);
+        }
+        cache.put(key(5, 90), serde_json::json!("new"), later);
+        assert!(cache.entries.lock().unwrap().len() <= ANALYTICS_CACHE_MAX);
+        assert_eq!(
+            cache.get(&key(5, 90), later),
+            Some(serde_json::json!("new"))
+        );
+    }
+}
+
 /// Dashboard state cannot run the moderation engine.
 /// ```compile_fail
 /// fn moderation(state: &jmodguard_api::web::state::ApiState) {
@@ -62,6 +136,7 @@ pub struct ApiState {
     pub(super) member_roles: std::sync::Mutex<MemberRolesCache>,
     pub preview: DashMap<String, crate::web::preview::PreviewGrant>,
     pub usage_cache: crate::web::usage::UsageCache,
+    pub analytics_cache: AnalyticsCache,
     config_observation: tokio::sync::Mutex<ConfigObservation>,
     /// Replaces the in-memory session store for one `web::router` build.
     session_store: std::sync::Mutex<Option<tower_sessions::MemoryStore>>,
@@ -111,6 +186,7 @@ impl ApiState {
             member_roles: std::sync::Mutex::new(std::collections::HashMap::new()),
             preview: DashMap::new(),
             usage_cache: crate::web::usage::UsageCache::default(),
+            analytics_cache: AnalyticsCache::default(),
             config_observation: tokio::sync::Mutex::new(ConfigObservation::from_primary(primed)),
             session_store: std::sync::Mutex::new(None),
         }))

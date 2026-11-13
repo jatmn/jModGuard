@@ -6717,3 +6717,119 @@ async fn case_removal_role_ids_require_administrator_or_server_owner() {
         }
     }
 }
+
+#[tokio::test]
+async fn analytics_serves_each_range_from_stored_data_and_caches_it_per_membership() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment.clone()).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let moderator = 9_007_199_254_740_993_i64;
+    store
+        .observe_member(
+            scope,
+            db::guild_data::MemberObservation {
+                user_id: moderator,
+                username: Some(Some("mod-user".into())),
+                global_name: Some(Some("Moderator One".into())),
+                nickname: Some(None),
+                joined_at_ms: Some(900),
+                observed_at_ms: 1_500,
+                is_join: true,
+            },
+        )
+        .await
+        .unwrap();
+    db::insert_enrolled_event(
+        &f.app.db,
+        Some(enrollment.clone()),
+        "mod_action",
+        Some(7),
+        Some(moderator),
+        &serde_json::json!({"action": "ban"}),
+    )
+    .await
+    .unwrap();
+    // Only the user's authorization guild-list snapshot reaches Discord; the
+    // API has no bot token and the panels never call Discord.
+    let other_discord_calls = |f: &Fixture| {
+        f.discord.member_calls.load(Ordering::SeqCst)
+            + f.discord.me_calls.load(Ordering::SeqCst)
+            + f.discord.token_calls.load(Ordering::SeqCst)
+    };
+    let (guild_lists, others) = (
+        f.discord.calls.load(Ordering::SeqCst),
+        other_discord_calls(&f),
+    );
+    for days in [7, 30, 90] {
+        let (status, body) = f
+            .request("POST", &format!("/api/guilds/10/analytics?days={days}"), "")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["window_days"], days);
+        assert_eq!(body["series"].as_array().unwrap().len(), days as usize);
+        assert_eq!(body["mod_action_kinds"][0]["key"], "ban");
+        // The moderator name comes from the stored member directory.
+        assert_eq!(body["moderators"][0]["moderator_id"], "9007199254740993");
+        assert_eq!(body["moderators"][0]["name"], "Moderator One");
+        assert_eq!(body["members"]["current"], 1);
+    }
+    // The default range keeps the old request shape working.
+    let (status, body) = f.request("POST", "/api/guilds/10/analytics", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["window_days"], 30);
+    // Four range reads share at most one reused authorization snapshot.
+    assert!(f.discord.calls.load(Ordering::SeqCst) - guild_lists <= 1);
+    assert_eq!(other_discord_calls(&f), others, "no other Discord call");
+
+    // A cached range answers without rereading new records until it expires.
+    db::insert_enrolled_event(
+        &f.app.db,
+        Some(enrollment.clone()),
+        "mod_action",
+        Some(7),
+        Some(moderator),
+        &serde_json::json!({"action": "kick"}),
+    )
+    .await
+    .unwrap();
+    let (_, cached) = f
+        .request("POST", "/api/guilds/10/analytics?days=7", "")
+        .await;
+    assert_eq!(cached["mod_action_kinds"].as_array().unwrap().len(), 1);
+    // A new membership never reads the old membership's entry.
+    db::retire_guild_enrollment(&f.app.db, 10, 100)
+        .await
+        .unwrap();
+    db::enroll_guild(&f.app.db, 10, 101).await.unwrap();
+    let (status, fresh) = f
+        .request("POST", "/api/guilds/10/analytics?days=7", "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{fresh}");
+    assert_eq!(fresh["mod_action_kinds"].as_array().unwrap().len(), 2);
+
+    for bad in ["14", "0", "-7", "abc"] {
+        let (status, body) = f
+            .request("POST", &format!("/api/guilds/10/analytics?days={bad}"), "")
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "days={bad}: {body}");
+    }
+    let (status, _) = f
+        .request("POST", "/api/guilds/10/analytics?range=7", "")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown parameters are refused"
+    );
+}

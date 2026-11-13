@@ -428,3 +428,66 @@ test("dashboard icons use the shared icon size, not a page-specific scale", () =
   // A busy setup link still greys its icon with the label.
   assert.match(iconCssRule('.btn:is(:disabled, [aria-disabled="true"]) svg.icon'), /color:\s*inherit/);
 });
+
+// Analytics dashboard (#587): one delimited stylesheet section, series colors
+// readable in both themes, no wrapping numbers and a one-column narrow layout.
+const ANALYTICS_START = "Analytics dashboard (#587). Self-contained";
+const ANALYTICS_END = "/* ==== end Analytics dashboard (#587) ==== */";
+function analyticsCss() {
+  const start = css.indexOf(ANALYTICS_START);
+  const end = css.indexOf(ANALYTICS_END);
+  assert.ok(start > 0 && end > start, "analytics styles live in one delimited section");
+  return css.slice(css.lastIndexOf("/*", start), end + ANALYTICS_END.length);
+}
+
+test("analytics styles stay inside their delimited section", () => {
+  const section = analyticsCss();
+  const outside = css.replace(section, "");
+  assert.doesNotMatch(outside, /\.an-[\w-]+|\.analytics-page/, "no analytics selector outside the section");
+  for (const [, selectors] of section.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{[^{}]*\}/g)) {
+    const trimmed = selectors.trim();
+    if (trimmed.startsWith("@media")) continue;
+    for (const selector of trimmed.split(",").map((part) => part.trim()))
+      assert.match(selector, /(?:^|\s|\[data-theme="dark"\] )(?:\.analytics-page|\.an-|#content \.an-)/, `scoped selector: ${selector}`);
+  }
+});
+
+for (const [theme, rootSelector, analyticsSelector] of [
+  ["light", ":root", ".analytics-page"],
+  ["dark", ':root[data-theme="dark"]', '[data-theme="dark"] .analytics-page'],
+]) {
+  test(`${theme} analytics series and secondary text stay readable on panels`, () => {
+    const shell = tokens(rootSelector);
+    const series = tokens(analyticsSelector);
+    const names = ["--an-warns", "--an-bans", "--an-spam", "--an-mod", "--an-timeouts", "--an-joins", "--an-leaves"];
+    for (const name of names) {
+      assert.ok(series[name], `${theme} defines ${name}`);
+      // WCAG 1.4.11: chart marks need 3:1 against the panel they sit on.
+      const ratio = contrast(series[name], shell["--panel"]);
+      assert.ok(ratio >= 3, `${theme} ${name} on panel: ${ratio.toFixed(2)}:1`);
+    }
+    assert.equal(new Set(names.map((name) => series[name].toLowerCase())).size, names.length, `${theme} series colors are distinct`);
+    const section = analyticsCss();
+    for (const selector of [".an-kpi-label", ".an-delta"])
+      assert.match(rule(selector, section), /color:\s*var\(--muted\)/, selector);
+    assert.ok(contrast(shell["--muted"], shell["--panel"]) >= 4.5, `${theme} muted labels`);
+    assert.ok(contrast(shell["--warn"], shell["--panel"]) >= 4.5, `${theme} coverage badge`);
+    assert.ok(contrast(shell["--accent-text"], shell["--accent"]) >= 4.5, `${theme} selected range`);
+  });
+}
+
+test("analytics numbers never wrap and the grid collapses on narrow screens", () => {
+  const section = analyticsCss();
+  for (const selector of [".an-kpi-value", ".an-delta", ".an-rank-count", ".an-badge"])
+    assert.match(rule(selector, section), /white-space:\s*nowrap/, selector);
+  assert.match(rule(".an-kpi-body", section), /white-space:\s*nowrap/);
+  assert.match(rule(".an-kpi-value", section), /font-variant-numeric:\s*tabular-nums/);
+  // Headline numerals stay below the shared stat scale (no oversized numbers).
+  assert.ok(px(declaration(rule(".an-kpi-value", section), "font-size")) <= 20);
+  assert.match(rule(".an-kpis", section), /grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(/);
+  const narrow = section.slice(section.indexOf("@media (max-width: 720px) {"));
+  assert.match(narrow, /\.an-grid\s*\{\s*grid-template-columns:\s*minmax\(0,\s*1fr\);/);
+  assert.match(narrow, /\.an-span-4, \.an-span-5, \.an-span-7, \.an-span-12\s*\{\s*grid-column:\s*auto;/);
+  const medium = section.slice(section.indexOf("@media (max-width: 1100px) {"));
+  assert.match(medium, /\.an-span-5, \.an-span-7\s*\{\s*grid-column:\s*span 12;/);
+});

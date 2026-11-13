@@ -1,6 +1,16 @@
 import { createState, useStore } from "./state.js";
 import { Appearance, useAppearance } from "./appearance.js";
-import { TrendChart, TrendMetricPicker, TREND_METRICS, sumSeries, useTrendMetric } from "./charts.js";
+import {
+  ActivityHeatmap,
+  ENFORCEMENT_METRICS,
+  EnforcementChart,
+  KpiTile,
+  MembershipChart,
+  RangeSelector,
+  RankList,
+  formatDelta,
+  sumSeries,
+} from "./charts.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import React, { useState, useEffect, useRef, createContext, useContext } from "react";
 import { createRoot } from "react-dom/client";
@@ -1202,6 +1212,7 @@ function isUnauthenticated(err) {
 }
 
 function stopPrivateWatchers() {
+  analyticsCache.clear();
   for (const dispose of authLossCleanups) dispose();
   for (const key of pendingLogChannelActions.keys()) clearPendingLogChannelEntry(key);
 }
@@ -2063,10 +2074,6 @@ function eventHeading(event) {
   );
 }
 
-function statsRow(...items) {
-  return h("div", { className: "stats bg-base-100 w-full" }, ...items);
-}
-
 // One header line per page (#590): the title, an optional muted detail and actions.
 function pageHeader(title, detail, ...actions) {
   return h(
@@ -2240,85 +2247,228 @@ function toTrendPoints(series) {
   }));
 }
 
+const ANALYTICS_HELP =
+  "Counts come from records the bot stored, bucketed by UTC day; nothing is fetched from Discord. Days before the bot started recording, or while it was offline, show zero, not missing history. Changes compare with the previous period of the same length; membership has no comparison for 90 days because daily join and leave counters are kept for 92 days. Enforcement metrics overlap (a warn command writes a warning and a mod action), so they are shown side by side and never added up. The heat map counts automod enforcement, moderator commands and spam bans once each. Members is the current member directory: partial while its initial import runs, and unverified while a coverage gap awaits Reconcile on the Members page.";
+
+// Loaded analytics summaries per guild, page membership and range. Switching
+// back to a loaded range, or returning to the tab, reuses it without a request.
+const ANALYTICS_CLIENT_TTL_MS = 60000;
+const analyticsCache = new Map();
+
+function analyticsKey(guildId, days) {
+  return `${guildId}|${state.config?.enrollment_id ?? ""}|${days}`;
+}
+
+function cachedAnalytics(key) {
+  const hit = analyticsCache.get(key);
+  if (hit && Date.now() - hit.at < ANALYTICS_CLIENT_TTL_MS) return hit.data;
+  if (hit) analyticsCache.delete(key);
+  return null;
+}
+
+function useAnalyticsSummary(guildId, days) {
+  const key = analyticsKey(guildId, days);
+  const [result, setResult] = useState(() => ({ key, data: cachedAnalytics(key), error: null }));
+  useEffect(() => {
+    const cached = cachedAnalytics(key);
+    if (cached) {
+      setResult({ key, data: cached, error: null });
+      return undefined;
+    }
+    setResult({ key, data: null, error: null });
+    const controller = new AbortController();
+    let current = true;
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    apiRead(`/api/guilds/${guildId}/analytics?days=${days}`, controller.signal)
+      .then((data) => {
+        if (!current) return;
+        const now = Date.now();
+        for (const [stale, hit] of analyticsCache) if (now - hit.at >= ANALYTICS_CLIENT_TTL_MS) analyticsCache.delete(stale);
+        analyticsCache.set(key, { at: now, data });
+        setResult({ key, data, error: null });
+      })
+      .catch((error) => {
+        if (current)
+          setResult({
+            key,
+            data: null,
+            error: controller.signal.aborted ? apiError("Request timed out. Refresh to try again.") : error,
+          });
+      })
+      .finally(() => clearTimeout(timeout));
+    return () => {
+      current = false;
+      clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [key]);
+  const fresh = result.key === key;
+  return {
+    data: fresh ? result.data : null,
+    error: fresh ? result.error : null,
+    loading: !fresh || (!result.data && !result.error),
+  };
+}
+
+const MOD_ACTION_LABELS = {
+  warn: "Warn",
+  warnclear: "Clear warnings",
+  ban: "Ban",
+  softban: "Softban",
+  unban: "Unban",
+  kick: "Kick",
+  timeout: "Timeout",
+  purge: "Purge",
+  slowmode: "Slowmode",
+};
+
+// Running net membership change, shifted to start at zero so the sparkline
+// shows its shape even when the server shrinks.
+function runningNetShape(points) {
+  let running = 0;
+  const net = points.map((point) => (running += (point.joins ?? 0) - (point.leaves ?? 0)));
+  const floor = Math.min(0, ...net);
+  return net.map((value) => value - floor);
+}
+
+function analyticsPanel(title, id, body, className = "") {
+  return h(
+    "section",
+    { className: `an-panel card bg-base-100 card-border ${className}`, "aria-labelledby": id },
+    h("h3", { className: "an-panel-title", id }, title),
+    body,
+  );
+}
+
 function tabAnalytics() {
   const guildId = useRef(state.guildId).current;
   const g = selectedGuild();
-  const result = useApiRead(`/api/guilds/${guildId}/analytics`);
-  const [metric, setMetric] = useTrendMetric("warns");
-  const trendLabels = Object.fromEntries(TREND_METRICS);
-  const points = toTrendPoints(result.data?.series);
-  const loading = result.loading && points.length === 0;
-  const members = result.data?.members ?? null;
-  const membersNow = () => {
-    if (loading) return "Loading…";
-    if (!members) return "Unavailable";
-    const suffix = { importing: " (partial)", uncertain: " (unverified)" }[members.coverage] ?? "";
-    return `${members.current}${suffix}`;
-  };
-  const statValue = (metricKey) => {
-    if (loading) return "Loading…";
-    if (result.error) return "Unavailable";
-    return String(sumSeries(points, metricKey));
-  };
+  const [days, setDays] = useState(30);
+  const result = useAnalyticsSummary(guildId, days);
+  const data = result.data;
+  const loading = result.loading;
+  const failed = Boolean(result.error) && !data;
+  const points = toTrendPoints(data?.series);
+  const previous = data?.previous ?? null;
+  const rangeLabel = `${days} days`;
+  const members = data?.members ?? null;
+  const total = (key) => sumSeries(points, key);
+  const prev = (key) => (previous ? previous[key] : null);
+  const daily = (key) => points.map((point) => point[key] ?? 0);
+  const coverage = {
+    importing: { label: "partial", tone: "warn", title: "The initial member import is still running." },
+    uncertain: { label: "unverified", tone: "warn", title: "A coverage gap awaits Reconcile on the Members page." },
+  }[members?.coverage];
+  const tile = (label, key, color) =>
+    h(KpiTile, {
+      key: label,
+      label,
+      value: total(key),
+      delta: data ? formatDelta(total(key), prev(key === "modActions" ? "mod_actions" : key)) : null,
+      values: data ? daily(key) : null,
+      color,
+      loading,
+      unavailable: failed,
+      rangeLabel,
+    });
+  const joins = total("joins");
+  const leaves = total("leaves");
+  const netPrevious = previous?.joins == null || previous?.leaves == null ? null : previous.joins - previous.leaves;
+  const rules = Object.fromEntries((state.config?.rules ?? []).map((rule) => [rule.rule_id, rule.name]));
+  const pending = (text) => h("p", { className: "an-empty muted", "aria-busy": "true" }, text);
+  const unavailable = h("p", { className: "an-empty muted" }, "Unavailable");
+  const body = (render) => (data ? render() : failed ? unavailable : pending("Loading…"));
   return h(
     "div",
-    { className: "contents" },
-    pageHeader("Analytics", g ? `Trends for ${g.name} over the last 30 days` : "Trends over the last 30 days"),
+    { className: "contents analytics-page" },
+    pageHeader(
+      "Analytics",
+      g ? `${g.name} · last ${rangeLabel} (UTC)` : `Last ${rangeLabel} (UTC)`,
+      h(RangeSelector, { value: days, onChange: setDays }),
+      h(InfoTip, { id: "analytics-help", label: "About these trends" }, ANALYTICS_HELP),
+    ),
+    failed
+      ? h(
+          "aside",
+          { className: "dashboard-note", role: "status" },
+          h("strong", {}, "Trends unavailable"),
+          h("p", {}, String(result.error?.message ?? result.error ?? "Refresh to try again.")),
+        )
+      : null,
     h(
       "section",
-      { className: "dashboard-section" },
-      h("h3", { className: "card-title" }, "Last 30 days"),
-      statsRow(
-        stat("Members now", membersNow()),
-        stat("Warnings", statValue("warns")),
-        stat("Bans", statValue("bans")),
-        stat("Spam hits", statValue("automod")),
-        stat("Mod actions", statValue("modActions")),
-        stat("Timeouts", statValue("timeouts")),
-        stat("Joins", statValue("joins")),
-        stat("Leaves", statValue("leaves")),
-      ),
-      result.error && points.length === 0
-        ? h(
-            "aside",
-            { className: "dashboard-note", role: "status" },
-            h("strong", {}, "Trends unavailable"),
-            h("p", {}, String(result.error?.message ?? result.error ?? "Refresh to try again.")),
-          )
-        : null,
+      { className: "an-kpis", "aria-label": `Totals for the last ${rangeLabel}` },
+      h(KpiTile, {
+        label: "Members",
+        value: members?.current ?? 0,
+        loading,
+        unavailable: failed || (data && !members),
+        badge: coverage,
+        rangeLabel,
+      }),
+      h(KpiTile, {
+        label: "Net growth",
+        value: joins - leaves,
+        delta: data ? formatDelta(joins - leaves, netPrevious) : null,
+        values: data ? runningNetShape(points) : null,
+        color: "an-joins",
+        loading,
+        unavailable: failed,
+        rangeLabel,
+      }),
+      tile("Joins", "joins", "an-joins"),
+      tile("Leaves", "leaves", "an-leaves"),
+      ...ENFORCEMENT_METRICS.map(([key, label, color]) => tile(label, key, color)),
     ),
     h(
-      "section",
-      { className: "dashboard-section" },
-      h("h3", { className: "card-title" }, "Daily trend"),
-      h(
-        "div",
-        { className: "card bg-base-100 card-border trend-card" },
-        h(
-          "div",
-          { className: "card-body" },
-          h(TrendMetricPicker, { metric, onChange: setMetric }),
-          loading
-            ? h("p", { className: "muted" }, "Loading trends…")
-            : points.length
-              ? h(TrendChart, {
-                  points,
-                  metric,
-                  title: trendLabels[metric],
-                })
-              : h("p", { className: "muted" }, "No trend data for this server yet."),
+      "div",
+      { className: "an-grid" },
+      analyticsPanel("Enforcement per day", "an-enforcement", body(() => h(EnforcementChart, { points })), "an-span-7"),
+      analyticsPanel("Membership per day", "an-membership", body(() => h(MembershipChart, { points })), "an-span-5"),
+      analyticsPanel(
+        "Top automod rules",
+        "an-rules",
+        body(() =>
+          h(RankList, {
+            label: "Automod enforcement by rule",
+            empty: "No automod enforcement in this range.",
+            color: "an-spam",
+            rows: (data.top_rules ?? []).map((row) => ({ key: row.key, label: rules[row.key] ?? row.key, title: row.key, count: row.count })),
+          }),
         ),
+        "an-span-4",
       ),
-      h(
-        "aside",
-        { className: "dashboard-note" },
-        h("strong", {}, "About these trends"),
-        h(
-          "p",
-          {},
-          "Days show counts recorded by the bot in UTC. Days before the bot started recording — or while it was offline — show zero, not missing history. Members now is the current member directory: partial while its initial import runs, and unverified while a coverage gap awaits Reconcile on the Members page. Join and leave trends accumulate from deployment onward.",
+      analyticsPanel(
+        "Mod actions by type",
+        "an-kinds",
+        body(() =>
+          h(RankList, {
+            label: "Mod actions by type",
+            empty: "No mod actions in this range.",
+            rows: (data.mod_action_kinds ?? []).map((row) => ({ key: row.key, label: MOD_ACTION_LABELS[row.key] ?? row.key, count: row.count })),
+          }),
         ),
+        "an-span-4",
       ),
+      analyticsPanel(
+        "Mod actions by moderator",
+        "an-moderators",
+        body(() =>
+          h(RankList, {
+            label: "Mod actions by moderator",
+            empty: "No attributed mod actions in this range.",
+            color: "an-timeouts",
+            rows: (data.moderators ?? []).map((row) => ({
+              key: row.moderator_id,
+              label: row.name || `User ${row.moderator_id}`,
+              title: `${row.name ? `${row.name} ` : ""}(${row.moderator_id})`,
+              count: row.count,
+            })),
+          }),
+        ),
+        "an-span-4",
+      ),
+      analyticsPanel("Activity by weekday and hour (UTC)", "an-heat", body(() => h(ActivityHeatmap, { cells: data.heatmap ?? [] })), "an-span-12"),
     ),
   );
 }

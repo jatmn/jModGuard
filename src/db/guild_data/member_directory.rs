@@ -458,6 +458,9 @@ pub struct MemberPage {
     pub next_cursor: Option<String>,
 }
 
+/// Largest ID set one directory name lookup accepts.
+pub const DIRECTORY_NAME_LOOKUP_LIMIT: usize = 32;
+
 /// Bounded directory counts for the analytics views. `known` includes
 /// departed members still retained by ban history.
 #[derive(Debug, Clone, Serialize)]
@@ -3617,7 +3620,24 @@ impl GuildDataStore {
     /// members with confirmed ban history, and all known rows for this scope,
     /// with the coverage those counts have.
     pub async fn directory_totals(&self, scope: GuildDataScope) -> Result<DirectoryTotals> {
+        Ok(self.directory_totals_with_names(scope, Vec::new()).await?.0)
+    }
+
+    /// [`Self::directory_totals`] plus stored display names for at most
+    /// [`DIRECTORY_NAME_LOOKUP_LIMIT`] user IDs, in the same statement. Names
+    /// come only from directory rows the bot already recorded (nickname, then
+    /// global name, then username); IDs without a stored name are omitted.
+    pub async fn directory_totals_with_names(
+        &self,
+        scope: GuildDataScope,
+        user_ids: Vec<i64>,
+    ) -> Result<(DirectoryTotals, Vec<(i64, String)>)> {
         checked_scope(self, &scope)?;
+        anyhow::ensure!(
+            user_ids.len() <= DIRECTORY_NAME_LOOKUP_LIMIT,
+            MemberSyncError::Invalid
+        );
+        let ids = serde_json::to_string(&user_ids)?;
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
@@ -3625,13 +3645,14 @@ impl GuildDataStore {
                 verify_scope(&tx, &expected, &scope, true)?;
                 // One statement: a remote snapshot cannot afford a round trip
                 // per count after scope verification.
-                let (current, banned, known, seed_present, completed, reconcile): (
+                let (current, banned, known, seed_present, completed, reconcile, names): (
                     i64,
                     i64,
                     i64,
                     bool,
                     bool,
                     bool,
+                    Option<String>,
                 ) = tx.query_row(
                     "SELECT \
                        (SELECT COUNT(*) FROM guild_member_directory \
@@ -3644,8 +3665,15 @@ impl GuildDataStore {
                        COALESCE((SELECT initial_completed_at_ms IS NOT NULL FROM guild_member_seed \
                         WHERE guild_id=?1 AND enrollment_id=?2), 0), \
                        COALESCE((SELECT reconciliation_needed FROM guild_member_seed \
-                        WHERE guild_id=?1 AND enrollment_id=?2), 0)",
-                    params![scope.guild_id(), scope.enrollment.id.as_str()],
+                        WHERE guild_id=?1 AND enrollment_id=?2), 0), \
+                       (SELECT json_group_array(json_array(user_id, name)) FROM \
+                         (SELECT user_id, COALESCE(NULLIF(nickname,''), NULLIF(global_name,''), \
+                                 NULLIF(username,'')) AS name \
+                          FROM guild_member_directory \
+                          WHERE guild_id=?1 AND enrollment_id=?2 \
+                            AND user_id IN (SELECT value FROM json_each(?3))) \
+                        WHERE name IS NOT NULL)",
+                    params![scope.guild_id(), scope.enrollment.id.as_str(), ids],
                     |row| {
                         Ok((
                             row.get(0)?,
@@ -3654,6 +3682,7 @@ impl GuildDataStore {
                             row.get(3)?,
                             row.get(4)?,
                             row.get(5)?,
+                            row.get(6)?,
                         ))
                     },
                 )?;
@@ -3664,12 +3693,19 @@ impl GuildDataStore {
                     Some((true, true)) => DirectoryCoverage::Uncertain,
                     Some((false, _)) | None => DirectoryCoverage::Importing,
                 };
-                Ok(DirectoryTotals {
-                    current,
-                    banned,
-                    known,
-                    coverage,
-                })
+                let names: Vec<(i64, String)> = match names {
+                    Some(raw) => serde_json::from_str(&raw)?,
+                    None => Vec::new(),
+                };
+                Ok((
+                    DirectoryTotals {
+                        current,
+                        banned,
+                        known,
+                        coverage,
+                    },
+                    names,
+                ))
             })
             .await
     }
