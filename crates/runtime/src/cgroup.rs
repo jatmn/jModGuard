@@ -704,6 +704,10 @@ fn parse_v1_memory(dir: &Path, current_text: &str, host_total: Option<u64>) -> O
 
 // Only v1 reports "no limit" as a huge page-rounded number; v2 uses `max`.
 // A v1 limit at or above the host's memory is the host ceiling, not a cap.
+// Accepted known limits: (a) where the host meminfo file reports the
+// container's own cap as MemTotal (LXCFS, gVisor), a real cap equal to it
+// shows as no limit; (b) a cgroup v2 numeric memory.max at or above host
+// memory is still shown, because only v1 uses the host-total check.
 fn read_v1_memory_limit(dir: &Path, host_total: Option<u64>) -> Option<MemoryLimit> {
     match read_memory_limit(dir, "memory.limit_in_bytes")? {
         MemoryLimit::Bytes(bytes)
