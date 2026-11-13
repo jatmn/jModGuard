@@ -13,7 +13,7 @@ Copilot is a backup reviewer here, requested manually only when Sourcery can't r
 ## Hard rules (flag any break as P1)
 - The bot must always be able to moderate. No change may block or disable bans, kicks, timeouts, deletes or automod enforcement.
 - The in-app updater never runs schema migrations. Schema changes use the durable bot/API paired protocol, and recovery after the migration fence is forward-only.
-- No host-wide memory estimates. Use the process's or container's own limits only.
+- Never display or estimate host-wide memory; reading MemTotal solely to detect an unbounded cgroup limit is allowed. Use the process's or container's own limits only.
 - Keep the service boundaries. Bot and API dependency graphs stay independent, the API never migrates, and API work never takes unscoped queue or moderation access.
 - Never run core migrations or defaults on a guild store. Credentials stay in process config, never in catalog rows.
 

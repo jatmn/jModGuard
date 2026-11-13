@@ -3,8 +3,9 @@
 //! Readings come from cgroup v2 (`memory.current`, `memory.stat`,
 //! `memory.max`, `cpu.stat`) or the v1 files when those are absent.
 //! Membership is `/proc/self/cgroup` resolved with mount roots from
-//! `/proc/self/mountinfo`. Host-wide memory and processor totals
-//! are not consulted. Nothing here writes a database or calls a provider.
+//! `/proc/self/mountinfo`. Host-wide memory and processor totals are not
+//! reported or used as estimates; the host's `MemTotal` only identifies a v1
+//! limit that caps nothing. Nothing here writes a database or calls a provider.
 
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -55,8 +56,9 @@ pub enum MemorySource {
     CgroupUsage,
 }
 
-/// `memory.max`. The v2 token `max`, and a v1 limit of at least 2^62 bytes,
-/// mean the cgroup has no limit. An absent limit file also means no limit.
+/// `memory.max`. The v2 token `max`, and a v1 limit of at least 2^62 bytes
+/// or of at least the host's total memory, mean the cgroup has no limit. An
+/// absent limit file also means no limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryLimit {
     Bytes(u64),
@@ -97,22 +99,40 @@ impl ContainerSample {
 ///
 /// Pass the same directory twice when v2 files, or a v1 memory and cpuacct
 /// pair, live together. A missing or unreadable layout yields `None` fields.
+/// The host's total memory is not known here, so only the v1 sentinel marks
+/// a v1 limit as no limit.
 pub fn read_cgroup(memory_dir: Option<&Path>, cpu_dir: Option<&Path>) -> CgroupReading {
     CgroupReading {
-        memory: memory_dir.and_then(read_memory),
+        memory: memory_dir.and_then(|dir| read_memory(dir, None)),
         cpu: cpu_dir.and_then(read_cpu),
     }
 }
 
 /// Read this process's cgroup. Unreadable layouts yield an empty reading.
 pub fn read_process_cgroup() -> CgroupReading {
-    let Some(text) = read_limited(Path::new("/proc/self/cgroup")) else {
-        return read_mount_root(Path::new("/sys/fs/cgroup"));
+    read_proc_cgroup(Path::new("/proc"), Path::new("/sys/fs/cgroup"))
+}
+
+fn read_proc_cgroup(proc: &Path, mount_root: &Path) -> CgroupReading {
+    let host_total = host_memory_total(proc);
+    let Some(text) = read_limited(&proc.join("self/cgroup")) else {
+        return read_mount_root(mount_root, host_total);
     };
-    let Some(mountinfo) = read_limited(Path::new("/proc/self/mountinfo")) else {
+    let Some(mountinfo) = read_limited(&proc.join("self/mountinfo")) else {
         return CgroupReading::default();
     };
-    read_mounted_cgroup(&text, &mountinfo)
+    read_mounted_cgroup(&text, &mountinfo, host_total)
+}
+
+// `MemTotal` in bytes, only to recognise a v1 limit that caps nothing. It is
+// never reported. Unreadable or malformed means unknown, not a cap.
+fn host_memory_total(proc: &Path) -> Option<u64> {
+    let text = read_limited(&proc.join("meminfo"))?;
+    let line = text.lines().find(|line| line.starts_with("MemTotal:"))?;
+    match line.split_whitespace().collect::<Vec<_>>()[..] {
+        [_, kib, "kB"] => kib.parse::<u64>().ok()?.checked_mul(1024),
+        _ => None,
+    }
 }
 
 /// Latest sample for this process.
@@ -261,9 +281,9 @@ async fn sample_loop() {
 }
 
 /// Counters at a cgroup mount when `/proc/self/cgroup` itself cannot be read.
-fn read_mount_root(mount: &Path) -> CgroupReading {
+fn read_mount_root(mount: &Path, host_total: Option<u64>) -> CgroupReading {
     CgroupReading {
-        memory: read_memory(mount),
+        memory: read_memory(mount, host_total),
         cpu: read_cpu(mount),
     }
 }
@@ -311,21 +331,26 @@ struct CgroupEntry {
     path: String,
 }
 
-fn read_mounted_cgroup(cgroup_text: &str, mountinfo: &str) -> CgroupReading {
+fn read_mounted_cgroup(
+    cgroup_text: &str,
+    mountinfo: &str,
+    host_total: Option<u64>,
+) -> CgroupReading {
     let (memory_dirs, cpu_dirs) = cgroup_dirs(cgroup_text, mountinfo);
+    let memory = first_reading(&memory_dirs, |dir| read_memory(dir, host_total));
     CgroupReading {
-        memory: first_reading(&memory_dirs, read_memory).map(|(_, memory)| memory),
+        memory: memory.map(|(_, memory)| memory),
         cpu: first_reading(&cpu_dirs, read_cpu).map(|(_, cpu)| cpu),
     }
 }
 
 // The first candidate that yields a reading, shared by the reader and the layout line.
-fn first_reading<T>(dirs: &[PathBuf], read: fn(&Path) -> Option<T>) -> Option<(&PathBuf, T)> {
+fn first_reading<T>(dirs: &[PathBuf], read: impl Fn(&Path) -> Option<T>) -> Option<(&PathBuf, T)> {
     dirs.iter().find_map(|dir| Some((dir, read(dir)?)))
 }
 
 // The directory supplying the reading, or the first candidate when none does.
-fn supplying_dir<T>(dirs: &[PathBuf], read: fn(&Path) -> Option<T>) -> Option<PathBuf> {
+fn supplying_dir<T>(dirs: &[PathBuf], read: impl Fn(&Path) -> Option<T>) -> Option<PathBuf> {
     first_reading(dirs, read)
         .map(|(dir, _)| dir)
         .or(dirs.first())
@@ -582,7 +607,7 @@ fn join_cgroup(mount: &Path, proc_path: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-fn read_memory(dir: &Path) -> Option<MemoryUse> {
+fn read_memory(dir: &Path, host_total: Option<u64>) -> Option<MemoryUse> {
     let v2_path = dir.join("memory.current");
     if let Some(text) = read_limited(&v2_path) {
         return parse_v2_memory(dir, &text);
@@ -597,7 +622,7 @@ fn read_memory(dir: &Path) -> Option<MemoryUse> {
         dir.join("cgroup.controllers").exists(),
     );
     let text = memory_input(read_limited(&v1_path), name)?;
-    parse_v1_memory(dir, &text)
+    parse_v1_memory(dir, &text, host_total)
 }
 
 fn missing_memory_usage_name(
@@ -663,19 +688,33 @@ fn parse_v2_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
     memory_use(current, &stat, read_memory_limit(dir, "memory.max")?, None)
 }
 
-fn parse_v1_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
+fn parse_v1_memory(dir: &Path, current_text: &str, host_total: Option<u64>) -> Option<MemoryUse> {
     let current = memory_input(parse_u64_token(current_text), "memory.usage_in_bytes")?;
     let Some(stat) = memory_input(read_limited(&dir.join("memory.stat")), "memory.stat") else {
-        return usage_only(current, read_v1_memory_limit(dir)?);
+        return usage_only(current, read_v1_memory_limit(dir, host_total)?);
     };
     let fallback = stat_value(&stat, "total_inactive_file");
-    memory_use(current, &stat, read_v1_memory_limit(dir)?, fallback)
+    memory_use(
+        current,
+        &stat,
+        read_v1_memory_limit(dir, host_total)?,
+        fallback,
+    )
 }
 
 // Only v1 reports "no limit" as a huge page-rounded number; v2 uses `max`.
-fn read_v1_memory_limit(dir: &Path) -> Option<MemoryLimit> {
+// A v1 limit at or above the host's memory is the host ceiling, not a cap.
+// Accepted known limits: (a) where the host meminfo file reports the
+// container's own cap as MemTotal (LXCFS, gVisor), a real cap equal to it
+// shows as no limit; (b) a cgroup v2 numeric memory.max at or above host
+// memory is still shown, because only v1 uses the host-total check.
+fn read_v1_memory_limit(dir: &Path, host_total: Option<u64>) -> Option<MemoryLimit> {
     match read_memory_limit(dir, "memory.limit_in_bytes")? {
-        MemoryLimit::Bytes(bytes) if bytes >= V1_UNLIMITED_BYTES => Some(MemoryLimit::Unlimited),
+        MemoryLimit::Bytes(bytes)
+            if bytes >= V1_UNLIMITED_BYTES || host_total.is_some_and(|total| bytes >= total) =>
+        {
+            Some(MemoryLimit::Unlimited)
+        }
         limit => Some(limit),
     }
 }
@@ -809,7 +848,8 @@ fn memory_layout(proc: &Path, mount_root: &Path) -> MemoryLayout {
         (Some(text), Some(info)) => {
             let (memory_dirs, cpu_dirs) = cgroup_dirs(text, info);
             (
-                supplying_dir(&memory_dirs, read_memory),
+                // The host total only changes the limit, never which dir reads.
+                supplying_dir(&memory_dirs, |dir| read_memory(dir, None)),
                 supplying_dir(&cpu_dirs, read_cpu),
             )
         }
@@ -1207,7 +1247,7 @@ mod tests {
             ],
         );
         // Root memory.stat alone must not be treated as container usage.
-        let reading = read_mount_root(&tree.path);
+        let reading = read_mount_root(&tree.path, None);
         assert_eq!(reading.memory, None);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(5000));
     }
@@ -1333,11 +1373,11 @@ mod tests {
             ],
         );
         let info = format!("{}\n", v2_mount_line("/", &tree.path));
-        let reading = read_mounted_cgroup("0::/app\n", &info);
+        let reading = read_mounted_cgroup("0::/app\n", &info, None);
         assert_eq!(reading.memory.unwrap().program_bytes, 900);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(9));
 
-        let elsewhere = read_mounted_cgroup("0::/other\n", &info);
+        let elsewhere = read_mounted_cgroup("0::/other\n", &info, None);
         assert_eq!(elsewhere, CgroupReading::default());
     }
 
@@ -1358,7 +1398,7 @@ mod tests {
             v1_mount_line("/", &tree.path.join("memory"), "memory"),
             v1_mount_line("/", &tree.path.join("cpuacct"), "cpuacct"),
         );
-        let reading = read_mounted_cgroup("2:cpu,cpuacct:/app\n1:memory:/app\n", &info);
+        let reading = read_mounted_cgroup("2:cpu,cpuacct:/app\n1:memory:/app\n", &info, None);
         assert_eq!(reading.memory.unwrap().program_bytes, 50);
         assert_eq!(reading.memory.unwrap().limit, MemoryLimit::Bytes(4096));
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_nanos(2_000));
@@ -1376,7 +1416,7 @@ mod tests {
             ],
         );
         let info = format!("{}\n", v2_mount_line("/", &tree.path));
-        let reading = read_mounted_cgroup("0::/../outside\n", &info);
+        let reading = read_mounted_cgroup("0::/../outside\n", &info, None);
         assert_eq!(reading, CgroupReading::default());
     }
 
@@ -1391,7 +1431,7 @@ mod tests {
                 ("memory.max", "max\n"),
             ],
         );
-        let reading = read_mount_root(&tree.path);
+        let reading = read_mount_root(&tree.path, None);
         assert_eq!(reading.memory.unwrap().program_bytes, 30);
     }
 
@@ -1452,18 +1492,22 @@ mod tests {
     }
 
     #[test]
-    fn reader_source_does_not_name_host_meminfo_or_stat() {
+    fn reader_source_reads_host_memory_only_for_the_v1_limit() {
         let source = include_str!("cgroup.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
         let meminfo = ["/proc/", "meminfo"].concat();
         let host_stat = ["/proc/", "stat"].concat();
         assert!(
             !source.contains(&meminfo),
-            "host memory file must not be read"
+            "host memory is read only through host_memory_total"
         );
         assert!(
             !source.contains(&host_stat),
             "host processor file must not be read"
         );
+        // One read of `MemTotal`, whose only consumer is the v1 limit check.
+        assert_eq!(production.matches("\"meminfo\"").count(), 1);
+        assert_eq!(production.matches("host_memory_total(").count(), 2);
     }
 
     #[test]
@@ -1493,7 +1537,7 @@ mod tests {
             ],
         );
         let info = format!("{}\n", v2_mount_line("/", &tree.path));
-        let reading = read_mounted_cgroup("0::/\n", &info);
+        let reading = read_mounted_cgroup("0::/\n", &info, None);
         assert_eq!(reading.memory.unwrap().program_bytes, 900);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(9));
     }
@@ -1532,6 +1576,7 @@ mod tests {
         let reading = read_mounted_cgroup(
             "1:memory:/docker/0123456789abcdef\n2:cpuacct:/docker/0123456789abcdef\n",
             &info,
+            None,
         );
         let got = reading.memory.unwrap();
         assert_eq!(got.program_bytes, 2_750);
@@ -1570,7 +1615,7 @@ mod tests {
             ],
         );
         let info = format!("{}\n", v2_mount_line("/workload", &tree.path));
-        let reading = read_mounted_cgroup("0::/workload/bot\n", &info);
+        let reading = read_mounted_cgroup("0::/workload/bot\n", &info, None);
         assert_eq!(reading.memory.unwrap().program_bytes, 900);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(9));
     }
@@ -1597,7 +1642,7 @@ mod tests {
             ],
         );
         let info = format!("{}\n", v2_mount_line("/workload", &tree.path));
-        let reading = read_mounted_cgroup("0::/other\n", &info);
+        let reading = read_mounted_cgroup("0::/other\n", &info, None);
         assert_eq!(reading, CgroupReading::default());
     }
 
@@ -1625,10 +1670,10 @@ mod tests {
         let point = tree.path.to_str().unwrap();
         let info =
             format!("21 1 8:1 / {point} rw,relatime shared:1 master:2 - ext4 /dev/sda1 rw\n");
-        let reading = read_mounted_cgroup("0::/workload/bot\n", &info);
+        let reading = read_mounted_cgroup("0::/workload/bot\n", &info, None);
         assert_eq!(reading, CgroupReading::default());
         assert_eq!(
-            read_mounted_cgroup("0::/workload/bot\n", ""),
+            read_mounted_cgroup("0::/workload/bot\n", "", None),
             CgroupReading::default()
         );
     }
@@ -1657,7 +1702,7 @@ mod tests {
             "{}\n",
             v1_mount_line("/docker/0123456789abcdef", &memory, "memory")
         );
-        let reading = read_mounted_cgroup("1:memory:/other\n", &info);
+        let reading = read_mounted_cgroup("1:memory:/other\n", &info, None);
         assert!(reading.memory.is_none());
         assert_eq!(reading, CgroupReading::default());
     }
@@ -1682,7 +1727,7 @@ mod tests {
             v2_mount_line("/workload", &specific),
             v2_mount_line("/", &parent),
         );
-        let missing = read_mounted_cgroup("0::/workload/bot\n", &longest_first);
+        let missing = read_mounted_cgroup("0::/workload/bot\n", &longest_first, None);
         assert_eq!(missing, CgroupReading::default());
 
         write_files(
@@ -1699,7 +1744,7 @@ mod tests {
             v2_mount_line("/", &parent),
             v2_mount_line("/workload", &specific),
         );
-        let reading = read_mounted_cgroup("0::/workload/bot\n", &longest_second);
+        let reading = read_mounted_cgroup("0::/workload/bot\n", &longest_second, None);
         assert_eq!(reading.memory.unwrap().program_bytes, 900);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(9));
     }
@@ -1720,7 +1765,7 @@ mod tests {
             v1_mount_line("/", &tree.path.join("cpu"), "cpu"),
             v1_mount_line("/", &tree.path.join("cpuacct"), "cpuacct"),
         );
-        let reading = read_mounted_cgroup("2:cpu:/app\n", &preferred);
+        let reading = read_mounted_cgroup("2:cpu:/app\n", &preferred, None);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_nanos(1_500_000));
 
         std::fs::create_dir_all(tree.path.join("empty-acct")).unwrap();
@@ -1729,7 +1774,7 @@ mod tests {
             v1_mount_line("/", &tree.path.join("empty-acct"), "cpuacct"),
             v1_mount_line("/", &tree.path.join("cpu"), "cpu"),
         );
-        let reading = read_mounted_cgroup("2:cpu:/app\n", &fallback);
+        let reading = read_mounted_cgroup("2:cpu:/app\n", &fallback, None);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(111));
     }
 
@@ -1759,7 +1804,7 @@ mod tests {
         let info = format!(
             "21 1 0:21 /work\\040load/ {point}/a\\040b rw,relatime shared:1 master:2 - cgroup2 cgroup rw\n"
         );
-        let reading = read_mounted_cgroup("0::/work load\n", &info);
+        let reading = read_mounted_cgroup("0::/work load\n", &info, None);
         assert_eq!(reading.memory.unwrap().program_bytes, 900);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(9));
     }
@@ -1791,13 +1836,13 @@ mod tests {
         let only_truncated =
             format!("21 1 0:21 /\\04 {point} rw,relatime shared:1 master:2 - cgroup2 cgroup rw\n");
         assert_eq!(
-            read_mounted_cgroup("0::/\n", &only_truncated),
+            read_mounted_cgroup("0::/\n", &only_truncated, None),
             CgroupReading::default()
         );
         let only_non_octal =
             format!("21 1 0:21 /\\018 {point} rw,relatime shared:1 master:2 - cgroup2 cgroup rw\n");
         assert_eq!(
-            read_mounted_cgroup("0::/\n", &only_non_octal),
+            read_mounted_cgroup("0::/\n", &only_non_octal, None),
             CgroupReading::default()
         );
         let mixed = format!(
@@ -1805,7 +1850,7 @@ mod tests {
              21 1 0:21 /\\018 {decoy} rw,relatime shared:1 master:2 - cgroup2 cgroup rw\n\
              22 1 0:22 / {point} rw,relatime shared:1 master:2 - cgroup2 cgroup rw\n"
         );
-        let reading = read_mounted_cgroup("0::/\n", &mixed);
+        let reading = read_mounted_cgroup("0::/\n", &mixed, None);
         assert_eq!(reading.memory.unwrap().program_bytes, 900);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(9));
     }
@@ -1826,7 +1871,7 @@ mod tests {
             "{}\n",
             v1_mount_line("/", &tree.path.join("memory"), "cpuacct")
         );
-        let reading = read_mounted_cgroup("1:memory:/app\n2:cpuacct:/app\n", &info);
+        let reading = read_mounted_cgroup("1:memory:/app\n2:cpuacct:/app\n", &info, None);
         assert!(reading.memory.is_none());
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_nanos(2_000));
     }
@@ -1848,6 +1893,141 @@ mod tests {
             assert_eq!(memory.source, MemorySource::CgroupUsage);
             write_files(&tree.path, &[(limit, "invalid\n")]);
             assert_eq!(read_cgroup(Some(&tree.path), None).memory, None);
+        }
+    }
+
+    // A v1 memory controller mounted at `cgroup_dir`, with an optional
+    // host `MemTotal` line, as read through the production /proc layout.
+    fn v1_proc_fixture(cgroup_dir: &Path, meminfo: Option<&str>) -> TempTree {
+        let proc = temp_tree();
+        let info = format!("{}\n", v1_mount_line("/", cgroup_dir, "memory"));
+        write_files(
+            &proc.path,
+            &[("self/cgroup", "1:memory:/\n"), ("self/mountinfo", &info)],
+        );
+        if let Some(meminfo) = meminfo {
+            write_files(&proc.path, &[("meminfo", meminfo)]);
+        }
+        proc
+    }
+
+    const GIB: u64 = 1 << 30;
+    const V1_SENTINEL: &str = "9223372036854771712";
+
+    fn v1_limit_on_host(limit: &str, meminfo: Option<&str>, with_stat: bool) -> MemoryLimit {
+        let cgroup = temp_tree();
+        let mut files = vec![
+            ("memory.usage_in_bytes", "90000000\n"),
+            ("memory.limit_in_bytes", limit),
+        ];
+        if with_stat {
+            files.push(("memory.stat", "total_inactive_file 1000\n"));
+        }
+        write_files(&cgroup.path, &files);
+        let proc = v1_proc_fixture(&cgroup.path, meminfo);
+        let memory = read_proc_cgroup(&proc.path, &cgroup.path).memory.unwrap();
+        let used = if with_stat { 89_999_000 } else { 90_000_000 };
+        assert_eq!(memory.program_bytes, used);
+        memory.limit
+    }
+
+    #[test]
+    fn v1_limit_at_or_above_host_memory_is_no_limit() {
+        // Bunny reports a 32 GiB v1 limit on a host with 32 GiB of memory.
+        let host_32_gib = "MemTotal:       33554432 kB\nMemFree: 1 kB\n";
+        // A real 32 GiB host reports slightly less than 32 GiB as MemTotal.
+        let host_just_under = "MemFree: 1 kB\nMemTotal: 32803456 kB\n";
+        for with_stat in [true, false] {
+            for (limit, meminfo) in [
+                ("34359738368\n", host_32_gib),
+                ("34359738368\n", host_just_under),
+                ("68719476736\n", host_32_gib),
+                (V1_SENTINEL, host_32_gib),
+            ] {
+                assert_eq!(
+                    v1_limit_on_host(limit, Some(meminfo), with_stat),
+                    MemoryLimit::Unlimited,
+                    "limit {limit:?} on {meminfo:?}, memory.stat present: {with_stat}"
+                );
+            }
+            // A cap below the host's memory is still a real limit.
+            for (limit, bytes) in [
+                ("536870912\n", 512 << 20),
+                ("34359734272\n", 32 * GIB - 4096),
+            ] {
+                assert_eq!(
+                    v1_limit_on_host(limit, Some(host_32_gib), with_stat),
+                    MemoryLimit::Bytes(bytes),
+                    "limit {limit:?}, memory.stat present: {with_stat}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mount_root_fallback_applies_the_host_memory() {
+        // Without /proc/self/cgroup the reader uses the mount root directly.
+        let cgroup = temp_tree();
+        write_files(
+            &cgroup.path,
+            &[
+                ("memory.usage_in_bytes", "10\n"),
+                ("memory.limit_in_bytes", "34359738368\n"),
+            ],
+        );
+        let proc = temp_tree();
+        write_files(&proc.path, &[("meminfo", "MemTotal: 33554432 kB\n")]);
+        let memory = read_proc_cgroup(&proc.path, &cgroup.path).memory.unwrap();
+        assert_eq!(memory.limit, MemoryLimit::Unlimited);
+    }
+
+    #[test]
+    fn unknown_host_memory_keeps_v1_limits_and_the_sentinel() {
+        for meminfo in [
+            None,
+            Some("MemFree: 1 kB\n"),
+            Some("MemTotal: 1\n"),
+            Some("MemTotal: 33554432 MB\n"),
+            Some("MemTotal: 18446744073709551615 kB\n"),
+        ] {
+            assert_eq!(
+                v1_limit_on_host("34359738368\n", meminfo, true),
+                MemoryLimit::Bytes(32 * GIB),
+                "{meminfo:?}"
+            );
+            assert_eq!(
+                v1_limit_on_host("536870912\n", meminfo, false),
+                MemoryLimit::Bytes(512 << 20),
+                "{meminfo:?}"
+            );
+            assert_eq!(
+                v1_limit_on_host(V1_SENTINEL, meminfo, true),
+                MemoryLimit::Unlimited,
+                "{meminfo:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_limits_ignore_host_memory() {
+        let host = "MemTotal: 33554432 kB\n";
+        for (max, want) in [
+            ("max\n", MemoryLimit::Unlimited),
+            ("536870912\n", MemoryLimit::Bytes(512 << 20)),
+        ] {
+            let cgroup = temp_tree();
+            write_files(
+                &cgroup.path,
+                &[
+                    ("memory.current", "10\n"),
+                    ("memory.stat", "inactive_file 1\n"),
+                    ("memory.max", max),
+                ],
+            );
+            let proc = proc_fixture(&cgroup.path);
+            write_files(&proc.path, &[("meminfo", host)]);
+            let memory = read_proc_cgroup(&proc.path, &cgroup.path).memory.unwrap();
+            assert_eq!((memory.program_bytes, memory.limit), (9, want), "{max:?}");
         }
     }
 
@@ -1914,7 +2094,7 @@ mod tests {
             &proc.path,
             &[("self/cgroup", "0::/\n"), ("self/mountinfo", &info)],
         );
-        let memory = read_mounted_cgroup("0::/\n", &info).memory;
+        let memory = read_mounted_cgroup("0::/\n", &info, None).memory;
         assert!(memory.is_some());
         assert_eq!(memory, read_cgroup(Some(&used.path), None).memory);
         let layout = memory_layout(&proc.path, &unreadable.path);
@@ -1923,7 +2103,7 @@ mod tests {
 
         // When no candidate yields memory, the first candidate is reported.
         std::fs::remove_file(used.path.join("memory.current")).unwrap();
-        assert_eq!(read_mounted_cgroup("0::/\n", &info).memory, None);
+        assert_eq!(read_mounted_cgroup("0::/\n", &info, None).memory, None);
         let layout = memory_layout(&proc.path, &unreadable.path);
         assert_eq!(layout.dir, unreadable.path.display().to_string());
     }
