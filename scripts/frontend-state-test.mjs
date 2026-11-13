@@ -296,7 +296,7 @@ test('dashboard merges every previous stat into one compact grid under a one-lin
   assert.equal(header.querySelector('h2').textContent, 'Dashboard');
   assert.equal(Boolean(header.querySelector('p')), false, 'the header carries no paragraph copy');
   assert.match(header.querySelector('.page-header-detail').textContent, /First/);
-  assert.deepEqual(Array.from(header.querySelectorAll('button')).map((b) => b.textContent), ['Review protection →', 'View audit log']);
+  assert.deepEqual(Array.from(header.querySelectorAll('button')).map((b) => b.textContent), ['Review protection', 'View audit log']);
   for (const button of header.querySelectorAll('button')) assert.match(button.className, /\bbtn-sm\b/);
 });
 
@@ -6453,7 +6453,7 @@ test('access-role fields stay locked until a delayed save acknowledgement settle
 
 // #588: one shared SVG icon set, one fixed color per meaning, on every row/record action
 // and navigation item. The colors themselves are contrast-tested in frontend-contrast-test.mjs.
-const iconSet = vm.runInContext(`${iconsSource}\n({ ICON_PATHS, ICON_INTENTS, ACTION_ICONS, NAV_ICONS })`, vm.createContext({ React }));
+const iconSet = vm.runInContext(`${iconsSource}\n({ ICON_PATHS, ICON_INTENTS, ACTION_ICONS, NAV_ICONS, DASHBOARD_ICONS })`, vm.createContext({ React }));
 const iconAction = (root, label) => findNode(root, n => n.localName === 'button' && n.getAttribute('aria-label') === label);
 function assertIconAction(button, action, label) {
   assert.ok(button, `missing ${label} action`);
@@ -6729,9 +6729,11 @@ test('every sidebar item shows its colored SVG icon beside its unchanged label',
 });
 
 test('the Web UI draws SVG icons, never emoji or glyph icons', () => {
-  // Emoji, pictographs, and the arrow, technical, geometric, symbol and dingbat blocks the old
-  // glyph icons came from. The dashboard's text arrow (U+2192) is part of #590's dashboard rework.
-  const glyph = /[\p{Extended_Pictographic}\p{Emoji_Presentation}←↑↓-⇿∀-⋿⌀-⏿■-◿☀-➿⬀-⯿\u{1F100}-\u{1F1FF}]/u;
+  // Emoji, pictographs, and the whole arrow, technical, geometric, symbol and dingbat blocks the
+  // old glyph icons came from. No arrow is exempt: the Dashboard's text arrows became SVGs (#608).
+  const glyph = /[\p{Extended_Pictographic}\p{Emoji_Presentation}←-⇿∀-⋿⌀-⏿■-◿☀-➿⬀-⯿\u{1F100}-\u{1F1FF}]/u;
+  for (const arrow of ['\u2190', '\u2192', '\u2197', '\u21BB', 'h("span", { "aria-hidden": "true" }, "\u2192")', '"Review protection \u2192"'])
+    assert.ok(glyph.test(arrow), `the scan flags ${JSON.stringify(arrow)}`);
   const read = file => fs.readFileSync(new URL(`../frontend/${file}`, import.meta.url), 'utf8');
   // Sample data shown as-is (a pasteable spam example and a bypass-test placeholder) is not UI chrome.
   const samples = [/^const STOCKS_SPAM_EXAMPLE = .*$/m, /"sample text to test, e\.g\. [^"]*"/];
@@ -6744,6 +6746,139 @@ test('the Web UI draws SVG icons, never emoji or glyph icons', () => {
     const lines = text.split('\n').map((line, index) => [index + 1, line]).filter(([, line]) => glyph.test(line));
     assert.deepEqual(lines, [], `${file} uses emoji or glyph icons`);
   }
+});
+
+// #608: every Dashboard Overview tile and Getting started link shows one decorative icon from the
+// shared map, in the color of the page or action it summarizes, with its label unchanged.
+// [label, DASHBOARD_ICONS key, icon, color, sidebar item with the same meaning]
+const DASHBOARD_TILES = [
+  ['Rules enabled', 'rules-enabled', 'shield', 'success', 'rules'],
+  ['Rules in dry-run', 'rules-dry-run', 'eye', 'info', null],
+  ['Commands enabled', 'commands-enabled', 'terminal', 'info', 'commands'],
+  ['Log channels', 'log-channels', 'hash', 'neutral', 'logchannels'],
+  ['Moderation records', 'moderation-records', 'list', 'neutral', 'events'],
+  ['Warns', 'warns', 'alert-triangle', 'warning', null],
+  ['Bans', 'bans', 'hammer', 'danger', 'bans'],
+  ['Cases', 'cases', 'briefcase', 'warning', 'cases'],
+  ['Prefix', 'prefix', 'sliders', 'neutral', 'settings'],
+  ['Bot name', 'bot-name', 'bot', 'info', 'actions'],
+  ['Badword patterns', 'badword-patterns', 'message-x', 'warning', 'badwords'],
+  ['Routine chat collection', 'routine-chat-collection', 'database', 'neutral', 'usage'],
+];
+const SETUP_LINKS = [
+  ['01', 'Tune automod', 'Review rules and test them in dry-run.', 'rules', 'shield', 'success'],
+  ['02', 'Configure commands', 'Choose commands and moderator permissions.', 'commands', 'terminal', 'info'],
+  ['03', 'Route your logs', 'Connect event reports to Discord channels.', 'logchannels', 'hash', 'neutral'],
+];
+function assertDecorativeIcon(icon, name, intent, where) {
+  assert.ok(icon, `${where} has an icon`);
+  assert.equal(icon.localName, 'svg', `${where} draws an SVG`);
+  assert.equal(icon.getAttribute('aria-hidden'), 'true', `${where} icon is decorative`);
+  assert.equal(icon.getAttribute('focusable'), 'false', `${where} icon is not focusable`);
+  assert.equal(icon.getAttribute('data-icon'), name, `${where} icon`);
+  assert.ok(iconSet.ICON_PATHS[name]?.length, `${where} draws a shared icon`);
+  assert.ok(icon.classList.contains('icon') && icon.classList.contains(`icon-${intent}`), `${where} is drawn in its ${intent} color`);
+}
+// Returns the setup links shown; asserts every tile and link icon on a rendered dashboard.
+function assertDashboardIcons(dashboard, name) {
+  const tiles = [...dashboard.querySelectorAll('.dashboard-stats > .stat')];
+  assert.equal(tiles.length, DASHBOARD_TILES.length, `${name}: every tile renders`);
+  for (const [index, tile] of tiles.entries()) {
+    const [label, , icon, intent] = DASHBOARD_TILES[index];
+    const title = tile.querySelector('.stat-title');
+    assert.ok(title.textContent.startsWith(label), `${name}: tile ${index + 1} keeps its label ${label}`);
+    const svgs = tile.querySelectorAll('svg');
+    assert.equal(svgs.length, 1, `${name}: ${label} has one icon`);
+    assert.equal(title.firstElementChild, svgs[0], `${name}: ${label} icon leads its label`);
+    assertDecorativeIcon(svgs[0], icon, intent, `${name}: ${label}`);
+    // Tiles have no setup link: the only control in any tile is the counts explainer.
+    assert.deepEqual([...tile.querySelectorAll('a, button')].map(control => control.getAttribute('aria-label')),
+      label === 'Moderation records' ? ['About these counts'] : [], `${name}: ${label} controls`);
+    if (label !== 'Moderation records') assert.equal(title.textContent, label, `${name}: ${label} adds no glyph`);
+  }
+  const links = [...dashboard.querySelectorAll('.setup-link')];
+  for (const [index, link] of links.entries()) {
+    const [number, title, description, , icon, intent] = SETUP_LINKS[index];
+    assert.equal(link.textContent, `${number}${title}${description}`, `${name}: setup link ${number} keeps its label, no arrow`);
+    const svgs = link.querySelectorAll('svg');
+    assert.equal(svgs.length, 1, `${name}: setup link ${number} has one icon`);
+    assert.equal(link.lastElementChild, svgs[0], `${name}: setup link ${number} icon sits where the arrow was`);
+    assertDecorativeIcon(svgs[0], icon, intent, `${name}: setup link ${number}`);
+  }
+  assert.doesNotMatch(textOf(dashboard), /→/, `${name}: no text arrow on the Dashboard`);
+  return links.length;
+}
+
+test('every Dashboard tile and setup link shows a colored SVG icon from the shared map', async () => {
+  // The map itself: each tile reuses the icon and color of the sidebar page or action it counts.
+  assert.deepEqual(Object.keys(iconSet.DASHBOARD_ICONS).length, DASHBOARD_TILES.length);
+  for (const [label, key, icon, intent, tab] of DASHBOARD_TILES) {
+    assert.deepEqual({ ...iconSet.DASHBOARD_ICONS[key] }, { icon, intent }, label);
+    if (tab) assert.deepEqual({ ...iconSet.DASHBOARD_ICONS[key] }, { ...iconSet.NAV_ICONS[tab] }, `${label} matches its ${tab} sidebar item`);
+  }
+  assert.deepEqual({ ...iconSet.DASHBOARD_ICONS.warns }, { ...iconSet.ACTION_ICONS.warn });
+  for (const [number, , , tab, icon, intent] of SETUP_LINKS) assert.deepEqual({ ...iconSet.NAV_ICONS[tab] }, { icon, intent }, number);
+
+  // Incomplete setup: Getting started with three links. Each link still opens its page.
+  const h = harness(async () => response({ events: 7, warns: 2, bans: 1, cases: 4 }));
+  h.app.state.config = { ...configuredDashboard(), rules: [] };
+  h.app.state.tab = 'dashboard';
+  h.app.renderTab();
+  await settle();
+  const content = h.nodes.get('#content');
+  assert.equal(assertDashboardIcons(content, 'incomplete setup'), SETUP_LINKS.length);
+  const header = content.querySelector('.page-header');
+  assert.deepEqual([...header.querySelectorAll('button')].map(button => button.textContent), ['Review protection', 'View audit log']);
+  assert.equal(header.querySelectorAll('svg').length, 0, 'page header actions stay text, like other page toolbars');
+  for (const [index, [, , , tab]] of SETUP_LINKS.entries()) {
+    const fresh = harness(async () => response({ events: 0, warns: 0, bans: 0, cases: 0 }));
+    fresh.app.state.config = { ...configuredDashboard(), rules: [] };
+    fresh.app.state.tab = 'dashboard';
+    fresh.app.renderTab();
+    await settle();
+    await fire(fresh.nodes.get('#content').querySelectorAll('.setup-link')[index], 'click', {});
+    assert.equal(fresh.app.state.tab, tab, `setup link ${index + 1} still opens ${tab}`);
+  }
+
+  // Complete setup: no Getting started card, so only tiles (no setup links) carry icons.
+  const done = harness(async () => response({ events: 7, warns: 2, bans: 1, cases: 4 }));
+  done.app.state.config = configuredDashboard();
+  const dashboard = done.app.tabDashboard();
+  await settle();
+  assert.equal(assertDashboardIcons(dashboard, 'complete setup'), 0);
+  assert.equal(dashboard.querySelectorAll('svg').length, DASHBOARD_TILES.length, 'one icon per tile and nothing else');
+
+  // Loading and unavailable counts keep the same tile icons.
+  for (const fetchImpl of [() => new Promise(() => {}), async () => { throw new Error('offline'); }]) {
+    const pending = harness(fetchImpl);
+    pending.app.state.config = configuredDashboard();
+    const view = pending.app.tabDashboard();
+    await settle();
+    assertDashboardIcons(view, 'stats loading or unavailable');
+  }
+});
+
+test('owner and non-owner Dashboards show the same tile and setup link icons', async () => {
+  const views = {
+    owner: ownerHarness(async () => response({ events: 1, warns: 0, bans: 0, cases: 0 })),
+    'non-owner': harness(async () => response({ events: 1, warns: 0, bans: 0, cases: 0 })),
+    'read-only role': harness(async () => response({ events: 1, warns: 0, bans: 0, cases: 0 })),
+  };
+  views['read-only role'].app.state.guilds[0].access = 'dashboard';
+  const icons = {};
+  for (const [name, h] of Object.entries(views)) {
+    h.app.state.config = { ...configuredDashboard(), commands: [] };
+    h.app.state.tab = 'dashboard';
+    h.app.renderTab();
+    await settle();
+    const content = h.nodes.get('#content');
+    assert.equal(assertDashboardIcons(content, name), SETUP_LINKS.length, `${name} sees every setup link`);
+    icons[name] = [...content.querySelectorAll('.dashboard-stats svg, .setup-link svg')].map(svg => `${svg.getAttribute('data-icon')}:${svg.getAttribute('class')}`);
+    const note = textOf(content.querySelector('.setup-note'));
+    assert.match(note, name === 'owner' ? /As bot owner, you can also edit Global defaults/ : /Global defaults can only be edited by the bot owner/, name);
+  }
+  assert.deepEqual(icons['non-owner'], icons.owner, 'no owner-only icon');
+  assert.deepEqual(icons['read-only role'], icons.owner);
 });
 
 test("the sidebar's own buttons show their colored SVG icons beside unchanged labels", async () => {

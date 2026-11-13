@@ -1,7 +1,7 @@
 import { createState, useStore } from "./state.js";
 import { Appearance, useAppearance } from "./appearance.js";
 import { TrendChart, TrendMetricPicker, TREND_METRICS, sumSeries, useTrendMetric } from "./charts.js";
-import { ACTION_ICONS, Icon, NAV_ICONS } from "./icons.js";
+import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import React, { useState, useEffect, useRef, createContext, useContext } from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -2023,7 +2023,7 @@ function tabDashboard() {
     pageHeader(
       "Dashboard",
       g?.name,
-      h(ActionButton, { className: "btn btn-sm btn-primary", onClick: () => navigate("rules") }, "Review protection →"),
+      h(ActionButton, { className: "btn btn-sm btn-primary", onClick: () => navigate("rules") }, "Review protection"),
       h(ActionButton, { className: "btn btn-sm btn-outline", onClick: () => navigate("events") }, "View audit log"),
     ),
     !setupComplete(cfg) &&
@@ -2047,7 +2047,8 @@ function tabDashboard() {
                 { className: "btn setup-link", onClick: () => navigate(tab) },
                 h("span", { className: "setup-number" }, number),
                 h("span", {}, h("strong", {}, title), h("span", {}, description)),
-                h("span", { "aria-hidden": "true" }, "→"),
+                // The sidebar icon of the page the step opens, where the decorative arrow was.
+                h(Icon, { name: NAV_ICONS[tab].icon, intent: NAV_ICONS[tab].intent }),
               ),
             ),
           ),
@@ -2069,31 +2070,34 @@ function tabDashboard() {
         "div",
         { className: "stats bg-base-100 w-full dashboard-stats" },
         // One row each for protection, moderation activity and server configuration.
-        stat("Rules enabled", `${rulesOn} / ${rules.length}`),
-        stat("Rules in dry-run", rulesDry),
-        stat("Commands enabled", `${commandsOn} / ${commands.length}`),
-        stat("Log channels", chans),
+        stat("Rules enabled", `${rulesOn} / ${rules.length}`, "rules-enabled"),
+        stat("Rules in dry-run", rulesDry, "rules-dry-run"),
+        stat("Commands enabled", `${commandsOn} / ${commands.length}`, "commands-enabled"),
+        stat("Log channels", chans, "log-channels"),
         stat(
           ["Moderation records", h(InfoTip, { id: "moderation-counts-help", label: "About these counts" }, MODERATION_COUNTS_HELP)],
           count("events"),
+          "moderation-records",
         ),
-        stat("Warns", count("warns")),
-        stat("Bans", count("bans")),
-        stat("Cases", count("cases")),
-        stat("Prefix", cfg.settings?.prefix),
-        stat("Bot name", cfg.settings?.bot_name || "default"),
-        stat("Badword patterns", (cfg.badwords ?? []).length),
-        stat("Routine chat collection", "Off"),
+        stat("Warns", count("warns"), "warns"),
+        stat("Bans", count("bans"), "bans"),
+        stat("Cases", count("cases"), "cases"),
+        stat("Prefix", cfg.settings?.prefix, "prefix"),
+        stat("Bot name", cfg.settings?.bot_name || "default", "bot-name"),
+        stat("Badword patterns", (cfg.badwords ?? []).length, "badword-patterns"),
+        stat("Routine chat collection", "Off", "routine-chat-collection"),
       ),
     ),
   );
 }
 
-function stat(label, value) {
+// Dashboard tiles pass a DASHBOARD_ICONS key; the decorative icon leads the label (#608).
+function stat(label, value, icon) {
+  const tile = icon && DASHBOARD_ICONS[icon];
   return h(
     "div",
     { className: "stat" },
-    h("div", { className: "stat-title" }, ...[label].flat()),
+    h("div", { className: "stat-title" }, tile && h(Icon, { name: tile.icon, intent: tile.intent }), ...[label].flat()),
     h("div", { className: "stat-value" }, value),
   );
 }

@@ -454,6 +454,30 @@ the highlighted current item. The sidebar's own buttons use the same set: **Admi
 (crown, blue), **View as…** (eye, blue), **Exit preview** (back arrow, gray) and **Sign out**
 (door with arrow, gray).
 
+Each Dashboard Overview tile shows a small icon before its label, in the icon and color of the
+page or action it counts, so a tile matches its sidebar item:
+
+| Dashboard tile | Icon | Color |
+|---|---|---|
+| Rules enabled | shield (as Automod Rules) | green |
+| Rules in dry-run | eye (watches without acting) | blue |
+| Commands enabled | terminal prompt (as Commands) | blue |
+| Log channels | # (as Log Channels) | gray |
+| Moderation records | list (as Audit Log) | gray |
+| Warns | triangle with an exclamation mark | amber |
+| Bans | hammer (as Bans) | red |
+| Cases | briefcase (as Cases) | amber |
+| Prefix | sliders (as Settings) | gray |
+| Bot name | robot | blue |
+| Badword patterns | speech bubble with x (as Badwords) | amber |
+| Routine chat collection | database | gray |
+
+The **Getting started** links show the sidebar icon of the page they open, where a text arrow
+used to be: **Tune automod** a green shield, **Configure commands** a blue terminal prompt and
+**Route your logs** a gray #. Tile and link labels are unchanged, the icons are hidden from
+screen readers, and they use the same 16px size as other inline icons. The header actions
+**Review protection** and **View audit log** stay text, like other page toolbars.
+
 Icon colors are their own `--icon-*` palette in `frontend/style.css`, separate from the theme's
 primary and accent colors. Light and Dark use a lighter or darker shade of the same color, and
 every shade keeps at least 3:1 contrast against the surfaces icons appear on.
