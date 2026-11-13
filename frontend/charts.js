@@ -306,13 +306,17 @@ export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
   const rows = metrics.map(([key, label, color], row) => {
     const values = points.map((p) => p[key] ?? 0);
     const max = Math.max(1, ...values);
+    const empty = values.every((value) => !(value > 0));
     const top = row * rowHeight + 4;
     const usable = rowHeight - 10;
     return h(
       "g",
       { key, className: `an-row ${color}` },
       h("text", { className: "an-axis-label", x: 0, y: top + usable / 2 + 4 }, label),
-      h("text", { className: "an-axis-value", x: labelWidth - 6, y: top + 9, textAnchor: "end" }, formatCount(max)),
+      // An empty row says so instead of drawing a scale for values it does not have.
+      empty
+        ? h("text", { className: "an-row-empty", x: labelWidth + 4, y: top + usable / 2 + 4 }, "None in this range")
+        : h("text", { className: "an-axis-value", x: labelWidth - 6, y: top + 9, textAnchor: "end" }, formatCount(max)),
       h("line", { className: "an-baseline", x1: labelWidth, x2: width - 8, y1: top + usable, y2: top + usable }),
       ...values.map((value, i) => {
         const barHeight = value > 0 ? Math.max(2, (value / max) * usable) : 0;
@@ -432,6 +436,9 @@ export function MembershipChart({ points }) {
           ),
         ),
       ),
+      points.every((p) => !(p.joins > 0) && !(p.leaves > 0))
+        ? h("text", { className: "an-row-empty", x: padLeft + innerWidth / 2, y: zero - 6, textAnchor: "middle" }, "No joins or leaves in this range")
+        : null,
       h("text", { className: "an-axis-net", x: width - padRight + 6, y: padTop + 8 }, `+${formatCount(netExtent)}`),
       h("text", { className: "an-axis-net", x: width - padRight + 6, y: zero + half }, formatDelta(-netExtent, 0).text),
       ...points.flatMap((p, i) => {
@@ -476,7 +483,8 @@ export function RankList({ rows, label, empty, color = "an-mod" }) {
         { key: row.key, className: "an-rank-row", title: `${row.title ?? row.label}: ${formatExact(row.count)}` },
         h("span", { className: "an-rank-label" }, row.label),
         h("span", { className: "an-rank-track", "aria-hidden": "true" }, h("span", { className: "an-rank-fill", style: { width: `${Math.max(2, (row.count / max) * 100).toFixed(1)}%` } })),
-        h("span", { className: "an-rank-count", "aria-label": formatExact(row.count) }, formatCount(row.count)),
+        // `text` replaces the count display (a share or signed change); `title` keeps the exact figures.
+        h("span", { className: "an-rank-count", "aria-label": row.text ?? formatExact(row.count) }, row.text ?? formatCount(row.count)),
       ),
     ),
   );

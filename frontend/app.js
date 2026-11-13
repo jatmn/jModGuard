@@ -10,12 +10,10 @@ import {
   RangeSelector,
   RankList,
   ShareBar,
-  TrendChart,
-  TrendMetricPicker,
+  formatCount,
   formatDelta,
   formatExact,
   sumSeries,
-  useTrendMetric,
 } from "./charts.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import React, { useState, useEffect, useRef, createContext, useContext } from "react";
@@ -934,24 +932,34 @@ function DatabaseUsage() {
   );
 }
 
-// Platform analytics: fleet-wide trends across every server. One owner-only
-// read per visit or Refresh.
-const PLATFORM_COLUMNS = [
-  ["warns", "Warnings"],
-  ["bans", "Bans"],
-  ["automod", "Spam hits"],
-  ["mod_actions", "Mod actions"],
-  ["timeouts", "Timeouts"],
-  ["joins", "Joins"],
-  ["leaves", "Leaves"],
+// Platform analytics (#618): the fleet-wide owner view. One owner-only read
+// per range or Refresh; every panel renders from that response.
+const PLATFORM_METRICS = [
+  ["warns", "Warnings", "an-warns"],
+  ["bans", "Bans", "an-bans"],
+  ["automod", "Spam hits", "an-spam"],
+  ["mod_actions", "Mod actions", "an-mod"],
+  ["timeouts", "Timeouts", "an-timeouts"],
+  ["joins", "Joins", "an-joins"],
+  ["leaves", "Leaves", "an-leaves"],
 ];
 
-function platformMemberTotal(members) {
-  if (!members || members.status === "unavailable") return "Unavailable";
-  if (members.guilds_unavailable) return `${members.current ?? 0}+`;
-  if (members.guilds_incomplete) return `${members.current ?? 0} (partial)`;
-  return String(members.current ?? 0);
-}
+const PLATFORM_HELP =
+  "Counts come from records the bot stored, bucketed by UTC day; days before recording started show zero. Changes compare with the previous period of the same length; joins and leaves have no 90-day comparison. Actions count automod enforcement and moderator commands once each. Share is a server's part of the fleet total.";
+
+const PLATFORM_COVERAGE = {
+  importing: { label: "importing", tone: "warn", title: "The initial member import is still running." },
+  uncertain: { label: "unverified", tone: "warn", title: "A coverage gap awaits Reconcile on the Members page." },
+  unavailable: { label: "unavailable", tone: "warn", title: "This server's member directory could not be read." },
+};
+
+const PLATFORM_SERVER_FILTERS = [
+  ["all", "All servers"],
+  ["active", "Active"],
+  ["departed", "Departed"],
+  ["activity", "With activity"],
+  ["directory", "Member directory incomplete"],
+];
 
 function platformMemberStatus(members) {
   if (!members || members.status === "unavailable") return "Member totals are unavailable.";
@@ -964,71 +972,309 @@ function platformMemberStatus(members) {
   return `Member totals are ${members.status || "complete"}.${unavailable}${incomplete}`;
 }
 
+// Enforcement actions counted once each: automod enforcement (including
+// dedicated spam bans) plus moderator commands, as in the activity heat map.
+function platformActions(totals) {
+  return (totals?.automod ?? 0) + (totals?.mod_actions ?? 0);
+}
+
+function platformServerLabel(row) {
+  return row.name || `Server ${row.guild_id}`;
+}
+
+// One server row with its display facts, enforcement actions and directory state.
+function platformRows(snapshot) {
+  const byGuild = snapshot?.members?.by_guild ?? {};
+  return (snapshot?.guilds ?? []).map((guild) => {
+    // An active server missing from the directory totals could not be read.
+    const directory = guild.active ? byGuild[guild.guild_id] : null;
+    return {
+      ...guild,
+      actions: platformActions(guild),
+      previousActions: platformActions(guild.previous),
+      members: directory ? directory.current : null,
+      coverage: !guild.active ? null : !directory ? "unavailable" : directory.coverage === "complete" ? null : directory.coverage,
+    };
+  });
+}
+
+function sharePercentText(value, total) {
+  if (!total) return "0%";
+  const percent = (value * 100) / total;
+  return percent >= 10 || percent === 0 ? `${Math.round(percent)}%` : `${percent.toFixed(1).replace(/\.0$/, "")}%`;
+}
+
+function platformRankRows(rows, value, text) {
+  return rows.map((row) => ({
+    key: row.guild_id,
+    label: platformServerLabel(row),
+    title: `${platformServerLabel(row)} (${row.guild_id})`,
+    count: value(row),
+    text: text?.(row),
+  }));
+}
+
+// Most and least active current servers, the largest changes against the
+// previous window, and which servers drive a metric's fleet total.
+function platformRankings(rows, totals) {
+  const byName = (a, b) => platformServerLabel(a).localeCompare(platformServerLabel(b)) || a.guild_id.localeCompare(b.guild_id);
+  const active = rows.filter((row) => row.active);
+  const most = active.filter((row) => row.actions > 0).sort((a, b) => b.actions - a.actions || byName(a, b)).slice(0, 5);
+  const least = [...active].sort((a, b) => a.actions - b.actions || byName(a, b)).slice(0, 5);
+  const change = (row) => row.actions - row.previousActions;
+  const movers = rows.filter((row) => change(row) !== 0).sort((a, b) => Math.abs(change(b)) - Math.abs(change(a)) || byName(a, b)).slice(0, 5);
+  const share = (field) =>
+    platformRankRows(
+      rows.filter((row) => row[field] > 0).sort((a, b) => b[field] - a[field] || byName(a, b)).slice(0, 5),
+      (row) => row[field],
+      (row) => sharePercentText(row[field], totals[field]),
+    );
+  return {
+    most: platformRankRows(most, (row) => row.actions),
+    least: platformRankRows(least, (row) => row.actions),
+    movers: platformRankRows(movers, (row) => Math.abs(change(row)), (row) => formatDelta(row.actions, row.previousActions).text),
+    share,
+  };
+}
+
+const PLATFORM_SORTS = {
+  name: (row) => platformServerLabel(row).toLowerCase(),
+  members: (row) => row.members ?? -1,
+  actions: (row) => row.actions,
+  ...Object.fromEntries(PLATFORM_METRICS.map(([field]) => [field, (row) => row[field] ?? 0])),
+};
+
+function PlatformServerTable({ rows, totals, rangeLabel }) {
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState("all");
+  const [sort, setSort] = useState({ key: "actions", direction: "descending" });
+  const needle = query.trim().toLowerCase();
+  const shown = rows
+    .filter((row) => !needle || platformServerLabel(row).toLowerCase().includes(needle) || row.guild_id.includes(needle))
+    .filter((row) => ({
+      all: true,
+      active: row.active,
+      departed: !row.active,
+      activity: row.actions > 0 || PLATFORM_METRICS.some(([field]) => row[field] > 0),
+      directory: Boolean(row.coverage),
+    })[filter])
+    .sort((a, b) => {
+      const key = PLATFORM_SORTS[sort.key];
+      const [x, y] = [key(a), key(b)];
+      const order = x < y ? -1 : x > y ? 1 : 0;
+      return (sort.direction === "ascending" ? order : -order) || a.guild_id.localeCompare(b.guild_id);
+    });
+  const header = (key, label) =>
+    h(
+      "th",
+      { key, scope: "col", "aria-sort": sort.key === key ? sort.direction : "none" },
+      h(
+        "button",
+        {
+          type: "button",
+          className: "pa-sort",
+          onClick: () =>
+            setSort((current) => ({
+              key,
+              direction: current.key === key ? (current.direction === "descending" ? "ascending" : "descending") : key === "name" ? "ascending" : "descending",
+            })),
+        },
+        label,
+        sort.key === key
+          ? h(Icon, { name: sort.direction === "descending" ? "chevron-down" : "chevron-up", intent: "neutral", className: "pa-sort-mark" })
+          : h("span", { className: "pa-sort-mark", "aria-hidden": "true" }),
+      ),
+    );
+  const metricCell = (row, field, color) => {
+    const value = row[field] ?? 0;
+    const share = totals[field] ? (value * 100) / totals[field] : 0;
+    return h(
+      "td",
+      { key: field, className: "pa-metric", title: `${formatExact(value)} · ${sharePercentText(value, totals[field])} of fleet` },
+      h("span", { className: "pa-num" }, formatCount(value)),
+      h("span", { className: `pa-share ${color}`, "aria-hidden": "true" }, value > 0 ? h("span", { className: "pa-share-fill", style: { width: `${Math.max(3, share).toFixed(1)}%` } }) : null),
+    );
+  };
+  return h(
+    "div",
+    { className: "pa-servers" },
+    h(
+      "div",
+      { className: "pa-controls" },
+      h("input", {
+        type: "search",
+        className: "input input-sm",
+        placeholder: "Filter by name or ID",
+        "aria-label": "Filter servers",
+        value: query,
+        onChange: (event) => setQuery(event.target.value),
+      }),
+      h(
+        "select",
+        { className: "select select-sm", "aria-label": "Server status", value: filter, onChange: (event) => setFilter(event.target.value) },
+        ...PLATFORM_SERVER_FILTERS.map(([value, label]) => h("option", { key: value, value }, label)),
+      ),
+      h("span", { className: "pa-count muted", role: "status" }, `${shown.length} of ${rows.length} servers`),
+    ),
+    h(
+      "div",
+      { className: "table-scroll rounded-box", tabIndex: 0, role: "region", "aria-label": "Servers" },
+      h(
+        "table",
+        { className: "table table-sm pa-table" },
+        h(
+          "thead",
+          null,
+          h("tr", null, header("name", "Server"), header("members", "Members"), header("actions", "Actions"), ...PLATFORM_METRICS.map(([field, label]) => header(field, label))),
+        ),
+        h(
+          "tbody",
+          null,
+          shown.length
+            ? shown.map((row) => {
+                const delta = formatDelta(row.actions, row.previousActions);
+                const coverage = PLATFORM_COVERAGE[row.coverage];
+                return h(
+                  "tr",
+                  { key: row.guild_id },
+                  h(
+                    "th",
+                    { scope: "row", title: `${platformServerLabel(row)} (${row.guild_id})` },
+                    h(
+                      "div",
+                      { className: "pa-server" },
+                      h(ServerIcon, { guild: { id: row.guild_id, icon: row.icon_hash, name: row.name } }),
+                      h(
+                        "span",
+                        { className: "pa-server-text" },
+                        h("span", { className: "pa-server-name" }, row.name || "Unknown server"),
+                        h("span", { className: "pa-server-id mono" }, row.guild_id),
+                      ),
+                      !row.active && h("span", { className: "badge badge-soft badge-sm badge-neutral" }, "Departed"),
+                    ),
+                  ),
+                  h(
+                    "td",
+                    { className: "pa-metric" },
+                    h("span", { className: "pa-num", title: row.members == null ? undefined : formatExact(row.members) }, row.active ? (row.members == null ? "—" : formatCount(row.members)) : "—"),
+                    coverage && h("span", { className: `an-badge an-badge-${coverage.tone}`, title: coverage.title }, coverage.label),
+                  ),
+                  h(
+                    "td",
+                    { className: "pa-metric", title: `${formatExact(row.actions)} actions, ${delta.exact} vs previous ${rangeLabel}` },
+                    h("span", { className: "pa-num" }, formatCount(row.actions)),
+                    h("span", { className: `an-delta an-delta-${delta.direction}` }, delta.text),
+                  ),
+                  ...PLATFORM_METRICS.map(([field, , color]) => metricCell(row, field, color)),
+                );
+              })
+            : h("tr", null, h("td", { colSpan: 3 + PLATFORM_METRICS.length, className: "muted" }, rows.length ? "No servers match this filter." : "No servers yet.")),
+        ),
+      ),
+    ),
+  );
+}
+
 function TabPlatformAnalytics() {
   return isBotOwner() ? h(PlatformAnalytics) : ownerAccessRequired();
 }
 
 function PlatformAnalytics() {
-  const result = useApiRead("/api/platform/analytics", { retainData: true });
-  const [metric, setMetric] = useTrendMetric("warns");
+  const [days, setDays] = useState(30);
+  const result = useApiRead(`/api/platform/analytics?days=${days}`, { retainData: true });
   const snapshot = result.data;
+  const loading = !snapshot && result.loading;
+  const failed = !snapshot && Boolean(result.error);
+  const rangeLabel = `${days} days`;
   const points = toTrendPoints(snapshot?.series);
-  const shown = (value) => (snapshot ? value : result.loading ? "Loading…" : "Unavailable");
+  const previous = snapshot?.previous ?? null;
   const members = snapshot?.members;
-  const guilds = snapshot?.guilds ?? [];
+  const rows = platformRows(snapshot);
+  const totals = Object.fromEntries(PLATFORM_METRICS.map(([field]) => [field, sumSeries(points, field === "mod_actions" ? "modActions" : field)]));
+  const rankings = platformRankings(rows, totals);
+  const tile = (label, field, color) =>
+    h(KpiTile, {
+      key: label,
+      label,
+      value: totals[field],
+      delta: snapshot ? formatDelta(totals[field], previous?.[field]) : null,
+      values: snapshot ? points.map((point) => point[field === "mod_actions" ? "modActions" : field] ?? 0) : null,
+      color,
+      loading,
+      unavailable: failed,
+      rangeLabel,
+    });
+  const membersUnavailable = failed || (snapshot && (!members || members.status === "unavailable"));
+  const memberBadge = members?.status === "partial" ? { label: "partial", tone: "warn", title: platformMemberStatus(members) } : null;
+  const netPrevious = previous?.joins == null || previous?.leaves == null ? null : previous.joins - previous.leaves;
+  const body = (render) =>
+    snapshot ? render() : h("p", { className: "an-empty muted", "aria-busy": loading ? "true" : "false" }, failed ? "Unavailable" : "Loading…");
+  const rank = (title, id, props) => analyticsPanel(title, id, body(() => h(RankList, props)), "an-span-4");
+  const note = result.error
+    ? h("p", { id: "platform-analytics-status", className: "alert alert-soft alert-warning", role: "status" }, snapshot
+        ? `Platform analytics refresh failed: ${result.error.message}. Showing the last successful response (stale). ${members?.status === "complete" ? "" : platformMemberStatus(members)}`.trim()
+        : `Platform analytics unavailable: ${result.error.message}`)
+    : snapshot && members?.status !== "complete" && h("p", { id: "platform-analytics-status", className: "an-note muted", role: "status" }, platformMemberStatus(members));
   return h(
     "div",
-    { className: "contents" },
+    { className: "contents analytics-page platform-page" },
     pageHeader(
       "Platform analytics",
-      `All servers · last ${snapshot?.window_days ?? 30} days (UTC)`,
+      `All servers · last ${rangeLabel} (UTC)`,
+      h(RangeSelector, { value: days, onChange: setDays }),
       h(ActionButton, { id: "refresh-platform-analytics", className: "btn btn-sm", onClick: () => result.refresh() }, "Refresh"),
+      h(InfoTip, { id: "platform-analytics-help", label: "About these figures" }, PLATFORM_HELP),
     ),
-    result.error
-      ? h("p", { id: "platform-analytics-status", className: "alert alert-soft alert-warning", role: "status" }, snapshot
-          ? `Platform analytics refresh failed: ${result.error.message}. Showing the last successful response (stale). ${platformMemberStatus(members)}`
-          : `Platform analytics unavailable: ${result.error.message}`)
-      : snapshot && h("p", { id: "platform-analytics-status", className: "muted", role: "status" }, platformMemberStatus(members)),
+    note,
     h(
-      "section",
-      { id: "platform-analytics", className: "card bg-base-100 card-border" },
+      "div",
+      { id: "platform-analytics", className: "contents" },
+      h(
+        "section",
+        { className: "an-kpis", "aria-label": `Fleet totals for the last ${rangeLabel}` },
+        h(KpiTile, { label: "Servers", value: snapshot?.servers ?? 0, loading, unavailable: failed, rangeLabel }),
+        h(KpiTile, { label: "Members", value: members?.current ?? 0, loading, unavailable: membersUnavailable, badge: memberBadge, rangeLabel }),
+        h(KpiTile, {
+          label: "Net growth",
+          value: totals.joins - totals.leaves,
+          delta: snapshot ? formatDelta(totals.joins - totals.leaves, netPrevious) : null,
+          values: snapshot ? runningNetShape(points) : null,
+          color: "an-joins",
+          loading,
+          unavailable: failed,
+          rangeLabel,
+        }),
+        tile("Joins", "joins", "an-joins"),
+        tile("Leaves", "leaves", "an-leaves"),
+        ...PLATFORM_METRICS.slice(0, 5).map(([field, label, color]) => tile(label, field, color)),
+      ),
       h(
         "div",
-        { className: "card-body" },
-        h(
-          "div",
-          { className: "stats bg-base-100 w-full platform-stats" },
-          stat("Servers", shown(String(snapshot?.servers ?? 0))),
-          stat("Members now", shown(platformMemberTotal(members))),
-          stat("Known members", shown(members?.known != null ? String(members.known) : "Unavailable")),
-          ...PLATFORM_COLUMNS.map(([field, label]) => stat(label, shown(String(sumSeries(points, field === "mod_actions" ? "modActions" : field))))),
+        { className: "an-grid" },
+        analyticsPanel(
+          "Enforcement per day",
+          "pa-enforcement",
+          body(() => (points.length ? h(EnforcementChart, { points }) : h("p", { className: "an-empty muted" }, "No platform trend data recorded yet."))),
+          "an-span-7",
         ),
-        h(TrendMetricPicker, { metric, onChange: setMetric }),
-        points.length
-          ? h(TrendChart, { points, metric, title: "Platform activity" })
-          : h("p", { className: "muted" }, snapshot ? "No platform trend data recorded yet." : result.loading ? "Loading analytics…" : "Platform analytics unavailable."),
-        guilds.length > 0 &&
-          h(
-            "div",
-            { className: "table-scroll rounded-box", tabIndex: 0 },
-            h(
-              "table",
-              { className: "table table-zebra table-sm" },
-              h("thead", null, h("tr", null, h("th", { scope: "col" }, "Server"), ...PLATFORM_COLUMNS.map(([, label]) => h("th", { key: label, scope: "col" }, label)))),
-              h(
-                "tbody",
-                null,
-                guilds.map((guild) =>
-                  h("tr", { key: guild.guild_id }, h("td", null, guild.guild_id), ...PLATFORM_COLUMNS.map(([field]) => h("td", { key: field }, String(guild[field] ?? 0)))),
-                ),
-              ),
-            ),
-          ),
-        h(
-          "p",
-          { className: "muted" },
-          "Fleet-wide moderation and membership trends. Member totals come from each server's member directory; servers whose store is unavailable are reported as unknown instead of failing the view. Per-server rows show guild IDs with recorded activity in the window, including servers that have since left until their data is erased; Servers counts current memberships. Days before the bot started recording — or while it was offline — show zero, not missing history. Members now is the current member directory across counted servers; known members includes departed members retained by ban history.",
+        analyticsPanel(
+          "Fleet membership per day",
+          "pa-membership",
+          body(() => (points.length ? h(MembershipChart, { points }) : h("p", { className: "an-empty muted" }, "No platform trend data recorded yet."))),
+          "an-span-5",
         ),
+        rank("Most active servers", "pa-most", { label: "Most active servers by actions", empty: "No actions in this range.", rows: rankings.most }),
+        rank("Least active servers", "pa-least", { label: "Least active servers by actions", empty: "No active servers.", color: "an-timeouts", rows: rankings.least }),
+        rank("Biggest movers", "pa-movers", {
+          label: `Largest change in actions vs previous ${rangeLabel}`,
+          empty: `No change from the previous ${rangeLabel}.`,
+          color: "an-joins",
+          rows: rankings.movers,
+        }),
+        rank("Share of bans", "pa-share-bans", { label: "Share of fleet bans by server", empty: "No bans in this range.", color: "an-bans", rows: rankings.share("bans") }),
+        rank("Share of spam hits", "pa-share-spam", { label: "Share of fleet spam hits by server", empty: "No spam hits in this range.", color: "an-spam", rows: rankings.share("automod") }),
+        rank("Share of mod actions", "pa-share-mod", { label: "Share of fleet mod actions by server", empty: "No mod actions in this range.", rows: rankings.share("mod_actions") }),
+        analyticsPanel("Servers", "pa-servers", body(() => h(PlatformServerTable, { rows, totals, rangeLabel })), "an-span-12"),
       ),
     ),
   );
