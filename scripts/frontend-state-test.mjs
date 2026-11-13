@@ -952,7 +952,8 @@ test('Members uses saved identity, keeps large IDs exact and labels partial impo
   await settle();
   assert.match(textOf(panel), /Test Member 1/);
   assert.match(textOf(panel), /9007199254740993/);
-  assert.match(textOf(panel), /Results are partial/);
+  assert.match(textOf(panel), /Member list: partial/);
+  assert.match(panel.querySelector('#member-coverage-notice .badge').title, /^Results stay partial/);
   assert.match(textOf(panel), /Unknown/);
   assert.equal(calls.length, 2);
   assert(calls.every(call => call.opts.method === 'POST' && call.opts.headers['x-jmodguard-enrollment'] === 'member-enrollment'));
@@ -1575,7 +1576,8 @@ test('Members keeps a running import compact but visible outside Details', async
   assert.equal(bar.getAttribute('value'), '42');
   assert.match(textOf(card).replace(textOf(details), ''), /Elapsed: 10 minutes · Remaining: Unknown/);
   assert.equal(details.contains(findNode(card, n => n.localName === 'button' && textOf(n) === 'Pause')), false);
-  assert.match(textOf(memberCoverage(panel)), /^Member list: partial\. Results are partial/);
+  assert.equal(textOf(memberCoverage(panel)), 'Member list: partial');
+  assert.match(memberCoverage(panel).querySelector('.badge').title, /^Results stay partial until the import finishes/);
   assert.match(textOf(details), /4,200 records saved in this run · approximately 10,000 members estimated/);
   details.open = true;
   await runMemberPoll(h);
@@ -2078,7 +2080,7 @@ test('queued log-channel saves clear dirty state and survive in-app navigation',
   };
   h.app.state.tab = 'logchannels';
   h.nodes.get('#content').append(h.app.tabLogChannels());
-  const input = h.elements.find((node) => node.localName === 'input' && node.getAttribute("placeholder") === 'channel id');
+  const input = h.elements.find((node) => node.localName === 'input' && node.getAttribute("placeholder") === 'Channel ID, #mention or link');
   const set = h.elements.find((node) => node.localName === 'button' && node.textContent === 'Set');
   input.value = '222';
   h.app.markDirty();
@@ -2299,14 +2301,14 @@ test('terminal log receipt repaints while retaining an unrelated row draft', asy
   h.app.state.tab = 'logchannels';
   h.app.applyQueuedLogChannel(pending);
   h.app.renderTab();
-  const inputs = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).filter((node) => node.getAttribute("placeholder") === 'channel id');
+  const inputs = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).filter((node) => node.getAttribute("placeholder") === 'Channel ID, #mention or link');
   inputs[1].value = '555';
   await fire(inputs[1], 'input');
 
   await h.app.reconcileQueuedLogChannel(pending);
   await settle();
 
-  const renderedInputs = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).filter((node) => node.getAttribute("placeholder") === 'channel id');
+  const renderedInputs = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).filter((node) => node.getAttribute("placeholder") === 'Channel ID, #mention or link');
   assert.equal(renderedInputs[1].value, '555');
   assert.equal(h.app.isDirty(), true);
   assert.equal(findNode(h.nodes.get('#content'), (node) => node.localName === 'span' && node.textContent === 'queued'), null);
@@ -2354,7 +2356,7 @@ for (const asyncRoot of [false, true]) test(`terminal request-key replay restore
   appRef.state.tab = 'logchannels';
   appRef.renderTab();
   await settle();
-  const input = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).find((node) => node.getAttribute("placeholder") === 'channel id');
+  const input = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).find((node) => node.getAttribute("placeholder") === 'Channel ID, #mention or link');
   input.value = '222';
   appRef.markDirty();
   const set = findNode(h.nodes.get('#content'), (node) => node.localName === 'button' && node.textContent === 'Set');
@@ -3021,7 +3023,9 @@ test('actions refresh only on demand and cancellation includes membership', asyn
   assert.equal(calls.length,1);
   assert.equal(calls[0].opts.method,'POST');
   assert.equal(calls[0].opts.headers['x-jmodguard-enrollment'],'membership');
-  assert.match(textOf(h.elements.find(n=>n.localName==='p')),/Force-cancel a stuck log-channel request/);
+  const notes=h.elements.find(n=>n.localName==='details'&&n.classList.contains('good-to-know'));
+  assert.equal(notes.open,false);
+  assert.match(textOf(notes),/Force-cancel clears a stuck log-channel request/);
   const cancel=h.elements.find(n=>n.localName==='button'&&n.getAttribute('aria-label')==='Cancel');
   await fire(cancel, 'click', {});
   assert.equal(calls[1].opts.method,'DELETE');
@@ -6376,6 +6380,39 @@ test('Workspace pages keep explanatory text short and move details into collapse
     assert.match(content.textContent, intro, tab);
     assertShortHelp(content, tab);
   }
+});
+
+test('Community pages keep explanatory text short and move details into collapsed notes', async () => {
+  const config = {
+    enrollment_id: 'membership', settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '!' },
+    rules: [], commands: [], badwords: [], log_channels: [{ event: 'message_delete', effective: null, scope: 'guild' }],
+  };
+  const expected = {
+    logchannels: /Pick a channel in this server for each kind of event report/,
+    bans: /Bans the bot made or saw in Discord/,
+    actions: /The latest 50 requests sent to the bot/,
+    cases: /Moderation cases for this server/,
+    settings: /Members with a listed role can sign in and open this server only/,
+  };
+  for (const [tab, intro] of Object.entries(expected)) {
+    const h = harness(async (url) => response(/access-roles/.test(url) ? { roles: [], revision: 'r1', ttl_secs: 30 }
+      : /case-delete-roles/.test(url) ? { roles: [], revision: 'r1' } : /cases/.test(url) ? { cases: [] } : []));
+    h.app.state.config = config;
+    h.app.state.tab = tab;
+    h.app.renderTab();
+    await settle();
+    const content = h.nodes.get('#content');
+    assert.match(content.textContent, intro, tab);
+    assertShortHelp(content, tab);
+  }
+  // The Analytics tooltip is one short idea per line.
+  const h = harness(async () => response(analyticsSummary(30)));
+  h.app.state.config = ANALYTICS_CONFIG;
+  const panel = h.app.tabAnalytics();
+  await settle();
+  const lines = [...panel.querySelectorAll('#analytics-help .info-tip-line')].map((line) => line.textContent);
+  assert.ok(lines.length > 1, 'the tooltip is split into lines');
+  for (const line of lines) assert.ok(line.split(/\s+/).length <= 20, line);
 });
 
 test('Badwords shows what is handled automatically, an entry counter, the action in words and results only after a test', async () => {
