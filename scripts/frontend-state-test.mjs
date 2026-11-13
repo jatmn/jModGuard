@@ -97,7 +97,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     set(target, key, value) { if (key === 'location') { location.href = value; return true; } return Reflect.set(target, key, value); },
   });
   const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
-    React, useSyncExternalStore, useState, useEffect, useRef, createContext, useContext, createRoot,
+    React, useSyncExternalStore, useState, useEffect, useRef, createContext, useContext, createRoot, flushSync,
     Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea,
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
@@ -687,7 +687,8 @@ test('template variable help lists each variable with its meaning and an example
     assert.ok(row?.meaning && row.example, `{${name}} has a meaning and an example`);
   }
   const firstGroup = [...reference.querySelectorAll('.template-variable-group')][0];
-  for (const name of ['{user}', '{guild}', '{channel}', '{time}']) assert.match(textOf(firstGroup), new RegExp(name.replace(/[{}]/g, '\\$&')));
+  for (const name of ['{user}', '{guild}', '{channel}', '{time}']) assert.ok(textOf(firstGroup).includes(name), `first group lists ${name}`);
+  assert.match(textOf(reference), /A variable marked \? isn't always filled in; point at it to see what shows instead\./);
 });
 
 test('each template editor offers only its event variables, matching the shipped templates', () => {
@@ -706,19 +707,44 @@ test('each template editor offers only its event variables, matching the shipped
     for (const used of new Set(text.match(/\{[a-z_]+\}/g))) assert.ok(names.includes(used), `${event} offers ${used}`);
     for (const universal of ['{guild}', '{time}', '{emoji}']) assert.ok(names.includes(universal), `${event} offers ${universal}`);
     for (const chip of chips.filter(chip => chip.classList.contains('template-var-optional'))) {
-      assert.match(chip.title, /Might be empty: \S/, `${event} ${chip.textContent} says when it is empty`);
+      assert.match(chip.title, /Not always filled in: \S/, `${event} ${chip.textContent} says what shows instead`);
     }
   });
   const chipsFor = event => [...cards[shipped.findIndex(([name]) => name === event)].querySelectorAll('.template-var-chip')];
+  const chipFor = (event, name) => chipsFor(event).find(chip => chip.textContent.replace(/\?$/, '') === name);
   const join = chipsFor('member_join').map(chip => chip.textContent);
   assert.ok(join.includes('{account_age}'));
   for (const other of ['{message_url}', '{content}', '{actor}', '{thread}', '{role}']) assert.ok(!join.includes(other), `member_join does not offer ${other}`);
-  const actor = chipsFor('member_ban').find(chip => chip.textContent.startsWith('{actor}'));
-  assert.ok(actor.classList.contains('template-var-optional'));
-  assert.match(actor.title, /audit log/);
-  const content = chipsFor('message_delete').find(chip => chip.textContent.startsWith('{content}'));
-  assert.match(content.title, /bot saw the original message/);
-  assert.ok(!chipsFor('member_join').some(chip => chip.classList.contains('template-var-optional') && chip.textContent.startsWith('{account_age}')));
+  // Values the bot can leave empty, "unavailable" or as typed, per event (crates/bot producers).
+  const conditional = {
+    member_join: ['joined'], member_leave: ['joined', 'duration'],
+    member_ban: ['actor', 'actor_id', 'reason'], member_unban: ['actor', 'actor_id', 'reason'], member_kick: ['reason'],
+    message_edit: ['mention', 'before', 'after', 'attachments'], message_delete: ['mention', 'content', 'attachments'],
+    automod: ['channel', 'content'], timeout_add: ['actor'], timeout_remove: ['actor'], plan_executed: ['content'],
+    role_change: ['role_name'], thread_create: ['mention', 'channel'],
+    thread_update: ['channel', 'before', 'archived', 'locked', 'auto_archive', 'invitable'], thread_delete: ['channel', 'thread_name'],
+    automod_delete: ['mention', 'content', 'attachments'], member_rejoin: ['cases', 'notice'],
+  };
+  for (const [event] of shipped) {
+    const marked = chipsFor(event).filter(chip => chip.classList.contains('template-var-optional')).map(chip => chip.textContent.replace(/^\{(.*)\}\?$/, '$1'));
+    assert.deepEqual(marked.sort(), [...(conditional[event] || [])].sort(), `${event} marks exactly its conditional variables`);
+  }
+  // Ban/unban attribution comes from the audit log; timeouts and kicks never look it up.
+  assert.match(chipFor('member_ban', '{actor}').title, /“unavailable”.*audit log.*View Audit Log/);
+  assert.match(chipFor('member_unban', '{reason}').title, /“No reason provided”/);
+  for (const event of ['timeout_add', 'timeout_remove']) {
+    assert.match(chipFor(event, '{actor}').title, /bot command.*stays as typed/);
+    assert.doesNotMatch(chipFor(event, '{actor}').title, /audit/i);
+  }
+  assert.ok(!chipFor('member_kick', '{actor}').classList.contains('template-var-optional'));
+  assert.doesNotMatch(chipFor('member_kick', '{reason}').title, /audit/i);
+  // A shared name gets its own event's explanation.
+  assert.match(chipFor('message_delete', '{content}').title, /bot didn't see the original message/);
+  assert.match(chipFor('plan_executed', '{content}').title, /Empty when none of the command's steps sent a reply/);
+  assert.match(chipFor('thread_update', '{before}').title, /thread's name/);
+  assert.doesNotMatch(chipFor('thread_update', '{before}').title.split('Not always filled in: ')[1], /message/);
+  assert.match(chipFor('message_edit', '{after}').title, /“not supplied in this update”/);
+  assert.match(chipFor('member_rejoin', '{cases}').title, /Empty when/);
 });
 
 test('a variable chip inserts at the cursor as an unsaved edit that previews and saves', async () => {
@@ -729,16 +755,27 @@ test('a variable chip inserts at the cursor as an unsaved edit that previews and
   });
   h.app.state.config = { enrollment_id: 'e', templates: [{ event: 'member_join', effective: 'Hi {user}!' }] };
   h.app.navigate('templates');
-  const input = h.document.querySelector('.template-card textarea');
-  input.setSelectionRange(9, 9);
-  const chip = [...h.document.querySelectorAll('.template-var-chip')].find(node => node.textContent === '{account_age}');
-  assert.ok(chip, 'member_join offers {account_age}');
-  await fire(chip, 'click');
-  assert.equal(h.document.querySelector('.template-card textarea').value, 'Hi {user}{account_age}!');
+  const input = () => h.document.querySelector('.template-card textarea');
+  const chip = name => [...h.document.querySelectorAll('.template-var-chip')].find(node => node.textContent === name);
+  const insert = async (name, expected, caret) => {
+    assert.ok(chip(name), `member_join offers ${name}`);
+    await fire(chip(name), 'click');
+    assert.equal(input().value, expected);
+    // The caret stays right after the variable once the new text has rendered.
+    assert.equal(h.document.activeElement, input());
+    assert.deepEqual([input().selectionStart, input().selectionEnd], [caret, caret], `caret after ${name}`);
+  };
+  input().setSelectionRange(3, 3);
+  await insert('{account_age}', 'Hi {account_age}{user}!', 16);
+  // A second click without moving the caret continues from there.
+  await insert('{username}', 'Hi {account_age}{username}{user}!', 26);
+  // A selection is replaced, keeping the text after it.
+  input().setSelectionRange(16, 26);
+  await insert('{user_id}', 'Hi {account_age}{user_id}{user}!', 25);
   assert.equal(h.app.isDirty(), true);
-  assert.equal(h.document.querySelector('.log-embed-description').textContent, 'Hi Alice1w 1d!');
+  assert.equal(h.document.querySelector('.log-embed-description').textContent, 'Hi 1w 1d123456789012345678Alice!');
   await fire(findNode(h.document.querySelector('.template-card'), n => n.localName === 'button' && n.textContent === 'Save'), 'click');
-  assert.equal(saved, 'Hi {user}{account_age}!');
+  assert.equal(saved, 'Hi {account_age}{user_id}{user}!');
 });
 
 test('workspace validates membership, tab, user identity and malformed storage', () => {

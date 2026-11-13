@@ -17,6 +17,7 @@ import {
 } from "./charts.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import React, { useState, useEffect, useRef, createContext, useContext } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import {
   Dialog,
@@ -4625,36 +4626,21 @@ const TEMPLATE_VARIABLES = [
   ["after_global", "member", "Their display name after the change", "Alice Example"],
 ].map(([name, group, meaning, example]) => ({ name, group, meaning, example }));
 
-// Why a variable marked with "?" below can come out empty.
-const TEMPLATE_VARIABLE_GAPS = {
-  user: "Shows “unavailable” if the bot didn't see the original message.",
-  mention: "Shows “unavailable” if the bot didn't see the original message.",
-  user_id: "Shows “unavailable” if the bot didn't see the original message.",
-  before: "Only filled in if the bot saw the original message.",
-  content: "Only filled in if the bot saw the original message.",
-  attachments: "Only filled in if the bot saw the original message.",
-  actor: "Empty when Discord's audit log doesn't say who did it. The bot needs View Audit Log.",
-  actor_id: "Empty when Discord's audit log doesn't say who did it. The bot needs View Audit Log.",
-  reason: "Empty when Discord's audit log has no reason. The bot needs View Audit Log.",
-  joined: "Shows “Unavailable” if the bot doesn't know when they joined.",
-  duration: "Shows “Unavailable” if the bot doesn't know when they joined.",
-};
-
-// Variables each event supplies besides {guild}, {time} and {emoji}; "?" marks
-// ones that can be empty. Every variable in a shipped template is listed here.
+// Variables each event supplies besides {guild}, {time} and {emoji}. Every variable
+// in a shipped template is listed here.
 const TEMPLATE_EVENT_VARIABLES = {
   member_join: "user mention user_id username account_created account_age joined",
-  member_leave: "user mention user_id username account_created account_age joined? duration?",
-  member_ban: "user mention user_id username account_created account_age actor? actor_id? reason?",
-  member_unban: "user mention user_id username account_created account_age actor? actor_id? reason?",
-  member_kick: "user mention user_id actor? reason?",
-  message_edit: "channel mention message_id message_url before? after attachments coverage",
-  message_delete: "channel mention? message_id message_url content? attachments? coverage",
+  member_leave: "user mention user_id username account_created account_age joined duration",
+  member_ban: "user mention user_id username account_created account_age actor actor_id reason",
+  member_unban: "user mention user_id username account_created account_age actor actor_id reason",
+  member_kick: "user mention user_id actor reason",
+  message_edit: "channel mention message_id message_url before after attachments coverage",
+  message_delete: "channel mention message_id message_url content attachments coverage",
   message_bulk_delete: "channel count retained unavailable unknown filtered omitted details",
   automod: "mention channel content rule action reason",
   mod_action: "user mention actor reason action",
-  timeout_add: "user mention user_id actor? reason duration",
-  timeout_remove: "user mention user_id actor?",
+  timeout_add: "user mention user_id actor reason duration",
+  timeout_remove: "user mention user_id actor",
   plan_executed: "content actor command",
   system: "content",
   member_role_update: "user mention user_id added removed",
@@ -4667,18 +4653,74 @@ const TEMPLATE_EVENT_VARIABLES = {
   thread_create: "mention channel thread thread_id thread_name notice",
   thread_update: "channel before thread thread_id thread_name archived locked auto_archive invitable",
   thread_delete: "channel thread thread_id thread_name",
-  automod_delete: "mention? channel message_id message_url content? attachments? coverage reason rule rule_id",
+  automod_delete: "mention channel message_id message_url content attachments coverage reason rule rule_id",
   member_rejoin: "user mention user_id notice cases",
 };
 
+// What a variable shows when the bot can't fill it in, per event: the same name can
+// come from different places. These variables get the "?" mark.
+const NOT_SEEN = "Shows “unavailable” if the bot didn't see the original message.";
+const JOIN_UNKNOWN = "Shows “Unavailable” if the bot doesn't know when they joined.";
+const BAN_AUDIT = "Shows “unavailable” if the bot can't match this in Discord's audit log. The bot needs View Audit Log.";
+const NOT_IN_UPDATE = "Shows “not supplied in this update” if Discord's update left it out and the bot has no copy.";
+const THREAD_PARENT = "Shows “unavailable” if Discord didn't say which channel the thread is in.";
+const THREAD_STATE = "Shows “unavailable” if Discord didn't send the thread's settings.";
+const TEMPLATE_VARIABLE_GAPS = {
+  member_join: { joined: JOIN_UNKNOWN },
+  member_leave: { joined: JOIN_UNKNOWN, duration: JOIN_UNKNOWN },
+  member_ban: {
+    actor: BAN_AUDIT,
+    actor_id: BAN_AUDIT,
+    reason: `${BAN_AUDIT} Shows “No reason provided” if the moderator gave none.`,
+  },
+  member_unban: {
+    actor: BAN_AUDIT,
+    actor_id: BAN_AUDIT,
+    reason: `${BAN_AUDIT} Shows “No reason provided” if the moderator gave none.`,
+  },
+  member_kick: { reason: "Stays as typed if the command that logged the kick has no reason." },
+  message_edit: {
+    mention: "Shows “unavailable” if the bot doesn't know who wrote the message.",
+    before: "Shows “unavailable” if the bot didn't see the message before the edit.",
+    after: NOT_IN_UPDATE,
+    attachments: NOT_IN_UPDATE,
+  },
+  message_delete: { mention: NOT_SEEN, content: NOT_SEEN, attachments: NOT_SEEN },
+  automod: {
+    channel: "Only filled in by the exact-image, repeated-text and attachment-burst rules. Other rules leave it as typed.",
+    content: "Empty for the honeypot role rule, which acts on a role change rather than a message.",
+  },
+  timeout_add: { actor: "Only filled in when a bot command gave the timeout. For a timeout given in Discord, it stays as typed." },
+  timeout_remove: { actor: "Only filled in when a bot command removed the timeout. For a timeout removed in Discord, it stays as typed." },
+  plan_executed: { content: "Empty when none of the command's steps sent a reply." },
+  role_change: { role_name: "Shows “unavailable” if the bot didn't know a deleted role's name." },
+  thread_create: {
+    mention: "Shows “unavailable” if Discord didn't say who owns the thread.",
+    channel: THREAD_PARENT,
+  },
+  thread_update: {
+    channel: THREAD_PARENT,
+    before: "Shows “unavailable” if the bot didn't know the thread's name before the change.",
+    archived: THREAD_STATE,
+    locked: THREAD_STATE,
+    auto_archive: THREAD_STATE,
+    invitable: THREAD_STATE,
+  },
+  thread_delete: {
+    channel: THREAD_PARENT,
+    thread_name: "Shows “unavailable” if the bot didn't know the deleted thread's name.",
+  },
+  automod_delete: { mention: NOT_SEEN, content: NOT_SEEN, attachments: NOT_SEEN },
+  member_rejoin: {
+    cases: "Empty when the bot can't list their cases yet. {notice} then says why.",
+    notice: "Empty when every case is listed.",
+  },
+};
+
 function templateEventVariables(event) {
-  const listed = (TEMPLATE_EVENT_VARIABLES[event] || "").split(" ").filter(Boolean);
-  const optional = new Set(listed.filter((name) => name.endsWith("?")).map((name) => name.slice(0, -1)));
-  const supplied = new Set([...listed.map((name) => name.replace(/\?$/, "")), "guild", "time", "emoji"]);
-  return TEMPLATE_VARIABLES.filter((v) => supplied.has(v.name)).map((v) => ({
-    ...v,
-    gap: optional.has(v.name) ? TEMPLATE_VARIABLE_GAPS[v.name] : null,
-  }));
+  const supplied = new Set([...(TEMPLATE_EVENT_VARIABLES[event] || "").split(" ").filter(Boolean), "guild", "time", "emoji"]);
+  const gaps = TEMPLATE_VARIABLE_GAPS[event] || {};
+  return TEMPLATE_VARIABLES.filter((v) => supplied.has(v.name)).map((v) => ({ ...v, gap: gaps[v.name] ?? null }));
 }
 
 const TEMPLATE_RENDERING_NOTES = [
@@ -4709,7 +4751,7 @@ function tabTemplates() {
       h(
         "p",
         { className: "muted" },
-        "Variables are swapped for real details when the bot posts. Each template lists the ones its event has; click one to add it. A variable marked ? might be empty; point at it to see when.",
+        "Variables are swapped for real details when the bot posts. Each template lists the ones its event has; click one to add it. A variable marked ? isn't always filled in; point at it to see what shows instead.",
       ),
       ...TEMPLATE_VARIABLE_GROUPS.map(([group, label]) =>
         h(
@@ -4759,7 +4801,8 @@ function insertTemplateVariable(textarea, draftKey, group, defaultValue, name) {
   const next = { ...drafts };
   if (value === baseline) delete next[draftKey];
   else next[draftKey] = { value, group };
-  ui.set({ drafts: next, edits: Object.keys(next).length > 0 ? "dirty" : "clean" });
+  // Render the new text first: React writing the controlled value moves the caret to the end.
+  flushSync(() => ui.set({ drafts: next, edits: Object.keys(next).length > 0 ? "dirty" : "clean" }));
   textarea.focus();
   textarea.setSelectionRange(start + token.length, start + token.length);
 }
@@ -4778,7 +4821,7 @@ function TemplateVariableChips({ event, textRef, draftKey, group, defaultValue }
           type: "button",
           className: `btn btn-xs template-var-chip${v.gap ? " template-var-optional" : ""}`,
           disabled: working,
-          title: v.gap ? `${v.meaning}. Might be empty: ${v.gap}` : v.meaning,
+          title: v.gap ? `${v.meaning}. Not always filled in: ${v.gap}` : v.meaning,
           onClick: () => insertTemplateVariable(textRef.current, draftKey, group, defaultValue, v.name),
         },
         `{${v.name}}`,
