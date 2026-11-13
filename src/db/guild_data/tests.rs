@@ -1274,9 +1274,14 @@ async fn assert_replacement_epoch_fences_writes(http: bool) {
     );
     raise_held(&old_store, &old_core).await;
     assert!(
-        claim_active_bot(&new_core, &new_owner, now.saturating_add(21_000), refuse(),)
-            .await
-            .unwrap()
+        claim_active_bot(
+            &new_core,
+            &new_owner,
+            now.saturating_add(crate::db::ACTIVE_BOT_LEASE_TTL_MS + 1_000),
+            refuse(),
+        )
+        .await
+        .unwrap()
     );
     // A successful core claim is insufficient while this store is deferred.
     let error = new_store
@@ -1359,7 +1364,7 @@ async fn older_epoch_raise_does_not_lower_the_stored_generation() {
         claim_active_bot(
             &f.catalog,
             &"cd".repeat(16),
-            now.saturating_add(21_000),
+            now.saturating_add(crate::db::ACTIVE_BOT_LEASE_TTL_MS + 1_000),
             refuse(),
         )
         .await
@@ -1396,7 +1401,7 @@ async fn renewal_keeps_the_generation_and_a_fresh_claim_increments_it() {
         claim_active_bot(
             &f.catalog,
             &"cd".repeat(16),
-            now.saturating_add(21_000),
+            now.saturating_add(crate::db::ACTIVE_BOT_LEASE_TTL_MS + 1_000),
             refuse(),
         )
         .await
