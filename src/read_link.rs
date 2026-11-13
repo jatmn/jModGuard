@@ -585,7 +585,10 @@ mod tests {
         let text = &embed
             .fields
             .iter()
-            .find(|field| field.name == crate::templates::STATS_CONTAINER_SECTION)
+            .find(|field| {
+                let name = crate::templates::STATS_CONTAINER_SECTION;
+                field.name == format!("{} {name}", crate::emoji::label(name).unwrap())
+            })
             .unwrap()
             .value;
         assert!(text.contains("**API CPU:** `unavailable`"), "{text}");

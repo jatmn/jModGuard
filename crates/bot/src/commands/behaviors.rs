@@ -2491,7 +2491,9 @@ mod tests {
         embed
             .fields
             .iter()
-            .find(|field| field.name == name)
+            .find(|field| {
+                field.name == format!("{} {name}", jmodguard::emoji::label(name).unwrap())
+            })
             .unwrap_or_else(|| panic!("{name} missing from {embed:?}"))
             .value
             .clone()
