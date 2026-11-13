@@ -101,6 +101,8 @@ body { background: var(--bg); color: var(--text); font-size: var(--ui-font-size)
 @layer utilities { .rounded-box { border-radius: var(--radius-box); } }
 .skip-link { position: fixed; top: -80px; left: 16px; z-index: 100; padding: 12px; background: var(--panel); }
 .skip-link:focus { top: 12px; }
+/* Visually hidden but still read by screen readers (e.g. chart summaries). */
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border-width: 0; }
 
 #main-view { display: flex; align-items: stretch; min-height: 100dvh; width: 100%; }
 .sidebar { border-right: 1px solid var(--shell-border); position: relative; width: 224px; flex: 0 0 224px; min-height: 100dvh; background: var(--sidebar); color: var(--side-text); padding: 16px 12px 12px; display: flex; flex-direction: column; overflow: visible; }
