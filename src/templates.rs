@@ -1533,6 +1533,40 @@ mod presentation_tests {
     }
 
     #[test]
+    fn embed_and_text_agree_on_the_memory_limit() {
+        // The reader reports a v1 host ceiling as Unlimited and keeps real caps.
+        for (limit, row) in [
+            (
+                crate::cgroup::MemoryLimit::Unlimited,
+                "`85.8 MiB / no limit (includes page cache)`",
+            ),
+            (
+                crate::cgroup::MemoryLimit::Bytes(512 << 20),
+                "`85.8 MiB / 512.0 MiB (includes page cache)`",
+            ),
+        ] {
+            let sample = crate::cgroup::ContainerSample {
+                memory: Some(crate::cgroup::MemoryUse {
+                    program_bytes: 90_000_000,
+                    limit,
+                    source: crate::cgroup::MemorySource::CgroupUsage,
+                }),
+                cpu_tenths: None,
+            };
+            let embed = container_text(&sample, Some(&sample));
+            let text = stats_text_with_container_use(String::new(), &sample, Some(&sample));
+            for line in [
+                format!("**Bot memory (real program use):** {row}"),
+                format!("**API memory (real program use):** {row}"),
+            ] {
+                assert!(embed.contains(&line), "{embed}");
+                assert!(text.contains(&line), "{text}");
+            }
+            assert!(!embed.contains("GiB") && !text.contains("GiB"), "{embed}");
+        }
+    }
+
+    #[test]
     fn unreadable_cgroup_layout_renders_unavailable() {
         let dir = std::env::temp_dir().join(format!(
             "jmg-status-cgroup-{}-{}",

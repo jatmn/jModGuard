@@ -151,8 +151,11 @@ availability is an icon: ✅ up to date, ⬆️ update available, ⚠️ source 
 but the image digest is unverified, ❓ unknown. A component with no cached
 release row is `❓` and has no SHA or age. Container use is this bot
 process's own cgroup. Memory is real program use (`memory.current` minus
-`inactive_file`) shown against `memory.max` (`max` means no limit); a host that
-does not report it shows `not reported by host`. When
+`inactive_file`) shown against `memory.max` (`max` means no limit). A cgroup v1
+`memory.limit_in_bytes` at the unlimited sentinel, or at least the host's total
+memory (`MemTotal`), caps nothing and is also shown as `no limit`; the host total
+itself is never shown. A host that
+does not report memory shows `not reported by host`. When
 `memory.stat` is missing or unreadable, it is raw `memory.current` (or v1
 `memory.usage_in_bytes`) marked `(includes page cache)`. CPU is the latest
 background sample. `!status` does not wait for one; until a sample
