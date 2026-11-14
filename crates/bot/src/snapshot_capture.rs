@@ -151,12 +151,23 @@ impl DeletedIdentities {
 /// Delete and edit reports use it when the guild store cannot supply a row, so
 /// a store outage does not drop text this process already observed. It follows
 /// snapshot eligibility and expiry, is bounded by count and bytes, drops deleted
-/// identities and is lost on restart.
+/// identities and is lost on restart. Each row keeps the captured scope it was
+/// observed under and is only used by work with that same scope.
 #[derive(Default)]
 struct RecentMessages {
-    entries: HashMap<Key, (MessageSnapshot, usize)>,
+    entries: HashMap<Key, RecentEntry>,
     order: VecDeque<Key>,
     bytes: usize,
+}
+
+struct RecentEntry {
+    row: MessageSnapshot,
+    scope: GuildDataScope,
+    size: usize,
+}
+
+fn same_scope(a: &GuildDataScope, b: &GuildDataScope) -> bool {
+    a.placement() == b.placement() && a.enrollment() == b.enrollment()
 }
 
 impl RecentMessages {
@@ -181,32 +192,41 @@ impl RecentMessages {
 
     /// Records an observation and returns the cached state it replaced. Fields
     /// an edit does not supply keep their earlier value; an older edit is ignored.
+    /// As in the guild store, a field already supplied at one edit timestamp
+    /// keeps its first value at that timestamp.
     fn observe(
         &mut self,
-        guild: u64,
+        scope: &GuildDataScope,
         observation: &SnapshotObservation,
         allow_insert: bool,
         now_ms: i64,
     ) -> Option<MessageSnapshot> {
+        let guild = scope.guild_id() as u64;
         let key = (
             guild,
             observation.channel_id as u64,
             observation.message_id as u64,
         );
-        let before = self.get(key, now_ms);
+        let before = self.get(key, scope, now_ms);
         let row = match before.clone() {
             Some(old) if old.edit_at_ms > observation.edit_at_ms => return before,
             Some(mut row) => {
+                if row.edit_at_ms != observation.edit_at_ms {
+                    row.content_supplied = false;
+                    row.attachments_supplied = false;
+                }
                 let fields = &observation.fields;
-                if fields.content.is_some() {
+                if fields.content.is_some() && !row.content_supplied {
                     row.fields.content = fields.content.clone();
                     row.fields.content_truncated = fields.content_truncated;
                     row.fields.content_original_bytes = fields.content_original_bytes;
+                    row.content_supplied = true;
                 }
-                if fields.attachments.is_some() {
+                if fields.attachments.is_some() && !row.attachments_supplied {
                     row.fields.attachments = fields.attachments.clone();
                     row.fields.attachments_truncated = fields.attachments_truncated;
                     row.fields.attachments_omitted = fields.attachments_omitted;
+                    row.attachments_supplied = true;
                 }
                 if fields.author_id.is_some() {
                     row.fields.author_id = fields.author_id;
@@ -225,8 +245,13 @@ impl RecentMessages {
             return before;
         }
         let size = fields_bytes(&row.fields);
-        if let Some((_, old)) = self.entries.insert(key, (row, size)) {
-            self.bytes -= old;
+        let entry = RecentEntry {
+            row,
+            scope: scope.clone(),
+            size,
+        };
+        if let Some(old) = self.entries.insert(key, entry) {
+            self.bytes -= old.size;
         } else {
             self.order.push_back(key);
         }
@@ -235,29 +260,40 @@ impl RecentMessages {
         before
     }
 
-    fn get(&self, key: Key, now_ms: i64) -> Option<MessageSnapshot> {
+    fn get(&self, key: Key, scope: &GuildDataScope, now_ms: i64) -> Option<MessageSnapshot> {
         self.entries
             .get(&key)
-            .filter(|(row, _)| row.expires_at_ms > now_ms)
-            .map(|(row, _)| row.clone())
+            .filter(|entry| entry.row.expires_at_ms > now_ms && same_scope(&entry.scope, scope))
+            .map(|entry| entry.row.clone())
     }
 
-    fn take(&mut self, key: Key, now_ms: i64) -> Option<MessageSnapshot> {
-        let (row, size) = self.entries.remove(&key)?;
-        self.bytes -= size;
-        (row.expires_at_ms > now_ms).then_some(row)
+    /// Removes the cached copy. It is returned only to work of the same scope.
+    fn take(&mut self, key: Key, scope: &GuildDataScope, now_ms: i64) -> Option<MessageSnapshot> {
+        let entry = self.entries.remove(&key)?;
+        self.bytes -= entry.size;
+        (entry.row.expires_at_ms > now_ms && same_scope(&entry.scope, scope)).then_some(entry.row)
     }
 
     fn remove(&mut self, key: Key) {
-        if let Some((_, size)) = self.entries.remove(&key) {
-            self.bytes -= size;
+        if let Some(entry) = self.entries.remove(&key) {
+            self.bytes -= entry.size;
         }
     }
 
     fn clear_guild(&mut self, guild: u64) {
         self.entries.retain(|(g, _, _), _| *g != guild);
         self.order.retain(|(g, _, _)| *g != guild);
-        self.bytes = self.entries.values().map(|(_, size)| size).sum();
+        self.bytes = self.entries.values().map(|entry| entry.size).sum();
+    }
+
+    /// Releases every expired entry. Creation time can differ from insertion
+    /// order, so `trim` alone can leave expired entries behind a live one.
+    fn expire(&mut self, now_ms: i64) {
+        self.entries
+            .retain(|_, entry| entry.row.expires_at_ms > now_ms);
+        let entries = &self.entries;
+        self.order.retain(|key| entries.contains_key(key));
+        self.bytes = self.entries.values().map(|entry| entry.size).sum();
     }
 
     /// Oldest observations leave first. Keys already taken or removed are
@@ -272,7 +308,7 @@ impl RecentMessages {
             let expired = self
                 .entries
                 .get(&oldest)
-                .is_none_or(|(row, _)| row.expires_at_ms <= now_ms);
+                .is_none_or(|entry| entry.row.expires_at_ms <= now_ms);
             if !over && !expired {
                 break;
             }
@@ -539,6 +575,9 @@ impl SnapshotIngress {
     }
 
     async fn maintain_at(&self, app: &BotState, now_override: Option<i64>) -> std::time::Duration {
+        self.recent
+            .lock()
+            .expire(now_override.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()));
         let stores = match app.tenant.usage_stores().await {
             Ok(stores) => stores,
             Err(error) => {
@@ -752,9 +791,14 @@ impl SnapshotIngress {
 
     pub fn clear_guild(&self, guild: u64) {
         self.scopes.lock().remove(&guild);
-        let mut known = self.known_humans.lock();
-        known.entries.retain(|(g, _, _)| *g != guild);
-        known.order.retain(|((g, _, _), _)| *g != guild);
+        {
+            // `mark_deleted` takes this lock while holding `deleted`, and
+            // `remember_recent` takes `deleted` while holding `recent`. Release
+            // it before `recent` so the three cannot form a cycle.
+            let mut known = self.known_humans.lock();
+            known.entries.retain(|(g, _, _)| *g != guild);
+            known.order.retain(|((g, _, _), _)| *g != guild);
+        }
         self.content_access.lock().remove(&guild);
         self.recent.lock().clear_guild(guild);
         self.gap();
@@ -902,37 +946,53 @@ impl SnapshotIngress {
 
     fn remember_recent(
         &self,
-        guild: u64,
+        scope: &GuildDataScope,
         observation: &SnapshotObservation,
         allow_insert: bool,
     ) -> Option<MessageSnapshot> {
+        let guild = scope.guild_id() as u64;
         let key = (
             guild,
             observation.channel_id as u64,
             observation.message_id as u64,
         );
         let mut recent = self.recent.lock();
-        if self.deleted.lock().knowledge(key).blocks_capture() {
+        // `clear_guild` removes the captured scope before it clears this cache,
+        // and scope refresh replaces it. Checking it under this lock keeps work
+        // queued under an old membership from restoring or reading old rows.
+        if !self.scope_is_current(scope) || self.deleted.lock().knowledge(key).blocks_capture() {
             return None;
         }
         recent.observe(
-            guild,
+            scope,
             observation,
             allow_insert,
             chrono::Utc::now().timestamp_millis(),
         )
     }
 
+    fn scope_is_current(&self, scope: &GuildDataScope) -> bool {
+        self.scopes
+            .lock()
+            .get(&(scope.guild_id() as u64))
+            .is_some_and(|current| same_scope(current, scope))
+    }
+
+    /// Always removes the cached copy; it is returned only while the deleting
+    /// work's scope is still the captured one.
     fn take_recent(
         &self,
-        guild: GuildId,
+        scope: &GuildDataScope,
         channel: ChannelId,
         id: MessageId,
     ) -> Option<MessageSnapshot> {
-        self.recent.lock().take(
-            (guild.get(), channel.get(), id.get()),
+        let mut recent = self.recent.lock();
+        let row = recent.take(
+            (scope.guild_id() as u64, channel.get(), id.get()),
+            scope,
             chrono::Utc::now().timestamp_millis(),
-        )
+        )?;
+        self.scope_is_current(scope).then_some(row)
     }
 
     fn enqueue(
@@ -1254,8 +1314,12 @@ async fn observe_configured_creates(
     let mut admitted = Vec::with_capacity(observations.len());
     let mut indices = Vec::with_capacity(observations.len());
     for (index, observation) in observations.into_iter().enumerate() {
-        match app.configs.get(&app.db, scope.guild_id() as u64).await {
+        let guild = scope.guild_id() as u64;
+        match app.configs.get(&app.db, guild).await {
             Ok(config) if capture_enabled(&config) => {
+                // The memory copy follows this per-row decision, so a drained
+                // create is not cached under an earlier item's configuration.
+                app.snapshots.remember_recent(scope, &observation, true);
                 let key = (
                     scope.guild_id() as u64,
                     observation.channel_id as u64,
@@ -1272,6 +1336,13 @@ async fn observe_configured_creates(
             Err(error) => {
                 tracing::warn!("message snapshot config unavailable: {error:#}");
                 app.snapshots.gap_scope(scope);
+                if app
+                    .configs
+                    .last_known(guild)
+                    .is_some_and(|cfg| capture_enabled(&cfg))
+                {
+                    app.snapshots.remember_recent(scope, &observation, true);
+                }
             }
         }
     }
@@ -1357,12 +1428,13 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     .is_some_and(|cfg| capture_enabled(&cfg)));
         let cached_before = match &work.body {
             Body::Create(observation) if cache_configured => {
-                app.snapshots.remember_recent(guild, observation, true);
+                app.snapshots
+                    .remember_recent(&work.scope, observation, true);
                 None
             }
             Body::Edit(observation, _, allow_insert) if cache_configured => app
                 .snapshots
-                .remember_recent(guild, observation, *allow_insert),
+                .remember_recent(&work.scope, observation, *allow_insert),
             _ => None,
         };
         let store = match app.tenant.store(&work.scope).await {
@@ -1392,7 +1464,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     } => {
                         let cached = ids
                             .first()
-                            .and_then(|id| app.snapshots.take_recent(guild, channel, *id));
+                            .and_then(|id| app.snapshots.take_recent(&work.scope, channel, *id));
                         app.snapshots.mark_deleted(guild, channel, &ids);
                         if let Some(id) = ids.first()
                             && let Some(mut report) = logging::observed_delete_report(
@@ -1420,7 +1492,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     } => {
                         let cached = ids
                             .iter()
-                            .map(|id| app.snapshots.take_recent(guild, channel, *id))
+                            .map(|id| app.snapshots.take_recent(&work.scope, channel, *id))
                             .collect();
                         app.snapshots.mark_deleted(guild, channel, &ids);
                         submit_peeled_bulk_deletes(
@@ -1483,7 +1555,6 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         app.snapshots.gap_scope(&next.scope);
                         continue;
                     }
-                    app.snapshots.remember_recent(guild, next_observation, true);
                     next_observation.coverage_epoch = next.epoch;
                     observations.push(next_observation.clone());
                 }
@@ -1709,18 +1780,11 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         }
                         if let Some(mut report) = report.take() {
                             apply_transition_report(&mut report, &transition);
-                            // The store had no earlier row, e.g. its create write
-                            // was lost while the store was unavailable.
-                            if transition.outcome == SnapshotOutcome::Stored
-                                && transition.before.is_none()
-                                && cached_before.is_some()
-                            {
-                                logging::apply_retained_edit(
-                                    &mut report,
-                                    cached_before.as_ref(),
-                                    None,
-                                );
-                            }
+                            apply_cached_edit_prior(
+                                &mut report,
+                                &transition,
+                                cached_before.as_ref(),
+                            );
                             submit_report(&app, &work.context, report);
                         }
                     }
@@ -1784,7 +1848,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 // or unreadable stored row.
                 let cached: Vec<_> = ids
                     .iter()
-                    .map(|id| app.snapshots.take_recent(*guild, *channel, *id))
+                    .map(|id| app.snapshots.take_recent(&work.scope, *channel, *id))
                     .collect();
                 let mut single = None;
                 let mut single_unknown = false;
@@ -1924,6 +1988,32 @@ fn apply_transition_report(report: &mut MessageReport, transition: &SnapshotTran
                 format!("retention unavailable: {outcome:?}; current edit not retained"),
             );
         }
+    }
+}
+
+/// The store had no earlier row, e.g. its create write was lost while the
+/// store was unavailable. Use the memory copy as the edit's prior observation;
+/// the event's own fields stay the after-state.
+fn apply_cached_edit_prior(
+    report: &mut MessageReport,
+    transition: &SnapshotTransition,
+    cached_before: Option<&MessageSnapshot>,
+) {
+    let prior_absent = match transition.outcome {
+        SnapshotOutcome::Stored => transition.before.is_none(),
+        SnapshotOutcome::Missing => true,
+        SnapshotOutcome::CapacityRefused => transition.after.is_none(),
+        _ => false,
+    };
+    if !prior_absent || cached_before.is_none() {
+        return;
+    }
+    logging::apply_retained_edit(report, cached_before, None);
+    if transition.outcome == SnapshotOutcome::CapacityRefused {
+        report.vars.insert(
+            "coverage".into(),
+            "from memory cache; current edit not retained (capacity); observation gap".into(),
+        );
     }
 }
 
@@ -2582,6 +2672,7 @@ mod tests {
             .unwrap();
         let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
         let store = app.tenant.store(&scope).await.unwrap();
+        app.snapshots.scopes.lock().insert(789, scope.clone());
         let now = chrono::Utc::now().timestamp_millis();
         let observation = |id| SnapshotObservation {
             channel_id: 456,
@@ -2637,7 +2728,18 @@ mod tests {
             vec![Some(SnapshotOutcome::Stored)]
         );
         // Both the batch and one-at-a-time pressure path must leave no payload
-        // behind when disabled. Re-enabling still permits new observations.
+        // behind when disabled, including the process memory copy. Re-enabling
+        // still permits new observations.
+        let mut cached: Vec<_> = app
+            .snapshots
+            .recent
+            .lock()
+            .entries
+            .keys()
+            .map(|(_, _, id)| *id)
+            .collect();
+        cached.sort_unstable();
+        assert_eq!(cached, vec![1, 2, 6]);
         let retained = store
             .take_snapshots(scope, 456, vec![1, 2, 3, 4, 5, 6], now + 1)
             .await
@@ -3277,10 +3379,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn memory_cache_respects_count_byte_and_age_caps() {
-        let now = chrono::Utc::now().timestamp_millis();
-        let observation = |id: i64, created_at_ms: i64, text: &str| SnapshotObservation {
+    /// Activates membership `joined_at_ns` for guild 789 and makes it the
+    /// captured scope, as `refresh_scope` does.
+    async fn cache_scope(app: &Arc<BotState>, joined_at_ns: i64) -> GuildDataScope {
+        let enrollment = crate::db::enroll_guild(&app.db, 789, joined_at_ns)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
+        app.snapshots.scopes.lock().insert(789, scope.clone());
+        scope
+    }
+
+    fn remove_db_and_store(path: &std::path::Path) {
+        remove_db(path);
+        for suffix in [".guild.db", ".guild.db-wal", ".guild.db-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    fn cache_observation(id: i64, created_at_ms: i64, text: &str) -> SnapshotObservation {
+        SnapshotObservation {
             channel_id: 456,
             message_id: id,
             created_at_ms,
@@ -3292,51 +3411,197 @@ mod tests {
                 author_id: Some(42),
                 ..Default::default()
             },
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_cache_respects_count_byte_and_age_caps() {
+        let (app, path) = temp_app("snapshot_memory_cache_caps");
+        let scope = cache_scope(&app, 100).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let observation = cache_observation;
         let mut recent = RecentMessages::default();
         for id in 1..=(MAX_RECENT as i64 + 10) {
-            recent.observe(789, &observation(id, now, "short"), true, now);
+            recent.observe(&scope, &observation(id, now, "short"), true, now);
         }
         assert_eq!(recent.entries.len(), MAX_RECENT);
-        assert!(recent.get((789, 456, 10), now).is_none(), "oldest kept");
+        assert!(
+            recent.get((789, 456, 10), &scope, now).is_none(),
+            "oldest kept"
+        );
         assert!(
             recent
-                .get((789, 456, MAX_RECENT as u64 + 10), now)
+                .get((789, 456, MAX_RECENT as u64 + 10), &scope, now)
                 .is_some()
         );
 
         let mut recent = RecentMessages::default();
         let large = "x".repeat(MAX_TEXT_BYTES);
         for id in 1..=1000 {
-            recent.observe(789, &observation(id, now, &large), true, now);
+            recent.observe(&scope, &observation(id, now, &large), true, now);
             assert!(recent.bytes <= MAX_RECENT_BYTES);
         }
         assert!(recent.entries.len() < 1000);
         assert_eq!(
             recent.bytes,
-            recent.entries.values().map(|(_, size)| size).sum::<usize>()
+            recent
+                .entries
+                .values()
+                .map(|entry| entry.size)
+                .sum::<usize>()
         );
-        assert!(recent.get((789, 456, 1000), now).is_some());
+        assert!(recent.get((789, 456, 1000), &scope, now).is_some());
 
         let mut recent = RecentMessages::default();
         let old = now - RECENT_LIFETIME_MS + 1000;
-        recent.observe(789, &observation(1, old, "old"), true, now);
-        assert!(recent.get((789, 456, 1), now).is_some());
+        recent.observe(&scope, &observation(1, old, "old"), true, now);
+        assert!(recent.get((789, 456, 1), &scope, now).is_some());
         let later = now + 1000;
-        recent.observe(789, &observation(2, later, "new"), true, later);
-        assert!(recent.take((789, 456, 1), later).is_none(), "expired row");
+        recent.observe(&scope, &observation(2, later, "new"), true, later);
+        assert!(
+            recent.take((789, 456, 1), &scope, later).is_none(),
+            "expired row"
+        );
         assert!(!recent.entries.contains_key(&(789, 456, 1)));
         assert!(
             recent
-                .observe(789, &observation(3, old - 2000, "late"), true, later)
+                .observe(&scope, &observation(3, old - 2000, "late"), true, later)
                 .is_none()
         );
         assert!(!recent.entries.contains_key(&(789, 456, 3)));
+        drop(app);
+        remove_db_and_store(&path);
     }
 
-    #[test]
-    fn memory_cache_merges_edits_and_never_keeps_deleted_messages() {
+    /// Creation time, not insertion order, sets expiry: an edit can first
+    /// cache an old message behind a newer one. Periodic maintenance releases
+    /// expired entries even when no further observation arrives.
+    #[tokio::test]
+    async fn memory_cache_releases_expired_entries_out_of_order_and_when_idle() {
+        let (app, path) = temp_app("snapshot_memory_cache_expiry");
+        let scope = cache_scope(&app, 100).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let old = now - RECENT_LIFETIME_MS + 1000;
+        let mut recent = RecentMessages::default();
+        recent.observe(&scope, &cache_observation(1, now, "live head"), true, now);
+        recent.observe(
+            &scope,
+            &cache_observation(2, old, "older message"),
+            true,
+            now,
+        );
+        let later = now + 2000;
+        recent.observe(&scope, &cache_observation(3, later, "newest"), true, later);
+        assert!(
+            recent.entries.contains_key(&(789, 456, 2)),
+            "front-only trim stops at the live head"
+        );
+        recent.expire(later);
+        assert!(!recent.entries.contains_key(&(789, 456, 2)));
+        assert_eq!(recent.entries.len(), 2);
+        assert!(!recent.order.contains(&(789, 456, 2)));
+        assert_eq!(
+            recent.bytes,
+            recent
+                .entries
+                .values()
+                .map(|entry| entry.size)
+                .sum::<usize>()
+        );
+
+        app.snapshots
+            .remember_recent(&scope, &cache_observation(4, old, "idle message"), true);
+        assert_eq!(app.snapshots.recent.lock().entries.len(), 1);
+        app.snapshots.maintain_at(&app, Some(later)).await;
+        let recent = app.snapshots.recent.lock();
+        assert!(
+            recent.entries.is_empty(),
+            "idle cache kept an expired entry"
+        );
+        assert_eq!(recent.bytes, 0);
+        drop(recent);
+        drop(app);
+        remove_db_and_store(&path);
+    }
+
+    /// Same first-supply rule as the guild-store edit merge.
+    #[tokio::test]
+    async fn memory_cache_keeps_first_supplied_fields_at_one_edit_timestamp() {
+        let (app, path) = temp_app("snapshot_memory_cache_first_supply");
+        let scope = cache_scope(&app, 100).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let attachment = |id: i64| SnapshotAttachment {
+            id,
+            filename: format!("file-{id}"),
+            size: 1,
+            content_type: None,
+            url: String::new(),
+        };
+        let edit = |at: Option<i64>, content: Option<&str>, attachments: Option<(i64, i64)>| {
+            SnapshotObservation {
+                channel_id: 456,
+                message_id: 1,
+                created_at_ms: now,
+                observed_at_ms: now,
+                edit_at_ms: at,
+                coverage_epoch: 0,
+                fields: SnapshotFields {
+                    content: content.map(Into::into),
+                    content_original_bytes: content.map(|text| text.len() as i64),
+                    attachments: attachments.map(|(id, _)| vec![attachment(id)]),
+                    attachments_omitted: attachments.map(|(_, omitted)| omitted),
+                    attachments_truncated: attachments.is_some_and(|(_, omitted)| omitted > 0),
+                    author_id: Some(42),
+                    ..Default::default()
+                },
+            }
+        };
+        let mut recent = RecentMessages::default();
+        let at = now + 10;
+        recent.observe(&scope, &edit(None, Some("A"), Some((1, 0))), true, now);
+        recent.observe(&scope, &edit(Some(at), Some("B"), None), false, now);
+        // A conflicting duplicate at the same timestamp keeps B.
+        recent.observe(&scope, &edit(Some(at), Some("conflict"), None), false, now);
+        // A complementary partial at that timestamp still fills attachments,
+        // and the first attachment value at that timestamp then stays.
+        recent.observe(&scope, &edit(Some(at), None, Some((2, 3))), false, now);
+        recent.observe(&scope, &edit(Some(at), None, Some((9, 0))), false, now);
+        // An older edit is ignored.
+        recent.observe(&scope, &edit(Some(at - 1), Some("stale"), None), false, now);
+        let row = recent.get((789, 456, 1), &scope, now).unwrap();
+        assert_eq!(row.fields.content.as_deref(), Some("B"));
+        assert_eq!(row.fields.content_original_bytes, Some(1));
+        let ids: Vec<_> = row
+            .fields
+            .attachments
+            .iter()
+            .flatten()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, vec![2]);
+        assert_eq!(row.fields.attachments_omitted, Some(3));
+        assert!(row.fields.attachments_truncated);
+        // A later edit supplies new values.
+        recent.observe(&scope, &edit(Some(at + 1), Some("later"), None), false, now);
+        let row = recent.take((789, 456, 1), &scope, now).unwrap();
+        assert_eq!(row.fields.content.as_deref(), Some("later"));
+        assert_eq!(row.fields.content_original_bytes, Some(5));
+        let ids: Vec<_> = row
+            .fields
+            .attachments
+            .iter()
+            .flatten()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, vec![2]);
+        drop(app);
+        remove_db_and_store(&path);
+    }
+
+    #[tokio::test]
+    async fn memory_cache_merges_edits_and_never_keeps_deleted_messages() {
         let (app, path) = temp_app("snapshot_memory_cache_edits");
+        let scope = cache_scope(&app, 100).await;
         let now = chrono::Utc::now().timestamp_millis();
         let observation = |edit_at_ms: Option<i64>, content: Option<&str>| SnapshotObservation {
             channel_id: 456,
@@ -3353,37 +3618,267 @@ mod tests {
         };
         assert!(
             app.snapshots
-                .remember_recent(789, &observation(Some(now), Some("edit")), false)
+                .remember_recent(&scope, &observation(Some(now), Some("edit")), false)
                 .is_none()
         );
         assert!(app.snapshots.recent.lock().entries.is_empty());
         app.snapshots
-            .remember_recent(789, &observation(None, Some("original")), true);
+            .remember_recent(&scope, &observation(None, Some("original")), true);
         let before = app
             .snapshots
-            .remember_recent(789, &observation(Some(now + 2), Some("second")), false)
+            .remember_recent(&scope, &observation(Some(now + 2), Some("second")), false)
             .unwrap();
         assert_eq!(before.fields.content.as_deref(), Some("original"));
         assert_eq!(before.generation, logging::MEMORY_CACHE_GENERATION);
         // An older edit and an edit without text keep the latest text.
         app.snapshots
-            .remember_recent(789, &observation(Some(now + 1), Some("first")), false);
+            .remember_recent(&scope, &observation(Some(now + 1), Some("first")), false);
         let before = app
             .snapshots
-            .remember_recent(789, &observation(Some(now + 3), None), false)
+            .remember_recent(&scope, &observation(Some(now + 3), None), false)
             .unwrap();
         assert_eq!(before.fields.content.as_deref(), Some("second"));
         app.snapshots
             .unhooked_delete(GuildId::new(789), ChannelId::new(456), &[MessageId::new(1)]);
         assert!(app.snapshots.recent.lock().entries.is_empty());
         app.snapshots
-            .remember_recent(789, &observation(None, Some("replayed")), true);
+            .remember_recent(&scope, &observation(None, Some("replayed")), true);
         assert!(
             app.snapshots.recent.lock().entries.is_empty(),
             "a deleted identity was cached again"
         );
         drop(app);
+        remove_db_and_store(&path);
+    }
+
+    /// Work queued under one membership must not restore cleared rows, and a
+    /// row captured under one membership is never used by another, including
+    /// a scope replacement without a Guild Delete callback.
+    #[tokio::test]
+    async fn memory_cache_is_bound_to_the_captured_scope() {
+        let (app, path) = temp_app("snapshot_memory_cache_scope");
+        let first = cache_scope(&app, 100).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let create = |id: i64, text: &str| cache_observation(id, now, text);
+        let edit = |id: i64| SnapshotObservation {
+            edit_at_ms: Some(now + 1),
+            ..cache_observation(id, now, "edited")
+        };
+        app.snapshots
+            .remember_recent(&first, &create(1, "old membership text"), true);
+        assert_eq!(app.snapshots.recent.lock().entries.len(), 1);
+        app.snapshots.clear_guild(789);
+        assert!(app.snapshots.recent.lock().entries.is_empty());
+        // The worker reaches work that was queued before the guild was removed.
+        app.snapshots
+            .remember_recent(&first, &create(1, "old membership text"), true);
+        assert!(
+            app.snapshots.recent.lock().entries.is_empty(),
+            "stale work restored old membership content"
+        );
+
+        app.snapshots.refresh_scope(&app, 789).await;
+        assert!(
+            app.snapshots
+                .scope(789)
+                .is_some_and(|scope| same_scope(&scope, &first))
+        );
+        app.snapshots
+            .remember_recent(&first, &create(2, "first membership text"), true);
+        app.snapshots
+            .remember_recent(&first, &create(5, "first membership text"), true);
+        crate::db::enroll_guild(&app.db, 789, 200)
+            .await
+            .unwrap()
+            .unwrap();
+        app.snapshots.refresh_scope(&app, 789).await;
+        let second = app.snapshots.scope(789).unwrap();
+        assert!(!same_scope(&first, &second), "membership was not replaced");
+        // Old work cannot write or consume, and new work cannot read or
+        // consume, a row from the earlier membership.
+        assert!(
+            app.snapshots
+                .take_recent(&first, ChannelId::new(456), MessageId::new(5))
+                .is_none(),
+            "a delete queued under the replaced membership used its cached row"
+        );
+        assert!(
+            app.snapshots
+                .remember_recent(&first, &create(3, "late old work"), true)
+                .is_none()
+        );
+        assert!(
+            !app.snapshots
+                .recent
+                .lock()
+                .entries
+                .contains_key(&(789, 456, 3))
+        );
+        assert!(
+            app.snapshots
+                .remember_recent(&second, &edit(2), false)
+                .is_none()
+        );
+        assert!(
+            app.snapshots
+                .take_recent(&second, ChannelId::new(456), MessageId::new(2))
+                .is_none()
+        );
+        assert!(app.snapshots.recent.lock().entries.is_empty());
+        // The current membership still has its outage fallback.
+        app.snapshots
+            .remember_recent(&second, &create(4, "current membership text"), true);
+        let row = app
+            .snapshots
+            .take_recent(&second, ChannelId::new(456), MessageId::new(4))
+            .unwrap();
+        assert_eq!(
+            row.fields.content.as_deref(),
+            Some("current membership text")
+        );
+        drop(app);
+        remove_db_and_store(&path);
+    }
+
+    /// `remember_recent` holds `recent` while taking `deleted`, and
+    /// `mark_deleted` holds `deleted` while taking `known_humans`. Guild
+    /// clearing must not hold `known_humans` while it waits for `recent`.
+    #[test]
+    fn clear_guild_does_not_hold_known_humans_while_waiting_for_recent() {
+        let (app, path) = temp_app("snapshot_memory_cache_lock_order");
+        app.snapshots.content_access.lock().insert(789);
+        app.snapshots.remember_human((789, 456, 1));
+        let recent = app.snapshots.recent.lock();
+        let clearing = {
+            let app = Arc::clone(&app);
+            std::thread::spawn(move || app.snapshots.clear_guild(789))
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshots.content_access.lock().contains(&789) {
+            assert!(Instant::now() < deadline, "guild clear did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let deleted = app.snapshots.deleted.lock();
+        let known = app
+            .snapshots
+            .known_humans
+            .try_lock_for(Duration::from_secs(2));
+        let progressed = known.is_some();
+        drop(known);
+        drop(deleted);
+        drop(recent);
+        clearing.join().unwrap();
+        assert!(
+            progressed,
+            "guild clear held known_humans while waiting for the recent cache"
+        );
+        assert!(!app.snapshots.known_human((789, 456, 1)));
+        drop(app);
         remove_db(&path);
+    }
+
+    #[test]
+    fn missing_or_refused_edit_prior_uses_the_memory_cache() {
+        let row = |generation: i64, text: &str| MessageSnapshot {
+            guild_id: 789,
+            channel_id: 456,
+            message_id: 1,
+            fields: SnapshotFields {
+                content: Some(text.into()),
+                author_id: Some(42),
+                ..Default::default()
+            },
+            created_at_ms: 1,
+            first_observed_at_ms: 1,
+            last_observed_at_ms: 1,
+            edit_at_ms: None,
+            expires_at_ms: i64::MAX,
+            generation,
+            coverage_epoch: 0,
+            continuous: false,
+            content_supplied: true,
+            attachments_supplied: false,
+        };
+        let cached = row(logging::MEMORY_CACHE_GENERATION, "cached prior");
+        let report_for = |outcome, before, after| {
+            let mut report = MessageReport {
+                retained_expiries: Default::default(),
+                guild_id: GuildId::new(789),
+                event: "message_edit",
+                vars: std::collections::BTreeMap::new(),
+            };
+            report.vars.insert("after".into(), "event text".into());
+            let transition = SnapshotTransition {
+                outcome,
+                before,
+                after,
+            };
+            apply_transition_report(&mut report, &transition);
+            apply_cached_edit_prior(&mut report, &transition, Some(&cached));
+            report
+        };
+        for outcome in [SnapshotOutcome::Missing, SnapshotOutcome::Stored] {
+            let report = report_for(outcome, None, None);
+            assert!(
+                report.vars["before"].contains("cached prior"),
+                "{outcome:?}"
+            );
+            assert_eq!(report.vars["after"], "event text");
+            assert_eq!(report.vars["coverage"], "from memory cache");
+        }
+        let refused = report_for(SnapshotOutcome::CapacityRefused, None, None);
+        assert!(refused.vars["before"].contains("cached prior"));
+        assert_eq!(refused.vars["after"], "event text");
+        assert!(refused.vars["coverage"].starts_with("from memory cache"));
+        assert!(refused.vars["coverage"].contains("not retained (capacity)"));
+        // A durable prior stays authoritative.
+        let stored = report_for(
+            SnapshotOutcome::CapacityRefused,
+            None,
+            Some(row(3, "stored")),
+        );
+        assert!(stored.vars["before"].contains("stored"));
+        assert!(stored.vars["coverage"].starts_with("last retained observation"));
+        let stored = report_for(SnapshotOutcome::Stored, Some(row(3, "stored")), None);
+        assert!(stored.vars["before"].contains("stored"));
+    }
+
+    /// The create write was lost; the store is healthy again and has no row.
+    /// An author-omitted edit returns `Missing` and uses the cached prior.
+    #[tokio::test]
+    async fn missing_durable_row_uses_cached_before_for_author_omitted_edit() {
+        let (app, path) = temp_app("snapshot_memory_cache_missing_row");
+        let scope = cache_scope(&app, 100).await;
+        crate::db::upsert_log_channel(&app.db, 789, "message_edit", 901)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        app.snapshots.content_access.lock().insert(789);
+        let (http, bodies, server) = recording_delete_proxy().await;
+        let ctx = test_delete_context_with(http).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let id = MessageId::new(((now as u64 - 1_420_070_400_000) << 22) + 1);
+        app.snapshots.remember_recent(
+            &scope,
+            &cache_observation(id.get() as i64, now, "cached original"),
+            true,
+        );
+        let update: MessageUpdateEvent = serde_json::from_value(serde_json::json!({
+            "id": id.to_string(), "channel_id": "456", "guild_id": "789",
+            "content": "current edit", "edited_timestamp": chrono::Utc::now().to_rfc3339()
+        }))
+        .unwrap();
+        app.snapshots
+            .on_gateway_event(&app, ctx.clone(), &Event::MessageUpdate(update));
+        let body = wait_for_body(&bodies, "edit", |body| body.contains("Message edited")).await;
+        server.abort();
+        assert!(body.contains("cached original"), "{body}");
+        assert!(body.contains("current edit"), "{body}");
+        assert!(body.contains("from memory cache"), "{body}");
+        assert!(!body.contains("not captured"), "{body}");
+        drop(ctx);
+        drop(app);
+        remove_db_and_store(&path);
     }
 
     #[tokio::test]
