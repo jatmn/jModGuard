@@ -6325,7 +6325,7 @@ test('Badwords setup reaches existing rule enable escalation exemptions without 
   const h = harness();
   const rule = {rule_id: 'badword', name: 'Badwords', effective: {enabled: true, dry_run: true, params: {}, actions: [{at: 1, action: 'warn'}]}};
   h.app.state.config = {badwords: [], rules: [rule]}; h.app.state.tab = 'badwords'; h.app.renderTab();
-  const settings = [...h.document.querySelectorAll('button')].find(n => /Actions and exemptions/.test(n.textContent));
+  const settings = [...h.document.querySelectorAll('button')].find(n => n.textContent === 'Edit actions & exemptions');
   assert.ok(settings); await fire(settings, 'click');
   const modal = h.document.querySelector('.modal-overlay');
   for (const text of ['Enabled', 'Dry-run', 'Action escalation', 'Whitelist roles', 'Skip moderators']) assert.ok(modal.textContent.includes(text));
@@ -6334,6 +6334,113 @@ test('Badwords setup reaches existing rule enable escalation exemptions without 
   assert.doesNotMatch(other.textContent, /Parameters \(JSON\)/);
   assert.match(other.textContent, /Window \(seconds\)/);
   assert.match(other.textContent, /Maximum mentions in window/);
+});
+
+// #620: visible help is one short idea per line; longer notes wait in a collapsed Good to know.
+function visibleHelp(root) {
+  return [...root.querySelectorAll('p')]
+    .filter((p) => !p.closest('details:not([open]), [role="tooltip"], table'))
+    .map((p) => p.textContent.trim())
+    .filter(Boolean);
+}
+function assertShortHelp(root, page, maxWords = 20) {
+  for (const text of visibleHelp(root)) assert.ok(text.split(/\s+/).length <= maxWords, `${page}: "${text}"`);
+  for (const notes of root.querySelectorAll('details.good-to-know')) {
+    assert.equal(notes.open, false, `${page}: Good to know starts collapsed`);
+    assert.ok(notes.querySelectorAll('li').length > 0, `${page}: Good to know has one note per line`);
+  }
+}
+
+test('Workspace pages keep explanatory text short and move details into collapsed notes', async () => {
+  const badword = { rule_id: 'badword', name: 'Badwords', description: 'Blocks listed words.', effective: { enabled: true, dry_run: false, params: {}, actions: [{ at: 1, action: 'warn' }] } };
+  const knownSpam = { rule_id: 'known_spam', name: 'Known spam', description: 'Bans confirmed spam.', effective: { enabled: true, dry_run: true, params: {}, actions: [] } };
+  const config = {
+    enrollment_id: 'membership', settings: { prefix: '!', bot_name: '' }, badwords: [], known_spam: [], known_bad_images: [], log_channels: [],
+    rules: [badword, knownSpam], commands: [{ name: 'ping', scope: 'guild', effective: { name: 'ping', category: 'util', description: 'Ping', permission: 'everyone', enabled: true } }],
+  };
+  const expected = {
+    dashboard: /Save in each editor/,
+    rules: /Each rule catches one kind of abuse/,
+    badwords: /Block words and phrases/,
+    'known-spam': /Ban members who post spam/,
+    'known-bad-images': /Ban images you've already confirmed/,
+    commands: /Rename any command/,
+  };
+  for (const [tab, intro] of Object.entries(expected)) {
+    const h = harness(async () => response({ events: 0, warns: 0, bans: 0, cases: 0 }));
+    h.app.state.config = config;
+    h.app.state.tab = tab;
+    h.app.renderTab();
+    await settle();
+    const content = h.nodes.get('#content');
+    assert.match(content.textContent, intro, tab);
+    assertShortHelp(content, tab);
+  }
+});
+
+test('Badwords shows what is handled automatically, an entry counter, the action in words and results only after a test', async () => {
+  const requests = [];
+  const h = harness(async (url, options) => {
+    requests.push({ url, body: JSON.parse(options.body) });
+    return response({ matched: true, matches: [{ label: 'scam', source: 'server' }] });
+  });
+  const rule = { rule_id: 'badword', name: 'Badwords', effective: { enabled: true, dry_run: false, params: {}, actions: [
+    { at: 3, action: 'timeout', duration_minutes: 10 }, { at: 1, action: 'warn' }, { at: 5, action: 'ban', purge_last_hour: true },
+  ] } };
+  h.app.state.config = { enrollment_id: 'membership', badwords: [], rules: [rule] };
+  h.app.state.tab = 'badwords'; h.app.renderTab(); await settle();
+  const content = h.nodes.get('#content');
+  const auto = content.querySelector('[aria-label="Words and phrases handle automatically"]');
+  assert.match(auto.textContent, /^Words and phrases handle automatically:/);
+  assert.deepEqual([...auto.querySelectorAll('.badge')].map((chip) => chip.textContent),
+    ['Upper and lower case', 'Accents', 'Hidden characters', 'Spacing', 'Leetspeak', 'Whole words']);
+  for (const chip of auto.querySelectorAll('.badge')) assert.ok(chip.title, `${chip.textContent} explains itself on hover`);
+  assert.equal(textOf(content.querySelector('.badword-action-summary')),
+    'On Strike 1: Warn · Strike 3: Timeout 10 min · Strike 5: Ban and delete the last hour of messages');
+  assert.match(content.textContent, /No words yet\. Add some above, for example: scam, free nitro/);
+  assert.match(content.textContent, /0\/32 entries/);
+  const words = content.querySelector('textarea[aria-label="Words or phrases"]');
+  words.value = 'scam, free nitro\n\nspam,'; await fire(words, 'input');
+  assert.match(content.textContent, /3\/32 entries/);
+  assert.equal(content.querySelector('pre.code'), null, 'no empty results box before a test');
+  const sample = content.querySelector('input[placeholder^="sample text"]');
+  sample.value = '5c4m'; await fire(sample, 'input');
+  await fire([...content.querySelectorAll('button')].find((b) => b.textContent === 'Test'), 'click');
+  assert.equal(requests.at(-1).body.sample, '5c4m');
+  assert.equal(content.querySelector('pre.code').textContent, 'Matched scam (server)');
+
+  // Advanced regex is also checked against the disguise-free lowercase forms (normalize::matches_badword),
+  // but only ordinary words get automatic whole-word boundaries (normalize::literal_badword_pattern).
+  const entryHelp = () => content.querySelector('.badword-entry-row .field .field-help').textContent;
+  assert.equal(entryHelp(), 'Matches whole words and catches common disguises.');
+  await chooseOption(content.querySelector('.badword-entry-row select'), 'Advanced regex');
+  assert.equal(entryHelp(), 'Checked as written and as a lowercase copy with disguises removed. Add \\b for whole words.');
+  assert.ok(content.querySelector('textarea[aria-label="Advanced regex pattern"]'));
+  assert.match(content.textContent, /One pattern, up to 512 bytes\./);
+  assert.doesNotMatch(content.textContent, /Disguises are not handled/);
+
+  // The summary names what the bot runs (RuleDef::action_for_strike, timeout of at least one minute).
+  const summary = () => textOf(h.nodes.get('#content').querySelector('.badword-action-summary'));
+  for (const [actions, expected] of [
+    [[{ at: 1, action: 'timeout', duration_minutes: 0 }], 'Strike 1: Timeout 1 min'],
+    [[{ at: 1, action: 'timeout' }], 'Strike 1: Timeout 1 min'],
+    [[{ at: 1, action: 'ban' }, { at: 1, action: 'warn' }], 'Strike 1: Warn'],
+    [[{ at: 1, action: 'warn' }, { at: 1, action: 'ban' }], 'Strike 1: Ban'],
+    [[{ at: 0, action: 'warn' }, { at: 2, action: 'kick' }], 'Strike 1: Warn · Strike 2: Kick'],
+    [[{ at: 0, action: 'warn' }, { at: 1, action: 'kick' }], 'Strike 1: Kick'],
+    [[], 'No actions set'],
+  ]) {
+    rule.effective.actions = actions;
+    rule.effective.dry_run = false;
+    h.app.renderTab(); await settle();
+    assert.equal(summary(), `On ${expected}`, JSON.stringify(actions));
+    rule.effective.dry_run = true;
+    h.app.renderTab(); await settle();
+    assert.equal(summary(), `Dry-run Only logs matches. When on: ${expected}`, JSON.stringify(actions));
+  }
+  rule.effective.enabled = false;
+  h.app.renderTab(); await settle();
+  assert.equal(summary(), 'Off Matches are ignored.');
 });
 
 test('Badwords rule saves enable actions and exemptions through the setup path', async () => {
@@ -6345,7 +6452,7 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   const rule = {rule_id: 'badword', name: 'Badwords', effective: {enabled: false, dry_run: true, params: {}, actions: [{at: 1, action: 'warn'}]}};
   h.app.state.config = {enrollment_id: 'membership', badwords: [], rules: [rule]};
   h.app.state.tab = 'badwords'; h.app.renderTab();
-  await fire([...h.document.querySelectorAll('button')].find(n => n.textContent === 'Actions and exemptions'), 'click');
+  await fire([...h.document.querySelectorAll('button')].find(n => n.textContent === 'Edit actions & exemptions'), 'click');
   const modal = h.document.querySelector('.modal-overlay');
   await fire(modal.querySelector('input[type="checkbox"]'), 'change', {target: {checked: true}});
   await chooseOption(modal.querySelector('.escalation-step select'), 'timeout');
@@ -6378,7 +6485,10 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   h.app.state.tab = 'known-spam';
   let panel = h.app.tabKnownSpam();
   await settle();
-  assert.match(panel.textContent, /lightly rewritten/i);
+  assert.match(panel.textContent, /reworded copy may not match/i);
+  // Samples and URL patterns count against one 1024-entry limit per scope (db::known_spam).
+  assert.match(panel.textContent, /This server and global each hold up to 1024 entries, samples and URL patterns combined\./);
+  assert.doesNotMatch(panel.textContent, /1024 patterns/);
   const sample = panel.querySelector('textarea');
   sample.value = 'I used to work as Full Stack AI developer'; await fire(sample, 'input');
   const note = panel.querySelector('input[data-note]');
@@ -7484,7 +7594,8 @@ test('owner and non-owner Dashboards show the same tile and setup link icons', a
     assert.equal(assertDashboardIcons(content, name), SETUP_LINKS.length, `${name} sees every setup link`);
     icons[name] = [...content.querySelectorAll('.dashboard-stats svg, .setup-link svg')].map(svg => `${svg.getAttribute('data-icon')}:${svg.getAttribute('class')}`);
     const note = textOf(content.querySelector('.setup-note'));
-    assert.match(note, name === 'owner' ? /As bot owner, you can also edit Global defaults/ : /Global defaults can only be edited by the bot owner/, name);
+    if (name === 'owner') assert.match(note, /As bot owner, you can also edit Global defaults/, name);
+    else assert.doesNotMatch(note, /Global defaults/, name);
   }
   assert.deepEqual(icons['non-owner'], icons.owner, 'no owner-only icon');
   assert.deepEqual(icons['read-only role'], icons.owner);
