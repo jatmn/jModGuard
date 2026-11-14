@@ -6,9 +6,12 @@ use super::tenant_logs::verify_scope;
 use super::*;
 
 /// Discord allows 250 roles and 500 channels; extra entries are dropped.
-pub const SERVER_NAME_ROLE_LIMIT: usize = 300;
-pub const SERVER_NAME_CHANNEL_LIMIT: usize = 600;
+pub(super) const SERVER_NAME_ROLE_LIMIT: usize = 300;
+pub(super) const SERVER_NAME_CHANNEL_LIMIT: usize = 600;
 const NAME_CHARS: usize = 100;
+/// Matches the table CHECK; the limits above stay well under it even when
+/// every name needs JSON escapes.
+const NAMES_MAX_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,6 +113,7 @@ impl GuildDataStore {
         self.check_target(&scope.placement)?;
         anyhow::ensure!(observed_at_ms > 0, TenantDataError::Setting);
         let encoded = serde_json::to_string(&names.normalized()?)?;
+        anyhow::ensure!(encoded.len() <= NAMES_MAX_BYTES, TenantDataError::Setting);
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
         self.db

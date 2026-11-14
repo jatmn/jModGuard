@@ -4624,6 +4624,7 @@ test('escalation editor labels numeric fields and saves edited threshold, durati
   assert.equal(label('Ban behavior'), null, 'warn has no ban behavior');
   await chooseOption(modal.querySelector('.escalation-step select'), 'Timeout');
   assert.ok(label('Timeout (minutes)'));
+  assert.equal(label('Timeout (minutes)').control.value, '0', 'an escalation step keeps its saved minutes');
   assert.equal(label('Ban behavior'), null);
   for (const [text, value] of [['Strike count', '3'], ['Timeout (minutes)', '15'], ['Reason template', 'Updated reason']]) {
     const wrapper = label(text);
@@ -4711,19 +4712,22 @@ test('rule exception pickers show server names and save only the chosen IDs', as
     ],
   };
   const h = harness(async (url, options) => {
-    requests.push({ url, method: options.method });
+    requests.push({ url, method: options.method, enrollment: options.headers['x-jmodguard-enrollment'] });
     if (url.endsWith('/server-names')) return response(names);
     if (url.includes('/members/9007199254740997')) return response({ user_id: '9007199254740997', display_name: 'Known Member' });
     if (url.includes('/members?')) return response({ members: [{ user_id: '9007199254740998', display_name: 'Searched Member' }] });
     if (options.method === 'PUT') saved = JSON.parse(options.body).data;
     return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
   });
+  h.app.state.config = { enrollment_id: 'page-membership', rules: [] };
   const modal = await h.app.editRule({ name: 'Mention spam', rule_id: 'mention_spam', effective: {
     enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn' }],
     whitelist_roles: ['9007199254740993'], whitelist_channels: [], whitelist_users: ['9007199254740997'], include_channels: [],
   } });
   await settle();
   assert.ok(requests.every((r) => r.method === 'POST'), 'picker reads use POST so a CDN cannot reuse them');
+  // The API refuses scoped reads without the loaded page's membership.
+  assert.deepEqual(requests.filter((r) => r.url.endsWith('/server-names')).map((r) => r.enrollment), ['page-membership']);
   const chips = (label) => [...modal.querySelectorAll(`ul.picker-chips[aria-label="${label}"] .picker-chip-text`)].map(textOf);
   assert.deepEqual(chips('Skip roles'), ['@Moderators']);
   assert.deepEqual(chips('Skip users'), ['Known Member']);
@@ -4737,6 +4741,11 @@ test('rule exception pickers show server names and save only the chosen IDs', as
   assert.deepEqual([...channels.querySelectorAll('optgroup')].map((g) => g.label), ['Staff']);
   await chooseOption(channels, '#mod-chat');
   assert.deepEqual(chips('Skip channels'), ['#mod-chat']);
+  // IDs the snapshot lacks, such as a thread, can still be added by ID.
+  const channelId = findNode(modal, n => n.getAttribute?.('aria-label') === 'Add a channel by ID');
+  channelId.value = 'https://discord.com/channels/987654321098765432/9007199254741000'; await fire(channelId, 'input');
+  await fire(channelId, 'keydown', { key: 'Enter' });
+  assert.deepEqual(chips('Skip channels'), ['#mod-chat', 'Channel 9007199254741000']);
   await fire(findNode(modal, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Remove @Moderators'), 'click');
   const search = control('Skip users');
   search.value = 'sear'; await fire(search, 'input');
@@ -4745,7 +4754,7 @@ test('rule exception pickers show server names and save only the chosen IDs', as
   assert.deepEqual(chips('Skip users'), ['Known Member', 'Searched Member']);
   await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
   assert.deepEqual(saved.whitelist_roles, ['9007199254740994']);
-  assert.deepEqual(saved.whitelist_channels, ['9007199254740995']);
+  assert.deepEqual(saved.whitelist_channels, ['9007199254740995', '9007199254741000']);
   assert.deepEqual(saved.whitelist_users, ['9007199254740997', '9007199254740998']);
   assert.deepEqual(saved.include_channels, []);
 });
@@ -4768,8 +4777,18 @@ test('global rules take exception IDs without server name reads', async () => {
   assert.match(textOf(modal), /Enter IDs as digits, mentions or links/);
   users.value = '<@9007199254740997>'; await fire(users, 'input'); await fire(users, 'keydown', { key: 'Enter' });
   assert.equal(requests.length, 0, 'no member search for global rules');
-  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.equal(h.app.isDirty(), true);
+  // Text left in an ID box is saved, or stops the save, never dropped silently.
+  const roles = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Skip roles').control;
+  const save = findNode(modal, n => n.localName === 'button' && n.textContent === 'Save');
+  roles.value = '111, oops'; await fire(roles, 'input');
+  await fire(save, 'click');
+  assert.equal(saved, undefined, 'an invalid leftover ID blocks the save');
+  assert.match(h.nodes.get('#toast').textContent, /Fix the ID fields/);
+  roles.value = '111, <@&222>'; await fire(roles, 'input');
+  await fire(save, 'click');
   assert.deepEqual(saved.whitelist_users, ['9007199254740997']);
+  assert.deepEqual(saved.whitelist_roles, ['111', '222']);
 });
 
 async function chooseOption(select, label) {

@@ -1991,7 +1991,7 @@ function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
   const edit = path.match(
-    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|analytics|cases|case-delete-roles|access-roles)(?:\/|\?|$)/,
+    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|analytics|cases|case-delete-roles|access-roles|server-names)(?:\/|\?|$)/,
   );
   if (
     edit &&
@@ -2014,6 +2014,7 @@ function pageEnrollment(path, method = "GET") {
         "cases",
         "case-delete-roles",
         "access-roles",
+        "server-names",
       ].includes(edit[2])) &&
     edit[1] !== "0" &&
     edit[1] === state.guildId &&
@@ -3657,14 +3658,18 @@ function PickerChip({ kind, id, names, onRemove }) {
   );
 }
 
-// Chips for the chosen roles, channels or users, plus one control to add more:
-// a native select of names when the bot has shared them, a member search for
-// users, and an ID box otherwise (Enter adds an ID, mention or link).
-function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, single = false }) {
+// Chips for the chosen roles, channels or users, plus controls to add more: a
+// native select of names when the bot has shared them, a member search for
+// users, and an ID box (Enter adds IDs, mentions or links). The ID box stays
+// next to the select for IDs the snapshot lacks, such as threads. Save commits
+// or refuses text still in the box through `pending`, as the old ID fields did.
+function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pending, single = false }) {
   const [, bump] = useState(0);
   const [results, setResults] = useState(null);
   const [error, setError] = useState("");
   const searchAbort = useRef(null);
+  const textRef = useRef(null);
+  const flushRef = useRef(null);
   const update = (next) => {
     ids.splice(0, ids.length, ...next);
     markDirty();
@@ -3680,7 +3685,9 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, singl
     if (!raw) return true;
     const found = raw.split(",").map((part) => parseSnowflake(part));
     if (found.some((id) => !id)) {
-      setError("Enter IDs as digits, mentions or links.");
+      setError(kind === "user" && names.status !== "unavailable"
+        ? "Pick a matching member, or enter IDs as digits or mentions."
+        : "Enter IDs as digits, mentions or links.");
       return false;
     }
     setError("");
@@ -3714,6 +3721,45 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, singl
     }
   };
   useEffect(() => () => searchAbort.current?.abort(), []);
+  flushRef.current = () => !textRef.current || addTyped(textRef.current);
+  useEffect(() => {
+    if (!pending) return undefined;
+    const flush = () => flushRef.current();
+    pending.add(flush);
+    return () => pending.delete(flush);
+  }, [pending]);
+  const textBox = (labelled) =>
+    h(Input, {
+      ref: textRef,
+      type: "text",
+      className: "input input-sm",
+      "aria-label": labelled ? undefined : `Add a ${noun} by ID`,
+      placeholder:
+        kind === "user" && names.status !== "unavailable"
+          ? "Search members by name, or paste an ID"
+          : labelled
+            ? `Paste a ${noun} ID${kind === "channel" ? ", #mention or link" : " or @mention"}`
+            : "Or paste an ID",
+      onInput: (e) => {
+        setError("");
+        search(e.target.value);
+      },
+      onKeyDown: (e) => {
+        if (e.key !== "Enter") return;
+        e.preventDefault();
+        if (results?.length === 1 && !parseSnowflake(e.target.value)) {
+          rememberUser?.(results[0].user_id, results[0].display_name);
+          add(results[0].user_id);
+          e.target.value = "";
+          setResults(null);
+          return;
+        }
+        addTyped(e.target);
+      },
+      onBlur: (e) => {
+        if (parseSnowflake(e.target.value)) addTyped(e.target);
+      },
+    });
   const categories = new Map(names.channels.filter((c) => c.kind === "category").map((c) => [c.id, c.name]));
   const channelGroups = [];
   if (kind === "channel") {
@@ -3739,7 +3785,6 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, singl
             {
               className: "select select-sm",
               defaultValue: "",
-              "data-search": "",
               onChange: (e) => {
                 add(e.target.value);
                 e.target.value = "";
@@ -3754,35 +3799,9 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, singl
                     : group.channels.map(optionFor),
                 ),
           )
-        : h(Input, {
-            type: "text",
-            className: "input input-sm",
-            "data-search": "",
-            placeholder:
-              kind === "user" && names.status !== "unavailable"
-                ? "Search members by name, or paste an ID"
-                : `Paste a ${noun} ID${kind === "channel" ? ", #mention or link" : kind === "role" ? " or @mention" : " or @mention"}`,
-            onInput: (e) => {
-              setError("");
-              search(e.target.value);
-            },
-            onKeyDown: (e) => {
-              if (e.key !== "Enter") return;
-              e.preventDefault();
-              if (results?.length === 1 && !parseSnowflake(e.target.value)) {
-                rememberUser?.(results[0].user_id, results[0].display_name);
-                add(results[0].user_id);
-                e.target.value = "";
-                setResults(null);
-                return;
-              }
-              addTyped(e.target);
-            },
-            onBlur: (e) => {
-              if (parseSnowflake(e.target.value)) addTyped(e.target);
-            },
-          }),
+        : textBox(true),
     ),
+    useSelect ? textBox(false) : null,
     results
       ? h(
           "ul",
@@ -3799,6 +3818,7 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, singl
                       onClick: () => {
                         rememberUser?.(member.user_id, member.display_name);
                         add(member.user_id);
+                        if (textRef.current) textRef.current.value = "";
                         setResults(null);
                       },
                     },
@@ -3830,8 +3850,16 @@ function ruleNamesHint(names) {
   return null;
 }
 
+// Text still in an ID box when Save is pressed is added, or the save stops with
+// an error, so nothing typed is lost silently.
+function flushPendingIds(pending) {
+  const ok = [...pending].map((flush) => flush()).every(Boolean);
+  if (!ok) toast("Fix the ID fields marked in red before saving.", "error");
+  return ok;
+}
+
 // Shared Exceptions section: who and where the rule never checks.
-function RuleExceptions({ rule, names, rememberUser, onChange }) {
+function RuleExceptions({ rule, names, rememberUser, onChange, pending }) {
   return h(
     EditorSection,
     { title: "Exceptions", hint: ruleNamesHint(names) || "The rule never acts on these." },
@@ -3852,14 +3880,14 @@ function RuleExceptions({ rule, names, rememberUser, onChange }) {
     h(
       "div",
       { className: "editor-columns" },
-      h(IdPicker, { kind: "role", label: "Skip roles", ids: rule.whitelist_roles, names, onChange }),
-      h(IdPicker, { kind: "channel", label: "Skip channels", ids: rule.whitelist_channels, names, onChange }),
-      h(IdPicker, { kind: "user", label: "Skip users", ids: rule.whitelist_users, names, rememberUser, onChange }),
+      h(IdPicker, { kind: "role", label: "Skip roles", ids: rule.whitelist_roles, names, onChange, pending }),
+      h(IdPicker, { kind: "channel", label: "Skip channels", ids: rule.whitelist_channels, names, onChange, pending }),
+      h(IdPicker, { kind: "user", label: "Skip users", ids: rule.whitelist_users, names, rememberUser, onChange, pending }),
     ),
   );
 }
 
-function RuleAdvanced({ rule, names, onChange, children }) {
+function RuleAdvanced({ rule, names, onChange, pending, children }) {
   return h(
     "details",
     { className: "editor-advanced" },
@@ -3871,6 +3899,7 @@ function RuleAdvanced({ rule, names, onChange, children }) {
       ids: rule.include_channels,
       names,
       onChange,
+      pending,
     }),
     children,
   );
@@ -3907,6 +3936,7 @@ function CustomRuleEditor({ record: r, creating }) {
   const refresh = () => bumpForm((n) => n + 1);
   const [names, rememberUser] = useServerNames(rule.whitelist_users);
   const [honeypotRoles] = useState(() => (rule.params?.role_id ? [String(rule.params.role_id)] : []));
+  const pending = useRef(new Set()).current;
   const kind = rule.params?.kind || "pattern";
   const action = rule.actions?.[0];
   const summary = ruleSummaryText(customRulePhrase(rule, names), action ? ruleStepPhrase(action) : "no action", rule.enabled, rule.dry_run);
@@ -4023,6 +4053,7 @@ function CustomRuleEditor({ record: r, creating }) {
             hint: "Members who take this role get the action below.",
             ids: honeypotRoles,
             names,
+            pending,
             single: true,
             onChange: () => {
               rule.params.role_id = honeypotRoles[0] || "";
@@ -4046,14 +4077,14 @@ function CustomRuleEditor({ record: r, creating }) {
           })
         : null,
     ),
-    h(RuleExceptions, { rule, names, rememberUser, onChange: refresh }),
+    h(RuleExceptions, { rule, names, rememberUser, onChange: refresh, pending }),
     h(
       EditorSection,
       { title: "Scope" },
       h("p", { className: "field-help" }, "Custom rules apply to this server only."),
       h(
         RuleAdvanced,
-        { rule, names, onChange: refresh },
+        { rule, names, onChange: refresh, pending },
         h(
           "div",
           { className: "row checkbox-group" },
@@ -4071,6 +4102,7 @@ function CustomRuleEditor({ record: r, creating }) {
         {
           className: "btn btn-primary",
           onClick: async () => {
+            if (!flushPendingIds(pending)) return;
             const data = buildCustomRuleSaveBody(rule, creating);
             const saved = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", { scope: "guild", data });
             if (!applyConfigPatch(saved) && !(await loadConfig())) return;
@@ -4127,6 +4159,7 @@ function RuleEditor({ record: r }) {
   const [dryRun, setDryRun] = useState(() => (spam ? !spamConfigured(r.rule_id, rule) || rule.dry_run : rule.dry_run));
   const dryRunRef = useRef(null);
   const [names, rememberUser] = useServerNames(rule.whitelist_users);
+  const pending = useRef(new Set()).current;
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef);
   const setValue = (key, value) => {
@@ -4228,12 +4261,12 @@ function RuleEditor({ record: r }) {
         : null,
     ),
     actions,
-    h(RuleExceptions, { rule, names, rememberUser, onChange: refresh }),
+    h(RuleExceptions, { rule, names, rememberUser, onChange: refresh, pending }),
     h(
       EditorSection,
       { title: "Scope", className: "rule-scope" },
       field("Applies to", scopeSel),
-      h(RuleAdvanced, { rule, names, onChange: refresh }),
+      h(RuleAdvanced, { rule, names, onChange: refresh, pending }),
     ),
     h(
       "div",
@@ -4306,6 +4339,7 @@ function RuleEditor({ record: r }) {
               toast("Invalid detection settings: " + e.message, "error");
               return;
             }
+            if (!flushPendingIds(pending)) return;
             const scope = scopeSelRef.current.value;
             const saved = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", {
               scope,
@@ -7821,7 +7855,8 @@ function RuleAction({ action, index, remove, onChange, strike = true, clearBan =
             onChange: (event) => {
               const next = event.target.value;
               action.action = next;
-              if (next === "timeout" && !action.duration_minutes) action.duration_minutes = 60;
+              // Custom rules always defaulted a new timeout to an hour; escalation steps keep their value.
+              if (clearBan && next === "timeout" && !action.duration_minutes) action.duration_minutes = 60;
               if (clearBan && next !== "ban") {
                 action.delete_days = 0;
                 action.purge_last_hour = false;
@@ -7841,8 +7876,8 @@ function RuleAction({ action, index, remove, onChange, strike = true, clearBan =
             h(Input, {
               className: "input input-num",
               type: "number",
-              min: 1,
-              defaultValue: action.duration_minutes || 60,
+              min: clearBan ? 1 : 0,
+              defaultValue: action.duration_minutes ?? 0,
               onChange: (event) => {
                 action.duration_minutes = parseInt(event.target.value) || 0;
                 onChange?.();

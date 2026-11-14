@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::guild_data::server_names::{SERVER_NAME_CHANNEL_LIMIT, SERVER_NAME_ROLE_LIMIT};
 
 async fn ready() -> (Fixture, GuildDataStore, GuildDataScope) {
     let f = Fixture::new();
@@ -149,6 +150,32 @@ async fn server_names_store_a_sorted_bounded_snapshot_and_skip_unchanged_writes(
                 .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn server_names_keep_a_worst_case_snapshot_within_the_row_limit() {
+    let (_f, store, scope) = ready().await;
+    // Control characters need six-byte JSON escapes, the most a name can grow.
+    let name = "\u{1}".repeat(150);
+    let names = ServerNames {
+        roles: (1..=400)
+            .map(|id| role(&id.to_string(), &name, id))
+            .collect(),
+        channels: (1..=800)
+            .map(|id| channel(&(10_000 + id).to_string(), &name, "text", id))
+            .collect(),
+        observed_at_ms: None,
+    };
+    assert!(
+        store
+            .replace_server_names(scope.clone(), names, 1_000)
+            .await
+            .unwrap()
+    );
+    let saved = store.server_names(scope).await.unwrap();
+    assert_eq!(saved.roles.len(), SERVER_NAME_ROLE_LIMIT);
+    assert_eq!(saved.channels.len(), SERVER_NAME_CHANNEL_LIMIT);
+    assert_eq!(saved.roles[0].name.chars().count(), 100);
 }
 
 #[tokio::test]

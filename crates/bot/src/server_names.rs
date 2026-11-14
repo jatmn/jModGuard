@@ -1,15 +1,17 @@
 //! Keeps the guild store's role and channel names current for the Web UI
 //! pickers (#621). Display data only: a failed write is logged and never
-//! affects moderation. Each change stores the whole snapshot again, so a missed
+//! affects moderation. Each refresh stores the whole snapshot again, so a missed
 //! event heals on the next role or channel change or Gateway reconnect.
 
 use crate::db::guild_data::{ServerChannelName, ServerNames, ServerRoleName};
 use crate::state::BotState;
 use serenity::model::{
     channel::{ChannelType, GuildChannel},
-    guild::{Guild, Role},
+    guild::Role,
 };
 use serenity::prelude::Context;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 fn channel_kind(kind: ChannelType) -> Option<&'static str> {
     Some(match kind {
@@ -56,22 +58,69 @@ pub fn snapshot<'a>(
     }
 }
 
-/// Store a full Gateway guild's names after its membership observation.
-pub async fn record_guild(app: &BotState, guild: &Guild) {
-    let names = snapshot(guild.roles.values(), guild.channels.values());
-    record(app, guild.id.get(), names).await;
+/// Guilds with a refresh running, and whether another change arrived meanwhile.
+/// Entries exist only while a refresh runs, so this stays bounded by busy guilds.
+static REFRESHING: LazyLock<Mutex<HashMap<u64, bool>>> = LazyLock::new(Default::default);
+
+/// Store the cached guild's names after a Gateway guild, role or channel event.
+/// The cache already reflects the event. One task per guild writes at a time and
+/// repeats while newer events arrive, so the last write is always the latest
+/// cache and a burst of reorder events costs a few writes, not one each. Runs in
+/// the background so activity logs and moderation never wait for it.
+pub fn refresh_from_cache(app: &Arc<BotState>, ctx: &Context, guild_id: u64) {
+    if !claim(guild_id) {
+        return;
+    }
+    let (app, ctx) = (Arc::clone(app), ctx.clone());
+    tokio::spawn(async move {
+        loop {
+            // Owned data is copied before any await.
+            let names = ctx
+                .cache
+                .guild(guild_id)
+                .map(|guild| snapshot(guild.roles.values(), guild.channels.values()));
+            if let Some(names) = names {
+                record(&app, guild_id, names).await;
+            }
+            if !finish(guild_id) {
+                break;
+            }
+        }
+    });
 }
 
-/// Store the cached guild's names after a role or channel change. The cache
-/// already reflects the event; owned data is copied before any await.
-pub async fn refresh_from_cache(app: &BotState, ctx: &Context, guild_id: u64) {
-    let names = {
-        let Some(guild) = ctx.cache.guild(guild_id) else {
-            return;
-        };
-        snapshot(guild.roles.values(), guild.channels.values())
-    };
-    record(app, guild_id, names).await;
+/// True when this caller should start the refresh task for `guild_id`.
+fn claim(guild_id: u64) -> bool {
+    let mut running = REFRESHING
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match running.get_mut(&guild_id) {
+        Some(again) => {
+            *again = true;
+            false
+        }
+        None => {
+            running.insert(guild_id, false);
+            true
+        }
+    }
+}
+
+/// True when another change arrived during the last write and the task must repeat.
+fn finish(guild_id: u64) -> bool {
+    let mut running = REFRESHING
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match running.get_mut(&guild_id) {
+        Some(again) if *again => {
+            *again = false;
+            true
+        }
+        _ => {
+            running.remove(&guild_id);
+            false
+        }
+    }
 }
 
 async fn record(app: &BotState, guild_id: u64, names: ServerNames) {
@@ -96,6 +145,21 @@ async fn record(app: &BotState, guild_id: u64, names: ServerNames) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refreshes_coalesce_per_guild_and_repeat_after_a_late_change() {
+        let guild = 9_007_199_254_740_001;
+        assert!(claim(guild), "the first event starts the task");
+        assert!(!claim(guild), "a second event joins the running task");
+        assert!(!claim(guild));
+        assert!(
+            finish(guild),
+            "a change during the write runs one more pass"
+        );
+        assert!(!finish(guild), "no newer change: the task ends");
+        assert!(claim(guild), "a later event starts a new task");
+        assert!(!finish(guild));
+    }
 
     #[test]
     fn snapshot_keeps_server_channels_and_role_display_facts() {

@@ -5,7 +5,7 @@ CREATE TABLE guild_server_names (
     guild_id INTEGER PRIMARY KEY CHECK(guild_id > 0),
     enrollment_id TEXT NOT NULL
         CHECK(length(CAST(enrollment_id AS BLOB)) = 32 AND enrollment_id NOT GLOB '*[^0-9a-f]*'),
-    names TEXT NOT NULL CHECK(json_valid(names) AND length(CAST(names AS BLOB)) <= 524288),
+    names TEXT NOT NULL CHECK(json_valid(names) AND length(CAST(names AS BLOB)) <= 1048576),
     observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms > 0),
     FOREIGN KEY(guild_id) REFERENCES guild_bindings(guild_id)
 );
