@@ -492,7 +492,7 @@ function TabOwnerServers() {
     h(
       "p",
       { className: "muted" },
-      "Every server the bot is or was connected to, who added it, and when. Removing the bot makes it depart that server immediately.",
+      "Every server the bot is in or has left, who added it and when.",
     ),
     h(
       "div",
@@ -589,8 +589,14 @@ const MB = 1000000;
 // for a response that omits them.
 const USAGE_DEFAULT_LIMITS = { limit: 1000 * MB, pressure: 700 * MB, capture: 800 * MB, growth: 900 * MB, snapshots: 400 * MB };
 
-const USAGE_HELP =
-  "Physical allocation includes reusable pages. Each database has its own 1,000 MB limit; the application starts faster cleanup at 700 MB (pressure), pauses snapshot capture at 800 MB and stops growth at 900 MB. Unknown measurements are not treated as free capacity. Category estimates are labeled when exact page attribution is unavailable. Details lists every diagnostic value.";
+const USAGE_HELP = [
+  "Each database has its own 1,000 MB limit.",
+  "Cleanup speeds up at 700 MB, snapshot capture pauses at 800 MB and growth stops at 900 MB.",
+  "Allocated size includes free pages the database can reuse.",
+  "Unknown sizes never count as free space.",
+  "Estimated categories are labeled as estimates.",
+  "Details lists every diagnostic value.",
+];
 
 // One badge per operating state the API reports; `state` is the full explanation.
 const USAGE_HEALTH = {

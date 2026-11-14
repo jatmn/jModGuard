@@ -6905,6 +6905,8 @@ test('Bot servers directory renders server facts without guild-scoped reads', as
   const panel = h.app.TabOwnerServers();
   await settle();
   const text = textOf(panel);
+  assert.match(text, /Every server the bot is in or has left, who added it and when\./);
+  assertShortHelp(panel, 'Bot servers');
   assert.match(text, /Alpha/);
   assert.match(text, /111111111111111111/);
   assert.match(text, /Admin Ada \(222222222222222222\)/);
@@ -7794,7 +7796,9 @@ test('Database Usage shows size, limit share, next threshold, health and freshne
   const header = h.nodes.get('#content .page-header');
   assert.equal(header.querySelector('h2').textContent, 'Database Usage');
   assert.match(header.querySelector('.page-header-detail').textContent, /^Response just now · catalog available$/);
-  assert.match(h.nodes.get('#usage-help').textContent, /Unknown measurements are not treated as free capacity/);
+  assert.deepEqual([...h.nodes.get('#usage-help').querySelectorAll('.info-tip-line')].map((line) => line.textContent).slice(0, 2),
+    ['Each database has its own 1,000 MB limit.', 'Cleanup speeds up at 700 MB, snapshot capture pauses at 800 MB and growth stops at 900 MB.']);
+  assert.match(h.nodes.get('#usage-help').textContent, /Unknown sizes never count as free space/);
   const [core, guild, unknown] = usageCards(h);
 
   assert.equal(core.querySelector('.du-title').textContent, 'Core database');

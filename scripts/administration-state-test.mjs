@@ -924,6 +924,9 @@ test("owner saves the boot repair alert channel as a string ID through the API",
     return response({ ...state([record("bot")]), alert_channel: alertChannel });
   });
   assert.match(view.elements.get("alert-channel-unset").textContent, /No alert channel is set/);
+  // #620: one short sentence explains the card.
+  const intro = view.elements.get("alert-channel-unset").previousElementSibling.textContent;
+  assert.equal(intro, "The bot posts here once when boot repair can't restore the recorded bot or API release.");
   const input = view.elements.get("alert-channel-id");
   // React loads before this harness creates a DOM, so it cannot observe native input events.
   const setValue = (element, value) => flushSync(() => element[Object.keys(element).find(key => key.startsWith("__reactProps"))].onChange({ target: { value } }));
