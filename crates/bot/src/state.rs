@@ -2506,6 +2506,14 @@ impl ConfigCache {
         self.invalidate();
     }
 
+    /// Last configuration loaded since the most recent invalidation, without
+    /// freshness checks. Not for authorization or delivery decisions.
+    pub(crate) fn last_known(&self, guild_id: u64) -> Option<Arc<CachedGuildConfig>> {
+        self.map
+            .get(&(guild_id as i64))
+            .map(|entry| Arc::clone(&entry))
+    }
+
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
         let required = self
             .durable_floor

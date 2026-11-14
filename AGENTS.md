@@ -30,6 +30,8 @@ current-membership and retained-ban feature; see `docs/MEMBERS.md`. It never
 records general activity. See `docs/LOGGING-DATA.md`. Historical archive tables
 and helpers remain removed. Basic reports use the last retained observation,
 with explicit gaps and bounded delivery; they never reconstruct Discord history.
+When the guild store cannot supply that observation, they use the bounded
+process-only memory cache of the same eligible messages (same expiry, no attachment bytes).
 Message-edit reports require Discord's `edited_timestamp`;
 embed/GIF/unfurl/reply/flag refreshes and the bot's own messages are not edits. Each
 report is that one event. Leave logs may use bounded join timestamps already received

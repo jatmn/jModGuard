@@ -17,8 +17,8 @@ use serenity::model::id::{ChannelId, GuildId, MessageId};
 use tokio::sync::mpsc;
 
 use crate::db::guild_data::{
-    GuildDataScope, GuildDataStore, SNAPSHOT_CAPTURE_BATCH, SnapshotAttachment, SnapshotError,
-    SnapshotFields, SnapshotHealthState, SnapshotHealthUpdate, SnapshotObservation,
+    GuildDataScope, GuildDataStore, MessageSnapshot, SNAPSHOT_CAPTURE_BATCH, SnapshotAttachment,
+    SnapshotError, SnapshotFields, SnapshotHealthState, SnapshotHealthUpdate, SnapshotObservation,
     SnapshotOutcome, SnapshotTransition,
 };
 use crate::logging::{self, MessageReport};
@@ -30,6 +30,9 @@ const MAX_TEXT_BYTES: usize = 32 * 1024;
 const MAX_ATTACHMENTS_BYTES: usize = 16 * 1024;
 const MAX_KNOWN: usize = 4096;
 const TOMBSTONE_KEEP: Duration = Duration::from_secs(86_400);
+const MAX_RECENT: usize = 8192;
+const MAX_RECENT_BYTES: usize = 16 * 1024 * 1024;
+const RECENT_LIFETIME_MS: i64 = 86_400_000;
 
 type Key = (u64, u64, u64);
 
@@ -144,6 +147,141 @@ impl DeletedIdentities {
     }
 }
 
+/// Process-only copy of the latest observation of recent eligible messages.
+/// Delete and edit reports use it when the guild store cannot supply a row, so
+/// a store outage does not drop text this process already observed. It follows
+/// snapshot eligibility and expiry, is bounded by count and bytes, drops deleted
+/// identities and is lost on restart.
+#[derive(Default)]
+struct RecentMessages {
+    entries: HashMap<Key, (MessageSnapshot, usize)>,
+    order: VecDeque<Key>,
+    bytes: usize,
+}
+
+impl RecentMessages {
+    fn row(guild: u64, observation: &SnapshotObservation) -> MessageSnapshot {
+        MessageSnapshot {
+            guild_id: guild as i64,
+            channel_id: observation.channel_id,
+            message_id: observation.message_id,
+            fields: observation.fields.clone(),
+            created_at_ms: observation.created_at_ms,
+            first_observed_at_ms: observation.observed_at_ms,
+            last_observed_at_ms: observation.observed_at_ms,
+            edit_at_ms: observation.edit_at_ms,
+            expires_at_ms: observation.created_at_ms.saturating_add(RECENT_LIFETIME_MS),
+            generation: logging::MEMORY_CACHE_GENERATION,
+            coverage_epoch: 0,
+            continuous: false,
+            content_supplied: observation.fields.content.is_some(),
+            attachments_supplied: observation.fields.attachments.is_some(),
+        }
+    }
+
+    /// Records an observation and returns the cached state it replaced. Fields
+    /// an edit does not supply keep their earlier value; an older edit is ignored.
+    fn observe(
+        &mut self,
+        guild: u64,
+        observation: &SnapshotObservation,
+        allow_insert: bool,
+        now_ms: i64,
+    ) -> Option<MessageSnapshot> {
+        let key = (
+            guild,
+            observation.channel_id as u64,
+            observation.message_id as u64,
+        );
+        let before = self.get(key, now_ms);
+        let row = match before.clone() {
+            Some(old) if old.edit_at_ms > observation.edit_at_ms => return before,
+            Some(mut row) => {
+                let fields = &observation.fields;
+                if fields.content.is_some() {
+                    row.fields.content = fields.content.clone();
+                    row.fields.content_truncated = fields.content_truncated;
+                    row.fields.content_original_bytes = fields.content_original_bytes;
+                }
+                if fields.attachments.is_some() {
+                    row.fields.attachments = fields.attachments.clone();
+                    row.fields.attachments_truncated = fields.attachments_truncated;
+                    row.fields.attachments_omitted = fields.attachments_omitted;
+                }
+                if fields.author_id.is_some() {
+                    row.fields.author_id = fields.author_id;
+                }
+                if fields.author_name.is_some() {
+                    row.fields.author_name = fields.author_name.clone();
+                }
+                row.last_observed_at_ms = observation.observed_at_ms;
+                row.edit_at_ms = observation.edit_at_ms.or(row.edit_at_ms);
+                row
+            }
+            None if allow_insert => Self::row(guild, observation),
+            None => return None,
+        };
+        if row.expires_at_ms <= now_ms {
+            return before;
+        }
+        let size = fields_bytes(&row.fields);
+        if let Some((_, old)) = self.entries.insert(key, (row, size)) {
+            self.bytes -= old;
+        } else {
+            self.order.push_back(key);
+        }
+        self.bytes += size;
+        self.trim(now_ms);
+        before
+    }
+
+    fn get(&self, key: Key, now_ms: i64) -> Option<MessageSnapshot> {
+        self.entries
+            .get(&key)
+            .filter(|(row, _)| row.expires_at_ms > now_ms)
+            .map(|(row, _)| row.clone())
+    }
+
+    fn take(&mut self, key: Key, now_ms: i64) -> Option<MessageSnapshot> {
+        let (row, size) = self.entries.remove(&key)?;
+        self.bytes -= size;
+        (row.expires_at_ms > now_ms).then_some(row)
+    }
+
+    fn remove(&mut self, key: Key) {
+        if let Some((_, size)) = self.entries.remove(&key) {
+            self.bytes -= size;
+        }
+    }
+
+    fn clear_guild(&mut self, guild: u64) {
+        self.entries.retain(|(g, _, _), _| *g != guild);
+        self.order.retain(|(g, _, _)| *g != guild);
+        self.bytes = self.entries.values().map(|(_, size)| size).sum();
+    }
+
+    /// Oldest observations leave first. Keys already taken or removed are
+    /// dropped from the order lazily and compacted once they dominate it.
+    fn trim(&mut self, now_ms: i64) {
+        if self.order.len() > MAX_RECENT.saturating_mul(2) {
+            let entries = &self.entries;
+            self.order.retain(|key| entries.contains_key(key));
+        }
+        while let Some(&oldest) = self.order.front() {
+            let over = self.entries.len() > MAX_RECENT || self.bytes > MAX_RECENT_BYTES;
+            let expired = self
+                .entries
+                .get(&oldest)
+                .is_none_or(|(row, _)| row.expires_at_ms <= now_ms);
+            if !over && !expired {
+                break;
+            }
+            self.order.pop_front();
+            self.remove(oldest);
+        }
+    }
+}
+
 struct CoverageEpoch(AtomicU64);
 
 impl CoverageEpoch {
@@ -229,6 +367,7 @@ pub struct SnapshotIngress {
     scopes: Mutex<HashMap<u64, GuildDataScope>>,
     known_humans: Mutex<KnownHumans>,
     deleted: Mutex<DeletedIdentities>,
+    recent: Mutex<RecentMessages>,
     content_access: Mutex<HashSet<u64>>,
     contexts: Mutex<HashMap<u64, (u64, Context)>>,
     collectors: Mutex<HashMap<u64, u64>>,
@@ -251,6 +390,7 @@ impl Default for SnapshotIngress {
             scopes: Mutex::new(HashMap::new()),
             known_humans: Mutex::new(KnownHumans::default()),
             deleted: Mutex::new(DeletedIdentities::default()),
+            recent: Mutex::new(RecentMessages::default()),
             content_access: Mutex::new(HashSet::new()),
             contexts: Mutex::new(HashMap::new()),
             collectors: Mutex::new(HashMap::new()),
@@ -616,6 +756,7 @@ impl SnapshotIngress {
         known.entries.retain(|(g, _, _)| *g != guild);
         known.order.retain(|((g, _, _), _)| *g != guild);
         self.content_access.lock().remove(&guild);
+        self.recent.lock().clear_guild(guild);
         self.gap();
     }
 
@@ -749,6 +890,49 @@ impl SnapshotIngress {
                 .entries
                 .remove(&(guild.get(), channel.get(), id.get()));
         }
+        drop(known);
+        drop(deleted);
+        // `remember_recent` checks deletion while holding this lock, so a
+        // concurrent observation cannot leave a deleted message cached.
+        let mut recent = self.recent.lock();
+        for id in ids {
+            recent.remove((guild.get(), channel.get(), id.get()));
+        }
+    }
+
+    fn remember_recent(
+        &self,
+        guild: u64,
+        observation: &SnapshotObservation,
+        allow_insert: bool,
+    ) -> Option<MessageSnapshot> {
+        let key = (
+            guild,
+            observation.channel_id as u64,
+            observation.message_id as u64,
+        );
+        let mut recent = self.recent.lock();
+        if self.deleted.lock().knowledge(key).blocks_capture() {
+            return None;
+        }
+        recent.observe(
+            guild,
+            observation,
+            allow_insert,
+            chrono::Utc::now().timestamp_millis(),
+        )
+    }
+
+    fn take_recent(
+        &self,
+        guild: GuildId,
+        channel: ChannelId,
+        id: MessageId,
+    ) -> Option<MessageSnapshot> {
+        self.recent.lock().take(
+            (guild.get(), channel.get(), id.get()),
+            chrono::Utc::now().timestamp_millis(),
+        )
     }
 
     fn enqueue(
@@ -1026,16 +1210,14 @@ fn fields(
 }
 
 fn estimated_bytes(observation: &SnapshotObservation) -> usize {
+    fields_bytes(&observation.fields)
+}
+
+fn fields_bytes(fields: &SnapshotFields) -> usize {
     256usize
-        .saturating_add(observation.fields.content.as_ref().map_or(0, String::len))
-        .saturating_add(
-            observation
-                .fields
-                .author_name
-                .as_ref()
-                .map_or(0, String::len),
-        )
-        .saturating_add(observation.fields.attachments.as_ref().map_or(0, |items| {
+        .saturating_add(fields.content.as_ref().map_or(0, String::len))
+        .saturating_add(fields.author_name.as_ref().map_or(0, String::len))
+        .saturating_add(fields.attachments.as_ref().map_or(0, |items| {
             items
                 .iter()
                 .map(|item| {
@@ -1155,56 +1337,6 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
         None => receiver.recv().await,
     } {
         app.snapshots.bytes.fetch_sub(work.bytes, Ordering::AcqRel);
-        let store = match app.tenant.store(&work.scope).await {
-            Ok(store) => store,
-            Err(error) => {
-                tracing::warn!("message snapshot store unavailable: {error:#}");
-                app.snapshots.gap_scope(&work.scope);
-                if let Body::Delete {
-                    guild,
-                    channel,
-                    ref ids,
-                    ..
-                } = work.body
-                {
-                    app.snapshots.mark_deleted(guild, channel, ids);
-                }
-                match work.body {
-                    Body::Edit(_, Some(mut report), _) => {
-                        report
-                            .vars
-                            .insert("coverage".into(), "snapshot storage unavailable".into());
-                        submit_report(&app, &work.context, report);
-                    }
-                    Body::Delete {
-                        guild,
-                        channel,
-                        ids,
-                        bulk: false,
-                    } => {
-                        if let Some(id) = ids.first()
-                            && let Some(mut report) =
-                                logging::observed_delete_report(&app, guild, channel, *id, None)
-                        {
-                            report
-                                .vars
-                                .insert("coverage".into(), "snapshot storage unavailable".into());
-                            submit_report(&app, &work.context, report);
-                        }
-                    }
-                    Body::Delete {
-                        guild,
-                        channel,
-                        ids,
-                        bulk: true,
-                    } => {
-                        submit_peeled_bulk_deletes(&app, &work.context, guild, channel, ids).await;
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-        };
         let guild = work.scope.guild_id() as u64;
         let (config, config_load_failed) = match app.configs.get(&app.db, guild).await {
             Ok(cfg) => (Some(cfg), false),
@@ -1215,6 +1347,97 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
             }
         };
         let configured = config.as_ref().is_some_and(|cfg| capture_enabled(cfg));
+        // The memory cache keeps the last loaded eligibility while configuration
+        // reads fail, so a database stall does not also empty it.
+        let cache_configured = configured
+            || (config_load_failed
+                && app
+                    .configs
+                    .last_known(guild)
+                    .is_some_and(|cfg| capture_enabled(&cfg)));
+        let cached_before = match &work.body {
+            Body::Create(observation) if cache_configured => {
+                app.snapshots.remember_recent(guild, observation, true);
+                None
+            }
+            Body::Edit(observation, _, allow_insert) if cache_configured => app
+                .snapshots
+                .remember_recent(guild, observation, *allow_insert),
+            _ => None,
+        };
+        let store = match app.tenant.store(&work.scope).await {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!("message snapshot store unavailable: {error:#}");
+                // A failed configuration read already charged this item.
+                if !config_load_failed {
+                    app.snapshots.gap_scope(&work.scope);
+                }
+                match work.body {
+                    Body::Edit(_, Some(mut report), _) => {
+                        if cached_before.is_some() {
+                            logging::apply_retained_edit(&mut report, cached_before.as_ref(), None);
+                        } else {
+                            report
+                                .vars
+                                .insert("coverage".into(), "snapshot storage unavailable".into());
+                        }
+                        submit_report(&app, &work.context, report);
+                    }
+                    Body::Delete {
+                        guild,
+                        channel,
+                        ids,
+                        bulk: false,
+                    } => {
+                        let cached = ids
+                            .first()
+                            .and_then(|id| app.snapshots.take_recent(guild, channel, *id));
+                        app.snapshots.mark_deleted(guild, channel, &ids);
+                        if let Some(id) = ids.first()
+                            && let Some(mut report) = logging::observed_delete_report(
+                                &app,
+                                guild,
+                                channel,
+                                *id,
+                                cached.as_ref(),
+                            )
+                        {
+                            if cached.is_none() {
+                                report.vars.insert(
+                                    "coverage".into(),
+                                    "snapshot storage unavailable".into(),
+                                );
+                            }
+                            submit_report(&app, &work.context, report);
+                        }
+                    }
+                    Body::Delete {
+                        guild,
+                        channel,
+                        ids,
+                        bulk: true,
+                    } => {
+                        let cached = ids
+                            .iter()
+                            .map(|id| app.snapshots.take_recent(guild, channel, *id))
+                            .collect();
+                        app.snapshots.mark_deleted(guild, channel, &ids);
+                        submit_peeled_bulk_deletes(
+                            &app,
+                            &work.context,
+                            guild,
+                            channel,
+                            ids,
+                            cached,
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+        };
         match &mut work.body {
             Body::Create(observation) => {
                 if !configured {
@@ -1260,6 +1483,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         app.snapshots.gap_scope(&next.scope);
                         continue;
                     }
+                    app.snapshots.remember_recent(guild, next_observation, true);
                     next_observation.coverage_epoch = next.epoch;
                     observations.push(next_observation.clone());
                 }
@@ -1405,9 +1629,13 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 }
                 if !configured {
                     if config_load_failed && let Some(mut report) = report.take() {
-                        report
-                            .vars
-                            .insert("coverage".into(), "configuration unavailable".into());
+                        if cached_before.is_some() {
+                            logging::apply_retained_edit(&mut report, cached_before.as_ref(), None);
+                        } else {
+                            report
+                                .vars
+                                .insert("coverage".into(), "configuration unavailable".into());
+                        }
                         submit_report(&app, &work.context, report);
                     }
                     continue;
@@ -1481,6 +1709,18 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         }
                         if let Some(mut report) = report.take() {
                             apply_transition_report(&mut report, &transition);
+                            // The store had no earlier row, e.g. its create write
+                            // was lost while the store was unavailable.
+                            if transition.outcome == SnapshotOutcome::Stored
+                                && transition.before.is_none()
+                                && cached_before.is_some()
+                            {
+                                logging::apply_retained_edit(
+                                    &mut report,
+                                    cached_before.as_ref(),
+                                    None,
+                                );
+                            }
                             submit_report(&app, &work.context, report);
                         }
                     }
@@ -1497,9 +1737,18 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         )
                         .await;
                         if let Some(mut report) = report.take() {
-                            report
-                                .vars
-                                .insert("coverage".into(), "snapshot storage unavailable".into());
+                            if cached_before.is_some() {
+                                logging::apply_retained_edit(
+                                    &mut report,
+                                    cached_before.as_ref(),
+                                    None,
+                                );
+                            } else {
+                                report.vars.insert(
+                                    "coverage".into(),
+                                    "snapshot storage unavailable".into(),
+                                );
+                            }
                             submit_report(&app, &work.context, report);
                         }
                     }
@@ -1527,23 +1776,19 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 let now = chrono::Utc::now().timestamp_millis();
                 let mut transcript = logging::BulkTranscript::new(ids.len());
                 let mut peeled_reports = Vec::new();
-                let ignored_authors: HashSet<i64> = config
-                    .as_ref()
-                    .and_then(|cfg| cfg.log_filters.get("message_bulk_delete"))
-                    .map(|filter| {
-                        filter
-                            .users
-                            .iter()
-                            .filter_map(|id| id.parse::<i64>().ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let ignored_authors = bulk_ignored_authors(config.as_deref());
                 let automod_individual = config
                     .as_ref()
                     .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
+                // Always consume the cached copy; it fills in only for a missing
+                // or unreadable stored row.
+                let cached: Vec<_> = ids
+                    .iter()
+                    .map(|id| app.snapshots.take_recent(*guild, *channel, *id))
+                    .collect();
                 let mut single = None;
                 let mut single_unknown = false;
-                for chunk in ids.chunks(100) {
+                for (chunk, cached_chunk) in ids.chunks(100).zip(cached.chunks(100)) {
                     let values = chunk.iter().map(|id| id.get() as i64).collect();
                     match store
                         .take_snapshots_at_epoch(
@@ -1556,7 +1801,8 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         .await
                     {
                         Ok(rows) => {
-                            for (id, row) in chunk.iter().zip(rows) {
+                            for ((id, row), cached) in chunk.iter().zip(rows).zip(cached_chunk) {
+                                let row = row.or_else(|| cached.clone());
                                 if *bulk {
                                     let placement = logging::place_bulk_delete(
                                         &app,
@@ -1590,16 +1836,21 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                             tracing::warn!("message snapshot delete unavailable: {error:#}");
                             app.snapshots.gap_scope(&work.scope);
                             if *bulk {
-                                peeled_reports.extend(peel_automod_bulk_chunk(
-                                    &app,
-                                    *guild,
-                                    *channel,
-                                    chunk,
-                                    &mut transcript,
-                                    automod_individual,
-                                ));
+                                for (id, cached) in chunk.iter().zip(cached_chunk) {
+                                    peeled_reports.extend(record_unread_bulk_member(
+                                        &app,
+                                        *guild,
+                                        *channel,
+                                        *id,
+                                        cached.as_ref(),
+                                        &mut transcript,
+                                        automod_individual,
+                                        &ignored_authors,
+                                    ));
+                                }
                             } else {
-                                single_unknown = true;
+                                single = cached_chunk.first().cloned().flatten();
+                                single_unknown = single.is_none();
                             }
                         }
                     }
@@ -1729,7 +1980,8 @@ fn schedule_unqueued_bulk_delete(
         let context = context.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            submit_peeled_bulk_deletes_admitted(&app, &context, guild, channel, ids).await;
+            let cached = vec![None; ids.len()];
+            submit_peeled_bulk_deletes_admitted(&app, &context, guild, channel, ids, cached).await;
         });
     } else {
         observe_unadmitted_bulk_delete(app, &context, guild, channel, &ids);
@@ -1845,12 +2097,60 @@ pub(crate) fn peel_automod_bulk_chunk(
     peeled
 }
 
+fn bulk_ignored_authors(config: Option<&crate::state::CachedGuildConfig>) -> HashSet<i64> {
+    config
+        .and_then(|cfg| cfg.log_filters.get("message_bulk_delete"))
+        .map(|filter| {
+            filter
+                .users
+                .iter()
+                .filter_map(|id| id.parse::<i64>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A bulk member the guild store could not read. A memory-cache row is
+/// recorded like a retained row; without one the member stays storage unknown.
+#[allow(clippy::too_many_arguments)]
+fn record_unread_bulk_member(
+    app: &Arc<BotState>,
+    guild: GuildId,
+    channel: ChannelId,
+    id: MessageId,
+    cached: Option<&MessageSnapshot>,
+    transcript: &mut logging::BulkTranscript,
+    automod_individual: bool,
+    ignored_authors: &HashSet<i64>,
+) -> Option<MessageReport> {
+    let Some(row) = cached else {
+        return peel_automod_bulk_chunk(app, guild, channel, &[id], transcript, automod_individual)
+            .pop();
+    };
+    let placement =
+        logging::place_bulk_delete(app, guild, channel, id, Some(row), !automod_individual);
+    let author_filtered = row
+        .fields
+        .author_id
+        .is_some_and(|author| ignored_authors.contains(&author));
+    record_observed_bulk_member(
+        transcript,
+        id,
+        Some(row),
+        placement,
+        automod_individual,
+        author_filtered,
+        false,
+    )
+}
+
 async fn submit_peeled_bulk_deletes(
     app: &Arc<BotState>,
     context: &Context,
     guild: GuildId,
     channel: ChannelId,
     ids: Vec<MessageId>,
+    cached: Vec<Option<MessageSnapshot>>,
 ) {
     let Some(permit) = acquire_report_slot(app) else {
         // The transcript cannot be sent. Observe pending ids on this worker
@@ -1862,7 +2162,7 @@ async fn submit_peeled_bulk_deletes(
     let context = context.clone();
     tokio::spawn(async move {
         let _permit = permit;
-        submit_peeled_bulk_deletes_admitted(&app, &context, guild, channel, ids).await;
+        submit_peeled_bulk_deletes_admitted(&app, &context, guild, channel, ids, cached).await;
     });
 }
 
@@ -1872,20 +2172,27 @@ async fn submit_peeled_bulk_deletes_admitted(
     guild: GuildId,
     channel: ChannelId,
     ids: Vec<MessageId>,
+    cached: Vec<Option<MessageSnapshot>>,
 ) {
     let cfg = app.configs.get(&app.db, guild.get()).await.ok();
     let automod_individual = cfg
         .as_ref()
         .is_some_and(|cfg| logging::channel_for(cfg, "automod_delete").is_some());
+    let ignored_authors = bulk_ignored_authors(cfg.as_deref());
     let mut transcript = logging::BulkTranscript::new(ids.len());
-    let peeled = peel_automod_bulk_chunk(
-        app,
-        guild,
-        channel,
-        &ids,
-        &mut transcript,
-        automod_individual,
-    );
+    let mut peeled = Vec::new();
+    for (id, cached) in ids.iter().zip(&cached) {
+        peeled.extend(record_unread_bulk_member(
+            app,
+            guild,
+            channel,
+            *id,
+            cached.as_ref(),
+            &mut transcript,
+            automod_individual,
+            &ignored_authors,
+        ));
+    }
     // This task already holds the report permit. Emit peeled automod reports
     // here instead of acquiring a second report slot.
     for report in peeled {
@@ -2790,6 +3097,293 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    fn message_json(id: MessageId, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id.to_string(), "channel_id": "456", "guild_id": "789",
+            "author": {"id": "42", "username": "advisor", "discriminator": "0"},
+            "content": content, "timestamp": chrono::Utc::now().to_rfc3339(),
+            "edited_timestamp": null, "tts": false, "mention_everyone": false,
+            "mentions": [], "mention_roles": [], "attachments": [], "embeds": [],
+            "pinned": false, "type": 0
+        })
+    }
+
+    async fn wait_for_body(
+        bodies: &std::sync::Mutex<Vec<String>>,
+        what: &str,
+        matches: impl Fn(&str) -> bool,
+    ) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let sent = bodies.lock().unwrap().clone();
+            if let Some(body) = sent.iter().find(|body| matches(body)) {
+                return body.clone();
+            }
+            assert!(Instant::now() < deadline, "no {what} report: {sent:#?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// #633: the guild store cannot be opened, so nothing reaches the snapshot
+    /// table. Reports still show the text this process observed.
+    #[tokio::test]
+    async fn unavailable_snapshot_store_logs_edit_and_deletes_from_memory_cache() {
+        let (app, path) = temp_app("snapshot_memory_cache");
+        // This process has no credentials for another installation's store, so
+        // `tenant.store` fails the same way as an unreachable guild store.
+        let (other, other_path) = temp_app("snapshot_memory_cache_other");
+        let enrollment = crate::db::enroll_guild(&other.db, 789, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = other.tenant.activate(enrollment).await.unwrap().unwrap();
+        assert!(app.tenant.store(&scope).await.is_err());
+        for event in ["message_edit", "message_delete", "message_bulk_delete"] {
+            crate::db::upsert_log_channel(&app.db, 789, event, 901)
+                .await
+                .unwrap();
+        }
+        app.invalidate_configs();
+        app.snapshots.scopes.lock().insert(789, scope);
+        let (http, bodies, server) = recording_delete_proxy().await;
+        let ctx = test_delete_context_with(http).await;
+        let snowflake = |offset: u64| {
+            let ms = chrono::Utc::now().timestamp_millis() as u64 - 1_420_070_400_000;
+            MessageId::new((ms << 22) + offset)
+        };
+        let (edited, bulk_cached, bulk_unseen) = (snowflake(1), snowflake(2), snowflake(3));
+        for (id, content) in [
+            (edited, "first draft text"),
+            (bulk_cached, "bulk member text"),
+        ] {
+            let create: serenity::model::event::MessageCreateEvent =
+                serde_json::from_value(message_json(id, content)).unwrap();
+            app.snapshots
+                .on_gateway_event(&app, ctx.clone(), &Event::MessageCreate(create));
+        }
+        let update: MessageUpdateEvent = serde_json::from_value(serde_json::json!({
+            "id": edited.to_string(), "channel_id": "456", "guild_id": "789",
+            "author": {"id": "42", "username": "advisor", "discriminator": "0"},
+            "content": "second draft text",
+            "edited_timestamp": chrono::Utc::now().to_rfc3339()
+        }))
+        .unwrap();
+        app.snapshots
+            .on_gateway_event(&app, ctx.clone(), &Event::MessageUpdate(update));
+        let delete: serenity::model::event::MessageDeleteEvent =
+            serde_json::from_value(serde_json::json!({
+                "id": edited.to_string(), "channel_id": "456", "guild_id": "789"
+            }))
+            .unwrap();
+        app.snapshots
+            .on_gateway_event(&app, ctx.clone(), &Event::MessageDelete(delete));
+        let bulk: serenity::model::event::MessageDeleteBulkEvent =
+            serde_json::from_value(serde_json::json!({
+                "guild_id": "789", "channel_id": "456",
+                "ids": [bulk_cached.to_string(), bulk_unseen.to_string()]
+            }))
+            .unwrap();
+        app.snapshots
+            .on_gateway_event(&app, ctx.clone(), &Event::MessageDeleteBulk(bulk));
+
+        let edit = wait_for_body(&bodies, "edit", |body| body.contains("Message edited")).await;
+        assert!(edit.contains("first draft text"), "{edit}");
+        assert!(edit.contains("second draft text"), "{edit}");
+        assert!(edit.contains("from memory cache"), "{edit}");
+        let single = wait_for_body(&bodies, "delete", |body| {
+            body.contains("Message deleted") && !body.contains("Bulk")
+        })
+        .await;
+        assert!(single.contains("second draft text"), "{single}");
+        assert!(!single.contains("not captured"), "{single}");
+        assert!(single.contains("from memory cache"), "{single}");
+        assert!(single.contains("<@42>"), "{single}");
+        let transcript =
+            wait_for_body(&bodies, "bulk", |body| body.contains("bulk member text")).await;
+        assert!(
+            transcript.contains(&format!(
+                "Message {bulk_cached} | author 42 | from memory cache"
+            )),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains(&format!(
+                "Message {bulk_unseen} | snapshot storage unavailable"
+            )),
+            "{transcript}"
+        );
+        assert!(
+            app.snapshots.recent.lock().entries.is_empty(),
+            "deleted messages stayed in the memory cache"
+        );
+        server.abort();
+        drop(ctx);
+        drop(other);
+        drop(app);
+        remove_db(&path);
+        remove_db(&other_path);
+        for path in [&path, &other_path] {
+            for suffix in [".guild.db", ".guild.db-wal", ".guild.db-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+    }
+
+    /// The store opens, but its create write and the delete read both fail.
+    #[tokio::test]
+    async fn failed_snapshot_read_logs_delete_from_memory_cache() {
+        let (app, path) = temp_app("snapshot_memory_cache_read");
+        let enrollment = crate::db::enroll_guild(&app.db, 789, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
+        let store = app.tenant.store(&scope).await.unwrap();
+        crate::db::upsert_log_channel(&app.db, 789, "message_delete", 901)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        app.snapshots.scopes.lock().insert(789, scope.clone());
+        store.close_membership(scope).await.unwrap();
+        let (http, bodies, server) = recording_delete_proxy().await;
+        let ctx = test_delete_context_with(http).await;
+        let ms = chrono::Utc::now().timestamp_millis() as u64 - 1_420_070_400_000;
+        let id = MessageId::new((ms << 22) + 1);
+        let create: serenity::model::event::MessageCreateEvent =
+            serde_json::from_value(message_json(id, "observed before the outage")).unwrap();
+        app.snapshots
+            .on_gateway_event(&app, ctx.clone(), &Event::MessageCreate(create));
+        let delete: serenity::model::event::MessageDeleteEvent =
+            serde_json::from_value(serde_json::json!({
+                "id": id.to_string(), "channel_id": "456", "guild_id": "789"
+            }))
+            .unwrap();
+        app.snapshots
+            .on_gateway_event(&app, ctx.clone(), &Event::MessageDelete(delete));
+        let report =
+            wait_for_body(&bodies, "delete", |body| body.contains("Message deleted")).await;
+        assert!(report.contains("observed before the outage"), "{report}");
+        assert!(report.contains("from memory cache"), "{report}");
+        assert!(!report.contains("snapshot storage unavailable"), "{report}");
+        server.abort();
+        drop(ctx);
+        drop(store);
+        drop(app);
+        remove_db(&path);
+        for suffix in [".guild.db", ".guild.db-wal", ".guild.db-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn memory_cache_respects_count_byte_and_age_caps() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let observation = |id: i64, created_at_ms: i64, text: &str| SnapshotObservation {
+            channel_id: 456,
+            message_id: id,
+            created_at_ms,
+            observed_at_ms: created_at_ms,
+            edit_at_ms: None,
+            coverage_epoch: 0,
+            fields: SnapshotFields {
+                content: Some(text.into()),
+                author_id: Some(42),
+                ..Default::default()
+            },
+        };
+        let mut recent = RecentMessages::default();
+        for id in 1..=(MAX_RECENT as i64 + 10) {
+            recent.observe(789, &observation(id, now, "short"), true, now);
+        }
+        assert_eq!(recent.entries.len(), MAX_RECENT);
+        assert!(recent.get((789, 456, 10), now).is_none(), "oldest kept");
+        assert!(
+            recent
+                .get((789, 456, MAX_RECENT as u64 + 10), now)
+                .is_some()
+        );
+
+        let mut recent = RecentMessages::default();
+        let large = "x".repeat(MAX_TEXT_BYTES);
+        for id in 1..=1000 {
+            recent.observe(789, &observation(id, now, &large), true, now);
+            assert!(recent.bytes <= MAX_RECENT_BYTES);
+        }
+        assert!(recent.entries.len() < 1000);
+        assert_eq!(
+            recent.bytes,
+            recent.entries.values().map(|(_, size)| size).sum::<usize>()
+        );
+        assert!(recent.get((789, 456, 1000), now).is_some());
+
+        let mut recent = RecentMessages::default();
+        let old = now - RECENT_LIFETIME_MS + 1000;
+        recent.observe(789, &observation(1, old, "old"), true, now);
+        assert!(recent.get((789, 456, 1), now).is_some());
+        let later = now + 1000;
+        recent.observe(789, &observation(2, later, "new"), true, later);
+        assert!(recent.take((789, 456, 1), later).is_none(), "expired row");
+        assert!(!recent.entries.contains_key(&(789, 456, 1)));
+        assert!(
+            recent
+                .observe(789, &observation(3, old - 2000, "late"), true, later)
+                .is_none()
+        );
+        assert!(!recent.entries.contains_key(&(789, 456, 3)));
+    }
+
+    #[test]
+    fn memory_cache_merges_edits_and_never_keeps_deleted_messages() {
+        let (app, path) = temp_app("snapshot_memory_cache_edits");
+        let now = chrono::Utc::now().timestamp_millis();
+        let observation = |edit_at_ms: Option<i64>, content: Option<&str>| SnapshotObservation {
+            channel_id: 456,
+            message_id: 1,
+            created_at_ms: now,
+            observed_at_ms: now,
+            edit_at_ms,
+            coverage_epoch: 0,
+            fields: SnapshotFields {
+                content: content.map(Into::into),
+                author_id: Some(42),
+                ..Default::default()
+            },
+        };
+        assert!(
+            app.snapshots
+                .remember_recent(789, &observation(Some(now), Some("edit")), false)
+                .is_none()
+        );
+        assert!(app.snapshots.recent.lock().entries.is_empty());
+        app.snapshots
+            .remember_recent(789, &observation(None, Some("original")), true);
+        let before = app
+            .snapshots
+            .remember_recent(789, &observation(Some(now + 2), Some("second")), false)
+            .unwrap();
+        assert_eq!(before.fields.content.as_deref(), Some("original"));
+        assert_eq!(before.generation, logging::MEMORY_CACHE_GENERATION);
+        // An older edit and an edit without text keep the latest text.
+        app.snapshots
+            .remember_recent(789, &observation(Some(now + 1), Some("first")), false);
+        let before = app
+            .snapshots
+            .remember_recent(789, &observation(Some(now + 3), None), false)
+            .unwrap();
+        assert_eq!(before.fields.content.as_deref(), Some("second"));
+        app.snapshots
+            .unhooked_delete(GuildId::new(789), ChannelId::new(456), &[MessageId::new(1)]);
+        assert!(app.snapshots.recent.lock().entries.is_empty());
+        app.snapshots
+            .remember_recent(789, &observation(None, Some("replayed")), true);
+        assert!(
+            app.snapshots.recent.lock().entries.is_empty(),
+            "a deleted identity was cached again"
+        );
+        drop(app);
+        remove_db(&path);
     }
 
     #[tokio::test]
