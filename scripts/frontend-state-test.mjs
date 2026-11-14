@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { JSDOM } from '../tools/webui/node_modules/jsdom/lib/api.js';
-import React, { useSyncExternalStore, useState, useEffect, useRef, createContext, useContext } from '../tools/webui/node_modules/react/index.js';
+import React, { useSyncExternalStore, useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from '../tools/webui/node_modules/react/index.js';
 
 
 // Node's WebSocket dispatches with the global Event; keep Node's before jsdom replaces it.
@@ -97,7 +97,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     set(target, key, value) { if (key === 'location') { location.href = value; return true; } return Reflect.set(target, key, value); },
   });
   const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
-    React, useSyncExternalStore, useState, useEffect, useRef, createContext, useContext, createRoot, flushSync,
+    React, useSyncExternalStore, useState, useEffect, useLayoutEffect, useRef, createContext, useContext, createRoot, flushSync,
     Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea,
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
@@ -441,6 +441,8 @@ test('analytics opens with a one-line header, range selector and info tip, then 
   const tip = header.querySelector('.info-tip-trigger');
   assert.equal(tip.getAttribute('aria-label'), 'About these trends');
   assert.match(panel.querySelector('#analytics-help').textContent, /never added up/);
+  // Unverified Members may be recovering on its own, so the tip defers to the Members page instead of demanding Reconcile.
+  assert.match(panel.querySelector('#analytics-help').textContent, /the Members page says whether to Reconcile or wait/);
   assert.equal([...panel.querySelectorAll('.dashboard-note strong')].some((n) => n.textContent === 'About these trends'), false);
   // Range selector: labelled group of pressed-state buttons.
   const range = panel.querySelector('[aria-label="Analytics date range"]');
@@ -952,7 +954,20 @@ test('Members uses saved identity, keeps large IDs exact and labels partial impo
   await settle();
   assert.match(textOf(panel), /Test Member 1/);
   assert.match(textOf(panel), /9007199254740993/);
-  assert.match(textOf(panel), /Results are partial/);
+  assert.match(textOf(panel), /Member list: partial/);
+  assert.equal(memberCoverage(panel).querySelector('.badge').textContent, 'partial');
+  // The explanation is reachable from the keyboard, not only by hovering the badge.
+  const trigger = memberCoverage(panel).querySelector('.info-tip-trigger');
+  assert.ok(trigger, 'expected an info button beside the partial badge');
+  assert.equal(trigger.tagName, 'BUTTON');
+  assert.notEqual(trigger.tabIndex, -1, 'keyboard focusable');
+  const tip = panel.querySelector(`#${trigger.getAttribute('aria-describedby')}`);
+  assert.equal(tip.textContent, 'Results stay partial until the import finishes. Older join or ban dates may be missing.');
+  assert.equal(tip.hidden, true);
+  await fire(trigger, 'focusin');
+  assert.equal(tip.hidden, false, 'focus shows the explanation');
+  // Opening the explanation must not re-announce the status line.
+  assert.equal(trigger.closest('[aria-live]')?.getAttribute('aria-live'), 'off');
   assert.match(textOf(panel), /Unknown/);
   assert.equal(calls.length, 2);
   assert(calls.every(call => call.opts.method === 'POST' && call.opts.headers['x-jmodguard-enrollment'] === 'member-enrollment'));
@@ -1575,7 +1590,8 @@ test('Members keeps a running import compact but visible outside Details', async
   assert.equal(bar.getAttribute('value'), '42');
   assert.match(textOf(card).replace(textOf(details), ''), /Elapsed: 10 minutes · Remaining: Unknown/);
   assert.equal(details.contains(findNode(card, n => n.localName === 'button' && textOf(n) === 'Pause')), false);
-  assert.match(textOf(memberCoverage(panel)), /^Member list: partial\. Results are partial/);
+  assert.match(textOf(memberCoverage(panel)), /^Member list: partial/);
+  assert.match(textOf(memberCoverage(panel).querySelector('[role="tooltip"]')), /^Results stay partial until the import finishes/);
   assert.match(textOf(details), /4,200 records saved in this run · approximately 10,000 members estimated/);
   details.open = true;
   await runMemberPoll(h);
@@ -2078,7 +2094,7 @@ test('queued log-channel saves clear dirty state and survive in-app navigation',
   };
   h.app.state.tab = 'logchannels';
   h.nodes.get('#content').append(h.app.tabLogChannels());
-  const input = h.elements.find((node) => node.localName === 'input' && node.getAttribute("placeholder") === 'channel id');
+  const input = h.elements.find((node) => node.localName === 'input' && node.getAttribute("placeholder") === 'Channel ID, #mention or link');
   const set = h.elements.find((node) => node.localName === 'button' && node.textContent === 'Set');
   input.value = '222';
   h.app.markDirty();
@@ -2299,14 +2315,14 @@ test('terminal log receipt repaints while retaining an unrelated row draft', asy
   h.app.state.tab = 'logchannels';
   h.app.applyQueuedLogChannel(pending);
   h.app.renderTab();
-  const inputs = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).filter((node) => node.getAttribute("placeholder") === 'channel id');
+  const inputs = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).filter((node) => node.getAttribute("placeholder") === 'Channel ID, #mention or link');
   inputs[1].value = '555';
   await fire(inputs[1], 'input');
 
   await h.app.reconcileQueuedLogChannel(pending);
   await settle();
 
-  const renderedInputs = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).filter((node) => node.getAttribute("placeholder") === 'channel id');
+  const renderedInputs = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).filter((node) => node.getAttribute("placeholder") === 'Channel ID, #mention or link');
   assert.equal(renderedInputs[1].value, '555');
   assert.equal(h.app.isDirty(), true);
   assert.equal(findNode(h.nodes.get('#content'), (node) => node.localName === 'span' && node.textContent === 'queued'), null);
@@ -2354,7 +2370,7 @@ for (const asyncRoot of [false, true]) test(`terminal request-key replay restore
   appRef.state.tab = 'logchannels';
   appRef.renderTab();
   await settle();
-  const input = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).find((node) => node.getAttribute("placeholder") === 'channel id');
+  const input = Array.from(h.nodes.get('#content').querySelectorAll('input, select, textarea')).find((node) => node.getAttribute("placeholder") === 'Channel ID, #mention or link');
   input.value = '222';
   appRef.markDirty();
   const set = findNode(h.nodes.get('#content'), (node) => node.localName === 'button' && node.textContent === 'Set');
@@ -3021,7 +3037,10 @@ test('actions refresh only on demand and cancellation includes membership', asyn
   assert.equal(calls.length,1);
   assert.equal(calls[0].opts.method,'POST');
   assert.equal(calls[0].opts.headers['x-jmodguard-enrollment'],'membership');
-  assert.match(textOf(h.elements.find(n=>n.localName==='p')),/Force-cancel a stuck log-channel request/);
+  const notes=h.elements.find(n=>n.localName==='details'&&n.classList.contains('good-to-know'));
+  assert.equal(notes.open,false);
+  assert.match(textOf(notes),/Cancel stops requests that haven't started/);
+  assert.match(textOf(notes),/Force-cancel clears a stuck log-channel request/);
   const cancel=h.elements.find(n=>n.localName==='button'&&n.getAttribute('aria-label')==='Cancel');
   await fire(cancel, 'click', {});
   assert.equal(calls[1].opts.method,'DELETE');
@@ -3312,7 +3331,7 @@ test('checkbox labels keep primary text color', () => {
 const firefoxBinary = (process.env.PATH || '').split(path.delimiter).map(dir => path.join(dir, 'firefox'))
   .find(file => { try { fs.accessSync(file, fs.constants.X_OK); return true; } catch { return false; } });
 
-async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', name: 'Guild' }]) {
+async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', name: 'Guild' }], memberSync = {}) {
   const dist = new URL('../dist/frontend/', import.meta.url);
   const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
   const server = http.createServer((req, res) => {
@@ -3324,6 +3343,7 @@ async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', 
     });
     if (url.pathname.endsWith('/config')) return json({ enrollment_id: 'e1', settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
     if (url.pathname.endsWith('/analytics')) return json(browserAnalytics(Number(url.searchParams.get('days')) || 30));
+    if (url.pathname.endsWith('/member-sync')) return json(memberSync);
     if (url.pathname.startsWith('/api/')) return json({});
     const file = new URL(url.pathname === '/' ? 'index.html' : url.pathname.slice(1), dist);
     if (!file.href.startsWith(dist.href) || !fs.existsSync(file)) { res.writeHead(404); return res.end(); }
@@ -3715,6 +3735,56 @@ test('analytics dashboard shows enforcement and membership above the fold in bot
     }
   }
   assert.equal(bars.size, 2, 'series colors follow the theme');
+});
+
+// Opens the Members partial-import explanation, which sits mid-line after the status badge (#620).
+const memberHelpProbe = `(async () => {
+  const wait = () => new Promise(resolve => setTimeout(resolve, 50));
+  const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  for (let i = 0; i < 200 && !document.querySelector('[data-tab="members"]'); i++) await wait();
+  document.querySelector('[data-tab="members"]').click();
+  for (let i = 0; i < 200 && !document.querySelector('#member-coverage-help'); i++) await wait();
+  await frame();
+  const trigger = document.querySelector('[aria-describedby="member-coverage-help"]');
+  const tip = document.getElementById('member-coverage-help');
+  const before = document.documentElement.scrollWidth;
+  trigger.focus();
+  await frame();
+  const { left, right } = tip.getBoundingClientRect();
+  return JSON.stringify({ shown: !tip.hidden, text: tip.textContent, left, right, viewport: document.documentElement.clientWidth,
+    before, after: document.documentElement.scrollWidth, trigger: trigger.getBoundingClientRect().left });
+})()`;
+
+test('Members partial-import explanation opens inside narrow screens', { timeout: 180000 }, async t => {
+  const missing = !firefoxBinary ? 'Firefox is not on PATH'
+    : !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url)) ? 'dist/frontend is not built (npm run build --prefix tools/webui)' : null;
+  if (missing) {
+    assert.ok(!process.env.CI, `${missing}; CI requires this browser layout check`);
+    t.skip(missing);
+    return;
+  }
+  const domEvent = globalThis.Event;
+  globalThis.Event = NodeEvent;
+  let server, browser;
+  t.after(async () => {
+    await browser?.close();
+    if (server) await new Promise(resolve => server.close(resolve));
+    globalThis.Event = domEvent;
+  });
+  server = await serveBuiltApp(() => false, undefined,
+    { status: 'running', phase: 'members', run_id: 'one', progress_revision: 2, processed: 42, total_estimate: 100, percent: 42, as_of: 1790000000000 });
+  browser = await launchFirefox();
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  for (const width of [320, 390, 1280]) {
+    await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height: 800 } });
+    await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
+    const { result } = await browser.send('script.evaluate', { expression: memberHelpProbe, target: { context: browser.context }, awaitPromise: true });
+    const m = JSON.parse(result.value);
+    assert.ok(m.shown, `${width}px: focus shows the explanation`);
+    assert.equal(m.text, 'Results stay partial until the import finishes. Older join or ban dates may be missing.');
+    assert.ok(m.left >= 0 && m.right <= m.viewport, `${width}px: explanation ${m.left}-${m.right} outside 0-${m.viewport} (trigger at ${m.trigger})`);
+    assert.equal(m.after, m.before, `${width}px: opening the explanation widens the page`);
+  }
 });
 
 test('text rule UI can save independent thresholds without generic escalation', async () => {
@@ -6376,6 +6446,39 @@ test('Workspace pages keep explanatory text short and move details into collapse
     assert.match(content.textContent, intro, tab);
     assertShortHelp(content, tab);
   }
+});
+
+test('Community pages keep explanatory text short and move details into collapsed notes', async () => {
+  const config = {
+    enrollment_id: 'membership', settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '!' },
+    rules: [], commands: [], badwords: [], log_channels: [{ event: 'message_delete', effective: null, scope: 'guild' }],
+  };
+  const expected = {
+    logchannels: /Pick a channel in this server for each kind of event report/,
+    bans: /Bans the bot made or saw in Discord/,
+    actions: /The latest 50 requests sent to the bot/,
+    cases: /Moderation cases for this server/,
+    settings: /Members with a listed role can sign in and open this server only/,
+  };
+  for (const [tab, intro] of Object.entries(expected)) {
+    const h = harness(async (url) => response(/access-roles/.test(url) ? { roles: [], revision: 'r1', ttl_secs: 30 }
+      : /case-delete-roles/.test(url) ? { roles: [], revision: 'r1' } : /cases/.test(url) ? { cases: [] } : []));
+    h.app.state.config = config;
+    h.app.state.tab = tab;
+    h.app.renderTab();
+    await settle();
+    const content = h.nodes.get('#content');
+    assert.match(content.textContent, intro, tab);
+    assertShortHelp(content, tab);
+  }
+  // The Analytics tooltip is one short idea per line.
+  const h = harness(async () => response(analyticsSummary(30)));
+  h.app.state.config = ANALYTICS_CONFIG;
+  const panel = h.app.tabAnalytics();
+  await settle();
+  const lines = [...panel.querySelectorAll('#analytics-help .info-tip-line')].map((line) => line.textContent);
+  assert.ok(lines.length > 1, 'the tooltip is split into lines');
+  for (const line of lines) assert.ok(line.split(/\s+/).length <= 20, line);
 });
 
 test('Badwords shows what is handled automatically, an entry counter, the action in words and results only after a test', async () => {

@@ -16,7 +16,7 @@ import {
   sumSeries,
 } from "./charts.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
-import React, { useState, useEffect, useRef, createContext, useContext } from "react";
+import React, { useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import {
@@ -2802,8 +2802,22 @@ function pageHeader(title, detail, ...actions) {
 // button's accessible description; it shows on hover or focus. The pointer can
 // move onto the text (it sits inside the hover area), and Escape hides it
 // wherever focus is, so hover-opened text is dismissible too (WCAG 1.4.13).
+// The text starts at the button, so a button partway along a line on a narrow
+// screen would push it past the edge; it shifts back inside before it paints.
 function InfoTip({ id, label, children }) {
   const [open, setOpen] = useState(false);
+  const tipRef = useRef(null);
+  useLayoutEffect(() => {
+    const tip = tipRef.current;
+    if (!open || !tip) return;
+    tip.style.transform = "";
+    const { left, right, width } = tip.getBoundingClientRect();
+    if (!width) return;
+    const margin = 8;
+    const viewport = document.documentElement.clientWidth;
+    const shift = right > viewport - margin ? Math.max(viewport - margin - right, margin - left) : left < margin ? margin - left : 0;
+    if (shift) tip.style.transform = `translateX(${shift}px)`;
+  }, [open]);
   useEffect(() => {
     if (!open) return undefined;
     const dismiss = (event) => {
@@ -2833,7 +2847,12 @@ function InfoTip({ id, label, children }) {
       },
       h("span", { "aria-hidden": "true" }, "ⓘ"),
     ),
-    h("span", { id, role: "tooltip", className: "info-tip-text", hidden: !open }, children),
+    h(
+      "span",
+      { id, ref: tipRef, role: "tooltip", className: "info-tip-text", hidden: !open },
+      // An array is one short idea per line (#620).
+      Array.isArray(children) ? children.map((line, index) => h("span", { key: index, className: "info-tip-line" }, line)) : children,
+    ),
   );
 }
 
@@ -2968,8 +2987,16 @@ function toTrendPoints(series) {
   }));
 }
 
-const ANALYTICS_HELP =
-  "Counts come from records the bot stored, bucketed by UTC day; nothing is fetched from Discord. Days before the bot started recording, or while it was offline, show zero, not missing history. Changes compare with the previous period of the same length; membership has no comparison for 90 days because daily join and leave counters are kept for 92 days. Enforcement metrics overlap (a warn command writes a warning and a mod action), so they are shown side by side and never added up. The heat map counts automod enforcement, moderator commands and spam bans once each. Members is the current member directory: partial while its initial import runs, and unverified while a coverage gap awaits Reconcile on the Members page.";
+const ANALYTICS_HELP = [
+  "Counts come from what the bot recorded, by UTC day. Nothing is fetched from Discord.",
+  "Days before the bot started, or while it was offline, show zero.",
+  "Each change compares with the previous period of the same length.",
+  "Members has no 90-day change: join and leave counts are kept for 92 days.",
+  "Some numbers overlap (a warn is also a mod action), so they're never added up.",
+  "The heat map counts each automod action, moderator command and spam ban once.",
+  "Members is partial while the first import runs.",
+  "If Members shows unverified, the Members page says whether to Reconcile or wait for it to clear.",
+];
 
 // Loaded analytics summaries per guild, page membership and range. Switching
 // back to a loaded range, or returning to the tab, reuses it without a request.
@@ -5135,11 +5162,14 @@ function tabLogChannels() {
         "Refresh configuration",
       ),
     ),
-    h(
-      "p",
-      { className: "muted", style: { marginBottom: "12px" } },
-      "Each event type routes to a channel in this server. Enter a channel ID, <#id> mention, or channel URL. Role and user ID fields on other tabs accept the same snowflake forms. Changes show as queued while the bot validates them, then reconcile automatically; Bot actions has the full receipt.",
-    ),
+    h("p", { className: "muted" }, "Pick a channel in this server for each kind of event report."),
+    h(GoodToKnow, {
+      items: [
+        "Paste a channel ID, #mention or channel link.",
+        "A change shows as queued until the bot handles it or it expires. It then updates by itself.",
+        "Bot actions shows the full result of each change.",
+      ],
+    }),
     ...state.config.log_channels.map((lc) => h(LogChannelCard, { key: lc.event, lc })),
   );
 }
@@ -5153,7 +5183,7 @@ function LogChannelCard({ lc }) {
     draftKey: `log:${lc.event}:channel`,
     type: "text",
     defaultValue: lc.effective && String(lc.effective) !== "0" ? String(lc.effective) : "",
-    placeholder: "channel id",
+    placeholder: "Channel ID, #mention or link",
     className: "input",
   });
   const ignoredUsersRef = useRef(null);
@@ -5846,7 +5876,21 @@ function tabMembers() {
           { id: "member-coverage-notice", className: "muted", role: "status" },
           complete
             ? "Member list: up to date"
-            : "Member list: partial. Results are partial until the import finishes; older join or ban dates may be unavailable.",
+            : [
+                "Member list: ",
+                h("span", { key: "partial", className: "badge badge-soft badge-sm badge-warning" }, "partial"),
+                " ",
+                // Not live: opening the explanation must not re-announce the status line.
+                h(
+                  "span",
+                  { key: "help", "aria-live": "off" },
+                  h(
+                    InfoTip,
+                    { id: "member-coverage-help", label: "About partial results" },
+                    "Results stay partial until the import finishes. Older join or ban dates may be missing.",
+                  ),
+                ),
+              ],
         );
       }
       if (sync.audit_recovery_status && sync.audit_recovery_status !== "complete") {
@@ -6691,16 +6735,14 @@ function tabCases() {
     "div",
     null,
     h("h2", null, "Cases"),
-    h(
-      "p",
-      { className: "muted" },
-      "Selected moderation facts for this bot membership. Ordinary messages are not archived. Removing a record does not reverse Discord.",
-    ),
-    h(
-      "p",
-      { className: "muted" },
-      "Use removed records to retry cleanup. Their private content stays deleted, and retrying does not undo Discord actions.",
-    ),
+    h("p", { className: "muted" }, "Moderation cases for this server."),
+    h(GoodToKnow, {
+      items: [
+        "Only moderation details are kept, never ordinary messages.",
+        "Removing a record doesn't undo the ban, kick, timeout or warning in Discord.",
+        "Removed records can retry cleanup. Their private content stays deleted.",
+      ],
+    }),
     h(
       "div",
       { className: "row", style: { marginBottom: "12px" } },
@@ -6852,7 +6894,7 @@ function tabSettings() {
             ? h(
                 "p",
                 { className: "muted" },
-                "Discord nickname work is paused. After confirming the bot is in this server, use Re-sync Discord nickname to submit a fresh request. Work from an earlier membership is never replayed.",
+                "Discord nickname updates are paused. Once the bot is in this server, select Re-sync Discord nickname.",
               )
             : null,
         h(
@@ -6981,9 +7023,13 @@ function tabSettings() {
         h(
           "p",
           { className: "muted" },
-          "Server owners and Administrators can remove case records. Stored role IDs are remembered for a later member-role check and are not applied yet. Removal never undoes a Discord action.",
+          "Server owners and Administrators can remove case records. Removal never undoes a Discord action.",
         ),
-        field("Delegated case-removal role IDs", roleInput),
+        field(
+          "Delegated case-removal role IDs",
+          roleInput,
+          h("p", { className: "field-help" }, "Saved for later. These roles can't remove cases yet."),
+        ),
         h(
           "div",
           { className: "card-actions" },
@@ -7025,7 +7071,12 @@ function tabSettings() {
           h(
             "p",
             { className: "muted", style: { marginBottom: "8px" } },
-            "Global settings apply to every server until that server overrides a field. Rules/templates/commands work the same way — choose 'Global' in any editor, or set the global prefix here.",
+            "Every server uses these until it sets its own value.",
+          ),
+          h(
+            "p",
+            { className: "field-help" },
+            "Rules, templates and commands have their own Global option in each editor.",
           ),
           h(
             "div",
@@ -7066,8 +7117,9 @@ function tabSettings() {
         h(
           "p",
           { className: "muted", style: { marginBottom: "8px" } },
-          "Replace rules, badwords, commands, templates, settings, or everything with another server's configuration. Log channels are server-specific and are not copied. Source must be a server you manage.",
+          "Replace part of this server's setup, or all of it, with another server you manage.",
         ),
+        h("p", { className: "field-help" }, "Log channels are never copied."),
         h(
           "div",
           { className: "row" },
@@ -7168,11 +7220,15 @@ function AccessRolesCard({ revision, generation }) {
       "div",
       { className: "card-body" },
       h("h3", { className: "card-title" }, "Web UI access by role"),
-      h(
-        "p",
-        { className: "muted" },
-        `Members with a listed Discord role can sign in and open this server only. Dashboard access is read-only. Settings access can also edit rules, badwords, known spam and images, templates, log channels and bot settings. Commands, copying configuration, member import controls, case notes, case removal and this list stay with Manage Server. Roles are checked with Discord; a removed role stops working within ${ttl} seconds.`,
-      ),
+      h("p", { className: "muted" }, "Members with a listed role can sign in and open this server only."),
+      h(GoodToKnow, {
+        items: [
+          "Dashboard access is view-only.",
+          "Settings access can also edit rules, badwords, known spam and images, templates, log channels and bot settings.",
+          "Commands, copying configuration, member import controls, case notes, case removal and this list need Manage Server.",
+          `A removed role stops working within ${ttl} seconds.`,
+        ],
+      }),
       rows === null
         ? h("p", { className: "muted", role: "status" }, "Loading roles…")
         : h(
@@ -7769,8 +7825,11 @@ function tabBans() {
     h(
       "p",
       { className: "muted", style: { marginBottom: "12px" } },
-      "Recorded bans include bot actions and observed Discord bans. Names and moderators appear when known. Request an unban here or unban in Discord. Check Bot actions for queued results.",
+      "Bans the bot made or saw in Discord.",
     ),
+    h(GoodToKnow, {
+      items: ["You can unban here or in Discord.", "Unbans you request here are queued. Bot actions shows the result."],
+    }),
     h(
       DataTable,
       { headings: ["Banned user", "Status", "Moderator", "Reason", "Time", "Actions"] },
@@ -7847,8 +7906,16 @@ function tabActions() {
     h(
       "p",
       { className: "muted" },
-      "Latest 50 requests. Queued work requires the bot to be online. Unknown outcomes are not retried automatically; verify the result in Discord. Cancel unstarted work, including claimed requests the bot has not dispatched. Force-cancel a stuck log-channel request that is running or unknown so a new save can run; this does not undo Discord.",
+      "The latest 50 requests sent to the bot.",
     ),
+    h(GoodToKnow, {
+      items: [
+        "Queued requests need the bot to be online.",
+        "A request with an unknown result is not retried. Check Discord to see what happened.",
+        "Cancel stops requests that haven't started.",
+        "Force-cancel clears a stuck log-channel request so you can save again. It doesn't undo anything in Discord.",
+      ],
+    }),
     h(ActionButton, { className: "btn standalone-action", onClick: result.refresh }, "Refresh"),
     h(
       DataTable,

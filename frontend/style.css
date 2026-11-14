@@ -270,6 +270,8 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .good-to-know summary { cursor: pointer; font-weight: 600; }
 .good-to-know ul { margin: 6px 0 0; padding-inline-start: 18px; list-style: disc; }
 .good-to-know li + li { margin-top: 2px; }
+.info-tip-line { display: block; }
+.info-tip-line + .info-tip-line { margin-top: 4px; }
 /* An alert with text and an action: the action wraps below long text instead of running past the box. */
 .alert-wrap { display: flex; flex-wrap: wrap; align-items: center; }
 .alert-wrap > * { min-width: 0; max-width: 100%; }
