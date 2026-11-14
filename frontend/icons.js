@@ -52,6 +52,7 @@ export const ICON_PATHS = {
   ],
   terminal: ["M5 7l5 5l-5 5", "M12 17h7"],
   "file-text": ["M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z", "M14 3v5h5", "M9 13h6", "M9 17h6"],
+  volume: ["M4 9h4l5-4v14l-5-4H4z", "M16 9a4 4 0 0 1 0 6", "M19 6a8 8 0 0 1 0 12"],
   hash: ["M9 4L7 20", "M17 4l-2 16", "M4 9h16", "M3 15h16"],
   list: ["M9 6h11", "M9 12h11", "M9 18h11", "M4 6v.01", "M4 12v.01", "M4 18v.01"],
   users: [

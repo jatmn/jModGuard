@@ -274,6 +274,7 @@ fn is_preview_post_read(path: &str) -> bool {
                     | "cases"
                     | "members"
                     | "member-sync"
+                    | "server-names"
             ),
             None,
             None,
@@ -335,6 +336,7 @@ mod tests {
             "/api/guilds/10/members/123",
             "/api/guilds/10/members/123/history",
             "/api/guilds/10/member-sync",
+            "/api/guilds/10/server-names",
             "/api/guilds/10/logchannels/message_edit",
         ] {
             assert!(is_preview_post_read(path), "{path}");

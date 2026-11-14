@@ -9,6 +9,7 @@
 @import "daisyui/base/svg.css";
 @import "daisyui/base/rootcolor.css";
 @import "daisyui/components/checkbox.css";
+@import "daisyui/components/toggle.css";
 @import "daisyui/components/badge.css";
 @import "daisyui/components/input.css";
 @import "daisyui/components/alert.css";

@@ -77,7 +77,7 @@ test("WebUI excludes unused Headless components and popup dependency families", 
 
 test("WebUI CSS retains used widgets and excludes unused component families", () => {
   const css = fs.readFileSync(path.join(repo, "dist/frontend/style.css"), "utf8");
-  for (const name of ["alert", "badge", "btn", "card", "checkbox", "hero", "input", "menu", "modal", "navbar", "select", "stat", "table", "textarea"]) {
+  for (const name of ["alert", "badge", "btn", "card", "checkbox", "hero", "input", "menu", "modal", "navbar", "select", "stat", "table", "textarea", "toggle"]) {
     assert.ok(new RegExp("\\." + name + "(?=[^a-zA-Z0-9_-])").test(css), "missing " + name);
   }
   for (const name of ["carousel", "chat", "countdown", "dock", "drawer", "rating", "timeline"]) {

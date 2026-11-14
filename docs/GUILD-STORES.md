@@ -85,13 +85,15 @@ legacy cases. Version17 adds `guild_member_pending_rejoin_notes` for durable
 member-rejoin log receipts keyed to the current stay. Version18 adds
 `guild_member_seed.gap_auto_clear` so a short-restart coverage gap can clear
 when audit recovery completes ([MEMBERS.md](MEMBERS.md)). Version19 adds
-`guild_tenant_settings.access_roles` for [WebUI access roles](WEBUI.md#access-by-discord-role). Core bootstrap
+`guild_tenant_settings.access_roles` for [WebUI access roles](WEBUI.md#access-by-discord-role). Version20 adds
+`guild_server_names`: one bounded row per membership with the bot's latest role and
+channel names for the rule editor pickers. Names are display data only. Core bootstrap
 never applies this schema; the existing core version is 17.
 
 | Operation | Contract |
 |---|---|
-| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to schema 19, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
-| `open` | Verify the current schema 19 identity and ownership; create no schema or binding. |
+| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to schema 20, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+| `open` | Verify the current schema 20 identity and ownership; create no schema or binding. |
 | `bind_initial_placement` | Verify identity and install the catalog's initial guild/revision in one primary transaction. Matching retries write nothing; a different revision or dedicated owner conflicts. |
 | `verify_placement` | Check identity, ownership and the exact stored guild/revision in one primary snapshot; missing bindings fail. This is not authorization for a later separate data operation. |
 

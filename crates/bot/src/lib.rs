@@ -26,6 +26,7 @@ pub mod member_rejoin;
 pub mod member_sync;
 pub mod nickname_worker;
 pub mod recovery;
+pub mod server_names;
 pub mod snapshot_capture;
 pub mod spam_actions;
 pub mod startup;

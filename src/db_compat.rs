@@ -1139,6 +1139,7 @@ fn require_reclaim_sql(sql: &str) -> Result<()> {
                     | "guild_case_sources"
                     | "guild_bunny_evidence"
                     | "guild_tenant_settings"
+                    | "guild_server_names"
                     | "guild_memberships"
                     | "guild_member_feature"
                     | "guild_member_seed"

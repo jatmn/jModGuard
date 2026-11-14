@@ -55,13 +55,13 @@ The dependency audit keeps the libraries that supply existing behavior:
 | Floating UI | Upstream Headless popup dependency | Excluded from browser assets; retained only in the installation lockfile |
 | React Aria and its support packages | Headless control focus/hover handling | Retained internal dependencies |
 | TanStack Virtual | Upstream Headless Combobox virtualization dependency | Excluded from browser assets; retained only in the installation lockfile |
-| daisyUI | Component styles on both pages | Include the 16 used component families, base styles and light/dark themes; omit the broad optional color and radius utility sheets |
+| daisyUI | Component styles on both pages | Include the 17 used component families, base styles and light/dark themes; omit the broad optional color and radius utility sheets |
 | esbuild, es-module-lexer and jsdom | Build, import checks and real React/DOM regression tests | Build/test only; never loaded by the browser |
 
 Exact versions are declared in `tools/webui/package.json` and pinned transitively
 by its lockfile. `tools/webui/style.css` lists the used CSS chunks; update it when
 adding a component family. These include alert, badge, button, card, checkbox,
-fieldset, hero, input, menu, modal, navbar, select, stat, table, textarea and toast.
+fieldset, hero, input, menu, modal, navbar, select, stat, table, textarea, toast and toggle.
 The four used theme utilities (`bg-base-100`, `bg-base-200`, `text-warning`,
 `rounded-box`) live with the existing token mappings in `frontend/style.css`.
 This avoids loading all color/opacity and directional/responsive radius variants
@@ -99,6 +99,10 @@ focused `role="listbox"`), Enter or Space selects, Escape closes and returns foc
 to the trigger, and Tab or an outside click closes. Opening it makes no API or
 Discord request; choosing another server runs the same unsaved-changes check,
 draft reset and configuration reload as before.
+The rule editor's member search is not a combobox either: matches appear as a
+short list of buttons in a daisyUI menu below a plain text input, and role and
+channel pickers are native selects. Chosen items are daisyUI badges with a remove
+button.
 Headless Listbox is another installed option, but its custom popup retains the
 Floating UI stack. React Aria offers lower-level selection hooks that need custom
 rendering and state integration. Reusing Headless Select for form fields and the
@@ -241,7 +245,22 @@ within the workspace, and editors support keyboard navigation.
 
 The dashboard separates setup guidance, protection settings and moderation counts.
 Rule badges distinguish enforcement state from global defaults and server overrides.
-The rule editor labels each escalation threshold, action and duration. Commands keep
+Every automod rule editor uses one layout ([#621](https://github.com/jatmn/jModGuard/issues/621)):
+Enabled and Dry-run toggles in the header, a one-line summary that updates as you edit
+(for example "When someone sends more than 5 @everyone, @here or role mentions within
+10 seconds: Ban (keep messages). Dry-run: only logs."), then **Trigger**, **Actions**,
+**Exceptions** and **Scope** sections, with the channel filter (and, for custom rules,
+log and case options) under a collapsed **Advanced**. Only Trigger differs between
+rules; its inputs read as one short sentence. Escalation steps are compact rows that
+show only the chosen action's own setting: minutes for a timeout, the message choice
+for a ban. Save, Reset and Cancel stay visible while the editor scrolls.
+Exception and channel pickers show names: roles and channels come from the bot's
+latest snapshot of the server (`guild_server_names`, refreshed on Gateway connect and
+on every role or channel change), users from the Members directory search. Each choice
+is a removable chip; the saved rule still stores decimal ID strings. Role and channel
+choices use native selects (channels grouped by category; `@everyone` is not offered).
+Before the bot's first snapshot, for global rules, or if names fail to load, the pickers
+take pasted IDs, mentions or links instead. Commands keep
 names separate from their scope badges. Template cards pair a full-width editor with
 a preview and put scope and save controls together below. Log-channel cards separate
 the destination from per-event ignore lists; each section keeps its own save action.
@@ -380,6 +399,8 @@ GET    /api/guilds/{id}/config
 POST   /api/guilds/{id}/config         # same body as GET; SPA workspace load (not CDN-cached)
 PUT    /api/guilds/{id}/settings
 GET    /api/guilds/{id}/rules/{rule}          PUT/DELETE …
+GET    /api/guilds/{id}/server-names   # settings level: bot's latest role/channel names
+POST   /api/guilds/{id}/server-names   # same body as GET; SPA rule editor pickers
 GET    /api/guilds/{id}/badwords              POST (add) / DELETE /{word_id}
 GET    /api/guilds/{id}/commands              POST (create) / PUT|DELETE /{name}
 GET    /api/guilds/{id}/templates/{event}     PUT/DELETE …

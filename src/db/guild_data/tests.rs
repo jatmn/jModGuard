@@ -86,8 +86,8 @@ async fn separate_store_initialization_reopen_and_no_core_tables() {
         let count: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'", (), |r| Ok(r.get(0)?))?;
         assert_eq!(
             count,
-            27,
-            "store contains tenant tables, transient snapshots, member-directory tables, the local write fence, and the writer epoch"
+            28,
+            "store contains tenant tables, transient snapshots, member-directory tables, the local write fence, the writer epoch, and server names"
         );
         Ok(())
     }).await.unwrap();
@@ -540,6 +540,8 @@ mod case_sources;
 mod case_evidence;
 
 mod member_directory;
+
+mod server_names;
 
 #[cfg(unix)]
 mod bunny_transfer;

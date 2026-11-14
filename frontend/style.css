@@ -310,14 +310,51 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .modal-box { width: min(56rem, 100%); max-width: 56rem; max-height: calc(100dvh - 48px); border: 1px solid var(--shell-border); }
 .editor-heading { margin-bottom: 16px; }
 .editor-heading h3 { margin: 4px 0 6px; }
-.rule-editor > .checkbox-group { padding: 12px; border: 1px solid var(--shell-border); border-radius: 8px; background: var(--panel2); gap: 16px; }
-.rule-editor > .field, .rule-editor > .form-row { margin-block: 16px; }
 .rule-editor .textarea { min-height: 10rem; line-height: 1.65; }
-.escalation-step { --radius-box: 10px; padding: 12px; margin: 8px 0; border-color: var(--shell-border); background: var(--panel2); }
-.escalation-fields { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
-.escalation-step .field { margin-bottom: 0; }
-.escalation-step > .field { margin-top: 10px; }
+/* Automod rule editor (#621): header toggles, live summary, then compact sections. */
+.rule-editor { padding-bottom: 0; }
+.rule-editor-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.rule-editor-header h3 { margin: 2px 0 0; }
+.rule-toggles { display: flex; gap: 16px; flex-wrap: wrap; padding-top: 4px; }
+.toggle-label { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 650; color: var(--text); }
+.toggle { --input-color: var(--input-border); }
+.toggle:checked { --input-color: var(--accent); }
+.rule-summary { margin: 0 0 12px; padding: 8px 12px; border: 1px solid var(--hero-border); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--hero); font-weight: 600; line-height: 1.45; }
+.editor-section { padding: 10px 0; border-top: 1px solid var(--shell-border); display: flex; flex-direction: column; gap: 8px; }
+.editor-section-title { margin: 0; font-size: var(--ui-font-size-sm); font-weight: 750; letter-spacing: .4px; text-transform: uppercase; color: var(--muted); }
+.editor-section > .field-help, .editor-section .field-help { margin: 0; }
+.editor-section > p { margin: 0; }
+.editor-section .field { margin-bottom: 0; }
+.editor-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; align-items: start; }
+.trigger-sentence, .escalation-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; }
+.trigger-field { display: inline-flex; align-items: center; gap: 6px; }
+.input.input-num { width: calc(7ch + 1.25rem); }
+.escalation-step { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px solid var(--shell-border); border-radius: 8px; background: var(--panel2); }
+.escalation-label { font-size: 12px; font-weight: 650; }
+.escalation-remove { margin-left: auto; }
+.escalation-reason { display: flex; align-items: center; gap: 8px; }
+.escalation-reason .input { flex: 1; min-width: 0; }
+.editor-section > .btn { align-self: flex-start; }
+.rule-scope .select { width: min(20rem, 100%); }
+.ban-options { display: inline-flex; align-items: center; gap: 4px; }
+.id-picker .fieldset { padding: 0; gap: 4px; }
+.id-picker .select, .id-picker .input { width: 100%; }
+.picker-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 0; padding: 0; list-style: none; }
+.picker-chip { gap: 4px; height: auto; min-height: var(--target-min); max-width: 100%; padding-inline: 8px 2px; }
+.picker-chip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-chip .icon { width: .875rem; height: .875rem; flex-shrink: 0; }
+.picker-chip-remove { display: inline-flex; align-items: center; justify-content: center; min-width: var(--target-min); min-height: var(--target-min); border-radius: 999px; color: var(--muted); cursor: pointer; }
+.picker-chip-remove:hover { color: var(--text); background: var(--panel); }
+.role-dot { width: 10px; height: 10px; border-radius: 999px; background: var(--muted); flex-shrink: 0; }
+.picker-results { margin: 4px 0 0; padding: 4px; border: 1px solid var(--shell-border); border-radius: 8px; background: var(--panel); }
+.picker-results button { display: flex; justify-content: space-between; gap: 8px; width: 100%; }
+.editor-advanced { padding-top: 4px; }
+.editor-advanced > summary { cursor: pointer; font-weight: 650; font-size: var(--ui-font-size-sm); }
+.editor-advanced[open] > summary { margin-bottom: 8px; }
+.editor-advanced > * + * { margin-top: 8px; }
 .modal-action { flex-wrap: wrap; align-items: flex-end; gap: 8px; padding-top: 12px; border-top: 1px solid var(--shell-border); }
+/* The rule editor keeps Save, Reset and Cancel in view while its sections scroll. */
+.rule-editor > .modal-action { position: sticky; bottom: 0; z-index: 1; margin-top: 4px; padding-bottom: 16px; background: var(--color-base-100); }
 .modal-action > .field { margin: 0 auto 0 0; flex: 1 1 220px; }
 .modal-action > .field > select { width: 100%; }
 
@@ -386,7 +423,7 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
   .dashboard-note { flex-direction: column; gap: 6px; }
   .modal-overlay { padding: 12px; }
   .modal-box { padding: 20px; max-height: calc(100dvh - 24px); }
-  .escalation-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .editor-columns { grid-template-columns: minmax(0, 1fr); }
   .template-workspace, .ignore-fields, .routing-fields { grid-template-columns: minmax(0, 1fr); }
   .editor-footer { align-items: stretch; }
   .editor-footer .row { flex-wrap: wrap; }
