@@ -190,10 +190,12 @@ impl RecentMessages {
         }
     }
 
-    /// Records an observation and returns the cached state it replaced. Fields
-    /// an edit does not supply keep their earlier value; an older edit is ignored.
+    /// Records an observation and returns the cached state that precedes it:
+    /// a row from an earlier revision (the create or an older edit). Fields an
+    /// edit does not supply keep their earlier value; an older edit is ignored.
     /// As in the guild store, a field already supplied at one edit timestamp
-    /// keeps its first value at that timestamp.
+    /// keeps its first value at that timestamp, and neither a newer nor an
+    /// equal revision is returned as this observation's prior.
     fn observe(
         &mut self,
         scope: &GuildDataScope,
@@ -207,9 +209,12 @@ impl RecentMessages {
             observation.channel_id as u64,
             observation.message_id as u64,
         );
-        let before = self.get(key, scope, now_ms);
-        let row = match before.clone() {
-            Some(old) if old.edit_at_ms > observation.edit_at_ms => return before,
+        let cached = self.get(key, scope, now_ms);
+        let before = cached
+            .clone()
+            .filter(|row| row.edit_at_ms < observation.edit_at_ms);
+        let row = match cached {
+            Some(old) if old.edit_at_ms > observation.edit_at_ms => return None,
             Some(mut row) => {
                 if row.edit_at_ms != observation.edit_at_ms {
                     row.content_supplied = false;
@@ -1671,10 +1676,15 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 if app.snapshots.capture_paused(&work.scope) {
                     app.snapshots.gap_scope(&work.scope);
                     if let Some(mut report) = report.take() {
-                        report.vars.insert(
-                            "coverage".into(),
-                            "capture paused after cleanup failure".into(),
-                        );
+                        // The pause stops durable growth only; an eligible prior
+                        // this process already observed still describes the edit.
+                        let coverage = if cached_before.is_some() {
+                            logging::apply_retained_edit(&mut report, cached_before.as_ref(), None);
+                            "from memory cache; capture paused after cleanup failure"
+                        } else {
+                            "capture paused after cleanup failure"
+                        };
+                        report.vars.insert("coverage".into(), coverage.into());
                         submit_report(&app, &work.context, report);
                     }
                     continue;
@@ -3630,9 +3640,21 @@ mod tests {
             .unwrap();
         assert_eq!(before.fields.content.as_deref(), Some("original"));
         assert_eq!(before.generation, logging::MEMORY_CACHE_GENERATION);
-        // An older edit and an edit without text keep the latest text.
-        app.snapshots
-            .remember_recent(&scope, &observation(Some(now + 1), Some("first")), false);
+        // An older edit and an edit without text keep the latest text. Neither
+        // the newer row nor this revision itself is a prior of the older edit
+        // or of a replay at the same timestamp.
+        assert!(
+            app.snapshots
+                .remember_recent(&scope, &observation(Some(now + 1), Some("first")), false)
+                .is_none(),
+            "a newer cached revision was returned as an older edit's prior"
+        );
+        assert!(
+            app.snapshots
+                .remember_recent(&scope, &observation(Some(now + 2), Some("second")), false)
+                .is_none(),
+            "an edit revision was returned as its own prior"
+        );
         let before = app
             .snapshots
             .remember_recent(&scope, &observation(Some(now + 3), None), false)
@@ -3879,6 +3901,138 @@ mod tests {
         drop(ctx);
         drop(app);
         remove_db_and_store(&path);
+    }
+
+    /// A cleanup failure pauses durable capture. The edit report still uses
+    /// the cached prior and keeps the pause visible; nothing is stored.
+    #[tokio::test]
+    async fn cleanup_paused_edit_uses_cached_before() {
+        let (app, path) = temp_app("snapshot_memory_cache_paused_edit");
+        let scope = cache_scope(&app, 100).await;
+        crate::db::upsert_log_channel(&app.db, 789, "message_edit", 901)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        app.snapshots.content_access.lock().insert(789);
+        let (http, bodies, server) = recording_delete_proxy().await;
+        let ctx = test_delete_context_with(http).await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let id = MessageId::new(((now as u64 - 1_420_070_400_000) << 22) + 1);
+        app.snapshots.remember_recent(
+            &scope,
+            &cache_observation(id.get() as i64, now, "cached original"),
+            true,
+        );
+        // The real maintenance failure path: the store rejects this cleanup time.
+        app.snapshots.maintain_at(&app, Some(-1)).await;
+        assert!(app.snapshots.capture_paused(&scope));
+        let update: MessageUpdateEvent = serde_json::from_value(serde_json::json!({
+            "id": id.to_string(), "channel_id": "456", "guild_id": "789",
+            "content": "current edit", "edited_timestamp": chrono::Utc::now().to_rfc3339()
+        }))
+        .unwrap();
+        app.snapshots
+            .on_gateway_event(&app, ctx.clone(), &Event::MessageUpdate(update));
+        let body = wait_for_body(&bodies, "edit", |body| body.contains("Message edited")).await;
+        server.abort();
+        assert!(body.contains("cached original"), "{body}");
+        assert!(body.contains("current edit"), "{body}");
+        assert!(body.contains("from memory cache"), "{body}");
+        assert!(
+            body.contains("capture paused after cleanup failure"),
+            "{body}"
+        );
+        assert!(!body.contains("not captured"), "{body}");
+        let store = app.tenant.store(&scope).await.unwrap();
+        let retained = store
+            .take_snapshots(scope.clone(), 456, vec![id.get() as i64], now + 1)
+            .await
+            .unwrap();
+        assert!(
+            retained.iter().all(Option::is_none),
+            "paused capture stored a row"
+        );
+        drop(store);
+        drop(ctx);
+        drop(app);
+        remove_db_and_store(&path);
+    }
+
+    /// During a store outage, an edit that arrives after a newer edit of the
+    /// same message is reported without claiming the newer text as its prior.
+    #[tokio::test]
+    async fn out_of_order_edit_does_not_report_newer_cached_revision_as_before() {
+        let (app, path) = temp_app("snapshot_memory_cache_edit_order");
+        let (other, other_path) = temp_app("snapshot_memory_cache_edit_order_other");
+        let enrollment = crate::db::enroll_guild(&other.db, 789, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = other.tenant.activate(enrollment).await.unwrap().unwrap();
+        assert!(app.tenant.store(&scope).await.is_err());
+        crate::db::upsert_log_channel(&app.db, 789, "message_edit", 901)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        app.snapshots.scopes.lock().insert(789, scope.clone());
+        let (http, bodies, server) = recording_delete_proxy().await;
+        let ctx = test_delete_context_with(http).await;
+        let now = chrono::Utc::now();
+        let id = MessageId::new(((now.timestamp_millis() as u64 - 1_420_070_400_000) << 22) + 1);
+        let create = serde_json::from_value(message_json(id, "original create text")).unwrap();
+        app.snapshots
+            .on_gateway_event(&app, ctx.clone(), &Event::MessageCreate(create));
+        let edit = |at: chrono::DateTime<chrono::Utc>, text: &str| {
+            Event::MessageUpdate(
+                serde_json::from_value(serde_json::json!({
+                    "id": id.to_string(), "channel_id": "456", "guild_id": "789",
+                    "author": {"id": "42", "username": "advisor", "discriminator": "0"},
+                    "content": text, "edited_timestamp": at.to_rfc3339()
+                }))
+                .unwrap(),
+            )
+        };
+        let newer = now + chrono::Duration::seconds(2);
+        app.snapshots
+            .on_gateway_event(&app, ctx.clone(), &edit(newer, "newer edit text"));
+        let first = wait_for_body(&bodies, "newer edit", |body| {
+            body.contains("newer edit text")
+        })
+        .await;
+        assert!(first.contains("original create text"), "{first}");
+        app.snapshots.on_gateway_event(
+            &app,
+            ctx.clone(),
+            &edit(newer - chrono::Duration::seconds(1), "older edit text"),
+        );
+        let body = wait_for_body(&bodies, "older edit", |body| {
+            body.contains("older edit text")
+        })
+        .await;
+        server.abort();
+        let json: serde_json::Value =
+            serde_json::from_str(body.split("\r\n\r\n").last().unwrap()).unwrap();
+        let before = json["embeds"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["name"].as_str().unwrap().contains("Before"))
+            .unwrap()["value"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!before.contains("newer edit text"), "{body}");
+        assert!(!body.contains("from memory cache"), "{body}");
+        let cached = app
+            .snapshots
+            .take_recent(&scope, ChannelId::new(456), id)
+            .unwrap();
+        assert_eq!(cached.fields.content.as_deref(), Some("newer edit text"));
+        drop(ctx);
+        drop(other);
+        drop(app);
+        remove_db_and_store(&path);
+        remove_db_and_store(&other_path);
     }
 
     #[tokio::test]

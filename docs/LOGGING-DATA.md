@@ -57,9 +57,11 @@ and persistence contracts below are unchanged.
   recent messages. It uses the same eligibility, field limits and 24-hour expiry
   as the snapshot, holds at most 8192 messages and 16 MiB across the bot, and
   drops the oldest first. It stores no attachment bytes. When the guild store
-  cannot be reached or has no row for a message, single and bulk deletions and
-  the edit `before` text use the cached copy, and coverage reads "from memory
-  cache". A deletion removes the cached copy. A restart empties the cache.
+  cannot be reached, has paused capture or has no row for a message, single and
+  bulk deletions and the edit `before` text use the cached copy, and coverage
+  reads "from memory cache". An edit uses it as `before` only when it predates
+  that edit; an older or repeated edit timestamp shows `before` as unavailable.
+  A deletion removes the cached copy. A restart empties the cache.
   Bulk deletions count each distinct message ID once across the entire event,
   distinguish retained, known missing, storage unknown and filtered entries,
   and attach a transient
