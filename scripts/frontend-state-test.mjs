@@ -953,7 +953,19 @@ test('Members uses saved identity, keeps large IDs exact and labels partial impo
   assert.match(textOf(panel), /Test Member 1/);
   assert.match(textOf(panel), /9007199254740993/);
   assert.match(textOf(panel), /Member list: partial/);
-  assert.match(panel.querySelector('#member-coverage-notice .badge').title, /^Results stay partial/);
+  assert.equal(memberCoverage(panel).querySelector('.badge').textContent, 'partial');
+  // The explanation is reachable from the keyboard, not only by hovering the badge.
+  const trigger = memberCoverage(panel).querySelector('.info-tip-trigger');
+  assert.ok(trigger, 'expected an info button beside the partial badge');
+  assert.equal(trigger.tagName, 'BUTTON');
+  assert.notEqual(trigger.tabIndex, -1, 'keyboard focusable');
+  const tip = panel.querySelector(`#${trigger.getAttribute('aria-describedby')}`);
+  assert.equal(tip.textContent, 'Results stay partial until the import finishes. Older join or ban dates may be missing.');
+  assert.equal(tip.hidden, true);
+  await fire(trigger, 'focusin');
+  assert.equal(tip.hidden, false, 'focus shows the explanation');
+  // Opening the explanation must not re-announce the status line.
+  assert.equal(trigger.closest('[aria-live]')?.getAttribute('aria-live'), 'off');
   assert.match(textOf(panel), /Unknown/);
   assert.equal(calls.length, 2);
   assert(calls.every(call => call.opts.method === 'POST' && call.opts.headers['x-jmodguard-enrollment'] === 'member-enrollment'));
@@ -1576,8 +1588,8 @@ test('Members keeps a running import compact but visible outside Details', async
   assert.equal(bar.getAttribute('value'), '42');
   assert.match(textOf(card).replace(textOf(details), ''), /Elapsed: 10 minutes · Remaining: Unknown/);
   assert.equal(details.contains(findNode(card, n => n.localName === 'button' && textOf(n) === 'Pause')), false);
-  assert.equal(textOf(memberCoverage(panel)), 'Member list: partial');
-  assert.match(memberCoverage(panel).querySelector('.badge').title, /^Results stay partial until the import finishes/);
+  assert.match(textOf(memberCoverage(panel)), /^Member list: partial/);
+  assert.match(textOf(memberCoverage(panel).querySelector('[role="tooltip"]')), /^Results stay partial until the import finishes/);
   assert.match(textOf(details), /4,200 records saved in this run · approximately 10,000 members estimated/);
   details.open = true;
   await runMemberPoll(h);

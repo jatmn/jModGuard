@@ -5151,7 +5151,7 @@ function tabLogChannels() {
     h(GoodToKnow, {
       items: [
         "Paste a channel ID, #mention or channel link.",
-        "A change shows as queued until the bot checks the channel. It then updates by itself.",
+        "A change shows as queued until the bot handles it or it expires. It then updates by itself.",
         "Bot actions shows the full result of each change.",
       ],
     }),
@@ -5863,14 +5863,17 @@ function tabMembers() {
             ? "Member list: up to date"
             : [
                 "Member list: ",
+                h("span", { key: "partial", className: "badge badge-soft badge-sm badge-warning" }, "partial"),
+                " ",
+                // Not live: opening the explanation must not re-announce the status line.
                 h(
                   "span",
-                  {
-                    key: "partial",
-                    className: "badge badge-soft badge-sm badge-warning",
-                    title: "Results stay partial until the import finishes. Older join or ban dates may be missing.",
-                  },
-                  "partial",
+                  { key: "help", "aria-live": "off" },
+                  h(
+                    InfoTip,
+                    { id: "member-coverage-help", label: "About partial results" },
+                    "Results stay partial until the import finishes. Older join or ban dates may be missing.",
+                  ),
                 ),
               ],
         );
@@ -7892,7 +7895,7 @@ function tabActions() {
     ),
     h(GoodToKnow, {
       items: [
-        "Queued requests run once the bot is online.",
+        "Queued requests need the bot to be online.",
         "A request with an unknown result is not retried. Check Discord to see what happened.",
         "Cancel stops any request the bot hasn't sent to Discord yet.",
         "Force-cancel clears a stuck log-channel request so you can save again. It doesn't undo anything in Discord.",
