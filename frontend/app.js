@@ -16,7 +16,7 @@ import {
   sumSeries,
 } from "./charts.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
-import React, { useState, useEffect, useRef, createContext, useContext } from "react";
+import React, { useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import {
@@ -2802,8 +2802,22 @@ function pageHeader(title, detail, ...actions) {
 // button's accessible description; it shows on hover or focus. The pointer can
 // move onto the text (it sits inside the hover area), and Escape hides it
 // wherever focus is, so hover-opened text is dismissible too (WCAG 1.4.13).
+// The text starts at the button, so a button partway along a line on a narrow
+// screen would push it past the edge; it shifts back inside before it paints.
 function InfoTip({ id, label, children }) {
   const [open, setOpen] = useState(false);
+  const tipRef = useRef(null);
+  useLayoutEffect(() => {
+    const tip = tipRef.current;
+    if (!open || !tip) return;
+    tip.style.transform = "";
+    const { left, right, width } = tip.getBoundingClientRect();
+    if (!width) return;
+    const margin = 8;
+    const viewport = document.documentElement.clientWidth;
+    const shift = right > viewport - margin ? Math.max(viewport - margin - right, margin - left) : left < margin ? margin - left : 0;
+    if (shift) tip.style.transform = `translateX(${shift}px)`;
+  }, [open]);
   useEffect(() => {
     if (!open) return undefined;
     const dismiss = (event) => {
@@ -2835,7 +2849,7 @@ function InfoTip({ id, label, children }) {
     ),
     h(
       "span",
-      { id, role: "tooltip", className: "info-tip-text", hidden: !open },
+      { id, ref: tipRef, role: "tooltip", className: "info-tip-text", hidden: !open },
       // An array is one short idea per line (#620).
       Array.isArray(children) ? children.map((line, index) => h("span", { key: index, className: "info-tip-line" }, line)) : children,
     ),

@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { JSDOM } from '../tools/webui/node_modules/jsdom/lib/api.js';
-import React, { useSyncExternalStore, useState, useEffect, useRef, createContext, useContext } from '../tools/webui/node_modules/react/index.js';
+import React, { useSyncExternalStore, useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from '../tools/webui/node_modules/react/index.js';
 
 
 // Node's WebSocket dispatches with the global Event; keep Node's before jsdom replaces it.
@@ -97,7 +97,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     set(target, key, value) { if (key === 'location') { location.href = value; return true; } return Reflect.set(target, key, value); },
   });
   const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
-    React, useSyncExternalStore, useState, useEffect, useRef, createContext, useContext, createRoot, flushSync,
+    React, useSyncExternalStore, useState, useEffect, useLayoutEffect, useRef, createContext, useContext, createRoot, flushSync,
     Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea,
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
@@ -3331,7 +3331,7 @@ test('checkbox labels keep primary text color', () => {
 const firefoxBinary = (process.env.PATH || '').split(path.delimiter).map(dir => path.join(dir, 'firefox'))
   .find(file => { try { fs.accessSync(file, fs.constants.X_OK); return true; } catch { return false; } });
 
-async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', name: 'Guild' }]) {
+async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', name: 'Guild' }], memberSync = {}) {
   const dist = new URL('../dist/frontend/', import.meta.url);
   const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
   const server = http.createServer((req, res) => {
@@ -3343,6 +3343,7 @@ async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', 
     });
     if (url.pathname.endsWith('/config')) return json({ enrollment_id: 'e1', settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
     if (url.pathname.endsWith('/analytics')) return json(browserAnalytics(Number(url.searchParams.get('days')) || 30));
+    if (url.pathname.endsWith('/member-sync')) return json(memberSync);
     if (url.pathname.startsWith('/api/')) return json({});
     const file = new URL(url.pathname === '/' ? 'index.html' : url.pathname.slice(1), dist);
     if (!file.href.startsWith(dist.href) || !fs.existsSync(file)) { res.writeHead(404); return res.end(); }
@@ -3734,6 +3735,56 @@ test('analytics dashboard shows enforcement and membership above the fold in bot
     }
   }
   assert.equal(bars.size, 2, 'series colors follow the theme');
+});
+
+// Opens the Members partial-import explanation, which sits mid-line after the status badge (#620).
+const memberHelpProbe = `(async () => {
+  const wait = () => new Promise(resolve => setTimeout(resolve, 50));
+  const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  for (let i = 0; i < 200 && !document.querySelector('[data-tab="members"]'); i++) await wait();
+  document.querySelector('[data-tab="members"]').click();
+  for (let i = 0; i < 200 && !document.querySelector('#member-coverage-help'); i++) await wait();
+  await frame();
+  const trigger = document.querySelector('[aria-describedby="member-coverage-help"]');
+  const tip = document.getElementById('member-coverage-help');
+  const before = document.documentElement.scrollWidth;
+  trigger.focus();
+  await frame();
+  const { left, right } = tip.getBoundingClientRect();
+  return JSON.stringify({ shown: !tip.hidden, text: tip.textContent, left, right, viewport: document.documentElement.clientWidth,
+    before, after: document.documentElement.scrollWidth, trigger: trigger.getBoundingClientRect().left });
+})()`;
+
+test('Members partial-import explanation opens inside narrow screens', { timeout: 180000 }, async t => {
+  const missing = !firefoxBinary ? 'Firefox is not on PATH'
+    : !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url)) ? 'dist/frontend is not built (npm run build --prefix tools/webui)' : null;
+  if (missing) {
+    assert.ok(!process.env.CI, `${missing}; CI requires this browser layout check`);
+    t.skip(missing);
+    return;
+  }
+  const domEvent = globalThis.Event;
+  globalThis.Event = NodeEvent;
+  let server, browser;
+  t.after(async () => {
+    await browser?.close();
+    if (server) await new Promise(resolve => server.close(resolve));
+    globalThis.Event = domEvent;
+  });
+  server = await serveBuiltApp(() => false, undefined,
+    { status: 'running', phase: 'members', run_id: 'one', progress_revision: 2, processed: 42, total_estimate: 100, percent: 42, as_of: 1790000000000 });
+  browser = await launchFirefox();
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  for (const width of [320, 390, 1280]) {
+    await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height: 800 } });
+    await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
+    const { result } = await browser.send('script.evaluate', { expression: memberHelpProbe, target: { context: browser.context }, awaitPromise: true });
+    const m = JSON.parse(result.value);
+    assert.ok(m.shown, `${width}px: focus shows the explanation`);
+    assert.equal(m.text, 'Results stay partial until the import finishes. Older join or ban dates may be missing.');
+    assert.ok(m.left >= 0 && m.right <= m.viewport, `${width}px: explanation ${m.left}-${m.right} outside 0-${m.viewport} (trigger at ${m.trigger})`);
+    assert.equal(m.after, m.before, `${width}px: opening the explanation widens the page`);
+  }
 });
 
 test('text rule UI can save independent thresholds without generic escalation', async () => {
