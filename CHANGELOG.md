@@ -4,6 +4,89 @@ Stable version notes are maintained by Release Please from Conventional Commits.
 Nightly publications use a separate `nightly-YYYYMMDD-<sha12>` identity and are
 not a Release Please baseline.
 
+## [0.3.0](https://github.com/jatmn/jModGuard/compare/v0.2.0...v0.3.0) (2026-11-14)
+
+
+### Features
+
+* add server and platform analytics dashboards with daily trend charts ([#583](https://github.com/jatmn/jModGuard/issues/583)) ([fae2a74](https://github.com/jatmn/jModGuard/commit/fae2a7470ba0ce05bef290a36218f1092f1d5fc1))
+* **automod:** add ban and ban-and-purge (previous hour) to every rule ([be1d160](https://github.com/jatmn/jModGuard/commit/be1d160c8f12fa7c2ae4e72828358693a1d88ef7))
+* **badwords:** accept ordinary words and phrases in setup ([35dbeec](https://github.com/jatmn/jModGuard/commit/35dbeecfeacb5167edaba4c19868389a17a7f1c8))
+* **bot:** add contextual emoji to default Discord message templates ([#597](https://github.com/jatmn/jModGuard/issues/597)) ([cbcb8d5](https://github.com/jatmn/jModGuard/commit/cbcb8d5bce5a59e2f10aef00326468ea1e4e90a4)), closes [#592](https://github.com/jatmn/jModGuard/issues/592)
+* **bot:** add shared-map emoji to status embed ([#616](https://github.com/jatmn/jModGuard/issues/616)) ([acbebf9](https://github.com/jatmn/jModGuard/commit/acbebf934e0e530e3817bab03ebcabf30b2131ce))
+* **bot:** render !status as a pastel embed ([#596](https://github.com/jatmn/jModGuard/issues/596)) ([c238018](https://github.com/jatmn/jModGuard/commit/c238018d4a1fa40cd58b07d77089c343cfa4ac5d))
+* **known-spam:** add a dedicated known-spam list ([3af9ed4](https://github.com/jatmn/jModGuard/commit/3af9ed417be4c83b049655be00a5fb08eeddba26))
+* **logs:** send log-channel events as pastel embeds ([980b7d3](https://github.com/jatmn/jModGuard/commit/980b7d3b9bef59ea4b510765bcf9bb3f11f35c06))
+* **preview:** render discord markdown in template live previews ([3d80be8](https://github.com/jatmn/jModGuard/commit/3d80be82d020ee6c31244377a04abb6afe73f88f))
+* **templates:** show years in Discord durations ([#530](https://github.com/jatmn/jModGuard/issues/530)) ([8fbb250](https://github.com/jatmn/jModGuard/commit/8fbb250f2df112d375f41d21b9e4212400743afe))
+* **webui:** colorful, meaningful icons for row actions and the sidebar menu ([#602](https://github.com/jatmn/jModGuard/issues/602)) ([4d3811e](https://github.com/jatmn/jModGuard/commit/4d3811e5a0af0e51cf4a81f5adc4c1cab713ad2c)), closes [#588](https://github.com/jatmn/jModGuard/issues/588)
+* **webui:** compact the Members page header ([#595](https://github.com/jatmn/jModGuard/issues/595)) ([4c5119d](https://github.com/jatmn/jModGuard/commit/4c5119dec0ab580c2ac269625883627d4e5fe732))
+* **webui:** dense Analytics page redesign ([#612](https://github.com/jatmn/jModGuard/issues/612)) ([b1707a2](https://github.com/jatmn/jModGuard/commit/b1707a24a6dc56ea01c666475327ee4b10c39d3d)), closes [#587](https://github.com/jatmn/jModGuard/issues/587)
+* **webui:** icons for dashboard cards and setup links ([#610](https://github.com/jatmn/jModGuard/issues/610)) ([49fdd64](https://github.com/jatmn/jModGuard/commit/49fdd64d7c53345504eb39a7c4bf0eabbb0add14)), closes [#608](https://github.com/jatmn/jModGuard/issues/608)
+* **webui:** let guild admins grant Web UI access to moderators by Discord role ([#581](https://github.com/jatmn/jModGuard/issues/581)) ([f86595a](https://github.com/jatmn/jModGuard/commit/f86595af2eaf94b50123c5eec9810409aa838fa5))
+* **webui:** make the Event templates variables help readable ([#629](https://github.com/jatmn/jModGuard/issues/629)) ([907cb46](https://github.com/jatmn/jModGuard/commit/907cb4645c85ded7a6823ef08ff06428ab01bcd1))
+* **webui:** move owner usage and platform analytics into workspace ([#614](https://github.com/jatmn/jModGuard/issues/614)) ([6cf67eb](https://github.com/jatmn/jModGuard/commit/6cf67eb516e9d6f33734449a2c75ff720f1e87f7))
+* **webui:** owner server directory with departure action ([#584](https://github.com/jatmn/jModGuard/issues/584)) ([8af6a6c](https://github.com/jatmn/jModGuard/commit/8af6a6c04a713bd9acd98e9456c86911cf38f193))
+* **webui:** redesign Owner Platform analytics as a fleet dashboard ([#626](https://github.com/jatmn/jModGuard/issues/626)) ([2f2d079](https://github.com/jatmn/jModGuard/commit/2f2d0790f31d79569139f8adf3530c863a953a41)), closes [#618](https://github.com/jatmn/jModGuard/issues/618)
+* **webui:** replace table row action text buttons with icons ([#582](https://github.com/jatmn/jModGuard/issues/582)) ([1380449](https://github.com/jatmn/jModGuard/commit/138044998130a8c2c443e42e811684df488a4453))
+* **webui:** shorten Community help text into one-line intros and collapsed notes ([#631](https://github.com/jatmn/jModGuard/issues/631)) ([fe119b4](https://github.com/jatmn/jModGuard/commit/fe119b4c2a34fea97e7861c26d902a212fd98fab))
+* **webui:** shorten Owner and Administration help text ([#632](https://github.com/jatmn/jModGuard/issues/632)) ([11ab20e](https://github.com/jatmn/jModGuard/commit/11ab20e75fa82b407453d65e6706e88b096c31e1)), closes [#620](https://github.com/jatmn/jModGuard/issues/620)
+* **webui:** shorten Workspace help text into one-line intros and collapsed notes ([#630](https://github.com/jatmn/jModGuard/issues/630)) ([f07d749](https://github.com/jatmn/jModGuard/commit/f07d749011337c891dec936e971771393dbd41f3))
+* **webui:** show server icons in the sidebar server switcher ([#611](https://github.com/jatmn/jModGuard/issues/611)) ([e7fd43d](https://github.com/jatmn/jModGuard/commit/e7fd43db7a24ef9512cb3e164976a4bca1973179))
+* **webui:** tighten global density to a desktop admin-console scale ([#599](https://github.com/jatmn/jModGuard/issues/599)) ([71b0bde](https://github.com/jatmn/jModGuard/commit/71b0bdebc528aa4bea7b177cecf5a94ad772ff6a))
+
+
+### Bug Fixes
+
+* **api:** load bot actions over the read-only database connection ([f1b7775](https://github.com/jatmn/jModGuard/commit/f1b77756313a58cdf1d08dc3da3516e007336cff))
+* **automod:** inherit global invite guidance for first guild overrides ([20b1f54](https://github.com/jatmn/jModGuard/commit/20b1f54ede95668771d53f76d5e3835a7daa18d8))
+* **automod:** keep invite descriptions when copying rules ([30831fd](https://github.com/jatmn/jModGuard/commit/30831fdeab9a5fbf0e1a2fe9ef0a335fe564eff9))
+* **automod:** keep the automod title for crlf guild templates ([9d6d53e](https://github.com/jatmn/jModGuard/commit/9d6d53e4770b040b6bafb2cf699d61524a3c0448))
+* **automod:** keep upgraded invite description on stale rule saves ([0a55120](https://github.com/jatmn/jModGuard/commit/0a551209f55daa18b27b377543349c7b9b36c47b))
+* **automod:** reapply invite descriptions after mixed-version writes ([7b94ec7](https://github.com/jatmn/jModGuard/commit/7b94ec70c8266ad1bdfc56fae229c82c7558216e))
+* **automod:** validate built-in rule windows and invite fields ([c575bfb](https://github.com/jatmn/jModGuard/commit/c575bfbe8cb0d8ffd0a305519fa40033659a29a9))
+* **bot:** hold on a refused guild-store schema instead of looping through the launcher ([#531](https://github.com/jatmn/jModGuard/issues/531)) ([#538](https://github.com/jatmn/jModGuard/issues/538)) ([7e8d313](https://github.com/jatmn/jModGuard/commit/7e8d31366d6ee6132a21b31dbf69a1a083855f48))
+* **bot:** keep deleted-message content when snapshot storage is unavailable ([#634](https://github.com/jatmn/jModGuard/issues/634)) ([5796701](https://github.com/jatmn/jModGuard/commit/5796701d176f3841a8434b50cc2a9d7413a9f0dd)), closes [#633](https://github.com/jatmn/jModGuard/issues/633)
+* **bot:** tolerate short database stalls and deduplicate startup notices ([#628](https://github.com/jatmn/jModGuard/issues/628)) ([f4f320f](https://github.com/jatmn/jModGuard/commit/f4f320f58fdb4a917da90334b597df8ec18f88bd))
+* **bot:** warn about missing message content intent only for blank user messages ([#537](https://github.com/jatmn/jModGuard/issues/537)) ([5815e65](https://github.com/jatmn/jModGuard/commit/5815e65cbb0582ea2ef8925050fb8c01c839a2af)), closes [#533](https://github.com/jatmn/jModGuard/issues/533)
+* **core:** drop release-only unused mut in commit_after_lease_probe ([#541](https://github.com/jatmn/jModGuard/issues/541)) ([#560](https://github.com/jatmn/jModGuard/issues/560)) ([f30e9f8](https://github.com/jatmn/jModGuard/commit/f30e9f8f8ce41f75bd05b0c0b32cc040047b87c2))
+* **db:** batch remote badword setup lookups and inserts ([#482](https://github.com/jatmn/jModGuard/issues/482)) ([#486](https://github.com/jatmn/jModGuard/issues/486)) ([ba1245f](https://github.com/jatmn/jModGuard/commit/ba1245fe43f15fffd81ebdaf0ab3ce58a293d077))
+* **db:** name the store and versions when a guild store schema is refused ([#531](https://github.com/jatmn/jModGuard/issues/531)) ([#535](https://github.com/jatmn/jModGuard/issues/535)) ([c368468](https://github.com/jatmn/jModGuard/commit/c3684688015d6b8c203b1f8c1c374fd71eaf0f40))
+* **db:** read member cleanup candidates in a snapshot ([#532](https://github.com/jatmn/jModGuard/issues/532)) ([#536](https://github.com/jatmn/jModGuard/issues/536)) ([d875191](https://github.com/jatmn/jModGuard/commit/d875191cfbc883257cf1ed76c914caf7a87afafc))
+* **docker:** set a non-root USER in Dockerfile.webui ([#559](https://github.com/jatmn/jModGuard/issues/559)) ([87fe6cb](https://github.com/jatmn/jModGuard/commit/87fe6cb17915cc0a26b063162fc2731351817680)), closes [#539](https://github.com/jatmn/jModGuard/issues/539)
+* **frontend:** index live-preview code spans once ([#522](https://github.com/jatmn/jModGuard/issues/522)) ([32688ef](https://github.com/jatmn/jModGuard/commit/32688efee5fa0dbe0f32c5699cfd6443c27f88cc)), closes [#520](https://github.com/jatmn/jModGuard/issues/520)
+* **frontend:** nest emphasis in the live preview like Discord ([#524](https://github.com/jatmn/jModGuard/issues/524)) ([04be7d6](https://github.com/jatmn/jModGuard/commit/04be7d6bf0ccb1ae97d42d453d53fda78009114f)), closes [#515](https://github.com/jatmn/jModGuard/issues/515)
+* **known-spam:** catch leading whitespace in markdown link destinations ([fecd7e5](https://github.com/jatmn/jModGuard/commit/fecd7e5d5afb77c860dad7323879bc200ae298f7))
+* **known-spam:** catch unicode padding in markdown link destinations ([2608b27](https://github.com/jatmn/jModGuard/commit/2608b270edc5ed4a9655b81109c1797d9cb7df1a))
+* **known-spam:** check adjacent Markdown destinations separately ([#497](https://github.com/jatmn/jModGuard/issues/497)) ([834a603](https://github.com/jatmn/jModGuard/commit/834a603c8b34b62cd63e7b03fb6e3b852ff3ac8b))
+* **known-spam:** ignore invisible characters inside scheme URLs ([#526](https://github.com/jatmn/jModGuard/issues/526)) ([71cc14e](https://github.com/jatmn/jModGuard/commit/71cc14ef47d271b152d3922999f72cfa0c93cc77))
+* **known-spam:** keep rejecting invisible-only usernames before [@host](https://github.com/host) ([#523](https://github.com/jatmn/jModGuard/issues/523)) ([0b90a6f](https://github.com/jatmn/jModGuard/commit/0b90a6fa4e68044e90dd24c88ef9360b69acb827))
+* **known-spam:** match bare URLs after invisible prefixes ([#511](https://github.com/jatmn/jModGuard/issues/511)) ([4c406d8](https://github.com/jatmn/jModGuard/commit/4c406d8ed6b3067bbb47a81410fc445122f7d5ae))
+* **known-spam:** match emphasis-wrapped URLs after an invisible prefix ([#525](https://github.com/jatmn/jModGuard/issues/525)) ([193b322](https://github.com/jatmn/jModGuard/commit/193b322ad57b1e41b77534231f4a3d4814deb307))
+* **logging:** keep expected startup states below WARN ([#615](https://github.com/jatmn/jModGuard/issues/615)) ([2e322b8](https://github.com/jatmn/jModGuard/commit/2e322b8689ebde280e0917487bc8ece3455c3cb1))
+* **logs:** stop duplicate mod_action rows from moderation commands ([980b7d3](https://github.com/jatmn/jModGuard/commit/980b7d3b9bef59ea4b510765bcf9bb3f11f35c06))
+* **preview:** bound unmatched link scans in the live preview ([980bb72](https://github.com/jatmn/jModGuard/commit/980bb722a9b3dd7c4c0c03880f48ebd66149b16f))
+* **runtime:** don't show the host memory ceiling as the container limit in !status ([#607](https://github.com/jatmn/jModGuard/issues/607)) ([96a5ad0](https://github.com/jatmn/jModGuard/commit/96a5ad0e96ff76697b5cfa85afaef9ea8c31160d)), closes [#603](https://github.com/jatmn/jModGuard/issues/603)
+* **runtime:** fall back from missing memory.stat and log cgroup layout ([#594](https://github.com/jatmn/jModGuard/issues/594)) ([4fc65d8](https://github.com/jatmn/jModGuard/commit/4fc65d85a3b29e23019c8f3e7da96720b56e1f15))
+* **runtime:** treat only "max" as unlimited for cgroup v2 memory.max ([#598](https://github.com/jatmn/jModGuard/issues/598)) ([59df8b3](https://github.com/jatmn/jModGuard/commit/59df8b32a2345ad08c4fe87d21fadad00a5fe7da))
+* **security:** resolve CodeQL hard-coded nonce and sanitization alerts ([#534](https://github.com/jatmn/jModGuard/issues/534)) ([f6c3070](https://github.com/jatmn/jModGuard/commit/f6c3070ea48b57cd6fdccdb32ec05e90caeaaf62))
+* **updater:** log one line per unsaved startup receipt attempt ([#552](https://github.com/jatmn/jModGuard/issues/552)) ([#570](https://github.com/jatmn/jModGuard/issues/570)) ([c1ddf20](https://github.com/jatmn/jModGuard/commit/c1ddf20c116ce3e79bd1ac67bd9daf7c807f98f1))
+* **updater:** wait quietly while the bot migrates the core schema ([#551](https://github.com/jatmn/jModGuard/issues/551)) ([#568](https://github.com/jatmn/jModGuard/issues/568)) ([a43e36d](https://github.com/jatmn/jModGuard/commit/a43e36d438a8611858f679c0bb4670b148eadd5f))
+* **webui:** bound Cases reads and cancel cold store opens ([#479](https://github.com/jatmn/jModGuard/issues/479)) ([f5400d2](https://github.com/jatmn/jModGuard/commit/f5400d24051c77c3128b19bfd6f5817476a904a8))
+* **webui:** define sr-only so the chart summary is visually hidden ([#605](https://github.com/jatmn/jModGuard/issues/605)) ([f35989f](https://github.com/jatmn/jModGuard/commit/f35989f45c6b9e83e8023831eb7b729ca938dff4)), closes [#600](https://github.com/jatmn/jModGuard/issues/600)
+* **webui:** keep the sidebar and its footer controls visible while the page scrolls ([#575](https://github.com/jatmn/jModGuard/issues/575)) ([481a9e2](https://github.com/jatmn/jModGuard/commit/481a9e24842bcf869b5e4f988172efc64575e954))
+* **webui:** lay out the Members import status card ([#555](https://github.com/jatmn/jModGuard/issues/555)) ([#567](https://github.com/jatmn/jModGuard/issues/567)) ([5f85068](https://github.com/jatmn/jModGuard/commit/5f850681bc5cae620b9346c869c221dc238595be))
+* **webui:** leave Known spam clean after a Global add and keep add errors visible ([#573](https://github.com/jatmn/jModGuard/issues/573)) ([07a460e](https://github.com/jatmn/jModGuard/commit/07a460e696d5e192f6bb0321de35b9eae389becd))
+* **webui:** make the Members coverage notice readable and let short planned restarts clear it ([#569](https://github.com/jatmn/jModGuard/issues/569)) ([b5c1f06](https://github.com/jatmn/jModGuard/commit/b5c1f06a23edda2b62aab391aa9e8d199b62221e))
+* **webui:** replace built-in automod JSON params with fields ([#483](https://github.com/jatmn/jModGuard/issues/483)) ([57a0699](https://github.com/jatmn/jModGuard/commit/57a0699e7eb31b297874e7af7180bd78f729471d))
+* **webui:** show current components as Up to date and disable their Update buttons ([#593](https://github.com/jatmn/jModGuard/issues/593)) ([36d6f69](https://github.com/jatmn/jModGuard/commit/36d6f698a8337391da74137273024e0dfdecc284))
+* **webui:** show Local case history as Not counted, not Unknown ([#578](https://github.com/jatmn/jModGuard/issues/578)) ([#580](https://github.com/jatmn/jModGuard/issues/580)) ([245b379](https://github.com/jatmn/jModGuard/commit/245b379e06b7768f9946301b0aa0549eb9752a66))
+
+
+### Performance Improvements
+
+* **db:** skip already-applied core migrations instead of relocking each ([#553](https://github.com/jatmn/jModGuard/issues/553)) ([#566](https://github.com/jatmn/jModGuard/issues/566)) ([aafa81c](https://github.com/jatmn/jModGuard/commit/aafa81c7755a787dd78cc53fadd247bfd8f3ea1e))
+
 ## [0.2.0](https://github.com/jatmn/jModGuard/compare/v0.1.0...v0.2.0) (2026-11-08)
 
 
