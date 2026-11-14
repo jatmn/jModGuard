@@ -2159,6 +2159,14 @@ pub(crate) fn bound_automod_content_var(
     vars.insert("content".into(), bounded);
 }
 
+/// Stored snapshot generations start at 1. A row with this generation was built
+/// from the bot's in-process recent-message cache, not read from the guild store.
+pub(crate) const MEMORY_CACHE_GENERATION: i64 = 0;
+
+fn from_memory_cache(row: &MessageSnapshot) -> bool {
+    row.generation == MEMORY_CACHE_GENERATION
+}
+
 pub(crate) fn apply_retained_edit(
     report: &mut MessageReport,
     before: Option<&MessageSnapshot>,
@@ -2169,7 +2177,9 @@ pub(crate) fn apply_retained_edit(
         report.vars.insert("before".into(), retained_content(row));
         report.vars.insert(
             "coverage".into(),
-            if row.continuous {
+            if from_memory_cache(row) {
+                "from memory cache".into()
+            } else if row.continuous {
                 "last observed; Gateway order may be incomplete".into()
             } else {
                 "last observed; observation gap or restart".into()
@@ -2213,7 +2223,9 @@ pub(crate) fn apply_retained_delete(report: &mut MessageReport, row: Option<&Mes
             .insert("attachments".into(), retained_attachments(row));
         report.vars.insert(
             "coverage".into(),
-            if row.continuous {
+            if from_memory_cache(row) {
+                "from memory cache".into()
+            } else if row.continuous {
                 "last observed; later edits may be missing".into()
             } else {
                 "last observed; observation gap or restart".into()
@@ -2284,7 +2296,9 @@ impl BulkTranscript {
                 row.fields
                     .author_id
                     .map_or_else(|| "unavailable".into(), |id| id.to_string()),
-                if row.continuous {
+                if from_memory_cache(row) {
+                    "from memory cache"
+                } else if row.continuous {
                     "last observed; later edits may be missing"
                 } else {
                     "observation gap"
