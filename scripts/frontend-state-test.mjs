@@ -441,6 +441,8 @@ test('analytics opens with a one-line header, range selector and info tip, then 
   const tip = header.querySelector('.info-tip-trigger');
   assert.equal(tip.getAttribute('aria-label'), 'About these trends');
   assert.match(panel.querySelector('#analytics-help').textContent, /never added up/);
+  // Unverified Members may be recovering on its own, so the tip defers to the Members page instead of demanding Reconcile.
+  assert.match(panel.querySelector('#analytics-help').textContent, /the Members page says whether to Reconcile or wait/);
   assert.equal([...panel.querySelectorAll('.dashboard-note strong')].some((n) => n.textContent === 'About these trends'), false);
   // Range selector: labelled group of pressed-state buttons.
   const range = panel.querySelector('[aria-label="Analytics date range"]');
@@ -3037,6 +3039,7 @@ test('actions refresh only on demand and cancellation includes membership', asyn
   assert.equal(calls[0].opts.headers['x-jmodguard-enrollment'],'membership');
   const notes=h.elements.find(n=>n.localName==='details'&&n.classList.contains('good-to-know'));
   assert.equal(notes.open,false);
+  assert.match(textOf(notes),/Cancel stops requests that haven't started/);
   assert.match(textOf(notes),/Force-cancel clears a stuck log-channel request/);
   const cancel=h.elements.find(n=>n.localName==='button'&&n.getAttribute('aria-label')==='Cancel');
   await fire(cancel, 'click', {});

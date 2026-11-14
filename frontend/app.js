@@ -2980,7 +2980,8 @@ const ANALYTICS_HELP = [
   "Members has no 90-day change: join and leave counts are kept for 92 days.",
   "Some numbers overlap (a warn is also a mod action), so they're never added up.",
   "The heat map counts each automod action, moderator command and spam ban once.",
-  "Members is partial while the first import runs, and unverified until you Reconcile on the Members page.",
+  "Members is partial while the first import runs.",
+  "If Members shows unverified, the Members page says whether to Reconcile or wait for it to clear.",
 ];
 
 // Loaded analytics summaries per guild, page membership and range. Switching
@@ -7897,7 +7898,7 @@ function tabActions() {
       items: [
         "Queued requests need the bot to be online.",
         "A request with an unknown result is not retried. Check Discord to see what happened.",
-        "Cancel stops any request the bot hasn't sent to Discord yet.",
+        "Cancel stops requests that haven't started.",
         "Force-cancel clears a stuck log-channel request so you can save again. It doesn't undo anything in Discord.",
       ],
     }),
