@@ -266,6 +266,10 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .good-to-know summary { cursor: pointer; font-weight: 600; }
 .good-to-know ul { margin: 6px 0 0; padding-inline-start: 18px; list-style: disc; }
 .good-to-know li + li { margin-top: 2px; }
+/* Badwords entry row (#620): the entry-type help wraps inside its field and each control keeps a readable width; controls move to the next line instead of shrinking. */
+.badword-entry-row > .field { flex: 1 1 200px; }
+.badword-entry-row > .badword-entry { flex: 3 1 280px; }
+.badword-entry-row > .input { flex: 2 1 160px; }
 /* An alert with text and an action: the action wraps below long text instead of running past the box. */
 .alert-wrap { display: flex; flex-wrap: wrap; align-items: center; }
 .alert-wrap > * { min-width: 0; max-width: 100%; }

@@ -6279,7 +6279,8 @@ test('Badwords shows what is handled automatically, an entry counter, the action
   h.app.state.config = { enrollment_id: 'membership', badwords: [], rules: [rule] };
   h.app.state.tab = 'badwords'; h.app.renderTab(); await settle();
   const content = h.nodes.get('#content');
-  const auto = content.querySelector('[aria-label="Handled automatically"]');
+  const auto = content.querySelector('[aria-label="Words and phrases handle automatically"]');
+  assert.match(auto.textContent, /^Words and phrases handle automatically:/);
   assert.deepEqual([...auto.querySelectorAll('.badge')].map((chip) => chip.textContent),
     ['Upper and lower case', 'Accents', 'Hidden characters', 'Spacing', 'Leetspeak', 'Whole words']);
   for (const chip of auto.querySelectorAll('.badge')) assert.ok(chip.title, `${chip.textContent} explains itself on hover`);
@@ -6297,12 +6298,38 @@ test('Badwords shows what is handled automatically, an entry counter, the action
   assert.equal(requests.at(-1).body.sample, '5c4m');
   assert.equal(content.querySelector('pre.code').textContent, 'Matched scam (server)');
 
-  rule.effective.dry_run = true;
-  h.app.renderTab(); await settle();
-  assert.match(textOf(h.nodes.get('#content').querySelector('.badword-action-summary')), /^Dry-run Only logs matches\. When on: Strike 1: Warn/);
+  // Advanced regex is also checked against the disguise-free lowercase forms (normalize::matches_badword),
+  // but only ordinary words get automatic whole-word boundaries (normalize::literal_badword_pattern).
+  const entryHelp = () => content.querySelector('.badword-entry-row .field .field-help').textContent;
+  assert.equal(entryHelp(), 'Matches whole words and catches common disguises.');
+  await chooseOption(content.querySelector('.badword-entry-row select'), 'Advanced regex');
+  assert.equal(entryHelp(), 'Checked as written and as a lowercase copy with disguises removed. Add \\b for whole words.');
+  assert.ok(content.querySelector('textarea[aria-label="Advanced regex pattern"]'));
+  assert.match(content.textContent, /One pattern, up to 512 bytes\./);
+  assert.doesNotMatch(content.textContent, /Disguises are not handled/);
+
+  // The summary names what the bot runs (RuleDef::action_for_strike, timeout of at least one minute).
+  const summary = () => textOf(h.nodes.get('#content').querySelector('.badword-action-summary'));
+  for (const [actions, expected] of [
+    [[{ at: 1, action: 'timeout', duration_minutes: 0 }], 'Strike 1: Timeout 1 min'],
+    [[{ at: 1, action: 'timeout' }], 'Strike 1: Timeout 1 min'],
+    [[{ at: 1, action: 'ban' }, { at: 1, action: 'warn' }], 'Strike 1: Warn'],
+    [[{ at: 1, action: 'warn' }, { at: 1, action: 'ban' }], 'Strike 1: Ban'],
+    [[{ at: 0, action: 'warn' }, { at: 2, action: 'kick' }], 'Strike 1: Warn · Strike 2: Kick'],
+    [[{ at: 0, action: 'warn' }, { at: 1, action: 'kick' }], 'Strike 1: Kick'],
+    [[], 'No actions set'],
+  ]) {
+    rule.effective.actions = actions;
+    rule.effective.dry_run = false;
+    h.app.renderTab(); await settle();
+    assert.equal(summary(), `On ${expected}`, JSON.stringify(actions));
+    rule.effective.dry_run = true;
+    h.app.renderTab(); await settle();
+    assert.equal(summary(), `Dry-run Only logs matches. When on: ${expected}`, JSON.stringify(actions));
+  }
   rule.effective.enabled = false;
   h.app.renderTab(); await settle();
-  assert.equal(textOf(h.nodes.get('#content').querySelector('.badword-action-summary')), 'Off Matches are ignored.');
+  assert.equal(summary(), 'Off Matches are ignored.');
 });
 
 test('Badwords rule saves enable actions and exemptions through the setup path', async () => {
@@ -6348,6 +6375,9 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   let panel = h.app.tabKnownSpam();
   await settle();
   assert.match(panel.textContent, /reworded copy may not match/i);
+  // Samples and URL patterns count against one 1024-entry limit per scope (db::known_spam).
+  assert.match(panel.textContent, /This server and global each hold up to 1024 entries, samples and URL patterns combined\./);
+  assert.doesNotMatch(panel.textContent, /1024 patterns/);
   const sample = panel.querySelector('textarea');
   sample.value = 'I used to work as Full Stack AI developer'; await fire(sample, 'input');
   const note = panel.querySelector('input[data-note]');

@@ -3950,9 +3950,12 @@ function applyPlanStepInput(step, type, raw) {
 }
 
 // A rule's escalation steps in plain words (#620), e.g. "Strike 1: Warn · Strike 3: Timeout 10 min".
+// Lists only the steps the bot can run: at each strike it picks the last step with the highest
+// strike count reached (RuleDef::action_for_strike), and a timeout lasts at least one minute.
 function describeRuleActions(rule) {
+  const actions = rule.actions ?? [];
   const name = (step) => {
-    if (step.action === "timeout") return `Timeout ${step.duration_minutes || 0} min`;
+    if (step.action === "timeout") return `Timeout ${Math.max(1, Number(step.duration_minutes) || 0)} min`;
     if (step.action === "ban")
       return step.purge_last_hour
         ? "Ban and delete the last hour of messages"
@@ -3962,8 +3965,14 @@ function describeRuleActions(rule) {
     const action = String(step.action || "unknown");
     return action[0].toUpperCase() + action.slice(1);
   };
-  const steps = [...(rule.actions ?? [])].sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
-  return steps.length ? steps.map((step) => `Strike ${step.at ?? 0}: ${name(step)}`).join(" · ") : "No actions set";
+  const at = (step) => step.at ?? 0;
+  const forStrike = (strike) =>
+    actions.reduce((best, step) => (at(step) <= strike && (!best || at(step) >= at(best)) ? step : best), null);
+  // Strikes start at 1, so a step at 0 first runs on strike 1.
+  const strikes = [...new Set(actions.map((step) => Math.max(1, at(step))))].sort((a, b) => a - b);
+  return strikes.length
+    ? strikes.map((strike) => `Strike ${strike}: ${name(forStrike(strike))}`).join(" · ")
+    : "No actions set";
 }
 
 // Badwords splits a words paste on commas and new lines (jmodguard::normalize::badword_patterns).
@@ -4002,7 +4011,6 @@ function tabBadwords() {
     draftKey: "badwords:note",
     type: "text",
     placeholder: "note (optional)",
-    style: { flex: "1" },
     className: "input",
   });
   const scopeRef = useRef(null);
@@ -4025,8 +4033,8 @@ function tabBadwords() {
     h("p", { className: "muted" }, "Block words and phrases in your server's messages."),
     h(
       "ul",
-      { className: "tag-group", "aria-label": "Handled automatically" },
-      h("li", { className: "muted" }, "Handled automatically:"),
+      { className: "tag-group", "aria-label": "Words and phrases handle automatically" },
+      h("li", { className: "muted" }, "Words and phrases handle automatically:"),
       ...BADWORD_AUTO_HANDLED.map(([label, title]) =>
         h("li", { key: label, className: "badge badge-soft badge-sm badge-neutral", title }, label),
       ),
@@ -4081,7 +4089,7 @@ function tabBadwords() {
         { className: "card-body" },
         h(
           "div",
-          { className: "row" },
+          { className: "row badword-entry-row" },
           field(
             "Entry type",
             h(
@@ -4094,13 +4102,13 @@ function tabBadwords() {
               "p",
               { className: "field-help" },
               mode === "regex"
-                ? "Matches your pattern exactly as written. Disguises are not handled."
+                ? "Checked as written and as a lowercase copy with disguises removed. Add \\b for whole words."
                 : "Matches whole words and catches common disguises.",
             ),
           ),
           h(
             "div",
-            { style: { flex: "2" } },
+            { className: "badword-entry" },
             pattern,
             h(
               "p",
@@ -7379,6 +7387,7 @@ function tabKnownSpam() {
         "The first match bans the member and deletes their messages from the last hour.",
         "In dry-run, matches are only logged.",
         "The rule below turns the list on or off and sets who is skipped.",
+        "This server and global each hold up to 1024 entries, samples and URL patterns combined.",
         isBotOwner()
           ? "Global entries apply to every server."
           : "Global entries apply to every server. Only the bot owner can change them.",
@@ -7405,7 +7414,6 @@ function tabKnownSpam() {
             "Links without http:// also match.",
             "Anything after ? or # in a link is ignored.",
             "Patterns can't contain regex, ports, logins, ? or #.",
-            "Up to 1024 patterns each for this server and global.",
           ],
         }),
         h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:url", "known-spam:note", "known-spam:scope"], onClick: () => add("url") }, "Add URL pattern"),
