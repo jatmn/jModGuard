@@ -139,10 +139,6 @@ body { background: var(--bg); color: var(--text); font-size: var(--ui-font-size)
 .title-row > h2 { margin-bottom: 0; }
 .form-row { align-items: flex-start; margin-bottom: 12px; }
 .form-row > .field { flex: 1 1 200px; margin-bottom: 0; }
-/* Badwords entry row (#620): the entry-type help wraps inside its field and each control keeps a readable width; controls move to the next line instead of shrinking. */
-.badword-entry-row > .field { flex: 1 1 200px; }
-.badword-entry-row > .badword-entry { flex: 3 1 280px; }
-.badword-entry-row > .input { flex: 2 1 160px; }
 .form-actions { align-items: flex-end; margin-bottom: 12px; }
 .form-actions > .field { margin-bottom: 0; }
 .checkbox-label { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 650; color: var(--text); }
@@ -339,6 +335,36 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .ban-options { display: inline-flex; align-items: center; gap: 4px; }
 .id-picker .fieldset { padding: 0; gap: 4px; }
 .id-picker .select, .id-picker .input { width: 100%; }
+/* List pages (#622): Badwords, Known spam and Known-bad images share one column at the rule
+   editor's width: status, add form, list, then a collapsible tester or preview. Every
+   control keeps daisyUI's default height, so inputs, selects and buttons line up. */
+.list-page { max-width: 56rem; }
+.list-card > .card-body, .list-card > details > .card-body { padding: 14px 18px; gap: 10px; }
+.list-card .card-title { margin: 0; }
+.list-card .field { margin-bottom: 0; padding-block: 0; }
+.list-card .input, .list-card .select, .list-card .textarea { width: 100%; }
+.list-status .rule-editor-header, .list-status .rule-summary { margin: 0; }
+.list-status-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+.list-status-actions > .badge { margin-inline-end: auto; }
+.list-form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(14rem, 100%), 1fr)); gap: 8px 16px; }
+.list-entry { display: flex; flex-direction: column; gap: 4px; }
+.list-entry .field-help, .list-card .field-help { margin: 0; }
+.list-entry .good-to-know { margin: 2px 0 0; }
+.list-form-submit { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 8px 16px; }
+.list-form-submit > .field, .list-form-submit > .input { flex: 1 1 16rem; }
+.list-form-submit > .btn { margin-inline-start: auto; }
+.list-toolbar { display: flex; flex-wrap: wrap; gap: 8px; }
+.list-toolbar > .input { flex: 2 1 14rem; width: auto; }
+.list-toolbar > .select { flex: 1 1 10rem; width: auto; }
+.list-table .table-scroll { border: 1px solid var(--shell-border); }
+.list-entry-cell { overflow-wrap: anywhere; min-width: 12rem; }
+.list-entry-cell > .badge { margin-inline-start: 6px; }
+.list-extra > summary { padding: 12px 18px; font-size: .9375rem; font-weight: 700; cursor: pointer; }
+.list-extra[open] > summary { padding-bottom: 0; }
+.tester-result { padding: 8px 12px; border: 1px solid var(--shell-border); border-radius: 8px; background: var(--panel2); }
+.tester-result-title { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+.tester-matches { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 0; padding: 0; list-style: none; }
+.tester-matches li { display: flex; align-items: center; gap: 8px; overflow-wrap: anywhere; }
 .picker-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 0; padding: 0; list-style: none; }
 .picker-chip { gap: 4px; height: auto; min-height: var(--target-min); max-width: 100%; padding-inline: 8px 2px; }
 .picker-chip-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

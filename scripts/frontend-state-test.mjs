@@ -5449,6 +5449,9 @@ test('transient Discord errors leave Members polling and sign-in state unchanged
   assert.ok(h.app.state.me);
 });
 
+// Known-bad images: the list search (shown once it has items), then the add form's hash and note.
+const knownBadInputs = panel => ['input[data-search]', 'input[data-hash]', 'input[data-note]'].map(selector => panel.querySelector(selector));
+
 test('known-bad images renders hash-only metadata and searches without re-fetching', async () => {
   const requests = [];
   const h = harness(async (url, options) => { requests.push({url, options}); return response({}); });
@@ -5459,14 +5462,14 @@ test('known-bad images renders hash-only metadata and searches without re-fetchi
   const panel = h.app.tabKnownBadImages();
   assert.match(textOf(panel), /confirmed spam/);
   assert.match(textOf(panel), /unknown/);
-  const search = panel.querySelector('input');
+  const search = knownBadInputs(panel)[0];
   search.value = 'confirmed'; await fire(search, 'input');
   assert.match(textOf(panel), /confirmed spam/);
   assert.doesNotMatch(textOf(panel), /cdcdcdcd/);
   assert.equal(requests.length, 0);
   const add = [...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash');
   assert.equal(add.disabled, true);
-  const digest = panel.querySelectorAll('input')[1];
+  const digest = knownBadInputs(panel)[1];
   digest.value = 'ab'.repeat(32); await fire(digest, 'input');
   assert.equal(add.disabled, false);
 });
@@ -5501,7 +5504,7 @@ test('known-bad image add and remove buttons save then reload the coherent list'
   });
   h.app.state.config = config();
   let panel = h.app.tabKnownBadImages();
-  const inputs = panel.querySelectorAll('input');
+  const inputs = knownBadInputs(panel);
   inputs[1].value = hash; await fire(inputs[1], 'input');
   inputs[2].value = 'confirmed spam'; await fire(inputs[2], 'input');
   await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash'), 'click');
@@ -5530,7 +5533,7 @@ test('known-bad image remove keeps unrelated add drafts', async () => {
   h.app.state.config = config();
   let panel = h.app.tabKnownBadImages();
   await settle();
-  const inputs = panel.querySelectorAll('input');
+  const inputs = knownBadInputs(panel);
   inputs[1].value = draftHash; await fire(inputs[1], 'input');
   inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
   assert.equal(h.app.isDirty(), true);
@@ -5538,7 +5541,7 @@ test('known-bad image remove keeps unrelated add drafts', async () => {
   await settle();
   panel = h.app.tabKnownBadImages();
   await settle();
-  const after = panel.querySelectorAll('input');
+  const after = knownBadInputs(panel);
   assert.equal(after[1].value, draftHash);
   assert.equal(after[2].value, 'draft note');
   assert.equal(h.app.isDirty(), true);
@@ -5560,14 +5563,14 @@ test('known-bad image add clears only its draft fields', async () => {
   h.app.state.config = config();
   let panel = h.app.tabKnownBadImages();
   await settle();
-  const inputs = panel.querySelectorAll('input');
+  const inputs = knownBadInputs(panel);
   inputs[1].value = hash; await fire(inputs[1], 'input');
   inputs[2].value = 'saved note'; await fire(inputs[2], 'input');
   await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash'), 'click');
   await settle();
   panel = h.app.tabKnownBadImages();
   await settle();
-  const cleared = panel.querySelectorAll('input');
+  const cleared = knownBadInputs(panel);
   assert.equal(cleared[1].value, '');
   assert.equal(cleared[2].value, '');
   assert.equal(h.app.isDirty(), false);
@@ -5586,7 +5589,7 @@ test('known-bad image delete 429 keeps draft and listed row', async () => {
   h.app.state.config = config();
   let panel = h.app.tabKnownBadImages();
   await settle();
-  const inputs = panel.querySelectorAll('input');
+  const inputs = knownBadInputs(panel);
   inputs[1].value = draftHash; await fire(inputs[1], 'input');
   inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
   await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
@@ -5614,7 +5617,7 @@ test('known-bad image delete succeeds after 429 without losing unrelated draft',
   h.app.state.config = config();
   let panel = h.app.tabKnownBadImages();
   await settle();
-  const inputs = panel.querySelectorAll('input');
+  const inputs = knownBadInputs(panel);
   inputs[1].value = draftHash; await fire(inputs[1], 'input');
   inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
   await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
@@ -5623,7 +5626,7 @@ test('known-bad image delete succeeds after 429 without losing unrelated draft',
   await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
   await settle();
   assert.equal(h.app.state.config.known_bad_images.length, 0);
-  const after = panel.querySelectorAll('input');
+  const after = knownBadInputs(panel);
   assert.equal(after[1].value, draftHash);
   assert.equal(after[2].value, 'draft note');
   assert.equal(h.app.isDirty(), true);
@@ -5637,7 +5640,7 @@ test('known-bad drafts do not restore after enrollment replacement', async () =>
   await settle();
   let panel = h.app.tabKnownBadImages();
   await settle();
-  const inputs = panel.querySelectorAll('input');
+  const inputs = knownBadInputs(panel);
   inputs[1].value = 'cd'.repeat(32); await fire(inputs[1], 'input');
   inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
   await h.app.handleEvent(async () => {
@@ -5647,7 +5650,7 @@ test('known-bad drafts do not restore after enrollment replacement', async () =>
   await settle();
   panel = h.app.tabKnownBadImages();
   await settle();
-  const after = panel.querySelectorAll('input');
+  const after = knownBadInputs(panel);
   assert.equal(after[1].value, '');
   assert.equal(after[2].value, '');
   assert.equal(h.app.isDirty(), false);
@@ -6660,7 +6663,7 @@ test('Badwords setup adds literal lists, displays entries and tests saved plus d
   assert.equal(calls.at(-1).body.words, 'draft');
   assert.equal(calls.at(-1).headers['x-jmodguard-enrollment'], 'membership');
   assert.equal(calls.at(-1).headers['x-jmodguard-save'], undefined);
-  assert.match(h.document.body.textContent, /Matched/);
+  assert.match(h.document.querySelector('.tester-result').textContent, /“pump and dump” matched:pump and dumpSaved list/);
   assert.equal(h.document.querySelector('#test-pattern'), null);
   const advanced = [...h.document.querySelectorAll('select')].find(n => [...n.options].some(o => /Advanced regex/.test(o.textContent)));
   assert.ok(advanced); advanced.value = 'regex'; await fire(advanced, 'change');
@@ -6763,7 +6766,7 @@ test('Badwords shows what is handled automatically, an entry counter, the action
   const requests = [];
   const h = harness(async (url, options) => {
     requests.push({ url, body: JSON.parse(options.body) });
-    return response({ matched: true, matches: [{ label: 'scam', source: 'server' }] });
+    return response({ matched: true, matches: [{ label: 'scam', source: 'saved' }, { label: 'Regex · c.m', source: 'draft' }] });
   });
   const rule = { rule_id: 'badword', name: 'Badwords', effective: { enabled: true, dry_run: false, params: {}, actions: [
     { at: 3, action: 'timeout', duration_minutes: 10 }, { at: 1, action: 'warn' }, { at: 5, action: 'ban', purge_last_hour: true },
@@ -6776,52 +6779,56 @@ test('Badwords shows what is handled automatically, an entry counter, the action
   assert.deepEqual([...auto.querySelectorAll('.badge')].map((chip) => chip.textContent),
     ['Upper and lower case', 'Accents', 'Hidden characters', 'Spacing', 'Leetspeak', 'Whole words']);
   for (const chip of auto.querySelectorAll('.badge')) assert.ok(chip.title, `${chip.textContent} explains itself on hover`);
-  assert.equal(textOf(content.querySelector('.badword-action-summary')),
-    'On Strike 1: Warn · Strike 3: Timeout 10 min · Strike 5: Ban and delete the last hour of messages');
+  assert.equal(textOf(content.querySelector('.list-status .rule-summary')),
+    'When a message matches your Badwords list: Strike 1: Warn · Strike 3: Timeout 10 min · Strike 5: Ban (delete last hour).');
   assert.match(content.textContent, /No words yet\. Add some above, for example: scam, free nitro/);
   assert.match(content.textContent, /0\/32 entries/);
   const words = content.querySelector('textarea[aria-label="Words or phrases"]');
   words.value = 'scam, free nitro\n\nspam,'; await fire(words, 'input');
   assert.match(content.textContent, /3\/32 entries/);
-  assert.equal(content.querySelector('pre.code'), null, 'no empty results box before a test');
+  assert.equal(content.querySelector('.tester-result'), null, 'no empty results box before a test');
   const sample = content.querySelector('input[placeholder^="sample text"]');
   sample.value = '5c4m'; await fire(sample, 'input');
   await fire([...content.querySelectorAll('button')].find((b) => b.textContent === 'Test'), 'click');
   assert.equal(requests.at(-1).body.sample, '5c4m');
-  assert.equal(content.querySelector('pre.code').textContent, 'Matched scam (server)');
+  const result = content.querySelector('.tester-result');
+  assert.equal(result.querySelector('.tester-result-title').textContent, '“5c4m” matched:');
+  assert.deepEqual([...result.querySelectorAll('li')].map((li) => [...li.children].map((n) => n.textContent)),
+    [['scam', 'Saved list'], ['Regex · c.m', 'Draft above']], 'each matching entry and where it came from');
 
   // Advanced regex is also checked against the disguise-free lowercase forms (normalize::matches_badword),
   // but only ordinary words get automatic whole-word boundaries (normalize::literal_badword_pattern).
-  const entryHelp = () => content.querySelector('.badword-entry-row .field .field-help').textContent;
+  const entryHelp = () => content.querySelector('.list-add .entry-help').textContent;
   assert.equal(entryHelp(), 'Matches whole words and catches common disguises.');
-  await chooseOption(content.querySelector('.badword-entry-row select'), 'Advanced regex');
+  await chooseOption(content.querySelector('.list-add select'), 'Advanced regex');
   assert.equal(entryHelp(), 'Checked as written and as a lowercase copy with disguises removed. Add \\b for whole words.');
   assert.ok(content.querySelector('textarea[aria-label="Advanced regex pattern"]'));
   assert.match(content.textContent, /One pattern, up to 512 bytes\./);
   assert.doesNotMatch(content.textContent, /Disguises are not handled/);
 
   // The summary names what the bot runs (RuleDef::action_for_strike, timeout of at least one minute).
-  const summary = () => textOf(h.nodes.get('#content').querySelector('.badword-action-summary'));
+  const summary = () => textOf(h.nodes.get('#content').querySelector('.list-status .rule-summary'));
+  const when = 'When a message matches your Badwords list: ';
   for (const [actions, expected] of [
-    [[{ at: 1, action: 'timeout', duration_minutes: 0 }], 'Strike 1: Timeout 1 min'],
-    [[{ at: 1, action: 'timeout' }], 'Strike 1: Timeout 1 min'],
-    [[{ at: 1, action: 'ban' }, { at: 1, action: 'warn' }], 'Strike 1: Warn'],
-    [[{ at: 1, action: 'warn' }, { at: 1, action: 'ban' }], 'Strike 1: Ban'],
+    [[{ at: 1, action: 'timeout', duration_minutes: 0 }], 'Timeout 1 min'],
+    [[{ at: 1, action: 'timeout' }], 'Timeout 1 min'],
+    [[{ at: 1, action: 'ban' }, { at: 1, action: 'warn' }], 'Warn'],
+    [[{ at: 1, action: 'warn' }, { at: 1, action: 'ban' }], 'Ban (keep messages)'],
     [[{ at: 0, action: 'warn' }, { at: 2, action: 'kick' }], 'Strike 1: Warn · Strike 2: Kick'],
-    [[{ at: 0, action: 'warn' }, { at: 1, action: 'kick' }], 'Strike 1: Kick'],
-    [[], 'No actions set'],
+    [[{ at: 0, action: 'warn' }, { at: 1, action: 'kick' }], 'Kick'],
+    [[], 'no action'],
   ]) {
     rule.effective.actions = actions;
     rule.effective.dry_run = false;
     h.app.renderTab(); await settle();
-    assert.equal(summary(), `On ${expected}`, JSON.stringify(actions));
+    assert.equal(summary(), `${when}${expected}.`, JSON.stringify(actions));
     rule.effective.dry_run = true;
     h.app.renderTab(); await settle();
-    assert.equal(summary(), `Dry-run Only logs matches. When on: ${expected}`, JSON.stringify(actions));
+    assert.equal(summary(), `${when}${expected}. Dry-run: only logs.`, JSON.stringify(actions));
   }
   rule.effective.enabled = false;
   h.app.renderTab(); await settle();
-  assert.equal(summary(), 'Off Matches are ignored.');
+  assert.equal(summary(), `${when}no action. Off: the rule is ignored.`);
 });
 
 test('Badwords rule saves enable actions and exemptions through the setup path', async () => {
@@ -6848,6 +6855,138 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   assert.equal(h.app.state.tab, 'badwords');
   assert.equal(h.document.querySelector('.modal-overlay'), null);
 });
+
+// #622: Badwords, Known spam and Known-bad images share one page pattern.
+const LIST_RULES = () => [
+  { rule_id: 'badword', name: 'Badwords', guild_override: true, effective: { enabled: true, dry_run: false, params: {}, actions: [{ at: 1, action: 'warn' }] } },
+  { rule_id: 'known_spam', name: 'Known spam', global: true, effective: { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'ban', purge_last_hour: true }] } },
+  { rule_id: 'attachment_flood', name: 'Exact image spam', effective: { enabled: true, dry_run: false,
+    params: { mode: 'exact_image', min_channels: 3, min_attachments: 2, window_secs: 90 },
+    actions: [{ at: 1, action: 'delete', reason: 'spam match' }, { at: 1, action: 'ban', reason: 'spam match', delete_days: 0, purge_last_hour: true }] } },
+];
+
+test('list pages show status, add form, list, then tester or preview, with search and filters once the list has items', async () => {
+  const guild = '987654321098765432';
+  const config = {
+    enrollment_id: 'membership', rules: LIST_RULES(),
+    badwords: [
+      { id: 1, guild_id: guild, word: 'free nitro', pattern: 'x', note: 'nitro wave', valid: true },
+      { id: 2, guild_id: '0', word: 'scam', pattern: 'x', note: '', valid: true },
+      { id: 3, guild_id: guild, word: null, pattern: '(a+)+$', note: '', valid: false, error: 'failed compile limits' },
+    ],
+    known_spam: [{ id: '1', guild_id: guild, kind: 'url', value: 'tinyurl.com/*', note: null }],
+    known_bad_images: [{ hash: 'ab'.repeat(32), added_at: '2026-01-01', added_via: 'webui', actor: 'unknown', note: 'qr' }],
+  };
+  const expected = {
+    badwords: [['list-status', 'list-add', 'list-table', 'list-extra'], 'When a message matches your Badwords list: Warn.'],
+    'known-spam': [['list-status', 'list-add', 'list-table', 'list-extra'], 'When a message matches Known spam: Ban and delete the last hour of messages. Dry-run: only logs.'],
+    'known-bad-images': [['list-status', 'list-add', 'list-table'], 'When someone posts a listed image, or posts the same 2 or more images in 3 or more channels within 90 seconds: Delete the messages and ban (delete last hour).'],
+  };
+  for (const [tab, [order, summary]] of Object.entries(expected)) {
+    const h = harness();
+    h.app.state.config = structuredClone(config);
+    h.app.state.tab = tab; h.app.renderTab(); await settle();
+    const page = h.nodes.get('#content .list-page');
+    const sections = [...page.querySelectorAll('.list-card')].map((card) => order.find((name) => card.classList.contains(name)));
+    assert.deepEqual(sections, order, tab);
+    assert.equal(textOf(page.querySelector('.list-status .rule-summary')), summary, tab);
+    assert.equal(page.querySelector('.list-status .btn').textContent, 'Edit actions & exemptions', tab);
+    assert.equal(page.querySelector('.list-status .btn').classList.contains('btn-sm'), false, `${tab}: normal-size edit button`);
+    assert.ok(page.querySelector('.list-add .list-form-submit .btn-primary'), `${tab}: Add is the primary button under the entry`);
+    assert.ok(page.querySelector('.list-table input[data-search]'), `${tab}: search once the list has items`);
+    const tester = page.querySelector('details.list-extra');
+    if (tester) assert.equal(tester.open, false, `${tab}: the tester or preview starts collapsed`);
+  }
+
+  // Badwords: the table has the issue's columns; search and filters narrow the rows without a request.
+  const requests = [];
+  const h = harness(async (url) => { requests.push(url); return response({}); });
+  h.app.state.config = structuredClone(config);
+  h.app.state.tab = 'badwords'; h.app.renderTab(); await settle();
+  const table = () => h.nodes.get('#content .list-table');
+  const entries = () => [...table().querySelectorAll('tbody tr')].map((row) => row.cells[0].textContent);
+  assert.deepEqual([...table().querySelectorAll('th')].map((th) => th.textContent), ['Entry', 'Type', 'Scope', 'Note', 'Actions']);
+  assert.deepEqual([...table().querySelectorAll('tbody tr')][2].cells[0].textContent, '(a+)+$not enforced');
+  assert.equal([...table().querySelectorAll('tbody tr')][1].cells[2].textContent, 'Global');
+  const search = table().querySelector('input[data-search]');
+  search.value = 'NITRO'; await fire(search, 'input');
+  assert.deepEqual(entries(), ['free nitro'], 'search matches entries and notes, ignoring case');
+  search.value = ''; await fire(search, 'input');
+  await chooseOption(table().querySelector('select[aria-label="Filter by type"]'), 'Advanced regex');
+  assert.deepEqual(entries(), ['(a+)+$not enforced']);
+  await chooseOption(table().querySelector('select[aria-label="Filter by scope"]'), 'Global');
+  assert.deepEqual(entries(), ['Nothing matches the search.']);
+  await chooseOption(table().querySelector('select[aria-label="Filter by type"]'), 'All types');
+  assert.deepEqual(entries(), ['scam']);
+  assert.deepEqual(requests, [], 'filtering never re-fetches');
+  assert.equal(h.app.isDirty(), false, 'search and filters are not unsaved edits');
+
+  // The tester stays open across the remount after a save.
+  const tester = () => h.nodes.get('#content details.list-extra');
+  tester().open = true; await fire(tester(), 'toggle');
+  h.app.renderTab(); await settle();
+  assert.equal(tester().open, true);
+
+  // An empty list shows its hint without search or filters.
+  h.app.state.config = { ...structuredClone(config), badwords: [] };
+  h.app.renderTab(); await settle();
+  assert.equal(table().querySelector('input[data-search], select'), null);
+  assert.match(table().textContent, /No words yet/);
+});
+
+test('list page status toggles save the rule with only that change and show the saved state after a failure', async () => {
+  const puts = [];
+  let fail = false;
+  const h = harness(async (url, options) => {
+    if (options.method !== 'PUT') return response({});
+    const body = JSON.parse(options.body);
+    puts.push({ url, body });
+    if (fail) return { ok: false, status: 500, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'database unavailable' }) };
+    return response({ config_patch: { kind: 'rule', id: url.split('/').pop(), scope: 'guild', value: body.data } });
+  });
+  h.app.state.config = { enrollment_id: 'membership', rules: LIST_RULES(), badwords: [], known_spam: [], known_bad_images: [] };
+  const toggle = (label) => findNode(h.nodes.get('#content .list-status'), (n) => n.localName === 'label' && textOf(n).startsWith(label)).querySelector('input');
+
+  h.app.state.tab = 'badwords'; h.app.renderTab(); await settle();
+  await fire(toggle('Enabled'), 'change', { target: { checked: false } });
+  assert.ok(puts[0].url.endsWith('/rules/badword'));
+  assert.deepEqual(puts[0].body, { scope: 'guild', clear_guild_override: false, data: { enabled: false, dry_run: false, params: {}, actions: [{ at: 1, action: 'warn' }] } });
+  assert.equal(textOf(h.nodes.get('#content .rule-summary')), 'When a message matches your Badwords list: Warn. Off: the rule is ignored.');
+  assert.equal(toggle('Enabled').checked, false);
+  assert.equal(h.app.isDirty(), false, 'a toggle saves at once, so it leaves no unsaved edit');
+
+  // Exact image spam keeps its test and enforce shapes, as the rule editor saves them.
+  h.app.state.tab = 'known-bad-images'; h.app.renderTab(); await settle();
+  await fire(toggle('Dry-run'), 'change', { target: { checked: true } });
+  const image = puts[1];
+  assert.ok(image.url.endsWith('/rules/attachment_flood'));
+  assert.equal(image.body.data.dry_run, true);
+  assert.deepEqual(image.body.data.params, { mode: 'exact_image_test', min_channels: 3, min_attachments: 2, window_secs: 90 });
+  assert.deepEqual(image.body.data.actions.map((a) => [a.action, a.purge_last_hour]), [['log', true]]);
+  assert.equal(h.app.spamConfigured('attachment_flood', image.body.data), true);
+  await fire(toggle('Dry-run'), 'change', { target: { checked: false } });
+  assert.deepEqual(puts[2].body.data.params.mode, 'exact_image');
+  assert.deepEqual(puts[2].body.data.actions.map((a) => a.action), ['delete', 'ban']);
+  assert.equal(puts[2].body.data.actions[1].purge_last_hour, true);
+
+  // A failed save leaves the toggle on the saved state.
+  fail = true;
+  await fire(toggle('Enabled'), 'change', { target: { checked: false } });
+  assert.equal(puts.length, 4);
+  assert.equal(toggle('Enabled').checked, true);
+  assert.equal(h.app.state.config.rules.find((r) => r.rule_id === 'attachment_flood').effective.enabled, true);
+  assert.equal(h.app.isDirty(), false);
+
+  // An unconverted legacy image rule can only be fixed in the editor.
+  h.app.state.config.rules.find((r) => r.rule_id === 'attachment_flood').effective = { enabled: true, dry_run: false, params: {}, actions: [{ at: 1, action: 'warn' }] };
+  h.app.renderTab(); await settle();
+  assert.equal(toggle('Enabled').disabled, true);
+  assert.equal(toggle('Dry-run').disabled, true);
+  assert.equal(textOf(h.nodes.get('#content .rule-summary')), 'Exact image spam is inactive. Open it to convert it.');
+});
+
+// Known spam's add form shows the sample or the URL entry, picked by its Entry type.
+const knownSpamType = root => [...root.querySelectorAll('select')].find(s => [...s.options].some(o => o.textContent === 'URL pattern'));
 
  test('known spam dedicated page adds samples and URL wildcards, displays and removes scoped rows', async () => {
   let rows = [];
@@ -6880,6 +7019,7 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   assert.equal(JSON.parse(requests[0].options.body).note, 'Owner sample');
   panel = h.app.tabKnownSpam(); await settle();
   assert.match(panel.textContent, /Full Stack AI developer/);
+  await chooseOption(knownSpamType(panel), 'URL pattern');
   const url = panel.querySelector('input[data-url]');
   url.value = 'tinyurl.com/*'; await fire(url, 'input');
   await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add URL pattern'), 'click');
@@ -6909,8 +7049,10 @@ test('known spam Global add keeps Global selected without an unsaved draft and k
   const content = () => h.document.querySelector('#app');
   const scopeSelect = () => [...content().querySelectorAll('select')].find(s => [...s.options].some(o => o.textContent === 'This server'));
   await chooseOption(scopeSelect(), 'Global');
+  await chooseOption(knownSpamType(content()), 'URL pattern');
   const url = content().querySelector('input[data-url]');
   url.value = 'tinyurl.com/*'; await fire(url, 'input');
+  await chooseOption(knownSpamType(content()), 'Full message sample');
   const sample = content().querySelector('textarea');
   sample.value = 'Join our stocks community'; await fire(sample, 'input');
   await fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Add sample'), 'click');
@@ -6918,16 +7060,20 @@ test('known spam Global add keeps Global selected without an unsaved draft and k
   assert.deepEqual(Object.keys(h.app.currentDrafts()), ['known-spam:url'], 'only the unsaved URL remains a draft');
   assert.equal(h.app.isDirty(), true);
   assert.equal(scopeSelect().value, 'global', 'the saved scope stays selected for the next add');
+  await chooseOption(knownSpamType(content()), 'URL pattern');
+  assert.equal(content().querySelector('input[data-url]').value, 'tinyurl.com/*', 'the URL draft survives switching forms');
   await fire([...content().querySelectorAll('button')].find(b => b.textContent === 'Add URL pattern'), 'click');
   assert.equal(posts[1].scope, 'global');
   assert.equal(posts[1].kind, 'url');
   assert.deepEqual(Object.keys(h.app.currentDrafts()), []);
   assert.equal(h.app.isDirty(), false, 'a successful Global add must not prompt to discard changes');
   assert.equal(scopeSelect().value, 'global');
+  assert.ok(content().querySelector('input[data-url]'), 'the URL form stays chosen after its save');
   assert.match(content().textContent, /Join our stocks community/);
   h.app.navigate('known-bad-images'); await settle();
   h.app.navigate('known-spam'); await settle();
   assert.equal(scopeSelect().value, 'guild', 'leaving the page resets the scope, as it cleared the Global draft before');
+  assert.equal(knownSpamType(content()).value, 'sample', 'and the entry type');
   assert.equal(h.app.isDirty(), false);
 });
 
@@ -6992,10 +7138,14 @@ test('known spam add failure stays with its draft without claiming an outcome th
   assert.equal(alert(), unconfirmed);
   assert.deepEqual(lookups, ['0', '1', '1']);
   assert.doesNotMatch(alert(), /checked|did not complete/);
+  await chooseOption(knownSpamType(content()), 'URL pattern');
+  assert.equal(alert(), '', 'the sample warning stays with the sample form');
+  assert.deepEqual(Object.keys(h.app.currentDrafts()), ['known-spam:sample'], 'switching forms is not an edit');
   const url = content().querySelector('input[data-url]');
   url.value = 'tinyurl.com/*'; await fire(url, 'input');
   await add('Add URL pattern');
   assert.deepEqual(Object.keys(h.app.currentDrafts()), ['known-spam:sample'], 'the URL add saved; the unconfirmed sample remains');
+  await chooseOption(knownSpamType(content()), 'Full message sample');
   assert.equal(alert(), unconfirmed, 'the other entry\'s add keeps the sample warning');
   const edited = content().querySelector('textarea');
   edited.value = 'Join our stocks community today'; await fire(edited, 'input');
@@ -7715,7 +7865,7 @@ test('Known spam and Badwords remove icons keep owner-only global rows', () => {
     const words = h.nodes.get('#content');
     assert.equal(assertIconRows(words), owner ? 2 : 1);
     for (const button of words.querySelectorAll('tbody button')) assertIconAction(button, 'remove', 'Remove');
-    assert.equal(/owner only/.test(textOf(words)), !owner);
+    assert.equal(/Owner only/.test(textOf(words)), !owner);
   }
 });
 
