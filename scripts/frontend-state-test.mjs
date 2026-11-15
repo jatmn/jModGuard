@@ -4759,6 +4759,126 @@ test('rule exception pickers show server names and save only the chosen IDs', as
   assert.deepEqual(saved.include_channels, []);
 });
 
+// Picker boxes that are replaced by named choices when the snapshot arrives.
+const pickerNames = {
+  roles: [
+    { id: '9007199254740993', name: 'Moderators', color: 0, position: 3, managed: false },
+  ],
+  channels: [
+    { id: '9007199254740995', name: 'mod-chat', kind: 'text', parent_id: null, position: 1 },
+  ],
+};
+const pickerRule = { name: 'Mention spam', rule_id: 'mention_spam', effective: {
+  enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn' }],
+  whitelist_roles: [], whitelist_channels: [], whitelist_users: [], include_channels: [],
+} };
+const pickerLabelled = (modal, label) => findNode(modal, n => n.localName === 'label' && textOf(n) === label).control;
+const pickerByName = (modal, label) => findNode(modal, n => n.getAttribute?.('aria-label') === label);
+
+test('ID text typed before server names arrive is still saved or refused once names replace the boxes', async () => {
+  let release;
+  let saved;
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/server-names')) return new Promise(resolve => { release = () => resolve(response(pickerNames)); });
+    if (options.method === 'PUT') saved = JSON.parse(options.body).data;
+    return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
+  });
+  h.app.state.config = { enrollment_id: 'page-membership', rules: [] };
+  for (const [rule, honeypot] of [
+    [pickerRule, false],
+    [{ name: 'Live pattern', rule_id: 'custom:0123456789abcdef', effective: { name: 'Live pattern', enabled: true, dry_run: false, params: { kind: 'honeypot_role' }, actions: [{ at: 1, action: 'kick' }] } }, true],
+  ]) {
+    saved = undefined;
+    const modal = await h.app.editRule(rule);
+    await settle();
+    const save = () => findNode(modal, n => n.localName === 'button' && n.textContent === 'Save');
+    const typeInto = async (control, value) => { control.value = value; await fire(control, 'input'); };
+    const labels = honeypot ? ['Honeypot role'] : ['Skip roles', 'Skip channels', 'Only check these channels'];
+    const typed = { 'Honeypot role': '111', 'Skip roles': '111', 'Skip channels': '222', 'Only check these channels': '333' };
+    for (const label of labels) await typeInto(pickerLabelled(modal, label), typed[label]);
+    release(); await settle();
+    // The select replaced the text box: the pending text moved to the ID box beside it.
+    const roleBox = pickerByName(modal, 'Add a role by ID');
+    assert.equal(roleBox.value, typed[labels[0]], `${labels[0]} keeps its pending text when names arrive`);
+    assert.ok(roleBox.isConnected);
+    await typeInto(roleBox, 'oops');
+    await fire(save(), 'click');
+    assert.equal(saved, undefined, 'an invalid leftover ID still blocks the save');
+    await typeInto(roleBox, typed[labels[0]]);
+    await fire(save(), 'click');
+    if (honeypot) assert.equal(saved.params.role_id, '111');
+    else {
+      assert.deepEqual(saved.whitelist_roles, ['111']);
+      assert.deepEqual(saved.whitelist_channels, ['222']);
+      assert.deepEqual(saved.include_channels, ['333']);
+    }
+  }
+});
+
+test('member search results only select for the query they answer', async () => {
+  const pending = new Map();
+  let saved;
+  const members = { alice: { user_id: '9007199254740998', display_name: 'Alice' }, bob: { user_id: '9007199254740999', display_name: 'Bob' } };
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/server-names')) return response(pickerNames);
+    const query = new URL(url, 'https://ui.example.test').searchParams.get('q');
+    if (query) return new Promise(resolve => { pending.set(query, () => resolve(response({ members: [members[query.toLowerCase()]] }))); });
+    if (options.method === 'PUT') saved = JSON.parse(options.body).data;
+    return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
+  });
+  h.app.state.config = { enrollment_id: 'page-membership', rules: [] };
+  const modal = await h.app.editRule(pickerRule);
+  await settle();
+  const search = pickerLabelled(modal, 'Skip users');
+  const chips = () => [...modal.querySelectorAll('ul.picker-chips[aria-label="Skip users"] .picker-chip-text')].map(textOf);
+  const results = () => modal.querySelector('ul.picker-results');
+  const typeQuery = async (value) => { search.value = value; await fire(search, 'input'); };
+  await typeQuery('Alice'); pending.get('Alice')(); await settle();
+  assert.match(textOf(results()), /Alice/);
+  await typeQuery('Bob');
+  assert.ok(!results(), 'old rows are not selectable while the new query is pending');
+  await fire(search, 'keydown', { key: 'Enter' });
+  assert.deepEqual(chips(), [], 'Enter never adds the previous query\'s only result');
+  assert.equal(search.value, 'Bob');
+  // A response for text that was since discarded must not bring its rows back.
+  await typeQuery('Alice');
+  pending.get('Alice')(); await settle();
+  assert.match(textOf(results()), /Alice/);
+  await fire(findNode(results(), n => n.localName === 'button' && textOf(n).startsWith('Alice')), 'click');
+  assert.deepEqual(chips(), ['Alice']);
+  pending.get('Bob')(); await settle();
+  assert.ok(!results(), 'a late response for a discarded query shows nothing');
+  await typeQuery('Bob'); pending.get('Bob')(); await settle();
+  await fire(search, 'keydown', { key: 'Enter' });
+  assert.deepEqual(chips(), ['Alice', 'Bob']);
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.deepEqual(saved.whitelist_users, ['9007199254740998', '9007199254740999']);
+});
+
+test('picker chip removal stays locked while the rule saves', async () => {
+  let acknowledge;
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/server-names')) return response(pickerNames);
+    if (options.method === 'PUT') return new Promise(resolve => { acknowledge = () => resolve(response({ ok: true })); });
+    return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
+  });
+  h.app.state.config = { enrollment_id: 'page-membership', rules: [] };
+  const modal = await h.app.editRule({ ...pickerRule, effective: { ...pickerRule.effective, whitelist_roles: ['9007199254740993'] } });
+  await settle();
+  const remove = () => findNode(modal, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Remove @Moderators');
+  assert.equal(remove().disabled, false);
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  try {
+    assert.equal(h.app.isBusy(), true);
+    assert.equal(remove().disabled, true, 'a chip cannot be removed while the old list is saving');
+    await fire(remove(), 'click');
+    assert.ok(remove(), 'the chip stays');
+  } finally {
+    acknowledge(); await settle();
+  }
+  assert.equal(h.app.isBusy(), false);
+});
+
 test('global rules take exception IDs without server name reads', async () => {
   const requests = [];
   let saved;

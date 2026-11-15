@@ -3651,7 +3651,7 @@ function PickerChip({ kind, id, names, onRemove }) {
     kind === "user" ? h("span", { className: "server-icon server-icon-letter", "aria-hidden": "true" }, (Array.from(String(known || "?"))[0] || "?").toUpperCase()) : null,
     h("span", { className: "picker-chip-text" }, text),
     h(
-      "button",
+      ActionButton,
       { type: "button", className: "picker-chip-remove", "aria-label": `Remove ${text}`, title: `Remove ${text}`, onClick: onRemove },
       h(Icon, { name: "x-circle" }),
     ),
@@ -3663,13 +3663,17 @@ function PickerChip({ kind, id, names, onRemove }) {
 // users, and an ID box (Enter adds IDs, mentions or links). The ID box stays
 // next to the select for IDs the snapshot lacks, such as threads. Save commits
 // or refuses text still in the box through `pending`, as the old ID fields did.
+// The box text is picker state, so it survives the box being replaced when
+// names arrive, and member results are kept with the query they answer.
 function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pending, single = false }) {
   const [, bump] = useState(0);
-  const [results, setResults] = useState(null);
+  const [text, setText] = useState("");
+  const [found, setFound] = useState(null);
   const [error, setError] = useState("");
   const searchAbort = useRef(null);
-  const textRef = useRef(null);
   const flushRef = useRef(null);
+  // Only results for the text now in the box can be chosen.
+  const results = found && found.query === text.trim() ? found.members : null;
   const update = (next) => {
     ids.splice(0, ids.length, ...next);
     markDirty();
@@ -3680,21 +3684,32 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
     if (!id || ids.includes(id)) return;
     update(single ? [id] : [...ids, id]);
   };
-  const addTyped = (input) => {
-    const raw = String(input.value || "").trim();
+  // Drop shown results and ignore any search still in flight.
+  const clearSearch = () => {
+    searchAbort.current?.abort();
+    setFound(null);
+  };
+  const addTyped = () => {
+    const raw = text.trim();
     if (!raw) return true;
-    const found = raw.split(",").map((part) => parseSnowflake(part));
-    if (found.some((id) => !id)) {
+    const typed = raw.split(",").map((part) => parseSnowflake(part));
+    if (typed.some((id) => !id)) {
       setError(kind === "user" && names.status !== "unavailable"
         ? "Pick a matching member, or enter IDs as digits or mentions."
         : "Enter IDs as digits, mentions or links.");
       return false;
     }
     setError("");
-    update(single ? [found.at(-1)] : [...ids, ...found.filter((id, i) => !ids.includes(id) && found.indexOf(id) === i)]);
-    input.value = "";
-    setResults(null);
+    update(single ? [typed.at(-1)] : [...ids, ...typed.filter((id, i) => !ids.includes(id) && typed.indexOf(id) === i)]);
+    setText("");
+    clearSearch();
     return true;
+  };
+  const choose = (member) => {
+    rememberUser?.(member.user_id, member.display_name);
+    add(member.user_id);
+    setText("");
+    clearSearch();
   };
   const options =
     kind === "role"
@@ -3704,24 +3719,24 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
         : [];
   const useSelect = kind !== "user" && names.status === "loaded" && options.length > 0;
   const noun = kind === "role" ? "role" : kind === "channel" ? "channel" : "member";
-  const search = async (text) => {
+  const search = async (value) => {
     searchAbort.current?.abort();
-    const q = text.trim();
+    const q = value.trim();
     if (kind !== "user" || names.status === "unavailable" || !q || parseSnowflake(q)) {
-      setResults(null);
+      setFound(null);
       return;
     }
     const controller = new AbortController();
     searchAbort.current = controller;
     try {
       const page = await apiRead(`/api/guilds/${state.guildId}/members?${new URLSearchParams({ q, limit: "8", status: "current" })}`, controller.signal);
-      if (searchAbort.current === controller) setResults(Array.isArray(page?.members) ? page.members : []);
+      if (searchAbort.current === controller) setFound({ query: q, members: Array.isArray(page?.members) ? page.members : [] });
     } catch (_) {
-      if (searchAbort.current === controller) setResults([]);
+      if (searchAbort.current === controller) setFound({ query: q, members: [] });
     }
   };
   useEffect(() => () => searchAbort.current?.abort(), []);
-  flushRef.current = () => !textRef.current || addTyped(textRef.current);
+  flushRef.current = addTyped;
   useEffect(() => {
     if (!pending) return undefined;
     const flush = () => flushRef.current();
@@ -3730,8 +3745,8 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
   }, [pending]);
   const textBox = (labelled) =>
     h(Input, {
-      ref: textRef,
       type: "text",
+      value: text,
       className: "input input-sm",
       "aria-label": labelled ? undefined : `Add a ${noun} by ID`,
       placeholder:
@@ -3740,24 +3755,22 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
           : labelled
             ? `Paste a ${noun} ID${kind === "channel" ? ", #mention or link" : " or @mention"}`
             : "Or paste an ID",
-      onInput: (e) => {
+      onChange: (e) => {
+        setText(e.target.value);
         setError("");
         search(e.target.value);
       },
       onKeyDown: (e) => {
         if (e.key !== "Enter") return;
         e.preventDefault();
-        if (results?.length === 1 && !parseSnowflake(e.target.value)) {
-          rememberUser?.(results[0].user_id, results[0].display_name);
-          add(results[0].user_id);
-          e.target.value = "";
-          setResults(null);
+        if (results?.length === 1 && !parseSnowflake(text)) {
+          choose(results[0]);
           return;
         }
-        addTyped(e.target);
+        addTyped();
       },
-      onBlur: (e) => {
-        if (parseSnowflake(e.target.value)) addTyped(e.target);
+      onBlur: () => {
+        if (parseSnowflake(text)) addTyped();
       },
     });
   const categories = new Map(names.channels.filter((c) => c.kind === "category").map((c) => [c.id, c.name]));
@@ -3812,16 +3825,8 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
                   "li",
                   { key: member.user_id },
                   h(
-                    "button",
-                    {
-                      type: "button",
-                      onClick: () => {
-                        rememberUser?.(member.user_id, member.display_name);
-                        add(member.user_id);
-                        if (textRef.current) textRef.current.value = "";
-                        setResults(null);
-                      },
-                    },
+                    ActionButton,
+                    { type: "button", onClick: () => choose(member) },
                     member.display_name,
                     h("span", { className: "muted" }, member.user_id),
                   ),
