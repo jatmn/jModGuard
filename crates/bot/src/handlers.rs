@@ -717,6 +717,7 @@ impl EventHandler for Handler {
                 crate::guild_directory::now_ns(),
             )
             .await;
+            crate::server_names::refresh_from_cache(&app, &ctx, gid.get());
             if is_new.unwrap_or(false) {
                 let bot_user_id = ctx.cache.current_user().id.get();
                 let joined_at_ns = guild.joined_at.timestamp_nanos_opt().unwrap_or_default();
@@ -1791,6 +1792,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        crate::server_names::refresh_from_cache(&self.app, &ctx, new.guild_id.get());
         let view = crate::activity_log::RoleView::from_role(&new);
         if let Some(report) = crate::activity_log::role_change_report(
             crate::activity_log::RoleAction::Created,
@@ -1811,6 +1813,7 @@ impl EventHandler for Handler {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
+        crate::server_names::refresh_from_cache(&self.app, &ctx, guild_id.get());
         let view = removed_role_data_if_available
             .as_ref()
             .map(crate::activity_log::RoleView::from_role)
@@ -1838,6 +1841,7 @@ impl EventHandler for Handler {
         self.app
             .remembered_discord_targets
             .clear_guild(new.guild_id.get());
+        crate::server_names::refresh_from_cache(&self.app, &ctx, new.guild_id.get());
         let new_view = crate::activity_log::RoleView::from_role(&new);
         let old_view = old_data_if_available
             .as_ref()
@@ -1851,7 +1855,28 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn channel_update(&self, _ctx: Context, old: Option<GuildChannel>, new: GuildChannel) {
+    async fn channel_create(&self, ctx: Context, channel: GuildChannel) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
+        crate::server_names::refresh_from_cache(&self.app, &ctx, channel.guild_id.get());
+    }
+
+    async fn category_create(&self, ctx: Context, category: GuildChannel) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
+        crate::server_names::refresh_from_cache(&self.app, &ctx, category.guild_id.get());
+    }
+
+    async fn category_delete(&self, ctx: Context, category: GuildChannel) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
+        crate::server_names::refresh_from_cache(&self.app, &ctx, category.guild_id.get());
+    }
+
+    async fn channel_update(&self, ctx: Context, old: Option<GuildChannel>, new: GuildChannel) {
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1862,6 +1887,19 @@ impl EventHandler for Handler {
                 .remembered_discord_targets
                 .clear_guild(new.guild_id.get());
         }
+        crate::server_names::refresh_from_cache(&self.app, &ctx, new.guild_id.get());
+    }
+
+    async fn channel_delete(
+        &self,
+        ctx: Context,
+        channel: GuildChannel,
+        _messages: Option<Vec<Message>>,
+    ) {
+        if !self.app.activation.allows_rule_trigger() {
+            return;
+        }
+        crate::server_names::refresh_from_cache(&self.app, &ctx, channel.guild_id.get());
     }
 
     async fn thread_create(&self, ctx: Context, thread: GuildChannel) {

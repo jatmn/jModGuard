@@ -7,6 +7,9 @@ at most 24 hours after the original message creation; edits never extend that ti
 Capacity pressure can evict it earlier. It stores no attachment bytes. The bounded [member directory](MEMBERS.md) retains current
 member identity and known join dates, plus people with confirmed ban history. It does
 not maintain message activity counters or the retired general user archive.
+For the rule editor pickers, the guild store also keeps one row per server with the
+bot's latest role and channel names, colors and positions (no members or messages);
+it is replaced on each role or channel change and erased with the server's data.
 Joining, leaving and talking still do not maintain a general activity archive.
 
 ## Log presentation

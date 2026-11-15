@@ -2612,6 +2612,7 @@ async function ruleSaveHarness({ scope = 'global', override = false, legacyAck =
     guild_override: guildRule, effective: guildRule || globalRule,
   }] });
   const h = harness(async (url, options) => {
+    if (url.endsWith('/server-names')) return response({ roles: [], channels: [] });
     const body = options.body && JSON.parse(options.body);
     calls.push({ url, method: options.method, body, headers: options.headers });
     if (options.method === 'PUT') {
@@ -3156,7 +3157,7 @@ for (const [id, params, fields, expected] of [
     }});
     assert.doesNotMatch(textOf(modal), /Parameters \(JSON\)/);
     assert.equal(modal.querySelector('textarea'), null);
-    assert.match(textOf(modal), /Action escalation/);
+    assert.ok(modal.querySelector('.escalation-step'), 'escalation rules show strike rows');
     for (const [label, value] of fields) {
       const labelNode = findNode(modal, n => n.localName === 'label' && textOf(n) === label);
       const input = labelNode?.control;
@@ -3289,7 +3290,7 @@ test('image rule UI can save test mode or delete-and-ban', async () => {
   const legacy={ name:'Images', rule_id:'attachment_flood', effective:{ enabled:true, dry_run:false, params:{min_channels:2,min_attachments:2,window_secs:60,min_messages:2}, actions:[{at:1,action:'ban'}] } };
   assert.match(textOf(h.app.ruleCard(legacy)), /inactive/);
   const modal=await h.app.editRule(legacy);
-  assert.doesNotMatch(textOf(modal), /Action escalation/);
+  assert.equal(modal.querySelector('.escalation-step'), null, 'no strike ladder');
   const dryRun = findNode(modal,n=>n.localName==='label' && textOf(n).includes('Dry-run (log only)'));
   assert.equal(findNode(dryRun,n=>n.localName==='input').checked,true);
   const save=findNode(modal,n=>n.textContent === 'Save');
@@ -3794,7 +3795,7 @@ test('text rule UI can save independent thresholds without generic escalation', 
     return response({ settings:{}, rules:[], commands:[], log_channels:[], badwords:[] });
   });
   let modal=await h.app.editRule({name:'Text',rule_id:'repeat_text',effective:{enabled:true,dry_run:true,params:{mode:'exact_text',min_channels:3,window_secs:60,min_length:20},actions:[{action:'log'}]}});
-  assert.doesNotMatch(textOf(modal), /Action escalation/);
+  assert.equal(modal.querySelector('.escalation-step'), null, 'no strike ladder');
   assert.match(textOf(modal), /Minimum length/);
   await fire(findNode(modal,n=>n.textContent === 'Save'), 'click', {});
   assert.equal(calls[0].data.params.mode,'exact_text');
@@ -3818,7 +3819,8 @@ test('text rule UI can save independent thresholds without generic escalation', 
 
 test('image test UI rejects invalid thresholds before the API request', async () => {
   let sent=0;
-  const h=harness(async()=>{sent++;return response({});});
+  // Opening the editor reads picker names; only a save would mutate.
+  const h=harness(async(url)=>{if (!url.endsWith('/server-names')) sent++;return response({});});
   const modal=await h.app.editRule({name:'Images',rule_id:'attachment_flood',effective:{enabled:true,params:{min_channels:1},actions:[]}});
   await fire(findNode(modal,n=>n.textContent === 'Save'), 'click', {});
   assert.equal(sent,0);
@@ -4616,21 +4618,297 @@ test('escalation editor labels numeric fields and saves edited threshold, durati
     return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
   });
   const modal = await h.app.editRule({ name: 'Mention spam', rule_id: 'mention_spam', effective: { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn', duration_minutes: 0, delete_days: 1, reason: 'spam' }] } });
-  await chooseOption(modal.querySelector('.escalation-step select'), 'ban');
-  for (const [label, value] of [['Strike count', '3'], ['Timeout (minutes)', '15'], ['Reason template', 'Updated reason']]) {
-    const wrapper = findNode(modal, n => n.localName === 'label' && textOf(n).startsWith(label));
-    assert.ok(wrapper, label);
+  const label = (text) => findNode(modal, n => n.localName === 'label' && textOf(n).startsWith(text));
+  // #621: each step shows only its own action's setting.
+  assert.equal(label('Timeout (minutes)'), null, 'warn has no minutes');
+  assert.equal(label('Ban behavior'), null, 'warn has no ban behavior');
+  await chooseOption(modal.querySelector('.escalation-step select'), 'Timeout');
+  assert.ok(label('Timeout (minutes)'));
+  assert.equal(label('Timeout (minutes)').control.value, '0', 'an escalation step keeps its saved minutes');
+  assert.equal(label('Ban behavior'), null);
+  for (const [text, value] of [['Strike count', '3'], ['Timeout (minutes)', '15'], ['Reason template', 'Updated reason']]) {
+    const wrapper = label(text);
+    assert.ok(wrapper, text);
     const input = wrapper.control;
     assert.equal(input?.localName, 'input');
     input.value = value;
     await fire(input, 'change');
   }
+  assert.match(textOf(modal.querySelector('.rule-summary')), /: Strike 3: Timeout 15 min\. Dry-run: only logs\.$/);
+  await chooseOption(modal.querySelector('.escalation-step select'), 'Ban');
+  assert.equal(label('Timeout (minutes)'), null, 'ban hides minutes');
+  assert.equal(label('Ban behavior').control.value, 'legacy', 'existing day count stays selected');
   await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click', {});
   assert.equal(submitted.data.actions[0].at, 3);
   assert.equal(submitted.data.actions[0].action, 'ban');
   assert.equal(submitted.data.actions[0].duration_minutes, 15);
   assert.equal(submitted.data.actions[0].delete_days, 1, 'editing other fields preserves legacy days');
   assert.equal(submitted.data.actions[0].reason, 'Updated reason');
+});
+
+// #621: one plain-language summary per rule, in the bot's own terms (automod.rs).
+test('rule editor summary describes every built-in rule and custom rule and updates live', async () => {
+  const h = harness(async () => response({ roles: [], channels: [] }));
+  const summary = (modal) => textOf(modal.querySelector('.rule-summary'));
+  const ban = { at: 1, action: 'ban', delete_days: 0, purge_last_hour: false };
+  for (const [rule_id, effective, expected] of [
+    ['mention_spam', { enabled: true, dry_run: true, params: { window_secs: 10, max_mentions_in_window: 5 }, actions: [ban] },
+      'When someone sends more than 5 @everyone, @here or role mentions within 10 seconds: Ban (keep messages). Dry-run: only logs.'],
+    ['velocity', { enabled: true, dry_run: false, params: {}, actions: [{ at: 1, action: 'delete' }, { at: 2, action: 'timeout', duration_minutes: 30 }, { at: 4, action: 'kick' }] },
+      'When someone sends more than 8 messages within 10 seconds: Strike 1: Delete the message · Strike 2: Timeout 30 min · Strike 4: Kick.'],
+    ['new_member_url', { enabled: true, dry_run: false, params: { grace_secs: 120 }, actions: [{ at: 1, action: 'kick' }] },
+      'When a member posts a link or invite within 120 seconds of joining: Kick.'],
+    ['account_age', { enabled: false, dry_run: false, params: { min_age_days: 3 }, actions: [{ at: 1, action: 'log' }] },
+      'When an account younger than 3 days posts a message: Log only. Off: the rule is ignored.'],
+    ['invite', { enabled: true, dry_run: false, params: { allowlist_codes: ['ok'] }, actions: [{ at: 1, action: 'delete' }] },
+      "When someone posts a Discord invite that isn't on the allowed list: Delete the message."],
+    ['badword', { enabled: true, dry_run: false, params: {}, actions: [{ ...ban, purge_last_hour: true }] },
+      'When a message matches your Badwords list: Ban (delete last hour).'],
+    ['attachment_flood', { enabled: true, dry_run: false, params: { mode: 'exact_image', min_channels: 3, min_attachments: 2, window_secs: 60 }, actions: [{ at: 1, action: 'delete' }, ban] },
+      'When someone posts the same 2 or more images in 3 or more channels within 60 seconds: Delete the messages and ban (keep messages).'],
+    ['repeat_text', { enabled: true, dry_run: true, params: { mode: 'exact_text', min_channels: 3, min_length: 20, window_secs: 60 }, actions: [{ at: 1, action: 'log' }] },
+      'When someone posts the same text (at least 20 characters) in 3 or more channels within 60 seconds: Delete the messages and ban (keep messages). Dry-run: only logs.'],
+    ['known_spam', { enabled: true, dry_run: false, params: {}, actions: [{ ...ban, purge_last_hour: true }] },
+      'When a message matches Known spam: Ban and delete the last hour of messages.'],
+    ['custom:0123456789abcdef', { name: 'Links', enabled: true, dry_run: true, params: { kind: 'channel_content', links: true, attachments: false }, actions: [{ at: 1, action: 'timeout', duration_minutes: 10 }] },
+      'When someone posts a link: Timeout 10 min. Dry-run: only logs.'],
+  ]) {
+    const modal = await h.app.editRule({ name: rule_id, rule_id, effective });
+    assert.equal(summary(modal), expected, rule_id);
+    // Every rule uses the same sections; only Trigger differs.
+    assert.deepEqual([...modal.querySelectorAll('.editor-section-title')].map(textOf).filter((t) => t !== 'Action'),
+      ['Trigger', 'Actions', 'Exceptions', 'Scope'].filter((t) => !(rule_id.startsWith('custom:') && t === 'Actions')), rule_id);
+    assert.ok(modal.querySelector('details.editor-advanced'), `${rule_id} keeps advanced options collapsed`);
+    await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Cancel'), 'click');
+  }
+
+  const modal = await h.app.editRule({ name: 'Mention spam', rule_id: 'mention_spam', effective: { enabled: true, dry_run: true, params: {}, actions: [ban] } });
+  const input = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Maximum mentions in window').control;
+  input.value = '7'; await fire(input, 'input');
+  assert.match(summary(modal), /^When someone sends more than 7 @everyone/);
+  input.value = ''; await fire(input, 'input');
+  assert.match(summary(modal), /more than … @everyone/);
+  await fire(findNode(modal, n => n.localName === 'label' && textOf(n) === 'Dry-run (log only)').control, 'change', { target: { checked: false } });
+  assert.match(summary(modal), /Ban \(keep messages\)\.$/);
+  await chooseOption(modal.querySelector('.ban-behavior select'), 'Delete last hour');
+  assert.match(summary(modal), /Ban \(delete last hour\)\.$/);
+  await fire(findNode(modal, n => n.localName === 'label' && textOf(n) === 'Enabled').control, 'change', { target: { checked: false } });
+  assert.match(summary(modal), /Off: the rule is ignored\.$/);
+});
+
+test('rule exception pickers show server names and save only the chosen IDs', async () => {
+  const requests = [];
+  let saved;
+  const names = {
+    roles: [
+      { id: '987654321098765432', name: '@everyone', color: 0, position: 0, managed: false },
+      { id: '9007199254740993', name: 'Moderators', color: 0x3498db, position: 3, managed: false },
+      { id: '9007199254740994', name: 'Helpers', color: 0, position: 2, managed: false },
+    ],
+    channels: [
+      { id: '50', name: 'Staff', kind: 'category', parent_id: null, position: 0 },
+      { id: '9007199254740995', name: 'mod-chat', kind: 'text', parent_id: '50', position: 1 },
+      { id: '9007199254740996', name: 'Lounge', kind: 'voice', parent_id: null, position: 2 },
+    ],
+  };
+  const h = harness(async (url, options) => {
+    requests.push({ url, method: options.method, enrollment: options.headers['x-jmodguard-enrollment'] });
+    if (url.endsWith('/server-names')) return response(names);
+    if (url.includes('/members/9007199254740997')) return response({ user_id: '9007199254740997', display_name: 'Known Member' });
+    if (url.includes('/members?')) return response({ members: [{ user_id: '9007199254740998', display_name: 'Searched Member' }] });
+    if (options.method === 'PUT') saved = JSON.parse(options.body).data;
+    return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
+  });
+  h.app.state.config = { enrollment_id: 'page-membership', rules: [] };
+  const modal = await h.app.editRule({ name: 'Mention spam', rule_id: 'mention_spam', effective: {
+    enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn' }],
+    whitelist_roles: ['9007199254740993'], whitelist_channels: [], whitelist_users: ['9007199254740997'], include_channels: [],
+  } });
+  await settle();
+  assert.ok(requests.every((r) => r.method === 'POST'), 'picker reads use POST so a CDN cannot reuse them');
+  // The API refuses scoped reads without the loaded page's membership.
+  assert.deepEqual(requests.filter((r) => r.url.endsWith('/server-names')).map((r) => r.enrollment), ['page-membership']);
+  const chips = (label) => [...modal.querySelectorAll(`ul.picker-chips[aria-label="${label}"] .picker-chip-text`)].map(textOf);
+  assert.deepEqual(chips('Skip roles'), ['@Moderators']);
+  assert.deepEqual(chips('Skip users'), ['Known Member']);
+  const control = (label) => findNode(modal, n => n.localName === 'label' && textOf(n) === label).control;
+  const roleOptions = [...control('Skip roles').options].map((o) => o.textContent);
+  assert.deepEqual(roleOptions, ['Add a role…', '@Moderators', '@Helpers'], '@everyone is not offered');
+  assert.equal(h.app.isDirty(), false);
+  await chooseOption(control('Skip roles'), '@Helpers');
+  assert.equal(h.app.isDirty(), true);
+  const channels = control('Skip channels');
+  assert.deepEqual([...channels.querySelectorAll('optgroup')].map((g) => g.label), ['Staff']);
+  await chooseOption(channels, '#mod-chat');
+  assert.deepEqual(chips('Skip channels'), ['#mod-chat']);
+  // IDs the snapshot lacks, such as a thread, can still be added by ID.
+  const channelId = findNode(modal, n => n.getAttribute?.('aria-label') === 'Add a channel by ID');
+  channelId.value = 'https://discord.com/channels/987654321098765432/9007199254741000'; await fire(channelId, 'input');
+  await fire(channelId, 'keydown', { key: 'Enter' });
+  assert.deepEqual(chips('Skip channels'), ['#mod-chat', 'Channel 9007199254741000']);
+  await fire(findNode(modal, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Remove @Moderators'), 'click');
+  const search = control('Skip users');
+  search.value = 'sear'; await fire(search, 'input');
+  assert.match(requests.at(-1).url, /\/members\?q=sear&limit=8&status=current$/);
+  await fire(findNode(modal, n => n.localName === 'button' && textOf(n).startsWith('Searched Member')), 'click');
+  assert.deepEqual(chips('Skip users'), ['Known Member', 'Searched Member']);
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.deepEqual(saved.whitelist_roles, ['9007199254740994']);
+  assert.deepEqual(saved.whitelist_channels, ['9007199254740995', '9007199254741000']);
+  assert.deepEqual(saved.whitelist_users, ['9007199254740997', '9007199254740998']);
+  assert.deepEqual(saved.include_channels, []);
+});
+
+// Picker boxes that are replaced by named choices when the snapshot arrives.
+const pickerNames = {
+  roles: [
+    { id: '9007199254740993', name: 'Moderators', color: 0, position: 3, managed: false },
+  ],
+  channels: [
+    { id: '9007199254740995', name: 'mod-chat', kind: 'text', parent_id: null, position: 1 },
+  ],
+};
+const pickerRule = { name: 'Mention spam', rule_id: 'mention_spam', effective: {
+  enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn' }],
+  whitelist_roles: [], whitelist_channels: [], whitelist_users: [], include_channels: [],
+} };
+const pickerLabelled = (modal, label) => findNode(modal, n => n.localName === 'label' && textOf(n) === label).control;
+const pickerByName = (modal, label) => findNode(modal, n => n.getAttribute?.('aria-label') === label);
+
+test('ID text typed before server names arrive is still saved or refused once names replace the boxes', async () => {
+  let release;
+  let saved;
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/server-names')) return new Promise(resolve => { release = () => resolve(response(pickerNames)); });
+    if (options.method === 'PUT') saved = JSON.parse(options.body).data;
+    return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
+  });
+  h.app.state.config = { enrollment_id: 'page-membership', rules: [] };
+  for (const [rule, honeypot] of [
+    [pickerRule, false],
+    [{ name: 'Live pattern', rule_id: 'custom:0123456789abcdef', effective: { name: 'Live pattern', enabled: true, dry_run: false, params: { kind: 'honeypot_role' }, actions: [{ at: 1, action: 'kick' }] } }, true],
+  ]) {
+    saved = undefined;
+    const modal = await h.app.editRule(rule);
+    await settle();
+    const save = () => findNode(modal, n => n.localName === 'button' && n.textContent === 'Save');
+    const typeInto = async (control, value) => { control.value = value; await fire(control, 'input'); };
+    const labels = honeypot ? ['Honeypot role'] : ['Skip roles', 'Skip channels', 'Only check these channels'];
+    const typed = { 'Honeypot role': '111', 'Skip roles': '111', 'Skip channels': '222', 'Only check these channels': '333' };
+    for (const label of labels) await typeInto(pickerLabelled(modal, label), typed[label]);
+    release(); await settle();
+    // The select replaced the text box: the pending text moved to the ID box beside it.
+    const roleBox = pickerByName(modal, 'Add a role by ID');
+    assert.equal(roleBox.value, typed[labels[0]], `${labels[0]} keeps its pending text when names arrive`);
+    assert.ok(roleBox.isConnected);
+    await typeInto(roleBox, 'oops');
+    await fire(save(), 'click');
+    assert.equal(saved, undefined, 'an invalid leftover ID still blocks the save');
+    await typeInto(roleBox, typed[labels[0]]);
+    await fire(save(), 'click');
+    if (honeypot) assert.equal(saved.params.role_id, '111');
+    else {
+      assert.deepEqual(saved.whitelist_roles, ['111']);
+      assert.deepEqual(saved.whitelist_channels, ['222']);
+      assert.deepEqual(saved.include_channels, ['333']);
+    }
+  }
+});
+
+test('member search results only select for the query they answer', async () => {
+  const pending = new Map();
+  let saved;
+  const members = { alice: { user_id: '9007199254740998', display_name: 'Alice' }, bob: { user_id: '9007199254740999', display_name: 'Bob' } };
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/server-names')) return response(pickerNames);
+    const query = new URL(url, 'https://ui.example.test').searchParams.get('q');
+    if (query) return new Promise(resolve => { pending.set(query, () => resolve(response({ members: [members[query.toLowerCase()]] }))); });
+    if (options.method === 'PUT') saved = JSON.parse(options.body).data;
+    return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
+  });
+  h.app.state.config = { enrollment_id: 'page-membership', rules: [] };
+  const modal = await h.app.editRule(pickerRule);
+  await settle();
+  const search = pickerLabelled(modal, 'Skip users');
+  const chips = () => [...modal.querySelectorAll('ul.picker-chips[aria-label="Skip users"] .picker-chip-text')].map(textOf);
+  const results = () => modal.querySelector('ul.picker-results');
+  const typeQuery = async (value) => { search.value = value; await fire(search, 'input'); };
+  await typeQuery('Alice'); pending.get('Alice')(); await settle();
+  assert.match(textOf(results()), /Alice/);
+  await typeQuery('Bob');
+  assert.ok(!results(), 'old rows are not selectable while the new query is pending');
+  await fire(search, 'keydown', { key: 'Enter' });
+  assert.deepEqual(chips(), [], 'Enter never adds the previous query\'s only result');
+  assert.equal(search.value, 'Bob');
+  // A response for text that was since discarded must not bring its rows back.
+  await typeQuery('Alice');
+  pending.get('Alice')(); await settle();
+  assert.match(textOf(results()), /Alice/);
+  await fire(findNode(results(), n => n.localName === 'button' && textOf(n).startsWith('Alice')), 'click');
+  assert.deepEqual(chips(), ['Alice']);
+  pending.get('Bob')(); await settle();
+  assert.ok(!results(), 'a late response for a discarded query shows nothing');
+  await typeQuery('Bob'); pending.get('Bob')(); await settle();
+  await fire(search, 'keydown', { key: 'Enter' });
+  assert.deepEqual(chips(), ['Alice', 'Bob']);
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  assert.deepEqual(saved.whitelist_users, ['9007199254740998', '9007199254740999']);
+});
+
+test('picker chip removal stays locked while the rule saves', async () => {
+  let acknowledge;
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/server-names')) return response(pickerNames);
+    if (options.method === 'PUT') return new Promise(resolve => { acknowledge = () => resolve(response({ ok: true })); });
+    return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
+  });
+  h.app.state.config = { enrollment_id: 'page-membership', rules: [] };
+  const modal = await h.app.editRule({ ...pickerRule, effective: { ...pickerRule.effective, whitelist_roles: ['9007199254740993'] } });
+  await settle();
+  const remove = () => findNode(modal, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Remove @Moderators');
+  assert.equal(remove().disabled, false);
+  await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
+  try {
+    assert.equal(h.app.isBusy(), true);
+    assert.equal(remove().disabled, true, 'a chip cannot be removed while the old list is saving');
+    await fire(remove(), 'click');
+    assert.ok(remove(), 'the chip stays');
+  } finally {
+    acknowledge(); await settle();
+  }
+  assert.equal(h.app.isBusy(), false);
+});
+
+test('global rules take exception IDs without server name reads', async () => {
+  const requests = [];
+  let saved;
+  const h = harness(async (url, options) => {
+    requests.push(url);
+    if (options.method === 'PUT') saved = JSON.parse(options.body).data;
+    return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
+  });
+  h.app.state.guildId = '0';
+  h.app.state.me.is_bot_owner = true;
+  const modal = await h.app.editRule({ name: 'Mention spam', rule_id: 'mention_spam', effective: { enabled: true, dry_run: true, params: {}, actions: [{ at: 1, action: 'warn' }] } });
+  assert.deepEqual(requests, []);
+  assert.match(textOf(modal), /Global rules use IDs/);
+  const users = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Skip users').control;
+  users.value = '<@9007199254740997>, nope'; await fire(users, 'input'); await fire(users, 'keydown', { key: 'Enter' });
+  assert.match(textOf(modal), /Enter IDs as digits, mentions or links/);
+  users.value = '<@9007199254740997>'; await fire(users, 'input'); await fire(users, 'keydown', { key: 'Enter' });
+  assert.equal(requests.length, 0, 'no member search for global rules');
+  assert.equal(h.app.isDirty(), true);
+  // Text left in an ID box is saved, or stops the save, never dropped silently.
+  const roles = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Skip roles').control;
+  const save = findNode(modal, n => n.localName === 'button' && n.textContent === 'Save');
+  roles.value = '111, oops'; await fire(roles, 'input');
+  await fire(save, 'click');
+  assert.equal(saved, undefined, 'an invalid leftover ID blocks the save');
+  assert.match(h.nodes.get('#toast').textContent, /Fix the ID fields/);
+  roles.value = '111, <@&222>'; await fire(roles, 'input');
+  await fire(save, 'click');
+  assert.deepEqual(saved.whitelist_users, ['9007199254740997']);
+  assert.deepEqual(saved.whitelist_roles, ['111', '222']);
 });
 
 async function chooseOption(select, label) {
@@ -4645,7 +4923,7 @@ test('changing only a rule action through Headless UI marks unsaved edits', asyn
   const h = harness();
   const modal = await h.app.editRule({name: 'Mentions', rule_id: 'mention_spam', effective: {enabled: true, dry_run: true, params: {}, actions: [{at: 1, action: 'warn'}]}});
   assert.equal(h.app.isDirty(), false);
-  await chooseOption(modal.querySelector('.escalation-step select'), 'ban');
+  await chooseOption(modal.querySelector('.escalation-step select'), 'Ban');
   assert.equal(modal.querySelector('.escalation-step select').value, 'ban');
   assert.equal(h.app.isDirty(), true);
 });
@@ -5101,10 +5379,10 @@ test('honeypot switch shows the kick action that save submits', async () => {
   await fire(type, 'change');
   const action = findNode(modal, (n) => n.localName === 'select' && [...n.options].some((option) => option.value === 'kick') && ![...n.options].some((option) => option.value === 'honeypot_role'));
   assert.equal(action.value, 'kick');
-  const roleField = findNode(modal, (n) => n.classList?.contains('field') && textOf(n).includes('Role id'));
-  const role = findNode(roleField, (n) => n.localName === 'input');
+  const role = findNode(modal, (n) => n.localName === 'label' && textOf(n) === 'Honeypot role').control;
   role.value = '42';
   await fire(role, 'input');
+  await fire(role, 'keydown', {key: 'Enter'});
   await fire(findNode(modal, (n) => n.localName === 'button' && n.textContent === 'Save'), 'click');
   assert.equal(calls[0].data.actions[0].action, 'kick');
   assert.equal(calls[0].data.dry_run, false);
@@ -6261,7 +6539,7 @@ for (const id of ['mention_spam', 'custom:0123456789abcdef', 'attachment_flood',
       actions: [...(spam ? [{at:1, action:'delete'}] : []), {at:1, action:'ban', delete_days:0}],
     };
     const edit = data => h.app.editRule({name:'Spam', rule_id:id, effective:data});
-    const banSelect = modal => [...modal.querySelectorAll('select')].find(select => [...select.options].some(o => o.textContent === 'Ban and purge (previous hour)'));
+    const banSelect = modal => [...modal.querySelectorAll('select')].find(select => [...select.options].some(o => o.textContent === 'Delete last hour'));
     const save = modal => fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
     let modal = await edit(effective);
     assert.equal(banSelect(modal).value, 'ban', 'missing option stays Ban');
@@ -6270,14 +6548,14 @@ for (const id of ['mention_spam', 'custom:0123456789abcdef', 'attachment_flood',
     assert.equal(action.delete_days, 0);
     assert.ok(!action.purge_last_hour);
     modal = await edit(calls.at(-1).data);
-    await chooseOption(banSelect(modal), 'Ban and purge (previous hour)');
+    await chooseOption(banSelect(modal), 'Delete last hour');
     await save(modal);
     action = calls.at(-1).data.actions.find(a=>a.action === 'ban');
     assert.equal(action.purge_last_hour, true);
     assert.equal(action.delete_days, 0);
     modal = await edit(calls.at(-1).data);
     assert.equal(banSelect(modal).value, 'purge');
-    await chooseOption(banSelect(modal), 'Ban');
+    await chooseOption(banSelect(modal), 'Keep messages');
     await save(modal);
     action = calls.at(-1).data.actions.find(a=>a.action === 'ban');
     assert.equal(action.purge_last_hour, false);
@@ -6289,7 +6567,7 @@ for (const id of ['mention_spam', 'custom:0123456789abcdef', 'attachment_flood',
     await save(modal);
     assert.equal(calls.at(-1).data.actions.at(-1).delete_days, 1, 'unchanged save keeps one day');
     modal = await edit(calls.at(-1).data);
-    await chooseOption(banSelect(modal), 'Ban and purge (previous hour)');
+    await chooseOption(banSelect(modal), 'Delete last hour');
     await save(modal);
     assert.equal(calls.at(-1).data.actions.at(-1).delete_days, 0);
     assert.equal(calls.at(-1).data.actions.at(-1).purge_last_hour, true);
@@ -6398,7 +6676,7 @@ test('Badwords setup reaches existing rule enable escalation exemptions without 
   const settings = [...h.document.querySelectorAll('button')].find(n => n.textContent === 'Edit actions & exemptions');
   assert.ok(settings); await fire(settings, 'click');
   const modal = h.document.querySelector('.modal-overlay');
-  for (const text of ['Enabled', 'Dry-run', 'Action escalation', 'Whitelist roles', 'Skip moderators']) assert.ok(modal.textContent.includes(text));
+  for (const text of ['Enabled', 'Dry-run', 'Actions', 'Skip roles', 'Skip moderators']) assert.ok(modal.textContent.includes(text));
   assert.doesNotMatch(modal.textContent, /Parameters \(JSON\)/);
   const other = await h.app.editRule({...rule, rule_id: 'mention_spam'});
   assert.doesNotMatch(other.textContent, /Parameters \(JSON\)/);
@@ -6558,9 +6836,9 @@ test('Badwords rule saves enable actions and exemptions through the setup path',
   await fire([...h.document.querySelectorAll('button')].find(n => n.textContent === 'Edit actions & exemptions'), 'click');
   const modal = h.document.querySelector('.modal-overlay');
   await fire(modal.querySelector('input[type="checkbox"]'), 'change', {target: {checked: true}});
-  await chooseOption(modal.querySelector('.escalation-step select'), 'timeout');
-  const roles = findNode(modal, n => n.localName === 'label' && textOf(n).startsWith('Whitelist roles')).control;
-  roles.value = '9007199254740993'; await fire(roles, 'input');
+  await chooseOption(modal.querySelector('.escalation-step select'), 'Timeout');
+  const roles = findNode(modal, n => n.localName === 'label' && textOf(n).startsWith('Skip roles')).control;
+  roles.value = '9007199254740993'; await fire(roles, 'input'); await fire(roles, 'keydown', {key: 'Enter'});
   await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Save'), 'click');
   assert.equal(submitted.data.enabled, true);
   assert.equal(submitted.data.dry_run, true);
@@ -6733,7 +7011,7 @@ test('known spam settings reuse exemptions and dry-run with a fixed action', asy
   const rule = {name:'Known spam', enabled:true, dry_run:false, params:{}, actions:[{at:1,action:'ban',delete_days:0,purge_last_hour:true}], whitelist_users:[],whitelist_roles:[],whitelist_channels:[],include_channels:[],skip_moderators:false};
   const modal = await h.app.editRule({name:'Known spam',rule_id:'known_spam',effective:rule});
   assert.match(modal.textContent,/3600 seconds/);
-  assert.doesNotMatch(modal.textContent,/Action escalation/);
+  assert.equal(modal.querySelector('.escalation-step'), null, 'no strike ladder');
   const dryLabel = findNode(modal,n=>n.localName === 'label' && textOf(n).includes('Dry-run (log only)'));
   await fire(findNode(dryLabel,n=>n.localName === 'input'),'change',{target:{checked:true}});
   const skipLabel = findNode(modal,n=>n.localName === 'label' && textOf(n).includes('Skip moderators'));

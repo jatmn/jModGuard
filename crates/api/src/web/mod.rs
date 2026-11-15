@@ -11,6 +11,7 @@ pub mod platform;
 pub mod preview;
 pub mod recovery;
 mod save;
+pub mod server_names;
 pub mod state;
 pub mod updates;
 pub mod usage;
@@ -1810,6 +1811,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             get_post(members::sync_status),
         )
         .route(
+            "/api/guilds/{guild_id}/server-names",
+            get_post(server_names::server_names),
+        )
+        .route(
             "/api/guilds/{guild_id}/member-sync/actions",
             axum::routing::post(members::sync_action),
         )
@@ -2481,6 +2486,8 @@ mod tests {
             ("GET", "/api/guilds/123/members/1", ""),
             ("GET", "/api/guilds/123/members/1/history", ""),
             ("GET", "/api/guilds/123/member-sync", ""),
+            ("GET", "/api/guilds/123/server-names", ""),
+            ("POST", "/api/guilds/123/server-names", ""),
             (
                 "POST",
                 "/api/guilds/123/member-sync/actions",

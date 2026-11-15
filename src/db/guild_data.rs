@@ -38,6 +38,7 @@ const MEMBER_PENDING_REJOIN_NOTES_SCHEMA: &str =
 const MEMBER_GAP_AUTO_CLEAR_SCHEMA: &str =
     include_str!("../../migrations/guild/0017_member_gap_auto_clear.sql");
 const ACCESS_ROLES_SCHEMA: &str = include_str!("../../migrations/guild/0018_access_roles.sql");
+const SERVER_NAMES_SCHEMA: &str = include_str!("../../migrations/guild/0019_server_names.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -57,6 +58,8 @@ mod member_directory;
 pub use member_directory::*;
 mod tenant_logs;
 pub use tenant_logs::{GuildDataScope, LogChannelSnapshot, TenantDataError};
+mod server_names;
+pub use server_names::{ServerChannelName, ServerNames, ServerRoleName};
 mod tenant_settings;
 pub use tenant_settings::{AccessLevel, AccessRole, TenantSettings, access_level_for_roles};
 
@@ -361,6 +364,12 @@ fn verify_identity_version(
             ),
             (15, "table", "guild_local_write_fence guild_writer_epoch"),
             (15, "trigger", "guild_case_settle_retain"),
+            (20, "table", "guild_server_names"),
+            (
+                20,
+                "trigger",
+                "guild_server_names_insert guild_server_names_update",
+            ),
         ];
         let missing = |kind: &str, name: &str| {
             StoreCheckError::Schema(format!(
@@ -533,6 +542,9 @@ fn initialize_store(
         if version < 19 {
             tx.execute_batch_bounded(ACCESS_ROLES_SCHEMA, 32_000_000)?;
         }
+        if version < 20 {
+            tx.execute_batch_bounded(SERVER_NAMES_SCHEMA, 32_000_000)?;
+        }
         // Version 16 adds the optional immutable ban_attempt_tag to case JSON.
         // No DDL or rewrite of legacy cases: their absent tags must remain absent.
         tx.pragma_update(None, "user_version", VERSION)?;
@@ -561,6 +573,7 @@ fn initialize_store(
     tx.execute_batch_bounded(MEMBER_PENDING_REJOIN_NOTES_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_GAP_AUTO_CLEAR_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(ACCESS_ROLES_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(SERVER_NAMES_SCHEMA, 32_000_000)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
@@ -648,6 +661,7 @@ impl GuildDataStore {
                     (MEMBER_PENDING_REJOIN_NOTES_SCHEMA, 17),
                     (MEMBER_GAP_AUTO_CLEAR_SCHEMA, 18),
                     (ACCESS_ROLES_SCHEMA, 19),
+                    (SERVER_NAMES_SCHEMA, 20),
                 ];
                 for (sql, at) in batches {
                     if *at <= version {

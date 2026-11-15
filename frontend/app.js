@@ -1991,7 +1991,7 @@ function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
   const edit = path.match(
-    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|analytics|cases|case-delete-roles|access-roles)(?:\/|\?|$)/,
+    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|analytics|cases|case-delete-roles|access-roles|server-names)(?:\/|\?|$)/,
   );
   if (
     edit &&
@@ -2014,6 +2014,7 @@ function pageEnrollment(path, method = "GET") {
         "cases",
         "case-delete-roles",
         "access-roles",
+        "server-names",
       ].includes(edit[2])) &&
     edit[1] !== "0" &&
     edit[1] === state.guildId &&
@@ -3405,134 +3406,698 @@ function buildCustomRuleSaveBody(rule, creating) {
   return body;
 }
 
+// #621: every automod rule editor has the same layout: a live plain-language
+// summary, then Trigger, Actions, Exceptions and Scope sections, with rarely
+// used options under Advanced. Only the Trigger section differs between rules.
+
+// Built-in rule triggers. Each input keeps a full label for screen readers; the
+// visible words around it read as one short sentence. Phrases follow the bot's
+// checks in crates/bot/src/automod.rs (mention and message counts must exceed
+// the maximum; new-member links count up to the grace period).
+const RULE_TRIGGERS = {
+  mention_spam: {
+    fields: [
+      { key: "max_mentions_in_window", label: "Maximum mentions in window", fallback: 5, before: "More than", after: "mentions in" },
+      { key: "window_secs", label: "Window (seconds)", fallback: 10, after: "seconds" },
+    ],
+    hint: "Counts @everyone, @here and role mentions.",
+    phrase: (v) =>
+      `When someone sends more than ${v.max_mentions_in_window} @everyone, @here or role mentions within ${v.window_secs} seconds`,
+  },
+  velocity: {
+    fields: [
+      { key: "max_messages", label: "Maximum messages in window", fallback: 8, before: "More than", after: "messages in" },
+      { key: "window_secs", label: "Window (seconds)", fallback: 10, after: "seconds" },
+    ],
+    phrase: (v) => `When someone sends more than ${v.max_messages} messages within ${v.window_secs} seconds`,
+  },
+  new_member_url: {
+    fields: [
+      { key: "grace_secs", label: "Seconds after joining", fallback: 120, before: "A link or invite within", after: "seconds of joining" },
+    ],
+    phrase: (v) => `When a member posts a link or invite within ${v.grace_secs} seconds of joining`,
+  },
+  account_age: {
+    fields: [
+      { key: "min_age_days", label: "Minimum account age (days)", fallback: 3, before: "A message from an account younger than", after: "days" },
+    ],
+    hint: "Uses the Discord account's age, not time in this server.",
+    phrase: (v) => `When an account younger than ${v.min_age_days} days posts a message`,
+  },
+  attachment_flood: {
+    fields: [
+      { key: "min_attachments", label: "Common distinct images per message", fallback: 2, min: 1, max: 10, before: "The same", after: "images in" },
+      { key: "min_channels", label: "Distinct channels", fallback: 3, min: 2, max: 10, after: "channels within" },
+      { key: "window_secs", label: "Window (seconds)", fallback: 60, after: "seconds" },
+    ],
+    hint: "Matches identical image files. Extra images in a message are fine.",
+    phrase: (v) =>
+      `When someone posts the same ${v.min_attachments} or more images in ${v.min_channels} or more channels within ${v.window_secs} seconds`,
+  },
+  repeat_text: {
+    fields: [
+      { key: "min_length", label: "Minimum length (characters)", fallback: 20, min: 1, max: 2000, before: "The same text of at least", after: "characters in" },
+      { key: "min_channels", label: "Distinct channels", fallback: 3, min: 2, max: 10, after: "channels within" },
+      { key: "window_secs", label: "Window (seconds)", fallback: 60, after: "seconds" },
+    ],
+    hint: "Exact match. Spaces at the ends are ignored; upper and lower case differ.",
+    phrase: (v) =>
+      `When someone posts the same text (at least ${v.min_length} characters) in ${v.min_channels} or more channels within ${v.window_secs} seconds`,
+  },
+  invite: {
+    phrase: (v) =>
+      String(v.allowlist_codes || "").trim()
+        ? "When someone posts a Discord invite that isn't on the allowed list"
+        : "When someone posts a Discord invite",
+  },
+  badword: {
+    text: "A message matches your Badwords list.",
+    hint: "Manage words and advanced regex on the Badwords page.",
+    phrase: () => "When a message matches your Badwords list",
+  },
+  known_spam: {
+    text: "A message matches a saved Known spam message or URL pattern.",
+    hint: "Manage samples and URLs on the Known spam page.",
+    phrase: () => "When a message matches Known spam",
+  },
+};
+
+const RULE_ACTION_LABELS = {
+  log: "Log only",
+  delete: "Delete message",
+  warn: "Warn",
+  timeout: "Timeout",
+  kick: "Kick",
+  ban: "Ban",
+};
+
+function banMessagesLabel(step) {
+  return step.purge_last_hour ? "Delete last hour" : step.delete_days ? `Delete ${step.delete_days} day(s)` : "Keep messages";
+}
+
+// One escalation step in the words the summary uses, e.g. "Ban (keep messages)".
+function ruleStepPhrase(step) {
+  if (step.action === "timeout") return `Timeout ${Math.max(1, Number(step.duration_minutes) || 0)} min`;
+  if (step.action === "ban") return `Ban (${banMessagesLabel(step).toLowerCase()})`;
+  if (step.action === "delete") return "Delete the message";
+  return RULE_ACTION_LABELS[step.action] || ruleActionName(step);
+}
+
+// What the bot does on a match: one step reads as itself, several as a strike list.
+function ruleOutcome(rule) {
+  const steps = describeRuleActions(rule, ruleStepPhrase);
+  if (steps === "No actions set") return "no action";
+  return steps.startsWith("Strike 1: ") && !steps.includes(" · ") ? steps.slice("Strike 1: ".length) : steps;
+}
+
+function ruleSummaryText(trigger, outcome, enabled, dryRun) {
+  const state = !enabled ? " Off: the rule is ignored." : dryRun ? " Dry-run: only logs." : "";
+  return `${trigger}: ${outcome}.${state}`;
+}
+
+function RuleSummary({ text }) {
+  return h("p", { className: "rule-summary", role: "status", "aria-live": "polite" }, text);
+}
+
+function EditorSection({ title, hint, className = "", children }) {
+  return h(
+    "section",
+    { className: `editor-section ${className}`.trim(), "aria-label": title },
+    h("h4", { className: "editor-section-title" }, title),
+    hint ? h("p", { className: "field-help" }, hint) : null,
+    children,
+  );
+}
+
+// Enabled and Dry-run sit in the header as toggles; their labels stay the
+// exact control names.
+function RuleEditorHeader({ title, enabled, dryRun, dryRunDisabled, onEnabled, onDryRun, dryRunRef }) {
+  return h(
+    "div",
+    { className: "editor-heading rule-editor-header" },
+    h("div", { className: "rule-editor-title" }, h("span", { className: "eyebrow" }, "AUTOMOD RULE"), h("h3", { className: "card-title" }, title)),
+    h(
+      "div",
+      { className: "rule-toggles" },
+      h(
+        "label",
+        { className: "toggle-label" },
+        h(Input, { type: "checkbox", className: "toggle toggle-sm", defaultChecked: enabled, onChange: (e) => onEnabled(e.target.checked) }),
+        "Enabled",
+      ),
+      h(
+        "label",
+        { className: "toggle-label" },
+        h(Input, {
+          ref: dryRunRef,
+          type: "checkbox",
+          className: "toggle toggle-sm",
+          defaultChecked: dryRun,
+          disabled: dryRunDisabled,
+          onChange: (e) => onDryRun(e.target.checked),
+        }),
+        "Dry-run (log only)",
+      ),
+    ),
+  );
+}
+
+function TriggerSentence({ fields, values, onValue }) {
+  return h(
+    "div",
+    { className: "trigger-sentence" },
+    ...fields.map((f) =>
+      h(
+        React.Fragment,
+        { key: f.key },
+        f.before ? h("span", null, f.before) : null,
+        h(
+          Field,
+          { className: "trigger-field" },
+          h(Label, { className: "sr-only" }, f.label),
+          h(Input, {
+            type: "number",
+            className: "input input-num",
+            min: f.min ?? (f.key === "window_secs" ? 1 : 0),
+            max: f.max ?? (f.key === "window_secs" ? 600 : Number.MAX_SAFE_INTEGER),
+            step: 1,
+            required: true,
+            defaultValue: values[f.key],
+            onInput: (e) => onValue(f.key, e.target.value),
+          }),
+        ),
+        f.after ? h("span", null, f.after) : null,
+      ),
+    ),
+  );
+}
+
+// Role and channel names come from the bot's latest snapshot of this server
+// (POST /api/guilds/{id}/server-names); user names from the Members directory.
+// Global rules have no server, so their pickers take IDs only.
+function useServerNames(userIds) {
+  const guildId = state.guildId;
+  const live = Boolean(guildId) && guildId !== "0";
+  const [names, setNames] = useState(() => ({
+    status: live ? "loading" : "unavailable",
+    roles: [],
+    channels: [],
+    users: new Map(),
+  }));
+  useEffect(() => {
+    if (!live) return undefined;
+    const controller = new AbortController();
+    apiRead(`/api/guilds/${guildId}/server-names`, controller.signal).then(
+      (data) =>
+        setNames((current) => ({
+          ...current,
+          status: "loaded",
+          roles: Array.isArray(data?.roles) ? data.roles : [],
+          channels: Array.isArray(data?.channels) ? data.channels : [],
+        })),
+      () => {
+        if (!controller.signal.aborted) setNames((current) => ({ ...current, status: "failed" }));
+      },
+    );
+    for (const id of (userIds || []).slice(0, 25)) {
+      apiRead(`/api/guilds/${guildId}/members/${id}`, controller.signal).then(
+        (member) => {
+          if (member?.display_name) setNames((current) => ({ ...current, users: new Map(current.users).set(id, member.display_name) }));
+        },
+        () => {},
+      );
+    }
+    return () => controller.abort();
+  }, [guildId]);
+  const rememberUser = (id, name) => setNames((current) => ({ ...current, users: new Map(current.users).set(id, name) }));
+  return [names, rememberUser];
+}
+
+function roleColor(role) {
+  return role?.color ? `#${Number(role.color).toString(16).padStart(6, "0")}` : null;
+}
+
+function PickerChip({ kind, id, names, onRemove }) {
+  const role = kind === "role" ? names.roles.find((r) => r.id === id) : null;
+  const channel = kind === "channel" ? names.channels.find((c) => c.id === id) : null;
+  const user = kind === "user" ? names.users.get(id) : null;
+  const known = role?.name ?? channel?.name ?? user;
+  const text = known != null ? (kind === "role" ? `@${known}` : kind === "channel" ? `#${known}` : known) : `${kind === "role" ? "Role" : kind === "channel" ? "Channel" : "User"} ${id}`;
+  return h(
+    "li",
+    { className: "badge badge-soft picker-chip", title: id },
+    kind === "role" ? h("span", { className: "role-dot", style: roleColor(role) ? { background: roleColor(role) } : null, "aria-hidden": "true" }) : null,
+    kind === "channel" ? h(Icon, { name: channel?.kind === "voice" || channel?.kind === "stage" ? "volume" : "hash", intent: "neutral" }) : null,
+    kind === "user" ? h("span", { className: "server-icon server-icon-letter", "aria-hidden": "true" }, (Array.from(String(known || "?"))[0] || "?").toUpperCase()) : null,
+    h("span", { className: "picker-chip-text" }, text),
+    h(
+      ActionButton,
+      { type: "button", className: "picker-chip-remove", "aria-label": `Remove ${text}`, title: `Remove ${text}`, onClick: onRemove },
+      h(Icon, { name: "x-circle" }),
+    ),
+  );
+}
+
+// Chips for the chosen roles, channels or users, plus controls to add more: a
+// native select of names when the bot has shared them, a member search for
+// users, and an ID box (Enter adds IDs, mentions or links). The ID box stays
+// next to the select for IDs the snapshot lacks, such as threads. Save commits
+// or refuses text still in the box through `pending`, as the old ID fields did.
+// The box text is picker state, so it survives the box being replaced when
+// names arrive, and member results are kept with the query they answer.
+function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pending, single = false }) {
+  const [, bump] = useState(0);
+  const [text, setText] = useState("");
+  const [found, setFound] = useState(null);
+  const [error, setError] = useState("");
+  const searchAbort = useRef(null);
+  const flushRef = useRef(null);
+  // Only results for the text now in the box can be chosen.
+  const results = found && found.query === text.trim() ? found.members : null;
+  const update = (next) => {
+    ids.splice(0, ids.length, ...next);
+    markDirty();
+    bump((n) => n + 1);
+    onChange?.();
+  };
+  const add = (id) => {
+    if (!id || ids.includes(id)) return;
+    update(single ? [id] : [...ids, id]);
+  };
+  // Drop shown results and ignore any search still in flight.
+  const clearSearch = () => {
+    searchAbort.current?.abort();
+    setFound(null);
+  };
+  const addTyped = () => {
+    const raw = text.trim();
+    if (!raw) return true;
+    const typed = raw.split(",").map((part) => parseSnowflake(part));
+    if (typed.some((id) => !id)) {
+      setError(kind === "user" && names.status !== "unavailable"
+        ? "Pick a matching member, or enter IDs as digits or mentions."
+        : "Enter IDs as digits, mentions or links.");
+      return false;
+    }
+    setError("");
+    update(single ? [typed.at(-1)] : [...ids, ...typed.filter((id, i) => !ids.includes(id) && typed.indexOf(id) === i)]);
+    setText("");
+    clearSearch();
+    return true;
+  };
+  const choose = (member) => {
+    rememberUser?.(member.user_id, member.display_name);
+    add(member.user_id);
+    setText("");
+    clearSearch();
+  };
+  const options =
+    kind === "role"
+      ? names.roles.filter((r) => r.id !== state.guildId)
+      : kind === "channel"
+        ? names.channels.filter((c) => c.kind !== "category")
+        : [];
+  const useSelect = kind !== "user" && names.status === "loaded" && options.length > 0;
+  const noun = kind === "role" ? "role" : kind === "channel" ? "channel" : "member";
+  const search = async (value) => {
+    searchAbort.current?.abort();
+    const q = value.trim();
+    if (kind !== "user" || names.status === "unavailable" || !q || parseSnowflake(q)) {
+      setFound(null);
+      return;
+    }
+    const controller = new AbortController();
+    searchAbort.current = controller;
+    try {
+      const page = await apiRead(`/api/guilds/${state.guildId}/members?${new URLSearchParams({ q, limit: "8", status: "current" })}`, controller.signal);
+      if (searchAbort.current === controller) setFound({ query: q, members: Array.isArray(page?.members) ? page.members : [] });
+    } catch (_) {
+      if (searchAbort.current === controller) setFound({ query: q, members: [] });
+    }
+  };
+  useEffect(() => () => searchAbort.current?.abort(), []);
+  flushRef.current = addTyped;
+  useEffect(() => {
+    if (!pending) return undefined;
+    const flush = () => flushRef.current();
+    pending.add(flush);
+    return () => pending.delete(flush);
+  }, [pending]);
+  const textBox = (labelled) =>
+    h(Input, {
+      type: "text",
+      value: text,
+      className: "input input-sm",
+      "aria-label": labelled ? undefined : `Add a ${noun} by ID`,
+      placeholder:
+        kind === "user" && names.status !== "unavailable"
+          ? "Search members by name, or paste an ID"
+          : labelled
+            ? `Paste a ${noun} ID${kind === "channel" ? ", #mention or link" : " or @mention"}`
+            : "Or paste an ID",
+      onChange: (e) => {
+        setText(e.target.value);
+        setError("");
+        search(e.target.value);
+      },
+      onKeyDown: (e) => {
+        if (e.key !== "Enter") return;
+        e.preventDefault();
+        if (results?.length === 1 && !parseSnowflake(text)) {
+          choose(results[0]);
+          return;
+        }
+        addTyped();
+      },
+      onBlur: () => {
+        if (parseSnowflake(text)) addTyped();
+      },
+    });
+  const categories = new Map(names.channels.filter((c) => c.kind === "category").map((c) => [c.id, c.name]));
+  const channelGroups = [];
+  if (kind === "channel") {
+    for (const channel of options) {
+      const group = categories.get(channel.parent_id) ?? "";
+      let entry = channelGroups.find((g) => g.name === group);
+      if (!entry) channelGroups.push((entry = { name: group, channels: [] }));
+      entry.channels.push(channel);
+    }
+  }
+  const optionFor = (item) =>
+    h("option", { key: item.id, value: item.id, disabled: ids.includes(item.id) }, kind === "role" ? `@${item.name}` : `#${item.name}`);
+  return h(
+    "div",
+    { className: "field id-picker" },
+    h(
+      Field,
+      { className: "fieldset" },
+      h(Label, { className: "fieldset-legend" }, label),
+      useSelect
+        ? h(
+            Select,
+            {
+              className: "select select-sm",
+              defaultValue: "",
+              onChange: (e) => {
+                add(e.target.value);
+                e.target.value = "";
+              },
+            },
+            h("option", { value: "" }, single ? `Choose a ${noun}…` : `Add a ${noun}…`),
+            kind === "role"
+              ? options.map(optionFor)
+              : channelGroups.map((group) =>
+                  group.name
+                    ? h("optgroup", { key: group.name, label: group.name }, group.channels.map(optionFor))
+                    : group.channels.map(optionFor),
+                ),
+          )
+        : textBox(true),
+    ),
+    useSelect ? textBox(false) : null,
+    results
+      ? h(
+          "ul",
+          { className: "menu menu-sm picker-results", "aria-label": `Matching ${noun}s` },
+          results.length
+            ? results.map((member) =>
+                h(
+                  "li",
+                  { key: member.user_id },
+                  h(
+                    ActionButton,
+                    { type: "button", onClick: () => choose(member) },
+                    member.display_name,
+                    h("span", { className: "muted" }, member.user_id),
+                  ),
+                ),
+              )
+            : h("li", { className: "muted" }, "No matching members."),
+        )
+      : null,
+    error ? h("p", { className: "err", role: "alert" }, error) : null,
+    ids.length
+      ? h(
+          "ul",
+          { className: "picker-chips", "aria-label": label },
+          ids.map((id) => h(PickerChip, { key: id, kind, id, names, onRemove: () => update(ids.filter((other) => other !== id)) })),
+        )
+      : null,
+    hint ? h("p", { className: "field-help" }, hint) : null,
+  );
+}
+
+function ruleNamesHint(names) {
+  if (names.status === "unavailable") return "Global rules use IDs: names differ in every server.";
+  if (names.status === "loaded" && !names.roles.length && !names.channels.length)
+    return "Names appear once the bot next connects to this server. Paste IDs meanwhile.";
+  if (names.status === "failed") return "Couldn't load names. Paste IDs instead.";
+  return null;
+}
+
+// Text still in an ID box when Save is pressed is added, or the save stops with
+// an error, so nothing typed is lost silently.
+function flushPendingIds(pending) {
+  const ok = [...pending].map((flush) => flush()).every(Boolean);
+  if (!ok) toast("Fix the ID fields marked in red before saving.", "error");
+  return ok;
+}
+
+// Shared Exceptions section: who and where the rule never checks.
+function RuleExceptions({ rule, names, rememberUser, onChange, pending }) {
+  return h(
+    EditorSection,
+    { title: "Exceptions", hint: ruleNamesHint(names) || "The rule never acts on these." },
+    h(
+      "label",
+      { className: "toggle-label" },
+      h(Input, {
+        type: "checkbox",
+        className: "toggle toggle-sm",
+        defaultChecked: rule.skip_moderators,
+        onChange: (e) => {
+          rule.skip_moderators = e.target.checked;
+          onChange();
+        },
+      }),
+      "Skip moderators",
+    ),
+    h(
+      "div",
+      { className: "editor-columns" },
+      h(IdPicker, { kind: "role", label: "Skip roles", ids: rule.whitelist_roles, names, onChange, pending }),
+      h(IdPicker, { kind: "channel", label: "Skip channels", ids: rule.whitelist_channels, names, onChange, pending }),
+      h(IdPicker, { kind: "user", label: "Skip users", ids: rule.whitelist_users, names, rememberUser, onChange, pending }),
+    ),
+  );
+}
+
+function RuleAdvanced({ rule, names, onChange, pending, children }) {
+  return h(
+    "details",
+    { className: "editor-advanced" },
+    h("summary", null, "Advanced"),
+    h(IdPicker, {
+      kind: "channel",
+      label: "Only check these channels",
+      hint: "Leave empty to check every channel.",
+      ids: rule.include_channels,
+      names,
+      onChange,
+      pending,
+    }),
+    children,
+  );
+}
+
+function ensureRuleLists(rule) {
+  for (const key of ["whitelist_roles", "whitelist_channels", "whitelist_users", "include_channels"]) {
+    rule[key] = Array.isArray(rule[key]) ? rule[key].map(String) : [];
+  }
+  return rule;
+}
+
+function customRulePhrase(rule, names) {
+  const p = rule.params || {};
+  if (p.kind === "word") {
+    const count = (p.words || []).length;
+    return count ? `When a message contains ${count === 1 ? "the listed word" : `any of ${count} listed words`}` : "When a message contains a listed word (none yet)";
+  }
+  if (p.kind === "channel_content") {
+    const parts = [p.links && "a link", p.attachments && "an attachment"].filter(Boolean);
+    return parts.length ? `When someone posts ${parts.join(" or ")}` : "Never (choose links or attachments)";
+  }
+  if (p.kind === "everyone_attempt") return "When someone without permission tries to mention @everyone or @here";
+  if (p.kind === "honeypot_role") {
+    const role = names.roles.find((r) => r.id === String(p.role_id || ""));
+    return p.role_id ? `When a member gets ${role ? `@${role.name}` : `role ${p.role_id}`}` : "When a member gets the chosen role (none yet)";
+  }
+  return p.pattern ? `When a message matches the pattern ${p.pattern}` : "When a message matches the pattern (none yet)";
+}
+
 function CustomRuleEditor({ record: r, creating }) {
-  const [rule] = useState(() => JSON.parse(JSON.stringify(r.effective)));
+  const [rule] = useState(() => ensureRuleLists(JSON.parse(JSON.stringify(r.effective))));
   const [, bumpForm] = useState(0);
+  const refresh = () => bumpForm((n) => n + 1);
+  const [names, rememberUser] = useServerNames(rule.whitelist_users);
+  const [honeypotRoles] = useState(() => (rule.params?.role_id ? [String(rule.params.role_id)] : []));
+  const pending = useRef(new Set()).current;
   const kind = rule.params?.kind || "pattern";
+  const action = rule.actions?.[0];
+  const summary = ruleSummaryText(customRulePhrase(rule, names), action ? ruleStepPhrase(action) : "no action", rule.enabled, rule.dry_run);
   return h(
     DialogPanel,
     { className: "modal-box rule-editor", onInput: trackDraft },
-    h("h3", { className: "card-title" }, creating ? "Add custom rule" : `Edit custom rule: ${r.name || r.rule_id}`),
-    field("Name", h(Input, { type: "text", defaultValue: rule.name, className: "input", onInput: (e) => (rule.name = e.target.value) })),
-    field(
-      "Type",
+    h(RuleEditorHeader, {
+      title: creating ? "Add custom rule" : `Edit custom rule: ${r.name || r.rule_id}`,
+      enabled: rule.enabled,
+      dryRun: rule.dry_run,
+      dryRunDisabled: creating,
+      onEnabled: (on) => {
+        rule.enabled = on;
+        refresh();
+      },
+      onDryRun: (on) => {
+        rule.dry_run = on;
+        refresh();
+      },
+    }),
+    h(RuleSummary, { text: summary }),
+    h(
+      EditorSection,
+      { title: "Trigger", hint: creating ? "New rules start in dry-run so you can check them first." : null },
       h(
-        Select,
-        {
-          className: "select",
-          defaultValue: kind,
-          onChange: (e) => {
-            const next = e.target.value;
-            const prev = rule.params || {};
-            rule.params = { kind: next };
-            if (next === "pattern") rule.params.pattern = prev.pattern || "";
-            if (next === "word") rule.params.words = Array.isArray(prev.words) ? prev.words : [];
-            if (next === "channel_content") {
-              rule.params.links = prev.links !== false;
-              rule.params.attachments = prev.attachments === true;
-            }
-            if (next === "honeypot_role") {
-              rule.params.role_id = prev.role_id || "";
-              const current = rule.actions?.[0]?.action;
-              if (!current || current === "delete") {
-                rule.actions = [{
-                  at: 1,
-                  action: "kick",
-                  duration_minutes: 0,
-                  delete_days: 0,
-                  reason: rule.actions?.[0]?.reason || "",
-                }];
-              }
-            }
-            markDirty();
-            bumpForm((n) => n + 1);
-          },
-        },
-        h("option", { value: "pattern" }, "Pattern (regex)"),
-        h("option", { value: "word" }, "Word list"),
-        h("option", { value: "channel_content" }, "Channel content"),
-        h("option", { value: "everyone_attempt" }, "@everyone / @here attempt"),
-        h("option", { value: "honeypot_role" }, "Honeypot role"),
+        "div",
+        { className: "editor-columns" },
+        field("Name", h(Input, { type: "text", defaultValue: rule.name, className: "input input-sm", onInput: (e) => (rule.name = e.target.value) })),
+        field(
+          "Type",
+          h(
+            Select,
+            {
+              className: "select select-sm",
+              defaultValue: kind,
+              onChange: (e) => {
+                const next = e.target.value;
+                const prev = rule.params || {};
+                rule.params = { kind: next };
+                if (next === "pattern") rule.params.pattern = prev.pattern || "";
+                if (next === "word") rule.params.words = Array.isArray(prev.words) ? prev.words : [];
+                if (next === "channel_content") {
+                  rule.params.links = prev.links !== false;
+                  rule.params.attachments = prev.attachments === true;
+                }
+                if (next === "honeypot_role") {
+                  rule.params.role_id = prev.role_id || honeypotRoles[0] || "";
+                  const current = rule.actions?.[0]?.action;
+                  if (!current || current === "delete") {
+                    rule.actions = [{
+                      at: 1,
+                      action: "kick",
+                      duration_minutes: 0,
+                      delete_days: 0,
+                      reason: rule.actions?.[0]?.reason || "",
+                    }];
+                  }
+                }
+                markDirty();
+                refresh();
+              },
+            },
+            h("option", { value: "pattern" }, "Pattern (regex)"),
+            h("option", { value: "word" }, "Word list"),
+            h("option", { value: "channel_content" }, "Channel content"),
+            h("option", { value: "everyone_attempt" }, "@everyone / @here attempt"),
+            h("option", { value: "honeypot_role" }, "Honeypot role"),
+          ),
+        ),
       ),
+      kind === "pattern"
+        ? field(
+            "Pattern",
+            h(Input, {
+              type: "text",
+              className: "input input-sm mono",
+              defaultValue: rule.params.pattern || "",
+              onInput: (e) => {
+                rule.params.pattern = e.target.value;
+                refresh();
+              },
+            }),
+            h("p", { className: "field-help" }, "A regular expression. Also checked with disguises removed."),
+          )
+        : null,
+      kind === "word"
+        ? field(
+            "Words",
+            h(Input, {
+              type: "text",
+              className: "input input-sm",
+              defaultValue: (rule.params.words || []).join(","),
+              onInput: (e) => {
+                rule.params.words = e.target.value.split(",").map((w) => w.trim()).filter(Boolean);
+                refresh();
+              },
+            }),
+            h("p", { className: "field-help" }, "Separate words with commas."),
+          )
+        : null,
+      kind === "channel_content"
+        ? h(
+            "div",
+            { className: "row checkbox-group" },
+            h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.params.links, onChange: (e) => { rule.params.links = e.target.checked; refresh(); } }), "Links"),
+            h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.params.attachments, onChange: (e) => { rule.params.attachments = e.target.checked; refresh(); } }), "Attachments"),
+          )
+        : null,
+      kind === "everyone_attempt" ? h("p", { className: "field-help" }, "Members allowed to mention everyone are never caught.") : null,
+      kind === "honeypot_role"
+        ? h(IdPicker, {
+            kind: "role",
+            label: "Honeypot role",
+            hint: "Members who take this role get the action below.",
+            ids: honeypotRoles,
+            names,
+            pending,
+            single: true,
+            onChange: () => {
+              rule.params.role_id = honeypotRoles[0] || "";
+              refresh();
+            },
+          })
+        : null,
     ),
-    kind === "pattern"
-      ? field("Pattern", h(Input, { type: "text", className: "input mono", defaultValue: rule.params.pattern || "", onInput: (e) => (rule.params.pattern = e.target.value) }))
-      : null,
-    kind === "word"
-      ? field("Words (comma-separated)", h(Input, { type: "text", className: "input", defaultValue: (rule.params.words || []).join(","), onInput: (e) => (rule.params.words = e.target.value.split(",").map((w) => w.trim()).filter(Boolean)) }))
-      : null,
-    kind === "channel_content"
-      ? h(
+    h(
+      EditorSection,
+      { title: "Action", hint: "Runs on every match." },
+      action
+        ? h(RuleAction, {
+            key: itemKey(action),
+            action,
+            index: 0,
+            strike: false,
+            clearBan: true,
+            choices: ["delete", "warn", "timeout", "kick", "ban"],
+            onChange: refresh,
+          })
+        : null,
+    ),
+    h(RuleExceptions, { rule, names, rememberUser, onChange: refresh, pending }),
+    h(
+      EditorSection,
+      { title: "Scope" },
+      h("p", { className: "field-help" }, "Custom rules apply to this server only."),
+      h(
+        RuleAdvanced,
+        { rule, names, onChange: refresh, pending },
+        h(
           "div",
           { className: "row checkbox-group" },
-          h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.params.links, onChange: (e) => (rule.params.links = e.target.checked) }), "Links"),
-          h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.params.attachments, onChange: (e) => (rule.params.attachments = e.target.checked) }), "Attachments"),
-        )
-      : null,
-    kind === "honeypot_role"
-      ? h(
-          "p",
-          { className: "muted" },
-          "Default action is kick. For a hidden case, turn on Open a case and turn off Post to automod log. Role id is a snowflake string.",
-          field("Role id", h(Input, { type: "text", className: "input mono", defaultValue: String(rule.params.role_id || ""), onInput: (e) => (rule.params.role_id = e.target.value.trim()) })),
-        )
-      : null,
-    field(
-      "Action",
-      h(
-        Select,
-        {
-          key: `action-${rule.actions?.[0]?.action || "delete"}`,
-          className: "select",
-          value: rule.actions?.[0]?.action || "delete",
-          onChange: (e) => {
-            const action = e.target.value;
-            const prev = rule.actions?.[0] || {};
-            let duration = prev.duration_minutes || 0;
-            if (action === "timeout" && !duration) duration = 60;
-            rule.actions = [{
-              at: 1,
-              action,
-              duration_minutes: duration,
-              delete_days: action === "ban" ? prev.delete_days || 0 : 0,
-              purge_last_hour: action === "ban" && prev.purge_last_hour === true,
-              reason: prev.reason || "",
-            }];
-            markDirty();
-            bumpForm((n) => n + 1);
-          },
-        },
-        ["delete", "warn", "timeout", "kick", "ban"].map((a) => h("option", { key: a, value: a }, a)),
+          h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.log_automod, onChange: (e) => (rule.log_automod = e.target.checked) }), "Post to automod log"),
+          h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.open_case, onChange: (e) => (rule.open_case = e.target.checked) }), "Open a case"),
+        ),
+        kind === "honeypot_role" ? h("p", { className: "field-help" }, "For a hidden case, turn on Open a case and turn off Post to automod log.") : null,
       ),
-    ),
-    rule.actions?.[0]?.action === "timeout"
-      ? field("Timeout (minutes)", h(Input, { type: "number", className: "input", defaultValue: rule.actions[0].duration_minutes || 60, onInput: (e) => (rule.actions[0].duration_minutes = Number(e.target.value)) }))
-      : null,
-    rule.actions?.[0]?.action === "ban"
-      ? h(BanOptions, { action: rule.actions[0] })
-      : null,
-    field("Reason template", h(Input, { type: "text", className: "input", defaultValue: rule.actions?.[0]?.reason || "", onInput: (e) => (rule.actions[0].reason = e.target.value) })),
-    h(
-      "div",
-      { className: "row checkbox-group" },
-      h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.enabled, onChange: (e) => (rule.enabled = e.target.checked) }), "Enabled"),
-      h(
-        "label",
-        { className: "checkbox-label" },
-        h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.dry_run, disabled: creating, onChange: (e) => (rule.dry_run = e.target.checked) }),
-        "Dry-run (log only)",
-      ),
-      h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.log_automod, onChange: (e) => (rule.log_automod = e.target.checked) }), "Post to automod log"),
-      h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.open_case, onChange: (e) => (rule.open_case = e.target.checked) }), "Open a case"),
-      h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.skip_moderators, onChange: (e) => (rule.skip_moderators = e.target.checked) }), "Skip moderators"),
-    ),
-    field("Only these channels (empty means all)", h(Input, { type: "text", className: "input", defaultValue: (rule.include_channels || []).join(","), onInput: (e) => (rule.include_channels = splitIds(e.target.value)) })),
-    h(
-      "div",
-      { className: "row form-row" },
-      field("Skip roles (ids, comma)", h(Input, { type: "text", className: "input", defaultValue: (rule.whitelist_roles || []).join(","), onInput: (e) => (rule.whitelist_roles = splitIds(e.target.value)) })),
-      field("Skip channels (ids)", h(Input, { type: "text", className: "input", defaultValue: (rule.whitelist_channels || []).join(","), onInput: (e) => (rule.whitelist_channels = splitIds(e.target.value)) })),
-      field("Skip users (ids)", h(Input, { type: "text", className: "input", defaultValue: (rule.whitelist_users || []).join(","), onInput: (e) => (rule.whitelist_users = splitIds(e.target.value)) })),
     ),
     h(
       "div",
@@ -3542,6 +4107,7 @@ function CustomRuleEditor({ record: r, creating }) {
         {
           className: "btn btn-primary",
           onClick: async () => {
+            if (!flushPendingIds(pending)) return;
             const data = buildCustomRuleSaveBody(rule, creating);
             const saved = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", { scope: "guild", data });
             if (!applyConfigPatch(saved) && !(await loadConfig())) return;
@@ -3573,221 +4139,75 @@ function CustomRuleEditor({ record: r, creating }) {
 }
 
 function RuleEditor({ record: r }) {
-  const [rule] = useState(() => JSON.parse(JSON.stringify(r.effective)));
-  const [, setActionsRevision] = useState(0);
-  const renderActions = () => setActionsRevision((value) => value + 1);
+  const [rule] = useState(() => ensureRuleLists(JSON.parse(JSON.stringify(r.effective))));
+  const [, setRevision] = useState(0);
+  const refresh = () => setRevision((value) => value + 1);
   const spam = spamRule(r.rule_id);
   const textRule = r.rule_id === "repeat_text";
-  const image = r.rule_id === "attachment_flood";
   const knownSpam = r.rule_id === "known_spam";
-  const imageChannelsRef = useRef(null);
-  const imageChannels = h(Input, {
-    ref: imageChannelsRef,
-    type: "number",
-    min: 2,
-    max: 10,
-    defaultValue: rule.params?.min_channels ?? 3,
-    className: "input",
-  });
-  const imageCountRef = useRef(null);
-  const imageCount = h(Input, {
-    ref: imageCountRef,
-    type: "number",
-    min: 1,
-    max: 10,
-    defaultValue: rule.params?.min_attachments ?? 2,
-    className: "input",
-  });
-  const imageWindowRef = useRef(null);
-  const imageWindow = h(Input, {
-    ref: imageWindowRef,
-    type: "number",
-    min: 1,
-    max: 600,
-    defaultValue: rule.params?.window_secs ?? 60,
-    className: "input",
-  });
-  const textLengthRef = useRef(null);
-  const textLength = h(Input, {
-    ref: textLengthRef,
-    type: "number",
-    min: 1,
-    max: 2000,
-    defaultValue: rule.params?.min_length ?? 20,
-    className: "input",
+  const trigger = RULE_TRIGGERS[r.rule_id] || { phrase: () => "When this rule matches" };
+  const fields = trigger.fields || [];
+  const inviteCodes = (value) => (Array.isArray(value) ? value.filter((code) => typeof code === "string") : []);
+  // Draft trigger values stay strings until Save validates them.
+  const [values] = useState(() => {
+    const draft = {};
+    for (const f of fields) draft[f.key] = String(rule.params?.[f.key] ?? f.fallback);
+    // Legacy allowlist_guilds was never read by the bot. Do not reinterpret
+    // those guild IDs as invite codes on edit.
+    if (r.rule_id === "invite") draft.allowlist_codes = inviteCodes(rule.params?.allowlist_codes).join(", ");
+    return draft;
   });
   const [spamBan] = useState(() => ({
     ...(rule.actions.find((action) => action.action === "ban") || rule.actions[0] || {}),
   }));
   // Inactive legacy image rows should convert to the safe dry-run mode by default.
+  const [dryRun, setDryRun] = useState(() => (spam ? !spamConfigured(r.rule_id, rule) || rule.dry_run : rule.dry_run));
   const dryRunRef = useRef(null);
-  const dryRun = h(Input, {
-    ref: dryRunRef,
-    type: "checkbox",
-    defaultChecked: spam ? !spamConfigured(r.rule_id, rule) || rule.dry_run : rule.dry_run,
-    onChange: (e) => (rule.dry_run = e.target.checked),
-    className: "checkbox",
-  });
-  const numberParams = {
-    mention_spam: [
-      ["window_secs", "Window (seconds)", 10],
-      ["max_mentions_in_window", "Maximum mentions in window", 5],
-    ],
-    new_member_url: [["grace_secs", "Seconds after joining", 120]],
-    velocity: [
-      ["window_secs", "Window (seconds)", 10],
-      ["max_messages", "Maximum messages in window", 8],
-    ],
-    account_age: [["min_age_days", "Minimum account age (days)", 3]],
-  }[r.rule_id] || [];
-  const numberParamsRef = useRef({});
-  const inviteCodesRef = useRef(null);
-  const inviteCodes = (value) => Array.isArray(value)
-    ? value.filter((code) => typeof code === "string") : [];
-  const detectionFields = numberParams.map(([key, label, fallback]) =>
-    h(React.Fragment, { key }, field(label, h(Input, {
-      ref: (node) => { numberParamsRef.current[key] = node; },
-      type: "number",
-      min: key === "window_secs" ? 1 : 0,
-      max: key === "window_secs" ? 600 : Number.MAX_SAFE_INTEGER,
-      step: 1,
-      required: true,
-      defaultValue: rule.params?.[key] ?? fallback,
-      className: "input",
-    }))),
-  );
-  if (r.rule_id === "invite") {
-    detectionFields.push(h(React.Fragment, { key: "invite_codes" }, field("Allowed invite codes (comma-separated)", h(Input, {
-      ref: inviteCodesRef,
-      type: "text",
-      defaultValue: inviteCodes(rule.params?.allowlist_codes).join(", "),
-      placeholder: "code-one, code-two",
-      className: "input",
-    }))));
-  }
-
-  const whitelistTextRef = useRef(null);
-  const whitelistText = h(Input, {
-    ref: whitelistTextRef,
-    type: "text",
-    defaultValue: (rule.whitelist_roles || []).join(","),
-    className: "input",
-  });
-  const channelsTextRef = useRef(null);
-  const channelsText = h(Input, {
-    ref: channelsTextRef,
-    type: "text",
-    defaultValue: (rule.whitelist_channels || []).join(","),
-    className: "input",
-  });
-  const usersTextRef = useRef(null);
-  const usersText = h(Input, {
-    ref: usersTextRef,
-    type: "text",
-    defaultValue: (rule.whitelist_users || []).join(","),
-    className: "input",
-  });
-  const skipModRef = useRef(null);
-  const skipMod = h(Input, {
-    ref: skipModRef,
-    type: "checkbox",
-    defaultChecked: rule.skip_moderators,
-    onChange: (e) => (rule.skip_moderators = e.target.checked),
-    className: "checkbox",
-  });
-  const includeChannelsRef = useRef(null);
-  const includeChannels = h(Input, {
-    ref: includeChannelsRef,
-    type: "text",
-    defaultValue: (rule.include_channels || []).join(","),
-    className: "input",
-  });
+  const [names, rememberUser] = useServerNames(rule.whitelist_users);
+  const pending = useRef(new Set()).current;
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef);
+  const setValue = (key, value) => {
+    values[key] = value;
+    refresh();
+  };
+  const shown = { ...values };
+  for (const { key } of fields) shown[key] = String(values[key]).trim() || "…";
+  const outcome = knownSpam
+    ? "Ban and delete the last hour of messages"
+    : spam
+      ? `Delete the messages and ban (${banMessagesLabel(spamBan).toLowerCase()})`
+      : ruleOutcome(rule);
+  const summary = ruleSummaryText(trigger.phrase(shown), outcome, rule.enabled, dryRun);
 
-  const actionsRows = h(
-    "div",
-    null,
-    ...rule.actions.map((action, i) =>
-      h(RuleAction, {
-        key: itemKey(action),
-        action,
-        index: i,
-        remove: () => {
-          rule.actions.splice(i, 1);
-          markDirty();
-          renderActions();
-        },
-      }),
-    ),
-  );
-
-  const box = h(
-    DialogPanel,
-    { className: "modal-box rule-editor", onInput: trackDraft },
-    h(
-      "div",
-      { className: "editor-heading" },
-      h("span", { className: "eyebrow" }, "AUTOMOD RULE"),
-      h("h3", { className: "card-title" }, `Edit rule: ${r.name}`),
-      h(
-        "p",
-        { className: "muted" },
-        r.description || "Configure detection, actions and exemptions for this rule.",
-      ),
-    ),
-    h(
-      "div",
-      { className: "row checkbox-group" },
-      h(
-        "label",
-        { className: "checkbox-label" },
-        h(Input, {
-          type: "checkbox",
-          defaultChecked: rule.enabled,
-          onChange: (e) => (rule.enabled = e.target.checked),
-          className: "checkbox",
-        }),
-        "Enabled",
-      ),
-      h("label", { className: "checkbox-label" }, dryRun, "Dry-run (log only)"),
-    ),
-    spam
+  const actions = knownSpam
+    ? h(
+        EditorSection,
+        { title: "Actions" },
+        h("p", { className: "field-help" }, "Ban and purge the previous hour (3600 seconds) on the first match. No strikes."),
+      )
+    : spam
       ? h(
-          "div",
-          {},
-          h(
-            "p",
-            {},
-            textRule
-              ? "Exact text after trimming ends only. No case folding. Empty text never matches. Default minimum length is 20 Unicode scalars."
-              : "Exact common image bytes across channels. Extra images are allowed. Creates and relevant attachment edits participate. Work limits can reduce coverage.",
-          ),
-          field("Distinct channels", imageChannels),
-          image
-            ? field("Common distinct images per message", imageCount)
-            : null,
-          textRule
-            ? field("Minimum length (Unicode scalars after trim)", textLength)
-            : null,
-          field("Window (seconds)", imageWindow),
-          h(BanOptions, { action: spamBan }),
+          EditorSection,
+          { title: "Actions", hint: "Deletes the matched messages, then bans. Dry-run logs instead." },
+          h("div", { className: "escalation-row" }, h("span", null, "Ban"), h(BanOptions, { action: spamBan, onChange: refresh })),
         )
-      : r.rule_id === "badword"
-        ? h("p", { className: "field-help" }, "Manage words and advanced regex in Badwords. These settings apply to that saved list.")
-        : knownSpam
-          ? h("p", { className: "field-help" }, "First match: Ban and purge the previous hour (3600 seconds). No strike ladder. Manage samples and URLs on Known spam.")
-          : detectionFields,
-    spam || knownSpam
-      ? null
-      : field(
-          "Action escalation",
-          h(
-            "p",
-            { className: "field-help" },
-            "Strike count is the threshold for an action. Timeout minutes apply to timeout. Choose Ban or Ban and purge for each ban action.",
+      : h(
+          EditorSection,
+          { title: "Actions", hint: "Each match is a strike. The highest step reached runs." },
+          ...rule.actions.map((action, i) =>
+            h(RuleAction, {
+              key: itemKey(action),
+              action,
+              index: i,
+              onChange: refresh,
+              remove: () => {
+                rule.actions.splice(i, 1);
+                markDirty();
+                refresh();
+              },
+            }),
           ),
-          actionsRows,
           h(
             ActionButton,
             {
@@ -3801,29 +4221,61 @@ function RuleEditor({ record: r }) {
                   reason: "",
                 });
                 markDirty();
-                renderActions();
+                refresh();
               },
             },
-            "+ add action",
+            "+ add step",
           ),
-        ),
+        );
+
+  return h(
+    DialogPanel,
+    { className: "modal-box rule-editor", onInput: trackDraft },
+    h(RuleEditorHeader, {
+      title: `Edit rule: ${r.name}`,
+      enabled: rule.enabled,
+      dryRun,
+      dryRunRef,
+      onEnabled: (on) => {
+        rule.enabled = on;
+        refresh();
+      },
+      onDryRun: (on) => {
+        rule.dry_run = on;
+        setDryRun(on);
+      },
+    }),
+    h(RuleSummary, { text: summary }),
     h(
-      "div",
-      { className: "row form-row" },
-      field("Whitelist roles (ids, comma)", whitelistText),
-      field("Whitelist channels (ids)", channelsText),
-      field("Whitelist users (ids)", usersText),
+      EditorSection,
+      { title: "Trigger", hint: trigger.hint },
+      trigger.text ? h("p", null, trigger.text) : null,
+      fields.length ? h(TriggerSentence, { fields, values, onValue: setValue }) : null,
+      r.rule_id === "invite"
+        ? field(
+            "Allowed invite codes (comma-separated)",
+            h(Input, {
+              type: "text",
+              defaultValue: values.allowlist_codes,
+              placeholder: "code-one, code-two",
+              className: "input input-sm",
+              onInput: (e) => setValue("allowlist_codes", e.target.value),
+            }),
+            h("p", { className: "field-help" }, "Invites with these codes are allowed."),
+          )
+        : null,
     ),
+    actions,
+    h(RuleExceptions, { rule, names, rememberUser, onChange: refresh, pending }),
     h(
-      "div",
-      { className: "row checkbox-group" },
-      h("label", { className: "checkbox-label" }, skipMod, "Skip moderators"),
-      field("Only these channels (empty means all)", includeChannels),
+      EditorSection,
+      { title: "Scope", className: "rule-scope" },
+      field("Applies to", scopeSel),
+      h(RuleAdvanced, { rule, names, onChange: refresh, pending }),
     ),
     h(
       "div",
       { className: "modal-action" },
-      field("Applies to", scopeSel),
       h(
         ActionButton,
         {
@@ -3831,20 +4283,22 @@ function RuleEditor({ record: r }) {
           onClick: async () => {
             try {
               if (spam) {
-                const punish = !dryRunRef.current.checked;
+                // The header toggle is the source of truth, including scripted checks.
+                const punish = !(dryRunRef.current?.checked ?? dryRun);
+                const number = (key) => Number(values[key]);
                 if (textRule) {
                   rule.params = {
                     mode: "exact_text",
-                    min_channels: Number(imageChannelsRef.current.value),
-                    window_secs: Number(imageWindowRef.current.value),
-                    min_length: Number(textLengthRef.current.value),
+                    min_channels: number("min_channels"),
+                    window_secs: number("window_secs"),
+                    min_length: number("min_length"),
                   };
                 } else {
                   rule.params = {
                     mode: punish ? "exact_image" : "exact_image_test",
-                    min_channels: Number(imageChannelsRef.current.value),
-                    min_attachments: Number(imageCountRef.current.value),
-                    window_secs: Number(imageWindowRef.current.value),
+                    min_channels: number("min_channels"),
+                    min_attachments: number("min_attachments"),
+                    window_secs: number("window_secs"),
                   };
                 }
                 rule.dry_run = !punish;
@@ -3869,20 +4323,20 @@ function RuleEditor({ record: r }) {
                   );
               } else if (r.rule_id !== "badword" && !knownSpam) {
                 const params = {};
-                for (const [key, label] of numberParams) {
-                  const input = numberParamsRef.current[key];
-                  const value = Number(input.value);
-                  if (input.value.trim() === "" || !Number.isSafeInteger(value) || value < 0)
+                for (const { key, label } of fields) {
+                  const raw = String(values[key] ?? "");
+                  const value = Number(raw);
+                  if (raw.trim() === "" || !Number.isSafeInteger(value) || value < 0)
                     throw new Error(`${label} must be a non-negative whole number.`);
                   if (key === "window_secs" && (value < 1 || value > 600))
                     throw new Error("Window must be 1–600 seconds.");
                   params[key] = value;
                 }
                 if (r.rule_id === "invite") {
-                  // Legacy allowlist_guilds was never read by the bot. Do not
-                  // reinterpret those guild IDs as invite codes on edit.
-                  params.allowlist_codes = inviteCodes(inviteCodesRef.current.value
-                    .split(",")).map((code) => code.trim()).filter(Boolean);
+                  params.allowlist_codes = String(values.allowlist_codes || "")
+                    .split(",")
+                    .map((code) => code.trim())
+                    .filter(Boolean);
                 }
                 rule.params = params;
               }
@@ -3890,11 +4344,7 @@ function RuleEditor({ record: r }) {
               toast("Invalid detection settings: " + e.message, "error");
               return;
             }
-            rule.whitelist_roles = splitIds(whitelistTextRef.current.value);
-            rule.whitelist_channels = splitIds(channelsTextRef.current.value);
-            rule.whitelist_users = splitIds(usersTextRef.current.value);
-            rule.skip_moderators = skipModRef.current?.checked ?? rule.skip_moderators;
-            rule.include_channels = splitIds(includeChannelsRef.current?.value || "");
+            if (!flushPendingIds(pending)) return;
             const scope = scopeSelRef.current.value;
             const saved = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", {
               scope,
@@ -3938,7 +4388,6 @@ function RuleEditor({ record: r }) {
       ),
     ),
   );
-  return box;
 }
 
 function parseSnowflake(raw) {
@@ -3986,19 +4435,19 @@ function applyPlanStepInput(step, type, raw) {
 // A rule's escalation steps in plain words (#620), e.g. "Strike 1: Warn · Strike 3: Timeout 10 min".
 // Lists only the steps the bot can run: at each strike it picks the last step with the highest
 // strike count reached (RuleDef::action_for_strike), and a timeout lasts at least one minute.
-function describeRuleActions(rule) {
+function ruleActionName(step) {
+  if (step.action === "timeout") return `Timeout ${Math.max(1, Number(step.duration_minutes) || 0)} min`;
+  if (step.action === "ban")
+    return step.purge_last_hour
+      ? "Ban and delete the last hour of messages"
+      : step.delete_days
+        ? `Ban and delete ${step.delete_days} day(s) of messages`
+        : "Ban";
+  const action = String(step.action || "unknown");
+  return action[0].toUpperCase() + action.slice(1);
+}
+function describeRuleActions(rule, name = ruleActionName) {
   const actions = rule.actions ?? [];
-  const name = (step) => {
-    if (step.action === "timeout") return `Timeout ${Math.max(1, Number(step.duration_minutes) || 0)} min`;
-    if (step.action === "ban")
-      return step.purge_last_hour
-        ? "Ban and delete the last hour of messages"
-        : step.delete_days
-          ? `Ban and delete ${step.delete_days} day(s) of messages`
-          : "Ban";
-    const action = String(step.action || "unknown");
-    return action[0].toUpperCase() + action.slice(1);
-  };
   const at = (step) => step.at ?? 0;
   const forStrike = (strike) =>
     actions.reduce((best, step) => (at(step) <= strike && (!best || at(step) >= at(best)) ? step : best), null);
@@ -7335,96 +7784,127 @@ function scopeSelect(
     allowGlobal && isBotOwner() && h("option", { value: "global" }, globalLabel),
   );
 }
-function BanOptions({ action }) {
-  const legacyDays = action.delete_days || 0;
-  const selected = action.purge_last_hour ? "purge" : legacyDays ? "legacy" : "ban";
-  return field(
-    "Ban behavior",
+function BanOptions({ action, onChange }) {
+  const id = React.useId();
+  // An existing day count stays selectable until the editor closes.
+  const [legacyDays] = useState(() => action.delete_days || 0);
+  const selected = action.purge_last_hour ? "purge" : action.delete_days ? "legacy" : "ban";
+  return h(
+    "div",
+    { className: "ban-options" },
     h(
-      Select,
-      {
-        className: "select",
-        defaultValue: selected,
-        onChange: (event) => {
-          const mode = event.target.value;
-          action.purge_last_hour = mode === "purge";
-          action.delete_days = mode === "legacy" ? legacyDays : 0;
+      Field,
+      { className: "ban-behavior" },
+      h(Label, { className: "sr-only" }, "Ban behavior"),
+      h(
+        Select,
+        {
+          className: "select select-sm",
+          defaultValue: selected,
+          onChange: (event) => {
+            const mode = event.target.value;
+            action.purge_last_hour = mode === "purge";
+            action.delete_days = mode === "legacy" ? legacyDays : 0;
+            onChange?.();
+          },
         },
-      },
-      h("option", { value: "ban" }, "Ban"),
-      h("option", { value: "purge" }, "Ban and purge (previous hour)"),
-      legacyDays > 0 && h("option", { value: "legacy" }, `Keep existing: delete ${legacyDays} day(s)`),
+        h("option", { value: "ban" }, "Keep messages"),
+        h("option", { value: "purge" }, "Delete last hour"),
+        legacyDays > 0 && h("option", { value: "legacy" }, `Delete ${legacyDays} day(s)`),
+      ),
     ),
-    h("p", { className: "field-help" }, "Ban keeps earlier messages. Ban and purge asks Discord to delete this member’s messages across the server from the previous hour. Applies only to ban actions; dry-run never bans or purges."),
+    h(InfoTip, { id: `ban-help-${id}`, label: "About ban behavior" }, [
+      "Keep messages: their earlier messages stay.",
+      "Delete last hour: Discord removes their messages from the past hour, server-wide.",
+      "Dry-run never bans or deletes.",
+    ]),
   );
 }
 
-function RuleAction({ action, index, remove }) {
+// One escalation step as a compact row: "Strike [1] [Ban] [Keep messages]".
+// Only the chosen action's own setting shows: minutes for a timeout, messages for a ban.
+function RuleAction({ action, index, remove, onChange, strike = true, clearBan = false, choices = ["log", "delete", "warn", "timeout", "kick", "ban"] }) {
+  const [kind, setKind] = useState(action.action);
   return h(
     "div",
-    { className: "card card-border escalation-step" },
+    { className: "escalation-step" },
     h(
       "div",
-      { className: "row title-row" },
-      h("strong", null, `Action ${index + 1}`),
+      { className: "escalation-row" },
+      strike
+        ? h(
+            Field,
+            { className: "trigger-field" },
+            h(Label, { className: "escalation-label" }, "Strike", h("span", { className: "sr-only" }, " count")),
+            h(Input, {
+              className: "input input-num",
+              type: "number",
+              min: 1,
+              defaultValue: action.at,
+              onChange: (event) => {
+                action.at = Math.max(1, parseInt(event.target.value) || 1);
+                onChange?.();
+              },
+            }),
+          )
+        : null,
       h(
-        IconButton,
-        { action: "remove", label: `Remove action ${index + 1}`, onClick: remove },
-      ),
-    ),
-    h(
-      "div",
-      { className: "escalation-fields" },
-      field(
-        "Strike count",
-        h(Input, {
-          className: "input",
-          type: "number",
-          min: 1,
-          defaultValue: action.at,
-          onChange: (event) => {
-            action.at = Math.max(1, parseInt(event.target.value) || 1);
-          },
-        }),
-      ),
-      field(
-        "Action",
+        Field,
+        { className: "trigger-field" },
+        h(Label, { className: "sr-only" }, "Action"),
         h(
           Select,
           {
-            className: "select",
-            defaultValue: action.action,
+            className: "select select-sm",
+            defaultValue: kind,
             onChange: (event) => {
-              action.action = event.target.value;
+              const next = event.target.value;
+              action.action = next;
+              // Custom rules always defaulted a new timeout to an hour; escalation steps keep their value.
+              if (clearBan && next === "timeout" && !action.duration_minutes) action.duration_minutes = 60;
+              if (clearBan && next !== "ban") {
+                action.delete_days = 0;
+                action.purge_last_hour = false;
+              }
+              setKind(next);
+              onChange?.();
             },
           },
-          ...["log", "delete", "warn", "timeout", "kick", "ban"].map((value) =>
-            h("option", { key: value, value }, value),
-          ),
+          ...choices.map((value) => h("option", { key: value, value }, RULE_ACTION_LABELS[value])),
         ),
       ),
-      field(
-        "Timeout (minutes)",
-        h(Input, {
-          className: "input",
-          type: "number",
-          min: 0,
-          defaultValue: action.duration_minutes ?? 0,
-          title: "minutes (timeout)",
-          onChange: (event) => {
-            action.duration_minutes = parseInt(event.target.value) || 0;
-          },
-        }),
-      ),
-      h(BanOptions, { action }),
+      kind === "timeout"
+        ? h(
+            Field,
+            { className: "trigger-field" },
+            h(Label, { className: "sr-only" }, "Timeout (minutes)"),
+            h(Input, {
+              className: "input input-num",
+              type: "number",
+              min: clearBan ? 1 : 0,
+              defaultValue: action.duration_minutes ?? 0,
+              onChange: (event) => {
+                action.duration_minutes = parseInt(event.target.value) || 0;
+                onChange?.();
+              },
+            }),
+            h("span", { "aria-hidden": "true" }, "min"),
+          )
+        : null,
+      kind === "ban" ? h(BanOptions, { action, onChange }) : null,
+      remove
+        ? h(IconButton, { action: "remove", label: `Remove action ${index + 1}`, className: "btn btn-sm btn-square escalation-remove", onClick: remove })
+        : null,
     ),
-    field(
-      "Reason template",
+    h(
+      Field,
+      { className: "escalation-reason" },
+      h(Label, { className: "escalation-label" }, "Reason", h("span", { className: "sr-only" }, " template")),
       h(Input, {
-        className: "input",
+        className: "input input-sm",
         type: "text",
         defaultValue: action.reason || "",
-        placeholder: "reason template",
+        placeholder: "Shown in logs (optional)",
         onChange: (event) => {
           action.reason = event.target.value;
         },

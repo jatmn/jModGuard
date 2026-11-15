@@ -6358,6 +6358,10 @@ async fn role_mapped_moderator_reaches_only_that_guild_at_its_level() {
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
     assert_eq!(denied["code"], "guild_access_denied");
+    // Picker names serve the rule editors, which need the settings level.
+    let (status, denied) = f.request("POST", "/api/guilds/10/server-names", "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    assert_eq!(denied["code"], "guild_access_denied");
     // Another guild, owner-only routes and Manage Server routes stay closed.
     let not_manager = "you cannot manage this server (needs MANAGE_GUILD permission)";
     let not_owner = "global config requires the configured bot owner (bot.owner_id)";
@@ -6756,6 +6760,68 @@ async fn case_removal_role_ids_require_administrator_or_server_owner() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn server_names_serve_the_bot_snapshot_with_string_ids_and_no_discord_call() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (status, body) = f.request("POST", "/api/guilds/10/server-names", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, serde_json::json!({"roles": [], "channels": []}));
+
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    let names = db::guild_data::ServerNames {
+        roles: vec![db::guild_data::ServerRoleName {
+            id: "9007199254740993".into(),
+            name: "Moderators".into(),
+            color: 0x3498db,
+            position: 3,
+            managed: false,
+        }],
+        channels: vec![db::guild_data::ServerChannelName {
+            id: "9007199254740995".into(),
+            name: "general".into(),
+            kind: "text".into(),
+            parent_id: None,
+            position: 0,
+        }],
+        observed_at_ms: None,
+    };
+    assert!(
+        store
+            .replace_server_names(scope, names, 1_700)
+            .await
+            .unwrap()
+    );
+    let discord_calls = f.discord.member_calls.load(Ordering::SeqCst)
+        + f.discord.me_calls.load(Ordering::SeqCst)
+        + f.discord.token_calls.load(Ordering::SeqCst);
+    for method in ["GET", "POST"] {
+        let (status, body) = f.request(method, "/api/guilds/10/server-names", "").await;
+        assert_eq!(status, StatusCode::OK, "{method}: {body}");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "roles": [{"id": "9007199254740993", "name": "Moderators", "color": 3447003, "position": 3, "managed": false}],
+                "channels": [{"id": "9007199254740995", "name": "general", "kind": "text", "parent_id": null, "position": 0}],
+                "observed_at_ms": 1700,
+            })
+        );
+    }
+    assert_eq!(
+        f.discord.member_calls.load(Ordering::SeqCst)
+            + f.discord.me_calls.load(Ordering::SeqCst)
+            + f.discord.token_calls.load(Ordering::SeqCst),
+        discord_calls
+    );
 }
 
 #[tokio::test]
