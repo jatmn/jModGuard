@@ -434,15 +434,15 @@ pub async fn get_command_row(db: &Db, guild_id: i64, name: &str) -> Result<Optio
 }
 
 pub async fn upsert_command(db: &Db, guild_id: i64, name: &str, cmd: &CommandDef) -> Result<()> {
-    if crate::defaults::rejects_binary_overlay_command_persist(name, cmd) {
-        anyhow::bail!(crate::defaults::command_persist_rejected_message(name));
+    if let Some(error) = crate::defaults::command_persist_error(name, cmd, guild_id) {
+        anyhow::bail!(error);
     }
     upsert_row(
         db,
         "commands",
         "guild_id, name",
         vec![guild_id.into(), name.to_string().into()],
-        cmd.clone(),
+        crate::defaults::command_row_for_storage(name, cmd),
         true,
         None,
     )
@@ -1173,9 +1173,27 @@ async fn copy_guild_config_inner(
         if wants("commands") {
             if src != dst {
                 tx.execute_reclaim("DELETE FROM commands WHERE guild_id = ?1", params![dst])?;
+                // Built-in overrides are per server (#623): a global built-in row is a
+                // shipped seed, never a server override, and the global scope takes none.
+                let builtin_filter = if src == GLOBAL_SCOPE || dst == GLOBAL_SCOPE {
+                    let names: Vec<String> = crate::defaults::default_commands()
+                        .iter()
+                        .filter(|cmd| {
+                            cmd.name
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                        })
+                        .map(|cmd| format!("'{}'", cmd.name))
+                        .collect();
+                    format!(" AND lower(name) NOT IN ({})", names.join(", "))
+                } else {
+                    String::new()
+                };
                 tx.execute_copy(
-                    "INSERT INTO commands (guild_id, name, data)
-                     SELECT ?1, name, data FROM commands WHERE guild_id = ?2",
+                    &format!(
+                        "INSERT INTO commands (guild_id, name, data)
+                     SELECT ?1, name, data FROM commands WHERE guild_id = ?2{builtin_filter}"
+                    ),
                     dst,
                     src,
                     "commands",
@@ -1551,11 +1569,14 @@ impl ConfigurationSnapshotRows {
                 }
             }
         }
-        let mut commands = self.global_commands.clone();
-        for (name, def) in self.guild_commands {
-            commands.insert(name, def);
-        }
-        crate::defaults::apply_shipped_builtin_commands(&mut commands);
+        // Built-in overrides are per server; the global scope has none.
+        let overrides = if guild_id == GLOBAL_SCOPE {
+            std::collections::HashMap::new()
+        } else {
+            self.guild_commands
+        };
+        let commands =
+            crate::defaults::effective_command_registry(&self.global_commands, &overrides);
         let mut templates = std::collections::HashMap::new();
         for (event, def) in crate::defaults::default_templates() {
             let resolved = resolve(
@@ -1702,12 +1723,14 @@ pub async fn load_slash_commands_with_version(
     db.with_conn(move |conn| {
         let tx = conn.transaction_consistent_read()?;
         let versions = get_version_state_conn(&tx)?;
-        let guild: std::collections::HashMap<String, CommandDef> =
-            rows_map_json(&tx, "commands", "name", "data", guild_id)?;
-        let mut commands: std::collections::HashMap<String, CommandDef> =
+        let guild: std::collections::HashMap<String, CommandDef> = if guild_id == GLOBAL_SCOPE {
+            std::collections::HashMap::new()
+        } else {
+            rows_map_json(&tx, "commands", "name", "data", guild_id)?
+        };
+        let global: std::collections::HashMap<String, CommandDef> =
             rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
-        commands.extend(guild);
-        crate::defaults::apply_shipped_builtin_commands(&mut commands);
+        let commands = crate::defaults::effective_command_registry(&global, &guild);
         tx.finish_read()?;
         Ok((versions.slash, versions.slash_revision, commands))
     })
@@ -1721,12 +1744,14 @@ pub async fn load_slash_commands_with_version_primary(
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_snapshot()?;
         let versions = get_version_state_conn(&tx)?;
-        let guild: std::collections::HashMap<String, CommandDef> =
-            rows_map_json(&tx, "commands", "name", "data", guild_id)?;
-        let mut commands: std::collections::HashMap<String, CommandDef> =
+        let guild: std::collections::HashMap<String, CommandDef> = if guild_id == GLOBAL_SCOPE {
+            std::collections::HashMap::new()
+        } else {
+            rows_map_json(&tx, "commands", "name", "data", guild_id)?
+        };
+        let global: std::collections::HashMap<String, CommandDef> =
             rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
-        commands.extend(guild);
-        crate::defaults::apply_shipped_builtin_commands(&mut commands);
+        let commands = crate::defaults::effective_command_registry(&global, &guild);
         tx.finish_read()?;
         Ok((versions.slash, versions.slash_revision, commands))
     })
@@ -1847,15 +1872,15 @@ pub async fn upsert_enrolled_command(
     name: &str,
     command: &CommandDef,
 ) -> Result<()> {
-    if crate::defaults::rejects_binary_overlay_command_persist(name, command) {
-        anyhow::bail!(crate::defaults::command_persist_rejected_message(name));
+    if let Some(error) = crate::defaults::command_persist_error(name, command, scope.guild_id()) {
+        anyhow::bail!(error);
     }
     upsert_row(
         db,
         "commands",
         "guild_id, name",
         vec![scope.guild_id().into(), name.to_owned().into()],
-        command.clone(),
+        crate::defaults::command_row_for_storage(name, command),
         true,
         Some(scope),
     )

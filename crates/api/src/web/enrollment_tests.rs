@@ -2860,7 +2860,7 @@ async fn individual_configuration_reads_keep_global_context_owner_only() {
 }
 
 #[tokio::test]
-async fn builtin_command_effective_read_uses_shipped_definition_and_access() {
+async fn builtin_command_reads_apply_the_server_override_within_its_floor() {
     use jmodguard::db::SqlExecutor;
 
     let f = Fixture::new(false).await;
@@ -2883,10 +2883,12 @@ async fn builtin_command_effective_read_uses_shipped_definition_and_access() {
     stored.channels = vec![777];
     stored.description = "legacy dashboard row".into();
     stored.aliases = vec!["legacy-alias".into()];
+    stored.builtin_override = true;
     let mut stored_voice = shipped_voice.clone();
     stored_voice.enabled = false;
     stored_voice.description = "legacy voice row".into();
     stored_voice.behavior = crate::types::Behavior::Say;
+    stored_voice.builtin_override = true;
     let stored_json = serde_json::to_string(&stored).unwrap();
     let voice_json = serde_json::to_string(&stored_voice).unwrap();
     f.app
@@ -2906,21 +2908,30 @@ async fn builtin_command_effective_read_uses_shipped_definition_and_access() {
         })
         .await
         .unwrap();
+    // A server row under a built-in name is that server's override (#623): its
+    // settings apply, its name and behavior kind stay shipped, and its permission
+    // never drops below the shipped level.
+    let check_ban = |effective: &serde_json::Value| {
+        assert_eq!(effective["description"], "legacy dashboard row");
+        assert_eq!(effective["aliases"], serde_json::json!(["legacy-alias"]));
+        assert_eq!(effective["enabled"], false);
+        assert_eq!(effective["permission"], "owner");
+        assert_eq!(effective["roles"], serde_json::json!(["555"]));
+        assert_eq!(effective["channels"], serde_json::json!(["777"]));
+        assert_eq!(effective["behavior"]["kind"], "ban");
+    };
+    let check_voice = |effective: &serde_json::Value| {
+        assert_eq!(effective["description"], "legacy voice row");
+        assert_eq!(
+            effective["behavior"]["kind"], "voice",
+            "the shipped behavior kind stays"
+        );
+        assert_eq!(effective["enabled"], false);
+        assert_eq!(effective["permission"], shipped_voice.permission.as_str());
+    };
     let (status, body) = f.request("GET", "/api/guilds/10/commands/ban", "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["effective"]["description"], shipped.description);
-    assert_eq!(
-        body["effective"]["aliases"],
-        serde_json::json!(shipped.aliases)
-    );
-    assert_eq!(body["effective"]["enabled"], shipped.enabled);
-    assert_eq!(body["effective"]["permission"], shipped.permission.as_str());
-    assert_eq!(body["effective"]["roles"], serde_json::json!([]));
-    assert_eq!(body["effective"]["channels"], serde_json::json!([]));
-    assert_eq!(
-        body["effective"]["cooldown_secs"],
-        serde_json::json!(shipped.cooldown_secs)
-    );
+    check_ban(&body["effective"]);
     assert_eq!(
         body["guild_override"]["description"],
         "legacy dashboard row"
@@ -2933,35 +2944,17 @@ async fn builtin_command_effective_read_uses_shipped_definition_and_access() {
             .iter()
             .find(|row| row["name"] == "ban")
             .expect("bundle ban");
-        assert_eq!(ban["effective"]["description"], shipped.description);
-        assert_eq!(
-            ban["effective"]["aliases"],
-            serde_json::json!(shipped.aliases)
-        );
-        assert_eq!(ban["effective"]["enabled"], shipped.enabled);
-        assert_eq!(ban["effective"]["permission"], shipped.permission.as_str());
-        assert_eq!(ban["effective"]["roles"], serde_json::json!([]));
-        assert_eq!(ban["effective"]["channels"], serde_json::json!([]));
-        assert_eq!(
-            ban["effective"]["cooldown_secs"],
-            serde_json::json!(shipped.cooldown_secs)
-        );
+        check_ban(&ban["effective"]);
         assert_eq!(ban["guild_override"]["description"], "legacy dashboard row");
+        assert_eq!(
+            (ban["builtin"].clone(), ban["min_permission"].clone()),
+            (serde_json::json!(true), serde_json::json!("mod"))
+        );
         let voice = commands
             .iter()
             .find(|row| row["name"] == "voice")
             .expect("bundle voice");
-        assert_eq!(voice["effective"]["description"], shipped_voice.description);
-        assert_eq!(voice["effective"]["behavior"]["kind"], "voice");
-        assert_eq!(voice["effective"]["enabled"], shipped_voice.enabled);
-        assert_eq!(
-            voice["effective"]["permission"],
-            shipped_voice.permission.as_str()
-        );
-        assert_eq!(
-            voice["effective"]["cooldown_secs"],
-            serde_json::json!(shipped_voice.cooldown_secs)
-        );
+        check_voice(&voice["effective"]);
         assert_eq!(voice["guild_override"]["description"], "legacy voice row");
     }
     let (status, listed) = f.request("GET", "/api/guilds/10/commands", "").await;
@@ -2972,34 +2965,10 @@ async fn builtin_command_effective_read_uses_shipped_definition_and_access() {
         .iter()
         .find(|row| row["name"] == "ban")
         .expect("listed ban");
-    assert_eq!(listed_ban["effective"]["description"], shipped.description);
-    assert_eq!(listed_ban["effective"]["enabled"], shipped.enabled);
-    assert_eq!(
-        listed_ban["effective"]["permission"],
-        shipped.permission.as_str()
-    );
-    assert_eq!(listed_ban["effective"]["roles"], serde_json::json!([]));
-    assert_eq!(listed_ban["effective"]["channels"], serde_json::json!([]));
-    assert_eq!(
-        listed_ban["effective"]["cooldown_secs"],
-        serde_json::json!(shipped.cooldown_secs)
-    );
+    check_ban(&listed_ban["effective"]);
     let (status, voice_body) = f.request("GET", "/api/guilds/10/commands/voice", "").await;
     assert_eq!(status, StatusCode::OK, "{voice_body}");
-    assert_eq!(
-        voice_body["effective"]["description"],
-        shipped_voice.description
-    );
-    assert_eq!(voice_body["effective"]["behavior"]["kind"], "voice");
-    assert_eq!(voice_body["effective"]["enabled"], shipped_voice.enabled);
-    assert_eq!(
-        voice_body["effective"]["permission"],
-        shipped_voice.permission.as_str()
-    );
-    assert_eq!(
-        voice_body["effective"]["cooldown_secs"],
-        serde_json::json!(shipped_voice.cooldown_secs)
-    );
+    check_voice(&voice_body["effective"]);
     assert_eq!(
         listed["guild"]
             .as_array()
@@ -3009,6 +2978,46 @@ async fn builtin_command_effective_read_uses_shipped_definition_and_access() {
             .expect("raw ban row")[1]["description"],
         "legacy dashboard row"
     );
+
+    // Writes: an override may not lower the permission; a valid one saves and
+    // Reset to default (a guild delete) brings back the shipped command.
+    let mut widened = shipped.clone();
+    widened.permission = "everyone".into();
+    let (status, body) = f
+        .request(
+            "PUT",
+            "/api/guilds/10/commands/ban",
+            &serde_json::json!({"scope":"guild","data":widened}).to_string(),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.to_string().contains("needs at least `mod` permission"),
+        "{body}"
+    );
+    let mut edited = shipped.clone();
+    edited.description = "server ban".into();
+    let (status, body) = f
+        .request(
+            "PUT",
+            "/api/guilds/10/commands/ban",
+            &serde_json::json!({"scope":"guild","data":edited}).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = f.request("GET", "/api/guilds/10/commands/ban", "").await;
+    assert_eq!(body["effective"]["description"], "server ban");
+    let (status, body) = f
+        .request(
+            "DELETE",
+            "/api/guilds/10/commands/ban",
+            &serde_json::json!({"scope":"guild"}).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, body) = f.request("GET", "/api/guilds/10/commands/ban", "").await;
+    assert_eq!(body["effective"]["description"], shipped.description);
+    assert_eq!(body["effective"]["permission"], shipped.permission.as_str());
 }
 
 #[tokio::test]

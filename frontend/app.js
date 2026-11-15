@@ -3714,7 +3714,7 @@ function PickerChip({ kind, id, names, onRemove }) {
 // or refuses text still in the box through `pending`, as the old ID fields did.
 // The box text is picker state, so it survives the box being replaced when
 // names arrive, and member results are kept with the query they answer.
-function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pending, single = false }) {
+function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pending, single = false, idLabel }) {
   const [, bump] = useState(0);
   const [text, setText] = useState("");
   const [found, setFound] = useState(null);
@@ -3797,7 +3797,7 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
       type: "text",
       value: text,
       className: "input input-sm",
-      "aria-label": labelled ? undefined : `Add a ${noun} by ID`,
+      "aria-label": labelled ? undefined : idLabel || `Add a ${noun} by ID`,
       placeholder:
         kind === "user" && names.status !== "unavailable"
           ? "Search members by name, or paste an ID"
@@ -4434,15 +4434,6 @@ function splitIds(s) {
   return ids;
 }
 
-function applyPlanStepInput(step, type, raw) {
-  if (type === "reply" || type === "dm" || type === "log") step.template = raw;
-  else if (type === "add_role" || type === "remove_role") step.role_id = parseSnowflake(raw);
-  else if (type === "timeout") step.minutes = Number(raw) || 1;
-  else if (type === "ban") step.delete_days = Math.min(7, Math.max(0, Number(raw) || 0));
-  else if (type === "react") step.emoji = raw;
-  else if (type === "wait") step.secs = Math.max(1, Number(raw) || 1);
-}
-
 // A rule's escalation steps in plain words (#620), e.g. "Strike 1: Warn · Strike 3: Timeout 10 min".
 // Lists only the steps the bot can run: at each strike it picks the last step with the highest
 // strike count reached (RuleDef::action_for_strike), and a timeout lasts at least one minute.
@@ -4900,7 +4891,7 @@ function tabCommands() {
     ),
     !canManageServer() &&
       h("p", { className: "muted" }, "Editing commands needs Manage Server: command plans can grant roles and run moderation actions."),
-    h("p", { className: "muted" }, "Rename any command, change its replies, who can use it, and its cooldown."),
+    h("p", { className: "muted" }, "Change any command's replies, who can use it, and its cooldown. Built-ins keep their name and behavior."),
     h(GoodToKnow, {
       items: [
         "Custom commands can run several steps: reply, DM, log, change roles, timeout, kick or ban.",
@@ -4961,22 +4952,272 @@ function tabCommands() {
   );
 }
 
-function parsePlanParams(value) {
-  const params = JSON.parse(value || "{}");
-  if (!params || typeof params !== "object" || Array.isArray(params))
-    throw new Error("plan parameters must be an object");
-  if (params.steps !== undefined && !Array.isArray(params.steps))
-    throw new Error("plan steps must be an array");
-  params.steps = params.steps || [];
-  if (params.steps.some((step) => !step || typeof step !== "object" || Array.isArray(step)))
-    throw new Error("each plan step must be an object");
-  return params;
+// What each command behavior does and the settings it takes (#623), keyed by the
+// saved `behavior.kind` (src/types.rs Behavior). `does` starts the live summary;
+// each field edits one of the behavior's own params, so no JSON is needed.
+const COMMAND_REASON = { key: "default_reason", type: "text", label: "Default reason", hint: "Used when the moderator gives none." };
+const COMMAND_SUBCOMMAND = (options) => ({ key: "action", type: "choice", label: "Default subcommand", hint: "Runs when none is typed.", options });
+const COMMAND_BEHAVIORS = {
+  ban: { does: "bans the target", fields: [COMMAND_REASON, { key: "delete_days", type: "days", label: "Delete messages" }] },
+  softban: { does: "bans the target, deletes their last day of messages, then unbans", fields: [COMMAND_REASON] },
+  unban: { does: "unbans the target", fields: [COMMAND_REASON] },
+  kick: { does: "kicks the target", fields: [COMMAND_REASON] },
+  warn: { does: "warns the target", fields: [COMMAND_REASON] },
+  timeout: {
+    does: "times out the target",
+    fields: [{ key: "default_minutes", type: "number", label: "Default length", unit: "min", min: 0, max: 40320, hint: "Used when no minutes are given. 0 removes a timeout." }],
+  },
+  purge: { does: "deletes recent messages", fields: [{ key: "default_count", type: "number", label: "Default count", unit: "messages", min: 1, max: 100 }] },
+  slowmode: { does: "sets this channel's slowmode", fields: [{ key: "default_seconds", type: "number", label: "Default slowmode", unit: "s", min: 0, max: 21600 }] },
+  rule: { does: "manages Automod rules", fields: [COMMAND_SUBCOMMAND(["list", "toggle", "dryrun"])] },
+  template: { does: "manages log templates", fields: [COMMAND_SUBCOMMAND(["list", "get", "set", "reset"])] },
+  logchannel: { does: "manages log channels", fields: [COMMAND_SUBCOMMAND(["list", "set", "unset"])] },
+  warns: { does: "lists the target's warnings" },
+  warn_clear: { does: "clears the target's warnings" },
+  user_info: { does: "shows a member's profile, warnings and recent cases" },
+  banlist: { does: "lists recent bans" },
+  voice: { does: "reports which voice channel a user is in" },
+  say: { does: "posts a message as the bot" },
+  setname: { does: "sets the bot's nickname" },
+  set_prefix: { does: "changes the command prefix" },
+  help: { does: "lists commands" },
+  about: { does: "shows bot info" },
+  stats: { does: "shows server counts, release state and container use" },
+  testregex: { does: "tests a regex against a sample" },
+};
+
+const COMMAND_PERMISSIONS = { everyone: "Everyone", mod: "Mods and up", admin: "Admins and up", owner: "Bot owner only" };
+
+// Action plan steps (PlanStep): the label in the step picker and the summary phrase.
+const PLAN_STEP_LABELS = {
+  reply: "Reply",
+  dm: "Send DM",
+  log: "Log",
+  add_role: "Add role",
+  remove_role: "Remove role",
+  timeout: "Timeout",
+  kick: "Kick",
+  ban: "Ban",
+  delete_command_message: "Delete command message",
+  react: "React",
+  wait: "Wait",
+};
+const STEP_TIMEOUT_MAX = 40320;
+// Common reactions offered first; "Other…" takes any Unicode emoji (the bot reacts with
+// Unicode only). None are from the bot's log emoji map, which the WebUI never copies.
+const REACT_EMOJI = ["👍", "👋", "🎉", "❤️", "👀", "🙏", "😂", "🔥", "💯", "👏"];
+
+function wholeIn(value, min, max) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
+}
+
+function daysText(days) {
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
+function deleteDaysLabel(days) {
+  return days ? `Delete ${daysText(days)}` : "Keep messages";
+}
+
+function logEventLabel(event) {
+  return String(event).replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase());
+}
+
+// The log events a command can post: every event the Log channels page routes.
+function commandLogEvents() {
+  const cfg = state.config || {};
+  const routed = (cfg.log_channels || []).map((lc) => lc.event).filter(Boolean);
+  return routed.length ? routed : cfg.event_types || [];
+}
+
+function logEventOptions(current, withNone) {
+  const events = commandLogEvents();
+  return [
+    withNone ? h("option", { key: "", value: "" }, "None") : current ? null : h("option", { key: "", value: "", disabled: true }, "Choose an event…"),
+    current && !events.includes(current) ? h("option", { key: current, value: current }, `${current} (not a log event)`) : null,
+    ...events.map((event) => h("option", { key: event, value: event }, logEventLabel(event))),
+  ];
+}
+
+function joinPhrases(parts) {
+  return parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts[0] || "";
+}
+
+function quoted(text) {
+  const value = String(text ?? "").trim();
+  return value ? `“${value}”` : "…";
+}
+
+function countShown(value, unit = "") {
+  return Number.isSafeInteger(value) ? `${value}${unit}` : "…";
+}
+
+function roleShown(id, names) {
+  if (!id) return "a role (none yet)";
+  const role = names.roles.find((r) => r.id === String(id));
+  return role ? `@${role.name}` : `role ${id}`;
+}
+
+function planStepPhrase(step, names) {
+  switch (step.type) {
+    case "reply": return `replies ${quoted(step.template)}`;
+    case "dm": return `DMs ${quoted(step.template)}`;
+    case "log": return `logs ${step.event ? logEventLabel(step.event) : "an event"}`;
+    case "add_role": return `gives ${roleShown(step.role_id, names)}`;
+    case "remove_role": return `removes ${roleShown(step.role_id, names)}`;
+    case "timeout": return `times out the target for ${countShown(step.minutes, " min")}`;
+    case "kick": return "kicks the target";
+    case "ban": return step.delete_days ? `bans the target (deleting ${daysText(step.delete_days)} of messages)` : "bans the target";
+    case "delete_command_message": return "deletes the command message";
+    case "react": return `reacts ${String(step.emoji || "").trim() || "…"}`;
+    case "wait": return `waits ${countShown(step.secs, "s")}`;
+    default: return `runs ${step.type || "an unknown step"}`;
+  }
+}
+
+function commandDoesParts(data, names) {
+  const behavior = data.behavior || {};
+  const params = behavior.params || {};
+  if (behavior.kind === "plan") return (params.steps || []).map((step) => planStepPhrase(step, names));
+  const spec = COMMAND_BEHAVIORS[behavior.kind];
+  if (!spec) return [`runs the ${behavior.kind || "unknown"} behavior`];
+  if (behavior.kind === "ban" && params.delete_days) return [spec.does, `deletes ${daysText(params.delete_days)} of messages`];
+  const number = (spec.fields || []).find((f) => f.type === "number");
+  if (number) return [`${spec.does} (default ${countShown(params[number.key], number.unit === "s" ? "s" : ` ${number.unit}`)})`];
+  if (spec.fields?.[0]?.type === "choice") return [`${spec.does} (default: ${params.action || "…"})`];
+  return [spec.does];
+}
+
+// One sentence for the whole command, e.g. "!ban <user> [reason]: bans the target, deletes
+// 1 day of messages and replies “Banned {target}”. Mods and up, 5s cooldown."
+function commandSummaryText(data, names) {
+  const prefix = state.config?.settings?.prefix || "!";
+  const call = String(data.usage || "").trim() || `${prefix}${String(data.name || "").trim().toLowerCase() || "…"}`;
+  const parts = commandDoesParts(data, names);
+  if (String(data.response || "").trim()) parts.push(`replies ${quoted(data.response)}`);
+  const who = [COMMAND_PERMISSIONS[data.permission] || data.permission || "Everyone"];
+  if (data.roles.length) who.push(`with ${data.roles.length === 1 ? "1 chosen role" : `one of ${data.roles.length} roles`}`);
+  if (data.channels.length) who.push(`in ${data.channels.length === 1 ? "1 channel" : `${data.channels.length} channels`}`);
+  const cooldown = Number(data.cooldown_secs);
+  if (cooldown > 0) who.push(`${countShown(cooldown, "s")} cooldown`);
+  const logs = data.log_event ? ` Logs ${logEventLabel(data.log_event)}.` : "";
+  const off = data.enabled ? "" : " Off: the command is ignored.";
+  return `${call}: ${parts.length ? joinPhrases(parts) : "does nothing yet"}. ${who.join(", ")}.${logs}${off}`;
+}
+
+// The first thing Save must refuse, or null. Numbers are checked here so a typo
+// stops the save with a message instead of being clamped or sent as-is.
+function commandFormError(data) {
+  if (!wholeIn(data.cooldown_secs, 0, Number.MAX_SAFE_INTEGER)) return "Cooldown must be a whole number of seconds.";
+  const behavior = data.behavior || {};
+  for (const f of COMMAND_BEHAVIORS[behavior.kind]?.fields || []) {
+    if (f.type === "number" && !wholeIn(behavior.params?.[f.key], f.min, f.max))
+      return `${f.label} must be a whole number from ${f.min} to ${f.max}.`;
+  }
+  if (behavior.kind !== "plan") return null;
+  for (const [i, step] of (behavior.params?.steps || []).entries()) {
+    const n = `Step ${i + 1}`;
+    if ((step.type === "add_role" || step.type === "remove_role") && !step.role_id) return `${n}: choose a role.`;
+    if (step.type === "timeout" && !wholeIn(step.minutes, 1, STEP_TIMEOUT_MAX)) return `${n}: timeout must be 1 to ${STEP_TIMEOUT_MAX} minutes.`;
+    if (step.type === "wait" && !wholeIn(step.secs, 1, Number.MAX_SAFE_INTEGER)) return `${n}: wait must be a whole number of seconds, at least 1.`;
+    if (step.type === "react" && !String(step.emoji || "").trim()) return `${n}: choose an emoji.`;
+    if (step.type === "log" && !step.event) return `${n}: choose a log event.`;
+  }
+  return null;
+}
+
+// The fields a step of this type saves. Shared values carry over when the type changes.
+function planStepFor(type, prev) {
+  const template = typeof prev.template === "string" ? prev.template : "";
+  switch (type) {
+    case "reply":
+    case "dm": return { type, template };
+    case "log": return { type, event: prev.event || "plan_executed", template };
+    case "add_role":
+    case "remove_role": return { type, role_id: prev.role_id || "" };
+    case "timeout": return { type, minutes: wholeIn(prev.minutes, 1, STEP_TIMEOUT_MAX) ? prev.minutes : 60 };
+    case "ban": return { type, delete_days: prev.delete_days || 0 };
+    case "react": return { type, emoji: prev.emoji || REACT_EMOJI[0] };
+    case "wait": return { type, secs: wholeIn(prev.secs, 1, Number.MAX_SAFE_INTEGER) ? prev.secs : 5 };
+    default: return { type };
+  }
+}
+
+function numberValue(raw) {
+  const text = String(raw ?? "").trim();
+  return text === "" ? NaN : Number(text);
+}
+
+function DeleteDaysSelect({ label, value, onChange }) {
+  return h(
+    Field,
+    { className: "trigger-field" },
+    h(Label, { className: "sr-only" }, label),
+    h(
+      Select,
+      { className: "select select-sm", defaultValue: String(value || 0), onChange: (e) => onChange(Number(e.target.value)) },
+      // A saved count outside Discord's 0-7 (from the old JSON box) stays visible as it is.
+      [...new Set([0, 1, 2, 3, 4, 5, 6, 7, Number(value) || 0])].map((days) => h("option", { key: days, value: String(days) }, deleteDaysLabel(days))),
+    ),
+  );
+}
+
+function NumberField({ label, value, unit, min, max, onChange, hidden }) {
+  return h(
+    Field,
+    { className: "trigger-field" },
+    h(Label, { className: hidden ? "sr-only" : "escalation-label" }, label),
+    h(Input, {
+      type: "number",
+      className: "input input-num",
+      min,
+      max,
+      step: 1,
+      defaultValue: Number.isFinite(value) ? value : "",
+      onInput: (e) => onChange(numberValue(e.target.value)),
+    }),
+    unit ? h("span", { "aria-hidden": "true" }, unit) : null,
+  );
+}
+
+// One behavior param as its own input (#623).
+function CommandBehaviorField({ spec, params, onChange }) {
+  const set = (value) => {
+    params[spec.key] = value;
+    markDirty();
+    onChange();
+  };
+  const help = spec.hint ? h("p", { className: "field-help" }, spec.hint) : null;
+  if (spec.type === "number")
+    return h("div", { className: "field" }, h(NumberField, { label: spec.label, value: params[spec.key], unit: spec.unit, min: spec.min, max: spec.max, onChange: set }), help);
+  if (spec.type === "days")
+    return h(
+      "div",
+      { className: "field" },
+      h("span", { className: "escalation-label" }, spec.label),
+      " ",
+      h(DeleteDaysSelect, { label: spec.label, value: params[spec.key], onChange: set }),
+    );
+  if (spec.type === "choice") {
+    const current = String(params[spec.key] ?? "");
+    const options = spec.options.includes(current) || !current ? spec.options : [current, ...spec.options];
+    return field(
+      spec.label,
+      h(Select, { className: "select select-sm", defaultValue: current, onChange: (e) => set(e.target.value) }, options.map((value) => h("option", { key: value, value }, value))),
+      help,
+    );
+  }
+  return field(
+    spec.label,
+    h(Input, { type: "text", className: "input input-sm", defaultValue: params[spec.key] ?? "", onInput: (e) => set(e.target.value) }),
+    help,
+  );
 }
 
 function CommandEditor({ record: c }) {
   const isNew = c === null;
-  const [data] = useState(() =>
-    isNew
+  const [data] = useState(() => {
+    const draft = isNew
       ? {
           name: "",
           aliases: [],
@@ -4992,246 +5233,263 @@ function CommandEditor({ record: c }) {
           response: "",
           log_event: "",
         }
-      : JSON.parse(JSON.stringify(c.effective)),
-  );
-
-  const nameInRef = useRef(null);
-  const nameIn = h(Input, {
-    ref: nameInRef,
-    type: "text",
-    defaultValue: data.name,
-    placeholder: "command name",
-    className: "input",
+      : JSON.parse(JSON.stringify(c.effective));
+    draft.roles = Array.isArray(draft.roles) ? draft.roles.map(String) : [];
+    draft.channels = Array.isArray(draft.channels) ? draft.channels.map(String) : [];
+    draft.cooldown_secs = Number(draft.cooldown_secs) || 0;
+    draft.behavior = draft.behavior && typeof draft.behavior === "object" ? draft.behavior : { kind: "plan", params: { steps: [] } };
+    if (draft.behavior.kind === "plan" || COMMAND_BEHAVIORS[draft.behavior.kind]?.fields) {
+      const params = draft.behavior.params;
+      draft.behavior.params = params && typeof params === "object" && !Array.isArray(params) ? params : {};
+    }
+    if (draft.behavior.kind === "plan" && !Array.isArray(draft.behavior.params.steps)) draft.behavior.params.steps = [];
+    return draft;
   });
-  const descInRef = useRef(null);
-  const descIn = h(Input, {
-    ref: descInRef,
-    type: "text",
-    defaultValue: data.description,
-    placeholder: "description",
-    className: "input",
-  });
-  const usageInRef = useRef(null);
-  const usageIn = h(Input, {
-    ref: usageInRef,
-    type: "text",
-    defaultValue: data.usage,
-    placeholder: "usage",
-    className: "input",
-  });
-  const aliasesInRef = useRef(null);
-  const aliasesIn = h(Input, {
-    ref: aliasesInRef,
-    type: "text",
-    defaultValue: (data.aliases || []).join(","),
-    placeholder: "aliases, comma separated",
-    className: "input",
-  });
-  const respInRef = useRef(null);
-  const respIn = h(Textarea, {
-    ref: respInRef,
-    defaultValue: data.response || "",
-    placeholder: "response template, e.g. Banned {target} | {reason}",
-    className: "textarea",
-  });
-  const permInRef = useRef(null);
-  const permIn = h(
-    Select,
-    { ref: permInRef, defaultValue: data.permission, className: "select" },
-    ["everyone", "mod", "admin", "owner"].map((p) => h("option", { value: p }, p)),
-  );
-  const cdInRef = useRef(null);
-  const cdIn = h(Input, {
-    ref: cdInRef,
-    type: "number",
-    min: 0,
-    defaultValue: data.cooldown_secs || 0,
-    className: "input",
-  });
-  const roleInRef = useRef(null);
-  const roleIn = h(Input, {
-    ref: roleInRef,
-    type: "text",
-    defaultValue: (data.roles || []).join(","),
-    placeholder: "role ids",
-    className: "input",
-  });
-  const chanInRef = useRef(null);
-  const chanIn = h(Input, {
-    ref: chanInRef,
-    type: "text",
-    defaultValue: (data.channels || []).join(","),
-    placeholder: "channel ids",
-    className: "input",
-  });
-  const logInRef = useRef(null);
-  const logIn = h(Input, {
-    ref: logInRef,
-    type: "text",
-    defaultValue: data.log_event || "",
-    placeholder: "mod_action",
-    className: "input",
-  });
+  const [aliasText] = useState(() => ({ value: (data.aliases || []).join(", ") }));
+  const [, bump] = useState(0);
+  const refresh = () => bump((n) => n + 1);
+  const [names, rememberUser] = useServerNames([]);
+  const pending = useRef(new Set()).current;
   const scopeSelRef = useRef(null);
-  const scopeSel = scopeSelect(scopeSelRef);
-  const isPlan = data.behavior && data.behavior.kind === "plan";
-  const [behaviorJson, setBehaviorJson] = useState(() =>
-    JSON.stringify(isPlan ? data.behavior.params || {} : data.behavior || {}, null, 2),
-  );
-  const [, setStepsRevision] = useState(0);
-  const renderSteps = () => setStepsRevision((value) => value + 1);
-  const syncPlanJson = () => {
-    if (isPlan) setBehaviorJson(JSON.stringify(data.behavior.params || {}, null, 2));
+  // Built-ins take per-server overrides only (#623): their name and behavior kind stay
+  // shipped, and their permission never drops below the shipped level.
+  const builtin = Boolean(c?.builtin);
+  const fixed = builtin && state.guildId === "0";
+  const scopeSel = scopeSelect(scopeSelRef, undefined, undefined, !builtin);
+  const kind = data.behavior.kind;
+  const isPlan = kind === "plan";
+  const spec = COMMAND_BEHAVIORS[kind];
+  const steps = isPlan ? data.behavior.params.steps : [];
+  const text = (key, props = {}) =>
+    h(Input, {
+      type: "text",
+      className: "input input-sm",
+      defaultValue: data[key] ?? "",
+      onInput: (e) => {
+        data[key] = e.target.value;
+        refresh();
+      },
+      ...props,
+    });
+  const structural = () => {
+    markDirty();
+    refresh();
   };
-  const behaviorAreaRef = useRef(null);
-  const behaviorArea = h(Textarea, {
-    ref: behaviorAreaRef,
-    className: "mono textarea",
-    style: { minHeight: "70px" },
-    value: behaviorJson,
-    onChange: (event) => setBehaviorJson(event.target.value),
-    onBlur: () => {
-      if (!isPlan) return;
-      try {
-        data.behavior.params = parsePlanParams(behaviorJson);
-        renderSteps();
-      } catch (error) {
-        toast("Invalid behavior JSON: " + error.message, "error");
-      }
-    },
-  });
-  const typePlaceholder = (t) =>
-    ({
-      reply: "message template, e.g. Hi {user}!",
-      dm: "DM template",
-      log: "log template",
-      add_role: "role id",
-      remove_role: "role id",
-      timeout: "minutes",
-      ban: "delete_days",
-      delete_command_message: "…",
-      react: "emoji",
-      wait: "seconds",
-    })[t] || "value";
-  const stepsBox = h(
-    "div",
-    null,
-    isPlan &&
-      data.behavior.params.steps.map((step, i) =>
-        h(CommandStep, {
-          key: itemKey(step),
-          step,
-          placeholder: typePlaceholder(step.type),
-          onChange: () => {
-            syncPlanJson();
-            renderSteps();
+  const levels = Object.keys(COMMAND_PERMISSIONS);
+  const floor = builtin ? Math.max(0, levels.indexOf(c.min_permission)) : 0;
+  const allowed = levels.slice(floor);
+  const permissions = allowed.includes(data.permission) ? allowed : [data.permission, ...allowed];
+
+  const doesSection = isPlan
+    ? h(
+        React.Fragment,
+        null,
+        h("p", { className: "field-help" }, "Steps run in order. Kick, ban and timeout need a target: !name @user."),
+        ...steps.map((step, i) =>
+          h(CommandStep, {
+            key: itemKey(step),
+            step,
+            index: i,
+            names,
+            pending,
+            onChange: refresh,
+            remove: () => {
+              steps.splice(i, 1);
+              structural();
+            },
+          }),
+        ),
+        h(
+          ActionButton,
+          {
+            className: "btn btn-sm",
+            onClick: () => {
+              steps.push({ type: "reply", template: "" });
+              structural();
+            },
           },
-          remove: () => {
-            data.behavior.params.steps.splice(i, 1);
-            markDirty();
-            syncPlanJson();
-            renderSteps();
-          },
-        }),
-      ),
-  );
+          "+ add step",
+        ),
+      )
+    : spec?.fields
+      ? h("div", { className: "editor-columns" }, spec.fields.map((f) => h(CommandBehaviorField, { key: f.key, spec: f, params: data.behavior.params, onChange: refresh })))
+      : h("p", { className: "field-help" }, spec ? "This built-in has no settings." : "This behavior has no form fields. Its saved settings are kept.");
+
   return h(
     DialogPanel,
-    { className: "modal-box", onInput: trackDraft },
-    h("h3", { className: "card-title" }, isNew ? "New custom command" : `Edit command: ${c.name}`),
+    { className: "modal-box rule-editor command-editor", onInput: trackDraft },
     h(
       "div",
-      { className: "row form-row" },
-      field("Name", nameIn),
-      field("Aliases", aliasesIn),
-      field("Permission", permIn),
+      { className: "editor-heading rule-editor-header" },
+      h(
+        "div",
+        { className: "rule-editor-title" },
+        h("span", { className: "eyebrow" }, builtin ? "BUILT-IN COMMAND" : isPlan ? "CUSTOM COMMAND" : "COMMAND"),
+        h("h3", { className: "card-title" }, isNew ? "New custom command" : `Edit command: ${c.name}`),
+      ),
+      h(
+        "div",
+        { className: "rule-toggles" },
+        h(
+          "label",
+          { className: "toggle-label" },
+          h(Input, {
+            type: "checkbox",
+            className: "toggle toggle-sm",
+            defaultChecked: data.enabled,
+            onChange: (e) => {
+              data.enabled = e.target.checked;
+              refresh();
+            },
+          }),
+          "Enabled",
+        ),
+      ),
     ),
-    field("Description", descIn),
-    field("Usage", usageIn),
-    isPlan
-      ? h(
-          "fieldset",
-          { className: "fieldset field plan-steps" },
-          h("legend", { className: "fieldset-legend" }, "Action plan steps"),
-          stepsBox,
+    h(RuleSummary, { text: commandSummaryText(data, names) }),
+    fixed ? h("p", { className: "field-help" }, "Built-ins are changed one server at a time. Pick a server to edit this one.") : null,
+    h(
+      EditorSection,
+      { title: "Basics", hint: builtin && !fixed ? "Changes apply to this server only. Reset to default undoes them." : null },
+      h(
+        "div",
+        { className: "editor-columns" },
+        field(
+          "Name",
+          text("name", { placeholder: "command name", readOnly: builtin }),
+          h("p", { className: "field-help" }, builtin ? "Built-in names stay fixed." : "Lowercase letters, digits, - and _."),
+        ),
+        field(
+          "Aliases",
+          h(Input, {
+            type: "text",
+            className: "input input-sm",
+            defaultValue: aliasText.value,
+            placeholder: "e.g. b, yeet",
+            onInput: (e) => (aliasText.value = e.target.value),
+          }),
+          h("p", { className: "field-help" }, "Other names, separated by commas."),
+        ),
+        field("Description", text("description", { maxLength: 100 })),
+        field("Usage", text("usage", { placeholder: "e.g. !name <user> [reason]" })),
+      ),
+    ),
+    h(
+      EditorSection,
+      { title: "What it does" },
+      doesSection,
+      field(
+        "Chat reply",
+        h(Textarea, {
+          className: "textarea textarea-sm",
+          rows: 2,
+          defaultValue: data.response || "",
+          placeholder: isPlan ? "Optional reply after the steps" : "Leave empty for the built-in reply",
+          onInput: (e) => {
+            data.response = e.target.value;
+            refresh();
+          },
+        }),
+        h(
+          "p",
+          { className: "field-help" },
+          "Sent after it runs. ",
+          h(InfoTip, { id: "command-reply-help", label: "Reply variables" }, [
+            "{target} {reason}: who it acted on and why.",
+            "{user} {actor} {guild} {channel}: who ran it and where.",
+            "{minutes} {duration} {count} {seconds}: the amounts used.",
+            "{response}: the built-in reply text. {emoji}: its map emoji.",
+          ]),
+        ),
+      ),
+    ),
+    h(
+      EditorSection,
+      { title: "Who can use it and where", hint: ruleNamesHint(names) || "Leave roles and channels empty to allow all." },
+      h(
+        "div",
+        { className: "editor-columns" },
+        field(
+          "Permission",
           h(
-            ActionButton,
+            Select,
             {
-              className: "btn btn-sm",
-              onClick: () => {
-                data.behavior.params.steps.push({ type: "reply", template: "" });
-                markDirty();
-                syncPlanJson();
-                renderSteps();
+              className: "select select-sm",
+              defaultValue: data.permission,
+              onChange: (e) => {
+                data.permission = e.target.value;
+                refresh();
               },
             },
-            "+ add step",
+            permissions.map((p) => h("option", { key: p, value: p }, COMMAND_PERMISSIONS[p] || p)),
           ),
-        )
-      : null,
-    field("Behavior (advanced JSON)", behaviorArea),
-    field("Response template (in-chat reply; {target} {reason} {response} …)", respIn),
+        ),
+        h(
+          "div",
+          { className: "field" },
+          h(NumberField, {
+            label: "Cooldown",
+            value: data.cooldown_secs,
+            unit: "s",
+            min: 0,
+            onChange: (value) => {
+              data.cooldown_secs = value;
+              refresh();
+            },
+          }),
+        ),
+        h(IdPicker, { kind: "role", label: "Only these roles", ids: data.roles, names, rememberUser, onChange: refresh, pending }),
+        h(IdPicker, { kind: "channel", label: "Only in these channels", ids: data.channels, names, onChange: refresh, pending }),
+      ),
+    ),
     h(
-      "div",
-      { className: "row form-row" },
-      field("Cooldown (secs)", cdIn),
-      field("Role restriction (ids)", roleIn),
-      field("Channel restriction (ids)", chanIn),
-      field("Log event", logIn),
+      EditorSection,
+      { title: "Logging" },
+      field(
+        "Log event",
+        h(
+          Select,
+          {
+            className: "select select-sm",
+            defaultValue: data.log_event || "",
+            onChange: (e) => {
+              data.log_event = e.target.value;
+              refresh();
+            },
+          },
+          logEventOptions(data.log_event || "", true),
+        ),
+        h("p", { className: "field-help" }, "Posted to that event's log channel after a successful run."),
+      ),
+      isBotOwner()
+        ? h(
+            "details",
+            { className: "editor-advanced" },
+            h("summary", null, "Advanced (raw)"),
+            h("pre", { className: "mono raw-behavior", "aria-label": "Saved behavior (read-only)" }, JSON.stringify(data.behavior, null, 2)),
+          )
+        : null,
     ),
     h(
       "div",
       { className: "modal-action" },
       field("Applies to", scopeSel),
       h(
-        "label",
-        { className: "checkbox-label" },
-        h(Input, {
-          type: "checkbox",
-          defaultChecked: data.enabled,
-          onChange: (e) => (data.enabled = e.target.checked),
-          className: "checkbox",
-        }),
-        "Enabled",
-      ),
-      h(
         ActionButton,
         {
           className: "btn btn-primary",
+          hidden: fixed,
           onClick: async () => {
-            try {
-              if (isPlan) {
-                data.behavior.params = parsePlanParams(behaviorAreaRef.current.value);
-              } else {
-                data.behavior = JSON.parse(behaviorAreaRef.current.value || "{}");
-              }
-            } catch (e) {
-              toast("Invalid behavior JSON: " + e.message, "error");
-              return;
-            }
-            data.name = nameInRef.current.value.trim().toLowerCase();
+            data.name = String(data.name || "").trim().toLowerCase();
             if (!data.name) return toast("Name required", "error");
-            data.aliases = aliasesInRef.current.value
+            // Typed role and channel IDs land in the data before it is checked.
+            if (!flushPendingIds(pending)) return;
+            const problem = commandFormError(data);
+            if (problem) return toast(problem, "error");
+            data.aliases = aliasText.value
               .split(",")
               .map((s) => s.trim())
               .filter(Boolean);
-            data.description = descInRef.current.value;
-            data.usage = usageInRef.current.value;
-            data.response = respInRef.current.value;
-            data.permission = permInRef.current.value;
-            data.cooldown_secs = Number(cdInRef.current.value) || 0;
-            data.roles = splitIds(roleInRef.current.value);
-            data.channels = splitIds(chanInRef.current.value);
-            data.log_event = logInRef.current.value;
-            if (isPlan) {
-              const steps = (data.behavior.params && data.behavior.params.steps) || [];
-              for (const s of steps) {
-                if (s.type === "add_role" || s.type === "remove_role") {
-                  applyPlanStepInput(s, s.type, s.role_id);
-                  if (!s.role_id) return toast("Role steps need a role id", "error");
-                }
-              }
-            }
             await reloadAfter(
               () =>
                 isNew
@@ -5256,9 +5514,10 @@ function CommandEditor({ record: c }) {
         ActionButton,
         {
           className: "btn btn-error",
-          hidden: isNew,
+          // A built-in has nothing to delete until this server overrides it.
+          hidden: isNew || (builtin && (fixed || !c.guild_override)),
           onClick: async () => {
-            if (!confirm(`Delete command ${c.name}?`)) return;
+            if (!confirm(builtin ? `Reset ${c.name} to its default?` : `Delete command ${c.name}?`)) return;
             // Prefer clearing a guild override (reset to global). Only delete the
             // global row when there is no override and the caller is the bot owner.
             const delScope = c.guild_override
@@ -5272,13 +5531,13 @@ function CommandEditor({ record: c }) {
                   scope: delScope,
                 }),
               () => {
-                toast(c.guild_override ? "Override cleared" : "Deleted", "success");
+                toast(builtin ? "Reset to default" : c.guild_override ? "Override cleared" : "Deleted", "success");
                 closeOverlay();
               },
             );
           },
         },
-        "Delete",
+        builtin ? "Reset to default" : "Delete",
       ),
       h(
         ActionButton,
@@ -8082,72 +8341,131 @@ function itemKey(item) {
   if (!itemKeys.has(item)) itemKeys.set(item, ++nextItemKey);
   return itemKeys.get(item);
 }
-function CommandStep({ step, placeholder, onChange, remove }) {
-  const input = useRef(null);
+// One action plan step as a compact row (#623): "1. [Add role] [@Role]". Only the
+// chosen type's own fields show; the step object is what Save sends.
+function CommandStep({ step, index, names, pending, onChange, remove }) {
+  const [roleIds] = useState(() => (step.role_id ? [String(step.role_id)] : []));
+  const [customEmoji, setCustomEmoji] = useState(() => !REACT_EMOJI.includes(step.emoji));
+  const [, bump] = useState(0);
+  const n = index + 1;
+  const changed = () => {
+    markDirty();
+    bump((value) => value + 1);
+    onChange();
+  };
+  const set = (key) => (value) => {
+    step[key] = value;
+    changed();
+  };
+  const type = step.type;
+  const sr = (text) => h(Label, { className: "sr-only" }, `Step ${n} ${text}`);
+  const known = Object.hasOwn(PLAN_STEP_LABELS, type);
+  let inline = null;
+  if (type === "log")
+    inline = h(
+      Field,
+      { className: "trigger-field" },
+      sr("log event"),
+      h(Select, { className: "select select-sm", defaultValue: step.event || "", onChange: (e) => set("event")(e.target.value) }, logEventOptions(step.event || "", false)),
+    );
+  else if (type === "timeout")
+    inline = h(NumberField, { label: `Step ${n} minutes`, hidden: true, value: step.minutes, unit: "min", min: 1, max: STEP_TIMEOUT_MAX, onChange: set("minutes") });
+  else if (type === "wait")
+    inline = h(NumberField, { label: `Step ${n} seconds`, hidden: true, value: step.secs, unit: "s", min: 1, onChange: set("secs") });
+  else if (type === "ban") inline = h(DeleteDaysSelect, { label: `Step ${n} messages`, value: step.delete_days, onChange: set("delete_days") });
+  else if (type === "react")
+    inline = h(
+      React.Fragment,
+      null,
+      h(
+        Field,
+        { className: "trigger-field" },
+        sr("emoji"),
+        h(
+          Select,
+          {
+            className: "select select-sm emoji-select",
+            defaultValue: customEmoji ? "" : step.emoji,
+            onChange: (e) => {
+              const custom = e.target.value === "";
+              setCustomEmoji(custom);
+              if (!custom) set("emoji")(e.target.value);
+            },
+          },
+          REACT_EMOJI.map((emoji) => h("option", { key: emoji, value: emoji }, emoji)),
+          h("option", { value: "" }, "Other…"),
+        ),
+      ),
+      customEmoji
+        ? h(
+            Field,
+            { className: "trigger-field" },
+            sr("other emoji"),
+            h(Input, { type: "text", className: "input input-sm input-num", defaultValue: step.emoji || "", placeholder: "Emoji", onInput: (e) => set("emoji")(e.target.value.trim()) }),
+          )
+        : null,
+    );
+  let below = null;
+  if (type === "reply" || type === "dm" || type === "log")
+    below = h(
+      Field,
+      { className: "escalation-reason" },
+      h(Label, { className: "escalation-label" }, "Message", h("span", { className: "sr-only" }, ` for step ${n}`)),
+      h(Input, {
+        type: "text",
+        className: "input input-sm",
+        defaultValue: step.template || "",
+        placeholder: type === "dm" ? "e.g. You were warned: {reason}" : type === "log" ? "e.g. {actor} ran {command}" : "e.g. Hi {user}!",
+        onInput: (e) => set("template")(e.target.value),
+      }),
+    );
+  else if (type === "add_role" || type === "remove_role")
+    below = h(IdPicker, {
+      kind: "role",
+      label: `Role for step ${n}`,
+      idLabel: `Add a role by ID for step ${n}`,
+      ids: roleIds,
+      names,
+      pending,
+      single: true,
+      onChange: () => {
+        step.role_id = roleIds[0] || "";
+        changed();
+      },
+    });
   return h(
     "div",
-    { className: "card card-border step-card" },
+    { className: "escalation-step command-step" },
     h(
       "div",
-      { className: "row control-row" },
+      { className: "escalation-row" },
       h(
-        Select,
-        {
-          className: "select",
-          value: step.type,
-          "aria-label": "Step action",
-          onChange: (event) => {
-            const type = event.target.value,
-              updated = { type };
-            applyPlanStepInput(updated, type, input.current.value);
-            if (type === "log") updated.event = "plan_executed";
-            Object.keys(step).forEach((key) => delete step[key]);
-            Object.assign(step, updated);
-            input.current.value =
-              type === "delete_command_message"
-                ? ""
-                : String(
-                    step.template ??
-                      step.role_id ??
-                      step.minutes ??
-                      step.delete_days ??
-                      step.emoji ??
-                      step.secs ??
-                      "",
-                  );
-            onChange();
+        Field,
+        { className: "trigger-field" },
+        h(Label, { className: "escalation-label" }, `${n}.`, h("span", { className: "sr-only" }, ` Step ${n} action`)),
+        h(
+          Select,
+          {
+            className: "select select-sm",
+            defaultValue: type,
+            onChange: (event) => {
+              const next = planStepFor(event.target.value, step);
+              Object.keys(step).forEach((key) => delete step[key]);
+              Object.assign(step, next);
+              roleIds.splice(0, roleIds.length, ...(step.role_id ? [String(step.role_id)] : []));
+              setCustomEmoji(false);
+              changed();
+            },
           },
-        },
-        ...[
-          "reply",
-          "dm",
-          "log",
-          "add_role",
-          "remove_role",
-          "timeout",
-          "kick",
-          "ban",
-          "delete_command_message",
-          "react",
-          "wait",
-        ].map((value) => h("option", { key: value, value }, value)),
+          known ? null : h("option", { value: type }, type),
+          Object.entries(PLAN_STEP_LABELS).map(([value, label]) => h("option", { key: value, value }, label)),
+        ),
       ),
-      h(Input, {
-        ref: input,
-        "aria-label": "Step value",
-        className: "input",
-        type: "text",
-        defaultValue:
-          step.template ?? step.role_id ?? step.minutes ?? step.delete_days ?? step.emoji ?? step.secs ?? "",
-        placeholder,
-        style: { flex: 1 },
-        onChange: (event) => {
-          applyPlanStepInput(step, step.type, event.target.value);
-          onChange();
-        },
-      }),
-      h(IconButton, { action: "remove", label: "Remove step", onClick: remove }),
+      // Keyed by type so a new type's inputs start from its own values.
+      h(React.Fragment, { key: type }, inline),
+      h(IconButton, { action: "remove", label: `Remove step ${n}`, className: "btn btn-sm btn-square escalation-remove", onClick: remove }),
     ),
+    below ? h(React.Fragment, { key: type }, below) : null,
   );
 }
 

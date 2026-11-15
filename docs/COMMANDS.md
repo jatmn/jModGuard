@@ -1,9 +1,25 @@
 # Commands
 
-Every command is **data**: it lives in the database (per-server, with a global
-fallback), can be renamed, reworded, re-permissioned, disabled, or given a
-cooldown — all from the WebUI **Commands** tab. Enabled commands are also
-registered as Discord **slash commands** (same logic, different invocation).
+Commands are edited in the WebUI **Commands** tab as a form: no JSON. Enabled
+commands are also registered as Discord **slash commands** (same logic,
+different invocation).
+
+- **Custom commands** live in the database (per server, with a global fallback)
+  and can be renamed, reworded, re-permissioned, disabled or given a cooldown.
+- **Built-in commands** ship with the bot. Each server can override one: its
+  aliases, description, usage, behavior settings (default reason, delete days,
+  default minutes/count/seconds, default subcommand), reply, log event, enabled
+  state, cooldown and role/channel restrictions. The name and behavior kind stay
+  fixed, and the permission can be raised but never set below the shipped level.
+  An override is a server row under the built-in's name that the writer marks
+  with `builtin_override: true`; **Reset to default** deletes it. Unmarked server
+  rows under a built-in name (older copies of global seeds, or a custom command
+  that a later release turns into a built-in) are ignored. Global built-in rows
+  are shipped seeds and are never applied, and the API refuses global built-in
+  writes. Copying configuration to or from the global scope skips built-in rows.
+  When two overrides claim the same new alias, the built-in whose name sorts
+  first keeps it. While a rolling update pairs this API with an older bot,
+  saving an override is refused until both are updated.
 
 Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 

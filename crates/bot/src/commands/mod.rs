@@ -2680,6 +2680,7 @@ mod tests {
             behavior: Behavior::Say,
             response: response.into(),
             log_event: String::new(),
+            builtin_override: false,
         }
     }
 
@@ -3616,6 +3617,7 @@ mod tests {
             behavior: ban_behavior,
             response: String::new(),
             log_event: String::new(),
+            builtin_override: false,
         };
         let denied =
             super::check_enforcement(&app, &cfg, &cmd, &guild_roles, &member, ChannelId::new(1))

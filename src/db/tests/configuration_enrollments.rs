@@ -17,6 +17,7 @@ fn writable_command_fixture(name: &str) -> CommandDef {
         behavior: Behavior::Say,
         response: String::new(),
         log_event: String::new(),
+        builtin_override: false,
     }
 }
 

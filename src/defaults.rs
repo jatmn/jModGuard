@@ -146,6 +146,7 @@ pub fn custom_command_fixture(name: &str) -> CommandDef {
         behavior: Behavior::Say,
         response: String::new(),
         log_event: String::new(),
+        builtin_override: false,
     }
 }
 
@@ -498,15 +499,59 @@ pub fn is_builtin_primary_command_name(name: &str) -> bool {
         .any(|cmd| cmd.name.eq_ignore_ascii_case(name))
 }
 
-/// Shipped built-in for runtime enforcement and API reads.
-/// Stored rows do not contribute definition or access controls.
+/// Command permission levels, lowest first. Unknown text has no rank.
+pub fn command_permission_rank(permission: &str) -> Option<u8> {
+    match permission {
+        "everyone" => Some(0),
+        "mod" => Some(1),
+        "admin" => Some(2),
+        "owner" => Some(3),
+        _ => None,
+    }
+}
+
+fn same_behavior_kind(a: &Behavior, b: &Behavior) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+/// Shipped built-in for runtime enforcement and API reads, with this server's
+/// override applied (#623). Only a row flagged `builtin_override` (set by the
+/// writers) is an override; an unflagged row under a built-in name is a copy of
+/// a global seed or a custom command named like a later built-in, and is
+/// ignored. An override changes settings only: the name, category and behavior
+/// kind stay shipped, the permission never drops below the shipped level, and
+/// aliases that are another built-in's label are dropped. Global rows are never
+/// passed here; they stay shipped seeds.
 pub fn effective_builtin_command(
     primary: &str,
-    _stored: Option<&CommandDef>,
+    guild_override: Option<&CommandDef>,
 ) -> Option<CommandDef> {
-    default_commands()
+    let shipped = default_commands()
         .into_iter()
-        .find(|cmd| cmd.name.eq_ignore_ascii_case(primary))
+        .find(|cmd| cmd.name.eq_ignore_ascii_case(primary))?;
+    let Some(stored) = guild_override.filter(|row| row.builtin_override) else {
+        return Some(shipped);
+    };
+    let mut effective = stored.clone();
+    effective.name = shipped.name.clone();
+    effective.category = shipped.category.clone();
+    if !same_behavior_kind(&stored.behavior, &shipped.behavior) {
+        effective.behavior = shipped.behavior.clone();
+    }
+    let floor = command_permission_rank(&shipped.permission).unwrap_or(0);
+    if command_permission_rank(&stored.permission).is_none_or(|rank| rank < floor) {
+        effective.permission = shipped.permission.clone();
+    }
+    let mut seen = HashSet::new();
+    effective.aliases.retain(|alias| {
+        let alias = alias.to_ascii_lowercase();
+        !alias.is_empty()
+            && !alias.eq_ignore_ascii_case(&shipped.name)
+            && builtin_command_for_label(&alias)
+                .is_none_or(|owner| owner.eq_ignore_ascii_case(&shipped.name))
+            && seen.insert(alias)
+    });
+    Some(effective)
 }
 
 fn install_shipped_builtin(
@@ -524,7 +569,9 @@ fn install_shipped_builtin(
     commands.insert(shipped.name.clone(), shipped);
 }
 
-/// Removes legacy rows and aliases that compete with shipped built-in labels.
+/// Removes legacy rows and aliases that compete with built-in labels. Shipped
+/// labels and built-in override aliases win over custom aliases; a custom
+/// command's own name wins over a built-in override alias.
 pub fn resolve_legacy_builtin_command_collisions(
     commands: &mut std::collections::HashMap<String, CommandDef>,
 ) {
@@ -538,18 +585,50 @@ pub fn resolve_legacy_builtin_command_collisions(
     for key in shadow_keys {
         commands.remove(&key);
     }
+    let custom_names: HashSet<String> = commands
+        .keys()
+        .filter(|key| !is_builtin_primary_command_name(key))
+        .map(|key| key.to_ascii_lowercase())
+        .collect();
+    // Built-ins claim their override aliases in name order, so two overrides
+    // that share one resolve the same way in every process.
+    let mut builtin_keys: Vec<String> = commands
+        .keys()
+        .filter(|key| is_builtin_primary_command_name(key))
+        .cloned()
+        .collect();
+    builtin_keys.sort();
+    let mut builtin_aliases = HashSet::new();
+    for key in builtin_keys {
+        let Some(command) = commands.get_mut(&key) else {
+            continue;
+        };
+        command.aliases.retain(|alias| {
+            let alias = alias.to_ascii_lowercase();
+            builtin_command_for_label(&alias).is_some()
+                || (!custom_names.contains(&alias) && !builtin_aliases.contains(&alias))
+        });
+        builtin_aliases.extend(
+            command
+                .aliases
+                .iter()
+                .map(|alias| alias.to_ascii_lowercase()),
+        );
+    }
     for (key, command) in commands.iter_mut() {
         if is_builtin_primary_command_name(key) {
             continue;
         }
-        command
-            .aliases
-            .retain(|alias| builtin_command_for_label(alias).is_none());
+        command.aliases.retain(|alias| {
+            builtin_command_for_label(alias).is_none()
+                && !builtin_aliases.contains(&alias.to_ascii_lowercase())
+        });
     }
 }
 
 /// Effective command map for one guild: guild rows overlay global rows, then
-/// shipped built-ins replace any stored primary (`apply_shipped_builtin_commands`).
+/// built-ins are installed with that guild's overrides
+/// (`apply_shipped_builtin_commands`). Pass no guild rows for the global scope.
 pub fn effective_command_registry(
     global_commands: &std::collections::HashMap<String, CommandDef>,
     guild_commands: &std::collections::HashMap<String, CommandDef>,
@@ -558,50 +637,92 @@ pub fn effective_command_registry(
     for (name, def) in guild_commands {
         commands.insert(name.clone(), def.clone());
     }
-    apply_shipped_builtin_commands(&mut commands);
+    apply_shipped_builtin_commands(&mut commands, guild_commands);
     commands
 }
 
-/// Replaces built-in primaries with the shipped command. Stored rows do not
-/// contribute definition or access controls.
+/// Replaces built-in primaries with the shipped command plus the guild's
+/// override from `guild_commands` (see [`effective_builtin_command`]). Global
+/// rows for built-ins are ignored.
 pub fn apply_shipped_builtin_commands(
     commands: &mut std::collections::HashMap<String, CommandDef>,
+    guild_commands: &std::collections::HashMap<String, CommandDef>,
 ) {
-    for shipped in default_global_seed_commands() {
-        install_shipped_builtin(commands, shipped);
+    for shipped in default_commands() {
+        let stored = guild_commands
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(&shipped.name))
+            .map(|(_, command)| command);
+        if let Some(effective) = effective_builtin_command(&shipped.name, stored) {
+            install_shipped_builtin(commands, effective);
+        }
     }
-    merge_binary_overlay_commands(commands);
     resolve_legacy_builtin_command_collisions(commands);
 }
 
-/// True when a command row must not be written to shared storage (rolling upgrades).
-pub fn rejects_binary_overlay_command_persist(storage_name: &str, cmd: &CommandDef) -> bool {
-    if is_binary_overlay_command_name(storage_name)
-        || is_binary_overlay_command_name(&cmd.name)
+/// The row a writer stores: a built-in primary is marked as this server's
+/// override, any other row is not.
+pub fn command_row_for_storage(storage_name: &str, cmd: &CommandDef) -> CommandDef {
+    let mut row = cmd.clone();
+    row.builtin_override = is_builtin_primary_command_name(storage_name);
+    row
+}
+
+/// Why a command row must not be written, or `None` when it may be.
+/// `guild_id` is the target scope (0 = global). A built-in primary may be
+/// written only as a guild override that keeps its name and behavior kind,
+/// never lowers its permission, and takes no other built-in's label. Other
+/// rows must not claim a built-in name or alias, or a binary-overlay behavior.
+pub fn command_persist_error(
+    storage_name: &str,
+    cmd: &CommandDef,
+    guild_id: i64,
+) -> Option<String> {
+    if let Some(shipped) = default_commands()
+        .into_iter()
+        .find(|shipped| shipped.name.eq_ignore_ascii_case(storage_name))
+    {
+        let name = &shipped.name;
+        if guild_id == 0 {
+            return Some(format!(
+                "built-in command `{name}` can only be changed for one server"
+            ));
+        }
+        if !cmd.name.eq_ignore_ascii_case(name) {
+            return Some(format!("built-in command `{name}` cannot be renamed"));
+        }
+        if !same_behavior_kind(&cmd.behavior, &shipped.behavior) {
+            return Some(format!(
+                "built-in command `{name}` keeps its behavior; only its settings can change"
+            ));
+        }
+        let floor = command_permission_rank(&shipped.permission).unwrap_or(0);
+        if command_permission_rank(&cmd.permission).is_none_or(|rank| rank < floor) {
+            return Some(format!(
+                "built-in command `{name}` needs at least `{}` permission",
+                shipped.permission
+            ));
+        }
+        for alias in &cmd.aliases {
+            if let Some(owner) = builtin_command_for_label(alias)
+                && !owner.eq_ignore_ascii_case(name)
+            {
+                return Some(format!(
+                    "alias `{alias}` belongs to built-in command `{owner}`"
+                ));
+            }
+        }
+        return None;
+    }
+    let rejected = is_binary_overlay_command_name(&cmd.name)
         || is_binary_overlay_behavior(&cmd.behavior)
+        || builtin_command_for_label(storage_name).is_some()
+        || builtin_command_for_label(&cmd.name).is_some()
         || cmd
             .aliases
             .iter()
-            .any(|alias| is_binary_overlay_command_name(alias))
-    {
-        return true;
-    }
-
-    if is_builtin_primary_command_name(storage_name) {
-        return true;
-    }
-
-    if builtin_command_for_label(storage_name).is_some() {
-        return true;
-    }
-
-    if builtin_command_for_label(&cmd.name).is_some() {
-        return true;
-    }
-
-    cmd.aliases
-        .iter()
-        .any(|alias| builtin_command_for_label(alias).is_some())
+            .any(|alias| builtin_command_for_label(alias).is_some());
+    rejected.then(|| command_persist_rejected_message(storage_name))
 }
 
 /// Global seed rows: every shipped default except [`BINARY_OVERLAY_COMMAND_NAMES`].
@@ -665,6 +786,7 @@ fn cmd(
         behavior,
         response: response.into(),
         log_event: log_event.into(),
+        builtin_override: false,
     }
 }
 
@@ -1056,6 +1178,7 @@ pub fn sample_plan_command() -> CommandDef {
         },
         response: String::new(),
         log_event: String::new(),
+        builtin_override: false,
     }
 }
 
@@ -1082,37 +1205,154 @@ mod rolling_upgrade_tests {
     }
 
     #[test]
-    fn shipped_builtin_ignores_stored_access_and_definition() {
+    fn builtin_override_applies_settings_but_keeps_shipped_identity_and_access_floor() {
         let shipped = default_commands()
             .into_iter()
             .find(|cmd| cmd.name == "ban")
             .expect("ban");
         let stored = CommandDef {
+            name: "Ban".into(),
+            category: "Custom".into(),
             enabled: false,
-            permission: "owner".into(),
+            permission: "admin".into(),
             roles: vec![555],
             channels: vec![777],
             cooldown_secs: 42,
-            description: "legacy".into(),
-            aliases: vec!["legacy-alias".into()],
-            behavior: Behavior::Say,
+            description: "server text".into(),
+            aliases: vec![
+                "Hammer".into(),
+                "k".into(),
+                "yeet".into(),
+                "hammer".into(),
+                "ban".into(),
+            ],
+            behavior: Behavior::Ban {
+                default_reason: "server reason".into(),
+                delete_days: 1,
+            },
+            response: "server reply".into(),
+            log_event: "plan_executed".into(),
+            builtin_override: true,
             ..shipped.clone()
         };
+        // Without the writer's flag the row is a seed copy and changes nothing.
+        let unflagged = CommandDef {
+            builtin_override: false,
+            ..stored.clone()
+        };
+        let ignored = effective_builtin_command("ban", Some(&unflagged)).expect("ban");
+        assert_eq!(ignored.description, shipped.description);
+        assert!(ignored.enabled);
         let merged = effective_builtin_command("ban", Some(&stored)).expect("ban");
-        assert_eq!(merged.description, shipped.description);
-        assert_eq!(merged.aliases, shipped.aliases);
-        assert!(matches!(merged.behavior, Behavior::Ban { .. }));
-        assert_eq!(merged.enabled, shipped.enabled);
+        assert_eq!(merged.name, "ban");
+        assert_eq!(merged.category, shipped.category);
+        assert_eq!(merged.description, "server text");
+        // Another built-in's label ("k"), the own name and duplicates are dropped.
+        assert_eq!(
+            merged.aliases,
+            vec!["Hammer".to_string(), "yeet".to_string()]
+        );
+        assert!(matches!(
+            &merged.behavior,
+            Behavior::Ban { default_reason, delete_days: 1 } if default_reason == "server reason"
+        ));
+        assert!(!merged.enabled);
+        assert_eq!(merged.permission, "admin");
+        assert_eq!(
+            (merged.roles.clone(), merged.channels.clone()),
+            (vec![555], vec![777])
+        );
+        assert_eq!(merged.cooldown_secs, 42);
+        assert_eq!(
+            (merged.response.as_str(), merged.log_event.as_str()),
+            ("server reply", "plan_executed")
+        );
+
+        // A row that would widen access or swap the behavior falls back to shipped values.
+        let widened = CommandDef {
+            permission: "everyone".into(),
+            behavior: Behavior::Say,
+            ..stored.clone()
+        };
+        let merged = effective_builtin_command("ban", Some(&widened)).expect("ban");
         assert_eq!(merged.permission, shipped.permission);
-        assert_eq!(merged.roles, shipped.roles);
-        assert_eq!(merged.channels, shipped.channels);
-        assert_eq!(merged.cooldown_secs, shipped.cooldown_secs);
-        let mut commands = std::collections::HashMap::from([("Ban".into(), stored)]);
-        apply_shipped_builtin_commands(&mut commands);
-        assert!(!commands.contains_key("Ban"));
-        assert_eq!(commands["ban"].enabled, shipped.enabled);
-        assert_eq!(commands["ban"].permission, shipped.permission);
-        assert_eq!(commands["ban"].cooldown_secs, shipped.cooldown_secs);
+        assert!(matches!(merged.behavior, Behavior::Ban { .. }));
+        let unknown = CommandDef {
+            permission: "moderator".into(),
+            ..stored.clone()
+        };
+        assert_eq!(
+            effective_builtin_command("ban", Some(&unknown))
+                .unwrap()
+                .permission,
+            "mod"
+        );
+
+        // Guild rows override; global rows (shipped seeds) never do.
+        let none = std::collections::HashMap::new();
+        let mut global_only = std::collections::HashMap::from([("ban".into(), stored.clone())]);
+        apply_shipped_builtin_commands(&mut global_only, &none);
+        assert!(global_only["ban"].enabled);
+        assert_eq!(global_only["ban"].permission, shipped.permission);
+        let guild = std::collections::HashMap::from([("Ban".to_string(), stored.clone())]);
+        let registry = effective_command_registry(&none, &guild);
+        assert!(!registry.contains_key("Ban"));
+        assert!(!registry["ban"].enabled);
+        assert_eq!(registry["ban"].cooldown_secs, 42);
+    }
+
+    #[test]
+    fn builtin_override_aliases_resolve_against_custom_commands() {
+        let custom = |name: &str, aliases: &[&str]| CommandDef {
+            name: name.into(),
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            category: "Custom".into(),
+            description: "x".into(),
+            usage: String::new(),
+            enabled: true,
+            permission: "everyone".into(),
+            roles: vec![],
+            channels: vec![],
+            cooldown_secs: 0,
+            behavior: Behavior::Say,
+            response: String::new(),
+            log_event: String::new(),
+            builtin_override: false,
+        };
+        let shipped = default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "ban")
+            .unwrap();
+        let ban = CommandDef {
+            aliases: vec!["hammer".into(), "greet".into(), "x".into()],
+            builtin_override: true,
+            ..shipped
+        };
+        let warn = CommandDef {
+            aliases: vec!["x".into(), "caution".into()],
+            builtin_override: true,
+            ..default_commands()
+                .into_iter()
+                .find(|cmd| cmd.name == "warn")
+                .unwrap()
+        };
+        let guild = std::collections::HashMap::from([
+            ("ban".to_string(), ban),
+            ("warn".to_string(), warn),
+            ("greet".to_string(), custom("greet", &[])),
+            ("other".to_string(), custom("other", &["hammer", "mine"])),
+        ]);
+        let registry = effective_command_registry(&std::collections::HashMap::new(), &guild);
+        // A custom command's own name beats a built-in override alias, and two
+        // overrides sharing an alias resolve by built-in name ("ban" before "warn")...
+        assert_eq!(
+            registry["ban"].aliases,
+            vec!["hammer".to_string(), "x".to_string()]
+        );
+        assert_eq!(registry["warn"].aliases, vec!["caution".to_string()]);
+        assert!(registry.contains_key("greet"));
+        // ...and a built-in override alias beats a custom alias.
+        assert_eq!(registry["other"].aliases, vec!["mine".to_string()]);
     }
 
     #[test]
@@ -1134,6 +1374,7 @@ mod rolling_upgrade_tests {
                     behavior: Behavior::Say,
                     response: String::new(),
                     log_event: String::new(),
+                    builtin_override: false,
                 },
             ),
             (
@@ -1152,6 +1393,7 @@ mod rolling_upgrade_tests {
                     behavior: Behavior::Help,
                     response: String::new(),
                     log_event: String::new(),
+                    builtin_override: false,
                 },
             ),
         ]);
@@ -1183,6 +1425,7 @@ mod rolling_upgrade_tests {
                 cooldown_secs: 99,
                 response: "stale".into(),
                 log_event: "stale".into(),
+                builtin_override: false,
             },
         )]);
         assert!(
@@ -1243,8 +1486,9 @@ mod rolling_upgrade_tests {
             behavior: Behavior::Help,
             response: String::new(),
             log_event: String::new(),
+            builtin_override: false,
         };
-        assert!(rejects_binary_overlay_command_persist("customvc", &hijack));
+        assert!(command_persist_error("customvc", &hijack, 10).is_some());
     }
 
     #[test]
@@ -1273,11 +1517,9 @@ mod rolling_upgrade_tests {
             behavior: Behavior::Help,
             response: String::new(),
             log_event: String::new(),
+            builtin_override: false,
         };
-        assert!(rejects_binary_overlay_command_persist(
-            "myplugin",
-            &kick_hijack
-        ));
+        assert!(command_persist_error("myplugin", &kick_hijack, 10).is_some());
 
         let alias_hijack = CommandDef {
             name: "myplugin".into(),
@@ -1293,20 +1535,98 @@ mod rolling_upgrade_tests {
             behavior: Behavior::Help,
             response: String::new(),
             log_event: String::new(),
+            builtin_override: false,
         };
-        assert!(rejects_binary_overlay_command_persist(
-            "myplugin",
-            &alias_hijack
-        ));
+        assert!(command_persist_error("myplugin", &alias_hijack, 10).is_some());
     }
 
     #[test]
-    fn builtin_row_rejects_even_identical_shipped_copy() {
-        let shipped = default_commands()
-            .into_iter()
-            .find(|cmd| cmd.name == "stats")
-            .expect("stats");
-        assert!(rejects_binary_overlay_command_persist("stats", &shipped));
+    fn builtin_rows_persist_only_as_guild_overrides_within_their_floor() {
+        let shipped = |name: &str| {
+            default_commands()
+                .into_iter()
+                .find(|cmd| cmd.name == name)
+                .unwrap()
+        };
+        let stats = shipped("stats");
+        assert_eq!(
+            command_persist_error("stats", &stats, 0).as_deref(),
+            Some("built-in command `stats` can only be changed for one server")
+        );
+        assert_eq!(command_persist_error("stats", &stats, 10), None);
+        let edited = CommandDef {
+            enabled: false,
+            permission: "owner".into(),
+            roles: vec![1],
+            channels: vec![2],
+            cooldown_secs: 5,
+            aliases: vec!["numbers".into()],
+            description: "Counts".into(),
+            ..stats.clone()
+        };
+        assert_eq!(command_persist_error("stats", &edited, 10), None);
+        for (bad, message) in [
+            (
+                CommandDef {
+                    name: "numbers".into(),
+                    ..stats.clone()
+                },
+                "built-in command `stats` cannot be renamed",
+            ),
+            (
+                CommandDef {
+                    behavior: Behavior::Help,
+                    ..stats.clone()
+                },
+                "built-in command `stats` keeps its behavior; only its settings can change",
+            ),
+            (
+                CommandDef {
+                    permission: "mod".into(),
+                    ..stats.clone()
+                },
+                "built-in command `stats` needs at least `admin` permission",
+            ),
+            (
+                CommandDef {
+                    permission: "moderators".into(),
+                    ..stats.clone()
+                },
+                "built-in command `stats` needs at least `admin` permission",
+            ),
+            (
+                CommandDef {
+                    aliases: vec!["B".into()],
+                    ..stats.clone()
+                },
+                "alias `B` belongs to built-in command `ban`",
+            ),
+        ] {
+            assert_eq!(
+                command_persist_error("stats", &bad, 10).as_deref(),
+                Some(message)
+            );
+        }
+        // Binary-overlay built-ins take guild overrides too: any binary that can
+        // open core schema 0024+ knows the softban and voice behavior kinds.
+        for name in ["voice", "softban"] {
+            assert_eq!(
+                command_persist_error(name, &shipped(name), 10),
+                None,
+                "{name}"
+            );
+            assert!(
+                command_persist_error(name, &shipped(name), 0).is_some(),
+                "{name}"
+            );
+        }
+        // A custom row still cannot carry an overlay behavior under another name.
+        let renamed = CommandDef {
+            name: "vc".into(),
+            aliases: vec![],
+            ..shipped("voice")
+        };
+        assert!(command_persist_error("vc", &renamed, 10).is_some());
     }
 }
 

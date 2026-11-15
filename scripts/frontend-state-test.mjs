@@ -102,7 +102,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId, COMMAND_BEHAVIORS, PLAN_STEP_LABELS, planStepFor})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -2593,7 +2593,7 @@ for (const kind of ['rule', 'command']) {
         'daisyUI only reveals editor panels that are direct children of the open modal');
       const button = action === 'add'
         ? elements.find(n => n.localName === 'button' && (n.textContent === '+ add step' || n.textContent === '+ add action'))
-        : elements.find(n => n.localName === 'button' && /^Remove (action 1|step)$/.test(n.getAttribute('aria-label')));
+        : elements.find(n => n.localName === 'button' && /^Remove (action|step) 1$/.test(n.getAttribute('aria-label')));
       assert.ok(button);
       await fire(button, 'click', {});
       assert.equal(app.isDirty(), true);
@@ -2738,6 +2738,7 @@ test('a refused command save retains its checkbox value for the next save', asyn
   let refuse = true;
   const h = harness(async (url, options) => {
     if (String(url).includes('/config') || options.method === 'GET') return response({ commands: [] });
+    if (String(url).endsWith('/server-names')) return response({ roles: [], channels: [] });
     calls.push(JSON.parse(options.body));
     if (refuse) throw new Error('write refused');
     return response({ ok: true });
@@ -2749,6 +2750,7 @@ test('a refused command save retains its checkbox value for the next save', asyn
   const modal = h.document.querySelector('.modal-overlay');
   const name = findNode(modal, (n) => n.getAttribute("placeholder") === 'command name');
   name.value = 'hello';
+  await fire(name, 'input');
   const enabled = findNode(modal, (n) => n.getAttribute("type") === 'checkbox');
   const save = findNode(modal, (n) => n.localName === 'button' && n.textContent === 'Save');
   await fire(enabled, 'change', { target: { checked: false } });
@@ -5198,53 +5200,336 @@ function assertAccessible(node) {
   }
 }
 
-test('command plan validation retains editable drafts and accessible errors on blur and Save', async () => {
+// #623: the command editor is a form. These fixtures are the built-in commands as
+// src/defaults.rs seeds them, with the saved wire shape of each behavior kind.
+const COMMAND_LOG_EVENTS = ['member_join', 'mod_action', 'plan_executed', 'system', 'voice_join'];
+const BUILTIN_COMMAND_FIXTURES = [
+  ['ban', { kind: 'ban', params: { default_reason: 'Banned by a moderator', delete_days: 0 } }, [['Default reason', 'text', 'Spam'], ['Delete messages', 'select', 'Delete 2 days']], { default_reason: 'Spam', delete_days: 2 }],
+  ['softban', { kind: 'softban', params: { default_reason: 'Softbanned by a moderator' } }, [['Default reason', 'text', 'Raid']], { default_reason: 'Raid' }],
+  ['unban', { kind: 'unban', params: { default_reason: 'Unbanned' } }, [['Default reason', 'text', 'Appeal']], { default_reason: 'Appeal' }],
+  ['kick', { kind: 'kick', params: { default_reason: 'Kicked by a moderator' } }, [['Default reason', 'text', 'Rules']], { default_reason: 'Rules' }],
+  ['timeout', { kind: 'timeout', params: { default_minutes: 60 } }, [['Default length', 'text', '30']], { default_minutes: 30 }],
+  ['warn', { kind: 'warn', params: { default_reason: 'Warning from moderator' } }, [['Default reason', 'text', 'Be nice']], { default_reason: 'Be nice' }],
+  ['warns', { kind: 'warns' }],
+  ['warnclear', { kind: 'warn_clear' }],
+  ['userinfo', { kind: 'user_info' }],
+  ['purge', { kind: 'purge', params: { default_count: 50 } }, [['Default count', 'text', '25']], { default_count: 25 }],
+  ['say', { kind: 'say' }],
+  ['slowmode', { kind: 'slowmode', params: { default_seconds: 5 } }, [['Default slowmode', 'text', '10']], { default_seconds: 10 }],
+  ['banlist', { kind: 'banlist' }],
+  ['voice', { kind: 'voice' }],
+  ['setname', { kind: 'setname' }],
+  ['prefix', { kind: 'set_prefix' }],
+  ['template', { kind: 'template', params: { action: 'list' } }, [['Default subcommand', 'select', 'get']], { action: 'get' }],
+  ['rule', { kind: 'rule', params: { action: 'list' } }, [['Default subcommand', 'select', 'toggle']], { action: 'toggle' }],
+  ['logchannel', { kind: 'logchannel', params: { action: 'list' } }, [['Default subcommand', 'select', 'set']], { action: 'set' }],
+  ['testregex', { kind: 'testregex' }],
+  ['help', { kind: 'help' }],
+  ['about', { kind: 'about' }],
+  ['stats', { kind: 'stats' }],
+];
+const commandNames = {
+  roles: [
+    { id: '987654321098765432', name: '@everyone', color: 0, position: 0, managed: false },
+    { id: '9007199254740993', name: 'Moderators', color: 0, position: 3, managed: false },
+  ],
+  channels: [{ id: '9007199254740995', name: 'mod-chat', kind: 'text', parent_id: null, position: 1 }],
+};
+const SHIPPED_PERMISSION = (name) => ['setname', 'prefix', 'template', 'rule', 'logchannel', 'testregex', 'stats'].includes(name) ? 'admin' : ['help', 'about'].includes(name) ? 'everyone' : 'mod';
+const builtinRecord = (effective, extra = {}) => ({ name: effective.name, scope: 'global', builtin: true, min_permission: SHIPPED_PERMISSION(effective.name), guild_override: null, effective, ...extra });
+function commandFixture(name, behavior, extra = {}) {
+  return { name, aliases: [], category: 'Moderation', description: `The ${name} command.`, usage: `!${name} <user>`, enabled: true, permission: 'mod',
+    roles: [], channels: [], cooldown_secs: 0, behavior: structuredClone(behavior), response: '', log_event: 'mod_action', ...extra };
+}
+function commandEditorHarness({ owner = false, refuse = 0 } = {}) {
   const writes = [];
-  let refuse = true;
-  const h = harness(async (_url, options) => {
-    const body = JSON.parse(options.body);
-    writes.push(body);
-    if (refuse) throw new Error('command write refused');
-    return response({ config_patch: { kind: 'command', name: body.data.name, scope: 'guild', value: body.data } });
+  let refusals = refuse;
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/server-names')) return response(commandNames);
+    if (url.includes('/commands')) {
+      const body = JSON.parse(options.body);
+      writes.push({ url, method: options.method, body });
+      if (refusals > 0) { refusals--; throw new Error('command write refused'); }
+      if (options.method === 'DELETE') return response({ ok: true });
+      return response({ config_patch: { kind: 'command', name: body.data.name, scope: 'guild', value: body.data } });
+    }
+    if (url.endsWith('/config')) return response({ enrollment_id: 'page-membership', settings: { prefix: '!' }, rules: [], commands: [], badwords: [], templates: [], event_types: [], log_channels: COMMAND_LOG_EVENTS.map(event => ({ event })) });
+    return response({});
   });
-  h.app.state.config = { commands: [] };
+  h.app.state.me.is_bot_owner = owner;
+  h.app.state.config = { enrollment_id: 'page-membership', commands: [], settings: { prefix: '!' }, event_types: [], log_channels: COMMAND_LOG_EVENTS.map(event => ({ event })) };
   h.app.state.tab = 'commands';
+  return { h, writes };
+}
+const labelled = (root, label) => findNode(root, n => n.localName === 'label' && textOf(n) === label)?.control;
+const commandSave = (modal) => findNode(modal, n => n.localName === 'button' && n.textContent === 'Save');
+const commandSummary = (modal) => textOf(modal.querySelector('.rule-summary[role="status"]'));
+async function typeValue(control, value) {
+  assert.ok(control, `control for ${value}`);
+  control.value = value;
+  await fire(control, 'input');
+}
+
+test('every built-in command edits its behavior through typed fields and saves the same shape', async () => {
+  for (const [name, behavior, edits = [], params] of BUILTIN_COMMAND_FIXTURES) {
+    const { h, writes } = commandEditorHarness();
+    const effective = commandFixture(name, behavior, { aliases: ['x'], roles: ['9007199254740993'], cooldown_secs: 5, response: 'Done {target}', permission: SHIPPED_PERMISSION(name) });
+    let modal = await h.app.editCommand(builtinRecord(effective));
+    assert.equal(modal.querySelector('textarea.mono, pre.raw-behavior') === null, true, `${name}: no JSON box`);
+    assert.doesNotMatch(textOf(modal), /JSON/, name);
+    assert.deepEqual([...modal.querySelectorAll('.editor-section-title')].map(textOf), ['Basics', 'What it does', 'Who can use it and where', 'Logging'], name);
+    assert.match(commandSummary(modal), new RegExp(`^!${name} <user>: \\S`), name);
+    if (!edits.length) assert.match(textOf(modal), /This built-in has no settings\./, name);
+    // An untouched save sends exactly the loaded definition.
+    await fire(commandSave(modal), 'click');
+    assert.equal(writes.length, 1, name);
+    assert.equal(writes[0].method, 'PUT', name);
+    assert.equal(writes[0].body.scope, 'guild', `${name}: a built-in override is saved for this server`);
+    assert.deepEqual(writes[0].body.data, effective, `${name}: unchanged round trip`);
+    if (!edits.length) continue;
+    modal = await h.app.editCommand(builtinRecord(effective));
+    for (const [label, how, value] of edits) {
+      const control = labelled(modal, label);
+      assert.ok(control, `${name}: ${label}`);
+      if (how === 'select') await chooseOption(control, value);
+      else await typeValue(control, value);
+    }
+    await fire(commandSave(modal), 'click');
+    assert.equal(writes.length, 2, name);
+    assert.deepEqual(writes[1].body.data.behavior, { kind: behavior.kind, params }, `${name}: edited round trip`);
+  }
+});
+
+test('every behavior kind and plan step in src/types.rs has form fields for exactly its params', () => {
+  const { app } = harness();
+  const types = fs.readFileSync(new URL('../src/types.rs', import.meta.url), 'utf8');
+  const variants = (name) => {
+    const body = types.match(new RegExp(`pub enum ${name} \\{\\n([\\s\\S]*?)\\n\\}`))[1];
+    const out = new Map();
+    for (const [, variant, fields = ''] of body.matchAll(/^ {4}(\w+)(?: \{([^}]*)\})?,$/gm))
+      out.set(variant.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase(), [...fields.matchAll(/^\s*(\w+): [\w<>]+,$/gm)].map(m => m[1]).sort());
+    return out;
+  };
+  const behaviors = variants('Behavior');
+  assert.ok(behaviors.size >= 24, 'parsed the Behavior enum');
+  for (const [kind, fields] of behaviors) {
+    if (kind === 'plan') { assert.deepEqual(fields, ['steps']); continue; }
+    const spec = app.COMMAND_BEHAVIORS[kind];
+    assert.ok(spec, `${kind} has a form entry`);
+    assert.deepEqual([...(spec.fields || []).map(f => f.key)].sort(), fields, `${kind} fields`);
+  }
+  assert.deepEqual(Object.keys(app.COMMAND_BEHAVIORS).sort(), [...behaviors.keys()].filter(k => k !== 'plan').sort());
+  const steps = variants('PlanStep');
+  assert.deepEqual(Object.keys(app.PLAN_STEP_LABELS).sort(), [...steps.keys()].sort());
+  for (const [type, fields] of steps)
+    assert.deepEqual(Object.keys(app.planStepFor(type, {})).filter(k => k !== 'type').sort(), fields, `${type} step fields`);
+});
+
+test('built-in commands save per-server overrides within their permission floor and reset to default', async () => {
+  const { h, writes } = commandEditorHarness({ owner: true });
+  const stats = commandFixture('stats', { kind: 'stats' }, { permission: 'admin' });
+  let modal = await h.app.editCommand(builtinRecord(stats));
+  assert.match(textOf(modal), /BUILT-IN COMMAND/);
+  assert.equal(labelled(modal, 'Name').readOnly, true, 'built-in names stay fixed');
+  assert.deepEqual([...labelled(modal, 'Permission').options].map(textOf), ['Admins and up', 'Bot owner only'], 'no level below the shipped one');
+  assert.deepEqual([...labelled(modal, 'Applies to').options].map(o => o.value), ['guild'], 'even the bot owner saves built-ins per server');
+  assert.equal(findNode(modal, n => n.localName === 'button' && /^(Delete|Reset to default)$/.test(n.textContent))?.hidden ?? true, true, 'nothing to reset without an override');
+  await chooseOption(labelled(modal, 'Permission'), 'Bot owner only');
+  await fire(commandSave(modal), 'click');
+  assert.equal(writes.at(-1).body.data.permission, 'owner');
+  assert.equal(writes.at(-1).body.scope, 'guild');
+
+  modal = await h.app.editCommand(builtinRecord({ ...stats, permission: 'owner' }, { guild_override: { ...stats, permission: 'owner' } }));
+  const reset = findNode(modal, n => n.localName === 'button' && n.textContent === 'Reset to default');
+  assert.equal(reset.hidden, false);
+  await fire(reset, 'click');
+  const removal = writes.find(w => w.method === 'DELETE');
+  assert.ok(removal, 'reset sends a delete');
+  assert.match(removal.url, /\/commands\/stats$/);
+  assert.equal(removal.body.scope, 'guild');
+  assert.match(h.nodes.get('#toast').textContent, /Reset to default/);
+
+  // The global view cannot change built-ins: they are per server.
+  h.app.state.guildId = '0';
+  modal = await h.app.editCommand(builtinRecord(stats));
+  assert.match(textOf(modal), /Built-ins are changed one server at a time/);
+  assert.equal(commandSave(modal).hidden, true);
+});
+
+test('action plan steps show only their own fields and round-trip every step type', async () => {
+  const { h, writes } = commandEditorHarness();
   const modal = await h.app.editCommand(null);
-  const json = modal.querySelector('textarea.mono');
-  const save = findNode(modal, n => n.localName === 'button' && n.textContent === 'Save');
-  for (const value of ['{broken', 'null', '[]', '{"steps":{}}', ...[null, 1, 'bad', true, []].map(step => JSON.stringify({steps: [step]}))]) {
-    json.value = value;
-    await fire(json, 'input');
-    await fire(json, 'focusout');
-    assert.equal(modal.isConnected, true, value);
-    assert.equal(json.value, value);
-    assert.match(h.nodes.get('#toast').textContent, /Invalid behavior JSON/);
-    assertAccessible(h.nodes.get('#toast'));
-    await fire(save, 'click');
+  await typeValue(labelled(modal, 'Name'), 'Steps');
+  const add = () => fire(findNode(modal, n => n.localName === 'button' && n.textContent === '+ add step'), 'click');
+  const step = (i) => modal.querySelectorAll('.command-step')[i];
+  const setType = (i, label) => chooseOption(step(i).querySelector('select'), label);
+  const message = (i) => step(i).querySelector('.escalation-reason input');
+  const plan = [
+    ['Reply', async (i) => typeValue(message(i), 'Hi {user}'), { type: 'reply', template: 'Hi {user}' }],
+    ['Send DM', async (i) => typeValue(message(i), 'Hello'), { type: 'dm', template: 'Hello' }],
+    ['Log', async (i) => { await chooseOption(step(i).querySelectorAll('select')[1], 'Mod action'); await typeValue(message(i), '{actor} ran it'); }, { type: 'log', event: 'mod_action', template: '{actor} ran it' }],
+    ['Add role', async (i) => chooseOption(labelled(step(i), `Role for step ${i + 1}`), '@Moderators'), { type: 'add_role', role_id: '9007199254740993' }],
+    ['Remove role', async (i) => { const box = findNode(modal, n => n.getAttribute?.('aria-label') === `Add a role by ID for step ${i + 1}`); await typeValue(box, '<@&111>'); await fire(box, 'keydown', { key: 'Enter' }); }, { type: 'remove_role', role_id: '111' }],
+    ['Timeout', async (i) => typeValue(labelled(step(i), `Step ${i + 1} minutes`), '15'), { type: 'timeout', minutes: 15 }],
+    ['Kick', async () => {}, { type: 'kick' }],
+    ['Ban', async (i) => chooseOption(labelled(step(i), `Step ${i + 1} messages`), 'Delete 3 days'), { type: 'ban', delete_days: 3 }],
+    ['Delete command message', async () => {}, { type: 'delete_command_message' }],
+    ['React', async (i) => chooseOption(labelled(step(i), `Step ${i + 1} emoji`), '🎉'), { type: 'react', emoji: '🎉' }],
+    ['React', async (i) => { await chooseOption(labelled(step(i), `Step ${i + 1} emoji`), 'Other…'); await typeValue(labelled(step(i), `Step ${i + 1} other emoji`), '🦊'); }, { type: 'react', emoji: '🦊' }],
+    ['Wait', async (i) => typeValue(labelled(step(i), `Step ${i + 1} seconds`), '3'), { type: 'wait', secs: 3 }],
+  ];
+  for (let i = 0; i < plan.length; i++) {
+    if (i > 0) await add();
+    await setType(i, plan[i][0]);
+    // Only this type's own controls: the type picker plus its fields and the remove button.
+    const own = { Reply: 1, 'Send DM': 1, Log: 2, Timeout: 1, Kick: 0, Ban: 1, 'Delete command message': 0, Wait: 1 }[plan[i][0]];
+    if (own !== undefined) assert.equal(step(i).querySelectorAll('input, select').length - 1, own, `${plan[i][0]} shows only its own fields`);
+    await plan[i][1](i);
+  }
+  assert.match(commandSummary(modal), /^!steps: replies “Hi \{user\}”, DMs “Hello”, logs Mod action, gives @Moderators, removes role 111, times out the target for 15 min, kicks the target, bans the target \(deleting 3 days of messages\), deletes the command message, reacts 🎉, reacts 🦊 and waits 3s\. Everyone\./);
+  await fire(commandSave(modal), 'click');
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].method, 'POST');
+  assert.equal(writes[0].body.data.name, 'steps');
+  assert.deepEqual(writes[0].body.data.behavior, { kind: 'plan', params: { steps: plan.map(([, , expected]) => expected) } });
+});
+
+test('saved edge values stay visible, and removing a step or typing a role ID keeps the rest', async () => {
+  const { h, writes } = commandEditorHarness();
+  const steps = [
+    { type: 'ban', delete_days: 9 },
+    { type: 'log', event: '', template: 't' },
+    { type: 'react', emoji: '' },
+    { type: 'wait', secs: 7 },
+    { type: 'add_role', role_id: '' },
+  ];
+  const modal = await h.app.editCommand({ name: 'legacy', scope: 'guild', effective: commandFixture('legacy', { kind: 'plan', params: { steps } }) });
+  const step = (i) => modal.querySelectorAll('.command-step')[i];
+  const days = labelled(step(0), 'Step 1 messages');
+  assert.equal(days.value, '9');
+  assert.equal(days.selectedOptions[0].textContent, 'Delete 9 days', 'an old day count is shown, not Keep messages');
+  const event = step(1).querySelectorAll('select')[1];
+  assert.equal(event.value, '');
+  assert.equal(event.selectedOptions[0].textContent, 'Choose an event…');
+  assert.ok(labelled(step(2), 'Step 3 other emoji'), 'an empty emoji opens the Other box');
+  await fire(commandSave(modal), 'click');
+  assert.match(h.nodes.get('#toast').textContent, /Step 2: choose a log event\./);
+  await chooseOption(event, 'Member join');
+  await typeValue(labelled(step(2), 'Step 3 other emoji'), '🦊');
+  // Remove the wait step; the steps after it keep their own values and names.
+  await fire(findNode(modal, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Remove step 4'), 'click');
+  assert.equal(modal.querySelectorAll('.command-step').length, 4);
+  // A role ID typed without Enter is added on Save, as a string.
+  await typeValue(findNode(modal, n => n.getAttribute?.('aria-label') === 'Add a role by ID for step 4'), '222');
+  await fire(commandSave(modal), 'click');
+  assert.equal(writes.length, 1);
+  assert.deepEqual(writes[0].body.data.behavior.params.steps, [
+    { type: 'ban', delete_days: 9 },
+    { type: 'log', event: 'member_join', template: 't' },
+    { type: 'react', emoji: '🦊' },
+    { type: 'add_role', role_id: '222' },
+  ]);
+});
+
+test('command form errors keep the editor open with accessible messages until fixed', async () => {
+  const { h, writes } = commandEditorHarness({ refuse: 1 });
+  const modal = await h.app.editCommand({ name: 'timeout', scope: 'global', effective: commandFixture('timeout', { kind: 'timeout', params: { default_minutes: 60 } }) });
+  const length = labelled(modal, 'Default length');
+  for (const [value, message] of [['', /Default length must be a whole number from 0 to 40320/], ['1.5', /Default length/], ['40321', /Default length/]]) {
+    await typeValue(length, value);
+    await fire(commandSave(modal), 'click');
+    assert.equal(writes.length, 0, value);
     assert.equal(modal.isConnected, true);
-    assert.equal(writes.length, 0);
+    assert.match(h.nodes.get('#toast').textContent, message);
     assertAccessible(h.nodes.get('#toast'));
   }
-  const name = modal.querySelector('input[placeholder="command name"]');
-  name.value = 'hello';
-  await fire(name, 'input');
-  json.value = '{"steps":[{"type":"reply","template":"Hello"}]}';
-  await fire(json, 'input');
-  await fire(json, 'focusout');
-  await fire(save, 'click');
-  assert.equal(modal.isConnected, true);
-  assert.equal(name.value, 'hello');
+  await typeValue(labelled(modal, 'Cooldown'), '-1');
+  await typeValue(length, '0');
+  await fire(commandSave(modal), 'click');
+  assert.match(h.nodes.get('#toast').textContent, /Cooldown must be a whole number/);
+  await typeValue(labelled(modal, 'Cooldown'), '5');
+  await fire(commandSave(modal), 'click');
+  assert.equal(writes.length, 1);
   assert.match(h.nodes.get('#toast').textContent, /command write refused/);
-  assertAccessible(h.nodes.get('#toast'));
-  refuse = false;
-  await fire(save, 'click');
+  assert.equal(length.value, '0', 'a refused save keeps the typed value');
+  await fire(commandSave(modal), 'click');
   assert.equal(modal.isConnected, false);
-  assert.deepEqual(writes.at(-1).data.behavior.params.steps, [{type: 'reply', template: 'Hello'}]);
+  assert.deepEqual(writes.at(-1).body.data.behavior, { kind: 'timeout', params: { default_minutes: 0 } });
+  assert.equal(writes.at(-1).body.data.cooldown_secs, 5);
+
+  const plan = commandEditorHarness();
+  const editor = await plan.h.app.editCommand(null);
+  await typeValue(labelled(editor, 'Name'), 'roles');
+  await chooseOption(editor.querySelector('.command-step select'), 'Add role');
+  await fire(commandSave(editor), 'click');
+  assert.match(plan.h.nodes.get('#toast').textContent, /Step 1: choose a role\./);
+  await chooseOption(editor.querySelector('.command-step select'), 'Timeout');
+  await typeValue(labelled(editor, 'Step 1 minutes'), '0');
+  await fire(commandSave(editor), 'click');
+  assert.match(plan.h.nodes.get('#toast').textContent, /Step 1: timeout must be 1 to 40320 minutes\./);
+  await typeValue(labelled(editor, 'Name'), '');
+  await fire(commandSave(editor), 'click');
+  assert.match(plan.h.nodes.get('#toast').textContent, /Name required/);
+  assert.equal(plan.writes.length, 0);
+});
+
+test('command restrictions use name pickers and the log event is a dropdown of real events', async () => {
+  const { h, writes } = commandEditorHarness();
+  const modal = await h.app.editCommand({ name: 'kick', scope: 'global', effective: commandFixture('kick', { kind: 'kick', params: { default_reason: 'x' } }, { channels: ['9007199254740995'], log_event: 'custom_event' }) });
+  const chips = (label) => [...modal.querySelectorAll(`ul.picker-chips[aria-label="${label}"] .picker-chip-text`)].map(textOf);
+  assert.deepEqual(chips('Only in these channels'), ['#mod-chat']);
+  await chooseOption(labelled(modal, 'Only these roles'), '@Moderators');
+  assert.deepEqual(chips('Only these roles'), ['@Moderators']);
+  assert.equal(findNode(modal, n => n.localName === 'input' && /role ids|channel ids/.test(n.getAttribute('placeholder') || '')) === null, true, 'no comma-separated ID boxes');
+  const log = labelled(modal, 'Log event');
+  assert.equal(log.localName, 'select');
+  assert.deepEqual([...log.options].map(textOf), ['None', 'custom_event (not a log event)', 'Member join', 'Mod action', 'Plan executed', 'System', 'Voice join']);
+  assert.equal(log.value, 'custom_event', 'an unknown saved event is kept');
+  await fire(commandSave(modal), 'click');
+  assert.equal(writes[0].body.data.log_event, 'custom_event');
+  assert.deepEqual(writes[0].body.data.roles, ['9007199254740993']);
+  assert.deepEqual(writes[0].body.data.channels, ['9007199254740995']);
+  const again = await h.app.editCommand({ name: 'kick', scope: 'global', effective: commandFixture('kick', { kind: 'kick', params: { default_reason: 'x' } }) });
+  await chooseOption(labelled(again, 'Log event'), 'Plan executed');
+  await fire(commandSave(again), 'click');
+  assert.equal(writes[1].body.data.log_event, 'plan_executed');
+  const none = await h.app.editCommand({ name: 'kick', scope: 'global', effective: commandFixture('kick', { kind: 'kick', params: { default_reason: 'x' } }) });
+  await chooseOption(labelled(none, 'Log event'), 'None');
+  await fire(commandSave(none), 'click');
+  assert.equal(writes[2].body.data.log_event, '');
+});
+
+test('the command summary reads the form live in plain words', async () => {
+  const { h } = commandEditorHarness();
+  const modal = await h.app.editCommand({ name: 'ban', scope: 'global', effective: commandFixture('ban', { kind: 'ban', params: { default_reason: 'r', delete_days: 1 } }, { usage: '!ban @user reason', response: 'Banned {target}', cooldown_secs: 5 }) });
+  assert.equal(commandSummary(modal), '!ban @user reason: bans the target, deletes 1 day of messages and replies “Banned {target}”. Mods and up, 5s cooldown. Logs Mod action.');
+  await chooseOption(labelled(modal, 'Permission'), 'Everyone');
+  await typeValue(labelled(modal, 'Cooldown'), '0');
+  await chooseOption(labelled(modal, 'Delete messages'), 'Keep messages');
+  await chooseOption(labelled(modal, 'Log event'), 'None');
+  await fire(modal.querySelector('.rule-toggles input[type="checkbox"]'), 'change', { target: { checked: false } });
+  assert.equal(commandSummary(modal), '!ban @user reason: bans the target and replies “Banned {target}”. Everyone. Off: the command is ignored.');
+});
+
+test('only the bot owner sees a read-only raw behavior view', async () => {
+  const effective = commandFixture('purge', { kind: 'purge', params: { default_count: 50 } });
+  const member = commandEditorHarness();
+  assert.doesNotMatch(textOf(await member.h.app.editCommand({ name: 'purge', scope: 'global', effective })), /Advanced \(raw\)/);
+  const owner = commandEditorHarness({ owner: true });
+  const modal = await owner.h.app.editCommand({ name: 'purge', scope: 'global', effective });
+  const raw = findNode(modal, n => n.localName === 'details' && textOf(n.querySelector('summary')) === 'Advanced (raw)');
+  assert.ok(raw);
+  assert.equal(raw.open, false, 'collapsed by default');
+  assert.equal(raw.querySelector('input, textarea, select') === null, true, 'read-only');
+  assert.deepEqual(JSON.parse(textOf(raw.querySelector('pre'))), effective.behavior);
+  await typeValue(labelled(modal, 'Default count'), '20');
+  assert.deepEqual(JSON.parse(textOf(raw.querySelector('pre'))), { kind: 'purge', params: { default_count: 20 } });
 });
 
 test('acknowledged command deletion exposes Retry when the config refresh fails', async () => {
   const calls = [];
   const h = harness(async (url, options) => {
+    if (url.endsWith('/server-names')) return response({roles: [], channels: []});
     calls.push({url, method: options.method});
     if (options.method === 'DELETE') return response({ok: true});
     throw new Error('refresh unavailable');
@@ -5298,10 +5583,20 @@ test('field labels exclude control values and command steps have individual iden
   }
   const modal = await h.app.editCommand(null);
   await fire(findNode(modal, n => n.localName === 'button' && n.textContent === '+ add step'), 'click');
-  const inputs = [...modal.querySelectorAll('.step-card input, .step-card select')];
+  const steps = [...modal.querySelectorAll('.command-step')];
+  const inputs = steps.flatMap(step => [...step.querySelectorAll('input, select')]);
   assert.equal(inputs.length, 4);
   assert.equal(new Set(inputs.map(input => input.id)).size, inputs.length);
-  for (const input of inputs) assert.match(input.getAttribute('aria-label'), /^Step (action|value)$/);
+  // Each step control is named for its own step number, so no two share a name.
+  const names = [];
+  steps.forEach((step, i) => {
+    for (const input of step.querySelectorAll('input, select')) {
+      const name = input.getAttribute('aria-labelledby').split(' ').map(id => h.document.getElementById(id)?.textContent || '').join(' ');
+      assert.match(name, new RegExp(`[Ss]tep ${i + 1}\\b`));
+      names.push(name);
+    }
+  });
+  assert.equal(new Set(names).size, names.length);
 });
 
 test('appearance retains the session choice across startup and workspace when storage is blocked', async () => {
@@ -6718,7 +7013,7 @@ test('Workspace pages keep explanatory text short and move details into collapse
     badwords: /Block words and phrases/,
     'known-spam': /Ban members who post spam/,
     'known-bad-images': /Ban images you've already confirmed/,
-    commands: /Rename any command/,
+    commands: /Change any command's replies/,
   };
   for (const [tab, intro] of Object.entries(expected)) {
     const h = harness(async () => response({ events: 0, warns: 0, bans: 0, cases: 0 }));
@@ -7905,7 +8200,7 @@ test('Commands and Automod rules edit with blue pencils and remove steps with re
   const editor = await h.app.editCommand(null);
   const add = findNode(editor, n => n.localName === 'button' && n.textContent === '+ add step');
   await fire(add, 'click', {});
-  assertIconAction(iconAction(editor, 'Remove step'), 'remove', 'Remove step');
+  assertIconAction(iconAction(editor, 'Remove step 2'), 'remove', 'Remove step 2');
 
   const limited = harness();
   limited.app.state.guilds[0].access = 'settings';
@@ -7990,8 +8285,9 @@ test('the Web UI draws SVG icons, never emoji or glyph icons', () => {
   for (const arrow of ['\u2190', '\u2192', '\u2197', '\u21BB', 'h("span", { "aria-hidden": "true" }, "\u2192")', '"Review protection \u2192"'])
     assert.ok(glyph.test(arrow), `the scan flags ${JSON.stringify(arrow)}`);
   const read = file => fs.readFileSync(new URL(`../frontend/${file}`, import.meta.url), 'utf8');
-  // Sample data shown as-is (a pasteable spam example and a bypass-test placeholder) is not UI chrome.
-  const samples = [/^const STOCKS_SPAM_EXAMPLE = .*$/m, /"sample text to test, e\.g\. [^"]*"/];
+  // Sample data shown as-is (a pasteable spam example and a bypass-test placeholder) is not UI chrome,
+  // nor are the emoji a command's React step can save (#623).
+  const samples = [/^const STOCKS_SPAM_EXAMPLE = .*$/m, /"sample text to test, e\.g\. [^"]*"/, /^const REACT_EMOJI = .*$/m];
   let app = read('app.js');
   for (const sample of samples) {
     assert.match(app, sample, 'sample exclusion still matches its source');

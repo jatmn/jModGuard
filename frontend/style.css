@@ -181,9 +181,6 @@ body { background: var(--bg); color: var(--text); font-size: var(--ui-font-size)
 .ok { color: var(--good); }
 .err, .error { color: var(--bad); }
 pre.code { background: var(--panel2); border: 1px solid var(--shell-border); border-radius: 8px; padding: 12px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.plan-steps { border: 0; padding: 0; }
-.plan-steps > .btn { justify-self: start; }
-.step-card { --radius-box: 8px; border-color: var(--shell-border); padding: 10px 12px; margin-bottom: 8px; background: var(--panel2); }
 .step-actions { display: flex; gap: 8px; margin-top: 10px; }
 .empty-state { text-align: center; }
 #toast { inset-inline-end: 24px; bottom: 24px; max-width: min(440px, calc(100vw - 32px)); z-index: 999; }
@@ -380,6 +377,11 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .editor-advanced > * + * { margin-top: 8px; }
 .modal-action { flex-wrap: wrap; align-items: flex-end; gap: 8px; padding-top: 12px; border-top: 1px solid var(--shell-border); }
 /* The rule editor keeps Save, Reset and Cancel in view while its sections scroll. */
+/* Command editor (#623): the #621 layout with compact step rows. */
+.command-editor .textarea { min-height: 3.5rem; }
+.command-step .id-picker { margin: 0; }
+.emoji-select { width: auto; }
+.raw-behavior { margin: 0; max-height: 14rem; overflow: auto; padding: 8px 10px; border: 1px solid var(--shell-border); border-radius: 8px; background: var(--panel2); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .rule-editor > .modal-action { position: sticky; bottom: 0; z-index: 1; margin-top: 4px; padding-bottom: 16px; background: var(--color-base-100); }
 .modal-action > .field { margin: 0 auto 0 0; flex: 1 1 220px; }
 .modal-action > .field > select { width: 100%; }
