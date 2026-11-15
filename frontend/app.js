@@ -1538,10 +1538,12 @@ function Notification() {
     }, ui.getSnapshot().notification.message),
   );
 }
+// Searches, filters and controls that save at once (data-no-draft) are not unsaved edits.
 function trackDraft(event) {
   if (
     event.target.matches("input, textarea, select") &&
     !event.target.hasAttribute("data-search") &&
+    !event.target.closest("[data-no-draft]") &&
     !["events", "members", "bans"].includes(state.tab)
   )
     markDirty();
@@ -3510,6 +3512,53 @@ function ruleOutcome(rule) {
   return steps.startsWith("Strike 1: ") && !steps.includes(" · ") ? steps.slice("Strike 1: ".length) : steps;
 }
 
+// Exact image spam and Repeated text store test and enforce as different shapes:
+// test logs only, enforce deletes then bans. Thresholds come from `number(key)`.
+function setSpamRuleMode(rule, ruleId, punish, number, ban) {
+  const textRule = ruleId === "repeat_text";
+  rule.params = textRule
+    ? {
+        mode: "exact_text",
+        min_channels: number("min_channels"),
+        window_secs: number("window_secs"),
+        min_length: number("min_length"),
+      }
+    : {
+        mode: punish ? "exact_image" : "exact_image_test",
+        min_channels: number("min_channels"),
+        min_attachments: number("min_attachments"),
+        window_secs: number("window_secs"),
+      };
+  rule.dry_run = !punish;
+  rule.actions = punish
+    ? [
+        { at: 1, action: "delete", reason: "spam match", duration_minutes: 0, delete_days: 0 },
+        { at: 1, action: "ban", reason: "spam match", duration_minutes: 0, delete_days: ban.delete_days || 0, purge_last_hour: ban.purge_last_hour === true },
+      ]
+    : [
+        {
+          at: 1,
+          action: "log",
+          reason: textRule ? "Repeated text test" : "Exact image spam test",
+          duration_minutes: 0,
+          delete_days: ban.delete_days || 0,
+          purge_last_hour: ban.purge_last_hour === true,
+        },
+      ];
+}
+
+// The ban step a spam rule keeps across test and enforce modes.
+function spamRuleBan(rule) {
+  return (rule.actions || []).find((action) => action.action === "ban") || (rule.actions || [])[0] || {};
+}
+
+// The "then" half of a rule summary, in the bot's terms.
+function ruleOutcomeFor(ruleId, rule, spamBan) {
+  if (ruleId === "known_spam") return "Ban and delete the last hour of messages";
+  if (spamRule(ruleId)) return `Delete the messages and ban (${banMessagesLabel(spamBan).toLowerCase()})`;
+  return ruleOutcome(rule);
+}
+
 function ruleSummaryText(trigger, outcome, enabled, dryRun) {
   const state = !enabled ? " Off: the rule is ignored." : dryRun ? " Dry-run: only logs." : "";
   return `${trigger}: ${outcome}.${state}`;
@@ -3531,7 +3580,7 @@ function EditorSection({ title, hint, className = "", children }) {
 
 // Enabled and Dry-run sit in the header as toggles; their labels stay the
 // exact control names.
-function RuleEditorHeader({ title, enabled, dryRun, dryRunDisabled, onEnabled, onDryRun, dryRunRef }) {
+function RuleEditorHeader({ title, enabled, dryRun, dryRunDisabled, disabled, onEnabled, onDryRun, dryRunRef }) {
   return h(
     "div",
     { className: "editor-heading rule-editor-header" },
@@ -3542,7 +3591,7 @@ function RuleEditorHeader({ title, enabled, dryRun, dryRunDisabled, onEnabled, o
       h(
         "label",
         { className: "toggle-label" },
-        h(Input, { type: "checkbox", className: "toggle toggle-sm", defaultChecked: enabled, onChange: (e) => onEnabled(e.target.checked) }),
+        h(Input, { type: "checkbox", className: "toggle toggle-sm", defaultChecked: enabled, disabled, onChange: (e) => onEnabled(e.target.checked) }),
         "Enabled",
       ),
       h(
@@ -3553,7 +3602,7 @@ function RuleEditorHeader({ title, enabled, dryRun, dryRunDisabled, onEnabled, o
           type: "checkbox",
           className: "toggle toggle-sm",
           defaultChecked: dryRun,
-          disabled: dryRunDisabled,
+          disabled: disabled || dryRunDisabled,
           onChange: (e) => onDryRun(e.target.checked),
         }),
         "Dry-run (log only)",
@@ -4143,7 +4192,6 @@ function RuleEditor({ record: r }) {
   const [, setRevision] = useState(0);
   const refresh = () => setRevision((value) => value + 1);
   const spam = spamRule(r.rule_id);
-  const textRule = r.rule_id === "repeat_text";
   const knownSpam = r.rule_id === "known_spam";
   const trigger = RULE_TRIGGERS[r.rule_id] || { phrase: () => "When this rule matches" };
   const fields = trigger.fields || [];
@@ -4157,9 +4205,7 @@ function RuleEditor({ record: r }) {
     if (r.rule_id === "invite") draft.allowlist_codes = inviteCodes(rule.params?.allowlist_codes).join(", ");
     return draft;
   });
-  const [spamBan] = useState(() => ({
-    ...(rule.actions.find((action) => action.action === "ban") || rule.actions[0] || {}),
-  }));
+  const [spamBan] = useState(() => ({ ...spamRuleBan(rule) }));
   // Inactive legacy image rows should convert to the safe dry-run mode by default.
   const [dryRun, setDryRun] = useState(() => (spam ? !spamConfigured(r.rule_id, rule) || rule.dry_run : rule.dry_run));
   const dryRunRef = useRef(null);
@@ -4173,11 +4219,7 @@ function RuleEditor({ record: r }) {
   };
   const shown = { ...values };
   for (const { key } of fields) shown[key] = String(values[key]).trim() || "…";
-  const outcome = knownSpam
-    ? "Ban and delete the last hour of messages"
-    : spam
-      ? `Delete the messages and ban (${banMessagesLabel(spamBan).toLowerCase()})`
-      : ruleOutcome(rule);
+  const outcome = ruleOutcomeFor(r.rule_id, rule, spamBan);
   const summary = ruleSummaryText(trigger.phrase(shown), outcome, rule.enabled, dryRun);
 
   const actions = knownSpam
@@ -4285,38 +4327,7 @@ function RuleEditor({ record: r }) {
               if (spam) {
                 // The header toggle is the source of truth, including scripted checks.
                 const punish = !(dryRunRef.current?.checked ?? dryRun);
-                const number = (key) => Number(values[key]);
-                if (textRule) {
-                  rule.params = {
-                    mode: "exact_text",
-                    min_channels: number("min_channels"),
-                    window_secs: number("window_secs"),
-                    min_length: number("min_length"),
-                  };
-                } else {
-                  rule.params = {
-                    mode: punish ? "exact_image" : "exact_image_test",
-                    min_channels: number("min_channels"),
-                    min_attachments: number("min_attachments"),
-                    window_secs: number("window_secs"),
-                  };
-                }
-                rule.dry_run = !punish;
-                rule.actions = punish
-                  ? [
-                      { at: 1, action: "delete", reason: "spam match", duration_minutes: 0, delete_days: 0 },
-                      { at: 1, action: "ban", reason: "spam match", duration_minutes: 0, delete_days: spamBan.delete_days || 0, purge_last_hour: spamBan.purge_last_hour === true },
-                    ]
-                  : [
-                      {
-                        at: 1,
-                        action: "log",
-                        reason: textRule ? "Repeated text test" : "Exact image spam test",
-                        duration_minutes: 0,
-                        delete_days: spamBan.delete_days || 0,
-                        purge_last_hour: spamBan.purge_last_hour === true,
-                      },
-                    ];
+                setSpamRuleMode(rule, r.rule_id, punish, (key) => Number(values[key]), spamBan);
                 if (!spamConfigured(r.rule_id, rule))
                   throw new Error(
                     "Channels must be 2–10 and window 1–600 seconds, all whole numbers. Images 1–10. Text length 1–2000.",
@@ -4458,6 +4469,157 @@ function describeRuleActions(rule, name = ruleActionName) {
     : "No actions set";
 }
 
+// List pages (#622): Badwords, Known spam and Known-bad images share one layout:
+// the rule's status, the add form, the list, then an optional tester or preview.
+// Each page supplies only its add form, table columns and extras.
+
+// A header toggle saves the effective rule with that one change, the same write
+// the rule editor's Save makes with its default "This server" scope.
+async function saveRuleToggle(record, change) {
+  const rule = JSON.parse(JSON.stringify(record.effective));
+  if ("dry_run" in change && spamRule(record.rule_id)) {
+    setSpamRuleMode(rule, record.rule_id, !change.dry_run, (key) => Number(rule.params?.[key]), spamRuleBan(rule));
+  }
+  Object.assign(rule, change);
+  await reloadAfter(
+    () => api(`/api/guilds/${state.guildId}/rules/${record.rule_id}`, "PUT", { scope: "guild", data: rule, clear_guild_override: false }),
+    () => toast("Rule saved", "success"),
+  );
+}
+
+// Status header: Enabled and Dry-run toggles, the rule summary in the editor's
+// words, and the editor for actions and exemptions.
+function RuleStatusCard({ record, trigger }) {
+  // Remount the toggles after every save attempt so they show the saved state.
+  const [attempt, setAttempt] = useState(0);
+  if (!record) return null;
+  const rule = record.effective;
+  const inactive = spamRule(record.rule_id) && !spamConfigured(record.rule_id, rule);
+  const toggle = (key) => (on) =>
+    handleEvent(async () => {
+      try {
+        await saveRuleToggle(record, { [key]: on });
+      } finally {
+        setAttempt((value) => value + 1);
+      }
+    }, null);
+  return h(
+    "section",
+    { className: "card bg-base-100 card-border list-card list-status", "aria-label": "Rule status", "data-no-draft": true },
+    h(
+      "div",
+      { className: "card-body" },
+      h(RuleEditorHeader, {
+        key: attempt,
+        title: record.name,
+        enabled: rule.enabled,
+        dryRun: rule.dry_run,
+        disabled: inactive,
+        onEnabled: toggle("enabled"),
+        onDryRun: toggle("dry_run"),
+      }),
+      h(RuleSummary, {
+        text: inactive
+          ? `${record.name} is inactive. Open it to convert it.`
+          : ruleSummaryText(trigger, ruleOutcomeFor(record.rule_id, rule, spamRuleBan(rule)), rule.enabled, rule.dry_run),
+      }),
+      h(
+        "div",
+        { className: "list-status-actions" },
+        record.guild_override
+          ? h("span", { className: "badge badge-soft badge-sm badge-neutral override-tag" }, "server override")
+          : record.global
+            ? h("span", { className: "badge badge-soft badge-sm badge-primary scope-tag" }, "global")
+            : null,
+        h(ActionButton, { className: "btn", onClick: () => editRule(record) }, "Edit actions & exemptions"),
+      ),
+    ),
+  );
+}
+
+function ListCard({ title, children, className = "" }) {
+  return h(
+    "section",
+    { className: `card bg-base-100 card-border list-card ${className}`.trim(), "aria-label": title },
+    h("div", { className: "card-body" }, h("h3", { className: "card-title" }, title), children),
+  );
+}
+
+// The row under an add form: the note on the left, the primary Add on the right.
+function ListFormSubmit({ children }) {
+  return h("div", { className: "list-form-submit" }, children);
+}
+
+// The list as a table. Search and filters appear once it has items.
+function ListTable({ title, rows, headings, renderRow, searchText, searchLabel, filters = [], empty }) {
+  const [query, setQuery] = useState("");
+  const [picked, setPicked] = useState({});
+  const needle = query.trim().toLowerCase();
+  const shown = rows.filter(
+    (row) =>
+      (!needle || searchText(row).toLowerCase().includes(needle)) &&
+      filters.every((filter) => !picked[filter.key] || filter.value(row) === picked[filter.key]),
+  );
+  return h(
+    ListCard,
+    { title: `${title} (${rows.length})`, className: "list-table" },
+    rows.length
+      ? h(
+          "div",
+          { className: "list-toolbar", "data-no-draft": true },
+          h(Input, {
+            type: "search",
+            className: "input",
+            "data-search": true,
+            "aria-label": searchLabel,
+            placeholder: searchLabel,
+            value: query,
+            onChange: (event) => setQuery(event.target.value),
+          }),
+          ...filters.map((filter) =>
+            h(
+              Select,
+              {
+                key: filter.key,
+                className: "select",
+                "aria-label": filter.label,
+                value: picked[filter.key] || "",
+                onChange: (event) => setPicked({ ...picked, [filter.key]: event.target.value }),
+              },
+              h("option", { value: "" }, filter.all),
+              ...filter.options.map(([value, label]) => h("option", { key: value, value }, label)),
+            ),
+          ),
+        )
+      : null,
+    rows.length
+      ? h(
+          DataTable,
+          { headings },
+          shown.length
+            ? shown.map(renderRow)
+            : h("tr", null, h("td", { colSpan: headings.length, className: "muted" }, "Nothing matches the search.")),
+        )
+      : h("p", { className: "muted" }, empty),
+  );
+}
+
+const SCOPE_FILTER = {
+  key: "scope",
+  label: "Filter by scope",
+  all: "All scopes",
+  options: [["guild", "This server"], ["global", "Global"]],
+  value: (row) => (String(row.guild_id) === "0" ? "global" : "guild"),
+};
+
+function scopeName(row) {
+  return String(row.guild_id) === "0" ? "Global" : "This server";
+}
+
+function badwordsRule() {
+  return (state.config.rules || []).find((rule) => rule.rule_id === "badword");
+}
+
 // Badwords splits a words paste on commas and new lines (jmodguard::normalize::badword_patterns).
 const BADWORD_MAX_ENTRIES = 32;
 const BADWORD_AUTO_HANDLED = [
@@ -4468,50 +4630,24 @@ const BADWORD_AUTO_HANDLED = [
   ["Leetspeak", "Common swaps like 5c4m for scam still match."],
   ["Whole words", "A word only matches on its own, not inside a longer word."],
 ];
+const BADWORD_MATCH_SOURCES = { saved: "Saved list", draft: "Draft above" };
 
 function tabBadwords() {
   const words = state.config.badwords;
-  const { drafts } = useStore(ui);
+  const { drafts, draftBaselines } = useStore(ui);
   const mode = drafts["badwords:mode"]?.value || "words";
   const entryCount = String(drafts["badwords:pattern"]?.value ?? "")
     .split(/[,\n\r]/)
     .filter((entry) => entry.trim()).length;
-  const badwordRule = state.config.rules.find((rule) => rule.rule_id === "badword");
   const patternRef = useRef(null);
-  const pattern = h(Textarea, {
-    ref: patternRef,
-    draftKey: "badwords:pattern",
-    rows: 3,
-    maxLength: mode === "regex" ? 512 : 4096,
-    "aria-label": mode === "regex" ? "Advanced regex pattern" : "Words or phrases",
-    placeholder: mode === "regex" ? "Advanced regex, e.g. (scam|pump and dump)" : "Words or phrases, separated by commas or newlines",
-    style: { width: "100%" },
-    className: "textarea",
-  });
   const noteRef = useRef(null);
-  const note = h(Input, {
-    ref: noteRef,
-    draftKey: "badwords:note",
-    type: "text",
-    placeholder: "note (optional)",
-    className: "input",
-  });
   const scopeRef = useRef(null);
-  const scope = scopeSelect(scopeRef, "This server", "Global", true, "badwords:scope");
   const sampleRef = useRef(null);
-  const sample = h(Input, {
-    ref: sampleRef,
-    draftKey: "badwords:sample",
-    type: "text",
-    placeholder: "sample text to test, e.g. 5c@m 🅿🆁🅾🅼🅾",
-    style: { flex: "2" },
-    className: "input",
-  });
-  const [result, setResult] = useState("");
+  const [result, setResult] = useState(null);
 
   return h(
     "div",
-    {},
+    { className: "list-page" },
     h("h2", {}, "Badwords (bypass-resistant)"),
     h("p", { className: "muted" }, "Block words and phrases in your server's messages."),
     h(
@@ -4529,50 +4665,17 @@ function tabBadwords() {
           : "Global entries apply to every server. Only the bot owner can change them.",
       ],
     }),
-    badwordRule
-      ? h(
-          "div",
-          { className: "card bg-base-100 card-border" },
-          h(
-            "div",
-            { className: "card-body" },
-            h("h3", { className: "card-title" }, "What happens on match"),
-            h(
-              "p",
-              { className: "badword-action-summary" },
-              !badwordRule.effective.enabled
-                ? h("span", { className: "badge badge-soft badge-sm badge-error" }, "Off")
-                : badwordRule.effective.dry_run
-                  ? h("span", { className: "badge badge-soft badge-sm badge-warning" }, "Dry-run")
-                  : h("span", { className: "badge badge-soft badge-sm badge-success" }, "On"),
-              " ",
-              !badwordRule.effective.enabled
-                ? "Matches are ignored."
-                : badwordRule.effective.dry_run
-                  ? `Only logs matches. When on: ${describeRuleActions(badwordRule.effective)}`
-                  : describeRuleActions(badwordRule.effective),
-            ),
-            h(
-              "div",
-              { className: "card-actions" },
-              h(
-                ActionButton,
-                { className: "btn btn-sm", onClick: () => editRule(badwordRule) },
-                "Edit actions & exemptions",
-              ),
-            ),
-          ),
-        )
-      : null,
+    h(RuleStatusCard, { record: badwordsRule(), trigger: RULE_TRIGGERS.badword.phrase() }),
     h(
       DraftCard,
-      { group: "badwords", className: "card bg-base-100 card-border" },
+      { group: "badwords", className: "card bg-base-100 card-border list-card list-add" },
       h(
         "div",
         { className: "card-body" },
+        h("h3", { className: "card-title" }, "Add words"),
         h(
           "div",
-          { className: "row badword-entry-row" },
+          { className: "list-form-row" },
           field(
             "Entry type",
             h(
@@ -4581,28 +4684,41 @@ function tabBadwords() {
               h("option", { value: "words" }, "Words or phrases"),
               h("option", { value: "regex" }, "Advanced regex"),
             ),
-            h(
-              "p",
-              { className: "field-help" },
-              mode === "regex"
-                ? "Checked as written and as a lowercase copy with disguises removed. Add \\b for whole words."
-                : "Matches whole words and catches common disguises.",
-            ),
+          ),
+          field("Applies to", scopeSelect(scopeRef, "This server", "Global", true, "badwords:scope")),
+        ),
+        h(
+          "div",
+          { className: "list-entry" },
+          h(Textarea, {
+            ref: patternRef,
+            draftKey: "badwords:pattern",
+            rows: 3,
+            maxLength: mode === "regex" ? 512 : 4096,
+            "aria-label": mode === "regex" ? "Advanced regex pattern" : "Words or phrases",
+            placeholder: mode === "regex" ? "Advanced regex, e.g. (scam|pump and dump)" : "Words or phrases, separated by commas or newlines",
+            className: "textarea",
+          }),
+          h(
+            "p",
+            { className: "field-help entry-help" },
+            mode === "regex"
+              ? "Checked as written and as a lowercase copy with disguises removed. Add \\b for whole words."
+              : "Matches whole words and catches common disguises.",
           ),
           h(
-            "div",
-            { className: "badword-entry" },
-            pattern,
-            h(
-              "p",
-              { className: "field-help", "aria-live": "polite" },
-              mode === "regex"
-                ? "One pattern, up to 512 bytes."
-                : `${entryCount}/${BADWORD_MAX_ENTRIES} entries`,
-            ),
+            "p",
+            { className: "field-help entry-count", "aria-live": "polite" },
+            mode === "regex" ? "One pattern, up to 512 bytes." : `${entryCount}/${BADWORD_MAX_ENTRIES} entries`,
           ),
-          note,
-          scope,
+        ),
+        h(
+          ListFormSubmit,
+          null,
+          field(
+            "Note (optional)",
+            h(Input, { ref: noteRef, draftKey: "badwords:note", type: "text", "data-note": true, className: "input" }),
+          ),
           h(
             ActionButton,
             {
@@ -4624,98 +4740,145 @@ function tabBadwords() {
         ),
       ),
     ),
+    h(ListTable, {
+      title: "Words and patterns",
+      rows: words,
+      headings: ["Entry", "Type", "Scope", "Note", "Actions"],
+      searchText: (w) => `${w.word || w.pattern} ${w.note || ""}`,
+      searchLabel: "Search entries and notes",
+      filters: [
+        {
+          key: "type",
+          label: "Filter by type",
+          all: "All types",
+          options: [["word", "Word or phrase"], ["regex", "Advanced regex"]],
+          value: (w) => (w.word ? "word" : "regex"),
+        },
+        SCOPE_FILTER,
+      ],
+      empty: "No words yet. Add some above, for example: scam, free nitro",
+      renderRow: (w) => {
+        const canDelete = String(w.guild_id) !== "0" || isBotOwner();
+        return h(
+          "tr",
+          { key: w.id },
+          h(
+            "td",
+            { className: "list-entry-cell" },
+            h("span", { className: "mono" }, w.word || w.pattern),
+            w.valid === false
+              ? h(
+                  "span",
+                  { className: "badge badge-soft badge-sm badge-error", title: w.error || "failed compile limits" },
+                  "not enforced",
+                )
+              : null,
+          ),
+          h("td", {}, w.word ? "Word or phrase" : "Advanced regex"),
+          h("td", {}, scopeName(w)),
+          h("td", { className: "muted" }, w.note || "—"),
+          h(
+            "td",
+            {},
+            canDelete
+              ? h(IconButton, {
+                  action: "remove",
+                  label: "Remove",
+                  onClick: async () => {
+                    await reloadAfter(
+                      () => api(`/api/guilds/${state.guildId}/badwords/${w.id}`, "DELETE"),
+                      () => toast("Removed", "success"),
+                    );
+                  },
+                })
+              : h("span", { className: "muted" }, "Owner only"),
+          ),
+        );
+      },
+    }),
     h(
       DraftCard,
-      { group: "badwords-test", className: "card bg-base-100 card-border" },
+      { group: "badwords-test" },
       h(
-        "div",
-        { className: "card-body" },
-        h("h3", { className: "card-title" }, "Live tester"),
-        h("p", { className: "field-help" }, "Checks text against your list and the draft above. It doesn't take any action."),
+        "details",
+        {
+          className: "card bg-base-100 card-border list-card list-extra",
+          // Open stays open after the remount each save makes; it resets on leaving the page.
+          open: Boolean(draftBaselines["badwords:tester-open"]),
+          onToggle: (event) => {
+            const open = event.currentTarget.open;
+            if (open !== Boolean(ui.getSnapshot().draftBaselines["badwords:tester-open"]))
+              ui.set({ draftBaselines: { ...ui.getSnapshot().draftBaselines, "badwords:tester-open": open } });
+          },
+        },
+        h("summary", null, "Live tester"),
         h(
           "div",
-          { className: "row" },
-          sample,
+          { className: "card-body" },
+          h("p", { className: "field-help" }, "Checks text against your list and the draft above. It doesn't take any action."),
           h(
-            ActionButton,
-            {
-              className: "btn",
-              onClick: async () => {
-                if (!sampleRef.current.value) return toast("Enter sample text", "error");
-                const draft = patternRef.current.value.trim();
-                const res = await api(`/api/guilds/${state.guildId}/testbadwords`, "POST", {
-                  sample: sampleRef.current.value,
-                  ...(draft ? { [mode === "regex" ? "pattern" : "words"]: draft } : {}),
-                });
-                const summary = res.matched
-                  ? `Matched ${res.matches.map((match) => `${match.label} (${match.source})`).join(", ")}`
-                  : "No match in the saved list or draft.";
-                setResult(summary + (res.invalid_patterns ? `\nSkipped ${res.invalid_patterns} invalid saved patterns.` : ""));
+            ListFormSubmit,
+            null,
+            h(Input, {
+              ref: sampleRef,
+              draftKey: "badwords:sample",
+              type: "text",
+              "aria-label": "Sample text",
+              placeholder: "sample text to test, e.g. 5c@m 🅿🆁🅾🅼🅾",
+              className: "input",
+            }),
+            h(
+              ActionButton,
+              {
+                className: "btn",
+                onClick: async () => {
+                  const sample = sampleRef.current.value;
+                  if (!sample) return toast("Enter sample text", "error");
+                  const draft = patternRef.current.value.trim();
+                  const res = await api(`/api/guilds/${state.guildId}/testbadwords`, "POST", {
+                    sample,
+                    ...(draft ? { [mode === "regex" ? "pattern" : "words"]: draft } : {}),
+                  });
+                  setResult({ sample, ...res });
+                },
               },
-            },
-            "Test",
-          ),
-        ),
-        result ? h("pre", { className: "code" }, result) : null,
-      ),
-    ),
-    h(
-      "div",
-      { className: "card bg-base-100 card-border" },
-      h(
-        "div",
-        { className: "card-body" },
-        h("h3", { className: "card-title" }, `Words and patterns (${words.length})`),
-        words.length === 0
-          ? h("p", { className: "muted" }, "No words yet. Add some above, for example: scam, free nitro")
-          : h(
-              DataTable,
-              { headings: ["Scope", "Word, phrase or advanced regex", "Note", "Status", ""] },
-              words.map((w) => {
-                const isGlobal = String(w.guild_id) === "0";
-                const canDelete = !isGlobal || isBotOwner();
-                const invalid = w.valid === false;
-                return h(
-                  "tr",
-                  { key: w.id },
-                  h("td", {}, isGlobal ? "global" : "server"),
-                  h("td", { className: "mono" }, w.word || `Regex · ${w.pattern}`),
-                  h("td", { className: "muted" }, w.note || ""),
-                  h(
-                    "td",
-                    {},
-                    invalid
-                      ? h(
-                          "span",
-                          {
-                            className: "badge badge-soft badge-sm badge-error",
-                            title: w.error || "failed compile limits",
-                          },
-                          "not enforced",
-                        )
-                      : h("span", { className: "badge badge-soft badge-sm badge-success" }, "valid"),
-                  ),
-                  h(
-                    "td",
-                    {},
-                    canDelete
-                      ? h(IconButton, {
-                          action: "remove",
-                          label: "Remove",
-                          onClick: async () => {
-                            await reloadAfter(
-                              () => api(`/api/guilds/${state.guildId}/badwords/${w.id}`, "DELETE"),
-                              () => toast("Removed", "success"),
-                            );
-                          },
-                        })
-                      : h("span", { className: "muted" }, "owner only"),
-                  ),
-                );
-              }),
+              "Test",
             ),
+          ),
+          result ? h(BadwordTestResult, { result }) : null,
+        ),
       ),
     ),
+  );
+}
+
+// Shown only after a test: the tested text, then each entry that matched it.
+function BadwordTestResult({ result }) {
+  return h(
+    "div",
+    { className: "tester-result", role: "status" },
+    h(
+      "p",
+      { className: "tester-result-title" },
+      result.matched ? `“${result.sample}” matched:` : `“${result.sample}” didn't match the saved list or draft.`,
+    ),
+    result.matched
+      ? h(
+          "ul",
+          { className: "tester-matches" },
+          ...result.matches.map((match, index) =>
+            h(
+              "li",
+              { key: index },
+              h("span", { className: "mono" }, match.label),
+              h("span", { className: "badge badge-soft badge-sm badge-neutral" }, BADWORD_MATCH_SOURCES[match.source] || match.source),
+            ),
+          ),
+        )
+      : null,
+    result.invalid_patterns
+      ? h("p", { className: "field-help" }, `Skipped ${result.invalid_patterns} invalid saved patterns.`)
+      : null,
   );
 }
 
@@ -8140,11 +8303,16 @@ function setKnownSpamAddError(key, error) {
 }
 
 function tabKnownSpam() {
-  const { drafts } = useStore(ui);
+  const { drafts, draftBaselines } = useStore(ui);
   const scopeRef = useRef(null);
   const guildId = state.guildId;
   const rows = state.config.known_spam || [];
   const rule = (state.config.rules || []).find((r) => r.rule_id === "known_spam");
+  // The chosen form is view state, not an edit: it lives with the baselines, so it
+  // survives the remount after each save and resets on leaving the page.
+  const kind = draftBaselines["known-spam:kind"] || "sample";
+  const setKind = (value) =>
+    ui.set({ draftBaselines: { ...ui.getSnapshot().draftBaselines, "known-spam:kind": value } });
   const add = async (kind) => {
     const key = kind === "sample" ? "known-spam:sample" : "known-spam:url";
     const value = drafts[key]?.value || "";
@@ -8170,7 +8338,8 @@ function tabKnownSpam() {
     }
   };
   const addErrorFor = (key) => drafts[key]?.error ? h("p", { className: "error", role: "alert" }, drafts[key].error) : null;
-  return h("div", null,
+  const sample = kind === "sample";
+  return h("div", { className: "list-page" },
     h("h2", null, "Known spam"),
     h("p", { className: "muted" }, "Ban members who post spam you've already confirmed."),
     h(GoodToKnow, {
@@ -8184,66 +8353,99 @@ function tabKnownSpam() {
           : "Global entries apply to every server. Only the bot owner can change them.",
       ],
     }),
-    rule ? ruleCard(rule) : null,
-    h(DraftCard, { group: "known-spam", className: "card bg-base-100 card-border" },
+    h(RuleStatusCard, { record: rule, trigger: RULE_TRIGGERS.known_spam.phrase() }),
+    h(DraftCard, { group: "known-spam", className: "card bg-base-100 card-border list-card list-add" },
       h("div", { className: "card-body" },
-        field("Applies to", scopeSelect(scopeRef, "This server", "Global", true, "known-spam:scope")),
-        field("Optional note (up to 512 bytes)", h(Input, { className: "input w-full", draftKey: "known-spam:note", "data-note": true, maxLength: 512 })),
-        field("Full sample message (up to 4096 bytes)", h(Textarea, { className: "textarea w-full", draftKey: "known-spam:sample", rows: 7, maxLength: 4096, placeholder: "Paste the entire confirmed spam message. No regex needed." }),
-          h("p", { className: "field-help" }, "Matches the same whole message, even with case, accent, spacing or leetspeak changes. A reworded copy may not match.")),
-        h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:sample", "known-spam:note", "known-spam:scope"], onClick: () => add("sample") }, "Add sample"),
-        addErrorFor("known-spam:sample"),
-        field("URL wildcard (up to 512 bytes)", h(Input, { className: "input w-full", draftKey: "known-spam:url", "data-url": true, maxLength: 512, placeholder: "tinyurl.com/*" })),
-        h("p", { className: "field-help" }, "Use * as a wildcard, for example tinyurl.com/* or *.example.com/*."),
-        h(GoodToKnow, {
-          summary: "How URL patterns match",
-          items: [
-            "http:// or https:// is optional.",
-            "tinyurl.com/* matches only that site. *.example.com/* matches its subdomains, not example.com itself.",
-            "No path means the whole site. Paths are case-sensitive.",
-            "* matches anything, including /.",
-            "Links without http:// also match.",
-            "Anything after ? or # in a link is ignored.",
-            "Patterns can't contain regex, ports, logins, ? or #.",
-          ],
-        }),
-        h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:url", "known-spam:note", "known-spam:scope"], onClick: () => add("url") }, "Add URL pattern"),
-        addErrorFor("known-spam:url"),
+        h("h3", { className: "card-title" }, "Add spam"),
+        h("div", { className: "list-form-row" },
+          field("Entry type", h(Select, { className: "select", "data-no-draft": true, value: kind, onChange: (event) => setKind(event.target.value) },
+            h("option", { value: "sample" }, "Full message sample"),
+            h("option", { value: "url" }, "URL pattern"),
+          )),
+          field("Applies to", scopeSelect(scopeRef, "This server", "Global", true, "known-spam:scope")),
+        ),
+        sample
+          ? h("div", { className: "list-entry" },
+              h(Textarea, { className: "textarea", draftKey: "known-spam:sample", rows: 5, maxLength: 4096, "aria-label": "Full sample message", placeholder: "Paste the entire confirmed spam message. No regex needed." }),
+              h("p", { className: "field-help" }, "Matches the same whole message, even with case, accent, spacing or leetspeak changes. A reworded copy may not match."),
+              h("p", { className: "field-help entry-count" }, "Up to 4096 bytes."))
+          : h("div", { className: "list-entry" },
+              h(Input, { className: "input", draftKey: "known-spam:url", "data-url": true, maxLength: 512, "aria-label": "URL wildcard", placeholder: "tinyurl.com/*" }),
+              h("p", { className: "field-help" }, "Use * as a wildcard, for example tinyurl.com/* or *.example.com/*."),
+              h("p", { className: "field-help entry-count" }, "Up to 512 bytes."),
+              h(GoodToKnow, {
+                summary: "How URL patterns match",
+                items: [
+                  "http:// or https:// is optional.",
+                  "tinyurl.com/* matches only that site. *.example.com/* matches its subdomains, not example.com itself.",
+                  "No path means the whole site. Paths are case-sensitive.",
+                  "* matches anything, including /.",
+                  "Links without http:// also match.",
+                  "Anything after ? or # in a link is ignored.",
+                  "Patterns can't contain regex, ports, logins, ? or #.",
+                ],
+              })),
+        h(ListFormSubmit, null,
+          field("Note (optional, up to 512 bytes)", h(Input, { className: "input", draftKey: "known-spam:note", "data-note": true, maxLength: 512 })),
+          sample
+            ? h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:sample", "known-spam:note", "known-spam:scope"], onClick: () => add("sample") }, "Add sample")
+            : h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:url", "known-spam:note", "known-spam:scope"], onClick: () => add("url") }, "Add URL pattern"),
+        ),
+        addErrorFor(sample ? "known-spam:sample" : "known-spam:url"),
       ),
     ),
-    h("details", { className: "card bg-base-100 card-border" },
-      h("summary", null, "Paste-as-sample examples (not active until saved)"),
-      h("p", null, "Copy the full owner sample you want to save into the sample field. These examples are not preloaded entries."),
-      h("pre", { style: { whiteSpace: "pre-wrap" } }, STOCKS_SPAM_EXAMPLE),
-      h("pre", { style: { whiteSpace: "pre-wrap" } }, AI_SPAM_EXAMPLE),
-    ),
-    h(DataTable, { headings: ["Type", "Sample or URL pattern", "Note", "Scope", "Actions"] },
-      rows.length ? rows.map((row) => h("tr", { key: row.id },
-        h("td", null, row.kind === "url" ? "URL" : "Sample"),
-        h("td", { style: { whiteSpace: "pre-wrap", overflowWrap: "anywhere" } }, row.value),
-        h("td", null, row.note || "—"), h("td", null, row.guild_id === "0" ? "Global" : "This server"),
+    h(ListTable, {
+      title: "Samples and URL patterns",
+      rows,
+      headings: ["Entry", "Type", "Scope", "Note", "Actions"],
+      searchText: (row) => `${row.value} ${row.note || ""}`,
+      searchLabel: "Search entries and notes",
+      filters: [
+        { key: "type", label: "Filter by type", all: "All types", options: [["sample", "Sample"], ["url", "URL pattern"]], value: (row) => (row.kind === "url" ? "url" : "sample") },
+        SCOPE_FILTER,
+      ],
+      empty: "No known spam entries.",
+      renderRow: (row) => h("tr", { key: row.id },
+        h("td", { className: "list-entry-cell", style: { whiteSpace: "pre-wrap" } }, row.value),
+        h("td", null, row.kind === "url" ? "URL pattern" : "Sample"),
+        h("td", null, scopeName(row)),
+        h("td", { className: "muted" }, row.note || "—"),
         h("td", null, row.guild_id !== "0" || isBotOwner() ? h(IconButton, { action: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm("Remove this known spam entry?")) return;
             await api(`/api/guilds/${guildId}/known-spam/${row.id}`, "DELETE");
             if (state.guildId === guildId && await loadConfig()) renderTab();
           },
-        }) : "Owner only"),
-      )) : h("tr", null, h("td", { colSpan: 5, className: "muted" }, "No known spam entries.")),
+        }) : h("span", { className: "muted" }, "Owner only")),
+      ),
+    }),
+    h("details", { className: "card bg-base-100 card-border list-card list-extra" },
+      h("summary", null, "Paste-as-sample examples (not active until saved)"),
+      h("div", { className: "card-body" },
+        h("p", null, "Copy the full owner sample you want to save into the sample field. These examples are not preloaded entries."),
+        h("pre", { style: { whiteSpace: "pre-wrap" } }, STOCKS_SPAM_EXAMPLE),
+        h("pre", { style: { whiteSpace: "pre-wrap" } }, AI_SPAM_EXAMPLE),
+      ),
     ),
   );
 }
 
+// The toggles here run the whole Exact image spam rule, so the summary names both of its
+// triggers: a listed image, and the same images posted across channels.
+function knownBadTrigger(rule) {
+  const shown = {};
+  for (const f of RULE_TRIGGERS.attachment_flood.fields) shown[f.key] = String(rule.params?.[f.key] ?? f.fallback);
+  return `When someone posts a listed image, or ${RULE_TRIGGERS.attachment_flood.phrase(shown).replace(/^When someone /, "")}`;
+}
+
 function tabKnownBadImages() {
-  const [query, setQuery] = useState("");
   const { drafts } = useStore(ui);
   const hashDraft = drafts["known-bad:hash"]?.value ?? "";
   const guildId = state.guildId;
-  const rows = (state.config.known_bad_images || []).filter((row) =>
-    `${row.hash} ${row.note || ""} ${row.added_via} ${row.actor}`.toLowerCase().includes(query.toLowerCase()),
-  );
+  const rows = state.config.known_bad_images || [];
+  const rule = (state.config.rules || []).find((r) => r.rule_id === "attachment_flood");
   if (guildId === "0") return h("p", { className: "muted" }, "Known-bad images are managed per server. Select a server.");
-  return h("div", null,
+  return h("div", { className: "list-page" },
     h("h2", null, "Known-bad images"),
     h("p", { className: "muted" }, "Ban images you've already confirmed as spam."),
     h(GoodToKnow, {
@@ -8254,41 +8456,51 @@ function tabKnownBadImages() {
         "Only the image's fingerprint (hash) and your note are kept, never the image.",
       ],
     }),
-    field("Search hashes or notes", h(Input, {
-      className: "input w-full", "data-search": true, value: query, onChange: (event) => setQuery(event.target.value),
-    })),
+    h(RuleStatusCard, { record: rule, trigger: rule ? knownBadTrigger(rule.effective) : "" }),
     h(
       DraftCard,
-      { group: "known-bad-images", className: "card bg-base-100 card-border" },
+      { group: "known-bad-images", className: "card bg-base-100 card-border list-card list-add" },
       h(
         "div",
         { className: "card-body" },
-        field("SHA-256 digest", h(Input, {
-          className: "input w-full", draftKey: "known-bad:hash", maxLength: 64,
-        }), h("p", { className: "field-help" }, "Copy it from an exact-image notice in your log channel.")),
-        field("Optional safe note", h(Input, {
-          className: "input w-full", draftKey: "known-bad:note", maxLength: 256,
-        })),
-        h(ActionButton, {
-          className: "btn btn-sm",
-          disabled: !/^[a-fA-F0-9]{64}$/.test(hashDraft),
-          savedFields: ["known-bad:hash", "known-bad:note"],
-          onClick: async () => {
-            const hash = drafts["known-bad:hash"]?.value ?? "";
-            const note = drafts["known-bad:note"]?.value ?? "";
-            await reloadAfter(
-              () => api(`/api/guilds/${guildId}/known-bad-images`, "POST", { hash, note: note || null }),
-              (result) => toast(result.changed ? "Hash added." : "Hash already listed.", "success"),
-            );
-          },
-        }, "Add hash"),
+        h("h3", { className: "card-title" }, "Add an image"),
+        h("div", { className: "list-entry" },
+          field("SHA-256 digest", h(Input, {
+            className: "input mono", draftKey: "known-bad:hash", "data-hash": true, maxLength: 64,
+          })),
+          h("p", { className: "field-help" }, "Copy it from an exact-image notice in your log channel."),
+        ),
+        h(ListFormSubmit, null,
+          field("Note (optional)", h(Input, {
+            className: "input", draftKey: "known-bad:note", "data-note": true, maxLength: 256,
+          })),
+          h(ActionButton, {
+            className: "btn btn-primary",
+            disabled: !/^[a-fA-F0-9]{64}$/.test(hashDraft),
+            savedFields: ["known-bad:hash", "known-bad:note"],
+            onClick: async () => {
+              const hash = drafts["known-bad:hash"]?.value ?? "";
+              const note = drafts["known-bad:note"]?.value ?? "";
+              await reloadAfter(
+                () => api(`/api/guilds/${guildId}/known-bad-images`, "POST", { hash, note: note || null }),
+                (result) => toast(result.changed ? "Hash added." : "Hash already listed.", "success"),
+              );
+            },
+          }, "Add hash"),
+        ),
       ),
     ),
-    h(DataTable, { headings: ["SHA-256", "Added", "Source", "Actor", "Note", "Actions"] },
-      rows.length ? rows.map((row) => h("tr", { key: row.hash },
-        h("td", { style: { overflowWrap: "anywhere" } }, row.hash),
+    h(ListTable, {
+      title: "Images",
+      rows,
+      headings: ["SHA-256", "Added", "Source", "Actor", "Note", "Actions"],
+      searchText: (row) => `${row.hash} ${row.note || ""} ${row.added_via} ${row.actor}`,
+      searchLabel: "Search hashes or notes",
+      empty: "No images yet. Add a hash above.",
+      renderRow: (row) => h("tr", { key: row.hash },
+        h("td", { className: "list-entry-cell mono" }, row.hash),
         h("td", null, row.added_at), h("td", null, row.added_via),
-        h("td", null, row.actor), h("td", null, row.note || "—"),
+        h("td", null, row.actor), h("td", { className: "muted" }, row.note || "—"),
         h("td", null, h(IconButton, { action: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm(`Remove SHA-256 ${row.hash}?`)) return;
@@ -8296,8 +8508,8 @@ function tabKnownBadImages() {
             if (state.guildId === guildId && await loadConfig()) renderTab();
           },
         })),
-      )) : h("tr", null, h("td", { colSpan: 6, className: "muted" }, "No matching hashes.")),
-    ),
+      ),
+    }),
   );
 }
 
