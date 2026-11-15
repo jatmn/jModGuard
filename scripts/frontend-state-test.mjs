@@ -3744,6 +3744,9 @@ const memberHelpProbe = `(async () => {
   const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
   for (let i = 0; i < 200 && !document.querySelector('[data-tab="members"]'); i++) await wait();
   document.querySelector('[data-tab="members"]').click();
+  // A reload reopens the saved tab, so Members may already show the explanation; the click
+  // then remounts it. Wait for that render before looking, not at the page it replaces.
+  await frame();
   for (let i = 0; i < 200 && !document.querySelector('#member-coverage-help'); i++) await wait();
   await frame();
   const trigger = document.querySelector('[aria-describedby="member-coverage-help"]');
