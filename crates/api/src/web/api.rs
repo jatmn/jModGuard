@@ -606,6 +606,20 @@ fn command_row_by_name<'a>(
         .map(|(_, command)| command)
 }
 
+fn guild_command_override<'a>(
+    guild_id: u64,
+    rows: &'a std::collections::HashMap<String, CommandDef>,
+    name: &str,
+) -> Option<&'a CommandDef> {
+    if crate::defaults::is_builtin_primary_command_name(name) {
+        (guild_id != 0)
+            .then(|| crate::defaults::builtin_command_override(rows, name))
+            .flatten()
+    } else {
+        command_row_by_name(rows, name)
+    }
+}
+
 /// Config-bundle command entries. Raw stored rows stay on `guild_override` and
 /// `global`. `effective` is the runtime registry for that name.
 fn command_config_rows(
@@ -628,9 +642,7 @@ fn command_config_rows(
             let shipped = crate::defaults::effective_builtin_command(&name, None);
             // In the global scope the "guild" rows are the global seeds, not overrides.
             // A built-in's server row counts only when it is a flagged override.
-            let guild_row = command_row_by_name(guild_commands, &name)
-                .filter(|row| shipped.is_none() || (guild_id != 0 && row.builtin_override))
-                .cloned();
+            let guild_row = guild_command_override(guild_id, guild_commands, &name).cloned();
             let global_row = command_row_by_name(global_commands, &name).cloned();
             let scope = if global_row.is_some() {
                 "global"
@@ -663,17 +675,21 @@ pub async fn get_command(
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let name = name.to_lowercase();
     let canonical = crate::defaults::builtin_command_for_label(&name).unwrap_or(name);
-    let layers = db::get_enrolled_command(&app.db, scope, &canonical).await?;
-    let (guild_override, global) = (layers.guild, layers.global);
-    let mut guild_map = std::collections::HashMap::new();
-    let mut global_map = std::collections::HashMap::new();
-    if let Some(row) = guild_override.clone().filter(|_| guild_id != 0) {
-        guild_map.insert(canonical.clone(), row);
-    }
-    if let Some(row) = global.clone() {
-        global_map.insert(canonical.clone(), row);
-    }
-    let registry = crate::defaults::effective_command_registry(&global_map, &guild_map);
+    // Effective aliases depend on peers. Read only the command section, with
+    // both layers and membership verified in the existing primary snapshot.
+    let layers = db::list_enrolled_commands(&app.db, scope).await?;
+    let guild_map = pairs_to_map(&layers.guild);
+    let global_map = pairs_to_map(&layers.global);
+    let global = command_row_by_name(&global_map, &canonical).cloned();
+    let guild_override = if guild_id == 0 {
+        // Preserve the raw global-context layer shape.
+        global.clone()
+    } else {
+        guild_command_override(guild_id, &guild_map, &canonical).cloned()
+    };
+    let none = std::collections::HashMap::new();
+    let overrides = if guild_id == 0 { &none } else { &guild_map };
+    let registry = crate::defaults::effective_command_registry(&global_map, overrides);
     let effective = registry.get(&canonical).cloned();
     Ok(Json(serde_json::json!({
         "effective": effective,

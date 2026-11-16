@@ -423,14 +423,54 @@ pub async fn delete_rule(db: &Db, guild_id: i64, rule_id: &str) -> Result<()> {
 // commands
 // ---------------------------------------------------------------------------
 
+fn command_storage_key(name: &str) -> String {
+    if crate::defaults::is_builtin_primary_command_name(name) {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_owned()
+    }
+}
+
+// Reset also clears case variants accepted by older built-in writers. Custom
+// command keys retain their exact-match semantics.
+fn command_delete_keys(name: &str) -> &'static str {
+    if crate::defaults::is_builtin_primary_command_name(name) {
+        "guild_id, lower(name)"
+    } else {
+        "guild_id, name"
+    }
+}
+
+fn load_command_row_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    name: &str,
+) -> Result<Option<CommandDef>> {
+    let key = if crate::defaults::is_builtin_primary_command_name(name) {
+        "name COLLATE NOCASE"
+    } else {
+        "name"
+    };
+    let rows = load_rows_conn::<CommandDef>(conn, guild_id, "commands", key, Some(name))?;
+    let canonical = command_storage_key(name);
+    // Raw reads preserve an explicitly requested old key. Otherwise use the
+    // canonical writer key, with a stable fallback for earlier case variants.
+    Ok(rows
+        .iter()
+        .find(|(key, _)| key == name)
+        .or_else(|| rows.iter().find(|(key, _)| key == &canonical))
+        .or_else(|| rows.iter().min_by_key(|(key, _)| key))
+        .map(|(_, row)| row.clone()))
+}
+
 pub async fn list_commands(db: &Db, guild_id: i64) -> Result<Vec<(String, CommandDef)>> {
     load_rows(db, guild_id, "commands", "name", None).await
 }
 
 pub async fn get_command_row(db: &Db, guild_id: i64, name: &str) -> Result<Option<CommandDef>> {
-    let rows: Vec<(String, CommandDef)> =
-        load_rows(db, guild_id, "commands", "name", Some(name)).await?;
-    Ok(rows.into_iter().next().map(|(_, c)| c))
+    let name = name.to_owned();
+    db.with_conn(move |conn| load_command_row_conn(conn, guild_id, &name))
+        .await
 }
 
 pub async fn upsert_command(db: &Db, guild_id: i64, name: &str, cmd: &CommandDef) -> Result<()> {
@@ -441,7 +481,7 @@ pub async fn upsert_command(db: &Db, guild_id: i64, name: &str, cmd: &CommandDef
         db,
         "commands",
         "guild_id, name",
-        vec![guild_id.into(), name.to_string().into()],
+        vec![guild_id.into(), command_storage_key(name).into()],
         crate::defaults::command_row_for_storage(name, cmd),
         true,
         None,
@@ -453,8 +493,8 @@ pub async fn delete_command(db: &Db, guild_id: i64, name: &str) -> Result<()> {
     delete_row(
         db,
         "commands",
-        "guild_id, name",
-        vec![guild_id.into(), name.to_string().into()],
+        command_delete_keys(name),
+        vec![guild_id.into(), command_storage_key(name).into()],
         true,
         None,
     )
@@ -1879,7 +1919,7 @@ pub async fn upsert_enrolled_command(
         db,
         "commands",
         "guild_id, name",
-        vec![scope.guild_id().into(), name.to_owned().into()],
+        vec![scope.guild_id().into(), command_storage_key(name).into()],
         crate::defaults::command_row_for_storage(name, command),
         true,
         Some(scope),
@@ -1894,8 +1934,8 @@ pub async fn delete_enrolled_command(
     delete_row(
         db,
         "commands",
-        "guild_id, name",
-        vec![scope.guild_id().into(), name.to_owned().into()],
+        command_delete_keys(name),
+        vec![scope.guild_id().into(), command_storage_key(name).into()],
         true,
         Some(scope),
     )
@@ -2034,14 +2074,7 @@ pub async fn get_enrolled_command(
 ) -> Result<ConfigurationLayers<Option<CommandDef>>> {
     let name = name.to_owned();
     configuration_read(db, scope, move |tx, guild| {
-        read_layers(guild, |g| {
-            Ok(
-                load_rows_conn::<CommandDef>(tx, g, "commands", "name", Some(&name))?
-                    .into_iter()
-                    .next()
-                    .map(|(_, row)| row),
-            )
-        })
+        read_layers(guild, |g| load_command_row_conn(tx, g, &name))
     })
     .await
 }

@@ -3051,6 +3051,19 @@ async fn command_saves_carry_no_patch_because_aliases_resolve_across_commands() 
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, serde_json::json!({"ok": true, "name": "greet"}));
+    let mut warn = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "warn")
+        .unwrap();
+    warn.aliases = vec!["hammer".into()];
+    let (status, body) = f
+        .request(
+            "PUT",
+            "/api/guilds/10/commands/warn",
+            &serde_json::json!({"scope":"guild","data":warn}).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let (status, bundle) = f.request("POST", "/api/guilds/10/config", "").await;
     assert_eq!(status, StatusCode::OK, "{bundle}");
     let row = |name: &str| {
@@ -3071,6 +3084,128 @@ async fn command_saves_carry_no_patch_because_aliases_resolve_across_commands() 
         row("ban")["effective"]["aliases"],
         serde_json::json!(["yeet", "b", "hammer"])
     );
+    // Targeted reads must see the same alias competition as the full registry.
+    for name in ["ban", "warn", "greet"] {
+        let (status, detail) = f
+            .request("GET", &format!("/api/guilds/10/commands/{name}"), "")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(detail["effective"], row(name)["effective"], "{name}");
+    }
+    // A custom primary takes an override alias, including in targeted reads.
+    let hammer = crate::defaults::custom_command_fixture("hammer");
+    let (status, body) = f
+        .request(
+            "POST",
+            "/api/guilds/10/commands",
+            &serde_json::json!({"scope":"guild","data":hammer}).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, detail) = f.request("GET", "/api/guilds/10/commands/ban", "").await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(
+        detail["effective"]["aliases"],
+        serde_json::json!(["yeet", "b"])
+    );
+    assert_eq!(
+        detail["guild_override"]["aliases"],
+        serde_json::json!(["yeet", "b", "hammer"]),
+        "raw saved aliases stay available for editing"
+    );
+}
+
+#[tokio::test]
+async fn builtin_case_variant_overrides_restore_and_reset_through_http() {
+    use jmodguard::db::SqlExecutor;
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let mut ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .unwrap();
+    ban.enabled = false;
+    ban.permission = "owner".into();
+    // Exercise the core writer's admitted mixed-case spelling, not a mock ACK.
+    db::upsert_command(&f.app.db, 10, "Ban", &ban)
+        .await
+        .unwrap();
+    let (status, detail) = f.request("GET", "/api/guilds/10/commands/ban", "").await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["effective"]["enabled"], false);
+    let (status, body) = f
+        .request(
+            "DELETE",
+            "/api/guilds/10/commands/ban",
+            r#"{"scope":"guild"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(db::list_commands(&f.app.db, 10).await.unwrap().is_empty());
+
+    // Rows accepted before key normalization must also remain readable/resettable.
+    ban.builtin_override = true;
+    let raw = serde_json::to_string(&ban).unwrap();
+    let unmarked = serde_json::to_string(
+        &crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "ban")
+            .unwrap(),
+    )
+    .unwrap();
+    f.app
+        .db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO commands(guild_id,name,data) VALUES (10,'Ban',?1),(10,'ban',?2)",
+                db::params![raw, unmarked],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(
+        db::get_command_row(&f.app.db, 10, "Ban")
+            .await
+            .unwrap()
+            .unwrap()
+            .builtin_override,
+        "an explicit raw read must retain access to a legacy case-variant row"
+    );
+    for path in [
+        "/api/guilds/10/commands/ban",
+        "/api/guilds/10/config",
+        "/api/guilds/10/commands",
+    ] {
+        let (status, value) = f.request("GET", path, "").await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let row = if path.ends_with("/ban") {
+            &value
+        } else {
+            value["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == "ban")
+                .unwrap()
+        };
+        assert_eq!(row["effective"]["enabled"], false, "{path}");
+        assert_eq!(row["effective"]["permission"], "owner", "{path}");
+        assert_eq!(row["guild_override"]["builtin_override"], true, "{path}");
+    }
+    let (status, body) = f
+        .request(
+            "DELETE",
+            "/api/guilds/10/commands/ban",
+            r#"{"scope":"guild"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(db::list_commands(&f.app.db, 10).await.unwrap().is_empty());
+    let (_, detail) = f.request("GET", "/api/guilds/10/commands/ban", "").await;
+    assert_eq!(detail["effective"]["enabled"], true);
+    assert!(detail["guild_override"].is_null());
 }
 
 #[tokio::test]

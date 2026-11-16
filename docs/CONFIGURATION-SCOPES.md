@@ -155,7 +155,7 @@ The following GET routes retain the loaded page membership after fresh permissio
 | Path after `/api/guilds/{id}/` | Data in one primary snapshot |
 |---|---|
 | `rules/{rule_id}` | Requested rule's guild/global rows; existing default resolution follows. |
-| `commands`, `commands/{name}` | Guild/global lists or requested command rows. Name normalization and default fallback are unchanged. |
+| `commands`, `commands/{name}` | Guild/global command rows. Targeted reads resolve effective aliases against peer commands in the same snapshot; unrelated configuration is not loaded. |
 | `templates`, `templates/{event}` | Guild/global lists or requested template rows; existing default fallback follows. |
 | `badwords` | Guild and global rows together, in existing ID order; validation status is computed after reading. |
 | `logchannels`, `logchannels/{event}` | Only that scope's mappings; no global inheritance; channel IDs remain strings on the wire. |

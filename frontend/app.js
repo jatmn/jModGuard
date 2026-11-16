@@ -5365,7 +5365,7 @@ function CommandEditor({ record: c }) {
           className: "textarea textarea-sm",
           rows: 2,
           defaultValue: data.response || "",
-          placeholder: isPlan ? "Optional reply after the steps" : "Leave empty for the built-in reply",
+          placeholder: isPlan ? "Optional reply after the steps" : "Leave empty for generated text or “done”.",
           onInput: (e) => {
             data.response = e.target.value;
             refresh();
@@ -5379,7 +5379,7 @@ function CommandEditor({ record: c }) {
             "{target} {reason}: who it acted on and why.",
             "{user} {actor} {guild} {channel}: who ran it and where.",
             "{minutes} {duration} {count} {seconds}: the amounts used.",
-            "{response}: the built-in reply text. {emoji}: its map emoji.",
+            "{response}: generated reply text, if any. {emoji}: its map emoji.",
           ]),
         ),
       ),

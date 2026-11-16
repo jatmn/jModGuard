@@ -649,10 +649,7 @@ pub fn apply_shipped_builtin_commands(
     guild_commands: &std::collections::HashMap<String, CommandDef>,
 ) {
     for shipped in default_commands() {
-        let stored = guild_commands
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(&shipped.name))
-            .map(|(_, command)| command);
+        let stored = builtin_command_override(guild_commands, &shipped.name);
         if let Some(effective) = effective_builtin_command(&shipped.name, stored) {
             install_shipped_builtin(commands, effective);
         }
@@ -660,11 +657,33 @@ pub fn apply_shipped_builtin_commands(
     resolve_legacy_builtin_command_collisions(commands);
 }
 
+/// Select an eligible override before resolving its settings. Prefer the
+/// canonical writer key; older case variants remain readable in stable order.
+/// An unmarked seed copy must never hide a marked override.
+pub fn builtin_command_override<'a>(
+    commands: &'a std::collections::HashMap<String, CommandDef>,
+    primary: &str,
+) -> Option<&'a CommandDef> {
+    commands
+        .get(primary)
+        .filter(|row| row.builtin_override)
+        .or_else(|| {
+            commands
+                .iter()
+                .filter(|(key, row)| row.builtin_override && key.eq_ignore_ascii_case(primary))
+                .min_by_key(|(key, _)| *key)
+                .map(|(_, row)| row)
+        })
+}
+
 /// The row a writer stores: a built-in primary is marked as this server's
 /// override, any other row is not.
 pub fn command_row_for_storage(storage_name: &str, cmd: &CommandDef) -> CommandDef {
     let mut row = cmd.clone();
     row.builtin_override = is_builtin_primary_command_name(storage_name);
+    if row.builtin_override {
+        row.name = storage_name.to_ascii_lowercase();
+    }
     row
 }
 

@@ -1038,6 +1038,118 @@ async fn identical_command_saves_preserve_versions_across_concurrency_and_restar
 }
 
 #[tokio::test]
+async fn builtin_writers_share_canonical_identity_through_restore_and_reset() {
+    let f = Fixture::new();
+    for enrolled in [false, true] {
+        let guild = if enrolled { 20 } else { 10 };
+        let scope = f.scope(guild).await;
+        let write = edit_scope(&scope, false);
+        let mut command = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "ban")
+            .unwrap();
+        command.name = "Ban".into();
+        command.enabled = false;
+        command.permission = "owner".into();
+        if enrolled {
+            upsert_enrolled_command(&f.db, write.clone(), "Ban", &command)
+                .await
+                .unwrap();
+        } else {
+            upsert_command(&f.db, guild, "Ban", &command).await.unwrap();
+        }
+        let rows = list_commands(&f.db, guild).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "ban");
+        assert_eq!(rows[0].1.name, "ban");
+        assert!(rows[0].1.builtin_override);
+        let versions = get_primary_versions(&f.db).await.unwrap();
+        // A different spelling is the same write, not a second durable row/revision.
+        if enrolled {
+            upsert_enrolled_command(&f.db, write.clone(), "BAN", &command)
+                .await
+                .unwrap();
+        } else {
+            upsert_command(&f.db, guild, "BAN", &command).await.unwrap();
+        }
+        assert_eq!(get_primary_versions(&f.db).await.unwrap(), versions);
+        assert_eq!(list_commands(&f.db, guild).await.unwrap().len(), 1);
+        assert!(
+            get_command_row(&f.db, guild, "Ban")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            get_enrolled_command(&f.db, scope.clone(), "BAN")
+                .await
+                .unwrap()
+                .guild
+                .is_some()
+        );
+        let legacy = CommandDef {
+            description: "legacy case-variant row".into(),
+            builtin_override: true,
+            ..command.clone()
+        };
+        let raw = serde_json::to_string(&legacy).unwrap();
+        f.db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO commands(guild_id,name,data) VALUES (?1,'BAN',?2)",
+                params![guild, raw],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            get_command_row(&f.db, guild, "BAN")
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            "legacy case-variant row"
+        );
+        assert_eq!(
+            get_enrolled_command(&f.db, scope.clone(), "BAN")
+                .await
+                .unwrap()
+                .guild
+                .unwrap()
+                .description,
+            "legacy case-variant row"
+        );
+        let reopened = Db::open(&f.path, 2).unwrap();
+        let parts = load_config_parts(&reopened, guild).await.unwrap();
+        assert!(!parts.commands["ban"].enabled);
+        for registry in [
+            load_slash_commands_with_version(&reopened, guild)
+                .await
+                .unwrap()
+                .2,
+            load_slash_commands_with_version_primary(&reopened, guild)
+                .await
+                .unwrap()
+                .2,
+        ] {
+            assert!(!registry["ban"].enabled);
+            assert_eq!(registry["ban"].permission, "owner");
+        }
+        if enrolled {
+            delete_enrolled_command(&f.db, write, "BAN").await.unwrap();
+        } else {
+            delete_command(&f.db, guild, "Ban").await.unwrap();
+        }
+        assert!(list_commands(&f.db, guild).await.unwrap().is_empty());
+        assert!(load_config_parts(&f.db, guild).await.unwrap().commands["ban"].enabled);
+        let reset = get_primary_versions(&f.db).await.unwrap();
+        assert_eq!(reset.config, versions.config + 1);
+        assert_eq!(reset.slash, versions.slash + 1);
+    }
+}
+
+#[tokio::test]
 async fn badword_setup_batches_are_atomic_deduplicated_and_revisioned() {
     let f = Fixture::new();
     let request = f.scope(10).await;
