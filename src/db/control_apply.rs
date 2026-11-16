@@ -282,6 +282,13 @@ pub enum ControlOp {
     SettleInterruptedWebui {
         release: ComponentRelease,
     },
+    /// Replace the jModGuard reason shown for one ban row; Discord is unchanged.
+    EditBanReason {
+        scope: ScopeWire,
+        ban_id: i64,
+        actor_id: i64,
+        reason: String,
+    },
     AppendCaseNote {
         scope: ScopeWire,
         case_id: String,
@@ -377,8 +384,11 @@ pub enum ControlActorNeed {
     Owner,
     ManageGuild(i64),
     GuildAdmin(i64),
+    /// Discord Ban Members in this guild (owner and administrators qualify).
+    BanMembers(i64),
 }
 
+const BAN_MEMBERS_BIT: u64 = 1 << 2;
 const MANAGE_GUILD_BIT: u64 = 1 << 5;
 const ADMINISTRATOR_BIT: u64 = 1 << 3;
 
@@ -406,6 +416,7 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         ControlOp::RemoveCase { scope, .. }
         | ControlOp::SetCaseDeleteRoles { scope, .. }
         | ControlOp::CleanupEvidence { scope } => ControlActorNeed::GuildAdmin(scope.guild_id),
+        ControlOp::EditBanReason { scope, .. } => ControlActorNeed::BanMembers(scope.guild_id),
         ControlOp::EnqueueBotAction { .. }
         | ControlOp::CancelBotAction { .. }
         | ControlOp::StoreRetryDeadlines { .. }
@@ -606,15 +617,18 @@ pub fn decide_control_actor(
                 Err("owner is required")
             }
         }
-        ControlActorNeed::ManageGuild(_) => guild_actor(actor_user_id, cached, true),
-        ControlActorNeed::GuildAdmin(_) => guild_actor(actor_user_id, cached, false),
+        ControlActorNeed::ManageGuild(_) => guild_actor(actor_user_id, cached, MANAGE_GUILD_BIT),
+        ControlActorNeed::GuildAdmin(_) => guild_actor(actor_user_id, cached, 0),
+        ControlActorNeed::BanMembers(_) => guild_actor(actor_user_id, cached, BAN_MEMBERS_BIT),
     }
 }
 
+/// Owner and administrators always qualify; `permission` is the one other
+/// Discord permission bit that also grants this need (0 for none).
 fn guild_actor(
     actor_user_id: i64,
     cached: Option<CachedGuildActor>,
-    manage_guild: bool,
+    permission: u64,
 ) -> Result<(), &'static str> {
     if actor_user_id <= 0 {
         return Err("actor is not allowed");
@@ -628,7 +642,7 @@ fn guild_actor(
     if cached.permissions & ADMINISTRATOR_BIT != 0 {
         return Ok(());
     }
-    if manage_guild && cached.permissions & MANAGE_GUILD_BIT != 0 {
+    if cached.permissions & permission != 0 {
         return Ok(());
     }
     Err("actor is not allowed")
@@ -1077,6 +1091,24 @@ async fn apply_control_inner(
             settle_interrupted_webui(db, &release).await?;
             saved_null()
         }
+        ControlOp::EditBanReason {
+            scope,
+            ban_id,
+            actor_id,
+            reason,
+        } => {
+            let ConfigurationScope::Guild(enrollment) = scope_of(scope)? else {
+                return Err(EnrollmentChanged.into());
+            };
+            let edit = edit_enrolled_ban_reason(db, enrollment, ban_id, actor_id, reason).await?;
+            if edit.changed {
+                saved_value(edit)
+            } else {
+                Ok(ControlReply::Unchanged {
+                    body: serde_json::to_value(edit)?,
+                })
+            }
+        }
         ControlOp::AppendCaseNote {
             scope,
             case_id,
@@ -1324,6 +1356,51 @@ mod tests {
         };
         assert!(decide_control_actor(ControlActorNeed::GuildAdmin(10), 5, 9, Some(admin)).is_ok());
         assert!(decide_control_actor(ControlActorNeed::Process, 0, 0, None).is_ok());
+    }
+
+    #[test]
+    fn ban_reason_edits_need_ban_members_not_manage_server() {
+        let op = ControlOp::EditBanReason {
+            scope: ScopeWire {
+                global: false,
+                guild_id: 10,
+                enrollment_id: "membership".into(),
+                joined_at_ns: 1,
+            },
+            ban_id: 3,
+            actor_id: 5,
+            reason: "raid".into(),
+        };
+        assert_eq!(
+            control_actor_needs(&op),
+            vec![ControlActorNeed::BanMembers(10)]
+        );
+        let need = ControlActorNeed::BanMembers(10);
+        let actor = |permissions| {
+            Some(CachedGuildActor {
+                guild_owner_id: 1,
+                permissions,
+            })
+        };
+        assert!(decide_control_actor(need, 5, 9, actor(BAN_MEMBERS_BIT)).is_ok());
+        assert!(decide_control_actor(need, 5, 9, actor(ADMINISTRATOR_BIT)).is_ok());
+        assert!(
+            decide_control_actor(need, 1, 9, actor(0)).is_ok(),
+            "server owner"
+        );
+        assert!(decide_control_actor(need, 5, 9, actor(MANAGE_GUILD_BIT)).is_err());
+        assert!(decide_control_actor(need, 5, 9, actor(0)).is_err());
+        assert!(decide_control_actor(need, 5, 9, None).is_err());
+        // Ban Members alone still grants no Manage Server control op.
+        assert!(
+            decide_control_actor(
+                ControlActorNeed::ManageGuild(10),
+                5,
+                9,
+                actor(BAN_MEMBERS_BIT)
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

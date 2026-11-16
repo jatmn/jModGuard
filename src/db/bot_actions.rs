@@ -540,6 +540,25 @@ async fn finish_bot_action_inner(
         }
         if state == ActionState::Succeeded {
             match &job.action {
+                Action::Ban {
+                    user_id,
+                    reason,
+                    duration_minutes,
+                    ..
+                } if !write_fenced => {
+                    record_confirmed_ban_conn(&tx, &job, *user_id, reason, *duration_minutes)?;
+                    let data = serde_json::json!({
+                        "reason":reason, "source":"webui", "action_id":job.id, "outcome":outcome,
+                    })
+                    .to_string();
+                    tx.execute_rows(
+                        "INSERT INTO events(guild_id,event_type,user_id,actor_id,data,created_at)
+                         VALUES(?1,'member_ban',?2,?3,?4,?5)",
+                        params![job.guild_id, user_id, job.actor_id, data, now_str()],
+                        1,
+                    )?;
+                }
+                Action::Ban { .. } => {}
                 Action::Unban { user_id, reason } if !write_fenced => {
                     tx.execute_matching(
                         "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2",
@@ -568,6 +587,62 @@ async fn finish_bot_action_inner(
         Ok(true)
     })
     .await
+}
+
+/// Discord confirmed this queued ban. The bot's gateway echo of this same
+/// request may already hold the active row (saved with the action ID); fill it.
+/// Otherwise end any older active row, kept as history, and insert this ban.
+/// A requested duration binds its deadline to this row and membership.
+fn record_confirmed_ban_conn(
+    conn: &impl SqlExecutor,
+    job: &BotAction,
+    user_id: i64,
+    reason: &str,
+    duration_minutes: Option<u32>,
+) -> Result<()> {
+    let now = now_str();
+    let echo: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM bans WHERE guild_id=?1 AND user_id=?2 AND active=1 AND operation_id=?3
+             ORDER BY id LIMIT 1",
+            params![job.guild_id, user_id, job.id.as_str()],
+            |row| Ok(row.get(0)?),
+        )
+        .optional()?;
+    let row_id = match echo {
+        Some(row_id) => {
+            conn.execute_rows(
+                "UPDATE bans SET moderator_id=?1, reason=?2, created_at=?3 WHERE id=?4",
+                params![job.actor_id, reason, now, row_id],
+                1,
+            )?;
+            row_id
+        }
+        None => {
+            conn.execute_matching(
+                "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1",
+                params![job.guild_id, user_id],
+            )?;
+            conn.query_row_write(
+                "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, operation_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6) RETURNING id",
+                params![job.guild_id, user_id, job.actor_id, reason, now, job.id.as_str()],
+                |row| Ok(row.get::<i64>(0)?),
+            )?
+        }
+    };
+    if let Some(minutes) = duration_minutes {
+        let expires_at = chrono::Utc::now()
+            .timestamp()
+            .checked_add(i64::from(minutes) * 60)
+            .context("ban expiry overflow")?;
+        conn.execute_rows(
+            "UPDATE bans SET expires_at=?1, expiry_enrollment_id=?2 WHERE id=?3",
+            params![expires_at, job.enrollment_id.as_deref(), row_id],
+            1,
+        )?;
+    }
+    Ok(())
 }
 
 pub async fn cancel_bot_action(db: &Db, guild: i64, id: &str) -> Result<bool> {

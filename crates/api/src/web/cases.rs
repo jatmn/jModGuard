@@ -92,7 +92,7 @@ async fn live(
 /// Display names the member directory already recorded for these users, keyed by
 /// string ID. Names are presentation only: a directory that is unavailable or has
 /// not seen a user leaves that user out instead of failing the case read.
-async fn directory_names(
+pub(super) async fn directory_names(
     store: &crate::db::guild_data::GuildDataStore,
     scope: crate::db::guild_data::GuildDataScope,
     ids: impl IntoIterator<Item = i64>,

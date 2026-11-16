@@ -1,6 +1,6 @@
 # Queued administrative actions
 
-The API queues typed unban and log-channel requests and returns HTTP 202 with a receipt.
+The API queues typed ban, unban and log-channel requests and returns HTTP 202 with a receipt.
 The bot executes them using its existing Discord client. The WebUI reports pending work
 and provides an Actions tab for manual status refresh, cancellation of unstarted work,
 and force-cancel of stuck log-channel requests. Acceptance
@@ -20,7 +20,8 @@ The nickname outbox remains a separate active path; see
   never rebound to a new join. Unknown remote commit outcomes require the **same** key.
 - Primary transactions enforce a per-guild pending limit and one active action per
   target (user for unban, event for log configuration). Uncertain work occupies both
-  limits within its membership. Reads and cancellation
+  limits within its membership. Ban and unban are separate targets (`ban:<user>`,
+  `unban:<user>`). Reads and cancellation
   require the current membership; scoped helpers also check the caller's captured identity.
   These checks are not user authorization or tenant credential isolation.
 - Claims are exclusive. Beginning consumes the claim once before any future dispatch;
@@ -36,7 +37,7 @@ The nickname outbox remains a separate active path; see
   advances configuration versions/revisions only when a mapping is actually deleted.
   An absent-mapping queued clear still commits its completed action state atomically.
 - Pending and claimed work can be cancelled within its guild. Claimed work has not
-  begun a Discord mutation. Running unban work cannot be cancelled as if Discord
+  begun a Discord mutation. Running ban or unban work cannot be cancelled as if Discord
   never ran. Log-channel `running` and `uncertain` rows can be force-cancelled
   because Discord is not mutated until local completion; that frees the event so a
   newer save can run. A newer queued log-channel request supersedes active queued
@@ -223,9 +224,43 @@ after the deadline was consumed, it logs `automatic unban skipped` and the ban s
 active. For either message, verify the ban in Discord and use `!unban` or the dashboard
 if the user should no longer be banned.
 
+## Queued bans
+
+`POST .../ban` (Ban Members, page membership, `request_id`) queues a real Discord ban:
+`user_id`, an optional `reason` (default `banned via WebUI`, at most 512 characters, no
+control characters), `delete_message_days` (0 to 7) and an optional positive
+`duration_minutes`. Before Discord is called the worker rechecks the requester's Ban
+Members like an unban, then applies the ban command's refusals and Discord's role
+hierarchy: never the server owner (`cannot_ban_owner`) or the bot (`cannot_ban_bot`), the
+bot must hold Ban Members (`bot_missing_ban_permission`), and a member whose highest role is
+not below the bot's (`target_role_not_below_bot`) or the requester's, unless the requester
+owns the server (`target_role_not_below_moderator`), is refused. Someone who is not in the
+server is banned by ID; Discord's Unknown User is `unknown_user`, and an unreadable check is
+`ban_check_unavailable`. Refusals are failed receipts without a Discord request.
+
+The worker then calls Discord create-ban with the reason as the audit-log reason and the
+deletion window. Discord's Missing Permissions is `bot_missing_permissions`; other explicit
+rejections are `discord_rejected`, and transport ambiguity or a timeout after the call is
+uncertain, as for unban. Only a confirmed ban (`banned`) writes local records: completion
+commits the receipt, the ban row (moderator = requester, `operation_id` = action ID, filling
+the bot's own gateway echo row when it arrived first), its deadline when a duration was
+given (bound to the action's membership, lifted by the timed-ban expiry below) and one
+`member_ban` audit event in one transaction, skipping local writes if a write fence
+appeared. The worker also records one tenant ban case with the action ID as its
+application source so the later Discord audit entry links to it. Failed and uncertain bans
+write no ban row or case and release the gateway echo marker, so a ban Discord did apply
+whose echo arrives afterwards is recorded from its gateway event like a manual ban. An
+echo consumed before an uncertain result, or a timed-out call, records only the ban row,
+with no case; the uncertain receipt asks the moderator to check Discord. A bot that is offline leaves the request queued
+until it expires (`expired_before_execution`).
+
+The Bans page dialog shows the receipt it was given and then reads `POST .../actions`
+every two seconds for at most one minute while it stays open, to show the result or
+refusal. Bot actions keeps the result.
+
 ## HTTP, browser and deployment contract
 
-Unban (`POST .../unban`), set log channel (`PUT .../logchannels/{event}`) and clear log channel
+Ban (`POST .../ban`), unban (`POST .../unban`), set log channel (`PUT .../logchannels/{event}`) and clear log channel
 (`DELETE .../logchannels/{event}`) require a JSON `request_id` and the loaded page's
 `x-jmodguard-enrollment` header. Routes are under `/api/guilds/{guild_id}`. Actor identity
 comes from the session, never the body. Every request rechecks Discord permissions.
@@ -234,7 +269,7 @@ returns up to the latest 50 receipts filtered to the caller's current action per
 The SPA reads that list with `POST` so a CDN cannot reuse a cached `GET`. `GET` and `POST .../logchannels/{event}` return one mapping; the receipt watcher reads it with `POST`.
 Unstarted (`pending`/`claimed`) work can be cancelled. Log-channel work that is `running`
 or `uncertain` can also be force-cancelled so a newer save can run; this does not undo
-Discord. Running unban work cannot be cancelled. Global guild-0 paths do not admit actions.
+Discord. Running ban or unban work cannot be cancelled. Global guild-0 paths do not admit actions.
 
 The browser saves the request key, payload identity and membership in session storage
 before sending. A lost response retains that key across retries/reloads in the same tab.

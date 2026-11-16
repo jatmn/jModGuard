@@ -1783,6 +1783,11 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         )
         .route("/api/guilds/{guild_id}/bans", get_post(api::bans))
         .route(
+            "/api/guilds/{guild_id}/bans/{ban_id}/reason",
+            axum::routing::put(api::edit_ban_reason),
+        )
+        .route("/api/guilds/{guild_id}/ban", axum::routing::post(api::ban))
+        .route(
             "/api/guilds/{guild_id}/unban",
             axum::routing::post(api::unban),
         )
@@ -2318,8 +2323,8 @@ pub(super) async fn manage_guild_from_auth(
     Ok(auth)
 }
 
-/// Authorizes a bot-token unban with fresh Discord ban authority, rather than
-/// configuration-only MANAGE_GUILD authority.
+/// Authorizes a bot-token ban, unban or ban-reason edit with fresh Discord ban
+/// authority, rather than configuration-only MANAGE_GUILD authority.
 pub async fn authorize_ban_members(
     app: &Arc<ApiState>,
     session: &Session,
@@ -2337,7 +2342,7 @@ pub async fn authorize_ban_members(
     let mut auth = auth?;
     if !auth.can_ban_members(guild_id) {
         return Err(ApiError(anyhow::anyhow!(
-            "you cannot unban members in this server (needs BAN_MEMBERS permission)"
+            "you cannot ban or unban members in this server (needs BAN_MEMBERS permission)"
         )));
     }
     auth.enrollment = Some(enrollment?);

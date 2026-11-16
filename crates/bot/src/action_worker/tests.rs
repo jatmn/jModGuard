@@ -3172,3 +3172,397 @@ async fn owner_leave_requires_the_captured_membership() {
     assert_eq!(state, "failed");
     assert_eq!(code.as_deref(), Some("bot_membership_changed"));
 }
+
+fn ban(user_id: i64, duration_minutes: Option<u32>) -> Action {
+    Action::Ban {
+        user_id,
+        reason: "raid account".into(),
+        delete_message_days: 1,
+        duration_minutes,
+    }
+}
+
+/// Discord for queued bans: the refusal check and the ban call are recorded.
+struct BanDiscord {
+    authorized: bool,
+    refusal: Result<Option<&'static str>, ()>,
+    outcome: Outcome,
+    bans: std::sync::Mutex<Vec<(i64, i64, u8, String)>>,
+}
+impl Default for BanDiscord {
+    fn default() -> Self {
+        Self {
+            authorized: true,
+            refusal: Ok(None),
+            outcome: Outcome::succeeded("banned"),
+            bans: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+#[serenity::async_trait]
+impl DiscordActions for BanDiscord {
+    async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+        Ok(true)
+    }
+    async fn guild_joined_at_ns(&self, _: i64) -> Result<Option<i64>> {
+        Ok(Some(1))
+    }
+    async fn authorized(&self, _: &BotAction) -> Result<bool> {
+        Ok(self.authorized)
+    }
+    async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
+        Ok(true)
+    }
+    async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+        panic!("not an unban")
+    }
+    async fn ban_refusal(&self, _: &BotAction, _: i64) -> Result<Option<&'static str>> {
+        self.refusal
+            .map_err(|()| anyhow::anyhow!("Discord unavailable"))
+    }
+    async fn ban(&self, guild: i64, user: i64, days: u8, reason: &str) -> Outcome {
+        self.bans
+            .lock()
+            .unwrap()
+            .push((guild, user, days, reason.to_owned()));
+        self.outcome
+    }
+}
+
+fn open_tenant(f: &Fixture) -> crate::tenant::TenantRuntime {
+    crate::tenant::TenantRuntime::open(
+        &f.db,
+        &crate::config::DbConfig {
+            path: f.path.clone(),
+            pool_size: 2,
+            ..Default::default()
+        },
+        &crate::config::GuildStoresConfig::default(),
+        &crate::config::EvidenceConfig {
+            backend: "none".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+async fn member_ban_events(f: &Fixture) -> i64 {
+    f.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT count(*) FROM events WHERE guild_id=10 AND event_type='member_ban'",
+            params![],
+            |row| Ok(row.get::<i64>(0)?),
+        )
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn queued_ban_records_row_case_and_audit_only_after_discord_confirms() {
+    for (label, outcome) in [
+        ("succeeded", Outcome::succeeded("banned")),
+        ("failed", Outcome::failed("bot_missing_permissions")),
+        ("unknown", Outcome::failed("unknown_user")),
+        ("uncertain", Outcome::uncertain("discord_outcome_unknown")),
+    ] {
+        let f = Fixture::new();
+        let job = f.enqueue(10, label, ban(99, None)).await;
+        let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+        let tenant = open_tenant(&f);
+        tenant.activate(enrollment.clone()).await.unwrap().unwrap();
+        let discord = BanDiscord {
+            outcome,
+            ..Default::default()
+        };
+
+        drain_with_tenant(&f.db, &tenant, &discord, &WorkerLimits::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *discord.bans.lock().unwrap(),
+            vec![(10, 99, 1, "raid account".to_owned())],
+            "{label}: Discord create-ban with the audit reason and deletion window"
+        );
+        let status = f.status(&job).await;
+        assert_eq!(
+            (status.state.as_str(), status.outcome.as_deref()),
+            (outcome.state, Some(outcome.code)),
+            "{label}: Bot actions shows the result"
+        );
+        let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
+        let (store, scope) = tenant.live(enrollment).await.unwrap();
+        let cases = store
+            .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        if outcome.state != "succeeded" {
+            assert!(
+                rows.is_empty(),
+                "{label}: no ban record Discord didn't apply"
+            );
+            assert!(cases.is_empty(), "{label}: no case for an unconfirmed ban");
+            assert_eq!(member_ban_events(&f).await, 0, "{label}");
+            continue;
+        }
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].active);
+        assert_eq!(rows[0].user_id, 99);
+        assert_eq!(rows[0].moderator_id, Some(42));
+        assert_eq!(rows[0].reason.as_deref(), Some("raid account"));
+        assert_eq!(member_ban_events(&f).await, 1);
+        assert_eq!(cases.len(), 1);
+        let case = store
+            .case(scope, cases[0].clone(), crate::tenant::case_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            case.source,
+            crate::db::guild_data::CaseSource::Application {
+                operation_id: crate::db::guild_data::CaseId::try_from(job.id.clone()).unwrap(),
+            }
+        );
+        assert_eq!(case.action, crate::db::guild_data::CaseAction::Ban);
+        assert_eq!(case.outcome, crate::db::guild_data::CaseOutcome::Succeeded);
+        assert_eq!(case.subject_id, 99);
+        assert_eq!(case.actor_id, Some(42));
+        assert_eq!(case.reason.as_deref(), Some("raid account"));
+    }
+}
+
+#[tokio::test]
+async fn queued_ban_refusals_and_permission_failures_never_call_discord() {
+    for (label, discord, code) in [
+        (
+            "owner",
+            BanDiscord {
+                refusal: Ok(Some("cannot_ban_owner")),
+                ..Default::default()
+            },
+            "cannot_ban_owner",
+        ),
+        (
+            "bot",
+            BanDiscord {
+                refusal: Ok(Some("cannot_ban_bot")),
+                ..Default::default()
+            },
+            "cannot_ban_bot",
+        ),
+        (
+            "bot-permission",
+            BanDiscord {
+                refusal: Ok(Some("bot_missing_ban_permission")),
+                ..Default::default()
+            },
+            "bot_missing_ban_permission",
+        ),
+        (
+            "above-bot",
+            BanDiscord {
+                refusal: Ok(Some("target_role_not_below_bot")),
+                ..Default::default()
+            },
+            "target_role_not_below_bot",
+        ),
+        (
+            "above-moderator",
+            BanDiscord {
+                refusal: Ok(Some("target_role_not_below_moderator")),
+                ..Default::default()
+            },
+            "target_role_not_below_moderator",
+        ),
+        (
+            "unknown-user",
+            BanDiscord {
+                refusal: Ok(Some("unknown_user")),
+                ..Default::default()
+            },
+            "unknown_user",
+        ),
+        (
+            "check-unavailable",
+            BanDiscord {
+                refusal: Err(()),
+                ..Default::default()
+            },
+            "ban_check_unavailable",
+        ),
+        (
+            "moderator-lost-ban-members",
+            BanDiscord {
+                authorized: false,
+                ..Default::default()
+            },
+            "permission_revoked",
+        ),
+    ] {
+        let f = Fixture::new();
+        let job = f.enqueue(10, label, ban(99, None)).await;
+        let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+        let tenant = open_tenant(&f);
+        tenant.activate(enrollment.clone()).await.unwrap().unwrap();
+
+        drain_with_tenant(&f.db, &tenant, &discord, &WorkerLimits::default())
+            .await
+            .unwrap();
+
+        assert!(discord.bans.lock().unwrap().is_empty(), "{label}");
+        let status = f.status(&job).await;
+        assert_eq!(status.state, "failed", "{label}");
+        assert_eq!(status.outcome.as_deref(), Some(code), "{label}");
+        assert!(
+            db::list_bans(&f.db, 10, 10).await.unwrap().is_empty(),
+            "{label}"
+        );
+        let (store, scope) = tenant.live(enrollment).await.unwrap();
+        assert!(
+            store
+                .case_ids(scope, None, 10, crate::tenant::case_limits())
+                .await
+                .unwrap()
+                .is_empty(),
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_ban_fills_its_gateway_echo_and_binds_its_deadline() {
+    let f = Fixture::new();
+    // The bot's own gateway echo of this request arrived first.
+    let job = f.enqueue(10, "timed", ban(99, Some(30))).await;
+    let echo = job.id.clone();
+    f.db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO bans(guild_id,user_id,reason,created_at,active,operation_id)
+             VALUES(10,99,'Reason unavailable','then',1,?1)",
+            params![echo],
+            65_536,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+    let before = now();
+    drain(&f.db, &BanDiscord::default(), &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(f.status(&job).await.state, "succeeded");
+    let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
+    assert_eq!(rows.len(), 1, "the echo row is this ban, not a second one");
+    assert_eq!(rows[0].moderator_id, Some(42));
+    assert_eq!(rows[0].reason.as_deref(), Some("raid account"));
+    let id = rows[0].id;
+    let (expires_at, bound): (i64, String) =
+        f.db.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT expires_at, expiry_enrollment_id FROM bans WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert!((before + 1800..=now() + 1800).contains(&expires_at));
+    assert_eq!(bound, enrollment.id);
+}
+
+#[test]
+fn ban_refusal_follows_the_ban_command_and_discord_role_hierarchy() {
+    use serenity::model::guild::{Member, PartialGuild, Role};
+    use serenity::model::id::RoleId;
+    let mut guild: PartialGuild = serde_json::from_value(serde_json::json!({
+        "id":"10", "name":"fixture", "owner_id":"11", "verification_level":0,
+        "default_message_notifications":0, "explicit_content_filter":0, "roles":[],
+        "emojis":[], "features":[], "mfa_level":0, "system_channel_flags":0,
+        "premium_tier":0, "preferred_locale":"en-US", "nsfw_level":0,
+        "stickers":[], "premium_progress_bar_enabled":false
+    }))
+    .unwrap();
+    let role = |id: u64, position: u16, permissions: Permissions| {
+        let mut role = Role::default();
+        role.id = RoleId::new(id);
+        role.position = position;
+        role.permissions = permissions;
+        role
+    };
+    for role in [
+        role(30, 30, Permissions::BAN_MEMBERS),
+        role(20, 20, Permissions::BAN_MEMBERS),
+        role(15, 15, Permissions::empty()),
+        role(10, 10, Permissions::empty()),
+    ] {
+        guild.roles.insert(role.id, role);
+    }
+    let member = |id: u64, roles: &[u64]| {
+        let mut member = Member::default();
+        member.user.id = UserId::new(id);
+        member.roles = roles.iter().map(|id| RoleId::new(*id)).collect();
+        member
+    };
+    let bot = member(1, &[30]);
+    let moderator = member(42, &[20]);
+    let target = member(99, &[10]);
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, Some(&target), 99),
+        None
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, None, 99),
+        None,
+        "someone outside the server is banned by ID"
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, Some(&member(11, &[])), 11),
+        Some("cannot_ban_owner")
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, Some(&bot), 1),
+        Some("cannot_ban_bot")
+    );
+    assert_eq!(
+        ban_refusal(&guild, &member(1, &[15]), &moderator, Some(&target), 99),
+        Some("bot_missing_ban_permission")
+    );
+    let above_moderator = member(99, &[20]);
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, Some(&above_moderator), 99),
+        Some("target_role_not_below_moderator"),
+        "an equal role is not below the moderator"
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &member(42, &[15]), Some(&above_moderator), 99),
+        Some("target_role_not_below_moderator")
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &member(11, &[]), Some(&above_moderator), 99),
+        None,
+        "the owner moderates above every role"
+    );
+    let above_bot = member(99, &[30]);
+    assert_eq!(
+        ban_refusal(&guild, &bot, &member(11, &[]), Some(&above_bot), 99),
+        Some("target_role_not_below_bot")
+    );
+    assert_eq!(
+        classify_ban_response(403, 50013),
+        Outcome::failed("bot_missing_permissions")
+    );
+    assert_eq!(
+        classify_ban_response(404, 10013),
+        Outcome::failed("unknown_user")
+    );
+    assert_eq!(
+        classify_ban_response(400, 0),
+        Outcome::failed("discord_rejected")
+    );
+    assert_eq!(
+        classify_ban_response(500, 0),
+        Outcome::uncertain("discord_outcome_unknown")
+    );
+}

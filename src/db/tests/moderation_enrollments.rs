@@ -3880,3 +3880,155 @@ async fn command_ban_record_binds_its_expiry_only_to_the_captured_ban() {
     assert!(unknown.published.is_some());
     assert_eq!(unknown.expiry_ban, None);
 }
+
+#[tokio::test]
+async fn ban_reason_edits_keep_the_original_and_record_each_change() {
+    let f = Fixture::new();
+    let current = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let other = enroll_guild(&f.db, 20, 100).await.unwrap().unwrap();
+    record_enrolled_ban(&f.db, Some(current.clone()), 7, Some(8), "Spamming")
+        .await
+        .unwrap();
+    record_enrolled_ban(&f.db, Some(other.clone()), 7, Some(8), "Other server")
+        .await
+        .unwrap();
+    let ban = list_enrolled_bans(&f.db, current.clone(), 10)
+        .await
+        .unwrap()[0]
+        .id;
+    let foreign = list_enrolled_bans(&f.db, other, 10).await.unwrap()[0].id;
+
+    let first = edit_enrolled_ban_reason(&f.db, current.clone(), ban, 42, "  Raid account ".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        BanReasonEdit {
+            changed: true,
+            reason: "Raid account".into()
+        }
+    );
+    let again = edit_enrolled_ban_reason(&f.db, current.clone(), ban, 42, "Raid account".into())
+        .await
+        .unwrap();
+    assert!(!again.changed, "an unchanged reason writes nothing");
+    edit_enrolled_ban_reason(&f.db, current.clone(), ban, 43, "Raid bot".into())
+        .await
+        .unwrap();
+
+    let row = list_enrolled_bans(&f.db, current.clone(), 10)
+        .await
+        .unwrap()[0]
+        .clone();
+    assert_eq!(
+        row.reason.as_deref(),
+        Some("Spamming"),
+        "the original stays"
+    );
+    assert_eq!(row.edited_reason.as_deref(), Some("Raid bot"));
+    assert_eq!(row.reason_edited_by, Some(43));
+    assert!(row.reason_edited_at.is_some());
+    let json = serde_json::to_value(&row).unwrap();
+    assert_eq!(json["reason_edited_by"], "43", "snowflakes stay strings");
+
+    let edits = query_enrolled_events(
+        &f.db,
+        current.clone(),
+        Some(BAN_REASON_EDIT_EVENT),
+        None,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(edits.len(), 2, "one history entry per change");
+    let latest: serde_json::Value =
+        serde_json::from_str(edits[0].data.as_deref().unwrap()).unwrap();
+    assert_eq!(latest["previous_reason"], "Raid account");
+    assert_eq!(latest["reason"], "Raid bot");
+    assert_eq!(edits[0].actor_id, Some(43));
+    assert_eq!(edits[0].user_id, Some(7));
+    let oldest: serde_json::Value =
+        serde_json::from_str(edits[1].data.as_deref().unwrap()).unwrap();
+    assert_eq!(oldest["previous_reason"], "Spamming");
+    assert_eq!(
+        enrolled_guild_stats(&f.db, current.clone())
+            .await
+            .unwrap()
+            .events,
+        0,
+        "reason edits are not moderation actions"
+    );
+
+    for bad in ["", "   ", "line\nbreak"] {
+        assert!(
+            edit_enrolled_ban_reason(&f.db, current.clone(), ban, 42, bad.into())
+                .await
+                .is_err(),
+            "{bad:?}"
+        );
+    }
+    assert!(
+        edit_enrolled_ban_reason(&f.db, current.clone(), ban, 42, "x".repeat(513))
+            .await
+            .is_err()
+    );
+    let missing = edit_enrolled_ban_reason(&f.db, current.clone(), foreign, 42, "x".into())
+        .await
+        .unwrap_err();
+    assert!(missing.to_string().contains("ban not found"), "{missing:#}");
+    enroll_guild(&f.db, 10, 101).await.unwrap().unwrap();
+    assert!(
+        edit_enrolled_ban_reason(&f.db, current, ban, 42, "late".into())
+            .await
+            .unwrap_err()
+            .is::<EnrollmentChanged>()
+    );
+}
+
+#[test]
+fn queued_ban_validation_bounds_the_deletion_window_and_duration() {
+    use crate::bot_actions::Action;
+    let ban = |delete_message_days, duration_minutes| Action::Ban {
+        user_id: 7,
+        reason: "raid".into(),
+        delete_message_days,
+        duration_minutes,
+    };
+    assert!(ban(0, None).validate().is_ok());
+    assert!(ban(7, Some(1)).validate().is_ok());
+    assert!(ban(8, None).validate().is_err());
+    assert!(ban(0, Some(0)).validate().is_err());
+    assert!(
+        Action::Ban {
+            user_id: 0,
+            reason: "raid".into(),
+            delete_message_days: 0,
+            duration_minutes: None
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        Action::Ban {
+            user_id: 7,
+            reason: "a\nb".into(),
+            delete_message_days: 0,
+            duration_minutes: None
+        }
+        .validate()
+        .is_err()
+    );
+    assert_eq!(ban(0, None).resource(), "ban:7");
+    let wire = serde_json::to_value(ban(1, None)).unwrap();
+    assert_eq!(
+        wire,
+        serde_json::json!({"kind":"ban","user_id":"7","reason":"raid","delete_message_days":1})
+    );
+    assert_eq!(
+        serde_json::from_value::<Action>(serde_json::json!({
+            "kind":"ban","user_id":"7","reason":"raid","delete_message_days":1,"duration_minutes":30
+        }))
+        .unwrap(),
+        ban(1, Some(30))
+    );
+}

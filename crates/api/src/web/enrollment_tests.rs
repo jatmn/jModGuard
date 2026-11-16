@@ -2084,6 +2084,188 @@ async fn action_visibility_cancellation_and_admission_follow_current_action_perm
 }
 
 #[tokio::test]
+async fn ban_and_reason_edit_routes_require_ban_members_and_page_membership() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    db::record_enrolled_ban(&f.app.db, Some(enrollment), 7, Some(8), "Spamming")
+        .await
+        .unwrap();
+    let (status, listed) = f.request("POST", "/api/guilds/10/bans", "").await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let ban_id = listed["bans"][0]["id"].as_i64().unwrap();
+    assert_eq!(listed["bans"][0]["user_id"], "7");
+    assert!(listed["names"].is_object(), "{listed}");
+    let reason_path = format!("/api/guilds/10/bans/{ban_id}/reason");
+    let ban = |label: &str, days: u8| {
+        serde_json::json!({
+            "request_id": action_key(label), "user_id": "99", "reason": "raid account",
+            "delete_message_days": days, "duration_minutes": 30
+        })
+        .to_string()
+    };
+    let edit = serde_json::json!({"reason":"Raid account"}).to_string();
+
+    // Manage Server alone may neither ban nor edit a ban's reason.
+    let mut manage_only = managed_guild(10);
+    manage_only.permissions = Some(oauth::PermissionsField::Number(1 << 5));
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    *f.discord.guilds.lock().unwrap() = vec![manage_only];
+    let (status, denied) = f
+        .request("POST", "/api/guilds/10/ban", &ban("denied", 1))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{denied}");
+    assert!(denied.to_string().contains("BAN_MEMBERS"), "{denied}");
+    let (status, denied) = f.request("PUT", &reason_path, &edit).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{denied}");
+    assert!(
+        db::recent_bot_actions(&f.app.db, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut ban_only = managed_guild(10);
+    ban_only.permissions = Some(oauth::PermissionsField::Number(1 << 2));
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    *f.discord.guilds.lock().unwrap() = vec![ban_only];
+    for (method, path, body) in [
+        ("POST", "/api/guilds/10/ban".to_owned(), ban("no-page", 1)),
+        ("PUT", reason_path.clone(), edit.clone()),
+    ] {
+        let (status, body) = f.request_token(method, &path, &body, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{method} {path}: {body}");
+    }
+    let (status, invalid) = f
+        .request("POST", "/api/guilds/10/ban", &ban("eight", 8))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+    let (status, queued) = f
+        .request("POST", "/api/guilds/10/ban", &ban("queued", 1))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(queued["state"], "pending");
+    assert_eq!(
+        queued["action"],
+        serde_json::json!({
+            "kind":"ban","user_id":"99","reason":"raid account",
+            "delete_message_days":1,"duration_minutes":30
+        })
+    );
+    let (_, history) = f.request("POST", "/api/guilds/10/actions", "").await;
+    assert_eq!(
+        history[0]["id"], queued["id"],
+        "Ban Members sees its ban receipt"
+    );
+    let (status, again) = f
+        .request("POST", "/api/guilds/10/ban", &ban("twice", 0))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "one active request per target: {again}"
+    );
+
+    let (status, edited) = f.request("PUT", &reason_path, &edit).await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    assert_eq!(
+        edited,
+        serde_json::json!({"changed":true,"reason":"Raid account"})
+    );
+    let (status, unchanged) = f.request("PUT", &reason_path, &edit).await;
+    assert_eq!(status, StatusCode::OK, "{unchanged}");
+    assert_eq!(unchanged["changed"], false);
+    let (status, blank) = f.request("PUT", &reason_path, r#"{"reason":"   "}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{blank}");
+    // The list itself stays a dashboard read.
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    *f.discord.guilds.lock().unwrap() = vec![managed_guild(10)];
+    let (_, listed) = f.request("POST", "/api/guilds/10/bans", "").await;
+    let row = &listed["bans"][0];
+    assert_eq!(row["reason"], "Spamming", "the original stays visible");
+    assert_eq!(row["edited_reason"], "Raid account");
+    assert_eq!(row["reason_edited_by"], "42");
+    let (status, missing) = f
+        .request("PUT", "/api/guilds/10/bans/999/reason", &edit)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{missing}");
+    assert!(missing.to_string().contains("ban not found"), "{missing}");
+}
+
+#[tokio::test]
+async fn queued_ban_handoff_lists_the_ban_after_the_bot_confirms_it() {
+    use jmodguard_bot::action_worker::{DiscordActions, Outcome, WorkerLimits};
+
+    struct Bans(std::sync::Mutex<Vec<(i64, i64, u8, String)>>);
+    #[async_trait::async_trait]
+    impl DiscordActions for Bans {
+        async fn membership_matches(&self, _: &db::BotAction) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn authorized(&self, _: &db::BotAction) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn valid_log_channel(&self, _: i64, _: i64) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+            panic!("not an unban")
+        }
+        async fn ban_refusal(
+            &self,
+            _: &db::BotAction,
+            _: i64,
+        ) -> anyhow::Result<Option<&'static str>> {
+            Ok(None)
+        }
+        async fn ban(&self, guild: i64, user: i64, days: u8, reason: &str) -> Outcome {
+            self.0
+                .lock()
+                .unwrap()
+                .push((guild, user, days, reason.to_owned()));
+            Outcome {
+                state: "succeeded",
+                code: "banned",
+            }
+        }
+    }
+
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let body = serde_json::json!({"request_id":action_key("handoff"),"user_id":"99"}).to_string();
+    let (status, queued) = f.request("POST", "/api/guilds/10/ban", &body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    let (_, listed) = f.request("POST", "/api/guilds/10/bans", "").await;
+    assert!(
+        listed["bans"].as_array().unwrap().is_empty(),
+        "queued is not banned"
+    );
+    let discord = Bans(Default::default());
+    jmodguard_bot::action_worker::drain_with_tenant(
+        &f.app.db,
+        &f.app.tenant,
+        &discord,
+        &WorkerLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *discord.0.lock().unwrap(),
+        vec![(10, 99, 0, "banned via WebUI".to_owned())]
+    );
+    let (_, history) = f.request("POST", "/api/guilds/10/actions", "").await;
+    assert_eq!(history[0]["id"], queued["id"]);
+    assert_eq!(history[0]["state"], "succeeded");
+    assert_eq!(history[0]["outcome"], "banned");
+    let (_, listed) = f.request("POST", "/api/guilds/10/bans", "").await;
+    let row = &listed["bans"][0];
+    assert_eq!(row["user_id"], "99");
+    assert_eq!(row["active"], true);
+    assert_eq!(row["moderator_id"], "42");
+    assert_eq!(row["reason"], "banned via WebUI");
+}
+
+#[tokio::test]
 async fn claimed_work_and_stuck_log_channels_can_be_cancelled_for_recovery() {
     let f = Fixture::new(true).await;
     f.enroll(10).await;

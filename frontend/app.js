@@ -1993,7 +1993,7 @@ function pageEnrollment(path, method = "GET") {
   // Bind edits and scoped reads to the membership this page loaded. Never
   // fetch a new token or retry against a replacement installation.
   const edit = path.match(
-    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|unban|actions|events|members|member-sync|bans|stats|analytics|cases|case-delete-roles|access-roles|server-names)(?:\/|\?|$)/,
+    /^\/api\/guilds\/(\d+)\/(settings|rules|badwords|testbadwords|known-spam|known-bad-images|commands|templates|copy|logchannels|logfilters|ban|unban|actions|events|members|member-sync|bans|stats|analytics|cases|case-delete-roles|access-roles|server-names)(?:\/|\?|$)/,
   );
   if (
     edit &&
@@ -9328,25 +9328,399 @@ function tabKnownBadImages() {
   );
 }
 
+// Bans page (#625). Rows come from the ban records; display names come from the
+// row or the member directory, and IDs only appear as copyable chips.
+const AUTOMOD_BAN_REASON = /^\[automod:([^\]]+)\]\s*/;
+// Texts the bot stores in place of a reason: Discord's audit entry had none, or
+// no audit entry named the ban yet. Both show as a muted placeholder.
+const BAN_REASON_PLACEHOLDERS = { "No reason provided": "No reason given", "Reason unavailable": "Reason unavailable" };
+
+function banReasonParts(reason) {
+  const raw = String(reason || "");
+  const automod = AUTOMOD_BAN_REASON.exec(raw);
+  const rest = (automod ? raw.slice(automod[0].length) : raw).trim();
+  const placeholder = Object.hasOwn(BAN_REASON_PLACEHOLDERS, rest) ? BAN_REASON_PLACEHOLDERS[rest] : rest ? null : "No reason given";
+  return { rule: automod ? automod[1] : null, text: placeholder ? "" : rest, placeholder };
+}
+
+function banPerson(id, storedName, storedDisplay, names) {
+  const known = id && names && Object.hasOwn(names, id) ? names[id] : null;
+  const handle = storedName || known?.username || null;
+  return { id, name: storedDisplay || known?.display_name || handle, handle };
+}
+
+// The one place a ban names its user: "Name (@handle)", else "user <id>".
+function banPersonText(person) {
+  if (!person.name) return `user ${person.id}`;
+  return person.handle && person.handle !== person.name ? `${person.name} (@${person.handle})` : person.name;
+}
+
+// A small ID chip with the shared copy icon action (#588), never inline ID text.
+function IdChip({ id, label }) {
+  return h(
+    "span",
+    { className: "id-chip" },
+    h("code", null, id),
+    h(IconButton, {
+      action: "copy",
+      label: `Copy ${label} ID ${id}`,
+      className: "btn btn-xs btn-square btn-ghost",
+      onClick: async () => {
+        try {
+          await navigator.clipboard.writeText(id);
+          toast("ID copied", "success");
+        } catch (_) {
+          toast("Could not copy the ID.", "error");
+        }
+      },
+    }),
+  );
+}
+
+function BanPersonCell({ person, label }) {
+  return h(
+    "div",
+    { className: "ban-person" },
+    h(LetterAvatar, { name: person.name || "?" }),
+    h(
+      "div",
+      { className: "ban-person-text" },
+      h("strong", { className: "ban-person-name" }, person.name || "Unknown user"),
+      person.handle && person.handle !== person.name ? h("span", { className: "muted" }, `@${person.handle}`) : null,
+      h(IdChip, { id: person.id, label }),
+    ),
+  );
+}
+
+function BanModeratorCell({ record, names, rule }) {
+  if (record.moderator_id) {
+    return h(BanPersonCell, { person: banPerson(record.moderator_id, record.moderator_name, null, names), label: "moderator" });
+  }
+  return h(
+    "div",
+    { className: "ban-person" },
+    h("span", { className: "case-avatar", "aria-hidden": "true" }, h(Icon, { name: rule ? "bot" : "users" })),
+    rule
+      ? h("strong", { className: "ban-person-name" }, `jModGuard (automod: ${rule})`)
+      : h("span", { className: "muted" }, "Unknown"),
+  );
+}
+
+// Two lines until clicked; a long reason never stretches the row. A disclosure,
+// not a row action, so it is the text itself rather than an icon button.
+function BanReasonText({ text }) {
+  const [open, setOpen] = useState(false);
+  return h(
+    "span",
+    {
+      role: "button",
+      tabIndex: 0,
+      className: `ban-reason${open ? " ban-reason-open" : ""}`,
+      "aria-expanded": open,
+      title: open ? "Show less" : "Show the whole reason",
+      onClick: () => setOpen(!open),
+      onKeyDown: (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        setOpen(!open);
+      },
+    },
+    text,
+  );
+}
+
+function BanReasonCell({ record, names, guildId, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const parts = banReasonParts(record.reason);
+  const current = record.edited_reason != null ? record.edited_reason : parts.text;
+  const finish = () => {
+    setEditing(false);
+    ui.set({ edits: "clean" });
+  };
+  if (editing) {
+    return h(
+      "div",
+      { className: "ban-reason-editor" },
+      h("textarea", {
+        className: "textarea textarea-sm",
+        "aria-label": "jModGuard reason",
+        maxLength: 512,
+        rows: 2,
+        value: draft,
+        autoFocus: true,
+        onChange: (event) => {
+          setDraft(event.target.value.replace(/[\r\n]+/g, " "));
+          markDirty();
+        },
+      }),
+      h("p", { className: "field-help" }, "Changes jModGuard's record only. Discord keeps the original reason."),
+      h(
+        "div",
+        { className: "row" },
+        h(
+          ActionButton,
+          {
+            type: "button",
+            className: "btn btn-sm btn-primary",
+            disabled: !draft.trim(),
+            onClick: async () => {
+              const result = await api(`/api/guilds/${guildId}/bans/${record.id}/reason`, "PUT", { reason: draft.trim() });
+              finish();
+              toast(result?.changed === false ? "Reason unchanged." : "Reason updated.", "success");
+              onSaved();
+            },
+          },
+          "Save reason",
+        ),
+        h(ActionButton, { type: "button", className: "btn btn-sm", onClick: finish }, "Cancel"),
+      ),
+    );
+  }
+  const editor = record.reason_edited_by
+    ? banPerson(record.reason_edited_by, record.reason_edited_by === record.moderator_id ? record.moderator_name : null, null, names)
+    : null;
+  return h(
+    "div",
+    { className: "ban-reason-cell" },
+    current ? h(BanReasonText, { text: current }) : h("span", { className: "muted" }, parts.placeholder || "No reason given"),
+    record.edited_reason != null
+      ? h(
+          "p",
+          { className: "ban-reason-history muted" },
+          `Edited${editor ? ` by ${banPersonText(editor)}` : ""} `,
+          h(CaseTime, { ms: memberInstant(record.reason_edited_at)?.getTime() }),
+          h("br"),
+          `Original: ${parts.text || (parts.placeholder || "No reason given").toLowerCase()}`,
+        )
+      : null,
+    isPreview()
+      ? null
+      : h(IconButton, {
+          action: "edit",
+          label: "Edit reason",
+          className: "btn btn-xs btn-square btn-ghost",
+          onClick: () => {
+            setDraft(current || "");
+            setEditing(true);
+          },
+        }),
+  );
+}
+
+// Readable bot-action results for ban and unban receipts, here and in Bot actions.
+const BAN_ACTION_OUTCOMES = {
+  banned: "Banned in Discord.",
+  unbanned: "Unbanned in Discord.",
+  already_unbanned: "Already unbanned in Discord.",
+  cannot_ban_owner: "Refused: the server owner can't be banned.",
+  cannot_ban_bot: "Refused: jModGuard can't ban itself.",
+  bot_missing_ban_permission: "Refused: jModGuard needs the Ban Members permission.",
+  bot_missing_permissions: "Discord refused: jModGuard lacks Ban Members or its role is too low.",
+  target_role_not_below_bot: "Refused: this member's highest role is not below jModGuard's.",
+  target_role_not_below_moderator: "Refused: this member's highest role is not below yours.",
+  unknown_user: "Refused: Discord has no user with this ID.",
+  permission_revoked: "Refused: you no longer have Ban Members here.",
+  permission_check_unavailable: "Discord couldn't confirm your permissions. Try again.",
+  ban_check_unavailable: "Discord couldn't be checked before the ban. Try again.",
+  discord_rejected: "Discord rejected the request.",
+  discord_outcome_unknown: "Discord's answer was lost. Check Discord before trying again.",
+  request_timed_out: "Discord didn't answer in time. Check Discord before trying again.",
+  expired_before_execution: "The bot didn't pick this up in time. It may be offline.",
+};
+
+function botActionOutcomeText(job) {
+  return (job.outcome && BAN_ACTION_OUTCOMES[job.outcome]) || job.outcome || null;
+}
+
+function banReceiptText(job) {
+  if (job.state === "succeeded") return botActionOutcomeText(job) || "Banned in Discord.";
+  if (job.state === "pending" || job.state === "claimed") return "Queued. Waiting for the bot to pick it up…";
+  if (job.state === "running") return "The bot is banning this user…";
+  if (job.state === "uncertain") return botActionOutcomeText(job) || "The result is unknown. Check Discord.";
+  return botActionOutcomeText(job) || `Ban ${job.state}.`;
+}
+
+// The dialog follows its own receipt for a bounded time, like a log-channel save.
+const BAN_RECEIPT_POLLS = 30;
+const BAN_RECEIPT_POLL_MS = 2000;
+
+function BanDialog({ guildId, onDone }) {
+  const [userIds] = useState(() => []);
+  const [, bump] = useState(0);
+  const [pickerNames, setPickerNames] = useState(() => ({ status: "loaded", roles: [], channels: [], users: new Map() }));
+  const [reason, setReason] = useState("");
+  const [days, setDays] = useState("0");
+  const [duration, setDuration] = useState("");
+  const [receipt, setReceipt] = useState(null);
+  const pending = useRef(new Set()).current;
+  const alive = useRef(true);
+  useEffect(() => () => {
+    alive.current = false;
+  }, []);
+  const rememberUser = (id, name) => setPickerNames((current) => ({ ...current, users: new Map(current.users).set(id, name) }));
+  const userId = userIds[0] || "";
+  const who = userId ? pickerNames.users.get(userId) || `user ${userId}` : "";
+  const minutes = duration.trim() ? Number(duration) : null;
+  const durationValid = minutes === null || (Number.isInteger(minutes) && minutes > 0 && minutes <= 4294967295);
+  const close = () => {
+    if (canLeave()) closeOverlay();
+  };
+  const watch = async (job) => {
+    for (let poll = 0; poll < BAN_RECEIPT_POLLS && alive.current && botActionPhase(job) === "active"; poll++) {
+      await new Promise((resolve) => setTimeout(resolve, BAN_RECEIPT_POLL_MS));
+      if (!alive.current) return;
+      try {
+        const jobs = await apiRead(`/api/guilds/${guildId}/actions`);
+        const next = Array.isArray(jobs) ? jobs.find((candidate) => candidate.id === job.id) : null;
+        if (!next) return;
+        job = next;
+        if (alive.current) setReceipt(job);
+      } catch (_) {
+        return;
+      }
+    }
+    if (alive.current && botActionPhase(job) !== "active") onDone();
+  };
+  const submit = async () => {
+    for (const flush of pending) if (!flush()) return;
+    const id = userIds[0];
+    if (!id) throw new Error("Choose a member or paste a user ID.");
+    if (!durationValid) throw new Error("Enter the duration as a whole number of minutes, or leave it empty.");
+    if (!confirm(`Ban ${pickerNames.users.get(id) || `user ${id}`} from this server? This runs in Discord.`)) return;
+    const job = await submitBotAction(`/api/guilds/${guildId}/ban`, "POST", {
+      user_id: id,
+      reason: reason.trim() || null,
+      delete_message_days: Number(days),
+      ...(minutes === null ? {} : { duration_minutes: minutes }),
+    });
+    ui.set({ edits: "clean" });
+    setReceipt(job);
+    if (botActionPhase(job) === "active") watch(job);
+    else onDone();
+  };
+  return h(
+    DialogPanel,
+    { className: "modal-box ban-dialog" },
+    h(
+      "header",
+      { className: "case-header" },
+      h(
+        "div",
+        { className: "case-title" },
+        h("h2", null, "Ban a user"),
+        h(IconButton, { action: "cancel", label: "Close", className: "btn btn-sm btn-square btn-ghost case-close", onClick: close }),
+      ),
+    ),
+    receipt
+      ? h(
+          "div",
+          { className: "ban-receipt", role: "status", "aria-live": "polite" },
+          h(
+            "p",
+            { className: receipt.state === "succeeded" ? "" : ["failed", "uncertain", "cancelled", "expired"].includes(receipt.state) ? "err" : "muted" },
+            h("strong", null, who ? `${who}: ` : ""),
+            banReceiptText(receipt),
+          ),
+          h("p", { className: "field-help" }, "Bot actions keeps this result."),
+          h("div", { className: "row" }, h(ActionButton, { type: "button", className: "btn btn-sm", onClick: closeOverlay }, "Close")),
+        )
+      : h(
+          "div",
+          { className: "ban-form" },
+          h(IdPicker, {
+            kind: "user",
+            label: "Member",
+            ids: userIds,
+            names: pickerNames,
+            rememberUser,
+            single: true,
+            pending,
+            idLabel: "User ID",
+            hint: "Search this server's members, or paste the ID of someone who isn't in it.",
+            onChange: () => bump((n) => n + 1),
+          }),
+          field(
+            "Reason",
+            h("input", {
+              type: "text",
+              className: "input",
+              maxLength: 512,
+              value: reason,
+              placeholder: "Shown in Discord's audit log",
+              onChange: (event) => {
+                setReason(event.target.value);
+                markDirty();
+              },
+            }),
+          ),
+          field(
+            "Delete their messages from",
+            h(
+              "select",
+              { className: "select", value: days, onChange: (event) => setDays(event.target.value) },
+              h("option", { value: "0" }, "Don't delete any"),
+              h("option", { value: "1" }, "The last day"),
+              h("option", { value: "3" }, "The last 3 days"),
+              h("option", { value: "7" }, "The last 7 days"),
+            ),
+          ),
+          field(
+            "Unban after (minutes, optional)",
+            h("input", {
+              type: "text",
+              inputMode: "numeric",
+              className: `input${durationValid ? "" : " input-error"}`,
+              value: duration,
+              placeholder: "Leave empty for a permanent ban",
+              onChange: (event) => {
+                setDuration(event.target.value);
+                markDirty();
+              },
+            }),
+          ),
+          h(
+            "div",
+            { className: "row" },
+            h(ActionButton, { type: "button", className: "btn btn-error", disabled: !durationValid, onClick: submit }, h(Icon, { name: "hammer" }), "Ban user"),
+            h(ActionButton, { type: "button", className: "btn", onClick: close }, "Cancel"),
+          ),
+        ),
+  );
+}
+
+function openBanDialog(guildId, onDone) {
+  ui.set({ editor: h(BanDialog, { guildId, onDone, dialogLabel: "Ban a user", key: `ban:${guildId}:${Date.now()}` }) });
+}
+
 function tabBans() {
   const guildId = state.guildId;
   const result = useApiRead(`/api/guilds/${guildId}/bans?limit=200`);
+  const rows = Array.isArray(result.data?.bans) ? result.data.bans : [];
+  const names = result.data?.names || {};
   return h(
     "div",
     null,
     h("h2", null, "Bans"),
-    h(
-      "p",
-      { className: "muted", style: { marginBottom: "12px" } },
-      "Bans the bot made or saw in Discord.",
-    ),
+    h("p", { className: "muted" }, "Bans the bot made or saw in Discord."),
     h(GoodToKnow, {
-      items: ["You can unban here or in Discord.", "Unbans you request here are queued. Bot actions shows the result."],
+      items: [
+        "Bans and unbans you request here run in Discord through the bot. Bot actions shows the result.",
+        "Editing a reason changes jModGuard's record only. Discord keeps the original, and the Audit log lists each edit.",
+      ],
     }),
     h(
+      "div",
+      { className: "row", style: { marginBottom: "12px" } },
+      isPreview()
+        ? null
+        : h(ActionButton, { type: "button", className: "btn btn-error", onClick: () => openBanDialog(guildId, result.refresh) }, h(Icon, { name: "hammer" }), "Ban user"),
+      h(ActionButton, { type: "button", className: "btn", onClick: result.refresh }, "Refresh"),
+    ),
+    h(
       DataTable,
-      { headings: ["Banned user", "Status", "Moderator", "Reason", "Time", "Actions"] },
-      result.loading || result.error || !result.data?.length
+      { headings: ["Banned user", "Status", "Moderator", "Reason", "Time", "Actions"], className: "table table-zebra ban-table" },
+      result.loading || result.error || !rows.length
         ? h(
             "tr",
             null,
@@ -9360,52 +9734,43 @@ function tabBans() {
                   : "No matching records.",
             ),
           )
-        : result.data.map((record, i) =>
-            h(
+        : rows.map((record, i) => {
+            const user = banPerson(record.user_id, record.user_name, record.user_display_name, names);
+            const { rule } = banReasonParts(record.reason);
+            return h(
               "tr",
               { key: record.id ?? i },
+              h("td", null, h(BanPersonCell, { person: user, label: "user" })),
               h(
                 "td",
                 null,
-                record.user_display_name
-                  ? `${record.user_display_name} (${record.user_name ? `${record.user_name}, ` : ""}${record.user_id})`
-                  : record.user_name
-                    ? `${record.user_name} (${record.user_id})`
-                    : record.user_id,
+                h(
+                  "span",
+                  { className: `badge badge-soft badge-sm ${record.active ? "badge-error" : "badge-success"}` },
+                  record.active ? "Banned" : "Unbanned",
+                ),
               ),
-              h("td", null, record.active ? "banned" : "unbanned"),
-              h(
-                "td",
-                null,
-                record.moderator_id
-                  ? record.moderator_name
-                    ? `${record.moderator_name} (${record.moderator_id})`
-                    : record.moderator_id
-                  : "Unavailable",
-              ),
-              h("td", null, record.reason || "Reason unavailable"),
-              h("td", { className: "muted" }, new Date(record.created_at).toLocaleString()),
+              h("td", null, h(BanModeratorCell, { record, names, rule })),
+              h("td", null, h(BanReasonCell, { record, names, guildId, onSaved: result.refresh })),
+              h("td", { className: "muted" }, h(CaseTime, { ms: memberInstant(record.created_at)?.getTime() })),
               h(
                 "td",
                 null,
                 record.active &&
-                  h(
-                    IconButton,
-                    {
-                      action: "unban",
-                      label: "Unban",
-                      onClick: async () => {
-                        if (confirm(`Unban ${record.user_id}?`))
-                          await submitBotAction(`/api/guilds/${guildId}/unban`, "POST", {
-                            user_id: String(record.user_id),
-                            reason: "unbanned via WebUI",
-                          });
-                      },
+                  h(IconButton, {
+                    action: "unban",
+                    label: `Unban ${banPersonText(user)}`,
+                    onClick: async () => {
+                      if (confirm(`Unban ${banPersonText(user)}?`))
+                        await submitBotAction(`/api/guilds/${guildId}/unban`, "POST", {
+                          user_id: String(record.user_id),
+                          reason: "unbanned via WebUI",
+                        });
                     },
-                  ),
+                  }),
               ),
-            ),
-          ),
+            );
+          }),
     ),
   );
 }
@@ -9457,13 +9822,15 @@ function tabActions() {
                 null,
                 job.action.kind === "unban"
                   ? `Unban ${job.action.user_id}`
-                  : job.action.kind === "member_sync"
-                    ? `Member sync: ${job.action.operation}`
-                    : `${job.action.event}: ${job.action.channel_id || "clear log channel"}`,
+                  : job.action.kind === "ban"
+                    ? `Ban ${job.action.user_id}`
+                    : job.action.kind === "member_sync"
+                      ? `Member sync: ${job.action.operation}`
+                      : `${job.action.event}: ${job.action.channel_id || "clear log channel"}`,
               ),
               h("td", null, job.actor_id),
               h("td", null, job.state === "uncertain" ? "Outcome unknown" : job.state),
-              h("td", null, job.outcome || "—"),
+              h("td", null, botActionOutcomeText(job) || "—"),
               h(
                 "td",
                 null,

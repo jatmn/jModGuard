@@ -345,6 +345,7 @@ mod tests {
             "/api/preview",
             "/api/guilds/0/config",
             "/api/guilds/10/unban",
+            "/api/guilds/10/ban",
             "/api/guilds/10/badwords",
             "/api/guilds/10/commands",
             "/api/guilds/10/copy",

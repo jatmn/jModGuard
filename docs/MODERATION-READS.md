@@ -10,7 +10,12 @@ The following GET routes require fresh Discord Manage Guild permissions, active 
 membership and the `x-jmodguard-enrollment` value from the page's loaded configuration:
 
 - `/api/guilds/{id}/events`, including event/user/limit filters.
-- `/api/guilds/{id}/bans`, including the limit filter.
+- `/api/guilds/{id}/bans`, including the limit filter. It answers `{bans, names}`: each
+  ban row carries its original `reason` plus the latest jModGuard reason edit
+  (`edited_reason`, `reason_edited_by`, `reason_edited_at`) read from `ban_reason_edit`
+  audit events in the same snapshot, and `names` holds member-directory display names
+  for the listed users, moderators and editors (presentation only; an unavailable
+  directory leaves it empty).
 - `/api/guilds/{id}/stats`.
 - `/api/guilds/{id}/analytics?days=7|30|90`, the Analytics summary read: one core
   statement returns the daily series, previous-period totals, rule/kind/moderator
@@ -24,7 +29,7 @@ Guild zero is not supported. Installation ownership does not bypass guild permis
 Missing or stale page membership returns HTTP409 `guild_enrollment_changed`; an unverifiable
 membership returns HTTP503 `guild_access_unverified`. The browser sends the loaded token
 without automatically fetching a replacement or retrying the read. Deploy matching API and
-frontend builds and reload old pages. Response shapes and string snowflake IDs are unchanged;
+frontend builds and reload old pages. String snowflake IDs are unchanged;
 event user IDs outside the signed database range are rejected rather than wrapped.
 
 ## Database contract and limits
