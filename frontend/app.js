@@ -7381,8 +7381,9 @@ function casePerson(id, names) {
   return { id: id || null, name: known?.display_name || null, handle: known?.username || null };
 }
 
+// No actor is not jModGuard: only the case source can say automod acted.
 function casePersonText(id, names) {
-  if (!id) return "jModGuard";
+  if (!id) return null;
   return casePerson(id, names).name || `user ${id}`;
 }
 
@@ -7509,14 +7510,15 @@ function caseTimeline(c, history, names) {
     const entry = item.entry || {};
     const body = entry.body || {};
     const who = casePersonText(entry.actor_id, names);
+    const by = who ? ` by ${who}` : "";
     const base = { key: item.id || item.sequence, at: entry.recorded_at_ms };
     if (body.note) {
-      items.push({ ...base, icon: "message-square", intent: "info", title: `Note added by ${who}`, note: body.note.text });
+      items.push({ ...base, icon: "message-square", intent: "info", title: `Note added${by}`, note: body.note.text });
     } else if (body.correction) {
       const fix = body.correction;
       const reason = fix.reason === "clear" ? "Reason cleared." : fix.reason?.set != null ? `Reason changed to: ${fix.reason.set}` : null;
       const changed = fix.outcome ? `Outcome set to ${caseEntry(CASE_OUTCOMES, fix.outcome)?.label || fix.outcome}.` : null;
-      items.push({ ...base, icon: "pencil", intent: "warning", title: `Record corrected by ${who}`, detail: [changed, reason].filter(Boolean).join(" ") || null, note: fix.explanation || null });
+      items.push({ ...base, icon: "pencil", intent: "warning", title: `Record corrected${by}`, detail: [changed, reason].filter(Boolean).join(" ") || null, note: fix.explanation || null });
     } else if (body.policy) {
       items.push({ ...base, icon: "shield", intent: "success", title: "Rule matched", detail: body.policy.description || null, meta: `Rule ${body.policy.rule_id} · revision ${body.policy.revision}` });
     } else {

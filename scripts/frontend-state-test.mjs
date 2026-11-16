@@ -8445,6 +8445,17 @@ test('Case view opens the last row of a full page in a dialog and loads case, hi
   assert.doesNotMatch(text, new RegExp(`author ${CASE_AUTHOR}|channel 400`), 'known names replace IDs');
 });
 
+test('Case view never names an author for a history note or correction with no recorded actor', async () => {
+  const unrecorded = caseHistory.slice(0, 2).map(item => ({ ...item, entry: { ...item.entry, actor_id: null } }));
+  const { fetchImpl } = caseFixture({ '/history': () => response({ history: unrecorded, names: {} }) });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await fire(findNode(root, n => n.getAttribute?.('aria-label') === `Open case ${CASE_ID}`), 'click', {});
+  await settle();
+  const titles = Array.from(caseDialog(h).querySelectorAll('.case-timeline strong'), n => n.textContent);
+  assert.deepEqual(titles, ['Ban recorded', 'Discord action succeeded', 'Note added', 'Record corrected']);
+});
+
 test('Case view shows a load failure inside the dialog and can try again', async () => {
   let fail = true;
   const { calls, fetchImpl } = caseFixture({
