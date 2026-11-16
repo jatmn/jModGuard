@@ -4932,7 +4932,19 @@ function tabCommands() {
 // saved `behavior.kind` (src/types.rs Behavior). `does` starts the live summary;
 // each field edits one of the behavior's own params, so no JSON is needed.
 const COMMAND_REASON = { key: "default_reason", type: "text", label: "Default reason", hint: "Used when the moderator gives none." };
-const COMMAND_SUBCOMMAND = (options) => ({ key: "action", type: "choice", label: "Default subcommand", hint: "Runs when none is typed.", options });
+// The saved action runs only when the command gets no arguments at all (run_rule,
+// run_template and run_logchannel in crates/bot), and every other subcommand needs
+// a rule or event argument, so `list` is the only default that can run. A saved
+// value outside `options` is still shown and kept: empty shows as Not set, any
+// other value is marked with `unlisted`.
+const COMMAND_SUBCOMMAND = {
+  key: "action",
+  type: "choice",
+  label: "Default subcommand",
+  hint: "Runs when the command is used with no arguments. Other subcommands must be typed.",
+  options: ["list"],
+  unlisted: "fails without arguments",
+};
 const COMMAND_BEHAVIORS = {
   ban: { does: "bans the target", fields: [COMMAND_REASON, { key: "delete_days", type: "days", label: "Delete messages" }] },
   softban: { does: "bans the target, deletes their last day of messages, then unbans", fields: [COMMAND_REASON] },
@@ -4945,9 +4957,9 @@ const COMMAND_BEHAVIORS = {
   },
   purge: { does: "deletes recent messages", fields: [{ key: "default_count", type: "number", label: "Default count", unit: "messages", min: 1, max: 100 }] },
   slowmode: { does: "sets this channel's slowmode", fields: [{ key: "default_seconds", type: "number", label: "Default slowmode", unit: "s", min: 0, max: 21600 }] },
-  rule: { does: "manages Automod rules", fields: [COMMAND_SUBCOMMAND(["list", "toggle", "dryrun"])] },
-  template: { does: "manages log templates", fields: [COMMAND_SUBCOMMAND(["list", "get", "set", "reset"])] },
-  logchannel: { does: "manages log channels", fields: [COMMAND_SUBCOMMAND(["list", "set", "unset"])] },
+  rule: { does: "manages Automod rules", fields: [COMMAND_SUBCOMMAND] },
+  template: { does: "manages log templates", fields: [COMMAND_SUBCOMMAND] },
+  logchannel: { does: "manages log channels", fields: [COMMAND_SUBCOMMAND] },
   warns: { does: "lists the target's warnings" },
   warn_clear: { does: "clears the target's warnings" },
   user_info: { does: "shows a member's profile, warnings and recent cases" },
@@ -5060,7 +5072,12 @@ function commandDoesParts(data, names) {
   if (behavior.kind === "ban" && params.delete_days) return [spec.does, `deletes ${daysText(params.delete_days)} of messages`];
   const number = (spec.fields || []).find((f) => f.type === "number");
   if (number) return [`${spec.does} (default ${countShown(params[number.key], number.unit === "s" ? "s" : ` ${number.unit}`)})`];
-  if (spec.fields?.[0]?.type === "choice") return [`${spec.does} (default: ${params.action || "…"})`];
+  const choice = spec.fields?.[0];
+  if (choice?.type === "choice") {
+    const value = params[choice.key];
+    const stale = value && !choice.options.includes(value) ? `, which ${choice.unlisted}` : "";
+    return [`${spec.does} (default: ${value || "…"}${stale})`];
+  }
   return [spec.does];
 }
 
@@ -5177,9 +5194,10 @@ function CommandBehaviorField({ spec, params, onChange }) {
   if (spec.type === "choice") {
     const current = String(params[spec.key] ?? "");
     const options = spec.options.includes(current) ? spec.options : [current, ...spec.options];
+    const text = (value) => (value === "" ? "Not set" : spec.options.includes(value) ? value : `${value} (${spec.unlisted})`);
     return field(
       spec.label,
-      h(Select, { className: "select select-sm", defaultValue: current, onChange: (e) => set(e.target.value) }, options.map((value) => h("option", { key: value, value }, value || "Not set"))),
+      h(Select, { className: "select select-sm", defaultValue: current, onChange: (e) => set(e.target.value) }, options.map((value) => h("option", { key: value, value }, text(value)))),
       help,
     );
   }

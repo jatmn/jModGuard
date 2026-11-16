@@ -5220,9 +5220,9 @@ const BUILTIN_COMMAND_FIXTURES = [
   ['voice', { kind: 'voice' }],
   ['setname', { kind: 'setname' }],
   ['prefix', { kind: 'set_prefix' }],
-  ['template', { kind: 'template', params: { action: 'list' } }, [['Default subcommand', 'select', 'get']], { action: 'get' }],
-  ['rule', { kind: 'rule', params: { action: 'list' } }, [['Default subcommand', 'select', 'toggle']], { action: 'toggle' }],
-  ['logchannel', { kind: 'logchannel', params: { action: 'list' } }, [['Default subcommand', 'select', 'set']], { action: 'set' }],
+  ['template', { kind: 'template', params: { action: 'list' } }, [['Default subcommand', 'select', 'list']], { action: 'list' }],
+  ['rule', { kind: 'rule', params: { action: 'list' } }, [['Default subcommand', 'select', 'list']], { action: 'list' }],
+  ['logchannel', { kind: 'logchannel', params: { action: 'list' } }, [['Default subcommand', 'select', 'list']], { action: 'list' }],
   ['testregex', { kind: 'testregex' }],
   ['help', { kind: 'help' }],
   ['about', { kind: 'about' }],
@@ -5454,22 +5454,35 @@ test('command edits preserve saved aliases while precedence hides them', async (
   }
 });
 
-test('empty saved default subcommands stay unset until explicitly selected', async () => {
+// The saved action runs only when the command gets no arguments (crates/bot
+// run_rule, run_template, run_logchannel), and every other subcommand needs an
+// argument, so `list` is the only default offered. Other saved values stay.
+test('default subcommands offer only list and keep other saved values visible until changed', async () => {
+  const needsArgs = { rule: ['toggle', 'dryrun'], template: ['get', 'set', 'reset'], logchannel: ['set', 'unset'] };
   for (const name of ['rule', 'template', 'logchannel']) {
     for (const builtin of [true, false]) {
-      const effective = commandFixture(builtin ? name : `custom-${name}`, { kind: name, params: { action: '' } }, { permission: 'admin' });
-      const record = builtin ? builtinRecord(effective) : { name: effective.name, effective };
-      const { h, writes } = commandEditorHarness();
-      let modal = await h.app.editCommand(record);
-      const choice = labelled(modal, 'Default subcommand');
-      assert.equal(choice.value, '', name);
-      assert.equal(choice.selectedOptions[0].textContent, 'Not set', name);
-      await fire(commandSave(modal), 'click');
-      assert.equal(writes.at(-1).body.data.behavior.params.action, '', name);
-      modal = await h.app.editCommand(record);
-      await chooseOption(labelled(modal, 'Default subcommand'), 'list');
-      await fire(commandSave(modal), 'click');
-      assert.equal(writes.at(-1).body.data.behavior.params.action, 'list', name);
+      for (const saved of ['list', '', ...needsArgs[name]]) {
+        const label = `${name} ${builtin ? 'built-in' : 'custom'} saved ${JSON.stringify(saved)}`;
+        const effective = commandFixture(builtin ? name : `custom-${name}`, { kind: name, params: { action: saved } }, { permission: 'admin' });
+        const record = builtin ? builtinRecord(effective) : { name: effective.name, effective };
+        const { h, writes } = commandEditorHarness();
+        let modal = await h.app.editCommand(record);
+        let choice = labelled(modal, 'Default subcommand');
+        const shown = saved === 'list' ? [] : [saved === '' ? 'Not set' : `${saved} (fails without arguments)`];
+        assert.deepEqual([...choice.options].map(textOf), [...shown, 'list'], label);
+        assert.equal(choice.value, saved, label);
+        assert.match(textOf(modal), /Runs when the command is used with no arguments\. Other subcommands must be typed\./, label);
+        const stale = saved && saved !== 'list' ? ', which fails without arguments' : '';
+        assert.equal(commandSummary(modal).includes(`(default: ${saved || '…'}${stale})`), true, `${label}: ${commandSummary(modal)}`);
+        await fire(commandSave(modal), 'click');
+        assert.equal(writes.at(-1).body.data.behavior.params.action, saved, `${label}: kept unchanged`);
+        modal = await h.app.editCommand(record);
+        choice = labelled(modal, 'Default subcommand');
+        await chooseOption(choice, 'list');
+        assert.equal(commandSummary(modal).includes('(default: list)'), true, `${label}: ${commandSummary(modal)}`);
+        await fire(commandSave(modal), 'click');
+        assert.equal(writes.at(-1).body.data.behavior.params.action, 'list', label);
+      }
     }
   }
 });
