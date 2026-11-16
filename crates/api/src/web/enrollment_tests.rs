@@ -2995,6 +2995,33 @@ async fn builtin_command_reads_apply_the_server_override_within_its_floor() {
         body.to_string().contains("needs at least `mod` permission"),
         "{body}"
     );
+    // A zero role ID would panic the bot's role check, so the API refuses it
+    // and leaves the saved override as it was.
+    let mut zero_role = shipped.clone();
+    zero_role.roles = vec![0];
+    let (status, body) = f
+        .request(
+            "PUT",
+            "/api/guilds/10/commands/ban",
+            &serde_json::json!({"scope":"guild","data":zero_role}).to_string(),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.to_string()
+            .contains("cannot be restricted to role ID 0"),
+        "{body}"
+    );
+    let (_, body) = f.request("GET", "/api/guilds/10/commands/ban", "").await;
+    assert_eq!(
+        body["guild_override"]["description"], "legacy dashboard row",
+        "{body}"
+    );
+    assert_eq!(
+        body["guild_override"]["roles"],
+        serde_json::to_value(&stored).unwrap()["roles"],
+        "{body}"
+    );
     let mut edited = shipped.clone();
     edited.description = "server ban".into();
     let (status, body) = f

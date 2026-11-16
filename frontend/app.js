@@ -5094,7 +5094,7 @@ function commandSummaryText(data, names) {
   const cooldown = Number(data.cooldown_secs);
   if (cooldown > 0) who.push(`${countShown(cooldown, "s")} cooldown`);
   const logs = data.log_event ? ` Logs ${logEventLabel(data.log_event)}.` : "";
-  const off = data.enabled ? "" : " Off: the command is ignored.";
+  const off = data.enabled ? "" : " Off: the bot replies that it is disabled.";
   return `${call}: ${parts.length ? joinPhrases(parts) : "does nothing yet"}. ${who.join(", ")}.${logs}${off}`;
 }
 
@@ -5465,7 +5465,7 @@ function CommandEditor({ record: c }) {
             "details",
             { className: "editor-advanced" },
             h("summary", null, "Advanced (raw)"),
-            h("pre", { className: "mono raw-behavior", "aria-label": "Saved behavior (read-only)" }, JSON.stringify(data.behavior, null, 2)),
+            h("pre", { className: "mono raw-behavior", "aria-label": "Behavior as edited in this form (read-only)" }, JSON.stringify(data.behavior, null, 2)),
           )
         : null,
     ),

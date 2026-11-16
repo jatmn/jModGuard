@@ -443,7 +443,8 @@ pub fn is_binary_overlay_command_name(name: &str) -> bool {
         .any(|overlay| overlay.eq_ignore_ascii_case(name))
 }
 
-/// Behaviors merged from the running binary and never written to shared `commands` rows.
+/// Behaviors merged from the running binary. Only a server override of the
+/// `voice` or `softban` built-in may store them; custom rows may not.
 pub fn is_binary_overlay_behavior(behavior: &Behavior) -> bool {
     matches!(behavior, Behavior::Voice | Behavior::Softban { .. })
 }
@@ -690,7 +691,9 @@ pub fn command_row_for_storage(storage_name: &str, cmd: &CommandDef) -> CommandD
 /// Why a command row must not be written, or `None` when it may be.
 /// `guild_id` is the target scope (0 = global). A built-in primary may be
 /// written only as a guild override that keeps its name and behavior kind,
-/// never lowers its permission, and takes no other built-in's label. Other
+/// never lowers its permission, takes no other built-in's label, and stores
+/// only settings the bot can run (one-word aliases, nonzero role IDs, and
+/// delete-days, timeout and slowmode values within Discord's limits). Other
 /// rows must not claim a built-in name or alias, or a binary-overlay behavior.
 pub fn command_persist_error(
     storage_name: &str,
@@ -723,6 +726,13 @@ pub fn command_persist_error(
             ));
         }
         for alias in &cmd.aliases {
+            // Prefix input splits on whitespace, so such an alias could never run.
+            if alias.is_empty() {
+                return Some("aliases cannot be empty".into());
+            }
+            if alias.chars().any(char::is_whitespace) {
+                return Some(format!("alias `{alias}` must be one word with no spaces"));
+            }
             if let Some(owner) = builtin_command_for_label(alias)
                 && !owner.eq_ignore_ascii_case(name)
             {
@@ -730,6 +740,27 @@ pub fn command_persist_error(
                     "alias `{alias}` belongs to built-in command `{owner}`"
                 ));
             }
+        }
+        // The bot builds a Discord role ID from each entry; zero is not one.
+        if cmd.roles.contains(&0) {
+            return Some(format!(
+                "built-in command `{name}` cannot be restricted to role ID 0"
+            ));
+        }
+        // Discord's limits, as the editor offers them; the bot clamps purge counts.
+        let out_of_range =
+            match &cmd.behavior {
+                Behavior::Ban { delete_days, .. } => {
+                    (*delete_days > 7).then_some("delete days must be 0 to 7")
+                }
+                Behavior::Timeout { default_minutes } => (*default_minutes > 40320)
+                    .then_some("default timeout must be 0 to 40320 minutes"),
+                Behavior::Slowmode { default_seconds } => (*default_seconds > 21600)
+                    .then_some("default slowmode must be 0 to 21600 seconds"),
+                _ => None,
+            };
+        if let Some(limit) = out_of_range {
+            return Some(format!("built-in command `{name}`: {limit}"));
         }
         return None;
     }
@@ -1625,6 +1656,124 @@ mod rolling_upgrade_tests {
                 command_persist_error("stats", &bad, 10).as_deref(),
                 Some(message)
             );
+        }
+        // Settings the bot cannot run as saved are refused: a zero role ID panics
+        // in the role check, a spaced alias never matches the split input, and
+        // out-of-range numbers are truncated or rejected by Discord.
+        let behavior_of = |name: &str, behavior: Behavior| CommandDef {
+            behavior,
+            ..shipped(name)
+        };
+        for (storage, bad, message) in [
+            (
+                "stats",
+                CommandDef {
+                    roles: vec![0],
+                    ..stats.clone()
+                },
+                "built-in command `stats` cannot be restricted to role ID 0",
+            ),
+            (
+                "stats",
+                CommandDef {
+                    roles: vec![0, 555],
+                    ..stats.clone()
+                },
+                "built-in command `stats` cannot be restricted to role ID 0",
+            ),
+            (
+                "stats",
+                CommandDef {
+                    aliases: vec!["count me".into()],
+                    ..stats.clone()
+                },
+                "alias `count me` must be one word with no spaces",
+            ),
+            (
+                "stats",
+                CommandDef {
+                    aliases: vec![String::new()],
+                    ..stats.clone()
+                },
+                "aliases cannot be empty",
+            ),
+            (
+                "ban",
+                behavior_of(
+                    "ban",
+                    Behavior::Ban {
+                        default_reason: "r".into(),
+                        delete_days: 8,
+                    },
+                ),
+                "built-in command `ban`: delete days must be 0 to 7",
+            ),
+            (
+                "timeout",
+                behavior_of(
+                    "timeout",
+                    Behavior::Timeout {
+                        default_minutes: 40321,
+                    },
+                ),
+                "built-in command `timeout`: default timeout must be 0 to 40320 minutes",
+            ),
+            (
+                "slowmode",
+                behavior_of(
+                    "slowmode",
+                    Behavior::Slowmode {
+                        default_seconds: 65536,
+                    },
+                ),
+                "built-in command `slowmode`: default slowmode must be 0 to 21600 seconds",
+            ),
+        ] {
+            assert_eq!(
+                command_persist_error(storage, &bad, 10).as_deref(),
+                Some(message)
+            );
+        }
+        // The limits themselves and real role IDs still save.
+        for (storage, ok) in [
+            (
+                "ban",
+                behavior_of(
+                    "ban",
+                    Behavior::Ban {
+                        default_reason: "r".into(),
+                        delete_days: 7,
+                    },
+                ),
+            ),
+            (
+                "timeout",
+                behavior_of(
+                    "timeout",
+                    Behavior::Timeout {
+                        default_minutes: 40320,
+                    },
+                ),
+            ),
+            (
+                "slowmode",
+                behavior_of(
+                    "slowmode",
+                    Behavior::Slowmode {
+                        default_seconds: 21600,
+                    },
+                ),
+            ),
+            (
+                "stats",
+                CommandDef {
+                    roles: vec![555],
+                    aliases: vec!["Numbers".into()],
+                    ..stats.clone()
+                },
+            ),
+        ] {
+            assert_eq!(command_persist_error(storage, &ok, 10), None, "{storage}");
         }
         // Binary-overlay built-ins take guild overrides too: any binary that can
         // open core schema 0024+ knows the softban and voice behavior kinds.

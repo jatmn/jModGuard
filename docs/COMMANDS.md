@@ -11,12 +11,17 @@ different invocation).
   default minutes/count/seconds, default subcommand), reply, log event, enabled
   state, cooldown and role/channel restrictions. The name and behavior kind stay
   fixed, and the permission can be raised but never set below the shipped level.
+  A save is refused for an alias with spaces, a role ID of 0, or a delete-days,
+  default timeout or default slowmode value outside the editor's limits.
   An override is a server row under the built-in's name that the writer marks
   with `builtin_override: true`; **Reset to default** deletes it. Unmarked server
   rows under a built-in name (older copies of global seeds, or a custom command
   that a later release turns into a built-in) are ignored. Global built-in rows
-  are shipped seeds and are never applied, and the API refuses global built-in
-  writes. Copying configuration to or from the global scope skips built-in rows.
+  are shipped seeds and are never applied, and the API refuses saving a
+  built-in at the global scope. Copying configuration to or from the global
+  scope does not copy built-in rows. A copy into the global scope replaces its
+  command rows, seeds included; the missing seeds return the next time the bot
+  opens the database.
   When two overrides claim the same new alias, the built-in whose name sorts
   first keeps it. While a rolling update pairs this API with an older bot,
   saving an override is refused until both are updated.

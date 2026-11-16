@@ -5339,7 +5339,8 @@ test('built-in commands save per-server overrides within their permission floor 
   assert.equal(labelled(modal, 'Name').readOnly, true, 'built-in names stay fixed');
   assert.deepEqual([...labelled(modal, 'Permission').options].map(textOf), ['Admins and up', 'Bot owner only'], 'no level below the shipped one');
   assert.deepEqual([...labelled(modal, 'Applies to').options].map(o => o.value), ['guild'], 'even the bot owner saves built-ins per server');
-  assert.equal(findNode(modal, n => n.localName === 'button' && /^(Delete|Reset to default)$/.test(n.textContent))?.hidden ?? true, true, 'nothing to reset without an override');
+  const noOverride = findNode(modal, n => n.localName === 'button' && /^(Delete|Reset to default)$/.test(n.textContent));
+  assert.equal(noOverride !== null && noOverride.hidden, true, 'nothing to reset without an override');
   await chooseOption(labelled(modal, 'Permission'), 'Bot owner only');
   await fire(commandSave(modal), 'click');
   assert.equal(writes.at(-1).body.data.permission, 'owner');
@@ -5639,7 +5640,7 @@ test('the command summary reads the form live in plain words', async () => {
   await chooseOption(labelled(modal, 'Delete messages'), 'Keep messages');
   await chooseOption(labelled(modal, 'Log event'), 'None');
   await fire(modal.querySelector('.rule-toggles input[type="checkbox"]'), 'change', { target: { checked: false } });
-  assert.equal(commandSummary(modal), '!ban @user reason: bans the target and replies “Banned {target}”. Everyone. Off: the command is ignored.');
+  assert.equal(commandSummary(modal), '!ban @user reason: bans the target and replies “Banned {target}”. Everyone. Off: the bot replies that it is disabled.');
 });
 
 test('only the bot owner sees a read-only raw behavior view', async () => {
@@ -5653,6 +5654,8 @@ test('only the bot owner sees a read-only raw behavior view', async () => {
   assert.equal(raw.open, false, 'collapsed by default');
   assert.equal(raw.querySelector('input, textarea, select') === null, true, 'read-only');
   assert.deepEqual(JSON.parse(textOf(raw.querySelector('pre'))), effective.behavior);
+  // It shows the form's current behavior, so it follows unsaved edits and says so.
+  assert.equal(raw.querySelector('pre').getAttribute('aria-label'), 'Behavior as edited in this form (read-only)');
   await typeValue(labelled(modal, 'Default count'), '20');
   assert.deepEqual(JSON.parse(textOf(raw.querySelector('pre'))), { kind: 'purge', params: { default_count: 20 } });
 });

@@ -1150,6 +1150,81 @@ async fn builtin_writers_share_canonical_identity_through_restore_and_reset() {
 }
 
 #[tokio::test]
+async fn builtin_writers_refuse_overrides_the_bot_cannot_run() {
+    let f = Fixture::new();
+    for enrolled in [false, true] {
+        let guild = if enrolled { 20 } else { 10 };
+        let scope = f.scope(guild).await;
+        let write = edit_scope(&scope, false);
+        let save = |command: CommandDef| {
+            let db = f.db.clone();
+            let write = write.clone();
+            async move {
+                if enrolled {
+                    upsert_enrolled_command(&db, write, "ban", &command).await
+                } else {
+                    upsert_command(&db, guild, "ban", &command).await
+                }
+            }
+        };
+        let mut ban = crate::defaults::default_commands()
+            .into_iter()
+            .find(|c| c.name == "ban")
+            .unwrap();
+        // Positive control: a real role restriction saves and applies.
+        ban.roles = vec![555];
+        save(ban.clone()).await.unwrap();
+        assert_eq!(
+            load_config_parts(&f.db, guild).await.unwrap().commands["ban"].roles,
+            vec![555]
+        );
+        let versions = get_primary_versions(&f.db).await.unwrap();
+        for (bad, message) in [
+            (
+                CommandDef {
+                    roles: vec![0],
+                    ..ban.clone()
+                },
+                "cannot be restricted to role ID 0",
+            ),
+            (
+                CommandDef {
+                    roles: vec![0, 555],
+                    ..ban.clone()
+                },
+                "cannot be restricted to role ID 0",
+            ),
+            (
+                CommandDef {
+                    aliases: vec!["ban hammer".into()],
+                    ..ban.clone()
+                },
+                "must be one word with no spaces",
+            ),
+            (
+                CommandDef {
+                    behavior: Behavior::Ban {
+                        default_reason: "r".into(),
+                        delete_days: 8,
+                    },
+                    ..ban.clone()
+                },
+                "delete days must be 0 to 7",
+            ),
+        ] {
+            let error = save(bad).await.expect_err(message);
+            assert!(error.to_string().contains(message), "{error:#}");
+        }
+        // Refused writes leave the saved override and the versions alone.
+        assert_eq!(get_primary_versions(&f.db).await.unwrap(), versions);
+        assert_eq!(
+            load_config_parts(&f.db, guild).await.unwrap().commands["ban"].roles,
+            vec![555]
+        );
+    }
+}
+
+#[tokio::test]
 async fn badword_setup_batches_are_atomic_deduplicated_and_revisioned() {
     let f = Fixture::new();
     let request = f.scope(10).await;
