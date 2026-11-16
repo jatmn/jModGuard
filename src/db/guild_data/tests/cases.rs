@@ -559,6 +559,145 @@ async fn tagged_attempt_survives_reopen_and_cannot_be_retagged_or_exposed() {
 }
 
 #[tokio::test]
+async fn matching_case_ids_filter_live_facts_and_keep_the_id_cursor() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let a = scope(&f, &store, &reg, 10).await;
+    let b = scope(&f, &store, &reg, 20).await;
+    let limits = CaseLimits::default();
+    // n: action, outcome, subject, actor
+    let facts = [
+        (CaseAction::Ban, CaseOutcome::Succeeded, 7, Some(42)),
+        (CaseAction::Kick, CaseOutcome::Succeeded, 7, None),
+        (CaseAction::Ban, CaseOutcome::Failed, 8, Some(42)),
+        (CaseAction::Ban, CaseOutcome::Succeeded, 8, Some(43)),
+        (
+            CaseAction::Warning,
+            CaseOutcome::Succeeded,
+            i64::MAX,
+            Some(i64::MAX),
+        ),
+    ];
+    let mut by_fact = Vec::new();
+    for (n, (action, outcome, subject, actor)) in facts.iter().enumerate() {
+        let mut case = data(n as i64 + 1);
+        case.action = action.clone();
+        case.outcome = outcome.clone();
+        case.subject_id = *subject;
+        case.actor_id = *actor;
+        let id = CaseId::new();
+        store
+            .record_case(a.clone(), id.clone(), case.clone(), limits)
+            .await
+            .unwrap();
+        // The other tenant holds matching facts that must never leak into a's pages.
+        store
+            .record_case(b.clone(), CaseId::new(), case, limits)
+            .await
+            .unwrap();
+        by_fact.push(id);
+    }
+    let sorted = |picks: &[usize]| {
+        let mut ids: Vec<CaseId> = picks.iter().map(|i| by_fact[*i].clone()).collect();
+        ids.sort_by(|x, y| x.as_str().cmp(y.as_str()));
+        ids
+    };
+    let page = |filter: CaseFilter, after: Option<CaseId>, count: u32| {
+        let store = &store;
+        let a = a.clone();
+        async move {
+            store
+                .matching_case_ids(a, after, count, filter, limits)
+                .await
+                .unwrap()
+        }
+    };
+    let bans = CaseFilter {
+        action: Some(CaseAction::Ban),
+        ..CaseFilter::default()
+    };
+    assert_eq!(page(bans.clone(), None, 10).await, sorted(&[0, 2, 3]));
+    assert_eq!(
+        page(
+            CaseFilter {
+                outcome: Some(CaseOutcome::Failed),
+                ..CaseFilter::default()
+            },
+            None,
+            10
+        )
+        .await,
+        sorted(&[2])
+    );
+    assert_eq!(
+        page(
+            CaseFilter {
+                subject_id: Some(7),
+                ..CaseFilter::default()
+            },
+            None,
+            10
+        )
+        .await,
+        sorted(&[0, 1])
+    );
+    // Snowflakes above 2^53 are stored as strings and still match exactly.
+    assert_eq!(
+        page(
+            CaseFilter {
+                actor_id: Some(i64::MAX),
+                ..CaseFilter::default()
+            },
+            None,
+            10
+        )
+        .await,
+        sorted(&[4])
+    );
+    let combined = CaseFilter {
+        action: Some(CaseAction::Ban),
+        outcome: Some(CaseOutcome::Succeeded),
+        actor_id: Some(42),
+        ..CaseFilter::default()
+    };
+    assert_eq!(page(combined, None, 10).await, sorted(&[0]));
+    // The ID cursor pages through matches only.
+    let all_bans = sorted(&[0, 2, 3]);
+    let first = page(bans.clone(), None, 2).await;
+    assert_eq!(first, all_bans[..2]);
+    assert_eq!(
+        page(bans.clone(), Some(first[1].clone()), 2).await,
+        all_bans[2..]
+    );
+    // An empty filter is the unfiltered page; removed records never match.
+    assert_eq!(
+        page(CaseFilter::default(), None, 10).await,
+        store.case_ids(a.clone(), None, 10, limits).await.unwrap()
+    );
+    store
+        .remove_case(a.clone(), by_fact[0].clone())
+        .await
+        .unwrap();
+    assert_eq!(page(bans, None, 10).await, sorted(&[2, 3]));
+    assert!(
+        store
+            .matching_case_ids(
+                a,
+                None,
+                10,
+                CaseFilter {
+                    subject_id: Some(0),
+                    ..CaseFilter::default()
+                },
+                limits
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn summary_pages_are_bounded_scoped_and_use_constant_database_calls() {
     let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
     let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
@@ -598,7 +737,8 @@ async fn summary_pages_are_bounded_scoped_and_use_constant_database_calls() {
             assert_eq!(
                 serde_json::to_value(summary).unwrap(),
                 serde_json::json!({
-                    "action": "ban", "outcome": "succeeded", "subject_id": i64::MAX.to_string(), "occurred_at_ms": 1000
+                    "action": "ban", "outcome": "succeeded", "subject_id": i64::MAX.to_string(),
+                    "actor_id": null, "occurred_at_ms": 1000
                 })
             );
         }

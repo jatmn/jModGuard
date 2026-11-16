@@ -768,11 +768,51 @@ async fn directory_names_come_only_from_stored_rows_in_one_bounded_lookup() {
     let too_many = (1..=DIRECTORY_NAME_LOOKUP_LIMIT as i64 + 1).collect();
     assert!(
         store
-            .directory_totals_with_names(scope, too_many)
+            .directory_totals_with_names(scope.clone(), too_many)
             .await
             .is_err(),
         "the lookup stays bounded"
     );
+    let profiles = store
+        .member_profiles(scope.clone(), vec![77, 78, big, 79, 80])
+        .await
+        .unwrap();
+    assert_eq!(
+        profiles
+            .iter()
+            .map(|p| (p.user_id.clone(), p.username.clone(), p.global_name.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "77".to_owned(),
+                Some("user77".to_owned()),
+                Some("Global 77".to_owned())
+            ),
+            (
+                "78".to_owned(),
+                Some("user78".to_owned()),
+                Some("Global 78".to_owned())
+            ),
+            ("79".to_owned(), None, None),
+            (big.to_string(), Some("big".to_owned()), None),
+        ],
+        "stored rows only, in ID order; unknown IDs are omitted"
+    );
+    assert!(
+        store
+            .member_profiles(scope.clone(), Vec::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let too_many = (1..=DIRECTORY_PROFILE_LOOKUP_LIMIT as i64 + 1).collect();
+    assert!(
+        store
+            .member_profiles(scope.clone(), too_many)
+            .await
+            .is_err()
+    );
+    assert!(store.member_profiles(scope, vec![0]).await.is_err());
 }
 
 #[tokio::test]

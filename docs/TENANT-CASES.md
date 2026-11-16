@@ -54,6 +54,8 @@ Backend permissions and lifecycle coordination remain mandatory before service a
 | `record_case` | Create immutable facts, return `Existing` for identical-source/payload retries, or `Removed` for a deleted source. Never recreate a removed payload. |
 | `case` | Read one live scoped record. Missing/deleted returns `None`; a record above the supplied byte/evidence budget fails without transferring an oversized SQL payload or erasing data. |
 | `case_ids` | Bounded keyset page of live IDs only, in opaque ID order, not chronological order. No evidence payloads or offset scan. |
+| `matching_case_ids` | The same keyset page limited to live records whose stored action, outcome, subject and actor match every supplied `CaseFilter` field. A narrow filter may read past many non-matching rows to fill a page; removed records never match. |
+| `case_summaries` | List fields for one ID page in one snapshot: action, outcome, subject, optional actor and time. Reason, source and evidence stay detail-only. |
 | `remove_case` | Atomically remove all retained payload, leaving only replay identities. Returns whether a live payload was removed; repeated/missing removal is a write-free false. |
 | `purge_closed_cases` | Delete at most a supplied batch of payloads/replay markers after exact membership closure. Refuse an active scope; an empty batch writes nothing. |
 

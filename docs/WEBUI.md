@@ -310,6 +310,7 @@ the workspace then refreshes current configuration. If that refresh fails, use
 | **Audit Log** | retained event history (type, user, actor), including older routine rows; new routine events report to Discord channels |
 | **Members** | search the saved bounded directory; inspect known join dates, linked cases and import state; request Pause, Resume, Retry or **Reconcile from Discord** when permitted |
 | **Bans** | recorded bot and observed Discord bans with known user name, exact ID, and audit-attributed moderator when available; unknown details remain unavailable; unban is queued for the bot |
+| **Cases** | filter by action, outcome, subject and moderator (names from the stored member directory); select a row to open its case file in a dialog: header badges, who (subject and moderator or automod, with links to their Members page and other cases), why, a readable timeline, evidence as message cards with image previews and downloads, and Add note / Remove case record (removal never undoes Discord) |
 | **Bot actions** | latest queued unban/log-channel receipts; cancel unstarted work; force-cancel a stuck log-channel request so a new save can run (does not undo Discord) |
 | **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; transient failures use persisted bounded backoff and permanent failures are shown for operator action; empty / `!setname` with no args / `/setname` without `name` all clear); global prefix (owner only); **copy config from another server** |
 
@@ -422,7 +423,7 @@ POST   /api/guilds/{id}/analytics      # same body as GET; SPA analytics tab
 POST   /api/platform/analytics         # owner-only, ?days=7|30|90 (default 30): fleet trends, previous-range totals, per-server rows, member directory totals
 GET    /api/guilds/{id}/actions
 POST   /api/guilds/{id}/actions        # same body as GET; SPA bot actions
-GET    /api/guilds/{id}/cases
+GET    /api/guilds/{id}/cases          # ?after=&limit=&removed=; live pages also ?action=&outcome=&subject=&actor=
 POST   /api/guilds/{id}/cases          # same query as GET; SPA case list
 GET    /api/guilds/{id}/cases/{case}
 POST   /api/guilds/{id}/cases/{case}   # same body as GET

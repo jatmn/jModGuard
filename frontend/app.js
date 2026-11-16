@@ -1515,7 +1515,7 @@ function App() {
             if (canLeave()) closeOverlay();
           },
           className: "modal modal-open modal-overlay",
-          "aria-label": "Configuration editor",
+          "aria-label": display.editor?.props?.dialogLabel || "Configuration editor",
         },
         display.editor,
         h(Notification),
@@ -2174,7 +2174,7 @@ function apiRead(path, signal) {
   return api(path, "POST", null, signal);
 }
 
-async function downloadPrivate(path, filename) {
+async function fetchPrivate(path) {
   const opts = credentialedOpts(path, "GET");
   const res = await fetch(apiUrl(path), opts);
   if (!res.ok) {
@@ -2184,7 +2184,11 @@ async function downloadPrivate(path, filename) {
     } catch (_) {}
     throwApiFailure(data, res.status);
   }
-  const blob = await res.blob();
+  return res.blob();
+}
+
+async function downloadPrivate(path, filename) {
+  const blob = await fetchPrivate(path);
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
@@ -3690,7 +3694,9 @@ function PickerChip({ kind, id, names, onRemove }) {
 // or refuses text still in the box through `pending`, as the old ID fields did.
 // The box text is picker state, so it survives the box being replaced when
 // names arrive, and member results are kept with the query they answer.
-function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pending, single = false, idLabel }) {
+// `draft: false` is for filters: choosing a value changes the view, not unsaved settings.
+// `memberStatus` widens member search, e.g. to banned or departed case subjects.
+function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pending, single = false, idLabel, draft = true, memberStatus = "current" }) {
   const [, bump] = useState(0);
   const [text, setText] = useState("");
   const [found, setFound] = useState(null);
@@ -3701,7 +3707,7 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
   const results = found && found.query === text.trim() ? found.members : null;
   const update = (next) => {
     ids.splice(0, ids.length, ...next);
-    markDirty();
+    if (draft) markDirty();
     bump((n) => n + 1);
     onChange?.();
   };
@@ -3754,7 +3760,7 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
     const controller = new AbortController();
     searchAbort.current = controller;
     try {
-      const page = await apiRead(`/api/guilds/${state.guildId}/members?${new URLSearchParams({ q, limit: "8", status: "current" })}`, controller.signal);
+      const page = await apiRead(`/api/guilds/${state.guildId}/members?${new URLSearchParams({ q, limit: "8", status: memberStatus })}`, controller.signal);
       if (searchAbort.current === controller) setFound({ query: q, members: Array.isArray(page?.members) ? page.members : [] });
     } catch (_) {
       if (searchAbort.current === controller) setFound({ query: q, members: [] });
@@ -6301,9 +6307,16 @@ function tabMembers() {
   const [memberRows, setMemberRows] = useState([]);
   const [detailParts, setDetailParts] = useState([]);
   const [pagination, setPagination] = useState({ first: true, next: true, label: "" });
+  // A case file's "Member page" link opens this list searched to that member.
+  const [memberHandoff] = useState(() => {
+    const next = pendingMember?.guildId === guildId ? pendingMember : null;
+    pendingMember = null;
+    return next;
+  });
   const searchRef = useRef(null);
   const search = h(Input, {
     ref: searchRef,
+    defaultValue: memberHandoff?.userId,
     onInput: () => handlers.current.queueFilteredList?.(),
     onBlur: () => handlers.current.loadChangedFilters?.(),
     type: "search",
@@ -6315,6 +6328,7 @@ function tabMembers() {
     Select,
     {
       ref: statusFilterRef,
+      defaultValue: memberHandoff ? "all" : undefined,
       onChange: () => handlers.current.loadChangedFilters?.(),
       className: "select",
     },
@@ -7318,156 +7332,580 @@ function caseCleanupState(cleanupPending) {
   return cleanupPending ? "pending" : "complete";
 }
 
+// Case file (#624): one label, badge color and icon per stored action and outcome.
+const CASE_ACTIONS = {
+  ban: { label: "Ban", badge: "badge-error", icon: "hammer" },
+  kick: { label: "Kick", badge: "badge-error", icon: "log-out" },
+  timeout: { label: "Timeout", badge: "badge-warning", icon: "clock" },
+  warning: { label: "Warning", badge: "badge-warning", icon: "alert-triangle" },
+  delete: { label: "Message delete", badge: "badge-info", icon: "message-x" },
+  unban: { label: "Unban", badge: "badge-success", icon: "user-check" },
+  timeout_removal: { label: "Timeout removed", badge: "badge-success", icon: "clock" },
+};
+const CASE_OUTCOMES = {
+  succeeded: { label: "Succeeded", badge: "badge-success", icon: "check-circle", intent: "success", result: "Discord action succeeded" },
+  failed: { label: "Failed", badge: "badge-error", icon: "x-circle", intent: "danger", result: "Discord action failed" },
+  uncertain: { label: "Uncertain", badge: "badge-warning", icon: "alert-circle", intent: "warning", result: "Discord result uncertain" },
+  attempted: { label: "Attempted", badge: "badge-info", icon: "clock", intent: "info", result: "Waiting for Discord's result" },
+};
+const CASE_SOURCES = {
+  application: "Recorded by jModGuard when it acted",
+  discord_audit: "From the Discord audit log",
+  gateway_observation: "Seen in Discord; who did it was not reported",
+};
+
+function caseEntry(table, value) {
+  return Object.hasOwn(table, value || "") ? table[value] : null;
+}
+
+function CaseBadge({ kind, value }) {
+  const known = caseEntry(kind === "action" ? CASE_ACTIONS : CASE_OUTCOMES, value);
+  return h(
+    "span",
+    { className: `badge badge-soft badge-sm case-badge${known ? ` ${known.badge}` : ""}` },
+    known ? h(Icon, { name: known.icon }) : null,
+    known ? known.label : String(value || "Unknown").replaceAll("_", " "),
+  );
+}
+
+// Relative time, with the exact time on hover.
+function CaseTime({ ms }) {
+  const date = memberInstant(ms);
+  if (!date) return h("span", { className: "muted" }, "Time unknown");
+  return h("time", { dateTime: date.toISOString(), title: memberTime(ms) }, usageAgeMs(Number(ms)));
+}
+
+// Names come from the Members directory through the case API; an unknown user keeps their ID.
+function casePerson(id, names) {
+  const known = id && names && Object.hasOwn(names, id) ? names[id] : null;
+  return { id: id || null, name: known?.display_name || null, handle: known?.username || null };
+}
+
+function casePersonText(id, names) {
+  if (!id) return "jModGuard";
+  return casePerson(id, names).name || `user ${id}`;
+}
+
+function LetterAvatar({ name, large = false }) {
+  return h(
+    "span",
+    { className: `case-avatar${large ? " case-avatar-lg" : ""}`, "aria-hidden": "true" },
+    (Array.from(String(name || "?").trim())[0] || "?").toUpperCase(),
+  );
+}
+
+function CasePersonCell({ id, names, empty }) {
+  if (!id) return h("span", { className: "muted" }, empty);
+  const person = casePerson(id, names);
+  if (!person.name) return h("span", { className: "mono", title: id }, id);
+  return h(
+    "span",
+    { className: "case-person", title: id },
+    h(LetterAvatar, { name: person.name }),
+    h("span", { className: "case-person-name" }, person.name),
+    person.handle ? h("small", { className: "muted" }, `@${person.handle}`) : null,
+  );
+}
+
+function caseSourceKind(source) {
+  return source && typeof source === "object" ? Object.keys(source)[0] || null : null;
+}
+
+let pendingMember = null;
+
+// Leave the case dialog for another view, asking first about an unsent note.
+function leaveCaseView(next) {
+  if (!canLeave()) return;
+  closeOverlay();
+  next();
+}
+
+function CasePersonCard({ role, id, names, automatic, guildId, onFilter, filterKey }) {
+  if (!id) {
+    return h(
+      "div",
+      { className: "case-person-card" },
+      h("span", { className: "case-avatar case-avatar-lg", "aria-hidden": "true" }, h(Icon, { name: automatic ? "bot" : "users" })),
+      h(
+        "div",
+        { className: "case-person-body" },
+        h("span", { className: "case-role" }, role),
+        h("strong", {}, automatic ? "jModGuard automod" : "Not recorded"),
+        h("span", { className: "muted" }, automatic ? "Acted automatically; no moderator involved." : "Discord didn't report who did this."),
+      ),
+    );
+  }
+  const person = casePerson(id, names);
+  return h(
+    "div",
+    { className: "case-person-card" },
+    h(LetterAvatar, { name: person.name || "?", large: true }),
+    h(
+      "div",
+      { className: "case-person-body" },
+      h("span", { className: "case-role" }, role),
+      h("strong", { className: "case-person-name" }, person.name || "Unknown member"),
+      person.handle ? h("span", { className: "muted" }, `@${person.handle}`) : null,
+      h(
+        "span",
+        { className: "case-id-line" },
+        h("code", {}, id),
+        h(IconButton, { action: "copy", label: `Copy ${role.toLowerCase()} ID ${id}`, onClick: () => navigator.clipboard.writeText(id) }),
+      ),
+      h(
+        "span",
+        { className: "case-person-links" },
+        h(
+          ActionButton,
+          {
+            type: "button",
+            className: "btn btn-sm btn-link",
+            onClick: () =>
+              leaveCaseView(() => {
+                pendingMember = { guildId, userId: id };
+                if (!navigate("members")) pendingMember = null;
+              }),
+          },
+          "Member page",
+        ),
+        onFilter
+          ? h(
+              ActionButton,
+              // Shows all of this member's cases: the link replaces any other list filters.
+              { type: "button", className: "btn btn-sm btn-link", onClick: () => leaveCaseView(() => onFilter({ ...CASE_FILTERS_EMPTY, [filterKey]: id }, person.name)) },
+              role === "Subject" ? "Their other cases" : "Their other actions",
+            )
+          : null,
+      ),
+    ),
+  );
+}
+
+// Readable timeline entries; never the stored JSON.
+function caseTimeline(c, history, names) {
+  const action = caseEntry(CASE_ACTIONS, c.action);
+  const outcome = caseEntry(CASE_OUTCOMES, c.outcome);
+  const source = caseSourceKind(c.source);
+  const items = [
+    {
+      key: "created",
+      icon: action?.icon || "briefcase",
+      intent: "info",
+      title: `${action?.label || "Action"} recorded`,
+      detail: c.actor_id
+        ? `By ${casePersonText(c.actor_id, names)}`
+        : source === "application" ? "By jModGuard automod" : "Moderator not recorded",
+      meta: CASE_SOURCES[source] || null,
+      at: c.occurred_at_ms,
+    },
+    {
+      key: "result",
+      icon: outcome?.icon || "alert-circle",
+      intent: outcome?.intent || "neutral",
+      title: outcome?.result || `Outcome: ${c.outcome || "unknown"}`,
+    },
+  ];
+  for (const item of history) {
+    const entry = item.entry || {};
+    const body = entry.body || {};
+    const who = casePersonText(entry.actor_id, names);
+    const base = { key: item.id || item.sequence, at: entry.recorded_at_ms };
+    if (body.note) {
+      items.push({ ...base, icon: "message-square", intent: "info", title: `Note added by ${who}`, note: body.note.text });
+    } else if (body.correction) {
+      const fix = body.correction;
+      const reason = fix.reason === "clear" ? "Reason cleared." : fix.reason?.set != null ? `Reason changed to: ${fix.reason.set}` : null;
+      const changed = fix.outcome ? `Outcome set to ${caseEntry(CASE_OUTCOMES, fix.outcome)?.label || fix.outcome}.` : null;
+      items.push({ ...base, icon: "pencil", intent: "warning", title: `Record corrected by ${who}`, detail: [changed, reason].filter(Boolean).join(" ") || null, note: fix.explanation || null });
+    } else if (body.policy) {
+      items.push({ ...base, icon: "shield", intent: "success", title: "Rule matched", detail: body.policy.description || null, meta: `Rule ${body.policy.rule_id} · revision ${body.policy.revision}` });
+    } else {
+      items.push({ ...base, icon: "file-text", intent: "neutral", title: "History entry", detail: "This kind of entry can't be shown here yet." });
+    }
+  }
+  return items;
+}
+
+function CaseTimeline({ items }) {
+  return h(
+    "ol",
+    { className: "case-timeline" },
+    items.map((item) =>
+      h(
+        "li",
+        { key: item.key },
+        h("span", { className: "case-timeline-icon" }, h(Icon, { name: item.icon, intent: item.intent })),
+        h(
+          "div",
+          { className: "case-timeline-body" },
+          h("div", { className: "case-timeline-head" }, h("strong", {}, item.title), item.at ? h(CaseTime, { ms: item.at }) : null),
+          item.detail ? h("p", {}, item.detail) : null,
+          item.note ? h("p", { className: "case-note" }, item.note) : null,
+          item.meta ? h("p", { className: "muted" }, item.meta) : null,
+        ),
+      ),
+    ),
+  );
+}
+
+const IMAGE_SIGNATURES = [
+  ["image/png", [0x89, 0x50, 0x4e, 0x47]],
+  ["image/jpeg", [0xff, 0xd8, 0xff]],
+  ["image/gif", [0x47, 0x49, 0x46, 0x38]],
+];
+// Evidence is served as opaque bytes; only known image signatures get a preview.
+function sniffImageType(bytes) {
+  for (const [type, signature] of IMAGE_SIGNATURES) if (signature.every((byte, i) => bytes[i] === byte)) return type;
+  const text = (from, to) => String.fromCharCode(...bytes.slice(from, to));
+  return text(0, 4) === "RIFF" && text(8, 12) === "WEBP" ? "image/webp" : null;
+}
+const EVIDENCE_PREVIEW_BYTES = 8 * 1024 * 1024;
+
+function evidenceSize(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  return value < 1024 * 1024 ? `${Math.max(1, Math.round(value / 1024))} KB` : `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function CaseEvidenceFile({ guildId, caseId, item }) {
+  const [preview, setPreview] = useState(null);
+  const path = `/api/guilds/${guildId}/cases/${caseId}/evidence/${item.id}`;
+  useEffect(() => {
+    if (!(Number(item.bytes) <= EVIDENCE_PREVIEW_BYTES) || typeof URL.createObjectURL !== "function") return undefined;
+    let url = null;
+    let live = true;
+    fetchPrivate(path)
+      .then(async (blob) => {
+        const type = sniffImageType(new Uint8Array(await blob.slice(0, 12).arrayBuffer()));
+        if (!live || !type) return;
+        url = URL.createObjectURL(new Blob([blob], { type }));
+        setPreview(url);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [path]);
+  return h(
+    "figure",
+    { className: "case-file" },
+    preview
+      ? h("img", { src: preview, alt: `Attachment ${item.attachment_id || item.id}` })
+      : h("span", { className: "case-file-placeholder", "aria-hidden": "true" }, h(Icon, { name: "paperclip", intent: "neutral" })),
+    h(
+      "figcaption",
+      { className: "case-file-meta" },
+      h("span", {}, preview ? "Image" : "Attachment", item.bytes ? ` · ${evidenceSize(item.bytes)}` : ""),
+      h(IconButton, { action: "download", label: `Download ${item.id}`, type: "button", onClick: () => downloadPrivate(path, item.id) }),
+    ),
+  );
+}
+
+function CaseEvidence({ guildId, caseId, texts, files, names, channels }) {
+  const channelName = (id) => channels.find((channel) => channel.id === id)?.name;
+  const where = (id) => (channelName(id) ? `#${channelName(id)}` : id ? `channel ${id}` : "");
+  const byMessage = new Map();
+  for (const file of files) byMessage.set(file.message_id, [...(byMessage.get(file.message_id) || []), file]);
+  const fileList = (list) =>
+    list.length ? h("div", { className: "case-files" }, list.map((item) => h(CaseEvidenceFile, { key: item.id, guildId, caseId, item }))) : null;
+  const cards = texts.map((item, index) => {
+    const author = casePerson(item.author_id, names);
+    const attached = byMessage.get(item.message_id) || [];
+    byMessage.delete(item.message_id);
+    return h(
+      "article",
+      { className: "case-message", key: `text-${index}` },
+      h(LetterAvatar, { name: author.name || "?", large: true }),
+      h(
+        "div",
+        { className: "case-message-body" },
+        h(
+          "div",
+          { className: "case-message-head" },
+          h("strong", { title: item.author_id }, author.name || `User ${item.author_id}`),
+          h("span", { className: "muted", title: item.channel_id }, `in ${where(item.channel_id)}`),
+          h("small", { className: "muted" }, h(CaseTime, { ms: item.occurred_at_ms })),
+        ),
+        h("pre", { className: "case-message-text" }, item.text),
+        fileList(attached),
+      ),
+    );
+  });
+  for (const [messageId, list] of byMessage) {
+    cards.push(
+      h(
+        "article",
+        { className: "case-message", key: `files-${messageId}` },
+        h("span", { className: "case-avatar case-avatar-lg", "aria-hidden": "true" }, h(Icon, { name: "paperclip" })),
+        h(
+          "div",
+          { className: "case-message-body" },
+          h("div", { className: "case-message-head" }, h("strong", {}, "Saved attachments"), h("span", { className: "muted", title: list[0].channel_id }, `in ${where(list[0].channel_id)}`)),
+          fileList(list),
+        ),
+      ),
+    );
+  }
+  return cards.length ? cards : h("p", { className: "muted" }, "No private evidence was saved for this case.");
+}
+
+function openCaseView(props) {
+  ui.set({
+    editor: h(CaseView, { ...props, dialogLabel: `Case ${props.caseId.slice(0, 8)}`, key: `${props.guildId}:${props.caseId}:${Date.now()}` }),
+  });
+}
+
+async function loadCaseHistory(base, signal) {
+  // The history contract admits at most 64 entries; read on only when a page is full.
+  const limit = 64;
+  const entries = [];
+  let names = {};
+  let after = "0";
+  for (;;) {
+    const page = await api(`${base}/history?limit=${limit}&after=${after}`, "GET", null, signal);
+    const found = page?.history || [];
+    entries.push(...found);
+    names = { ...names, ...(page?.names || {}) };
+    if (found.length < limit) return { entries, names };
+    after = found[found.length - 1].sequence;
+  }
+}
+
+// The case file dialog (#624). Opens at once with a loading state, then reads the
+// case, its history, its evidence and the server's channel names together.
+function CaseView({ guildId, caseId, onRemoved, onFilter }) {
+  const base = `/api/guilds/${guildId}/cases/${caseId}`;
+  const [attempt, setAttempt] = useState(0);
+  const [view, setView] = useState({ status: "loading" });
+  const noteRef = useRef(null);
+  const note = useRef({ intent: { kind: "empty" }, activity: "idle" }).current;
+  useEffect(() => {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 30000);
+    setView({ status: "loading" });
+    Promise.all([
+      apiRead(base, controller.signal),
+      loadCaseHistory(base, controller.signal),
+      apiRead(`${base}/evidence`, controller.signal),
+      // Channel names are a settings-level read; read-only access keeps channel IDs.
+      canEditSettings() ? apiRead(`/api/guilds/${guildId}/server-names`, controller.signal).catch(() => null) : null,
+    ]).then(
+      ([payload, history, evidence, serverNames]) => {
+        if (controller.signal.aborted) return;
+        setView({
+          status: "ready",
+          c: payload?.case || {},
+          canDelete: !!payload?.can_delete,
+          names: { ...(payload?.names || {}), ...history.names },
+          history: history.entries,
+          files: Array.isArray(evidence?.evidence) ? evidence.evidence : [],
+          channels: Array.isArray(serverNames?.channels) ? serverNames.channels : [],
+        });
+      },
+      (error) => {
+        if (controller.signal.aborted && !timedOut) return;
+        setView({ status: "error", message: timedOut ? "Request timed out." : error?.message || String(error) });
+      },
+    ).finally(() => clearTimeout(timer));
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [base, attempt]);
+  const short = caseId.slice(0, 8);
+  const close = () => {
+    if (canLeave()) closeOverlay();
+  };
+  const header = h(
+    "header",
+    { className: "case-header" },
+    h(
+      "div",
+      { className: "case-title" },
+      h("h2", { title: caseId }, `Case ${short}`),
+      h(IconButton, { action: "copy", label: `Copy case ID ${caseId}`, onClick: () => navigator.clipboard.writeText(caseId) }),
+      h(IconButton, { action: "cancel", label: "Close case", className: "btn btn-sm btn-square btn-ghost case-close", onClick: close }),
+    ),
+    view.status === "ready"
+      ? h(
+          "div",
+          { className: "case-tags" },
+          h(CaseBadge, { kind: "action", value: view.c.action }),
+          h(CaseBadge, { kind: "outcome", value: view.c.outcome }),
+          h("span", { className: "muted" }, h(CaseTime, { ms: view.c.occurred_at_ms })),
+          h("span", { className: "badge badge-soft badge-sm" }, state.guilds.find((g) => g.id === guildId)?.name || "This server"),
+        )
+      : null,
+  );
+  if (view.status !== "ready") {
+    return h(
+      DialogPanel,
+      { className: "modal-box case-view", "aria-busy": view.status === "loading" },
+      header,
+      view.status === "loading"
+        ? h("p", { className: "case-loading", role: "status", "aria-live": "polite" }, "Loading case…")
+        : h(
+            "div",
+            { className: "case-error", role: "alert" },
+            h("p", { className: "err" }, `Could not load this case: ${view.message}`),
+            h(ActionButton, { type: "button", className: "btn btn-sm", onClick: () => setAttempt((n) => n + 1) }, "Try again"),
+          ),
+    );
+  }
+  const { c, names } = view;
+  const automatic = !c.actor_id && caseSourceKind(c.source) === "application";
+  const policies = view.history.filter((item) => item.entry?.body?.policy).map((item) => item.entry.body.policy);
+  const texts = Array.isArray(c.evidence?.text) ? c.evidence.text : [];
+  const addNote = async () => {
+    if (note.activity === "submitting") return;
+    const text = noteRef.current.value.trim();
+    if (!text) throw new Error("Write a note first.");
+    if (note.intent.kind === "empty" || note.intent.body.text !== text) {
+      note.intent = { kind: "retained", body: { entry_id: crypto.randomUUID().replaceAll("-", ""), text } };
+    }
+    note.activity = "submitting";
+    try {
+      await api(`${base}/history`, "POST", note.intent.body);
+      note.intent = { kind: "empty" };
+      noteRef.current.value = "";
+      ui.set({ edits: "clean" });
+      try {
+        const history = await loadCaseHistory(base);
+        setView((current) => (current.status === "ready" ? { ...current, history: history.entries, names: { ...current.names, ...history.names } } : current));
+        toast("Note added", "success");
+      } catch (_) {
+        // The note is saved; only the timeline refresh failed.
+        toast("Note added. Reopen the case to see it in the timeline.", "success");
+      }
+    } finally {
+      note.activity = "idle";
+    }
+  };
+  const remove = async () => {
+    if (!confirm("Remove this case record? This does not undo the Discord action.")) return;
+    const result = await api(base, "DELETE");
+    closeOverlay();
+    toast(
+      caseCleanupState(result?.cleanup_pending) === "pending"
+        ? "Case record removed. Cleanup is pending. Use Removed records / retry cleanup."
+        : "Case record removed",
+      "success",
+    );
+    onRemoved?.();
+  };
+  return h(
+    DialogPanel,
+    { className: "modal-box case-view", onInput: trackDraft },
+    header,
+    h(
+      "section",
+      { className: "case-section", "aria-label": "Who" },
+      h("h3", {}, "Who"),
+      h(
+        "div",
+        { className: "case-who" },
+        h(CasePersonCard, { role: "Subject", id: c.subject_id, names, guildId, onFilter, filterKey: "subject" }),
+        h(CasePersonCard, { role: "Moderator", id: c.actor_id, names, automatic, guildId, onFilter, filterKey: "actor" }),
+      ),
+    ),
+    h(
+      "section",
+      { className: "case-section", "aria-label": "Why" },
+      h("h3", {}, "Why"),
+      c.reason ? h("p", { className: "case-reason" }, c.reason) : h("p", { className: "muted" }, "No reason recorded."),
+      automatic ? h("p", { className: "muted" }, "Automatic action: jModGuard automod acted on its own.") : null,
+      ...policies.map((policy, index) =>
+        h("p", { key: `policy-${index}`, className: "muted" }, `Rule: ${policy.description || policy.rule_id}`),
+      ),
+    ),
+    h("section", { className: "case-section", "aria-label": "Timeline" }, h("h3", {}, "Timeline"), h(CaseTimeline, { items: caseTimeline(c, view.history, names) })),
+    h(
+      "section",
+      { className: "case-section", "aria-label": "Evidence" },
+      h("h3", {}, "Evidence"),
+      h(CaseEvidence, { guildId, caseId, texts, files: view.files, names, channels: view.channels }),
+    ),
+    canManageServer() || view.canDelete
+      ? h(
+          "div",
+          { className: "case-actions" },
+          canManageServer()
+            ? h(
+                "div",
+                { className: "case-note-form" },
+                h(Textarea, {
+                  ref: noteRef,
+                  rows: "2",
+                  "aria-label": "Note",
+                  placeholder: "Add a note for other moderators. Discord isn't changed.",
+                  className: "textarea",
+                }),
+                h(ActionButton, { className: "btn btn-sm btn-primary", type: "button", onClick: addNote }, "Add note"),
+              )
+            : null,
+          view.canDelete
+            ? h(
+                ActionButton,
+                {
+                  type: "button",
+                  className: "btn btn-sm case-remove",
+                  title: "Deletes jModGuard's private record only. Discord isn't changed.",
+                  onClick: remove,
+                },
+                h(Icon, { name: ACTION_ICONS.remove.icon, intent: ACTION_ICONS.remove.intent }),
+                "Remove case record",
+              )
+            : null,
+        )
+      : null,
+  );
+}
+
+const CASE_FILTERS_EMPTY = { action: "", outcome: "", subject: "", actor: "" };
+
 function tabCases() {
   const guildId = state.guildId;
   const handlers = useRef({});
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [detailParts, setDetailParts] = useState([]);
   const [pagination, setPagination] = useState({ first: true, next: true });
   const [canDelete, setCanDelete] = useState(false);
   const [removedView, setRemovedView] = useState(false);
+  const [filters, setFilters] = useState(CASE_FILTERS_EMPTY);
+  const filtersRef = useRef(CASE_FILTERS_EMPTY);
+  const subjectIds = useRef([]).current;
+  const actorIds = useRef([]).current;
+  const [pickerNames, setPickerNames] = useState(() => ({ status: "loaded", roles: [], channels: [], users: new Map() }));
+  const rememberUser = (id, name) =>
+    setPickerNames((current) => ({ ...current, users: new Map(current.users).set(id, name) }));
   const [handoff] = useState(() => {
     const next = pendingCase;
     pendingCase = null;
     return next;
   });
+  const applyFilters = (next, name) => {
+    const merged = { ...filtersRef.current, ...next };
+    filtersRef.current = merged;
+    subjectIds.splice(0, subjectIds.length, ...(merged.subject ? [merged.subject] : []));
+    actorIds.splice(0, actorIds.length, ...(merged.actor ? [merged.actor] : []));
+    if (name) for (const id of Object.values(next)) if (id) rememberUser(id, name);
+    setFilters(merged);
+    handlers.current.first?.();
+  };
   useEffect(() => {
     let lifecycle = "active";
     let request = 0;
     let listController;
-    let detailRequest = 0;
     let after = "";
     let listMode = "live";
     let nextAfter = "";
     const pageSize = 50;
-    const openCase = async (id) => {
-      const currentDetail = ++detailRequest;
-      try {
-        const payload = await apiRead(`/api/guilds/${guildId}/cases/${id}`);
-        const history = { history: [] };
-        let sequence = "0";
-        // The existing history contract admits at most 64 entries. Consume both
-        // bounded pages so successful notes beyond the first 32 remain visible.
-        for (let page = 0; page < 2; page++) {
-          const result = await api(`/api/guilds/${guildId}/cases/${id}/history?limit=32&after=${sequence}`);
-          const entries = result.history || [];
-          history.history.push(...entries);
-          if (entries.length < 32) break;
-          sequence = entries[entries.length - 1].sequence;
-        }
-        const evidence = await apiRead(`/api/guilds/${guildId}/cases/${id}/evidence`);
-        if (lifecycle === "disposed" || currentDetail !== detailRequest || state.guildId !== guildId) return;
-        const c = payload.case || {};
-        let noteIntent = { kind: "empty" };
-        let noteActivity = "idle";
-        const noteRef = React.createRef();
-        const note = h(Textarea, {
-          key: `${id}:${currentDetail}`,
-          ref: noteRef,
-          rows: "3",
-          placeholder: "Add a note. This does not change Discord.",
-          className: "textarea",
-        });
-        setDetailParts([
-          h("h3", { className: "card-title" }, "Case " + id),
-          h("p", {}, `${c.action || "unknown"} · ${c.outcome || "unknown"} · subject ${c.subject_id || ""}`),
-          h("p", { className: "muted" }, c.reason || "No reason recorded."),
-          h(
-            "p",
-            { className: "muted" },
-            "Removing a case deletes retained private records. It does not reverse a Discord ban, kick, timeout, or warning.",
-          ),
-          payload.can_delete
-            ? h(
-                IconButton,
-                {
-                  action: "remove",
-                  label: "Remove case record",
-                  className: "btn btn-sm btn-square standalone-action",
-                  onClick: async () => {
-                    if (!confirm("Remove this case record? This does not undo the Discord action.")) return;
-                    const result = await api(`/api/guilds/${guildId}/cases/${id}`, "DELETE");
-                    toast(
-                      caseCleanupState(result?.cleanup_pending) === "pending"
-                        ? "Case record removed. Cleanup is pending. Use Removed records / retry cleanup."
-                        : "Case record removed",
-                      "success",
-                    );
-                    renderTab();
-                  },
-                },
-              )
-            : null,
-          h("h3", { className: "card-title" }, "History"),
-          ...(history.history || []).map((entry) =>
-            h("p", { className: "muted" }, JSON.stringify(entry.entry.body)),
-          ),
-          canManageServer() &&
-          field(
-            "Note",
-            note,
-            h(
-              ActionButton,
-              {
-                className: "btn btn-sm",
-                type: "button",
-                onClick: async () => {
-                  if (noteActivity === "submitting") return;
-                  const text = noteRef.current.value.trim();
-                  if (noteIntent.kind === "empty" || noteIntent.body.text !== text) {
-                    noteIntent = { kind: "retained", body: { entry_id: crypto.randomUUID().replaceAll("-", ""), text } };
-                  }
-                  noteActivity = "submitting";
-                  try {
-                    await api(`/api/guilds/${guildId}/cases/${id}/history`, "POST", noteIntent.body);
-                    noteIntent = { kind: "empty" };
-                    toast("Note added", "success");
-                    await openCase(id);
-                    ui.set({ edits: "clean" });
-                  } finally {
-                    noteActivity = "idle";
-                  }
-                },
-              },
-              "Add note",
-            ),
-          ),
-          h("h3", { className: "card-title" }, "Private evidence"),
-          ...(Array.isArray(c.evidence?.text) ? c.evidence.text : []).map((item) =>
-            h(
-              "div",
-              {},
-              h(
-                "p",
-                { className: "muted" },
-                `Message ${item.message_id} · channel ${item.channel_id} · author ${item.author_id}`,
-              ),
-              h("pre", {}, item.text),
-            ),
-          ),
-          ...(evidence.evidence || []).map((item) =>
-            h(
-              "p",
-              {},
-              h("span", { className: "mono" }, item.id),
-              " ",
-              h(IconButton, {
-                action: "download",
-                label: `Download ${item.id}`,
-                type: "button",
-                onClick: async () => {
-                  await downloadPrivate(`/api/guilds/${guildId}/cases/${id}/evidence/${item.id}`, item.id);
-                },
-              }),
-            ),
-          ),
-        ]);
-      } catch (e) {
-        if (lifecycle === "disposed" || currentDetail !== detailRequest || state.guildId !== guildId) return;
-        setDetailParts([h("p", { className: "err" }, e.message || String(e))]);
-      }
-    };
+    const open = (id) => openCaseView({ guildId, caseId: id, onRemoved: () => renderTab(), onFilter: applyFilters });
     const run = async () => {
       const current = ++request;
       listController?.abort();
@@ -7476,17 +7914,24 @@ function tabCases() {
       const signal = controller.signal;
       const timeout = setTimeout(() => controller.abort(), 30000);
       setLoading(true);
-      ++detailRequest;
-      setDetailParts([]);
       setPagination((value) => ({ ...value, next: true }));
       setRows([]);
       try {
         const query = new URLSearchParams({ limit: String(pageSize), removed: String(listMode === "removed") });
         if (after) query.set("after", after);
+        const filtered = listMode === "live" && Object.values(filtersRef.current).some(Boolean);
+        if (listMode === "live") for (const [key, value] of Object.entries(filtersRef.current)) if (value) query.set(key, value);
         const payload = await apiRead(`/api/guilds/${guildId}/cases?${query}`, signal);
         if (lifecycle === "disposed" || current !== request || state.guildId !== guildId) return;
         setCanDelete(!!payload.can_delete);
         const ids = payload.cases || [];
+        const names = payload.names || {};
+        if (Object.keys(names).length)
+          setPickerNames((value) => {
+            const users = new Map(value.users);
+            for (const [id, person] of Object.entries(names)) users.set(id, person.display_name);
+            return { ...value, users };
+          });
         nextAfter = ids.length === pageSize ? ids[ids.length - 1] : "";
         setPagination({ next: !nextAfter, first: !after });
         if (!ids.length) {
@@ -7496,8 +7941,10 @@ function tabCases() {
               {},
               h(
                 "td",
-                { colSpan: 5, className: "muted" },
-                listMode === "removed" ? "No more removed records." : "No selected cases on this page.",
+                { colSpan: 6, className: "muted" },
+                listMode === "removed"
+                  ? "No more removed records."
+                  : filtered ? "No cases match these filters." : "No selected cases on this page.",
               ),
             ),
           ]);
@@ -7513,7 +7960,7 @@ function tabCases() {
                 h("td", {}, id),
                 h(
                   "td",
-                  { colSpan: 4 },
+                  { colSpan: 5 },
                   h(
                     IconButton,
                     {
@@ -7539,22 +7986,25 @@ function tabCases() {
           rows.push(
             h(
               "tr",
-              {},
+              {
+                className: "case-row",
+                // The whole row opens the case; its own controls keep their action.
+                onClick: (event) => {
+                  if (!event.target.closest("button, a, input, select, textarea")) open(id);
+                },
+              },
               h(
                 "td",
                 {},
-                h("span", { className: "mono" }, id.slice(0, 8)),
+                h("span", { className: "mono", title: id }, id.slice(0, 8)),
                 " ",
-                h(IconButton, { action: "view", label: `Open case ${id}`, onClick: () => openCase(id) }),
+                h(IconButton, { action: "view", label: `Open case ${id}`, onClick: () => open(id) }),
               ),
-              h("td", {}, c?.action || "Summary unavailable"),
-              h("td", {}, c?.outcome || ""),
-              h("td", {}, String(c?.subject_id || "")),
-              h(
-                "td",
-                { className: "muted" },
-                c?.occurred_at_ms ? new Date(Number(c.occurred_at_ms)).toLocaleString() : "",
-              ),
+              h("td", {}, c ? h(CaseBadge, { kind: "action", value: c.action }) : "Summary unavailable"),
+              h("td", {}, c?.outcome ? h(CaseBadge, { kind: "outcome", value: c.outcome }) : ""),
+              h("td", {}, c?.subject_id ? h(CasePersonCell, { id: String(c.subject_id), names }) : ""),
+              h("td", {}, c ? h(CasePersonCell, { id: c.actor_id ? String(c.actor_id) : null, names, empty: "Not recorded" }) : ""),
+              h("td", { className: "muted" }, c?.occurred_at_ms ? h(CaseTime, { ms: c.occurred_at_ms }) : ""),
             ),
           );
         }
@@ -7567,7 +8017,7 @@ function tabCases() {
             {},
             h(
               "td",
-              { colSpan: 5, className: "err", role: "alert" },
+              { colSpan: 6, className: "err", role: "alert" },
               "Could not load cases: " + (signal.aborted
                 ? "Request timed out. Refresh to verify saved state before trying again."
                 : e.message || String(e)),
@@ -7599,19 +8049,29 @@ function tabCases() {
       },
     };
     run();
-    if (handoff?.guildId === guildId) openCase(handoff.caseId);
+    if (handoff?.guildId === guildId) open(handoff.caseId);
     return () => {
       lifecycle = "disposed";
       listController?.abort();
       ++request;
-      ++detailRequest;
     };
   }, [guildId, handoff]);
+  const anyFilter = Object.values(filters).some(Boolean);
+  const choice = (label, key, options) =>
+    field(
+      label,
+      h(
+        Select,
+        { className: "select select-sm", value: filters[key], onChange: (event) => applyFilters({ [key]: event.target.value }) },
+        h("option", { value: "" }, `Any ${label.toLowerCase()}`),
+        ...Object.entries(options).map(([value, entry]) => h("option", { key: value, value }, entry.label)),
+      ),
+    );
   return h(
     "div",
     null,
     h("h2", null, "Cases"),
-    h("p", { className: "muted" }, "Moderation cases for this server."),
+    h("p", { className: "muted" }, "Moderation cases for this server. Select a case to open its file."),
     h(GoodToKnow, {
       items: [
         "Only moderation details are kept, never ordinary messages.",
@@ -7619,6 +8079,41 @@ function tabCases() {
         "Removed records can retry cleanup. Their private content stays deleted.",
       ],
     }),
+    removedView
+      ? null
+      : h(
+          "div",
+          { className: "case-filters", "data-no-draft": true, role: "group", "aria-label": "Filter cases" },
+          choice("Action", "action", CASE_ACTIONS),
+          choice("Outcome", "outcome", CASE_OUTCOMES),
+          h(IdPicker, {
+            kind: "user",
+            label: "Subject",
+            ids: subjectIds,
+            names: pickerNames,
+            rememberUser,
+            single: true,
+            draft: false,
+            memberStatus: "all",
+            idLabel: "Subject user ID",
+            onChange: () => applyFilters({ subject: subjectIds[0] || "" }),
+          }),
+          h(IdPicker, {
+            kind: "user",
+            label: "Moderator",
+            ids: actorIds,
+            names: pickerNames,
+            rememberUser,
+            single: true,
+            draft: false,
+            memberStatus: "all",
+            idLabel: "Moderator user ID",
+            onChange: () => applyFilters({ actor: actorIds[0] || "" }),
+          }),
+          anyFilter
+            ? h(ActionButton, { type: "button", className: "btn btn-sm", onClick: () => applyFilters(CASE_FILTERS_EMPTY) }, "Clear filters")
+            : null,
+        ),
     h(
       "div",
       { className: "row", style: { marginBottom: "12px" } },
@@ -7649,12 +8144,7 @@ function tabCases() {
         { className: "card bg-base-100 card-border", role: "status", "aria-live": "polite" },
         h("div", { className: "card-body" }, "Loading cases…"),
       )
-      : h(DataTable, { headings: ["Case", "Action", "Outcome", "Subject", "When"] }, rows),
-    h(
-      "div",
-      { className: "card bg-base-100 card-border", style: { marginTop: "16px" } },
-      ...detailParts,
-    ),
+      : h(DataTable, { headings: ["Case", "Action", "Outcome", "Subject", "Moderator", "When"], className: "table table-zebra case-table" }, rows),
   );
 }
 

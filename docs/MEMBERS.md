@@ -119,6 +119,8 @@ The page searches saved user IDs, pasted mentions, display names, and usernames;
 no per-search Discord request runs. Name fallback is server nickname, global
 display name, username, then ID. Results can be filtered by current membership,
 current ban, previous ban, and known join-date range (UTC calendar dates).
+A case file's **Member page** link opens this search for that user ID across all
+retained members, so banned and departed subjects are found too.
 Displayed timestamps use the viewer's local time zone. History is paginated and
 links selected actions to canonical cases. Distinct repeated bans and unbans
 remain distinct actions when their identities are known. Unknown action dates
