@@ -278,10 +278,12 @@ are disabled to prevent duplicate saves or switching its target server. If a
 configuration refresh fails, the workspace shows **Retry** instead of stale
 settings. Server loads ignore out-of-order responses. Navigation warns before
 discarding unsaved edits, including action/step additions and removals. Ordinary
-settings, rule, badword, command and template saves apply the authoritative
+settings, rule, badword and template saves apply the authoritative
 representation returned by that mutation instead of downloading the complete
 configuration bundle again. Multi-section copies and responses without a
-representation still reload the authoritative snapshot. Other edited fields stay
+representation still reload the authoritative snapshot. Command saves always
+reload it: built-in override aliases resolve against the other commands, so
+one save can change another command's aliases. Other edited fields stay
 marked **Unsaved changes**, including when a field-specific settings action runs or
 a failed refresh needs Retry. Log-channel saves immediately show the accepted queued
 value, clear the submitted row's dirty state, and reconcile the terminal bot-action
@@ -302,7 +304,7 @@ the workspace then refreshes current configuration. If that refresh fails, use
 | **Analytics** | command-center dashboard for one range (7, 30 or 90 days, one selector for every panel): a compact KPI strip (member directory size with a partial/unverified badge, net growth, joins, leaves, warnings, bans, spam hits, mod actions, timeouts), each with its change against the previous period of the same length and a daily sparkline; aligned daily enforcement bars; joins/leaves with a running net-change line; top automod rules, mod actions by type and by moderator (names from the stored member directory); and a weekday × UTC hour heat map. Hover or arrow keys show exact per-day values. One captured membership-bound summary read per range, served from stored records only; the API caches complete answers for 30 seconds per membership and range and the browser reuses loaded ranges for 60 seconds |
 | **Automod Rules** | per-rule editor: params JSON, action escalation table, whitelists, dry-run, scope, reset-to-global |
 | **Badwords** | add/remove regex patterns (server; global if bot owner), live tester; invalid legacy patterns show **not enforced** |
-| **Commands** | edit every command (name, aliases, description, permission, cooldown, roles/channels, response template); create custom commands with the **step editor**; delete custom commands |
+| **Commands** | form editor with a live summary (Basics, What it does, Who can use it and where, Logging): typed behavior settings, role/channel name pickers, a log event dropdown; custom commands use the **step editor** (one compact row per step); built-ins take per-server overrides (name and behavior kind fixed, permission never below the shipped level) with **Reset to default**; delete custom commands; the bot owner sees a collapsed read-only raw behavior view |
 | **Templates** | edit event templates with live preview; server or (owner) global scope |
 | **Log Channels** | map each event type to a channel in that server (ID, `<#id>` mention, or Discord channel URL); queued for the bot; save per-event ignored user/bot IDs and source channel IDs |
 | **Audit Log** | retained event history (type, user, actor), including older routine rows; new routine events report to Discord channels |

@@ -2410,7 +2410,8 @@ impl CachedGuildConfig {
     pub fn find_command(&self, name: &str) -> Option<&CommandDef> {
         let lower = name.to_lowercase();
         if let Some(primary) = jmodguard::defaults::builtin_command_for_label(&lower) {
-            return self.commands.get(&primary);
+            // A server override may drop a shipped alias; the label then runs nothing.
+            return self.commands.get(&primary).filter(|c| c.matches(&lower));
         }
         self.commands.values().find(|c| c.matches(&lower))
     }

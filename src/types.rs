@@ -313,6 +313,12 @@ pub struct CommandDef {
     /// Log event type emitted after a successful run ("" = none).
     #[serde(default)]
     pub log_event: String,
+    /// Set on a server's override of a built-in command (#623). Only flagged
+    /// server rows under a built-in name apply; unflagged ones (copies of global
+    /// seeds, or a custom command named like a later built-in) are ignored.
+    /// Omitted when false, so custom rows and older binaries are unaffected.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub builtin_override: bool,
 }
 
 impl CommandDef {

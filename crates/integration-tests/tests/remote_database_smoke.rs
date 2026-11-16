@@ -945,6 +945,44 @@ async fn exercise_configuration_reads(bot: &Db, api: &Db) {
     })
     .await
     .unwrap();
+    // Built-in identity is shared by both backends, including reset of rows
+    // accepted before writers canonicalized the storage key.
+    let write = ConfigurationWriteScope::new(scope.clone(), scope.clone()).unwrap();
+    let mut ban = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|c| c.name == "ban")
+        .unwrap();
+    ban.enabled = false;
+    upsert_enrolled_command(bot, write.clone(), "Ban", &ban)
+        .await
+        .unwrap();
+    let stored = get_enrolled_command(api, scope.clone(), "BAN")
+        .await
+        .unwrap()
+        .guild
+        .unwrap();
+    assert_eq!(stored.name, "ban");
+    assert!(!stored.enabled);
+    let raw = serde_json::to_string(&stored).unwrap();
+    bot.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO commands(guild_id,name,data) VALUES(460,'BAN',?1)",
+            jmodguard::db::params![raw],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    delete_enrolled_command(bot, write, "ban").await.unwrap();
+    assert!(
+        list_enrolled_commands(api, scope.clone())
+            .await
+            .unwrap()
+            .guild
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("ban"))
+    );
     retire_guild_enrollment(bot, 460, 100).await.unwrap();
     enroll_guild(bot, 460, 101).await.unwrap();
     for result in [

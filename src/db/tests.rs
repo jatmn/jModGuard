@@ -2779,7 +2779,7 @@ fn voice_command_loads_from_binary_overlay_without_global_row() {
 }
 
 #[test]
-fn voice_command_cannot_be_persisted_to_the_database() {
+fn voice_command_persists_only_as_a_guild_override() {
     let tmp = tmp_db_path("voice_persist_rejected");
     let db = Db::open(&tmp, 2).unwrap();
     let voice = crate::defaults::default_commands()
@@ -2787,13 +2787,16 @@ fn voice_command_cannot_be_persisted_to_the_database() {
         .find(|cmd| cmd.name == "voice")
         .expect("voice command");
     let error = tokio_test_block_on(upsert_command(&db, 0, "voice", &voice))
-        .expect_err("binary overlay commands must not be stored");
+        .expect_err("binary overlay commands must not be stored as global rows");
     assert!(
         error
             .to_string()
-            .contains("cannot be written to the database"),
+            .contains("can only be changed for one server"),
         "{error:#}"
     );
+    // Any binary that can open core schema 0024+ knows the voice behavior kind.
+    tokio_test_block_on(upsert_command(&db, 10, "voice", &voice))
+        .expect("a guild override of voice is stored");
     let renamed = CommandDef {
         name: "vc_lookup".into(),
         ..voice.clone()
@@ -2828,13 +2831,14 @@ fn voice_command_cannot_be_persisted_to_the_database() {
         cooldown_secs: 0,
         response: String::new(),
         log_event: String::new(),
+        builtin_override: false,
     };
-    let ban_row_error = tokio_test_block_on(upsert_command(&db, 0, "ban", &ban_shell))
+    let ban_row_error = tokio_test_block_on(upsert_command(&db, 10, "ban", &ban_shell))
         .expect_err("voice behavior must not be stored on the ban row");
     assert!(
         ban_row_error
             .to_string()
-            .contains("cannot be written to the database"),
+            .contains("keeps its behavior; only its settings can change"),
         "{ban_row_error:#}"
     );
     cleanup_db(&tmp);
@@ -2853,11 +2857,11 @@ fn voice_dashboard_disable_save_cannot_persist_voice_behavior() {
         ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
             .unwrap();
     let error = tokio_test_block_on(upsert_enrolled_command(&db, scope, "voice", &voice))
-        .expect_err("dashboard save of overlay voice must not persist");
+        .expect_err("a global dashboard save of overlay voice must not persist");
     assert!(
         error
             .to_string()
-            .contains("cannot be written to the database"),
+            .contains("can only be changed for one server"),
         "{error:#}"
     );
     let before = tokio_test_block_on(get_primary_versions(&db)).unwrap();
@@ -2900,6 +2904,7 @@ fn voice_command_alias_cannot_replace_builtin_via_dashboard_writer() {
         behavior: crate::types::Behavior::Help,
         response: String::new(),
         log_event: String::new(),
+        builtin_override: false,
     };
     let scope =
         ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
@@ -2933,11 +2938,11 @@ async fn voice_command_cannot_be_replaced_via_api_control_dispatch() {
     };
     let direct_error = apply_control(&db, None, direct, None)
         .await
-        .expect_err("API upsert must not replace built-in voice");
+        .expect_err("a global API upsert must not replace built-in voice");
     assert!(
         direct_error
             .to_string()
-            .contains("cannot be written to the database"),
+            .contains("can only be changed for one server"),
         "{direct_error:#}"
     );
     let hijack = CommandDef {
@@ -2954,6 +2959,7 @@ async fn voice_command_cannot_be_replaced_via_api_control_dispatch() {
         behavior: crate::types::Behavior::Help,
         response: String::new(),
         log_event: String::new(),
+        builtin_override: false,
     };
     let alias_op = ControlOp::UpsertCommand {
         request: wire.clone(),
@@ -2992,6 +2998,7 @@ fn custom_command_hijack(
         behavior,
         response: String::new(),
         log_event: String::new(),
+        builtin_override: false,
     }
 }
 
@@ -3022,23 +3029,48 @@ fn builtin_command_cannot_be_replaced_via_db_writer() {
         .into_iter()
         .find(|cmd| cmd.name == "ban")
         .expect("ban");
+    // Guild overrides of a built-in's settings are stored (#623).
     ban.description = "guild-specific ban copy".into();
-    let ban_error = tokio_test_block_on(upsert_command(&db, 10, "ban", &ban))
-        .expect_err("db writer must reject built-in ban edits");
-    assert!(
-        ban_error
-            .to_string()
-            .contains("cannot be written to the database"),
-        "{ban_error:#}"
-    );
     ban.aliases = vec!["custom-ban-alias".into()];
-    let alias_edit_error = tokio_test_block_on(upsert_command(&db, 10, "ban", &ban))
-        .expect_err("db writer must reject built-in alias edits");
+    tokio_test_block_on(upsert_command(&db, 10, "ban", &ban)).expect("guild ban override");
+    let global_error = tokio_test_block_on(upsert_command(&db, 0, "ban", &ban))
+        .expect_err("db writer must reject global built-in edits");
     assert!(
-        alias_edit_error
+        global_error
             .to_string()
-            .contains("cannot be written to the database"),
-        "{alias_edit_error:#}"
+            .contains("can only be changed for one server"),
+        "{global_error:#}"
+    );
+    let widened = CommandDef {
+        permission: "everyone".into(),
+        ..ban.clone()
+    };
+    let widened_error = tokio_test_block_on(upsert_command(&db, 10, "ban", &widened))
+        .expect_err("an override must not lower the shipped permission");
+    assert!(
+        widened_error
+            .to_string()
+            .contains("needs at least `mod` permission"),
+        "{widened_error:#}"
+    );
+    let stolen = CommandDef {
+        aliases: vec!["k".into()],
+        ..ban.clone()
+    };
+    let stolen_error = tokio_test_block_on(upsert_command(&db, 10, "ban", &stolen))
+        .expect_err("an override must not take another built-in's alias");
+    assert!(
+        stolen_error
+            .to_string()
+            .contains("alias `k` belongs to built-in command `kick`"),
+        "{stolen_error:#}"
+    );
+    let stored = tokio_test_block_on(get_command_row(&db, 10, "ban"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.description, "guild-specific ban copy",
+        "refused writes leave the override"
     );
     cleanup_db(&tmp);
 }
@@ -3074,11 +3106,11 @@ fn builtin_command_cannot_be_replaced_via_dashboard_writer() {
         .expect("ban");
     ban.description = "dashboard ban copy".into();
     let ban_error = tokio_test_block_on(upsert_enrolled_command(&db, scope.clone(), "ban", &ban))
-        .expect_err("dashboard writer must reject built-in ban description edits");
+        .expect_err("dashboard writer must reject global built-in ban description edits");
     assert!(
         ban_error
             .to_string()
-            .contains("cannot be written to the database"),
+            .contains("can only be changed for one server"),
         "{ban_error:#}"
     );
     ban.enabled = false;
@@ -3087,20 +3119,20 @@ fn builtin_command_cannot_be_replaced_via_dashboard_writer() {
     ban.channels = vec![777];
     let access_error =
         tokio_test_block_on(upsert_enrolled_command(&db, scope.clone(), "ban", &ban))
-            .expect_err("dashboard writer must reject built-in access-control edits");
+            .expect_err("dashboard writer must reject global built-in access-control edits");
     assert!(
         access_error
             .to_string()
-            .contains("cannot be written to the database"),
+            .contains("can only be changed for one server"),
         "{access_error:#}"
     );
     ban.aliases = vec!["extra-ban-alias".into()];
     let alias_error = tokio_test_block_on(upsert_enrolled_command(&db, scope, "ban", &ban))
-        .expect_err("dashboard writer must reject built-in ban alias edits");
+        .expect_err("dashboard writer must reject global built-in ban alias edits");
     assert!(
         alias_error
             .to_string()
-            .contains("cannot be written to the database"),
+            .contains("can only be changed for one server"),
         "{alias_error:#}"
     );
     cleanup_db(&tmp);
@@ -3140,11 +3172,11 @@ async fn builtin_command_cannot_be_replaced_via_api_control_dispatch() {
     };
     let ban_error = apply_control(&db, None, ban_op, None)
         .await
-        .expect_err("API upsert must reject built-in ban description edits");
+        .expect_err("API upsert must reject global built-in ban description edits");
     assert!(
         ban_error
             .to_string()
-            .contains("cannot be written to the database"),
+            .contains("can only be changed for one server"),
         "{ban_error:#}"
     );
     ban.aliases = vec!["api-ban-alias".into()];
@@ -3156,44 +3188,38 @@ async fn builtin_command_cannot_be_replaced_via_api_control_dispatch() {
     };
     let alias_error = apply_control(&db, None, alias_op, None)
         .await
-        .expect_err("API upsert must reject built-in ban alias edits");
+        .expect_err("API upsert must reject global built-in ban alias edits");
     assert!(
         alias_error
             .to_string()
-            .contains("cannot be written to the database"),
+            .contains("can only be changed for one server"),
         "{alias_error:#}"
     );
     cleanup_db(&tmp);
 }
 
 #[test]
-fn builtin_command_stored_guild_override_ignored_on_load() {
+fn builtin_command_guild_override_applies_on_load() {
     let tmp = tmp_db_path("builtin_guild_override_ignored");
     let db = Db::open(&tmp, 2).unwrap();
-    let shipped_ban = crate::defaults::default_commands()
+    let mut override_row = crate::defaults::default_commands()
         .into_iter()
         .find(|cmd| cmd.name == "ban")
         .expect("ban");
-    let mut override_row = shipped_ban.clone();
-    override_row.description = "legacy guild ban override".into();
-    override_row.aliases = vec!["legacy-ban-alias".into()];
-    tokio_test_block_on(db.with_conn(move |conn| {
-        conn.execute_bounded(
-            "INSERT INTO commands(guild_id,name,data) VALUES (?1,'ban',?2)",
-            params![10_i64, serde_json::to_string(&override_row)?],
-            64 * 1024 * 1024,
-        )?;
-        Ok(())
-    }))
-    .unwrap();
+    override_row.description = "guild ban override".into();
+    override_row.aliases = vec!["hammer".into()];
+    tokio_test_block_on(upsert_command(&db, 10, "ban", &override_row)).unwrap();
     let parts = tokio_test_block_on(load_config_parts(&db, 10)).unwrap();
-    assert_eq!(parts.commands["ban"].description, shipped_ban.description);
-    assert_eq!(parts.commands["ban"].aliases, shipped_ban.aliases);
+    assert_eq!(parts.commands["ban"].description, "guild ban override");
+    assert_eq!(parts.commands["ban"].aliases, vec!["hammer".to_string()]);
+    // Another server keeps the shipped command.
+    let other = tokio_test_block_on(load_config_parts(&db, 11)).unwrap();
+    assert_ne!(other.commands["ban"].description, "guild ban override");
     cleanup_db(&tmp);
 }
 
 #[test]
-fn builtin_voice_stored_guild_override_ignored_on_load() {
+fn builtin_voice_guild_override_keeps_its_behavior_on_load() {
     let tmp = tmp_db_path("builtin_voice_guild_override_ignored");
     let db = Db::open(&tmp, 2).unwrap();
     let shipped_voice = crate::defaults::default_commands()
@@ -3201,9 +3227,11 @@ fn builtin_voice_stored_guild_override_ignored_on_load() {
         .find(|cmd| cmd.name == "voice")
         .expect("voice");
     let mut override_row = shipped_voice.clone();
-    override_row.description = "legacy guild voice override".into();
+    override_row.description = "guild voice override".into();
     override_row.enabled = false;
     override_row.behavior = crate::types::Behavior::Say;
+    override_row.builtin_override = true;
+    // Written raw: the writer refuses a changed behavior kind; a load must too.
     tokio_test_block_on(db.with_conn(move |conn| {
         conn.execute_bounded(
             "INSERT INTO commands(guild_id,name,data) VALUES (?1,'voice',?2)",
@@ -3214,18 +3242,9 @@ fn builtin_voice_stored_guild_override_ignored_on_load() {
     }))
     .unwrap();
     let parts = tokio_test_block_on(load_config_parts(&db, 10)).unwrap();
-    assert_eq!(
-        parts.commands["voice"].description,
-        shipped_voice.description
-    );
-    assert_eq!(parts.commands["voice"].enabled, shipped_voice.enabled);
+    assert_eq!(parts.commands["voice"].description, "guild voice override");
+    assert!(!parts.commands["voice"].enabled);
     assert_eq!(parts.commands["voice"].permission, shipped_voice.permission);
-    assert_eq!(parts.commands["voice"].roles, shipped_voice.roles);
-    assert_eq!(parts.commands["voice"].channels, shipped_voice.channels);
-    assert_eq!(
-        parts.commands["voice"].cooldown_secs,
-        shipped_voice.cooldown_secs
-    );
     assert!(matches!(
         parts.commands["voice"].behavior,
         crate::types::Behavior::Voice
@@ -3234,7 +3253,7 @@ fn builtin_voice_stored_guild_override_ignored_on_load() {
 }
 
 #[test]
-fn builtin_access_controls_ignored_on_load_and_slash_registry() {
+fn builtin_access_overrides_only_narrow_on_load_and_slash_registry() {
     let tmp = tmp_db_path("builtin_access_controls");
     let db = Db::open(&tmp, 2).unwrap();
     let shipped_ban = crate::defaults::default_commands()
@@ -3246,36 +3265,169 @@ fn builtin_access_controls_ignored_on_load_and_slash_registry() {
     stored.permission = "owner".into();
     stored.roles = vec![555];
     stored.channels = vec![777];
-    stored.description = "legacy description".into();
-    stored.aliases = vec!["legacy-alias".into()];
     stored.cooldown_secs = 42;
+    tokio_test_block_on(upsert_command(&db, 10, "ban", &stored)).unwrap();
+    // A raw row that would widen access is clamped to the shipped level.
+    let mut widened = shipped_ban.clone();
+    widened.permission = "everyone".into();
+    widened.builtin_override = true;
+    // Even a flagged global row is a seed, never an override.
+    let mut global = shipped_ban.clone();
+    global.description = "stale global seed".into();
+    global.enabled = false;
+    global.builtin_override = true;
     tokio_test_block_on(db.with_conn(move |conn| {
         conn.execute_bounded(
-            "INSERT INTO commands(guild_id,name,data) VALUES (?1,'ban',?2)",
-            params![10_i64, serde_json::to_string(&stored)?],
+            "INSERT INTO commands(guild_id,name,data) VALUES (11,'ban',?1)",
+            params![serde_json::to_string(&widened)?],
+            64 * 1024 * 1024,
+        )?;
+        conn.execute_bounded(
+            "UPDATE commands SET data = ?1 WHERE guild_id = 0 AND name = 'ban'",
+            params![serde_json::to_string(&global)?],
             64 * 1024 * 1024,
         )?;
         Ok(())
     }))
     .unwrap();
     let parts = tokio_test_block_on(load_config_parts(&db, 10)).unwrap();
-    let ban = &parts.commands["ban"];
-    assert_eq!(ban.description, shipped_ban.description);
-    assert_eq!(ban.aliases, shipped_ban.aliases);
-    assert!(matches!(ban.behavior, crate::types::Behavior::Ban { .. }));
-    assert_eq!(ban.enabled, shipped_ban.enabled);
-    assert_eq!(ban.permission, shipped_ban.permission);
-    assert_eq!(ban.roles, shipped_ban.roles);
-    assert_eq!(ban.channels, shipped_ban.channels);
-    assert_eq!(ban.cooldown_secs, shipped_ban.cooldown_secs);
     let (_, _, slash_commands) =
         tokio_test_block_on(load_slash_commands_with_version(&db, 10)).unwrap();
-    let slash_ban = slash_commands.get("ban").expect("slash ban");
-    assert_eq!(slash_ban.enabled, shipped_ban.enabled);
-    assert_eq!(slash_ban.permission, shipped_ban.permission);
-    assert_eq!(slash_ban.roles, shipped_ban.roles);
-    assert_eq!(slash_ban.channels, shipped_ban.channels);
-    assert_eq!(slash_ban.cooldown_secs, shipped_ban.cooldown_secs);
+    for ban in [
+        &parts.commands["ban"],
+        slash_commands.get("ban").expect("slash ban"),
+    ] {
+        assert!(matches!(ban.behavior, crate::types::Behavior::Ban { .. }));
+        assert!(!ban.enabled);
+        assert_eq!(ban.permission, "owner");
+        assert_eq!(
+            (ban.roles.clone(), ban.channels.clone()),
+            (vec![555], vec![777])
+        );
+        assert_eq!(ban.cooldown_secs, 42);
+        assert_eq!(
+            ban.description, shipped_ban.description,
+            "the global row is never applied"
+        );
+    }
+    let clamped = tokio_test_block_on(load_config_parts(&db, 11)).unwrap();
+    assert_eq!(clamped.commands["ban"].permission, shipped_ban.permission);
+    // Global rows are shipped seeds: neither a guild without an override nor the
+    // global scope applies them.
+    for guild in [12, 0] {
+        let parts = tokio_test_block_on(load_config_parts(&db, guild)).unwrap();
+        assert_eq!(
+            parts.commands["ban"].description, shipped_ban.description,
+            "{guild}"
+        );
+        assert!(parts.commands["ban"].enabled, "{guild}");
+    }
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn copying_commands_keeps_builtin_overrides_per_server() {
+    let tmp = tmp_db_path("copy_builtin_overrides");
+    let db = Db::open(&tmp, 2).unwrap();
+    let mut ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    ban.description = "server ban".into();
+    tokio_test_block_on(upsert_command(&db, 10, "ban", &ban)).unwrap();
+    let custom = crate::defaults::custom_command_fixture("hello");
+    tokio_test_block_on(upsert_command(&db, 0, "hello", &custom)).unwrap();
+    let sections = || vec!["commands".to_string()];
+    // Server to server: the override travels with the server's commands.
+    tokio_test_block_on(crate::db::copy_guild_config(&db, 10, 11, sections())).unwrap();
+    assert_eq!(
+        tokio_test_block_on(get_command_row(&db, 11, "ban"))
+            .unwrap()
+            .unwrap()
+            .description,
+        "server ban"
+    );
+    // Global to server: global built-in rows are seeds, never overrides.
+    tokio_test_block_on(crate::db::copy_guild_config(&db, 0, 12, sections())).unwrap();
+    assert!(
+        tokio_test_block_on(get_command_row(&db, 12, "ban"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        tokio_test_block_on(get_command_row(&db, 12, "hello"))
+            .unwrap()
+            .is_some()
+    );
+    // Server to global: the global scope takes no built-in rows.
+    tokio_test_block_on(crate::db::copy_guild_config(&db, 10, 0, sections())).unwrap();
+    assert!(
+        tokio_test_block_on(get_command_row(&db, 0, "ban"))
+            .unwrap()
+            .is_none()
+    );
+    assert_ne!(
+        tokio_test_block_on(load_config_parts(&db, 0))
+            .unwrap()
+            .commands["ban"]
+            .description,
+        "server ban"
+    );
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn unflagged_guild_builtin_rows_are_ignored_and_writers_flag_overrides() {
+    let tmp = tmp_db_path("builtin_unflagged_rows");
+    let db = Db::open(&tmp, 2).unwrap();
+    let shipped = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "kick")
+        .expect("kick");
+    // A copy of a global seed (Copy from Global before #623) or a custom command
+    // named like a later built-in: stored without the override flag.
+    let mut stale = shipped.clone();
+    stale.description = "copied from an old global seed".into();
+    stale.enabled = false;
+    let raw = serde_json::to_string(&stale).unwrap();
+    assert!(
+        !raw.contains("builtin_override"),
+        "custom rows keep the old wire shape"
+    );
+    tokio_test_block_on(db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO commands(guild_id,name,data) VALUES (10,'kick',?1)",
+            params![raw],
+            64 * 1024 * 1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+    let parts = tokio_test_block_on(load_config_parts(&db, 10)).unwrap();
+    assert_eq!(parts.commands["kick"].description, shipped.description);
+    assert!(parts.commands["kick"].enabled);
+    // The writer marks the same row as this server's override, and it applies.
+    tokio_test_block_on(upsert_command(&db, 10, "kick", &stale)).unwrap();
+    let stored = tokio_test_block_on(get_command_row(&db, 10, "kick"))
+        .unwrap()
+        .unwrap();
+    assert!(stored.builtin_override);
+    let parts = tokio_test_block_on(load_config_parts(&db, 10)).unwrap();
+    assert_eq!(
+        parts.commands["kick"].description,
+        "copied from an old global seed"
+    );
+    assert!(!parts.commands["kick"].enabled);
+    // A custom command never carries the flag, even if the caller set it.
+    let mut custom = crate::defaults::custom_command_fixture("hello");
+    custom.builtin_override = true;
+    tokio_test_block_on(upsert_command(&db, 10, "hello", &custom)).unwrap();
+    assert!(
+        !tokio_test_block_on(get_command_row(&db, 10, "hello"))
+            .unwrap()
+            .unwrap()
+            .builtin_override
+    );
     cleanup_db(&tmp);
 }
 

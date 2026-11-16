@@ -125,8 +125,12 @@ pub async fn guild_config(
     let badwords: Vec<_> = snapshot.badwords.iter().map(|w| w.with_status()).collect();
 
     // commands: raw scope rows stay on guild_override/global. `effective` matches
-    // runtime (shipped built-ins and their shipped access, reserved-label collisions).
-    let commands = command_config_rows(&snapshot.global_commands, &snapshot.guild_commands);
+    // runtime (shipped built-ins with this server's overrides, reserved-label collisions).
+    let commands = command_config_rows(
+        guild_id,
+        &snapshot.global_commands,
+        &snapshot.guild_commands,
+    );
 
     let mut templates = Vec::new();
     for (event, def) in crate::defaults::rendered_log_templates() {
@@ -583,7 +587,7 @@ pub async fn list_commands(
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let layers = db::list_enrolled_commands(&app.db, scope).await?;
     let (g, gl) = (layers.guild, layers.global);
-    let commands = command_config_rows(&pairs_to_map(&gl), &pairs_to_map(&g));
+    let commands = command_config_rows(guild_id, &pairs_to_map(&gl), &pairs_to_map(&g));
     Ok(Json(
         serde_json::json!({ "guild": g, "global": gl, "commands": commands }),
     ))
@@ -602,20 +606,43 @@ fn command_row_by_name<'a>(
         .map(|(_, command)| command)
 }
 
+fn guild_command_override<'a>(
+    guild_id: u64,
+    rows: &'a std::collections::HashMap<String, CommandDef>,
+    name: &str,
+) -> Option<&'a CommandDef> {
+    if crate::defaults::is_builtin_primary_command_name(name) {
+        (guild_id != 0)
+            .then(|| crate::defaults::builtin_command_override(rows, name))
+            .flatten()
+    } else {
+        command_row_by_name(rows, name)
+    }
+}
+
 /// Config-bundle command entries. Raw stored rows stay on `guild_override` and
 /// `global`. `effective` is the runtime registry for that name.
 fn command_config_rows(
+    guild_id: u64,
     global_commands: &std::collections::HashMap<String, CommandDef>,
     guild_commands: &std::collections::HashMap<String, CommandDef>,
 ) -> Vec<serde_json::Value> {
-    let effective = crate::defaults::effective_command_registry(global_commands, guild_commands);
+    // Built-in overrides are per server; in the global scope the "guild" rows are global.
+    let none = std::collections::HashMap::new();
+    let overrides = if guild_id == 0 { &none } else { guild_commands };
+    let effective = crate::defaults::effective_command_registry(global_commands, overrides);
     let mut names: Vec<String> = effective.keys().cloned().collect();
     names.sort();
     names
         .into_iter()
         .map(|name| {
             let def = &effective[&name];
-            let guild_row = command_row_by_name(guild_commands, &name).cloned();
+            // Display only: built-ins take per-server overrides that keep their
+            // shipped permission as a floor (#623).
+            let shipped = crate::defaults::effective_builtin_command(&name, None);
+            // In the global scope the "guild" rows are the global seeds, not overrides.
+            // A built-in's server row counts only when it is a flagged override.
+            let guild_row = guild_command_override(guild_id, guild_commands, &name).cloned();
             let global_row = command_row_by_name(global_commands, &name).cloned();
             let scope = if global_row.is_some() {
                 "global"
@@ -630,6 +657,8 @@ fn command_config_rows(
                 "effective": def,
                 "guild_override": guild_row,
                 "global": global_row,
+                "builtin": shipped.is_some(),
+                "min_permission": shipped.map(|cmd| cmd.permission),
             })
         })
         .collect()
@@ -646,17 +675,21 @@ pub async fn get_command(
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let name = name.to_lowercase();
     let canonical = crate::defaults::builtin_command_for_label(&name).unwrap_or(name);
-    let layers = db::get_enrolled_command(&app.db, scope, &canonical).await?;
-    let (guild_override, global) = (layers.guild, layers.global);
-    let mut guild_map = std::collections::HashMap::new();
-    let mut global_map = std::collections::HashMap::new();
-    if let Some(row) = guild_override.clone() {
-        guild_map.insert(canonical.clone(), row);
-    }
-    if let Some(row) = global.clone() {
-        global_map.insert(canonical.clone(), row);
-    }
-    let registry = crate::defaults::effective_command_registry(&global_map, &guild_map);
+    // Effective aliases depend on peers. Read only the command section, with
+    // both layers and membership verified in the existing primary snapshot.
+    let layers = db::list_enrolled_commands(&app.db, scope).await?;
+    let guild_map = pairs_to_map(&layers.guild);
+    let global_map = pairs_to_map(&layers.global);
+    let global = command_row_by_name(&global_map, &canonical).cloned();
+    let guild_override = if guild_id == 0 {
+        // Preserve the raw global-context layer shape.
+        global.clone()
+    } else {
+        guild_command_override(guild_id, &guild_map, &canonical).cloned()
+    };
+    let none = std::collections::HashMap::new();
+    let overrides = if guild_id == 0 { &none } else { &guild_map };
+    let registry = crate::defaults::effective_command_registry(&global_map, overrides);
     let effective = registry.get(&canonical).cloned();
     Ok(Json(serde_json::json!({
         "effective": effective,
@@ -665,7 +698,7 @@ pub async fn get_command(
     })))
 }
 
-fn validate_command_descriptor(storage_name: &str, cmd: &CommandDef) -> ApiResult<()> {
+fn validate_command_descriptor(storage_name: &str, cmd: &CommandDef, scope: i64) -> ApiResult<()> {
     let valid_name = !cmd.name.is_empty()
         && cmd.name.len() <= 32
         && cmd
@@ -683,10 +716,8 @@ fn validate_command_descriptor(storage_name: &str, cmd: &CommandDef) -> ApiResul
             "command description must be 1-100 characters"
         )));
     }
-    if crate::defaults::rejects_binary_overlay_command_persist(storage_name, cmd) {
-        return Err(ApiError(anyhow::anyhow!(
-            crate::defaults::command_persist_rejected_message(storage_name)
-        )));
+    if let Some(error) = crate::defaults::command_persist_error(storage_name, cmd, scope) {
+        return Err(ApiError(anyhow::anyhow!(error)));
     }
     Ok(())
 }
@@ -704,7 +735,8 @@ pub async fn put_command(
     let name = name.to_lowercase();
     let mut data = body.data;
     data.name = name.clone();
-    validate_command_descriptor(&name, &data)?;
+    validate_command_descriptor(&name, &data, scope)?;
+    let data = crate::defaults::command_row_for_storage(&name, &data);
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     app.commit_json_actor(
@@ -712,20 +744,15 @@ pub async fn put_command(
         db::ControlOp::UpsertCommand {
             request,
             target,
-            name: name.clone(),
-            command: data.clone(),
+            name,
+            command: data,
         },
     )
     .await?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "config_patch": {
-            "kind": "command",
-            "name": name,
-            "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
-            "value": data,
-        }
-    })))
+    // No config_patch: the stored row is not the effective command. Overrides
+    // are normalized and aliases resolve across commands (#623), so one save
+    // can change other commands too. The dashboard reloads the configuration.
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn create_command(
@@ -741,7 +768,8 @@ pub async fn create_command(
     let name = body.data.name.to_lowercase();
     let mut data = body.data;
     data.name = name.clone();
-    validate_command_descriptor(&name, &data)?;
+    validate_command_descriptor(&name, &data, scope)?;
+    let data = crate::defaults::command_row_for_storage(&name, &data);
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     app.commit_json_actor(
@@ -750,20 +778,12 @@ pub async fn create_command(
             request,
             target,
             name: name.clone(),
-            command: data.clone(),
+            command: data,
         },
     )
     .await?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "name": name,
-        "config_patch": {
-            "kind": "command",
-            "name": name,
-            "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
-            "value": data,
-        }
-    })))
+    // No config_patch, as in `put_command`.
+    Ok(Json(serde_json::json!({ "ok": true, "name": name })))
 }
 
 pub async fn delete_command(
