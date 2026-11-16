@@ -5416,6 +5416,64 @@ test('a command save shows the server effective aliases of every command, not th
   }
 });
 
+test('command edits preserve saved aliases while precedence hides them', async () => {
+  const plan = { kind: 'plan', params: { steps: [{ type: 'reply', template: 'hi' }] } };
+  const custom = commandFixture('greet', plan, { aliases: [], permission: 'everyone' });
+  const ban = commandFixture('ban', { kind: 'ban', params: { default_reason: 'r', delete_days: 0 } }, { aliases: [], permission: 'mod' });
+  const warn = commandFixture('warn', { kind: 'warn', params: { default_reason: 'r' } }, { aliases: [], permission: 'mod' });
+  const cases = [
+    ['custom guild', { name: 'greet', effective: custom, guild_override: { ...custom, aliases: ['hammer'] }, global: { ...custom, aliases: ['global-alias'] } }, ['hammer']],
+    ['custom global fallback', { name: 'greet', effective: custom, guild_override: null, global: { ...custom, aliases: ['hammer'] } }, ['hammer']],
+    ['builtin vs custom name', builtinRecord(ban, { guild_override: { ...ban, builtin_override: true, aliases: ['hammer'], permission: 'everyone', behavior: { kind: 'say' } } }), ['hammer']],
+    ['builtin vs earlier builtin', builtinRecord(warn, { guild_override: { ...warn, builtin_override: true, aliases: ['hammer'] } }), ['hammer']],
+    ['explicit empty guild aliases', { name: 'greet', effective: custom, guild_override: custom, global: { ...custom, aliases: ['global-alias'] } }, []],
+    ['builtin ignores global seeds', builtinRecord({ ...ban, aliases: ['yeet', 'b'] }, { global: { ...ban, aliases: ['stale-global-alias'] } }), ['yeet', 'b']],
+  ];
+  for (const [label, record, expected] of cases) {
+    const { h, writes } = commandEditorHarness();
+    // Both an untouched save and an unrelated edit must retain the saved setting.
+    for (const edit of [false, true]) {
+      const modal = await h.app.editCommand(record);
+      assert.deepEqual(labelled(modal, 'Aliases').value.split(',').map(s => s.trim()).filter(Boolean), expected, label);
+      if (edit) await typeValue(labelled(modal, 'Description'), 'Changed description');
+      await fire(commandSave(modal), 'click');
+      const saved = writes.at(-1).body.data;
+      assert.deepEqual(saved.aliases, expected, label);
+      assert.equal(saved.description, edit ? 'Changed description' : record.effective.description, label);
+      assert.equal(saved.permission, record.effective.permission, `${label}: retain the normalized permission`);
+      assert.deepEqual(saved.behavior, record.effective.behavior, `${label}: retain the normalized behavior`);
+      assert.deepEqual(record.effective.aliases, label === 'builtin ignores global seeds' ? ['yeet', 'b'] : [], 'editing does not mutate the effective display');
+    }
+    // Preservation must not prevent an intentional replacement or removal.
+    for (const [input, expectedEdit] of [['replacement', ['replacement']], ['', []]]) {
+      const modal = await h.app.editCommand(record);
+      await typeValue(labelled(modal, 'Aliases'), input);
+      await fire(commandSave(modal), 'click');
+      assert.deepEqual(writes.at(-1).body.data.aliases, expectedEdit, label);
+    }
+  }
+});
+
+test('empty saved default subcommands stay unset until explicitly selected', async () => {
+  for (const name of ['rule', 'template', 'logchannel']) {
+    for (const builtin of [true, false]) {
+      const effective = commandFixture(builtin ? name : `custom-${name}`, { kind: name, params: { action: '' } }, { permission: 'admin' });
+      const record = builtin ? builtinRecord(effective) : { name: effective.name, effective };
+      const { h, writes } = commandEditorHarness();
+      let modal = await h.app.editCommand(record);
+      const choice = labelled(modal, 'Default subcommand');
+      assert.equal(choice.value, '', name);
+      assert.equal(choice.selectedOptions[0].textContent, 'Not set', name);
+      await fire(commandSave(modal), 'click');
+      assert.equal(writes.at(-1).body.data.behavior.params.action, '', name);
+      modal = await h.app.editCommand(record);
+      await chooseOption(labelled(modal, 'Default subcommand'), 'list');
+      await fire(commandSave(modal), 'click');
+      assert.equal(writes.at(-1).body.data.behavior.params.action, 'list', name);
+    }
+  }
+});
+
 test('action plan steps show only their own fields and round-trip every step type', async () => {
   const { h, writes } = commandEditorHarness();
   const modal = await h.app.editCommand(null);

@@ -5176,10 +5176,10 @@ function CommandBehaviorField({ spec, params, onChange }) {
     );
   if (spec.type === "choice") {
     const current = String(params[spec.key] ?? "");
-    const options = spec.options.includes(current) || !current ? spec.options : [current, ...spec.options];
+    const options = spec.options.includes(current) ? spec.options : [current, ...spec.options];
     return field(
       spec.label,
-      h(Select, { className: "select select-sm", defaultValue: current, onChange: (e) => set(e.target.value) }, options.map((value) => h("option", { key: value, value }, value))),
+      h(Select, { className: "select select-sm", defaultValue: current, onChange: (e) => set(e.target.value) }, options.map((value) => h("option", { key: value, value }, value || "Not set"))),
       help,
     );
   }
@@ -5221,7 +5221,12 @@ function CommandEditor({ record: c }) {
     if (draft.behavior.kind === "plan" && !Array.isArray(draft.behavior.params.steps)) draft.behavior.params.steps = [];
     return draft;
   });
-  const [aliasText] = useState(() => ({ value: (data.aliases || []).join(", ") }));
+  const [aliasText] = useState(() => {
+    // Precedence can hide saved aliases temporarily. Edit that saved setting,
+    // keeping the rest of the draft normalized; global built-in rows are seeds.
+    const saved = c?.guild_override || (!c?.builtin && c?.global);
+    return { value: (saved?.aliases ?? data.aliases ?? []).join(", ") };
+  });
   const [, bump] = useState(0);
   const refresh = () => bump((n) => n + 1);
   const [names, rememberUser] = useServerNames([]);
@@ -5344,7 +5349,7 @@ function CommandEditor({ record: c }) {
             placeholder: "e.g. b, yeet",
             onInput: (e) => (aliasText.value = e.target.value),
           }),
-          h("p", { className: "field-help" }, "Other names, separated by commas."),
+          h("p", { className: "field-help" }, "Other names, separated by commas. Conflicting names may be inactive."),
         ),
         field("Description", text("description", { maxLength: 100 })),
         field("Usage", text("usage", { placeholder: "e.g. !name <user> [reason]" })),
