@@ -5241,8 +5241,11 @@ function commandFixture(name, behavior, extra = {}) {
   return { name, aliases: [], category: 'Moderation', description: `The ${name} command.`, usage: `!${name} <user>`, enabled: true, permission: 'mod',
     roles: [], channels: [], cooldown_secs: 0, behavior: structuredClone(behavior), response: '', log_event: 'mod_action', ...extra };
 }
-function commandEditorHarness({ owner = false, refuse = 0 } = {}) {
+// `ack` answers a command write; `served` is the server's command list in the
+// configuration read (crates/api command_config_rows).
+function commandEditorHarness({ owner = false, refuse = 0, commands = [], ack = (body, method) => response(method === 'POST' ? { ok: true, name: body.data.name } : { ok: true }), served = () => [] } = {}) {
   const writes = [];
+  const reads = [];
   let refusals = refuse;
   const h = harness(async (url, options) => {
     if (url.endsWith('/server-names')) return response(commandNames);
@@ -5251,15 +5254,18 @@ function commandEditorHarness({ owner = false, refuse = 0 } = {}) {
       writes.push({ url, method: options.method, body });
       if (refusals > 0) { refusals--; throw new Error('command write refused'); }
       if (options.method === 'DELETE') return response({ ok: true });
-      return response({ config_patch: { kind: 'command', name: body.data.name, scope: 'guild', value: body.data } });
+      return ack(body, options.method);
     }
-    if (url.endsWith('/config')) return response({ enrollment_id: 'page-membership', settings: { prefix: '!' }, rules: [], commands: [], badwords: [], templates: [], event_types: [], log_channels: COMMAND_LOG_EVENTS.map(event => ({ event })) });
+    if (url.endsWith('/config')) {
+      reads.push(writes.length);
+      return response({ enrollment_id: 'page-membership', settings: { prefix: '!' }, rules: [], commands: served(), badwords: [], templates: [], event_types: [], log_channels: COMMAND_LOG_EVENTS.map(event => ({ event })) });
+    }
     return response({});
   });
   h.app.state.me.is_bot_owner = owner;
-  h.app.state.config = { enrollment_id: 'page-membership', commands: [], settings: { prefix: '!' }, event_types: [], log_channels: COMMAND_LOG_EVENTS.map(event => ({ event })) };
+  h.app.state.config = { enrollment_id: 'page-membership', commands, settings: { prefix: '!' }, event_types: [], log_channels: COMMAND_LOG_EVENTS.map(event => ({ event })) };
   h.app.state.tab = 'commands';
-  return { h, writes };
+  return { h, writes, reads };
 }
 const labelled = (root, label) => findNode(root, n => n.localName === 'label' && textOf(n) === label)?.control;
 const commandSave = (modal) => findNode(modal, n => n.localName === 'button' && n.textContent === 'Save');
@@ -5354,6 +5360,60 @@ test('built-in commands save per-server overrides within their permission floor 
   modal = await h.app.editCommand(builtinRecord(stats));
   assert.match(textOf(modal), /Built-ins are changed one server at a time/);
   assert.equal(commandSave(modal).hidden, true);
+});
+
+test('a command save shows the server effective aliases of every command, not the saved row', async () => {
+  // Aliases resolve across commands (src/defaults.rs): a built-in override's alias
+  // beats a custom alias, and a custom name beats a built-in override alias. The
+  // second ack is an earlier API's raw saved row, which must not be shown as effective.
+  const acks = {
+    current: (body, method) => response(method === 'POST' ? { ok: true, name: body.data.name } : { ok: true }),
+    'raw row': (body) => response({ ok: true, config_patch: { kind: 'command', name: body.data.name, scope: 'guild', value: body.data } }),
+  };
+  const ban = (aliases) => commandFixture('ban', { kind: 'ban', params: { default_reason: 'r', delete_days: 0 } }, { aliases });
+  const greet = (aliases) => commandFixture('greet', { kind: 'plan', params: { steps: [{ type: 'reply', template: 'hi' }] } }, { category: 'Custom', permission: 'everyone', aliases });
+  const banRow = (stored, effective) => builtinRecord(ban(effective), { guild_override: ban(stored) });
+  const greetRow = (stored, effective) => ({ name: 'greet', scope: 'guild', builtin: false, min_permission: null, global: null, guild_override: greet(stored), effective: greet(effective) });
+  const row = (h, name) => h.app.state.config.commands.find(c => c.name === name);
+  // The app parses in its own realm; copy before a strict deep comparison.
+  const aliases = (h, name, layer = 'effective') => [...row(h, name)[layer].aliases];
+  for (const [label, ack] of Object.entries(acks)) {
+    let served = [banRow(['yeet', 'b', 'hammer'], ['yeet', 'b', 'hammer']), greetRow([], [])];
+    const { h, writes, reads } = commandEditorHarness({ commands: structuredClone(served), ack, served: () => structuredClone(served) });
+
+    // The custom command saves alias hammer, but the ban override keeps it.
+    let modal = await h.app.editCommand(row(h, 'greet'));
+    await typeValue(labelled(modal, 'Aliases'), 'hammer');
+    served = [banRow(['yeet', 'b', 'hammer'], ['yeet', 'b', 'hammer']), greetRow(['hammer'], [])];
+    await fire(commandSave(modal), 'click');
+    assert.equal(writes.at(-1).method, 'PUT', label);
+    assert.deepEqual(writes.at(-1).body.data.aliases, ['hammer'], label);
+    assert.deepEqual(reads, [1], `${label}: the save reloads the configuration`);
+    assert.equal(modal.isConnected, false, label);
+    assert.deepEqual(aliases(h, 'greet', 'guild_override'), ['hammer'], label);
+    assert.deepEqual(aliases(h, 'greet'), [], `${label}: the edited command shows only aliases it answers to`);
+
+    // The override releases hammer: the custom peer now answers to it.
+    modal = await h.app.editCommand(row(h, 'ban'));
+    await typeValue(labelled(modal, 'Aliases'), 'yeet, b');
+    served = [banRow(['yeet', 'b'], ['yeet', 'b']), greetRow(['hammer'], ['hammer'])];
+    await fire(commandSave(modal), 'click');
+    assert.deepEqual(reads, [1, 2], label);
+    assert.deepEqual(aliases(h, 'ban'), ['yeet', 'b'], label);
+    assert.deepEqual(aliases(h, 'greet'), ['hammer'], `${label}: a peer gets back a released alias`);
+
+    // A new custom command named like an override alias takes it from the built-in.
+    served = [banRow(['yeet', 'b', 'mallet'], ['yeet', 'b', 'mallet']), greetRow(['hammer'], ['hammer'])];
+    h.app.state.config.commands = structuredClone(served);
+    modal = await h.app.editCommand(null);
+    await typeValue(labelled(modal, 'Name'), 'mallet');
+    served = [banRow(['yeet', 'b', 'mallet'], ['yeet', 'b']), greetRow(['hammer'], ['hammer']), { ...greetRow([], []), name: 'mallet', effective: { ...greet([]), name: 'mallet' }, guild_override: { ...greet([]), name: 'mallet' } }];
+    await fire(commandSave(modal), 'click');
+    assert.equal(writes.at(-1).method, 'POST', label);
+    assert.deepEqual(reads, [1, 2, 3], label);
+    assert.deepEqual(aliases(h, 'ban'), ['yeet', 'b'], `${label}: a peer loses an alias a new command name takes`);
+    assert.ok(row(h, 'mallet'), label);
+  }
 });
 
 test('action plan steps show only their own fields and round-trip every step type', async () => {

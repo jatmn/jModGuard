@@ -2692,32 +2692,8 @@ function applyConfigPatch(res) {
     else return false;
     return true;
   }
-  if (patch.kind === "command" && patch.value) {
-    config.commands ||= [];
-    let row = config.commands.find((command) => command.name === patch.name);
-    if (!row) {
-      row = {
-        name: patch.name,
-        scope: patch.scope,
-        effective: patch.value,
-        guild_override: null,
-        global: null,
-      };
-      config.commands.push(row);
-    }
-    if (patch.scope === "global") {
-      row.global = patch.value;
-      if (!row.guild_override) {
-        row.scope = "global";
-        row.effective = patch.value;
-      }
-    } else {
-      row.scope = "guild";
-      row.guild_override = patch.value;
-      row.effective = patch.value;
-    }
-    return true;
-  }
+  // A command save reloads instead (#623): built-in overrides are normalized
+  // and aliases resolve across commands, so one saved row can change others.
   if (patch.kind === "template") {
     const row = config.templates?.find((template) => template.event === patch.event);
     if (!row || (patch.value == null && (patch.scope === "global" || row.global == null))) return false;

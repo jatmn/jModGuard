@@ -278,10 +278,12 @@ are disabled to prevent duplicate saves or switching its target server. If a
 configuration refresh fails, the workspace shows **Retry** instead of stale
 settings. Server loads ignore out-of-order responses. Navigation warns before
 discarding unsaved edits, including action/step additions and removals. Ordinary
-settings, rule, badword, command and template saves apply the authoritative
+settings, rule, badword and template saves apply the authoritative
 representation returned by that mutation instead of downloading the complete
 configuration bundle again. Multi-section copies and responses without a
-representation still reload the authoritative snapshot. Other edited fields stay
+representation still reload the authoritative snapshot. Command saves always
+reload it: built-in override aliases resolve against the other commands, so
+one save can change another command's aliases. Other edited fields stay
 marked **Unsaved changes**, including when a field-specific settings action runs or
 a failed refresh needs Retry. Log-channel saves immediately show the accepted queued
 value, clear the submitted row's dirty state, and reconcile the terminal bot-action

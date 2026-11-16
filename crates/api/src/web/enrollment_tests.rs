@@ -3021,6 +3021,59 @@ async fn builtin_command_reads_apply_the_server_override_within_its_floor() {
 }
 
 #[tokio::test]
+async fn command_saves_carry_no_patch_because_aliases_resolve_across_commands() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let mut ban = crate::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "ban")
+        .expect("ban");
+    ban.aliases.push("hammer".into());
+    let (status, body) = f
+        .request(
+            "PUT",
+            "/api/guilds/10/commands/ban",
+            &serde_json::json!({"scope":"guild","data":ban}).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, serde_json::json!({"ok": true}));
+    // The saved custom row keeps `hammer`, but the override's alias wins it. A
+    // patch with the saved row would show an alias the bot runs as `ban`.
+    let mut greet = crate::defaults::custom_command_fixture("greet");
+    greet.aliases = vec!["hammer".into()];
+    let (status, body) = f
+        .request(
+            "POST",
+            "/api/guilds/10/commands",
+            &serde_json::json!({"scope":"guild","data":greet}).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, serde_json::json!({"ok": true, "name": "greet"}));
+    let (status, bundle) = f.request("POST", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::OK, "{bundle}");
+    let row = |name: &str| {
+        bundle["commands"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .find(|row| row["name"] == name)
+            .cloned()
+            .expect(name)
+    };
+    assert_eq!(
+        row("greet")["guild_override"]["aliases"],
+        serde_json::json!(["hammer"])
+    );
+    assert_eq!(row("greet")["effective"]["aliases"], serde_json::json!([]));
+    assert_eq!(
+        row("ban")["effective"]["aliases"],
+        serde_json::json!(["yeet", "b", "hammer"])
+    );
+}
+
+#[tokio::test]
 async fn individual_configuration_reads_preserve_inheritance_and_log_channel_wire_shapes() {
     let f = Fixture::new(false).await;
     f.enroll(10).await;

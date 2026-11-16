@@ -728,20 +728,15 @@ pub async fn put_command(
         db::ControlOp::UpsertCommand {
             request,
             target,
-            name: name.clone(),
-            command: data.clone(),
+            name,
+            command: data,
         },
     )
     .await?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "config_patch": {
-            "kind": "command",
-            "name": name,
-            "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
-            "value": data,
-        }
-    })))
+    // No config_patch: the stored row is not the effective command. Overrides
+    // are normalized and aliases resolve across commands (#623), so one save
+    // can change other commands too. The dashboard reloads the configuration.
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn create_command(
@@ -767,20 +762,12 @@ pub async fn create_command(
             request,
             target,
             name: name.clone(),
-            command: data.clone(),
+            command: data,
         },
     )
     .await?;
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "name": name,
-        "config_patch": {
-            "kind": "command",
-            "name": name,
-            "scope": if scope == GLOBAL_SCOPE { "global" } else { "guild" },
-            "value": data,
-        }
-    })))
+    // No config_patch, as in `put_command`.
+    Ok(Json(serde_json::json!({ "ok": true, "name": name })))
 }
 
 pub async fn delete_command(
