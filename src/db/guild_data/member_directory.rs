@@ -461,6 +461,10 @@ pub struct MemberPage {
 /// Largest ID set one directory name lookup accepts.
 pub const DIRECTORY_NAME_LOOKUP_LIMIT: usize = 32;
 
+/// Largest ID set one [`GuildDataStore::member_profiles`] lookup accepts: the
+/// subjects and moderators of one full case page.
+pub const DIRECTORY_PROFILE_LOOKUP_LIMIT: usize = 200;
+
 /// Bounded directory counts for the analytics views. `known` includes
 /// departed members still retained by ban history.
 #[derive(Debug, Clone, Serialize)]
@@ -3613,6 +3617,32 @@ impl GuildDataStore {
         self.db.with_conn(move |conn| { let tx=conn.transaction_primary_snapshot()?; verify_scope(&tx,&expected,&scope,true)?;
             let sql=format!("SELECT {PROFILE_SQL} FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3");
             let found=tx.query_row(&sql,params![scope.guild_id(),scope.enrollment.id.as_str(),user_id],profile).optional()?; tx.finish_read()?; Ok(found)
+        }).await
+    }
+
+    /// Stored directory profiles for at most [`DIRECTORY_PROFILE_LOOKUP_LIMIT`]
+    /// user IDs in one snapshot. IDs the directory has never recorded are omitted.
+    pub async fn member_profiles(
+        &self,
+        scope: GuildDataScope,
+        user_ids: Vec<i64>,
+    ) -> Result<Vec<MemberProfile>> {
+        checked_scope(self, &scope)?;
+        anyhow::ensure!(
+            user_ids.len() <= DIRECTORY_PROFILE_LOOKUP_LIMIT && user_ids.iter().all(|id| *id > 0),
+            MemberSyncError::Invalid
+        );
+        if user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = serde_json::to_string(&user_ids)?;
+        let expected = self.expected.clone();
+        self.db.with_conn(move |conn| { let tx=conn.transaction_primary_snapshot()?; verify_scope(&tx,&expected,&scope,true)?;
+            let sql=format!("SELECT {PROFILE_SQL} FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id IN (SELECT value FROM json_each(?3)) ORDER BY user_id");
+            let mut stmt=tx.prepare(&sql)?;
+            let rows=stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),ids],profile)?;
+            let mut found=Vec::new(); for row in rows { found.push(row?); } drop(stmt);
+            tx.finish_read()?; Ok(found)
         }).await
     }
 

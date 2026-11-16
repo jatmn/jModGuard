@@ -3406,7 +3406,8 @@ async fn cases_are_isolated_and_deletion_requires_administrator() {
     assert_eq!(
         body["summaries"][id],
         serde_json::json!({
-            "action": "ban", "outcome": "succeeded", "subject_id": "1", "occurred_at_ms": 1
+            "action": "ban", "outcome": "succeeded", "subject_id": "1", "actor_id": null,
+            "source_kind": "application", "occurred_at_ms": 1
         })
     );
     assert!(!body.to_string().contains(tag.as_str()));
@@ -5704,7 +5705,8 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
         assert_eq!(
             first["summaries"][id],
             serde_json::json!({
-                "action": "ban", "outcome": "succeeded", "subject_id": i64::MAX.to_string(), "occurred_at_ms": n + 1
+                "action": "ban", "outcome": "succeeded", "subject_id": i64::MAX.to_string(),
+                "actor_id": "42", "source_kind": "discord_audit", "occurred_at_ms": n + 1
             })
         );
     }
@@ -5744,6 +5746,169 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
     assert_eq!(status, StatusCode::OK, "{empty}");
     assert_eq!(empty["cases"], serde_json::json!([]));
     assert_eq!(empty["summaries"], serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn case_reads_filter_the_list_and_name_known_members() {
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource, TextEvidence,
+    };
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    // Snowflakes above 2^53 must reach the browser as exact strings.
+    let subject = 9_007_199_254_740_993_i64;
+    let moderator = 9_007_199_254_740_995_i64;
+    let author = 9_007_199_254_740_997_i64;
+    for (user_id, username, nickname) in [
+        (subject, "spammer", Some("Spammy")),
+        // An empty nickname falls back to the next stored name.
+        (moderator, "kit.mod", Some("")),
+        (author, "witness", None),
+    ] {
+        store
+            .observe_member(
+                scope.clone(),
+                db::guild_data::MemberObservation {
+                    user_id,
+                    username: Some(Some(username.into())),
+                    global_name: Some(None),
+                    nickname: Some(nickname.map(str::to_owned)),
+                    joined_at_ms: Some(900),
+                    observed_at_ms: 1_500,
+                    is_join: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let case = |n: i64, action: CaseAction, outcome: CaseOutcome, actor: Option<i64>| CaseData {
+        ban_attempt_tag: None,
+        source: CaseSource::DiscordAudit { entry_id: n },
+        action,
+        outcome,
+        subject_id: subject,
+        actor_id: actor,
+        occurred_at_ms: n,
+        reason: None,
+        evidence: CaseEvidence::Text(vec![TextEvidence {
+            channel_id: 5,
+            message_id: 6,
+            author_id: author,
+            occurred_at_ms: n,
+            text: "excerpt".into(),
+        }]),
+    };
+    let ban = CaseId::try_from(format!("{:032x}", 1)).unwrap();
+    let kick = CaseId::try_from(format!("{:032x}", 2)).unwrap();
+    let failed = CaseId::try_from(format!("{:032x}", 3)).unwrap();
+    for (id, data) in [
+        (
+            &ban,
+            case(1, CaseAction::Ban, CaseOutcome::Succeeded, Some(moderator)),
+        ),
+        (
+            &kick,
+            case(2, CaseAction::Kick, CaseOutcome::Succeeded, None),
+        ),
+        (
+            &failed,
+            case(3, CaseAction::Ban, CaseOutcome::Failed, Some(moderator)),
+        ),
+    ] {
+        store
+            .record_case(
+                scope.clone(),
+                id.clone(),
+                data,
+                crate::tenant::case_limits(),
+            )
+            .await
+            .unwrap();
+    }
+    let list = |query: String| {
+        let f = &f;
+        async move {
+            f.request("POST", &format!("/api/guilds/10/cases?{query}"), "")
+                .await
+        }
+    };
+    let (status, all) = list(String::new()).await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    assert_eq!(
+        all["names"],
+        serde_json::json!({
+            subject.to_string(): {"display_name": "Spammy", "username": "spammer"},
+            moderator.to_string(): {"display_name": "kit.mod", "username": "kit.mod"},
+        }),
+        "subjects and moderators on the page only"
+    );
+    for (query, expected) in [
+        ("action=ban".to_owned(), vec![&ban, &failed]),
+        ("outcome=failed".to_owned(), vec![&failed]),
+        ("action=ban&outcome=succeeded".to_owned(), vec![&ban]),
+        (format!("subject={subject}"), vec![&ban, &kick, &failed]),
+        (format!("actor={moderator}"), vec![&ban, &failed]),
+        (format!("actor={author}"), vec![]),
+        (format!("action=ban&actor={moderator}&limit=1"), vec![&ban]),
+        (
+            format!("action=ban&actor={moderator}&after={}", ban.as_str()),
+            vec![&failed],
+        ),
+        ("subject=&actor=".to_owned(), vec![&ban, &kick, &failed]),
+    ] {
+        let (status, page) = list(query.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {page}");
+        let expected: Vec<&str> = expected.iter().map(|id| id.as_str()).collect();
+        assert_eq!(page["cases"], serde_json::json!(expected), "{query}");
+    }
+    for bad in [
+        "action=purge",
+        "outcome=maybe",
+        "subject=abc",
+        "actor=0",
+        "removed=true&action=ban",
+    ] {
+        let (status, body) = list(bad.to_owned()).await;
+        assert_ne!(status, StatusCode::OK, "{bad}: {body}");
+    }
+    let (status, detail) = f
+        .request(
+            "POST",
+            &format!("/api/guilds/10/cases/{}", ban.as_str()),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(
+        detail["names"],
+        serde_json::json!({
+            subject.to_string(): {"display_name": "Spammy", "username": "spammer"},
+            moderator.to_string(): {"display_name": "kit.mod", "username": "kit.mod"},
+            author.to_string(): {"display_name": "witness", "username": "witness"},
+        }),
+        "subject, moderator and evidence authors"
+    );
+    let note_url = format!("/api/guilds/10/cases/{}/history", kick.as_str());
+    let note = serde_json::json!({"entry_id": "b".repeat(32), "text": "checked"}).to_string();
+    let (status, added) = f.request("POST", &note_url, &note).await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    let (status, history) = f.request("GET", &note_url, "").await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["history"].as_array().unwrap().len(), 1);
+    // The fixture's session user has no directory row, so no name is invented.
+    assert_eq!(history["names"], serde_json::json!({}));
 }
 
 #[tokio::test]

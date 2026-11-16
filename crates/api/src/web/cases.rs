@@ -1,7 +1,7 @@
 //! Private selected-case and evidence administration for an enrolled guild.
 use super::state::ApiState;
 use super::{ApiError, ApiResult, AuthCtx, GuildAccess, authorize_guild};
-use crate::db::guild_data::CaseId;
+use crate::db::guild_data::{CaseAction, CaseEvidence, CaseFilter, CaseId, CaseOutcome};
 use crate::tenant::{self, TenantError};
 use axum::Json;
 use axum::body::Body;
@@ -18,6 +18,33 @@ pub struct CasePage {
     limit: Option<u32>,
     #[serde(default)]
     removed: bool,
+    action: Option<CaseAction>,
+    outcome: Option<CaseOutcome>,
+    subject: Option<String>,
+    actor: Option<String>,
+}
+
+impl CasePage {
+    fn filter(&self) -> ApiResult<CaseFilter> {
+        let user = |raw: &Option<String>| -> ApiResult<Option<i64>> {
+            raw.as_deref()
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|id| *id > 0)
+                        .ok_or_else(|| ApiError(anyhow::anyhow!("invalid user id filter")))
+                })
+                .transpose()
+        };
+        Ok(CaseFilter {
+            action: self.action.clone(),
+            outcome: self.outcome.clone(),
+            subject_id: user(&self.subject)?,
+            actor_id: user(&self.actor)?,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -60,6 +87,36 @@ async fn live(
     crate::db::guild_data::GuildDataScope,
 )> {
     Ok(app.tenant.live(enrollment).await?)
+}
+
+/// Display names the member directory already recorded for these users, keyed by
+/// string ID. Names are presentation only: a directory that is unavailable or has
+/// not seen a user leaves that user out instead of failing the case read.
+async fn directory_names(
+    store: &crate::db::guild_data::GuildDataStore,
+    scope: crate::db::guild_data::GuildDataScope,
+    ids: impl IntoIterator<Item = i64>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut ids: Vec<i64> = ids.into_iter().filter(|id| *id > 0).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.truncate(crate::db::guild_data::DIRECTORY_PROFILE_LOOKUP_LIMIT);
+    let profiles = store.member_profiles(scope, ids).await.unwrap_or_default();
+    let present = |name: &Option<String>| name.clone().filter(|name| !name.is_empty());
+    profiles
+        .into_iter()
+        .filter_map(|p| {
+            // The Members display order: nickname, then global name, then username.
+            let display_name = present(&p.nickname)
+                .or_else(|| present(&p.global_name))
+                .or_else(|| present(&p.username))?;
+            let entry = serde_json::json!({
+                "display_name": display_name,
+                "username": present(&p.username),
+            });
+            Some((p.user_id, entry))
+        })
+        .collect()
 }
 
 fn parse_case_id(id: &str) -> ApiResult<CaseId> {
@@ -105,7 +162,13 @@ async fn list_cases_inner(
         .limit
         .unwrap_or(50)
         .clamp(1, tenant::case_limits().max_page_size);
+    let filter = page.filter()?;
     let ids = if page.removed {
+        if filter != CaseFilter::default() {
+            return Err(ApiError(anyhow::anyhow!(
+                "removed records cannot be filtered"
+            )));
+        }
         if !can_delete_cases(&auth, guild_id) {
             return Err(ApiError(anyhow::anyhow!(
                 "case cleanup requires Administrator permission"
@@ -116,7 +179,7 @@ async fn list_cases_inner(
             .await?
     } else {
         store
-            .case_ids(scope.clone(), after, limit, tenant::case_limits())
+            .matching_case_ids(scope.clone(), after, limit, filter, tenant::case_limits())
             .await?
     };
     // Keep the ID page (including its cursor) stable if a case is removed
@@ -125,12 +188,19 @@ async fn list_cases_inner(
         std::collections::BTreeMap::new()
     } else {
         store
-            .case_summaries(scope, ids.clone(), tenant::case_limits())
+            .case_summaries(scope.clone(), ids.clone(), tenant::case_limits())
             .await?
     };
+    let people = summaries
+        .values()
+        .flat_map(|summary| [Some(summary.subject_id), summary.actor_id])
+        .flatten()
+        .collect::<Vec<_>>();
+    let names = directory_names(&store, scope, people).await;
     Ok(Json(serde_json::json!({
         "cases": ids.into_iter().map(|id| id.as_str().to_owned()).collect::<Vec<_>>(),
         "summaries": summaries,
+        "names": names,
         "can_delete": can_delete_cases(&auth, guild_id),
     })))
 }
@@ -151,9 +221,19 @@ pub async fn get_case(
     else {
         return Err(ApiError(anyhow::anyhow!("case not found")));
     };
+    let authors = match &data.evidence {
+        CaseEvidence::Text(items) => items.iter().map(|item| item.author_id).collect(),
+        CaseEvidence::Unavailable => Vec::new(),
+    };
+    let people = [Some(data.subject_id), data.actor_id]
+        .into_iter()
+        .flatten()
+        .chain(authors);
+    let names = directory_names(&store, scope, people).await;
     Ok(Json(serde_json::json!({
         "id": case_id,
         "case": data,
+        "names": names,
         "can_delete": can_delete_cases(&auth, guild_id),
     })))
 }
@@ -184,6 +264,7 @@ pub async fn list_history(
         )
         .await?;
     let mut entries = Vec::new();
+    let mut actors = Vec::new();
     for item in refs {
         if let Some(data) = store
             .case_history_entry(
@@ -194,6 +275,7 @@ pub async fn list_history(
             )
             .await?
         {
+            actors.extend(data.actor_id);
             entries.push(serde_json::json!({
                 "id": item.id.as_str(),
                 "sequence": item.sequence.to_string(),
@@ -201,7 +283,10 @@ pub async fn list_history(
             }));
         }
     }
-    Ok(Json(serde_json::json!({ "history": entries })))
+    let names = directory_names(&store, scope, actors).await;
+    Ok(Json(
+        serde_json::json!({ "history": entries, "names": names }),
+    ))
 }
 
 pub async fn add_note(

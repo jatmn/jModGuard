@@ -31,6 +31,10 @@ export const ICON_PATHS = {
   "log-out": ["M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4", "M16 17l5-5l-5-5", "M21 12H9"],
   "external-link": ["M14 4h6v6", "M20 4l-9 9", "M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"],
   "arrow-left": ["M19 12H5", "M11 6l-6 6l6 6"],
+  // Case file: timeout actions, notes and evidence attachments.
+  clock: ["M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0", "M12 7v5l3 2"],
+  "message-square": ["M5 4h14a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1h-8l-5 4v-4H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"],
+  paperclip: ["M20 11l-8 8a5 5 0 0 1-7-7l8-8a3.5 3.5 0 0 1 5 5l-8 8a2 2 0 0 1-3-3l7-7"],
   // Sorted table column direction.
   "chevron-down": ["M6 9l6 6l6-6"],
   "chevron-up": ["M6 15l6-6l6 6"],

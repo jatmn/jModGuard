@@ -70,6 +70,14 @@ impl CaseSource {
         }
     }
 }
+/// The variant of a [`CaseSource`] without its identifier, for list summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseSourceKind {
+    Application,
+    GatewayObservation,
+    DiscordAudit,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaseAction {
@@ -182,7 +190,7 @@ pub struct CaseData {
     pub evidence: CaseEvidence,
 }
 
-/// Private list fields only; reason, actor, source and evidence remain detail-only.
+/// Private list fields only; reason, source identifiers and evidence remain detail-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaseSummary {
     pub action: CaseAction,
@@ -192,7 +200,46 @@ pub struct CaseSummary {
         deserialize_with = "crate::ids::de_i64"
     )]
     pub subject_id: i64,
+    #[serde(
+        default,
+        serialize_with = "crate::ids::ser_opt_i64_str",
+        deserialize_with = "crate::ids::de_opt_i64"
+    )]
+    pub actor_id: Option<i64>,
+    /// Lets a list tell a bot-recorded case with no actor from an unknown moderator.
+    pub source_kind: CaseSourceKind,
     pub occurred_at_ms: i64,
+}
+
+/// Optional exact-match filters for a live case ID page. Every set field must match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaseFilter {
+    pub action: Option<CaseAction>,
+    pub outcome: Option<CaseOutcome>,
+    pub subject_id: Option<i64>,
+    pub actor_id: Option<i64>,
+}
+
+impl CaseFilter {
+    /// Stored JSON values to compare, in SQL parameter order. Snowflakes are stored as strings.
+    fn sql_values(&self) -> Result<[Option<String>; 4]> {
+        anyhow::ensure!(
+            self.subject_id.is_none_or(|id| id > 0) && self.actor_id.is_none_or(|id| id > 0),
+            CaseError::Invalid
+        );
+        fn tag<T: Serialize>(value: &T) -> Result<String> {
+            match serde_json::to_value(value)? {
+                serde_json::Value::String(tag) => Ok(tag),
+                _ => Err(CaseError::Invalid.into()),
+            }
+        }
+        Ok([
+            self.action.as_ref().map(tag).transpose()?,
+            self.outcome.as_ref().map(tag).transpose()?,
+            self.subject_id.map(|id| id.to_string()),
+            self.actor_id.map(|id| id.to_string()),
+        ])
+    }
 }
 
 /// Trusted installation budgets, configurable by future operator settings. No age expiry.
@@ -465,6 +512,8 @@ impl GuildDataStore {
                     json_object('action',json_extract(payload,'$.action'),
                                 'outcome',json_extract(payload,'$.outcome'),
                                 'subject_id',json_extract(payload,'$.subject_id'),
+                                'actor_id',json_extract(payload,'$.actor_id'),
+                                'source_kind',(SELECT key FROM json_each(payload,'$.source')),
                                 'occurred_at_ms',json_extract(payload,'$.occurred_at_ms'))
                     ELSE NULL END
                  FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0
@@ -485,7 +534,9 @@ impl GuildDataStore {
                     let payload = payload.ok_or(CaseError::Limit)?;
                     let summary: CaseSummary = serde_json::from_str(&payload)?;
                     anyhow::ensure!(
-                        summary.subject_id > 0 && summary.occurred_at_ms > 0,
+                        summary.subject_id > 0
+                            && summary.actor_id.is_none_or(|id| id > 0)
+                            && summary.occurred_at_ms > 0,
                         CaseError::Invalid
                     );
                     summaries.insert(id, summary);
@@ -505,7 +556,22 @@ impl GuildDataStore {
         count: u32,
         limits: CaseLimits,
     ) -> Result<Vec<CaseId>> {
-        self.case_ids_by_removal(scope, after, count, limits, false)
+        self.case_ids_by_removal(scope, after, count, limits, false, CaseFilter::default())
+            .await
+    }
+
+    /// [`Self::case_ids`] limited to live records whose stored facts match every set
+    /// filter field. Still a keyset page in opaque ID order; a narrow filter may read
+    /// past many non-matching rows to fill it.
+    pub async fn matching_case_ids(
+        &self,
+        scope: GuildDataScope,
+        after: Option<CaseId>,
+        count: u32,
+        filter: CaseFilter,
+        limits: CaseLimits,
+    ) -> Result<Vec<CaseId>> {
+        self.case_ids_by_removal(scope, after, count, limits, false, filter)
             .await
     }
 
@@ -517,7 +583,7 @@ impl GuildDataStore {
         count: u32,
         limits: CaseLimits,
     ) -> Result<Vec<CaseId>> {
-        self.case_ids_by_removal(scope, after, count, limits, true)
+        self.case_ids_by_removal(scope, after, count, limits, true, CaseFilter::default())
             .await
     }
 
@@ -528,15 +594,23 @@ impl GuildDataStore {
         count: u32,
         limits: CaseLimits,
         removed: bool,
+        filter: CaseFilter,
     ) -> Result<Vec<CaseId>> {
         self.check_target(&scope.placement)?;
         limits.page(count)?;
+        let [action, outcome, subject, actor] = filter.sql_values()?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
             let tx = conn.transaction_primary_snapshot()?;
             verify_scope(&tx, &expected, &scope, true)?;
-            let mut stmt = tx.prepare("SELECT case_id FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=?5 AND case_id>?3 ORDER BY case_id LIMIT ?4")?;
-            let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_ref().map_or("",CaseId::as_str),count as i64,removed], |r| Ok(r.get::<String>(0)?))?;
+            // Removed rows keep no payload, so callers filter live pages only.
+            let mut stmt = tx.prepare("SELECT case_id FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=?5 AND case_id>?3
+                AND (?6 IS NULL OR json_extract(payload,'$.action')=?6)
+                AND (?7 IS NULL OR json_extract(payload,'$.outcome')=?7)
+                AND (?8 IS NULL OR json_extract(payload,'$.subject_id')=?8)
+                AND (?9 IS NULL OR json_extract(payload,'$.actor_id')=?9)
+                ORDER BY case_id LIMIT ?4")?;
+            let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_ref().map_or("",CaseId::as_str),count as i64,removed,action,outcome,subject,actor], |r| Ok(r.get::<String>(0)?))?;
             let mut ids = Vec::new();
             for row in rows { ids.push(CaseId::try_from(row?)?); }
             drop(stmt);

@@ -59,8 +59,13 @@ asynchronous effects and carry it through result recording; completion never ado
 replacement enrollment.
 
 The dashboard Cases tab pages through the current membership's records in opaque ID
-order, displays all admitted history (up to 64 entries) and selected inline text, and
-provides authorized private evidence downloads. Case removal clears retained private facts in the guild-store
+order and filters them by action, outcome, subject and moderator. Subjects and moderators
+show the names the member directory already stored; unknown users keep their IDs.
+Opening a case shows its case file in a dialog: it reads the case, all admitted history
+(up to 64 entries), the evidence index and, for settings-level access, channel names
+together (read-only access keeps channel IDs), then shows a readable
+timeline, the selected inline text as message cards, previews of image evidence and
+authorized private evidence downloads. Case removal clears retained private facts in the guild-store
 journal immediately. It does not reverse a Discord action. The delete HTTP response reports
 `removed` for that journal step; `cleanup_pending` is true when object-backend cleanup
 could not finish in the same request. The administrator-only

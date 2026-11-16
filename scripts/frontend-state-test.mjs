@@ -99,7 +99,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
     React, useSyncExternalStore, useState, useEffect, useLayoutEffect, useRef, createContext, useContext, createRoot, flushSync,
     Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea,
-    fetch: fetchImpl, console, AbortController, URLSearchParams, Event: win.Event, Date: TestDate,
+    fetch: fetchImpl, console, AbortController, URLSearchParams, URL: win.URL, Blob: win.Blob, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
   const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId, COMMAND_BEHAVIORS, PLAN_STEP_LABELS, planStepFor})`, context);
@@ -912,6 +912,7 @@ for (const route of ['same guild', 'late callback', 'cancelled navigation']) tes
   if (route === 'same guild') {
     assert.ok(calls.includes(`/api/guilds/${originalGuild}/cases/case-one`));
     assert.equal(h.app.state.tab, 'cases');
+    assert.ok(h.document.querySelector('.case-view'), 'the handoff opens the case file dialog');
   } else {
     h.app.state.guildId = h.app.state.guilds[1].id;
     h.app.tabCases();
@@ -3334,7 +3335,7 @@ test('checkbox labels keep primary text color', () => {
 const firefoxBinary = (process.env.PATH || '').split(path.delimiter).map(dir => path.join(dir, 'firefox'))
   .find(file => { try { fs.accessSync(file, fs.constants.X_OK); return true; } catch { return false; } });
 
-async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', name: 'Guild' }], memberSync = {}) {
+async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', name: 'Guild' }], memberSync = {}, routes = () => false) {
   const dist = new URL('../dist/frontend/', import.meta.url);
   const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
   const server = http.createServer((req, res) => {
@@ -3347,6 +3348,7 @@ async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', 
     if (url.pathname.endsWith('/config')) return json({ enrollment_id: 'e1', settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
     if (url.pathname.endsWith('/analytics')) return json(browserAnalytics(Number(url.searchParams.get('days')) || 30));
     if (url.pathname.endsWith('/member-sync')) return json(memberSync);
+    if (routes(url, json, res)) return;
     if (url.pathname.startsWith('/api/')) return json({});
     const file = new URL(url.pathname === '/' ? 'index.html' : url.pathname.slice(1), dist);
     if (!file.href.startsWith(dist.href) || !fs.existsSync(file)) { res.writeHead(404); return res.end(); }
@@ -3793,6 +3795,80 @@ test('Members partial-import explanation opens inside narrow screens', { timeout
   }
 });
 
+// #624: in the real layout engine, viewing the last case of a full page opens its file on screen.
+const caseFileProbe = `(async () => {
+  const wait = () => new Promise(resolve => setTimeout(resolve, 50));
+  const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  for (let i = 0; i < 200 && !document.querySelector('#tabs'); i++) await wait();
+  [...document.querySelectorAll('#tabs button')].find(button => /Cases/.test(button.textContent)).click();
+  for (let i = 0; i < 200 && document.querySelectorAll('tbody tr').length < 50; i++) await wait();
+  const buttons = [...document.querySelectorAll('button[aria-label^="Open case"]')];
+  const pageHeight = document.documentElement.scrollHeight;
+  buttons.at(-1).click();
+  for (let i = 0; i < 200 && !document.querySelector('.case-view .case-who'); i++) await wait();
+  for (let i = 0; i < 100 && !document.querySelector('.case-file img')?.naturalWidth; i++) await wait();
+  await frame();
+  const rect = element => { const { top, bottom, left, right } = element.getBoundingClientRect(); return { top, bottom, left, right }; };
+  const view = document.querySelector('.case-view');
+  const cards = [...document.querySelectorAll('.case-person-card')].map(rect);
+  return JSON.stringify({ rows: buttons.length, pageHeight, viewport: { width: innerWidth, height: innerHeight },
+    dialog: rect(view), header: document.querySelector('.case-header h2').textContent, cards,
+    overflow: view.scrollWidth - view.clientWidth, image: document.querySelector('.case-file img')?.naturalWidth || 0,
+    actions: rect(document.querySelector('.case-actions')) });
+})()`;
+
+test('the last case of a full page opens on screen and its file stacks on narrow screens', { timeout: 180000 }, async t => {
+  const missing = !firefoxBinary ? 'Firefox is not on PATH'
+    : !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url)) ? 'dist/frontend is not built (npm run build --prefix tools/webui)' : null;
+  if (missing) {
+    assert.ok(!process.env.CI, `${missing}; CI requires this browser layout check`);
+    t.skip(missing);
+    return;
+  }
+  const domEvent = globalThis.Event;
+  globalThis.Event = NodeEvent;
+  let server, browser;
+  t.after(async () => {
+    await browser?.close();
+    if (server) await new Promise(resolve => server.close(resolve));
+    globalThis.Event = domEvent;
+  });
+  const ids = Array.from({ length: 50 }, (_, i) => (i + 1).toString(16).padStart(32, '0'));
+  const names = { '300000000000000001': { display_name: 'Spammy', username: 'spammer' }, '300000000000000002': { display_name: 'Kit Mod', username: 'kit.mod' } };
+  const summary = { action: 'ban', outcome: 'succeeded', subject_id: '300000000000000001', actor_id: '300000000000000002', occurred_at_ms: 1790000000000 };
+  // A 1x1 PNG: the evidence preview recognises it by its signature.
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC', 'base64');
+  server = await serveBuiltApp(() => false, undefined, {}, (url, json, res) => {
+    if (url.pathname.endsWith('/cases')) return json({ cases: ids, names, can_delete: true, summaries: Object.fromEntries(ids.map(id => [id, summary])) }), true;
+    if (/\/evidence\/[0-9a-f]{32}$/.test(url.pathname)) { res.writeHead(200, { 'content-type': 'application/octet-stream' }); res.end(png); return true; }
+    if (url.pathname.endsWith('/evidence')) return json({ evidence: [{ id: 'e'.repeat(32), bytes: png.length, channel_id: '400', message_id: '500', attachment_id: '600' }] }), true;
+    if (url.pathname.endsWith('/history')) return json({ history: [{ id: 'h1', sequence: '1', entry: { actor_id: '300000000000000002', recorded_at_ms: 1790000100000, body: { note: { text: 'Checked.' } } } }], names }), true;
+    if (/\/cases\/[0-9a-f]{32}$/.test(url.pathname)) return json({ case: { ...summary, source: { application: { operation_id: 'd'.repeat(32) } }, reason: 'Phishing link',
+      evidence: { text: [{ channel_id: '400', message_id: '500', author_id: '300000000000000001', occurred_at_ms: 1789999990000, text: 'free nitro' }] } }, can_delete: true, names }), true;
+    return false;
+  });
+  browser = await launchFirefox();
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  for (const [width, height] of [[1280, 800], [390, 800]]) {
+    await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height } });
+    await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
+    const { result } = await browser.send('script.evaluate', { expression: caseFileProbe, target: { context: browser.context }, awaitPromise: true });
+    assert.ok(result?.value, `${width}px: probe failed ${JSON.stringify(result)}`);
+    const m = JSON.parse(result.value);
+    assert.equal(m.rows, 50);
+    assert.ok(m.pageHeight > m.viewport.height * 2, `${width}px: the full page scrolls, so a card below it would be off screen`);
+    assert.equal(m.header, `Case ${ids.at(-1).slice(0, 8)}`);
+    assert.ok(m.dialog.top >= 0 && m.dialog.bottom <= m.viewport.height && m.dialog.left >= 0 && m.dialog.right <= m.viewport.width,
+      `${width}px: case file ${JSON.stringify(m.dialog)} outside the viewport ${JSON.stringify(m.viewport)}`);
+    assert.ok(m.actions.bottom <= m.viewport.height, `${width}px: the action bar stays reachable`);
+    assert.ok(m.overflow <= 0, `${width}px: the case file scrolls sideways by ${m.overflow}px`);
+    assert.ok(m.image > 0, `${width}px: the image evidence shows a preview`);
+    const [subject, moderator] = m.cards;
+    if (width < 720) assert.ok(moderator.top >= subject.bottom, `${width}px: Who cards stack`);
+    else assert.equal(Math.round(moderator.top), Math.round(subject.top), `${width}px: Who cards sit side by side`);
+  }
+});
+
 test('text rule UI can save independent thresholds without generic escalation', async () => {
   const calls=[];
   const h=harness(async (url, options) => {
@@ -3833,6 +3909,16 @@ test('image test UI rejects invalid thresholds before the API request', async ()
 });
 
 
+// #624: case details open in the shared dialog, outside the Cases list's own container.
+const caseDialog = h => h.document.querySelector('.case-view');
+// The dialog belongs to the application's main view, so these tests open Cases the way the sidebar does.
+async function casesView(h) {
+  h.app.state.config ??= { enrollment_id: 'membership' };
+  h.app.navigate('cases');
+  await settle();
+  return h.document.querySelector('#content');
+}
+
 test('case administration reaches later pages, all admitted history and inline evidence', async () => {
   const ids = Array.from({length: 51}, (_, i) => (i + 1).toString(16).padStart(32, '0'));
   const calls = [];
@@ -3840,14 +3926,16 @@ test('case administration reaches later pages, all admitted history and inline e
     calls.push(url);
     const u = new URL(url, 'https://fixture.test');
     if (u.pathname.endsWith('/history')) {
+      // The history contract admits 64 entries; a full page reads on after its last sequence.
       const start = Number(u.searchParams.get('after'));
-      return response({history: Array.from({length: 32}, (_, i) => ({sequence: String(start + i + 1), entry: {body: {text: `note ${start + i + 1}`}}}))});
+      const count = Math.max(0, Math.min(Number(u.searchParams.get('limit')), 64 - start));
+      return response({history: Array.from({length: count}, (_, i) => ({id: `n${start + i + 1}`, sequence: String(start + i + 1), entry: {recorded_at_ms: 1, body: {note: {text: `note ${start + i + 1}`}}}}))});
     }
     if (u.pathname.endsWith('/evidence')) return response({evidence: []});
     if (u.pathname.endsWith('/cases')) return response({cases: u.searchParams.has('after') ? ids.slice(50) : ids.slice(0, 50), can_delete: true});
     return response({can_delete: true, case: {action: 'warning', evidence: {text: [{text: '<script>literal excerpt</script>', message_id: '9', channel_id: '8', author_id: '7'}]}}});
   });
-  const root = h.app.tabCases();
+  const root = await casesView(h);
   await settle();
   const next = findNode(root, n => n.localName === 'button' && n.textContent === 'Next page');
   assert.equal(next.disabled, false);
@@ -3857,9 +3945,12 @@ test('case administration reaches later pages, all admitted history and inline e
   const caseButton = findNode(root, n => n.localName === 'button' && n.getAttribute('aria-label') === `Open case ${ids[50]}`);
   fire(caseButton, 'click');
   await settle();
-  assert.ok(textOf(root).includes('note 33'));
-  assert.ok(textOf(root).includes('note 64'));
-  const excerpt = findNode(root, n => n.localName === 'pre');
+  const dialog = caseDialog(h);
+  assert.ok(dialog, 'the case opens in a dialog');
+  assert.ok(textOf(dialog).includes('note 1'));
+  assert.ok(textOf(dialog).includes('note 64'));
+  assert.deepEqual(calls.filter(url => url.includes('/history')).map(url => new URL(url, 'https://fixture.test').searchParams.get('after')), ['0', '64']);
+  const excerpt = findNode(dialog, n => n.localName === 'pre');
   assert.equal(excerpt.textContent, '<script>literal excerpt</script>');
   assert.equal(next.disabled, true);
 });
@@ -3897,12 +3988,12 @@ test('note retry retains intent after a lost response and blocks overlapping sub
     if (url.includes('/cases?')) return response({cases: [id]});
     return response({case: {action: 'warning', evidence: {}}, can_delete: true});
   });
-  const root = h.app.tabCases();
+  const root = await casesView(h);
   await settle();
   fire(findNode(root, n => n.localName === 'button' && n.getAttribute('aria-label') === `Open case ${id}`), 'click');
   await settle();
-  const note = findNode(root, n => n.localName === 'textarea');
-  const submit = findNode(root, n => n.localName === 'button' && n.textContent === 'Add note');
+  const note = findNode(caseDialog(h), n => n.localName === 'textarea');
+  const submit = findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Add note');
   assert.ok(note, textOf(root));
   note.value = 'same note';
   const first = fire(submit, 'click');
@@ -3925,19 +4016,17 @@ test('acknowledged case note no longer leaves a false unsaved warning', async ()
     if (url.includes('/cases?')) return response({ cases: [id] });
     return response({ case: { action: 'warning', evidence: {} }, can_delete: true });
   });
-  h.app.state.tab = 'cases';
-  const root = h.app.tabCases();
-  h.nodes.get('#content').append(root);
+  const root = await casesView(h);
   await settle();
   fire(findNode(root, n => n.localName === 'button' && n.getAttribute('aria-label') === `Open case ${id}`), 'click');
   await settle();
-  const note = findNode(root, n => n.localName === 'textarea');
+  const note = findNode(caseDialog(h), n => n.localName === 'textarea');
   note.value = 'saved note';
   h.app.markDirty();
-  const submit = findNode(root, n => n.localName === 'button' && n.textContent === 'Add note');
+  const submit = findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Add note');
   await fire(submit, 'click', {});
   assert.equal(h.app.isDirty(), false);
-  assert.equal(findNode(root, n => n.localName === 'textarea').value, '', 'acknowledged note must not remain as a fresh draft');
+  assert.equal(findNode(caseDialog(h), n => n.localName === 'textarea').value, '', 'acknowledged note must not remain as a fresh draft');
 });
 
 // Exercise the mounted template preview, including draft edits, through its real renderer.
@@ -6308,7 +6397,8 @@ for (const count of [0, 1, 50]) test(`Cases renders ${count} summaries with one 
   assert.match(calls[0], /\/cases\?/);
   if (count) {
     assert.equal(panel.querySelectorAll('tbody tr').length, count);
-    assert.match(textOf(panel), /bansucceeded9007199254740993/);
+    // Without a directory name the subject keeps its exact ID; no moderator was recorded.
+    assert.match(textOf(panel), /BanSucceeded9007199254740993Not recorded/);
   } else assert.match(textOf(panel), /No selected cases on this page/);
 });
 
@@ -8240,26 +8330,325 @@ test('Cases record actions are colored icons and removal stays limited to permit
     return response({ can_delete: canDelete, case: { action: 'ban' } });
   };
   const h = harness(fixture(true));
-  const root = h.app.tabCases();
+  const root = await casesView(h);
   await settle();
   assertIconAction(iconAction(root, `Open case ${id}`), 'view', `Open case ${id}`);
   assert.match(textOf(root), new RegExp(id.slice(0, 8)), 'the short case ID stays visible');
   assert.equal(assertIconRows(root), 1);
   await fire(iconAction(root, `Open case ${id}`), 'click', {});
   await settle();
-  assertIconAction(iconAction(root, 'Remove case record'), 'remove', 'Remove case record');
-  assertIconAction(iconAction(root, 'Download evidence-1'), 'download', 'Download evidence-1');
+  // Removal is a labelled action in the case file's action bar, drawn with the remove icon.
+  const remove = findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Remove case record');
+  assert.ok(remove, 'removal is offered');
+  assert.equal(remove.querySelector('svg').getAttribute('data-icon'), iconSet.ACTION_ICONS.remove.icon);
+  assert.ok(remove.querySelector('svg').classList.contains(`icon-${iconSet.ACTION_ICONS.remove.intent}`));
+  assert.match(remove.getAttribute('title'), /Discord isn't changed/);
+  assertIconAction(iconAction(caseDialog(h), 'Download evidence-1'), 'download', 'Download evidence-1');
+  await fire(iconAction(caseDialog(h), 'Close case'), 'click', {});
+  assert.equal(caseDialog(h), null, 'Close case closes the dialog');
   fire(findNode(root, n => n.textContent === 'Removed records / retry cleanup'), 'click');
   await settle();
   assertIconAction(iconAction(root, 'Retry cleanup'), 'retry', 'Retry cleanup');
   assert.equal(assertIconRows(root), 1);
 
   const limited = harness(fixture(false));
-  const view = limited.app.tabCases();
+  const view = await casesView(limited);
   await settle();
   await fire(iconAction(view, `Open case ${id}`), 'click', {});
   await settle();
-  assert.equal(iconAction(view, 'Remove case record'), null, 'only permitted roles see case removal');
+  assert.ok(caseDialog(limited));
+  assert.equal(findNode(caseDialog(limited), n => n.localName === 'button' && n.textContent === 'Remove case record'), null, 'only permitted roles see case removal');
+});
+
+// #624 case file: fixtures shared by the dialog tests.
+const CASE_ID = 'c'.repeat(32);
+const CASE_SUBJECT = '9007199254740993';
+const CASE_MODERATOR = '9007199254740995';
+const CASE_AUTHOR = '9007199254740997';
+const caseNames = {
+  [CASE_SUBJECT]: { display_name: 'Spammy', username: 'spammer' },
+  [CASE_MODERATOR]: { display_name: 'Kit Mod', username: 'kit.mod' },
+  [CASE_AUTHOR]: { display_name: 'Witness', username: null },
+};
+const caseRecord = (extra = {}) => ({
+  source: { application: { operation_id: 'd'.repeat(32) } }, action: 'ban', outcome: 'succeeded',
+  subject_id: CASE_SUBJECT, actor_id: CASE_MODERATOR, occurred_at_ms: 1790000000000, reason: 'Posted a phishing link',
+  evidence: { text: [{ channel_id: '400', message_id: '500', author_id: CASE_AUTHOR, occurred_at_ms: 1789999990000, text: 'free nitro here' }] },
+  ...extra,
+});
+const caseHistory = [
+  { id: 'h1', sequence: '1', entry: { actor_id: CASE_MODERATOR, recorded_at_ms: 1790000100000, body: { note: { text: 'Checked the link.' } } } },
+  { id: 'h2', sequence: '2', entry: { actor_id: CASE_MODERATOR, recorded_at_ms: 1790000200000, body: { correction: { outcome: 'failed', reason: { set: 'Phishing' }, explanation: 'Discord refused.' } } } },
+  { id: 'h3', sequence: '3', entry: { actor_id: null, recorded_at_ms: 1790000300000, body: { policy: { rule_id: 'invite_spam', revision: '7', description: 'Invite links in 4 channels' } } } },
+];
+function caseFixture(overrides = {}) {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, method: options.method, body: options.body });
+    const u = new URL(url, 'https://fixture.test');
+    for (const [suffix, handler] of Object.entries(overrides)) if (u.pathname.endsWith(suffix)) return handler(u, options, calls);
+    if (u.pathname.endsWith('/server-names')) return response({ roles: [], channels: [{ id: '400', name: 'general', kind: 'text' }] });
+    if (u.pathname.endsWith('/history')) return response({ history: caseHistory, names: { [CASE_MODERATOR]: caseNames[CASE_MODERATOR] } });
+    if (u.pathname.endsWith('/evidence')) return response({ evidence: [{ id: 'e'.repeat(32), bytes: 2048, channel_id: '400', message_id: '500', attachment_id: '600' }] });
+    if (u.pathname.endsWith(`/cases/${CASE_ID}`)) return response({ id: CASE_ID, case: caseRecord(), can_delete: true, names: caseNames });
+    if (u.pathname.endsWith('/cases')) return response({ cases: [CASE_ID], can_delete: true, names: caseNames,
+      summaries: { [CASE_ID]: { action: 'ban', outcome: 'succeeded', subject_id: CASE_SUBJECT, actor_id: CASE_MODERATOR, occurred_at_ms: 1790000000000 } } });
+    return response({});
+  };
+  return { calls, fetchImpl };
+}
+
+test('Case view opens the last row of a full page in a dialog and loads case, history, evidence and names together', async () => {
+  const ids = Array.from({ length: 50 }, (_, i) => (i + 1).toString(16).padStart(32, '0'));
+  const pending = [];
+  const calls = [];
+  const h = harness(async (url, options = {}) => {
+    calls.push(url);
+    const u = new URL(url, 'https://fixture.test');
+    if (u.pathname.endsWith('/cases')) return response({ cases: ids, names: caseNames,
+      summaries: Object.fromEntries(ids.map(id => [id, { action: 'ban', outcome: 'succeeded', subject_id: CASE_SUBJECT, actor_id: null, occurred_at_ms: 1790000000000 }])) });
+    return new Promise(resolve => pending.push({ path: u.pathname, resolve }));
+  });
+  const root = await casesView(h);
+  await settle();
+  assert.equal(root.querySelectorAll('tbody tr').length, 50);
+  assert.match(textOf(root.querySelector('tbody tr')), /Spammy@spammer/, 'the list names the subject');
+  assert.match(textOf(root.querySelector('tbody tr')), /Not recorded/);
+  const last = ids.at(-1);
+  await fire(findNode(root, n => n.getAttribute?.('aria-label') === `Open case ${last}`), 'click', {});
+  const dialog = caseDialog(h);
+  assert.ok(dialog, 'the dialog opens at once');
+  assert.equal(h.document.querySelector('.modal-overlay').getAttribute('aria-label'), `Case ${last.slice(0, 8)}`);
+  assert.match(dialog.querySelector('[role="status"]').textContent, /Loading case/);
+  assert.equal(h.app.isBusy(), false, 'opening a case does not grey out the page');
+  // Every read starts before any answers.
+  assert.deepEqual(pending.map(p => p.path.replace(`/api/guilds/${h.app.state.guildId}`, '')).filter(path => /cases|server-names/.test(path)).sort(),
+    [`/cases/${last}`, `/cases/${last}/evidence`, `/cases/${last}/history`, '/server-names'].sort());
+  for (const p of pending) {
+    if (p.path.endsWith('/server-names')) p.resolve(response({ roles: [], channels: [{ id: '400', name: 'general', kind: 'text' }] }));
+    else if (p.path.endsWith('/history')) p.resolve(response({ history: caseHistory, names: { [CASE_MODERATOR]: caseNames[CASE_MODERATOR] } }));
+    else if (p.path.endsWith('/evidence')) p.resolve(response({ evidence: [] }));
+    else if (p.path.endsWith(`/cases/${last}`)) p.resolve(response({ id: last, case: caseRecord(), can_delete: false, names: caseNames }));
+    else p.resolve(response({}));
+  }
+  await settle();
+  const text = textOf(caseDialog(h));
+  assert.equal(caseDialog(h).querySelector('[role="status"]'), null);
+  for (const expected of [`Case ${last.slice(0, 8)}`, 'Ban', 'Succeeded', 'First',
+    'SubjectSpammy@spammer', CASE_SUBJECT, 'ModeratorKit Mod@kit.mod', CASE_MODERATOR,
+    'Posted a phishing link', 'Ban recorded', 'By Kit Mod', 'Discord action succeeded',
+    'Note added by Kit Mod', 'Checked the link.', 'Record corrected by Kit Mod', 'Outcome set to Failed.',
+    'Reason changed to: Phishing', 'Discord refused.', 'Rule matched', 'Invite links in 4 channels', 'Rule: Invite links in 4 channels',
+    'Witness', 'in #general', 'free nitro here'])
+    assert.ok(text.includes(expected), `case file shows ${expected}: ${text}`);
+  assert.doesNotMatch(text, /[{}]|"note"|"text"/, 'history never shows stored JSON');
+  assert.doesNotMatch(text, new RegExp(`author ${CASE_AUTHOR}|channel 400`), 'known names replace IDs');
+});
+
+test('Case view never names an author for a history note or correction with no recorded actor', async () => {
+  const unrecorded = caseHistory.slice(0, 2).map(item => ({ ...item, entry: { ...item.entry, actor_id: null } }));
+  const { fetchImpl } = caseFixture({ '/history': () => response({ history: unrecorded, names: {} }) });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await fire(findNode(root, n => n.getAttribute?.('aria-label') === `Open case ${CASE_ID}`), 'click', {});
+  await settle();
+  const titles = Array.from(caseDialog(h).querySelectorAll('.case-timeline strong'), n => n.textContent);
+  assert.deepEqual(titles, ['Ban recorded', 'Discord action succeeded', 'Note added', 'Record corrected']);
+});
+
+test('Cases list and case file agree on automod versus an unrecorded moderator', async () => {
+  const OBSERVED_ID = 'f'.repeat(32);
+  const summary = { action: 'ban', outcome: 'succeeded', subject_id: CASE_SUBJECT, actor_id: null, occurred_at_ms: 1790000000000 };
+  const { fetchImpl } = caseFixture({
+    '/cases': () => response({ cases: [CASE_ID, OBSERVED_ID], can_delete: false, names: caseNames, summaries: {
+      [CASE_ID]: { ...summary, source_kind: 'application' },
+      [OBSERVED_ID]: { ...summary, source_kind: 'gateway_observation' },
+    } }),
+    [`/cases/${CASE_ID}`]: () => response({ id: CASE_ID, case: caseRecord({ actor_id: null }), can_delete: false, names: caseNames }),
+    [`/cases/${OBSERVED_ID}`]: () => response({ id: OBSERVED_ID, case: caseRecord({ actor_id: null, source: { gateway_observation: { observation_id: 'c'.repeat(32) } } }), can_delete: false, names: caseNames }),
+  });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await settle();
+  const moderators = Array.from(root.querySelectorAll('tbody tr'), row => textOf(row.querySelectorAll('td')[4]));
+  assert.deepEqual(moderators, ['jModGuard automod', 'Not recorded']);
+  for (const [id, expected] of [[CASE_ID, 'jModGuard automod'], [OBSERVED_ID, 'Not recorded']]) {
+    await fire(findNode(root, n => n.getAttribute?.('aria-label') === `Open case ${id}`), 'click', {});
+    await settle();
+    const card = caseDialog(h).querySelectorAll('.case-person-card')[1];
+    assert.match(textOf(card), new RegExp(`^Moderator${expected}`), `case ${id.slice(0, 8)} file matches its list row`);
+  }
+});
+
+test('Case view shows a load failure inside the dialog and can try again', async () => {
+  let fail = true;
+  const { calls, fetchImpl } = caseFixture({
+    [`/cases/${CASE_ID}`]: () => fail
+      ? { ok: false, status: 503, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'guild store is unavailable' }) }
+      : response({ id: CASE_ID, case: caseRecord(), can_delete: false, names: caseNames }),
+  });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await settle();
+  await fire(findNode(root, n => n.getAttribute?.('aria-label') === `Open case ${CASE_ID}`), 'click', {});
+  await settle();
+  const alert = caseDialog(h).querySelector('[role="alert"]');
+  assert.match(alert.textContent, /Could not load this case: guild store is unavailable/);
+  fail = false;
+  await fire(findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Try again'), 'click', {});
+  await settle();
+  assert.equal(caseDialog(h).querySelector('[role="alert"]'), null);
+  assert.match(textOf(caseDialog(h)), /Posted a phishing link/);
+  assert.equal(calls.filter(c => c.url.endsWith(`/cases/${CASE_ID}`)).length, 2);
+});
+
+test('Case view adds a note and shows it in the timeline without reopening', async () => {
+  let history = [];
+  const { calls, fetchImpl } = caseFixture({
+    '/history': (_u, options) => {
+      if (options.method === 'POST') {
+        const body = JSON.parse(options.body);
+        history = [{ id: body.entry_id, sequence: '1', entry: { actor_id: CASE_MODERATOR, recorded_at_ms: 1790000100000, body: { note: { text: body.text } } } }];
+        return response({ result: 'created' });
+      }
+      return response({ history, names: { [CASE_MODERATOR]: caseNames[CASE_MODERATOR] } });
+    },
+  });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await settle();
+  await fire(findNode(root, n => n.getAttribute?.('aria-label') === `Open case ${CASE_ID}`), 'click', {});
+  await settle();
+  assert.doesNotMatch(textOf(caseDialog(h)), /Note added/);
+  const note = findNode(caseDialog(h), n => n.localName === 'textarea');
+  note.value = 'Appeal denied.';
+  await fire(note, 'input');
+  assert.equal(h.app.isDirty(), true, 'an unsent note is an unsaved edit');
+  await fire(findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Add note'), 'click', {});
+  await settle();
+  const posts = calls.filter(c => c.method === 'POST' && c.url.endsWith('/history'));
+  assert.equal(posts.length, 1);
+  assert.equal(JSON.parse(posts[0].body).text, 'Appeal denied.');
+  assert.match(textOf(caseDialog(h)), /Note added by Kit Mod/);
+  assert.match(textOf(caseDialog(h)), /Appeal denied\./);
+  assert.equal(h.app.isDirty(), false);
+});
+
+test('Case view with read-only access skips the settings-level channel names', async () => {
+  const { calls, fetchImpl } = caseFixture();
+  const h = harness(fetchImpl);
+  h.app.state.guilds[0].access = 'dashboard';
+  const root = await casesView(h);
+  await fire(findNode(root, n => n.getAttribute?.('aria-label') === `Open case ${CASE_ID}`), 'click', {});
+  await settle();
+  assert.match(textOf(caseDialog(h)), /in channel 400/);
+  assert.equal(calls.filter(c => c.url.endsWith('/server-names')).length, 0);
+  assert.equal(findNode(caseDialog(h), n => n.localName === 'textarea'), null, 'read-only access cannot add notes');
+});
+
+test('Case view keeps a saved note as saved when the timeline refresh fails', async () => {
+  let posted = false;
+  const { fetchImpl } = caseFixture({
+    '/history': (_u, options) => {
+      if (options.method === 'POST') { posted = true; return response({ result: 'created' }); }
+      if (posted) return { ok: false, status: 503, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'guild store is unavailable' }) };
+      return response({ history: [], names: {} });
+    },
+  });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await fire(findNode(root, n => n.getAttribute?.('aria-label') === `Open case ${CASE_ID}`), 'click', {});
+  await settle();
+  findNode(caseDialog(h), n => n.localName === 'textarea').value = 'Saved anyway.';
+  await fire(findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Add note'), 'click', {});
+  await settle();
+  assert.match(h.nodes.get('#toast').textContent, /Note added\. Reopen the case/);
+  assert.equal(findNode(caseDialog(h), n => n.localName === 'textarea').value, '');
+});
+
+test('Cases rows open on click while their own buttons keep their action', async () => {
+  const { calls, fetchImpl } = caseFixture();
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await settle();
+  const row = root.querySelector('tbody tr');
+  assert.ok(row.classList.contains('case-row'));
+  await fire(row.querySelectorAll('td')[3], 'click', {});
+  await settle();
+  assert.ok(caseDialog(h), 'clicking the row opens the case');
+  assert.equal(calls.filter(c => c.url.endsWith(`/cases/${CASE_ID}`)).length, 1);
+});
+
+test('Cases filters send exact filters, restart at the first page and hide for removed records', async () => {
+  const { calls, fetchImpl } = caseFixture({
+    '/members': () => response({ members: [{ user_id: CASE_MODERATOR, display_name: 'Kit Mod' }], next_cursor: null }),
+  });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await settle();
+  const lists = () => calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/cases')).map(c => new URL(c.url, 'https://fixture.test').searchParams);
+  const filters = root.querySelector('.case-filters');
+  assert.ok(filters.hasAttribute('data-no-draft'));
+  const [action, outcome] = filters.querySelectorAll('select');
+  action.value = 'ban';
+  await fire(action, 'change');
+  assert.equal(lists().at(-1).get('action'), 'ban');
+  assert.equal(lists().at(-1).has('after'), false);
+  outcome.value = 'failed';
+  await fire(outcome, 'change');
+  assert.equal(lists().at(-1).get('outcome'), 'failed');
+  // Subject by pasted ID, moderator by member search.
+  const [subject, moderator] = filters.querySelectorAll('input');
+  subject.value = CASE_SUBJECT;
+  await fire(subject, 'input');
+  await fire(subject, 'keydown', { key: 'Enter' });
+  assert.equal(lists().at(-1).get('subject'), CASE_SUBJECT);
+  moderator.value = 'Kit';
+  await fire(moderator, 'input');
+  await settle();
+  const search = calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/members')).at(-1);
+  assert.equal(new URL(search.url, 'https://fixture.test').searchParams.get('status'), 'all', 'banned and departed members can be picked');
+  await fire(findNode(filters, n => n.localName === 'button' && /Kit Mod/.test(n.textContent)), 'click', {});
+  assert.equal(lists().at(-1).get('actor'), CASE_MODERATOR);
+  assert.equal(h.app.isDirty(), false, 'filters are not unsaved edits');
+  await fire(findNode(root, n => n.localName === 'button' && n.textContent === 'Clear filters'), 'click', {});
+  for (const key of ['action', 'outcome', 'subject', 'actor']) assert.equal(lists().at(-1).has(key), false, key);
+  await fire(findNode(root, n => n.textContent === 'Removed records / retry cleanup'), 'click', {});
+  assert.equal(root.querySelector('.case-filters'), null);
+  assert.equal(lists().at(-1).get('removed'), 'true');
+});
+
+test('Case file links filter to the member\'s other cases and open their Members page', async () => {
+  const { calls, fetchImpl } = caseFixture({ '/members': () => response({ members: [], next_cursor: null }), '/member-sync': () => response({ status: 'complete' }) });
+  const h = harness(fetchImpl);
+  h.app.state.config = { enrollment_id: 'membership' };
+  const root = await casesView(h);
+  await settle();
+  const openCase = async () => {
+    await fire(findNode(h.document, n => n.getAttribute?.('aria-label') === `Open case ${CASE_ID}`), 'click', {});
+    await settle();
+  };
+  await openCase();
+  await fire(findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Their other cases'), 'click', {});
+  await settle();
+  assert.equal(caseDialog(h), null);
+  const lastList = () => new URL(calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/cases')).at(-1).url, 'https://fixture.test').searchParams;
+  assert.equal(lastList().get('subject'), CASE_SUBJECT);
+  assert.match(textOf(root.querySelector('.case-filters')), /Spammy/, 'the filter chip names the member');
+  await openCase();
+  await fire(findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Their other actions'), 'click', {});
+  await settle();
+  assert.equal(lastList().get('actor'), CASE_MODERATOR);
+  assert.equal(lastList().has('subject'), false, 'the link shows all of their actions, not the earlier subject filter');
+  await openCase();
+  await fire(findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Member page'), 'click', {});
+  await settle();
+  assert.equal(h.app.state.tab, 'members');
+  assert.equal(caseDialog(h), null);
+  const members = calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/members')).at(-1);
+  const query = new URL(members.url, 'https://fixture.test').searchParams;
+  assert.equal(query.get('q'), CASE_SUBJECT);
+  assert.equal(query.get('status'), 'all', 'banned or departed subjects are found too');
 });
 
 test('Bot actions cancel controls are gray x-circle icons', async () => {
