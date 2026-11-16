@@ -738,10 +738,49 @@ async fn summary_pages_are_bounded_scoped_and_use_constant_database_calls() {
                 serde_json::to_value(summary).unwrap(),
                 serde_json::json!({
                     "action": "ban", "outcome": "succeeded", "subject_id": i64::MAX.to_string(),
-                    "actor_id": null, "occurred_at_ms": 1000
+                    "actor_id": null, "source_kind": "discord_audit", "occurred_at_ms": 1000
                 })
             );
         }
+    }
+    // Every source variant lists as its kind alone, never its identifier.
+    let c = scope(&f, &store, &reg, 30).await;
+    for (source, kind) in [
+        (
+            CaseSource::Application {
+                operation_id: CaseId::new(),
+            },
+            "application",
+        ),
+        (
+            CaseSource::GatewayObservation {
+                observation_id: CaseId::new(),
+            },
+            "gateway_observation",
+        ),
+        (CaseSource::DiscordAudit { entry_id: 7 }, "discord_audit"),
+    ] {
+        let id = CaseId::new();
+        store
+            .record_case(
+                c.clone(),
+                id.clone(),
+                CaseData { source, ..data(1) },
+                limits,
+            )
+            .await
+            .unwrap();
+        let summaries = store
+            .case_summaries(c.clone(), vec![id.clone()], limits)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&summaries[id.as_str()]).unwrap(),
+            serde_json::json!({
+                "action": "ban", "outcome": "succeeded", "subject_id": i64::MAX.to_string(),
+                "actor_id": null, "source_kind": kind, "occurred_at_ms": 1000
+            })
+        );
     }
     assert!(
         store

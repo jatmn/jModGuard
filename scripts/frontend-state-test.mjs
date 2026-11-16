@@ -8456,6 +8456,30 @@ test('Case view never names an author for a history note or correction with no r
   assert.deepEqual(titles, ['Ban recorded', 'Discord action succeeded', 'Note added', 'Record corrected']);
 });
 
+test('Cases list and case file agree on automod versus an unrecorded moderator', async () => {
+  const OBSERVED_ID = 'f'.repeat(32);
+  const summary = { action: 'ban', outcome: 'succeeded', subject_id: CASE_SUBJECT, actor_id: null, occurred_at_ms: 1790000000000 };
+  const { fetchImpl } = caseFixture({
+    '/cases': () => response({ cases: [CASE_ID, OBSERVED_ID], can_delete: false, names: caseNames, summaries: {
+      [CASE_ID]: { ...summary, source_kind: 'application' },
+      [OBSERVED_ID]: { ...summary, source_kind: 'gateway_observation' },
+    } }),
+    [`/cases/${CASE_ID}`]: () => response({ id: CASE_ID, case: caseRecord({ actor_id: null }), can_delete: false, names: caseNames }),
+    [`/cases/${OBSERVED_ID}`]: () => response({ id: OBSERVED_ID, case: caseRecord({ actor_id: null, source: { gateway_observation: { observation_id: 'c'.repeat(32) } } }), can_delete: false, names: caseNames }),
+  });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await settle();
+  const moderators = Array.from(root.querySelectorAll('tbody tr'), row => textOf(row.querySelectorAll('td')[4]));
+  assert.deepEqual(moderators, ['jModGuard automod', 'Not recorded']);
+  for (const [id, expected] of [[CASE_ID, 'jModGuard automod'], [OBSERVED_ID, 'Not recorded']]) {
+    await fire(findNode(root, n => n.getAttribute?.('aria-label') === `Open case ${id}`), 'click', {});
+    await settle();
+    const card = caseDialog(h).querySelectorAll('.case-person-card')[1];
+    assert.match(textOf(card), new RegExp(`^Moderator${expected}`), `case ${id.slice(0, 8)} file matches its list row`);
+  }
+});
+
 test('Case view shows a load failure inside the dialog and can try again', async () => {
   let fail = true;
   const { calls, fetchImpl } = caseFixture({

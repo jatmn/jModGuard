@@ -70,6 +70,14 @@ impl CaseSource {
         }
     }
 }
+/// The variant of a [`CaseSource`] without its identifier, for list summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseSourceKind {
+    Application,
+    GatewayObservation,
+    DiscordAudit,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaseAction {
@@ -182,7 +190,7 @@ pub struct CaseData {
     pub evidence: CaseEvidence,
 }
 
-/// Private list fields only; reason, source and evidence remain detail-only.
+/// Private list fields only; reason, source identifiers and evidence remain detail-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaseSummary {
     pub action: CaseAction,
@@ -198,6 +206,8 @@ pub struct CaseSummary {
         deserialize_with = "crate::ids::de_opt_i64"
     )]
     pub actor_id: Option<i64>,
+    /// Lets a list tell a bot-recorded case with no actor from an unknown moderator.
+    pub source_kind: CaseSourceKind,
     pub occurred_at_ms: i64,
 }
 
@@ -503,6 +513,7 @@ impl GuildDataStore {
                                 'outcome',json_extract(payload,'$.outcome'),
                                 'subject_id',json_extract(payload,'$.subject_id'),
                                 'actor_id',json_extract(payload,'$.actor_id'),
+                                'source_kind',(SELECT key FROM json_each(payload,'$.source')),
                                 'occurred_at_ms',json_extract(payload,'$.occurred_at_ms'))
                     ELSE NULL END
                  FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0

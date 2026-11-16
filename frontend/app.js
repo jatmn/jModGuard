@@ -7412,6 +7412,12 @@ function caseSourceKind(source) {
   return source && typeof source === "object" ? Object.keys(source)[0] || null : null;
 }
 
+// A case jModGuard recorded itself with no moderator is automod; any other missing
+// moderator is unknown. Lists pass the summary's source_kind, the case file its source.
+function caseAutomatic(actorId, sourceKind) {
+  return !actorId && sourceKind === "application";
+}
+
 let pendingMember = null;
 
 // Leave the case dialog for another view, asking first about an unsent note.
@@ -7495,7 +7501,7 @@ function caseTimeline(c, history, names) {
       title: `${action?.label || "Action"} recorded`,
       detail: c.actor_id
         ? `By ${casePersonText(c.actor_id, names)}`
-        : source === "application" ? "By jModGuard automod" : "Moderator not recorded",
+        : caseAutomatic(c.actor_id, source) ? "By jModGuard automod" : "Moderator not recorded",
       meta: CASE_SOURCES[source] || null,
       at: c.occurred_at_ms,
     },
@@ -7760,7 +7766,7 @@ function CaseView({ guildId, caseId, onRemoved, onFilter }) {
     );
   }
   const { c, names } = view;
-  const automatic = !c.actor_id && caseSourceKind(c.source) === "application";
+  const automatic = caseAutomatic(c.actor_id, caseSourceKind(c.source));
   const policies = view.history.filter((item) => item.entry?.body?.policy).map((item) => item.entry.body.policy);
   const texts = Array.isArray(c.evidence?.text) ? c.evidence.text : [];
   const addNote = async () => {
@@ -8005,7 +8011,7 @@ function tabCases() {
               h("td", {}, c ? h(CaseBadge, { kind: "action", value: c.action }) : "Summary unavailable"),
               h("td", {}, c?.outcome ? h(CaseBadge, { kind: "outcome", value: c.outcome }) : ""),
               h("td", {}, c?.subject_id ? h(CasePersonCell, { id: String(c.subject_id), names }) : ""),
-              h("td", {}, c ? h(CasePersonCell, { id: c.actor_id ? String(c.actor_id) : null, names, empty: "Not recorded" }) : ""),
+              h("td", {}, c ? h(CasePersonCell, { id: c.actor_id ? String(c.actor_id) : null, names, empty: caseAutomatic(c.actor_id, c.source_kind) ? "jModGuard automod" : "Not recorded" }) : ""),
               h("td", { className: "muted" }, c?.occurred_at_ms ? h(CaseTime, { ms: c.occurred_at_ms }) : ""),
             ),
           );

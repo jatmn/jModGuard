@@ -3407,7 +3407,7 @@ async fn cases_are_isolated_and_deletion_requires_administrator() {
         body["summaries"][id],
         serde_json::json!({
             "action": "ban", "outcome": "succeeded", "subject_id": "1", "actor_id": null,
-            "occurred_at_ms": 1
+            "source_kind": "application", "occurred_at_ms": 1
         })
     );
     assert!(!body.to_string().contains(tag.as_str()));
@@ -5706,7 +5706,7 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
             first["summaries"][id],
             serde_json::json!({
                 "action": "ban", "outcome": "succeeded", "subject_id": i64::MAX.to_string(),
-                "actor_id": "42", "occurred_at_ms": n + 1
+                "actor_id": "42", "source_kind": "discord_audit", "occurred_at_ms": n + 1
             })
         );
     }
