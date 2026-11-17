@@ -372,6 +372,67 @@ test('the ban dialog queues a real ban with its options and shows the refusal', 
   assert.match(textOf(h.document.querySelector('.ban-receipt')), /Refused: this member's highest role is not below yours\./);
 });
 
+test('the ban dialog locks all submitted options until acknowledgment or failure', async t => {
+  for (const acknowledged of [true, false]) await t.test(acknowledged ? 'acknowledged' : 'failed request', async () => {
+    const calls = [];
+    let release;
+    const pending = new Promise(resolve => { release = resolve; });
+    const h = harness(async (url, opts) => {
+      calls.push({ url, opts });
+      if (url.endsWith('/ban')) return pending;
+      return response({ bans: [], names: {} });
+    });
+    const root = await bansView(h);
+    const button = node => findNode(node, n => n.localName === 'button' && n.textContent === 'Ban user');
+    await fire(button(root), 'click');
+    const dialog = h.document.querySelector('.ban-dialog');
+    const idBox = dialog.querySelector('input[placeholder="Search members by name, or paste an ID"]');
+    idBox.value = '4242';
+    await fire(idBox, 'input');
+    await fire(idBox, 'keydown', { key: 'Enter' });
+    const reason = dialog.querySelector('input[placeholder="Shown in Discord\'s audit log"]');
+    const days = dialog.querySelector('select');
+    const duration = dialog.querySelector('input[placeholder="Leave empty for a permanent ban"]');
+    const options = [[reason, 'Submitted reason'], [days, '3'], [duration, '30']];
+    for (const [control, value] of options) {
+      assert.equal(control.disabled, false);
+      control.value = value;
+      await fire(control, control === days ? 'change' : 'input');
+    }
+    await fire(button(dialog), 'click');
+    assert.equal(h.app.isBusy(), true);
+    assert.equal(h.app.isDirty(), true);
+    for (const [control, value] of options) {
+      assert.equal(control.disabled, true, 'submitted options cannot accept unsent edits');
+      assert.equal(control.value, value);
+    }
+    const requests = calls.filter(call => call.url.endsWith('/ban'));
+    assert.equal(requests.length, 1);
+    const body = JSON.parse(requests[0].opts.body);
+    assert.equal(body.user_id, '4242');
+    assert.equal(body.reason, 'Submitted reason');
+    assert.equal(body.delete_message_days, 3);
+    assert.equal(body.duration_minutes, 30);
+    release(acknowledged
+      ? response({ id: 'ban-job', guild_id: h.app.state.guildId, actor_id: '123456789012345678', enrollment_id: 'membership', state: 'pending', outcome: null, action: { kind: 'ban', ...body } })
+      : { ok: false, status: 400, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'Ban request rejected' }) });
+    await settle();
+    assert.equal(h.app.isBusy(), false);
+    if (acknowledged) {
+      assert.equal(dialog.querySelector('.ban-form'), null);
+      assert.match(textOf(dialog.querySelector('.ban-receipt')), /Queued\. Waiting for the bot/);
+      assert.equal(h.app.isDirty(), false);
+    } else {
+      assert.equal(dialog.querySelector('.ban-receipt'), null);
+      assert.equal(h.app.isDirty(), true, 'a failed request keeps its draft');
+      for (const [control, value] of options) {
+        assert.equal(control.disabled, false, 'options can be corrected after failure');
+        assert.equal(control.value, value);
+      }
+    }
+  });
+});
+
 test('Bot actions names ban requests and explains their results', async () => {
   const jobs = [
     { id: 'b1', guild_id: '987654321098765432', actor_id: '1', enrollment_id: 'membership', created_at: 1790000000, state: 'failed', outcome: 'bot_missing_permissions', action: { kind: 'ban', user_id: '4242', reason: 'x', delete_message_days: 0 } },

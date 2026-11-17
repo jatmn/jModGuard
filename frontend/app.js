@@ -9646,7 +9646,7 @@ function BanDialog({ guildId, onDone }) {
           }),
           field(
             "Reason",
-            h("input", {
+            h(Input, {
               type: "text",
               className: "input",
               maxLength: 512,
@@ -9661,7 +9661,7 @@ function BanDialog({ guildId, onDone }) {
           field(
             "Delete their messages from",
             h(
-              "select",
+              Select,
               { className: "select", value: days, onChange: (event) => setDays(event.target.value) },
               h("option", { value: "0" }, "Don't delete any"),
               h("option", { value: "1" }, "The last day"),
@@ -9671,7 +9671,7 @@ function BanDialog({ guildId, onDone }) {
           ),
           field(
             "Unban after (minutes, optional)",
-            h("input", {
+            h(Input, {
               type: "text",
               inputMode: "numeric",
               className: `input${durationValid ? "" : " input-error"}`,
