@@ -613,7 +613,8 @@ async fn finish_bot_action_inner(
 /// - The bot's gateway echo of this request (saved with the action ID) is this
 ///   ban's row: fill it, keeping its observation time so a later unban, even
 ///   one applied after this completion, still ends it. If a later unban or ban
-///   already ended it, it stays ended history.
+///   already ended it, it stays ended history. Check later boundaries from the
+///   echo's observation, so an earlier unban does not discard its deadline.
 /// - Without an echo, a ban or unban saved after the request was sent, applied
 ///   or still pending, means this ban is history: record it ended and leave the
 ///   current row untouched. Otherwise end any older active row, kept as
@@ -632,20 +633,27 @@ fn record_confirmed_ban_conn(
     duration_minutes: Option<u32>,
     requested_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
-    let echo: Option<(i64, bool)> = conn
+    let echo: Option<(i64, bool, String)> = conn
         .query_row(
-            "SELECT id, active FROM bans WHERE guild_id=?1 AND user_id=?2 AND operation_id=?3
+            "SELECT id, active, created_at FROM bans WHERE guild_id=?1 AND user_id=?2 AND operation_id=?3
              ORDER BY id LIMIT 1",
             params![job.guild_id, user_id, job.id.as_str()],
-            |row| Ok((row.get(0)?, row.get::<i64>(1)? != 0)),
+            |row| Ok((row.get(0)?, row.get::<i64>(1)? != 0, row.get(2)?)),
         )
         .optional()?;
-    let current = match requested_at {
+    // A matching echo is a more precise boundary than request start. Keep the
+    // request-time fallback when no valid observation is available.
+    let observed_at = echo
+        .as_ref()
+        .and_then(|(_, _, at)| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.with_timezone(&chrono::Utc))
+        .or(requested_at);
+    let current = match observed_at {
         Some(at) => !ban_or_unban_saved_since(conn, job, user_id, at)?,
         None => true,
     };
     let deadline_row = match echo {
-        Some((row_id, active)) => {
+        Some((row_id, active, _)) => {
             conn.execute_rows(
                 "UPDATE bans SET moderator_id=?1, reason=?2 WHERE id=?3",
                 params![job.actor_id, reason, row_id],

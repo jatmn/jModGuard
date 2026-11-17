@@ -248,7 +248,9 @@ given (bound to the action's membership, lifted by the timed-ban expiry below) a
 `member_ban` audit event in one transaction, skipping local writes if a write fence
 appeared. A later unban or ban wins, as for gateway deliveries. The echo row keeps its
 observation time, so a later unban ends it even when applied after completion, and an echo
-already ended stays ended. Without an echo, a ban row, unban event, or gateway unban or
+already ended stays ended. Its deadline checks later boundaries against that observation,
+so an unban between request start and the owned echo does not suppress the current ban's
+deadline. Without an echo, a ban row, unban event, or gateway unban or
 another ban delivery saved after the request was sent (applied or still pending) records
 this ban as an ended row. A row completion inserts is dated when the request was sent, as
 a gateway row is dated when it was observed, so an unban or ban observed after the request

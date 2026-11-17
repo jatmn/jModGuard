@@ -3649,6 +3649,16 @@ async fn queued_ban_completion_keeps_a_later_unban_or_ban() {
         ("echo-unban", &[Echo, Unban][..], false),
         ("echo-unban-reban", &[Echo, Unban, Reban][..], true),
         ("echo-pending-unban", &[Echo, UnbanSaved][..], false),
+        (
+            "unban-echo-pending-unban",
+            &[Unban, Echo, UnbanSaved][..],
+            false,
+        ),
+        (
+            "unban-echo-pending-unban-reban",
+            &[Unban, Echo, UnbanSaved, RebanSaved][..],
+            true,
+        ),
         ("unban-before-echo", &[Unban][..], false),
         ("pending-unban-before-echo", &[UnbanSaved][..], false),
         ("unban-event-before-echo", &[UnbanEvent][..], false),
@@ -3770,34 +3780,54 @@ async fn queued_ban_completion_keeps_a_later_unban_or_ban() {
 
 #[tokio::test]
 async fn queued_ban_completion_keeps_its_own_echo_current_with_its_deadline() {
-    let f = Fixture::new();
-    let job = f.enqueue(10, "own-echo", ban(99, Some(30))).await;
-    let discord = BanDiscord {
-        race: Some((f.db.clone(), job.clone(), vec![BanRace::Echo])),
-        ..Default::default()
-    };
-    let before = now();
-    drain(&f.db, &discord, &WorkerLimits::default())
-        .await
-        .unwrap();
-    assert_eq!(f.status(&job).await.state, "succeeded");
-    let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
-    assert_eq!(rows.len(), 1, "its own echo is not a later ban");
-    assert!(rows[0].active);
-    assert_eq!(rows[0].moderator_id, Some(42));
-    let id = rows[0].id;
-    let expires_at: Option<i64> =
-        f.db.with_conn(move |conn| {
-            conn.query_row(
-                "SELECT expires_at FROM bans WHERE id=?1",
-                params![id],
-                |row| Ok(row.get(0)?),
-            )
-        })
-        .await
-        .unwrap();
-    let expires_at = expires_at.expect("the current ban takes its deadline");
-    assert!((before + 1800..=now() + 1800).contains(&expires_at));
+    use BanRace::*;
+    for (label, race) in [
+        ("own-echo", vec![Echo]),
+        ("unban-then-own-echo", vec![Unban, Echo]),
+        ("pending-unban-then-own-echo", vec![UnbanSaved, Echo]),
+        ("unban-event-then-own-echo", vec![UnbanEvent, Echo]),
+    ] {
+        let f = Fixture::new();
+        let job = f.enqueue(10, label, ban(99, Some(30))).await;
+        let discord = BanDiscord {
+            race: Some((f.db.clone(), job.clone(), race)),
+            ..Default::default()
+        };
+        let before = now();
+        drain(&f.db, &discord, &WorkerLimits::default())
+            .await
+            .unwrap();
+        // An earlier saved unban still cannot end this newer echo when applied.
+        let pending = std::mem::take(&mut *discord.pending.lock().unwrap());
+        for late in pending {
+            late.apply(&f.db).await;
+        }
+        assert_eq!(f.status(&job).await.state, "succeeded", "{label}");
+        let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "{label}: its own echo is not a later ban");
+        assert!(rows[0].active, "{label}");
+        assert_eq!(rows[0].moderator_id, Some(42), "{label}");
+        let id = rows[0].id;
+        let (expires_at, bound): (Option<i64>, Option<String>) =
+            f.db.with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT expires_at, expiry_enrollment_id FROM bans WHERE id=?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            expires_at.is_some(),
+            "{label}: the current ban takes its deadline"
+        );
+        assert!((before + 1800..=now() + 1800).contains(&expires_at.unwrap()));
+        assert_eq!(
+            bound, job.enrollment_id,
+            "{label}: deadline is membership-bound"
+        );
+    }
 }
 
 #[tokio::test]
