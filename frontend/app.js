@@ -9524,7 +9524,7 @@ const BAN_ACTION_OUTCOMES = {
   target_role_not_below_bot: "Refused: this member's highest role is not below jModGuard's.",
   target_role_not_below_moderator: "Refused: this member's highest role is not below yours.",
   unknown_user: "Refused: Discord has no user with this ID.",
-  permission_revoked: "Refused: you no longer have Ban Members here.",
+  permission_revoked: "Refused: you no longer have permission for this action.",
   permission_check_unavailable: "Discord couldn't confirm your permissions. Try again.",
   ban_check_unavailable: "Discord couldn't be checked before the ban. Try again.",
   discord_rejected: "Discord rejected the request.",

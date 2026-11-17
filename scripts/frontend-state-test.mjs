@@ -438,6 +438,12 @@ test('Bot actions names ban requests and explains their results', async () => {
     { id: 'b1', guild_id: '987654321098765432', actor_id: '1', enrollment_id: 'membership', created_at: 1790000000, state: 'failed', outcome: 'bot_missing_permissions', action: { kind: 'ban', user_id: '4242', reason: 'x', delete_message_days: 0 } },
     { id: 'b2', guild_id: '987654321098765432', actor_id: '1', enrollment_id: 'membership', created_at: 1790000000, state: 'succeeded', outcome: 'banned', action: { kind: 'ban', user_id: '4343', reason: 'x', delete_message_days: 0 } },
   ];
+  for (const action of [
+    { kind: 'set_log_channel', event: 'member_ban', channel_id: '5555' },
+    { kind: 'member_sync', operation: 'resume' },
+    { kind: 'ban', user_id: '4444', reason: 'x', delete_message_days: 0 },
+    { kind: 'unban', user_id: '4444', reason: 'x' },
+  ]) jobs.push({ ...jobs[0], id: `permission-${jobs.length}`, outcome: 'permission_revoked', action });
   const h = harness(async () => response(jobs));
   h.app.state.config = { enrollment_id: 'membership' };
   const panel = h.app.tabActions();
@@ -446,6 +452,10 @@ test('Bot actions names ban requests and explains their results', async () => {
   assert.equal(textOf(rows[0].cells[1]), 'Ban 4242');
   assert.equal(textOf(rows[0].cells[4]), 'Discord refused: jModGuard lacks Ban Members or its role is too low.');
   assert.equal(textOf(rows[1].cells[4]), 'Banned in Discord.');
+  assert.equal(rows.length, 6);
+  for (const [index, row] of rows.slice(2).entries()) {
+    assert.equal(textOf(row.cells[4]), 'Refused: you no longer have permission for this action.', `permission_revoked for ${jobs[index + 2].action.kind}`);
+  }
 });
 
 test('dashboard moderation counts stay with their requested server', async () => {
