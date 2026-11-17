@@ -255,6 +255,52 @@ test('editing a ban reason saves the jModGuard reason and reloads the list', asy
   assert.equal(findNode(row, n => n.localName === 'textarea'), null);
 });
 
+test('an unsaved ban reason survives reloads and is never discarded without asking', async () => {
+  const prompts = [];
+  let discard = false;
+  const calls = [];
+  const h = harness(async (url, opts) => {
+    calls.push({ url, opts });
+    return response(banRows());
+  }, new Map(), new Map(), message => { prompts.push(message); return discard; });
+  const root = await bansView(h);
+  const rows = () => [...root.querySelectorAll('tbody tr')];
+  const button = (node, name) => findNode(node, n => n.localName === 'button' && (n.getAttribute('aria-label') === name || n.textContent === name));
+  const box = node => findNode(node, n => n.localName === 'textarea');
+  await fire(button(rows()[0], 'Edit reason'), 'click');
+  box(rows()[0]).value = 'Draft for the first ban';
+  await fire(box(rows()[0]), 'input', { target: { value: 'Draft for the first ban' } });
+  assert.equal(h.app.isDirty(), true);
+  // Opening a second editor asks first; declining keeps the open draft and its protection.
+  await fire(button(rows()[1], 'Edit reason'), 'click');
+  assert.deepEqual(prompts, ['Discard unsaved changes?']);
+  assert.equal(box(rows()[1]), null, 'only one reason editor is open');
+  assert.equal(box(rows()[0]).value, 'Draft for the first ban');
+  assert.equal(h.app.isDirty(), true);
+  // Reloading the list, by hand or after a ban, keeps the draft.
+  const reads = calls.length;
+  await fire(button(root, 'Refresh'), 'click');
+  await settle();
+  assert.ok(calls.length > reads, 'the list was read again');
+  assert.equal(box(rows()[0]).value, 'Draft for the first ban');
+  assert.equal(h.app.isDirty(), true);
+  // The ban dialog clears the page's unsaved state when it closes, so it asks first too.
+  await fire(button(root, 'Ban user'), 'click');
+  assert.equal(prompts.length, 2);
+  assert.equal(h.document.querySelector('.ban-dialog'), null);
+  assert.equal(box(rows()[0]).value, 'Draft for the first ban');
+  // Accepting discards that draft and opens the other row clean; cancelling it stays clean.
+  discard = true;
+  await fire(button(rows()[1], 'Edit reason'), 'click');
+  assert.equal(prompts.length, 3);
+  assert.equal(box(rows()[0]), null);
+  assert.equal(box(rows()[1]).value, 'Repeated messages');
+  assert.equal(h.app.isDirty(), false);
+  await fire(button(rows()[1], 'Cancel'), 'click');
+  assert.equal(box(rows()[1]), null);
+  assert.equal(h.app.isDirty(), false);
+});
+
 test('the ban dialog queues a real ban with its options and shows the refusal', async () => {
   const calls = [];
   const confirms = [];

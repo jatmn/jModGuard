@@ -9429,15 +9429,13 @@ function BanReasonText({ text }) {
   );
 }
 
-function BanReasonCell({ record, names, guildId, onSaved }) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState("");
+// The Bans page holds its one open reason editor ({ id, draft }) so a list reload keeps the
+// draft, and the page's single unsaved-changes flag belongs to that one editor.
+function BanReasonCell({ record, names, guildId, editor: reasonEditor, onEdit, onDraft, onClose, onSaved }) {
+  const editing = reasonEditor?.id === record.id;
+  const draft = editing ? reasonEditor.draft : "";
   const parts = banReasonParts(record.reason);
   const current = record.edited_reason != null ? record.edited_reason : parts.text;
-  const finish = () => {
-    setEditing(false);
-    ui.set({ edits: "clean" });
-  };
   if (editing) {
     return h(
       "div",
@@ -9450,7 +9448,7 @@ function BanReasonCell({ record, names, guildId, onSaved }) {
         value: draft,
         autoFocus: true,
         onChange: (event) => {
-          setDraft(event.target.value.replace(/[\r\n]+/g, " "));
+          onDraft(event.target.value.replace(/[\r\n]+/g, " "));
           markDirty();
         },
       }),
@@ -9466,14 +9464,14 @@ function BanReasonCell({ record, names, guildId, onSaved }) {
             disabled: !draft.trim(),
             onClick: async () => {
               const result = await api(`/api/guilds/${guildId}/bans/${record.id}/reason`, "PUT", { reason: draft.trim() });
-              finish();
+              onClose();
               toast(result?.changed === false ? "Reason unchanged." : "Reason updated.", "success");
               onSaved();
             },
           },
           "Save reason",
         ),
-        h(ActionButton, { type: "button", className: "btn btn-sm", onClick: finish }, "Cancel"),
+        h(ActionButton, { type: "button", className: "btn btn-sm", onClick: onClose }, "Cancel"),
       ),
     );
   }
@@ -9500,10 +9498,7 @@ function BanReasonCell({ record, names, guildId, onSaved }) {
           action: "edit",
           label: "Edit reason",
           className: "btn btn-xs btn-square btn-ghost",
-          onClick: () => {
-            setDraft(current || "");
-            setEditing(true);
-          },
+          onClick: () => onEdit(current || ""),
         }),
   );
 }
@@ -9698,6 +9693,19 @@ function tabBans() {
   const result = useApiRead(`/api/guilds/${guildId}/bans?limit=200`);
   const rows = Array.isArray(result.data?.bans) ? result.data.bans : [];
   const names = result.data?.names || {};
+  const [reasonEditor, setReasonEditor] = useState(null);
+  // Closing the open reason editor for another task asks before discarding its draft.
+  const leaveReasonEditor = () => {
+    if (!reasonEditor) return true;
+    if (!canLeave()) return false;
+    setReasonEditor(null);
+    ui.set({ edits: "clean" });
+    return true;
+  };
+  const closeReasonEditor = () => {
+    setReasonEditor(null);
+    ui.set({ edits: "clean" });
+  };
   return h(
     "div",
     null,
@@ -9714,7 +9722,12 @@ function tabBans() {
       { className: "row", style: { marginBottom: "12px" } },
       isPreview()
         ? null
-        : h(ActionButton, { type: "button", className: "btn btn-error", onClick: () => openBanDialog(guildId, result.refresh) }, h(Icon, { name: "hammer" }), "Ban user"),
+        : h(
+            ActionButton,
+            { type: "button", className: "btn btn-error", onClick: () => leaveReasonEditor() && openBanDialog(guildId, result.refresh) },
+            h(Icon, { name: "hammer" }),
+            "Ban user",
+          ),
       h(ActionButton, { type: "button", className: "btn", onClick: result.refresh }, "Refresh"),
     ),
     h(
@@ -9751,7 +9764,20 @@ function tabBans() {
                 ),
               ),
               h("td", null, h(BanModeratorCell, { record, names, rule })),
-              h("td", null, h(BanReasonCell, { record, names, guildId, onSaved: result.refresh })),
+              h(
+                "td",
+                null,
+                h(BanReasonCell, {
+                  record,
+                  names,
+                  guildId,
+                  editor: reasonEditor,
+                  onEdit: (draft) => leaveReasonEditor() && setReasonEditor({ id: record.id, draft }),
+                  onDraft: (draft) => setReasonEditor((current) => (current?.id === record.id ? { ...current, draft } : current)),
+                  onClose: closeReasonEditor,
+                  onSaved: result.refresh,
+                }),
+              ),
               h("td", { className: "muted" }, h(CaseTime, { ms: memberInstant(record.created_at)?.getTime() })),
               h(
                 "td",

@@ -3496,6 +3496,11 @@ fn ban_refusal_follows_the_ban_command_and_discord_role_hierarchy() {
         role(20, 20, Permissions::BAN_MEMBERS),
         role(15, 15, Permissions::empty()),
         role(10, 10, Permissions::empty()),
+        // Distinct roles sharing a position: Discord ranks the lower ID higher.
+        role(29, 30, Permissions::empty()),
+        role(31, 30, Permissions::empty()),
+        role(19, 20, Permissions::empty()),
+        role(21, 20, Permissions::empty()),
     ] {
         guild.roles.insert(role.id, role);
     }
@@ -3548,6 +3553,27 @@ fn ban_refusal_follows_the_ban_command_and_discord_role_hierarchy() {
     assert_eq!(
         ban_refusal(&guild, &bot, &member(11, &[]), Some(&above_bot), 99),
         Some("target_role_not_below_bot")
+    );
+    // Equal positions follow Discord's ID tie-break for both comparisons.
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, Some(&member(99, &[21])), 99),
+        None,
+        "a higher-ID role at the moderator's position is below the moderator"
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, Some(&member(99, &[19])), 99),
+        Some("target_role_not_below_moderator"),
+        "a lower-ID role at the moderator's position is above the moderator"
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &member(11, &[]), Some(&member(99, &[31])), 99),
+        None,
+        "a higher-ID role at the bot's position is below the bot"
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &member(11, &[]), Some(&member(99, &[29])), 99),
+        Some("target_role_not_below_bot"),
+        "a lower-ID role at the bot's position is above the bot"
     );
     assert_eq!(
         classify_ban_response(403, 50013),

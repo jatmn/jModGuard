@@ -369,18 +369,18 @@ async fn settings_role_authorized(
     Ok(roles.iter().any(|role| mapped.contains(role)))
 }
 
-/// Highest role position of a member; 0 (`@everyone`) when they have no role.
-fn top_role_position(
-    guild: &serenity::model::guild::PartialGuild,
+/// Highest role of a member in Discord's hierarchy: position first, then the
+/// lower ID among roles sharing a position (Serenity's `Role` order). `None`
+/// (`@everyone`) when they have no role, which sorts below every role.
+fn top_role<'a>(
+    guild: &'a serenity::model::guild::PartialGuild,
     member: &serenity::model::guild::Member,
-) -> u16 {
+) -> Option<&'a serenity::model::guild::Role> {
     member
         .roles
         .iter()
         .filter_map(|role| guild.roles.get(role))
-        .map(|role| role.position)
         .max()
-        .unwrap_or(0)
 }
 
 /// The same refusals as the ban command, plus Discord's role hierarchy: the
@@ -407,11 +407,11 @@ fn ban_refusal(
         return Some("bot_missing_ban_permission");
     }
     let target = target?;
-    let target_top = top_role_position(guild, target);
-    if target_top >= top_role_position(guild, bot) {
+    let target_top = top_role(guild, target);
+    if target_top >= top_role(guild, bot) {
         return Some("target_role_not_below_bot");
     }
-    if guild.owner_id != actor.user.id && target_top >= top_role_position(guild, actor) {
+    if guild.owner_id != actor.user.id && target_top >= top_role(guild, actor) {
         return Some("target_role_not_below_moderator");
     }
     None
