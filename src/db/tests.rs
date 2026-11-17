@@ -6323,7 +6323,7 @@ async fn retire_guild_enrollment_invalidates_a_running_leave_like_any_other_work
     );
     assert_eq!(mid_outcome.as_deref(), Some("enrollment_ended"));
     assert!(
-        !finish_dispatched_bot_action(&db, &claimed, "succeeded", "left_guild")
+        !finish_dispatched_bot_action(&db, &claimed, "succeeded", "left_guild", None)
             .await
             .unwrap(),
         "a retired enrollment cannot accept a late completion"

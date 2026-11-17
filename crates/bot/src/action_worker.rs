@@ -42,20 +42,26 @@ enum MutationPhase {
     Started,
 }
 
+/// Whether, and when, the action's mutation was started.
 #[derive(Default)]
-struct MutationProgress(std::sync::atomic::AtomicBool);
+struct MutationProgress(std::sync::OnceLock<chrono::DateTime<chrono::Utc>>);
 
 impl MutationProgress {
     fn start(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.0.get_or_init(chrono::Utc::now);
     }
 
     fn phase(&self) -> MutationPhase {
-        if self.0.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.0.get().is_some() {
             MutationPhase::Started
         } else {
             MutationPhase::Validating
         }
+    }
+
+    /// When the mutation was started; for a Discord action, when it was requested.
+    fn started_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.0.get().copied()
     }
 }
 
@@ -469,7 +475,7 @@ fn unban_case_outcome(outcome: &Outcome) -> crate::db::guild_data::CaseOutcome {
 
 async fn finish_validation_outcome(db: &Db, job: &BotAction, code: &str) -> Result<()> {
     if db::begin_bot_action(db, job, chrono::Utc::now().timestamp()).await? {
-        db::finish_dispatched_bot_action(db, job, "failed", code).await?;
+        db::finish_dispatched_bot_action(db, job, "failed", code, None).await?;
     }
     Ok(())
 }
@@ -894,7 +900,14 @@ async fn execute_inner(
     if app.is_some_and(|app| !app.activation.may_record()) {
         return Err(anyhow::anyhow!("writer lease is not held"));
     }
-    let finished = db::finish_dispatched_bot_action(db, job, outcome.state, outcome.code).await;
+    let finished = db::finish_dispatched_bot_action(
+        db,
+        job,
+        outcome.state,
+        outcome.code,
+        mutation.started_at(),
+    )
+    .await;
     if matches!(finished, Ok(false)) {
         tracing::warn!(
             action_id = %job.id,

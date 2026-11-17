@@ -291,13 +291,17 @@ pub struct BanRow {
 /// row ID and the previous and new reason; the ban row's own reason is kept.
 pub const BAN_REASON_EDIT_EVENT: &str = "ban_reason_edit";
 
-/// Latest reason edit per ban row in one page, from the guild's edit events.
+/// Latest reason edit per ban row in one page, from the guild's edit events: one
+/// row per edited ban, however many times it was edited.
 const BAN_REASON_EDITS_SQL: &str = "SELECT CAST(json_extract(data, '$.ban_id') AS INTEGER),
                     json_extract(data, '$.reason'), actor_id, created_at
              FROM events
-             WHERE guild_id = ?1 AND event_type = 'ban_reason_edit' AND json_valid(data)
-               AND CAST(json_extract(data, '$.ban_id') AS INTEGER) BETWEEN ?2 AND ?3
-             ORDER BY id";
+             WHERE id IN (
+                 SELECT max(id) FROM events
+                 WHERE guild_id = ?1 AND event_type = 'ban_reason_edit' AND json_valid(data)
+                   AND json_type(data, '$.reason') = 'text'
+                   AND CAST(json_extract(data, '$.ban_id') AS INTEGER) BETWEEN ?2 AND ?3
+                 GROUP BY CAST(json_extract(data, '$.ban_id') AS INTEGER))";
 
 /// Result of [`edit_enrolled_ban_reason`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2572,6 +2576,64 @@ mod query_plan_tests {
                 }
             }
             crate::db::tests::assert_index_plan(conn, BAN_PAGE_SQL, params![42, 50], true);
+            crate::db::tests::assert_index_plan(
+                conn,
+                BAN_REASON_EDITS_SQL,
+                params![42, 1, 50],
+                false,
+            );
+            Ok(())
+        })
+        .unwrap();
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ban_reason_edit_reads_return_one_latest_edit_per_ban() {
+        let path =
+            std::env::temp_dir().join(format!("reason_edits_{:032x}.db", rand::random::<u128>()));
+        let db = Db::open(&path, 2).unwrap();
+        db.with_conn_sync(|conn| {
+            for (ban_id, reason) in (1..=40)
+                .map(|n| (1, format!("first {n}")))
+                .chain((1..=3).map(|n| (2, format!("second {n}"))))
+            {
+                let data = serde_json::json!({"ban_id": ban_id, "reason": reason}).to_string();
+                conn.execute_bounded(
+                    "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
+                     VALUES (42, 'ban_reason_edit', 7, 8, ?1, 'now')",
+                    params![data],
+                    65_536,
+                )?;
+            }
+            let rows = |first: i64, last: i64| {
+                let mut stmt = conn.prepare(BAN_REASON_EDITS_SQL).unwrap();
+                stmt.query_map(params![42, first, last], |r| {
+                    Ok((r.get::<i64>(0)?, r.get::<String>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+            };
+            let mut page = rows(1, 2);
+            page.sort();
+            assert_eq!(
+                page,
+                [(1, "first 40".to_owned()), (2, "second 3".to_owned())],
+                "one latest edit per ban, not its history"
+            );
+            assert_eq!(
+                rows(1, 1),
+                [(1, "first 40".to_owned())],
+                "a save reads one edit"
+            );
+            let kept: i64 = conn.query_row(
+                "SELECT count(*) FROM events WHERE event_type='ban_reason_edit'",
+                params![],
+                |r| Ok(r.get(0)?),
+            )?;
+            assert_eq!(kept, 43, "the audit history is kept");
             Ok(())
         })
         .unwrap();

@@ -471,18 +471,29 @@ pub async fn finish_bot_action(
     state: &str,
     outcome: &str,
 ) -> Result<bool> {
-    finish_bot_action_inner(db, job, state, outcome, CompletionPolicy::Trusted).await
+    finish_bot_action_inner(db, job, state, outcome, CompletionPolicy::Trusted, None).await
 }
 
 /// Worker completion: a local log-setting effect must still be within its deadline
 /// when the primary writer lock is acquired. Remote unban results may arrive late.
+/// `requested_at` is when the Discord request was sent, if one was: a confirmed
+/// ban is ordered against ban and unban records saved after it.
 pub async fn finish_dispatched_bot_action(
     db: &Db,
     job: &BotAction,
     state: &str,
     outcome: &str,
+    requested_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<bool> {
-    finish_bot_action_inner(db, job, state, outcome, CompletionPolicy::Dispatched).await
+    finish_bot_action_inner(
+        db,
+        job,
+        state,
+        outcome,
+        CompletionPolicy::Dispatched,
+        requested_at,
+    )
+    .await
 }
 
 async fn finish_bot_action_inner(
@@ -491,6 +502,7 @@ async fn finish_bot_action_inner(
     state: &str,
     outcome: &str,
     policy: CompletionPolicy,
+    requested_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<bool> {
     anyhow::ensure!(
         ActionState::from_saved(state).is_completion(),
@@ -546,7 +558,14 @@ async fn finish_bot_action_inner(
                     duration_minutes,
                     ..
                 } if !write_fenced => {
-                    record_confirmed_ban_conn(&tx, &job, *user_id, reason, *duration_minutes)?;
+                    record_confirmed_ban_conn(
+                        &tx,
+                        &job,
+                        *user_id,
+                        reason,
+                        *duration_minutes,
+                        requested_at,
+                    )?;
                     let data = serde_json::json!({
                         "reason":reason, "source":"webui", "action_id":job.id, "outcome":outcome,
                     })
@@ -589,49 +608,80 @@ async fn finish_bot_action_inner(
     .await
 }
 
-/// Discord confirmed this queued ban. The bot's gateway echo of this same
-/// request may already hold the active row (saved with the action ID); fill it.
-/// Otherwise end any older active row, kept as history, and insert this ban.
-/// A requested duration binds its deadline to this row and membership.
+/// Discord confirmed this queued ban, requested at `requested_at`. A later
+/// unban or ban keeps the current ban, as for gateway deliveries:
+/// - The bot's gateway echo of this request (saved with the action ID) is this
+///   ban's row: fill it. If a later unban or ban already ended it, it stays
+///   ended history.
+/// - Without an echo, a ban or unban saved after the request was sent means this
+///   ban is history: record it ended and leave the current row untouched.
+///   Otherwise end any older active row, kept as history, and insert this ban.
+///
+/// A requested duration binds its deadline to this row and membership only
+/// while this row is the active ban, never to a later one.
 fn record_confirmed_ban_conn(
     conn: &impl SqlExecutor,
     job: &BotAction,
     user_id: i64,
     reason: &str,
     duration_minutes: Option<u32>,
+    requested_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
-    let now = now_str();
-    let echo: Option<i64> = conn
+    let echo: Option<(i64, bool)> = conn
         .query_row(
-            "SELECT id FROM bans WHERE guild_id=?1 AND user_id=?2 AND active=1 AND operation_id=?3
+            "SELECT id, active FROM bans WHERE guild_id=?1 AND user_id=?2 AND operation_id=?3
              ORDER BY id LIMIT 1",
             params![job.guild_id, user_id, job.id.as_str()],
-            |row| Ok(row.get(0)?),
+            |row| Ok((row.get(0)?, row.get::<i64>(1)? != 0)),
         )
         .optional()?;
-    let row_id = match echo {
-        Some(row_id) => {
+    let active_row = match echo {
+        Some((row_id, true)) => {
             conn.execute_rows(
                 "UPDATE bans SET moderator_id=?1, reason=?2, created_at=?3 WHERE id=?4",
-                params![job.actor_id, reason, now, row_id],
+                params![job.actor_id, reason, now_str(), row_id],
                 1,
             )?;
-            row_id
+            Some(row_id)
+        }
+        Some((row_id, false)) => {
+            // Keep its date: it stays ordered before the unban or ban that ended it.
+            conn.execute_rows(
+                "UPDATE bans SET moderator_id=?1, reason=?2 WHERE id=?3",
+                params![job.actor_id, reason, row_id],
+                1,
+            )?;
+            None
         }
         None => {
-            conn.execute_matching(
-                "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1",
-                params![job.guild_id, user_id],
-            )?;
-            conn.query_row_write(
+            let current = match requested_at {
+                Some(at) => !ban_or_unban_saved_since(conn, job, user_id, at)?,
+                None => true,
+            };
+            if current {
+                conn.execute_matching(
+                    "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1",
+                    params![job.guild_id, user_id],
+                )?;
+            }
+            let row_id = conn.query_row_write(
                 "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, operation_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6) RETURNING id",
-                params![job.guild_id, user_id, job.actor_id, reason, now, job.id.as_str()],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) RETURNING id",
+                params![
+                    job.guild_id,
+                    user_id,
+                    job.actor_id,
+                    reason,
+                    now_str(),
+                    current,
+                    job.id.as_str()
+                ],
                 |row| Ok(row.get::<i64>(0)?),
-            )?
+            )?;
+            current.then_some(row_id)
         }
     };
-    if let Some(minutes) = duration_minutes {
+    if let (Some(minutes), Some(row_id)) = (duration_minutes, active_row) {
         let expires_at = chrono::Utc::now()
             .timestamp()
             .checked_add(i64::from(minutes) * 60)
@@ -643,6 +693,33 @@ fn record_confirmed_ban_conn(
         )?;
     }
     Ok(())
+}
+
+/// Whether a ban row, a `member_unban` event or a gateway unban delivery of this
+/// membership was saved for the user at or after `at`: the boundaries a gateway
+/// ban observation is ordered against.
+fn ban_or_unban_saved_since(
+    conn: &impl SqlExecutor,
+    job: &BotAction,
+    user_id: i64,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM gateway_ban_deliveries
+             WHERE guild_id=?1 AND user_id=?2 AND kind='unban' AND observed_at_ms>=?3 AND enrollment_id=?5)
+          OR EXISTS(SELECT 1 FROM bans WHERE guild_id=?1 AND user_id=?2
+             AND julianday(created_at)>julianday(?4))
+          OR EXISTS(SELECT 1 FROM events WHERE guild_id=?1 AND user_id=?2
+             AND event_type='member_unban' AND julianday(created_at)>=julianday(?4))",
+        params![
+            job.guild_id,
+            user_id,
+            at.timestamp_millis(),
+            at.to_rfc3339(),
+            job.enrollment_id.as_deref()
+        ],
+        |row| Ok(row.get::<bool>(0)?),
+    )
 }
 
 pub async fn cancel_bot_action(db: &Db, guild: i64, id: &str) -> Result<bool> {
