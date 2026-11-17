@@ -3182,19 +3182,17 @@ fn ban(user_id: i64, duration_minutes: Option<u32>) -> Action {
     }
 }
 
-/// One local write made while the Discord ban is in flight, given the time it runs.
-type BanRaceStep = Box<dyn Fn(&str) -> String + Send + Sync>;
-
 /// Discord for queued bans: the refusal check and the ban call are recorded.
-/// `during` writes run on `race_db` after Discord applied the ban and before the
-/// worker completes it, each a few milliseconds after the last.
+/// `race` writes run after Discord applied the ban and before the worker
+/// completes it, each a few milliseconds after the last.
 struct BanDiscord {
     authorized: bool,
     refusal: Result<Option<&'static str>, ()>,
     outcome: Outcome,
     bans: std::sync::Mutex<Vec<(i64, i64, u8, String)>>,
-    race_db: Option<Db>,
-    during: Vec<BanRaceStep>,
+    race: Option<(Db, BotAction, Vec<BanRace>)>,
+    /// Gateway deliveries `race` saved but did not apply.
+    pending: std::sync::Mutex<Vec<String>>,
 }
 impl Default for BanDiscord {
     fn default() -> Self {
@@ -3203,8 +3201,8 @@ impl Default for BanDiscord {
             refusal: Ok(None),
             outcome: Outcome::succeeded("banned"),
             bans: std::sync::Mutex::new(Vec::new()),
-            race_db: None,
-            during: Vec::new(),
+            race: None,
+            pending: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -3234,16 +3232,12 @@ impl DiscordActions for BanDiscord {
             .lock()
             .unwrap()
             .push((guild, user, days, reason.to_owned()));
-        if let Some(db) = &self.race_db {
-            for step in &self.during {
+        if let Some((db, job, race)) = &self.race {
+            for (n, write) in race.iter().enumerate() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                let sql = step(&chrono::Utc::now().to_rfc3339());
-                db.with_conn(move |conn| {
-                    conn.execute_bounded(&sql, params![], 65_536)?;
-                    Ok(())
-                })
-                .await
-                .unwrap();
+                if let Some(saved) = write.run(db, job, n).await {
+                    self.pending.lock().unwrap().push(saved);
+                }
             }
         }
         self.outcome
@@ -3497,55 +3491,92 @@ async fn queued_ban_fills_its_gateway_echo_and_binds_its_deadline() {
 /// completion.
 #[derive(Clone, Copy, Debug)]
 enum BanRace {
-    /// The bot's own gateway echo of this request.
+    /// The bot's own gateway echo of this request, saved and applied.
     Echo,
-    /// A gateway unban applied: active rows end and a `member_unban` event.
+    /// A gateway unban, saved and applied.
+    Unban,
+    /// A gateway unban saved but applied only after completion.
+    UnbanSaved,
+    /// A `member_unban` event without a gateway delivery, as a queued unban
+    /// records: active rows end.
     UnbanEvent,
-    /// A gateway unban saved for delivery but not yet applied.
-    UnbanDelivery,
-    /// A newer permanent ban recorded by someone else.
+    /// A newer ban row recorded outside the gateway, as a command records.
     Reban,
+    /// A newer gateway ban by someone else, saved but applied only after
+    /// completion.
+    RebanSaved,
+}
+
+/// A gateway delivery for user 99 of guild 10, observed now.
+async fn gateway_delivery(db: &Db, id: String, payload: db::GatewayBanPayload) -> String {
+    let delivery = db::GatewayBanDelivery {
+        id,
+        enrollment: db::guild_enrollment(db, 10).await.unwrap().unwrap(),
+        user_id: 99,
+        observed_at: chrono::Utc::now().to_rfc3339(),
+        payload,
+        case: None,
+    };
+    db::save_gateway_ban_delivery(db, delivery)
+        .await
+        .unwrap()
+        .id
+}
+
+fn gateway_ban(operation_id: Option<String>) -> db::GatewayBanPayload {
+    db::GatewayBanPayload::Ban {
+        user_name: "target".into(),
+        user_display_name: None,
+        owned_by_bot: operation_id.is_some(),
+        operation_id,
+        member_was_banned: true,
+        pending_audits: Vec::new(),
+        overlapping_deliveries: Vec::new(),
+        audit_after_ms: 0,
+    }
 }
 
 impl BanRace {
-    fn steps(self, job: &BotAction) -> Vec<BanRaceStep> {
-        let (op, enrollment) = (job.id.clone(), job.enrollment_id.clone().unwrap());
-        match self {
-            Self::Echo => vec![Box::new(move |at| {
-                format!(
-                    "INSERT INTO bans(guild_id,user_id,reason,created_at,active,operation_id)
-                     VALUES(10,99,'Reason unavailable','{at}',1,'{op}')"
-                )
-            })],
+    /// Make this write; a saved delivery left to apply later is returned.
+    async fn run(self, db: &Db, job: &BotAction, n: usize) -> Option<String> {
+        let id = format!("{}-{n}", job.id);
+        let unban = db::GatewayBanPayload::Unban { suppressed: false };
+        let sql = match self {
+            Self::Echo => {
+                let id = gateway_delivery(db, id, gateway_ban(Some(job.id.clone()))).await;
+                db::apply_gateway_ban_delivery(db, id).await.unwrap();
+                return None;
+            }
+            Self::Unban => {
+                let id = gateway_delivery(db, id, unban).await;
+                db::apply_gateway_ban_delivery(db, id).await.unwrap();
+                return None;
+            }
+            Self::UnbanSaved => return Some(gateway_delivery(db, id, unban).await),
+            Self::RebanSaved => return Some(gateway_delivery(db, id, gateway_ban(None)).await),
             Self::UnbanEvent => vec![
-                Box::new(|_| {
-                    "UPDATE bans SET active=0 WHERE guild_id=10 AND user_id=99 AND active=1"
-                        .to_owned()
-                }),
-                Box::new(|at| {
-                    format!(
-                        "INSERT INTO events(guild_id,event_type,user_id,data,created_at)
-                         VALUES(10,'member_unban',99,'{{}}','{at}')"
-                    )
-                }),
+                "UPDATE bans SET active=0 WHERE guild_id=10 AND user_id=99 AND active=1".to_owned(),
+                format!(
+                    "INSERT INTO events(guild_id,event_type,user_id,data,created_at)
+                     VALUES(10,'member_unban',99,'{{}}','{}')",
+                    chrono::Utc::now().to_rfc3339()
+                ),
             ],
-            Self::UnbanDelivery => vec![Box::new(move |at| {
-                let ms = chrono::DateTime::parse_from_rfc3339(at)
-                    .unwrap()
-                    .timestamp_millis();
-                format!(
-                    "INSERT INTO gateway_ban_deliveries
-                     (id,guild_id,enrollment_id,user_id,kind,observed_at_ms,payload,applied,case_saved)
-                     VALUES('unban-{ms}',10,'{enrollment}',99,'unban',{ms},'{{}}',0,1)"
-                )
-            })],
-            Self::Reban => vec![Box::new(|at| {
-                format!(
-                    "INSERT INTO bans(guild_id,user_id,moderator_id,reason,created_at,active)
-                     VALUES(10,99,7,'permanent','{at}',1)"
-                )
-            })],
-        }
+            Self::Reban => vec![format!(
+                "INSERT INTO bans(guild_id,user_id,moderator_id,reason,created_at,active)
+                 VALUES(10,99,7,'permanent','{}',1)",
+                chrono::Utc::now().to_rfc3339()
+            )],
+        };
+        db.with_conn(move |conn| {
+            for sql in sql {
+                conn.execute_bounded(&sql, params![], 65_536)?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        None
     }
 }
 
@@ -3555,49 +3586,45 @@ type BanRowState = (Option<String>, bool, Option<i64>, Option<i64>);
 #[tokio::test]
 async fn queued_ban_completion_keeps_a_later_unban_or_ban() {
     use BanRace::*;
-    // (label, writes before completion, whether a newer ban stays active)
+    // (label, writes before completion, whether a newer ban stays active).
+    // Saved deliveries are applied after completion, then the echo arrives if
+    // it has not yet.
     for (label, race, rebanned) in [
-        ("echo-unban", &[Echo, UnbanEvent][..], false),
-        ("echo-unban-reban", &[Echo, UnbanEvent, Reban][..], true),
+        ("echo-unban", &[Echo, Unban][..], false),
+        ("echo-unban-reban", &[Echo, Unban, Reban][..], true),
+        ("echo-pending-unban", &[Echo, UnbanSaved][..], false),
+        ("unban-before-echo", &[Unban][..], false),
+        ("pending-unban-before-echo", &[UnbanSaved][..], false),
         ("unban-event-before-echo", &[UnbanEvent][..], false),
-        ("unban-delivery-before-echo", &[UnbanDelivery][..], false),
-        ("reban-before-echo", &[UnbanEvent, Reban][..], true),
-        ("newer-ban-row-before-echo", &[Reban][..], true),
+        ("reban-row-before-echo", &[Reban][..], true),
+        ("pending-reban-before-echo", &[RebanSaved][..], true),
+        (
+            "unban-pending-reban-before-echo",
+            &[Unban, RebanSaved][..],
+            true,
+        ),
     ] {
         let f = Fixture::new();
         let job = f.enqueue(10, label, ban(99, Some(30))).await;
         let discord = BanDiscord {
-            race_db: Some(f.db.clone()),
-            during: race.iter().flat_map(|write| write.steps(&job)).collect(),
+            race: Some((f.db.clone(), job.clone(), race.to_vec())),
             ..Default::default()
         };
         drain(&f.db, &discord, &WorkerLimits::default())
             .await
             .unwrap();
+        let pending = std::mem::take(&mut *discord.pending.lock().unwrap());
+        for id in pending {
+            db::apply_gateway_ban_delivery(&f.db, id).await.unwrap();
+        }
         if !race.iter().any(|write| matches!(write, Echo)) {
-            // The echo is persisted after completion, as a gateway delivery: it is
-            // this ban's row, never a second one.
-            let delivery = db::GatewayBanDelivery {
-                id: format!("late-echo-{label}"),
-                enrollment: db::guild_enrollment(&f.db, 10).await.unwrap().unwrap(),
-                user_id: 99,
-                observed_at: chrono::Utc::now().to_rfc3339(),
-                payload: db::GatewayBanPayload::Ban {
-                    user_name: "target".into(),
-                    user_display_name: None,
-                    owned_by_bot: true,
-                    operation_id: Some(job.id.clone()),
-                    member_was_banned: true,
-                    pending_audits: Vec::new(),
-                    overlapping_deliveries: Vec::new(),
-                    audit_after_ms: 0,
-                },
-                case: None,
-            };
-            let id = db::save_gateway_ban_delivery(&f.db, delivery)
-                .await
-                .unwrap()
-                .id;
+            // A late echo is this ban's row, never a second one.
+            let id = gateway_delivery(
+                &f.db,
+                format!("{label}-late-echo"),
+                gateway_ban(Some(job.id.clone())),
+            )
+            .await;
             assert!(
                 matches!(
                     db::apply_gateway_ban_delivery(&f.db, id).await.unwrap(),
@@ -3609,11 +3636,19 @@ async fn queued_ban_completion_keeps_a_later_unban_or_ban() {
 
         let status = f.status(&job).await;
         assert_eq!(status.state, "succeeded", "{label}: Discord's result stays");
-        assert_eq!(
-            member_ban_events(&f).await,
-            1,
-            "{label}: the ban is audited"
-        );
+        let op = job.id.clone();
+        let audited: i64 =
+            f.db.with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT count(*) FROM events WHERE event_type='member_ban'
+                     AND json_extract(data,'$.action_id')=?1",
+                    params![op],
+                    |row| Ok(row.get(0)?),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(audited, 1, "{label}: the ban is audited once");
         let rows: Vec<BanRowState> =
             f.db.with_conn(|conn| {
                 let mut stmt = conn.prepare(
@@ -3649,9 +3684,12 @@ async fn queued_ban_completion_keeps_a_later_unban_or_ban() {
         assert_eq!(mine[0].3, None, "{label}: no deadline on an ended ban");
         let active: Vec<_> = rows.iter().filter(|row| row.1).collect();
         if rebanned {
-            assert_eq!(active.len(), 1, "{label}: {rows:?}");
-            assert_eq!(active[0].0, None, "{label}: the newer ban stays active");
-            assert_eq!(active[0].2, Some(7), "{label}: {rows:?}");
+            assert_eq!(
+                active.len(),
+                1,
+                "{label}: the newer ban is active: {rows:?}"
+            );
+            assert_eq!(active[0].0, None, "{label}: {rows:?}");
             assert_eq!(
                 active[0].3, None,
                 "{label}: the newer permanent ban takes no deadline"
@@ -3660,6 +3698,38 @@ async fn queued_ban_completion_keeps_a_later_unban_or_ban() {
             assert!(active.is_empty(), "{label}: nothing resurrected: {rows:?}");
         }
     }
+}
+
+#[tokio::test]
+async fn queued_ban_completion_keeps_its_own_echo_current_with_its_deadline() {
+    let f = Fixture::new();
+    let job = f.enqueue(10, "own-echo", ban(99, Some(30))).await;
+    let discord = BanDiscord {
+        race: Some((f.db.clone(), job.clone(), vec![BanRace::Echo])),
+        ..Default::default()
+    };
+    let before = now();
+    drain(&f.db, &discord, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(f.status(&job).await.state, "succeeded");
+    let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
+    assert_eq!(rows.len(), 1, "its own echo is not a later ban");
+    assert!(rows[0].active);
+    assert_eq!(rows[0].moderator_id, Some(42));
+    let id = rows[0].id;
+    let expires_at: Option<i64> =
+        f.db.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT expires_at FROM bans WHERE id=?1",
+                params![id],
+                |row| Ok(row.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    let expires_at = expires_at.expect("the current ban takes its deadline");
+    assert!((before + 1800..=now() + 1800).contains(&expires_at));
 }
 
 #[tokio::test]
