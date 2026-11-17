@@ -265,6 +265,28 @@ test('editing a ban reason saves the jModGuard reason and reloads the list', asy
   assert.equal(findNode(row, n => n.localName === 'textarea'), null);
 });
 
+test('a ban reason cannot be retyped while its save is pending', async () => {
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const h = harness(async (url, opts) => {
+    if (opts.method === 'PUT') { await pending; return response({ changed: true, reason: 'First submitted draft' }); }
+    return response(banRows());
+  });
+  const root = await bansView(h);
+  const row = root.querySelectorAll('tbody tr')[1];
+  await fire(findNode(row, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Edit reason'), 'click');
+  const box = findNode(row, n => n.localName === 'textarea');
+  box.value = 'First submitted draft';
+  await fire(box, 'input', { target: { value: 'First submitted draft' } });
+  assert.equal(box.disabled, false);
+  await fire(findNode(row, n => n.localName === 'button' && n.textContent === 'Save reason'), 'click');
+  await settle();
+  assert.equal(findNode(row, n => n.localName === 'textarea').disabled, true, 'no new text can be typed and then dropped');
+  release();
+  await settle();
+  assert.equal(findNode(row, n => n.localName === 'textarea'), null);
+});
+
 test('an unsaved ban reason survives reloads and is never discarded without asking', async () => {
   const prompts = [];
   let discard = false;

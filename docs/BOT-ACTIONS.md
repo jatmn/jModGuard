@@ -250,8 +250,10 @@ appeared. A later unban or ban wins, as for gateway deliveries. The echo row kee
 observation time, so a later unban ends it even when applied after completion, and an echo
 already ended stays ended. Without an echo, a ban row, unban event, or gateway unban or
 another ban delivery saved after the request was sent (applied or still pending) records
-this ban as an ended row dated at the request, so that later delivery still projects as
-current. None of these replaces the current ban or takes this ban's deadline. The worker also records one tenant ban case with the action ID
+this ban as an ended row. A row completion inserts is dated when the request was sent, as
+a gateway row is dated when it was observed, so an unban or ban observed after the request
+still ends or follows it even if it is saved after completion. None of these replaces the
+current ban or takes this ban's deadline. The worker also records one tenant ban case with the action ID
 as its application source so the later Discord audit entry links to it. Failed and uncertain bans
 write no ban row or case and release the gateway echo marker, so a ban Discord did apply
 whose echo arrives afterwards is recorded from its gateway event like a manual ban. An

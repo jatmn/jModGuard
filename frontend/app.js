@@ -9437,6 +9437,9 @@ function BanReasonText({ text }) {
 // The Bans page holds its one open reason editor ({ id, draft }) so a list reload keeps the
 // draft, and the page's single unsaved-changes flag belongs to that one editor.
 function BanReasonCell({ record, names, guildId, editor: reasonEditor, onEdit, onDraft, onClose, onSaved }) {
+  // Like the shared draft controls: no typing while a save is in flight, so a
+  // newer draft cannot be closed and dropped when the earlier save completes.
+  const working = useContext(BusyContext);
   const editing = reasonEditor?.id === record.id;
   const draft = editing ? reasonEditor.draft : "";
   const parts = banReasonParts(record.reason);
@@ -9452,6 +9455,7 @@ function BanReasonCell({ record, names, guildId, editor: reasonEditor, onEdit, o
         rows: 2,
         value: draft,
         autoFocus: true,
+        disabled: working,
         onChange: (event) => {
           onDraft(event.target.value.replace(/[\r\n]+/g, " "));
           markDirty();

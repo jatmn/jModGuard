@@ -3191,8 +3191,8 @@ struct BanDiscord {
     outcome: Outcome,
     bans: std::sync::Mutex<Vec<(i64, i64, u8, String)>>,
     race: Option<(Db, BotAction, Vec<BanRace>)>,
-    /// Gateway deliveries `race` saved but did not apply.
-    pending: std::sync::Mutex<Vec<String>>,
+    /// Gateway deliveries `race` left to save or apply after completion.
+    pending: std::sync::Mutex<Vec<LateDelivery>>,
 }
 impl Default for BanDiscord {
     fn default() -> Self {
@@ -3505,19 +3505,62 @@ enum BanRace {
     /// A newer gateway ban by someone else, saved but applied only after
     /// completion.
     RebanSaved,
+    /// A gateway unban observed now but saved and applied only after
+    /// completion, as when its membership capture or save is still retrying.
+    UnbanObserved,
+    /// A newer gateway ban by someone else observed now but saved and applied
+    /// only after completion.
+    RebanObserved,
+}
+
+impl BanRace {
+    fn observed_late(self) -> bool {
+        matches!(self, Self::UnbanObserved | Self::RebanObserved)
+    }
+}
+
+/// A gateway delivery the race left for after completion.
+enum LateDelivery {
+    /// Saved; apply it.
+    Saved(String),
+    /// Observed only; save then apply it.
+    Observed(Box<db::GatewayBanDelivery>),
+}
+
+impl LateDelivery {
+    async fn apply(self, db: &Db) {
+        let id = match self {
+            Self::Saved(id) => id,
+            Self::Observed(delivery) => {
+                db::save_gateway_ban_delivery(db, *delivery)
+                    .await
+                    .unwrap()
+                    .id
+            }
+        };
+        db::apply_gateway_ban_delivery(db, id).await.unwrap();
+    }
 }
 
 /// A gateway delivery for user 99 of guild 10, observed now.
-async fn gateway_delivery(db: &Db, id: String, payload: db::GatewayBanPayload) -> String {
-    let delivery = db::GatewayBanDelivery {
+async fn observed_delivery(
+    db: &Db,
+    id: String,
+    payload: db::GatewayBanPayload,
+) -> db::GatewayBanDelivery {
+    db::GatewayBanDelivery {
         id,
         enrollment: db::guild_enrollment(db, 10).await.unwrap().unwrap(),
         user_id: 99,
         observed_at: chrono::Utc::now().to_rfc3339(),
         payload,
         case: None,
-    };
-    db::save_gateway_ban_delivery(db, delivery)
+    }
+}
+
+/// [`observed_delivery`], saved.
+async fn gateway_delivery(db: &Db, id: String, payload: db::GatewayBanPayload) -> String {
+    db::save_gateway_ban_delivery(db, observed_delivery(db, id, payload).await)
         .await
         .unwrap()
         .id
@@ -3538,7 +3581,7 @@ fn gateway_ban(operation_id: Option<String>) -> db::GatewayBanPayload {
 
 impl BanRace {
     /// Make this write; a saved delivery left to apply later is returned.
-    async fn run(self, db: &Db, job: &BotAction, n: usize) -> Option<String> {
+    async fn run(self, db: &Db, job: &BotAction, n: usize) -> Option<LateDelivery> {
         let id = format!("{}-{n}", job.id);
         let unban = db::GatewayBanPayload::Unban { suppressed: false };
         let sql = match self {
@@ -3552,8 +3595,21 @@ impl BanRace {
                 db::apply_gateway_ban_delivery(db, id).await.unwrap();
                 return None;
             }
-            Self::UnbanSaved => return Some(gateway_delivery(db, id, unban).await),
-            Self::RebanSaved => return Some(gateway_delivery(db, id, gateway_ban(None)).await),
+            Self::UnbanSaved => {
+                return Some(LateDelivery::Saved(gateway_delivery(db, id, unban).await));
+            }
+            Self::RebanSaved => {
+                let id = gateway_delivery(db, id, gateway_ban(None)).await;
+                return Some(LateDelivery::Saved(id));
+            }
+            Self::UnbanObserved => {
+                let delivery = observed_delivery(db, id, unban).await;
+                return Some(LateDelivery::Observed(Box::new(delivery)));
+            }
+            Self::RebanObserved => {
+                let delivery = observed_delivery(db, id, gateway_ban(None)).await;
+                return Some(LateDelivery::Observed(Box::new(delivery)));
+            }
             Self::UnbanEvent => vec![
                 "UPDATE bans SET active=0 WHERE guild_id=10 AND user_id=99 AND active=1".to_owned(),
                 format!(
@@ -3598,6 +3654,12 @@ async fn queued_ban_completion_keeps_a_later_unban_or_ban() {
         ("unban-event-before-echo", &[UnbanEvent][..], false),
         ("reban-row-before-echo", &[Reban][..], true),
         ("pending-reban-before-echo", &[RebanSaved][..], true),
+        ("unban-saved-after-completion", &[UnbanObserved][..], false),
+        (
+            "unban-reban-saved-after-completion",
+            &[UnbanObserved, RebanObserved][..],
+            true,
+        ),
         (
             "unban-pending-reban-before-echo",
             &[Unban, RebanSaved][..],
@@ -3614,8 +3676,8 @@ async fn queued_ban_completion_keeps_a_later_unban_or_ban() {
             .await
             .unwrap();
         let pending = std::mem::take(&mut *discord.pending.lock().unwrap());
-        for id in pending {
-            db::apply_gateway_ban_delivery(&f.db, id).await.unwrap();
+        for late in pending {
+            late.apply(&f.db).await;
         }
         if !race.iter().any(|write| matches!(write, Echo)) {
             // A late echo is this ban's row, never a second one.
@@ -3681,7 +3743,13 @@ async fn queued_ban_completion_keeps_a_later_unban_or_ban() {
             "{label}: a later unban or ban ended it: {rows:?}"
         );
         assert_eq!(mine[0].2, Some(42), "{label}: the requester is recorded");
-        assert_eq!(mine[0].3, None, "{label}: no deadline on an ended ban");
+        if !race.iter().any(|write| write.observed_late()) {
+            assert_eq!(mine[0].3, None, "{label}: no deadline on an ended ban");
+        }
+        assert!(
+            rows.iter().all(|row| !row.1 || row.3.is_none()),
+            "{label}: no deadline stays effective: {rows:?}"
+        );
         let active: Vec<_> = rows.iter().filter(|row| row.1).collect();
         if rebanned {
             assert_eq!(

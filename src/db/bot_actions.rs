@@ -615,10 +615,11 @@ async fn finish_bot_action_inner(
 ///   one applied after this completion, still ends it. If a later unban or ban
 ///   already ended it, it stays ended history.
 /// - Without an echo, a ban or unban saved after the request was sent, applied
-///   or still pending, means this ban is history: record it ended, dated when
-///   the request was sent so that later observation still projects as current,
-///   and leave the current row untouched. Otherwise end any older active row,
-///   kept as history, and insert this ban.
+///   or still pending, means this ban is history: record it ended and leave the
+///   current row untouched. Otherwise end any older active row, kept as
+///   history, and insert this ban. Either row is dated when the request was
+///   sent, so a later observation, even one saved after this completion,
+///   still orders after it.
 ///
 /// A requested duration binds its deadline to this row and membership only
 /// while this row is the active ban and nothing later is saved, never to a
@@ -659,10 +660,10 @@ fn record_confirmed_ban_conn(
                     params![job.guild_id, user_id],
                 )?;
             }
-            let created_at = match requested_at {
-                Some(at) if !current => at.to_rfc3339(),
-                _ => now_str(),
-            };
+            // Dated when the request was sent, as a gateway row is dated when it
+            // was observed, so a later unban or ban observed before this
+            // completion but saved after it still orders after this ban.
+            let created_at = requested_at.map_or_else(now_str, |at| at.to_rfc3339());
             let row_id = conn.query_row_write(
                 "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, operation_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) RETURNING id",
