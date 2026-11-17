@@ -98,6 +98,8 @@ const config = JSON.parse(fs.readFileSync("release-please-config.json", "utf8"))
 const manifest = JSON.parse(fs.readFileSync(".release-please-manifest.json", "utf8"));
 assert.equal(config["release-type"], "simple");
 assert.equal(config["include-v-in-tag"], true);
+assert.equal(config["bump-minor-pre-major"], true);
+assert.equal(config["bump-patch-for-minor-pre-major"], true);
 assert.deepEqual(Object.keys(config.packages), ["."]);
 assert.deepEqual(Object.keys(manifest), ["."]);
 assert.match(manifest["."], /^[0-9]+\.[0-9]+\.[0-9]+$/);
