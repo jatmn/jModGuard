@@ -9394,7 +9394,12 @@ function BanPersonCell({ person, label }) {
 
 function BanModeratorCell({ record, names, rule }) {
   if (record.moderator_id) {
-    return h(BanPersonCell, { person: banPerson(record.moderator_id, record.moderator_name, null, names), label: "moderator" });
+    const moderator = h(BanPersonCell, { person: banPerson(record.moderator_id, record.moderator_name, null, names), label: "moderator" });
+    // The reason cell drops the automod prefix, so its rule is named here
+    // beside the person who acted rather than replacing them.
+    return rule
+      ? h("div", { className: "ban-moderator" }, moderator, h("span", { className: "muted ban-moderator-rule" }, `jModGuard (automod: ${rule})`))
+      : moderator;
   }
   return h(
     "div",

@@ -323,6 +323,28 @@ pub fn ban_reason_edit_text(reason: &str) -> Result<String> {
     Ok(reason.to_owned())
 }
 
+/// The stored link from a ban row to its case: the operation ID saved on the
+/// row (the case's application source), or the Discord audit entry its manual
+/// ban event recorded (the case's audit source). No other link is inferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BanCaseLink {
+    Operation(String),
+    AuditEntry(i64),
+}
+
+/// One reason edit to add to the ban's case history, read from its audit event
+/// so a retry carries the same facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BanReasonHistory {
+    pub case: BanCaseLink,
+    /// The `ban_reason_edit` event; the stable identity of this history entry.
+    pub event_id: i64,
+    pub actor_id: Option<i64>,
+    pub recorded_at_ms: i64,
+    pub previous_reason: Option<String>,
+    pub reason: String,
+}
+
 /// Replace the jModGuard reason shown for one ban row in the captured
 /// membership. Only our record changes: the row keeps its original reason and
 /// each edit is one audit event (who, when, previous and new reason), written
@@ -334,31 +356,58 @@ pub async fn edit_enrolled_ban_reason(
     actor_id: i64,
     reason: String,
 ) -> Result<BanReasonEdit> {
+    edit_enrolled_ban_reason_with_history(db, enrollment, ban_id, actor_id, reason)
+        .await
+        .map(|(edit, _)| edit)
+}
+
+/// [`edit_enrolled_ban_reason`], also returning the edit to add to the ban's
+/// case history when the row has a stored case link. An unchanged reason
+/// returns the latest edit that set it, so a retry can still record it.
+pub async fn edit_enrolled_ban_reason_with_history(
+    db: &Db,
+    enrollment: GuildEnrollment,
+    ban_id: i64,
+    actor_id: i64,
+    reason: String,
+) -> Result<(BanReasonEdit, Option<BanReasonHistory>)> {
     let reason = ban_reason_edit_text(&reason)?;
     anyhow::ensure!(ban_id > 0 && actor_id > 0, "invalid ban or actor");
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
         super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
-        let row: Option<(i64, Option<String>)> = tx
+        let row: Option<(i64, Option<String>, Option<String>)> = tx
             .query_row(
-                "SELECT user_id, reason FROM bans WHERE id = ?1 AND guild_id = ?2",
+                "SELECT user_id, reason, operation_id FROM bans WHERE id = ?1 AND guild_id = ?2",
                 params![ban_id, enrollment.guild_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let (user_id, original) = row.context("ban not found")?;
+        let (user_id, original, operation_id) = row.context("ban not found")?;
+        let case = ban_case_link_conn(&tx, enrollment.guild_id, user_id, ban_id, operation_id)?;
         let mut edits = ban_reason_edits_conn(&tx, enrollment.guild_id, ban_id, ban_id)?;
-        let previous = match edits.remove(&ban_id) {
+        let latest_edit = edits.remove(&ban_id);
+        let edited = latest_edit.is_some();
+        let previous = match latest_edit {
             Some(edit) => Some(edit.reason),
             None => original,
         };
         if previous.as_deref() == Some(reason.as_str()) {
+            let history = match case {
+                Some(case) if edited => {
+                    latest_ban_reason_history_conn(&tx, enrollment.guild_id, ban_id, case)?
+                }
+                _ => None,
+            };
             tx.finish_read()?;
-            return Ok(BanReasonEdit {
-                changed: false,
-                reason,
-            });
+            return Ok((
+                BanReasonEdit {
+                    changed: false,
+                    reason,
+                },
+                history,
+            ));
         }
         tx.ensure_mutation_receipt()?;
         let data = serde_json::json!({
@@ -367,6 +416,7 @@ pub async fn edit_enrolled_ban_reason(
             "reason": reason,
         })
         .to_string();
+        let at = now_str();
         tx.execute_rows(
             "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -376,17 +426,102 @@ pub async fn edit_enrolled_ban_reason(
                 user_id,
                 actor_id,
                 data,
-                now_str()
+                at.clone()
             ],
             1,
         )?;
+        let event_id = tx.last_insert_rowid();
         tx.commit()?;
-        Ok(BanReasonEdit {
-            changed: true,
+        let history = case
+            .map(|case| -> Result<BanReasonHistory> {
+                Ok(BanReasonHistory {
+                    case,
+                    event_id,
+                    actor_id: Some(actor_id),
+                    recorded_at_ms: event_time_ms(&at)?,
+                    previous_reason: previous,
+                    reason: reason.clone(),
+                })
+            })
+            .transpose()?;
+        Ok((
+            BanReasonEdit {
+                changed: true,
+                reason,
+            },
+            history,
+        ))
+    })
+    .await
+}
+
+fn event_time_ms(created_at: &str) -> Result<i64> {
+    Ok(chrono::DateTime::parse_from_rfc3339(created_at)?
+        .timestamp_millis()
+        .max(1))
+}
+
+/// The stored case link of one ban row, see [`BanCaseLink`].
+fn ban_case_link_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+    ban_id: i64,
+    operation_id: Option<String>,
+) -> Result<Option<BanCaseLink>> {
+    if let Some(operation_id) = operation_id.filter(|id| !id.is_empty()) {
+        return Ok(Some(BanCaseLink::Operation(operation_id)));
+    }
+    let entry: Option<Option<String>> = conn
+        .query_row(
+            "SELECT CAST(json_extract(data, '$.audit_entry_id') AS TEXT) FROM events
+             WHERE guild_id=?1 AND user_id=?2 AND event_type='member_ban' AND json_valid(data)
+               AND CAST(json_extract(data, '$.ban_id') AS INTEGER)=?3
+               AND json_extract(data, '$.audit_entry_id') IS NOT NULL
+             ORDER BY id DESC LIMIT 1",
+            params![guild_id, user_id, ban_id],
+            |row| Ok(row.get(0)?),
+        )
+        .optional()?;
+    Ok(parse_gateway_audit_entry_id_text(entry.flatten())?
+        .filter(|id| *id > 0)
+        .map(BanCaseLink::AuditEntry))
+}
+
+/// (event id, actor, created_at, previous reason, reason) of one reason edit.
+type BanReasonEditRow = (i64, Option<i64>, String, Option<String>, String);
+
+/// The latest edit of one ban row as a history entry.
+fn latest_ban_reason_history_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    ban_id: i64,
+    case: BanCaseLink,
+) -> Result<Option<BanReasonHistory>> {
+    let row: Option<BanReasonEditRow> = conn
+        .query_row(
+            "SELECT id, actor_id, created_at, json_extract(data, '$.previous_reason'),
+                    json_extract(data, '$.reason')
+             FROM events
+             WHERE id = (SELECT max(id) FROM events
+                 WHERE guild_id = ?1 AND event_type = 'ban_reason_edit' AND json_valid(data)
+                   AND json_type(data, '$.reason') = 'text'
+                   AND CAST(json_extract(data, '$.ban_id') AS INTEGER) = ?2)",
+            params![guild_id, ban_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    row.map(|(event_id, actor_id, at, previous_reason, reason)| {
+        Ok(BanReasonHistory {
+            case,
+            event_id,
+            actor_id,
+            recorded_at_ms: event_time_ms(&at)?,
+            previous_reason,
             reason,
         })
     })
-    .await
+    .transpose()
 }
 
 /// The latest reason edit of one ban row.

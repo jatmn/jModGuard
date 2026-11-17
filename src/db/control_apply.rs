@@ -1097,10 +1097,15 @@ async fn apply_control_inner(
             actor_id,
             reason,
         } => {
-            let ConfigurationScope::Guild(enrollment) = scope_of(scope)? else {
+            let ConfigurationScope::Guild(enrollment) = scope_of(scope.clone())? else {
                 return Err(EnrollmentChanged.into());
             };
-            let edit = edit_enrolled_ban_reason(db, enrollment, ban_id, actor_id, reason).await?;
+            let (edit, history) =
+                edit_enrolled_ban_reason_with_history(db, enrollment, ban_id, actor_id, reason)
+                    .await?;
+            if let (Some(tenant), Some(history)) = (tenant, history) {
+                record_ban_reason_history(tenant, scope, history).await?;
+            }
             if edit.changed {
                 saved_value(edit)
             } else {
@@ -1264,6 +1269,74 @@ fn scope_of(wire: ScopeWire) -> Result<ConfigurationScope> {
 
 fn write_scope(request: ScopeWire, target: ScopeWire) -> Result<ConfigurationWriteScope> {
     ConfigurationWriteScope::new(scope_of(request)?, scope_of(target)?)
+}
+
+/// First half of a ban reason edit's case-history entry ID; the second half is
+/// its `ban_reason_edit` event ID, so a retry reuses the same entry.
+const BAN_REASON_HISTORY_TAG: u64 = 0xba7e_ed17_0000_0001;
+
+/// Add one reason edit to the case its ban row is linked to, as a reason
+/// correction keeping the case's original facts. A ban without a live case
+/// (none recorded, or removed) keeps only its audit event. A full case history
+/// budget is logged rather than failing the saved edit.
+async fn record_ban_reason_history(
+    tenant: &TenantRuntime,
+    scope: ScopeWire,
+    history: BanReasonHistory,
+) -> Result<()> {
+    use crate::db::guild_data::{
+        CaseError, CaseHistoryBody, CaseHistoryData, CaseId, CaseReasonCorrection, CaseSource,
+    };
+    let source = match history.case {
+        BanCaseLink::Operation(operation_id) => match CaseId::try_from(operation_id) {
+            Ok(operation_id) => CaseSource::Application { operation_id },
+            // Not a case operation ID, so no case carries it.
+            Err(_) => return Ok(()),
+        },
+        BanCaseLink::AuditEntry(entry_id) => CaseSource::DiscordAudit { entry_id },
+    };
+    let (store, scope) = captured_guild(Some(tenant), scope)
+        .await
+        .map_err(as_enrollment)?;
+    let Some(case) = store
+        .case_for_source(scope.clone(), source)
+        .await
+        .map_err(as_enrollment)?
+        .filter(|case| !case.removed)
+    else {
+        return Ok(());
+    };
+    let entry = CaseId::try_from(format!(
+        "{BAN_REASON_HISTORY_TAG:016x}{:016x}",
+        history.event_id as u64
+    ))?;
+    let explanation = match &history.previous_reason {
+        Some(previous) => format!("Ban reason edited in jModGuard. Previous reason: {previous}"),
+        None => "Ban reason edited in jModGuard. There was no previous reason.".to_owned(),
+    };
+    let data = CaseHistoryData {
+        actor_id: history.actor_id,
+        recorded_at_ms: history.recorded_at_ms,
+        body: CaseHistoryBody::Correction {
+            outcome: None,
+            reason: Some(CaseReasonCorrection::Set(history.reason)),
+            explanation,
+        },
+    };
+    match store
+        .append_case_history(scope, case.id, entry, data, crate::tenant::history_limits())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if matches!(error.downcast_ref::<CaseError>(), Some(CaseError::Limit)) => {
+            tracing::warn!(
+                event_id = history.event_id,
+                "ban reason edit saved; its case history is full: {error:#}"
+            );
+            Ok(())
+        }
+        Err(error) => Err(as_enrollment(error)),
+    }
 }
 
 async fn captured_guild(

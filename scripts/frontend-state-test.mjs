@@ -228,6 +228,16 @@ test('Bans cells name people with ID chips, label automod and keep the original 
   assert.deepEqual(confirms, ['Unban Directory-Name (@directory-user)?']);
 });
 
+test('a ban with a moderator and an automod rule shows both', async () => {
+  const rows = { bans: [{ id: 4, user_id: '9007199254740993', user_name: 'test-user-1', user_display_name: null, moderator_id: '9007199254740995', moderator_name: 'test-mod-1', active: true, reason: '[automod:spam_burst] Repeated messages', created_at: '2020-01-01T12:00:00Z' }], names: {} };
+  const h = harness(async () => response(rows));
+  const root = await bansView(h);
+  const cell = root.querySelector('tbody tr').cells[2];
+  assert.equal(findNode(cell, n => n.localName === 'strong').textContent, 'test-mod-1', 'the moderator who acted stays');
+  assert.equal(findNode(cell, n => String(n.className).includes('id-chip')).textContent, '9007199254740995');
+  assert.match(textOf(cell), /jModGuard \(automod: spam_burst\)/, 'the rule is not dropped');
+});
+
 test('editing a ban reason saves the jModGuard reason and reloads the list', async () => {
   const calls = [];
   const h = harness(async (url, opts) => {

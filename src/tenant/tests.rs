@@ -1887,6 +1887,172 @@ async fn case_control_rejects_replaced_enrollment() {
     );
 }
 
+#[tokio::test]
+async fn ban_reason_edits_are_added_to_the_linked_case_history() {
+    use crate::db::guild_data::{CaseHistoryBody, CaseReasonCorrection};
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    let (store, scope) = f.tenant.live(enrollment.clone()).await.unwrap();
+    let ban_case = |subject, source| CaseData {
+        action: CaseAction::Ban,
+        source,
+        ..case_data(subject)
+    };
+    // A queued or bot ban: the row keeps the case's operation ID.
+    let operation = CaseId::new();
+    let queued = CaseId::new();
+    let source = CaseSource::Application {
+        operation_id: operation.clone(),
+    };
+    store
+        .record_case(
+            scope.clone(),
+            queued.clone(),
+            ban_case(99, source),
+            case_limits(),
+        )
+        .await
+        .unwrap();
+    // A ban made in Discord: its ban event keeps the audit entry its case uses.
+    let manual = CaseId::new();
+    let source = CaseSource::DiscordAudit { entry_id: 555 };
+    store
+        .record_case(
+            scope.clone(),
+            manual.clone(),
+            ban_case(98, source),
+            case_limits(),
+        )
+        .await
+        .unwrap();
+    let op: String = operation.into();
+    let bans: (i64, i64, i64) = f
+        .db
+        .with_conn(move |conn| {
+            let insert = |user: i64, operation_id: Option<String>| -> anyhow::Result<i64> {
+                conn.execute_bounded(
+                    "INSERT INTO bans (guild_id,user_id,moderator_id,reason,created_at,active,operation_id)
+                     VALUES (10,?1,42,'raid','2020-01-01T00:00:00+00:00',1,?2)",
+                    db::params![user, operation_id],
+                    65_536,
+                )?;
+                conn.query_row(
+                    "SELECT id FROM bans WHERE guild_id=10 AND user_id=?1",
+                    db::params![user],
+                    |row| Ok(row.get::<i64>(0)?),
+                )
+            };
+            let queued = insert(99, Some(op))?;
+            let manual = insert(98, None)?;
+            let command = insert(97, None)?;
+            conn.execute_bounded(
+                "INSERT INTO events (guild_id,event_type,user_id,data,created_at)
+                 VALUES (10,'member_ban',98,?1,'2020-01-01T00:00:00+00:00')",
+                db::params![serde_json::json!({"ban_id": manual, "audit_entry_id": "555"}).to_string()],
+                65_536,
+            )?;
+            Ok((queued, manual, command))
+        })
+        .await
+        .unwrap();
+    let wire = db::ScopeWire {
+        global: false,
+        guild_id: 10,
+        enrollment_id: enrollment.id.clone(),
+        joined_at_ns: enrollment.joined_at_ns,
+    };
+    let edit = |ban_id: i64, reason: &str| {
+        db::apply_control(
+            &f.db,
+            Some(&f.tenant),
+            db::ControlOp::EditBanReason {
+                scope: wire.clone(),
+                ban_id,
+                actor_id: 43,
+                reason: reason.into(),
+            },
+            None,
+        )
+    };
+    let history = |case: CaseId| {
+        let (store, scope) = (store.clone(), scope.clone());
+        async move {
+            let mut out = Vec::new();
+            for entry in store
+                .case_history_ids(scope.clone(), case.clone(), 0, 32, history_limits())
+                .await
+                .unwrap()
+            {
+                out.push(
+                    store
+                        .case_history_entry(scope.clone(), case.clone(), entry.id, history_limits())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+            out
+        }
+    };
+
+    edit(bans.0, "raid account").await.unwrap();
+    let entries = history(queued.clone()).await;
+    assert_eq!(entries.len(), 1, "each edit is one case history entry");
+    assert_eq!(entries[0].actor_id, Some(43), "who");
+    assert!(entries[0].recorded_at_ms > 1, "when");
+    let CaseHistoryBody::Correction {
+        outcome,
+        reason,
+        explanation,
+    } = &entries[0].body
+    else {
+        panic!("{entries:?}");
+    };
+    assert_eq!(*outcome, None);
+    assert_eq!(
+        *reason,
+        Some(CaseReasonCorrection::Set("raid account".into())),
+        "new reason"
+    );
+    assert!(
+        explanation.contains("Previous reason: raid"),
+        "{explanation}"
+    );
+    // A retry of the same edit records nothing new; a further edit is a new entry.
+    assert!(matches!(
+        edit(bans.0, "raid account").await.unwrap(),
+        db::ControlReply::Unchanged { .. }
+    ));
+    assert_eq!(history(queued.clone()).await.len(), 1);
+    edit(bans.0, "raid bot").await.unwrap();
+    let entries = history(queued.clone()).await;
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(
+        &entries[1].body,
+        CaseHistoryBody::Correction { explanation, .. } if explanation.contains("Previous reason: raid account")
+    ));
+    let (store_check, scope_check) = (store.clone(), scope.clone());
+    let original = store_check
+        .case(scope_check, queued, case_limits())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        original.reason.as_deref(),
+        Some("test"),
+        "the case keeps its original reason"
+    );
+
+    edit(bans.1, "phishing").await.unwrap();
+    assert_eq!(
+        history(manual).await.len(),
+        1,
+        "linked through its audit entry"
+    );
+    // No stored link: only the audit event records the edit.
+    edit(bans.2, "spam").await.unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn read_only_evidence_retries_until_storage_id_appears() {
