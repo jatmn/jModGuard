@@ -1100,11 +1100,18 @@ async fn apply_control_inner(
             let ConfigurationScope::Guild(enrollment) = scope_of(scope.clone())? else {
                 return Err(EnrollmentChanged.into());
             };
-            let (edit, history) =
-                edit_enrolled_ban_reason_with_history(db, enrollment, ban_id, actor_id, reason)
-                    .await?;
+            let (edit, history) = edit_enrolled_ban_reason_with_history(
+                db,
+                enrollment.clone(),
+                ban_id,
+                actor_id,
+                reason,
+            )
+            .await?;
             if let (Some(tenant), Some(history)) = (tenant, history) {
+                let event_id = history.event_id;
                 record_ban_reason_history(tenant, scope, history).await?;
+                acknowledge_ban_reason_history(db, enrollment, event_id).await?;
             }
             if edit.changed {
                 saved_value(edit)
@@ -1269,6 +1276,34 @@ fn scope_of(wire: ScopeWire) -> Result<ConfigurationScope> {
 
 fn write_scope(request: ScopeWire, target: ScopeWire) -> Result<ConfigurationWriteScope> {
     ConfigurationWriteScope::new(scope_of(request)?, scope_of(target)?)
+}
+
+/// Recover linked edits independently of request replay or the current reason.
+/// Every attempt uses its original source, membership, event ID and payload.
+/// Advancing past failed items keeps one unavailable guild from starving others.
+pub async fn recover_pending_ban_reason_history(
+    db: &Db,
+    tenant: &TenantRuntime,
+    after: &mut i64,
+) -> Result<()> {
+    let pending = pending_ban_reason_history(db, *after).await?;
+    *after = pending.last().map_or(0, |(_, history)| history.event_id);
+    for (pending, history) in pending {
+        let event_id = history.event_id;
+        let scope = ConfigurationScope::Guild(pending.enrollment.clone()).to_wire();
+        let result = async {
+            record_ban_reason_history(tenant, scope, history).await?;
+            acknowledge_ban_reason_history(db, pending.enrollment, event_id).await
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(
+                event_id,
+                "ban reason history recovery will retry: {error:#}"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// First half of a ban reason edit's case-history entry ID; the second half is

@@ -326,10 +326,16 @@ pub fn ban_reason_edit_text(reason: &str) -> Result<String> {
 /// The stored link from a ban row to its case: the operation ID saved on the
 /// row (the case's application source), or the Discord audit entry its manual
 /// ban event recorded (the case's audit source). No other link is inferred.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BanCaseLink {
     Operation(String),
-    AuditEntry(i64),
+    AuditEntry(
+        #[serde(
+            serialize_with = "crate::ids::ser_i64_str",
+            deserialize_with = "crate::ids::de_i64"
+        )]
+        i64,
+    ),
 }
 
 /// One reason edit to add to the ban's case history, read from its audit event
@@ -343,6 +349,13 @@ pub struct BanReasonHistory {
     pub recorded_at_ms: i64,
     pub previous_reason: Option<String>,
     pub reason: String,
+}
+
+/// Durable append ownership kept with the edit, not with its latest-value overlay.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct PendingBanReasonHistory {
+    pub enrollment: GuildEnrollment,
+    pub case: BanCaseLink,
 }
 
 /// Replace the jModGuard reason shown for one ban row in the captured
@@ -414,6 +427,9 @@ pub async fn edit_enrolled_ban_reason_with_history(
             "ban_id": ban_id,
             "previous_reason": previous,
             "reason": reason,
+            "case_history": case.as_ref().map(|case| PendingBanReasonHistory {
+                enrollment: enrollment.clone(), case: case.clone(),
+            }),
         })
         .to_string();
         let at = now_str();
@@ -522,6 +538,63 @@ fn latest_ban_reason_history_conn(
         })
     })
     .transpose()
+}
+
+/// One bounded round-robin page of exact, still-owned linked-history work.
+/// Old memberships stay dormant and can never be rebound to a later join.
+pub(super) async fn pending_ban_reason_history(
+    db: &Db,
+    after: i64,
+) -> Result<Vec<(PendingBanReasonHistory, BanReasonHistory)>> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_snapshot()?;
+        let rows = tx.prepare(
+            "SELECT v.id,v.actor_id,v.created_at,v.data FROM events v
+             JOIN guild_enrollments e ON e.guild_id=v.guild_id AND e.active=1
+               AND e.id=json_extract(v.data,'$.case_history.enrollment.id')
+               AND CAST(e.joined_at_ns AS TEXT)=json_extract(v.data,'$.case_history.enrollment.joined_at_ns')
+             WHERE v.id>?1 AND v.event_type='ban_reason_edit' AND json_valid(v.data)
+               AND json_type(v.data,'$.case_history')='object'
+               AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=v.guild_id)
+             ORDER BY v.id LIMIT 32",
+        )?.query_map(params![after], |row| Ok((row.get::<i64>(0)?,row.get::<Option<i64>>(1)?,row.get::<String>(2)?,row.get::<String>(3)?)))?
+            .collect::<Result<Vec<_>>>()?;
+        tx.finish_read()?;
+        rows.into_iter().map(|(event_id,actor_id,at,data)| {
+            let mut data: serde_json::Value = serde_json::from_str(&data)?;
+            let pending: PendingBanReasonHistory = serde_json::from_value(data["case_history"].take())?;
+            let history = BanReasonHistory {
+                case: pending.case.clone(), event_id, actor_id,
+                recorded_at_ms: event_time_ms(&at)?,
+                previous_reason: serde_json::from_value(data["previous_reason"].take())?,
+                reason: serde_json::from_value(data["reason"].take())?,
+            };
+            Ok((pending,history))
+        }).collect()
+    }).await
+}
+
+/// Clear only the exact edit's ownership after its idempotent append settles.
+pub(super) async fn acknowledge_ban_reason_history(
+    db: &Db,
+    enrollment: GuildEnrollment,
+    event_id: i64,
+) -> Result<()> {
+    db.with_conn(move |conn| {
+        let mut tx = conn.transaction_primary_write()?;
+        super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
+        super::guild_stores::refuse_fenced_write(&tx, enrollment.guild_id)?;
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE id=?1 AND guild_id=?2 AND event_type='ban_reason_edit'
+               AND json_extract(data,'$.case_history.enrollment.id')=?3)",
+            params![event_id,enrollment.guild_id,enrollment.id.as_str()], |r| Ok(r.get(0)?),
+        )?;
+        if !pending { tx.finish_read()?; return Ok(()); }
+        tx.ensure_mutation_receipt()?;
+        tx.execute_rows("UPDATE events SET data=json_remove(data,'$.case_history') WHERE id=?1", params![event_id], 1)?;
+        tx.commit()?;
+        Ok(())
+    }).await
 }
 
 /// The latest reason edit of one ban row.

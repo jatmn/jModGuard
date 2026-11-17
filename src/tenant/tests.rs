@@ -2053,6 +2053,223 @@ async fn ban_reason_edits_are_added_to_the_linked_case_history() {
     edit(bans.2, "spam").await.unwrap();
 }
 
+#[tokio::test]
+async fn ban_reason_history_recovers_each_committed_edit_after_an_intervening_edit() {
+    use crate::db::guild_data::{CaseHistoryBody, CaseReasonCorrection};
+    let f = Fixture::new();
+    let enrollment = enroll(&f, 10, 100).await;
+    let (store, scope) = f.tenant.live(enrollment.clone()).await.unwrap();
+    let operation = CaseId::new();
+    let case = CaseId::new();
+    store
+        .record_case(
+            scope.clone(),
+            case.clone(),
+            CaseData {
+                action: CaseAction::Ban,
+                source: CaseSource::Application {
+                    operation_id: operation.clone(),
+                },
+                ..case_data(99)
+            },
+            case_limits(),
+        )
+        .await
+        .unwrap();
+    let operation: String = operation.into();
+    let ban_id =
+        f.db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO bans(guild_id,user_id,reason,created_at,active,operation_id)
+            VALUES(10,99,'original','2020-01-01T00:00:00+00:00',1,?1)",
+                db::params![operation],
+                65_536,
+            )?;
+            conn.query_row(
+                "SELECT id FROM bans WHERE guild_id=10 AND user_id=99",
+                (),
+                |r| Ok(r.get::<i64>(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    let wire = db::ScopeWire {
+        global: false,
+        guild_id: enrollment.guild_id,
+        enrollment_id: enrollment.id.clone(),
+        joined_at_ns: enrollment.joined_at_ns,
+    };
+    let edit = |reason: &str, actor_id| {
+        db::apply_control(
+            &f.db,
+            Some(&f.tenant),
+            db::ControlOp::EditBanReason {
+                scope: wire.clone(),
+                ban_id,
+                actor_id,
+                reason: reason.into(),
+            },
+            None,
+        )
+    };
+    // Real tenant SQL rejects only the append. The production core event still commits.
+    let fault_db = libsql::Builder::new_local(&f.tenant.inner.credentials[0].options.path)
+        .build()
+        .await
+        .unwrap();
+    let fault = fault_db.connect().unwrap();
+    fault
+        .execute_batch(
+            "CREATE TRIGGER fail_reason_history BEFORE INSERT ON guild_case_history
+        BEGIN SELECT RAISE(ABORT,'injected history outage'); END",
+        )
+        .await
+        .unwrap();
+    assert!(
+        edit("A", 43)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("injected history outage")
+    );
+    let (event_id, actor, at): (i64, Option<i64>, String) = f.db.with_conn(|conn| conn.query_row(
+        "SELECT id,actor_id,created_at FROM events WHERE guild_id=10 AND event_type='ban_reason_edit' ORDER BY id LIMIT 1",
+        (), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )).await.unwrap();
+    fault
+        .execute_batch("DROP TRIGGER fail_reason_history")
+        .await
+        .unwrap();
+    edit("B", 44).await.unwrap();
+    // The bot's maintenance owner recovers the exact event without replaying
+    // the failed writer-link request or changing the current reason B.
+    let mut cursor = 0;
+    db::recover_pending_ban_reason_history(&f.db, &f.tenant, &mut cursor)
+        .await
+        .unwrap();
+    let entry_id = CaseId::try_from(format!(
+        "{:016x}{:016x}",
+        0xba7e_ed17_0000_0001u64, event_id as u64
+    ))
+    .unwrap();
+    let recovered = store
+        .case_history_entry(scope.clone(), case.clone(), entry_id, history_limits())
+        .await
+        .unwrap()
+        .expect("the original committed A event must reach linked case history despite B");
+    assert_eq!(recovered.actor_id, actor);
+    assert_eq!(
+        recovered.recorded_at_ms,
+        chrono::DateTime::parse_from_rfc3339(&at)
+            .unwrap()
+            .timestamp_millis()
+    );
+    assert!(
+        matches!(recovered.body, CaseHistoryBody::Correction { reason: Some(CaseReasonCorrection::Set(ref reason)), ref explanation, .. }
+        if reason == "A" && explanation.contains("Previous reason: original"))
+    );
+    let events: i64 =
+        f.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT count(*) FROM events WHERE guild_id=10 AND event_type='ban_reason_edit'",
+                (),
+                |r| Ok(r.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(events, 2, "history recovery creates no new edit");
+    assert_eq!(
+        db::list_bans(&f.db, 10, 10).await.unwrap()[0]
+            .edited_reason
+            .as_deref(),
+        Some("B")
+    );
+    assert_eq!(
+        store
+            .case_history_ids(scope.clone(), case.clone(), 0, 32, history_limits())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(matches!(
+        edit("B", 44).await.unwrap(),
+        db::ControlReply::Unchanged { .. }
+    ));
+    cursor = 0; // A fresh process/replayed scan acknowledges no duplicate entry.
+    db::recover_pending_ban_reason_history(&f.db, &f.tenant, &mut cursor)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .case_history_ids(scope.clone(), case.clone(), 0, 32, history_limits())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    // The tenant append can commit while the core acknowledgment fails. The
+    // still-owned event must replay its stable entry, then clear its marker.
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded(
+            "CREATE TRIGGER fail_history_ack BEFORE UPDATE ON events
+            WHEN OLD.event_type='ban_reason_edit' AND json_type(OLD.data,'$.case_history')='object'
+              AND json_type(NEW.data,'$.case_history') IS NULL
+            BEGIN SELECT RAISE(ABORT,'injected history acknowledgment outage'); END",
+            65_536,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(
+        edit("C", 45)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("injected history acknowledgment outage")
+    );
+    let pending: i64 = f.db.with_conn(|conn| conn.query_row(
+        "SELECT count(*) FROM events WHERE event_type='ban_reason_edit' AND json_type(data,'$.case_history')='object'",
+        (), |r| Ok(r.get(0)?),
+    )).await.unwrap();
+    assert_eq!(
+        pending, 1,
+        "the appended C event remains owned until acknowledgment"
+    );
+    f.db.with_conn(|conn| {
+        conn.execute_batch_bounded("DROP TRIGGER fail_history_ack", 65_536)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    cursor = 0;
+    db::recover_pending_ban_reason_history(&f.db, &f.tenant, &mut cursor)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .case_history_ids(scope, case, 0, 32, history_limits())
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "acknowledgment recovery must not duplicate the already committed C history"
+    );
+    let (events, pending): (i64, i64) = f.db.with_conn(|conn| conn.query_row(
+        "SELECT count(*),sum(CASE WHEN json_type(data,'$.case_history')='object' THEN 1 ELSE 0 END) FROM events WHERE event_type='ban_reason_edit'",
+        (), |r| Ok((r.get(0)?,r.get(1)?)),
+    )).await.unwrap();
+    assert_eq!((events, pending), (3, 0));
+    assert_eq!(
+        db::list_bans(&f.db, 10, 10).await.unwrap()[0]
+            .edited_reason
+            .as_deref(),
+        Some("C")
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn read_only_evidence_retries_until_storage_id_appears() {
