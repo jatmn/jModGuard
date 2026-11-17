@@ -471,18 +471,29 @@ pub async fn finish_bot_action(
     state: &str,
     outcome: &str,
 ) -> Result<bool> {
-    finish_bot_action_inner(db, job, state, outcome, CompletionPolicy::Trusted).await
+    finish_bot_action_inner(db, job, state, outcome, CompletionPolicy::Trusted, None).await
 }
 
 /// Worker completion: a local log-setting effect must still be within its deadline
 /// when the primary writer lock is acquired. Remote unban results may arrive late.
+/// `requested_at` is when the Discord request was sent, if one was: a confirmed
+/// ban is ordered against ban and unban records saved after it.
 pub async fn finish_dispatched_bot_action(
     db: &Db,
     job: &BotAction,
     state: &str,
     outcome: &str,
+    requested_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<bool> {
-    finish_bot_action_inner(db, job, state, outcome, CompletionPolicy::Dispatched).await
+    finish_bot_action_inner(
+        db,
+        job,
+        state,
+        outcome,
+        CompletionPolicy::Dispatched,
+        requested_at,
+    )
+    .await
 }
 
 async fn finish_bot_action_inner(
@@ -491,6 +502,7 @@ async fn finish_bot_action_inner(
     state: &str,
     outcome: &str,
     policy: CompletionPolicy,
+    requested_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<bool> {
     anyhow::ensure!(
         ActionState::from_saved(state).is_completion(),
@@ -540,6 +552,33 @@ async fn finish_bot_action_inner(
         }
         if state == ActionState::Succeeded {
             match &job.action {
+                Action::Ban {
+                    user_id,
+                    reason,
+                    duration_minutes,
+                    ..
+                } if !write_fenced => {
+                    let pending_gateway_echo = record_confirmed_ban_conn(
+                        &tx,
+                        &job,
+                        *user_id,
+                        reason,
+                        *duration_minutes,
+                        requested_at,
+                    )?;
+                    let data = serde_json::json!({
+                        "reason":reason, "source":"webui", "action_id":job.id, "outcome":outcome,
+                        "pending_gateway_echo":pending_gateway_echo,
+                    })
+                    .to_string();
+                    tx.execute_rows(
+                        "INSERT INTO events(guild_id,event_type,user_id,actor_id,data,created_at)
+                         VALUES(?1,'member_ban',?2,?3,?4,?5)",
+                        params![job.guild_id, user_id, job.actor_id, data, now_str()],
+                        1,
+                    )?;
+                }
+                Action::Ban { .. } => {}
                 Action::Unban { user_id, reason } if !write_fenced => {
                     tx.execute_matching(
                         "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2",
@@ -568,6 +607,254 @@ async fn finish_bot_action_inner(
         Ok(true)
     })
     .await
+}
+
+/// Discord confirmed this queued ban, requested at `requested_at`. A later
+/// unban or ban keeps the current ban, as for gateway deliveries:
+/// - The bot's gateway echo of this request (saved with the action ID) is this
+///   ban's row: fill it, keeping its observation time so a later unban, even
+///   one applied after this completion, still ends it. If a later unban or ban
+///   already ended it, it stays ended history. Check later boundaries from the
+///   echo's observation, so an earlier unban does not discard its deadline.
+///   A saved owned delivery supplies that observation even before projection;
+///   date an inserted row at that observation so older unbans cannot end it.
+/// - Without a known echo, a ban or unban saved after the request was sent, applied
+///   or still pending, means this ban is history: record it ended and leave the
+///   current row untouched. Otherwise end any older active row, kept as
+///   history, and insert this ban. Either row is dated when the request was
+///   sent, so a later observation, even one saved after this completion,
+///   still orders after it. Retain provisional recovery in the audit event:
+///   the first exact owned echo can reconcile this fallback if saved later.
+///
+/// A requested duration binds its deadline to this row and membership only
+/// while this row is the active ban and nothing later is saved, never to a
+/// later ban.
+fn record_confirmed_ban_conn(
+    conn: &impl SqlExecutor,
+    job: &BotAction,
+    user_id: i64,
+    reason: &str,
+    duration_minutes: Option<u32>,
+    requested_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<Option<serde_json::Value>> {
+    let echo: Option<(i64, bool, String)> = conn
+        .query_row(
+            "SELECT id, active, created_at FROM bans WHERE guild_id=?1 AND user_id=?2 AND operation_id=?3
+             ORDER BY id LIMIT 1",
+            params![job.guild_id, user_id, job.id.as_str()],
+            |row| Ok((row.get(0)?, row.get::<i64>(1)? != 0, row.get(2)?)),
+        )
+        .optional()?;
+    // Projection order must not hide a durable owned observation. Use the first
+    // matching delivery, so a redelivery cannot move this ban past an unban.
+    let echo_at = match &echo {
+        Some((_, _, at)) => Some(at.clone()),
+        None => conn
+            .query_row(
+                "SELECT json_extract(payload, '$.observed_at') FROM gateway_ban_deliveries
+                 WHERE guild_id=?1 AND user_id=?2 AND kind='ban' AND enrollment_id=?3
+                   AND json_extract(payload, '$.payload.Ban.owned_by_bot')=1
+                   AND json_extract(payload, '$.payload.Ban.operation_id')=?4
+                 ORDER BY observed_at_ms, rowid LIMIT 1",
+                params![
+                    job.guild_id,
+                    user_id,
+                    job.enrollment_id.as_deref(),
+                    job.id.as_str()
+                ],
+                |row| Ok(row.get::<String>(0)?),
+            )
+            .optional()?,
+    };
+    // Keep the request-time fallback when no valid observation is available.
+    let observed_at = echo_at
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.with_timezone(&chrono::Utc))
+        .or(requested_at);
+    let pending_echo = echo.is_none() && echo_at.is_none();
+    let current = match observed_at {
+        Some(at) => !ban_or_unban_saved_since(
+            conn,
+            job.guild_id,
+            user_id,
+            job.enrollment_id.as_deref(),
+            &job.id,
+            at,
+        )?,
+        None => true,
+    };
+    let (row_id, deadline_row) = match echo {
+        Some((row_id, active, _)) => {
+            conn.execute_rows(
+                "UPDATE bans SET moderator_id=?1, reason=?2 WHERE id=?3",
+                params![job.actor_id, reason, row_id],
+                1,
+            )?;
+            (row_id, (active && current).then_some(row_id))
+        }
+        None => {
+            if current {
+                conn.execute_matching(
+                    "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1",
+                    params![job.guild_id, user_id],
+                )?;
+            }
+            // Use the known echo observation, otherwise request start. The
+            // same anchor must govern later gateway projection as completion.
+            let created_at = observed_at.map_or_else(now_str, |at| at.to_rfc3339());
+            let row_id = conn.query_row_write(
+                "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, operation_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) RETURNING id",
+                params![
+                    job.guild_id,
+                    user_id,
+                    job.actor_id,
+                    reason,
+                    created_at,
+                    current,
+                    job.id.as_str()
+                ],
+                |row| Ok(row.get::<i64>(0)?),
+            )?;
+            (row_id, current.then_some(row_id))
+        }
+    };
+    let expires_at = duration_minutes
+        .map(|minutes| {
+            chrono::Utc::now()
+                .timestamp()
+                .checked_add(i64::from(minutes) * 60)
+                .context("ban expiry overflow")
+        })
+        .transpose()?;
+    if let (Some(expires_at), Some(row_id)) = (expires_at, deadline_row) {
+        conn.execute_rows(
+            "UPDATE bans SET expires_at=?1, expiry_enrollment_id=?2 WHERE id=?3",
+            params![expires_at, job.enrollment_id.as_deref(), row_id],
+            1,
+        )?;
+    }
+    // Keep provisional recovery with the retained moderation event, not the
+    // prunable action receipt. A late first echo must use the original deadline.
+    Ok(pending_echo.then(|| {
+        serde_json::json!({
+            "ban_id": row_id,
+            "enrollment_id": job.enrollment_id,
+            // Once armed, only the row owns the deadline: claiming consumes
+            // it there. Keep recovery intent only for a never-armed deadline.
+            "expires_at": expires_at.filter(|_| deadline_row.is_none()),
+        })
+    }))
+}
+
+/// Whether another request's ban row, a `member_unban` event, a gateway unban
+/// delivery or another request's gateway ban delivery of this membership was
+/// saved for the user at or after `at`, applied or not. These are the boundaries a gateway ban
+/// observation is ordered against, plus the bans still waiting to be applied.
+fn ban_or_unban_saved_since(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    user_id: i64,
+    enrollment_id: Option<&str>,
+    operation_id: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM gateway_ban_deliveries
+             WHERE guild_id=?1 AND user_id=?2 AND observed_at_ms>=?3 AND enrollment_id=?5
+               AND (kind='unban' OR (kind='ban'
+                 AND json_extract(payload, '$.payload.Ban.operation_id') IS NOT ?6)))
+          OR EXISTS(SELECT 1 FROM bans WHERE guild_id=?1 AND user_id=?2
+             AND julianday(created_at)>julianday(?4) AND operation_id IS NOT ?6)
+          OR EXISTS(SELECT 1 FROM events WHERE guild_id=?1 AND user_id=?2
+             AND event_type='member_unban' AND julianday(created_at)>=julianday(?4))",
+        params![
+            guild_id,
+            user_id,
+            at.timestamp_millis(),
+            at.to_rfc3339(),
+            enrollment_id,
+            operation_id
+        ],
+        |row| Ok(row.get::<bool>(0)?),
+    )
+}
+
+/// The first exact owned echo can arrive after completion used request time.
+/// Reconcile that provisional row once, in the same transaction as its inbox save.
+/// Completion with an already saved/projected echo has no pending marker, and
+/// consuming the marker prevents redeliveries from re-dating or resurrecting it.
+pub(super) fn reconcile_queued_ban_echo_conn(
+    conn: &impl SqlExecutor,
+    delivery: &GatewayBanDelivery,
+) -> Result<()> {
+    let GatewayBanPayload::Ban {
+        owned_by_bot: true,
+        operation_id: Some(operation),
+        ..
+    } = &delivery.payload
+    else {
+        return Ok(());
+    };
+    let pending = conn
+        .query_row(
+            "SELECT e.id, b.id, COALESCE(b.expires_at, json_extract(e.data, '$.pending_gateway_echo.expires_at')),
+           b.expiry_enrollment_id
+         FROM events e JOIN bans b ON b.guild_id=e.guild_id AND b.user_id=e.user_id
+           AND b.operation_id=?3 AND b.id=json_extract(e.data, '$.pending_gateway_echo.ban_id')
+         WHERE e.guild_id=?1 AND e.user_id=?2 AND e.event_type='member_ban'
+           AND json_valid(e.data) AND json_extract(e.data, '$.source')='webui'
+           AND json_extract(e.data, '$.action_id')=?3
+           AND json_extract(e.data, '$.pending_gateway_echo.enrollment_id')=?4
+         ORDER BY e.id LIMIT 1",
+            params![
+                delivery.enrollment.guild_id,
+                delivery.user_id,
+                operation.as_str(),
+                delivery.enrollment.id.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get::<i64>(0)?,
+                    row.get::<i64>(1)?,
+                    row.get::<Option<i64>>(2)?,
+                    row.get::<Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((event_id, row_id, expires_at, expiry_enrollment_id)) = pending else {
+        return Ok(());
+    };
+    let at =
+        chrono::DateTime::parse_from_rfc3339(&delivery.observed_at)?.with_timezone(&chrono::Utc);
+    let current = !ban_or_unban_saved_since(
+        conn,
+        delivery.enrollment.guild_id,
+        delivery.user_id,
+        Some(&delivery.enrollment.id),
+        operation,
+        at,
+    )?;
+    if current {
+        conn.execute_matching(
+            "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1 AND id!=?3",
+            params![delivery.enrollment.guild_id, delivery.user_id, row_id],
+        )?;
+    }
+    conn.execute_rows(
+        "UPDATE bans SET created_at=?1, active=?2, expires_at=?3, expiry_enrollment_id=?4 WHERE id=?5",
+        params![delivery.observed_at.as_str(), current, expires_at.filter(|_| current),
+            expiry_enrollment_id.as_deref().or_else(|| expires_at.map(|_| delivery.enrollment.id.as_str())).filter(|_| current), row_id],
+        1,
+    )?;
+    conn.execute_rows(
+        "UPDATE events SET data=json_set(json_remove(data, '$.pending_gateway_echo'), '$.gateway_echo_observed_at', ?1) WHERE id=?2",
+        params![delivery.observed_at.as_str(), event_id],
+        1,
+    )?;
+    Ok(())
 }
 
 pub async fn cancel_bot_action(db: &Db, guild: i64, id: &str) -> Result<bool> {

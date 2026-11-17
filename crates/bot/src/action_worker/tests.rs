@@ -1424,7 +1424,7 @@ async fn local_completion_deadline_does_not_discard_a_known_remote_outcome() {
         );
         let version = db::get_config_version(&f.db).await.unwrap();
         assert!(
-            db::finish_dispatched_bot_action(&f.db, &claim, "succeeded", "confirmed")
+            db::finish_dispatched_bot_action(&f.db, &claim, "succeeded", "confirmed", None)
                 .await
                 .unwrap()
         );
@@ -3171,4 +3171,1182 @@ async fn owner_leave_requires_the_captured_membership() {
     let (state, code) = f.persisted_status(&job).await;
     assert_eq!(state, "failed");
     assert_eq!(code.as_deref(), Some("bot_membership_changed"));
+}
+
+fn ban(user_id: i64, duration_minutes: Option<u32>) -> Action {
+    Action::Ban {
+        user_id,
+        reason: "raid account".into(),
+        delete_message_days: 1,
+        duration_minutes,
+    }
+}
+
+/// Discord for queued bans: the refusal check and the ban call are recorded.
+/// `race` writes run after Discord applied the ban and before the worker
+/// completes it, each a few milliseconds after the last.
+struct BanDiscord {
+    authorized: bool,
+    refusal: Result<Option<&'static str>, ()>,
+    outcome: Outcome,
+    bans: std::sync::Mutex<Vec<(i64, i64, u8, String)>>,
+    race: Option<(Db, BotAction, Vec<BanRace>)>,
+    /// Gateway deliveries `race` left to save or apply after completion.
+    pending: std::sync::Mutex<Vec<LateDelivery>>,
+}
+impl Default for BanDiscord {
+    fn default() -> Self {
+        Self {
+            authorized: true,
+            refusal: Ok(None),
+            outcome: Outcome::succeeded("banned"),
+            bans: std::sync::Mutex::new(Vec::new()),
+            race: None,
+            pending: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+#[serenity::async_trait]
+impl DiscordActions for BanDiscord {
+    async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+        Ok(true)
+    }
+    async fn guild_joined_at_ns(&self, _: i64) -> Result<Option<i64>> {
+        Ok(Some(1))
+    }
+    async fn authorized(&self, _: &BotAction) -> Result<bool> {
+        Ok(self.authorized)
+    }
+    async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
+        Ok(true)
+    }
+    async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+        panic!("not an unban")
+    }
+    async fn ban_refusal(&self, _: &BotAction, _: i64) -> Result<Option<&'static str>> {
+        self.refusal
+            .map_err(|()| anyhow::anyhow!("Discord unavailable"))
+    }
+    async fn ban(&self, guild: i64, user: i64, days: u8, reason: &str) -> Outcome {
+        self.bans
+            .lock()
+            .unwrap()
+            .push((guild, user, days, reason.to_owned()));
+        if let Some((db, job, race)) = &self.race {
+            for (n, write) in race.iter().enumerate() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                if let Some(saved) = write.run(db, job, n).await {
+                    self.pending.lock().unwrap().push(saved);
+                }
+            }
+        }
+        self.outcome
+    }
+}
+
+fn open_tenant(f: &Fixture) -> crate::tenant::TenantRuntime {
+    crate::tenant::TenantRuntime::open(
+        &f.db,
+        &crate::config::DbConfig {
+            path: f.path.clone(),
+            pool_size: 2,
+            ..Default::default()
+        },
+        &crate::config::GuildStoresConfig::default(),
+        &crate::config::EvidenceConfig {
+            backend: "none".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+async fn member_ban_events(f: &Fixture) -> i64 {
+    f.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT count(*) FROM events WHERE guild_id=10 AND event_type='member_ban'",
+            params![],
+            |row| Ok(row.get::<i64>(0)?),
+        )
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn queued_ban_records_row_case_and_audit_only_after_discord_confirms() {
+    for (label, outcome) in [
+        ("succeeded", Outcome::succeeded("banned")),
+        ("failed", Outcome::failed("bot_missing_permissions")),
+        ("unknown", Outcome::failed("unknown_user")),
+        ("uncertain", Outcome::uncertain("discord_outcome_unknown")),
+    ] {
+        let f = Fixture::new();
+        let job = f.enqueue(10, label, ban(99, None)).await;
+        let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+        let tenant = open_tenant(&f);
+        tenant.activate(enrollment.clone()).await.unwrap().unwrap();
+        let discord = BanDiscord {
+            outcome,
+            ..Default::default()
+        };
+
+        drain_with_tenant(&f.db, &tenant, &discord, &WorkerLimits::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *discord.bans.lock().unwrap(),
+            vec![(10, 99, 1, "raid account".to_owned())],
+            "{label}: Discord create-ban with the audit reason and deletion window"
+        );
+        let status = f.status(&job).await;
+        assert_eq!(
+            (status.state.as_str(), status.outcome.as_deref()),
+            (outcome.state, Some(outcome.code)),
+            "{label}: Bot actions shows the result"
+        );
+        let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
+        let (store, scope) = tenant.live(enrollment).await.unwrap();
+        let cases = store
+            .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
+            .await
+            .unwrap();
+        if outcome.state != "succeeded" {
+            assert!(
+                rows.is_empty(),
+                "{label}: no ban record Discord didn't apply"
+            );
+            assert!(cases.is_empty(), "{label}: no case for an unconfirmed ban");
+            assert_eq!(member_ban_events(&f).await, 0, "{label}");
+            continue;
+        }
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].active);
+        assert_eq!(rows[0].user_id, 99);
+        assert_eq!(rows[0].moderator_id, Some(42));
+        assert_eq!(rows[0].reason.as_deref(), Some("raid account"));
+        assert_eq!(member_ban_events(&f).await, 1);
+        assert_eq!(cases.len(), 1);
+        let case = store
+            .case(scope, cases[0].clone(), crate::tenant::case_limits())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            case.source,
+            crate::db::guild_data::CaseSource::Application {
+                operation_id: crate::db::guild_data::CaseId::try_from(job.id.clone()).unwrap(),
+            }
+        );
+        assert_eq!(case.action, crate::db::guild_data::CaseAction::Ban);
+        assert_eq!(case.outcome, crate::db::guild_data::CaseOutcome::Succeeded);
+        assert_eq!(case.subject_id, 99);
+        assert_eq!(case.actor_id, Some(42));
+        assert_eq!(case.reason.as_deref(), Some("raid account"));
+    }
+}
+
+#[tokio::test]
+async fn queued_ban_refusals_and_permission_failures_never_call_discord() {
+    for (label, discord, code) in [
+        (
+            "owner",
+            BanDiscord {
+                refusal: Ok(Some("cannot_ban_owner")),
+                ..Default::default()
+            },
+            "cannot_ban_owner",
+        ),
+        (
+            "bot",
+            BanDiscord {
+                refusal: Ok(Some("cannot_ban_bot")),
+                ..Default::default()
+            },
+            "cannot_ban_bot",
+        ),
+        (
+            "bot-permission",
+            BanDiscord {
+                refusal: Ok(Some("bot_missing_ban_permission")),
+                ..Default::default()
+            },
+            "bot_missing_ban_permission",
+        ),
+        (
+            "above-bot",
+            BanDiscord {
+                refusal: Ok(Some("target_role_not_below_bot")),
+                ..Default::default()
+            },
+            "target_role_not_below_bot",
+        ),
+        (
+            "above-moderator",
+            BanDiscord {
+                refusal: Ok(Some("target_role_not_below_moderator")),
+                ..Default::default()
+            },
+            "target_role_not_below_moderator",
+        ),
+        (
+            "unknown-user",
+            BanDiscord {
+                refusal: Ok(Some("unknown_user")),
+                ..Default::default()
+            },
+            "unknown_user",
+        ),
+        (
+            "check-unavailable",
+            BanDiscord {
+                refusal: Err(()),
+                ..Default::default()
+            },
+            "ban_check_unavailable",
+        ),
+        (
+            "moderator-lost-ban-members",
+            BanDiscord {
+                authorized: false,
+                ..Default::default()
+            },
+            "permission_revoked",
+        ),
+    ] {
+        let f = Fixture::new();
+        let job = f.enqueue(10, label, ban(99, None)).await;
+        let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+        let tenant = open_tenant(&f);
+        tenant.activate(enrollment.clone()).await.unwrap().unwrap();
+
+        drain_with_tenant(&f.db, &tenant, &discord, &WorkerLimits::default())
+            .await
+            .unwrap();
+
+        assert!(discord.bans.lock().unwrap().is_empty(), "{label}");
+        let status = f.status(&job).await;
+        assert_eq!(status.state, "failed", "{label}");
+        assert_eq!(status.outcome.as_deref(), Some(code), "{label}");
+        assert!(
+            db::list_bans(&f.db, 10, 10).await.unwrap().is_empty(),
+            "{label}"
+        );
+        let (store, scope) = tenant.live(enrollment).await.unwrap();
+        assert!(
+            store
+                .case_ids(scope, None, 10, crate::tenant::case_limits())
+                .await
+                .unwrap()
+                .is_empty(),
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_ban_fills_its_gateway_echo_and_binds_its_deadline() {
+    let f = Fixture::new();
+    // The bot's own gateway echo of this request arrived first.
+    let job = f.enqueue(10, "timed", ban(99, Some(30))).await;
+    let echo = job.id.clone();
+    f.db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO bans(guild_id,user_id,reason,created_at,active,operation_id)
+             VALUES(10,99,'Reason unavailable','then',1,?1)",
+            params![echo],
+            65_536,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+    let before = now();
+    drain(&f.db, &BanDiscord::default(), &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(f.status(&job).await.state, "succeeded");
+    let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
+    assert_eq!(rows.len(), 1, "the echo row is this ban, not a second one");
+    assert_eq!(rows[0].moderator_id, Some(42));
+    assert_eq!(rows[0].reason.as_deref(), Some("raid account"));
+    let id = rows[0].id;
+    let (expires_at, bound): (i64, String) =
+        f.db.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT expires_at, expiry_enrollment_id FROM bans WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert!((before + 1800..=now() + 1800).contains(&expires_at));
+    assert_eq!(bound, enrollment.id);
+}
+
+/// Local writes that can land between Discord applying a queued ban and its
+/// completion.
+#[derive(Clone, Copy, Debug)]
+enum BanRace {
+    /// The bot's own gateway echo of this request, saved and applied.
+    Echo,
+    /// The owned echo saved before completion, projected afterward.
+    EchoSaved,
+    /// The owned echo observed before completion, saved and projected afterward.
+    EchoObserved,
+    /// A gateway unban, saved and applied.
+    Unban,
+    /// A gateway unban saved but applied only after completion.
+    UnbanSaved,
+    /// A `member_unban` event without a gateway delivery, as a queued unban
+    /// records: active rows end.
+    UnbanEvent,
+    /// A newer ban row recorded outside the gateway, as a command records.
+    Reban,
+    /// A newer gateway ban by someone else, saved but applied only after
+    /// completion.
+    RebanSaved,
+    /// A gateway unban observed now but saved and applied only after
+    /// completion, as when its membership capture or save is still retrying.
+    UnbanObserved,
+    /// A newer gateway ban by someone else observed now but saved and applied
+    /// only after completion.
+    RebanObserved,
+}
+
+impl BanRace {
+    fn observed_late(self) -> bool {
+        matches!(self, Self::UnbanObserved | Self::RebanObserved)
+    }
+}
+
+/// A gateway delivery the race left for after completion.
+enum LateDelivery {
+    /// Saved; apply it.
+    Saved(String),
+    /// Observed only; save then apply it.
+    Observed(Box<db::GatewayBanDelivery>),
+}
+
+impl LateDelivery {
+    async fn apply(self, db: &Db) {
+        let id = match self {
+            Self::Saved(id) => id,
+            Self::Observed(delivery) => {
+                db::save_gateway_ban_delivery(db, *delivery)
+                    .await
+                    .unwrap()
+                    .id
+            }
+        };
+        db::apply_gateway_ban_delivery(db, id).await.unwrap();
+    }
+}
+
+/// A gateway delivery for user 99 of guild 10, observed now.
+async fn observed_delivery(
+    db: &Db,
+    id: String,
+    payload: db::GatewayBanPayload,
+) -> db::GatewayBanDelivery {
+    db::GatewayBanDelivery {
+        id,
+        enrollment: db::guild_enrollment(db, 10).await.unwrap().unwrap(),
+        user_id: 99,
+        observed_at: chrono::Utc::now().to_rfc3339(),
+        payload,
+        case: None,
+    }
+}
+
+/// [`observed_delivery`], saved.
+async fn gateway_delivery(db: &Db, id: String, payload: db::GatewayBanPayload) -> String {
+    db::save_gateway_ban_delivery(db, observed_delivery(db, id, payload).await)
+        .await
+        .unwrap()
+        .id
+}
+
+fn gateway_ban(operation_id: Option<String>) -> db::GatewayBanPayload {
+    db::GatewayBanPayload::Ban {
+        user_name: "target".into(),
+        user_display_name: None,
+        owned_by_bot: operation_id.is_some(),
+        operation_id,
+        member_was_banned: true,
+        pending_audits: Vec::new(),
+        overlapping_deliveries: Vec::new(),
+        audit_after_ms: 0,
+    }
+}
+
+impl BanRace {
+    /// Make this write; a saved delivery left to apply later is returned.
+    async fn run(self, db: &Db, job: &BotAction, n: usize) -> Option<LateDelivery> {
+        let id = format!("{}-{n}", job.id);
+        let unban = db::GatewayBanPayload::Unban { suppressed: false };
+        let sql = match self {
+            Self::Echo => {
+                let id = gateway_delivery(db, id, gateway_ban(Some(job.id.clone()))).await;
+                db::apply_gateway_ban_delivery(db, id).await.unwrap();
+                return None;
+            }
+            Self::EchoSaved => {
+                let id = gateway_delivery(db, id, gateway_ban(Some(job.id.clone()))).await;
+                return Some(LateDelivery::Saved(id));
+            }
+            Self::EchoObserved => {
+                let delivery = observed_delivery(db, id, gateway_ban(Some(job.id.clone()))).await;
+                return Some(LateDelivery::Observed(Box::new(delivery)));
+            }
+            Self::Unban => {
+                let id = gateway_delivery(db, id, unban).await;
+                db::apply_gateway_ban_delivery(db, id).await.unwrap();
+                return None;
+            }
+            Self::UnbanSaved => {
+                return Some(LateDelivery::Saved(gateway_delivery(db, id, unban).await));
+            }
+            Self::RebanSaved => {
+                let id = gateway_delivery(db, id, gateway_ban(None)).await;
+                return Some(LateDelivery::Saved(id));
+            }
+            Self::UnbanObserved => {
+                let delivery = observed_delivery(db, id, unban).await;
+                return Some(LateDelivery::Observed(Box::new(delivery)));
+            }
+            Self::RebanObserved => {
+                let delivery = observed_delivery(db, id, gateway_ban(None)).await;
+                return Some(LateDelivery::Observed(Box::new(delivery)));
+            }
+            Self::UnbanEvent => vec![
+                "UPDATE bans SET active=0 WHERE guild_id=10 AND user_id=99 AND active=1".to_owned(),
+                format!(
+                    "INSERT INTO events(guild_id,event_type,user_id,data,created_at)
+                     VALUES(10,'member_unban',99,'{{}}','{}')",
+                    chrono::Utc::now().to_rfc3339()
+                ),
+            ],
+            Self::Reban => vec![format!(
+                "INSERT INTO bans(guild_id,user_id,moderator_id,reason,created_at,active)
+                 VALUES(10,99,7,'permanent','{}',1)",
+                chrono::Utc::now().to_rfc3339()
+            )],
+        };
+        db.with_conn(move |conn| {
+            for sql in sql {
+                conn.execute_bounded(&sql, params![], 65_536)?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        None
+    }
+}
+
+/// (operation_id, active, moderator_id, expires_at) of one ban row.
+type BanRowState = (Option<String>, bool, Option<i64>, Option<i64>);
+
+#[tokio::test]
+async fn queued_ban_completion_keeps_a_later_unban_or_ban() {
+    use BanRace::*;
+    // (label, writes before completion, whether a newer ban stays active).
+    // Saved deliveries are applied after completion, then the echo arrives if
+    // it has not yet.
+    for (label, race, rebanned) in [
+        (
+            "unban-late-echo-later-unban",
+            &[Unban, EchoObserved, Unban][..],
+            false,
+        ),
+        (
+            "unban-late-echo-later-reban",
+            &[Unban, EchoObserved, Unban, Reban][..],
+            true,
+        ),
+        (
+            "unban-late-echo-pending-unban",
+            &[Unban, EchoObserved, UnbanSaved][..],
+            false,
+        ),
+        (
+            "unban-late-echo-pending-reban",
+            &[Unban, EchoObserved, UnbanSaved, RebanSaved][..],
+            true,
+        ),
+        ("echo-unban", &[Echo, Unban][..], false),
+        ("echo-unban-reban", &[Echo, Unban, Reban][..], true),
+        ("echo-pending-unban", &[Echo, UnbanSaved][..], false),
+        ("pending-echo-unban", &[EchoSaved, Unban][..], false),
+        (
+            "pending-echo-pending-unban",
+            &[EchoSaved, UnbanSaved][..],
+            false,
+        ),
+        (
+            "pending-echo-unban-redelivery",
+            &[EchoSaved, UnbanSaved, EchoSaved][..],
+            false,
+        ),
+        (
+            "unban-pending-echo-unban-reban",
+            &[Unban, EchoSaved, UnbanSaved, RebanSaved][..],
+            true,
+        ),
+        (
+            "unban-echo-pending-unban",
+            &[Unban, Echo, UnbanSaved][..],
+            false,
+        ),
+        (
+            "unban-echo-pending-unban-reban",
+            &[Unban, Echo, UnbanSaved, RebanSaved][..],
+            true,
+        ),
+        ("unban-before-echo", &[Unban][..], false),
+        ("pending-unban-before-echo", &[UnbanSaved][..], false),
+        ("unban-event-before-echo", &[UnbanEvent][..], false),
+        ("reban-row-before-echo", &[Reban][..], true),
+        ("pending-reban-before-echo", &[RebanSaved][..], true),
+        ("unban-saved-after-completion", &[UnbanObserved][..], false),
+        (
+            "unban-reban-saved-after-completion",
+            &[UnbanObserved, RebanObserved][..],
+            true,
+        ),
+        (
+            "unban-pending-reban-before-echo",
+            &[Unban, RebanSaved][..],
+            true,
+        ),
+    ] {
+        for reverse_projection in [false, true] {
+            // Reverse the newly admitted late-save interleavings; earlier
+            // projected-echo cases retain their established projection order.
+            if reverse_projection && !race.iter().any(|write| matches!(write, EchoObserved)) {
+                continue;
+            }
+            let f = Fixture::new();
+            // Capture the echo before the later boundaries even when its save is
+            // delayed. Creating its observation after an unban models a new ban,
+            // not a late delivery of the older one.
+            let mut writes = race.to_vec();
+            if !writes
+                .iter()
+                .any(|write| matches!(write, Echo | EchoSaved | EchoObserved))
+            {
+                writes.insert(0, EchoObserved);
+            }
+            let job = f.enqueue(10, label, ban(99, Some(30))).await;
+            let discord = BanDiscord {
+                race: Some((f.db.clone(), job.clone(), writes)),
+                ..Default::default()
+            };
+            drain(&f.db, &discord, &WorkerLimits::default())
+                .await
+                .unwrap();
+            let mut pending = std::mem::take(&mut *discord.pending.lock().unwrap());
+            if reverse_projection {
+                pending.reverse();
+            }
+            for late in pending {
+                late.apply(&f.db).await;
+            }
+
+            let status = f.status(&job).await;
+            assert_eq!(status.state, "succeeded", "{label}: Discord's result stays");
+            let op = job.id.clone();
+            let audited: i64 =
+                f.db.with_conn(move |conn| {
+                    conn.query_row(
+                        "SELECT count(*) FROM events WHERE event_type='member_ban'
+                     AND json_extract(data,'$.action_id')=?1",
+                        params![op],
+                        |row| Ok(row.get(0)?),
+                    )
+                })
+                .await
+                .unwrap();
+            assert_eq!(audited, 1, "{label}: the ban is audited once");
+            let rows: Vec<BanRowState> =
+                f.db.with_conn(|conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT operation_id, active, moderator_id, expires_at FROM bans
+                     WHERE guild_id=10 AND user_id=99 ORDER BY id",
+                    )?;
+                    let rows = stmt.query_map(params![], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get::<i64>(1)? != 0,
+                            row.get(2)?,
+                            row.get(3)?,
+                        ))
+                    })?;
+                    let mut out = Vec::new();
+                    for row in rows {
+                        out.push(row?);
+                    }
+                    Ok(out)
+                })
+                .await
+                .unwrap();
+            let mine: Vec<_> = rows
+                .iter()
+                .filter(|row| row.0.as_deref() == Some(job.id.as_str()))
+                .collect();
+            assert_eq!(mine.len(), 1, "{label}: one row for this ban: {rows:?}");
+            assert!(
+                !mine[0].1,
+                "{label}: a later unban or ban ended it: {rows:?}"
+            );
+            assert_eq!(mine[0].2, Some(42), "{label}: the requester is recorded");
+            if !race
+                .iter()
+                .any(|write| write.observed_late() || matches!(write, EchoObserved))
+            {
+                assert_eq!(mine[0].3, None, "{label}: no deadline on an ended ban");
+            }
+            assert!(
+                rows.iter().all(|row| !row.1 || row.3.is_none()),
+                "{label}: no deadline stays effective: {rows:?}"
+            );
+            let active: Vec<_> = rows.iter().filter(|row| row.1).collect();
+            if rebanned {
+                assert_eq!(
+                    active.len(),
+                    1,
+                    "{label}: the newer ban is active: {rows:?}"
+                );
+                assert_eq!(active[0].0, None, "{label}: {rows:?}");
+                assert_eq!(
+                    active[0].3, None,
+                    "{label}: the newer permanent ban takes no deadline"
+                );
+            } else {
+                assert!(active.is_empty(), "{label}: nothing resurrected: {rows:?}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn queued_ban_completion_keeps_its_own_echo_current_with_its_deadline() {
+    use BanRace::*;
+    for (label, race) in [
+        ("unban-then-late-own-echo", vec![Unban, EchoObserved]),
+        (
+            "pending-unban-then-late-own-echo",
+            vec![UnbanSaved, EchoObserved],
+        ),
+        (
+            "unban-event-then-late-own-echo",
+            vec![UnbanEvent, EchoObserved],
+        ),
+        ("own-echo", vec![Echo]),
+        ("unban-then-own-echo", vec![Unban, Echo]),
+        ("pending-unban-then-own-echo", vec![UnbanSaved, Echo]),
+        ("unban-event-then-own-echo", vec![UnbanEvent, Echo]),
+        ("pending-own-echo", vec![EchoSaved]),
+        ("unban-then-pending-own-echo", vec![Unban, EchoSaved]),
+        (
+            "pending-unban-then-pending-own-echo",
+            vec![UnbanSaved, EchoSaved],
+        ),
+        (
+            "unban-event-then-pending-own-echo",
+            vec![UnbanEvent, EchoSaved],
+        ),
+    ] {
+        let f = Fixture::new();
+        let job = f.enqueue(10, label, ban(99, Some(30))).await;
+        let discord = BanDiscord {
+            race: Some((f.db.clone(), job.clone(), race)),
+            ..Default::default()
+        };
+        let before = now();
+        drain(&f.db, &discord, &WorkerLimits::default())
+            .await
+            .unwrap();
+        // An earlier saved unban still cannot end this newer echo when applied.
+        let pending = std::mem::take(&mut *discord.pending.lock().unwrap());
+        for late in pending {
+            late.apply(&f.db).await;
+        }
+        assert_eq!(f.status(&job).await.state, "succeeded", "{label}");
+        let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "{label}: its own echo is not a later ban");
+        assert!(rows[0].active, "{label}");
+        assert_eq!(rows[0].moderator_id, Some(42), "{label}");
+        let id = rows[0].id;
+        let (expires_at, bound): (Option<i64>, Option<String>) =
+            f.db.with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT expires_at, expiry_enrollment_id FROM bans WHERE id=?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            expires_at.is_some(),
+            "{label}: the current ban takes its deadline"
+        );
+        assert!((before + 1800..=now() + 1800).contains(&expires_at.unwrap()));
+        assert_eq!(
+            bound, job.enrollment_id,
+            "{label}: deadline is membership-bound"
+        );
+        let due = db::next_expired_ban(&f.db, now() + 1801, Vec::new(), Vec::new(), Vec::new())
+            .await
+            .unwrap()
+            .expect("the timed ban must reach automatic unban selection");
+        assert_eq!(due.id, id, "{label}: expiry selects this exact ban");
+        assert_eq!(Some(due.enrollment.id), bound, "{label}");
+    }
+}
+
+#[tokio::test]
+async fn queued_ban_holds_the_command_ban_slot_through_dispatch_and_completion() {
+    /// A ban command that runs once Discord shows the queued ban records it as
+    /// present, as the command does, whenever it can take the user's ban slot.
+    struct CommandDuringBan<'a> {
+        app: &'a crate::state::BotState,
+        command_ran: std::sync::Mutex<Vec<bool>>,
+    }
+    #[serenity::async_trait]
+    impl DiscordActions for CommandDuringBan<'_> {
+        async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+            Ok(true)
+        }
+        async fn guild_joined_at_ns(&self, _: i64) -> Result<Option<i64>> {
+            Ok(Some(1))
+        }
+        async fn authorized(&self, _: &BotAction) -> Result<bool> {
+            Ok(true)
+        }
+        async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
+            Ok(true)
+        }
+        async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+            panic!("not an unban")
+        }
+        async fn ban_refusal(&self, _: &BotAction, _: i64) -> Result<Option<&'static str>> {
+            Ok(None)
+        }
+        async fn ban(&self, guild: i64, user: i64, _: u8, _: &str) -> Outcome {
+            let ran = match crate::member_directory::begin_command_ban_in_progress(
+                self.app,
+                guild as u64,
+                user as u64,
+            ) {
+                Ok(_command) => {
+                    let enrollment = db::guild_enrollment(&self.app.db, guild).await.unwrap();
+                    crate::commands::behaviors::continue_present_command_ban(
+                        self.app,
+                        enrollment,
+                        user,
+                        Some("raider"),
+                        None,
+                        7,
+                        "moderator",
+                        "command ban",
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    true
+                }
+                Err(_) => false,
+            };
+            self.command_ran.lock().unwrap().push(ran);
+            Outcome::succeeded("banned")
+        }
+    }
+
+    let f = Fixture::new();
+    let refused = f.enqueue(10, "refused", ban(99, None)).await;
+    let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    app.tenant.activate(enrollment).await.unwrap();
+    let discord = CommandDuringBan {
+        app: &app,
+        command_ran: Default::default(),
+    };
+
+    // A ban command already in progress refuses the queued ban before Discord.
+    let command = crate::member_directory::begin_command_ban_in_progress(&app, 10, 99).unwrap();
+    drain_with_state(&app, &discord, &WorkerLimits::default())
+        .await
+        .unwrap();
+    drop(command);
+    assert!(discord.command_ran.lock().unwrap().is_empty());
+    let status = f.status(&refused).await;
+    assert_eq!(
+        (status.state.as_str(), status.outcome.as_deref()),
+        ("failed", Some("ban_in_progress"))
+    );
+    assert!(db::list_bans(&f.db, 10, 10).await.unwrap().is_empty());
+
+    // A ban command started while Discord applies the queued ban is refused,
+    // so it cannot record that ban first and take its deadline.
+    let job = f.enqueue(10, "timed", ban(99, Some(30))).await;
+    let before = now();
+    drain_with_state(&app, &discord, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(*discord.command_ran.lock().unwrap(), vec![false]);
+    assert_eq!(f.status(&job).await.state, "succeeded");
+    let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].active);
+    assert_eq!(rows[0].moderator_id, Some(42));
+    let due = db::next_expired_ban(&f.db, now() + 1801, Vec::new(), Vec::new(), Vec::new())
+        .await
+        .unwrap()
+        .expect("the queued timed ban keeps its deadline");
+    assert_eq!(due.id, rows[0].id);
+    assert!(before + 1800 <= due.expires_at);
+    // The slot is released after completion.
+    drop(crate::member_directory::begin_command_ban_in_progress(&app, 10, 99).unwrap());
+}
+
+#[tokio::test]
+async fn queued_ban_late_echo_recovers_after_receipt_pruning_and_never_replays() {
+    let f = Fixture::new();
+    let job = f.enqueue(10, "late-echo-replay", ban(99, Some(30))).await;
+    let discord = BanDiscord {
+        race: Some((
+            f.db.clone(),
+            job.clone(),
+            vec![BanRace::Unban, BanRace::EchoObserved],
+        )),
+        ..Default::default()
+    };
+    let before = now();
+    drain(&f.db, &discord, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(f.status(&job).await.state, "succeeded");
+    assert!(!db::list_bans(&f.db, 10, 10).await.unwrap()[0].active);
+    let pending = std::mem::take(&mut *discord.pending.lock().unwrap());
+    let LateDelivery::Observed(echo) = pending.into_iter().next().unwrap() else {
+        panic!("expected unsaved echo")
+    };
+    let observed_at = echo.observed_at.clone();
+    // Operational receipts are prunable; the moderation record must retain
+    // everything needed to reconcile the first exact echo.
+    assert_eq!(
+        db::prune_bot_action_history(&f.db, now() + 8 * 86400, Limits::default())
+            .await
+            .unwrap(),
+        1
+    );
+    let saved = db::save_gateway_ban_delivery(&f.db, *echo).await.unwrap();
+    let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].active,
+        "the durable echo repairs the mirror before projection"
+    );
+    assert_eq!(rows[0].created_at, observed_at);
+    let due = db::next_expired_ban(&f.db, now() + 1801, Vec::new(), Vec::new(), Vec::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(due.id, rows[0].id);
+    let expiry: i64 =
+        f.db.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT expires_at FROM bans WHERE id=?1",
+                params![due.id],
+                |row| Ok(row.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert!((before + 1800..=now() + 1800).contains(&expiry));
+    assert_eq!(
+        member_ban_events(&f).await,
+        1,
+        "recovery does not duplicate audit events"
+    );
+    db::save_gateway_ban_delivery(&f.db, saved.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        db::apply_gateway_ban_delivery(&f.db, saved.id.clone())
+            .await
+            .unwrap(),
+        Some(db::GatewayBanWrite::Existing { .. })
+    ));
+    db::apply_gateway_ban_delivery(&f.db, saved.id)
+        .await
+        .unwrap();
+    let unban = gateway_delivery(
+        &f.db,
+        "after-recovery".into(),
+        db::GatewayBanPayload::Unban { suppressed: false },
+    )
+    .await;
+    db::apply_gateway_ban_delivery(&f.db, unban).await.unwrap();
+    let replay =
+        gateway_delivery(&f.db, "owned-redelivery".into(), gateway_ban(Some(job.id))).await;
+    db::apply_gateway_ban_delivery(&f.db, replay).await.unwrap();
+    let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        !rows[0].active,
+        "a redelivery must never resurrect the ended ban"
+    );
+    assert_eq!(
+        rows[0].created_at, observed_at,
+        "the first echo fixes ordering permanently"
+    );
+    assert!(
+        db::next_expired_ban(&f.db, now() + 1801, Vec::new(), Vec::new(), Vec::new())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn queued_ban_late_echo_preserves_a_consumed_deadline_and_its_dispatch() {
+    for echo_before_dispatch in [false, true] {
+        let f = Fixture::new();
+        let job = f.enqueue(10, "consumed-late-echo", ban(99, Some(30))).await;
+        let ban_discord = BanDiscord {
+            race: Some((f.db.clone(), job.clone(), vec![BanRace::EchoObserved])),
+            ..Default::default()
+        };
+        drain(&f.db, &ban_discord, &WorkerLimits::default())
+            .await
+            .unwrap();
+        let claimed = db::next_expired_ban(&f.db, now() + 1801, Vec::new(), Vec::new(), Vec::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db::claim_expired_ban(&f.db, &claimed).await.unwrap());
+        let late = std::mem::take(&mut *ban_discord.pending.lock().unwrap())
+            .pop()
+            .unwrap();
+        let discord = MockDiscord {
+            outcome: Outcome::uncertain("request_timed_out"),
+            ..Default::default()
+        };
+        if echo_before_dispatch {
+            late.apply(&f.db).await;
+            assert_eq!(
+                db::expired_ban_state(&f.db, &claimed).await.unwrap(),
+                db::ExpiredBanState::Current,
+                "reconciliation must preserve the already-consumed claim's membership"
+            );
+            dispatch_expired_ban(
+                &f.db,
+                None,
+                &discord,
+                ConsumedExpiry(claimed),
+                &WorkerLimits::default(),
+            )
+            .await
+            .unwrap();
+        } else {
+            dispatch_expired_ban(
+                &f.db,
+                None,
+                &discord,
+                ConsumedExpiry(claimed),
+                &WorkerLimits::default(),
+            )
+            .await
+            .unwrap();
+            late.apply(&f.db).await;
+        }
+        expire_bans(
+            &f.db,
+            None,
+            &discord,
+            now() + 1801,
+            &WorkerLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            discord.calls.load(Ordering::SeqCst),
+            1,
+            "a consumed deadline never dispatches twice"
+        );
+        assert!(
+            db::next_expired_ban(&f.db, now() + 1801, Vec::new(), Vec::new(), Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn queued_ban_completion_replaces_a_ban_recorded_before_its_request() {
+    let f = Fixture::new();
+    f.db.with_conn(|conn| {
+        conn.execute_bounded(
+            "INSERT INTO bans(guild_id,user_id,moderator_id,reason,created_at,active)
+             VALUES(10,99,7,'older','2020-01-01T00:00:00+00:00',1)",
+            params![],
+            65_536,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let job = f.enqueue(10, "older", ban(99, Some(30))).await;
+    drain(&f.db, &BanDiscord::default(), &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(f.status(&job).await.state, "succeeded");
+    let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].active, "this ban is the current one");
+    assert_eq!(rows[0].moderator_id, Some(42));
+    assert!(!rows[1].active, "the older ban is kept as history");
+    let id = rows[0].id;
+    let expires_at: Option<i64> =
+        f.db.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT expires_at FROM bans WHERE id=?1",
+                params![id],
+                |row| Ok(row.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(expires_at.is_some(), "the current ban takes its deadline");
+}
+
+#[test]
+fn ban_refusal_follows_the_ban_command_and_discord_role_hierarchy() {
+    use serenity::model::guild::{Member, PartialGuild, Role};
+    use serenity::model::id::RoleId;
+    let mut guild: PartialGuild = serde_json::from_value(serde_json::json!({
+        "id":"10", "name":"fixture", "owner_id":"11", "verification_level":0,
+        "default_message_notifications":0, "explicit_content_filter":0, "roles":[],
+        "emojis":[], "features":[], "mfa_level":0, "system_channel_flags":0,
+        "premium_tier":0, "preferred_locale":"en-US", "nsfw_level":0,
+        "stickers":[], "premium_progress_bar_enabled":false
+    }))
+    .unwrap();
+    let role = |id: u64, position: u16, permissions: Permissions| {
+        let mut role = Role::default();
+        role.id = RoleId::new(id);
+        role.position = position;
+        role.permissions = permissions;
+        role
+    };
+    for role in [
+        role(30, 30, Permissions::BAN_MEMBERS),
+        role(20, 20, Permissions::BAN_MEMBERS),
+        role(15, 15, Permissions::empty()),
+        role(10, 10, Permissions::empty()),
+        // Distinct roles sharing a position: Discord ranks the lower ID higher.
+        role(29, 30, Permissions::empty()),
+        role(31, 30, Permissions::empty()),
+        role(19, 20, Permissions::empty()),
+        role(21, 20, Permissions::empty()),
+    ] {
+        guild.roles.insert(role.id, role);
+    }
+    let member = |id: u64, roles: &[u64]| {
+        let mut member = Member::default();
+        member.user.id = UserId::new(id);
+        member.roles = roles.iter().map(|id| RoleId::new(*id)).collect();
+        member
+    };
+    let bot = member(1, &[30]);
+    let moderator = member(42, &[20]);
+    let target = member(99, &[10]);
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, Some(&target), 99),
+        None
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, None, 99),
+        None,
+        "someone outside the server is banned by ID"
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, Some(&member(11, &[])), 11),
+        Some("cannot_ban_owner")
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, Some(&bot), 1),
+        Some("cannot_ban_bot")
+    );
+    assert_eq!(
+        ban_refusal(&guild, &member(1, &[15]), &moderator, Some(&target), 99),
+        Some("bot_missing_ban_permission")
+    );
+    let above_moderator = member(99, &[20]);
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, Some(&above_moderator), 99),
+        Some("target_role_not_below_moderator"),
+        "an equal role is not below the moderator"
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &member(42, &[15]), Some(&above_moderator), 99),
+        Some("target_role_not_below_moderator")
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &member(11, &[]), Some(&above_moderator), 99),
+        None,
+        "the owner moderates above every role"
+    );
+    let above_bot = member(99, &[30]);
+    assert_eq!(
+        ban_refusal(&guild, &bot, &member(11, &[]), Some(&above_bot), 99),
+        Some("target_role_not_below_bot")
+    );
+    // Equal positions follow Discord's ID tie-break for both comparisons.
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, Some(&member(99, &[21])), 99),
+        None,
+        "a higher-ID role at the moderator's position is below the moderator"
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &moderator, Some(&member(99, &[19])), 99),
+        Some("target_role_not_below_moderator"),
+        "a lower-ID role at the moderator's position is above the moderator"
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &member(11, &[]), Some(&member(99, &[31])), 99),
+        None,
+        "a higher-ID role at the bot's position is below the bot"
+    );
+    assert_eq!(
+        ban_refusal(&guild, &bot, &member(11, &[]), Some(&member(99, &[29])), 99),
+        Some("target_role_not_below_bot"),
+        "a lower-ID role at the bot's position is above the bot"
+    );
+    assert_eq!(
+        classify_ban_response(403, 50013),
+        Outcome::failed("bot_missing_permissions")
+    );
+    assert_eq!(
+        classify_ban_response(404, 10013),
+        Outcome::failed("unknown_user")
+    );
+    assert_eq!(
+        classify_ban_response(400, 0),
+        Outcome::failed("discord_rejected")
+    );
+    assert_eq!(
+        classify_ban_response(500, 0),
+        Outcome::uncertain("discord_outcome_unknown")
+    );
 }

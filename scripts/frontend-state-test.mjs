@@ -165,19 +165,297 @@ async function runMemberPoll(h, delay = 10000) {
   await settle();
 }
 
-test('Bans shows known names and actor with exact IDs and honest unknown fallbacks', async () => {
-  const h = harness(async () => response([
-    { user_id: '9007199254740993', user_name: 'test-user-1', user_display_name: 'Test-User-1', moderator_id: '9007199254740995', moderator_name: 'test-mod-1', active: true, reason: 'No reason provided', created_at: '2020-01-01T12:00:00Z' },
-    { user_id: '9007199254740997', user_name: null, moderator_id: null, moderator_name: null, active: true, reason: null, created_at: '2020-01-02T12:00:00Z' },
-  ]));
-  const panel = h.app.tabBans();
+// #625: the Bans page opens the way the sidebar does, so its dialog has the application view.
+async function bansView(h) {
+  h.app.state.config ??= { enrollment_id: 'membership' };
+  h.app.navigate('bans');
   await settle();
-  const text = textOf(panel);
-  assert.match(text, /Test-User-1 \(test-user-1, 9007199254740993\)/);
-  assert.match(text, /test-mod-1 \(9007199254740995\)/);
-  assert.match(text, /9007199254740997/);
-  assert.match(text, /Unavailable/);
-  assert.match(text, /Reason unavailable/);
+  return h.document.querySelector('#content');
+}
+
+const banRows = () => ({
+  bans: [
+    { id: 3, user_id: '9007199254740993', user_name: 'test-user-1', user_display_name: 'Test-User-1', moderator_id: '9007199254740995', moderator_name: 'test-mod-1', active: true, reason: 'Spamming invites', created_at: '2020-01-01T12:00:00Z',
+      edited_reason: 'Spamming invite links in #general', reason_edited_by: '9007199254740995', reason_edited_at: '2020-01-03T12:00:00Z' },
+    { id: 2, user_id: '9007199254740997', user_name: null, user_display_name: null, moderator_id: null, moderator_name: null, active: true, reason: '[automod:spam_burst] Repeated messages', created_at: '2020-01-02T12:00:00Z' },
+    { id: 1, user_id: '9007199254740999', user_name: null, user_display_name: null, moderator_id: null, moderator_name: null, active: false, reason: 'No reason provided', created_at: '2020-01-02T12:00:00Z' },
+  ],
+  names: { '9007199254740997': { display_name: 'Directory-Name', username: 'directory-user' } },
+});
+
+test('Bans cells name people with ID chips, label automod and keep the original reason visible', async () => {
+  const confirms = [];
+  const h = harness(async () => response(banRows()), new Map(), new Map(), message => { confirms.push(message); return false; });
+  const root = await bansView(h);
+  const rows = [...root.querySelectorAll('tbody tr')];
+  assert.equal(rows.length, 3);
+  const [edited, automod, unknown] = rows;
+  const user = edited.cells[0];
+  assert.equal(findNode(user, n => n.localName === 'strong').textContent, 'Test-User-1');
+  assert.match(textOf(user), /@test-user-1/);
+  const chip = findNode(user, n => String(n.className).includes('id-chip'));
+  assert.equal(chip.textContent, '9007199254740993', 'the ID is a chip, not inline text');
+  assert.ok(findNode(chip, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Copy user ID 9007199254740993'));
+  assert.doesNotMatch(textOf(edited), /\(test-user-1, 9007199254740993\)/);
+  assert.equal(textOf(edited.cells[1]), 'Banned');
+  assert.ok(findNode(edited.cells[1], n => String(n.className).includes('badge-error')));
+  assert.match(textOf(edited.cells[2]), /test-mod-1/);
+  assert.equal(findNode(edited.cells[2], n => String(n.className).includes('id-chip')).textContent, '9007199254740995');
+  // The edited jModGuard reason leads; the original and the editor stay visible.
+  assert.equal(findNode(edited.cells[3], n => String(n.className).split(' ').includes('ban-reason')).textContent, 'Spamming invite links in #general');
+  assert.match(textOf(edited.cells[3]), /Edited by test-mod-1/);
+  assert.match(textOf(edited.cells[3]), /Original: Spamming invites/);
+  assert.ok(findNode(edited.cells[4], n => n.localName === 'time' && n.getAttribute('title')), 'relative time with the full time on hover');
+  // Directory names fill rows the bot could not name; automod shows its rule, not an ID.
+  assert.equal(findNode(automod.cells[0], n => n.localName === 'strong').textContent, 'Directory-Name');
+  assert.match(textOf(automod.cells[0]), /@directory-user/);
+  assert.equal(textOf(automod.cells[2]), 'jModGuard (automod: spam_burst)');
+  assert.equal(findNode(automod.cells[3], n => String(n.className).split(' ').includes('ban-reason')).textContent, 'Repeated messages');
+  assert.equal(textOf(unknown.cells[2]), 'Unknown');
+  assert.doesNotMatch(textOf(unknown), /Unavailable/);
+  const placeholder = findNode(unknown.cells[3], n => n.localName === 'span' && n.textContent === 'No reason given');
+  assert.ok(String(placeholder.className).includes('muted'));
+  assert.equal(textOf(unknown.cells[1]), 'Unbanned');
+  // Long reasons stay clamped until clicked.
+  const reason = findNode(automod.cells[3], n => String(n.className).split(' ').includes('ban-reason'));
+  assert.equal(reason.getAttribute('aria-expanded'), 'false');
+  await fire(reason, 'click');
+  assert.equal(reason.getAttribute('aria-expanded'), 'true');
+  // The unban confirmation names the user rather than the raw ID.
+  const unban = findNode(automod, n => n.localName === 'button' && n.getAttribute('aria-label')?.startsWith('Unban'));
+  assert.equal(unban.getAttribute('aria-label'), 'Unban Directory-Name (@directory-user)');
+  await fire(unban, 'click');
+  assert.deepEqual(confirms, ['Unban Directory-Name (@directory-user)?']);
+});
+
+test('a ban with a moderator and an automod rule shows both', async () => {
+  const rows = { bans: [{ id: 4, user_id: '9007199254740993', user_name: 'test-user-1', user_display_name: null, moderator_id: '9007199254740995', moderator_name: 'test-mod-1', active: true, reason: '[automod:spam_burst] Repeated messages', created_at: '2020-01-01T12:00:00Z' }], names: {} };
+  const h = harness(async () => response(rows));
+  const root = await bansView(h);
+  const cell = root.querySelector('tbody tr').cells[2];
+  assert.equal(findNode(cell, n => n.localName === 'strong').textContent, 'test-mod-1', 'the moderator who acted stays');
+  assert.equal(findNode(cell, n => String(n.className).includes('id-chip')).textContent, '9007199254740995');
+  assert.match(textOf(cell), /jModGuard \(automod: spam_burst\)/, 'the rule is not dropped');
+});
+
+test('editing a ban reason saves the jModGuard reason and reloads the list', async () => {
+  const calls = [];
+  const h = harness(async (url, opts) => {
+    calls.push({ url, opts });
+    if (opts.method === 'PUT') return response({ changed: true, reason: 'Raid account' });
+    return response(banRows());
+  });
+  const root = await bansView(h);
+  const row = root.querySelectorAll('tbody tr')[1];
+  await fire(findNode(row, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Edit reason'), 'click');
+  const box = findNode(row, n => n.localName === 'textarea');
+  assert.equal(box.value, 'Repeated messages', 'the editor starts from the reason shown');
+  assert.match(textOf(row), /Discord keeps the original reason/);
+  await fire(box, 'input', { target: { value: 'Raid account' } });
+  box.value = 'Raid account';
+  await fire(box, 'change');
+  const reads = calls.length;
+  await fire(findNode(row, n => n.localName === 'button' && n.textContent === 'Save reason'), 'click');
+  await settle();
+  const put = calls.find(call => call.opts.method === 'PUT');
+  assert.equal(put.url, `/api/guilds/${h.app.state.guildId}/bans/2/reason`);
+  assert.deepEqual(JSON.parse(put.opts.body), { reason: 'Raid account' });
+  assert.equal(put.opts.headers['x-jmodguard-enrollment'], 'membership');
+  assert.ok(calls.length > reads + 1, 'the list is read again after saving');
+  assert.equal(findNode(row, n => n.localName === 'textarea'), null);
+});
+
+test('a ban reason cannot be retyped while its save is pending', async () => {
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const h = harness(async (url, opts) => {
+    if (opts.method === 'PUT') { await pending; return response({ changed: true, reason: 'First submitted draft' }); }
+    return response(banRows());
+  });
+  const root = await bansView(h);
+  const row = root.querySelectorAll('tbody tr')[1];
+  await fire(findNode(row, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Edit reason'), 'click');
+  const box = findNode(row, n => n.localName === 'textarea');
+  box.value = 'First submitted draft';
+  await fire(box, 'input', { target: { value: 'First submitted draft' } });
+  assert.equal(box.disabled, false);
+  await fire(findNode(row, n => n.localName === 'button' && n.textContent === 'Save reason'), 'click');
+  await settle();
+  assert.equal(findNode(row, n => n.localName === 'textarea').disabled, true, 'no new text can be typed and then dropped');
+  release();
+  await settle();
+  assert.equal(findNode(row, n => n.localName === 'textarea'), null);
+});
+
+test('an unsaved ban reason survives reloads and is never discarded without asking', async () => {
+  const prompts = [];
+  let discard = false;
+  const calls = [];
+  const h = harness(async (url, opts) => {
+    calls.push({ url, opts });
+    return response(banRows());
+  }, new Map(), new Map(), message => { prompts.push(message); return discard; });
+  const root = await bansView(h);
+  const rows = () => [...root.querySelectorAll('tbody tr')];
+  const button = (node, name) => findNode(node, n => n.localName === 'button' && (n.getAttribute('aria-label') === name || n.textContent === name));
+  const box = node => findNode(node, n => n.localName === 'textarea');
+  await fire(button(rows()[0], 'Edit reason'), 'click');
+  box(rows()[0]).value = 'Draft for the first ban';
+  await fire(box(rows()[0]), 'input', { target: { value: 'Draft for the first ban' } });
+  assert.equal(h.app.isDirty(), true);
+  // Opening a second editor asks first; declining keeps the open draft and its protection.
+  await fire(button(rows()[1], 'Edit reason'), 'click');
+  assert.deepEqual(prompts, ['Discard unsaved changes?']);
+  assert.equal(box(rows()[1]), null, 'only one reason editor is open');
+  assert.equal(box(rows()[0]).value, 'Draft for the first ban');
+  assert.equal(h.app.isDirty(), true);
+  // Reloading the list, by hand or after a ban, keeps the draft.
+  const reads = calls.length;
+  await fire(button(root, 'Refresh'), 'click');
+  await settle();
+  assert.ok(calls.length > reads, 'the list was read again');
+  assert.equal(box(rows()[0]).value, 'Draft for the first ban');
+  assert.equal(h.app.isDirty(), true);
+  // The ban dialog clears the page's unsaved state when it closes, so it asks first too.
+  await fire(button(root, 'Ban user'), 'click');
+  assert.equal(prompts.length, 2);
+  assert.equal(h.document.querySelector('.ban-dialog'), null);
+  assert.equal(box(rows()[0]).value, 'Draft for the first ban');
+  // Accepting discards that draft and opens the other row clean; cancelling it stays clean.
+  discard = true;
+  await fire(button(rows()[1], 'Edit reason'), 'click');
+  assert.equal(prompts.length, 3);
+  assert.equal(box(rows()[0]), null);
+  assert.equal(box(rows()[1]).value, 'Repeated messages');
+  assert.equal(h.app.isDirty(), false);
+  await fire(button(rows()[1], 'Cancel'), 'click');
+  assert.equal(box(rows()[1]), null);
+  assert.equal(h.app.isDirty(), false);
+});
+
+test('the ban dialog queues a real ban with its options and shows the refusal', async () => {
+  const calls = [];
+  const confirms = [];
+  const job = (state, outcome) => ({ id: 'ban-job', guild_id: '987654321098765432', actor_id: '123456789012345678', enrollment_id: 'membership', state, outcome,
+    action: { kind: 'ban', user_id: '4242', reason: 'Raid account', delete_message_days: 1 } });
+  const h = harness(async (url, opts) => {
+    calls.push({ url, opts });
+    if (url.endsWith('/ban')) return response(job('failed', 'target_role_not_below_moderator'));
+    return response({ bans: [], names: {} });
+  }, new Map(), new Map(), message => { confirms.push(message); return true; });
+  const root = await bansView(h);
+  await fire(findNode(root, n => n.localName === 'button' && n.textContent === 'Ban user'), 'click');
+  const dialog = h.document.querySelector('.ban-dialog');
+  assert.ok(dialog, 'Ban user opens the dialog');
+  const idBox = findNode(dialog, n => n.localName === 'input' && n.getAttribute('placeholder') === 'Search members by name, or paste an ID');
+  idBox.value = '4242';
+  await fire(idBox, 'input', { target: { value: '4242' } });
+  await fire(idBox, 'keydown', { key: 'Enter' });
+  const reason = findNode(dialog, n => n.localName === 'input' && n.getAttribute('placeholder') === "Shown in Discord's audit log");
+  reason.value = 'Raid account';
+  await fire(reason, 'input', { target: { value: 'Raid account' } });
+  const days = findNode(dialog, n => n.localName === 'select');
+  days.value = '1';
+  await fire(days, 'change', { target: { value: '1' } });
+  await fire(findNode(dialog, n => n.localName === 'button' && n.textContent === 'Ban user'), 'click');
+  await settle();
+  assert.deepEqual(confirms, ['Ban user 4242 from this server? This runs in Discord.']);
+  const post = calls.find(call => call.url.endsWith('/ban'));
+  assert.equal(post.opts.method, 'POST');
+  assert.equal(post.opts.headers['x-jmodguard-enrollment'], 'membership');
+  const body = JSON.parse(post.opts.body);
+  assert.equal(body.user_id, '4242', 'snowflakes stay strings');
+  assert.equal(body.reason, 'Raid account');
+  assert.equal(body.delete_message_days, 1);
+  assert.equal(body.duration_minutes, undefined, 'an empty duration is a permanent ban');
+  assert.match(body.request_id, /^\d+_/);
+  assert.match(textOf(h.document.querySelector('.ban-receipt')), /Refused: this member's highest role is not below yours\./);
+});
+
+test('the ban dialog locks all submitted options until acknowledgment or failure', async t => {
+  for (const acknowledged of [true, false]) await t.test(acknowledged ? 'acknowledged' : 'failed request', async () => {
+    const calls = [];
+    let release;
+    const pending = new Promise(resolve => { release = resolve; });
+    const h = harness(async (url, opts) => {
+      calls.push({ url, opts });
+      if (url.endsWith('/ban')) return pending;
+      return response({ bans: [], names: {} });
+    });
+    const root = await bansView(h);
+    const button = node => findNode(node, n => n.localName === 'button' && n.textContent === 'Ban user');
+    await fire(button(root), 'click');
+    const dialog = h.document.querySelector('.ban-dialog');
+    const idBox = dialog.querySelector('input[placeholder="Search members by name, or paste an ID"]');
+    idBox.value = '4242';
+    await fire(idBox, 'input');
+    await fire(idBox, 'keydown', { key: 'Enter' });
+    const reason = dialog.querySelector('input[placeholder="Shown in Discord\'s audit log"]');
+    const days = dialog.querySelector('select');
+    const duration = dialog.querySelector('input[placeholder="Leave empty for a permanent ban"]');
+    const options = [[reason, 'Submitted reason'], [days, '3'], [duration, '30']];
+    for (const [control, value] of options) {
+      assert.equal(control.disabled, false);
+      control.value = value;
+      await fire(control, control === days ? 'change' : 'input');
+    }
+    await fire(button(dialog), 'click');
+    assert.equal(h.app.isBusy(), true);
+    assert.equal(h.app.isDirty(), true);
+    for (const [control, value] of options) {
+      assert.equal(control.disabled, true, 'submitted options cannot accept unsent edits');
+      assert.equal(control.value, value);
+    }
+    const requests = calls.filter(call => call.url.endsWith('/ban'));
+    assert.equal(requests.length, 1);
+    const body = JSON.parse(requests[0].opts.body);
+    assert.equal(body.user_id, '4242');
+    assert.equal(body.reason, 'Submitted reason');
+    assert.equal(body.delete_message_days, 3);
+    assert.equal(body.duration_minutes, 30);
+    release(acknowledged
+      ? response({ id: 'ban-job', guild_id: h.app.state.guildId, actor_id: '123456789012345678', enrollment_id: 'membership', state: 'pending', outcome: null, action: { kind: 'ban', ...body } })
+      : { ok: false, status: 400, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'Ban request rejected' }) });
+    await settle();
+    assert.equal(h.app.isBusy(), false);
+    if (acknowledged) {
+      assert.equal(dialog.querySelector('.ban-form'), null);
+      assert.match(textOf(dialog.querySelector('.ban-receipt')), /Queued\. Waiting for the bot/);
+      assert.equal(h.app.isDirty(), false);
+    } else {
+      assert.equal(dialog.querySelector('.ban-receipt'), null);
+      assert.equal(h.app.isDirty(), true, 'a failed request keeps its draft');
+      for (const [control, value] of options) {
+        assert.equal(control.disabled, false, 'options can be corrected after failure');
+        assert.equal(control.value, value);
+      }
+    }
+  });
+});
+
+test('Bot actions names ban requests and explains their results', async () => {
+  const jobs = [
+    { id: 'b1', guild_id: '987654321098765432', actor_id: '1', enrollment_id: 'membership', created_at: 1790000000, state: 'failed', outcome: 'bot_missing_permissions', action: { kind: 'ban', user_id: '4242', reason: 'x', delete_message_days: 0 } },
+    { id: 'b2', guild_id: '987654321098765432', actor_id: '1', enrollment_id: 'membership', created_at: 1790000000, state: 'succeeded', outcome: 'banned', action: { kind: 'ban', user_id: '4343', reason: 'x', delete_message_days: 0 } },
+  ];
+  for (const action of [
+    { kind: 'set_log_channel', event: 'member_ban', channel_id: '5555' },
+    { kind: 'member_sync', operation: 'resume' },
+    { kind: 'ban', user_id: '4444', reason: 'x', delete_message_days: 0 },
+    { kind: 'unban', user_id: '4444', reason: 'x' },
+  ]) jobs.push({ ...jobs[0], id: `permission-${jobs.length}`, outcome: 'permission_revoked', action });
+  const h = harness(async () => response(jobs));
+  h.app.state.config = { enrollment_id: 'membership' };
+  const panel = h.app.tabActions();
+  await settle();
+  const rows = [...panel.querySelectorAll('tbody tr')];
+  assert.equal(textOf(rows[0].cells[1]), 'Ban 4242');
+  assert.equal(textOf(rows[0].cells[4]), 'Discord refused: jModGuard lacks Ban Members or its role is too low.');
+  assert.equal(textOf(rows[1].cells[4]), 'Banned in Discord.');
+  assert.equal(rows.length, 6);
+  for (const [index, row] of rows.slice(2).entries()) {
+    assert.equal(textOf(row.cells[4]), 'Refused: you no longer have permission for this action.', `permission_revoked for ${jobs[index + 2].action.kind}`);
+  }
 });
 
 test('dashboard moderation counts stay with their requested server', async () => {
@@ -8294,19 +8572,22 @@ test('Members row actions are colored icons and history links open their case', 
   assert.match(textOf(panel), /Case case-one/, 'the case ID stays visible beside its icon');
 });
 
-test('Bans unban is a green user-check icon behind the unchanged confirmation', async () => {
+test('Bans row actions are colored icons and unban confirms the named user', async () => {
   const prompts = [];
-  const h = harness(async () => response([
-    { user_id: '9007199254740993', active: true, created_at: '2020-01-01T12:00:00Z' },
-    { user_id: '9007199254740997', active: false, created_at: '2020-01-02T12:00:00Z' },
-  ]), new Map(), new Map(), message => { prompts.push(message); return false; });
+  const h = harness(async () => response({ bans: [
+    { id: 2, user_id: '9007199254740993', active: true, created_at: '2020-01-01T12:00:00Z' },
+    { id: 1, user_id: '9007199254740997', active: false, created_at: '2020-01-02T12:00:00Z' },
+  ], names: {} }), new Map(), new Map(), message => { prompts.push(message); return false; });
   const panel = h.app.tabBans();
   await settle();
-  const unban = iconAction(panel, 'Unban');
-  assertIconAction(unban, 'unban', 'Unban');
-  assert.equal(assertIconRows(panel), 1, 'only the active ban offers Unban');
+  const unban = iconAction(panel, 'Unban user 9007199254740993');
+  assertIconAction(unban, 'unban', 'Unban user 9007199254740993');
+  assertIconAction(iconAction(panel, 'Copy user ID 9007199254740993'), 'copy', 'Copy user ID 9007199254740993');
+  assert.equal(iconAction(panel, 'Unban user 9007199254740997'), null, 'only the active ban offers Unban');
+  // Per row: copy the user ID and edit the reason; the active ban also offers Unban.
+  assert.equal(assertIconRows(panel), 5);
   await fire(unban, 'click', {});
-  assert.deepEqual(prompts, ['Unban 9007199254740993?']);
+  assert.deepEqual(prompts, ['Unban user 9007199254740993?']);
 });
 
 test('Audit log rows carry no text-only actions', async () => {

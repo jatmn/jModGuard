@@ -120,6 +120,7 @@ pub async fn save_gateway_ban_delivery(
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![delivery.id.clone(),delivery.enrollment.guild_id,delivery.enrollment.id.clone(),delivery.user_id,delivery.kind(),observed,payload,delivery.case.is_none()], 1,
         )?;
+        super::bot_actions::reconcile_queued_ban_echo_conn(&tx, &delivery)?;
         tx.commit()?;
         Ok(delivery)
     }).await

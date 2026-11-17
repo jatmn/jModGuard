@@ -282,6 +282,13 @@ pub enum ControlOp {
     SettleInterruptedWebui {
         release: ComponentRelease,
     },
+    /// Replace the jModGuard reason shown for one ban row; Discord is unchanged.
+    EditBanReason {
+        scope: ScopeWire,
+        ban_id: i64,
+        actor_id: i64,
+        reason: String,
+    },
     AppendCaseNote {
         scope: ScopeWire,
         case_id: String,
@@ -377,8 +384,11 @@ pub enum ControlActorNeed {
     Owner,
     ManageGuild(i64),
     GuildAdmin(i64),
+    /// Discord Ban Members in this guild (owner and administrators qualify).
+    BanMembers(i64),
 }
 
+const BAN_MEMBERS_BIT: u64 = 1 << 2;
 const MANAGE_GUILD_BIT: u64 = 1 << 5;
 const ADMINISTRATOR_BIT: u64 = 1 << 3;
 
@@ -406,6 +416,7 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         ControlOp::RemoveCase { scope, .. }
         | ControlOp::SetCaseDeleteRoles { scope, .. }
         | ControlOp::CleanupEvidence { scope } => ControlActorNeed::GuildAdmin(scope.guild_id),
+        ControlOp::EditBanReason { scope, .. } => ControlActorNeed::BanMembers(scope.guild_id),
         ControlOp::EnqueueBotAction { .. }
         | ControlOp::CancelBotAction { .. }
         | ControlOp::StoreRetryDeadlines { .. }
@@ -606,15 +617,18 @@ pub fn decide_control_actor(
                 Err("owner is required")
             }
         }
-        ControlActorNeed::ManageGuild(_) => guild_actor(actor_user_id, cached, true),
-        ControlActorNeed::GuildAdmin(_) => guild_actor(actor_user_id, cached, false),
+        ControlActorNeed::ManageGuild(_) => guild_actor(actor_user_id, cached, MANAGE_GUILD_BIT),
+        ControlActorNeed::GuildAdmin(_) => guild_actor(actor_user_id, cached, 0),
+        ControlActorNeed::BanMembers(_) => guild_actor(actor_user_id, cached, BAN_MEMBERS_BIT),
     }
 }
 
+/// Owner and administrators always qualify; `permission` is the one other
+/// Discord permission bit that also grants this need (0 for none).
 fn guild_actor(
     actor_user_id: i64,
     cached: Option<CachedGuildActor>,
-    manage_guild: bool,
+    permission: u64,
 ) -> Result<(), &'static str> {
     if actor_user_id <= 0 {
         return Err("actor is not allowed");
@@ -628,7 +642,7 @@ fn guild_actor(
     if cached.permissions & ADMINISTRATOR_BIT != 0 {
         return Ok(());
     }
-    if manage_guild && cached.permissions & MANAGE_GUILD_BIT != 0 {
+    if cached.permissions & permission != 0 {
         return Ok(());
     }
     Err("actor is not allowed")
@@ -1077,6 +1091,36 @@ async fn apply_control_inner(
             settle_interrupted_webui(db, &release).await?;
             saved_null()
         }
+        ControlOp::EditBanReason {
+            scope,
+            ban_id,
+            actor_id,
+            reason,
+        } => {
+            let ConfigurationScope::Guild(enrollment) = scope_of(scope.clone())? else {
+                return Err(EnrollmentChanged.into());
+            };
+            let (edit, history) = edit_enrolled_ban_reason_with_history(
+                db,
+                enrollment.clone(),
+                ban_id,
+                actor_id,
+                reason,
+            )
+            .await?;
+            if let (Some(tenant), Some(history)) = (tenant, history) {
+                let event_id = history.event_id;
+                record_ban_reason_history(tenant, scope, history).await?;
+                acknowledge_ban_reason_history(db, enrollment, event_id).await?;
+            }
+            if edit.changed {
+                saved_value(edit)
+            } else {
+                Ok(ControlReply::Unchanged {
+                    body: serde_json::to_value(edit)?,
+                })
+            }
+        }
         ControlOp::AppendCaseNote {
             scope,
             case_id,
@@ -1234,6 +1278,102 @@ fn write_scope(request: ScopeWire, target: ScopeWire) -> Result<ConfigurationWri
     ConfigurationWriteScope::new(scope_of(request)?, scope_of(target)?)
 }
 
+/// Recover linked edits independently of request replay or the current reason.
+/// Every attempt uses its original source, membership, event ID and payload.
+/// Advancing past failed items keeps one unavailable guild from starving others.
+pub async fn recover_pending_ban_reason_history(
+    db: &Db,
+    tenant: &TenantRuntime,
+    after: &mut i64,
+) -> Result<()> {
+    let pending = pending_ban_reason_history(db, *after).await?;
+    *after = pending.last().map_or(0, |(_, history)| history.event_id);
+    for (pending, history) in pending {
+        let event_id = history.event_id;
+        let scope = ConfigurationScope::Guild(pending.enrollment.clone()).to_wire();
+        let result = async {
+            record_ban_reason_history(tenant, scope, history).await?;
+            acknowledge_ban_reason_history(db, pending.enrollment, event_id).await
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(
+                event_id,
+                "ban reason history recovery will retry: {error:#}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// First half of a ban reason edit's case-history entry ID; the second half is
+/// its `ban_reason_edit` event ID, so a retry reuses the same entry.
+const BAN_REASON_HISTORY_TAG: u64 = 0xba7e_ed17_0000_0001;
+
+/// Add one reason edit to the case its ban row is linked to, as a reason
+/// correction keeping the case's original facts. A ban without a live case
+/// (none recorded, or removed) keeps only its audit event. A full case history
+/// budget is logged rather than failing the saved edit.
+async fn record_ban_reason_history(
+    tenant: &TenantRuntime,
+    scope: ScopeWire,
+    history: BanReasonHistory,
+) -> Result<()> {
+    use crate::db::guild_data::{
+        CaseError, CaseHistoryBody, CaseHistoryData, CaseId, CaseReasonCorrection, CaseSource,
+    };
+    let source = match history.case {
+        BanCaseLink::Operation(operation_id) => match CaseId::try_from(operation_id) {
+            Ok(operation_id) => CaseSource::Application { operation_id },
+            // Not a case operation ID, so no case carries it.
+            Err(_) => return Ok(()),
+        },
+        BanCaseLink::AuditEntry(entry_id) => CaseSource::DiscordAudit { entry_id },
+    };
+    let (store, scope) = captured_guild(Some(tenant), scope)
+        .await
+        .map_err(as_enrollment)?;
+    let Some(case) = store
+        .case_for_source(scope.clone(), source)
+        .await
+        .map_err(as_enrollment)?
+        .filter(|case| !case.removed)
+    else {
+        return Ok(());
+    };
+    let entry = CaseId::try_from(format!(
+        "{BAN_REASON_HISTORY_TAG:016x}{:016x}",
+        history.event_id as u64
+    ))?;
+    let explanation = match &history.previous_reason {
+        Some(previous) => format!("Ban reason edited in jModGuard. Previous reason: {previous}"),
+        None => "Ban reason edited in jModGuard. There was no previous reason.".to_owned(),
+    };
+    let data = CaseHistoryData {
+        actor_id: history.actor_id,
+        recorded_at_ms: history.recorded_at_ms,
+        body: CaseHistoryBody::Correction {
+            outcome: None,
+            reason: Some(CaseReasonCorrection::Set(history.reason)),
+            explanation,
+        },
+    };
+    match store
+        .append_case_history(scope, case.id, entry, data, crate::tenant::history_limits())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if matches!(error.downcast_ref::<CaseError>(), Some(CaseError::Limit)) => {
+            tracing::warn!(
+                event_id = history.event_id,
+                "ban reason edit saved; its case history is full: {error:#}"
+            );
+            Ok(())
+        }
+        Err(error) => Err(as_enrollment(error)),
+    }
+}
+
 async fn captured_guild(
     tenant: Option<&TenantRuntime>,
     scope: ScopeWire,
@@ -1324,6 +1464,51 @@ mod tests {
         };
         assert!(decide_control_actor(ControlActorNeed::GuildAdmin(10), 5, 9, Some(admin)).is_ok());
         assert!(decide_control_actor(ControlActorNeed::Process, 0, 0, None).is_ok());
+    }
+
+    #[test]
+    fn ban_reason_edits_need_ban_members_not_manage_server() {
+        let op = ControlOp::EditBanReason {
+            scope: ScopeWire {
+                global: false,
+                guild_id: 10,
+                enrollment_id: "membership".into(),
+                joined_at_ns: 1,
+            },
+            ban_id: 3,
+            actor_id: 5,
+            reason: "raid".into(),
+        };
+        assert_eq!(
+            control_actor_needs(&op),
+            vec![ControlActorNeed::BanMembers(10)]
+        );
+        let need = ControlActorNeed::BanMembers(10);
+        let actor = |permissions| {
+            Some(CachedGuildActor {
+                guild_owner_id: 1,
+                permissions,
+            })
+        };
+        assert!(decide_control_actor(need, 5, 9, actor(BAN_MEMBERS_BIT)).is_ok());
+        assert!(decide_control_actor(need, 5, 9, actor(ADMINISTRATOR_BIT)).is_ok());
+        assert!(
+            decide_control_actor(need, 1, 9, actor(0)).is_ok(),
+            "server owner"
+        );
+        assert!(decide_control_actor(need, 5, 9, actor(MANAGE_GUILD_BIT)).is_err());
+        assert!(decide_control_actor(need, 5, 9, actor(0)).is_err());
+        assert!(decide_control_actor(need, 5, 9, None).is_err());
+        // Ban Members alone still grants no Manage Server control op.
+        assert!(
+            decide_control_actor(
+                ControlActorNeed::ManageGuild(10),
+                5,
+                9,
+                actor(BAN_MEMBERS_BIT)
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

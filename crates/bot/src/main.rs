@@ -444,6 +444,7 @@ async fn main() -> Result<()> {
         let app = Arc::clone(&app);
         tokio::spawn(async move {
             let mut cursor = 0;
+            let mut history_cursor = 0;
             let mut poll = tokio::time::interval(Duration::from_secs(5));
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -453,6 +454,10 @@ async fn main() -> Result<()> {
                         if app.activation.may_record()
                             && let Err(error) = jmodguard_bot::gateway_ban_persistence::drain(&app, &mut cursor).await {
                             tracing::warn!("gateway ban inbox recovery will retry: {error:#}");
+                        }
+                        if let Some(_hold) = app.activation.hold_control()
+                            && let Err(error) = db::recover_pending_ban_reason_history(&app.db, &app.tenant, &mut history_cursor).await {
+                            tracing::warn!("ban reason history scan will retry: {error:#}");
                         }
                     }
                 }

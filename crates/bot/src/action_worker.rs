@@ -42,20 +42,26 @@ enum MutationPhase {
     Started,
 }
 
+/// Whether, and when, the action's mutation was started.
 #[derive(Default)]
-struct MutationProgress(std::sync::atomic::AtomicBool);
+struct MutationProgress(std::sync::OnceLock<chrono::DateTime<chrono::Utc>>);
 
 impl MutationProgress {
     fn start(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.0.get_or_init(chrono::Utc::now);
     }
 
     fn phase(&self) -> MutationPhase {
-        if self.0.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.0.get().is_some() {
             MutationPhase::Started
         } else {
             MutationPhase::Validating
         }
+    }
+
+    /// When the mutation was started; for a Discord action, when it was requested.
+    fn started_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.0.get().copied()
     }
 }
 
@@ -123,6 +129,19 @@ pub trait DiscordActions: Send + Sync {
     }
     async fn valid_log_channel(&self, guild: i64, channel: i64) -> Result<bool>;
     async fn unban(&self, guild: i64, user: i64, reason: &str) -> Outcome;
+    /// The checks a queued ban needs before Discord is called: never the bot or
+    /// the server owner, the bot must hold Ban Members, and a present member's
+    /// top role must be below both the bot's and the requesting moderator's.
+    /// `Ok(None)` allows the ban; `Some(code)` is the failed outcome code.
+    async fn ban_refusal(&self, job: &BotAction, user: i64) -> Result<Option<&'static str>> {
+        let _ = (job, user);
+        Ok(Some("ban_unavailable"))
+    }
+    /// Discord create-ban with `reason` as the audit-log reason.
+    async fn ban(&self, guild: i64, user: i64, delete_message_days: u8, reason: &str) -> Outcome {
+        let _ = (guild, user, delete_message_days, reason);
+        Outcome::failed("ban_unavailable")
+    }
     /// Depart one guild. Live implementations race the Discord call; test
     /// implementations may keep the default refusal.
     async fn leave_guild(&self, guild: i64) -> Outcome {
@@ -223,6 +242,65 @@ impl DiscordActions for LiveDiscord<'_> {
             }
         }
     }
+    async fn ban_refusal(&self, job: &BotAction, user: i64) -> Result<Option<&'static str>> {
+        if user == i64::try_from(self.bot_user_id.get()).unwrap_or(0) {
+            return Ok(Some("cannot_ban_bot"));
+        }
+        let guild = self
+            .http
+            .get_guild(GuildId::new(job.guild_id as u64))
+            .await?;
+        if guild.owner_id.get() == user as u64 {
+            return Ok(Some("cannot_ban_owner"));
+        }
+        let bot = self.http.get_member(guild.id, self.bot_user_id).await?;
+        let actor = self
+            .http
+            .get_member(guild.id, UserId::new(job.actor_id as u64))
+            .await?;
+        // Someone who is not in the server is banned by ID; no hierarchy applies.
+        let target = match self
+            .http
+            .get_member(guild.id, UserId::new(user as u64))
+            .await
+        {
+            Ok(member) => Some(member),
+            Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(r)))
+                if r.status_code.as_u16() == 404 && r.error.code == 10013 =>
+            {
+                return Ok(Some("unknown_user"));
+            }
+            Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(r)))
+                if r.status_code.as_u16() == 404 && r.error.code == 10007 =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(ban_refusal(&guild, &bot, &actor, target.as_ref(), user))
+    }
+    async fn ban(&self, guild: i64, user: i64, delete_message_days: u8, reason: &str) -> Outcome {
+        match crate::discord::race_discord_call(
+            self.activation,
+            self.http.ban_user(
+                GuildId::new(guild as u64),
+                UserId::new(user as u64),
+                delete_message_days,
+                Some(reason),
+            ),
+        )
+        .await
+        {
+            crate::discord::DiscordCall::Cancelled => Outcome::uncertain("discord_outcome_unknown"),
+            crate::discord::DiscordCall::Finished(Ok(())) => Outcome::succeeded("banned"),
+            crate::discord::DiscordCall::Finished(Err(serenity::Error::Http(
+                serenity::http::HttpError::UnsuccessfulRequest(r),
+            ))) => classify_ban_response(r.status_code.as_u16(), r.error.code),
+            crate::discord::DiscordCall::Finished(Err(_)) => {
+                Outcome::uncertain("discord_outcome_unknown")
+            }
+        }
+    }
     async fn leave_guild(&self, guild: i64) -> Outcome {
         match crate::discord::race_discord_call(
             self.activation,
@@ -247,7 +325,7 @@ fn actor_authorized(
     action: &Action,
 ) -> bool {
     let needed = match action {
-        Action::Unban { .. } => Permissions::BAN_MEMBERS,
+        Action::Ban { .. } | Action::Unban { .. } => Permissions::BAN_MEMBERS,
         Action::SetLogChannel { .. } | Action::MemberSync { .. } => Permissions::MANAGE_GUILD,
         // Unreachable through the worker: leave actions skip the actor check
         // because the platform owner holds no membership in arbitrary guilds.
@@ -297,6 +375,67 @@ async fn settings_role_authorized(
     Ok(roles.iter().any(|role| mapped.contains(role)))
 }
 
+/// Highest role of a member in Discord's hierarchy: position first, then the
+/// lower ID among roles sharing a position (Serenity's `Role` order). `None`
+/// (`@everyone`) when they have no role, which sorts below every role.
+fn top_role<'a>(
+    guild: &'a serenity::model::guild::PartialGuild,
+    member: &serenity::model::guild::Member,
+) -> Option<&'a serenity::model::guild::Role> {
+    member
+        .roles
+        .iter()
+        .filter_map(|role| guild.roles.get(role))
+        .max()
+}
+
+/// The same refusals as the ban command, plus Discord's role hierarchy: the
+/// owner and the bot cannot be banned, the bot needs Ban Members, and a member
+/// whose top role is not below the bot's, or the requesting moderator's (unless
+/// the moderator owns the server), is refused before Discord is called.
+fn ban_refusal(
+    guild: &serenity::model::guild::PartialGuild,
+    bot: &serenity::model::guild::Member,
+    actor: &serenity::model::guild::Member,
+    target: Option<&serenity::model::guild::Member>,
+    user: i64,
+) -> Option<&'static str> {
+    let Ok(user) = u64::try_from(user) else {
+        return Some("unknown_user");
+    };
+    if guild.owner_id.get() == user {
+        return Some("cannot_ban_owner");
+    }
+    if bot.user.id.get() == user {
+        return Some("cannot_ban_bot");
+    }
+    if !guild.member_permissions(bot).ban_members() {
+        return Some("bot_missing_ban_permission");
+    }
+    let target = target?;
+    let target_top = top_role(guild, target);
+    if target_top >= top_role(guild, bot) {
+        return Some("target_role_not_below_bot");
+    }
+    if guild.owner_id != actor.user.id && target_top >= top_role(guild, actor) {
+        return Some("target_role_not_below_moderator");
+    }
+    None
+}
+
+/// Discord's 50013 means the bot lacks Ban Members or its role is too low.
+fn classify_ban_response(status: u16, code: isize) -> Outcome {
+    if status == 403 && code == 50013 {
+        Outcome::failed("bot_missing_permissions")
+    } else if status == 404 && code == 10013 {
+        Outcome::failed("unknown_user")
+    } else if (400..500).contains(&status) && status != 408 {
+        Outcome::failed("discord_rejected")
+    } else {
+        Outcome::uncertain("discord_outcome_unknown")
+    }
+}
+
 fn classify_unban_response(status: u16, code: isize) -> Outcome {
     if status == 404 && code == 10026 {
         Outcome::succeeded("already_unbanned")
@@ -336,7 +475,7 @@ fn unban_case_outcome(outcome: &Outcome) -> crate::db::guild_data::CaseOutcome {
 
 async fn finish_validation_outcome(db: &Db, job: &BotAction, code: &str) -> Result<()> {
     if db::begin_bot_action(db, job, chrono::Utc::now().timestamp()).await? {
-        db::finish_dispatched_bot_action(db, job, "failed", code).await?;
+        db::finish_dispatched_bot_action(db, job, "failed", code, None).await?;
     }
     Ok(())
 }
@@ -431,6 +570,21 @@ async fn execute_inner(
         }
         Err(_) => return finish_validation_outcome(db, job, "validation_timed_out").await,
     }
+    // Hold the command-ban slot through dispatch and completion, like a ban
+    // command, so an overlapping ban cannot record this ban as a later one.
+    let _ban_in_progress = match (&job.action, app) {
+        (Action::Ban { user_id, .. }, Some(app)) => {
+            match crate::member_directory::begin_command_ban_in_progress(
+                app,
+                job.guild_id as u64,
+                *user_id as u64,
+            ) {
+                Ok(in_progress) => Some(in_progress),
+                Err(_) => return finish_validation_outcome(db, job, "ban_in_progress").await,
+            }
+        }
+        _ => None,
+    };
     if !db::begin_bot_action(db, job, chrono::Utc::now().timestamp()).await? {
         return Ok(());
     }
@@ -452,6 +606,13 @@ async fn execute_inner(
                     Err(_) => return Outcome::failed("permission_check_unavailable"),
                 },
                 Err(_) => return Outcome::failed("permission_check_unavailable"),
+            }
+        }
+        if let Action::Ban { user_id, .. } = &job.action {
+            match discord.ban_refusal(job, *user_id).await {
+                Ok(None) => {}
+                Ok(Some(code)) => return Outcome::failed(code),
+                Err(_) => return Outcome::failed("ban_check_unavailable"),
             }
         }
         if chrono::Utc::now().timestamp() >= job.expires_at {
@@ -596,6 +757,40 @@ async fn execute_inner(
                 }
                 outcome
             }
+            Action::Ban {
+                user_id,
+                reason,
+                delete_message_days,
+                ..
+            } => {
+                if chrono::Utc::now().timestamp() >= job.expires_at {
+                    return Outcome::failed("expired_before_execution");
+                }
+                if app.is_some_and(|app| !app.activation.may_record()) {
+                    return Outcome::failed("writer_lease_not_held");
+                }
+                // The echo of this ban fills the row this action records, not
+                // a second manual ban. A failed or uncertain result releases it,
+                // so an echo that arrives later is recorded as a seen ban.
+                let suppression = app.map(|app| {
+                    app.suppress_next_gateway_case(
+                        crate::state::GatewayCaseAction::Ban,
+                        job.guild_id as u64,
+                        *user_id as u64,
+                        Some(job.id.as_str()),
+                    )
+                });
+                mutation.start();
+                let outcome = discord
+                    .ban(job.guild_id, *user_id, *delete_message_days, reason)
+                    .await;
+                if outcome.phase() != OutcomeState::Succeeded
+                    && let (Some(app), Some(suppression)) = (app, suppression)
+                {
+                    app.release_gateway_case_suppression(suppression);
+                }
+                outcome
+            }
             Action::LeaveGuild {} => {
                 if chrono::Utc::now().timestamp() >= job.expires_at {
                     return Outcome::failed("expired_before_execution");
@@ -709,10 +904,25 @@ async fn execute_inner(
             );
         }
     }
+    if outcome.phase() == OutcomeState::Succeeded
+        && let Some(tenant) = tenant
+        && let Action::Ban {
+            user_id, reason, ..
+        } = &job.action
+    {
+        record_confirmed_ban_case(tenant, app, job, *user_id, reason).await;
+    }
     if app.is_some_and(|app| !app.activation.may_record()) {
         return Err(anyhow::anyhow!("writer lease is not held"));
     }
-    let finished = db::finish_dispatched_bot_action(db, job, outcome.state, outcome.code).await;
+    let finished = db::finish_dispatched_bot_action(
+        db,
+        job,
+        outcome.state,
+        outcome.code,
+        mutation.started_at(),
+    )
+    .await;
     if matches!(finished, Ok(false)) {
         tracing::warn!(
             action_id = %job.id,
@@ -738,6 +948,52 @@ async fn execute_inner(
     }
     finished?;
     Ok(())
+}
+
+/// One tenant case for a ban Discord confirmed, keyed by the action ID so a
+/// later Discord audit entry links to it. Failed or uncertain bans record no
+/// case here. An echo that arrives after such a result is recorded as a seen
+/// ban; one consumed before the result (or a timed-out call) leaves only the
+/// ban row, and the receipt stays uncertain for the moderator to check.
+async fn record_confirmed_ban_case(
+    tenant: &crate::tenant::TenantRuntime,
+    app: Option<&crate::state::BotState>,
+    job: &BotAction,
+    user_id: i64,
+    reason: &str,
+) {
+    let (Some(id), Some(joined_at_ns), Ok(operation_id)) = (
+        &job.enrollment_id,
+        job.joined_at_ns,
+        crate::db::guild_data::CaseId::try_from(job.id.clone()),
+    ) else {
+        tracing::warn!(
+            action_id = %job.id,
+            guild_id = job.guild_id,
+            "queued ban case not recorded: invalid captured action identity"
+        );
+        return;
+    };
+    let enrollment = db::GuildEnrollment {
+        guild_id: job.guild_id,
+        id: id.clone(),
+        joined_at_ns,
+    };
+    let data = crate::db::guild_data::CaseData {
+        ban_attempt_tag: None,
+        source: crate::db::guild_data::CaseSource::Application { operation_id },
+        action: crate::db::guild_data::CaseAction::Ban,
+        outcome: crate::db::guild_data::CaseOutcome::Succeeded,
+        subject_id: user_id,
+        actor_id: Some(job.actor_id),
+        occurred_at_ms: chrono::Utc::now().timestamp_millis().max(1),
+        reason: Some(reason.to_owned()),
+        evidence: crate::db::guild_data::CaseEvidence::Unavailable,
+    };
+    let case_id = crate::cases::record_data(tenant, enrollment.clone(), data.clone()).await;
+    if let (Some(app), Some(case_id)) = (app, case_id) {
+        crate::cases::remember_recorded_application(app, enrollment, &data, case_id, true).await;
+    }
 }
 
 const RETIRE_DEPARTURE_ATTEMPTS: u32 = 3;

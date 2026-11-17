@@ -815,7 +815,7 @@ async fn exercise_dispatch_completion(bot: &Db) {
     let before = get_primary_versions(bot).await.unwrap();
     test_drop_next_commit_response();
     assert!(
-        finish_dispatched_bot_action(bot, &claim, "succeeded", "log_channel_set")
+        finish_dispatched_bot_action(bot, &claim, "succeeded", "log_channel_set", None)
             .await
             .unwrap()
     );

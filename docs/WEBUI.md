@@ -214,8 +214,8 @@ bans, kicks and timeouts through the bot), copying configuration, member import 
 itself. Case removal, the Removed records view and case-removal role IDs stay with
 Administrators and the server owner. Global configuration, Administration (Updates),
 the Owner sections (Bot servers, Database Usage, Platform analytics) and **View as…**
-stay with the configured bot owner. Unban keeps
-its own Discord **Ban Members** requirement.
+stay with the configured bot owner. Ban, unban and ban-reason edits keep
+their own Discord **Ban Members** requirement.
 
 The API checks the user's current roles with Discord on every guild request
 (`guilds.members.read`, `GET /users/@me/guilds/{id}/member` with the user's own
@@ -309,9 +309,9 @@ the workspace then refreshes current configuration. If that refresh fails, use
 | **Log Channels** | map each event type to a channel in that server (ID, `<#id>` mention, or Discord channel URL); queued for the bot; save per-event ignored user/bot IDs and source channel IDs |
 | **Audit Log** | retained event history (type, user, actor), including older routine rows; new routine events report to Discord channels |
 | **Members** | search the saved bounded directory; inspect known join dates, linked cases and import state; request Pause, Resume, Retry or **Reconcile from Discord** when permitted |
-| **Bans** | recorded bot and observed Discord bans with known user name, exact ID, and audit-attributed moderator when available; unknown details remain unavailable; unban is queued for the bot |
+| **Bans** | recorded bot and observed Discord bans. Each person shows a letter avatar, bold display name, muted `@username` and their ID as a small copyable chip; names the row lacks come from the member directory. An automod ban's moderator reads "jModGuard (automod: rule)"; a ban recorded with both a moderator and an automod rule shows the moderator with that label beneath, and a missing moderator reads "Unknown". The reason is clamped to two lines and expands on click, a missing reason is a muted placeholder, status is a Banned/Unbanned badge and the time is relative with the exact time on hover. **Ban user** opens a dialog (member search or a pasted ID, reason, message-deletion window of 0, 1, 3 or 7 days, optional minutes until an automatic unban) and queues a real Discord ban for the bot; the dialog follows its receipt for up to a minute and shows the result or refusal, which Bot actions keeps. An edit icon replaces the jModGuard reason inline: Discord keeps the reason it was given, the row keeps showing the original, and each edit is an Audit log `ban_reason_edit` event (who, when, previous and new reason). When the ban row is linked to a case (the operation ID saved on the row, as for bot, automod and Bans-page bans, or the Discord audit entry its ban event recorded, as for bans made in Discord), the edit is also added to that case's history as a reason correction with the same facts; the case keeps its original reason. Each committed linked edit retains its exact source, membership and audit-event identity until its history append is acknowledged. The bot retries pending appends in bounded maintenance batches after a transient store failure, even after another edit, without rewriting the current reason; a retry or lost acknowledgment adds no second entry. A ban with no such link, such as a `!ban` command row, or whose case was removed, keeps only the Audit log event. Unban is queued for the bot and its confirmation names the user |
 | **Cases** | filter by action, outcome, subject and moderator (names from the stored member directory); select a row to open its case file in a dialog: header badges, who (subject and moderator or automod, with links to their Members page and other cases), why, a readable timeline, evidence as message cards with image previews and downloads, and Add note / Remove case record (removal never undoes Discord) |
-| **Bot actions** | latest queued unban/log-channel receipts; cancel unstarted work; force-cancel a stuck log-channel request so a new save can run (does not undo Discord) |
+| **Bot actions** | latest queued ban/unban/log-channel receipts with readable ban results; cancel unstarted work; force-cancel a stuck log-channel request so a new save can run (does not undo Discord) |
 | **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; transient failures use persisted bounded backoff and permanent failures are shown for operator action; empty / `!setname` with no args / `/setname` without `name` all clear); global prefix (owner only); **copy config from another server** |
 
 The **Owner** sidebar group appears only for the configured bot owner and needs no
@@ -414,7 +414,9 @@ POST   /api/guilds/{id}/testregex      # pattern/sample length + compile limits
 GET    /api/guilds/{id}/events?event=&user=&limit=
 POST   /api/guilds/{id}/events         # same query as GET; SPA audit log
 GET    /api/guilds/{id}/bans
-POST   /api/guilds/{id}/bans           # same query as GET; SPA bans list
+POST   /api/guilds/{id}/bans           # same query as GET; SPA bans list ({bans, names})
+PUT    /api/guilds/{id}/bans/{ban_id}/reason  # Ban Members; jModGuard reason only, never Discord
+POST   /api/guilds/{id}/ban            # Ban Members; queued real Discord ban
 POST   /api/guilds/{id}/unban
 GET    /api/guilds/{id}/stats          # guild-scoped aggregates only
 POST   /api/guilds/{id}/stats          # same body as GET; SPA dashboard counts

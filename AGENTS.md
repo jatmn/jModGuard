@@ -96,7 +96,7 @@ Keep request/target and copy source/destination checks in the mutation transacti
 objects confer no user/owner permission. Global targets through guild paths retain the guild
 check; explicit guild-0 routes remain independently owner-only. Preserve settings/read floors,
 nickname/checksum/version and validate-before-replace semantics. Empty captured settings
-patches verify using a primary read without mutation receipts. Unban/log-channel actions
+patches verify using a primary read without mutation receipts. Ban/unban/log-channel actions
 use the queue. Moderation event/ban/statistics GET routes also require loaded page membership
 and captured primary reads; see `docs/MODERATION-READS.md`. Keep the API guard against
 unscoped moderation helpers. These reads create no receipts or version changes. Web, API, and status reads use a

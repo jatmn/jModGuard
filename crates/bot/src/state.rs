@@ -1380,7 +1380,9 @@ impl BotState {
             db::ControlActorNeed::Process | db::ControlActorNeed::Owner => {
                 return db::decide_control_actor(need, actor_user_id, self.cfg.bot.owner_id, None);
             }
-            db::ControlActorNeed::ManageGuild(id) | db::ControlActorNeed::GuildAdmin(id) => id,
+            db::ControlActorNeed::ManageGuild(id)
+            | db::ControlActorNeed::GuildAdmin(id)
+            | db::ControlActorNeed::BanMembers(id) => id,
         };
         match self.cached_guild_actor(guild_id, actor_user_id) {
             GuildActorCache::Known(cached) => {
@@ -1485,7 +1487,11 @@ fn cached_actor_from_discord(
     op: &db::ControlOp,
 ) -> Option<db::CachedGuildActor> {
     let guild_id = match db::control_actor_need(op) {
-        db::ControlActorNeed::ManageGuild(id) | db::ControlActorNeed::GuildAdmin(id) if id > 0 => {
+        db::ControlActorNeed::ManageGuild(id)
+        | db::ControlActorNeed::GuildAdmin(id)
+        | db::ControlActorNeed::BanMembers(id)
+            if id > 0 =>
+        {
             id as u64
         }
         _ => return None,
@@ -1504,17 +1510,9 @@ fn cached_actor_from_discord(
     let member = guild
         .members
         .get(&serenity::model::id::UserId::new(actor_user_id as u64))?;
-    let permissions = guild.member_permissions(member);
-    let mut bits = 0u64;
-    if permissions.administrator() {
-        bits |= 1 << 3;
-    }
-    if permissions.manage_guild() {
-        bits |= 1 << 5;
-    }
     Some(db::CachedGuildActor {
         guild_owner_id: owner,
-        permissions: bits,
+        permissions: permission_bits(guild.member_permissions(member)),
     })
 }
 
@@ -1528,6 +1526,9 @@ fn member_role_ids(member: &serenity::model::guild::Member) -> Vec<i64> {
 
 fn permission_bits(permissions: serenity::model::permissions::Permissions) -> u64 {
     let mut bits = 0u64;
+    if permissions.ban_members() {
+        bits |= 1 << 2;
+    }
     if permissions.administrator() {
         bits |= 1 << 3;
     }

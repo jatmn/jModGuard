@@ -1299,8 +1299,21 @@ pub async fn bans(
     let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
-    let rows = db::list_enrolled_bans(&app.db, enrollment, query.limit.unwrap_or(100)).await?;
-    Ok(Json(serde_json::json!(rows)))
+    let rows =
+        db::list_enrolled_bans(&app.db, enrollment.clone(), query.limit.unwrap_or(100)).await?;
+    // Presentation only, as on the Cases list: names the member directory
+    // recorded for the people on these rows. An unavailable directory leaves
+    // them out instead of failing the read.
+    let people = rows
+        .iter()
+        .flat_map(|row| [Some(row.user_id), row.moderator_id, row.reason_edited_by])
+        .flatten()
+        .collect::<Vec<_>>();
+    let names = match app.tenant.live(enrollment).await {
+        Ok((store, scope)) => super::cases::directory_names(&store, scope, people).await,
+        Err(_) => serde_json::Map::new(),
+    };
+    Ok(Json(serde_json::json!({ "bans": rows, "names": names })))
 }
 
 #[derive(Deserialize)]
@@ -1333,6 +1346,87 @@ pub async fn unban(
         Action::Unban { user_id, reason },
     )
     .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BanBody {
+    request_id: String,
+    #[serde(deserialize_with = "crate::ids::de_u64")]
+    user_id: u64,
+    reason: Option<String>,
+    #[serde(default)]
+    delete_message_days: u8,
+    #[serde(default)]
+    duration_minutes: Option<u32>,
+}
+
+/// Queue a real Discord ban. The bot rechecks the requester and the target,
+/// and records the ban and its case only after Discord confirms it.
+pub async fn ban(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path(guild_id): Path<u64>,
+    Json(body): Json<BanBody>,
+) -> ApiResult<(StatusCode, Json<db::BotAction>)> {
+    let auth = super::authorize_ban_members(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let reason = body
+        .reason
+        .map(|reason| reason.trim().to_owned())
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or_else(|| "banned via WebUI".into());
+    let user_id =
+        i64::try_from(body.user_id).map_err(|_| ApiError(anyhow::anyhow!("invalid user id")))?;
+    enqueue_action(
+        &app,
+        guild_id,
+        &auth,
+        &body.request_id,
+        Action::Ban {
+            user_id,
+            reason,
+            delete_message_days: body.delete_message_days,
+            duration_minutes: body.duration_minutes,
+        },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BanReasonBody {
+    reason: String,
+}
+
+/// Replace the jModGuard reason shown for one ban. Only our record changes:
+/// Discord keeps the reason it was given and the original stays on the row.
+pub async fn edit_ban_reason(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: axum::http::HeaderMap,
+    Path((guild_id, ban_id)): Path<(u64, i64)>,
+    Json(body): Json<BanReasonBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = super::authorize_ban_members(&app, &session, guild_id).await?;
+    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    let enrollment = super::authorized_enrollment(&auth, guild_id)?;
+    let reason = db::ban_reason_edit_text(&body.reason)?;
+    let actor = i64::try_from(auth.discord_user_id())
+        .map_err(|_| ApiError(anyhow::anyhow!("invalid actor id")))?;
+    let (_, edit) = app
+        .commit_json_actor(
+            actor,
+            db::ControlOp::EditBanReason {
+                scope: db::ConfigurationScope::Guild(enrollment).to_wire(),
+                ban_id,
+                actor_id: actor,
+                reason,
+            },
+        )
+        .await?;
+    Ok(Json(edit))
 }
 
 pub async fn stats(
@@ -1461,7 +1555,7 @@ pub(super) async fn enqueue_action(
 /// level may see it and a settings level may also cancel it.
 fn can_access_action(auth: &AuthCtx, guild: u64, action: &Action, need: GuildAccess) -> bool {
     match action {
-        Action::Unban { .. } => auth.can_ban_members(guild),
+        Action::Ban { .. } | Action::Unban { .. } => auth.can_ban_members(guild),
         Action::SetLogChannel { .. } => auth
             .guild_access(guild)
             .is_some_and(|access| access >= need),
