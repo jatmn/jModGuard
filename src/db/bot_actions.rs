@@ -558,7 +558,7 @@ async fn finish_bot_action_inner(
                     duration_minutes,
                     ..
                 } if !write_fenced => {
-                    record_confirmed_ban_conn(
+                    let pending_gateway_echo = record_confirmed_ban_conn(
                         &tx,
                         &job,
                         *user_id,
@@ -568,6 +568,7 @@ async fn finish_bot_action_inner(
                     )?;
                     let data = serde_json::json!({
                         "reason":reason, "source":"webui", "action_id":job.id, "outcome":outcome,
+                        "pending_gateway_echo":pending_gateway_echo,
                     })
                     .to_string();
                     tx.execute_rows(
@@ -622,7 +623,8 @@ async fn finish_bot_action_inner(
 ///   current row untouched. Otherwise end any older active row, kept as
 ///   history, and insert this ban. Either row is dated when the request was
 ///   sent, so a later observation, even one saved after this completion,
-///   still orders after it.
+///   still orders after it. Retain provisional recovery in the audit event:
+///   the first exact owned echo can reconcile this fallback if saved later.
 ///
 /// A requested duration binds its deadline to this row and membership only
 /// while this row is the active ban and nothing later is saved, never to a
@@ -634,7 +636,7 @@ fn record_confirmed_ban_conn(
     reason: &str,
     duration_minutes: Option<u32>,
     requested_at: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<()> {
+) -> Result<Option<serde_json::Value>> {
     let echo: Option<(i64, bool, String)> = conn
         .query_row(
             "SELECT id, active, created_at FROM bans WHERE guild_id=?1 AND user_id=?2 AND operation_id=?3
@@ -670,18 +672,26 @@ fn record_confirmed_ban_conn(
         .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
         .map(|at| at.with_timezone(&chrono::Utc))
         .or(requested_at);
+    let pending_echo = echo.is_none() && echo_at.is_none();
     let current = match observed_at {
-        Some(at) => !ban_or_unban_saved_since(conn, job, user_id, at)?,
+        Some(at) => !ban_or_unban_saved_since(
+            conn,
+            job.guild_id,
+            user_id,
+            job.enrollment_id.as_deref(),
+            &job.id,
+            at,
+        )?,
         None => true,
     };
-    let deadline_row = match echo {
+    let (row_id, deadline_row) = match echo {
         Some((row_id, active, _)) => {
             conn.execute_rows(
                 "UPDATE bans SET moderator_id=?1, reason=?2 WHERE id=?3",
                 params![job.actor_id, reason, row_id],
                 1,
             )?;
-            (active && current).then_some(row_id)
+            (row_id, (active && current).then_some(row_id))
         }
         None => {
             if current {
@@ -707,21 +717,35 @@ fn record_confirmed_ban_conn(
                 ],
                 |row| Ok(row.get::<i64>(0)?),
             )?;
-            current.then_some(row_id)
+            (row_id, current.then_some(row_id))
         }
     };
-    if let (Some(minutes), Some(row_id)) = (duration_minutes, deadline_row) {
-        let expires_at = chrono::Utc::now()
-            .timestamp()
-            .checked_add(i64::from(minutes) * 60)
-            .context("ban expiry overflow")?;
+    let expires_at = duration_minutes
+        .map(|minutes| {
+            chrono::Utc::now()
+                .timestamp()
+                .checked_add(i64::from(minutes) * 60)
+                .context("ban expiry overflow")
+        })
+        .transpose()?;
+    if let (Some(expires_at), Some(row_id)) = (expires_at, deadline_row) {
         conn.execute_rows(
             "UPDATE bans SET expires_at=?1, expiry_enrollment_id=?2 WHERE id=?3",
             params![expires_at, job.enrollment_id.as_deref(), row_id],
             1,
         )?;
     }
-    Ok(())
+    // Keep provisional recovery with the retained moderation event, not the
+    // prunable action receipt. A late first echo must use the original deadline.
+    Ok(pending_echo.then(|| {
+        serde_json::json!({
+            "ban_id": row_id,
+            "enrollment_id": job.enrollment_id,
+            // Once armed, only the row owns the deadline: claiming consumes
+            // it there. Keep recovery intent only for a never-armed deadline.
+            "expires_at": expires_at.filter(|_| deadline_row.is_none()),
+        })
+    }))
 }
 
 /// Whether another request's ban row, a `member_unban` event, a gateway unban
@@ -730,8 +754,10 @@ fn record_confirmed_ban_conn(
 /// observation is ordered against, plus the bans still waiting to be applied.
 fn ban_or_unban_saved_since(
     conn: &impl SqlExecutor,
-    job: &BotAction,
+    guild_id: i64,
     user_id: i64,
+    enrollment_id: Option<&str>,
+    operation_id: &str,
     at: chrono::DateTime<chrono::Utc>,
 ) -> Result<bool> {
     conn.query_row(
@@ -744,15 +770,91 @@ fn ban_or_unban_saved_since(
           OR EXISTS(SELECT 1 FROM events WHERE guild_id=?1 AND user_id=?2
              AND event_type='member_unban' AND julianday(created_at)>=julianday(?4))",
         params![
-            job.guild_id,
+            guild_id,
             user_id,
             at.timestamp_millis(),
             at.to_rfc3339(),
-            job.enrollment_id.as_deref(),
-            job.id.as_str()
+            enrollment_id,
+            operation_id
         ],
         |row| Ok(row.get::<bool>(0)?),
     )
+}
+
+/// The first exact owned echo can arrive after completion used request time.
+/// Reconcile that provisional row once, in the same transaction as its inbox save.
+/// Completion with an already saved/projected echo has no pending marker, and
+/// consuming the marker prevents redeliveries from re-dating or resurrecting it.
+pub(super) fn reconcile_queued_ban_echo_conn(
+    conn: &impl SqlExecutor,
+    delivery: &GatewayBanDelivery,
+) -> Result<()> {
+    let GatewayBanPayload::Ban {
+        owned_by_bot: true,
+        operation_id: Some(operation),
+        ..
+    } = &delivery.payload
+    else {
+        return Ok(());
+    };
+    let pending = conn
+        .query_row(
+            "SELECT e.id, b.id, COALESCE(b.expires_at, json_extract(e.data, '$.pending_gateway_echo.expires_at')),
+           b.expiry_enrollment_id
+         FROM events e JOIN bans b ON b.guild_id=e.guild_id AND b.user_id=e.user_id
+           AND b.operation_id=?3 AND b.id=json_extract(e.data, '$.pending_gateway_echo.ban_id')
+         WHERE e.guild_id=?1 AND e.user_id=?2 AND e.event_type='member_ban'
+           AND json_valid(e.data) AND json_extract(e.data, '$.source')='webui'
+           AND json_extract(e.data, '$.action_id')=?3
+           AND json_extract(e.data, '$.pending_gateway_echo.enrollment_id')=?4
+         ORDER BY e.id LIMIT 1",
+            params![
+                delivery.enrollment.guild_id,
+                delivery.user_id,
+                operation.as_str(),
+                delivery.enrollment.id.as_str()
+            ],
+            |row| {
+                Ok((
+                    row.get::<i64>(0)?,
+                    row.get::<i64>(1)?,
+                    row.get::<Option<i64>>(2)?,
+                    row.get::<Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((event_id, row_id, expires_at, expiry_enrollment_id)) = pending else {
+        return Ok(());
+    };
+    let at =
+        chrono::DateTime::parse_from_rfc3339(&delivery.observed_at)?.with_timezone(&chrono::Utc);
+    let current = !ban_or_unban_saved_since(
+        conn,
+        delivery.enrollment.guild_id,
+        delivery.user_id,
+        Some(&delivery.enrollment.id),
+        operation,
+        at,
+    )?;
+    if current {
+        conn.execute_matching(
+            "UPDATE bans SET active=0 WHERE guild_id=?1 AND user_id=?2 AND active=1 AND id!=?3",
+            params![delivery.enrollment.guild_id, delivery.user_id, row_id],
+        )?;
+    }
+    conn.execute_rows(
+        "UPDATE bans SET created_at=?1, active=?2, expires_at=?3, expiry_enrollment_id=?4 WHERE id=?5",
+        params![delivery.observed_at.as_str(), current, expires_at.filter(|_| current),
+            expiry_enrollment_id.as_deref().or_else(|| expires_at.map(|_| delivery.enrollment.id.as_str())).filter(|_| current), row_id],
+        1,
+    )?;
+    conn.execute_rows(
+        "UPDATE events SET data=json_set(json_remove(data, '$.pending_gateway_echo'), '$.gateway_echo_observed_at', ?1) WHERE id=?2",
+        params![delivery.observed_at.as_str(), event_id],
+        1,
+    )?;
+    Ok(())
 }
 
 pub async fn cancel_bot_action(db: &Db, guild: i64, id: &str) -> Result<bool> {

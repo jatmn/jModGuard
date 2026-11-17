@@ -46,6 +46,16 @@ The nickname outbox remains a separate active path; see
   It cannot undo a remote effect already performed.
   Clearing an absent mapping still supersedes queued changes, but does not advance
   configuration versions or revisions when no mapping was deleted.
+- A confirmed queued ban without a saved owned Gateway echo uses request time
+  provisionally. Its retained `member_ban` event holds the exact row, membership
+  and original expiry needed for recovery, independently of the prunable receipt.
+  Saving its first exact owned echo reconciles the row in the same transaction as
+  the inbox insert, using the observation time and the existing later-ban/unban
+  boundaries. A current row regains its original deadline; an ended row cannot
+  affect a newer ban. The pending marker is consumed once, so replay cannot
+  re-date the row, extend expiry or resurrect it after a later unban. A deadline
+  already consumed by automatic unban stays consumed, including when that
+  dispatch is still in flight or finishes failed/uncertain.
 - Cleanup removes only a bounded batch of resolved operational history. Age uses the
   later of completion and request timestamp. It never purges unresolved uncertain work
   or retained moderation audits. Deletions and a monotonically increasing admission
