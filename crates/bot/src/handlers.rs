@@ -4720,11 +4720,7 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
         })
         .await;
         assert!(poll.is_ok());
-        assert_eq!(
-            app.member_sync_rate_limit_epoch.load(Ordering::Relaxed),
-            app.member_sync_rate_limit_persisted_epoch
-                .load(Ordering::Relaxed)
-        );
+        wait_epoch_persisted(&app, Duration::from_secs(5)).await;
         std::fs::remove_dir_all(directory).unwrap();
     }
 
