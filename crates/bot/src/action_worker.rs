@@ -570,6 +570,21 @@ async fn execute_inner(
         }
         Err(_) => return finish_validation_outcome(db, job, "validation_timed_out").await,
     }
+    // Hold the command-ban slot through dispatch and completion, like a ban
+    // command, so an overlapping ban cannot record this ban as a later one.
+    let _ban_in_progress = match (&job.action, app) {
+        (Action::Ban { user_id, .. }, Some(app)) => {
+            match crate::member_directory::begin_command_ban_in_progress(
+                app,
+                job.guild_id as u64,
+                *user_id as u64,
+            ) {
+                Ok(in_progress) => Some(in_progress),
+                Err(_) => return finish_validation_outcome(db, job, "ban_in_progress").await,
+            }
+        }
+        _ => None,
+    };
     if !db::begin_bot_action(db, job, chrono::Utc::now().timestamp()).await? {
         return Ok(());
     }

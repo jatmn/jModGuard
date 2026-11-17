@@ -3911,6 +3911,113 @@ async fn queued_ban_completion_keeps_its_own_echo_current_with_its_deadline() {
 }
 
 #[tokio::test]
+async fn queued_ban_holds_the_command_ban_slot_through_dispatch_and_completion() {
+    /// A ban command that runs once Discord shows the queued ban records it as
+    /// present, as the command does, whenever it can take the user's ban slot.
+    struct CommandDuringBan<'a> {
+        app: &'a crate::state::BotState,
+        command_ran: std::sync::Mutex<Vec<bool>>,
+    }
+    #[serenity::async_trait]
+    impl DiscordActions for CommandDuringBan<'_> {
+        async fn membership_matches(&self, _: &BotAction) -> Result<bool> {
+            Ok(true)
+        }
+        async fn guild_joined_at_ns(&self, _: i64) -> Result<Option<i64>> {
+            Ok(Some(1))
+        }
+        async fn authorized(&self, _: &BotAction) -> Result<bool> {
+            Ok(true)
+        }
+        async fn valid_log_channel(&self, _: i64, _: i64) -> Result<bool> {
+            Ok(true)
+        }
+        async fn unban(&self, _: i64, _: i64, _: &str) -> Outcome {
+            panic!("not an unban")
+        }
+        async fn ban_refusal(&self, _: &BotAction, _: i64) -> Result<Option<&'static str>> {
+            Ok(None)
+        }
+        async fn ban(&self, guild: i64, user: i64, _: u8, _: &str) -> Outcome {
+            let ran = match crate::member_directory::begin_command_ban_in_progress(
+                self.app,
+                guild as u64,
+                user as u64,
+            ) {
+                Ok(_command) => {
+                    let enrollment = db::guild_enrollment(&self.app.db, guild).await.unwrap();
+                    crate::commands::behaviors::continue_present_command_ban(
+                        self.app,
+                        enrollment,
+                        user,
+                        Some("raider"),
+                        None,
+                        7,
+                        "moderator",
+                        "command ban",
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    true
+                }
+                Err(_) => false,
+            };
+            self.command_ran.lock().unwrap().push(ran);
+            Outcome::succeeded("banned")
+        }
+    }
+
+    let f = Fixture::new();
+    let refused = f.enqueue(10, "refused", ban(99, None)).await;
+    let enrollment = db::guild_enrollment(&f.db, 10).await.unwrap().unwrap();
+    let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    app.tenant.activate(enrollment).await.unwrap();
+    let discord = CommandDuringBan {
+        app: &app,
+        command_ran: Default::default(),
+    };
+
+    // A ban command already in progress refuses the queued ban before Discord.
+    let command = crate::member_directory::begin_command_ban_in_progress(&app, 10, 99).unwrap();
+    drain_with_state(&app, &discord, &WorkerLimits::default())
+        .await
+        .unwrap();
+    drop(command);
+    assert!(discord.command_ran.lock().unwrap().is_empty());
+    let status = f.status(&refused).await;
+    assert_eq!(
+        (status.state.as_str(), status.outcome.as_deref()),
+        ("failed", Some("ban_in_progress"))
+    );
+    assert!(db::list_bans(&f.db, 10, 10).await.unwrap().is_empty());
+
+    // A ban command started while Discord applies the queued ban is refused,
+    // so it cannot record that ban first and take its deadline.
+    let job = f.enqueue(10, "timed", ban(99, Some(30))).await;
+    let before = now();
+    drain_with_state(&app, &discord, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(*discord.command_ran.lock().unwrap(), vec![false]);
+    assert_eq!(f.status(&job).await.state, "succeeded");
+    let rows = db::list_bans(&f.db, 10, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].active);
+    assert_eq!(rows[0].moderator_id, Some(42));
+    let due = db::next_expired_ban(&f.db, now() + 1801, Vec::new(), Vec::new(), Vec::new())
+        .await
+        .unwrap()
+        .expect("the queued timed ban keeps its deadline");
+    assert_eq!(due.id, rows[0].id);
+    assert!(before + 1800 <= due.expires_at);
+    // The slot is released after completion.
+    drop(crate::member_directory::begin_command_ban_in_progress(&app, 10, 99).unwrap());
+}
+
+#[tokio::test]
 async fn queued_ban_late_echo_recovers_after_receipt_pruning_and_never_replays() {
     let f = Fixture::new();
     let job = f.enqueue(10, "late-echo-replay", ban(99, Some(30))).await;

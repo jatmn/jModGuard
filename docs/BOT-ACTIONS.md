@@ -246,7 +246,11 @@ bot must hold Ban Members (`bot_missing_ban_permission`), and a member whose hig
 not below the bot's (`target_role_not_below_bot`) or the requester's, unless the requester
 owns the server (`target_role_not_below_moderator`), is refused. Someone who is not in the
 server is banned by ID; Discord's Unknown User is `unknown_user`, and an unreadable check is
-`ban_check_unavailable`. Refusals are failed receipts without a Discord request.
+`ban_check_unavailable`. Like a ban command, a queued ban holds the user's ban slot from
+before these checks until its completion commits. It is refused (`ban_in_progress`) while
+a ban command, an automatic unban or a gateway ban/unban observation for that user holds
+the slot, and a ban command started meanwhile is refused. Refusals are failed receipts
+without a Discord request.
 
 The worker then calls Discord create-ban with the reason as the audit-log reason and the
 deletion window. Discord's Missing Permissions is `bot_missing_permissions`; other explicit
