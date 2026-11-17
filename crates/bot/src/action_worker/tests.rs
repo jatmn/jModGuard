@@ -3493,6 +3493,8 @@ async fn queued_ban_fills_its_gateway_echo_and_binds_its_deadline() {
 enum BanRace {
     /// The bot's own gateway echo of this request, saved and applied.
     Echo,
+    /// The owned echo saved before completion, projected afterward.
+    EchoSaved,
     /// A gateway unban, saved and applied.
     Unban,
     /// A gateway unban saved but applied only after completion.
@@ -3590,6 +3592,10 @@ impl BanRace {
                 db::apply_gateway_ban_delivery(db, id).await.unwrap();
                 return None;
             }
+            Self::EchoSaved => {
+                let id = gateway_delivery(db, id, gateway_ban(Some(job.id.clone()))).await;
+                return Some(LateDelivery::Saved(id));
+            }
             Self::Unban => {
                 let id = gateway_delivery(db, id, unban).await;
                 db::apply_gateway_ban_delivery(db, id).await.unwrap();
@@ -3649,6 +3655,22 @@ async fn queued_ban_completion_keeps_a_later_unban_or_ban() {
         ("echo-unban", &[Echo, Unban][..], false),
         ("echo-unban-reban", &[Echo, Unban, Reban][..], true),
         ("echo-pending-unban", &[Echo, UnbanSaved][..], false),
+        ("pending-echo-unban", &[EchoSaved, Unban][..], false),
+        (
+            "pending-echo-pending-unban",
+            &[EchoSaved, UnbanSaved][..],
+            false,
+        ),
+        (
+            "pending-echo-unban-redelivery",
+            &[EchoSaved, UnbanSaved, EchoSaved][..],
+            false,
+        ),
+        (
+            "unban-pending-echo-unban-reban",
+            &[Unban, EchoSaved, UnbanSaved, RebanSaved][..],
+            true,
+        ),
         (
             "unban-echo-pending-unban",
             &[Unban, Echo, UnbanSaved][..],
@@ -3689,7 +3711,7 @@ async fn queued_ban_completion_keeps_a_later_unban_or_ban() {
         for late in pending {
             late.apply(&f.db).await;
         }
-        if !race.iter().any(|write| matches!(write, Echo)) {
+        if !race.iter().any(|write| matches!(write, Echo | EchoSaved)) {
             // A late echo is this ban's row, never a second one.
             let id = gateway_delivery(
                 &f.db,
@@ -3786,6 +3808,16 @@ async fn queued_ban_completion_keeps_its_own_echo_current_with_its_deadline() {
         ("unban-then-own-echo", vec![Unban, Echo]),
         ("pending-unban-then-own-echo", vec![UnbanSaved, Echo]),
         ("unban-event-then-own-echo", vec![UnbanEvent, Echo]),
+        ("pending-own-echo", vec![EchoSaved]),
+        ("unban-then-pending-own-echo", vec![Unban, EchoSaved]),
+        (
+            "pending-unban-then-pending-own-echo",
+            vec![UnbanSaved, EchoSaved],
+        ),
+        (
+            "unban-event-then-pending-own-echo",
+            vec![UnbanEvent, EchoSaved],
+        ),
     ] {
         let f = Fixture::new();
         let job = f.enqueue(10, label, ban(99, Some(30))).await;
@@ -3827,6 +3859,12 @@ async fn queued_ban_completion_keeps_its_own_echo_current_with_its_deadline() {
             bound, job.enrollment_id,
             "{label}: deadline is membership-bound"
         );
+        let due = db::next_expired_ban(&f.db, now() + 1801, Vec::new(), Vec::new(), Vec::new())
+            .await
+            .unwrap()
+            .expect("the timed ban must reach automatic unban selection");
+        assert_eq!(due.id, id, "{label}: expiry selects this exact ban");
+        assert_eq!(Some(due.enrollment.id), bound, "{label}");
     }
 }
 

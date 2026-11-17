@@ -250,10 +250,14 @@ appeared. A later unban or ban wins, as for gateway deliveries. The echo row kee
 observation time, so a later unban ends it even when applied after completion, and an echo
 already ended stays ended. Its deadline checks later boundaries against that observation,
 so an unban between request start and the owned echo does not suppress the current ban's
-deadline. Without an echo, a ban row, unban event, or gateway unban or
-another ban delivery saved after the request was sent (applied or still pending) records
-this ban as an ended row. A row completion inserts is dated when the request was sent, as
-a gateway row is dated when it was observed, so an unban or ban observed after the request
+deadline. A matching owned echo saved in the delivery inbox supplies that observation
+even if it has not been projected yet; completion dates its row at the observation so
+an older unban applied later cannot end it. The first matching delivery supplies that
+boundary, rather than a later redelivery. Without a known echo, a ban row, unban event,
+or gateway unban or another ban delivery saved after the request was sent (applied or
+still pending) records this ban as an ended row. In that fallback, a row completion
+inserts is dated when the request was sent, as a gateway row is dated when it was
+observed, so an unban or ban observed after the request
 still ends or follows it even if it is saved after completion. None of these replaces the
 current ban or takes this ban's deadline. The worker also records one tenant ban case with the action ID
 as its application source so the later Discord audit entry links to it. Failed and uncertain bans

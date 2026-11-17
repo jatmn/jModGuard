@@ -615,7 +615,9 @@ async fn finish_bot_action_inner(
 ///   one applied after this completion, still ends it. If a later unban or ban
 ///   already ended it, it stays ended history. Check later boundaries from the
 ///   echo's observation, so an earlier unban does not discard its deadline.
-/// - Without an echo, a ban or unban saved after the request was sent, applied
+///   A saved owned delivery supplies that observation even before projection;
+///   date an inserted row at that observation so older unbans cannot end it.
+/// - Without a known echo, a ban or unban saved after the request was sent, applied
 ///   or still pending, means this ban is history: record it ended and leave the
 ///   current row untouched. Otherwise end any older active row, kept as
 ///   history, and insert this ban. Either row is dated when the request was
@@ -641,11 +643,31 @@ fn record_confirmed_ban_conn(
             |row| Ok((row.get(0)?, row.get::<i64>(1)? != 0, row.get(2)?)),
         )
         .optional()?;
-    // A matching echo is a more precise boundary than request start. Keep the
-    // request-time fallback when no valid observation is available.
-    let observed_at = echo
-        .as_ref()
-        .and_then(|(_, _, at)| chrono::DateTime::parse_from_rfc3339(at).ok())
+    // Projection order must not hide a durable owned observation. Use the first
+    // matching delivery, so a redelivery cannot move this ban past an unban.
+    let echo_at = match &echo {
+        Some((_, _, at)) => Some(at.clone()),
+        None => conn
+            .query_row(
+                "SELECT json_extract(payload, '$.observed_at') FROM gateway_ban_deliveries
+                 WHERE guild_id=?1 AND user_id=?2 AND kind='ban' AND enrollment_id=?3
+                   AND json_extract(payload, '$.payload.Ban.owned_by_bot')=1
+                   AND json_extract(payload, '$.payload.Ban.operation_id')=?4
+                 ORDER BY observed_at_ms, rowid LIMIT 1",
+                params![
+                    job.guild_id,
+                    user_id,
+                    job.enrollment_id.as_deref(),
+                    job.id.as_str()
+                ],
+                |row| Ok(row.get::<String>(0)?),
+            )
+            .optional()?,
+    };
+    // Keep the request-time fallback when no valid observation is available.
+    let observed_at = echo_at
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
         .map(|at| at.with_timezone(&chrono::Utc))
         .or(requested_at);
     let current = match observed_at {
@@ -668,10 +690,9 @@ fn record_confirmed_ban_conn(
                     params![job.guild_id, user_id],
                 )?;
             }
-            // Dated when the request was sent, as a gateway row is dated when it
-            // was observed, so a later unban or ban observed before this
-            // completion but saved after it still orders after this ban.
-            let created_at = requested_at.map_or_else(now_str, |at| at.to_rfc3339());
+            // Use the known echo observation, otherwise request start. The
+            // same anchor must govern later gateway projection as completion.
+            let created_at = observed_at.map_or_else(now_str, |at| at.to_rfc3339());
             let row_id = conn.query_row_write(
                 "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active, operation_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) RETURNING id",
