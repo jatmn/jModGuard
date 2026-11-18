@@ -48,9 +48,9 @@ if [[ "${NEED_NEXTEST:-false}" == true ]]; then
   nextest_archive="$RUNNER_TEMP/jmodguard/nextest.tar.gz"
   curl --fail --silent --show-error --location --retry 3 \
     --connect-timeout 10 --max-time 60 --retry-max-time 120 \
-    https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/cargo-nextest-0.9.148-x86_64-unknown-linux-gnu.tar.gz \
+    https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.152/cargo-nextest-0.9.152-x86_64-unknown-linux-gnu.tar.gz \
     --output "$nextest_archive"
-  echo "223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc  $nextest_archive" | sha256sum --check
+  echo "d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a  $nextest_archive" | sha256sum --check
   mkdir -p "$RUNNER_TEMP/jmodguard/bin"
   tar -xzf "$nextest_archive" -C "$RUNNER_TEMP/jmodguard/bin" cargo-nextest
   "$RUNNER_TEMP/jmodguard/bin/cargo-nextest" --version

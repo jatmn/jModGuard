@@ -158,7 +158,7 @@ const configureEnv = configure.match(/^        env:\n((?:          [^\n]+\n)+)/m
 assert.ok(configureEnv, "Configure runner must receive its setup flags");
 const compilerCache = jobs.get("checks").match(/^      - name: Cache Rust compiler outputs\n([\s\S]*?)(?=^      - |$(?![\s\S]))/m)?.[1];
 assert.ok(compilerCache, "missing compiler cache setup");
-assert.match(compilerCache, /version: v0\.18\.0/);
+assert.match(compilerCache, /version: v0\.19\.0/);
 const compilerGuard = compilerCache.match(/^        if: (.+)$/m)?.[1];
 assert.ok(compilerGuard);
 // actions/cache never re-saves a primary-key hit, so the pinned tool cache key
@@ -768,12 +768,12 @@ function runRegistryDelete(tag, responses, options = {}) {
   fs.writeFileSync(responsesFile, JSON.stringify(responses));
   const timeoutCommand = spawnSync("bash", ["-c", "command -v timeout"], { encoding: "utf8" });
   assert.equal(timeoutCommand.status, 0, timeoutCommand.stderr);
-  fs.symlinkSync(timeoutCommand.stdout.trim(), path.join(bin, "real-timeout"));
   // Record production arguments in every case; shorten only the stalling cases.
   fs.writeFileSync(path.join(bin, "timeout"), `#!/bin/bash
 set -euo pipefail
 printf '%s\\n' "$*" >>${JSON.stringify(timeoutLog)}
-${options.stallFrom ? 'shift 2\nexec real-timeout --kill-after=1s 1s "$@"' : 'exec real-timeout "$@"'}
+${options.stallFrom ? 'shift 2\nset -- --kill-after=1s 1s "$@"' : ""}
+exec "$REAL_TIMEOUT" "$@"
 `);
   fs.chmodSync(path.join(bin, "timeout"), 0o755);
   fs.writeFileSync(path.join(dir, "emit-pages.mjs"), [
@@ -843,6 +843,7 @@ exit 0
     env: {
       ...process.env,
       PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      REAL_TIMEOUT: timeoutCommand.stdout.trim(),
       IMAGE_TAG: `ghcr.io/jatmn/jmodguard-bot:${tag}`,
       STATUS: statusFile,
       GHCR_TOKEN: "promote-job-token",

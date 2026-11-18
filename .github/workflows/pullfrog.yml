@@ -17,7 +17,7 @@ jobs:
       github.triggering_actor == 'jatmn' &&
       github.event.comment.user.id == 12479882 &&
       contains(github.event.comment.body, '@pullfrog')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 65
     permissions:
       id-token: write

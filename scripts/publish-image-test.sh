@@ -14,10 +14,10 @@ ensure_cosign() {
   if command -v cosign >/dev/null; then
     return 0
   fi
-  local cache="${TMPDIR:-/tmp}/jmodguard-cosign"
+  local version='v2.6.5'
+  local cache="${TMPDIR:-/tmp}/jmodguard-cosign-${version}"
   mkdir -p "$cache"
   if [[ ! -x "$cache/cosign" ]]; then
-    local version='v2.4.1'
     local url="https://github.com/sigstore/cosign/releases/download/${version}/cosign-linux-amd64"
     curl -fsSL "$url" -o "$cache/cosign" || fail "could not download cosign ${version}"
     chmod 700 "$cache/cosign"
