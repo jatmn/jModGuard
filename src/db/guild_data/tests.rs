@@ -1134,6 +1134,8 @@ async fn guild_commits_release_remote_core_for_concurrent_writes() {
     use crate::db::tests::remote_stream::HranaFixture;
     use std::time::Duration;
 
+    const WRITE_PROBE_BUDGET: Duration = Duration::from_secs(5);
+
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
     let mut placements = Vec::new();
@@ -1171,7 +1173,7 @@ async fn guild_commits_release_remote_core_for_concurrent_writes() {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         core.arm_during_leased_guild_commit(move || {
             paused_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            release_rx.recv_timeout(2 * WRITE_PROBE_BUDGET).unwrap();
         });
         let write_store = store.clone();
         let write_placement = placement.clone();
@@ -1198,7 +1200,9 @@ async fn guild_commits_release_remote_core_for_concurrent_writes() {
                 })
                 .await
         });
-        let finished = tokio::time::timeout(Duration::from_secs(1), &mut writer).await;
+        // Allow for transport and executor scheduling while the commit stays
+        // paused. The writer still has to finish before we release the gate.
+        let finished = tokio::time::timeout(WRITE_PROBE_BUDGET, &mut writer).await;
         release_tx.send(()).unwrap();
         guild.await.unwrap().unwrap();
         let independent = finished.is_ok();

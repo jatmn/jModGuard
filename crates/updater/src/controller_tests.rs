@@ -4319,6 +4319,13 @@ async fn ordinary_exit_after_idle_keeps_health_during_stalled_control() {
     tokio::fs::remove_file(&exit).await.unwrap();
     tokio::fs::remove_file(&bound).await.unwrap();
     bot.tick().await.unwrap();
+    tokio::time::timeout(POLL, async {
+        while child_start_count(&root, name) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("restarted child never published its start");
     assert_eq!(child_start_count(&root, name), 2);
     bot.stop_application().await.unwrap();
     bot.end_idle().await.unwrap();
