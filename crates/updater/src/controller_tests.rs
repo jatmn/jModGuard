@@ -2183,11 +2183,11 @@ async fn api_role_serves_immediately_and_stores_startup_receipts_once_the_bot_is
 }
 
 #[derive(Clone)]
-struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+struct LogCapture(tokio::sync::watch::Sender<Vec<u8>>);
 
 impl std::io::Write for LogCapture {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
+        self.0.send_modify(|log| log.extend_from_slice(bytes));
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -2197,12 +2197,12 @@ impl std::io::Write for LogCapture {
 
 /// Every event on this thread at any level, formatted as the launcher logs
 /// it, until the guard is dropped.
-fn capture_all_logs() -> (
-    Arc<std::sync::Mutex<Vec<u8>>>,
+pub(super) fn capture_all_logs() -> (
+    tokio::sync::watch::Receiver<Vec<u8>>,
     tracing::subscriber::DefaultGuard,
 ) {
-    let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let writer = LogCapture(bytes.clone());
+    let (sender, bytes) = tokio::sync::watch::channel(Vec::new());
+    let writer = LogCapture(sender);
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
         .without_time()
@@ -2212,8 +2212,8 @@ fn capture_all_logs() -> (
     (bytes, tracing::subscriber::set_default(subscriber))
 }
 
-fn captured(bytes: &std::sync::Mutex<Vec<u8>>) -> String {
-    String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+fn captured(bytes: &tokio::sync::watch::Receiver<Vec<u8>>) -> String {
+    String::from_utf8(bytes.borrow().clone()).unwrap()
 }
 
 /// Issue #552: a rolling swap leaves the local bot control link unreachable

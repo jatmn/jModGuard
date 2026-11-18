@@ -3908,10 +3908,26 @@ mod tests {
             .unwrap()
         };
         let held = row();
-        let renewal = spawn_launcher_fence_renewal(control.clone());
-        tokio::time::sleep(POLL + Duration::from_millis(500)).await;
+        let (mut logs, _capture) = super::controller_tests::capture_all_logs();
+        let mut renewal = spawn_launcher_fence_renewal(control.clone());
+        // The expired horizon wakes the worker immediately. The next refusal
+        // must come from a regular poll while the other launcher still owns the row.
+        let refusals = logs.wait_for(|bytes| {
+            String::from_utf8_lossy(bytes)
+                .matches("bot launcher fence is held by another launcher")
+                .nth(1)
+                .is_some()
+        });
+        tokio::select! {
+            result = &mut renewal => panic!("periodic renewal exited early: {result:?}"),
+            result = tokio::time::timeout(2 * POLL, refusals) => {
+                result
+                    .expect("periodic recovery must observe the foreign owner on both attempts")
+                    .expect("launcher log capture closed");
+            }
+        }
         renewal.abort();
-        let _ = renewal.await;
+        assert!(renewal.await.unwrap_err().is_cancelled());
         assert_eq!(
             row(),
             held,
