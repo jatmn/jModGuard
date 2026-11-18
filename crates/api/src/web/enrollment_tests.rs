@@ -353,7 +353,7 @@ impl Fixture {
         if matches!(token_transport, TokenTransport::Timeout) {
             Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth)
                 .unwrap()
-                .http = reqwest::Client::builder()
+                .http = crate::http_client_builder()
                 .timeout(std::time::Duration::from_secs(1))
                 .build()
                 .unwrap();

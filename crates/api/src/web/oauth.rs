@@ -1169,7 +1169,7 @@ pub(crate) fn next_guilds_after_cursor(page: &[DiscordGuild], page_limit: usize)
 
 impl OAuthClient {
     pub fn from_config(cfg: &crate::config::ApiProcessConfig) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let http = crate::http_client_builder()
             .user_agent("jModGuard (Discord dashboard)")
             .timeout(Duration::from_secs(15))
             .build()
@@ -1316,7 +1316,7 @@ mod tests {
             client_id: String::new(),
             client_secret: String::new(),
             redirect_uri: String::new(),
-            http: reqwest::Client::new(),
+            http: crate::http_client_builder().build().unwrap(),
             guild_list: std::sync::Arc::new(std::sync::Mutex::new(GuildListGate::new())),
             guild_flights: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             retry_db: std::sync::Mutex::new(None),
@@ -1366,7 +1366,7 @@ mod tests {
             client_id: String::new(),
             client_secret: String::new(),
             redirect_uri: String::new(),
-            http: reqwest::Client::new(),
+            http: crate::http_client_builder().build().unwrap(),
             guild_list: std::sync::Arc::new(std::sync::Mutex::new(GuildListGate::new())),
             guild_flights: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             retry_db: std::sync::Mutex::new(None),
@@ -1421,7 +1421,7 @@ mod tests {
             client_id: String::new(),
             client_secret: String::new(),
             redirect_uri: String::new(),
-            http: reqwest::Client::builder()
+            http: crate::http_client_builder()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap(),
@@ -1486,7 +1486,7 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
             let client = test_oauth(
-                reqwest::Client::new(),
+                crate::http_client_builder().build().unwrap(),
                 None,
                 Some(format!("http://{address}/token")),
                 None,
@@ -1551,7 +1551,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let client = std::sync::Arc::new(test_oauth(
-            reqwest::Client::new(),
+            crate::http_client_builder().build().unwrap(),
             Some(format!("http://{address}/guilds")),
             None,
             None,
@@ -1591,7 +1591,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let client = test_oauth(
-            reqwest::Client::new(),
+            crate::http_client_builder().build().unwrap(),
             None,
             None,
             Some(format!("http://{address}/me")),
@@ -1627,7 +1627,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let client = test_oauth(
-            reqwest::Client::new(),
+            crate::http_client_builder().build().unwrap(),
             None,
             Some(format!("http://{address}/token")),
             None,
@@ -1709,7 +1709,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let client = test_oauth(
-            reqwest::Client::new(),
+            crate::http_client_builder().build().unwrap(),
             Some(format!("http://{address}/guilds")),
             None,
             None,
@@ -1752,7 +1752,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let client = test_oauth(
-            reqwest::Client::new(),
+            crate::http_client_builder().build().unwrap(),
             Some(format!("http://{address}/guilds")),
             None,
             None,
@@ -1776,7 +1776,7 @@ mod tests {
         let guilds = tokio::net::TcpListener::bind(loopback).await.unwrap();
         let me = tokio::net::TcpListener::bind(loopback).await.unwrap();
         let client = std::sync::Arc::new(test_oauth(
-            reqwest::Client::builder()
+            crate::http_client_builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
@@ -1838,7 +1838,12 @@ mod tests {
         let remaining = client.route_remaining("global").unwrap();
         let reloaded = load_deadlines(&db).unwrap();
         let reloaded_deadline = reloaded["global"];
-        let restarted = test_oauth(reqwest::Client::new(), None, None, None);
+        let restarted = test_oauth(
+            crate::http_client_builder().build().unwrap(),
+            None,
+            None,
+            None,
+        );
         restarted.restore_deadlines(reloaded);
         let restored_wait = restarted.route_remaining("global").unwrap();
 
@@ -1857,7 +1862,12 @@ mod tests {
 
     #[test]
     fn scoped_explicit_429_replaces_bucket_hint_and_only_extends_another_429() {
-        let client = test_oauth(reqwest::Client::new(), None, None, None);
+        let client = test_oauth(
+            crate::http_client_builder().build().unwrap(),
+            None,
+            None,
+            None,
+        );
         let key = "g:42";
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
@@ -1912,7 +1922,12 @@ mod tests {
     #[tokio::test]
     async fn identity_rate_limit_without_a_body_is_not_fetched_again() {
         let (calls, endpoint) = truncated_429("/me").await;
-        let client = test_oauth(reqwest::Client::new(), None, None, Some(endpoint));
+        let client = test_oauth(
+            crate::http_client_builder().build().unwrap(),
+            None,
+            None,
+            Some(endpoint),
+        );
         assert!(
             client
                 .me(4, "token")
@@ -1935,7 +1950,12 @@ mod tests {
     #[tokio::test]
     async fn token_rate_limit_without_a_body_is_not_exchanged_again() {
         let (calls, endpoint) = truncated_429("/token").await;
-        let client = test_oauth(reqwest::Client::new(), None, Some(endpoint), None);
+        let client = test_oauth(
+            crate::http_client_builder().build().unwrap(),
+            None,
+            Some(endpoint),
+            None,
+        );
         assert!(
             client
                 .refresh(4, "one")
@@ -1969,7 +1989,7 @@ mod tests {
                 socket.write_all(format!("HTTP/1.1 {status} Refused\r\ncontent-length: 20\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
             });
             let client = test_oauth(
-                reqwest::Client::new(),
+                crate::http_client_builder().build().unwrap(),
                 None,
                 None,
                 Some(format!("http://{address}/me")),
@@ -2022,7 +2042,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let client = test_oauth(
-            reqwest::Client::new(),
+            crate::http_client_builder().build().unwrap(),
             Some(format!("http://{address}/guilds")),
             None,
             Some(format!("http://{address}/me")),

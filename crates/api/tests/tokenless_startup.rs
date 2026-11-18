@@ -51,6 +51,7 @@ async fn api_process_waits_for_first_boot_with_overlapping_read_bind_without_a_b
             .unwrap(),
         root,
     };
+    jmodguard::init_tls_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()

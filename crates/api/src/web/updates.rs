@@ -329,7 +329,7 @@ async fn purge_webui_cache(
         );
         return Ok(false);
     };
-    let http = reqwest::Client::builder()
+    let http = crate::http_client_builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;

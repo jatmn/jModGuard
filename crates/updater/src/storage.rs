@@ -1,6 +1,6 @@
 //! Scoped WebUI publication using a Bunny Storage Zone password. This never
 //! calls the account API or recursively deletes a Storage directory.
-use crate::oci::{Registry, sha256_hex};
+use crate::oci::{Registry, http_client_builder, sha256_hex};
 use anyhow::{Context, Result, ensure};
 use jmodguard::db::ComponentRelease;
 use reqwest::StatusCode;
@@ -32,7 +32,7 @@ impl Storage {
         );
         ensure!(!password.is_empty(), "Bunny Storage password is missing");
         Ok(Self {
-            http: reqwest::Client::builder()
+            http: http_client_builder()
                 .timeout(Duration::from_secs(30))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
@@ -317,7 +317,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let storage = Storage {
-            http: reqwest::Client::new(),
+            http: http_client_builder().build().unwrap(),
             root: format!("http://{address}/PRIVATE_ZONE"),
             password: "PRIVATE_PASSWORD".into(),
         };
@@ -400,7 +400,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let storage = Storage {
-            http: reqwest::Client::builder()
+            http: http_client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),

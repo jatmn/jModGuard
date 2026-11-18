@@ -19,6 +19,11 @@ const MAX_UNPACKED: u64 = 256 * 1024 * 1024;
 const MAX_FILE: u64 = 64 * 1024 * 1024;
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
 
+pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
+    jmodguard::init_tls_provider();
+    reqwest::Client::builder()
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     digest(&SHA256, bytes)
         .as_ref()
@@ -149,7 +154,7 @@ impl Registry {
             "invalid registry base"
         );
         Ok(Self {
-            http: reqwest::Client::builder()
+            http: http_client_builder()
                 .timeout(Duration::from_secs(30))
                 .redirect(reqwest::redirect::Policy::limited(2))
                 .build()?,
@@ -729,7 +734,7 @@ mod tests {
                 std::future::pending::<()>().await;
             });
             let mut registry = Registry::new(&base).unwrap();
-            registry.http = reqwest::Client::builder()
+            registry.http = http_client_builder()
                 .timeout(Duration::from_millis(100))
                 .build()
                 .unwrap();
