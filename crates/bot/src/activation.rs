@@ -104,6 +104,8 @@ pub struct Activation {
     #[cfg(test)]
     renewal_attempts: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
+    renewal_confirmed: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
     renewal_stopped_for_authority: AtomicBool,
     #[cfg(test)]
     renewal_loop_stopped_at: Mutex<Option<Instant>>,
@@ -173,6 +175,8 @@ impl Activation {
             renewal_fault_delay: Mutex::new(Duration::ZERO),
             #[cfg(test)]
             renewal_attempts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            renewal_confirmed: Mutex::new(None),
             #[cfg(test)]
             renewal_stopped_for_authority: AtomicBool::new(false),
             #[cfg(test)]
@@ -651,6 +655,10 @@ fn spawn_renewal_every(
                 }
                 last_error = None;
                 activation.note_authority(requested_at);
+                #[cfg(test)]
+                if let Some(confirmed) = activation.renewal_confirmed.lock().unwrap().take() {
+                    let _ = confirmed.send(());
+                }
                 let generation = db.leased_generation();
                 if generation != armed {
                     if let Some(tenant) = &tenant
@@ -1060,6 +1068,8 @@ mod tests {
         let (task, started) = start_polled_discord(&activation);
         wait_until_polled(&started).await;
         activation.fail_next_renewal();
+        let (confirmed, renewal_done) = std::sync::mpsc::channel();
+        *activation.renewal_confirmed.lock().unwrap() = Some(confirmed);
         tokio::time::pause();
         let began = tokio::time::Instant::now();
         let renewal = spawn_renewal_every(
@@ -1072,17 +1082,12 @@ mod tests {
             while activation.renewal_attempts.load(Ordering::Acquire) < 2 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            // The retry is running on the separate SQLite executor. Keep the
-            // virtual clock at this point while waiting for its real result.
-            let database_deadline = Instant::now() + Duration::from_secs(5);
-            while activation.authority_deadline() == Some(before) && !activation.recording_cut_off()
-            {
-                assert!(
-                    Instant::now() < database_deadline,
-                    "SQLite renewal did not finish"
-                );
-                tokio::task::yield_now().await;
-            }
+            // A blocking waiter holds Tokio's virtual clock at the retry
+            // while the separate SQLite executor confirms the renewal.
+            tokio::task::spawn_blocking(move || renewal_done.recv_timeout(Duration::from_secs(5)))
+                .await
+                .unwrap()
+                .expect("SQLite renewal did not finish");
         })
         .await
         .expect("retry must finish before the next 500 ms tick");

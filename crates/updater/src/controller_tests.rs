@@ -3929,9 +3929,12 @@ fn child_start_count(root: &std::path::Path, name: &str) -> usize {
     let Ok(text) = std::fs::read_to_string(root.join("events")) else {
         return 0;
     };
-    text.lines()
-        .filter(|line| *line == format!("{name}.start"))
-        .count()
+    count_child_starts(&text, name)
+}
+
+fn count_child_starts(text: &str, name: &str) -> usize {
+    let start = format!("{name}.start");
+    text.lines().filter(|line| *line == start).count()
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4319,9 +4322,13 @@ async fn ordinary_exit_after_idle_keeps_health_during_stalled_control() {
     tokio::fs::remove_file(&exit).await.unwrap();
     tokio::fs::remove_file(&bound).await.unwrap();
     bot.tick().await.unwrap();
+    let events = root.join("events");
     tokio::time::timeout(POLL, async {
-        while child_start_count(&root, name) < 2 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        loop {
+            let text = tokio::fs::read_to_string(&events).await.unwrap();
+            if count_child_starts(&text, name) >= 2 {
+                break;
+            }
         }
     })
     .await

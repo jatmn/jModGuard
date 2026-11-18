@@ -37,7 +37,7 @@ const listControlsSource = fs.readFileSync(new URL('../frontend/list-controls.js
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
   .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, '\n');
 const pages = [];
-const testClockStartedAt = Date.now();
+const testClockStartedAt = Date.UTC(2026, 10, 18, 12);
 after(() => bootDom.window.close());
 function activate(window) {
   globalThis.window = window; globalThis.document = window.document;
@@ -762,7 +762,7 @@ test('no page renders the old multi-line hero card markup', () => {
 
 const ANALYTICS_CONFIG = { settings: { prefix: '!', bot_name: '' }, rules: [{ rule_id: 'spam', name: 'Spam filter' }], commands: [], log_channels: [], badwords: [], enrollment_id: 'enroll-token' };
 function analyticsDays(count, fill = () => ({})) {
-  const today = new Date();
+  const today = new Date(testClockStartedAt);
   return Array.from({ length: count }, (_, i) => {
     const day = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - (count - 1 - i))).toISOString().slice(0, 10);
     return { day, warns: 0, bans: 0, automod: 0, mod_actions: 0, timeouts: 0, joins: 0, leaves: 0, ...fill(i) };
