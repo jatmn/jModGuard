@@ -10,12 +10,20 @@ The following GET routes require fresh Discord Manage Guild permissions, active 
 membership and the `x-jmodguard-enrollment` value from the page's loaded configuration:
 
 - `/api/guilds/{id}/events`, including event/user/limit filters.
-- `/api/guilds/{id}/bans`, including the limit filter. It answers `{bans, names}`: each
-  ban row carries its original `reason` plus the latest jModGuard reason edit
-  (`edited_reason`, `reason_edited_by`, `reason_edited_at`) read from `ban_reason_edit`
-  audit events in the same snapshot, and `names` holds member-directory display names
-  for the listed users, moderators and editors (presentation only; an unavailable
-  directory leaves it empty).
+- `/api/guilds/{id}/bans` (also POST for the browser). It answers
+  `{bans, names, total, next_cursor, moderators}`. The default is newest first by ban
+  timestamp and row ID. `sort` accepts `subject`, `id` (Discord user ID),
+  `reason`, `actor`, `date`, and `status`. Set `dir=asc|desc` and pass `next_cursor`
+  as the following request's `after` with the same order and filters.
+  `total` counts all matching rows. `moderators` contains actors from the
+  guild's full ban history. The filters are `subject` (name or positive
+  Discord ID), `actor` (ID), `reason` (literal substring of the current
+  reason), `status=active|unbanned`, and inclusive UTC calendar dates `from`
+  and `to`. `q` matches stored user and moderator identities and original
+  and edited reasons. Names from the member directory are display enrichment.
+  Rows keep the original reason and supply the latest edit, editor and edit
+  time from the same snapshot. Reason writes keep the indexed row and audit
+  event in one transaction.
 - `/api/guilds/{id}/stats`.
 - `/api/guilds/{id}/analytics?days=7|30|90`, the Analytics summary read: one core
   statement returns the daily series, previous-period totals, rule/kind/moderator
@@ -34,20 +42,20 @@ event user IDs outside the signed database range are rejected rather than wrappe
 
 ## Database contract and limits
 
-`query_enrolled_events`, `list_enrolled_bans` and `enrolled_guild_stats` take the captured
+`query_enrolled_events`, `page_enrolled_bans` and `enrolled_guild_stats` take the captured
 `GuildEnrollment`. These values are internal scope, not credentials; callers must authorize
 the user before using them. The API service guard rejects the old guild-ID moderation reads.
-Bot callers retain those helpers, sharing the same SQL and row decoding with scoped reads.
+Bot callers retain those helpers. The Bans API page shares the ban row decoder.
 
 Membership verification and data queries share one deferred primary snapshot (`BEGIN
 DEFERRED`) and close it with ROLLBACK after the read. That snapshot is still routed to the
 primary, and it does not take the writer lock, so a bot write is not queued behind the
 read and a held writer does not stall the read. No recovery receipt, configuration version
 change, new table, dependency, cache, connection pool or polling task is added. Event/ban
-results retain their 1–200 row clamp, ordering and filters. Statistics retain existing
-definitions, with all three counts in one snapshot. Counts use guild-scoped index searches,
-and ordered event/ban pages use guild/ID indexes (guild/type/ID for type-only event
-filters). Event queries with a user filter use the existing user index for both
+results retain their 1–200 row clamp. Statistics retain their existing definitions,
+with all three counts in one snapshot. Counts use guild-scoped index searches.
+Ordered event pages use guild/ID indexes (guild/type/ID for type-only event filters).
+Ban pages use guild-prefixed indexes for their selected order. Event queries with a user filter use the existing user index for both
 user-only and type-plus-user lookups, retaining guild and type checks. Counting work still grows with the
 guild’s retained records; this change does not establish large-database performance or
 distributed read scaling.

@@ -204,31 +204,31 @@ test('Bans cells name people with ID chips, label automod and keep the original 
   const user = edited.cells[0];
   assert.equal(findNode(user, n => n.localName === 'strong').textContent, 'Test-User-1');
   assert.match(textOf(user), /@test-user-1/);
-  const chip = findNode(user, n => String(n.className).includes('id-chip'));
+  const chip = findNode(edited.cells[1], n => String(n.className).includes('id-chip'));
   assert.equal(chip.textContent, '9007199254740993', 'the ID is a chip, not inline text');
   assert.ok(findNode(chip, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Copy user ID 9007199254740993'));
   assert.doesNotMatch(textOf(edited), /\(test-user-1, 9007199254740993\)/);
-  assert.equal(textOf(edited.cells[1]), 'Banned');
-  assert.ok(findNode(edited.cells[1], n => String(n.className).includes('badge-error')));
-  assert.match(textOf(edited.cells[2]), /test-mod-1/);
-  assert.equal(findNode(edited.cells[2], n => String(n.className).includes('id-chip')).textContent, '9007199254740995');
+  assert.equal(textOf(edited.cells[2]), 'Banned');
+  assert.ok(findNode(edited.cells[2], n => String(n.className).includes('badge-error')));
+  assert.match(textOf(edited.cells[3]), /test-mod-1/);
+  assert.equal(findNode(edited.cells[3], n => String(n.className).includes('id-chip')).textContent, '9007199254740995');
   // The edited jModGuard reason leads; the original and the editor stay visible.
-  assert.equal(findNode(edited.cells[3], n => String(n.className).split(' ').includes('ban-reason')).textContent, 'Spamming invite links in #general');
-  assert.match(textOf(edited.cells[3]), /Edited by test-mod-1/);
-  assert.match(textOf(edited.cells[3]), /Original: Spamming invites/);
-  assert.ok(findNode(edited.cells[4], n => n.localName === 'time' && n.getAttribute('title')), 'relative time with the full time on hover');
+  assert.equal(findNode(edited.cells[4], n => String(n.className).split(' ').includes('ban-reason')).textContent, 'Spamming invite links in #general');
+  assert.match(textOf(edited.cells[4]), /Edited by test-mod-1/);
+  assert.match(textOf(edited.cells[4]), /Original: Spamming invites/);
+  assert.ok(findNode(edited.cells[5], n => n.localName === 'time' && n.getAttribute('title')), 'relative time with the full time on hover');
   // Directory names fill rows the bot could not name; automod shows its rule, not an ID.
   assert.equal(findNode(automod.cells[0], n => n.localName === 'strong').textContent, 'Directory-Name');
   assert.match(textOf(automod.cells[0]), /@directory-user/);
-  assert.equal(textOf(automod.cells[2]), 'jModGuard (automod: spam_burst)');
-  assert.equal(findNode(automod.cells[3], n => String(n.className).split(' ').includes('ban-reason')).textContent, 'Repeated messages');
-  assert.equal(textOf(unknown.cells[2]), 'Unknown');
+  assert.equal(textOf(automod.cells[3]), 'jModGuard (automod: spam_burst)');
+  assert.equal(findNode(automod.cells[4], n => String(n.className).split(' ').includes('ban-reason')).textContent, 'Repeated messages');
+  assert.equal(textOf(unknown.cells[3]), 'Unknown');
   assert.doesNotMatch(textOf(unknown), /Unavailable/);
-  const placeholder = findNode(unknown.cells[3], n => n.localName === 'span' && n.textContent === 'No reason given');
+  const placeholder = findNode(unknown.cells[4], n => n.localName === 'span' && n.textContent === 'No reason given');
   assert.ok(String(placeholder.className).includes('muted'));
-  assert.equal(textOf(unknown.cells[1]), 'Unbanned');
+  assert.equal(textOf(unknown.cells[2]), 'Unbanned');
   // Long reasons stay clamped until clicked.
-  const reason = findNode(automod.cells[3], n => String(n.className).split(' ').includes('ban-reason'));
+  const reason = findNode(automod.cells[4], n => String(n.className).split(' ').includes('ban-reason'));
   assert.equal(reason.getAttribute('aria-expanded'), 'false');
   await fire(reason, 'click');
   assert.equal(reason.getAttribute('aria-expanded'), 'true');
@@ -243,10 +243,82 @@ test('a ban with a moderator and an automod rule shows both', async () => {
   const rows = { bans: [{ id: 4, user_id: '9007199254740993', user_name: 'test-user-1', user_display_name: null, moderator_id: '9007199254740995', moderator_name: 'test-mod-1', active: true, reason: '[automod:spam_burst] Repeated messages', created_at: '2020-01-01T12:00:00Z' }], names: {} };
   const h = harness(async () => response(rows));
   const root = await bansView(h);
-  const cell = root.querySelector('tbody tr').cells[2];
+  const cell = root.querySelector('tbody tr').cells[3];
   assert.equal(findNode(cell, n => n.localName === 'strong').textContent, 'test-mod-1', 'the moderator who acted stays');
   assert.equal(findNode(cell, n => String(n.className).includes('id-chip')).textContent, '9007199254740995');
   assert.match(textOf(cell), /jModGuard \(automod: spam_burst\)/, 'the rule is not dropped');
+});
+
+test('Bans maps its columns, filters, row people, and paging onto the shared list controls', async () => {
+  const requests = [];
+  const next = '{"anchor":{"id":2,"value":"reason & %"}}';
+  const f = harness(async (path, opts) => {
+    if (!path.includes('/bans?')) return response({});
+    assert.equal(opts.method, 'POST');
+    const query = new URL(path, 'https://fixture.test').searchParams;
+    requests.push(query);
+    const moderators = [{ id: '9007199254740995', name: 'test-mod-1' }, { id: '50', name: 'Older moderator' }];
+    if (query.has('reason')) return response({ bans: [], moderators, total: 0, next_cursor: null });
+    return response({ ...banRows(), moderators, total: 78, next_cursor: query.has('after') ? null : next });
+  });
+  const originalGuild = f.app.state.guildId;
+  const guild = f.app.state.guilds[1].id;
+  f.location.search = `?list=bans&guild=${guild}&sort=reason&dir=desc&q=seed`;
+  f.app.restoreWorkspace();
+  assert.notEqual(f.app.state.guildId, originalGuild);
+  assert.equal(f.app.state.tab, 'bans');
+  const root = await bansView(f);
+  const request = () => requests.at(-1);
+  const button = (text) => findNode(root, n => n.localName === 'button' && n.textContent === text);
+  assert.equal(request().get('q'), 'seed');
+  assert.equal(root.querySelector('th[aria-sort="descending"]').textContent, 'Reason');
+  assert.deepEqual([...root.querySelectorAll('th button')].map(n => n.textContent),
+    ['Banned user', 'ID', 'Status', 'Moderator', 'Reason', 'Time']);
+  const [moderator, status] = root.querySelectorAll('[aria-label="Filter bans"] select');
+  assert.equal([...moderator.options].find(option => option.value === '50')?.textContent, 'Older moderator (50)');
+  assert.match(root.textContent, /78 matching bans/);
+  await fire(button('Next page'), 'click');
+  assert.equal(request().get('after'), next);
+  assert.equal(request().get('q'), 'seed');
+  assert.equal(button('Next page').disabled, true);
+  await fire(button('ID'), 'click');
+  assert.equal(request().get('sort'), 'id');
+  assert.equal(request().get('dir'), 'asc');
+  assert.equal(request().get('after'), null);
+  await fire(button('ID'), 'click');
+  assert.equal(request().get('dir'), 'desc');
+  await fire(root.querySelector('a[aria-label^="Filter by user Test-User-1"]'), 'click');
+  assert.equal(request().get('subject'), '9007199254740993');
+  assert.equal(request().get('q'), null);
+  await fire(root.querySelector('a[aria-label^="Filter by moderator test-mod-1"]'), 'click');
+  assert.equal(request().get('actor'), '9007199254740995');
+  assert.equal(request().get('subject'), null);
+  assert.equal(moderator.value, '9007199254740995');
+  status.value = 'unbanned';
+  await fire(status, 'change');
+  assert.equal(request().get('status'), 'unbanned');
+  const input = root.querySelector('input[placeholder="Name or ID"]');
+  input.value = 'Test-User';
+  await fire(input, 'input');
+  assert.equal(request().get('subject'), null);
+  await [...f.timers.values()].find(timer => timer.delay === 300).fn();
+  assert.equal(request().get('subject'), 'Test-User');
+  const reason = [...root.querySelectorAll('label')].find(label => label.textContent === 'Reason contains').querySelector('input');
+  reason.value = '  invite %  ';
+  await fire(reason, 'input');
+  await [...f.timers.values()].find(timer => timer.delay === 300).fn();
+  assert.equal(request().get('reason'), 'invite %');
+  assert.equal(request().get('actor'), '9007199254740995');
+  assert.equal(root.querySelector('tbody').textContent, 'No bans match these filters.');
+  assert.match(root.textContent, /0 matching bans/);
+  const location = new URL(f.historyUrls.at(-1), 'https://fixture.test').searchParams;
+  for (const key of ['subject', 'reason', 'actor', 'status', 'sort', 'dir']) assert.equal(location.get(key), request().get(key));
+  assert.equal(location.get('list'), 'bans');
+  assert.equal(location.get('guild'), guild);
+  await fire(button('Clear filters'), 'click');
+  for (const key of ['subject', 'reason', 'actor', 'status', 'q', 'after']) assert.equal(request().get(key), null);
+  assert.equal(reason.value, '');
+  assert.ok(root.querySelector('a[aria-label^="Filter by user Test-User-1"]'));
 });
 
 test('editing a ban reason saves the jModGuard reason and reloads the list', async () => {
@@ -9081,8 +9153,7 @@ test('Cases restores pending search after reauthentication before debounce', asy
   assert.equal(search.value, 'previous');
   search.value = '  pending review %  ';
   await fire(search, 'input');
-  const listRequests = () => calls.map(call => new URL(call.url, 'https://fixture.test'))
-    .filter(url => url.pathname.endsWith('/cases'));
+  const listRequests = () => calls.filter(call => call.url.split('?')[0].endsWith('/cases'));
   assert.equal(listRequests().length, 1, 'typing has not issued a request yet');
 
   h.app.handleAuthLoss({ status: 401 });
@@ -9096,7 +9167,7 @@ test('Cases restores pending search after reauthentication before debounce', asy
   h.app.restoreWorkspace();
   const restored = await casesView(h);
   assert.equal(restored.querySelector('input[type="search"]').value, 'pending review %');
-  const query = listRequests().at(-1).searchParams;
+  const query = new URLSearchParams(listRequests().at(-1).url.split('?')[1]);
   assert.equal(query.get('q'), 'pending review %');
   assert.equal(query.get('outcome'), 'failed');
 });
