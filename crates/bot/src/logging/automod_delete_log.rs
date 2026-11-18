@@ -13,10 +13,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "automod_delete_log_{:032x}",
-            rand::random::<u128>()
-        ));
+        Self::open(fixture_path())
+    }
+
+    fn open(path: std::path::PathBuf) -> Self {
         let db = Db::open(&path, 2).unwrap();
         let mut cfg = BotProcessConfig::default();
         cfg.log.discord_concurrency = 4;
@@ -32,6 +32,45 @@ impl Drop for Fixture {
             let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
         }
         crate::tenant::remove_sidecars(&self.path);
+    }
+}
+
+fn fixture_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "automod_delete_log_{:032x}",
+        rand::random::<u128>()
+    ))
+}
+
+/// A migrated core database built once and copied for each matrix case, so a
+/// case reopens a current core instead of replaying its bootstrap.
+struct CoreTemplate(std::path::PathBuf);
+
+impl CoreTemplate {
+    fn new() -> Self {
+        let path = fixture_path();
+        // Closing the database leaves no writer behind while its files are copied.
+        drop(Db::open(&path, 2).unwrap());
+        Self(path)
+    }
+
+    fn fixture(&self) -> Fixture {
+        let path = fixture_path();
+        for suffix in ["", "-wal"] {
+            let source = format!("{}{suffix}", self.0.display());
+            if std::path::Path::new(&source).exists() {
+                std::fs::copy(source, format!("{}{suffix}", path.display())).unwrap();
+            }
+        }
+        Fixture::open(path)
+    }
+}
+
+impl Drop for CoreTemplate {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+        }
     }
 }
 
@@ -1012,6 +1051,7 @@ async fn pending_bulk_automod_keeps_a_destination_for_every_route_and_outcome() 
         (false, true, true),
         (true, true, true),
     ];
+    let core = CoreTemplate::new();
     for (automod, message, bulk) in routes {
         for outcome in [
             BulkOutcome::Success,
@@ -1020,14 +1060,15 @@ async fn pending_bulk_automod_keeps_a_destination_for_every_route_and_outcome() 
             BulkOutcome::Uncertain,
             BulkOutcome::Race,
         ] {
-            account_pending_bulk(automod, message, bulk, outcome, false, false).await;
+            account_pending_bulk(&core, automod, message, bulk, outcome, false, false).await;
         }
     }
-    account_pending_bulk(true, false, true, BulkOutcome::Failure, true, false).await;
-    account_pending_bulk(true, false, true, BulkOutcome::Failure, false, true).await;
+    account_pending_bulk(&core, true, false, true, BulkOutcome::Failure, true, false).await;
+    account_pending_bulk(&core, true, false, true, BulkOutcome::Failure, false, true).await;
 }
 
 async fn account_pending_bulk(
+    core: &CoreTemplate,
     automod: bool,
     message: bool,
     bulk: bool,
@@ -1035,7 +1076,7 @@ async fn account_pending_bulk(
     filter_author: bool,
     filter_channel: bool,
 ) {
-    let f = Fixture::new();
+    let f = core.fixture();
     if automod {
         db::upsert_log_channel(&f.app.db, 789, "automod_delete", 901)
             .await

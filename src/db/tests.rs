@@ -368,6 +368,37 @@ fn cleanup_db(path: &Path) {
     let _ = std::fs::remove_file(format!("{}-shm", path.display()));
 }
 
+/// A migrated database built once and copied for each matrix case, so a case
+/// reopens a current database instead of replaying bootstrap.
+struct MigratedTemplate(PathBuf);
+
+impl MigratedTemplate {
+    fn new(label: &str) -> Self {
+        let path = tmp_db_path(label);
+        // Closing the database leaves no writer behind while its files are copied.
+        drop(Db::open(&path, 2).unwrap());
+        Self(path)
+    }
+
+    fn open_copy(&self, label: &str) -> (PathBuf, Db) {
+        let path = tmp_db_path(label);
+        for suffix in ["", "-wal"] {
+            let source = format!("{}{suffix}", self.0.display());
+            if Path::new(&source).exists() {
+                std::fs::copy(source, format!("{}{suffix}", path.display())).unwrap();
+            }
+        }
+        let db = Db::open(&path, 2).unwrap();
+        (path, db)
+    }
+}
+
+impl Drop for MigratedTemplate {
+    fn drop(&mut self) {
+        cleanup_db(&self.0);
+    }
+}
+
 #[test]
 fn config_version_bumps_on_settings_write() {
     let tmp = tmp_db_path("cfgver");
@@ -5425,7 +5456,9 @@ async fn copy_rules_fixture(
 
 // Exercise both public copy APIs and the dashboard's control dispatch, including
 // global sources/targets. Expected text is supplied independently of the guard.
+#[allow(clippy::too_many_arguments)]
 async fn assert_invite_copy_case(
+    template: &MigratedTemplate,
     mode: &str,
     src: i64,
     dst: i64,
@@ -5434,8 +5467,7 @@ async fn assert_invite_copy_case(
     marker: bool,
     expected_description: &str,
 ) {
-    let tmp = tmp_db_path("invite_copy");
-    let db = Db::open(&tmp, 2).unwrap();
+    let (tmp, db) = template.open_copy("invite_copy");
     let mut scopes = Vec::new();
     for guild in [src, dst] {
         scopes.push(if guild == 0 {
@@ -5549,6 +5581,7 @@ async fn assert_invite_copy_case(
 fn invite_description_copy_guards_old_text_using_target_row() {
     use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
     tokio_test_block_on(async {
+        let template = MigratedTemplate::new("invite_copy_template");
         for mode in ["direct", "enrolled", "control"] {
             for (src, dst) in [(10, 20), (0, 20), (10, 0)] {
                 for (stored, expected) in [
@@ -5557,7 +5590,8 @@ fn invite_description_copy_guards_old_text_using_target_row() {
                     (Some(CURRENT), CURRENT),
                     (Some("Target custom guidance"), "Target custom guidance"),
                 ] {
-                    assert_invite_copy_case(mode, src, dst, OLD, stored, true, expected).await;
+                    assert_invite_copy_case(&template, mode, src, dst, OLD, stored, true, expected)
+                        .await;
                 }
             }
         }
@@ -5568,10 +5602,12 @@ fn invite_description_copy_guards_old_text_using_target_row() {
 fn invite_description_copy_preserves_custom_current_and_near_match() {
     use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
     tokio_test_block_on(async {
+        let template = MigratedTemplate::new("invite_copy_template");
         for mode in ["direct", "enrolled", "control"] {
             for (src, dst) in [(10, 20), (0, 20), (10, 0)] {
                 for description in ["Source custom guidance", CURRENT, &format!("{OLD} ")] {
                     assert_invite_copy_case(
+                        &template,
                         mode,
                         src,
                         dst,
@@ -5591,6 +5627,7 @@ fn invite_description_copy_preserves_custom_current_and_near_match() {
 fn invite_description_copy_without_marker_matches_save_semantics() {
     use crate::defaults::{INVITE_DESCRIPTION as CURRENT, OLD_INVITE_DESCRIPTION as OLD};
     tokio_test_block_on(async {
+        let template = MigratedTemplate::new("invite_copy_template");
         for mode in ["direct", "enrolled", "control"] {
             for (src, dst) in [(10, 20), (0, 20), (10, 0)] {
                 // Fresh/current target is protected without a migration marker;
@@ -5601,10 +5638,15 @@ fn invite_description_copy_without_marker_matches_save_semantics() {
                     (Some(OLD), OLD),
                     (Some("Pre-upgrade custom guidance"), OLD),
                 ] {
-                    assert_invite_copy_case(mode, src, dst, OLD, stored, false, expected).await;
+                    assert_invite_copy_case(
+                        &template, mode, src, dst, OLD, stored, false, expected,
+                    )
+                    .await;
                 }
-                assert_invite_copy_case(mode, src, dst, CURRENT, None, false, CURRENT).await;
+                assert_invite_copy_case(&template, mode, src, dst, CURRENT, None, false, CURRENT)
+                    .await;
                 assert_invite_copy_case(
+                    &template,
                     mode,
                     src,
                     dst,

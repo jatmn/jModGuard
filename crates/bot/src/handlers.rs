@@ -2563,7 +2563,9 @@ mod tests {
 
     #[tokio::test]
     async fn in_flight_same_subject_audit_never_binds_to_the_younger_commit() {
-        for completion in ["saved", "failed", "cancelled", "restart"] {
+        // Every case owns its database and state, and each waits out the real
+        // audit match window, so the cases run together and the waits overlap.
+        let case = |completion: &'static str| async move {
             let directory = std::env::temp_dir()
                 .join(format!("in_flight_audit_{:032x}", rand::random::<u128>()));
             std::fs::create_dir_all(&directory).unwrap();
@@ -2643,7 +2645,13 @@ mod tests {
             );
             drop(app);
             std::fs::remove_dir_all(directory).unwrap();
-        }
+        };
+        tokio::join!(
+            case("saved"),
+            case("failed"),
+            case("cancelled"),
+            case("restart")
+        );
     }
 
     #[tokio::test]
