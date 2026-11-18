@@ -4141,6 +4141,7 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
   const flushRef = useRef(null);
   // Only results for the text now in the box can be chosen.
   const results = found && found.query === text.trim() ? found.members : null;
+  const searchError = results ? found.error : null;
   const update = (next) => {
     ids.splice(0, ids.length, ...next);
     if (draft) markDirty();
@@ -4198,8 +4199,9 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
     try {
       const page = await apiRead(`/api/guilds/${state.guildId}/members?${new URLSearchParams({ q, limit: "8", status: memberStatus })}`, controller.signal);
       if (searchAbort.current === controller) setFound({ query: q, members: Array.isArray(page?.members) ? page.members : [] });
-    } catch (_) {
-      if (searchAbort.current === controller) setFound({ query: q, members: [] });
+    } catch (error) {
+      // A failed search is not an empty one: say why, so an ID can be pasted instead.
+      if (searchAbort.current === controller) setFound({ query: q, members: [], error: String(error?.message || error).replace(/[.\s]+$/, "") });
     }
   };
   useEffect(() => () => searchAbort.current?.abort(), []);
@@ -4299,7 +4301,9 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
                   ),
                 ),
               )
-            : h("li", { className: "muted" }, "No matching members."),
+            : searchError
+              ? h("li", { className: "err", role: "alert" }, `Couldn't search members: ${searchError}. Paste their ID instead.`)
+              : h("li", { className: "muted" }, "No matching members."),
         )
       : null,
     error ? h("p", { className: "err", role: "alert" }, error) : null,
