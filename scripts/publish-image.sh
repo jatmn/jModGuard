@@ -359,16 +359,29 @@ build_args() {
     # Startup requires the selected source's completed core migrations. Read
     # that source, including for historical publication, rather than labeling
     # a migrating binary with the publisher's former schema version.
-    local schema
-    schema="$(node - "$context/src/db.rs" <<'JS'
+    local schema min_core min_guild
+    read -r schema min_core min_guild < <(node - "$context/src/db.rs" <<'JS'
 const fs = require("node:fs");
 const source = fs.readFileSync(process.argv[2], "utf8");
-const migrations = source.match(/const MIGRATIONS: &\[&str\] = &\[([\s\S]*?)\];/);
-const count = migrations?.[1].match(/include_str!\("\.\.\/migrations\/\d{4}_[^"\n]+\.sql"\)/g)?.length;
-if (!count || count < 15) throw new Error("selected source has no supported updater schema");
-process.stdout.write(String(count));
+const migrations = source.match(/const MIGRATIONS: &\[(?:&str|\(i64, &str\))\] = &\[([\s\S]*?)\];/);
+const sql = /include_str!\("\.\.\/migrations\/(\d{4})_[^"\n]+\.sql"\)/g;
+const files = Array.from(migrations?.[1].matchAll(sql) ?? [], ([, file]) => Number(file));
+const schema = files.at(-1);
+if (!schema || schema < 15) throw new Error("selected source has no supported updater schema");
+
+if (source.includes("const CORE_BASELINE_VERSION:")) {
+  const core = Number(source.match(/const CORE_BASELINE_VERSION: i64 = ([0-9]+);/)?.[1]);
+  const guild = Number(source.match(/const GUILD_BASELINE_VERSION: i64 = ([0-9]+);/)?.[1]);
+  if (files[0] !== core || !(guild > 0)) throw new Error("invalid selected schema baseline");
+  console.log(schema, core, guild);
+} else {
+  // Historical sources used the array length as the schema version and had
+  // their own, earlier migration floor.
+  if (schema !== files.length) throw new Error("invalid historical migration chain");
+  console.log(schema, 15, 1);
+}
 JS
-)" || publish_fail 'cannot determine selected source core schema'
+) || publish_fail 'cannot determine selected source core schema'
     args+=(
       --label "io.jmodguard.component=${component}"
       --label "io.jmodguard.channel=${release_channel}"
@@ -408,11 +421,11 @@ JS
         guild_schema_file="$context/migrations/guild/current_version.rs"
       fi
       guild_schema="$(cat "$guild_schema_file")"
-      [[ "$guild_schema" =~ ^[1-9][0-9]*$ ]] || publish_fail 'invalid selected guild schema'
+      [[ "$guild_schema" =~ ^[1-9][0-9]*$ && "$guild_schema" -ge "$min_guild" ]] || publish_fail 'invalid selected guild schema'
       args+=(
         --label "io.jmodguard.update-control=${control_protocol}"
-        --label "io.jmodguard.upgrade-min-core=15"
-        --label "io.jmodguard.upgrade-min-guild=1"
+        --label "io.jmodguard.upgrade-min-core=${min_core}"
+        --label "io.jmodguard.upgrade-min-guild=${min_guild}"
         --label "io.jmodguard.guild-schema=${guild_schema}"
       )
     fi

@@ -1069,15 +1069,13 @@ async fn newer_launcher_cancellation_restores_baked_schema_and_observation() {
         .baked_compatibility("bot", &base_sha, true)
         .await
         .unwrap();
-    // Represent the persistent record written by an older baked controller.
-    // The executing test launcher is compiled for core16; baked app/DB are15.
-    let old = db::BakedCompatibility {
-        source_sha: base_sha.clone(),
-        core: 15,
-        guild: db::guild_data::SCHEMA_VERSION,
-        launcher_revision: 0,
-    };
-    let raw = serde_json::to_string(&old).unwrap();
+    // Represent a baked controller from before the persisted migration floor.
+    let raw = json!({
+        "source_sha": base_sha,
+        "core": 15,
+        "guild": db::guild_data::SCHEMA_VERSION,
+    })
+    .to_string();
     db.with_conn(move |conn| {
         conn.pragma_update(None, "user_version", 15)?;
         let tx = conn.transaction_immediate()?;
@@ -1095,6 +1093,7 @@ async fn newer_launcher_cancellation_restores_baked_schema_and_observation() {
         .await
         .unwrap();
     assert_eq!(contract.core, 15);
+    assert_eq!(contract.migration_min_core, 15);
     assert!(
         control
             .baked_compatibility("bot", &"d".repeat(40), false)
@@ -3008,14 +3007,23 @@ async fn superseded_clear_receipt_retires_when_no_row_matches() {
     tokio::fs::remove_dir_all(&root).await.unwrap();
 }
 
+const QUEUED_RELEASED_CORE: i64 = 23;
+const BEFORE_CORE_24: &str = "DROP TABLE known_spam;
+    DROP INDEX idx_analytics_warns_time;
+    DROP INDEX idx_analytics_bans_time;
+    DROP TABLE analytics_member_daily;
+    DROP TABLE guild_join_info;";
+
 /// Reconstruct the historical schema, rather than only lowering user_version
 /// on an otherwise current DB. The child is the existing ELF fixture; application
 /// migrations below use the real bot-owned Db::open path after launcher admission.
 #[tokio::test]
-async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early() {
+async fn baked_bot_migrates_queued_protocol3_core_baseline_without_starting_api_early() {
     for stale_meta in [false, true] {
-        let root =
-            std::env::temp_dir().join(format!("queued-core16-{:032x}", rand::random::<u128>()));
+        let root = std::env::temp_dir().join(format!(
+            "queued-core-baseline-{:032x}",
+            rand::random::<u128>()
+        ));
         tokio::fs::create_dir_all(&root).await.unwrap();
         let baked = executable(&root, "baked-bot").await;
         let path = root.join("core.db");
@@ -3028,17 +3036,8 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
                 include_str!("../../../tests/fixtures/before-core-0027.sql"),
                 1024 * 1024,
             )?;
-            tx.execute_batch_bounded(
-                "DROP TABLE known_spam; DROP TABLE gateway_ban_deliveries; DROP TABLE known_bad_images; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id;
-                 DROP INDEX idx_bans_guild_id; DROP INDEX bot_actions_expiry;
-                 DROP INDEX idx_bans_one_active; ALTER TABLE bans DROP COLUMN operation_id;
-                 DROP INDEX idx_bans_expiry;
-                 DROP INDEX IF EXISTS idx_analytics_warns_time; DROP INDEX IF EXISTS idx_analytics_bans_time; DROP TABLE IF EXISTS analytics_member_daily;
-                 ALTER TABLE bans DROP COLUMN expires_at; ALTER TABLE bans DROP COLUMN expiry_enrollment_id;
-                 DROP TABLE IF EXISTS guild_join_info;
-                 PRAGMA user_version=16;",
-                1024 * 1024,
-            )?;
+            tx.execute_batch_bounded(BEFORE_CORE_24, 1024 * 1024)?;
+            tx.pragma_update(None, "user_version", QUEUED_RELEASED_CORE)?;
             for row in fixture["component_updates"].as_array().unwrap() {
                 // Column names are from this committed synthetic fixture only.
                 for (column, value) in row.as_object().unwrap() {
@@ -3065,6 +3064,11 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
                     .map_or_else(|| value.to_string(), str::to_owned);
                 db::write_meta_string_conn(&tx, key, &value)?;
             }
+            db::write_meta_string_conn(
+                &tx,
+                "bootstrap_complete",
+                &QUEUED_RELEASED_CORE.to_string(),
+            )?;
             if stale_meta {
                 for role in ["bot", "api"] {
                     // Failed newer baked boot, followed by rollback to the old app.
@@ -3092,7 +3096,10 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
             retention_days: 1,
         };
         let control = UpdateControl::open(&opts).unwrap().unwrap();
-        assert_eq!(control.schema_version().await.unwrap(), 16);
+        assert_eq!(
+            control.schema_version().await.unwrap(),
+            QUEUED_RELEASED_CORE
+        );
         assert!(control.upgrade().await.unwrap().is_none());
         let before = control.component("bot").await.unwrap();
         assert_eq!(before.observed.as_ref().unwrap().update_protocol, 3);
@@ -3112,6 +3119,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
                 .await
                 .unwrap();
             assert_eq!(contract.core, db::CORE_SCHEMA_VERSION);
+            assert_eq!(contract.migration_min_core, QUEUED_RELEASED_CORE);
             assert_eq!(contract.source_sha, bot.base_sha);
             if role == "bot" {
                 bot.baked_compatibility = contract;
@@ -3147,7 +3155,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
         .await
         .expect("the launcher keeps a live maintenance child while waiting");
         let waiting = format!(
-            "INFO waiting for the bot to migrate core schema 16 -> {}",
+            "INFO waiting for the bot to migrate core schema {QUEUED_RELEASED_CORE} -> {}",
             db::CORE_SCHEMA_VERSION
         );
         assert_eq!(logs, [waiting], "stale_meta={stale_meta}");
@@ -3171,7 +3179,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
         bot.tick().await.unwrap();
         assert!(
             bot.running.is_some(),
-            "baked migrator must start from core16"
+            "baked migrator must start from the v0.2.0 baseline"
         );
         assert!(bot.running.as_ref().unwrap().release.is_none());
         // A crash before bootstrap completes must retain baked migration eligibility.
@@ -3179,7 +3187,7 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
         bot.restart_exited_child().await.unwrap();
         assert!(
             bot.running.is_some(),
-            "baked migrator must restart from core16"
+            "baked migrator must restart from the v0.2.0 baseline"
         );
         // Real application bootstrap applies the remaining migrations and the readiness
         // marker. The ELF child itself deliberately does no DB/application work.
@@ -3306,7 +3314,11 @@ async fn api_waits_only_for_a_migration_the_bot_would_run() {
         db::CORE_SCHEMA_VERSION
     );
     for (case, schema, install_bot) in [
-        ("below the bot's migration range", 14, false),
+        (
+            "below the bot's migration range",
+            QUEUED_RELEASED_CORE - 1,
+            false,
+        ),
         ("bot would migrate", db::CORE_SCHEMA_VERSION - 1, false),
         ("installed bot release", db::CORE_SCHEMA_VERSION - 1, true),
     ] {
@@ -3325,10 +3337,12 @@ async fn api_waits_only_for_a_migration_the_bot_would_run() {
             assert_eq!(logs, std::slice::from_ref(&waiting), "{case}");
         } else {
             let error = format!("{:#}", result.unwrap_err());
-            assert!(
-                error.contains("baked application cannot open database; use owner recovery"),
-                "{case}: {error}"
-            );
+            let expected = if install_bot {
+                "baked application cannot open database; use owner recovery"
+            } else {
+                "upgrade to v0.2.0 first"
+            };
+            assert!(error.contains(expected), "{case}: {error}");
             assert!(api.core_migration_wait.is_none(), "{case}");
             assert!(logs.is_empty(), "{case}: {logs:?}");
         }
@@ -3362,17 +3376,8 @@ async fn stale_schema_selections_without_upgrade_are_refused_once_after_migratio
                 include_str!("../../../tests/fixtures/before-core-0027.sql"),
                 1024 * 1024,
             )?;
-            tx.execute_batch_bounded(
-                "DROP TABLE known_spam; DROP TABLE gateway_ban_deliveries; DROP TABLE known_bad_images; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id;
-                 DROP INDEX idx_bans_guild_id; DROP INDEX bot_actions_expiry;
-                 DROP INDEX idx_bans_one_active; ALTER TABLE bans DROP COLUMN operation_id;
-                 DROP INDEX idx_bans_expiry;
-                 DROP INDEX IF EXISTS idx_analytics_warns_time; DROP INDEX IF EXISTS idx_analytics_bans_time; DROP TABLE IF EXISTS analytics_member_daily;
-                 ALTER TABLE bans DROP COLUMN expires_at; ALTER TABLE bans DROP COLUMN expiry_enrollment_id;
-                 DROP TABLE IF EXISTS guild_join_info;
-                 PRAGMA user_version=16;",
-                1024 * 1024,
-            )?;
+            tx.execute_batch_bounded(BEFORE_CORE_24, 1024 * 1024)?;
+            tx.pragma_update(None, "user_version", QUEUED_RELEASED_CORE)?;
             for row in fixture["component_updates"].as_array().unwrap() {
                 for (column, value) in row.as_object().unwrap() {
                     if column == "component" {
@@ -3398,6 +3403,11 @@ async fn stale_schema_selections_without_upgrade_are_refused_once_after_migratio
                     .map_or_else(|| value.to_string(), str::to_owned);
                 db::write_meta_string_conn(&tx, key, &value)?;
             }
+            db::write_meta_string_conn(
+                &tx,
+                "bootstrap_complete",
+                &QUEUED_RELEASED_CORE.to_string(),
+            )?;
             tx.commit()
         }
     })
@@ -3438,7 +3448,10 @@ async fn stale_schema_selections_without_upgrade_are_refused_once_after_migratio
         retention_days: 1,
     };
     let control = UpdateControl::open(&opts).unwrap().unwrap();
-    assert_eq!(control.schema_version().await.unwrap(), 16);
+    assert_eq!(
+        control.schema_version().await.unwrap(),
+        QUEUED_RELEASED_CORE
+    );
     let mut bot = controller(
         "bot",
         baked.clone(),

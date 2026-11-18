@@ -276,34 +276,48 @@ for component in bot api webui; do
 done
 
 # Migration origins are distinct from exact application runtime ranges.
-for field in update-control=3 upgrade-min-core=15 upgrade-min-guild=1 guild-schema=22; do
+for field in update-control=3 upgrade-min-core=23 upgrade-min-guild=17 guild-schema=22; do
   contains_arg "io.jmodguard.${field}" "${schema_args[@]}" || fail "missing coordinated metadata ${field}"
 done
 
 # Capability labels come from the selected source, independently of SHA.
 readarray -d '' -t launcher_args < <(build_args bot "$HEAD_SHA" "" . "" current "$(staging_ref bot)")
-for field in launcher-revision=45 min-launcher-revision=7; do
+for field in launcher-revision=46 min-launcher-revision=7; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "missing launcher requirement ${field}"
 done
 launcher_source="$(mktemp -d)"
 mkdir -p "$launcher_source/src/db" "$launcher_source/migrations/guild"
 cp src/db.rs "$launcher_source/src/db.rs"
 cp migrations/guild/current_version.txt "$launcher_source/migrations/guild/current_version.txt"
-sed -e 's/^pub const LAUNCHER_REVISION: u32 = 45;$/pub const LAUNCHER_REVISION: u32 = 46;/' \
+sed -e 's/^pub const LAUNCHER_REVISION: u32 = 46;$/pub const LAUNCHER_REVISION: u32 = 47;/' \
     src/db/update_control.rs >"$launcher_source/src/db/update_control.rs"
 readarray -d '' -t launcher_args < <(build_args api "$HEAD_SHA" "" "$launcher_source" "" current "$(staging_ref api)")
-for field in launcher-revision=46 min-launcher-revision=7; do
+for field in launcher-revision=47 min-launcher-revision=7; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "selected source lost ${field}"
 done
 
 # Historical coordinated sources keep the Rust-expression filename. Metadata
 # must come from that source, even when the publisher uses the text filename.
+write_historical_core_source() {
+  local target=$1 version=$2 number
+  {
+    printf 'const MIGRATIONS: &[&str] = &[\n'
+    for ((number = 1; number <= version; number++)); do
+      printf '    include_str!("../migrations/%04d_fixture.sql"),\n' "$number"
+    done
+    printf '];\n'
+  } > "$target"
+}
+
+write_historical_core_source "$launcher_source/src/db.rs" 23
 mv "$launcher_source/migrations/guild/current_version.txt" "$launcher_source/migrations/guild/current_version.rs"
 printf '16\n' >"$launcher_source/migrations/guild/current_version.rs"
 for component in bot api webui; do
   readarray -d '' -t historical_args < <(build_args "$component" "$BASE_SHA" "" "$launcher_source" "" current "$(staging_ref "$component" "$BASE_SHA")")
-  contains_arg "io.jmodguard.guild-schema=16" "${historical_args[@]}" \
-    || fail "${component} must advertise the historical source's guild schema"
+  for field in guild-schema=16 upgrade-min-core=15 upgrade-min-guild=1; do
+    contains_arg "io.jmodguard.${field}" "${historical_args[@]}" \
+      || fail "${component} must advertise the historical source's ${field}"
+  done
 done
 printf 'invalid\n' >"$launcher_source/migrations/guild/current_version.txt"
 if (build_args bot "$HEAD_SHA" "" "$launcher_source" "" current "$(staging_ref bot)") >/dev/null 2>&1; then
@@ -323,7 +337,7 @@ rm -rf "$launcher_source"
 # Publishing an older source must keep its schema, not the publisher's schema.
 schema_source="$(mktemp -d)"
 mkdir -p "$schema_source/src"
-sed -e '/include_str!("..\/migrations\/001[6789]_/d' -e '/include_str!("..\/migrations\/002[0-7]_/d' src/db.rs >"$schema_source/src/db.rs"
+write_historical_core_source "$schema_source/src/db.rs" 15
 readarray -d '' -t old_schema_args < <(build_args bot "$BASE_SHA" "" "$schema_source" "" current "$(staging_ref bot "$BASE_SHA")")
 contains_arg "io.jmodguard.update-control=2" "${old_schema_args[@]}" && fail 'historical sources cannot claim coordinated-update support'
 
@@ -333,7 +347,7 @@ for field in min-schema max-schema result-schema; do
 done
 # The pre-fix schema16 source had literal schema15 launcher observations.
 # Republishing it may produce a dashboard image, never an eligible launcher.
-sed -e '/include_str!("..\/migrations\/001[789]_/d' -e '/include_str!("..\/migrations\/002[0-7]_/d' src/db.rs >"$schema_source/src/db.rs"
+write_historical_core_source "$schema_source/src/db.rs" 16
 mkdir -p "$schema_source/crates/updater/src"
 printf 'min_schema: 15,\nmax_schema: 15,\n' >"$schema_source/crates/updater/src/main.rs"
 for component in bot api; do
@@ -1022,8 +1036,8 @@ crates/updater/tests/registry.rs|
 crates/runtime/src/health.rs|bot api
 crates/updater/src/main.rs|bot api
 crates/updater/build.rs|bot api
-migrations/guild/0001_identity.sql|bot api
-migrations/0012_guild_moves.sql|bot api
+migrations/guild/0016_baseline.sql|bot api
+migrations/0023_baseline.sql|bot api
 src/lib.rs|bot api
 src/db.rs|bot api webui
 vendor/tokio-tungstenite/src/lib.rs|bot api

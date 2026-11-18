@@ -152,19 +152,7 @@ async fn version_eight_upgrade_admits_existing_enrollment_once() {
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
     let placement = f.placement(&reg, 10).await;
     let raw = Connection::open(&f.store_path).unwrap();
-    for schema in [
-        SCHEMA,
-        TENANT_SCHEMA,
-        CASE_SCHEMA,
-        HISTORY_SCHEMA,
-        SOURCE_SCHEMA,
-        EVIDENCE_SCHEMA,
-        BUNNY_SCHEMA,
-        ERASURE_SCHEMA,
-    ] {
-        raw.execute_batch_bounded(schema, SCHEMA_BATCH_LIMIT)
-            .unwrap();
-    }
+    apply_guild_fixture(&raw, 0, 8).unwrap();
     raw.execute_bounded(
         "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
         params![FAMILY, reg.id().as_str()],
@@ -186,7 +174,7 @@ async fn version_eight_upgrade_admits_existing_enrollment_once() {
     raw.execute_bounded("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','cccccccccccccccccccccccccccccccc','discord:99',?1,0)",params![legacy_payload], SCHEMA_BATCH_LIMIT).unwrap();
     let old_app_unban = r#"{"source":{"application":{"operation_id":"dddddddddddddddddddddddddddddddd"}},"action":"unban","outcome":"succeeded","subject_id":"78","actor_id":null,"occurred_at_ms":901,"reason":null,"evidence":"unavailable"}"#;
     raw.execute_bounded("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','dddddddddddddddddddddddddddddddd','app:dddddddddddddddddddddddddddddddd',?1,0)",params![old_app_unban], SCHEMA_BATCH_LIMIT).unwrap();
-    raw.pragma_update(None, "user_version", 8).unwrap();
+    apply_guild_fixture(&raw, 8, GUILD_BASELINE_VERSION).unwrap();
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
     let scope = GuildDataScope::new(
         placement,
@@ -3811,21 +3799,7 @@ async fn version_nine_upgrade_preserves_completion_and_unknown_time_history() {
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
     let placement = f.placement(&reg, 10).await;
     let raw = Connection::open(&f.store_path).unwrap();
-    for schema in [
-        SCHEMA,
-        TENANT_SCHEMA,
-        CASE_SCHEMA,
-        HISTORY_SCHEMA,
-        SOURCE_SCHEMA,
-        EVIDENCE_SCHEMA,
-        BUNNY_SCHEMA,
-        ERASURE_SCHEMA,
-        SNAPSHOT_SCHEMA,
-        MEMBER_SCHEMA,
-    ] {
-        raw.execute_batch_bounded(schema, SCHEMA_BATCH_LIMIT)
-            .unwrap();
-    }
+    apply_guild_fixture(&raw, 0, 10).unwrap();
     raw.execute_bounded(
         "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
         params![FAMILY, reg.id().as_str()],
@@ -3847,7 +3821,7 @@ async fn version_nine_upgrade_preserves_completion_and_unknown_time_history() {
         SCHEMA_BATCH_LIMIT,
     )
     .unwrap();
-    raw.pragma_update(None, "user_version", 10).unwrap();
+    apply_guild_fixture(&raw, 10, GUILD_BASELINE_VERSION).unwrap();
     drop(raw);
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
     let scope = GuildDataScope::new(
@@ -3895,22 +3869,7 @@ async fn version_ten_upgrade_preserves_existing_run_and_marks_old_phase_counts_u
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
     let placement = f.placement(&reg, 10).await;
     let raw = Connection::open(&f.store_path).unwrap();
-    for schema in [
-        SCHEMA,
-        TENANT_SCHEMA,
-        CASE_SCHEMA,
-        HISTORY_SCHEMA,
-        SOURCE_SCHEMA,
-        EVIDENCE_SCHEMA,
-        BUNNY_SCHEMA,
-        ERASURE_SCHEMA,
-        SNAPSHOT_SCHEMA,
-        MEMBER_SCHEMA,
-        MEMBER_STATUS_SCHEMA,
-    ] {
-        raw.execute_batch_bounded(schema, SCHEMA_BATCH_LIMIT)
-            .unwrap();
-    }
+    apply_guild_fixture(&raw, 0, 11).unwrap();
     raw.execute_bounded(
         "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
         params![FAMILY, reg.id().as_str()],
@@ -3931,7 +3890,7 @@ async fn version_ten_upgrade_preserves_existing_run_and_marks_old_phase_counts_u
         SCHEMA_BATCH_LIMIT,
     )
     .unwrap();
-    raw.pragma_update(None, "user_version", 11).unwrap();
+    apply_guild_fixture(&raw, 11, GUILD_BASELINE_VERSION).unwrap();
     drop(raw);
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
     let scope = GuildDataScope::new(
@@ -5170,23 +5129,7 @@ async fn version_eleven_upgrade_keeps_completed_seed_and_reconcile_cursor() {
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
     let placement = f.placement(&reg, 10).await;
     let raw = Connection::open(&f.store_path).unwrap();
-    for schema in [
-        SCHEMA,
-        TENANT_SCHEMA,
-        CASE_SCHEMA,
-        HISTORY_SCHEMA,
-        SOURCE_SCHEMA,
-        EVIDENCE_SCHEMA,
-        BUNNY_SCHEMA,
-        ERASURE_SCHEMA,
-        SNAPSHOT_SCHEMA,
-        MEMBER_SCHEMA,
-        MEMBER_STATUS_SCHEMA,
-        MEMBER_PROGRESS_SCHEMA,
-    ] {
-        raw.execute_batch_bounded(schema, SCHEMA_BATCH_LIMIT)
-            .unwrap();
-    }
+    apply_guild_fixture(&raw, 0, 12).unwrap();
     raw.execute_bounded(
         "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
         params![FAMILY, reg.id().as_str()],
@@ -5207,7 +5150,7 @@ async fn version_eleven_upgrade_keeps_completed_seed_and_reconcile_cursor() {
         SCHEMA_BATCH_LIMIT,
     )
     .unwrap();
-    raw.pragma_update(None, "user_version", 12).unwrap();
+    apply_guild_fixture(&raw, 12, GUILD_BASELINE_VERSION).unwrap();
     drop(raw);
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
     let scope = GuildDataScope::new(

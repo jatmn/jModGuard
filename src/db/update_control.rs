@@ -15,7 +15,7 @@ pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 45;
+pub const LAUNCHER_REVISION: u32 = 46;
 // Selected bots need the auth-exit hold before the readiness deadline check.
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 /// First launcher that verifies an image signature before staging.
@@ -160,10 +160,17 @@ pub struct UpdateControl {
 pub struct BakedCompatibility {
     pub source_sha: String,
     pub core: i64,
+    /// Old rows describe images that could migrate from the update-control schema.
+    #[serde(default = "legacy_baked_migration_min_core")]
+    pub migration_min_core: i64,
     pub guild: i64,
     /// Launcher revision of the baked image's build. Rows from older images read as 0.
     #[serde(default)]
     pub launcher_revision: u32,
+}
+
+fn legacy_baked_migration_min_core() -> i64 {
+    15
 }
 
 impl BakedCompatibility {
@@ -171,6 +178,7 @@ impl BakedCompatibility {
         Self {
             source_sha: source_sha.into(),
             core: CORE_SCHEMA_VERSION,
+            migration_min_core: CORE_BASELINE_VERSION,
             guild: guild_data::SCHEMA_VERSION,
             launcher_revision: LAUNCHER_REVISION,
         }
@@ -186,7 +194,9 @@ fn read_baked_compatibility(
         .context("baked compatibility missing; restart the container's baked controller")?;
     let baked: BakedCompatibility = serde_json::from_str(&raw)?;
     anyhow::ensure!(
-        baked.source_sha == base_sha && baked.core >= 15 && baked.guild >= 1,
+        baked.source_sha == base_sha
+            && (legacy_baked_migration_min_core()..=baked.core).contains(&baked.migration_min_core)
+            && baked.guild >= 1,
         "baked compatibility does not match this base image"
     );
     Ok(baked)
@@ -2236,7 +2246,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupted_first_boot_resumes_without_adopting_existing_installations() {
-        for version in [1usize, 14, 15] {
+        for completed in 1..=MIGRATIONS.len() {
             let path = std::env::temp_dir().join(format!(
                 "initial-control-{:032x}.db",
                 rand::random::<u128>()
@@ -2254,10 +2264,10 @@ mod tests {
             let partial = Db::open_with_bootstrap(
                 &opts,
                 |conn| {
-                    for (index, migration) in MIGRATIONS.iter().enumerate().take(version) {
+                    for &(at, sql) in &MIGRATIONS[..completed] {
                         let tx = conn.transaction_immediate()?;
-                        tx.execute_batch_bounded(migration, 16 * 1024 * 1024)?;
-                        tx.pragma_update(None, "user_version", index + 1)?;
+                        tx.execute_batch_bounded(sql, 16 * 1024 * 1024)?;
+                        tx.pragma_update(None, "user_version", at)?;
                         tx.commit()?;
                     }
                     Ok(())

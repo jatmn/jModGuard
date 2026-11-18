@@ -10,14 +10,13 @@ your operator runbook for promote and rollout.
 
 ## 0. Check database compatibility
 
-This release starts the `jmodguard-core-1` family. An installation from before this
-baseline must use a fresh database and be configured again; no in-place conversion or
-old-backup import is provided. Keep any old environment and its backup paired with its
-old binaries. Never add the marker manually to bypass the check.
+The oldest supported upgrade source is v0.2.0. Its core and guild databases
+use the `jmodguard-core-1` and `jmodguard-guild-1` families at schema
+versions 23 and 17. For an earlier database in either family, run v0.2.0 first.
+Keep databases from other lineages paired with their original binaries and
+backups. Use [SETUP.md](SETUP.md) to install into a fresh database.
 
-Use [SETUP.md](SETUP.md) for that fresh installation. The steps below apply to subsequent
-upgrades **within a supported family/version**, subject to each release's compatibility
-notes. Both bot and API must match the selected release. The bot initializes the database;
+Both bot and API must match the selected release. The bot initializes the database;
 the API waits for completed bootstrap. See [DATABASE-BASELINE.md](DATABASE-BASELINE.md).
 
 Tenant-runtime releases also require a separate shared guild database for a remote
@@ -25,8 +24,8 @@ core. Before rollout, configure both services with the shared-store URL/token pa
 and an explicit evidence backend from [the Bunny runbook](DEPLOY-BUNNY.md#1-create-the-core-and-guild-databases).
 Local installs use `{core-path}.guild.db` and, on Unix, `{core-path}.evidence` by default.
 Keep these stores and evidence resources with their core catalog during recovery;
-a missing owned guild database fails closed. Guild schema version 15 requires matching
-binaries; rollback needs the corresponding pre-upgrade stores, not just the core file.
+a missing owned guild database fails closed. Rollback across a schema change
+requires the matching binaries and pre-upgrade core and guild backups.
 The completed initial member import marker is preserved by compatible upgrades;
 upgrading does not trigger another full roster or current-ban scan. See [MEMBERS.md](MEMBERS.md).
 

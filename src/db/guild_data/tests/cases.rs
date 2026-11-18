@@ -443,9 +443,7 @@ async fn upgrade_from_two_preserves_scoped_settings_without_adopting_cases() {
     let p = f.placement(&reg, 10).await;
     {
         let raw = Connection::open(&f.store_path).unwrap();
-        raw.execute_batch_bounded(SCHEMA, 64 * 1024 * 1024).unwrap();
-        raw.execute_batch_bounded(TENANT_SCHEMA, 64 * 1024 * 1024)
-            .unwrap();
+        apply_guild_fixture(&raw, 0, 2).unwrap();
         raw.execute_bounded(
             "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
             params![FAMILY, reg.id().as_str()],
@@ -459,7 +457,7 @@ async fn upgrade_from_two_preserves_scoped_settings_without_adopting_cases() {
         )
         .unwrap();
         raw.execute_batch_bounded("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'); INSERT INTO guild_log_channels VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','system',12)", 64 * 1024 * 1024).unwrap();
-        raw.pragma_update(None, "user_version", 2).unwrap();
+        apply_guild_fixture(&raw, 2, GUILD_BASELINE_VERSION).unwrap();
     }
     assert!(GuildDataStore::open(f.options(), reg.clone()).is_err());
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
@@ -490,8 +488,9 @@ async fn tagged_attempt_survives_reopen_and_cannot_be_retagged_or_exposed() {
     use crate::ban_reason::{BanAttemptTag, discord_reason};
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
-    // The payload-format upgrade must admit an existing v15 database.
-    GuildDataStore::create_historical_store(f.options(), reg.clone(), 15).unwrap();
+    // Exercise the immutable payload tag on a store upgraded from v0.2.0.
+    GuildDataStore::create_historical_store(f.options(), reg.clone(), GUILD_BASELINE_VERSION)
+        .unwrap();
     let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
     let captured = scope(&f, &store, &reg, 10).await;
     let limits = CaseLimits::default();

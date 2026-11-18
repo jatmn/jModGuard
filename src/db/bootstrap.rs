@@ -24,7 +24,7 @@ impl CoreBaseline {
         match self {
             Self::Fresh => 0,
             Self::Behind(version) => *version,
-            Self::Current => MIGRATIONS.len() as i64,
+            Self::Current => CORE_SCHEMA_VERSION,
         }
     }
 }
@@ -98,13 +98,19 @@ fn read_core_baseline(conn: &impl SqlExecutor) -> Result<CoreBaseline> {
         )
         .into());
     }
-    if version > MIGRATIONS.len() as i64 {
+    if version < CORE_BASELINE_VERSION {
+        return Err(UnsupportedSchema(format!(
+            "database schema version {version} predates v0.2.0; upgrade to v0.2.0 first"
+        ))
+        .into());
+    }
+    if version > CORE_SCHEMA_VERSION {
         return Err(UnsupportedSchema(
             "database schema is newer than this binary; use a compatible release".into(),
         )
         .into());
     }
-    Ok(if version < MIGRATIONS.len() as i64 {
+    Ok(if version < CORE_SCHEMA_VERSION {
         CoreBaseline::Behind(version)
     } else {
         CoreBaseline::Current
@@ -175,13 +181,12 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
         if current {
             return Ok(());
         }
-        baseline.version() as usize
+        baseline.version()
     };
     // Migration selection must be authoritative. A lagging remote replica can
     // otherwise report vN-1 after vN committed and make us replay a
     // non-idempotent CREATE/ALTER migration against the primary.
-    for (i, sql) in MIGRATIONS.iter().enumerate().skip(applied) {
-        let target = (i + 1) as i64;
+    for &(target, sql) in MIGRATIONS.iter().filter(|(version, _)| *version > applied) {
         let tx = conn.transaction_primary_write()?;
         // Recheck while holding the primary write lock. Separate bot
         // processes can otherwise both decide to replay a non-idempotent
@@ -243,7 +248,7 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
 
 pub(super) fn ensure_schema_current(conn: &impl SqlExecutor) -> Result<()> {
     let version = read_core_baseline(conn)?.version();
-    let required = MIGRATIONS.len() as i64;
+    let required = CORE_SCHEMA_VERSION;
     if version < required {
         return Err(SchemaNotReady(format!(
             "database schema is behind (user_version={version}, required={required}). \
@@ -968,7 +973,7 @@ fn annotate_readonly_token(error: anyhow::Error) -> anyhow::Error {
 }
 
 pub(super) fn ensure_bootstrap_complete(conn: &impl SqlExecutor) -> Result<()> {
-    let expected = MIGRATIONS.len().to_string();
+    let expected = CORE_SCHEMA_VERSION.to_string();
     if meta_string_conn(conn, META_BOOTSTRAP_COMPLETE)?.as_deref() != Some(expected.as_str()) {
         return Err(SchemaNotReady(
             "database bootstrap is incomplete. Start jmodguard-bot once first, then start jmodguard-api."

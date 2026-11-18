@@ -695,15 +695,7 @@ async fn version_five_upgrade_preserves_cases_without_inventing_files() {
     let id = CaseId::new();
     {
         let raw = Connection::open(&f.store_path).unwrap();
-        for schema in [
-            SCHEMA,
-            TENANT_SCHEMA,
-            CASE_SCHEMA,
-            HISTORY_SCHEMA,
-            SOURCE_SCHEMA,
-        ] {
-            raw.execute_batch_bounded(schema, 64 * 1024 * 1024).unwrap();
-        }
+        apply_guild_fixture(&raw, 0, 5).unwrap();
         raw.execute_bounded(
             "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
             params![FAMILY, reg.id().as_str()],
@@ -718,7 +710,7 @@ async fn version_five_upgrade_preserves_cases_without_inventing_files() {
         .unwrap();
         raw.execute_batch_bounded("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", 64 * 1024 * 1024).unwrap();
         raw.execute_bounded("INSERT INTO guild_cases VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,'discord:1',?2,0)",params![id.as_str(),serde_json::to_string(&data(1)).unwrap()], 64 * 1024 * 1024).unwrap();
-        raw.pragma_update(None, "user_version", 5).unwrap();
+        apply_guild_fixture(&raw, 5, GUILD_BASELINE_VERSION).unwrap();
     }
     assert!(GuildDataStore::open(f.options(), reg.clone()).is_err());
     let foreign = f.registration(StoreId::new(), StorePolicy::Shared).await;

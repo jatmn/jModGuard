@@ -313,26 +313,18 @@ fn config_parts_loads_every_section() {
 #[test]
 fn migration_archives_legacy_global_log_channels() {
     let tmp = tmp_db_path("archive_global_logchannels");
+    let conn = Connection::open(&tmp).unwrap();
+    apply_historical_core(&conn, 0, 2);
+    conn.execute_bounded(
+        "INSERT INTO log_channels (guild_id, event_type, channel_id) VALUES (0, 'automod', 12345)",
+        (),
+        64 * 1024 * 1024,
+    )
+    .unwrap();
+    apply_historical_core(&conn, 2, CORE_BASELINE_VERSION);
+    drop(conn);
     let db = Db::open(&tmp, 2).unwrap();
     db.with_conn_sync(|conn| {
-        conn.execute_bounded(
-            "INSERT INTO log_channels (guild_id, event_type, channel_id) VALUES (0, 'automod', 12345)",
-            (), 64 * 1024 * 1024,
-        )?;
-        // Simulate an installation that had reached migration 0002 before
-        // the per-guild-only log-channel migration was released.
-        conn.execute_batch_bounded(
-            include_str!("../../tests/fixtures/before-core-0027.sql"),
-            64 * 1024 * 1024,
-        )?;
-        conn.execute_batch_bounded("DROP TABLE known_spam; DROP TABLE gateway_ban_deliveries; DROP TABLE known_bad_images; DROP INDEX idx_bans_one_active; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id; DROP INDEX idx_bans_guild_id; DROP INDEX IF EXISTS idx_analytics_warns_time; DROP INDEX IF EXISTS idx_analytics_bans_time; DROP TABLE IF EXISTS analytics_member_daily; DROP TABLE IF EXISTS member_sync_pacing; DROP TABLE IF EXISTS webui_managed_assets; DROP TABLE IF EXISTS component_updates; DROP TABLE IF EXISTS log_filters; DROP TABLE IF EXISTS guild_write_fences; DROP TABLE IF EXISTS backup_cleanup_intents; DROP TABLE IF EXISTS guild_erasure_jobs; DROP TABLE guild_store_placements; DROP TABLE guild_store_catalog; DROP TABLE nickname_reconcile; DROP TABLE mutation_receipts; DROP TABLE bot_actions; DROP TABLE guild_enrollments; DROP TABLE IF EXISTS guild_join_info; ALTER TABLE bans DROP COLUMN operation_id; ALTER TABLE bans DROP COLUMN moderator_name; ALTER TABLE bans DROP COLUMN user_display_name; ALTER TABLE bans DROP COLUMN user_name; DELETE FROM meta WHERE key='action_request_floor';", 64 * 1024 * 1024)?;
-        conn.execute_batch_bounded(
-            "DROP INDEX idx_bans_expiry; ALTER TABLE bans DROP COLUMN expires_at; ALTER TABLE bans DROP COLUMN expiry_enrollment_id;",
-            64 * 1024 * 1024,
-        )?;
-        conn.pragma_update(None, "user_version", 2)?;
-        migrate_conn(conn)?;
-
         let active: i64 = conn.query_row(
             "SELECT COUNT(*) FROM log_channels WHERE guild_id = 0",
             (),
@@ -3491,12 +3483,7 @@ fn nickname_reconcile_exists_before_settings_commit() {
 fn nickname_outbox_migration_does_not_adopt_unbound_guild_nicknames() {
     let tmp = tmp_db_path("nickname_outbox_migration");
     let legacy = Connection::open(&tmp).unwrap();
-    for (index, sql) in MIGRATIONS[..4].iter().enumerate() {
-        legacy.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-        legacy
-            .pragma_update(None, "user_version", (index + 1) as i64)
-            .unwrap();
-    }
+    apply_historical_core(&legacy, 0, 4);
     legacy
         .execute_bounded(
             "INSERT INTO guild_settings (guild_id, settings) VALUES (?1, ?2)",
@@ -3518,6 +3505,7 @@ fn nickname_outbox_migration_does_not_adopt_unbound_guild_nicknames() {
             64 * 1024 * 1024,
         )
         .unwrap();
+    apply_historical_core(&legacy, 4, CORE_BASELINE_VERSION);
     drop(legacy);
 
     let db = Db::open(&tmp, 2).unwrap();
@@ -3854,7 +3842,9 @@ fn patch_settings_noop_does_not_bump_config_version() {
     cleanup_db(&tmp);
 }
 
+pub(super) mod migration_fixtures;
 mod schema;
+use migration_fixtures::{apply_core_steps, apply_historical_core};
 
 mod action_history;
 mod action_queue;
@@ -4343,12 +4333,7 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
     let tmp = tmp_db_path("ban_expiry");
     // Start on the pre-expiry schema, with an existing permanent ban.
     let legacy = Connection::open(&tmp).unwrap();
-    for (index, sql) in MIGRATIONS[..22].iter().enumerate() {
-        legacy.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-        legacy
-            .pragma_update(None, "user_version", (index + 1) as i64)
-            .unwrap();
-    }
+    apply_historical_core(&legacy, 0, 22);
     legacy
         .execute_bounded(
             "INSERT INTO bans(guild_id,user_id,created_at) VALUES(10,20,'2026-01-01T00:00:00Z')",
@@ -4356,6 +4341,7 @@ fn ban_expiry_survives_restart_and_preserves_untimed_bans() {
             4096,
         )
         .unwrap();
+    apply_historical_core(&legacy, 22, CORE_BASELINE_VERSION);
     drop(legacy);
     let db = Db::open(&tmp, 2).unwrap();
     let enrollment = tokio_test_block_on(async {

@@ -16,6 +16,19 @@ Nightly identifiers never enter Release Please's stable version/changelog baseli
 Nightly publication must not move `latest` or a stable tag. Manual commit-SHA builds
 publish all eligible components; sources predating the WebUI package skip that image.
 
+## Release migrations
+
+Before tagging a release, fold the migrations added since the previous release
+into one migration per changed database family. Keep the previous release's
+schema as the upgrade starting point and keep its recorded version valid.
+Compare a fresh install with an upgrade from the previous release, including the
+schema and retained rows, before tagging. Check that the images advertise the
+completed schema versions and the supported migration origins.
+
+The oldest supported release for database upgrades is v0.2.0 (core schema 23
+and guild-store schema 17). For an earlier database in the same schema family,
+run v0.2.0 first. See [Database baseline](DATABASE-BASELINE.md).
+
 ## Publication
 
 GitHub Actions runs the pinned Release Please action after trusted main checks.

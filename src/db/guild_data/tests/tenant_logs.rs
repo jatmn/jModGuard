@@ -371,7 +371,7 @@ async fn version_one_upgrade_preserves_identity_bindings_and_refuses_wrong_ident
     let p = f.placement(&reg, 10).await;
     {
         let raw = Connection::open(&f.store_path).unwrap();
-        raw.execute_batch_bounded(SCHEMA, 64 * 1024 * 1024).unwrap();
+        apply_guild_fixture(&raw, 0, 1).unwrap();
         raw.execute_bounded(
             "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
             params![FAMILY, reg.id().as_str()],
@@ -384,11 +384,9 @@ async fn version_one_upgrade_preserves_identity_bindings_and_refuses_wrong_ident
             64 * 1024 * 1024,
         )
         .unwrap();
-        raw.pragma_update(None, "user_version", 1).unwrap();
     }
     assert!(GuildDataStore::open(f.options(), reg.clone()).is_err());
     let wrong = f.registration(StoreId::new(), StorePolicy::Shared).await;
-    assert!(GuildDataStore::initialize(f.options(), wrong).is_err());
     {
         let raw = Connection::open(&f.store_path).unwrap();
         assert_eq!(
@@ -404,6 +402,11 @@ async fn version_one_upgrade_preserves_identity_bindings_and_refuses_wrong_ident
             .is_err()
         );
     }
+    {
+        let raw = Connection::open(&f.store_path).unwrap();
+        apply_guild_fixture(&raw, 1, GUILD_BASELINE_VERSION).unwrap();
+    }
+    assert!(GuildDataStore::initialize(f.options(), wrong).is_err());
     let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
     store.verify_placement(p.clone()).await.unwrap();
     let a = GuildDataScope::new(p, enrollment(10, 100)).unwrap();

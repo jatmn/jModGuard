@@ -55,8 +55,9 @@ Options intentionally have no Debug/Serialize implementation. Missing remote URL
 pairs fail instead of falling back to a local file. Synchronous open/initialization belongs
 on a startup or blocking worker, like core database opening.
 
-The separate `jmodguard-guild-1` family uses migrations 0001–0021 and is at schema
-version 22. Version1 introduced an immutable singleton identity (family, store ID,
+The separate `jmodguard-guild-1` family starts at the v0.2.0 baseline (schema
+version 17) and applies migrations 0017–0021 to reach version 22. The baseline
+includes the earlier schema changes described below. Version1 introduced an immutable singleton identity (family, store ID,
 shared/dedicated owner), immutable initial
 guild/revision bindings and mutation receipts. Version2 adds captured membership and
 log-channel settings; see [transactional tenant operations](TENANT-LOG-CHANNELS.md).
@@ -91,11 +92,11 @@ when audit recovery completes ([MEMBERS.md](MEMBERS.md)). Version19 adds
 channel names for the rule editor pickers. Names are display data only. Version 21
 adds virtual sort keys and scoped indexes for the [Cases list](TENANT-CASES.md).
 Version 22 adds virtual sort keys and scoped indexes for the [Members list](MEMBERS.md#search-and-history).
-Core bootstrap never applies this schema; the existing core version is 17.
+Guild-store migrations run separately from core bootstrap.
 
 | Operation | Contract |
 |---|---|
-| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to schema 22, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+| `initialize` | Initialize an empty database atomically, upgrade a matching store at version 17 or later to schema 22, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
 | `open` | Verify the current schema 22 identity and ownership; create no schema or binding. |
 | `bind_initial_placement` | Verify identity and install the catalog's initial guild/revision in one primary transaction. Matching retries write nothing; a different revision or dedicated owner conflicts. |
 | `verify_placement` | Check identity, ownership and the exact stored guild/revision in one primary snapshot; missing bindings fail. This is not authorization for a later separate data operation. |

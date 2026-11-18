@@ -325,11 +325,7 @@ async fn matching_observation_only_writes_when_resuming_bound_dormant_work() {
 async fn version_eight_upgrade_does_not_bind_existing_nickname_to_active_membership() {
     let path = tmp_db_path("nickname_version_eight");
     let conn = Connection::open(&path).unwrap();
-    for (index, sql) in MIGRATIONS[..8].iter().enumerate() {
-        conn.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-        conn.pragma_update(None, "user_version", (index + 1) as i64)
-            .unwrap();
-    }
+    apply_historical_core(&conn, 0, 8);
     for (guild, state) in [(10, "pending"), (20, "terminal"), (30, "dormant")] {
         conn.execute_bounded(
             "INSERT INTO guild_enrollments(guild_id,id,joined_at_ns,active) VALUES(?1,?2,100,1)",
@@ -339,6 +335,7 @@ async fn version_eight_upgrade_does_not_bind_existing_nickname_to_active_members
         .unwrap();
         conn.execute_bounded("INSERT INTO nickname_reconcile(guild_id,generation,state,attempt_count,next_attempt_at) VALUES(?1,3,?2,2,99)", params![guild, state], 64 * 1024 * 1024).unwrap();
     }
+    apply_historical_core(&conn, 8, CORE_BASELINE_VERSION);
     drop(conn);
     let db = Db::open(&path, 2).unwrap();
     for guild in [10, 20, 30] {

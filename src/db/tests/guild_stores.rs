@@ -357,15 +357,12 @@ async fn catalog_migration_keeps_version_nine_data_and_starts_empty() {
     let path = tmp_db_path("catalog_v9");
     {
         let c = Connection::open(&path).unwrap();
-        for (index, sql) in MIGRATIONS[..9].iter().enumerate() {
-            c.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-            c.pragma_update(None, "user_version", (index + 1) as i64)
-                .unwrap();
-        }
+        apply_historical_core(&c, 0, 9);
         c.execute_batch_bounded(
             "INSERT INTO events(guild_id,event_type,data,created_at) VALUES(10,'member_ban','{}','fixture')", 64 * 1024 * 1024,
         )
         .unwrap();
+        apply_historical_core(&c, 9, CORE_BASELINE_VERSION);
     }
     let db = Db::open(&path, 2).unwrap();
     assert_eq!(
@@ -382,15 +379,12 @@ async fn tenant_runtime_migration_keeps_version_ten_catalog_and_starts_empty() {
     let path = tmp_db_path("catalog_v10");
     {
         let c = Connection::open(&path).unwrap();
-        for (index, sql) in MIGRATIONS[..10].iter().enumerate() {
-            c.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-            c.pragma_update(None, "user_version", (index + 1) as i64)
-                .unwrap();
-        }
+        apply_historical_core(&c, 0, 10);
         c.execute_batch_bounded(
             "INSERT INTO events(guild_id,event_type,data,created_at) VALUES(10,'member_ban','{}','fixture')", 64 * 1024 * 1024,
         )
         .unwrap();
+        apply_historical_core(&c, 10, CORE_BASELINE_VERSION);
     }
     let db = Db::open(&path, 2).unwrap();
     assert_eq!(
@@ -424,11 +418,8 @@ async fn guild_move_migration_starts_with_empty_fences() {
     let path = tmp_db_path("catalog_v11");
     {
         let c = Connection::open(&path).unwrap();
-        for (index, sql) in MIGRATIONS[..11].iter().enumerate() {
-            c.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-            c.pragma_update(None, "user_version", (index + 1) as i64)
-                .unwrap();
-        }
+        apply_historical_core(&c, 0, 11);
+        apply_historical_core(&c, 11, CORE_BASELINE_VERSION);
     }
     let db = Db::open(&path, 2).unwrap();
     let fences: i64 = db

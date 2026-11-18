@@ -588,7 +588,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn older_guild_store_stays_live_then_becomes_ready_after_bot_migration() {
         let _ready_guard = crate::process_ready_test_lock::ProcessReadyTestGuard::acquire().await;
-        let path = temp_db("guild14");
+        let path = temp_db("guild_baseline");
         let core = Db::open(&path, 2).unwrap();
         assert_eq!(
             db::core_schema_version(&core).await.unwrap(),
@@ -600,7 +600,7 @@ mod tests {
         db::guild_data::GuildDataStore::create_historical_store(
             guild_options(guild.clone(), false),
             registration.clone(),
-            14,
+            17,
         )
         .unwrap();
         let cfg = api_config(&path);

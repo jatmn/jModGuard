@@ -12,29 +12,7 @@ pub const SCHEMA_VERSION: i64 = match i64::from_str_radix(
     _ => panic!("guild schema version must be a positive integer"),
 };
 const VERSION: i64 = SCHEMA_VERSION;
-const SCHEMA: &str = include_str!("../../migrations/guild/0001_identity.sql");
-
-const TENANT_SCHEMA: &str = include_str!("../../migrations/guild/0002_tenant_log_channels.sql");
-const CASE_SCHEMA: &str = include_str!("../../migrations/guild/0003_cases.sql");
-const HISTORY_SCHEMA: &str = include_str!("../../migrations/guild/0004_case_history.sql");
-const SOURCE_SCHEMA: &str = include_str!("../../migrations/guild/0005_case_sources.sql");
-const EVIDENCE_SCHEMA: &str = include_str!("../../migrations/guild/0006_case_evidence.sql");
-const BUNNY_SCHEMA: &str = include_str!("../../migrations/guild/0007_bunny_evidence.sql");
-const ERASURE_SCHEMA: &str = include_str!("../../migrations/guild/0008_erasure.sql");
-const SNAPSHOT_SCHEMA: &str = include_str!("../../migrations/guild/0009_message_snapshots.sql");
-const MEMBER_SCHEMA: &str = include_str!("../../migrations/guild/0010_member_directory.sql");
-const MEMBER_STATUS_SCHEMA: &str =
-    include_str!("../../migrations/guild/0011_member_directory_status.sql");
-const MEMBER_PROGRESS_SCHEMA: &str =
-    include_str!("../../migrations/guild/0012_member_sync_progress.sql");
-const MEMBER_UNRESOLVED_AUDITS_SCHEMA: &str =
-    include_str!("../../migrations/guild/0013_member_unresolved_audits.sql");
-const MEMBER_CASE_RETAIN_REVISION_SCHEMA: &str =
-    include_str!("../../migrations/guild/0014_member_case_retain_revision.sql");
-const LOCAL_WRITE_FENCE_SCHEMA: &str =
-    include_str!("../../migrations/guild/0015_local_write_fence.sql");
-const MEMBER_PENDING_REJOIN_NOTES_SCHEMA: &str =
-    include_str!("../../migrations/guild/0016_member_pending_rejoin_notes.sql");
+const BASELINE_SCHEMA: &str = include_str!("../../migrations/guild/0016_baseline.sql");
 const MEMBER_GAP_AUTO_CLEAR_SCHEMA: &str =
     include_str!("../../migrations/guild/0017_member_gap_auto_clear.sql");
 const ACCESS_ROLES_SCHEMA: &str = include_str!("../../migrations/guild/0018_access_roles.sql");
@@ -42,6 +20,8 @@ const SERVER_NAMES_SCHEMA: &str = include_str!("../../migrations/guild/0019_serv
 const CASE_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0020_case_list_orders.sql");
 const MEMBER_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0021_member_list_orders.sql");
 mod bunny_transfer;
+#[cfg(any(test, feature = "test-support"))]
+mod historical_schema;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
 mod case_evidence;
@@ -118,12 +98,14 @@ fn store_label(id: &str, dedicated: Option<i64>) -> String {
 
 /// Runs before the stamped identity row is read, so it names the configured store and
 /// advises conditionally. The advice mirrors `GuildSchemaLayout::observed`: only versions
-/// `1..wanted` are migratable; a nonempty store at version 0 or below is never adopted.
+/// from the v0.2.0 baseline through `wanted` are supported.
 fn version_mismatch(id: &str, dedicated: Option<i64>, found: i64, wanted: i64) -> StoreCheckError {
     let action = if found > wanted {
         "if a newer jModGuard release migrated the store, run that release or a later one (a store is never downgraded)"
-    } else if found >= 1 {
+    } else if found >= GUILD_BASELINE_VERSION {
         "if the store is older, start the bot so it migrates the store; otherwise restore the original store"
+    } else if found >= 1 {
+        "this store predates v0.2.0; upgrade to v0.2.0 first or restore the original store"
     } else {
         "a store with no recognized schema version is never adopted; restore the original store"
     };
@@ -437,7 +419,7 @@ impl GuildSchemaLayout {
     fn observed(version: i64, objects: i64) -> Self {
         if version == 0 && objects == 0 {
             Self::Empty
-        } else if (1..VERSION).contains(&version) {
+        } else if (GUILD_BASELINE_VERSION..VERSION).contains(&version) {
             Self::Older(version)
         } else if version == VERSION {
             Self::Current
@@ -492,54 +474,6 @@ fn initialize_store(
         // Verify the old family and expected identity before extending it. No core migration.
         verify_identity_version(&tx, expected, version)?;
         tx.ensure_mutation_receipt()?;
-        if version < 2 {
-            tx.execute_batch_bounded(TENANT_SCHEMA, 32_000_000)?;
-        }
-        if version < 3 {
-            tx.execute_batch_bounded(CASE_SCHEMA, 32_000_000)?;
-        }
-        if version < 4 {
-            tx.execute_batch_bounded(HISTORY_SCHEMA, 32_000_000)?;
-        }
-        if version < 5 {
-            let source_bound = crate::capacity::allocated_bytes(&tx)?
-                .saturating_mul(2)
-                .saturating_add(32_000_000);
-            tx.execute_batch_bounded(SOURCE_SCHEMA, source_bound)?;
-        }
-        if version < 6 {
-            tx.execute_batch_bounded(EVIDENCE_SCHEMA, 32_000_000)?;
-        }
-        if version < 7 {
-            tx.execute_batch_bounded(BUNNY_SCHEMA, 32_000_000)?;
-        }
-        if version < 8 {
-            tx.execute_batch_bounded(ERASURE_SCHEMA, 32_000_000)?;
-        }
-        if version < 9 {
-            tx.execute_batch_bounded(SNAPSHOT_SCHEMA, 32_000_000)?;
-        }
-        if version < 10 {
-            tx.execute_batch_bounded(MEMBER_SCHEMA, 32_000_000)?;
-        }
-        if version < 11 {
-            tx.execute_batch_bounded(MEMBER_STATUS_SCHEMA, 32_000_000)?;
-        }
-        if version < 12 {
-            tx.execute_batch_bounded(MEMBER_PROGRESS_SCHEMA, 32_000_000)?;
-        }
-        if version < 13 {
-            tx.execute_batch_bounded(MEMBER_UNRESOLVED_AUDITS_SCHEMA, 32_000_000)?;
-        }
-        if version < 14 {
-            tx.execute_batch_bounded(MEMBER_CASE_RETAIN_REVISION_SCHEMA, 32_000_000)?;
-        }
-        if version < 15 {
-            tx.execute_batch_bounded(LOCAL_WRITE_FENCE_SCHEMA, 32_000_000)?;
-        }
-        if version < 17 {
-            tx.execute_batch_bounded(MEMBER_PENDING_REJOIN_NOTES_SCHEMA, 32_000_000)?;
-        }
         if version < 18 {
             tx.execute_batch_bounded(MEMBER_GAP_AUTO_CLEAR_SCHEMA, 32_000_000)?;
         }
@@ -590,8 +524,6 @@ fn initialize_store(
                 .saturating_add(1024 * 1024);
             tx.execute_batch_bounded(MEMBER_LIST_SCHEMA, index_bound)?;
         }
-        // Version 16 adds the optional immutable ban_attempt_tag to case JSON.
-        // No DDL or rewrite of legacy cases: their absent tags must remain absent.
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -600,22 +532,7 @@ fn initialize_store(
         tx.finish_read()?;
         return Ok(());
     }
-    tx.execute_batch_bounded(SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(TENANT_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(CASE_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(HISTORY_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(SOURCE_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(EVIDENCE_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(BUNNY_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(ERASURE_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(SNAPSHOT_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(MEMBER_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(MEMBER_STATUS_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(MEMBER_PROGRESS_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(MEMBER_UNRESOLVED_AUDITS_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(MEMBER_CASE_RETAIN_REVISION_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(LOCAL_WRITE_FENCE_SCHEMA, 32_000_000)?;
-    tx.execute_batch_bounded(MEMBER_PENDING_REJOIN_NOTES_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(BASELINE_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_GAP_AUTO_CLEAR_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(ACCESS_ROLES_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(SERVER_NAMES_SCHEMA, 32_000_000)?;
@@ -689,34 +606,7 @@ impl GuildDataStore {
             &opts,
             |conn| {
                 let mut tx = conn.transaction_immediate()?;
-                let batches: &[(&str, i64)] = &[
-                    (SCHEMA, 1),
-                    (TENANT_SCHEMA, 2),
-                    (CASE_SCHEMA, 3),
-                    (HISTORY_SCHEMA, 4),
-                    (SOURCE_SCHEMA, 5),
-                    (EVIDENCE_SCHEMA, 6),
-                    (BUNNY_SCHEMA, 7),
-                    (ERASURE_SCHEMA, 8),
-                    (SNAPSHOT_SCHEMA, 9),
-                    (MEMBER_SCHEMA, 10),
-                    (MEMBER_STATUS_SCHEMA, 11),
-                    (MEMBER_PROGRESS_SCHEMA, 12),
-                    (MEMBER_UNRESOLVED_AUDITS_SCHEMA, 13),
-                    (MEMBER_CASE_RETAIN_REVISION_SCHEMA, 14),
-                    (LOCAL_WRITE_FENCE_SCHEMA, 15),
-                    (MEMBER_PENDING_REJOIN_NOTES_SCHEMA, 17),
-                    (MEMBER_GAP_AUTO_CLEAR_SCHEMA, 18),
-                    (ACCESS_ROLES_SCHEMA, 19),
-                    (SERVER_NAMES_SCHEMA, 20),
-                    (CASE_LIST_SCHEMA, 21),
-                    (MEMBER_LIST_SCHEMA, 22),
-                ];
-                for (sql, at) in batches {
-                    if *at <= version {
-                        tx.execute_batch_bounded(sql, 32_000_000)?;
-                    }
-                }
+                historical_schema::apply(&tx, 0, version)?;
                 tx.ensure_mutation_receipt()?;
                 tx.execute_rows(
                     "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
