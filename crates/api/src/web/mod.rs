@@ -700,16 +700,16 @@ async fn require_auth_with(
     if let Some((retry_after, cause)) = refresh_wait {
         // A hold never renews a successful snapshot, and permission checks
         // cannot borrow the longer display cache while refresh is unavailable.
-        let guilds = if guild_list_cache_allowed(guild_mode) {
-            take_cached_guilds(guild_mode, app, user_id)
+        let cached = if guild_list_cache_allowed(guild_mode) {
+            take_cached_guilds(guild_mode, app, user_id, false)
         } else {
             state.guilds.as_ref().and_then(|(at, guilds)| {
                 GuildSnapshotAge::from_age(at.elapsed())
                     .permits(cause)
-                    .then(|| guilds.clone())
+                    .then(|| (guilds.clone(), false))
             })
         };
-        if let Some(guilds) = guilds
+        if let Some((guilds, guild_discovery_incomplete)) = cached
             && let Some(user) = cached_user(app, user_id)
         {
             let mut auth = AuthCtx {
@@ -717,7 +717,7 @@ async fn require_auth_with(
                 guilds,
                 enrollment: None,
                 role_access: None,
-                guild_discovery_incomplete: false,
+                guild_discovery_incomplete,
             };
             preview::apply_overlay(&mut auth)?;
             return Ok(auth);
@@ -812,8 +812,8 @@ async fn load_auth(
     // Display path only: serve a fresh list, or the last good list while
     // Discord is still cooling down. Authorization never takes this branch.
     // A rate-limited profile lookup must not drop that list.
-    if let Some(guilds) = take_cached_guilds(guild_mode, app, user_id) {
-        return display_auth(app, user_id, token, cached_user, guilds, false).await;
+    if let Some((guilds, incomplete)) = take_cached_guilds(guild_mode, app, user_id, false) {
+        return display_auth(app, user_id, token, cached_user, guilds, incomplete).await;
     }
 
     let guilds = if let Some((at, guilds)) = &state.guilds
@@ -866,15 +866,10 @@ async fn finish_guild_list(
     cached_user: Option<DiscordUser>,
     error: oauth::GuildListError,
 ) -> ApiResult<AuthCtx> {
-    if matches!(guild_mode, GuildListMode::CachedOk)
-        && matches!(error, oauth::GuildListError::RateLimited { .. })
+    if matches!(error, oauth::GuildListError::RateLimited { .. })
+        && let Some((guilds, incomplete)) = take_cached_guilds(guild_mode, app, user_id, true)
     {
-        let guilds = app
-            .guild_cache
-            .get(&user_id)
-            .map(|entry| entry.value().1.clone())
-            .unwrap_or_default();
-        return display_auth(app, user_id, token, cached_user, guilds, true).await;
+        return display_auth(app, user_id, token, cached_user, guilds, incomplete).await;
     }
     Err(guild_list_failure(user_id, error))
 }
@@ -974,27 +969,32 @@ fn display_user_during_limit(app: &ApiState, user_id: u64) -> DiscordUser {
     }
 }
 
-/// Returns cached guilds only when the mode permits it (display path).
+/// Selects the display list and its discovery status. A lookup blocked by a
+/// rate limit can fall back to an empty list if there is no cached entry.
 /// `MustRefresh` uses only the separate short session/token snapshot.
 fn take_cached_guilds(
     mode: GuildListMode,
     app: &ApiState,
     user_id: u64,
-) -> Option<Vec<DiscordGuild>> {
+    lookup_rate_limited: bool,
+) -> Option<(Vec<DiscordGuild>, bool)> {
     if !guild_list_cache_allowed(mode) {
         return None;
     }
-    let entry = app.guild_cache.get(&user_id)?;
-    let (fetched_at, guilds) = entry.value();
-    if guild_display_usable(
-        fetched_at.elapsed(),
-        GUILD_DISPLAY_CACHE_TTL,
-        app.oauth.guild_route_limited(user_id),
-    ) {
-        Some(guilds.clone())
-    } else {
-        None
-    }
+    let incomplete = lookup_rate_limited || app.oauth.guild_route_limited(user_id);
+    let guilds = app
+        .guild_cache
+        .get(&user_id)
+        .filter(|entry| {
+            guild_display_usable(
+                entry.value().0.elapsed(),
+                GUILD_DISPLAY_CACHE_TTL,
+                incomplete,
+            )
+        })
+        .map(|entry| entry.value().1.clone())
+        .or_else(|| lookup_rate_limited.then(Vec::new))?;
+    Some((guilds, incomplete))
 }
 
 /// A display list is usable while it is younger than the TTL, or while Discord
@@ -1325,11 +1325,37 @@ async fn callback_response(
     if let Some(app) = app {
         app.user_cache
             .insert(uid, (std::time::Instant::now(), user));
-        // Only a complete guild list enters the display cache. A 429 leaves
-        // any previous list intact and the cooldown guides the next /api/me.
+        // Only a complete guild list enters either cache. A 429 leaves any
+        // previous display list intact and the cooldown guides the next /api/me.
         if let Ok(guilds) = oauth.my_guilds(uid, &tok.access_token).await {
-            app.guild_cache
-                .insert(uid, (std::time::Instant::now(), guilds));
+            let observed_at = std::time::Instant::now();
+            // Rotation leaves the session without an ID until the store creates
+            // the new record. Publish the permission snapshot before the
+            // middleware returns the new session cookie.
+            if let Err(error) = session.save().await {
+                tracing::warn!("oauth callback: failed to save rotated session: {error}");
+                return finish(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to save login session",
+                    )
+                        .into_response(),
+                );
+            }
+            if let Some(id) = session.id() {
+                app.sweep_auth_sessions(observed_at);
+                app.auth_sessions.insert(
+                    id,
+                    Arc::new(tokio::sync::Mutex::new(SessionAuth {
+                        token: Some(tok.access_token),
+                        refresh: tok.refresh_token,
+                        guilds: Some((observed_at, guilds.clone())),
+                        last_used: Some(observed_at),
+                        ..SessionAuth::default()
+                    })),
+                );
+            }
+            app.guild_cache.insert(uid, (observed_at, guilds));
         }
     }
     let requested_return_to = cookie_value(&headers, COOKIE_OAUTH_RETURN_TO);
