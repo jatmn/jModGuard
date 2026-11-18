@@ -137,8 +137,47 @@ grep -Eq 'eval |bash -c|python3|shell=True' "$root/scripts/publish-image.sh" \
   && fail 'publisher must not eval, invoke python, or use bash -c'
 grep -Fq 'run_git() { git "$@" || publish_fail "git failed: $*"; }' "$root/scripts/publish-image.sh" \
   || fail 'publisher must invoke git as an argv list'
-grep -Fq 'run_docker() { docker "$@" || publish_fail "docker failed: $*"; }' "$root/scripts/publish-image.sh" \
+grep -Fq 'docker "$@" || publish_fail "docker failed: $*"' "$root/scripts/publish-image.sh" \
   || fail 'publisher must invoke docker as an argv list'
+
+# Retry the reported registry failure with the same build arguments and fresh
+# metadata. Docker and the backoff clock are local stand-ins.
+(
+  push_trace="$TEST_SIGNING_DIR/push-trace"
+  push_metadata="$TEST_SIGNING_DIR/build-metadata"
+  push=(buildx build --push --metadata-file "$push_metadata")
+  push_error='ERROR: failed to build: unknown blob'
+  docker() {
+    local attempt
+    assert_eq "$*" "${push[*]}"
+    [[ ! -s "$push_metadata" ]] || fail 'build metadata must be empty at the start of each attempt'
+    printf 'build\n' >>"$push_trace"
+    attempt="$(grep -c '^build$' "$push_trace")"
+    if (( attempt <= push_failures )); then
+      printf 'partial\n' >"$push_metadata"
+      printf '%s\n' "$push_error" >&2
+      return 1
+    fi
+    printf 'complete\n' >"$push_metadata"
+  }
+  sleep() { printf 'sleep %s\n' "$1" >>"$push_trace"; }
+
+  push_failures=1
+  run_docker "${push[@]}" 2>"$TEST_SIGNING_DIR/push-output"
+  assert_eq "$(<"$push_trace")" $'build\nsleep 5\nbuild'
+  assert_eq "$(<"$push_metadata")" complete
+  grep -Fxq "$push_error" "$TEST_SIGNING_DIR/push-output" || fail 'failed attempt must retain its registry diagnostic'
+
+  push_failures=3
+  : >"$push_trace"
+  if (run_docker "${push[@]}") >/dev/null 2>&1; then fail 'persistent registry errors must fail'; fi
+  assert_eq "$(<"$push_trace")" $'build\nsleep 5\nbuild\nsleep 10\nbuild'
+
+  push_error='ERROR: failed to build: compiler exited with error'
+  : >"$push_trace"
+  if (run_docker "${push[@]}") >/dev/null 2>&1; then fail 'unrelated build errors must fail'; fi
+  assert_eq "$(<"$push_trace")" build
+)
 
 # Real file-backed plan survives retries without resolving a moved tag again.
 plan_scratch="$(mktemp -d)"
