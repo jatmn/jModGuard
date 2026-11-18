@@ -4900,6 +4900,31 @@ test('loadConfig reads guild config with POST', async () => {
   assert.deepEqual(calls[0], { url: `/api/guilds/${app.state.guildId}/config`, method: 'POST' });
 });
 
+test('signed-out dashboard links to public policies on the page origin', async () => {
+  const dashboard = fs.readFileSync(new URL('../dist/frontend/index.html', import.meta.url), 'utf8');
+  const stylesheet = fs.readFileSync(new URL('../dist/frontend/style.css', import.meta.url), 'utf8');
+  assert.match(dashboard, /id="app"/);
+  assert.match(stylesheet, /\.legal-page\b/);
+  for (const splitOrigin of [false, true]) {
+    const h = harness(async () => ({
+      ok: false,
+      status: 401,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ error: 'not authenticated' }),
+    }));
+    const apiOrigin = new URL(h.document.URL);
+    apiOrigin.hostname = `api.${apiOrigin.hostname}`;
+    h.window.JMODGUARD_API_BASE = splitOrigin ? apiOrigin.origin : '';
+    await h.app.init();
+    await settle();
+    const links = h.document.querySelectorAll('#login-view nav[aria-label="Policies"] a');
+    assert.deepEqual(Array.from(links, link => [link.textContent, link.getAttribute('href')]), [
+      ['Privacy Policy', '/privacy'],
+      ['Terms of Service', '/terms'],
+    ]);
+  }
+});
+
 test('unauthenticated settings save returns to login', async () => {
   const h = harness(async () => ({
     ok: false,

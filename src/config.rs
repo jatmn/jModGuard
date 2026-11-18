@@ -20,6 +20,7 @@ struct Config {
     pub guild_stores: GuildStoresConfig,
     pub evidence: EvidenceConfig,
     pub web: WebConfig,
+    pub legal: LegalConfig,
     pub bot: BotConfig,
     pub log: LogConfig,
 }
@@ -53,6 +54,18 @@ pub struct WebConfig {
     /// Empty = same-origin only (no CORS layer). Env: `JMODGUARD_CORS_ORIGINS`
     /// (comma-separated).
     pub cors_origins: Vec<String>,
+}
+
+/// Operator-supplied public policy details. These fields are published by the API.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LegalConfig {
+    pub operator_name: String,
+    pub privacy_contact: String,
+    pub deletion_instructions: String,
+    pub subprocessors: Vec<String>,
+    pub jurisdiction: String,
+    pub effective_date: String,
 }
 
 impl std::fmt::Debug for DiscordConfig {
@@ -480,6 +493,7 @@ pub struct ApiProcessConfig {
     pub guild_stores: GuildStoresConfig,
     pub evidence: EvidenceConfig,
     pub web: WebConfig,
+    pub legal: LegalConfig,
     pub bot: BotConfig,
     pub log: LogConfig,
 }
@@ -509,6 +523,7 @@ impl From<Config> for ApiProcessConfig {
             guild_stores: c.guild_stores,
             evidence: c.evidence,
             web: c.web,
+            legal: c.legal,
             bot: c.bot,
             log: c.log,
         }
@@ -527,6 +542,7 @@ impl From<BotProcessConfig> for Config {
             guild_stores: c.guild_stores,
             evidence: c.evidence,
             web: WebConfig::default(),
+            legal: LegalConfig::default(),
             bot: c.bot,
             log: c.log,
         }
@@ -545,6 +561,7 @@ impl From<ApiProcessConfig> for Config {
             guild_stores: c.guild_stores,
             evidence: c.evidence,
             web: c.web,
+            legal: c.legal,
             bot: c.bot,
             log: c.log,
         }
@@ -839,6 +856,40 @@ impl Config {
             );
         }
         if api {
+            for (name, target) in [
+                (
+                    "JMODGUARD_LEGAL_OPERATOR_NAME",
+                    &mut self.legal.operator_name,
+                ),
+                (
+                    "JMODGUARD_LEGAL_PRIVACY_CONTACT",
+                    &mut self.legal.privacy_contact,
+                ),
+                (
+                    "JMODGUARD_LEGAL_DELETION_INSTRUCTIONS",
+                    &mut self.legal.deletion_instructions,
+                ),
+                ("JMODGUARD_LEGAL_JURISDICTION", &mut self.legal.jurisdiction),
+                (
+                    "JMODGUARD_LEGAL_EFFECTIVE_DATE",
+                    &mut self.legal.effective_date,
+                ),
+            ] {
+                if let Ok(value) = env::var(name) {
+                    *target = value;
+                }
+            }
+            if let Ok(value) = env::var("JMODGUARD_LEGAL_SUBPROCESSORS") {
+                self.legal.subprocessors = if value.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    serde_json::from_str(&value).map_err(|_| {
+                        anyhow::anyhow!(
+                            "JMODGUARD_LEGAL_SUBPROCESSORS must be a JSON array of strings"
+                        )
+                    })?
+                };
+            }
             if let Ok(v) = env::var("JMODGUARD_WEB_BIND") {
                 self.web.bind = v.trim().to_string();
             }
@@ -1411,6 +1462,43 @@ mod tests {
         assert_eq!(api.web.base_url, "https://dashboard.invalid");
         assert_eq!(bot.discord.token, "bot-secret");
         assert!(api.discord.token.is_empty());
+    }
+
+    #[test]
+    fn legal_configuration_loads_from_toml_with_api_only_environment_overrides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _saved = SavedEnv::capture(&[
+            "JMODGUARD_LEGAL_PRIVACY_CONTACT",
+            "JMODGUARD_LEGAL_SUBPROCESSORS",
+        ]);
+        let raw = r#"
+            [legal]
+            operator_name = "Specimen Works"
+            privacy_contact = "Sample Privacy Desk"
+            deletion_instructions = "Ask for deletion"
+            subprocessors = ["Sample Hosting"]
+            jurisdiction = "Sample Region"
+            effective_date = "2030-02-03"
+        "#;
+        let mut api = Config::parse_file(raw, true).unwrap();
+        assert_eq!(api.legal.privacy_contact, "Sample Privacy Desk");
+        assert_eq!(api.legal.subprocessors, ["Sample Hosting"]);
+        assert_eq!(api.legal.deletion_instructions, "Ask for deletion");
+        assert_eq!(api.legal.jurisdiction, "Sample Region");
+        assert_eq!(api.legal.effective_date, "2030-02-03");
+        unsafe {
+            std::env::set_var("JMODGUARD_LEGAL_PRIVACY_CONTACT", "");
+            std::env::set_var("JMODGUARD_LEGAL_SUBPROCESSORS", r#"["Sample Database"]"#);
+        }
+        api.apply_env_for(true).unwrap();
+        let api: super::ApiProcessConfig = api.into();
+        assert_eq!(api.legal.operator_name, "Specimen Works");
+        assert!(api.legal.privacy_contact.is_empty());
+        assert_eq!(api.legal.subprocessors, ["Sample Database"]);
+        let mut bot = Config::parse_file(raw, false).unwrap();
+        bot.apply_env_for(false).unwrap();
+        assert!(bot.legal.operator_name.is_empty());
+        assert!(bot.legal.subprocessors.is_empty());
     }
 
     #[test]

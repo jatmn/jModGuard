@@ -78,6 +78,16 @@ oauth_client_secret = ""
 # leaves this empty. Env: JMODGUARD_CORS_ORIGINS. `*` is not allowed.
 # cors_origins = ["https://admin.example.com"]
 
+# Public details for the Privacy Policy and Terms of Service. Fill in the
+# values for your instance. Everything here is visible without signing in.
+[legal]
+operator_name = ""
+privacy_contact = ""
+deletion_instructions = ""
+subprocessors = []  # List each provider and its role (hosting, CDN, database).
+jurisdiction = ""
+effective_date = ""
+
 # Bot-only positive membership repair; the API ignores this section and its env vars.
 # This checks the bot's own membership, never a member roster. See docs/ENROLLMENTS.md.
 [enrollment]

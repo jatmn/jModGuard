@@ -5,6 +5,7 @@ pub mod api;
 pub mod cases;
 mod directory;
 mod discord_retry;
+mod legal;
 pub mod members;
 pub mod oauth;
 pub mod platform;
@@ -1913,6 +1914,9 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             .route("/health/", get(health))
             .route("/ready", get(ready))
             .route("/ready/", get(ready))
+            .route("/privacy", get(legal::privacy))
+            .route("/terms", get(legal::terms))
+            .route("/api/legal", get(legal::details))
             .merge(sessioned),
     )
     .with_state(app.clone())
@@ -2432,14 +2436,18 @@ mod tests {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn test_app() -> Router {
+        router(test_app_with_config(Default::default()))
+    }
+
+    fn test_app_with_config(cfg: crate::config::ApiProcessConfig) -> Arc<ApiState> {
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let tmp =
             std::env::temp_dir().join(format!("jmodguard_web_{}_{}.db", std::process::id(), n));
         let db = crate::db::Db::open(&tmp, 2).unwrap();
-        let app = crate::web::state::ApiState::new(Default::default(), db).unwrap();
+        let app = crate::web::state::ApiState::new(cfg, db).unwrap();
         std::fs::remove_file(&tmp).ok();
         crate::tenant::remove_sidecars(&tmp);
-        router(app)
+        app
     }
 
     #[tokio::test]
@@ -2674,6 +2682,237 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"], "not authenticated", "{method} {uri}");
+    }
+
+    async fn public_legal_response(app: Router, path: &str, cookie: Option<&str>) -> Response {
+        let mut builder = Request::builder().uri(path);
+        if let Some(cookie) = cookie {
+            builder = builder.header(COOKIE, cookie);
+        }
+        let response = app
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert!(!response.headers().contains_key(SET_COOKIE), "{path}");
+        super::assert_uncacheable_headers(response.headers());
+        response
+    }
+
+    async fn public_legal_html(app: Router, path: &str) -> String {
+        let response = public_legal_response(app, path, None).await;
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/html; charset=utf-8"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn assert_public_legal_page(
+        app: Router,
+        path: &str,
+        heading: &str,
+        text: &str,
+        related_link: &str,
+    ) {
+        let html = public_legal_html(app, path).await;
+        assert!(html.contains(&format!("<h1>{heading}</h1>")), "{path}");
+        assert!(html.contains(text), "{path}");
+        assert!(html.contains(related_link), "{path}");
+        assert!(
+            html.contains("This instance’s operator has not configured contact details."),
+            "{path}"
+        );
+        assert!(!html.contains("<script"), "{path}");
+    }
+
+    #[tokio::test]
+    async fn legal_pages_privacy_discloses_dashboard_session_inventory() {
+        let html = public_legal_html(test_app(), "/privacy").await;
+        for disclosure in [
+            "Discord user ID, OAuth access token, and refresh token",
+            "a server-side session in memory",
+            "keyed by your session cookie",
+            "look up your servers and check your permissions",
+            "Signing out clears the session",
+            "7 days of inactivity",
+            "Expired records can remain in memory until the API restarts",
+            "Restarting the API clears all sessions",
+        ] {
+            assert!(
+                html.contains(disclosure),
+                "missing disclosure: {disclosure}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legal_pages_privacy_is_public_without_a_session() {
+        let app = test_app();
+        assert_public_legal_page(
+            app.clone(),
+            "/privacy",
+            "Privacy Policy",
+            "Request deletion or ask a privacy question",
+            r#"href="/terms""#,
+        )
+        .await;
+        assert_unauthenticated(app, "GET", "/api/me", "").await;
+    }
+
+    #[tokio::test]
+    async fn legal_pages_terms_are_public_without_a_session() {
+        assert_public_legal_page(
+            test_app(),
+            "/terms",
+            "Terms of Service",
+            "Using jModGuard",
+            r#"href="/privacy""#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn legal_pages_use_dashboard_origin_for_style_home_and_cross_links() {
+        let app = test_app();
+        for (path, other) in [("/privacy", "/terms"), ("/terms", "/privacy")] {
+            let html = public_legal_html(app.clone(), path).await;
+            assert!(
+                html.contains(r#"<link rel="stylesheet" href="/style.css">"#),
+                "{path}"
+            );
+            assert!(html.contains(r#"<a href="/">jModGuard</a>"#), "{path}");
+            assert!(html.contains(&format!(r#"href="{other}""#)), "{path}");
+        }
+
+        // In split deployments the dashboard origin serves these two assets
+        // and forwards the policy paths to this router.
+        for path in ["/", "/style.css"] {
+            let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let expected = if cfg!(feature = "embed-ui") {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
+
+    async fn public_legal_json(app: Router, cookie: Option<&str>) -> serde_json::Value {
+        let response = public_legal_response(app, "/api/legal", cookie).await;
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn legal_pages_publish_configured_details_without_exposing_session_or_guild_data() {
+        let mut cfg = crate::config::ApiProcessConfig {
+            legal: crate::config::LegalConfig {
+                operator_name: " Specimen & Sample ".into(),
+                privacy_contact: "Sample Privacy Desk".into(),
+                deletion_instructions: "Ask for <data removal>".into(),
+                subprocessors: vec![
+                    "Hosting by Specimen".into(),
+                    " ".into(),
+                    "Sample CDN".into(),
+                    "Sample Database".into(),
+                ],
+                jurisdiction: "Sample Region".into(),
+                effective_date: "2030-02-03".into(),
+            },
+            ..Default::default()
+        };
+        cfg.web.oauth_client_secret = "nonpublic-secret".into();
+        let state = test_app_with_config(cfg);
+        let store = MemoryStore::default();
+        let session = Session::new(None, Arc::new(store.clone()), None);
+        store_login_session(&session, 42, "nonpublic-access", Some("nonpublic-refresh"))
+            .await
+            .unwrap();
+        session.save().await.unwrap();
+        let cookie = format!("{SESSION_COOKIE_NAME}={}", session.id().unwrap());
+        let app = router_with_store(state, store);
+        let expected = serde_json::json!({
+            "operator_name": "Specimen & Sample",
+            "privacy_contact": "Sample Privacy Desk",
+            "deletion_instructions": "Ask for <data removal>",
+            "subprocessors": ["Hosting by Specimen", "Sample CDN", "Sample Database"],
+            "jurisdiction": "Sample Region",
+            "effective_date": "2030-02-03"
+        });
+        assert_eq!(public_legal_json(app.clone(), None).await, expected);
+        assert_eq!(
+            public_legal_json(app.clone(), Some(&cookie)).await,
+            expected
+        );
+        for path in ["/privacy", "/terms"] {
+            let html = public_legal_html(app.clone(), path).await;
+            for value in [
+                "Specimen &amp; Sample",
+                "Sample Privacy Desk",
+                "Ask for &lt;data removal&gt;",
+                "Hosting by Specimen",
+                "Sample CDN",
+                "Sample Database",
+                "Sample Region",
+                "2030-02-03",
+            ] {
+                assert!(html.contains(value), "{path}: missing {value}");
+            }
+            assert!(
+                !html.contains("has not configured contact details"),
+                "{path}"
+            );
+            assert!(!html.contains("<data removal>"), "{path}");
+            assert!(!html.contains("nonpublic-"), "{path}");
+        }
+        assert_unauthenticated(app, "GET", "/api/me", "").await;
+    }
+
+    #[tokio::test]
+    async fn legal_pages_report_blank_or_unset_details_without_fallback_values() {
+        for legal in [
+            crate::config::LegalConfig::default(),
+            crate::config::LegalConfig {
+                operator_name: " ".into(),
+                privacy_contact: " ".into(),
+                deletion_instructions: " ".into(),
+                subprocessors: vec![" ".into()],
+                jurisdiction: " ".into(),
+                effective_date: " ".into(),
+            },
+        ] {
+            let app = router(test_app_with_config(crate::config::ApiProcessConfig {
+                legal,
+                ..Default::default()
+            }));
+            assert_eq!(
+                public_legal_json(app.clone(), None).await,
+                serde_json::json!({
+                    "operator_name": null,
+                    "privacy_contact": null,
+                    "deletion_instructions": null,
+                    "subprocessors": [],
+                    "jurisdiction": null,
+                    "effective_date": null
+                })
+            );
+            for path in ["/privacy", "/terms"] {
+                let html = public_legal_html(app.clone(), path).await;
+                assert!(
+                    html.contains("This instance’s operator has not configured contact details."),
+                    "{path}"
+                );
+                assert_eq!(html.matches("<dd>Not configured</dd>").count(), 6, "{path}");
+            }
+        }
     }
 
     #[tokio::test]
