@@ -31,7 +31,7 @@ type GuildFlightSender = tokio::sync::watch::Sender<GuildFlightUpdate>;
 
 pub(crate) struct GuildListGate {
     /// Route key → earliest instant another request for that route may start.
-    cooldowns: HashMap<String, Cooldown>,
+    cooldowns: HashMap<String, RouteCooldown>,
     /// Durable unix-millis deadlines. `Instant` values do not survive a restart.
     deadlines_ms: HashMap<String, i64>,
     generation: u64,
@@ -45,6 +45,20 @@ pub(crate) enum Cooldown {
     RestOfProcess,
     /// Discord already returned 429. Stay blocked until its body is applied.
     AwaitingBody,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteCooldown {
+    BucketReset(Cooldown),
+    Explicit429(Cooldown),
+}
+
+impl RouteCooldown {
+    fn deadline(self) -> Cooldown {
+        match self {
+            Self::BucketReset(deadline) | Self::Explicit429(deadline) => deadline,
+        }
+    }
 }
 
 struct RetryDeadlineSnapshot {
@@ -67,22 +81,19 @@ impl GuildListGate {
     }
 
     fn await_body(&mut self, user_key: &str) {
-        if !matches!(
-            self.cooldowns.get(user_key),
-            Some(Cooldown::RestOfProcess | Cooldown::Until(_))
-        ) {
-            self.cooldowns
-                .insert(user_key.to_owned(), Cooldown::AwaitingBody);
-        }
+        self.cooldowns
+            .entry(user_key.to_owned())
+            .or_insert(RouteCooldown::Explicit429(Cooldown::AwaitingBody));
     }
 
     fn remaining(&mut self, token: &str) -> Option<Duration> {
         let now = Instant::now();
-        self.cooldowns.retain(|_, cooldown| match *cooldown {
-            Cooldown::RestOfProcess | Cooldown::AwaitingBody => true,
-            Cooldown::Until(until) => until > now,
-        });
-        match self.cooldowns.get(token).copied()? {
+        self.cooldowns
+            .retain(|_, cooldown| match cooldown.deadline() {
+                Cooldown::RestOfProcess | Cooldown::AwaitingBody => true,
+                Cooldown::Until(until) => until > now,
+            });
+        match self.cooldowns.get(token)?.deadline() {
             Cooldown::RestOfProcess => Some(Duration::MAX),
             Cooldown::AwaitingBody => Some(Duration::from_secs(1)),
             Cooldown::Until(until) => Some(until.saturating_duration_since(now)),
@@ -98,29 +109,50 @@ impl GuildListGate {
         retry_after: Option<Duration>,
     ) -> bool {
         let key = if global {
-            if self.cooldowns.get(route_key) == Some(&Cooldown::AwaitingBody) {
+            if self.cooldowns.get(route_key)
+                == Some(&RouteCooldown::Explicit429(Cooldown::AwaitingBody))
+            {
                 self.cooldowns.remove(route_key);
             }
             "global"
         } else {
             route_key
         };
-        // The 429's retry time supersedes any earlier bucket reset for this
-        // scope. Anchor it to receipt so reading the body cannot add extra wait.
+        // An explicit 429 supersedes a bucket hint. Other 429 bodies can finish
+        // out of order, so compare their receipt-anchored deadlines.
         let wait = retry_after.unwrap_or(Duration::from_secs(1));
+        let next = cooldown_deadline(received, wait);
+        if let Some(RouteCooldown::Explicit429(previous)) = self.cooldowns.get(key) {
+            match (*previous, next) {
+                (Cooldown::RestOfProcess, _) => return false,
+                (Cooldown::Until(existing), Cooldown::Until(until)) if until <= existing => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
         self.cooldowns
-            .insert(key.to_owned(), cooldown_deadline(received, wait));
+            .insert(key.to_owned(), RouteCooldown::Explicit429(next));
         if !super::discord_retry::durable_key(key) {
             return false;
         }
-        if let Some(wait_ms) = retry_after.and_then(|wait| i64::try_from(wait.as_millis()).ok())
-            && let Some(deadline_ms) = received_ms.checked_add(wait_ms)
+        let Some(deadline_ms) = retry_after
+            .and_then(|wait| i64::try_from(wait.as_millis()).ok())
+            .and_then(|wait_ms| received_ms.checked_add(wait_ms))
+        else {
+            // A missing or unrepresentable wait adds no durable deadline.
+            return false;
+        };
+        // The wall clock can move between receipts. Keep the durable floor as
+        // well as the monotonic floor.
+        if self
+            .deadlines_ms
+            .get(key)
+            .is_some_and(|&existing| deadline_ms <= existing)
         {
-            self.deadlines_ms.insert(key.to_owned(), deadline_ms);
-        } else if self.deadlines_ms.remove(key).is_none() {
-            // An absent or unrepresentable wait has no durable deadline.
             return false;
         }
+        self.deadlines_ms.insert(key.to_owned(), deadline_ms);
         self.generation = self.generation.saturating_add(1);
         true
     }
@@ -840,7 +872,7 @@ impl OAuthClient {
         if gate.remaining(key).is_none() {
             gate.cooldowns.insert(
                 key.to_owned(),
-                cooldown_deadline(Instant::now(), retry_after),
+                RouteCooldown::BucketReset(cooldown_deadline(Instant::now(), retry_after)),
             );
         }
     }
@@ -858,8 +890,10 @@ impl OAuthClient {
             }
             let retry_after =
                 Duration::from_millis(u64::try_from(millis - now_ms).unwrap_or(u64::MAX));
-            gate.cooldowns
-                .insert(key.clone(), cooldown_deadline(now, retry_after));
+            gate.cooldowns.insert(
+                key.clone(),
+                RouteCooldown::Explicit429(cooldown_deadline(now, retry_after)),
+            );
             gate.deadlines_ms.insert(key, millis);
         }
     }
@@ -1726,6 +1760,125 @@ mod tests {
         let guilds = client.my_guilds(12, "token").await.unwrap();
         assert_eq!(guilds.len(), 201);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn late_short_global_429_preserves_the_longer_deadline() {
+        use crate::web::discord_retry::load_deadlines;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let path = std::env::temp_dir().join(format!(
+            "discord_overlapping_429s_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = crate::db::Db::open(&path, 2).unwrap();
+        let loopback = (std::net::Ipv4Addr::LOCALHOST, 0);
+        let guilds = tokio::net::TcpListener::bind(loopback).await.unwrap();
+        let me = tokio::net::TcpListener::bind(loopback).await.unwrap();
+        let client = std::sync::Arc::new(test_oauth(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            Some(format!("http://{}/guilds", guilds.local_addr().unwrap())),
+            None,
+            Some(format!("http://{}/me", me.local_addr().unwrap())),
+        ));
+        client.attach_retry_store(db.clone());
+
+        let (release_body, body_released) = tokio::sync::oneshot::channel();
+        let guilds_server = tokio::spawn(async move {
+            let (mut socket, _) = guilds.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            let body = br#"{"global":true,"retry_after":2}"#;
+            let headers = format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            body_released.await.unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/me",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        axum::Json(serde_json::json!({"global": true, "retry_after": 10})),
+                    )
+                }),
+            );
+            axum::serve(me, app).await.unwrap();
+        });
+
+        let guilds_client = std::sync::Arc::clone(&client);
+        let short = tokio::spawn(async move { guilds_client.my_guilds(42, "token").await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.route_remaining("g:42").is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("guilds response headers should reach the gate before its body");
+
+        let long = client.me(42, "token").await.unwrap_err();
+        let long_wait = long.downcast_ref::<DiscordRateLimit>().unwrap().retry_after;
+        assert!(long_wait > Duration::from_secs(5));
+        let long_deadline = load_deadlines(&db).unwrap()["global"];
+
+        release_body.send(()).unwrap();
+        assert!(matches!(
+            short.await.unwrap(),
+            Err(GuildListError::RateLimited { retry_after, fresh: true })
+                if retry_after <= Duration::from_secs(2)
+        ));
+        guilds_server.await.unwrap();
+        let remaining = client.route_remaining("global").unwrap();
+        let reloaded = load_deadlines(&db).unwrap();
+        let reloaded_deadline = reloaded["global"];
+        let restarted = test_oauth(reqwest::Client::new(), None, None, None);
+        restarted.restore_deadlines(reloaded);
+        let restored_wait = restarted.route_remaining("global").unwrap();
+
+        drop(client);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        assert!(
+            remaining > Duration::from_secs(5)
+                && restored_wait > Duration::from_secs(5)
+                && reloaded_deadline == long_deadline,
+            "short 429 replaced the long deadline: in memory {remaining:?}, reloaded {restored_wait:?}, persisted {reloaded_deadline} vs {long_deadline}"
+        );
+    }
+
+    #[test]
+    fn scoped_explicit_429_replaces_bucket_hint_and_only_extends_another_429() {
+        let client = test_oauth(reqwest::Client::new(), None, None, None);
+        let key = "g:42";
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset-after", "30".parse().unwrap());
+        client.note_bucket_reset(key, &headers);
+        assert!(client.route_remaining(key).unwrap() > Duration::from_secs(20));
+
+        let received = Instant::now();
+        let received_ms = chrono::Utc::now().timestamp_millis();
+        let short = Duration::from_secs(2);
+        let long = Duration::from_secs(10);
+        let mut gate = client.guild_list.lock().unwrap();
+        assert!(gate.deadlines_ms.is_empty());
+        assert!(gate.record_429(key, false, received, received_ms, Some(short)));
+        assert!(gate.remaining(key).unwrap() <= short);
+        assert_eq!(gate.deadlines_ms[key], received_ms + 2_000);
+        assert!(gate.record_429(key, false, received, received_ms, Some(long)));
+        assert!(!gate.record_429(key, false, received, received_ms, Some(short)));
+        assert!(gate.remaining(key).unwrap() > short);
+        assert_eq!(gate.deadlines_ms[key], received_ms + 10_000);
+        assert_eq!(gate.remaining("g:43"), None);
     }
 
     async fn truncated_429(path: &str) -> (std::sync::Arc<std::sync::atomic::AtomicUsize>, String) {
