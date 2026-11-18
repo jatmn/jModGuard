@@ -345,7 +345,7 @@ async fn sql_guards_prevent_overwrite_replacement_and_live_replay_key_deletion()
         .unwrap();
     store.db.with_conn(|c| {
         c.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA recursive_triggers=OFF")?;
-        for sql in ["INSERT OR REPLACE INTO guild_cases SELECT * FROM guild_cases", "UPDATE guild_cases SET payload='{}'", "DELETE FROM guild_cases", "UPDATE guild_cases SET guild_id=20", "INSERT INTO guild_cases SELECT 20,enrollment_id,case_id,source_key,payload,deleted FROM guild_cases"] {
+        for sql in ["INSERT OR REPLACE INTO guild_cases SELECT guild_id,enrollment_id,case_id,source_key,payload,deleted FROM guild_cases", "UPDATE guild_cases SET payload='{}'", "DELETE FROM guild_cases", "UPDATE guild_cases SET guild_id=20", "INSERT INTO guild_cases SELECT 20,enrollment_id,case_id,source_key,payload,deleted FROM guild_cases"] {
             assert!(c.execute_batch_bounded(sql, 64 * 1024 * 1024).is_err(),"accepted {sql}");
         }
         c.execute_batch_bounded("CREATE TRIGGER reject_removal BEFORE UPDATE ON guild_cases BEGIN SELECT RAISE(ABORT,'test removal failure'); END", 64 * 1024 * 1024)?;
@@ -836,5 +836,128 @@ async fn summary_pages_are_bounded_scoped_and_use_constant_database_calls() {
             store.case_summaries(a.clone(), page, limits).await.is_err(),
             "even an empty page must check membership"
         );
+    }
+}
+
+#[tokio::test]
+async fn case_listing_migration_indexes_existing_guild_rows_for_every_seek() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let placement = f.placement(&reg, 10).await;
+    let enrollment = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    GuildDataStore::create_historical_store(f.options(), reg.clone(), 20).unwrap();
+    {
+        let raw = Connection::open(&f.store_path).unwrap();
+        raw.execute_bounded(
+            "INSERT INTO guild_bindings VALUES(10,?1)",
+            params![placement.revision()],
+            32_000_000,
+        )
+        .unwrap();
+        raw.execute_bounded(
+            "INSERT INTO guild_memberships VALUES(10,?1,100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')",
+            params![enrollment],
+            32_000_000,
+        )
+        .unwrap();
+        raw.execute_bounded(
+            "WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n < 8192)
+             INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted)
+             SELECT 10,?1,printf('%032x',n),'discord:' || n,
+                    json_set(?2, '$.source.discord_audit.entry_id', CAST(n AS TEXT),
+                                '$.occurred_at_ms', 1 + n % 4),0
+             FROM numbers",
+            params![enrollment, serde_json::to_string(&data(1)).unwrap()],
+            32_000_000,
+        )
+        .unwrap();
+    }
+    let scope = GuildDataScope::new(
+        placement,
+        GuildEnrollment {
+            guild_id: 10,
+            id: enrollment.into(),
+            joined_at_ns: 100,
+        },
+    )
+    .unwrap();
+    assert!(GuildDataStore::open(f.options(), reg.clone()).is_err());
+    let store = GuildDataStore::initialize(f.options(), reg).unwrap();
+    let limits = CaseLimits::default();
+    for (sort, index, seek) in [
+        (
+            CaseSort::Date,
+            "guild_cases_list_date",
+            "(list_date,case_id)",
+        ),
+        (CaseSort::Case, "guild_cases_visible", "case_id"),
+        (
+            CaseSort::Action,
+            "guild_cases_list_action",
+            "(list_action,case_id)",
+        ),
+        (
+            CaseSort::Subject,
+            "guild_cases_list_subject",
+            "(list_subject,case_id)",
+        ),
+        (
+            CaseSort::Actor,
+            "guild_cases_list_actor",
+            "(list_actor,case_id)",
+        ),
+        (
+            CaseSort::Outcome,
+            "guild_cases_list_outcome",
+            "(list_outcome,case_id)",
+        ),
+    ] {
+        for descending in [false, true] {
+            let query = |after| CaseListQuery {
+                filter: CaseFilter::default(),
+                search: None,
+                from_ms: None,
+                until_ms: None,
+                sort,
+                descending,
+                after,
+            };
+            let first = store
+                .list_cases(scope.clone(), query(None), 50, limits)
+                .await
+                .unwrap();
+            assert_eq!(first.entries.len(), 50);
+            assert!(first.next.is_some());
+            for (has_cursor, query) in [(false, query(None)), (true, query(first.next))] {
+                let (sql, params) = query.statement(&scope, 50, limits).unwrap();
+                let plan = store
+                    .db
+                    .with_conn(move |conn| {
+                        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                        stmt.query_map(crate::db_compat::params_from_iter(params), |row| {
+                            Ok(row.get::<String>(3)?)
+                        })?
+                        .collect::<Result<Vec<_>>>()
+                    })
+                    .await
+                    .unwrap();
+                let range = plan
+                    .iter()
+                    .find(|line| line.contains("SEARCH guild_cases"))
+                    .unwrap_or_else(|| panic!("{plan:?}"));
+                assert!(
+                    range.contains(index) && range.contains("guild_id=? AND enrollment_id=?"),
+                    "{plan:?}"
+                );
+                if has_cursor {
+                    let comparison = if descending { '<' } else { '>' };
+                    assert!(range.contains(&format!("{seek}{comparison}")), "{plan:?}");
+                }
+                assert!(
+                    plan.iter().all(|line| !line.contains("TEMP B-TREE")),
+                    "{plan:?}"
+                );
+            }
+        }
     }
 }

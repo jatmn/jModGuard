@@ -98,7 +98,11 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     get(target, key) { return key === 'location' ? location : Reflect.get(target, key); },
     set(target, key, value) { if (key === 'location') { location.href = value; return true; } return Reflect.set(target, key, value); },
   });
-  const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
+  const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) {
+      historyUrls.push(url);
+      const next = new URL(url, win.location.origin);
+      Object.assign(location, {pathname: next.pathname, search: next.search, hash: next.hash});
+    } },
     React, useSyncExternalStore, useState, useEffect, useLayoutEffect, useRef, createContext, useContext, createRoot, flushSync,
     Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea,
     fetch: fetchImpl, console, AbortController, URLSearchParams, URL: win.URL, Blob: win.Blob, Event: win.Event, Date: TestDate,
@@ -4212,7 +4216,9 @@ test('case administration reaches later pages, all admitted history and inline e
       return response({history: Array.from({length: count}, (_, i) => ({id: `n${start + i + 1}`, sequence: String(start + i + 1), entry: {recorded_at_ms: 1, body: {note: {text: `note ${start + i + 1}`}}}}))});
     }
     if (u.pathname.endsWith('/evidence')) return response({evidence: []});
-    if (u.pathname.endsWith('/cases')) return response({cases: u.searchParams.has('after') ? ids.slice(50) : ids.slice(0, 50), can_delete: true});
+    if (u.pathname.endsWith('/cases')) return u.searchParams.has('after')
+      ? response({cases: ids.slice(50), can_delete: true, next_cursor: null})
+      : response({cases: ids.slice(0, 50), can_delete: true, next_cursor: 'opaque%2Fcursor'});
     return response({can_delete: true, case: {action: 'warning', evidence: {text: [{text: '<script>literal excerpt</script>', message_id: '9', channel_id: '8', author_id: '7'}]}}});
   });
   const root = await casesView(h);
@@ -4221,7 +4227,7 @@ test('case administration reaches later pages, all admitted history and inline e
   assert.equal(next.disabled, false);
   fire(next, 'click');
   await settle();
-  assert.ok(calls.some(url => url.includes(`after=${ids[49]}`)));
+  assert.ok(calls.some(url => new URL(url, 'https://fixture.test').searchParams.get('after') === 'opaque%2Fcursor'));
   const caseButton = findNode(root, n => n.localName === 'button' && n.getAttribute('aria-label') === `Open case ${ids[50]}`);
   fire(caseButton, 'click');
   await settle();
@@ -8877,7 +8883,9 @@ test('Shared list controls restore, debounce, sort, clear and write the list URL
   await settle();
   assert.equal(controls.query().get('outcome'), 'active');
   assert.equal(controls.query().get('from'), '2026-01-01');
-  assert.equal(root.querySelector('th[aria-sort="descending"] button').textContent, 'Reason');
+  const descending = root.querySelector('th[aria-sort="descending"] button');
+  assert.equal(descending.textContent, 'Reason');
+  const down = descending.querySelector('svg path').getAttribute('d');
   assert.equal(root.querySelector('tbody').textContent, 'No matching entries.');
   const search = root.querySelector('input[type="search"]');
   search.value = 'one';
@@ -8891,7 +8899,9 @@ test('Shared list controls restore, debounce, sort, clear and write the list URL
   assert.equal(changes, 1);
   assert.equal(controls.query().get('q'), 'one %');
   await fire(root.querySelector('th[aria-sort="descending"] button'), 'click');
-  assert.equal(root.querySelector('th[aria-sort="ascending"] button').textContent, 'Reason');
+  const ascending = root.querySelector('th[aria-sort="ascending"] button');
+  assert.equal(ascending.textContent, 'Reason');
+  assert.notEqual(ascending.querySelector('svg path').getAttribute('d'), down);
   const url = new URL(fixture.historyUrls.at(-1), 'https://fixture.test');
   assert.equal(url.searchParams.get('q'), 'one %');
   assert.equal(url.searchParams.get('dir'), 'asc');
@@ -8923,7 +8933,7 @@ test('Cases filters send exact filters, restart at the first page and hide for r
   const root = await casesView(h);
   await settle();
   const lists = () => calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/cases')).map(c => new URL(c.url, 'https://fixture.test').searchParams);
-  const filters = root.querySelector('.case-filters');
+  const filters = root.querySelector('.list-filters');
   assert.ok(filters.hasAttribute('data-no-draft'));
   const [action, outcome] = filters.querySelectorAll('select');
   action.value = 'ban';
@@ -8934,7 +8944,7 @@ test('Cases filters send exact filters, restart at the first page and hide for r
   await fire(outcome, 'change');
   assert.equal(lists().at(-1).get('outcome'), 'failed');
   // Subject by pasted ID, moderator by member search.
-  const [subject, moderator] = filters.querySelectorAll('input');
+  const [subject, moderator] = filters.querySelectorAll('input[type="text"]');
   subject.value = CASE_SUBJECT;
   await fire(subject, 'input');
   await fire(subject, 'keydown', { key: 'Enter' });
@@ -8950,8 +8960,49 @@ test('Cases filters send exact filters, restart at the first page and hide for r
   await fire(findNode(root, n => n.localName === 'button' && n.textContent === 'Clear filters'), 'click', {});
   for (const key of ['action', 'outcome', 'subject', 'actor']) assert.equal(lists().at(-1).has(key), false, key);
   await fire(findNode(root, n => n.textContent === 'Removed records / retry cleanup'), 'click', {});
-  assert.equal(root.querySelector('.case-filters'), null);
+  assert.equal(root.querySelector('.list-filters'), null);
   assert.equal(lists().at(-1).get('removed'), 'true');
+});
+
+test('Cases maps sortable headers and a bookmarked filtered view to the API', async () => {
+  const { calls, fetchImpl } = caseFixture();
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  const lists = () => calls.map(call => new URL(call.url, 'https://fixture.test'))
+    .filter(url => url.pathname.endsWith('/cases')).map(url => url.searchParams);
+  assert.equal(lists().at(-1).get('sort'), 'date');
+  assert.equal(lists().at(-1).get('dir'), 'desc');
+  assert.match(root.querySelector('th[aria-sort="descending"]').textContent, /Newest first/);
+  for (const [label, sort] of [['Case', 'case'], ['Action', 'action'], ['Outcome', 'outcome'], ['Subject', 'subject'], ['Moderator', 'actor'], ['When', 'date']]) {
+    const button = [...root.querySelectorAll('thead button')].find(node => node.textContent === label);
+    await fire(button, 'click');
+    assert.equal(lists().at(-1).get('sort'), sort);
+    assert.equal(lists().at(-1).get('dir'), sort === 'date' ? 'desc' : 'asc');
+    assert.equal(lists().at(-1).has('after'), false);
+    await fire(button, 'click');
+    assert.equal(lists().at(-1).get('dir'), sort === 'date' ? 'asc' : 'desc');
+  }
+
+  const bookmarked = harness(fetchImpl);
+  const guild = bookmarked.app.state.guilds[1].id;
+  bookmarked.location.search = `?list=cases&guild=${guild}&sort=subject&dir=desc&q=review%25&from=2026-01-02&to=2026-01-03&outcome=failed`;
+  const { me, guilds } = bookmarked.app.state;
+  bookmarked.app.handleAuthLoss({ status: 401 });
+  await settle();
+  const login = bookmarked.document.getElementById('login-link');
+  login.addEventListener('click', event => event.preventDefault());
+  await fire(login, 'click', { button: 0 });
+  bookmarked.location.search = '';
+  Object.assign(bookmarked.app.state, { me, guilds });
+  bookmarked.app.restoreWorkspace();
+  assert.equal(bookmarked.app.state.guildId, guild);
+  assert.equal(bookmarked.app.state.tab, 'cases');
+  const restored = await casesView(bookmarked);
+  assert.equal(restored.querySelector('th[aria-sort="descending"]').textContent, 'Subject');
+  assert.equal(restored.querySelector('input[type="search"]').value, 'review%');
+  for (const [key, value] of Object.entries({
+    sort: 'subject', dir: 'desc', q: 'review%', from: '2026-01-02', to: '2026-01-03', outcome: 'failed',
+  })) assert.equal(lists().at(-1).get(key), value, key);
 });
 
 test('Case file links filter to the member\'s other cases and open their Members page', async () => {
@@ -8970,7 +9021,7 @@ test('Case file links filter to the member\'s other cases and open their Members
   assert.equal(caseDialog(h), null);
   const lastList = () => new URL(calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/cases')).at(-1).url, 'https://fixture.test').searchParams;
   assert.equal(lastList().get('subject'), CASE_SUBJECT);
-  assert.match(textOf(root.querySelector('.case-filters')), /Spammy/, 'the filter chip names the member');
+  assert.match(textOf(root.querySelector('.list-filters')), /Spammy/, 'the filter chip names the member');
   await openCase();
   await fire(findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Their other actions'), 'click', {});
   await settle();

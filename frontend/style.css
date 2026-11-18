@@ -707,16 +707,15 @@ svg.icon-neutral { color: var(--icon-neutral); }
 .du-unknown { margin: 6px 0 0; color: var(--muted); }
 .du-detail-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
 /* ==== end Database usage (#613) ==== */
-/* ==== Cases (#624): filters, list rows and the case file dialog ==== */
-.case-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 12px; }
-.case-filters > .field, .case-filters > .id-picker { flex: 1 1 10rem; min-width: 0; max-width: 16rem; margin: 0; }
-.case-filters .select { width: 100%; }
+/* ==== Shared dashboard list controls ==== */
 .list-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 12px; }
 .list-filters > .field, .list-filters > .id-picker { flex: 1 1 10rem; min-width: 0; max-width: 16rem; margin: 0; }
 .list-filters .select { width: 100%; }
 .list-sort { display: inline-flex; align-items: center; gap: .35rem; color: inherit; font: inherit; cursor: pointer; }
+.list-sort-order { font-size: var(--ui-font-size-sm); font-weight: 400; }
 .list-sort-mark { width: 1rem; height: 1rem; flex: none; }
 
+/* ==== Cases (#624): list rows and the case file dialog ==== */
 .case-row { cursor: pointer; }
 .case-row:hover > td { background: var(--panel2); }
 .case-badge { gap: 4px; white-space: nowrap; }
@@ -775,7 +774,6 @@ svg.icon-neutral { color: var(--icon-neutral); }
 .case-remove { margin-inline-start: auto; }
 @media (max-width: 720px) {
   .case-who { grid-template-columns: minmax(0, 1fr); }
-  .case-filters > .field, .case-filters > .id-picker,
   .list-filters > .field, .list-filters > .id-picker { flex-basis: 100%; max-width: none; }
   .case-file { width: 100%; }
 }

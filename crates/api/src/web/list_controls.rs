@@ -1,7 +1,7 @@
 //! Common query parameters and keyset cursor encoding for dashboard lists.
 use super::{ApiError, ApiResult};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::NaiveDate;
-use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 const MAX_SEARCH_CHARS: usize = 200;
@@ -115,14 +115,14 @@ pub fn encode_cursor<S: Serialize, A: Serialize>(
     dir: SortDirection,
     anchor: A,
 ) -> ApiResult<String> {
-    let json = serde_json::to_string(&Cursor {
+    let json = serde_json::to_vec(&Cursor {
         version: CURSOR_VERSION,
         list: list.to_owned(),
         sort,
         dir,
         anchor,
     })?;
-    let encoded = utf8_percent_encode(&json, NON_ALPHANUMERIC).to_string();
+    let encoded = URL_SAFE_NO_PAD.encode(json);
     if encoded.len() > MAX_CURSOR_BYTES {
         return Err(invalid("list cursor is too long"));
     }
@@ -139,11 +139,8 @@ pub fn decode_cursor<S: DeserializeOwned + PartialEq, A: DeserializeOwned>(
     if raw.len() > MAX_CURSOR_BYTES {
         return Err(bad());
     }
-    let json = percent_decode_str(raw).decode_utf8().map_err(|_| bad())?;
-    if utf8_percent_encode(&json, NON_ALPHANUMERIC).to_string() != raw {
-        return Err(bad());
-    }
-    let cursor: Cursor<S, A> = serde_json::from_str(&json).map_err(|_| bad())?;
+    let json = URL_SAFE_NO_PAD.decode(raw).map_err(|_| bad())?;
+    let cursor: Cursor<S, A> = serde_json::from_slice(&json).map_err(|_| bad())?;
     if cursor.version != CURSOR_VERSION
         || cursor.list != list
         || cursor.sort != sort
@@ -228,6 +225,17 @@ mod tests {
         assert!(decode(&token, "example", TestSort::Date, SortDirection::Asc).is_err());
         assert!(decode(&token, "example", TestSort::Reason, SortDirection::Desc).is_err());
         assert!(decode("%FF", "example", TestSort::Reason, SortDirection::Asc).is_err());
+        let reason = "🌐".repeat(512);
+        let token = encode_cursor(
+            "example",
+            TestSort::Reason,
+            SortDirection::Asc,
+            (&reason, 17),
+        )
+        .unwrap_or_else(|_| panic!("encode a full-length reason"));
+        let anchor = decode(&token, "example", TestSort::Reason, SortDirection::Asc)
+            .unwrap_or_else(|_| panic!("decode a full-length reason"));
+        assert_eq!(anchor, (reason, 17));
         assert!(
             decode_cursor::<_, i64>(&token, "example", TestSort::Reason, SortDirection::Asc)
                 .is_err()

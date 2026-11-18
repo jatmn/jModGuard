@@ -15,6 +15,10 @@ import {
   formatExact,
   sumSeries,
 } from "./charts.js";
+import {
+  clearListLocation, ListControls, ListEmptyRow, ListSortHeading, readListLocation,
+  rememberListLocation, restoreListLocation, useListControls,
+} from "./list-controls.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import React, { useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
 import { flushSync } from "react-dom";
@@ -314,6 +318,7 @@ async function switchGuild(guildId) {
   pendingCase = null;
   state.guildId = guildId;
   if (!tabAllowed(state.tab)) state.tab = "dashboard";
+  syncListLocation();
   state.config = null;
   ui.set({ edits: "clean" });
   persistWorkspace();
@@ -1479,7 +1484,10 @@ function App() {
                     ),
                     h(
                       "a",
-                      { id: "login-link", className: "btn btn-primary", href: authUrl("/login") },
+                      {
+                        id: "login-link", className: "btn btn-primary", href: authUrl("/login"),
+                        onClick: () => rememberListLocation(WORKSPACE_LISTS),
+                      },
                       "Continue with Discord",
                       h(Icon, { name: "external-link" }),
                     ),
@@ -1740,8 +1748,17 @@ function restoreWorkspace() {
   } catch (_) {
     /* Storage may be unavailable. */
   }
-  state.guildId = state.guilds.find((g) => g.id === saved.guildId)?.id || state.guilds[0]?.id || null;
-  state.tab = tabs.includes(saved.tab) && tabAllowed(saved.tab) ? saved.tab : "dashboard";
+  const { list, guild } = restoreListLocation(WORKSPACE_LISTS, state.guilds);
+  const linkedGuild = WORKSPACE_LISTS.has(list) && state.guilds.find((g) => g.id === guild);
+  state.guildId = linkedGuild?.id || state.guilds.find((g) => g.id === saved.guildId)?.id || state.guilds[0]?.id || null;
+  const destination = linkedGuild ? list : saved.tab;
+  state.tab = tabs.includes(destination) && tabAllowed(destination) ? destination : "dashboard";
+}
+
+function syncListLocation() {
+  const { list, guild } = readListLocation();
+  const config = WORKSPACE_LISTS.get(list);
+  if (config && (list !== state.tab || guild !== state.guildId)) clearListLocation(config);
 }
 
 function persistWorkspace() {
@@ -1799,6 +1816,7 @@ function navigate(tab) {
   if (!canLeave()) return false;
   ui.set({ view: "main-view", pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
   state.tab = tabs.includes(tab) && tabAllowed(tab) ? tab : "dashboard";
+  syncListLocation();
   persistWorkspace();
   renderTab();
   return true;
@@ -7479,7 +7497,7 @@ function CasePersonCard({ role, id, names, automatic, guildId, onFilter, filterK
           ? h(
               ActionButton,
               // Shows all of this member's cases: the link replaces any other list filters.
-              { type: "button", className: "btn btn-sm btn-link", onClick: () => leaveCaseView(() => onFilter({ ...CASE_FILTERS_EMPTY, [filterKey]: id }, person.name)) },
+              { type: "button", className: "btn btn-sm btn-link", onClick: () => leaveCaseView(() => onFilter(filterKey, id, person.name)) },
               role === "Subject" ? "Their other cases" : "Their other actions",
             )
           : null,
@@ -7874,20 +7892,38 @@ function CaseView({ guildId, caseId, onRemoved, onFilter }) {
   );
 }
 
-const CASE_FILTERS_EMPTY = { action: "", outcome: "", subject: "", actor: "" };
+const CASE_LIST = {
+  list: "cases",
+  filterLabel: "Filter cases",
+  searchPlaceholder: "Reason, case or user ID, action, outcome",
+  defaultSort: "date",
+  defaultDir: "desc",
+  filters: [
+    { key: "action", label: "Action", options: CASE_ACTIONS },
+    { key: "outcome", label: "Outcome", options: CASE_OUTCOMES },
+    { key: "subject", label: "Subject", kind: "user", idLabel: "Subject user ID" },
+    { key: "actor", label: "Moderator", kind: "user", idLabel: "Moderator user ID" },
+  ],
+  columns: [
+    { key: "case", label: "Case" },
+    { key: "action", label: "Action" },
+    { key: "outcome", label: "Outcome" },
+    { key: "subject", label: "Subject", title: "Sort by subject ID" },
+    { key: "actor", label: "Moderator", title: "Sort by moderator ID" },
+    { key: "date", label: "When", initialDir: "desc", orderLabels: { desc: "Newest first", asc: "Oldest first" } },
+  ],
+};
+const WORKSPACE_LISTS = new Map([[CASE_LIST.list, CASE_LIST]]);
 
 function tabCases() {
   const guildId = state.guildId;
   const handlers = useRef({});
-  const [rows, setRows] = useState([]);
+  const [rows, setRows] = useState(null);
   const [loading, setLoading] = useState(true);
   const [pagination, setPagination] = useState({ first: true, next: true });
   const [canDelete, setCanDelete] = useState(false);
   const [removedView, setRemovedView] = useState(false);
-  const [filters, setFilters] = useState(CASE_FILTERS_EMPTY);
-  const filtersRef = useRef(CASE_FILTERS_EMPTY);
-  const subjectIds = useRef([]).current;
-  const actorIds = useRef([]).current;
+  const controls = useListControls(CASE_LIST, guildId, () => handlers.current.first?.());
   const [pickerNames, setPickerNames] = useState(() => ({ status: "loaded", roles: [], channels: [], users: new Map() }));
   const rememberUser = (id, name) =>
     setPickerNames((current) => ({ ...current, users: new Map(current.users).set(id, name) }));
@@ -7896,15 +7932,6 @@ function tabCases() {
     pendingCase = null;
     return next;
   });
-  const applyFilters = (next, name) => {
-    const merged = { ...filtersRef.current, ...next };
-    filtersRef.current = merged;
-    subjectIds.splice(0, subjectIds.length, ...(merged.subject ? [merged.subject] : []));
-    actorIds.splice(0, actorIds.length, ...(merged.actor ? [merged.actor] : []));
-    if (name) for (const id of Object.values(next)) if (id) rememberUser(id, name);
-    setFilters(merged);
-    handlers.current.first?.();
-  };
   useEffect(() => {
     let lifecycle = "active";
     let request = 0;
@@ -7913,7 +7940,15 @@ function tabCases() {
     let listMode = "live";
     let nextAfter = "";
     const pageSize = 50;
-    const open = (id) => openCaseView({ guildId, caseId: id, onRemoved: () => renderTab(), onFilter: applyFilters });
+    const open = (id) => openCaseView({
+      guildId,
+      caseId: id,
+      onRemoved: () => renderTab(),
+      onFilter: (key, userId, name) => {
+        if (name) rememberUser(userId, name);
+        controls.replaceFilters({ [key]: userId });
+      },
+    });
     const run = async () => {
       const current = ++request;
       listController?.abort();
@@ -7923,12 +7958,11 @@ function tabCases() {
       const timeout = setTimeout(() => controller.abort(), 30000);
       setLoading(true);
       setPagination((value) => ({ ...value, next: true }));
-      setRows([]);
       try {
-        const query = new URLSearchParams({ limit: String(pageSize), removed: String(listMode === "removed") });
+        const query = listMode === "live" ? controls.query() : new URLSearchParams();
+        query.set("limit", String(pageSize));
+        query.set("removed", String(listMode === "removed"));
         if (after) query.set("after", after);
-        const filtered = listMode === "live" && Object.values(filtersRef.current).some(Boolean);
-        if (listMode === "live") for (const [key, value] of Object.entries(filtersRef.current)) if (value) query.set(key, value);
         const payload = await apiRead(`/api/guilds/${guildId}/cases?${query}`, signal);
         if (lifecycle === "disposed" || current !== request || state.guildId !== guildId) return;
         setCanDelete(!!payload.can_delete);
@@ -7940,22 +7974,16 @@ function tabCases() {
             for (const [id, person] of Object.entries(names)) users.set(id, person.display_name);
             return { ...value, users };
           });
-        nextAfter = ids.length === pageSize ? ids[ids.length - 1] : "";
+        nextAfter = payload.next_cursor || "";
         setPagination({ next: !nextAfter, first: !after });
         if (!ids.length) {
-          setRows([
-            h(
-              "tr",
-              {},
-              h(
-                "td",
-                { colSpan: 6, className: "muted" },
-                listMode === "removed"
-                  ? "No more removed records."
-                  : filtered ? "No cases match these filters." : "No selected cases on this page.",
-              ),
-            ),
-          ]);
+          setRows([listMode === "removed"
+            ? h("tr", null, h("td", { colSpan: 6, className: "muted" }, "No more removed records."))
+            : h(ListEmptyRow, {
+                controls, colSpan: 6,
+                empty: "No selected cases on this page.",
+                filtered: "No cases match these filters.",
+              })]);
           return;
         }
         const rows = [];
@@ -8064,17 +8092,6 @@ function tabCases() {
       ++request;
     };
   }, [guildId, handoff]);
-  const anyFilter = Object.values(filters).some(Boolean);
-  const choice = (label, key, options) =>
-    field(
-      label,
-      h(
-        Select,
-        { className: "select select-sm", value: filters[key], onChange: (event) => applyFilters({ [key]: event.target.value }) },
-        h("option", { value: "" }, `Any ${label.toLowerCase()}`),
-        ...Object.entries(options).map(([value, entry]) => h("option", { key: value, value }, entry.label)),
-      ),
-    );
   return h(
     "div",
     null,
@@ -8087,41 +8104,11 @@ function tabCases() {
         "Removed records can retry cleanup. Their private content stays deleted.",
       ],
     }),
-    removedView
-      ? null
-      : h(
-          "div",
-          { className: "case-filters", "data-no-draft": true, role: "group", "aria-label": "Filter cases" },
-          choice("Action", "action", CASE_ACTIONS),
-          choice("Outcome", "outcome", CASE_OUTCOMES),
-          h(IdPicker, {
-            kind: "user",
-            label: "Subject",
-            ids: subjectIds,
-            names: pickerNames,
-            rememberUser,
-            single: true,
-            draft: false,
-            memberStatus: "all",
-            idLabel: "Subject user ID",
-            onChange: () => applyFilters({ subject: subjectIds[0] || "" }),
-          }),
-          h(IdPicker, {
-            kind: "user",
-            label: "Moderator",
-            ids: actorIds,
-            names: pickerNames,
-            rememberUser,
-            single: true,
-            draft: false,
-            memberStatus: "all",
-            idLabel: "Moderator user ID",
-            onChange: () => applyFilters({ actor: actorIds[0] || "" }),
-          }),
-          anyFilter
-            ? h(ActionButton, { type: "button", className: "btn btn-sm", onClick: () => applyFilters(CASE_FILTERS_EMPTY) }, "Clear filters")
-            : null,
-        ),
+    removedView ? null : h(ListControls, {
+      controls,
+      UserPicker: IdPicker,
+      userPickerProps: { names: pickerNames, rememberUser, memberStatus: "all" },
+    }),
     h(
       "div",
       { className: "row", style: { marginBottom: "12px" } },
@@ -8146,13 +8133,17 @@ function tabCases() {
         removedView ? "Back to cases" : "Removed records / retry cleanup",
       ),
     ),
-    loading
-      ? h(
-        "div",
-        { className: "card bg-base-100 card-border", role: "status", "aria-live": "polite" },
-        h("div", { className: "card-body" }, "Loading cases…"),
-      )
-      : h(DataTable, { headings: ["Case", "Action", "Outcome", "Subject", "Moderator", "When"], className: "table table-zebra case-table" }, rows),
+    rows === null ? h(
+      "div",
+      { className: "card bg-base-100 card-border", role: "status", "aria-live": "polite" },
+      h("div", { className: "card-body" }, "Loading cases…"),
+    ) : h(DataTable, {
+      headings: CASE_LIST.columns.map((column) =>
+        removedView ? column.label : h(ListSortHeading, { key: column.key, column, controls })),
+      className: "table table-zebra case-table",
+    }, loading
+      ? h("tr", null, h("td", { colSpan: 6, role: "status" }, "Loading cases…"))
+      : rows),
   );
 }
 
@@ -9018,7 +9009,7 @@ function DataTable({ headings, children, className = "table table-zebra" }) {
     h(
       "table",
       { className },
-      h("thead", null, h("tr", null, ...headings.map((text) => h("th", { key: text }, text)))),
+      h("thead", null, h("tr", null, ...headings.map((heading) => typeof heading === "string" ? h("th", { key: heading, scope: "col" }, heading) : heading))),
       h("tbody", null, ...React.Children.toArray(children)),
     ),
   );

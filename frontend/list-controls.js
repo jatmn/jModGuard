@@ -4,10 +4,15 @@ import { Icon } from "./icons.js";
 const h = React.createElement;
 const SEARCH_LIMIT = 200;
 const SEARCH_DELAY_MS = 300;
+const savedListLocation = "jmodguard.list-before-login";
 const commonKeys = ["q", "from", "to"];
 
 function filterKeys(config) {
   return [...config.filters.map(({ key }) => key), ...commonKeys];
+}
+
+function boundedSearch(value) {
+  return Array.from(value).slice(0, SEARCH_LIMIT).join("");
 }
 
 function emptyFilters(config) {
@@ -24,6 +29,34 @@ function replaceListLocation(query) {
   history.replaceState(history.state, "", location.pathname + (search ? "?" + search : "") + location.hash);
 }
 
+// OAuth returns to the workspace root. Preserve a list link in this browser tab.
+export function rememberListLocation(configs) {
+  if (!configs.has(readListLocation().list)) return;
+  try {
+    window.sessionStorage.setItem(savedListLocation, location.search);
+  } catch (_) {}
+}
+
+export function restoreListLocation(configs, guilds) {
+  const current = readListLocation();
+  try {
+    const remembered = new URLSearchParams(window.sessionStorage.getItem(savedListLocation));
+    window.sessionStorage.removeItem(savedListLocation);
+    const list = remembered.get("list");
+    const guild = remembered.get("guild");
+    const config = configs.get(list);
+    if (!current.list && config && guilds.some(({ id }) => id === guild)) {
+      const restored = new URLSearchParams(location.search);
+      for (const key of ["list", "guild", "sort", "dir", ...filterKeys(config)]) {
+        if (remembered.has(key)) restored.set(key, remembered.get(key));
+      }
+      replaceListLocation(restored);
+      return { list, guild };
+    }
+  } catch (_) {}
+  return current;
+}
+
 export function clearListLocation(config) {
   const query = new URLSearchParams(location.search);
   if (query.get("list") !== config.list) return;
@@ -37,7 +70,7 @@ function readView(config, guildId) {
   const initial = { filters, sort: config.defaultSort, dir: config.defaultDir };
   if (query.get("list") !== config.list || query.get("guild") !== guildId) return initial;
   for (const key of filterKeys(config)) filters[key] = query.get(key) || "";
-  filters.q = filters.q.trim().slice(0, SEARCH_LIMIT);
+  filters.q = boundedSearch(filters.q.trim());
   const sort = query.get("sort");
   const dir = query.get("dir");
   return {
@@ -88,9 +121,10 @@ export function useListControls(config, guildId, onChange) {
     commit({ ...current.current, filters: { ...emptyFilters(config), ...filters } });
   };
   const setSearch = (value) => {
-    setSearchText(value);
+    const text = boundedSearch(value);
+    setSearchText(text);
     clearTimeout(searchTimer.current);
-    searchTimer.current = setTimeout(() => setFilter("q", value.trim()), SEARCH_DELAY_MS);
+    searchTimer.current = setTimeout(() => setFilter("q", text.trim()), SEARCH_DELAY_MS);
   };
   const sortBy = (column) => {
     const previous = current.current;
@@ -156,7 +190,7 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
         type: "search",
         value: searchText,
         placeholder: config.searchPlaceholder,
-        maxLength: SEARCH_LIMIT,
+        maxLength: SEARCH_LIMIT * 2,
         onChange: (event) => setSearch(event.target.value),
       }),
     ),
@@ -172,8 +206,9 @@ export function ListSortHeading({ column, controls }) {
   const { sort, dir } = controls.view;
   const active = sort === column.key;
   return h("th", { scope: "col", "aria-sort": active ? (dir === "asc" ? "ascending" : "descending") : undefined },
-    h("button", { type: "button", className: "list-sort", onClick: () => controls.sortBy(column) },
+    h("button", { type: "button", className: "list-sort", title: column.title, onClick: () => controls.sortBy(column) },
       column.label,
+      active && column.orderLabels?.[dir] ? h("span", { className: "muted list-sort-order" }, column.orderLabels[dir]) : null,
       active ? h(Icon, {
         name: dir === "asc" ? "chevron-up" : "chevron-down",
         intent: "neutral",

@@ -39,6 +39,7 @@ const MEMBER_GAP_AUTO_CLEAR_SCHEMA: &str =
     include_str!("../../migrations/guild/0017_member_gap_auto_clear.sql");
 const ACCESS_ROLES_SCHEMA: &str = include_str!("../../migrations/guild/0018_access_roles.sql");
 const SERVER_NAMES_SCHEMA: &str = include_str!("../../migrations/guild/0019_server_names.sql");
+const CASE_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0020_case_list_orders.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -50,6 +51,8 @@ mod case_history;
 pub use case_history::*;
 mod cases;
 pub use cases::*;
+mod case_listing;
+pub use case_listing::*;
 mod erasure;
 pub(crate) use erasure::ErasureProgress;
 mod snapshots;
@@ -545,6 +548,12 @@ fn initialize_store(
         if version < 20 {
             tx.execute_batch_bounded(SERVER_NAMES_SCHEMA, 32_000_000)?;
         }
+        if version < 21 {
+            let index_bound = crate::capacity::allocated_bytes(&tx)?
+                .saturating_mul(2)
+                .saturating_add(32_000_000);
+            tx.execute_batch_bounded(CASE_LIST_SCHEMA, index_bound)?;
+        }
         // Version 16 adds the optional immutable ban_attempt_tag to case JSON.
         // No DDL or rewrite of legacy cases: their absent tags must remain absent.
         tx.pragma_update(None, "user_version", VERSION)?;
@@ -574,6 +583,7 @@ fn initialize_store(
     tx.execute_batch_bounded(MEMBER_GAP_AUTO_CLEAR_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(ACCESS_ROLES_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(SERVER_NAMES_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(CASE_LIST_SCHEMA, 32_000_000)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
@@ -662,6 +672,7 @@ impl GuildDataStore {
                     (MEMBER_GAP_AUTO_CLEAR_SCHEMA, 18),
                     (ACCESS_ROLES_SCHEMA, 19),
                     (SERVER_NAMES_SCHEMA, 20),
+                    (CASE_LIST_SCHEMA, 21),
                 ];
                 for (sql, at) in batches {
                     if *at <= version {
