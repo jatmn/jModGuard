@@ -29,7 +29,19 @@ if [[ "$1" == true ]]; then
   fi
   toolchain="$(awk -F '\"' '/^channel = / {print $2; exit}' rust-toolchain.toml)"
   [[ -n "$toolchain" ]] || exit 1
-  rustup toolchain install "$toolchain" --profile minimal --component clippy,rustfmt
+  for attempt in 1 2 3; do
+    if rustup toolchain install "$toolchain" --profile minimal --component clippy,rustfmt; then
+      break
+    else
+      status=$?
+    fi
+    if (( attempt == 3 )); then
+      exit "$status"
+    fi
+    delay=$((5 * attempt))
+    echo "ci-setup: rustup install attempt $attempt failed (exit $status); retrying in ${delay}s" >&2
+    sleep "$delay"
+  done
 fi
 if [[ "${NEED_NEXTEST:-false}" == true ]]; then
   # Prebuilt, checksum-pinned runner: avoid compiling tools or launching Cargo per test.

@@ -37,6 +37,7 @@ const listControlsSource = fs.readFileSync(new URL('../frontend/list-controls.js
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
   .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, '\n');
 const pages = [];
+const testClockStartedAt = Date.now();
 after(() => bootDom.window.close());
 function activate(window) {
   globalThis.window = window; globalThis.document = window.document;
@@ -78,8 +79,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   win.matchMedia = () => ({matches: false, addEventListener() {}, removeEventListener() {}});
   const roots = [], timers = new Map(), documentListeners = new Map(), opened = [], historyUrls = [];
   let nextTimer = 1, clockOffsetMs = 0, rendering = false;
-  const clockStartedAt = Date.now();
-  class TestDate extends Date { static now() { return clockStartedAt + clockOffsetMs; } }
+  class TestDate extends Date { static now() { return testClockStartedAt + clockOffsetMs; } }
   const location = { search: '', pathname: '/', hash: '', replaced: null, replace(value) { this.replaced = value; } };
   win.open = (...args) => opened.push(args);
   const addEventListener = document.addEventListener.bind(document), removeEventListener = document.removeEventListener.bind(document);
@@ -9579,11 +9579,11 @@ test("the sidebar's own buttons show their colored SVG icons beside unchanged la
 
 // #613: Database Usage and Platform analytics are Owner sections of the main
 // workspace. Each database reads at a glance; diagnostics stay in Details.
-const USAGE_NOW = () => Math.floor(Date.now() / 1000);
+const USAGE_NOW = Math.floor(testClockStartedAt / 1000);
 const USAGE_POLICY = { provider_hard_limit_bytes: 1e9, pressure_bytes: 7e8, capture_pause_bytes: 8e8, growth_stop_bytes: 9e8, snapshot_budget_bytes: 4e8, effective_snapshot_allowance_bytes: null };
 function usageDatabase({ id = 'core', kind = 'core', pages = 118, free = 20, status = 'normal', ...overrides } = {}) {
   const allocated = pages * 4096;
-  const sampled = USAGE_NOW() - 120;
+  const sampled = USAGE_NOW - 120;
   return {
     id, kind, role: kind, policy: kind === 'core' ? null : { kind: 'shared' }, availability: 'available', status,
     measurement: { source: 'sqlite_primary_pragma', sampled_at: sampled, last_success_at: sampled, capability: 'available', error_code: null },
@@ -9604,7 +9604,7 @@ const unknownDatabase = () => ({
   measurement: { source: 'sqlite_primary_pragma', sampled_at: null, last_success_at: null, capability: 'unavailable', error_code: 'timeout' },
   headroom_bytes: null, percent_of_limit: null, snapshot_usage_estimate_bytes: null,
 });
-const usageOverview = (databases) => ({ generated_at: USAGE_NOW() - 30, catalog_status: 'available', databases });
+const usageOverview = (databases) => ({ generated_at: USAGE_NOW - 30, catalog_status: 'available', databases });
 const usageCards = (h) => [...h.nodes.get('#content').querySelectorAll('.du-card')];
 const usageFigures = (card) => [...card.querySelectorAll('.du-figures > *')].map(node => node.textContent);
 const usageFacts = (card) => Object.fromEntries([...card.querySelectorAll('.du-facts > div')].map(row => [row.querySelector('dt').textContent, row.querySelector('dd').textContent]));
@@ -9777,7 +9777,7 @@ test('Database Usage keeps the last figures, marked stale, when a refresh fails,
 
 test('Database Usage Details lists disjoint physical categories and unknown guard status', async () => {
   const database = usageDatabase({ id: 'a'.repeat(32), kind: 'guild' });
-  database.usage = { allocated_bytes: 10000000, breakdown_quality: 'measured', category_sampled_at: USAGE_NOW() - 30, snapshot_count: 7,
+  database.usage = { allocated_bytes: 10000000, breakdown_quality: 'measured', category_sampled_at: USAGE_NOW - 30, snapshot_count: 7,
     categories: { snapshot_data_bytes: 1000000, moderation_evidence_data_bytes: 2000000, configuration_data_bytes: 1000000,
       operational_data_bytes: 2000000, index_bytes: 1000000, reusable_bytes: 1000000, system_unattributed_bytes: 2000000 } };
   const h = ownerHarness(async () => response(usageOverview([database])));

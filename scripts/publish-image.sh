@@ -12,8 +12,32 @@ publish_fail() {
 }
 
 run_git() { git "$@" || publish_fail "git failed: $*"; }
-run_docker() { docker "$@" || publish_fail "docker failed: $*"; }
+run_docker() {
+  if [[ "$1 ${2:-}" == 'buildx build' && "${@: -2:1}" == --metadata-file ]]; then
+    retry_staging_push "$@"
+  else
+    docker "$@" || publish_fail "docker failed: $*"
+  fi
+}
 run_cosign() { cosign "$@" || publish_fail "cosign failed: $*"; }
+
+retry_staging_push() {
+  local metadata_file="${@: -1}" attempt delay
+  local log_file="${metadata_file}.log"
+  for attempt in 1 2 3; do
+    # Only a successful attempt's digest may advance to verification.
+    : >"$metadata_file" || publish_fail 'cannot reset image build metadata'
+    if docker "$@" 2>&1 | tee "$log_file" >&2; then
+      return 0
+    fi
+    if (( attempt == 3 )) || ! grep -Fxq 'ERROR: failed to build: unknown blob' "$log_file"; then
+      publish_fail 'docker failed: buildx build'
+    fi
+    delay=$((5 * attempt))
+    printf 'Staging image push reported unknown blob (attempt %d); retrying in %ds\n' "$attempt" "$delay" >&2
+    sleep "$delay"
+  done
+}
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SIGNING_PUBLIC_KEY="${REPO_ROOT}/deploy/update-signing.pub"
@@ -1328,6 +1352,7 @@ publish_component_build() {
   local -a build_cmd=()
   readarray -d '' -t build_cmd < <(build_args "$component" "$sha" "$label" "$context" "$channel" "$layout" "$staging_ref")
   [[ "${#build_cmd[@]}" -gt 1 ]] || publish_fail 'cannot construct image build arguments'
+  # Keep the metadata destination last so the staging retry can reset it.
   build_cmd+=("--metadata-file" "$metadata_file")
   run_selected_source_build run_docker "${build_cmd[@]:1}"
   published_digest="$(digest_from_build_metadata "$metadata_file")" \

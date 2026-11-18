@@ -91,29 +91,53 @@ impl HranaState {
 // transaction lifetime. The actual statements still execute on real SQLite.
 struct ProviderModel {
     writer: Arc<tokio::sync::Semaphore>,
-    transactions: Mutex<
-        std::collections::HashMap<String, (tokio::sync::OwnedSemaphorePermit, std::time::Instant)>,
-    >,
+    transactions:
+        Mutex<std::collections::HashMap<String, (tokio::sync::OwnedSemaphorePermit, Duration)>>,
     timed_out: Mutex<HashSet<String>>,
     delay: Duration,
     limit: Duration,
+    clock: ProviderClock,
     timeouts: AtomicUsize,
     committed_durations: Mutex<Vec<Duration>>,
     stall_owned: AtomicBool,
 }
 
+enum ProviderClock {
+    Wall(std::time::Instant),
+    Modeled(Arc<Mutex<Duration>>),
+}
+
 impl ProviderModel {
     fn new(delay: Duration, limit: Duration) -> Arc<Self> {
+        Self::with_clock(delay, limit, ProviderClock::Wall(std::time::Instant::now()))
+    }
+
+    fn with_clock(delay: Duration, limit: Duration, clock: ProviderClock) -> Arc<Self> {
         Arc::new(Self {
             writer: Arc::new(tokio::sync::Semaphore::new(1)),
             transactions: Mutex::new(std::collections::HashMap::new()),
             timed_out: Mutex::new(HashSet::new()),
             delay,
             limit,
+            clock,
             timeouts: AtomicUsize::new(0),
             committed_durations: Mutex::new(Vec::new()),
             stall_owned: AtomicBool::new(false),
         })
+    }
+
+    fn now(&self) -> Duration {
+        match &self.clock {
+            ProviderClock::Wall(started) => started.elapsed(),
+            ProviderClock::Modeled(elapsed) => *elapsed.lock().unwrap(),
+        }
+    }
+
+    async fn charge_request_latency(&self) {
+        match &self.clock {
+            ProviderClock::Wall(_) => tokio::time::sleep(self.delay).await,
+            ProviderClock::Modeled(elapsed) => *elapsed.lock().unwrap() += self.delay,
+        }
     }
 }
 
@@ -152,7 +176,7 @@ async fn provider_response(
         }
         std::future::pending::<()>().await;
     }
-    tokio::time::sleep(model.delay).await;
+    model.charge_request_latency().await;
     let mut responses = Vec::new();
     let mut closed = false;
     for request in &requests {
@@ -187,7 +211,7 @@ async fn provider_response(
             .lock()
             .unwrap()
             .get(&baton)
-            .is_some_and(|(_, start)| start.elapsed() > model.limit);
+            .is_some_and(|(_, start)| model.now() - *start > model.limit);
         if expired {
             let owned = model.transactions.lock().unwrap().remove(&baton);
             let mut state = state.lock().unwrap();
@@ -261,7 +285,7 @@ async fn provider_response(
                 .transactions
                 .lock()
                 .unwrap()
-                .insert(baton.clone(), (permit.unwrap(), std::time::Instant::now()));
+                .insert(baton.clone(), (permit.unwrap(), model.now()));
         } else if (sql.starts_with("COMMIT") || sql.starts_with("ROLLBACK"))
             && !results[0].is_null()
         {
@@ -272,7 +296,7 @@ async fn provider_response(
                     .committed_durations
                     .lock()
                     .unwrap()
-                    .push(start.elapsed());
+                    .push(model.now() - *start);
             }
         }
         if path == "/v3/cursor" {
@@ -359,6 +383,25 @@ impl HranaFixture {
         delay: Duration,
         limit: Duration,
     ) -> (Self, Db) {
+        Self::provider_database(path, ProviderModel::new(delay, limit)).await
+    }
+
+    /// Account for each Hrana round trip without charging host scheduling to
+    /// the provider lifetime. Paired databases can share one elapsed clock.
+    pub(in crate::db) async fn modeled_latency_database(
+        path: &std::path::Path,
+        delay: Duration,
+        limit: Duration,
+        elapsed: Arc<Mutex<Duration>>,
+    ) -> (Self, Db) {
+        Self::provider_database(
+            path,
+            ProviderModel::with_clock(delay, limit, ProviderClock::Modeled(elapsed)),
+        )
+        .await
+    }
+
+    async fn provider_database(path: &std::path::Path, provider: Arc<ProviderModel>) -> (Self, Db) {
         let fixture = Self::start().await;
         let runtime = DbRuntime::new().unwrap();
         let backing = runtime
@@ -369,7 +412,7 @@ impl HranaFixture {
         {
             let mut state = fixture.state.lock().unwrap();
             state.backing = Some((runtime, backing));
-            state.provider = Some(ProviderModel::new(delay, limit));
+            state.provider = Some(provider);
         }
         let db = fixture.db();
         (fixture, db)
@@ -1014,9 +1057,13 @@ async fn maximal_badword_batch_commits_within_remote_transaction_lifetime() {
 
     // Real libSQL HTTP client against SQLite, with modeled remote latency and
     // the provider's five-second interactive transaction lifetime.
-    let (fixture, remote) =
-        HranaFixture::delayed_database(&path, Duration::from_millis(80), Duration::from_secs(5))
-            .await;
+    let (fixture, remote) = HranaFixture::modeled_latency_database(
+        &path,
+        Duration::from_millis(80),
+        Duration::from_secs(5),
+        Arc::default(),
+    )
+    .await;
     let saved = add_enrolled_badwords(&remote, scope.clone(), &words.join("\n"), Some("batch"))
         .await
         .expect("a maximal batch must commit inside the provider lifetime");

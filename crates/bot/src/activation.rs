@@ -1060,7 +1060,8 @@ mod tests {
         let (task, started) = start_polled_discord(&activation);
         wait_until_polled(&started).await;
         activation.fail_next_renewal();
-        let began = Instant::now();
+        tokio::time::pause();
+        let began = tokio::time::Instant::now();
         let renewal = spawn_renewal_every(
             db.clone(),
             Arc::clone(&activation),
@@ -1068,15 +1069,26 @@ mod tests {
             Duration::from_millis(500),
         );
         tokio::time::timeout(Duration::from_millis(950), async {
+            while activation.renewal_attempts.load(Ordering::Acquire) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // The retry is running on the separate SQLite executor. Keep the
+            // virtual clock at this point while waiting for its real result.
+            let database_deadline = Instant::now() + Duration::from_secs(5);
             while activation.authority_deadline() == Some(before) && !activation.recording_cut_off()
             {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                assert!(
+                    Instant::now() < database_deadline,
+                    "SQLite renewal did not finish"
+                );
+                tokio::task::yield_now().await;
             }
         })
         .await
         .expect("retry must finish before the next 500 ms tick");
         assert!(activation.authority_deadline().unwrap() > before);
         assert!(began.elapsed() < Duration::from_millis(950));
+        assert_eq!(activation.renewal_attempts.load(Ordering::Acquire), 2);
         assert!(
             !activation.renewal_fault.load(Ordering::Acquire),
             "injected first attempt ran"

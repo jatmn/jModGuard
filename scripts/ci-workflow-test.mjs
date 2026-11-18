@@ -293,7 +293,13 @@ try {
   fs.mkdirSync(rustBin);
   fs.writeFileSync(path.join(rustBin, "df"), '#!/bin/sh\nprintf "    Avail\\n%s\\n" "$FREE_KB"\n', { mode: 0o755 });
   fs.writeFileSync(path.join(rustBin, "sudo"), '#!/bin/sh\nprintf "sudo %s\\n" "$*" >>"$SETUP_CALLS"\nexit "${SUDO_RESULT:-0}"\n', { mode: 0o755 });
-  fs.writeFileSync(path.join(rustBin, "rustup"), '#!/bin/sh\necho rustup >>"$SETUP_CALLS"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(rustBin, "rustup"), [
+    '#!/bin/sh',
+    'echo rustup >>"$SETUP_CALLS"',
+    'test "$(grep -c "^rustup$" "$SETUP_CALLS")" -gt "${RUSTUP_FAILURES:-0}" || exit 28',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  fs.writeFileSync(path.join(rustBin, "sleep"), '#!/bin/sh\nprintf "sleep %s\\n" "$*" >>"$SETUP_CALLS"\n', { mode: 0o755 });
   const rustSetup = (freeKb, extra = {}) => {
     fs.rmSync(setupCalls, { force: true });
     const result = spawnSync("bash", [setupScript, "true"], { cwd: root, encoding: "utf8", env: {
@@ -316,6 +322,12 @@ try {
   const unreadable = rustSetup("unknown");
   assert.notEqual(unreadable.status, 0, "unreadable free space must fail setup, not skip the delete");
   assert.deepEqual(unreadable.calls, []);
+  const transientRustup = rustSetup("1073741824", { RUSTUP_FAILURES: "1" });
+  assert.equal(transientRustup.status, 0, transientRustup.stderr);
+  assert.deepEqual(transientRustup.calls, ["rustup", "sleep 5", "rustup"]);
+  const failedRustup = rustSetup("1073741824", { RUSTUP_FAILURES: "3" });
+  assert.equal(failedRustup.status, 28, "persistent install failures must fail setup");
+  assert.deepEqual(failedRustup.calls, ["rustup", "sleep 5", "rustup", "sleep 10", "rustup"]);
 
   const selectScan = socketSteps.find(step => step.startsWith("name: Select dependency scan"));
   const selectRun = selectScan?.match(/^        run: \|\n([\s\S]*)/m)?.[1];

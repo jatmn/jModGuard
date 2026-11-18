@@ -6408,8 +6408,6 @@ async fn coverage_gap_mark_commits_with_hrana_latency_within_transaction_lifetim
     let (f, local, scope) = ready().await;
     complete_for_checks(&local, &scope).await;
     let owner = "ab".repeat(16);
-    // Both delayed marks take longer on the wall clock than the normal 20s
-    // claim window. The expiry still has to be a real held lease.
     assert!(
         claim_active_bot(
             &f.catalog,
@@ -6425,17 +6423,20 @@ async fn coverage_gap_mark_commits_with_hrana_latency_within_transaction_lifetim
     // ~350 ms per request is the reported remote latency. Both databases are
     // delayed, and the writer lease plus epoch check are armed. The whole
     // guild write transaction, including COMMIT, has to finish inside 5 s.
-    let (_core_fixture, core_db) = HranaFixture::delayed_database(
+    let elapsed = std::sync::Arc::default();
+    let (_core_fixture, core_db) = HranaFixture::modeled_latency_database(
         &f.catalog_path,
         Duration::from_millis(350),
         Duration::from_secs(5),
+        std::sync::Arc::clone(&elapsed),
     )
     .await;
     core_db.arm_writer_term(&owner, generation);
-    let (fixture, db) = HranaFixture::delayed_database(
+    let (fixture, db) = HranaFixture::modeled_latency_database(
         &f.store_path,
         Duration::from_millis(350),
         Duration::from_secs(5),
+        elapsed,
     )
     .await;
     let remote = GuildDataStore {

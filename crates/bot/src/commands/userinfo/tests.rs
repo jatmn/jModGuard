@@ -1306,6 +1306,9 @@ async fn test_context(
     ctx
 }
 
+// The joined timestamp deliberately contains the same digits as a hidden channel.
+const JOINED_AT_WITH_HIDDEN_CHANNEL_DIGITS: &str = "2024-01-01T00:00:00.802Z";
+
 #[tokio::test]
 async fn userinfo_prefix_and_slash_hide_voice_the_caller_cannot_view() {
     use crate::commands::voice_lookup::{VoiceLookupSnapshot, snapshot_cached_voice};
@@ -1418,10 +1421,9 @@ async fn userinfo_prefix_and_slash_hide_voice_the_caller_cannot_view() {
             }
             guild.channels.insert(voice.id, voice);
         }
-        guild.members.insert(
-            UserId::new(TARGET),
-            target_member(GUILD, TARGET, Some("Nick")),
-        );
+        let mut target = target_member(GUILD, TARGET, Some("Nick"));
+        target.joined_at = Some(JOINED_AT_WITH_HIDDEN_CHANNEL_DIGITS.parse().unwrap());
+        guild.members.insert(target.user.id, target);
         let mut caller = target_member(GUILD, ACTOR, None);
         caller.user.name = "mod".into();
         caller.roles = vec![RoleId::new(ROLE)];
@@ -1505,25 +1507,17 @@ async fn userinfo_prefix_and_slash_hide_voice_the_caller_cannot_view() {
         .unwrap();
 
     let report_from = |label: &str| {
-        let requests = captured.lock().unwrap().clone();
-        captured.lock().unwrap().clear();
-        let report = requests
-            .iter()
-            .find(|raw| raw.contains("**🔊 Voice:**"))
-            .unwrap_or_else(|| panic!("{label} produced no userinfo report: {requests:?}"));
+        let report = report_content(label, &captured);
         assert!(
             report.contains("**👤 User info**"),
             "{label} did not pass command authorization: {report}"
         );
-        assert!(
-            report.contains("\\#801") || report.contains("#801"),
-            "{label} dropped a visible case channel: {report}"
+        assert_eq!(
+            rendered_test_case_reason(&report),
+            format!(r"\<\#{VISIBLE_CASE_CHANNEL}\> and {VOICE_UNAVAILABLE}"),
+            "{label} must retain the visible case channel and redact the uncached one"
         );
-        assert!(
-            !report.contains("802"),
-            "{label} leaked an uncached case channel: {report}"
-        );
-        report.to_string()
+        report
     };
 
     install(Some("Lobby"), false);
@@ -1541,7 +1535,7 @@ async fn userinfo_prefix_and_slash_hide_voice_the_caller_cannot_view() {
     crate::commands::handle_interaction(&app, &ctx, interaction.clone()).await;
     let slash = report_from("visible slash");
     for report in [&prefix, &slash] {
-        let voice = voice_line(report);
+        let voice = voice_line_from_content(report);
         assert!(voice.contains("Lobby"), "{voice}");
         assert!(voice.contains("`700`") || voice.contains("700"), "{voice}");
     }
@@ -1584,7 +1578,7 @@ async fn userinfo_prefix_and_slash_hide_voice_the_caller_cannot_view() {
     crate::commands::handle_interaction(&app, &ctx, interaction.clone()).await;
     let slash = report_from("hidden slash");
     for report in [&prefix, &slash] {
-        let voice = voice_line(report);
+        let voice = voice_line_from_content(report);
         assert!(voice.contains(VOICE_UNAVAILABLE), "{voice}");
         assert!(!voice.contains("Secret"), "{voice}");
         assert!(!voice.contains("700"), "{voice}");
@@ -1599,11 +1593,11 @@ async fn userinfo_prefix_and_slash_hide_voice_the_caller_cannot_view() {
     crate::commands::handle_interaction(&app, &ctx, interaction).await;
     let slash = report_from("uncached slash");
     for report in [&prefix, &slash] {
-        let voice = voice_line(report);
+        let voice = voice_line_from_content(report);
         assert!(voice.contains(VOICE_UNAVAILABLE), "{voice}");
         assert!(!voice.contains("700"), "{voice}");
         assert!(!report.contains("Ghost"), "{report}");
-        assert!(!report.contains("700"), "{report}");
+        assert!(!report.contains(&format!("`{VOICE}`")), "{report}");
     }
 
     server.abort();
@@ -1962,10 +1956,9 @@ async fn userinfo_prefix_and_slash_hide_private_threads_without_access() {
             "old-secret",
             true,
         ));
-        guild.members.insert(
-            UserId::new(TARGET),
-            target_member(GUILD, TARGET, Some("Nick")),
-        );
+        let mut target = target_member(GUILD, TARGET, Some("Nick"));
+        target.joined_at = Some(JOINED_AT_WITH_HIDDEN_CHANNEL_DIGITS.parse().unwrap());
+        guild.members.insert(target.user.id, target);
         let mut caller = target_member(GUILD, ACTOR, None);
         caller.user.name = "mod".into();
         caller.roles = vec![RoleId::new(ROLE)];
@@ -2108,14 +2101,12 @@ async fn userinfo_prefix_and_slash_hide_private_threads_without_access() {
         ));
     }
     let (prefix, slash) = run("hidden").await;
+    let redacted =
+        format!(r"\<\#{PARENT}\> {VOICE_UNAVAILABLE} \<\#{PUBLIC_ARCHIVED}\> {VOICE_UNAVAILABLE}");
     for content in [&prefix, &slash] {
-        assert!(content.contains("800"), "{content}");
-        assert!(content.contains("803"), "{content}");
-        assert!(!content.contains("802"), "{content}");
-        assert!(!content.contains("804"), "{content}");
+        assert_eq!(rendered_test_case_reason(content), redacted, "{content}");
         assert!(!content.contains("secret-thread"), "{content}");
         assert!(!content.contains("old-secret"), "{content}");
-        assert!(content.contains("unavailable"), "{content}");
         let voice = voice_line_from_content(content);
         assert!(voice.contains("Lobby"), "{voice}");
         assert!(voice.contains("700"), "{voice}");
@@ -2124,19 +2115,19 @@ async fn userinfo_prefix_and_slash_hide_private_threads_without_access() {
     install(true, false);
     let (prefix, slash) = run("manage threads").await;
     for content in [&prefix, &slash] {
-        assert!(content.contains("802"), "{content}");
-        assert!(content.contains("804"), "{content}");
-        assert!(content.contains("800"), "{content}");
-        assert!(content.contains("803"), "{content}");
+        assert_eq!(
+            rendered_test_case_reason(content),
+            format!(
+                r"\<\#{PARENT}\> \<\#{PRIVATE}\> \<\#{PUBLIC_ARCHIVED}\> \<\#{PRIVATE_ARCHIVED}\>"
+            ),
+            "{content}"
+        );
     }
 
     install(true, true);
     let (prefix, slash) = run("manage threads denied").await;
     for content in [&prefix, &slash] {
-        assert!(content.contains("800"), "{content}");
-        assert!(content.contains("803"), "{content}");
-        assert!(!content.contains("802"), "{content}");
-        assert!(!content.contains("804"), "{content}");
+        assert_eq!(rendered_test_case_reason(content), redacted, "{content}");
         assert!(!content.contains("secret-thread"), "{content}");
         assert!(!content.contains("old-secret"), "{content}");
     }
@@ -2145,6 +2136,13 @@ async fn userinfo_prefix_and_slash_hide_private_threads_without_access() {
     drop(app);
     crate::tenant::remove_sidecars(&path);
     let _ = std::fs::remove_file(path);
+}
+
+fn rendered_test_case_reason(content: &str) -> &str {
+    content
+        .lines()
+        .find_map(|line| line.split_once(" — see ").map(|(_, reason)| reason))
+        .unwrap_or_else(|| panic!("no fixture case reason in {content}"))
 }
 
 fn voice_line_from_content(content: &str) -> String {
@@ -2156,43 +2154,15 @@ fn voice_line_from_content(content: &str) -> String {
 }
 
 fn report_content(label: &str, captured: &Arc<std::sync::Mutex<Vec<String>>>) -> String {
-    let requests = captured.lock().unwrap().clone();
-    captured.lock().unwrap().clear();
+    let requests = std::mem::take(&mut *captured.lock().unwrap());
     let report = requests
         .iter()
         .find(|raw| raw.contains("**🔊 Voice:**"))
         .unwrap_or_else(|| panic!("{label} produced no userinfo report: {requests:?}"));
-    let (_, body) = report
-        .split_once("\r\n\r\n")
-        .unwrap_or_else(|| panic!("{label} report had no body: {report}"));
-    let payload: serde_json::Value =
-        serde_json::from_str(body).unwrap_or_else(|error| panic!("{error} in {body}"));
-    let message = payload
-        .get("data")
-        .filter(|data| data.is_object())
-        .unwrap_or(&payload);
+    let message = message_fields(report);
     message["content"]
         .as_str()
-        .unwrap_or_else(|| panic!("{label} had no content in {payload}"))
-        .to_string()
-}
-
-fn voice_line(report: &str) -> String {
-    let (_, body) = report
-        .split_once("\r\n\r\n")
-        .unwrap_or_else(|| panic!("report had no body: {report}"));
-    let payload: serde_json::Value =
-        serde_json::from_str(body).unwrap_or_else(|error| panic!("{error} in {body}"));
-    let message = payload
-        .get("data")
-        .filter(|data| data.is_object())
-        .unwrap_or(&payload);
-    message["content"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no content in {payload}"))
-        .lines()
-        .find(|line| line.contains("**🔊 Voice:**"))
-        .unwrap_or_else(|| panic!("no voice line in {payload}"))
+        .unwrap_or_else(|| panic!("{label} had no content in {message}"))
         .to_string()
 }
 
