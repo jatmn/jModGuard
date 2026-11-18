@@ -111,6 +111,54 @@ fn read_core_baseline(conn: &impl SqlExecutor) -> Result<CoreBaseline> {
     })
 }
 
+fn ban_list_migration_growth(tx: &impl SqlExecutor) -> Result<u64> {
+    // Match 0027's latest valid edit per guild and ban. Every ban adds six
+    // index entries, and a backfilled ban also rewrites the full table record.
+    let (bans, edited_bans, payload_bytes): (i64, i64, i64) = tx.query_row(
+        "WITH latest AS (
+             SELECT guild_id, CAST(json_extract(data, '$.ban_id') AS INTEGER) AS ban_id,
+                    MAX(id) AS id
+             FROM events
+             WHERE event_type = 'ban_reason_edit' AND json_valid(data)
+               AND json_type(data, '$.reason') = 'text'
+             GROUP BY guild_id, ban_id
+         )
+         SELECT COUNT(*), COUNT(e.id), COALESCE(SUM(
+             length(CAST(COALESCE(NULLIF(b.user_display_name, ''), b.user_name, '') AS BLOB))
+           + length(CAST(COALESCE(NULLIF(b.moderator_name, ''), CAST(b.moderator_id AS TEXT), '') AS BLOB))
+           + length(CAST(COALESCE(json_extract(e.data, '$.reason'), b.reason, '') AS BLOB))
+           + CASE WHEN e.id IS NOT NULL THEN
+                 length(CAST(COALESCE(b.user_name, '') AS BLOB))
+               + length(CAST(COALESCE(b.user_display_name, '') AS BLOB))
+               + length(CAST(COALESCE(b.moderator_name, '') AS BLOB))
+               + length(CAST(COALESCE(b.reason, '') AS BLOB))
+               + length(CAST(b.created_at AS BLOB))
+               + length(CAST(COALESCE(b.operation_id, '') AS BLOB))
+               + length(CAST(COALESCE(b.expiry_enrollment_id, '') AS BLOB))
+               + length(CAST(json_extract(e.data, '$.reason') AS BLOB))
+               + length(CAST(e.created_at AS BLOB))
+             ELSE 0 END
+         ), 0)
+         FROM bans b
+         LEFT JOIN latest l ON l.guild_id = b.guild_id AND l.ban_id = b.id
+         LEFT JOIN events e ON e.id = l.id",
+        (),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    // Allow for numeric keys and record headers in each index, overflow pages
+    // and slack for variable-length payloads, and page splits in the rewritten
+    // table. Keep 1 MiB apiece for the six index builds and the table DDL.
+    const INDEX_COUNT: u64 = 6;
+    let index_entries = u64::try_from(bans)?.saturating_mul(INDEX_COUNT * 256);
+    let backfill_pages = u64::try_from(edited_bans)?
+        .saturating_mul(8)
+        .saturating_mul(tx.capacity_page_size()?);
+    Ok(index_entries
+        .saturating_add(backfill_pages)
+        .saturating_add(u64::try_from(payload_bytes)?.saturating_mul(8))
+        .saturating_add((INDEX_COUNT + 1) * 1024 * 1024))
+}
+
 pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
     // A current database must not open one immediate transaction per migration.
     // Each of those is a primary write lock and several Hrana round trips, and
@@ -140,13 +188,17 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
         // migration from the same stale pre-lock user_version.
         let version = read_core_baseline(&tx)?.version();
         if version < target {
-            // Historical migrations can copy existing rows and build indexes.
-            // Reserve their complete conservative rebuild allowance under the
-            // same primary lock; a large upgrade must fail before mutation.
-            let growth = crate::capacity::allocated_bytes(&tx)?
-                .checked_mul(8)
-                .and_then(|n| n.checked_add(16 * 1024 * 1024))
-                .ok_or_else(|| anyhow::anyhow!("migration capacity bound overflow"))?;
+            let growth = if target == 27 {
+                ban_list_migration_growth(&tx).context("measure migration 27 growth")?
+            } else {
+                // Historical migrations can copy existing rows and build indexes.
+                // Reserve their complete conservative rebuild allowance under the
+                // same primary lock; a large upgrade must fail before mutation.
+                crate::capacity::allocated_bytes(&tx)?
+                    .checked_mul(8)
+                    .and_then(|n| n.checked_add(16 * 1024 * 1024))
+                    .ok_or_else(|| anyhow::anyhow!("migration capacity bound overflow"))?
+            };
             tx.execute_batch_bounded(sql, growth)
                 .with_context(|| format!("migration {target}"))?;
             tx.pragma_update(None, "user_version", target)?;

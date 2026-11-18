@@ -234,6 +234,120 @@ fn migrating_one_version_takes_only_baseline_and_migration_writer_locks() {
 }
 
 #[test]
+fn ban_list_migration_admits_core_store_with_large_reusable_allocation() {
+    let path = tmp_db_path("ban_list_migration_reusable_pages");
+    {
+        let conn = open_core_26(&path);
+        conn.execute_batch_bounded(
+            r#"INSERT INTO bans (id, guild_id, user_id, reason, created_at) VALUES
+                (7, 10, 123, 'original', '2026-01-01T00:00:00Z'),
+                (8, 10, 124, 'untouched', '2026-01-01T00:00:00Z');
+            INSERT INTO events (guild_id, event_type, actor_id, data, created_at) VALUES
+                (10, 'ban_reason_edit', 80, '{"ban_id":7,"reason":"old"}', '2026-01-02T00:00:00Z'),
+                (10, 'ban_reason_edit', 81, '{"ban_id":7,"reason":"Latest"}', '2026-01-03T00:00:00Z'),
+                (11, 'ban_reason_edit', 82, '{"ban_id":7,"reason":"foreign"}', '2026-01-04T00:00:00Z');
+            CREATE TABLE allocation_fixture (payload BLOB);
+            INSERT INTO allocation_fixture VALUES (zeroblob(280000000));
+            DROP TABLE allocation_fixture;"#,
+            300_000_000,
+        )
+        .unwrap();
+        let allocation = crate::capacity::sample(&conn).unwrap();
+        let reusable_pages: i64 = conn
+            .query_row("PRAGMA freelist_count", (), |row| Ok(row.get(0)?))
+            .unwrap();
+        assert!(reusable_pages as u64 * allocation.page_size >= 280_000_000);
+        assert!(allocation.allocated_bytes < crate::capacity::GROWTH_STOP_BYTES);
+    }
+
+    let db = Db::open(&path, 2).expect("core-26 store with reusable pages should upgrade");
+    db.with_conn_sync(|conn| {
+        let version: i64 = conn.query_row("PRAGMA user_version", (), |row| Ok(row.get(0)?))?;
+        assert_eq!(version, 27);
+        let edited: (String, String, i64, String, String) = conn.query_row(
+            "SELECT reason, list_edited_reason, list_reason_edited_by, list_reason_edited_at, list_reason
+             FROM bans WHERE id=7",
+            (),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+        assert_eq!(
+            edited,
+            ("original".into(), "Latest".into(), 81, "2026-01-03T00:00:00Z".into(), "latest".into())
+        );
+        let untouched: (Option<String>, String) = conn.query_row(
+            "SELECT list_edited_reason, list_reason FROM bans WHERE id=8",
+            (),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(untouched, (None, "untouched".into()));
+        Ok(())
+    })
+    .unwrap();
+    drop(db);
+    cleanup_db(&path);
+}
+
+#[test]
+fn ban_list_migration_rejects_payload_beyond_growth_budget_before_ddl() {
+    let path = tmp_db_path("ban_list_migration_capacity");
+    let conn = open_core_26(&path);
+    conn.execute_batch_bounded(
+        "INSERT INTO bans (guild_id, user_id, reason, created_at)
+         VALUES (10, 123, hex(zeroblob(1048576)), '2026-01-01T00:00:00Z');",
+        4 * 1024 * 1024,
+    )
+    .unwrap();
+    let allocated = crate::capacity::allocated_bytes(&conn).unwrap();
+    drop(conn);
+
+    // Leave room for the fixed DDL allowance, but not the legacy reason index entry
+    // and its conservative page allowance.
+    let growth_limit = allocated + 8 * 1024 * 1024;
+    let error = crate::db_compat::with_test_default_capacity_limits(
+        growth_limit,
+        crate::capacity::RECLAIM_STOP_BYTES,
+        || {
+            Db::open(&path, 2)
+                .err()
+                .expect("migration must refuse growth")
+        },
+    );
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("migration 27: application database capacity budget exhausted"),
+        "{message}"
+    );
+    let conn = Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", (), |row| Ok(row.get(0)?))
+        .unwrap();
+    assert_eq!(version, 26);
+    let columns: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_xinfo('bans') WHERE name GLOB 'list_*'",
+            (),
+            |row| Ok(row.get(0)?),
+        )
+        .unwrap();
+    assert_eq!(columns, 0);
+    drop(conn);
+    cleanup_db(&path);
+}
+
+fn open_core_26(path: &Path) -> Connection {
+    let conn = Connection::open(path).unwrap();
+    for (index, sql) in MIGRATIONS[..26].iter().enumerate() {
+        let tx = conn.transaction_primary_write().unwrap();
+        tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
+        tx.pragma_update(None, "user_version", (index + 1) as i64)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    write_meta_string_conn(&conn, META_BOOTSTRAP_COMPLETE, "26").unwrap();
+    conn
+}
+
+#[test]
 fn action_schema_upgrade_preserves_version_five_configuration_and_audits() {
     let path = tmp_db_path("queue_upgrade");
     let conn = Connection::open(&path).unwrap();
