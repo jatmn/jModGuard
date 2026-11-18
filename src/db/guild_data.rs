@@ -40,6 +40,7 @@ const MEMBER_GAP_AUTO_CLEAR_SCHEMA: &str =
 const ACCESS_ROLES_SCHEMA: &str = include_str!("../../migrations/guild/0018_access_roles.sql");
 const SERVER_NAMES_SCHEMA: &str = include_str!("../../migrations/guild/0019_server_names.sql");
 const CASE_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0020_case_list_orders.sql");
+const MEMBER_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0021_member_list_orders.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -562,6 +563,33 @@ fn initialize_store(
                 .saturating_add(1024 * 1024);
             tx.execute_batch_bounded(CASE_LIST_SCHEMA, index_bound)?;
         }
+        if version < 22 {
+            let (all, current, banned, previous): (u64, u64, u64, u64) = tx.query_row(
+                "SELECT COUNT(*), COUNT(*) FILTER (WHERE is_current=1),
+                        COUNT(*) FILTER (WHERE is_banned=1),
+                        COUNT(*) FILTER (WHERE ever_banned=1 AND is_banned=0)
+                 FROM guild_member_directory",
+                (),
+                |row| {
+                    Ok((
+                        row.get::<i64>(0)? as u64,
+                        row.get::<i64>(1)? as u64,
+                        row.get::<i64>(2)? as u64,
+                        row.get::<i64>(3)? as u64,
+                    ))
+                },
+            )?;
+            // Every row enters three indexes, plus four for each matching filter.
+            // Reserve 1 KiB for each name and numeric index set (including page
+            // overhead and a name up to 256 bytes), plus 1 MiB for the DDL.
+            let index_bound = all
+                .saturating_add(current)
+                .saturating_add(banned)
+                .saturating_add(previous)
+                .saturating_mul(1024)
+                .saturating_add(1024 * 1024);
+            tx.execute_batch_bounded(MEMBER_LIST_SCHEMA, index_bound)?;
+        }
         // Version 16 adds the optional immutable ban_attempt_tag to case JSON.
         // No DDL or rewrite of legacy cases: their absent tags must remain absent.
         tx.pragma_update(None, "user_version", VERSION)?;
@@ -592,6 +620,7 @@ fn initialize_store(
     tx.execute_batch_bounded(ACCESS_ROLES_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(SERVER_NAMES_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(CASE_LIST_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_LIST_SCHEMA, 32_000_000)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
@@ -681,6 +710,7 @@ impl GuildDataStore {
                     (ACCESS_ROLES_SCHEMA, 19),
                     (SERVER_NAMES_SCHEMA, 20),
                     (CASE_LIST_SCHEMA, 21),
+                    (MEMBER_LIST_SCHEMA, 22),
                 ];
                 for (sql, at) in batches {
                     if *at <= version {

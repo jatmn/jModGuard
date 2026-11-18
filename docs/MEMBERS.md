@@ -119,6 +119,22 @@ The page searches saved user IDs, pasted mentions, display names, and usernames;
 no per-search Discord request runs. Name fallback is server nickname, global
 display name, username, then ID. Results can be filtered by current membership,
 current ban, previous ban, and known join-date range (UTC calendar dates).
+Current members and newest join first are the defaults. The Member, User ID,
+Joined and Status headings each toggle between ascending and descending.
+Member names are ordered by the displayed name with ASCII case ignored.
+Unknown join dates use zero for ordering and stay outside date filters.
+Ties use numeric user ID in the selected direction. The URL saves the sort and
+filters. Changes restart pagination from the first page.
+
+The Members API accepts `sort=name|user_id|joined|status` and `dir=asc|desc`.
+Use `from` and `to` for inclusive UTC join dates. The existing `joined_from`,
+`joined_to`, `joined_newest` and `joined_oldest` inputs are still accepted.
+Each page returns an opaque `next_cursor` bound to its sort and direction.
+Use that value as `after` with the same filters. Paging reads the current saved
+directory, so changes to a member's sort value between requests can move it
+across the cursor. The sort and status filters use scoped indexes. Substring
+search and join-date restrictions can examine additional rows in that index.
+
 A case file's **Member page** link opens this search for that user ID across all
 retained members, so banned and departed subjects are found too.
 Displayed timestamps use the viewer's local time zone. History is paginated and

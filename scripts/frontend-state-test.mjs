@@ -1191,9 +1191,9 @@ const memberImportStatus = (panel) => findNode(memberImport(panel), n => n.getAt
 const memberCoverage = (panel) => findNode(panel, n => n.id === 'member-coverage-notice');
 // A visible filter label must name its control through the DOM association.
 function memberLabelled(panel, text) {
-  const label = findNode(panel, n => n.localName === 'label' && textOf(n) === text);
+  const label = findNode(panel, n => n.localName === 'label' && n.firstChild?.textContent === text);
   assert(label, `missing visible label ${text}`);
-  const control = label.ownerDocument.getElementById(label.htmlFor);
+  const control = label.control;
   assert(control, `label ${text} is not associated with a control`);
   assert.equal(control.getAttribute('aria-labelledby')?.split(' ').includes(label.id) || control.labels?.[0] === label, true);
   return control;
@@ -2065,7 +2065,11 @@ test('Members labels its filters and counts first, middle, last and empty pages'
   assert.equal(status.localName, 'select');
   assert.equal(memberLabelled(panel, 'Joined from (UTC)').type, 'date');
   assert.equal(memberLabelled(panel, 'Joined to (UTC)').type, 'date');
-  assert.equal(memberLabelled(panel, 'Sort').localName, 'select');
+  assert.equal(status.selectedOptions[0].textContent, 'Current members');
+  assert.match(textOf(panel), /Default order is newest join first/);
+  assert.match(panel.querySelector('th[aria-sort="descending"]').textContent, /JoinedNewest first/);
+  assert.deepEqual([...panel.querySelectorAll('thead button')].map(node => node.firstChild.textContent),
+    ['Member', 'User ID', 'Joined', 'Status']);
   const count = () => textOf(findNode(panel, n => n.getAttribute?.('aria-live') === 'polite'));
   const button = (label) => findNode(panel, n => n.localName === 'button' && textOf(n) === label);
   assert.equal(count(), 'Page 1 · 1–50');
@@ -2201,21 +2205,57 @@ test('Members filter, date, and sort changes discard old history and list respon
   assert.match(oldList.url, /status=banned/);
   const date = memberLabelled(panel, 'Joined from (UTC)');
   date.value = '2026-09-01';
-  fire(date, 'input');
+  fire(date, 'change');
   assert.equal(oldList.opts.signal.aborted, true);
   oldList.resolve(response({ members: [{ user_id: '10002', display_name: 'Wrong Filter' }] }));
   await settle();
   assert.doesNotMatch(textOf(panel), /Wrong Filter/);
-  const sort = memberLabelled(panel, 'Sort');
-  sort.value = 'joined_oldest';
-  fire(sort, 'change');
-  assert.equal([...h.timers.values()].filter(timer => timer.delay === 300).length, 0);
+  const datedList = pending.filter(item => item.type === 'list').at(-1);
+  fire(panel.querySelector('th[aria-sort="descending"] button'), 'click');
+  assert.equal(datedList.opts.signal.aborted, true);
+  assert.match(panel.querySelector('th[aria-sort="ascending"]').textContent, /JoinedOldest first/);
   const newList = pending.filter(item => item.type === 'list').at(-1);
-  assert.match(newList.url, /joined_from=2026-09-01/);
-  assert.match(newList.url, /sort=joined_oldest/);
+  const query = new URLSearchParams(newList.url.split('?')[1]);
+  for (const [key, value] of Object.entries({ from: '2026-09-01', status: 'banned', sort: 'joined', dir: 'asc' })) {
+    assert.equal(query.get(key), value);
+  }
   newList.resolve(response({ members: [{ user_id: '10007', display_name: 'Right Filter' }] }));
   await settle();
   assert.match(textOf(panel), /Right Filter/);
+});
+
+test('Members restores sort and filters from its URL and discards the cursor on sort', async () => {
+  const queries = [];
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync')) return response({ status: 'complete' });
+    queries.push(new URLSearchParams(url.split('?')[1]));
+    return response({ members: [{ user_id: '41' }], next_cursor: 'next-member' });
+  });
+  const guild = h.app.state.guilds[1].id;
+  h.location.search = `?list=members&guild=${guild}&sort=name&dir=desc&status=all&q=example&to=2026-11-16`;
+  h.app.restoreWorkspace();
+  assert.equal(h.app.state.guildId, guild);
+  assert.equal(h.app.state.tab, 'members');
+  const panel = memberView(h);
+  await settle();
+  assert.equal(memberLabelled(panel, 'Search').value, 'example');
+  assert.equal(memberLabelled(panel, 'Status').value, 'all');
+  assert.equal(memberLabelled(panel, 'Joined to (UTC)').value, '2026-11-16');
+  const descending = panel.querySelector('th[aria-sort="descending"] button');
+  assert.equal(descending.textContent, 'Member');
+  const down = descending.querySelector('svg path').getAttribute('d');
+  await fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Next page'), 'click');
+  assert.equal(queries.at(-1).get('after'), 'next-member');
+  await fire(descending, 'click');
+  assert.equal(queries.at(-1).has('after'), false);
+  const ascending = panel.querySelector('th[aria-sort="ascending"] button');
+  assert.notEqual(ascending.querySelector('svg path').getAttribute('d'), down);
+  const location = new URLSearchParams(h.location.search);
+  for (const [key, value] of Object.entries({ sort: 'name', dir: 'asc', q: 'example', status: 'all', to: '2026-11-16' })) {
+    assert.equal(queries.at(-1).get(key), value);
+    assert.equal(location.get(key), value);
+  }
+  assert.equal(location.has('after'), false);
 });
 
 test('Members drops responses from a previous server and page enrollment', async () => {
@@ -8996,6 +9036,8 @@ test('Shared list controls restore, debounce, sort, clear and write the list URL
   await settle();
   assert.equal(controls.query().get('outcome'), 'active');
   assert.equal(controls.query().get('from'), '2026-01-01');
+  assert.equal(root.querySelector('select option').textContent, 'Any status');
+  assert.match(root.querySelector('label:has(input[type="date"])').textContent, /From \(UTC\)/);
   const descending = root.querySelector('th[aria-sort="descending"] button');
   assert.equal(descending.textContent, 'Reason');
   const down = descending.querySelector('svg path').getAttribute('d');
