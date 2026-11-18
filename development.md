@@ -151,6 +151,27 @@ feature requires granting the consuming repository Read access under the
 package's **Manage Actions access** settings; it does not provide
 Git fetch authentication.
 
+The [dependency audit](https://github.com/jatmn/jModGuard/issues/668) tracks
+these constraints on Rust updates.
+
+- Serenity 0.12.5 enables reqwest's `rustls-tls` feature, and the bot passes
+  reqwest responses to Serenity. Moving both to reqwest 0.13 needs a release
+  containing [Serenity's TLS feature change](https://github.com/serenity-rs/serenity/pull/3492).
+- Serenity also requires tokio-tungstenite 0.21. The patch under `vendor/`
+  exposes that version using 0.24 sources for rustls 0.23. Serenity constructs
+  `WebSocketConfig` with a struct literal. Tungstenite 0.25 made that type
+  non-exhaustive. The bot's independent test server already uses 0.30.
+- The libSQL remote client and connector still use Hyper 0.14. The h2 0.3
+  advisory exception and expiry are tracked in [#349](https://github.com/jatmn/jModGuard/issues/349).
+  Keep the parser Git patch until a published release includes the
+  [parser security fix](https://github.com/advisories/GHSA-8m95-fffc-h4c5).
+- Axum 0.8.9 pins matchit to 0.8.4, and crypto-common 0.1.7 pins
+  generic-array to 0.14.7. Cargo can advance those copies when the parents
+  relax their exact requirements.
+- The Chrono advisory has no patched release. Its timestamp and serialization
+  types are shared with Serenity. Track [Chrono maintenance](https://github.com/chronotope/chrono/issues/1768)
+  before changing that contract.
+
 Dependabot alerts and security updates are separate repository settings.
 Keep both enabled under **Settings → Advanced Security → Dependabot**;
 the weekly schedule controls version updates, not the timing of security
