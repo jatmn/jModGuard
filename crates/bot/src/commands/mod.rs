@@ -2449,7 +2449,8 @@ mod tests {
                 assert!(!app.finish_slash_resync(changed, [10].into_iter().collect()));
                 response_status.store(200, Ordering::SeqCst);
                 requests.lock().clear();
-                tokio::time::sleep(std::time::Duration::from_secs(38)).await;
+                assert!(!sync_slash_commands_versioned_http(&app, &http, guild, changed).await);
+                assert!(requests.lock().is_empty(), "backoff must suppress the PUT");
                 assert_eq!(
                     app.pending_slash_registry_version().await.unwrap(),
                     Some(changed)
@@ -2460,6 +2461,15 @@ mod tests {
                     panic!("expected retry");
                 };
                 assert_eq!(guilds, vec![10]);
+                let after_backoff = std::time::Instant::now() + std::time::Duration::from_secs(38);
+                assert!(app.slash_sync_due(
+                    guild.get(),
+                    changed,
+                    &app.slash_registry_revision(),
+                    after_backoff,
+                ));
+                // Apply the elapsed backoff to the fixture before retrying over real HTTP.
+                app.reset_slash_guild_retry(guild.get());
                 assert!(sync_slash_commands_versioned_http(&app, &http, guild, changed).await);
                 assert!(app.finish_slash_resync(changed, Default::default()));
                 assert_eq!(
