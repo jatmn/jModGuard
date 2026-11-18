@@ -4900,6 +4900,25 @@ test('loadConfig reads guild config with POST', async () => {
   assert.deepEqual(calls[0], { url: `/api/guilds/${app.state.guildId}/config`, method: 'POST' });
 });
 
+test('signed-out dashboard links to public policies on the API origin', async () => {
+  for (const base of ['', 'https://api.example.test']) {
+    const h = harness(async () => ({
+      ok: false,
+      status: 401,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ error: 'not authenticated' }),
+    }));
+    h.window.JMODGUARD_API_BASE = base;
+    await h.app.init();
+    await settle();
+    const links = h.document.querySelectorAll('#login-view nav[aria-label="Policies"] a');
+    assert.deepEqual(Array.from(links, link => [link.textContent, link.getAttribute('href')]), [
+      ['Privacy Policy', `${base}/privacy`],
+      ['Terms of Service', `${base}/terms`],
+    ]);
+  }
+});
+
 test('unauthenticated settings save returns to login', async () => {
   const h = harness(async () => ({
     ok: false,

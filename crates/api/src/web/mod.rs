@@ -19,7 +19,7 @@ pub mod usage;
 use axum::extract::Query;
 use axum::http::header::{CACHE_CONTROL, COOKIE, SET_COOKIE, VARY};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{MethodRouter, get};
 use axum::{Json, Router};
 use std::sync::Arc;
@@ -1913,6 +1913,14 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             .route("/health/", get(health))
             .route("/ready", get(ready))
             .route("/ready/", get(ready))
+            .route(
+                "/privacy",
+                get(|| async { Html(include_str!("legal/privacy.html")) }),
+            )
+            .route(
+                "/terms",
+                get(|| async { Html(include_str!("legal/terms.html")) }),
+            )
             .merge(sessioned),
     )
     .with_state(app.clone())
@@ -2674,6 +2682,60 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"], "not authenticated", "{method} {uri}");
+    }
+
+    async fn assert_public_legal_page(
+        app: Router,
+        path: &str,
+        heading: &str,
+        text: &str,
+        related_link: &str,
+    ) {
+        let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let headers = response.headers();
+        assert_eq!(headers["content-type"], "text/html; charset=utf-8");
+        assert!(!headers.contains_key("set-cookie"), "{path}");
+        super::assert_uncacheable_headers(headers);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        assert!(html.contains(&format!("<h1>{heading}</h1>")), "{path}");
+        assert!(html.contains(text), "{path}");
+        assert!(html.contains(related_link), "{path}");
+        assert!(
+            html.contains("Send a direct message on Discord to <strong>jatmn</strong>"),
+            "{path}"
+        );
+        assert!(!html.contains("<script"), "{path}");
+    }
+
+    #[tokio::test]
+    async fn legal_pages_privacy_is_public_without_a_session() {
+        let app = test_app();
+        assert_public_legal_page(
+            app.clone(),
+            "/privacy",
+            "Privacy Policy",
+            "Request deletion or ask a privacy question",
+            r#"href="/terms""#,
+        )
+        .await;
+        assert_unauthenticated(app, "GET", "/api/me", "").await;
+    }
+
+    #[tokio::test]
+    async fn legal_pages_terms_are_public_without_a_session() {
+        assert_public_legal_page(
+            test_app(),
+            "/terms",
+            "Terms of Service",
+            "Using jModGuard",
+            r#"href="/privacy""#,
+        )
+        .await;
     }
 
     #[tokio::test]

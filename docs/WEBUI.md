@@ -2,8 +2,8 @@
 
 The WebUI is a single-page admin app. On a laptop it is served by
 **`jmodguard-api`** (feature `embed-ui`). On Bunny it is built files from `dist/frontend/`
-on Storage/CDN; the API container stays private and only answers `/api`,
-login, and OAuth. The pages never open SQL from the browser. They call the
+on Storage/CDN; the API container stays private and the CDN forwards selected
+paths to it. The dashboard never opens SQL from the browser. It calls the
 API; the API (and the bot) open the database. If the CDN page loads while
 the API is still starting, `POST /api/me` (and `GET /api/me`) returns `503` `{error:"not ready"}`
 and the UI keeps waiting (up to eight minutes). Consecutive `502`/`504`,
@@ -17,6 +17,32 @@ and Discord's return still completes the handshake.
 
 Start `jmodguard-bot` once first so the database is migrated, then start
 `jmodguard-api`. Both use the same local SQLite file or remote libSQL database.
+
+## Public policy pages
+
+[Privacy Policy](../crates/api/src/web/legal/privacy.html) is served at
+`/privacy` and [Terms of Service](../crates/api/src/web/legal/terms.html) at
+`/terms`. The API serves both in either build. They return HTML without
+sign-in or JavaScript and use the dashboard’s stylesheet when available.
+The signed-out dashboard links to both.
+
+When the dashboard is hosted separately, forward both paths to the API
+alongside the existing proxied paths, or use the API origin in a split-origin
+setup. See [Bunny edge rules](DEPLOY-BUNNY.md#5-point-api-paths-on-the-pull-zone-at-the-api-container).
+Before registering the URLs with Discord, deploy the API and WebUI, then
+open both paths on the public origin in a signed-out window. Check that each
+returns its own HTML with HTTP 200 and that both sign-in links reach it.
+
+For privacy questions or deletion requests, send a direct message on Discord
+to `jatmn` from the account the request is about. Before acting on a deletion
+request, verify the sender’s Discord account and use its Discord user ID.
+Review that account’s live
+member-directory and message-snapshot data across the hosted guild stores.
+Coordinate the manual removal with the operator responsible for the bot’s
+guild-store writes so queued work and member sync are accounted for. Preserve
+moderation cases and their history. Confirm what was removed and what was
+retained to the requester privately. The policy gives the initial response
+target and explains that later Discord events can recreate entries.
 
 ## Getting and hosting the files
 
@@ -169,7 +195,8 @@ serves them at `http://localhost:8080`.
    DEPLOY-BUNNY.md). Do not
    use Override Origin: Magic Containers on a Storage Pull Zone. Leave
    `window.JMODGUARD_API_BASE` unset. Strip Response Cookies must be off
-   (Caching → General; `DisableCookies=false`).
+   (Caching → General; `DisableCookies=false`). Add the separate public policy
+   rule for `/privacy` and `/terms` described in [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md#5-point-api-paths-on-the-pull-zone-at-the-api-container).
 
 For the initial bootstrap only, upload all five files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. After that, GitHub Actions **Publish** builds an independent WebUI package to GHCR on trusted publication builds; it does not upload it to Bunny directly. The owner installs it from **Administration → Updates**, and the API writes it to Storage with `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, and `BUNNY_STORAGE_ENDPOINT`, then purges the Pull Zone when both `BUNNY_PULL_ZONE_ID` and a scoped `BUNNY_PURGE_API_KEY` (where the Bunny account offers scoped keys; otherwise purge from the dashboard) are set on the API container (never git); see
 [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) and [BUNNY-UPDATES.md](BUNNY-UPDATES.md#storage-zone-publication). A private ops repo is **not required** to install.

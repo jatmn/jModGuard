@@ -480,8 +480,17 @@ On the Pull Zone from step 2 (Storage origin for the files):
    stripped. If you update the zone via the Bunny API, send only the
    fields you are changing — posting the full GET body back fails
    (`model.invalid` on `id`).
-5. Everything else stays on Storage (`/`, `/app.js`, `/style.css`). daisyUI and
+5. Add a separate edge rule for the exact paths `/privacy` and `/terms` on
+   the public origin. Use the same **Override Origin URL**, **Bypass
+   Perma-Cache**, and **Override Cache Time = 0** actions. The API serves
+   both pages in the Bunny build. The separate rule keeps the existing
+   path patterns within Bunny’s per-trigger limit.
+6. Everything else stays on Storage (`/`, `/app.js`, `/style.css`). daisyUI and
    Headless UI are included in those built CSS/JS files.
+
+After rollout, request both policy paths on the public origin without cookies.
+Each should return HTTP 200 and its policy HTML before you register the URLs
+with Discord.
 
 After this, a browser on the **public admin host** (`JMODGUARD_WEB_BASE_URL`:
 the Pull Zone `*.b-cdn.net` hostname, or the owned domain/subdomain if you

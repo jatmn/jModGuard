@@ -40,6 +40,14 @@ path.
 - **Prefix + slash commands**, multi-server, Linux binary (SQLite and
   TLS are bundled — zero system dependencies).
 
+## Privacy and terms
+
+The dashboard serves the [Privacy Policy](crates/api/src/web/legal/privacy.html)
+at `/privacy` and the [Terms of Service](crates/api/src/web/legal/terms.html)
+at `/terms`. Both are available without signing in. For privacy questions or deletion requests, send
+a direct message on Discord to `jatmn`. See [WebUI policy pages](docs/WEBUI.md#public-policy-pages)
+for hosting and rollout details.
+
 ## Quick start
 
 While this repository is private, authenticate **HTTPS** GitHub access

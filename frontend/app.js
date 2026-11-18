@@ -1484,6 +1484,12 @@ function App() {
                       h(Icon, { name: "external-link" }),
                     ),
                     h("small", null, "For server managers and community builders."),
+                    h(
+                      "nav",
+                      { className: "legal-links", "aria-label": "Policies" },
+                      h("a", { href: apiUrl("/privacy") }, "Privacy Policy"),
+                      h("a", { href: apiUrl("/terms") }, "Terms of Service"),
+                    ),
                   )
                 : h(
                     React.Fragment,
