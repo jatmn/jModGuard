@@ -3025,6 +3025,10 @@ async fn baked_bot_migrates_queued_protocol3_core16_without_starting_api_early()
         db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
             tx.execute_batch_bounded(
+                include_str!("../../../tests/fixtures/before-core-0027.sql"),
+                1024 * 1024,
+            )?;
+            tx.execute_batch_bounded(
                 "DROP TABLE known_spam; DROP TABLE gateway_ban_deliveries; DROP TABLE known_bad_images; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id;
                  DROP INDEX idx_bans_guild_id; DROP INDEX bot_actions_expiry;
                  DROP INDEX idx_bans_one_active; ALTER TABLE bans DROP COLUMN operation_id;
@@ -3354,6 +3358,10 @@ async fn stale_schema_selections_without_upgrade_are_refused_once_after_migratio
         let fixture = fixture.clone();
         move |conn| {
             let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(
+                include_str!("../../../tests/fixtures/before-core-0027.sql"),
+                1024 * 1024,
+            )?;
             tx.execute_batch_bounded(
                 "DROP TABLE known_spam; DROP TABLE gateway_ban_deliveries; DROP TABLE known_bad_images; DROP INDEX idx_events_guild_id; DROP INDEX idx_events_guild_type_id;
                  DROP INDEX idx_bans_guild_id; DROP INDEX bot_actions_expiry;

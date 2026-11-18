@@ -55,9 +55,28 @@ Backend permissions and lifecycle coordination remain mandatory before service a
 | `case` | Read one live scoped record. Missing/deleted returns `None`; a record above the supplied byte/evidence budget fails without transferring an oversized SQL payload or erasing data. |
 | `case_ids` | Bounded keyset page of live IDs only, in opaque ID order, not chronological order. No evidence payloads or offset scan. |
 | `matching_case_ids` | The same keyset page limited to live records whose stored action, outcome, subject and actor match every supplied `CaseFilter` field. A narrow filter may read past many non-matching rows to fill a page; removed records never match. |
+| `list_cases` | A scoped page of live case summaries and a sort position, read in one primary snapshot. |
 | `case_summaries` | List fields for one ID page in one snapshot: action, outcome, subject, optional actor, source kind (`application`, `gateway_observation` or `discord_audit`) and time. Reason, source identifiers and evidence stay detail-only. |
 | `remove_case` | Atomically remove all retained payload, leaving only replay identities. Returns whether a live payload was removed; repeated/missing removal is a write-free false. |
 | `purge_closed_cases` | Delete at most a supplied batch of payloads/replay markers after exact membership closure. Refuse an active scope; an empty batch writes nothing. |
+
+The Cases dashboard uses `GET/POST /api/guilds/{id}/cases`. It defaults to
+`sort=date&dir=desc` by action time, breaking ties by case ID in the same direction.
+Other sort keys are `case`, `action`, `subject`, `actor` and `outcome`. Subject and
+moderator sort by their numeric Discord IDs, with missing moderator IDs before
+recorded IDs in ascending order. Each request after the first sends the last
+response's opaque `next_cursor` as the URL-encoded `after` with the same sort and
+filters. A null cursor marks the final page. Removed-case recovery keeps its
+ID-order paging.
+
+Exact filters are `action`, `outcome` (also accepted as `status`), `subject` and
+`actor`. The `from` and `to` dates are inclusive UTC calendar days in
+`YYYY-MM-DD` form. Search `q` matches a literal substring in the case ID, user
+IDs, stored action, outcome or reason. SQLite's lowercasing makes ASCII case
+insensitive. Detail fields such as reasons and evidence stay out of the list
+response. Guild-scoped indexes support both directions and seek past the last
+sort value and ID, even if that row has since been removed. Text search can read
+past nonmatching entries within that index range.
 
 `CaseLimits` is trusted installation policy: defaults are64KiB serialized record size,
 32 selected excerpts and100 IDs/cleanup rows per request. All three are configurable through

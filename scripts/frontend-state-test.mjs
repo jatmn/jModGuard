@@ -32,6 +32,8 @@ const chartsSource = fs.readFileSync(new URL('../frontend/charts.js', import.met
   .replaceAll('export const', 'const').replaceAll('export function', 'function');
 const iconsSource = fs.readFileSync(new URL('../frontend/icons.js', import.meta.url), 'utf8')
   .replace(/^import .*;$/gm, '').replaceAll('export const', 'const').replaceAll('export function', 'function');
+const listControlsSource = fs.readFileSync(new URL('../frontend/list-controls.js', import.meta.url), 'utf8')
+  .replace(/^import .*;$/gm, '').replace(/^const h = React\.createElement;$/m, '').replaceAll('export function', 'function');
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
   .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, '\n');
 const pages = [];
@@ -101,13 +103,17 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     },
     set(target, key, value) { if (key === 'location') { location.href = value; return true; } return Reflect.set(target, key, value); },
   });
-  const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
+  const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) {
+      historyUrls.push(url);
+      const next = new URL(url, win.location.origin);
+      Object.assign(location, {pathname: next.pathname, search: next.search, hash: next.hash});
+    } },
     React, useSyncExternalStore, useState, useEffect, useLayoutEffect, useRef, createContext, useContext, createRoot, flushSync,
     Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea,
     fetch: fetchImpl, console, AbortController, URLSearchParams, URL: win.URL, Blob: win.Blob, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId, COMMAND_BEHAVIORS, PLAN_STEP_LABELS, planStepFor})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${listControlsSource}\n${source}\n({ListControls, ListSortHeading, ListEmptyRow, useListControls, state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId, COMMAND_BEHAVIORS, PLAN_STEP_LABELS, planStepFor})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -142,7 +148,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   const elements = { find: predicate => collect().find(predicate), filter: predicate => collect().filter(predicate), some: predicate => collect().some(predicate), [Symbol.iterator]: function* () { yield* collect(); } };
   vm.runInContext('root.render(h(App));', context);
   pages.push({dom, roots});
-  return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, advanceTime(ms) { clockOffsetMs += ms; } };
+  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, advanceTime(ms) { clockOffsetMs += ms; } };
 }
 
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
@@ -198,31 +204,31 @@ test('Bans cells name people with ID chips, label automod and keep the original 
   const user = edited.cells[0];
   assert.equal(findNode(user, n => n.localName === 'strong').textContent, 'Test-User-1');
   assert.match(textOf(user), /@test-user-1/);
-  const chip = findNode(user, n => String(n.className).includes('id-chip'));
+  const chip = findNode(edited.cells[1], n => String(n.className).includes('id-chip'));
   assert.equal(chip.textContent, '9007199254740993', 'the ID is a chip, not inline text');
   assert.ok(findNode(chip, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Copy user ID 9007199254740993'));
   assert.doesNotMatch(textOf(edited), /\(test-user-1, 9007199254740993\)/);
-  assert.equal(textOf(edited.cells[1]), 'Banned');
-  assert.ok(findNode(edited.cells[1], n => String(n.className).includes('badge-error')));
-  assert.match(textOf(edited.cells[2]), /test-mod-1/);
-  assert.equal(findNode(edited.cells[2], n => String(n.className).includes('id-chip')).textContent, '9007199254740995');
+  assert.equal(textOf(edited.cells[2]), 'Banned');
+  assert.ok(findNode(edited.cells[2], n => String(n.className).includes('badge-error')));
+  assert.match(textOf(edited.cells[3]), /test-mod-1/);
+  assert.equal(findNode(edited.cells[3], n => String(n.className).includes('id-chip')).textContent, '9007199254740995');
   // The edited jModGuard reason leads; the original and the editor stay visible.
-  assert.equal(findNode(edited.cells[3], n => String(n.className).split(' ').includes('ban-reason')).textContent, 'Spamming invite links in #general');
-  assert.match(textOf(edited.cells[3]), /Edited by test-mod-1/);
-  assert.match(textOf(edited.cells[3]), /Original: Spamming invites/);
-  assert.ok(findNode(edited.cells[4], n => n.localName === 'time' && n.getAttribute('title')), 'relative time with the full time on hover');
+  assert.equal(findNode(edited.cells[4], n => String(n.className).split(' ').includes('ban-reason')).textContent, 'Spamming invite links in #general');
+  assert.match(textOf(edited.cells[4]), /Edited by test-mod-1/);
+  assert.match(textOf(edited.cells[4]), /Original: Spamming invites/);
+  assert.ok(findNode(edited.cells[5], n => n.localName === 'time' && n.getAttribute('title')), 'relative time with the full time on hover');
   // Directory names fill rows the bot could not name; automod shows its rule, not an ID.
   assert.equal(findNode(automod.cells[0], n => n.localName === 'strong').textContent, 'Directory-Name');
   assert.match(textOf(automod.cells[0]), /@directory-user/);
-  assert.equal(textOf(automod.cells[2]), 'jModGuard (automod: spam_burst)');
-  assert.equal(findNode(automod.cells[3], n => String(n.className).split(' ').includes('ban-reason')).textContent, 'Repeated messages');
-  assert.equal(textOf(unknown.cells[2]), 'Unknown');
+  assert.equal(textOf(automod.cells[3]), 'jModGuard (automod: spam_burst)');
+  assert.equal(findNode(automod.cells[4], n => String(n.className).split(' ').includes('ban-reason')).textContent, 'Repeated messages');
+  assert.equal(textOf(unknown.cells[3]), 'Unknown');
   assert.doesNotMatch(textOf(unknown), /Unavailable/);
-  const placeholder = findNode(unknown.cells[3], n => n.localName === 'span' && n.textContent === 'No reason given');
+  const placeholder = findNode(unknown.cells[4], n => n.localName === 'span' && n.textContent === 'No reason given');
   assert.ok(String(placeholder.className).includes('muted'));
-  assert.equal(textOf(unknown.cells[1]), 'Unbanned');
+  assert.equal(textOf(unknown.cells[2]), 'Unbanned');
   // Long reasons stay clamped until clicked.
-  const reason = findNode(automod.cells[3], n => String(n.className).split(' ').includes('ban-reason'));
+  const reason = findNode(automod.cells[4], n => String(n.className).split(' ').includes('ban-reason'));
   assert.equal(reason.getAttribute('aria-expanded'), 'false');
   await fire(reason, 'click');
   assert.equal(reason.getAttribute('aria-expanded'), 'true');
@@ -237,10 +243,82 @@ test('a ban with a moderator and an automod rule shows both', async () => {
   const rows = { bans: [{ id: 4, user_id: '9007199254740993', user_name: 'test-user-1', user_display_name: null, moderator_id: '9007199254740995', moderator_name: 'test-mod-1', active: true, reason: '[automod:spam_burst] Repeated messages', created_at: '2020-01-01T12:00:00Z' }], names: {} };
   const h = harness(async () => response(rows));
   const root = await bansView(h);
-  const cell = root.querySelector('tbody tr').cells[2];
+  const cell = root.querySelector('tbody tr').cells[3];
   assert.equal(findNode(cell, n => n.localName === 'strong').textContent, 'test-mod-1', 'the moderator who acted stays');
   assert.equal(findNode(cell, n => String(n.className).includes('id-chip')).textContent, '9007199254740995');
   assert.match(textOf(cell), /jModGuard \(automod: spam_burst\)/, 'the rule is not dropped');
+});
+
+test('Bans maps its columns, filters, row people, and paging onto the shared list controls', async () => {
+  const requests = [];
+  const next = '{"anchor":{"id":2,"value":"reason & %"}}';
+  const f = harness(async (path, opts) => {
+    if (!path.includes('/bans?')) return response({});
+    assert.equal(opts.method, 'POST');
+    const query = new URL(path, 'https://fixture.test').searchParams;
+    requests.push(query);
+    const moderators = [{ id: '9007199254740995', name: 'test-mod-1' }, { id: '50', name: 'Older moderator' }];
+    if (query.has('reason')) return response({ bans: [], moderators, total: 0, next_cursor: null });
+    return response({ ...banRows(), moderators, total: 78, next_cursor: query.has('after') ? null : next });
+  });
+  const originalGuild = f.app.state.guildId;
+  const guild = f.app.state.guilds[1].id;
+  f.location.search = `?list=bans&guild=${guild}&sort=reason&dir=desc&q=seed`;
+  f.app.restoreWorkspace();
+  assert.notEqual(f.app.state.guildId, originalGuild);
+  assert.equal(f.app.state.tab, 'bans');
+  const root = await bansView(f);
+  const request = () => requests.at(-1);
+  const button = (text) => findNode(root, n => n.localName === 'button' && n.textContent === text);
+  assert.equal(request().get('q'), 'seed');
+  assert.equal(root.querySelector('th[aria-sort="descending"]').textContent, 'Reason');
+  assert.deepEqual([...root.querySelectorAll('th button')].map(n => n.textContent),
+    ['Banned user', 'ID', 'Status', 'Moderator', 'Reason', 'Time']);
+  const [moderator, status] = root.querySelectorAll('[aria-label="Filter bans"] select');
+  assert.equal([...moderator.options].find(option => option.value === '50')?.textContent, 'Older moderator (50)');
+  assert.match(root.textContent, /78 matching bans/);
+  await fire(button('Next page'), 'click');
+  assert.equal(request().get('after'), next);
+  assert.equal(request().get('q'), 'seed');
+  assert.equal(button('Next page').disabled, true);
+  await fire(button('ID'), 'click');
+  assert.equal(request().get('sort'), 'id');
+  assert.equal(request().get('dir'), 'asc');
+  assert.equal(request().get('after'), null);
+  await fire(button('ID'), 'click');
+  assert.equal(request().get('dir'), 'desc');
+  await fire(root.querySelector('a[aria-label^="Filter by user Test-User-1"]'), 'click');
+  assert.equal(request().get('subject'), '9007199254740993');
+  assert.equal(request().get('q'), null);
+  await fire(root.querySelector('a[aria-label^="Filter by moderator test-mod-1"]'), 'click');
+  assert.equal(request().get('actor'), '9007199254740995');
+  assert.equal(request().get('subject'), null);
+  assert.equal(moderator.value, '9007199254740995');
+  status.value = 'unbanned';
+  await fire(status, 'change');
+  assert.equal(request().get('status'), 'unbanned');
+  const input = root.querySelector('input[placeholder="Name or ID"]');
+  input.value = 'Test-User';
+  await fire(input, 'input');
+  assert.equal(request().get('subject'), null);
+  await [...f.timers.values()].find(timer => timer.delay === 300).fn();
+  assert.equal(request().get('subject'), 'Test-User');
+  const reason = [...root.querySelectorAll('label')].find(label => label.textContent === 'Reason contains').querySelector('input');
+  reason.value = '  invite %  ';
+  await fire(reason, 'input');
+  await [...f.timers.values()].find(timer => timer.delay === 300).fn();
+  assert.equal(request().get('reason'), 'invite %');
+  assert.equal(request().get('actor'), '9007199254740995');
+  assert.equal(root.querySelector('tbody').textContent, 'No bans match these filters.');
+  assert.match(root.textContent, /0 matching bans/);
+  const location = new URL(f.historyUrls.at(-1), 'https://fixture.test').searchParams;
+  for (const key of ['subject', 'reason', 'actor', 'status', 'sort', 'dir']) assert.equal(location.get(key), request().get(key));
+  assert.equal(location.get('list'), 'bans');
+  assert.equal(location.get('guild'), guild);
+  await fire(button('Clear filters'), 'click');
+  for (const key of ['subject', 'reason', 'actor', 'status', 'q', 'after']) assert.equal(request().get(key), null);
+  assert.equal(reason.value, '');
+  assert.ok(root.querySelector('a[aria-label^="Filter by user Test-User-1"]'));
 });
 
 test('editing a ban reason saves the jModGuard reason and reloads the list', async () => {
@@ -4215,7 +4293,9 @@ test('case administration reaches later pages, all admitted history and inline e
       return response({history: Array.from({length: count}, (_, i) => ({id: `n${start + i + 1}`, sequence: String(start + i + 1), entry: {recorded_at_ms: 1, body: {note: {text: `note ${start + i + 1}`}}}}))});
     }
     if (u.pathname.endsWith('/evidence')) return response({evidence: []});
-    if (u.pathname.endsWith('/cases')) return response({cases: u.searchParams.has('after') ? ids.slice(50) : ids.slice(0, 50), can_delete: true});
+    if (u.pathname.endsWith('/cases')) return u.searchParams.has('after')
+      ? response({cases: ids.slice(50), can_delete: true, next_cursor: null})
+      : response({cases: ids.slice(0, 50), can_delete: true, next_cursor: 'opaque%2Fcursor'});
     return response({can_delete: true, case: {action: 'warning', evidence: {text: [{text: '<script>literal excerpt</script>', message_id: '9', channel_id: '8', author_id: '7'}]}}});
   });
   const root = await casesView(h);
@@ -4224,7 +4304,7 @@ test('case administration reaches later pages, all admitted history and inline e
   assert.equal(next.disabled, false);
   fire(next, 'click');
   await settle();
-  assert.ok(calls.some(url => url.includes(`after=${ids[49]}`)));
+  assert.ok(calls.some(url => new URL(url, 'https://fixture.test').searchParams.get('after') === 'opaque%2Fcursor'));
   const caseButton = findNode(root, n => n.localName === 'button' && n.getAttribute('aria-label') === `Open case ${ids[50]}`);
   fire(caseButton, 'click');
   await settle();
@@ -8888,6 +8968,63 @@ test('Case view keeps a saved note as saved when the timeline refresh fails', as
   assert.equal(findNode(caseDialog(h), n => n.localName === 'textarea').value, '');
 });
 
+test('Shared list controls restore, debounce, sort, clear and write the list URL', async () => {
+  const fixture = harness();
+  const { app } = fixture;
+  const guild = app.state.guildId;
+  fixture.location.search = `?list=example&guild=${guild}&outcome=active&sort=reason&dir=desc&from=2026-01-01`;
+  fixture.location.hash = '#preview=test';
+  const config = {
+    list: 'example', filterLabel: 'Filter example', defaultSort: 'date', defaultDir: 'desc',
+    columns: [{ key: 'date', label: 'When' }, { key: 'reason', label: 'Reason' }],
+    filters: [{ key: 'outcome', label: 'Status', options: { active: { label: 'Active' } } }],
+  };
+  let controls;
+  let changes = 0;
+  const root = fixture.mount(function ExampleList() {
+    controls = app.useListControls(config, guild, () => changes++);
+    return React.createElement(React.Fragment, null,
+      React.createElement(app.ListControls, { controls }),
+      React.createElement('table', null,
+        React.createElement('thead', null, React.createElement('tr', null,
+          ...config.columns.map(column => React.createElement(app.ListSortHeading, { key: column.key, controls, column })))),
+        React.createElement('tbody', null, React.createElement(app.ListEmptyRow, {
+          controls, empty: 'No entries.', filtered: 'No matching entries.', colSpan: 2,
+        }))),
+    );
+  });
+  await settle();
+  assert.equal(controls.query().get('outcome'), 'active');
+  assert.equal(controls.query().get('from'), '2026-01-01');
+  const descending = root.querySelector('th[aria-sort="descending"] button');
+  assert.equal(descending.textContent, 'Reason');
+  const down = descending.querySelector('svg path').getAttribute('d');
+  assert.equal(root.querySelector('tbody').textContent, 'No matching entries.');
+  const search = root.querySelector('input[type="search"]');
+  search.value = 'one';
+  await fire(search, 'input');
+  search.value = 'one %';
+  await fire(search, 'input');
+  assert.equal(changes, 0);
+  const pending = [...fixture.timers.values()].filter(timer => timer.delay === 300);
+  assert.equal(pending.length, 1);
+  await pending[0].fn();
+  assert.equal(changes, 1);
+  assert.equal(controls.query().get('q'), 'one %');
+  await fire(root.querySelector('th[aria-sort="descending"] button'), 'click');
+  const ascending = root.querySelector('th[aria-sort="ascending"] button');
+  assert.equal(ascending.textContent, 'Reason');
+  assert.notEqual(ascending.querySelector('svg path').getAttribute('d'), down);
+  const url = new URL(fixture.historyUrls.at(-1), 'https://fixture.test');
+  assert.equal(url.searchParams.get('q'), 'one %');
+  assert.equal(url.searchParams.get('dir'), 'asc');
+  assert.equal(url.hash, '#preview=test');
+  await fire(findNode(root, n => n.localName === 'button' && n.textContent === 'Clear filters'), 'click');
+  assert.equal(search.value, '');
+  assert.equal(controls.query().toString(), 'sort=reason&dir=asc');
+  assert.equal(root.querySelector('tbody').textContent, 'No entries.');
+});
+
 test('Cases rows open on click while their own buttons keep their action', async () => {
   const { calls, fetchImpl } = caseFixture();
   const h = harness(fetchImpl);
@@ -8909,7 +9046,7 @@ test('Cases filters send exact filters, restart at the first page and hide for r
   const root = await casesView(h);
   await settle();
   const lists = () => calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/cases')).map(c => new URL(c.url, 'https://fixture.test').searchParams);
-  const filters = root.querySelector('.case-filters');
+  const filters = root.querySelector('.list-filters');
   assert.ok(filters.hasAttribute('data-no-draft'));
   const [action, outcome] = filters.querySelectorAll('select');
   action.value = 'ban';
@@ -8920,7 +9057,7 @@ test('Cases filters send exact filters, restart at the first page and hide for r
   await fire(outcome, 'change');
   assert.equal(lists().at(-1).get('outcome'), 'failed');
   // Subject by pasted ID, moderator by member search.
-  const [subject, moderator] = filters.querySelectorAll('input');
+  const [subject, moderator] = filters.querySelectorAll('input[type="text"]');
   subject.value = CASE_SUBJECT;
   await fire(subject, 'input');
   await fire(subject, 'keydown', { key: 'Enter' });
@@ -8936,8 +9073,103 @@ test('Cases filters send exact filters, restart at the first page and hide for r
   await fire(findNode(root, n => n.localName === 'button' && n.textContent === 'Clear filters'), 'click', {});
   for (const key of ['action', 'outcome', 'subject', 'actor']) assert.equal(lists().at(-1).has(key), false, key);
   await fire(findNode(root, n => n.textContent === 'Removed records / retry cleanup'), 'click', {});
-  assert.equal(root.querySelector('.case-filters'), null);
+  assert.equal(root.querySelector('.list-filters'), null);
   assert.equal(lists().at(-1).get('removed'), 'true');
+});
+
+test('Cases maps sortable headers and a bookmarked filtered view to the API', async () => {
+  const { calls, fetchImpl } = caseFixture();
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  const lists = () => calls.map(call => new URL(call.url, 'https://fixture.test'))
+    .filter(url => url.pathname.endsWith('/cases')).map(url => url.searchParams);
+  assert.equal(lists().at(-1).get('sort'), 'date');
+  assert.equal(lists().at(-1).get('dir'), 'desc');
+  assert.match(root.querySelector('th[aria-sort="descending"]').textContent, /Newest first/);
+  for (const [label, sort] of [['Case', 'case'], ['Action', 'action'], ['Outcome', 'outcome'], ['Subject', 'subject'], ['Moderator', 'actor'], ['When', 'date']]) {
+    const button = [...root.querySelectorAll('thead button')].find(node => node.textContent === label);
+    await fire(button, 'click');
+    assert.equal(lists().at(-1).get('sort'), sort);
+    assert.equal(lists().at(-1).get('dir'), sort === 'date' ? 'desc' : 'asc');
+    assert.equal(lists().at(-1).has('after'), false);
+    await fire(button, 'click');
+    assert.equal(lists().at(-1).get('dir'), sort === 'date' ? 'asc' : 'desc');
+  }
+
+  const bookmarked = harness(fetchImpl);
+  const guild = bookmarked.app.state.guilds[1].id;
+  bookmarked.location.search = `?list=cases&guild=${guild}&sort=subject&dir=desc&q=review%25&from=2026-01-02&to=2026-01-03&outcome=failed`;
+  const { me, guilds } = bookmarked.app.state;
+  bookmarked.app.handleAuthLoss({ status: 401 });
+  await settle();
+  const login = bookmarked.document.getElementById('login-link');
+  login.addEventListener('click', event => event.preventDefault());
+  await fire(login, 'click', { button: 0 });
+  bookmarked.location.search = '';
+  Object.assign(bookmarked.app.state, { me, guilds });
+  bookmarked.app.restoreWorkspace();
+  assert.equal(bookmarked.app.state.guildId, guild);
+  assert.equal(bookmarked.app.state.tab, 'cases');
+  const restored = await casesView(bookmarked);
+  assert.equal(restored.querySelector('th[aria-sort="descending"]').textContent, 'Subject');
+  assert.equal(restored.querySelector('input[type="search"]').value, 'review%');
+  for (const [key, value] of Object.entries({
+    sort: 'subject', dir: 'desc', q: 'review%', from: '2026-01-02', to: '2026-01-03', outcome: 'failed',
+  })) assert.equal(lists().at(-1).get(key), value, key);
+});
+
+test('Cases resets its filters, sort and pending search on a server switch', async () => {
+  const { h, calls, trigger, options } = await switcherHarness(switcherGuilds);
+  const [first, second] = switcherGuilds;
+  h.location.search = `?list=cases&guild=${first.id}&sort=action&dir=asc&q=first&outcome=failed`;
+  const root = await casesView(h);
+  const search = root.querySelector('input[type="search"]');
+  assert.equal(search.value, 'first');
+  search.value = 'pending first';
+  await fire(search, 'input');
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 300));
+
+  await fire(trigger(), 'click');
+  await fire(options()[1], 'click');
+  const request = calls.findLast(call => call.startsWith(`POST /api/guilds/${second.id}/cases?`));
+  assert.ok(request, 'the new guild loads Cases');
+  const query = new URLSearchParams(request.split('?')[1]);
+  assert.equal(query.get('sort'), 'date');
+  assert.equal(query.get('dir'), 'desc');
+  assert.equal(query.has('q'), false);
+  assert.equal(query.has('outcome'), false);
+  assert.equal(h.document.querySelector('#content input[type="search"]').value, '');
+  assert.equal(new URLSearchParams(h.location.search).has('list'), false);
+  assert.equal([...h.timers.values()].some(timer => timer.delay === 300), false);
+});
+
+test('Cases restores pending search after reauthentication before debounce', async () => {
+  const { calls, fetchImpl } = caseFixture();
+  const h = harness(fetchImpl);
+  const { me, guilds, guildId } = h.app.state;
+  h.location.search = `?list=cases&guild=${guildId}&q=previous&outcome=failed`;
+  const root = await casesView(h);
+  const search = root.querySelector('input[type="search"]');
+  assert.equal(search.value, 'previous');
+  search.value = '  pending review %  ';
+  await fire(search, 'input');
+  const listRequests = () => calls.filter(call => call.url.split('?')[0].endsWith('/cases'));
+  assert.equal(listRequests().length, 1, 'typing has not issued a request yet');
+
+  h.app.handleAuthLoss({ status: 401 });
+  await settle();
+  const login = h.document.getElementById('login-link');
+  login.addEventListener('click', event => event.preventDefault());
+  await fire(login, 'click', { button: 0 });
+  assert.equal(listRequests().length, 1, 'saving the search does not request a page');
+  h.location.search = '';
+  Object.assign(h.app.state, { me, guilds });
+  h.app.restoreWorkspace();
+  const restored = await casesView(h);
+  assert.equal(restored.querySelector('input[type="search"]').value, 'pending review %');
+  const query = new URLSearchParams(listRequests().at(-1).url.split('?')[1]);
+  assert.equal(query.get('q'), 'pending review %');
+  assert.equal(query.get('outcome'), 'failed');
 });
 
 test('Case file links filter to the member\'s other cases and open their Members page', async () => {
@@ -8956,7 +9188,7 @@ test('Case file links filter to the member\'s other cases and open their Members
   assert.equal(caseDialog(h), null);
   const lastList = () => new URL(calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/cases')).at(-1).url, 'https://fixture.test').searchParams;
   assert.equal(lastList().get('subject'), CASE_SUBJECT);
-  assert.match(textOf(root.querySelector('.case-filters')), /Spammy/, 'the filter chip names the member');
+  assert.match(textOf(root.querySelector('.list-filters')), /Spammy/, 'the filter chip names the member');
   await openCase();
   await fire(findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Their other actions'), 'click', {});
   await settle();
