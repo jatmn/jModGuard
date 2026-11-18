@@ -294,7 +294,7 @@ fn standalone_bot_without_launcher_markers_is_not_gated() {
 
 #[test]
 fn guild_store_ahead_of_the_build_is_held_once_not_exited_for_a_launcher_restart() {
-    use jmodguard::db::guild_data::{GuildDataStore, GuildStoreOptions};
+    use jmodguard::db::guild_data::{GuildDataStore, GuildStoreOptions, SCHEMA_VERSION};
     use jmodguard::db::guild_stores::{StoreId, StorePolicy, StoreRegistration};
 
     let root = temp_root("store-ahead");
@@ -350,7 +350,7 @@ fn guild_store_ahead_of_the_build_is_held_once_not_exited_for_a_launcher_restart
         log.contains("unsupported guild-store schema")
             && log.contains(store_id.as_str())
             && log.contains("schema version 99")
-            && log.contains("expects 20"),
+            && log.contains(&format!("expects {SCHEMA_VERSION};")),
         "{log}"
     );
     let addr = health_addr(&wait_log(&running, "health listener"));

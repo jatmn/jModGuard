@@ -16,6 +16,7 @@ jmodguard = { path = "../.." }
 jmodguard-updater = { path = "../updater" }
 anyhow = "1"
 axum = { version = "0.8", features = ["json", "macros"] }
+base64 = "0.23.1"
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 percent-encoding = "2"

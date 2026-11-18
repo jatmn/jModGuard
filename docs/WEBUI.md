@@ -454,7 +454,7 @@ POST   /api/guilds/{id}/analytics      # same body as GET; SPA analytics tab
 POST   /api/platform/analytics         # owner-only, ?days=7|30|90 (default 30): fleet trends, previous-range totals, per-server rows, member directory totals
 GET    /api/guilds/{id}/actions
 POST   /api/guilds/{id}/actions        # same body as GET; SPA bot actions
-GET    /api/guilds/{id}/cases          # ?after=&limit=&removed=; live pages also ?action=&outcome=&subject=&actor=
+GET    /api/guilds/{id}/cases          # query options below
 POST   /api/guilds/{id}/cases          # same query as GET; SPA case list
 GET    /api/guilds/{id}/cases/{case}
 POST   /api/guilds/{id}/cases/{case}   # same body as GET
@@ -471,6 +471,30 @@ PUT    /api/guilds/{id}/access-roles       # {roles:[{role_id,level}], revision}
 
 Scopes in request bodies: `"scope": "guild" | "global"` (`global` requires
 bot owner).
+
+### Cases list
+
+The GET and POST list routes accept the same query parameters.
+
+| Parameter | Behavior |
+|---|---|
+| `sort` | `date` (default, by action time), `case` (case ID), `action`, `subject` (numeric ID), `actor` (numeric ID), or `outcome`. Case ID breaks ties. |
+| `dir` | `desc` (default) or `asc`. |
+| `action`, `outcome` (alias `status`), `subject`, `actor` | Exact filters. Subject and actor take decimal Discord IDs. |
+| `q` | Up to 200 characters of literal substring search over reason, case ID, action, outcome, subject ID and actor ID, with ASCII case folding. |
+| `from`, `to` | Inclusive UTC calendar dates in `YYYY-MM-DD` format. Either bound may be omitted. |
+| `limit` | Page size, default 50 and clamped to 1–100. |
+| `after` | Omit for the first page. Pass the previous page's opaque `next_cursor` unchanged. For live lists, keep the same guild, filters, sort and direction. A mismatch returns HTTP 400. |
+| `removed` | `true` lists IDs for cleanup in ascending order and requires Administrator permission. Use only `limit` and `after` with this mode. |
+
+The response includes `cases` (ordered IDs), `summaries` (keyed by case ID),
+`names`, `can_delete` and `next_cursor`. A null `next_cursor` means there are
+no more rows. Legacy live clients that omit `sort` and `dir` can still pass a
+bare case ID to continue in ascending ID order. Subsequent pages can use the
+returned cursor with the same parameters.
+
+The list reads current case outcomes. An outcome that settles between requests
+can move a case across the cursor when sorting by outcome.
 
 ## Auth & sessions
 

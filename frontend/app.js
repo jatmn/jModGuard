@@ -15,6 +15,10 @@ import {
   formatExact,
   sumSeries,
 } from "./charts.js";
+import {
+  clearListLocation, ListControls, ListEmptyRow, ListSortHeading, readListLocation,
+  flushPendingListSearch, rememberListLocation, restoreListLocation, useListControls,
+} from "./list-controls.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import React, { useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
 import { flushSync } from "react-dom";
@@ -314,6 +318,7 @@ async function switchGuild(guildId) {
   pendingCase = null;
   state.guildId = guildId;
   if (!tabAllowed(state.tab)) state.tab = "dashboard";
+  syncListLocation();
   state.config = null;
   ui.set({ edits: "clean" });
   persistWorkspace();
@@ -1479,7 +1484,10 @@ function App() {
                     ),
                     h(
                       "a",
-                      { id: "login-link", className: "btn btn-primary", href: authUrl("/login") },
+                      {
+                        id: "login-link", className: "btn btn-primary", href: authUrl("/login"),
+                        onClick: () => rememberListLocation(WORKSPACE_LISTS),
+                      },
                       "Continue with Discord",
                       h(Icon, { name: "external-link" }),
                     ),
@@ -1746,8 +1754,17 @@ function restoreWorkspace() {
   } catch (_) {
     /* Storage may be unavailable. */
   }
-  state.guildId = state.guilds.find((g) => g.id === saved.guildId)?.id || state.guilds[0]?.id || null;
-  state.tab = tabs.includes(saved.tab) && tabAllowed(saved.tab) ? saved.tab : "dashboard";
+  const { list, guild } = restoreListLocation(WORKSPACE_LISTS, state.guilds);
+  const linkedGuild = WORKSPACE_LISTS.has(list) && state.guilds.find((g) => g.id === guild);
+  state.guildId = linkedGuild?.id || state.guilds.find((g) => g.id === saved.guildId)?.id || state.guilds[0]?.id || null;
+  const destination = linkedGuild ? list : saved.tab;
+  state.tab = tabs.includes(destination) && tabAllowed(destination) ? destination : "dashboard";
+}
+
+function syncListLocation() {
+  const { list, guild } = readListLocation();
+  const config = WORKSPACE_LISTS.get(list);
+  if (config && (list !== state.tab || guild !== state.guildId)) clearListLocation(config);
 }
 
 function persistWorkspace() {
@@ -1805,6 +1822,7 @@ function navigate(tab) {
   if (!canLeave()) return false;
   ui.set({ view: "main-view", pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
   state.tab = tabs.includes(tab) && tabAllowed(tab) ? tab : "dashboard";
+  syncListLocation();
   persistWorkspace();
   renderTab();
   return true;
@@ -1952,6 +1970,7 @@ function handleAuthLoss(error) {
     return true;
   }
   if (ui.getSnapshot().view !== "login-view") {
+    if (state.tab === "cases" && state.guildId) flushPendingListSearch(state.tab, state.guildId);
     state.me = null;
     state.guilds = [];
     state.guildId = null;
@@ -7485,7 +7504,7 @@ function CasePersonCard({ role, id, names, automatic, guildId, onFilter, filterK
           ? h(
               ActionButton,
               // Shows all of this member's cases: the link replaces any other list filters.
-              { type: "button", className: "btn btn-sm btn-link", onClick: () => leaveCaseView(() => onFilter({ ...CASE_FILTERS_EMPTY, [filterKey]: id }, person.name)) },
+              { type: "button", className: "btn btn-sm btn-link", onClick: () => leaveCaseView(() => onFilter(filterKey, id, person.name)) },
               role === "Subject" ? "Their other cases" : "Their other actions",
             )
           : null,
@@ -7880,20 +7899,60 @@ function CaseView({ guildId, caseId, onRemoved, onFilter }) {
   );
 }
 
-const CASE_FILTERS_EMPTY = { action: "", outcome: "", subject: "", actor: "" };
+const CASE_LIST = {
+  list: "cases",
+  filterLabel: "Filter cases",
+  searchPlaceholder: "Reason, case or user ID, action, outcome",
+  defaultSort: "date",
+  defaultDir: "desc",
+  filters: [
+    { key: "action", label: "Action", options: CASE_ACTIONS },
+    { key: "outcome", label: "Outcome", options: CASE_OUTCOMES },
+    { key: "subject", label: "Subject", kind: "user", idLabel: "Subject user ID" },
+    { key: "actor", label: "Moderator", kind: "user", idLabel: "Moderator user ID" },
+  ],
+  columns: [
+    { key: "case", label: "Case" },
+    { key: "action", label: "Action" },
+    { key: "outcome", label: "Outcome" },
+    { key: "subject", label: "Subject", title: "Sort by subject ID" },
+    { key: "actor", label: "Moderator", title: "Sort by moderator ID" },
+    { key: "date", label: "When", initialDir: "desc", orderLabels: { desc: "Newest first", asc: "Oldest first" } },
+  ],
+};
+const BANS_LIST = {
+  list: "bans",
+  filterLabel: "Filter bans",
+  defaultSort: "date",
+  defaultDir: "desc",
+  searchPlaceholder: "User, ID, reason or moderator",
+  columns: [
+    { key: "subject", label: "Banned user" },
+    { key: "id", label: "ID" },
+    { key: "status", label: "Status" },
+    { key: "actor", label: "Moderator" },
+    { key: "reason", label: "Reason" },
+    { key: "date", label: "Time", initialDir: "desc", orderLabels: { desc: "Newest first", asc: "Oldest first" } },
+  ],
+  filters: [
+    { key: "subject", label: "User", kind: "text", placeholder: "Name or ID" },
+    { key: "actor", label: "Moderator" },
+    { key: "reason", label: "Reason contains", kind: "text" },
+    { key: "status", label: "Status", options: { active: { label: "Active" }, unbanned: { label: "Unbanned" } } },
+  ],
+};
+
+const WORKSPACE_LISTS = new Map([[CASE_LIST.list, CASE_LIST], [BANS_LIST.list, BANS_LIST]]);
 
 function tabCases() {
   const guildId = state.guildId;
   const handlers = useRef({});
-  const [rows, setRows] = useState([]);
+  const [rows, setRows] = useState(null);
   const [loading, setLoading] = useState(true);
   const [pagination, setPagination] = useState({ first: true, next: true });
   const [canDelete, setCanDelete] = useState(false);
   const [removedView, setRemovedView] = useState(false);
-  const [filters, setFilters] = useState(CASE_FILTERS_EMPTY);
-  const filtersRef = useRef(CASE_FILTERS_EMPTY);
-  const subjectIds = useRef([]).current;
-  const actorIds = useRef([]).current;
+  const controls = useListControls(CASE_LIST, guildId, () => handlers.current.first?.());
   const [pickerNames, setPickerNames] = useState(() => ({ status: "loaded", roles: [], channels: [], users: new Map() }));
   const rememberUser = (id, name) =>
     setPickerNames((current) => ({ ...current, users: new Map(current.users).set(id, name) }));
@@ -7902,15 +7961,6 @@ function tabCases() {
     pendingCase = null;
     return next;
   });
-  const applyFilters = (next, name) => {
-    const merged = { ...filtersRef.current, ...next };
-    filtersRef.current = merged;
-    subjectIds.splice(0, subjectIds.length, ...(merged.subject ? [merged.subject] : []));
-    actorIds.splice(0, actorIds.length, ...(merged.actor ? [merged.actor] : []));
-    if (name) for (const id of Object.values(next)) if (id) rememberUser(id, name);
-    setFilters(merged);
-    handlers.current.first?.();
-  };
   useEffect(() => {
     let lifecycle = "active";
     let request = 0;
@@ -7919,7 +7969,15 @@ function tabCases() {
     let listMode = "live";
     let nextAfter = "";
     const pageSize = 50;
-    const open = (id) => openCaseView({ guildId, caseId: id, onRemoved: () => renderTab(), onFilter: applyFilters });
+    const open = (id) => openCaseView({
+      guildId,
+      caseId: id,
+      onRemoved: () => renderTab(),
+      onFilter: (key, userId, name) => {
+        if (name) rememberUser(userId, name);
+        controls.replaceFilters({ [key]: userId });
+      },
+    });
     const run = async () => {
       const current = ++request;
       listController?.abort();
@@ -7929,12 +7987,11 @@ function tabCases() {
       const timeout = setTimeout(() => controller.abort(), 30000);
       setLoading(true);
       setPagination((value) => ({ ...value, next: true }));
-      setRows([]);
       try {
-        const query = new URLSearchParams({ limit: String(pageSize), removed: String(listMode === "removed") });
+        const query = listMode === "live" ? controls.query() : new URLSearchParams();
+        query.set("limit", String(pageSize));
+        query.set("removed", String(listMode === "removed"));
         if (after) query.set("after", after);
-        const filtered = listMode === "live" && Object.values(filtersRef.current).some(Boolean);
-        if (listMode === "live") for (const [key, value] of Object.entries(filtersRef.current)) if (value) query.set(key, value);
         const payload = await apiRead(`/api/guilds/${guildId}/cases?${query}`, signal);
         if (lifecycle === "disposed" || current !== request || state.guildId !== guildId) return;
         setCanDelete(!!payload.can_delete);
@@ -7946,22 +8003,16 @@ function tabCases() {
             for (const [id, person] of Object.entries(names)) users.set(id, person.display_name);
             return { ...value, users };
           });
-        nextAfter = ids.length === pageSize ? ids[ids.length - 1] : "";
+        nextAfter = payload.next_cursor || "";
         setPagination({ next: !nextAfter, first: !after });
         if (!ids.length) {
-          setRows([
-            h(
-              "tr",
-              {},
-              h(
-                "td",
-                { colSpan: 6, className: "muted" },
-                listMode === "removed"
-                  ? "No more removed records."
-                  : filtered ? "No cases match these filters." : "No selected cases on this page.",
-              ),
-            ),
-          ]);
+          setRows([listMode === "removed"
+            ? h("tr", null, h("td", { colSpan: 6, className: "muted" }, "No more removed records."))
+            : h(ListEmptyRow, {
+                controls, colSpan: 6,
+                empty: "No selected cases on this page.",
+                filtered: "No cases match these filters.",
+              })]);
           return;
         }
         const rows = [];
@@ -8070,17 +8121,6 @@ function tabCases() {
       ++request;
     };
   }, [guildId, handoff]);
-  const anyFilter = Object.values(filters).some(Boolean);
-  const choice = (label, key, options) =>
-    field(
-      label,
-      h(
-        Select,
-        { className: "select select-sm", value: filters[key], onChange: (event) => applyFilters({ [key]: event.target.value }) },
-        h("option", { value: "" }, `Any ${label.toLowerCase()}`),
-        ...Object.entries(options).map(([value, entry]) => h("option", { key: value, value }, entry.label)),
-      ),
-    );
   return h(
     "div",
     null,
@@ -8093,41 +8133,11 @@ function tabCases() {
         "Removed records can retry cleanup. Their private content stays deleted.",
       ],
     }),
-    removedView
-      ? null
-      : h(
-          "div",
-          { className: "case-filters", "data-no-draft": true, role: "group", "aria-label": "Filter cases" },
-          choice("Action", "action", CASE_ACTIONS),
-          choice("Outcome", "outcome", CASE_OUTCOMES),
-          h(IdPicker, {
-            kind: "user",
-            label: "Subject",
-            ids: subjectIds,
-            names: pickerNames,
-            rememberUser,
-            single: true,
-            draft: false,
-            memberStatus: "all",
-            idLabel: "Subject user ID",
-            onChange: () => applyFilters({ subject: subjectIds[0] || "" }),
-          }),
-          h(IdPicker, {
-            kind: "user",
-            label: "Moderator",
-            ids: actorIds,
-            names: pickerNames,
-            rememberUser,
-            single: true,
-            draft: false,
-            memberStatus: "all",
-            idLabel: "Moderator user ID",
-            onChange: () => applyFilters({ actor: actorIds[0] || "" }),
-          }),
-          anyFilter
-            ? h(ActionButton, { type: "button", className: "btn btn-sm", onClick: () => applyFilters(CASE_FILTERS_EMPTY) }, "Clear filters")
-            : null,
-        ),
+    removedView ? null : h(ListControls, {
+      controls,
+      UserPicker: IdPicker,
+      userPickerProps: { names: pickerNames, rememberUser, memberStatus: "all" },
+    }),
     h(
       "div",
       { className: "row", style: { marginBottom: "12px" } },
@@ -8152,13 +8162,17 @@ function tabCases() {
         removedView ? "Back to cases" : "Removed records / retry cleanup",
       ),
     ),
-    loading
-      ? h(
-        "div",
-        { className: "card bg-base-100 card-border", role: "status", "aria-live": "polite" },
-        h("div", { className: "card-body" }, "Loading cases…"),
-      )
-      : h(DataTable, { headings: ["Case", "Action", "Outcome", "Subject", "Moderator", "When"], className: "table table-zebra case-table" }, rows),
+    rows === null ? h(
+      "div",
+      { className: "card bg-base-100 card-border", role: "status", "aria-live": "polite" },
+      h("div", { className: "card-body" }, "Loading cases…"),
+    ) : h(DataTable, {
+      headings: CASE_LIST.columns.map((column) =>
+        removedView ? column.label : h(ListSortHeading, { key: column.key, column, controls })),
+      className: "table table-zebra case-table",
+    }, loading
+      ? h("tr", null, h("td", { colSpan: 6, role: "status" }, "Loading cases…"))
+      : rows),
   );
 }
 
@@ -9024,7 +9038,7 @@ function DataTable({ headings, children, className = "table table-zebra" }) {
     h(
       "table",
       { className },
-      h("thead", null, h("tr", null, ...headings.map((text) => h("th", { key: text }, text)))),
+      h("thead", null, h("tr", null, ...headings.map((heading) => typeof heading === "string" ? h("th", { key: heading, scope: "col" }, heading) : heading))),
       h("tbody", null, ...React.Children.toArray(children)),
     ),
   );
@@ -9383,7 +9397,7 @@ function IdChip({ id, label }) {
   );
 }
 
-function BanPersonCell({ person, label }) {
+function BanPersonCell({ person, label, filterLink, showId = true }) {
   return h(
     "div",
     { className: "ban-person" },
@@ -9391,16 +9405,19 @@ function BanPersonCell({ person, label }) {
     h(
       "div",
       { className: "ban-person-text" },
-      h("strong", { className: "ban-person-name" }, person.name || "Unknown user"),
+      h("strong", { className: "ban-person-name" }, person.id && filterLink
+        ? h("a", { ...filterLink(String(person.id)), className: "list-person-filter",
+          "aria-label": `Filter by ${label} ${banPersonText(person)}` }, person.name || "Unknown user")
+        : person.name || "Unknown user"),
       person.handle && person.handle !== person.name ? h("span", { className: "muted" }, `@${person.handle}`) : null,
-      h(IdChip, { id: person.id, label }),
+      showId ? h(IdChip, { id: person.id, label }) : null,
     ),
   );
 }
 
-function BanModeratorCell({ record, names, rule }) {
+function BanModeratorCell({ record, names, rule, filterLink }) {
   if (record.moderator_id) {
-    const moderator = h(BanPersonCell, { person: banPerson(record.moderator_id, record.moderator_name, null, names), label: "moderator" });
+    const moderator = h(BanPersonCell, { person: banPerson(record.moderator_id, record.moderator_name, null, names), label: "moderator", filterLink });
     // The reason cell drops the automod prefix, so its rule is named here
     // beside the person who acted rather than replacing them.
     return rule
@@ -9706,10 +9723,9 @@ function openBanDialog(guildId, onDone) {
 
 function tabBans() {
   const guildId = state.guildId;
-  const result = useApiRead(`/api/guilds/${guildId}/bans?limit=200`);
-  const rows = Array.isArray(result.data?.bans) ? result.data.bans : [];
-  const names = result.data?.names || {};
   const [reasonEditor, setReasonEditor] = useState(null);
+  const [after, setAfter] = useState("");
+  const [moderators, setModerators] = useState({});
   // Closing the open reason editor for another task asks before discarding its draft.
   const leaveReasonEditor = () => {
     if (!reasonEditor) return true;
@@ -9721,6 +9737,23 @@ function tabBans() {
   const closeReasonEditor = () => {
     setReasonEditor(null);
     ui.set({ edits: "clean" });
+  };
+  const controls = useListControls(BANS_LIST, guildId, () => setAfter(""), leaveReasonEditor);
+  const query = controls.query();
+  query.set("limit", "50");
+  if (after) query.set("after", after);
+  const result = useApiRead(`/api/guilds/${guildId}/bans?${query}`, { retainData: true });
+  const rows = Array.isArray(result.data?.bans) ? result.data.bans : [];
+  const names = result.data?.names || {};
+  const availableModerators = result.data?.moderators;
+  useEffect(() => {
+    if (Array.isArray(availableModerators)) setModerators(Object.fromEntries(availableModerators.map(({ id, name }) =>
+      [id, { label: name ? `${name} (${id})` : id }],
+    )));
+  }, [availableModerators]);
+  const next = result.data?.next_cursor;
+  const changePage = (cursor) => {
+    if (leaveReasonEditor()) setAfter(cursor);
   };
   return h(
     "div",
@@ -9746,30 +9779,37 @@ function tabBans() {
           ),
       h(ActionButton, { type: "button", className: "btn", onClick: result.refresh }, "Refresh"),
     ),
+    h(ListControls, { controls, filterOptions: { actor: moderators } }),
+    h("div", { className: "row list-pagination" },
+      h(ActionButton, { type: "button", className: "btn", disabled: !after || result.loading, onClick: () => changePage("") }, "First page"),
+      h(ActionButton, { type: "button", className: "btn", disabled: !next || result.loading, onClick: () => changePage(next) }, "Next page"),
+      Number.isInteger(result.data?.total)
+        ? h("span", { className: "muted", role: "status" }, `${result.data.total.toLocaleString()} matching bans`)
+        : null,
+    ),
     h(
       DataTable,
-      { headings: ["Banned user", "Status", "Moderator", "Reason", "Time", "Actions"], className: "table table-zebra ban-table" },
-      result.loading || result.error || !rows.length
-        ? h(
-            "tr",
-            null,
-            h(
-              "td",
-              { colSpan: 6, className: result.error ? "err" : result.loading ? "" : "muted" },
-              result.loading
-                ? "Loading…"
-                : result.error
-                  ? "Could not load records: " + result.error.message
-                  : "No matching records.",
-            ),
-          )
+      {
+        headings: [
+          ...BANS_LIST.columns.map((column) => h(ListSortHeading, { key: column.key, column, controls })),
+          "Actions",
+        ],
+        className: "table table-zebra ban-table",
+      },
+      result.loading || result.error
+        ? h("tr", null, h("td", { colSpan: 7, className: result.error ? "err" : "" },
+            result.error ? "Could not load records: " + result.error.message : "Loading…"))
+        : !rows.length
+          ? h(ListEmptyRow, { controls, colSpan: 7, empty: "No bans recorded.", filtered: "No bans match these filters." })
         : rows.map((record, i) => {
             const user = banPerson(record.user_id, record.user_name, record.user_display_name, names);
             const { rule } = banReasonParts(record.reason);
             return h(
               "tr",
               { key: record.id ?? i },
-              h("td", null, h(BanPersonCell, { person: user, label: "user" })),
+              h("td", null, h(BanPersonCell, { person: user, label: "user", showId: false,
+                filterLink: (id) => controls.filterLink({ subject: id }) })),
+              h("td", null, h(IdChip, { id: user.id, label: "user" })),
               h(
                 "td",
                 null,
@@ -9779,7 +9819,7 @@ function tabBans() {
                   record.active ? "Banned" : "Unbanned",
                 ),
               ),
-              h("td", null, h(BanModeratorCell, { record, names, rule })),
+              h("td", null, h(BanModeratorCell, { record, names, rule, filterLink: (id) => controls.filterLink({ actor: id }) })),
               h(
                 "td",
                 null,

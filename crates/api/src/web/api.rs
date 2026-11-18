@@ -1252,8 +1252,22 @@ pub async fn test_regex(
 }
 
 #[derive(Deserialize)]
-pub struct SearchQuery {
+pub struct BansQuery {
     limit: Option<i64>,
+    reason: Option<String>,
+    #[serde(flatten)]
+    list: super::list_controls::ListQuery<db::BanListSort, db::BanListStatus>,
+}
+
+fn ban_list_subject(raw: Option<&str>) -> ApiResult<Option<db::BanListSubject>> {
+    use super::list_controls::{bounded_list_text, parse_user_id};
+    let Some(subject) = bounded_list_text(raw)? else {
+        return Ok(None);
+    };
+    if subject.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(parse_user_id(Some(&subject))?.map(db::BanListSubject::Id));
+    }
+    Ok(Some(db::BanListSubject::Name(subject)))
 }
 
 #[derive(Deserialize)]
@@ -1294,17 +1308,51 @@ pub async fn bans(
     session: Session,
     headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
-    Query(query): Query<SearchQuery>,
+    Query(query): Query<BansQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
-    let rows =
-        db::list_enrolled_bans(&app.db, enrollment.clone(), query.limit.unwrap_or(100)).await?;
+    use super::list_controls::{SortDirection, bounded_list_text, decode_cursor, encode_cursor};
+    let list = query.list.validate_with_subject(
+        db::BanListSort::Date,
+        SortDirection::Desc,
+        ban_list_subject,
+    )?;
+    let after: Option<db::BanListAnchor> = list
+        .after
+        .as_deref()
+        .map(|cursor| decode_cursor(cursor, "bans", list.sort, list.dir))
+        .transpose()?;
+    let page = db::page_enrolled_bans(
+        &app.db,
+        enrollment.clone(),
+        db::BanListRequest {
+            filters: db::BanListFilters {
+                subject: list.subject,
+                actor: list.actor,
+                status: list.outcome,
+                reason: bounded_list_text(query.reason.as_deref())?,
+                q: list.q,
+                from_ms: list.from_ms,
+                until_ms: list.until_ms,
+            },
+            sort: list.sort,
+            descending: list.dir == SortDirection::Desc,
+            after,
+            limit: query.limit.unwrap_or(100),
+        },
+    )
+    .await?;
+    let next = page
+        .next
+        .map(|anchor| encode_cursor("bans", list.sort, list.dir, anchor))
+        .transpose()?;
     // Presentation only, as on the Cases list: names the member directory
     // recorded for the people on these rows. An unavailable directory leaves
     // them out instead of failing the read.
-    let people = rows
+    let people = page
+        .rows
         .iter()
         .flat_map(|row| [Some(row.user_id), row.moderator_id, row.reason_edited_by])
         .flatten()
@@ -1313,7 +1361,13 @@ pub async fn bans(
         Ok((store, scope)) => super::cases::directory_names(&store, scope, people).await,
         Err(_) => serde_json::Map::new(),
     };
-    Ok(Json(serde_json::json!({ "bans": rows, "names": names })))
+    Ok(Json(serde_json::json!({
+        "bans": page.rows,
+        "names": names,
+        "total": page.total,
+        "next_cursor": next,
+        "moderators": page.moderators,
+    })))
 }
 
 #[derive(Deserialize)]

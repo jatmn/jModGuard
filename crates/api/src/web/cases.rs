@@ -1,50 +1,46 @@
 //! Private selected-case and evidence administration for an enrolled guild.
+use super::list_controls::{ListQuery, SortDirection, decode_cursor, encode_cursor};
 use super::state::ApiState;
 use super::{ApiError, ApiResult, AuthCtx, GuildAccess, authorize_guild};
-use crate::db::guild_data::{CaseAction, CaseEvidence, CaseFilter, CaseId, CaseOutcome};
+use crate::db::guild_data::{
+    CaseAction, CaseEvidence, CaseFilter, CaseId, CaseListPosition, CaseListQuery, CaseOutcome,
+    CaseSort,
+};
 use crate::tenant::{self, TenantError};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
-use serde::Deserialize;
+use jmodguard_updater::oci::sha256_hex;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_sessions::Session;
 
+const CASE_LIST: &str = "cases";
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CaseCursor {
+    context: String,
+    position: CaseListPosition,
+    legacy_id_order: bool,
+}
+
 #[derive(Deserialize)]
 pub struct CasePage {
-    after: Option<String>,
     limit: Option<u32>,
     #[serde(default)]
     removed: bool,
     action: Option<CaseAction>,
-    outcome: Option<CaseOutcome>,
-    subject: Option<String>,
-    actor: Option<String>,
+    #[serde(flatten)]
+    list: ListQuery<CaseSort, CaseOutcome>,
 }
 
-impl CasePage {
-    fn filter(&self) -> ApiResult<CaseFilter> {
-        let user = |raw: &Option<String>| -> ApiResult<Option<i64>> {
-            raw.as_deref()
-                .filter(|value| !value.is_empty())
-                .map(|value| {
-                    value
-                        .parse::<i64>()
-                        .ok()
-                        .filter(|id| *id > 0)
-                        .ok_or_else(|| ApiError(anyhow::anyhow!("invalid user id filter")))
-                })
-                .transpose()
-        };
-        Ok(CaseFilter {
-            action: self.action.clone(),
-            outcome: self.outcome.clone(),
-            subject_id: user(&self.subject)?,
-            actor_id: user(&self.actor)?,
-        })
-    }
+#[derive(Deserialize)]
+pub struct CaseDetailPage {
+    after: Option<String>,
+    limit: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -153,43 +149,118 @@ async fn list_cases_inner(
 ) -> ApiResult<Json<serde_json::Value>> {
     let (auth, enrollment) =
         scoped(app, session, headers, guild_id, GuildAccess::Dashboard).await?;
-    let (store, scope) = live(app, enrollment).await?;
-    let after = match page.after.as_deref() {
-        Some(id) => Some(parse_case_id(id)?),
-        None => None,
+    let limits = tenant::case_limits();
+    let limit = page.limit.unwrap_or(50).clamp(1, limits.max_page_size);
+    let explicit_sort = page.list.sort.is_some() || page.list.dir.is_some();
+    let list = page.list.validate(CaseSort::Date, SortDirection::Desc)?;
+    let filter = CaseFilter {
+        action: page.action,
+        outcome: list.outcome,
+        subject_id: list.subject,
+        actor_id: list.actor,
     };
-    let limit = page
-        .limit
-        .unwrap_or(50)
-        .clamp(1, tenant::case_limits().max_page_size);
-    let filter = page.filter()?;
-    let ids = if page.removed {
-        if filter != CaseFilter::default() {
+    let can_delete = can_delete_cases(&auth, guild_id);
+    let (store, scope) = live(app, enrollment).await?;
+    let mut summaries = std::collections::BTreeMap::new();
+    let (ids, next_cursor) = if page.removed {
+        if filter != CaseFilter::default()
+            || list.q.is_some()
+            || list.from_ms.is_some()
+            || list.until_ms.is_some()
+            || explicit_sort
+        {
             return Err(ApiError(anyhow::anyhow!(
-                "removed records cannot be filtered"
+                "removed records cannot be filtered or sorted"
             )));
         }
-        if !can_delete_cases(&auth, guild_id) {
+        if !can_delete {
             return Err(ApiError(anyhow::anyhow!(
                 "case cleanup requires Administrator permission"
             )));
         }
-        store
-            .removed_case_ids(scope.clone(), after, limit, tenant::case_limits())
-            .await?
+        let after = list.after.as_deref().map(parse_case_id).transpose()?;
+        let (ids, next) = store
+            .removed_case_page(scope.clone(), after, limit, limits)
+            .await?;
+        (ids, next.map(String::from))
     } else {
-        store
-            .matching_case_ids(scope.clone(), after, limit, filter, tenant::case_limits())
-            .await?
-    };
-    // Keep the ID page (including its cursor) stable if a case is removed
-    // between these scoped reads. Missing summaries do not trigger client reads.
-    let summaries = if page.removed {
-        std::collections::BTreeMap::new()
-    } else {
-        store
-            .case_summaries(scope.clone(), ids.clone(), tenant::case_limits())
-            .await?
+        let context = sha256_hex(&serde_json::to_vec(&(
+            guild_id,
+            &filter.action,
+            &filter.outcome,
+            filter.subject_id,
+            filter.actor_id,
+            list.q.as_deref().map(str::to_ascii_lowercase),
+            list.from_ms,
+            list.until_ms,
+        ))?);
+        let after = list
+            .after
+            .as_deref()
+            .map(|token| {
+                // The old endpoint used bare case IDs and always paged in ascending ID order.
+                if !explicit_sort && let Ok(id) = parse_case_id(token) {
+                    return Ok((CaseListPosition::from_case_id(id), true));
+                }
+                let cursor: CaseCursor = decode_cursor(token, CASE_LIST, list.sort, list.dir)?;
+                if cursor.context != context {
+                    return Err(ApiError(anyhow::anyhow!(
+                        "list cursor does not match the guild or filters"
+                    )));
+                }
+                if cursor.legacy_id_order && explicit_sort {
+                    return Err(ApiError(anyhow::anyhow!(
+                        "list cursor does not match the requested sort"
+                    )));
+                }
+                Ok((cursor.position, cursor.legacy_id_order))
+            })
+            .transpose()?;
+        let legacy_id_order = after.as_ref().is_some_and(|(_, legacy)| *legacy);
+        let page = store
+            .list_cases(
+                scope.clone(),
+                CaseListQuery {
+                    filter,
+                    search: list.q,
+                    from_ms: list.from_ms,
+                    until_ms: list.until_ms,
+                    sort: if legacy_id_order {
+                        CaseSort::Case
+                    } else {
+                        list.sort
+                    },
+                    descending: !legacy_id_order && list.dir == SortDirection::Desc,
+                    after: after.map(|(position, _)| position),
+                },
+                limit,
+                limits,
+            )
+            .await?;
+        let next = page
+            .next
+            .map(|position| {
+                encode_cursor(
+                    CASE_LIST,
+                    list.sort,
+                    list.dir,
+                    CaseCursor {
+                        context,
+                        position,
+                        legacy_id_order,
+                    },
+                )
+            })
+            .transpose()?;
+        let ids = page
+            .entries
+            .into_iter()
+            .map(|(id, summary)| {
+                summaries.insert(id.as_str().to_owned(), summary);
+                id
+            })
+            .collect();
+        (ids, next)
     };
     let people = summaries
         .values()
@@ -201,7 +272,8 @@ async fn list_cases_inner(
         "cases": ids.into_iter().map(|id| id.as_str().to_owned()).collect::<Vec<_>>(),
         "summaries": summaries,
         "names": names,
-        "can_delete": can_delete_cases(&auth, guild_id),
+        "can_delete": can_delete,
+        "next_cursor": next_cursor,
     })))
 }
 
@@ -243,7 +315,7 @@ pub async fn list_history(
     session: Session,
     headers: HeaderMap,
     Path((guild_id, case_id)): Path<(u64, String)>,
-    Query(page): Query<CasePage>,
+    Query(page): Query<CaseDetailPage>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let (_, enrollment) =
         scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;

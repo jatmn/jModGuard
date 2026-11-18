@@ -14,6 +14,9 @@ const BAN_PAGE_SQL: &str = "SELECT id, guild_id, user_id, moderator_id, reason, 
              FROM bans WHERE guild_id = ?1 ORDER BY id DESC LIMIT ?2";
 use super::*;
 
+mod ban_list;
+pub use ban_list::*;
+
 // ---------------------------------------------------------------------------
 // events (audit log)
 // ---------------------------------------------------------------------------
@@ -447,6 +450,12 @@ pub async fn edit_enrolled_ban_reason_with_history(
             1,
         )?;
         let event_id = tx.last_insert_rowid();
+        tx.execute_rows(
+            "UPDATE bans SET list_edited_reason=?1, list_reason_edited_by=?2, list_reason_edited_at=?3
+             WHERE guild_id=?4 AND id=?5",
+            params![reason.clone(), actor_id, at.clone(), enrollment.guild_id, ban_id],
+            1,
+        )?;
         tx.commit()?;
         let history = case
             .map(|case| -> Result<BanReasonHistory> {
@@ -679,23 +688,7 @@ pub async fn list_bans(db: &Db, guild_id: i64, limit: i64) -> Result<Vec<BanRow>
 fn list_bans_conn(conn: &impl SqlExecutor, guild_id: i64, limit: i64) -> Result<Vec<BanRow>> {
     let limit = limit.clamp(1, 200);
     let mut stmt = conn.prepare(BAN_PAGE_SQL)?;
-    let rows = stmt.query_map(params![guild_id, limit], |r| {
-        Ok(BanRow {
-            id: r.get(0)?,
-            guild_id: r.get(1)?,
-            user_id: r.get(2)?,
-            moderator_id: r.get(3)?,
-            reason: r.get(4)?,
-            created_at: r.get(5)?,
-            active: r.get::<i64>(6)? != 0,
-            user_name: r.get(7)?,
-            user_display_name: r.get(8)?,
-            moderator_name: r.get(9)?,
-            edited_reason: None,
-            reason_edited_by: None,
-            reason_edited_at: None,
-        })
-    })?;
+    let rows = stmt.query_map(params![guild_id, limit], decode_ban_row)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -714,6 +707,24 @@ fn list_bans_conn(conn: &impl SqlExecutor, guild_id: i64, limit: i64) -> Result<
         }
     }
     Ok(out)
+}
+
+fn decode_ban_row(r: &crate::db_compat::Row) -> Result<BanRow> {
+    Ok(BanRow {
+        id: r.get(0)?,
+        guild_id: r.get(1)?,
+        user_id: r.get(2)?,
+        moderator_id: r.get(3)?,
+        reason: r.get(4)?,
+        created_at: r.get(5)?,
+        active: r.get::<i64>(6)? != 0,
+        user_name: r.get(7)?,
+        user_display_name: r.get(8)?,
+        moderator_name: r.get(9)?,
+        edited_reason: None,
+        reason_edited_by: None,
+        reason_edited_at: None,
+    })
 }
 
 // ---------------------------------------------------------------------------

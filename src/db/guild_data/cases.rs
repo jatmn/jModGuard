@@ -211,6 +211,29 @@ pub struct CaseSummary {
     pub occurred_at_ms: i64,
 }
 
+// The size check also bounds the work if a stored record no longer fits the
+// installation's current read limit. Parameter 3 is the limit in both readers.
+pub(super) const CASE_SUMMARY_SQL: &str = "CASE WHEN length(CAST(payload AS BLOB))<=?3 THEN
+    json_object('action',json_extract(payload,'$.action'),
+                'outcome',json_extract(payload,'$.outcome'),
+                'subject_id',json_extract(payload,'$.subject_id'),
+                'actor_id',json_extract(payload,'$.actor_id'),
+                'source_kind',(SELECT key FROM json_each(payload,'$.source')),
+                'occurred_at_ms',json_extract(payload,'$.occurred_at_ms'))
+    ELSE NULL END";
+
+pub(super) fn parse_case_summary(payload: Option<String>) -> Result<CaseSummary> {
+    let payload = payload.ok_or(CaseError::Limit)?;
+    let summary: CaseSummary = serde_json::from_str(&payload)?;
+    anyhow::ensure!(
+        summary.subject_id > 0
+            && summary.actor_id.is_none_or(|id| id > 0)
+            && summary.occurred_at_ms > 0,
+        CaseError::Invalid
+    );
+    Ok(summary)
+}
+
 /// Optional exact-match filters for a live case ID page. Every set field must match.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CaseFilter {
@@ -222,7 +245,7 @@ pub struct CaseFilter {
 
 impl CaseFilter {
     /// Stored JSON values to compare, in SQL parameter order. Snowflakes are stored as strings.
-    fn sql_values(&self) -> Result<[Option<String>; 4]> {
+    pub(super) fn sql_values(&self) -> Result<[Option<String>; 4]> {
         anyhow::ensure!(
             self.subject_id.is_none_or(|id| id > 0) && self.actor_id.is_none_or(|id| id > 0),
             CaseError::Invalid
@@ -507,39 +530,24 @@ impl GuildDataStore {
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
-                let mut stmt = tx.prepare(
-                    "SELECT case_id, CASE WHEN length(CAST(payload AS BLOB))<=?4 THEN
-                    json_object('action',json_extract(payload,'$.action'),
-                                'outcome',json_extract(payload,'$.outcome'),
-                                'subject_id',json_extract(payload,'$.subject_id'),
-                                'actor_id',json_extract(payload,'$.actor_id'),
-                                'source_kind',(SELECT key FROM json_each(payload,'$.source')),
-                                'occurred_at_ms',json_extract(payload,'$.occurred_at_ms'))
-                    ELSE NULL END
-                 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0
-                    AND case_id IN (SELECT value FROM json_each(?3))",
-                )?;
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT case_id, {CASE_SUMMARY_SQL}
+                     FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND deleted=0
+                       AND case_id IN (SELECT value FROM json_each(?4))",
+                ))?;
                 let rows = stmt.query_map(
                     params![
                         scope.guild_id(),
                         scope.enrollment.id.as_str(),
-                        ids,
-                        limits.max_record_bytes as i64
+                        i64::from(limits.max_record_bytes),
+                        ids
                     ],
                     |r| Ok((r.get::<String>(0)?, r.get::<Option<String>>(1)?)),
                 )?;
                 let mut summaries = std::collections::BTreeMap::new();
                 for row in rows {
                     let (id, payload) = row?;
-                    let payload = payload.ok_or(CaseError::Limit)?;
-                    let summary: CaseSummary = serde_json::from_str(&payload)?;
-                    anyhow::ensure!(
-                        summary.subject_id > 0
-                            && summary.actor_id.is_none_or(|id| id > 0)
-                            && summary.occurred_at_ms > 0,
-                        CaseError::Invalid
-                    );
-                    summaries.insert(id, summary);
+                    summaries.insert(id, parse_case_summary(payload)?);
                 }
                 drop(stmt);
                 tx.finish_read()?;
@@ -556,7 +564,7 @@ impl GuildDataStore {
         count: u32,
         limits: CaseLimits,
     ) -> Result<Vec<CaseId>> {
-        self.case_ids_by_removal(scope, after, count, limits, false, CaseFilter::default())
+        self.matching_case_ids(scope, after, count, CaseFilter::default(), limits)
             .await
     }
 
@@ -571,7 +579,8 @@ impl GuildDataStore {
         filter: CaseFilter,
         limits: CaseLimits,
     ) -> Result<Vec<CaseId>> {
-        self.case_ids_by_removal(scope, after, count, limits, false, filter)
+        limits.page(count)?;
+        self.case_ids_by_removal(scope, after, i64::from(count), false, filter)
             .await
     }
 
@@ -583,21 +592,47 @@ impl GuildDataStore {
         count: u32,
         limits: CaseLimits,
     ) -> Result<Vec<CaseId>> {
-        self.case_ids_by_removal(scope, after, count, limits, true, CaseFilter::default())
+        limits.page(count)?;
+        self.case_ids_by_removal(scope, after, i64::from(count), true, CaseFilter::default())
             .await
+    }
+
+    /// Page retained removal identities with one extra row to detect continuation.
+    pub async fn removed_case_page(
+        &self,
+        scope: GuildDataScope,
+        after: Option<CaseId>,
+        count: u32,
+        limits: CaseLimits,
+    ) -> Result<(Vec<CaseId>, Option<CaseId>)> {
+        limits.page(count)?;
+        let mut ids = self
+            .case_ids_by_removal(
+                scope,
+                after,
+                i64::from(count) + 1,
+                true,
+                CaseFilter::default(),
+            )
+            .await?;
+        let next = if ids.len() > count as usize {
+            ids.pop();
+            ids.last().cloned()
+        } else {
+            None
+        };
+        Ok((ids, next))
     }
 
     async fn case_ids_by_removal(
         &self,
         scope: GuildDataScope,
         after: Option<CaseId>,
-        count: u32,
-        limits: CaseLimits,
+        count: i64,
         removed: bool,
         filter: CaseFilter,
     ) -> Result<Vec<CaseId>> {
         self.check_target(&scope.placement)?;
-        limits.page(count)?;
         let [action, outcome, subject, actor] = filter.sql_values()?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
@@ -610,7 +645,7 @@ impl GuildDataStore {
                 AND (?8 IS NULL OR json_extract(payload,'$.subject_id')=?8)
                 AND (?9 IS NULL OR json_extract(payload,'$.actor_id')=?9)
                 ORDER BY case_id LIMIT ?4")?;
-            let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_ref().map_or("",CaseId::as_str),count as i64,removed,action,outcome,subject,actor], |r| Ok(r.get::<String>(0)?))?;
+            let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_ref().map_or("",CaseId::as_str),count,removed,action,outcome,subject,actor], |r| Ok(r.get::<String>(0)?))?;
             let mut ids = Vec::new();
             for row in rows { ids.push(CaseId::try_from(row?)?); }
             drop(stmt);

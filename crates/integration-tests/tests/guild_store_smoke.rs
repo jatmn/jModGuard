@@ -666,16 +666,42 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             CaseData {
                 ban_attempt_tag: None,
                 source: late_source.clone(),
+                occurred_at_ms: 1_001,
                 ..facts.clone()
             },
             limits,
         )
         .await
         .unwrap();
+    let query = |after| CaseListQuery {
+        filter: CaseFilter {
+            subject_id: Some(1234),
+            ..CaseFilter::default()
+        },
+        search: Some("ban".into()),
+        from_ms: Some(1_000),
+        until_ms: Some(1_002),
+        sort: CaseSort::Date,
+        descending: true,
+        after,
+    };
+    let first = reopened
+        .list_cases(scoped.clone(), query(None), 1, limits)
+        .await
+        .unwrap();
+    assert_eq!(&first.entries[0].0, &late_id);
+    assert!(first.next.is_some());
     store
         .remove_case(scoped.clone(), late_id.clone())
         .await
         .unwrap();
+    let second = reopened
+        .list_cases(scoped.clone(), query(first.next), 1, limits)
+        .await
+        .unwrap();
+    assert_eq!(&second.entries[0].0, &live_case);
+    assert_eq!(second.entries[0].1.subject_id, 1234);
+    assert!(second.next.is_none());
     test_drop_next_commit_response();
     assert_eq!(
         store

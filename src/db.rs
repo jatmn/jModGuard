@@ -98,6 +98,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0024_known_spam.sql"),
     include_str!("../migrations/0025_analytics_member_daily.sql"),
     include_str!("../migrations/0026_guild_join_info.sql"),
+    include_str!("../migrations/0027_ban_list.sql"),
 ];
 
 /// Completed core schema required by service startup and release observations.

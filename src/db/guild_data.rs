@@ -39,6 +39,7 @@ const MEMBER_GAP_AUTO_CLEAR_SCHEMA: &str =
     include_str!("../../migrations/guild/0017_member_gap_auto_clear.sql");
 const ACCESS_ROLES_SCHEMA: &str = include_str!("../../migrations/guild/0018_access_roles.sql");
 const SERVER_NAMES_SCHEMA: &str = include_str!("../../migrations/guild/0019_server_names.sql");
+const CASE_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0020_case_list_orders.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -50,6 +51,8 @@ mod case_history;
 pub use case_history::*;
 mod cases;
 pub use cases::*;
+mod case_listing;
+pub use case_listing::*;
 mod erasure;
 pub(crate) use erasure::ErasureProgress;
 mod snapshots;
@@ -545,6 +548,20 @@ fn initialize_store(
         if version < 20 {
             tx.execute_batch_bounded(SERVER_NAMES_SCHEMA, 32_000_000)?;
         }
+        if version < 21 {
+            let live_cases: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM guild_cases WHERE deleted=0",
+                (),
+                |r| Ok(r.get(0)?),
+            )?;
+            // Each of the five partial indexes stores two 32-byte IDs, a guild ID,
+            // an integer or short enum sort key, and a rowid. Allow 256 bytes per
+            // entry for record and B-tree page overhead, plus 1 MiB for the DDL.
+            let index_bound = (live_cases as u64)
+                .saturating_mul(5 * 256)
+                .saturating_add(1024 * 1024);
+            tx.execute_batch_bounded(CASE_LIST_SCHEMA, index_bound)?;
+        }
         // Version 16 adds the optional immutable ban_attempt_tag to case JSON.
         // No DDL or rewrite of legacy cases: their absent tags must remain absent.
         tx.pragma_update(None, "user_version", VERSION)?;
@@ -574,6 +591,7 @@ fn initialize_store(
     tx.execute_batch_bounded(MEMBER_GAP_AUTO_CLEAR_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(ACCESS_ROLES_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(SERVER_NAMES_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(CASE_LIST_SCHEMA, 32_000_000)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
@@ -662,6 +680,7 @@ impl GuildDataStore {
                     (MEMBER_GAP_AUTO_CLEAR_SCHEMA, 18),
                     (ACCESS_ROLES_SCHEMA, 19),
                     (SERVER_NAMES_SCHEMA, 20),
+                    (CASE_LIST_SCHEMA, 21),
                 ];
                 for (sql, at) in batches {
                     if *at <= version {

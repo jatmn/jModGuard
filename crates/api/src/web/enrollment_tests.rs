@@ -2233,6 +2233,327 @@ async fn ban_and_reason_edit_routes_require_ban_members_and_page_membership() {
 }
 
 #[tokio::test]
+async fn ban_list_filters_and_orders_use_the_same_cursor_page() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let scope = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let a = 9_007_199_254_740_999;
+    let b = 100;
+    let c = 200;
+    let d = 300;
+    let e = 999;
+    let bans = [
+        (
+            a,
+            Some("zed"),
+            Some("alpha"),
+            Some(9),
+            Some("Zulu"),
+            "invite %",
+            "2026-01-04T00:00:00Z",
+        ),
+        (
+            b,
+            Some("bravo"),
+            None,
+            Some(8),
+            Some("Alpha"),
+            "other",
+            "2026-01-02T00:00:00Z",
+        ),
+        (
+            c,
+            Some("cider-invite"),
+            Some("Alpha"),
+            Some(8),
+            Some("Alpha"),
+            "invite",
+            "2026-01-03T20:00:00-04:00",
+        ),
+        (d, None, None, None, None, "", "2026-01-03T00:00:00Z"),
+        (
+            e,
+            Some("Delta"),
+            None,
+            Some(5),
+            None,
+            "Other",
+            "2026-01-01T00:00:00Z",
+        ),
+    ];
+    for (user, name, display, actor, actor_name, reason, at) in bans {
+        db::record_enrolled_ban_with_identity(
+            &f.app.db,
+            Some(scope.clone()),
+            user,
+            name,
+            display,
+            actor,
+            actor_name,
+            reason,
+            Some(at),
+        )
+        .await
+        .unwrap();
+    }
+    let other = db::guild_enrollment(&f.app.db, 20).await.unwrap().unwrap();
+    db::record_enrolled_ban(&f.app.db, Some(other), a, Some(7), "invite")
+        .await
+        .unwrap();
+    for user in [b, e] {
+        db::mark_unbanned(&f.app.db, 10, user).await.unwrap();
+    }
+    let initial = ban_page(&f, "").await;
+    let edited = initial["bans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["user_id"].as_str().and_then(|id| id.parse().ok()) == Some(d))
+        .unwrap();
+    let row_id = edited["id"].as_i64().unwrap();
+    let edited_path = format!("/api/guilds/10/bans/{row_id}/reason");
+    let (status, body) = f
+        .request("PUT", &edited_path, r#"{"reason":"zeta invite"}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let default = ban_page(&f, "").await;
+    assert_eq!(ban_user_ids(&default), [c, a, d, b, e]);
+    assert_eq!(default["total"], 5);
+    assert_eq!(
+        default["moderators"],
+        serde_json::json!([
+            {"id": "5", "name": null}, {"id": "8", "name": "Alpha"}, {"id": "9", "name": "Zulu"},
+        ])
+    );
+
+    for (sort, ascending) in [
+        ("subject", [d, a, c, b, e]),
+        ("id", [b, c, d, e, a]),
+        ("status", [b, e, a, c, d]),
+        ("actor", [d, e, b, c, a]),
+        ("reason", [c, a, b, e, d]),
+        ("date", [e, b, d, a, c]),
+    ] {
+        for dir in ["asc", "desc"] {
+            let mut expected = ascending;
+            if dir == "desc" {
+                expected.reverse();
+            }
+            let query = format!("limit=1&sort={sort}&dir={dir}");
+            assert_eq!(walk_ban_pages(&f, &query, 5).await, expected, "{query}");
+        }
+    }
+
+    for (query, expected) in [
+        ("subject=ALPHA", vec![c, a]),
+        ("subject=cider", vec![c]),
+        ("subject=9007199254740999", vec![a]),
+        ("actor=8", vec![c, b]),
+        ("reason=invite", vec![c, a, d]),
+        ("reason=%25", vec![a]),
+        ("status=active", vec![c, a, d]),
+        ("status=unbanned", vec![b, e]),
+        ("from=2026-01-04&to=2026-01-04", vec![c, a]),
+        ("q=ZULU", vec![a]),
+        ("q=cider", vec![c]),
+        ("q=ALPHA", vec![c, a, b]),
+        ("q=9007199254740999", vec![a]),
+        ("q=zeta", vec![d]),
+        ("q=%25", vec![a]),
+        (
+            "subject=alpha&actor=8&reason=invite&status=active&q=cider&from=2026-01-04&to=2026-01-04",
+            vec![c],
+        ),
+        ("q=%27%20OR%201%3D1", vec![]),
+        ("status=unbanned&reason=invite", vec![]),
+    ] {
+        let page = ban_page(&f, query).await;
+        assert_eq!(ban_user_ids(&page), expected, "{query}");
+        assert_eq!(page["total"], expected.len(), "{query}");
+        assert!(page["next_cursor"].is_null(), "{query}");
+        assert_eq!(page["moderators"], default["moderators"], "{query}");
+    }
+    assert_eq!(
+        walk_ban_pages(&f, "q=invite&limit=1&sort=reason&dir=asc", 3).await,
+        [c, a, d]
+    );
+
+    let first = ban_page(&f, "limit=1&sort=reason&dir=asc").await;
+    let cursor = ban_page_cursor(&first);
+    for query in [
+        format!("sort=reason&dir=desc&after={cursor}"),
+        "sort=elsewhere".into(),
+        "actor=%2B8".into(),
+        "subject=9223372036854775808".into(),
+        "from=2026-02-30".into(),
+        format!("q={}", "x".repeat(201)),
+        format!("reason={}", "x".repeat(201)),
+    ] {
+        let (status, body) = f
+            .request("POST", &format!("/api/guilds/10/bans?{query}"), "")
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+
+    // The maximum-length edit still participates in reason ordering.
+    let long_reason = serde_json::json!({"reason": "🪐".repeat(512)}).to_string();
+    assert_eq!(
+        f.request("PUT", &edited_path, &long_reason).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        walk_ban_pages(&f, "limit=1&sort=reason&dir=desc", 5).await,
+        [d, e, b, a, c]
+    );
+}
+
+#[tokio::test]
+async fn ban_list_pages_through_long_stored_text_keys() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let scope = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let prefix = format!("m{}", "🪐".repeat(900));
+    let first_long = format!("{prefix}a");
+    let last_long = format!("{prefix}b");
+    for (user, text) in [
+        (1, "a"),
+        (2, last_long.as_str()),
+        (3, first_long.as_str()),
+        (4, first_long.as_str()),
+        (5, "z"),
+    ] {
+        db::record_enrolled_ban_if_absent(
+            &f.app.db,
+            Some(scope.clone()),
+            user,
+            Some("username"),
+            Some(text),
+            Some(8),
+            Some(text),
+            text,
+            None,
+            db::BanRecord::Fresh,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    for sort in ["reason", "subject", "actor"] {
+        for (dir, expected) in [("asc", [1, 3, 4, 2, 5]), ("desc", [5, 2, 4, 3, 1])] {
+            let query = format!("limit=1&sort={sort}&dir={dir}");
+            assert_eq!(walk_ban_pages(&f, &query, 5).await, expected, "{query}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn ban_list_rejects_foreign_edited_and_missing_text_anchors() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    for (guild, user, reason) in [(10, 1, "a"), (10, 2, "b"), (20, 3, "z")] {
+        let scope = db::guild_enrollment(&f.app.db, guild)
+            .await
+            .unwrap()
+            .unwrap();
+        db::record_enrolled_ban(&f.app.db, Some(scope), user, Some(8), reason)
+            .await
+            .unwrap();
+    }
+    let query = "limit=1&sort=reason&dir=asc";
+    let first = ban_page(&f, query).await;
+    assert_eq!(ban_user_ids(&first), [1]);
+    let anchor_id = first["bans"][0]["id"].as_i64().unwrap();
+    let after = format!("{query}&after={}", ban_page_cursor(&first));
+    let (status, body) = f
+        .request("POST", &format!("/api/guilds/20/bans?{after}"), "")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid list cursor");
+
+    let (status, body) = f
+        .request(
+            "PUT",
+            &format!("/api/guilds/10/bans/{anchor_id}/reason"),
+            r#"{"reason":"c"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = f
+        .request("POST", &format!("/api/guilds/10/bans?{after}"), "")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid list cursor");
+    assert_eq!(walk_ban_pages(&f, query, 2).await, [2, 1]);
+
+    let first = ban_page(&f, query).await;
+    let anchor_id = first["bans"][0]["id"].as_i64().unwrap();
+    f.app
+        .db
+        .with_conn(move |conn| {
+            let deleted = db::SqlExecutor::execute_reclaim_bounded(
+                conn,
+                "DELETE FROM bans WHERE guild_id = 10 AND id = ?1",
+                db::params![anchor_id],
+                16 * 1024 * 1024,
+            )?;
+            assert_eq!(deleted, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let after = format!("{query}&after={}", ban_page_cursor(&first));
+    let (status, body) = f
+        .request("POST", &format!("/api/guilds/10/bans?{after}"), "")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid list cursor");
+    assert_eq!(walk_ban_pages(&f, query, 1).await, [1]);
+}
+
+async fn ban_page(f: &Fixture, query: &str) -> serde_json::Value {
+    let (status, body) = f
+        .request("POST", &format!("/api/guilds/10/bans?{query}"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{query}: {body}");
+    body
+}
+
+fn ban_user_ids(page: &serde_json::Value) -> Vec<i64> {
+    page["bans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["user_id"].as_str().unwrap().parse().unwrap())
+        .collect()
+}
+
+fn ban_page_cursor(page: &serde_json::Value) -> &str {
+    page["next_cursor"].as_str().unwrap()
+}
+
+async fn walk_ban_pages(f: &Fixture, query: &str, total: usize) -> Vec<i64> {
+    let mut ids = Vec::new();
+    let mut page = ban_page(f, query).await;
+    for index in 0..total {
+        assert_eq!(page["total"], total);
+        let user_ids = ban_user_ids(&page);
+        assert_eq!(user_ids.len(), 1, "{query}: {page}");
+        ids.extend(user_ids);
+        if index + 1 == total {
+            assert!(page["next_cursor"].is_null(), "{query}: {page}");
+        } else {
+            page = ban_page(f, &format!("{query}&after={}", ban_page_cursor(&page))).await;
+        }
+    }
+    ids
+}
+
+#[tokio::test]
 async fn queued_ban_handoff_lists_the_ban_after_the_bot_confirms_it() {
     use jmodguard_bot::action_worker::{DiscordActions, Outcome, WorkerLimits};
 
@@ -6161,6 +6482,7 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
             .unwrap();
         expected.push(id.as_str().to_owned());
     }
+    expected.reverse();
     let (status, first) = f.request("POST", "/api/guilds/10/cases?limit=50", "").await;
     assert_eq!(status, StatusCode::OK, "{first}");
     assert_eq!(first["cases"], serde_json::json!(expected[..50]));
@@ -6170,7 +6492,7 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
             first["summaries"][id],
             serde_json::json!({
                 "action": "ban", "outcome": "succeeded", "subject_id": i64::MAX.to_string(),
-                "actor_id": "42", "source_kind": "discord_audit", "occurred_at_ms": n + 1
+                "actor_id": "42", "source_kind": "discord_audit", "occurred_at_ms": 51 - n
             })
         );
     }
@@ -6188,28 +6510,47 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
         assert_eq!(page["summaries"].as_object().unwrap().len(), count);
     }
     store
-        .remove_case(scope, CaseId::try_from(expected[49].clone()).unwrap())
+        .remove_case(
+            scope.clone(),
+            CaseId::try_from(expected[49].clone()).unwrap(),
+        )
         .await
         .unwrap();
+    for (id, occurred_at_ms) in [(52, 100), (53, 1)] {
+        store
+            .record_case(
+                scope.clone(),
+                CaseId::try_from(format!("{id:032x}")).unwrap(),
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::DiscordAudit { entry_id: id },
+                    action: CaseAction::Ban,
+                    outcome: CaseOutcome::Succeeded,
+                    subject_id: i64::MAX,
+                    actor_id: Some(42),
+                    occurred_at_ms,
+                    reason: None,
+                    evidence: CaseEvidence::Unavailable,
+                },
+                crate::tenant::case_limits(),
+            )
+            .await
+            .unwrap();
+    }
+    let cursor = first["next_cursor"].as_str().unwrap();
     let (status, next) = f
         .request(
             "POST",
-            &format!("/api/guilds/10/cases?after={}&limit=50", expected[49]),
+            &format!("/api/guilds/10/cases?after={cursor}&limit=50"),
             "",
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{next}");
-    assert_eq!(next["cases"], serde_json::json!(expected[50..]));
-    let (status, empty) = f
-        .request(
-            "POST",
-            &format!("/api/guilds/10/cases?after={}", expected[50]),
-            "",
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{empty}");
-    assert_eq!(empty["cases"], serde_json::json!([]));
-    assert_eq!(empty["summaries"], serde_json::json!({}));
+    assert_eq!(
+        next["cases"],
+        serde_json::json!([format!("{:032x}", 53), expected[50]])
+    );
+    assert!(next["next_cursor"].is_null());
 }
 
 #[tokio::test]
@@ -6319,18 +6660,17 @@ async fn case_reads_filter_the_list_and_name_known_members() {
         "subjects and moderators on the page only"
     );
     for (query, expected) in [
-        ("action=ban".to_owned(), vec![&ban, &failed]),
+        ("action=ban".to_owned(), vec![&failed, &ban]),
         ("outcome=failed".to_owned(), vec![&failed]),
         ("action=ban&outcome=succeeded".to_owned(), vec![&ban]),
-        (format!("subject={subject}"), vec![&ban, &kick, &failed]),
-        (format!("actor={moderator}"), vec![&ban, &failed]),
+        (format!("subject={subject}"), vec![&failed, &kick, &ban]),
+        (format!("actor={moderator}"), vec![&failed, &ban]),
         (format!("actor={author}"), vec![]),
-        (format!("action=ban&actor={moderator}&limit=1"), vec![&ban]),
         (
-            format!("action=ban&actor={moderator}&after={}", ban.as_str()),
+            format!("action=ban&actor={moderator}&limit=1"),
             vec![&failed],
         ),
-        ("subject=&actor=".to_owned(), vec![&ban, &kick, &failed]),
+        ("subject=&actor=".to_owned(), vec![&failed, &kick, &ban]),
     ] {
         let (status, page) = list(query.clone()).await;
         assert_eq!(status, StatusCode::OK, "{query}: {page}");
@@ -6373,6 +6713,305 @@ async fn case_reads_filter_the_list_and_name_known_members() {
     assert_eq!(history["history"].as_array().unwrap().len(), 1);
     // The fixture's session user has no directory row, so no name is invented.
     assert_eq!(history["names"], serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn case_list_orders_and_filters_are_applied_before_paging() {
+    use crate::db::guild_data::{
+        CaseAction as Action, CaseData, CaseEvidence, CaseId, CaseOutcome as Outcome, CaseSource,
+    };
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    const DAY: i64 = 1_767_312_000_000; // 2026-01-02 UTC
+    const NEXT_DAY: i64 = DAY + 86_400_000;
+    for (id, time, action, subject, actor, outcome, reason) in [
+        (
+            1,
+            NEXT_DAY,
+            Action::Ban,
+            10,
+            Some(10),
+            Outcome::Failed,
+            "reviewXY",
+        ),
+        (
+            2,
+            DAY + 5,
+            Action::Warning,
+            2,
+            None,
+            Outcome::Succeeded,
+            "Review%_ first",
+        ),
+        (
+            3,
+            DAY + 5,
+            Action::Kick,
+            2,
+            Some(2),
+            Outcome::Failed,
+            "Review%_ failed",
+        ),
+        (
+            4,
+            NEXT_DAY,
+            Action::Kick,
+            10,
+            Some(2),
+            Outcome::Succeeded,
+            "Review%_ following day",
+        ),
+        (
+            5,
+            DAY,
+            Action::Ban,
+            2,
+            None,
+            Outcome::Succeeded,
+            "REVIEW%_ at midnight",
+        ),
+        (
+            6,
+            DAY + 6,
+            Action::Timeout,
+            3,
+            Some(10),
+            Outcome::Attempted,
+            "ReviewXX",
+        ),
+    ] {
+        store
+            .record_case(
+                scope.clone(),
+                CaseId::try_from(format!("{id:032x}")).unwrap(),
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::DiscordAudit { entry_id: id },
+                    action,
+                    outcome,
+                    subject_id: subject,
+                    actor_id: actor,
+                    occurred_at_ms: time,
+                    reason: Some(reason.into()),
+                    evidence: CaseEvidence::Unavailable,
+                },
+                crate::tenant::case_limits(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let list = |query: String| {
+        let f = &f;
+        async move {
+            f.request("POST", &format!("/api/guilds/10/cases?{query}"), "")
+                .await
+        }
+    };
+    let expect_ids = |ids: &[i64]| {
+        serde_json::json!(
+            ids.iter()
+                .map(|id| format!("{id:032x}"))
+                .collect::<Vec<_>>()
+        )
+    };
+
+    let (status, default) = list(String::new()).await;
+    assert_eq!(status, StatusCode::OK, "{default}");
+    assert_eq!(default["cases"], expect_ids(&[4, 1, 6, 3, 2, 5]));
+
+    for (sort, ascending) in [
+        ("date", [5, 2, 3, 6, 1, 4]),
+        ("case", [1, 2, 3, 4, 5, 6]),
+        ("action", [1, 5, 3, 4, 6, 2]),
+        ("subject", [2, 3, 5, 6, 1, 4]),
+        ("actor", [2, 5, 3, 4, 1, 6]),
+        ("outcome", [6, 1, 3, 2, 4, 5]),
+    ] {
+        for dir in ["asc", "desc"] {
+            let mut expected = ascending;
+            if dir == "desc" {
+                expected.reverse();
+            }
+            let mut after = String::new();
+            for (index, ids) in expected.chunks(2).enumerate() {
+                let (status, page) = list(format!("sort={sort}&dir={dir}&limit=2{after}")).await;
+                assert_eq!(status, StatusCode::OK, "{sort} {dir} page {index}: {page}");
+                assert_eq!(page["cases"], expect_ids(ids), "{sort} {dir} page {index}");
+                if index == 2 {
+                    assert!(
+                        page["next_cursor"].is_null(),
+                        "exact-sized final page must end"
+                    );
+                } else {
+                    after = format!("&after={}", page["next_cursor"].as_str().unwrap());
+                }
+            }
+        }
+    }
+
+    let filters = "sort=action&dir=desc&subject=2&status=succeeded&q=review%25_&from=2026-01-02&to=2026-01-02&limit=1";
+    let (status, filtered) = list(filters.into()).await;
+    assert_eq!(status, StatusCode::OK, "{filtered}");
+    assert_eq!(filtered["cases"], expect_ids(&[2]));
+    let cursor = filtered["next_cursor"].as_str().unwrap();
+    let (status, next) = list(format!("{filters}&after={cursor}")).await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(next["cases"], expect_ids(&[5]));
+    assert!(next["next_cursor"].is_null());
+
+    let normalized = "sort=action&dir=desc&subject=02&outcome=succeeded&q=+REVIEW%25_+&from=2026-01-02&to=2026-01-02&limit=2";
+    let (status, next) = list(format!("{normalized}&after={cursor}")).await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(next["cases"], expect_ids(&[5]));
+    assert!(cursor.len() <= 4096);
+    for changed in [
+        filters.replace("subject=2", "subject=3"),
+        filters.replace("status=succeeded", "status=failed"),
+        filters.replace("q=review%25_", "q=review"),
+        filters.replace("from=2026-01-02", "from=2026-01-01"),
+        filters.replace("to=2026-01-02", "to=2026-01-03"),
+        format!("{filters}&action=ban"),
+        format!("{filters}&actor=10"),
+    ] {
+        let (status, body) = list(format!("{changed}&after={cursor}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{changed}: {body}");
+        assert_eq!(
+            body["error"],
+            "list cursor does not match the guild or filters"
+        );
+    }
+    f.enroll(20).await;
+    let other = db::guild_enrollment(&f.app.db, 20).await.unwrap().unwrap();
+    f.app.tenant.activate(other).await.unwrap().unwrap();
+    let (status, body) = f
+        .request(
+            "GET",
+            &format!("/api/guilds/20/cases?{filters}&after={cursor}"),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        "list cursor does not match the guild or filters"
+    );
+
+    // The old client sent the last visible ID and expected an ascending ID seek.
+    let (status, legacy) = list(format!("after={:032x}&limit=1", 2)).await;
+    assert_eq!(status, StatusCode::OK, "{legacy}");
+    assert_eq!(legacy["cases"], expect_ids(&[3]));
+    let legacy_cursor = legacy["next_cursor"].as_str().unwrap();
+    assert_ne!(legacy_cursor, format!("{:032x}", 3));
+    let (status, next) = list(format!("after={legacy_cursor}&limit=3")).await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(next["cases"], expect_ids(&[4, 5, 6]));
+    assert!(next["next_cursor"].is_null());
+    let (status, body) = list(format!("sort=date&dir=desc&after={legacy_cursor}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, literal) = list("q=review%25_&sort=case&dir=asc".into()).await;
+    assert_eq!(status, StatusCode::OK, "{literal}");
+    assert_eq!(literal["cases"], expect_ids(&[2, 3, 4, 5]));
+    let (status, day) = list("from=2026-01-02&to=2026-01-02".into()).await;
+    assert_eq!(status, StatusCode::OK, "{day}");
+    assert_eq!(day["cases"], expect_ids(&[6, 3, 2, 5]));
+    for query in [
+        "sort=reason".into(),
+        "dir=sideways".into(),
+        "after=broken".into(),
+        "after=".into(),
+        "from=2026-01-03&to=2026-01-02".into(),
+        "removed=true&sort=date".into(),
+        "removed=true&q=reason".into(),
+        format!("sort=date&dir=desc&after={:032x}", 3),
+        format!("sort=action&dir=asc&after={cursor}"),
+        format!("sort=date&dir=desc&after={cursor}"),
+    ] {
+        let (status, body) = list(query.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn removed_case_list_checks_for_a_row_past_the_maximum_page() {
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource,
+    };
+    let f = Fixture::new(false).await;
+    let mut admin = managed_guild(10);
+    admin.owner = true;
+    *f.discord.guilds.lock().unwrap() = vec![admin.clone()];
+    tests::seed_auth_caches(&f.app, 42, vec![admin]);
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    let limits = crate::tenant::case_limits();
+    let max = limits.max_page_size;
+    let mut ids = Vec::new();
+    for n in 1..=max + 1 {
+        let id = CaseId::try_from(format!("{n:032x}")).unwrap();
+        store
+            .record_case(
+                scope.clone(),
+                id.clone(),
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::DiscordAudit {
+                        entry_id: i64::from(n),
+                    },
+                    action: CaseAction::Ban,
+                    outcome: CaseOutcome::Succeeded,
+                    subject_id: 42,
+                    actor_id: Some(42),
+                    occurred_at_ms: i64::from(n),
+                    reason: None,
+                    evidence: CaseEvidence::Unavailable,
+                },
+                limits,
+            )
+            .await
+            .unwrap();
+        assert!(store.remove_case(scope.clone(), id.clone()).await.unwrap());
+        ids.push(id.as_str().to_owned());
+    }
+    let list = |query: String| {
+        let f = &f;
+        async move {
+            f.request(
+                "POST",
+                &format!("/api/guilds/10/cases?removed=true&{query}"),
+                "",
+            )
+            .await
+        }
+    };
+    let (status, first) = list(format!("limit={max}")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["cases"], serde_json::json!(ids[..max as usize]));
+    let cursor = first["next_cursor"].as_str().unwrap();
+    assert_eq!(cursor, ids[max as usize - 1]);
+    let (status, last) = list(format!("limit=1&after={cursor}")).await;
+    assert_eq!(status, StatusCode::OK, "{last}");
+    assert_eq!(last["cases"], serde_json::json!(ids[max as usize..]));
+    assert!(
+        last["next_cursor"].is_null(),
+        "a full final page ends the list"
+    );
 }
 
 #[tokio::test]
