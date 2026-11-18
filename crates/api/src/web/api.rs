@@ -1324,12 +1324,6 @@ pub async fn bans(
         .as_deref()
         .map(|cursor| decode_cursor(cursor, "bans", list.sort, list.dir))
         .transpose()?;
-    if after
-        .as_ref()
-        .is_some_and(|anchor| !anchor.matches_sort(list.sort))
-    {
-        return Err(ApiError(anyhow::anyhow!("invalid list cursor")));
-    }
     let page = db::page_enrolled_bans(
         &app.db,
         enrollment.clone(),

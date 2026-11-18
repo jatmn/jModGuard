@@ -2357,7 +2357,7 @@ async fn ban_list_filters_and_orders_use_the_same_cursor_page() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
     }
 
-    // A 512-character non-ASCII edit still fits in a portable next-page token.
+    // The maximum-length edit still participates in reason ordering.
     let long_reason = serde_json::json!({"reason": "🪐".repeat(512)}).to_string();
     assert_eq!(
         f.request("PUT", &edited_path, &long_reason).await.0,
@@ -2367,6 +2367,112 @@ async fn ban_list_filters_and_orders_use_the_same_cursor_page() {
         walk_ban_pages(&f, "limit=1&sort=reason&dir=desc", 5).await,
         [d, e, b, a, c]
     );
+}
+
+#[tokio::test]
+async fn ban_list_pages_through_long_stored_text_keys() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let scope = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let prefix = format!("m{}", "🪐".repeat(900));
+    let first_long = format!("{prefix}a");
+    let last_long = format!("{prefix}b");
+    for (user, text) in [
+        (1, "a"),
+        (2, last_long.as_str()),
+        (3, first_long.as_str()),
+        (4, first_long.as_str()),
+        (5, "z"),
+    ] {
+        db::record_enrolled_ban_if_absent(
+            &f.app.db,
+            Some(scope.clone()),
+            user,
+            Some("username"),
+            Some(text),
+            Some(8),
+            Some(text),
+            text,
+            None,
+            db::BanRecord::Fresh,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    for sort in ["reason", "subject", "actor"] {
+        for (dir, expected) in [("asc", [1, 3, 4, 2, 5]), ("desc", [5, 2, 4, 3, 1])] {
+            let query = format!("limit=1&sort={sort}&dir={dir}");
+            assert_eq!(walk_ban_pages(&f, &query, 5).await, expected, "{query}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn ban_list_rejects_foreign_edited_and_missing_text_anchors() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    for (guild, user, reason) in [(10, 1, "a"), (10, 2, "b"), (20, 3, "z")] {
+        let scope = db::guild_enrollment(&f.app.db, guild)
+            .await
+            .unwrap()
+            .unwrap();
+        db::record_enrolled_ban(&f.app.db, Some(scope), user, Some(8), reason)
+            .await
+            .unwrap();
+    }
+    let query = "limit=1&sort=reason&dir=asc";
+    let first = ban_page(&f, query).await;
+    assert_eq!(ban_user_ids(&first), [1]);
+    let anchor_id = first["bans"][0]["id"].as_i64().unwrap();
+    let after = format!("{query}&after={}", ban_page_cursor(&first));
+    let (status, body) = f
+        .request("POST", &format!("/api/guilds/20/bans?{after}"), "")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid list cursor");
+
+    let (status, body) = f
+        .request(
+            "PUT",
+            &format!("/api/guilds/10/bans/{anchor_id}/reason"),
+            r#"{"reason":"c"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = f
+        .request("POST", &format!("/api/guilds/10/bans?{after}"), "")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid list cursor");
+    assert_eq!(walk_ban_pages(&f, query, 2).await, [2, 1]);
+
+    let first = ban_page(&f, query).await;
+    let anchor_id = first["bans"][0]["id"].as_i64().unwrap();
+    f.app
+        .db
+        .with_conn(move |conn| {
+            let deleted = db::SqlExecutor::execute_reclaim_bounded(
+                conn,
+                "DELETE FROM bans WHERE guild_id = 10 AND id = ?1",
+                db::params![anchor_id],
+                16 * 1024 * 1024,
+            )?;
+            assert_eq!(deleted, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let after = format!("{query}&after={}", ban_page_cursor(&first));
+    let (status, body) = f
+        .request("POST", &format!("/api/guilds/10/bans?{after}"), "")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid list cursor");
+    assert_eq!(walk_ban_pages(&f, query, 1).await, [1]);
 }
 
 async fn ban_page(f: &Fixture, query: &str) -> serde_json::Value {

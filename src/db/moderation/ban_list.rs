@@ -1,6 +1,9 @@
 use super::{decode_ban_row, enrolled_moderation_read};
-use crate::db::{BanRow, Db, GuildEnrollment, SqlExecutor, Value, params, params_from_iter};
-use anyhow::Result;
+use crate::db::{
+    BanRow, Db, GuildEnrollment, OptionalExtension, SqlExecutor, Value, params, params_from_iter,
+};
+use anyhow::{Context as _, Result};
+use ring::digest::{SHA256, SHA256_OUTPUT_LEN, digest};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -56,22 +59,55 @@ pub struct BanListFilters {
 
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum BanListValue {
-    Text(String),
+enum BanListValue {
+    TextDigest([u8; SHA256_OUTPUT_LEN]),
     Number(i64),
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BanListAnchor {
-    pub value: BanListValue,
-    pub id: i64,
+    value: BanListValue,
+    id: i64,
 }
 
 impl BanListAnchor {
-    pub fn matches_sort(&self, sort: BanListSort) -> bool {
-        self.id > 0 && matches!(self.value, BanListValue::Text(_)) == sort.is_text()
+    fn seek_value(
+        &self,
+        conn: &impl SqlExecutor,
+        guild: i64,
+        sort: BanListSort,
+    ) -> Result<(Value, i64)> {
+        anyhow::ensure!(
+            self.id > 0 && matches!(self.value, BanListValue::TextDigest(_)) == sort.is_text(),
+            "invalid list cursor"
+        );
+        let value = match self.value {
+            BanListValue::TextDigest(expected) => {
+                // Resolve the full indexed key in the same snapshot as the page.
+                // A changed boundary would otherwise move the seek between requests.
+                let (column, _) = sort.order();
+                let key: String = conn
+                    .query_row(
+                        &format!("SELECT {column} FROM bans WHERE guild_id = ?1 AND id = ?2"),
+                        params![guild, self.id],
+                        |r| Ok(r.get(0)?),
+                    )
+                    .optional()?
+                    .context("invalid list cursor")?;
+                anyhow::ensure!(text_key_digest(&key) == expected, "invalid list cursor");
+                Value::Text(key)
+            }
+            BanListValue::Number(key) => Value::Integer(key),
+        };
+        Ok((value, self.id))
     }
+}
+
+fn text_key_digest(key: &str) -> [u8; SHA256_OUTPUT_LEN] {
+    let mut bytes = [0; SHA256_OUTPUT_LEN];
+    bytes.copy_from_slice(digest(&SHA256, key.as_bytes()).as_ref());
+    bytes
 }
 
 pub struct BanListRequest {
@@ -108,39 +144,44 @@ pub async fn page_enrolled_bans(
 }
 
 fn list_page(conn: &impl SqlExecutor, guild: i64, request: BanListRequest) -> Result<BanListPage> {
+    let after = request
+        .after
+        .as_ref()
+        .map(|anchor| anchor.seek_value(conn, guild, request.sort))
+        .transpose()?;
     let (predicate, values) = filters_sql(guild, &request.filters);
     let total = conn.query_row(
         &format!("SELECT COUNT(*) FROM bans WHERE {predicate}"),
         params_from_iter(values.iter().cloned()),
         |r| Ok(r.get::<i64>(0)?),
     )?;
-    let (sql, params) = page_sql(&request, &predicate, values);
-    let mut pairs = conn
+    let (sql, params) = page_sql(&request, &predicate, values, after);
+    let limit = request.limit.clamp(1, 200) as usize;
+    let mut seen = 0;
+    let mut boundary = None;
+    let mut rows = conn
         .prepare(&sql)?
         .query_map(params_from_iter(params), |r| {
             let mut ban = decode_ban_row(r)?;
             ban.edited_reason = r.get(10)?;
             ban.reason_edited_by = r.get(11)?;
             ban.reason_edited_at = r.get(12)?;
-            let value = if request.sort.is_text() {
-                BanListValue::Text(r.get(13)?)
-            } else {
-                BanListValue::Number(r.get(13)?)
-            };
-            let id = ban.id;
-            Ok((ban, BanListAnchor { value, id }))
+            seen += 1;
+            if seen == limit {
+                let value = if request.sort.is_text() {
+                    let key: String = r.get(13)?;
+                    BanListValue::TextDigest(text_key_digest(&key))
+                } else {
+                    BanListValue::Number(r.get(13)?)
+                };
+                boundary = Some(BanListAnchor { value, id: ban.id });
+            }
+            Ok(ban)
         })?
         .collect::<Result<Vec<_>>>()?;
 
-    let limit = request.limit.clamp(1, 200) as usize;
-    let has_more = pairs.len() > limit;
-    pairs.truncate(limit);
-    let (rows, anchors): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-    let next = if has_more {
-        anchors.into_iter().last()
-    } else {
-        None
-    };
+    let next = if rows.len() > limit { boundary } else { None };
+    rows.truncate(limit);
     let moderators = conn
         .prepare(
             "SELECT moderator_id, MAX(NULLIF(moderator_name, '')) FROM bans
@@ -215,6 +256,7 @@ fn page_sql(
     request: &BanListRequest,
     predicate: &str,
     mut values: Vec<Value>,
+    after: Option<(Value, i64)>,
 ) -> (String, Vec<Value>) {
     let (key, index) = request.sort.order();
     let (dir, seek) = if request.descending {
@@ -228,15 +270,11 @@ fn page_sql(
                 list_reason_edited_at, {key}
          FROM bans INDEXED BY {index} WHERE {predicate}"
     );
-    if let Some(after) = &request.after {
-        let value = match &after.value {
-            BanListValue::Text(value) => Value::Text(value.clone()),
-            BanListValue::Number(value) => Value::Integer(*value),
-        };
+    if let Some((value, id)) = after {
         let key_arg = values.len() + 1;
         let id_arg = key_arg + 1;
         sql.push_str(&format!(" AND ({key}, id) {seek} (?{key_arg}, ?{id_arg})"));
-        values.extend([value, Value::Integer(after.id)]);
+        values.extend([value, Value::Integer(id)]);
     }
     values.push(Value::Integer(request.limit.clamp(1, 200) + 1));
     sql.push_str(&format!(
@@ -320,24 +358,21 @@ mod tests {
                         ..Default::default()
                     };
                     let (predicate, values) = filters_sql(10, &filters);
-                    let mut request = BanListRequest {
+                    let request = BanListRequest {
                         filters,
                         sort,
                         descending,
                         after: None,
                         limit: 50,
                     };
-                    let (sql, args) = page_sql(&request, &predicate, values.clone());
+                    let (sql, args) = page_sql(&request, &predicate, values.clone(), None);
                     crate::db::tests::assert_index_plan(conn, &sql, params_from_iter(args), true);
-                    request.after = Some(BanListAnchor {
-                        value: if sort.is_text() {
-                            BanListValue::Text("same".into())
-                        } else {
-                            BanListValue::Number(5)
-                        },
-                        id: 1,
-                    });
-                    let (sql, args) = page_sql(&request, &predicate, values);
+                    let key = if sort.is_text() {
+                        Value::Text("same".into())
+                    } else {
+                        Value::Integer(5)
+                    };
+                    let (sql, args) = page_sql(&request, &predicate, values, Some((key, 1)));
                     crate::db::tests::assert_index_plan(conn, &sql, params_from_iter(args), true);
                 }
             }
