@@ -3809,8 +3809,7 @@ async fn enabled_only_command_updates_preserve_saved_fields_and_scope() {
 }
 
 #[tokio::test]
-async fn enabled_only_builtin_command_override_inherits_defaults_and_updates_registry_and_audit_log()
- {
+async fn enabled_only_builtin_command_override_supports_fallback_and_updates_registry_and_audit() {
     use jmodguard::db::SqlExecutor;
 
     let f = Fixture::new(false).await;
@@ -3837,13 +3836,13 @@ async fn enabled_only_builtin_command_override_inherits_defaults_and_updates_reg
         })
         .await
         .unwrap();
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&stored).unwrap(),
-        serde_json::json!({"enabled": false})
-    );
     let mut expected = before["effective"].clone();
     expected["enabled"] = false.into();
     expected["builtin_override"] = true.into();
+    // Older compatible binaries deserialize command rows without expanding overrides.
+    let decoded: crate::types::CommandDef =
+        serde_json::from_str(&stored).expect("first toggle stores an older-readable command");
+    assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
     let (status, bundle) = f.request("POST", "/api/guilds/10/config", "").await;
     assert_eq!(status, StatusCode::OK, "{bundle}");
     let row = bundle["commands"]
@@ -3887,6 +3886,34 @@ async fn enabled_only_builtin_command_override_inherits_defaults_and_updates_reg
     let (status, detail) = f.request("GET", path, "").await;
     assert_eq!(status, StatusCode::OK, "{detail}");
     expected["enabled"] = true.into();
+    assert_eq!(detail["effective"], expected);
+    assert_eq!(detail["guild_override"], expected);
+}
+
+#[tokio::test]
+async fn enabled_only_compact_builtin_command_override_stays_readable() {
+    use jmodguard::db::SqlExecutor;
+
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let mut expected = crate::defaults::effective_builtin_command("ban", None).unwrap();
+    expected.enabled = false;
+    expected.builtin_override = true;
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_bounded(
+                "INSERT INTO commands(guild_id,name,data) VALUES (10,'ban',?1)",
+                jmodguard::db::params![r#"{"enabled":false}"#],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (status, detail) = f.request("GET", "/api/guilds/10/commands/ban", "").await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    let expected = serde_json::to_value(expected).unwrap();
     assert_eq!(detail["effective"], expected);
     assert_eq!(detail["guild_override"], expected);
 }

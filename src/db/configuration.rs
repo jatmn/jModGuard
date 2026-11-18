@@ -1,5 +1,6 @@
 use super::*;
 use serde::Deserialize;
+use std::borrow::Cow;
 
 /// Guild-local exclusions for one log event. Both lists contain canonical
 /// decimal Discord snowflake IDs, serialized as strings for the WebUI.
@@ -454,8 +455,7 @@ fn read_command_json(name: &str, raw: &str) -> Result<CommandDef> {
     if full.is_ok() {
         return full;
     }
-    // A toggle can create a server override that inherits everything except
-    // enabled. An editor save still stores a full CommandDef.
+    // Earlier toggle builds wrote compact overrides. Keep those rows readable.
     if let Ok(patch) = serde_json::from_str::<BuiltinEnabledOverride>(raw)
         && let Some(mut command) = crate::defaults::effective_builtin_command(name, None)
     {
@@ -2027,8 +2027,15 @@ pub(super) async fn set_enrolled_command_enabled(
             .filter(|(_, (command, _))| shipped.is_none() || command.builtin_override)
             .min_by_key(|(key, _)| (key != &name, key));
         let (key, raw, previous) = match (stored, shipped) {
-            (Some((key, (command, raw))), _) => (key.as_str(), raw.as_str(), command.enabled),
-            (None, Some(command)) => (name.as_str(), "{}", command.enabled),
+            (Some((key, (command, raw))), _) => {
+                (key.as_str(), Cow::Borrowed(raw.as_str()), command.enabled)
+            }
+            (None, Some(command)) => {
+                // Schema-compatible fallback binaries decode full CommandDef rows.
+                let row = crate::defaults::command_row_for_storage(&name, &command);
+                let raw = serde_json::to_string(&row)?;
+                (name.as_str(), Cow::Owned(raw), command.enabled)
+            }
             (None, None) => anyhow::bail!("command not found in the requested scope"),
         };
         if previous != enabled {
@@ -2036,7 +2043,12 @@ pub(super) async fn set_enrolled_command_enabled(
                 "INSERT INTO commands (guild_id, name, data)
                  VALUES (?1, ?2, json_set(?3, '$.enabled', json(?4)))
                  ON CONFLICT(guild_id, name) DO UPDATE SET data = excluded.data",
-                params![guild_id, key, raw, if enabled { "true" } else { "false" }],
+                params![
+                    guild_id,
+                    key,
+                    raw.as_ref(),
+                    if enabled { "true" } else { "false" }
+                ],
                 1,
             )?;
             let audit = serde_json::json!({
