@@ -104,18 +104,46 @@ function lineNumber(text, index) {
 
 const rustUnit = { nanos: 1e-6, micros: 1e-3, millis: 1, secs: 1000, secs_f64: 1000, secs_f32: 1000, mins: 60000 };
 const rustDuration = String.raw`(?:(?:std|tokio)::time::)?Duration::from_(nanos|micros|millis|secs_f64|secs_f32|secs|mins)\s*\(\s*([\d_]+(?:\.\d+)?)\s*\)`;
-const budgetName = String.raw`\w*(?:timeout|deadline|time_budget)\w*`;
+const budgetName = String.raw`\w*(?:timeout|deadline|time_budget)`;
 
 function rustTestSection(file, text) {
     if (/(?:\/tests?[/.]|(?:^|\/)(?:test(?:s|_\w*)|\w+_tests?)\.rs$)/.test(file)) return () => true;
     // Repository Rust is rustfmt-formatted. Recognize inline test functions and
     // cfg(test) fixture modules by the indentation of their closing brace.
-    const sections = [...text.matchAll(/^( *)#\[(?:cfg\(test\)|(?:[\w:]+::)?test)(?:\([^\n]*\))?\][^\n]*\n(?:[ \t]*#\[[^\n]*\][^\n]*\n)*\1[^\n]*(?:\bmod\b|\bfn\b)[^\n]*$/gm)]
-        .map((match) => {
-            const closing = new RegExp(`^${match[1]}\\}`, "gm");
-            closing.lastIndex = match.index + match[0].length;
-            return [match.index, closing.exec(text)?.index ?? text.length];
-        });
+    const testAttribute = /^ *#\[(?:cfg\(test\)|(?:[\w:]+::)?test)(?:\]|\([^\n]*\)\])/;
+    const followingAttribute = /^[ \t]*#\[[^\]]*\]/;
+    const nextClosing = new Map();
+    const nextDeclaration = [];
+    const candidates = [];
+    let offset = text.length + 1;
+    for (const line of text.split("\n").reverse()) {
+        const lineEnd = offset - 1;
+        offset = lineEnd - line.length;
+        const indent = /^ */.exec(line)[0].length;
+        const declaration = nextDeclaration[indent];
+        if (declaration && testAttribute.test(line)) {
+            candidates.push({ start: offset, ...declaration });
+        }
+        // Within each run of attributes, remember the furthest declaration
+        // reachable for each indent. A declaration may be more indented than
+        // its marker, while a closing brace must have the marker's indent.
+        if (!followingAttribute.test(line)) nextDeclaration.length = 0;
+        if (/\b(?:mod|fn)\b/.test(line)) {
+            for (let depth = nextDeclaration.length; depth <= indent; depth++) {
+                nextDeclaration.push({ lineEnd, end: nextClosing.get(depth) ?? text.length });
+            }
+        }
+        if (line[indent] === "}") nextClosing.set(indent, offset);
+    }
+
+    // A declaration consumes its line, including any potential marker there.
+    const sections = [];
+    let previousDeclarationEnd = -1;
+    for (const { start, lineEnd, end } of candidates.reverse()) {
+        if (start <= previousDeclarationEnd) continue;
+        sections.push([start, end]);
+        previousDeclarationEnd = lineEnd;
+    }
     return (index) => sections.some(([start, end]) => index >= start && index < end);
 }
 
@@ -135,7 +163,7 @@ export function timeoutBudgets(file, text) {
         const duration = (value, unit) => Number(value.replaceAll("_", "")) * rustUnit[unit];
         collect(new RegExp(String.raw`\b((?:[\w:]+::)?(?:timeout|recv_timeout|wait_timeout))\s*\(\s*` + rustDuration, "g"),
             ([, name, unit, value]) => [name.split("::").at(-1), duration(value, unit)], inTest);
-        collect(new RegExp(String.raw`\b(` + budgetName + String.raw`)[ \t]*(?::[^=\n]+)?[ \t]*=\s*` + rustDuration, "gi"),
+        collect(new RegExp(String.raw`\b(?=` + budgetName + String.raw`)(\w+)[ \t]*(?::[^=\n]+)?=\s*` + rustDuration, "gi"),
             ([, name, unit, value]) => [name, duration(value, unit)], inTest);
         collect(new RegExp(String.raw`\belapsed\s*\(\s*\)\s*<=?\s*` + rustDuration, "g"),
             ([, unit, value]) => ["elapsed budget", duration(value, unit)], inTest);

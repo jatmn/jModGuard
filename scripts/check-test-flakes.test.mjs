@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { timeoutBudgets } from "./check-test-flakes.mjs";
 
 const script = fileURLToPath(new URL("./check-test-flakes.mjs", import.meta.url));
 const allowlist = "tools/test-flake-allowlist.tsv";
@@ -14,6 +15,8 @@ pub async fn production() {
     timeout(Duration::from_secs(90), x()).await;
 }
 #[tokio::test]
+#[allow(unused_variables)]
+#[cfg(any(test, feature = "test-support"))]
 async fn example() {
     timeout(
         Duration::from_millis(${duration}),
@@ -73,6 +76,38 @@ test("a shorter test budget and allowlist and ordinary production budget changes
     write(allowlist, entry.replace("\t2\t", "\t1\t"));
     const result = run("contracts");
     assert.equal(result.status, 0, result.stderr);
+});
+
+test("inline Rust test ranges follow attributes and use the marker's closing indent", () => {
+    const source = `
+#[cfg(test)]
+mod fixtures {
+    const TEST_TIMEOUT: Duration = Duration::from_secs(1);
+    #[tokio::test(start_paused = true)] // trailing comment
+    #[allow(unused_variables)]
+    async fn example() {
+        let read_deadline = Duration::from_millis(20);
+        let not_a_budget = Duration::from_millis(50);
+        timeout(Duration::from_millis(100), fixture()).await;
+    }
+}
+fn production() {
+    let read_deadline = Duration::from_secs(90);
+}
+`;
+    assert.deepEqual(timeoutBudgets("src/service.rs", source).map(({ name, value }) => [name, value]), [
+        ["timeout", 100], ["TEST_TIMEOUT", 1000], ["read_deadline", 20],
+    ]);
+});
+
+test("the contracts gate finishes on a long malformed Rust attribute run", (t) => {
+    const { write, run } = fixture(t);
+    const attributes = "#[test]\n#[" + "]]\n#[".repeat(4096) + "\n";
+    write("src/service.rs", attributes + sample("1_001"));
+    const result = run("contracts", { timeout: 5000 });
+    assert.ifError(result.error);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /timeout increased/);
 });
 
 test("the compiler gate distinguishes a new finding from inherited unlisted debt", (t) => {
