@@ -308,8 +308,7 @@ mod tests {
         let conn = crate::db::Connection::open(&path).unwrap();
         let migration_budget = 16 * 1024 * 1024;
         for sql in [
-            include_str!("../../../migrations/0001_init.sql"),
-            include_str!("../../../migrations/0014_ban_display_identity.sql"),
+            include_str!("../../../migrations/0023_baseline.sql"),
             r#"INSERT INTO bans (id, guild_id, user_id, reason, created_at)
                  VALUES (7, 10, 123, 'original', '2026-01-01T00:00:00Z');
              INSERT INTO events (guild_id, event_type, actor_id, data, created_at) VALUES

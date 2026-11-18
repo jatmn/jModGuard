@@ -477,9 +477,7 @@ async fn version_four_upgrade_indexes_live_removed_and_closed_cases() {
     let ids = [CaseId::new(), CaseId::new(), CaseId::new()];
     {
         let raw = Connection::open(&f.store_path).unwrap();
-        for schema in [SCHEMA, TENANT_SCHEMA, CASE_SCHEMA, HISTORY_SCHEMA] {
-            raw.execute_batch_bounded(schema, 64 * 1024 * 1024).unwrap();
-        }
+        apply_guild_fixture(&raw, 0, 4).unwrap();
         raw.execute_bounded(
             "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
             params![FAMILY, reg.id().as_str()],
@@ -513,7 +511,7 @@ async fn version_four_upgrade_indexes_live_removed_and_closed_cases() {
         .unwrap();
         raw.execute_batch_bounded("UPDATE guild_memberships SET active=0", 64 * 1024 * 1024)
             .unwrap();
-        raw.pragma_update(None, "user_version", 4).unwrap();
+        apply_guild_fixture(&raw, 4, GUILD_BASELINE_VERSION).unwrap();
     }
     assert!(GuildDataStore::open(f.options(), reg.clone()).is_err());
     let foreign = f.registration(StoreId::new(), StorePolicy::Shared).await;

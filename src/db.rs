@@ -74,38 +74,26 @@ use write_budget::BoundedWrites;
 /// Maximum rows in one live dashboard list response.
 pub const DASHBOARD_LIST_PAGE_LIMIT: u32 = 250;
 
-const MIGRATIONS: &[&str] = &[
-    include_str!("../migrations/0001_init.sql"),
-    include_str!("../migrations/0002_config_version.sql"),
-    include_str!("../migrations/0003_archive_global_log_channels.sql"),
-    include_str!("../migrations/0004_nickname_reconcile.sql"),
-    include_str!("../migrations/0005_mutation_receipts_nickname_jobs.sql"),
-    include_str!("../migrations/0006_bot_actions.sql"),
-    include_str!("../migrations/0007_guild_enrollments.sql"),
-    include_str!("../migrations/0008_action_enrollments.sql"),
-    include_str!("../migrations/0009_nickname_enrollments.sql"),
-    include_str!("../migrations/0010_guild_store_catalog.sql"),
-    include_str!("../migrations/0011_tenant_runtime.sql"),
-    include_str!("../migrations/0012_guild_moves.sql"),
-    include_str!("../migrations/0013_log_filters.sql"),
-    include_str!("../migrations/0014_ban_display_identity.sql"),
-    include_str!("../migrations/0015_component_updates.sql"),
-    include_str!("../migrations/0016_member_sync_pacing.sql"),
-    include_str!("../migrations/0017_hot_query_indexes.sql"),
-    include_str!("../migrations/0018_one_active_ban.sql"),
-    include_str!("../migrations/0019_known_bad_images.sql"),
-    include_str!("../migrations/0020_gateway_ban_deliveries.sql"),
-    include_str!("../migrations/0021_clear_builtin_command_access.sql"),
-    include_str!("../migrations/0022_clear_userinfo_command_rows.sql"),
-    include_str!("../migrations/0023_ban_expiry.sql"),
-    include_str!("../migrations/0024_known_spam.sql"),
-    include_str!("../migrations/0025_analytics_member_daily.sql"),
-    include_str!("../migrations/0026_guild_join_info.sql"),
-    include_str!("../migrations/0027_ban_list.sql"),
+// The first step initializes an empty database at the v0.2.0 release version.
+const CORE_BASELINE_VERSION: i64 = 23;
+// Guild file 0016 advanced user_version to 17 (version 16 had no SQL).
+const GUILD_BASELINE_VERSION: i64 = 17;
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        CORE_BASELINE_VERSION,
+        include_str!("../migrations/0023_baseline.sql"),
+    ),
+    (24, include_str!("../migrations/0024_known_spam.sql")),
+    (
+        25,
+        include_str!("../migrations/0025_analytics_member_daily.sql"),
+    ),
+    (26, include_str!("../migrations/0026_guild_join_info.sql")),
+    (27, include_str!("../migrations/0027_ban_list.sql")),
 ];
 
 /// Completed core schema required by service startup and release observations.
-pub const CORE_SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+pub const CORE_SCHEMA_VERSION: i64 = MIGRATIONS[MIGRATIONS.len() - 1].0;
 
 /// Set `PRAGMA user_version` on a local file without an application pool.
 /// Startup tests use this so the writer-open tripwire stays quiet.
@@ -932,7 +920,7 @@ impl Db {
                     write_meta_string_conn(
                         bootstrap,
                         META_BOOTSTRAP_COMPLETE,
-                        &MIGRATIONS.len().to_string(),
+                        &CORE_SCHEMA_VERSION.to_string(),
                     )?;
                 }
                 Ok(())

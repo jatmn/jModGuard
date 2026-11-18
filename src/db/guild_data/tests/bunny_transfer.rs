@@ -173,16 +173,7 @@ async fn version_six_upgrade_preserves_ownership_and_rolls_back_failed_extension
     let evidence = CaseId::new();
     let storage = CaseId::new();
     let raw = Connection::open(&f.store_path).unwrap();
-    for schema in [
-        SCHEMA,
-        TENANT_SCHEMA,
-        CASE_SCHEMA,
-        HISTORY_SCHEMA,
-        SOURCE_SCHEMA,
-        EVIDENCE_SCHEMA,
-    ] {
-        raw.execute_batch_bounded(schema, 64 * 1024 * 1024).unwrap();
-    }
+    apply_guild_fixture(&raw, 0, 6).unwrap();
     raw.execute_bounded(
         "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
         params![FAMILY, reg.id().as_str()],
@@ -203,13 +194,12 @@ async fn version_six_upgrade_preserves_ownership_and_rolls_back_failed_extension
     )
     .unwrap();
     raw.execute_bounded("INSERT INTO guild_case_evidence VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,?2,?3,3,0,0,1,2,3,NULL)",params![case.as_str(),evidence.as_str(),storage.as_str()], 64 * 1024 * 1024).unwrap();
-    raw.pragma_update(None, "user_version", 6).unwrap();
     raw.execute_batch_bounded(
         "CREATE INDEX guild_bunny_resource ON guild_case_evidence(storage_id)",
         64 * 1024 * 1024,
     )
     .unwrap();
-    assert!(GuildDataStore::initialize(f.options(), reg.clone()).is_err());
+    assert!(apply_guild_fixture(&raw, 6, GUILD_BASELINE_VERSION).is_err());
     assert_eq!(
         raw.query_row("PRAGMA user_version", (), |r| Ok(r.get::<i64>(0)?))
             .unwrap(),
@@ -224,6 +214,7 @@ async fn version_six_upgrade_preserves_ownership_and_rolls_back_failed_extension
     raw.execute_batch_bounded("DROP INDEX guild_bunny_resource", 64 * 1024 * 1024)
         .unwrap();
     assert!(GuildDataStore::open(f.options(), reg.clone()).is_err());
+    apply_guild_fixture(&raw, 6, GUILD_BASELINE_VERSION).unwrap();
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
     assert_eq!(
         raw.query_row("PRAGMA user_version", (), |r| Ok(r.get::<i64>(0)?))

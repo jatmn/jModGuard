@@ -5,11 +5,11 @@ empty database for a new installation. Databases created by the previous applica
 or unpublished development baselines with a different marker are unsupported. This release does not
 copy, convert, erase or adopt them. Recreate development fixtures explicitly.
 
-The first migration writes `meta.schema_family` in the same transaction as its initial
-tables and `user_version`. An interrupted uncommitted initialization leaves no partial
-marker. Bot startup can resume subsequent schema/bootstrap steps in the recognized
-family. API startup continues to wait for the bot to initialize an empty database and
-publish the completed bootstrap marker.
+The v0.2.0 baseline writes `meta.schema_family` in the same transaction as
+its tables and `user_version=23`. An interrupted uncommitted initialization leaves
+no partial marker. Bot startup resumes the remaining schema and bootstrap steps
+from the recorded version. API startup waits for the bot to publish the completed
+bootstrap marker.
 
 Both processes check the family on an authoritative snapshot. Foreign/unmarked schemas,
 invalid initialized versions and schemas newer than the running binary fail startup
@@ -40,15 +40,23 @@ modified or used to establish provider-specific behavior.
 ## Setup and recovery boundary
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
-binaries. Start the bot to initialize it, then the API. The current baseline contains
-migrations 0001–0027. Do not add or edit the family marker on an old database to bypass
-the guard; the version number alone cannot establish compatibility.
+binaries. Start the bot to initialize it, then the API. Core migration
+`0023_baseline.sql` creates the v0.2.0 schema and migrations 0024–0027 run after it.
+Guild stores start from `0016_baseline.sql` at schema version 17 and run migrations
+0017–0021 after it. Existing installations at or past those baseline versions
+resume from their recorded version. For a recognized earlier database, upgrade
+to v0.2.0 first. Keep the family marker and version intact when upgrading.
 
 Keep a backup with the binaries/images that support its family and version. A backup from an unsupported
 lineage requires its matching release; it cannot be restored into this baseline as
 an upgrade. This is a schema boundary, not an automatic backup or restore implementation.
 
-## Action storage extension
+## Core schema history through v0.2.0
+
+The following changes are part of the baseline for fresh installs. Their original
+SQL remains in the test fixtures to verify release upgrades.
+
+### Action storage extension
 
 Migration 0006 adds an initially empty durable action queue and replay-floor metadata
 within `jmodguard-core-1`. Bot startup can extend version 5 while retaining configuration
@@ -59,7 +67,7 @@ This does not add a production backup implementation or an old-lineage migration
 This storage foundation is now used by [queued administrative actions](BOT-ACTIONS.md);
 runtime activation adds no further schema change.
 
-## Membership observation extension
+### Membership observation extension
 
 Migration 0007 adds an empty `guild_enrollments` table for the bot's own membership
 observations. It does not infer a join from old settings/jobs or bind queue/nickname work.
@@ -67,7 +75,7 @@ The bot initializes it; the matching API waits for completed bootstrap. Older bi
 supporting only version6 reject version7. Preserve matched pre-upgrade backups for rollback.
 No data erasure or authorization boundary is activated. See [membership observations](ENROLLMENTS.md).
 
-## Action membership extension
+### Action membership extension
 
 Migration 0008 binds new queue work to observed membership without recreating the table
 introduced in 0007. Earlier actions are never adopted: unstarted work becomes cancelled,
@@ -76,7 +84,7 @@ moderation data stay in place. Runtime activation is documented separately. Depl
 with bot migration first; version7 binaries reject version8, so use the matched pre-upgrade
 backup for rollback. See [membership-bound queue storage](BOT-ACTIONS.md#membership-bound-storage).
 
-## Nickname membership extension
+### Nickname membership extension
 
 Migration 0009 captures request identity, membership and immutable nickname on new work.
 Existing nickname rows become dormant and remain unbound, even if an active membership
@@ -85,7 +93,7 @@ startup and rejoin never adopt them. Settings/moderation records remain intact. 
 matched bot/API builds, bot first. Version8 binaries reject version9; rollback requires
 matching pre-upgrade backup and binaries. No live upgrade/restore automation is supplied.
 
-## Guild-store catalog extension
+### Guild-store catalog extension
 
 Migration0010 adds empty `guild_store_catalog` and `guild_store_placements` tables with
 SQL constraints/triggers for valid shared/dedicated ownership. It does not infer placements
@@ -112,10 +120,10 @@ across guilds ([MEMBERS.md](MEMBERS.md)).
 ## Separate guild-store family
 
 The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version 22,
-using `migrations/guild/0001_identity.sql` through `0021_member_list_orders.sql`. Version 16
-adds optional immutable ban attempt tags to case payloads without changing tables or
-rewriting legacy cases. Version 17 adds durable `guild_member_pending_rejoin_notes` so
-member-rejoin log delivery can survive restarts and member-sync ahead of gateway joins.
+using `migrations/guild/0016_baseline.sql` through `0021_member_list_orders.sql`.
+The v0.2.0 baseline includes the version 16 payload format with optional immutable
+ban attempt tags, and the version 17 `guild_member_pending_rejoin_notes` table for
+durable member-rejoin log delivery.
 Version 18 adds `guild_member_seed.gap_auto_clear`; existing coverage gaps keep 0
 and still need an explicit Reconcile.
 Version 19 adds `guild_tenant_settings.access_roles` (WebUI role -> access level

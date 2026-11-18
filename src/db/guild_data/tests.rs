@@ -55,6 +55,14 @@ fn options(path: &Path) -> GuildStoreOptions {
     }
 }
 
+// Exercise retired migration SQL explicitly before starting the current binary.
+fn apply_guild_fixture(conn: &Connection, from: i64, to: i64) -> Result<()> {
+    let tx = conn.transaction_immediate()?;
+    historical_schema::apply(&tx, from, to)?;
+    tx.pragma_update(None, "user_version", to)?;
+    tx.commit()
+}
+
 #[tokio::test]
 async fn separate_store_initialization_reopen_and_no_core_tables() {
     let f = Fixture::new();
@@ -207,8 +215,9 @@ fn version_mismatch_advice_follows_the_migratable_range() {
     let advice = |found| version_mismatch("store", None, found, VERSION).to_string();
     let newer = advice(VERSION + 1);
     assert!(newer.contains("never downgraded") && !newer.contains("start the bot"));
-    let older = advice(1);
+    let older = advice(GUILD_BASELINE_VERSION);
     assert!(older.contains("start the bot") && !older.contains("never downgraded"));
+    assert!(advice(GUILD_BASELINE_VERSION - 1).contains("upgrade to v0.2.0 first"));
     for unrecognized in [0, -1] {
         let text = advice(unrecognized);
         assert!(
@@ -475,26 +484,12 @@ async fn remote_option_mistakes_never_fall_back_to_local() {
 
 #[tokio::test]
 async fn version_seven_upgrade_adds_erasure_and_tenant_settings() {
-    use super::{
-        BUNNY_SCHEMA, CASE_SCHEMA, EVIDENCE_SCHEMA, FAMILY, HISTORY_SCHEMA, SCHEMA, SOURCE_SCHEMA,
-        TENANT_SCHEMA, VERSION,
-    };
     use crate::db_compat::Connection;
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
     let p = f.placement(&reg, 10).await;
     let raw = Connection::open(&f.store_path).unwrap();
-    for schema in [
-        SCHEMA,
-        TENANT_SCHEMA,
-        CASE_SCHEMA,
-        HISTORY_SCHEMA,
-        SOURCE_SCHEMA,
-        EVIDENCE_SCHEMA,
-        BUNNY_SCHEMA,
-    ] {
-        raw.execute_batch_bounded(schema, 64 * 1024 * 1024).unwrap();
-    }
+    apply_guild_fixture(&raw, 0, 7).unwrap();
     raw.execute_bounded(
         "INSERT INTO store_identity VALUES(1,?1,?2,NULL)",
         params![FAMILY, reg.id().as_str()],
@@ -508,7 +503,7 @@ async fn version_seven_upgrade_adds_erasure_and_tenant_settings() {
     )
     .unwrap();
     raw.execute_batch_bounded("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", 64 * 1024 * 1024).unwrap();
-    raw.pragma_update(None, "user_version", 7).unwrap();
+    apply_guild_fixture(&raw, 7, GUILD_BASELINE_VERSION).unwrap();
     let store = GuildDataStore::initialize(f.options(), reg).unwrap();
     assert_eq!(
         raw.query_row("PRAGMA user_version", (), |r| Ok(r.get::<i64>(0)?))
@@ -1493,4 +1488,127 @@ async fn write_core_lease(db: &Db, value: Option<String>) {
     })
     .await
     .unwrap();
+}
+
+const V0_2_1_GUILD_VERSION: i64 = 20;
+
+#[test]
+fn fresh_guild_matches_the_v0_2_1_replay_and_later_steps() {
+    use crate::db::tests::migration_fixtures::{schema_dump, user_version};
+
+    let registration = StoreRegistration::from_parts(StoreId::new(), StorePolicy::Shared);
+    let fresh = path("guild_baseline_fresh");
+    drop(GuildDataStore::initialize(options(&fresh), registration.clone()).unwrap());
+    let replay = path("guild_full_replay");
+    GuildDataStore::create_historical_store(options(&replay), registration, V0_2_1_GUILD_VERSION)
+        .unwrap();
+    let conn = Connection::open(&replay).unwrap();
+    apply_guild_fixture(&conn, V0_2_1_GUILD_VERSION, VERSION).unwrap();
+    let fresh_conn = Connection::open(&fresh).unwrap();
+    assert_eq!(user_version(&fresh_conn), user_version(&conn));
+    assert_eq!(schema_dump(&fresh_conn), schema_dump(&conn));
+    drop((fresh_conn, conn));
+    clean(&fresh);
+    clean(&replay);
+}
+
+#[tokio::test]
+async fn released_guild_stores_upgrade_with_data_and_reopen() {
+    use crate::db::tests::migration_fixtures::{schema_dump, user_version};
+
+    let f = Fixture::new();
+    let registration = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    drop(GuildDataStore::initialize(f.options(), registration.clone()).unwrap());
+    let expected = schema_dump(&Connection::open(&f.store_path).unwrap());
+    let placement = f.placement(&registration, 10).await;
+    let scope = GuildDataScope::new(
+        placement.clone(),
+        GuildEnrollment {
+            guild_id: 10,
+            id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            joined_at_ns: 100,
+        },
+    )
+    .unwrap();
+
+    for released in [GUILD_BASELINE_VERSION, V0_2_1_GUILD_VERSION] {
+        let historical = path("released_guild_upgrade");
+        let opts = options(&historical);
+        GuildDataStore::create_historical_store(opts.clone(), registration.clone(), released)
+            .unwrap();
+        let conn = Connection::open(&historical).unwrap();
+        assert_eq!(user_version(&conn), released);
+        conn.execute_bounded(
+            "INSERT INTO guild_bindings VALUES (10, ?1)",
+            params![placement.revision()],
+            1024 * 1024,
+        )
+        .unwrap();
+        conn.execute_batch_bounded(
+            "INSERT INTO guild_memberships VALUES
+             (10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+             INSERT INTO guild_log_channels (guild_id, enrollment_id, event_type, channel_id)
+             VALUES (10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','system',12);",
+            1024 * 1024,
+        )
+        .unwrap();
+        drop(conn);
+        let reader = GuildStoreOptions {
+            read_only: true,
+            ..opts.clone()
+        };
+        let error = GuildDataStore::open(reader.clone(), registration.clone())
+            .err()
+            .unwrap();
+        assert!(is_schema_not_ready(&error), "{error:#}");
+
+        for _ in 0..2 {
+            drop(GuildDataStore::initialize(opts.clone(), registration.clone()).unwrap());
+            let store = GuildDataStore::open(reader.clone(), registration.clone()).unwrap();
+            store.verify_placement(placement.clone()).await.unwrap();
+            assert_eq!(
+                store.log_channels(scope.clone()).await.unwrap().channels(),
+                &[("system".into(), 12)]
+            );
+            let conn = Connection::open(&historical).unwrap();
+            assert_eq!(user_version(&conn), VERSION);
+            assert_eq!(schema_dump(&conn), expected);
+        }
+        clean(&historical);
+    }
+}
+
+#[test]
+fn pre_v0_2_0_guild_store_is_refused_without_schema_or_data_changes() {
+    use crate::db::tests::migration_fixtures::{schema_dump, user_version};
+
+    let path = path("unsupported_guild_version");
+    let opts = options(&path);
+    let registration = StoreRegistration::from_parts(StoreId::new(), StorePolicy::Shared);
+    let older = GUILD_BASELINE_VERSION - 1;
+    GuildDataStore::create_historical_store(opts.clone(), registration.clone(), older).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let before = schema_dump(&conn);
+    for error in [
+        GuildDataStore::initialize(opts.clone(), registration.clone())
+            .err()
+            .unwrap(),
+        GuildDataStore::open(opts, registration.clone())
+            .err()
+            .unwrap(),
+    ] {
+        assert!(StoreCheckError::is_schema_refusal(&error), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("upgrade to v0.2.0 first"),
+            "{error:#}"
+        );
+    }
+    assert_eq!(schema_dump(&conn), before);
+    assert_eq!(user_version(&conn), older);
+    assert_eq!(
+        read_existing_registration(&conn).unwrap(),
+        Some(registration)
+    );
+    drop(conn);
+    clean(&path);
 }

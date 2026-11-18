@@ -207,8 +207,8 @@ objects and does not perform that Discord re-fetch.
 
 ## Migrations
 
-The [fresh database baseline](DATABASE-BASELINE.md) remains `jmodguard-core-1`,
-migrations 0001–0020. Migration 0006 adds action storage and its replay floor.
+The [fresh database baseline](DATABASE-BASELINE.md) initializes `jmodguard-core-1`
+at version 23. It incorporates the earlier migrations described here. Migration 0006 adds action storage and its replay floor.
 Migration 0007 adds bot membership observations. Migration 0008 binds queue
 storage and captured queue scope to those observations. Migration 0009 binds nickname
 requests without adopting earlier work. Migration 0010 adds the guild-store catalog.
@@ -263,7 +263,7 @@ crates/api/src/web/state.rs           ApiState and config-version observation
 crates/api/src/web/oauth.rs           dashboard OAuth client and identity models
 crates/runtime/src/health.rs  GET/HEAD /health liveness and /ready readiness (in-memory; bot listener; API bind until axum)
 frontend/                  admin SPA (Bunny CDN; local embed-ui; daisyUI/Headless bundled at build time, not vendored)
-migrations/                0001_init through 0022_clear_userinfo_command_rows
+migrations/                v0.2.0 schema and later migration steps
 Dockerfile.bot
 Dockerfile.api
 ```

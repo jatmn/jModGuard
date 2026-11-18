@@ -1,3 +1,4 @@
+use super::migration_fixtures::{schema_dump, user_version};
 use super::*;
 
 fn options(path: &Path, migrate: bool) -> DbOpenOptions {
@@ -115,7 +116,7 @@ fn old_or_foreign_databases_are_rejected_without_changing_their_rows() {
 
 #[test]
 fn newer_or_invalid_versions_refuse_before_bootstrap_changes() {
-    for version in [0, -1, MIGRATIONS.len() as i64 + 1] {
+    for version in [0, -1, CORE_SCHEMA_VERSION + 1] {
         let path = tmp_db_path("schema_version_refusal");
         let db = Db::open(&path, 2).unwrap();
         db.with_conn_sync(move |conn| conn.pragma_update(None, "user_version", version))
@@ -134,7 +135,7 @@ fn newer_or_invalid_versions_refuse_before_bootstrap_changes() {
             assert_eq!(actual, version);
             assert_eq!(
                 meta_string_conn(conn, META_BOOTSTRAP_COMPLETE)?.as_deref(),
-                Some(MIGRATIONS.len().to_string().as_str())
+                Some(CORE_SCHEMA_VERSION.to_string().as_str())
             );
             Ok(())
         })
@@ -150,9 +151,10 @@ fn first_schema_and_family_marker_rollback_together() {
     let conn = Connection::open(&path).unwrap();
     {
         let tx = conn.transaction_primary_write().unwrap();
-        tx.execute_batch_bounded(MIGRATIONS[0], 64 * 1024 * 1024)
+        tx.execute_batch_bounded(MIGRATIONS[0].1, 64 * 1024 * 1024)
             .unwrap();
-        tx.pragma_update(None, "user_version", 1).unwrap();
+        tx.pragma_update(None, "user_version", CORE_BASELINE_VERSION)
+            .unwrap();
         // Interrupted initializer before commit: dropping rolls back both.
     }
     assert_eq!(
@@ -180,13 +182,7 @@ fn bot_resumes_each_committed_schema_step_before_api_opens() {
     for completed in 1..=MIGRATIONS.len() {
         let path = tmp_db_path("partial_schema_bootstrap");
         let conn = Connection::open(&path).unwrap();
-        for (index, sql) in MIGRATIONS[..completed].iter().enumerate() {
-            let tx = conn.transaction_primary_write().unwrap();
-            tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-            tx.pragma_update(None, "user_version", (index + 1) as i64)
-                .unwrap();
-            tx.commit().unwrap();
-        }
+        apply_core_steps(&conn, &MIGRATIONS[..completed]);
         drop(conn);
         let error = Db::open_with(options(&path, false))
             .err()
@@ -202,18 +198,127 @@ fn bot_resumes_each_committed_schema_step_before_api_opens() {
     }
 }
 
+const V0_2_1_CORE_VERSION: i64 = 26;
+
+fn replay_released_core(conn: &Connection, version: i64) {
+    apply_historical_core(conn, 0, CORE_BASELINE_VERSION);
+    let end = MIGRATIONS.partition_point(|&(at, _)| at <= version);
+    // Versions 24–26 still use the original v0.2.1 SQL, verified against the tag.
+    apply_core_steps(conn, &MIGRATIONS[1..end]);
+}
+
+#[test]
+fn fresh_core_matches_the_v0_2_1_replay_and_later_steps() {
+    let fresh = tmp_db_path("core_baseline_fresh");
+    drop(Db::open_with(options(&fresh, true)).unwrap());
+    let replay = tmp_db_path("core_full_replay");
+    let conn = Connection::open(&replay).unwrap();
+    replay_released_core(&conn, V0_2_1_CORE_VERSION);
+    let start = MIGRATIONS.partition_point(|&(at, _)| at <= V0_2_1_CORE_VERSION);
+    apply_core_steps(&conn, &MIGRATIONS[start..]);
+    let fresh_conn = Connection::open(&fresh).unwrap();
+    assert_eq!(user_version(&fresh_conn), user_version(&conn));
+    assert_eq!(schema_dump(&fresh_conn), schema_dump(&conn));
+    drop((fresh_conn, conn));
+    cleanup_db(&fresh);
+    cleanup_db(&replay);
+}
+
+#[test]
+fn released_core_databases_upgrade_with_data_and_reopen() {
+    let fresh = tmp_db_path("core_baseline_comparison");
+    drop(Db::open_with(options(&fresh, true)).unwrap());
+    let expected = schema_dump(&Connection::open(&fresh).unwrap());
+    cleanup_db(&fresh);
+    for released in [CORE_BASELINE_VERSION, V0_2_1_CORE_VERSION] {
+        let path = tmp_db_path("released_core_upgrade");
+        let opts = options(&path, true);
+        let conn = Connection::open(&path).unwrap();
+        replay_released_core(&conn, released);
+        write_meta_string_conn(&conn, META_BOOTSTRAP_COMPLETE, &released.to_string()).unwrap();
+        conn.execute_batch_bounded(
+            r#"INSERT INTO guild_settings VALUES (42, '{"prefix":"?"}');
+               INSERT INTO warns (id, guild_id, user_id, moderator_id, reason, created_at)
+               VALUES (7, 42, 100, 200, 'retained moderation', '2026-01-01');
+               INSERT INTO bans (id, guild_id, user_id, reason, created_at)
+               VALUES (8, 42, 101, 'retained ban', '2026-01-02');"#,
+            1024 * 1024,
+        )
+        .unwrap();
+        drop(conn);
+        let control = UpdateControl::open(&opts).unwrap().unwrap();
+        assert_eq!(
+            tokio_test_block_on(control.schema_version()).unwrap(),
+            released
+        );
+        assert!(tokio_test_block_on(control.upgrade()).unwrap().is_none());
+        drop(control);
+        let api_opts = DbOpenOptions {
+            read_only: true,
+            ..options(&path, false)
+        };
+        assert!(is_schema_not_ready(
+            &Db::open_with(api_opts.clone()).err().unwrap()
+        ));
+
+        for _ in 0..2 {
+            drop(Db::open_with(opts.clone()).unwrap());
+            let api = Db::open_with(api_opts.clone()).unwrap();
+            api.with_conn_sync(|conn| {
+                assert_eq!(user_version(conn), CORE_SCHEMA_VERSION);
+                assert_eq!(schema_dump(conn), expected);
+                let retained: (String, String, String) = conn.query_row(
+                    "SELECT (SELECT settings FROM guild_settings WHERE guild_id=42),
+                            (SELECT reason FROM warns WHERE id=7 AND guild_id=42 AND user_id=100 AND moderator_id=200),
+                            (SELECT list_reason FROM bans WHERE id=8 AND guild_id=42 AND user_id=101)",
+                    (), |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                assert_eq!(retained, (r#"{"prefix":"?"}"#.into(), "retained moderation".into(), "retained ban".into()));
+                Ok(())
+            }).unwrap();
+        }
+        let control = UpdateControl::open(&opts).unwrap().unwrap();
+        assert_eq!(
+            tokio_test_block_on(control.schema_version()).unwrap(),
+            CORE_SCHEMA_VERSION
+        );
+        drop(control);
+        cleanup_db(&path);
+    }
+}
+
+#[test]
+fn pre_v0_2_0_core_is_refused_without_schema_or_data_changes() {
+    let path = tmp_db_path("unsupported_core_version");
+    let conn = Connection::open(&path).unwrap();
+    let released = CORE_BASELINE_VERSION - 1;
+    apply_historical_core(&conn, 0, released);
+    write_meta_string_conn(&conn, META_BOOTSTRAP_COMPLETE, &released.to_string()).unwrap();
+    let before = schema_dump(&conn);
+    for migrate in [true, false] {
+        let error = Db::open_with(options(&path, migrate)).err().unwrap();
+        assert!(error.is::<UnsupportedSchema>(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("upgrade to v0.2.0 first"),
+            "{error:#}"
+        );
+    }
+    assert_eq!(schema_dump(&conn), before);
+    assert_eq!(user_version(&conn), released);
+    assert_eq!(
+        meta_string_conn(&conn, META_BOOTSTRAP_COMPLETE).unwrap(),
+        Some(released.to_string())
+    );
+    drop(conn);
+    cleanup_db(&path);
+}
+
 #[test]
 fn migrating_one_version_takes_only_baseline_and_migration_writer_locks() {
     let path = tmp_db_path("migrate_skips_applied");
     let prior = MIGRATIONS.len() - 1;
     let conn = Connection::open(&path).unwrap();
-    for (index, sql) in MIGRATIONS[..prior].iter().enumerate() {
-        let tx = conn.transaction_primary_write().unwrap();
-        tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-        tx.pragma_update(None, "user_version", (index + 1) as i64)
-            .unwrap();
-        tx.commit().unwrap();
-    }
+    apply_core_steps(&conn, &MIGRATIONS[..prior]);
     drop(conn);
     let probe = Arc::new(crate::db_compat::StartupProbe::default());
     let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
@@ -227,7 +332,7 @@ fn migrating_one_version_takes_only_baseline_and_migration_writer_locks() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", (), |r| Ok(r.get::<i64>(0)?))
             .unwrap(),
-        MIGRATIONS.len() as i64
+        CORE_SCHEMA_VERSION
     );
     drop(conn);
     cleanup_db(&path);
@@ -336,13 +441,7 @@ fn ban_list_migration_rejects_payload_beyond_growth_budget_before_ddl() {
 
 fn open_core_26(path: &Path) -> Connection {
     let conn = Connection::open(path).unwrap();
-    for (index, sql) in MIGRATIONS[..26].iter().enumerate() {
-        let tx = conn.transaction_primary_write().unwrap();
-        tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-        tx.pragma_update(None, "user_version", (index + 1) as i64)
-            .unwrap();
-        tx.commit().unwrap();
-    }
+    apply_core_steps(&conn, &MIGRATIONS[..MIGRATIONS.len() - 1]);
     write_meta_string_conn(&conn, META_BOOTSTRAP_COMPLETE, "26").unwrap();
     conn
 }
@@ -351,15 +450,10 @@ fn open_core_26(path: &Path) -> Connection {
 fn action_schema_upgrade_preserves_version_five_configuration_and_audits() {
     let path = tmp_db_path("queue_upgrade");
     let conn = Connection::open(&path).unwrap();
-    for (index, sql) in MIGRATIONS[..5].iter().enumerate() {
-        let tx = conn.transaction_primary_write().unwrap();
-        tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-        tx.pragma_update(None, "user_version", (index + 1) as i64)
-            .unwrap();
-        tx.commit().unwrap();
-    }
+    apply_historical_core(&conn, 0, 5);
     conn.execute_batch_bounded("INSERT INTO log_channels(guild_id,event_type,channel_id) VALUES(42,'member_join',123);
         INSERT INTO warns(guild_id,user_id,moderator_id,reason,created_at) VALUES(42,100,200,'keep audit','2026-09-07');", 64 * 1024 * 1024).unwrap();
+    apply_historical_core(&conn, 5, CORE_BASELINE_VERSION);
     drop(conn);
     assert!(is_schema_not_ready(
         &Db::open_with(options(&path, false)).err().unwrap()
@@ -390,13 +484,7 @@ fn one_active_ban_migration_collapses_existing_duplicates() {
     let path = tmp_db_path("one_active_ban_migration");
     let mut conn = Connection::open(&path).unwrap();
     let prior = 17; // Test 0018 even after later migrations are added.
-    for (index, sql) in MIGRATIONS[..prior].iter().enumerate() {
-        let tx = conn.transaction_primary_write().unwrap();
-        tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-        tx.pragma_update(None, "user_version", (index + 1) as i64)
-            .unwrap();
-        tx.commit().unwrap();
-    }
+    apply_historical_core(&conn, 0, prior);
     conn.execute_batch_bounded(
         "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active) VALUES
             (10, 55, 9, 'spam', '2024-01-01T00:00:00Z', 1),
@@ -408,6 +496,7 @@ fn one_active_ban_migration_collapses_existing_duplicates() {
         64 * 1024 * 1024,
     )
     .unwrap();
+    apply_historical_core(&conn, prior, CORE_BASELINE_VERSION);
     migrate_conn(&mut conn).unwrap();
     let row = |sql: &str| -> (Option<i64>, i64) {
         conn.query_row(sql, (), |r| Ok((r.get(0)?, r.get(1)?)))
@@ -456,13 +545,7 @@ fn builtin_command_access_migration_drops_legacy_rows_and_is_idempotent() {
     let path = tmp_db_path("builtin_command_access_migration");
     let mut conn = Connection::open(&path).unwrap();
     let prior = 20; // 0021 deletes built-in and reserved-alias command rows.
-    for (index, sql) in MIGRATIONS[..prior].iter().enumerate() {
-        let tx = conn.transaction_primary_write().unwrap();
-        tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-        tx.pragma_update(None, "user_version", (index + 1) as i64)
-            .unwrap();
-        tx.commit().unwrap();
-    }
+    apply_historical_core(&conn, 0, prior);
     let ban = crate::defaults::default_commands()
         .into_iter()
         .find(|cmd| cmd.name == "ban")
@@ -528,6 +611,7 @@ fn builtin_command_access_migration_drops_legacy_rows_and_is_idempotent() {
         )
         .unwrap();
     }
+    apply_historical_core(&conn, prior, CORE_BASELINE_VERSION);
     migrate_conn(&mut conn).unwrap();
     let count = |conn: &Connection, sql: &str| -> i64 {
         conn.query_row(sql, (), |row| Ok(row.get(0)?)).unwrap()
@@ -552,12 +636,18 @@ fn builtin_command_access_migration_drops_legacy_rows_and_is_idempotent() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", (), |row| Ok(row.get(0)?))
         .unwrap();
-    assert_eq!(version, MIGRATIONS.len() as i64);
+    assert_eq!(version, CORE_SCHEMA_VERSION);
     let changes_before: i64 = count(&conn, "SELECT total_changes()");
-    conn.execute_batch_bounded(MIGRATIONS[prior], 64 * 1024 * 1024)
-        .unwrap();
-    conn.execute_batch_bounded(MIGRATIONS[21], 64 * 1024 * 1024)
-        .unwrap();
+    conn.execute_batch_bounded(
+        super::migration_fixtures::HISTORICAL_CORE[prior as usize].1,
+        64 * 1024 * 1024,
+    )
+    .unwrap();
+    conn.execute_batch_bounded(
+        super::migration_fixtures::HISTORICAL_CORE[21].1,
+        64 * 1024 * 1024,
+    )
+    .unwrap();
     assert_eq!(
         count(&conn, "SELECT total_changes()"),
         changes_before,

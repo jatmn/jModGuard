@@ -2230,6 +2230,9 @@ impl Supervisor {
         state: &db::ComponentUpdate,
         schema: i64,
     ) -> Result<bool> {
+        if schema < self.baked_compatibility.migration_min_core {
+            return Ok(false);
+        }
         let legacy_baseline = state
             .observed
             .as_ref()
@@ -2251,7 +2254,7 @@ impl Supervisor {
         // A baked bot owns migrations only without managed history or a
         // durable paired operation. The API still requires its exact schema.
         let baked_migration = role == "bot"
-            && (15..=self.baked_compatibility.core).contains(&schema)
+            && schema <= self.baked_compatibility.core
             && state.previous.is_none()
             && (state.desired.is_none() || state.state == "queued")
             && state
@@ -2334,6 +2337,10 @@ impl Supervisor {
                 CORE_MIGRATION_WAIT.as_secs()
             );
             self.idle().await?;
+        } else if schema < self.baked_compatibility.migration_min_core {
+            anyhow::bail!(
+                "baked application cannot open database; core schema version {schema} predates v0.2.0, upgrade to v0.2.0 first"
+            );
         } else {
             anyhow::bail!("baked application cannot open database; use owner recovery");
         }

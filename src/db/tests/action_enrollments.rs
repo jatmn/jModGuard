@@ -583,13 +583,7 @@ async fn newer_log_writes_preserve_uncertain_work_from_a_former_membership() {
 fn version_seven_actions_are_not_adopted_by_an_existing_membership() {
     let path = tmp_db_path("action_enrollment_upgrade");
     let conn = Connection::open(&path).unwrap();
-    for (index, sql) in MIGRATIONS[..7].iter().enumerate() {
-        let tx = conn.transaction_primary_write().unwrap();
-        tx.execute_batch_bounded(sql, 64 * 1024 * 1024).unwrap();
-        tx.pragma_update(None, "user_version", (index + 1) as i64)
-            .unwrap();
-        tx.commit().unwrap();
-    }
+    apply_historical_core(&conn, 0, 7);
     conn.execute_batch_bounded(
         "INSERT INTO guild_enrollments VALUES(10,'existing-membership',100,1)",
         64 * 1024 * 1024,
@@ -606,6 +600,7 @@ fn version_seven_actions_are_not_adopted_by_an_existing_membership() {
         conn.execute_bounded("INSERT INTO bot_actions(id,guild_id,actor_id,request_key,resource,payload,state,created_at,expires_at,request_created_at,claim,finished_at)
             VALUES(?1,10,42,?2,?3,?4,?5,1000,1300,1000,'old-claim',1000)",params![state,format!("1000_{state}"),action.resource(),serde_json::to_string(&action).unwrap(),state], 64 * 1024 * 1024).unwrap();
     }
+    apply_historical_core(&conn, 7, CORE_BASELINE_VERSION);
     drop(conn);
     let db = Db::open(&path, 2).unwrap();
     db.with_conn_sync(|conn| {

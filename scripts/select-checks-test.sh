@@ -69,7 +69,7 @@ core="contracts fmt dylint api bot updater core integration boundaries supply-ch
 core_omits="runtime publish-tests bootstrap"
 expect "$core" src/config.rs src/db.rs
 expect "$core" config.example.toml src/config.rs
-expect "$core" migrations/guild/0009_message_snapshots.sql
+expect "$core" migrations/guild/0016_baseline.sql
 for group in $rust; do
   case " $core $core_omits " in
     *" $group "*) ;;
