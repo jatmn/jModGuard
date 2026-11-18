@@ -39,6 +39,15 @@ pub mod tenant;
 pub use crate::config::LogConfig;
 pub use jmodguard_runtime::shutdown_signal;
 
+/// Installs ring as the process-wide Rustls provider if none has been installed.
+/// Call before building clients that enable reqwest's `rustls-no-provider` feature.
+pub fn init_tls_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Initializes tracing from config (console or rolling files under `log.directory`).
 ///
 /// `process` selects a per-binary log file stem (`jmodguard-bot` / `jmodguard-api`)

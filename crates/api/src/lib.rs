@@ -7,3 +7,8 @@ pub use jmodguard::{
 pub mod process_ready_test_lock;
 pub mod startup;
 pub mod web;
+
+pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
+    jmodguard::init_tls_provider();
+    reqwest::Client::builder()
+}
