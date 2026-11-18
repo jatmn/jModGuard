@@ -23,7 +23,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 jmodguard = { path = "../..", features = ["test-support"] }
 libsql = { version = "0.10.0", default-features = false, features = ["core"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

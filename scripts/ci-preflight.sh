@@ -874,6 +874,30 @@ if should_run bootstrap; then
   bash scripts/bootstrap-container-test.sh
 fi
 
+# Cargo's build messages identify final executables even when intermediate
+# test artifacts use a different directory layout.
+build_smoke_service() {
+  local package=$1
+  echo "ci-preflight: cargo build --locked -p $package" >&2
+  cargo build --locked -p "$package" --message-format=json-render-diagnostics \
+    | jq -ers --arg name "$package" '
+        map(select(.reason == "compiler-artifact" and .target.name == $name
+          and .executable != null))
+        | if length == 1 then .[0].executable
+          else error("expected one executable for " + $name)
+          end
+      '
+}
+
+run_dual_process_smoke() {
+  local bot api
+  bot="$(build_smoke_service jmodguard-bot)" || return $?
+  api="$(build_smoke_service jmodguard-api)" || return $?
+  echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture'
+  JMODGUARD_SMOKE_BOT_BIN="$bot" JMODGUARD_SMOKE_API_BIN="$api" \
+    run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture
+}
+
 if [ -z "${only_names}" ]; then
   echo 'ci-preflight: cargo clippy --locked --workspace --all-targets -- -D warnings'
   cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -940,12 +964,7 @@ else
     cargo clippy --locked -p jmodguard-integration-tests --all-targets -- -D warnings
     echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests'
     run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests || exit $?
-    echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
-    cargo build --locked -p jmodguard-bot
-    echo 'ci-preflight: cargo build --locked -p jmodguard-api'
-    cargo build --locked -p jmodguard-api
-    echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture'
-    run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture || exit $?
+    run_dual_process_smoke || exit $?
   fi
 fi
 
@@ -1000,14 +1019,7 @@ if should_run frontend; then
 fi
 
 if [ -z "${only_names}" ]; then
-  echo 'ci-preflight: cargo build --locked -p jmodguard-bot'
-  cargo build --locked -p jmodguard-bot
-
-  echo 'ci-preflight: cargo build --locked -p jmodguard-api'
-  cargo build --locked -p jmodguard-api
-
-  echo 'ci-preflight: cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture'
-  run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture || exit $?
+  run_dual_process_smoke || exit $?
 
   echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
   cargo build --locked -p jmodguard-api --no-default-features

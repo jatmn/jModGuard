@@ -1869,10 +1869,10 @@ impl MemberSyncConfig {
         Ok(())
     }
     fn apply_env(&mut self) -> Result<()> {
-        for (name, target) in [("JMODGUARD_MEMBER_SYNC_PAGE_SIZE", &mut self.page_size)] {
-            if let Ok(value) = env::var(name) {
-                *target = value.parse().with_context(|| format!("invalid {name}"))?;
-            }
+        if let Ok(value) = env::var("JMODGUARD_MEMBER_SYNC_PAGE_SIZE") {
+            self.page_size = value
+                .parse()
+                .context("invalid JMODGUARD_MEMBER_SYNC_PAGE_SIZE")?;
         }
         for (name, target) in [
             (

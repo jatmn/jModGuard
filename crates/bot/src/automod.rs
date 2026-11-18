@@ -1308,7 +1308,7 @@ pub(crate) async fn execute_pending_with(
                                         );
                                     }
                                     let outcome =
-                                        crate::cases::classify_discord(discord.err().as_ref());
+                                        crate::cases::classify_discord(discord.err().as_deref());
                                     if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed)
                                     {
                                         app.release_gateway_case_suppression(suppression);

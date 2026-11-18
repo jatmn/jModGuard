@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for jmodguard-api.
-# Pins Rust 1.96 (lockfile MSRV; edition 2024). JSON API + OAuth only: do not
+# Pins Rust 1.100 (lockfile MSRV; edition 2024). JSON API + OAuth only: do not
 # embed frontend/ (Bunny serves that from Storage/CDN). linux/amd64 manifest
-# digest for rust:1.96-bookworm (must match the FROM line below).
+# digest for rust:1.100.0-bookworm (must match the FROM line below).
 # Local: docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.api .
-FROM rust:1.96-bookworm@sha256:d99f7b31f49909348dc59b51f3c95d1efded1701ffb222f095aaab7de3c4abd8 AS builder
+FROM rust:1.100.0-bookworm@sha256:198cd28b4ba92b20fe849d5d8b119ace1bd28423d9e82e9c4de5ee1300d453a0 AS builder
 WORKDIR /app
 # git and the rust-toolchain.toml toolchain are installed before source COPY
 # so those layers stay cached when only application source changes.
