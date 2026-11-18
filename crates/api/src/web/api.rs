@@ -576,6 +576,20 @@ pub struct CommandBody {
     data: CommandDef,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandEnabledBody {
+    scope: Option<String>,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum CommandUpdate {
+    Full(Box<CommandBody>),
+    Enabled(CommandEnabledBody),
+}
+
 pub async fn list_commands(
     State(app): State<Arc<ApiState>>,
     session: Session,
@@ -727,28 +741,41 @@ pub async fn put_command(
     session: Session,
     headers: axum::http::HeaderMap,
     Path((guild_id, name)): Path<(u64, String)>,
-    Json(body): Json<CommandBody>,
+    Json(body): Json<CommandUpdate>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = guild_scope_at(&app, &session, guild_id, GuildAccess::Manage).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
-    let scope = scope_from(&app, &auth, &body.scope, guild_id)?;
     let name = name.to_lowercase();
-    let mut data = body.data;
-    data.name = name.clone();
-    validate_command_descriptor(&name, &data, scope)?;
-    let data = crate::defaults::command_row_for_storage(&name, &data);
+    let requested_scope = match &body {
+        CommandUpdate::Full(body) => &body.scope,
+        CommandUpdate::Enabled(body) => &body.scope,
+    };
+    let scope = scope_from(&app, &auth, requested_scope, guild_id)?;
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
-    app.commit_json_actor(
-        dashboard_actor(&auth),
-        db::ControlOp::UpsertCommand {
+    let actor_id = dashboard_actor(&auth);
+    let op = match body {
+        CommandUpdate::Full(body) => {
+            let mut data = body.data;
+            data.name = name.clone();
+            validate_command_descriptor(&name, &data, scope)?;
+            let command = crate::defaults::command_row_for_storage(&name, &data);
+            db::ControlOp::UpsertCommand {
+                request,
+                target,
+                name,
+                command,
+            }
+        }
+        CommandUpdate::Enabled(body) => db::ControlOp::SetCommandEnabled {
             request,
             target,
             name,
-            command: data,
+            enabled: body.enabled,
+            actor_id,
         },
-    )
-    .await?;
+    };
+    app.commit_json_actor(actor_id, op).await?;
     // No config_patch: the stored row is not the effective command. Overrides
     // are normalized and aliases resolve across commands (#623), so one save
     // can change other commands too. The dashboard reloads the configuration.

@@ -4880,8 +4880,57 @@ function BadwordTestResult({ result }) {
   );
 }
 
+function CommandEnabledCell({ record, canManage }) {
+  const [pending, setPending] = useState(null);
+  const [error, setError] = useState("");
+  const enabled = record.effective.enabled;
+  if (!canManage) {
+    return h("td", {},
+      h("span", { className: `badge badge-soft badge-sm ${enabled ? "badge-success" : "badge-error"}` },
+        enabled ? "enabled" : "disabled"),
+    );
+  }
+  const guildId = state.guildId;
+  const scope = record.builtin || record.guild_override ? "guild" : "global";
+  const restriction = record.builtin && guildId === "0" ? "Built-ins are changed one server at a time."
+    : scope === "global" && !isBotOwner() ? "Only the bot owner can change a global command."
+    : undefined;
+  return h("td", {},
+    h(Input, {
+      type: "checkbox",
+      role: "switch",
+      className: "toggle toggle-sm",
+      "aria-label": `Enable /${record.name}`,
+      "data-no-draft": true,
+      title: restriction,
+      checked: pending ?? enabled,
+      disabled: pending !== null || Boolean(restriction),
+      onChange: (event) => {
+        const enabled = event.target.checked;
+        return handleEvent(async () => {
+          setPending(enabled);
+          setError("");
+          try {
+            await reloadAfter(() => api(
+              `/api/guilds/${guildId}/commands/${encodeURIComponent(record.name)}`,
+              "PUT",
+              { scope, enabled },
+            ));
+          } catch (error) {
+            setError(error.message || String(error));
+          } finally {
+            setPending(null);
+          }
+        }, event);
+      },
+    }),
+    error && h("p", { className: "err", role: "alert" }, error),
+  );
+}
+
 function tabCommands() {
   const cmds = state.config.commands;
+  const canManage = canManageServer();
   return h(
     "div",
     {},
@@ -4889,14 +4938,14 @@ function tabCommands() {
       "div",
       { className: "row title-row" },
       h("h2", {}, "Commands"),
-      canManageServer() &&
+      canManage &&
         h(
           ActionButton,
           { className: "btn btn-primary", onClick: () => editCommand(null) },
           "+ New custom command",
         ),
     ),
-    !canManageServer() &&
+    !canManage &&
       h("p", { className: "muted" }, "Editing commands needs Manage Server: command plans can grant roles and run moderation actions."),
     h("p", { className: "muted" }, "Change any command's replies, who can use it, and its cooldown. Built-ins keep their name and behavior."),
     h(GoodToKnow, {
@@ -4939,19 +4988,11 @@ function tabCommands() {
           h("td", {}, d.category),
           h("td", { className: "muted command-description" }, d.description),
           h("td", {}, d.permission),
+          h(CommandEnabledCell, { record: c, canManage }),
           h(
             "td",
             {},
-            h(
-              "span",
-              { className: `badge badge-soft badge-sm ${d.enabled ? "badge-success" : "badge-error"}` },
-              d.enabled ? "enabled" : "disabled",
-            ),
-          ),
-          h(
-            "td",
-            {},
-            canManageServer() && h(IconButton, { action: "edit", label: "Edit", onClick: () => editCommand(c) }),
+            canManage && h(IconButton, { action: "edit", label: "Edit", onClick: () => editCommand(c) }),
           ),
         );
       }),

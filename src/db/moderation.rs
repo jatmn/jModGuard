@@ -54,7 +54,7 @@ pub async fn insert_event(
     actor_id: Option<i64>,
     data: &serde_json::Value,
 ) -> Result<i64> {
-    let (now, event_type) = (now_str(), event_type.to_string());
+    let (now, event_type) = (now_str(), event_type.to_owned());
     // Persist WebUI-safe JSON: snowflakes above JS MAX_SAFE_INTEGER as strings.
     let data = if data.is_null() {
         None
@@ -63,17 +63,29 @@ pub async fn insert_event(
     };
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let id = tx.query_row_write(
-            "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             RETURNING id",
-            params![guild_id, event_type, user_id, actor_id, data, now],
-            |row| Ok(row.get::<i64>(0)?),
-        )?;
+        let id = insert_event_conn(&tx, guild_id, &event_type, user_id, actor_id, data, now)?;
         tx.commit()?;
         Ok(id)
     })
     .await
+}
+
+pub(super) fn insert_event_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    event_type: &str,
+    user_id: Option<i64>,
+    actor_id: Option<i64>,
+    data: Option<String>,
+    created_at: String,
+) -> Result<i64> {
+    conn.query_row_write(
+        "INSERT INTO events (guild_id, event_type, user_id, actor_id, data, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         RETURNING id",
+        params![guild_id, event_type, user_id, actor_id, data, created_at],
+        |row| Ok(row.get::<i64>(0)?),
+    )
 }
 
 pub async fn query_events(

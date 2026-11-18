@@ -3746,6 +3746,180 @@ async fn command_saves_carry_no_patch_because_aliases_resolve_across_commands() 
 }
 
 #[tokio::test]
+async fn enabled_only_command_updates_preserve_saved_fields_and_scope() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let mut custom = crate::defaults::custom_command_fixture("greet");
+    custom.aliases = vec!["hello".into()];
+    custom.roles = vec![3];
+    custom.channels = vec![4];
+    custom.cooldown_secs = 7;
+    custom.response = "A saved reply".into();
+    let mut builtin = crate::defaults::effective_builtin_command("ban", None).unwrap();
+    builtin.description = "A server description".into();
+    builtin.aliases.push("hammer".into());
+    let mut global = custom.clone();
+    global.description = "A global description".into();
+    let global_only = crate::defaults::custom_command_fixture("global-only");
+    for (guild, command) in [
+        (10, &custom),
+        (10, &builtin),
+        (0, &global),
+        (0, &global_only),
+    ] {
+        db::upsert_command(&f.app.db, guild, &command.name, command)
+            .await
+            .unwrap();
+    }
+    for (name, scope, layer) in [
+        ("greet", "guild", "guild_override"),
+        ("ban", "guild", "guild_override"),
+        ("global-only", "global", "global"),
+    ] {
+        let path = format!("/api/guilds/10/commands/{name}");
+        let (status, mut expected) = f.request("GET", &path, "").await;
+        assert_eq!(status, StatusCode::OK, "{expected}");
+        let previous = expected["effective"]["enabled"].as_bool().unwrap();
+        let toggle = serde_json::json!({"scope": scope, "enabled": !previous}).to_string();
+        let (status, body) = f.request("PUT", &path, &toggle).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!({"ok": true}));
+        expected["effective"]["enabled"] = (!previous).into();
+        expected[layer]["enabled"] = (!previous).into();
+        let (status, saved) = f.request("GET", &path, "").await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved, expected, "{name}");
+    }
+    let (status, body) = f
+        .request(
+            "PUT",
+            "/api/guilds/10/commands/greet",
+            r#"{"scope":"global","enabled":false}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        db::get_command_row(&f.app.db, 0, "greet")
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled,
+        "the same-name global definition is unchanged"
+    );
+}
+
+#[tokio::test]
+async fn enabled_only_builtin_command_override_inherits_defaults_and_updates_registry_and_audit_log()
+ {
+    use jmodguard::db::SqlExecutor;
+
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let path = "/api/guilds/10/commands/ban";
+    let (status, before) = f.request("GET", path, "").await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(before["guild_override"], serde_json::Value::Null);
+    assert_eq!(before["effective"]["enabled"], true);
+    let versions = db::get_version_state(&f.app.db).await.unwrap();
+    let toggle = r#"{"scope":"guild","enabled":false}"#;
+    let (status, body) = f.request("PUT", path, toggle).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let stored: String = f
+        .app
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT data FROM commands WHERE guild_id = 10 AND name = 'ban'",
+                (),
+                |row| Ok(row.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stored).unwrap(),
+        serde_json::json!({"enabled": false})
+    );
+    let mut expected = before["effective"].clone();
+    expected["enabled"] = false.into();
+    expected["builtin_override"] = true.into();
+    let (status, bundle) = f.request("POST", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::OK, "{bundle}");
+    let row = bundle["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "ban")
+        .unwrap();
+    assert_eq!(row["effective"], expected);
+    let (version, revision, registry) = db::load_slash_commands_with_version_primary(&f.app.db, 10)
+        .await
+        .unwrap();
+    assert!(!registry["ban"].enabled);
+    assert!(version > versions.slash);
+    assert_ne!(revision, versions.slash_revision);
+    assert!(db::get_version_state(&f.app.db).await.unwrap().config > versions.config);
+
+    // A repeated state is a no-op for the configuration, registration and audit.
+    let (status, body) = f.request("PUT", path, toggle).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        db::get_version_state(&f.app.db).await.unwrap().slash,
+        version
+    );
+    let (status, body) = f
+        .request("POST", "/api/guilds/10/events?event=command_enabled", "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let events = body.as_array().unwrap();
+    assert_eq!(events.len(), 1, "{body}");
+    assert_eq!(events[0]["actor_id"], "42");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(events[0]["data"].as_str().unwrap()).unwrap(),
+        serde_json::json!({"command": "ban", "scope": "guild", "previous_enabled": true, "enabled": false})
+    );
+
+    let (status, body) = f
+        .request("PUT", path, r#"{"scope":"guild","enabled":true}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, detail) = f.request("GET", path, "").await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    expected["enabled"] = true.into();
+    assert_eq!(detail["effective"], expected);
+    assert_eq!(detail["guild_override"], expected);
+}
+
+#[tokio::test]
+async fn enabled_only_command_updates_require_manage_server() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let mut guild = managed_guild(10);
+    guild.permissions = Some(oauth::PermissionsField::Number(1 << 2));
+    tests::seed_auth_caches(&f.app, 42, vec![guild.clone()]);
+    *f.discord.guilds.lock().unwrap() = vec![guild];
+    let (status, body) = f
+        .request(
+            "PUT",
+            "/api/guilds/10/commands/ban",
+            r#"{"scope":"guild","enabled":false}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        "you cannot manage this server (needs MANAGE_GUILD permission)"
+    );
+    assert!(
+        db::get_command_row(&f.app.db, 10, "ban")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn builtin_case_variant_overrides_restore_and_reset_through_http() {
     use jmodguard::db::SqlExecutor;
     let f = Fixture::new(false).await;
