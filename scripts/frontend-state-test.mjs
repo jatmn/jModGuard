@@ -37,7 +37,6 @@ const listControlsSource = fs.readFileSync(new URL('../frontend/list-controls.js
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
   .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, '\n');
 const pages = [];
-const testClockStartedAt = Date.UTC(2026, 10, 18, 12);
 after(() => bootDom.window.close());
 function activate(window) {
   globalThis.window = window; globalThis.document = window.document;
@@ -69,6 +68,7 @@ function fire(element, type, props = {}) {
   flushSync(() => element.dispatchEvent(new EventType(type, { bubbles: true, cancelable: true, ...props })));
   return settle();
 }
+function fixtureClockEpoch() { return Date.UTC(2026, 10, 18, 12); }
 function harness(fetchImpl = async () => {}, storage = new Map(), session = new Map(), confirm = () => true, timerImpl = null, asyncRoot = false) {
   const dom = new JSDOM('<!doctype html><html><head><meta name="theme-color"></head><body><div id="app"></div><main id="content"></main></body></html>', {url:'https://ui.example.test', pretendToBeVisual: true});
   const win = dom.window, document = win.document;
@@ -79,7 +79,8 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   win.matchMedia = () => ({matches: false, addEventListener() {}, removeEventListener() {}});
   const roots = [], timers = new Map(), documentListeners = new Map(), opened = [], historyUrls = [];
   let nextTimer = 1, clockOffsetMs = 0, rendering = false;
-  class TestDate extends Date { static now() { return testClockStartedAt + clockOffsetMs; } }
+  const clockStartedAt = fixtureClockEpoch();
+  class TestDate extends Date { static now() { return clockStartedAt + clockOffsetMs; } }
   const location = { search: '', pathname: '/', hash: '', replaced: null, replace(value) { this.replaced = value; } };
   win.open = (...args) => opened.push(args);
   const addEventListener = document.addEventListener.bind(document), removeEventListener = document.removeEventListener.bind(document);
@@ -762,7 +763,7 @@ test('no page renders the old multi-line hero card markup', () => {
 
 const ANALYTICS_CONFIG = { settings: { prefix: '!', bot_name: '' }, rules: [{ rule_id: 'spam', name: 'Spam filter' }], commands: [], log_channels: [], badwords: [], enrollment_id: 'enroll-token' };
 function analyticsDays(count, fill = () => ({})) {
-  const today = new Date(testClockStartedAt);
+  const today = new Date(fixtureClockEpoch());
   return Array.from({ length: count }, (_, i) => {
     const day = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - (count - 1 - i))).toISOString().slice(0, 10);
     return { day, warns: 0, bans: 0, automod: 0, mod_actions: 0, timeouts: 0, joins: 0, leaves: 0, ...fill(i) };
@@ -9579,7 +9580,7 @@ test("the sidebar's own buttons show their colored SVG icons beside unchanged la
 
 // #613: Database Usage and Platform analytics are Owner sections of the main
 // workspace. Each database reads at a glance; diagnostics stay in Details.
-const USAGE_NOW = Math.floor(testClockStartedAt / 1000);
+const USAGE_NOW = Math.floor(fixtureClockEpoch() / 1000);
 const USAGE_POLICY = { provider_hard_limit_bytes: 1e9, pressure_bytes: 7e8, capture_pause_bytes: 8e8, growth_stop_bytes: 9e8, snapshot_budget_bytes: 4e8, effective_snapshot_allowance_bytes: null };
 function usageDatabase({ id = 'core', kind = 'core', pages = 118, free = 20, status = 'normal', ...overrides } = {}) {
   const allocated = pages * 4096;

@@ -3929,12 +3929,29 @@ fn child_start_count(root: &std::path::Path, name: &str) -> usize {
     let Ok(text) = std::fs::read_to_string(root.join("events")) else {
         return 0;
     };
-    count_child_starts(&text, name)
+    text.lines()
+        .filter(|line| *line == format!("{name}.start"))
+        .count()
 }
 
-fn count_child_starts(text: &str, name: &str) -> usize {
-    let start = format!("{name}.start");
-    text.lines().filter(|line| *line == start).count()
+fn watch_fixture_renames(root: &Path) -> std::io::Result<tokio::io::unix::AsyncFd<std::fs::File>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(root.as_os_str().as_bytes())?;
+    // SAFETY: inotify_init1 accepts these flags and returns a new fd on success.
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the successful call returned a unique fd owned by this file.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    // SAFETY: the fd remains open and path is a valid NUL-terminated string.
+    if unsafe { libc::inotify_add_watch(file.as_raw_fd(), path.as_ptr(), libc::IN_MOVED_TO) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: AsyncFd takes ownership of the File and its stable descriptor.
+    unsafe { tokio::io::unix::AsyncFd::register_with_interest(file, tokio::io::Interest::READABLE) }
+        .map_err(Into::into)
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4321,18 +4338,23 @@ async fn ordinary_exit_after_idle_keeps_health_during_stalled_control() {
     bot.restart.not_before = None;
     tokio::fs::remove_file(&exit).await.unwrap();
     tokio::fs::remove_file(&bound).await.unwrap();
+    let marker_changes = watch_fixture_renames(&root).unwrap();
     bot.tick().await.unwrap();
-    let events = root.join("events");
+    // The child records its start before publishing the health-bound marker.
     tokio::time::timeout(POLL, async {
-        loop {
-            let text = tokio::fs::read_to_string(&events).await.unwrap();
-            if count_child_starts(&text, name) >= 2 {
-                break;
-            }
+        use std::io::Read;
+        let mut events = [0; 4096];
+        while !bound.exists() {
+            marker_changes
+                .async_io(tokio::io::Interest::READABLE, |mut file| {
+                    file.read(&mut events)
+                })
+                .await
+                .unwrap();
         }
     })
     .await
-    .expect("restarted child never published its start");
+    .expect("restarted child never published its health-bound marker");
     assert_eq!(child_start_count(&root, name), 2);
     bot.stop_application().await.unwrap();
     bot.end_idle().await.unwrap();
