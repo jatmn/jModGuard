@@ -9112,8 +9112,7 @@ test('Cases restores pending search after reauthentication before debounce', asy
   assert.equal(search.value, 'previous');
   search.value = '  pending review %  ';
   await fire(search, 'input');
-  const listRequests = () => calls.map(call => new URL(call.url, 'https://fixture.test'))
-    .filter(url => url.pathname.endsWith('/cases'));
+  const listRequests = () => calls.filter(call => call.url.split('?')[0].endsWith('/cases'));
   assert.equal(listRequests().length, 1, 'typing has not issued a request yet');
 
   h.app.handleAuthLoss({ status: 401 });
@@ -9127,7 +9126,7 @@ test('Cases restores pending search after reauthentication before debounce', asy
   h.app.restoreWorkspace();
   const restored = await casesView(h);
   assert.equal(restored.querySelector('input[type="search"]').value, 'pending review %');
-  const query = listRequests().at(-1).searchParams;
+  const query = new URLSearchParams(listRequests().at(-1).url.split('?')[1]);
   assert.equal(query.get('q'), 'pending review %');
   assert.equal(query.get('outcome'), 'failed');
 });
