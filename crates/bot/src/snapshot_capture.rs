@@ -194,8 +194,7 @@ impl RecentMessages {
     /// Fields an edit does not supply keep their earlier value; an older edit
     /// is ignored.
     /// As in the guild store, a field already supplied at one edit timestamp
-    /// keeps its first value at that timestamp. A same-revision row is
-    /// comparison evidence only and cannot fill the report's before text.
+    /// keeps its first value at that timestamp.
     fn observe(
         &mut self,
         scope: &GuildDataScope,
@@ -361,9 +360,35 @@ struct Work {
     epoch: u64,
 }
 
+#[derive(Clone)]
+struct PendingEditReport {
+    report: MessageReport,
+    window: Arc<logging::EditReportWindow>,
+}
+
+impl PendingEditReport {
+    fn from_gateway(
+        app: &BotState,
+        context: &Context,
+        event: &MessageUpdateEvent,
+        known_author_id: Option<u64>,
+    ) -> Option<Self> {
+        let report = logging::message_update_report(
+            event,
+            known_author_id,
+            Some(context.cache.current_user().id.get()),
+            Some(&context.cache),
+        )?;
+        let window = app
+            .edit_reports
+            .window((report.guild_id, event.channel_id, event.id));
+        Some(Self { report, window })
+    }
+}
+
 enum Body {
     Create(SnapshotObservation),
-    Edit(SnapshotObservation, Option<MessageReport>, bool),
+    Edit(SnapshotObservation, Option<PendingEditReport>, bool),
     Delete {
         guild: GuildId,
         channel: ChannelId,
@@ -380,8 +405,9 @@ impl Body {
             Self::Create(observation) => ITEM_OVERHEAD.saturating_add(estimated_bytes(observation)),
             Self::Edit(observation, report, _) => ITEM_OVERHEAD
                 .saturating_add(estimated_bytes(observation))
-                .saturating_add(report.as_ref().map_or(0, |report| {
-                    report
+                .saturating_add(report.as_ref().map_or(0, |pending| {
+                    pending
+                        .report
                         .vars
                         .iter()
                         .map(|(key, value)| {
@@ -519,16 +545,11 @@ impl SnapshotIngress {
                         event.id.get(),
                     )
                 });
-                let report = crate::logging::message_update_report(
-                    event,
-                    known,
-                    Some(context.cache.current_user().id.get()),
-                    Some(&context.cache),
-                );
+                let report = PendingEditReport::from_gateway(app, &context, event, known);
                 let queued = self.edit(app, context.clone(), event, &observation, report.clone());
                 if !queued
                     && let Some(report) = report
-                    && let Some(report) = self.admit_unqueued_edit(app, &observation, report)
+                    && let Some(report) = self.admit_unqueued_edit(&observation, report)
                 {
                     submit_report(app, &context, report);
                 }
@@ -1114,7 +1135,7 @@ impl SnapshotIngress {
         context: Context,
         event: &MessageUpdateEvent,
         observation: &SnapshotObservation,
-        report: Option<MessageReport>,
+        report: Option<PendingEditReport>,
     ) -> bool {
         if !app.cfg.bot.message_capture_enabled
             || app.db.capacity_runtime_status().startup_deferred
@@ -1158,23 +1179,17 @@ impl SnapshotIngress {
         known_author_id: Option<u64>,
         received_at: chrono::DateTime<chrono::Utc>,
     ) -> Option<MessageReport> {
-        let report = logging::message_update_report(
-            event,
-            known_author_id,
-            Some(context.cache.current_user().id.get()),
-            Some(&context.cache),
-        )?;
+        let report = PendingEditReport::from_gateway(app, context, event, known_author_id)?;
         let observation = edit_observation(event, received_at)?;
-        self.admit_unqueued_edit(app, &observation, report)
+        self.admit_unqueued_edit(&observation, report)
     }
 
     fn admit_unqueued_edit(
         &self,
-        app: &BotState,
         observation: &SnapshotObservation,
-        report: MessageReport,
+        pending: PendingEditReport,
     ) -> Option<MessageReport> {
-        let guild = report.guild_id.get();
+        let guild = pending.report.guild_id.get();
         let key = (
             guild,
             observation.channel_id as u64,
@@ -1193,11 +1208,8 @@ impl SnapshotIngress {
                 .get(key, &scope, observation.observed_at_ms)
                 .filter(|row| row.edit_at_ms <= observation.edit_at_ms)
         });
-        let mut report = self.admit_edit_report(app, observation, prior.as_ref(), report)?;
-        if let Some(before) = prior
-            .as_ref()
-            .filter(|row| row.edit_at_ms < observation.edit_at_ms)
-        {
+        let mut report = self.admit_edit_report(observation, prior.as_ref(), pending)?;
+        if let Some(before) = prior.as_ref() {
             logging::apply_retained_edit(&mut report, Some(before), None);
         }
         Some(report)
@@ -1205,11 +1217,11 @@ impl SnapshotIngress {
 
     fn admit_edit_report(
         &self,
-        app: &BotState,
         observation: &SnapshotObservation,
         prior: Option<&MessageSnapshot>,
-        mut report: MessageReport,
+        pending: PendingEditReport,
     ) -> Option<MessageReport> {
+        let PendingEditReport { mut report, window } = pending;
         let edited_at_ms = observation.edit_at_ms?;
         let latest_cutoff =
             observation.observed_at_ms - logging::EDIT_REPORT_KEEP.as_millis() as i64;
@@ -1225,12 +1237,7 @@ impl SnapshotIngress {
             }
             return None;
         }
-        let key = (
-            report.guild_id,
-            ChannelId::new(observation.channel_id as u64),
-            MessageId::new(observation.message_id as u64),
-        );
-        if !app.edit_reports.should_report(key, edited_at_ms) {
+        if !window.claim(edited_at_ms) {
             return None;
         }
         if stale
@@ -1344,7 +1351,12 @@ fn fields(
                     }
                     None => (None, false),
                 };
+                let (description, description_clipped) = clip_bytes(
+                    attachment.description.as_deref().unwrap_or_default(),
+                    SnapshotAttachment::MAX_DESCRIPTION_BYTES,
+                );
                 let entry = SnapshotAttachment {
+                    description: Some(description),
                     id: attachment.id.get() as i64,
                     filename,
                     size: u64::from(attachment.size),
@@ -1357,7 +1369,8 @@ fn fields(
                     break;
                 }
                 bytes += encoded;
-                metadata_clipped |= filename_clipped || url_clipped || type_clipped;
+                metadata_clipped |=
+                    filename_clipped || url_clipped || type_clipped || description_clipped;
                 out.push(entry);
             }
             let omitted = items.len().saturating_sub(out.len());
@@ -1394,6 +1407,7 @@ fn fields_bytes(fields: &SnapshotFields) -> usize {
                 .iter()
                 .map(|item| {
                     item.filename.len()
+                        + item.description.as_ref().map_or(0, String::len)
                         + item.url.len()
                         + item.content_type.as_ref().map_or(0, String::len)
                         + 64
@@ -1538,7 +1552,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     .configs
                     .last_known(guild)
                     .is_some_and(|cfg| capture_enabled(&cfg)));
-        let cached_prior = match &work.body {
+        let cached_row = match &work.body {
             Body::Create(observation) if cache_configured => {
                 app.snapshots
                     .remember_recent(&work.scope, observation, true);
@@ -1549,9 +1563,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 .remember_recent(&work.scope, observation, *allow_insert),
             _ => None,
         };
-        let cached_before = cached_prior.as_ref().filter(|row| {
-            matches!(&work.body, Body::Edit(observation, _, _) if row.edit_at_ms < observation.edit_at_ms)
-        });
+        let cached_before = cached_row.as_ref();
         let store = match app.tenant.store(&work.scope).await {
             Ok(store) => store,
             Err(error) => {
@@ -1562,12 +1574,10 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 }
                 match work.body {
                     Body::Edit(observation, Some(report), _) => {
-                        let Some(mut report) = app.snapshots.admit_edit_report(
-                            &app,
-                            &observation,
-                            cached_prior.as_ref(),
-                            report,
-                        ) else {
+                        let Some(mut report) =
+                            app.snapshots
+                                .admit_edit_report(&observation, cached_before, report)
+                        else {
                             continue;
                         };
                         if cached_before.is_some() {
@@ -1794,12 +1804,8 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 if app.snapshots.capture_paused(&work.scope) {
                     app.snapshots.gap_scope(&work.scope);
                     if let Some(mut report) = report.take().and_then(|report| {
-                        app.snapshots.admit_edit_report(
-                            &app,
-                            observation,
-                            cached_prior.as_ref(),
-                            report,
-                        )
+                        app.snapshots
+                            .admit_edit_report(observation, cached_before, report)
                     }) {
                         // The pause stops durable growth only; an eligible prior
                         // this process already observed still describes the edit.
@@ -1822,8 +1828,7 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 if app.snapshots.deleted(key) {
                     app.snapshots.gap_scope(&work.scope);
                     if let Some(mut report) = report.take().and_then(|report| {
-                        app.snapshots
-                            .admit_edit_report(&app, observation, None, report)
+                        app.snapshots.admit_edit_report(observation, None, report)
                     }) {
                         report
                             .vars
@@ -1839,12 +1844,8 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                 if !configured {
                     if config_load_failed
                         && let Some(mut report) = report.take().and_then(|report| {
-                            app.snapshots.admit_edit_report(
-                                &app,
-                                observation,
-                                cached_prior.as_ref(),
-                                report,
-                            )
+                            app.snapshots
+                                .admit_edit_report(observation, cached_before, report)
                         })
                     {
                         if cached_before.is_some() {
@@ -1929,19 +1930,16 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                             _ => {}
                         }
                         let prior = match transition.outcome {
-                            SnapshotOutcome::Stored => {
-                                transition.before.as_ref().or(cached_prior.as_ref())
-                            }
+                            SnapshotOutcome::Stored => transition.before.as_ref().or(cached_before),
                             SnapshotOutcome::Duplicate => transition.same_revision_before.as_ref(),
                             SnapshotOutcome::CapacityRefused => {
-                                transition.after.as_ref().or(cached_prior.as_ref())
+                                transition.after.as_ref().or(cached_before)
                             }
-                            SnapshotOutcome::Missing => cached_prior.as_ref(),
+                            SnapshotOutcome::Missing => cached_before,
                             _ => None,
                         };
                         if let Some(mut report) = report.take().and_then(|report| {
-                            app.snapshots
-                                .admit_edit_report(&app, observation, prior, report)
+                            app.snapshots.admit_edit_report(observation, prior, report)
                         }) {
                             apply_transition_report(&mut report, &transition);
                             apply_cached_edit_prior(&mut report, &transition, cached_before);
@@ -1961,12 +1959,8 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         )
                         .await;
                         if let Some(mut report) = report.take().and_then(|report| {
-                            app.snapshots.admit_edit_report(
-                                &app,
-                                observation,
-                                cached_prior.as_ref(),
-                                report,
-                            )
+                            app.snapshots
+                                .admit_edit_report(observation, cached_before, report)
                         }) {
                             if cached_before.is_some() {
                                 logging::apply_retained_edit(&mut report, cached_before, None);
@@ -2126,7 +2120,10 @@ fn apply_transition_report(report: &mut MessageReport, transition: &SnapshotTran
     match transition.outcome {
         SnapshotOutcome::Stored | SnapshotOutcome::Duplicate => logging::apply_retained_edit(
             report,
-            transition.before.as_ref(),
+            transition
+                .before
+                .as_ref()
+                .or(transition.same_revision_before.as_ref()),
             transition.after.as_ref(),
         ),
         SnapshotOutcome::CapacityRefused => {
@@ -3312,7 +3309,7 @@ mod tests {
         let attachment: serenity::model::channel::Attachment =
             serde_json::from_value(serde_json::json!({
                 "id": "1", "filename": filename, "url": url, "proxy_url": url,
-                "size": 100, "content_type": content_type
+                "size": 100, "content_type": content_type, "description": "🦀".repeat(1025)
             }))
             .unwrap();
         let observed = fields(None, Some(&[attachment]), Some(9), None);
@@ -3320,6 +3317,10 @@ mod tests {
         assert_eq!(observed.attachments_omitted, Some(0));
         let retained = observed.attachments.unwrap();
         assert_eq!(retained.len(), 1);
+        assert_eq!(
+            retained[0].description.as_deref(),
+            Some("🦀".repeat(1024).as_str())
+        );
         assert!(retained[0].filename.len() <= 256);
         assert!(retained[0].url.len() <= 1024);
         assert!(retained[0].content_type.as_ref().unwrap().len() <= 128);
@@ -3412,10 +3413,12 @@ mod tests {
         let unchanged = snowflake(created, 1);
         let changed = snowflake(created, 2);
         let partial = snowflake(created, 3);
+        let described = snowflake(now, 4);
         for id in [unchanged, changed, partial] {
             let mut prior =
                 cache_observation(id.get() as i64, created.timestamp_millis(), "retained text");
             prior.fields.attachments = Some(vec![SnapshotAttachment {
+                description: None,
                 id: 10,
                 filename: "old.png".into(),
                 size: 10,
@@ -3436,6 +3439,15 @@ mod tests {
                 "proxy_url": format!("https://cdn.discordapp.com/{filename}?ex=refreshed")
             }])
         };
+        let mut create = message_json(described, "retained text");
+        create["attachments"] = attachment("10", "old.png");
+        app.snapshots.on_gateway_event(
+            &app,
+            ctx.clone(),
+            &Event::MessageCreate(serde_json::from_value(create).unwrap()),
+        );
+        let mut with_description = attachment("10", "old.png");
+        with_description[0]["description"] = "new alt text".into();
         let update = |id: MessageId,
                       channel: u64,
                       at: chrono::DateTime<chrono::Utc>,
@@ -3461,16 +3473,31 @@ mod tests {
         );
         let report_slots = app.snapshots.report_slots.available_permits() as u32;
         for event in [
+            update(changed, 456, stale, Some("changed text"), None),
             update(no_prior, 456, very_old, Some("very old replay"), None),
             update(
                 unchanged,
                 456,
                 now,
                 Some("retained text"),
-                Some(attachment("10", "old.png")),
+                Some(with_description.clone()), // Legacy row has no known description.
+            ),
+            update(described, 456, now, None, Some(with_description.clone())),
+            update(
+                described,
+                456,
+                now + chrono::Duration::milliseconds(1),
+                None,
+                Some(with_description),
             ),
             update(changed, 456, stale, Some("changed text"), None),
-            update(changed, 456, stale, Some("changed text"), None),
+            update(
+                changed,
+                456,
+                stale,
+                None,
+                Some(attachment("12", "complement.png")),
+            ),
             update(partial, 456, stale, Some("retained text"), None),
             update(partial, 456, stale, None, Some(attachment("11", "new.png"))),
             update(
@@ -3485,6 +3512,21 @@ mod tests {
                 .on_gateway_event(&app, ctx.clone(), &Event::MessageUpdate(event));
         }
         receiver.close();
+        // Process the create and the first changed text. Its complementary
+        // attachment was received in the same burst, but the worker stalls.
+        let (first, initial) = mpsc::channel(2);
+        for _ in 0..2 {
+            first.send(receiver.recv().await.unwrap()).await.unwrap();
+        }
+        drop(first);
+        run(Arc::clone(&app), initial).await;
+        wait_for_body(&bodies, "first partial", |body| {
+            body.contains("changed text")
+        })
+        .await;
+        tokio::time::pause();
+        tokio::time::advance(logging::EDIT_REPORT_KEEP + Duration::from_secs(1)).await;
+        tokio::time::resume();
         run(Arc::clone(&app), receiver).await;
         let _drained = Arc::clone(&app.snapshots.report_slots)
             .acquire_many_owned(report_slots)
@@ -3496,7 +3538,19 @@ mod tests {
             .iter()
             .filter(|body| body.starts_with("POST ") && body.contains("Message edited"))
             .collect();
-        assert_eq!(reports.len(), 3, "{requests:#?}");
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|body| body.contains(&format!("/456/{described}")))
+                .count(),
+            1,
+            "description-only change and replay: {requests:#?}"
+        );
+        assert!(
+            !reports.iter().any(|body| body.contains("complement.png")),
+            "delayed second partial reported twice"
+        );
+        assert_eq!(reports.len(), 4, "{requests:#?}");
         let changed_report = reports
             .iter()
             .find(|body| body.contains("changed text"))
@@ -3517,6 +3571,20 @@ mod tests {
             .unwrap();
         assert!(
             attachment_report.contains(&format!("https://discord.com/channels/789/456/{partial}"))
+        );
+        let (_, body) = attachment_report.split_once("\r\n\r\n").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(
+            payload["embeds"][0]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field["name"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("Before (last observed)")
+                    && field["value"] == "retained text"),
+            "{attachment_report}"
         );
         let fresh = reports
             .iter()
@@ -3837,6 +3905,7 @@ mod tests {
         let scope = cache_scope(&app, 100).await;
         let now = chrono::Utc::now().timestamp_millis();
         let attachment = |id: i64| SnapshotAttachment {
+            description: None,
             id,
             filename: format!("file-{id}"),
             size: 1,

@@ -775,71 +775,52 @@ pub(crate) fn member_join_vars_ms(
     ])
 }
 type EditKey = (GuildId, ChannelId, MessageId);
-struct EditObservation {
-    edited_at_ms: i64,
-    reported_timestamps: Vec<i64>,
-    at: Instant,
+#[derive(Default)]
+pub(crate) struct EditReportWindow {
+    reported_timestamps: Mutex<Vec<i64>>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EditIdentity {
-    Current,
-    PreviouslyReported,
-    New,
-}
-
-impl EditObservation {
-    fn observe(&mut self, timestamp: i64) -> EditIdentity {
-        let identity = if self.edited_at_ms == timestamp {
-            EditIdentity::Current
-        } else if self.reported_timestamps.contains(&timestamp) {
-            EditIdentity::PreviouslyReported
-        } else {
-            EditIdentity::New
-        };
-        if identity == EditIdentity::New {
-            self.edited_at_ms = timestamp;
-            if self.reported_timestamps.len() >= 64 {
-                self.reported_timestamps.remove(0);
-            }
-            self.reported_timestamps.push(timestamp);
+impl EditReportWindow {
+    pub(crate) fn claim(&self, edited_at_ms: i64) -> bool {
+        let mut reported = self.reported_timestamps.lock();
+        if reported.contains(&edited_at_ms) {
+            return false;
         }
-        self.at = Instant::now();
-        identity
+        if reported.len() >= 64 {
+            reported.remove(0);
+        }
+        reported.push(edited_at_ms);
+        true
     }
 }
 
 #[derive(Default)]
 pub struct EditReportDedup {
-    inner: Mutex<HashMap<EditKey, EditObservation>>,
+    inner: Mutex<HashMap<EditKey, (tokio::time::Instant, Arc<EditReportWindow>)>>,
 }
 
 impl EditReportDedup {
-    /// Timestamp identity coalesces partial Gateway updates without storing text.
-    pub(crate) fn should_report(&self, key: EditKey, edited_at_ms: i64) -> bool {
+    /// Partials received together share a window even if a queued store read
+    /// delays admission. Only a report with a qualifying change claims its timestamp.
+    pub(crate) fn window(&self, key: EditKey) -> Arc<EditReportWindow> {
         let mut entries = self.inner.lock();
-        entries.retain(|_, seen| seen.at.elapsed() < EDIT_REPORT_KEEP);
-        if let Some(seen) = entries.get_mut(&key) {
-            return seen.observe(edited_at_ms) == EditIdentity::New;
+        let now = tokio::time::Instant::now();
+        entries.retain(|_, (at, _)| now.duration_since(*at) < EDIT_REPORT_KEEP);
+        if let Some((at, window)) = entries.get_mut(&key) {
+            *at = now;
+            return Arc::clone(window);
         }
         if entries.len() >= EDIT_REPORT_LIMIT
-            && !entries.contains_key(&key)
             && let Some(oldest) = entries
                 .iter()
-                .min_by_key(|(_, seen)| seen.at)
+                .min_by_key(|(_, (at, _))| *at)
                 .map(|(key, _)| *key)
         {
             entries.remove(&oldest);
         }
-        entries.insert(
-            key,
-            EditObservation {
-                edited_at_ms,
-                reported_timestamps: vec![edited_at_ms],
-                at: Instant::now(),
-            },
-        );
-        true
+        let window = Arc::new(EditReportWindow::default());
+        entries.insert(key, (now, Arc::clone(&window)));
+        window
     }
 }
 

@@ -538,6 +538,7 @@ async fn attachment_metadata_clipping_marks_truncation_without_omitting_entries(
     let (_fixture, _registration, store, scope) = ready().await;
     let mut item = observation(98, Some("before"), None, 1);
     item.fields.attachments = Some(vec![SnapshotAttachment {
+        description: Some("€".repeat(1500)),
         id: 1,
         filename: "€".repeat(100),
         size: 1,
@@ -560,6 +561,7 @@ async fn attachment_metadata_clipping_marks_truncation_without_omitting_entries(
     assert!(edited.fields.attachments_truncated);
     assert_eq!(edited.fields.attachments_omitted, Some(0));
     let kept = &edited.fields.attachments.as_ref().unwrap()[0];
+    assert_eq!(kept.description.as_deref(), Some("€".repeat(1365).as_str()));
     assert_eq!(kept.filename.len(), 255);
     assert_eq!(kept.url.len(), 1023);
     assert_eq!(kept.content_type.as_ref().unwrap().len(), 126);
@@ -576,6 +578,7 @@ async fn attachment_metadata_clipping_marks_truncation_without_omitting_entries(
     for (id, omitted) in [(99, 0), (100, 2)] {
         let mut preclipped = observation(id, Some("before"), None, 1);
         preclipped.fields.attachments = Some(vec![SnapshotAttachment {
+            description: None,
             id: 2,
             filename: "short".into(),
             size: 1,
@@ -865,6 +868,7 @@ async fn measure_sustained_snapshot_workload_and_cleanup_reuse() {
         item.fields.attachments = Some(
             (0..8)
                 .map(|index| SnapshotAttachment {
+                    description: None,
                     id: index + 1,
                     filename: format!("synthetic-{index}.bin"),
                     size: 1,
@@ -1005,6 +1009,7 @@ async fn equal_version_partials_merge_supplied_fields_and_keep_conflicts() {
     let (f, reg, store, scope) = ready().await;
     let mut created = observation(70, Some("A"), None, 1);
     created.fields.attachments = Some(vec![SnapshotAttachment {
+        description: None,
         id: 1,
         filename: "x.txt".into(),
         size: 4,
@@ -1071,6 +1076,7 @@ async fn equal_version_partials_merge_supplied_fields_and_keep_conflicts() {
 
     let mut reversed = observation(71, Some("A"), None, 1);
     reversed.fields.attachments = Some(vec![SnapshotAttachment {
+        description: None,
         id: 2,
         filename: "y.txt".into(),
         size: 1,

@@ -290,6 +290,7 @@ fn shipped_edit_template_keeps_both_long_unicode_sides_and_coverage() {
     let mut after = before.clone();
     after.fields.content = Some("🌕".repeat(700));
     after.fields.attachments = Some(vec![crate::db::guild_data::SnapshotAttachment {
+        description: None,
         id: 1,
         filename: "f".repeat(256),
         size: 5,
@@ -558,7 +559,9 @@ fn dedup_report(dedup: &EditReportDedup, event: &MessageUpdateEvent) -> bool {
     let Some((guild, at)) = event.guild_id.zip(event.edited_timestamp) else {
         return false;
     };
-    dedup.should_report((guild, event.channel_id, event.id), at.timestamp_millis())
+    dedup
+        .window((guild, event.channel_id, event.id))
+        .claim(at.timestamp_millis())
 }
 
 fn edit_report(event: &MessageUpdateEvent, known_author_id: Option<u64>) -> Option<MessageReport> {

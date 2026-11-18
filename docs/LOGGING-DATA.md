@@ -34,14 +34,16 @@ and persistence contracts below are unchanged.
   unknown, not empty. An edit report requires Discord's `edited_timestamp`
   and at least one supplied content or attachment field. Gateway refreshes can
   replay an existing timestamp. When a prior observation is available, an update
-  must change known text or attachments. A refreshed attachment URL alone does
+  must change known text or attachments, including a change to previously observed
+  attachment alt text. Older snapshots acquire an alt-text baseline on the next
+  accepted attachment observation. A refreshed attachment URL alone does
   not count. Without a prior observation, the timestamp must be within 10 seconds
   of Gateway receipt and at or after the bot's observation start. A retained
   change with an older timestamp reports both **Edited at** and **Observed at**.
   Edit reports look up the channel or thread name in cache and then via a
   bounded Discord request. The message link always uses the event IDs.
   Updates to the bot's own messages never produce edit reports.
-  A bounded 10-second dedup window coalesces reports at the same timestamp. The
+  A bounded 10-second window at Gateway receipt coalesces reports at the same timestamp. The
   stored snapshot does the same: a field inherited from an earlier observation
   is not treated as already supplied at the new timestamp, so a complementary
   partial can fill it. A different value for a field already supplied at that

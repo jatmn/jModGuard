@@ -31,9 +31,18 @@ pub(super) fn growth_reserve(tx: &impl SqlExecutor) -> Result<u64> {
 pub struct SnapshotAttachment {
     pub id: i64,
     pub filename: String,
+    /// Missing in snapshots from before description capture. An empty string
+    /// records that the attachment had no alt text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub size: u64,
     pub content_type: Option<String>,
     pub url: String,
+}
+
+impl SnapshotAttachment {
+    /// Discord allows up to 1024 Unicode characters of alt text.
+    pub const MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -100,6 +109,11 @@ impl SnapshotObservation {
                                 item.id != prior.id
                                     || item.filename != prior.filename
                                     || item.size != prior.size
+                                    || item
+                                        .description
+                                        .as_ref()
+                                        .zip(prior.description.as_ref())
+                                        .is_some_and(|(current, old)| current != old)
                             })
                     }))
     }
@@ -142,7 +156,7 @@ pub struct SnapshotTransition {
     pub before: Option<MessageSnapshot>,
     pub after: Option<MessageSnapshot>,
     /// A same-timestamp partial may fill an inherited field. This row is for
-    /// comparison only: it is already in the current revision.
+    /// the last observation before that partial, within the current revision.
     pub same_revision_before: Option<MessageSnapshot>,
 }
 
@@ -217,6 +231,10 @@ fn bound_fields(fields: &mut SnapshotFields) -> Result<usize> {
         for attachment in attachments.iter_mut() {
             clipped_metadata |= truncate_utf8(&mut attachment.filename, 256);
             clipped_metadata |= truncate_utf8(&mut attachment.url, 1024);
+            if let Some(description) = &mut attachment.description {
+                clipped_metadata |=
+                    truncate_utf8(description, SnapshotAttachment::MAX_DESCRIPTION_BYTES);
+            }
             if let Some(content_type) = &mut attachment.content_type {
                 clipped_metadata |= truncate_utf8(content_type, 128);
             }
@@ -770,10 +788,11 @@ impl GuildDataStore {
             let row = MessageSnapshot { guild_id: scope.guild_id(), channel_id: observation.channel_id, message_id: observation.message_id, fields: bounded, created_at_ms: old.as_ref().map_or(observation.created_at_ms, |r| r.created_at_ms), first_observed_at_ms: old.as_ref().map_or(observation.observed_at_ms, |r| r.first_observed_at_ms), last_observed_at_ms: observation.observed_at_ms, edit_at_ms: Some(edit), expires_at_ms: old.as_ref().map_or(expires, |r| r.expires_at_ms), generation: old.as_ref().map_or(1, |r| r.generation.saturating_add(1)), coverage_epoch: observation.coverage_epoch, continuous: old.as_ref().is_some_and(|r| r.continuity_at(observation.coverage_epoch) == SnapshotContinuity::Continuous), content_supplied: content_supplied.is_supplied(), attachments_supplied: attachments_supplied.is_supplied() };
             if old.is_some() { update(&tx, &scope, &row, bytes)?; } else { insert(&tx, &scope, &row, incoming_bytes)?; }
             tx.commit()?;
+            let old = old.map(|mut row| { row.reconcile_coverage(observation.coverage_epoch); row });
             let (before, same_revision_before) = if equal {
                 (None, old)
             } else {
-                (old.map(|mut row| { row.reconcile_coverage(observation.coverage_epoch); row }), None)
+                (old, None)
             };
             Ok(SnapshotTransition { outcome: if equal { SnapshotOutcome::Duplicate } else { SnapshotOutcome::Stored }, before, after: Some(row), same_revision_before })
         }).await
