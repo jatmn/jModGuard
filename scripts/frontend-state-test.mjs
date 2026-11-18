@@ -32,6 +32,8 @@ const chartsSource = fs.readFileSync(new URL('../frontend/charts.js', import.met
   .replaceAll('export const', 'const').replaceAll('export function', 'function');
 const iconsSource = fs.readFileSync(new URL('../frontend/icons.js', import.meta.url), 'utf8')
   .replace(/^import .*;$/gm, '').replaceAll('export const', 'const').replaceAll('export function', 'function');
+const listControlsSource = fs.readFileSync(new URL('../frontend/list-controls.js', import.meta.url), 'utf8')
+  .replace(/^import .*;$/gm, '').replace(/^const h = React\.createElement;$/m, '').replaceAll('export function', 'function');
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
   .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, '\n');
 const pages = [];
@@ -102,7 +104,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     fetch: fetchImpl, console, AbortController, URLSearchParams, URL: win.URL, Blob: win.Blob, Event: win.Event, Date: TestDate,
     setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${source}\n({state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId, COMMAND_BEHAVIORS, PLAN_STEP_LABELS, planStepFor})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${listControlsSource}\n${source}\n({ListControls, ListSortHeading, ListEmptyRow, useListControls, state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId, COMMAND_BEHAVIORS, PLAN_STEP_LABELS, planStepFor})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   app.state.guildId = app.state.guilds[0].id;
@@ -137,7 +139,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   const elements = { find: predicate => collect().find(predicate), filter: predicate => collect().filter(predicate), some: predicate => collect().some(predicate), [Symbol.iterator]: function* () { yield* collect(); } };
   vm.runInContext('root.render(h(App));', context);
   pages.push({dom, roots});
-  return { app, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, advanceTime(ms) { clockOffsetMs += ms; } };
+  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, advanceTime(ms) { clockOffsetMs += ms; } };
 }
 
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
@@ -8845,6 +8847,59 @@ test('Case view keeps a saved note as saved when the timeline refresh fails', as
   await settle();
   assert.match(h.nodes.get('#toast').textContent, /Note added\. Reopen the case/);
   assert.equal(findNode(caseDialog(h), n => n.localName === 'textarea').value, '');
+});
+
+test('Shared list controls restore, debounce, sort, clear and write the list URL', async () => {
+  const fixture = harness();
+  const { app } = fixture;
+  const guild = app.state.guildId;
+  fixture.location.search = `?list=example&guild=${guild}&outcome=active&sort=reason&dir=desc&from=2026-01-01`;
+  fixture.location.hash = '#preview=test';
+  const config = {
+    list: 'example', filterLabel: 'Filter example', defaultSort: 'date', defaultDir: 'desc',
+    columns: [{ key: 'date', label: 'When' }, { key: 'reason', label: 'Reason' }],
+    filters: [{ key: 'outcome', label: 'Status', options: { active: { label: 'Active' } } }],
+  };
+  let controls;
+  let changes = 0;
+  const root = fixture.mount(function ExampleList() {
+    controls = app.useListControls(config, guild, () => changes++);
+    return React.createElement(React.Fragment, null,
+      React.createElement(app.ListControls, { controls }),
+      React.createElement('table', null,
+        React.createElement('thead', null, React.createElement('tr', null,
+          ...config.columns.map(column => React.createElement(app.ListSortHeading, { key: column.key, controls, column })))),
+        React.createElement('tbody', null, React.createElement(app.ListEmptyRow, {
+          controls, empty: 'No entries.', filtered: 'No matching entries.', colSpan: 2,
+        }))),
+    );
+  });
+  await settle();
+  assert.equal(controls.query().get('outcome'), 'active');
+  assert.equal(controls.query().get('from'), '2026-01-01');
+  assert.equal(root.querySelector('th[aria-sort="descending"] button').textContent, 'Reason');
+  assert.equal(root.querySelector('tbody').textContent, 'No matching entries.');
+  const search = root.querySelector('input[type="search"]');
+  search.value = 'one';
+  await fire(search, 'input');
+  search.value = 'one %';
+  await fire(search, 'input');
+  assert.equal(changes, 0);
+  const pending = [...fixture.timers.values()].filter(timer => timer.delay === 300);
+  assert.equal(pending.length, 1);
+  await pending[0].fn();
+  assert.equal(changes, 1);
+  assert.equal(controls.query().get('q'), 'one %');
+  await fire(root.querySelector('th[aria-sort="descending"] button'), 'click');
+  assert.equal(root.querySelector('th[aria-sort="ascending"] button').textContent, 'Reason');
+  const url = new URL(fixture.historyUrls.at(-1), 'https://fixture.test');
+  assert.equal(url.searchParams.get('q'), 'one %');
+  assert.equal(url.searchParams.get('dir'), 'asc');
+  assert.equal(url.hash, '#preview=test');
+  await fire(findNode(root, n => n.localName === 'button' && n.textContent === 'Clear filters'), 'click');
+  assert.equal(search.value, '');
+  assert.equal(controls.query().toString(), 'sort=reason&dir=asc');
+  assert.equal(root.querySelector('tbody').textContent, 'No entries.');
 });
 
 test('Cases rows open on click while their own buttons keep their action', async () => {

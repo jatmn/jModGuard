@@ -711,6 +711,12 @@ svg.icon-neutral { color: var(--icon-neutral); }
 .case-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 12px; }
 .case-filters > .field, .case-filters > .id-picker { flex: 1 1 10rem; min-width: 0; max-width: 16rem; margin: 0; }
 .case-filters .select { width: 100%; }
+.list-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 12px; }
+.list-filters > .field, .list-filters > .id-picker { flex: 1 1 10rem; min-width: 0; max-width: 16rem; margin: 0; }
+.list-filters .select { width: 100%; }
+.list-sort { display: inline-flex; align-items: center; gap: .35rem; color: inherit; font: inherit; cursor: pointer; }
+.list-sort-mark { width: 1rem; height: 1rem; flex: none; }
+
 .case-row { cursor: pointer; }
 .case-row:hover > td { background: var(--panel2); }
 .case-badge { gap: 4px; white-space: nowrap; }
@@ -769,7 +775,8 @@ svg.icon-neutral { color: var(--icon-neutral); }
 .case-remove { margin-inline-start: auto; }
 @media (max-width: 720px) {
   .case-who { grid-template-columns: minmax(0, 1fr); }
-  .case-filters > .field, .case-filters > .id-picker { flex-basis: 100%; max-width: none; }
+  .case-filters > .field, .case-filters > .id-picker,
+  .list-filters > .field, .list-filters > .id-picker { flex-basis: 100%; max-width: none; }
   .case-file { width: 100%; }
 }
 /* ==== end Cases (#624) ==== */

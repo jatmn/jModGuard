@@ -5,6 +5,7 @@ pub mod api;
 pub mod cases;
 mod directory;
 mod discord_retry;
+pub mod list_controls;
 pub mod members;
 pub mod oauth;
 pub mod platform;
