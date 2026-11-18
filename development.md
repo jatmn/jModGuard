@@ -114,7 +114,9 @@ and the CI toolchain. `Dockerfile.{bot,api}` pin
 no Docker Dependabot job; bump those digests together with the toolchain pin.
 Moving the application images to Debian 13 (Trixie) requires a rollout plan
 for installed Bookworm releases. The launcher checks the base ABI when
-restoring a release, and the publisher validates that ABI before promotion
+restoring a release. Publication stamps the declared `io.jmodguard.base-abi`
+label from the pinned Dockerfile base and release admission enforces that
+metadata before promotion; it does not independently verify the image OS
 ([dependency tracker](https://github.com/jatmn/jModGuard/issues/668)).
 
 Dependabot version updates are supported on this private GitHub.com
