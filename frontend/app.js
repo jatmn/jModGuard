@@ -1359,9 +1359,9 @@ function memoryLimitBytes(memory) {
 }
 
 // The snapshot is fresh only while the response itself is recent.
-function resourceFreshness(current, generatedAtMs) {
+function resourceFreshness(current, generatedAtMs, nowMs = Date.now()) {
   if (!current || current.availability !== "available") return "unavailable";
-  const drift = generatedAtMs ? Math.max(0, Date.now() - generatedAtMs) : 0;
+  const drift = generatedAtMs ? Math.max(0, nowMs - generatedAtMs) : 0;
   return current.stale || (current.age_ms ?? Infinity) + drift > (current.stale_after_ms ?? 0) ? "stale" : "fresh";
 }
 
@@ -1401,11 +1401,11 @@ function diskRows(disks) {
   });
 }
 
-function ResourceCard({ id, title, process, generatedAtMs, range, chartFrom, chartTo }) {
+function ResourceCard({ id, title, process, generatedAtMs, nowMs, range, chartFrom, chartTo }) {
   const current = process?.current;
   const history = process?.history;
   const points = history?.points ?? [];
-  const freshness = resourceFreshness(current, generatedAtMs);
+  const freshness = resourceFreshness(current, generatedAtMs, nowMs);
   const info = current?.info;
   const badge =
     freshness === "unavailable"
@@ -1419,7 +1419,10 @@ function ResourceCard({ id, title, process, generatedAtMs, range, chartFrom, cha
   const memoryLimit = memoryLimitBytes(current?.memory);
   const memory = current?.memory?.program_bytes ?? null;
   const cpu = cpuPercent(current?.cpu_tenths, scale);
-  const sampled = current?.age_ms != null ? `Sampled ${formatDuration(current.age_ms)} ago` : "Not sampled";
+  const sampleAgeMs = current?.age_ms != null && generatedAtMs != null
+    ? current.age_ms + Math.max(0, nowMs - generatedAtMs)
+    : null;
+  const sampled = sampleAgeMs != null ? `Sampled ${formatDuration(sampleAgeMs)} ago` : "Not sampled";
   const headingId = `resources-${id}`;
   const percent = (value) => (value == null ? "—" : `${formatRate(value)}%`);
   const cores = info?.schedulable_cpus != null ? `${info.schedulable_cpus} schedulable CPU${info.schedulable_cpus === 1 ? "" : "s"}` : "schedulable CPUs unavailable";
@@ -1540,6 +1543,11 @@ function TabBotResources() {
 
 function BotResources() {
   const [range, setRange] = useState("24h");
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 5000);
+    return () => window.clearInterval(id);
+  }, []);
   const result = useApiRead(`/api/owner/resources?range=${range}`, { retainData: true });
   const snapshot = result.data;
   const bot = snapshot?.processes?.bot;
@@ -1548,7 +1556,7 @@ function BotResources() {
   const apiHistory = api?.history;
   const from = snapshot?.from_secs;
   const to = snapshot?.to_secs;
-  const gauge = (process, name) => (resourceFreshness(process?.current, snapshot?.generated_at_ms) === "unavailable" ? null : process?.current?.gauges?.[name] ?? null);
+  const gauge = (process, name) => (resourceFreshness(process?.current, snapshot?.generated_at_ms, nowMs) === "unavailable" ? null : process?.current?.gauges?.[name] ?? null);
   const rangeLabel = RESOURCE_RANGES.find(([value]) => value === range)?.[1].toLowerCase() ?? range;
   const note = result.error
     ? h("p", { id: "resources-status", className: "alert alert-soft alert-warning", role: "status" }, snapshot
@@ -1582,7 +1590,7 @@ function BotResources() {
         "div",
         { id: "resources-cards", className: "du-grid" },
         ...RESOURCE_PROCESSES.map(([id, title]) =>
-          h(ResourceCard, { key: id, id, title, process: snapshot.processes?.[id], generatedAtMs: snapshot.generated_at_ms, range: rangeLabel, chartFrom: from, chartTo: to }),
+          h(ResourceCard, { key: id, id, title, process: snapshot.processes?.[id], generatedAtMs: snapshot.generated_at_ms, nowMs, range: rangeLabel, chartFrom: from, chartTo: to }),
         ),
       ),
     h(

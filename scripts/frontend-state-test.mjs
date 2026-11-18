@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import test from 'node:test';
+import test, { afterEach, after } from 'node:test';
 import vm from 'node:vm';
 import { performance } from 'node:perf_hooks';
 import { renderToStaticMarkup } from '../tools/webui/node_modules/react-dom/server.node.js';
@@ -22,7 +22,6 @@ activate(bootDom.window);
 const { createRoot: reactRoot } = await import('../tools/webui/node_modules/react-dom/client.js');
 const { flushSync } = await import('../tools/webui/node_modules/react-dom/index.js');
 const { Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea } = await import('../tools/webui/components.js');
-import { afterEach, after } from 'node:test';
 const stateSource = fs.readFileSync(new URL("../frontend/state.js", import.meta.url), "utf8")
   .replace(/^import .*;$/gm, "").replaceAll("export function", "function");
 const appearanceSource = fs.readFileSync(new URL('../frontend/appearance.js', import.meta.url), 'utf8')
@@ -86,7 +85,32 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   const addEventListener = document.addEventListener.bind(document), removeEventListener = document.removeEventListener.bind(document);
   document.addEventListener = (name, fn, ...args) => { documentListeners.set(name, fn); addEventListener(name, fn, ...args); };
   document.removeEventListener = (name, fn, ...args) => { if (documentListeners.get(name) === fn) documentListeners.delete(name); removeEventListener(name, fn, ...args); };
-  const timerApi = timerImpl ?? { setTimeout(fn, delay) { const id = nextTimer++; timers.set(id, { fn: (...args) => { let result; flushSync(() => { result = fn(...args); }); return Promise.resolve(result).then(settle); }, delay }); return id; }, clearTimeout(id) { timers.delete(id); } };
+  const timerApi = timerImpl ?? {
+    setTimeout(fn, delay) {
+      const id = nextTimer++;
+      timers.set(id, { fn: (...args) => { let result; flushSync(() => { result = fn(...args); }); return Promise.resolve(result).then(settle); }, delay });
+      return id;
+    },
+    clearTimeout(id) { timers.delete(id); },
+    setInterval(fn, delay) {
+      const id = nextTimer++;
+      timers.set(id, {
+        repeating: true,
+        delay,
+        fn: (...args) => {
+          let result;
+          flushSync(() => { result = fn(...args); });
+          return Promise.resolve(result).then(settle);
+        },
+      });
+      return id;
+    },
+    clearInterval(id) { timers.delete(id); },
+  };
+  win.setTimeout = (...args) => timerApi.setTimeout(...args);
+  win.clearTimeout = (...args) => timerApi.clearTimeout(...args);
+  win.setInterval = (...args) => timerApi.setInterval(...args);
+  win.clearInterval = (...args) => timerApi.clearInterval(...args);
   function createRoot(container) {
     const root = reactRoot(container); roots.push(root);
     return { render(element) {
@@ -112,7 +136,9 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     React, useSyncExternalStore, useState, useEffect, useLayoutEffect, useRef, createContext, useContext, createRoot, flushSync,
     Dialog, DialogPanel, Field, Label, HeadlessInput, HeadlessSelect, HeadlessTextarea,
     fetch: fetchImpl, console, AbortController, URLSearchParams, URL: win.URL, Blob: win.Blob, Event: win.Event, Date: TestDate,
-    setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout, confirm, crypto: {randomUUID}, navigator: win.navigator,
+    setTimeout: timerApi.setTimeout, clearTimeout: timerApi.clearTimeout,
+    setInterval: timerApi.setInterval, clearInterval: timerApi.clearInterval,
+    confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
   const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${listControlsSource}\n${source}\n({ListControls, ListSortHeading, ListEmptyRow, useListControls, state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId, COMMAND_BEHAVIORS, PLAN_STEP_LABELS, planStepFor})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
@@ -10779,4 +10805,28 @@ test('Bot Resources marks an old status stale and re-reads on range change and R
   await fire(h.nodes.get('#refresh-resources'), 'click');
   await settle();
   assert.deepEqual(calls, ['/api/owner/resources?range=24h', '/api/owner/resources?range=7d', '/api/owner/resources?range=7d']);
+});
+
+async function runHarnessInterval(h, delay = 5000) {
+  const pending = [...h.timers].find(([, timer]) => timer.repeating && timer.delay === delay);
+  assert(pending, `expected a ${delay}ms interval`);
+  h.advanceTime(delay);
+  await pending[1].fn();
+  await settle();
+}
+
+test('Bot Resources becomes stale on an idle page without Refresh', async () => {
+  const snapshot = resourceSnapshot({
+    bot: { current: resourceCurrent({ age_ms: 2000, stale_after_ms: 15000, interval_ms: 5000 }) },
+    api: { current: resourceCurrent({ age_ms: 2000, stale_after_ms: 15000, interval_ms: 5000 }) },
+    generated_at_ms: RESOURCE_NOW_MS,
+  });
+  const h = ownerHarness(async () => response(snapshot));
+  h.app.navigate('resources');
+  await settle();
+  assert.equal(resourceCards(h)[0].getAttribute('data-freshness'), 'fresh');
+  h.advanceTime(20_000);
+  await runHarnessInterval(h);
+  assert.equal(resourceCards(h)[0].getAttribute('data-freshness'), 'stale');
+  assert.equal(resourceCards(h)[1].getAttribute('data-freshness'), 'stale');
 });

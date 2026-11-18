@@ -318,6 +318,14 @@ impl RollupBuilder {
             self.current.memory_max_bytes =
                 max_option(self.current.memory_max_bytes, Some(memory.program_bytes));
         }
+        for (name, value) in gauges() {
+            self.current
+                .data
+                .gauges
+                .entry(name)
+                .and_modify(|peak| *peak = (*peak).max(value))
+                .or_insert(value);
+        }
         finished
     }
 
@@ -355,7 +363,6 @@ impl RollupBuilder {
         if taken.latency.iter().any(|count| *count > 0) {
             rollup.data.latency = taken.latency.to_vec();
         }
-        rollup.data.gauges = gauges();
         rollup
     }
 }
@@ -660,6 +667,20 @@ mod tests {
             "no reading is unavailable, not 0"
         );
         assert_eq!(empty.memory_max_bytes, None);
+    }
+
+    #[test]
+    fn builder_records_peak_gauges_across_samples_in_one_minute() {
+        let mut builder = RollupBuilder::default();
+        set_gauge("shard_latency_ms", 900);
+        assert!(builder.observe(120, sample(None, None)).is_none());
+        set_gauge("shard_latency_ms", 50);
+        assert!(builder.observe(140, sample(None, None)).is_none());
+        let minute = builder
+            .observe(180, sample(None, None))
+            .expect("minute closes");
+        assert_eq!(minute.data.gauges["shard_latency_ms"], 900);
+        clear_gauge("shard_latency_ms");
     }
 
     #[test]
