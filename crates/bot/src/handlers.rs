@@ -1761,6 +1761,7 @@ impl EventHandler for Handler {
                         strikes: 1,
                         evidence: serde_json::json!({}),
                         mention_permission_unknown: false,
+                        matched_rule: None,
                     };
                     execute_pending(
                         &app,

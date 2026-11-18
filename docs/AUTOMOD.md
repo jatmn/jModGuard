@@ -174,8 +174,9 @@ If a custom rule is deleted, or its configuration cannot be read, before a
 pending action runs, the bot logs a warning and takes no Discord action, including
 delete, timeout, or warn. The pending action does not carry its match-time dry-run
 state, so unavailable custom configuration cannot authorize enforcement. A failed
-configuration read for a built-in rule uses the fallback only for kick or ban;
-its other actions keep their normal paths. Known dry-run rules remain log-only.
+configuration read for a built-in rule uses that rule's settings from when the
+message matched, so a dry-run rule stays log-only and its exemptions still apply.
+Kick or ban then uses the fallback; other actions keep their normal paths.
 Whitelist your announcement channels and your mod/admin roles so @everyone pings
 in them never trigger.
 
