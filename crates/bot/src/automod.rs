@@ -129,6 +129,10 @@ pub struct PendingAction {
     /// The winning action is an everyone-attempt whose channel permission
     /// could not be resolved. Kick and ban delete the message and stop.
     pub mention_permission_unknown: bool,
+    /// The built-in rule as it was when the message matched. If its
+    /// configuration cannot be re-read before acting, these settings still
+    /// decide dry-run and exemptions. Custom rules leave this empty.
+    pub matched_rule: Option<RuleDef>,
 }
 
 static URL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
@@ -268,6 +272,7 @@ impl AutomodEngine {
                     mention_permission_unknown: false,
                     evidence: serde_json::json!({ "content": ctx.content,
                         "channel_id": ctx.channel_id, "message_id": ctx.message_id }),
+                    matched_rule: Some(rule.clone()),
                 };
                 // This list promises the same fixed one-hour action even when
                 // another detector would also ban with a different window.
@@ -296,6 +301,7 @@ impl AutomodEngine {
                     "attachments": ctx.attachment_count,
                     "mentions": ctx.everyone_mentions + ctx.here_mentions + ctx.role_mentions,
                 }),
+                matched_rule: Some(rule.clone()),
             };
             if is_more_severe(&pending, &best) {
                 best = Some(pending);
@@ -366,6 +372,7 @@ impl AutomodEngine {
                     "message_id": ctx.message_id,
                     "attachments": ctx.attachment_count,
                 }),
+                matched_rule: None,
             };
             if is_more_severe(&pending, &best) {
                 best = Some(pending);
@@ -774,33 +781,37 @@ pub(crate) async fn execute_pending_with(
             return;
         }
     }
-    let resolved = loaded.as_ref().ok().and_then(|cfg| {
-        cfg.rules.get(&pending.rule_id).map(|r| {
-            (
-                r.dry_run,
-                r.log_automod,
-                r.open_case,
-                r.skip_moderators,
-                r.whitelist_roles.as_slice(),
-            )
-        })
-    });
-    let config_unknown = resolved.is_none();
-    let (dry, log_automod, open_case, skip_moderators, skipped_roles) =
-        if jmodguard::custom_rules::is_custom_id(&pending.rule_id) {
-            let Some(values) = resolved else {
-                tracing::warn!(
-                    guild_id = guild_id.get(),
-                    rule_id = pending.rule_id.as_str(),
-                    "{}",
-                    jmodguard::custom_rules::CUSTOM_RULE_UNAVAILABLE_WARNING
-                );
-                return;
-            };
-            values
-        } else {
-            resolved.unwrap_or((false, true, true, false, &[]))
-        };
+    let current = loaded
+        .as_ref()
+        .ok()
+        .and_then(|cfg| cfg.rules.get(&pending.rule_id));
+    let config_unknown = current.is_none();
+    let custom = jmodguard::custom_rules::is_custom_id(&pending.rule_id);
+    let settings = if custom {
+        current
+    } else {
+        current.or(pending.matched_rule.as_ref())
+    };
+    let Some(settings) = settings else {
+        tracing::warn!(
+            guild_id = guild_id.get(),
+            rule_id = pending.rule_id.as_str(),
+            "{}",
+            if custom {
+                jmodguard::custom_rules::CUSTOM_RULE_UNAVAILABLE_WARNING
+            } else {
+                "rule configuration unavailable; skipping the action"
+            }
+        );
+        return;
+    };
+    let (dry, log_automod, open_case, skip_moderators, skipped_roles) = (
+        settings.dry_run,
+        settings.log_automod,
+        settings.open_case,
+        settings.skip_moderators,
+        settings.whitelist_roles.as_slice(),
+    );
 
     if dry {
         let mut v = vars.clone();
@@ -3865,80 +3876,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builtin_rule_still_deletes_when_config_read_fails() {
+    async fn builtin_rule_uses_matched_settings_when_config_read_fails() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
         use serenity::model::id::{GuildId, UserId};
         use serenity::model::user::User;
 
-        let path = std::env::temp_dir().join(format!(
-            "builtin_read_fail_{:032x}.db",
-            rand::random::<u128>()
-        ));
-        let app =
-            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
-        assert!(
-            crate::db::claim_active_bot(
-                &app.db,
-                app.activation.instance(),
-                jmodguard::control::now_ms(),
-                Arc::new(AtomicBool::new(false)),
+        for dry_run in [false, true] {
+            let path = std::env::temp_dir().join(format!(
+                "builtin_read_fail_{:032x}.db",
+                rand::random::<u128>()
+            ));
+            let app =
+                BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+            assert!(
+                crate::db::claim_active_bot(
+                    &app.db,
+                    app.activation.instance(),
+                    jmodguard::control::now_ms(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+                .unwrap()
+            );
+            app.activation.mark_lock_held(true);
+            app.db
+                .with_conn(|conn| conn.execute_batch_bounded("DROP TABLE rules", 65_536))
+                .await
+                .unwrap();
+            app.configs.invalidate();
+            let badword = crate::types::RULE_IDS
+                .iter()
+                .position(|id| *id == "badword")
+                .unwrap();
+            let mut matched = crate::defaults::default_rules().remove(badword);
+            matched.dry_run = dry_run;
+            let pending = PendingAction {
+                rule_id: "badword".into(),
+                rule_name: "Badwords".into(),
+                action: ActionDef {
+                    at: 1,
+                    action: "delete".into(),
+                    duration_minutes: 0,
+                    delete_days: 0,
+                    purge_last_hour: false,
+                    reason: "Banned word".into(),
+                },
+                strikes: 1,
+                evidence: serde_json::json!({
+                    "content": "spamword",
+                    "channel_id": 70,
+                    "message_id": 42,
+                }),
+                mention_permission_unknown: false,
+                matched_rule: Some(matched),
+            };
+            let mut user = User::default();
+            user.id = UserId::new(99);
+            user.name = "member".into();
+            let stub = DiscordStub::start();
+            execute_pending_with(
+                &app,
+                &stub.http,
+                &stub.cache,
+                GuildId::new(10),
+                &user,
+                None,
+                "member",
+                Some(42),
+                Some(70),
+                &pending,
             )
-            .await
-            .unwrap()
-        );
-        app.activation.mark_lock_held(true);
-        app.db
-            .with_conn(|conn| conn.execute_batch_bounded("DROP TABLE rules", 65_536))
-            .await
-            .unwrap();
-        app.configs.invalidate();
-        let pending = PendingAction {
-            rule_id: "badword".into(),
-            rule_name: "Badwords".into(),
-            action: ActionDef {
-                at: 1,
-                action: "delete".into(),
-                duration_minutes: 0,
-                delete_days: 0,
-                purge_last_hour: false,
-                reason: "Banned word".into(),
-            },
-            strikes: 1,
-            evidence: serde_json::json!({
-                "content": "spamword",
-                "channel_id": 70,
-                "message_id": 42,
-            }),
-            mention_permission_unknown: false,
-        };
-        let mut user = User::default();
-        user.id = UserId::new(99);
-        user.name = "member".into();
-        let stub = DiscordStub::start();
-        execute_pending_with(
-            &app,
-            &stub.http,
-            &stub.cache,
-            GuildId::new(10),
-            &user,
-            None,
-            "member",
-            Some(42),
-            Some(70),
-            &pending,
-        )
-        .await;
-        let seen = stub.finish();
-        assert!(
-            seen.iter()
-                .any(|line| line.starts_with("DELETE ") && line.contains("/messages/42")),
-            "a built-in rule still deletes when the config read fails: {seen:?}"
-        );
-        drop(app);
-        let _ = std::fs::remove_file(&path);
-        crate::tenant::remove_sidecars(&path);
+            .await;
+            let seen = stub.finish();
+            let deleted = seen
+                .iter()
+                .any(|line| line.starts_with("DELETE ") && line.contains("/messages/42"));
+            assert_eq!(
+                deleted, !dry_run,
+                "dry_run={dry_run}: a failed config read must keep the matched rule settings: {seen:?}"
+            );
+            drop(app);
+            let _ = std::fs::remove_file(&path);
+            crate::tenant::remove_sidecars(&path);
+        }
     }
 
     #[tokio::test]
