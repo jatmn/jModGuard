@@ -14,7 +14,10 @@ membership and the `x-jmodguard-enrollment` value from the page's loaded configu
   `{bans, names, total, next_cursor, moderators}`. The default is newest first by ban
   timestamp and row ID. `sort` accepts `subject`, `id` (Discord user ID),
   `reason`, `actor`, `date`, and `status`. Set `dir=asc|desc` and pass `next_cursor`
-  as the following request's `after` with the same order and filters.
+  as the following request's `after` with the same guild, sort, direction and
+  filters. An incompatible cursor returns HTTP 400 with a JSON `error`. Start
+  again without `after` when changing filters or using a cursor from before the
+  binding was added. The page limit and `skip_metadata` may change between requests.
   Each request caps the response at 250 ban records. Dashboard continuation
   requests can use `skip_metadata=true` to omit the count and moderator lookup.
   `total` counts all matching rows. `moderators` contains actors from the

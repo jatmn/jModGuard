@@ -7,7 +7,7 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_sessions::Session;
 
@@ -1261,6 +1261,13 @@ pub struct BansQuery {
     list: super::list_controls::ListQuery<db::BanListSort, db::BanListStatus>,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BanCursor {
+    context: String,
+    anchor: db::BanListAnchor,
+}
+
 fn ban_list_subject(raw: Option<&str>) -> ApiResult<Option<db::BanListSubject>> {
     use super::list_controls::{bounded_list_text, parse_user_id};
     let Some(subject) = bounded_list_text(raw)? else {
@@ -1329,30 +1336,54 @@ async fn bans_inner(
     let auth = real_guild_scope(app, session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
-    use super::list_controls::{SortDirection, bounded_list_text, decode_cursor, encode_cursor};
+    use super::list_controls::{
+        SortDirection, bounded_list_text, check_cursor_context, cursor_context, decode_cursor,
+        encode_cursor,
+    };
     let list = query.list.validate_with_subject(
         db::BanListSort::Date,
         SortDirection::Desc,
         ban_list_subject,
     )?;
-    let after: Option<db::BanListAnchor> = list
+    let filters = db::BanListFilters {
+        subject: list.subject,
+        actor: list.actor,
+        status: list.outcome,
+        reason: bounded_list_text(query.reason.as_deref())?,
+        q: list.q,
+        from_ms: list.from_ms,
+        until_ms: list.until_ms,
+    };
+    // Match SQLite's ASCII case folding for the text filters.
+    let subject = match &filters.subject {
+        Some(db::BanListSubject::Id(id)) => (Some(*id), None),
+        Some(db::BanListSubject::Name(name)) => (None, Some(name.to_ascii_lowercase())),
+        None => (None, None),
+    };
+    let context = cursor_context((
+        guild_id,
+        subject,
+        filters.actor,
+        filters.status,
+        filters.reason.as_deref().map(str::to_ascii_lowercase),
+        filters.q.as_deref().map(str::to_ascii_lowercase),
+        filters.from_ms,
+        filters.until_ms,
+    ))?;
+    let after = list
         .after
         .as_deref()
-        .map(|cursor| decode_cursor(cursor, "bans", list.sort, list.dir))
+        .map(|token| {
+            let cursor: BanCursor = decode_cursor(token, "bans", list.sort, list.dir)?;
+            check_cursor_context(&cursor.context, &context)?;
+            Ok::<_, ApiError>(cursor.anchor)
+        })
         .transpose()?;
     let page = db::page_enrolled_bans(
         &app.db,
         enrollment.clone(),
         db::BanListRequest {
-            filters: db::BanListFilters {
-                subject: list.subject,
-                actor: list.actor,
-                status: list.outcome,
-                reason: bounded_list_text(query.reason.as_deref())?,
-                q: list.q,
-                from_ms: list.from_ms,
-                until_ms: list.until_ms,
-            },
+            filters,
             sort: list.sort,
             descending: list.dir == SortDirection::Desc,
             after,
@@ -1363,7 +1394,7 @@ async fn bans_inner(
     .await?;
     let next = page
         .next
-        .map(|anchor| encode_cursor("bans", list.sort, list.dir, anchor))
+        .map(|anchor| encode_cursor("bans", list.sort, list.dir, BanCursor { context, anchor }))
         .transpose()?;
     // Presentation only, as on the Cases list: names the member directory
     // recorded for the people on these rows. An unavailable directory leaves

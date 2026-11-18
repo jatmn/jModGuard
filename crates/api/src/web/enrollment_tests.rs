@@ -2380,10 +2380,58 @@ async fn ban_list_filters_and_orders_use_the_same_cursor_page() {
         [c, a, d]
     );
 
-    let first = ban_page(&f, "limit=1&sort=reason&dir=asc").await;
+    let filters = "sort=reason&dir=asc&limit=1&subject=alpha&status=active&reason=invite&q=invite&from=2026-01-03&to=2026-01-04";
+    let first = ban_page(&f, filters).await;
+    assert_eq!(ban_user_ids(&first), [c]);
     let cursor = ban_page_cursor(&first);
+    for changed in [
+        filters.replace("status=active", "status=unbanned"),
+        filters.replace("subject=alpha", "subject=bravo"),
+        format!("{filters}&actor=8"),
+        filters.replace("reason=invite", "reason=other"),
+        filters.replace("q=invite", "q=other"),
+        filters.replace("from=2026-01-03", "from=2026-01-04"),
+        filters.replace("to=2026-01-04", "to=2026-01-05"),
+    ] {
+        let (status, body) = f
+            .request(
+                "POST",
+                &format!("/api/guilds/10/bans?{changed}&after={cursor}"),
+                "",
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{changed}: {body}");
+        assert_eq!(
+            body,
+            serde_json::json!({"error":"list cursor does not match the guild or filters"})
+        );
+    }
+    for changed in [
+        filters.replace("sort=reason", "sort=actor"),
+        filters.replace("dir=asc", "dir=desc"),
+    ] {
+        let (status, body) = f
+            .request(
+                "POST",
+                &format!("/api/guilds/10/bans?{changed}&after={cursor}"),
+                "",
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{changed}: {body}");
+        assert_eq!(body, serde_json::json!({"error":"invalid list cursor"}));
+    }
+
+    let next = ban_page(&f, &format!("{filters}&after={cursor}")).await;
+    assert_eq!(ban_user_ids(&next), [a]);
+    assert!(next["next_cursor"].is_null());
+
+    let normalized = "sort=reason&dir=asc&limit=2&subject=+ALPHA+&outcome=active&reason=INVITE&q=+INVITE+&from=2026-01-03&to=2026-01-04&skip_metadata=true";
+    let next = ban_page(&f, &format!("{normalized}&after={cursor}")).await;
+    assert_eq!(ban_user_ids(&next), [a]);
+    assert!(next["total"].is_null());
+    assert!(next["next_cursor"].is_null());
+
     for query in [
-        format!("sort=reason&dir=desc&after={cursor}"),
         "sort=elsewhere".into(),
         "actor=%2B8".into(),
         "subject=9223372036854775808".into(),
@@ -2469,11 +2517,23 @@ async fn ban_list_rejects_foreign_edited_and_missing_text_anchors() {
     assert_eq!(ban_user_ids(&first), [1]);
     let anchor_id = first["bans"][0]["id"].as_i64().unwrap();
     let after = format!("{query}&after={}", ban_page_cursor(&first));
-    let (status, body) = f
-        .request("POST", &format!("/api/guilds/20/bans?{after}"), "")
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"], "invalid list cursor");
+    for sort in ["reason", "id"] {
+        let query = format!("limit=1&sort={sort}&dir=asc");
+        let first = ban_page(&f, &query).await;
+        let cursor = ban_page_cursor(&first);
+        let (status, body) = f
+            .request(
+                "POST",
+                &format!("/api/guilds/20/bans?{query}&after={cursor}"),
+                "",
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{sort}: {body}");
+        assert_eq!(
+            body["error"],
+            "list cursor does not match the guild or filters"
+        );
+    }
 
     let (status, body) = f
         .request(

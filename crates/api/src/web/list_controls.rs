@@ -2,6 +2,7 @@
 use super::{ApiError, ApiResult};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::NaiveDate;
+use jmodguard_updater::oci::sha256_hex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::future::Future;
 use std::time::Duration;
@@ -182,6 +183,17 @@ pub fn decode_cursor<S: DeserializeOwned + PartialEq, A: DeserializeOwned>(
         return Err(bad());
     }
     Ok(cursor.anchor)
+}
+
+pub(super) fn cursor_context(filters: impl Serialize) -> ApiResult<String> {
+    Ok(sha256_hex(&serde_json::to_vec(&filters)?))
+}
+
+pub(super) fn check_cursor_context(actual: &str, expected: &str) -> ApiResult<()> {
+    if actual != expected {
+        return Err(invalid("list cursor does not match the guild or filters"));
+    }
+    Ok(())
 }
 
 fn invalid(message: &'static str) -> ApiError {
