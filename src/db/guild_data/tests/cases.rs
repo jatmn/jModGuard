@@ -839,6 +839,79 @@ async fn summary_pages_are_bounded_scoped_and_use_constant_database_calls() {
     }
 }
 
+async fn check_case_listing_migration_with_snapshot_allocation(delete_snapshots: bool) {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let placement = f.placement(&reg, 10).await;
+    GuildDataStore::create_historical_store(f.options(), reg.clone(), 20).unwrap();
+    {
+        let raw = Connection::open(&f.store_path).unwrap();
+        raw.execute_bounded(
+            "INSERT INTO guild_bindings VALUES(10,?1)",
+            params![placement.revision()],
+            32_000_000,
+        )
+        .unwrap();
+        raw.execute_batch_bounded(
+            "INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+             WITH RECURSIVE messages(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM messages WHERE id < 9200)
+             INSERT INTO guild_message_snapshots(
+                 guild_id,enrollment_id,channel_id,message_id,content,content_supplied,created_at_ms,
+                 first_observed_at_ms,last_observed_at_ms,expires_at_ms,coverage_epoch,encoded_bytes
+             )
+             SELECT 10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',20,id,printf('%032768d',0),1,1,1,1,86400001,0,32768
+             FROM messages",
+            340_000_000,
+        )
+        .unwrap();
+        if delete_snapshots {
+            raw.execute_batch_bounded("DELETE FROM guild_message_snapshots", 1_000_000)
+                .unwrap();
+        }
+        let allocation = crate::capacity::sample(&raw).unwrap();
+        assert!(
+            (300_000_000..crate::capacity::GROWTH_STOP_BYTES).contains(&allocation.allocated_bytes),
+            "{allocation:?}"
+        );
+        if delete_snapshots {
+            let reusable_pages: u64 = raw
+                .query_row("PRAGMA freelist_count", (), |r| Ok(r.get::<i64>(0)? as u64))
+                .unwrap();
+            assert!(reusable_pages * allocation.page_size >= 300_000_000);
+        }
+    }
+
+    let store =
+        GuildDataStore::initialize(f.options(), reg).expect("schema-20 store should upgrade");
+    store
+        .db
+        .with_conn(|conn| {
+            let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
+            assert_eq!(version, 21);
+            let indexes: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND tbl_name='guild_cases'
+                 AND name IN ('guild_cases_list_date','guild_cases_list_action','guild_cases_list_outcome',
+                              'guild_cases_list_subject','guild_cases_list_actor')",
+                (),
+                |r| Ok(r.get(0)?),
+            )?;
+            assert_eq!(indexes, 5);
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn case_listing_migration_admits_large_store_with_retained_snapshots() {
+    check_case_listing_migration_with_snapshot_allocation(false).await;
+}
+
+#[tokio::test]
+async fn case_listing_migration_admits_large_store_with_reusable_snapshot_pages() {
+    check_case_listing_migration_with_snapshot_allocation(true).await;
+}
+
 #[tokio::test]
 async fn case_listing_migration_indexes_existing_guild_rows_for_every_seek() {
     let f = Fixture::new();

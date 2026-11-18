@@ -549,9 +549,17 @@ fn initialize_store(
             tx.execute_batch_bounded(SERVER_NAMES_SCHEMA, 32_000_000)?;
         }
         if version < 21 {
-            let index_bound = crate::capacity::allocated_bytes(&tx)?
-                .saturating_mul(2)
-                .saturating_add(32_000_000);
+            let live_cases: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM guild_cases WHERE deleted=0",
+                (),
+                |r| Ok(r.get(0)?),
+            )?;
+            // Each of the five partial indexes stores two 32-byte IDs, a guild ID,
+            // an integer or short enum sort key, and a rowid. Allow 256 bytes per
+            // entry for record and B-tree page overhead, plus 1 MiB for the DDL.
+            let index_bound = (live_cases as u64)
+                .saturating_mul(5 * 256)
+                .saturating_add(1024 * 1024);
             tx.execute_batch_bounded(CASE_LIST_SCHEMA, index_bound)?;
         }
         // Version 16 adds the optional immutable ban_attempt_tag to case JSON.
