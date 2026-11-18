@@ -449,8 +449,8 @@ The GET and POST list routes accept the same query parameters.
 
 | Parameter | Behavior |
 |---|---|
-| `sort` | `date` (default, by action time), `case` (case ID), `action`, `subject` (numeric ID), `actor` (numeric ID), or `outcome`. Case ID breaks ties. |
-| `dir` | `desc` (default) or `asc`. |
+| `sort` | `date` (by action time), `case` (case ID), `action`, `subject` (numeric ID), `actor` (numeric ID), or `outcome`. Case ID breaks ties. If only `dir` is supplied, the sort is `date`. |
+| `dir` | `desc` or `asc`. If only `sort` is supplied, the direction is `desc`. |
 | `action`, `outcome` (alias `status`), `subject`, `actor` | Exact filters. Subject and actor take decimal Discord IDs. |
 | `q` | Up to 200 characters of literal substring search over reason, case ID, action, outcome, subject ID and actor ID, with ASCII case folding. |
 | `from`, `to` | Inclusive UTC calendar dates in `YYYY-MM-DD` format. Either bound may be omitted. |
@@ -460,9 +460,11 @@ The GET and POST list routes accept the same query parameters.
 
 The response includes `cases` (ordered IDs), `summaries` (keyed by case ID),
 `names`, `can_delete` and `next_cursor`. A null `next_cursor` means there are
-no more rows. Legacy live clients that omit `sort` and `dir` can still pass a
-bare case ID to continue in ascending ID order. Subsequent pages can use the
-returned cursor with the same parameters.
+no more rows. When both `sort` and `dir` are omitted, the first page uses
+ascending case ID order. Legacy live clients can continue in that order by
+passing the last visible case ID as `after`. They can also use the returned
+opaque cursor with the same parameters. The dashboard requests `sort=date&dir=desc`
+by default.
 
 The list reads current case outcomes. An outcome that settles between requests
 can move a case across the cursor when sorting by outcome.
