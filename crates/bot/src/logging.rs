@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 const SNIPPET_KEEP: Duration = Duration::from_secs(600);
 const SNIPPETS_PER_GUILD: usize = 64;
-const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
+pub(crate) const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
 const EDIT_REPORT_LIMIT: usize = 4096;
 const MEMBER_JOINS_LIMIT: usize = 4096;
 pub(crate) const MEMBER_JOINS_KEEP: Duration = Duration::from_secs(3600);
@@ -774,7 +774,7 @@ pub(crate) fn member_join_vars_ms(
         ("time".into(), observed.to_rfc3339()),
     ])
 }
-type EditKey = (u64, u64, u64);
+type EditKey = (GuildId, ChannelId, MessageId);
 struct EditObservation {
     edited_at_ms: i64,
     reported_timestamps: Vec<i64>,
@@ -816,18 +816,7 @@ pub struct EditReportDedup {
 
 impl EditReportDedup {
     /// Timestamp identity coalesces partial Gateway updates without storing text.
-    pub fn should_report(&self, event: &MessageUpdateEvent) -> bool {
-        let Some(guild) = event.guild_id else {
-            return false;
-        };
-        // Unfurls and other refreshes cannot enter the reported-edit state.
-        // Every stored observation therefore has an authoritative timestamp;
-        // field fingerprints never decide a transition after this guard.
-        let Some(edited_at) = event.edited_timestamp else {
-            return false;
-        };
-        let edited_at_ms = edited_at.timestamp_millis();
-        let key = (guild.get(), event.channel_id.get(), event.id.get());
+    pub(crate) fn should_report(&self, key: EditKey, edited_at_ms: i64) -> bool {
         let mut entries = self.inner.lock();
         entries.retain(|_, seen| seen.at.elapsed() < EDIT_REPORT_KEEP);
         if let Some(seen) = entries.get_mut(&key) {
@@ -1188,6 +1177,9 @@ pub(crate) trait LogDelivery: Sync {
     async fn member_audit(&self, _guild: GuildId, _action: Action) -> anyhow::Result<AuditLogs> {
         anyhow::bail!("audit context unavailable")
     }
+    async fn edit_channel_name(&self, _guild: GuildId, _channel: ChannelId) -> Option<String> {
+        None
+    }
 }
 #[serenity::async_trait]
 impl LogDelivery for serenity::http::Http {
@@ -1195,6 +1187,16 @@ impl LogDelivery for serenity::http::Http {
         Ok(self
             .get_audit_logs(guild, Some(action), None, None, Some(100))
             .await?)
+    }
+    async fn edit_channel_name(&self, guild: GuildId, id: ChannelId) -> Option<String> {
+        match self.get_channel(id).await.ok()? {
+            serenity::model::channel::Channel::Guild(channel)
+                if channel.guild_id == guild && channel.id == id =>
+            {
+                Some(channel.name)
+            }
+            _ => None,
+        }
     }
     async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
         channel.send_message(self, message).await?;
@@ -1221,6 +1223,9 @@ impl LogDelivery for serenity::http::Http {
 impl LogDelivery for std::sync::Arc<serenity::http::Http> {
     async fn member_audit(&self, guild: GuildId, action: Action) -> anyhow::Result<AuditLogs> {
         self.as_ref().member_audit(guild, action).await
+    }
+    async fn edit_channel_name(&self, guild: GuildId, channel: ChannelId) -> Option<String> {
+        self.as_ref().edit_channel_name(guild, channel).await
     }
     async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
         self.as_ref().send(channel, message).await
@@ -1524,6 +1529,29 @@ async fn emit_to_observed_with_audit(
         // immediately before the Discord call.
         if !commit() {
             return Ok(Delivery::Dropped);
+        }
+        if event == "message_edit"
+            && vars
+                .get("channel")
+                .is_some_and(|value| value.starts_with("<#"))
+            && let Some(id) = vars
+                .get("channel_id")
+                .and_then(|id| id.parse::<u64>().ok())
+                .filter(|id| *id != 0)
+        {
+            let budget = deadline
+                .saturating_sub(started.elapsed())
+                .div_f64(2.0)
+                .min(Duration::from_secs(3));
+            let name =
+                tokio::time::timeout(budget, sink.edit_channel_name(guild_id, ChannelId::new(id)))
+                    .await
+                    .ok()
+                    .flatten();
+            vars.insert(
+                "channel".into(),
+                format!("#{}", name.unwrap_or_else(|| id.to_string())),
+            );
         }
         #[cfg(test)]
         if event == "automod"
@@ -2868,15 +2896,14 @@ fn take_utf16_prefix(text: &str, max_units: usize) -> (&str, &str) {
 }
 
 /// Use only fields in the delivered update; cache-filled values are not edit history.
-/// Discord sets `edited_timestamp` only for an actual edit. Embed, GIF/link unfurl,
-/// reply-preview, pin, and flag refreshes omit it and produce no report — even when
-/// the Gateway repeats the original content, a `message_reference`, or an empty
-/// attachment list. The bot never reports Gateway updates of its own messages, so a
-/// log post cannot stack into another `message_edit` report.
+/// A timestamp and supplied content or attachments make an update an edit
+/// candidate. Capture compares it with the prior observation before delivery.
+/// The bot's own updates never become candidates.
 pub(crate) fn message_update_report(
     event: &MessageUpdateEvent,
     known_author_id: Option<u64>,
     bot_user_id: Option<u64>,
+    cache: Option<&serenity::cache::Cache>,
 ) -> Option<MessageReport> {
     let guild_id = event.guild_id?;
     let edited_at = event.edited_timestamp?;
@@ -2895,6 +2922,16 @@ pub(crate) fn message_update_report(
         return None;
     }
     let mut vars = message_vars(guild_id, event.channel_id, event.id);
+    if let Some(guild) = cache.and_then(|cache| cache.guild(guild_id))
+        && let Some(channel) = guild.channels.get(&event.channel_id).or_else(|| {
+            guild
+                .threads
+                .iter()
+                .find(|thread| thread.id == event.channel_id)
+        })
+    {
+        vars.insert("channel".into(), format!("#{}", channel.name));
+    }
     vars.insert("time".into(), edited_at.to_string());
     vars.insert(
         "after".into(),

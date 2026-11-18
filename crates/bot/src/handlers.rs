@@ -1425,12 +1425,16 @@ impl EventHandler for Handler {
             })
             .unwrap_or_default();
         logging::remember_message_update(&self.app, &event, known_author_id);
-        let bot_user_id = ctx.cache.current_user().id.get();
         let hooked = self.app.snapshots.collector_active(&ctx);
         let retained_report = (!hooked)
             .then(|| {
-                logging::message_update_report(&event, known_author_id, Some(bot_user_id))
-                    .filter(|_| self.app.edit_reports.should_report(&event))
+                self.app.snapshots.unhooked_edit_report(
+                    &self.app,
+                    &ctx,
+                    &event,
+                    known_author_id,
+                    received_at,
+                )
             })
             .flatten();
         if let Some(guild) = event.guild_id {
@@ -1480,9 +1484,9 @@ impl EventHandler for Handler {
                 }
             }
         }
-        if !hooked && let Some(report) = retained_report {
+        if let Some(report) = retained_report {
             self.app.snapshots.gap();
-            logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;
+            logging::emit_message_report(&self.app, ctx.http.as_ref(), report, None).await;
         }
     }
 

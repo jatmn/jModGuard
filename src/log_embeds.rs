@@ -160,12 +160,31 @@ pub fn render(event: &str, template: &str, vars: &BTreeMap<String, String>) -> L
     let shipped = crate::defaults::rendered_log_templates()
         .into_iter()
         .any(|(name, text)| name == event && text == template);
+    let mut edit_times = if event == "message_edit" {
+        vars.get("time")
+            .zip(vars.get("edit_observed_at"))
+            .map(|(edited, observed)| {
+                [("Edited at", edited), ("Observed at", observed)].map(|(name, value)| Field {
+                    name: crate::emoji::decorate(crate::emoji::label("Time"), name),
+                    value: format!("`{value}`"),
+                    inline: false,
+                })
+            })
+    } else {
+        None
+    };
     if shipped {
         // Discord-only decoration from the shared map; stored text stays emoji-free.
         embed.title = crate::emoji::decorate(crate::emoji::title(event, vars), &embed.title);
         for line in template.lines().skip(1).filter(|line| !line.is_empty()) {
             if let Some((name, value)) = line.strip_prefix("**").and_then(|s| s.split_once(":** "))
             {
+                if name == "Time"
+                    && let Some(times) = edit_times.take()
+                {
+                    embed.fields.extend(times);
+                    continue;
+                }
                 let value = crate::templates::render_bounded(value, vars, 1024);
                 embed.fields.push(Field {
                     name: crate::emoji::decorate(crate::emoji::label(name), name),
@@ -186,6 +205,9 @@ pub fn render(event: &str, template: &str, vars: &BTreeMap<String, String>) -> L
             .flatten();
         embed.description =
             crate::templates::render_bounded(template, opted.as_ref().unwrap_or(vars), 4096);
+        if let Some(times) = edit_times {
+            embed.fields.extend(times);
+        }
     }
     embed.bounded()
 }

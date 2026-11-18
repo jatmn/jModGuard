@@ -31,20 +31,22 @@ and persistence contracts below are unchanged.
   the actual edit. A supplied author sets the display name; for ID-only filtering, a
   recent observation of that exact message can supply its author ID when the edit
   omits the author. An unknown author remains unavailable. An absent field is
-  unknown, not empty. Discord sets `edited_timestamp` only for an actual edit;
-  Gateway refreshes that omit it (embed, GIF/link unfurl, reply preview, pin,
-  flags), including full objects that repeat the original content, a
-  `message_reference`, or an empty attachment list, are not reports. The bot does
-  not report Gateway updates of its own messages, so a log post cannot stack prior
-  reports as current text. Each report is one observed edit. Reports use the short
-  title "Message edited"; they do not claim a verified complete revision diff. A bounded
-  10-second fingerprint merges partial content/attachment updates
-  that share an edit timestamp for the same message in one bot process. The
+  unknown, not empty. An edit report requires Discord's `edited_timestamp`
+  and at least one supplied content or attachment field. Gateway refreshes can
+  replay an existing timestamp. When a prior observation is available, an update
+  must change known text or attachments. A refreshed attachment URL alone does
+  not count. Without a prior observation, the timestamp must be within 10 seconds
+  of Gateway receipt and at or after the bot's observation start. A retained
+  change with an older timestamp reports both **Edited at** and **Observed at**.
+  Edit reports look up the channel or thread name in cache and then via a
+  bounded Discord request. The message link always uses the event IDs.
+  Updates to the bot's own messages never produce edit reports.
+  A bounded 10-second dedup window coalesces reports at the same timestamp. The
   stored snapshot does the same: a field inherited from an earlier observation
   is not treated as already supplied at the new timestamp, so a complementary
   partial can fill it. A different value for a field already supplied at that
-  timestamp does not replace the first. A later distinct edit timestamp reports
-  again.
+  timestamp does not replace the first. A complementary partial can trigger the
+  report if it is the first supplied field to show a change.
 - Each guild can save ignored Discord user IDs (including bot IDs) and source channel
   IDs separately for each event in Log Channels. Matching uses the IDs known to
   the report. If no user ID is known, only a source channel exclusion can apply.
