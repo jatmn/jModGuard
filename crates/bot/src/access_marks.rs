@@ -8,12 +8,13 @@
 
 use crate::state::BotState;
 use jmodguard::db;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 /// Users kept per guild before they become one guild mark.
 const MEMBERS_PER_GUILD: usize = db::ACCESS_MARK_BATCH_MEMBERS;
 
@@ -106,40 +107,18 @@ impl AccessMarks {
     }
 }
 
-/// Epochs written, by commit time, until they are old enough to prune.
-#[derive(Default)]
-struct Written(VecDeque<(Instant, i64)>);
-
-impl Written {
-    fn record(&mut self, epoch: i64) {
-        self.0.push_back((Instant::now(), epoch));
-    }
-
-    /// How many leading epochs no unexpired API snapshot can predate, and
-    /// the newest of them.
-    fn prunable(&self) -> Option<(usize, i64)> {
-        let now = Instant::now();
-        let count = self
-            .0
-            .iter()
-            .take_while(|(at, _)| now.saturating_duration_since(*at) >= db::ACCESS_MARK_RETENTION)
-            .count();
-        count.checked_sub(1).map(|last| (count, self.0[last].1))
-    }
-}
-
 /// Writes pending marks until the process exits.
 pub async fn run(app: Arc<BotState>) {
     let mut tick = tokio::time::interval(FLUSH_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut written = Written::default();
+    let mut next_maintenance = Instant::now();
     let mut failing = false;
     loop {
         tick.tick().await;
         if !app.activation.may_record() {
             continue;
         }
-        match flush(&app, &mut written).await {
+        match flush(&app, &mut next_maintenance).await {
             Ok(()) => failing = false,
             Err(error) => {
                 if !failing {
@@ -151,24 +130,17 @@ pub async fn run(app: Arc<BotState>) {
     }
 }
 
-/// Writes every pending batch, pruning marks past their retention. A failed
-/// batch goes back to the queue for the next tick.
-async fn flush(app: &BotState, written: &mut Written) -> anyhow::Result<()> {
+/// Writes pending batches and runs retention maintenance even when idle.
+async fn flush(app: &BotState, next_maintenance: &mut Instant) -> anyhow::Result<()> {
     while let Some(batch) = app.access_marks.take_batch() {
-        let prune = written.prunable();
-        let through = prune.map(|(_, epoch)| epoch);
-        match db::record_access_marks(&app.db, batch.0.clone(), batch.1.clone(), through).await {
-            Ok(epoch) => {
-                if let Some((count, _)) = prune {
-                    written.0.drain(..count);
-                }
-                written.record(epoch);
-            }
-            Err(error) => {
-                app.access_marks.restore(batch);
-                return Err(error);
-            }
+        if let Err(error) = db::record_access_marks(&app.db, batch.0.clone(), batch.1.clone()).await
+        {
+            app.access_marks.restore(batch);
+            return Err(error);
         }
+    }
+    if Instant::now() >= *next_maintenance && !db::maintain_access_marks(&app.db).await? {
+        *next_maintenance = Instant::now() + MAINTENANCE_INTERVAL;
     }
     Ok(())
 }
@@ -203,7 +175,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn flush_writes_queued_marks_then_prunes_them_after_the_retention() {
+    async fn both_owner_transfers_mark_the_guild_with_an_unchanged_serenity_cache() {
+        use serenity::client::EventHandler;
+        use serenity::model::guild::{Guild, PartialGuild};
+        use serenity::model::id::{GuildId, UserId};
+
         let directory =
             std::env::temp_dir().join(format!("access_marks_{:032x}", rand::random::<u128>()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -212,38 +188,81 @@ mod tests {
             db::Db::open(&directory.join("core.db"), 2).unwrap(),
         )
         .unwrap();
-        let mut written = Written::default();
-        app.access_marks.member(10, 42);
-        app.access_marks.guild(20);
-        flush(&app, &mut written).await.unwrap();
-        assert!(
-            app.access_marks.take_batch().is_none(),
-            "the queue is drained"
-        );
-        assert_eq!(db::access_mark(&app.db, 10, 42).await.unwrap(), 1);
-        assert_eq!(db::access_mark(&app.db, 20, 7).await.unwrap(), 1);
-        assert_eq!(db::access_mark(&app.db, 10, 7).await.unwrap(), 0);
+        let handler = crate::handlers::Handler {
+            app: Arc::clone(&app),
+        };
+        let ctx = crate::commands::mod_reason_dm::fixture_context_for_dm_order_test(
+            Arc::new(serenity::http::Http::new("fixture")),
+            Arc::new(serenity::cache::Cache::new()),
+        )
+        .await;
+        let mut cached = Guild::default();
+        cached.id = GuildId::new(10);
+        cached.owner_id = UserId::new(41);
+        let mut incoming = PartialGuild::from(cached.clone());
+        incoming.owner_id = UserId::new(42);
+        let mut next_maintenance = Instant::now();
 
-        tokio::time::advance(db::ACCESS_MARK_RETENTION).await;
-        app.access_marks.member(30, 42);
-        flush(&app, &mut written).await.unwrap();
-        assert_eq!(db::access_epoch(&app.db).await.unwrap(), 2);
-        assert_eq!(db::access_mark(&app.db, 10, 42).await.unwrap(), 0, "pruned");
-        assert_eq!(db::access_mark(&app.db, 20, 7).await.unwrap(), 0, "pruned");
-        assert_eq!(db::access_mark(&app.db, 30, 42).await.unwrap(), 2);
+        handler
+            .guild_update(ctx.clone(), Some(cached.clone()), incoming.clone())
+            .await;
+        flush(&app, &mut next_maintenance).await.unwrap();
+        let snapshot_epoch = db::access_epoch(&app.db).await.unwrap();
+        assert_eq!(snapshot_epoch, 1);
+
+        // Serenity still supplies owner 41 as the cached owner on the return transfer.
+        incoming.owner_id = cached.owner_id;
+        handler.guild_update(ctx, Some(cached), incoming).await;
+        flush(&app, &mut next_maintenance).await.unwrap();
+        assert!(db::access_mark(&app.db, 10, 42).await.unwrap() > snapshot_epoch);
+        assert_eq!(db::access_mark(&app.db, 20, 42).await.unwrap(), 0);
+        drop(handler);
         drop(app);
         let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn only_epochs_older_than_the_retention_are_pruned() {
-        let mut written = Written::default();
-        written.record(3);
-        tokio::time::advance(Duration::from_secs(2)).await;
-        written.record(5);
-        assert_eq!(written.prunable(), None);
-        tokio::time::advance(db::ACCESS_MARK_RETENTION).await;
-        written.record(6);
-        assert_eq!(written.prunable(), Some((2, 5)));
+    async fn idle_flush_prunes_expired_marks_after_reopening_the_database() {
+        let directory =
+            std::env::temp_dir().join(format!("access_marks_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("core.db");
+        let app = BotState::new(Default::default(), db::Db::open(&path, 2).unwrap()).unwrap();
+        let mut next_maintenance = Instant::now();
+        app.access_marks.member(10, 42);
+        app.access_marks.guild(20);
+        flush(&app, &mut next_maintenance).await.unwrap();
+        assert_eq!(db::access_mark(&app.db, 10, 42).await.unwrap(), 1);
+        assert_eq!(db::access_mark(&app.db, 20, 7).await.unwrap(), 1);
+        assert_eq!(db::access_mark(&app.db, 10, 7).await.unwrap(), 0);
+        drop(app);
+
+        let app = BotState::new(Default::default(), db::Db::open(&path, 2).unwrap()).unwrap();
+        let mut next_maintenance = Instant::now();
+        flush(&app, &mut next_maintenance).await.unwrap();
+        assert_eq!(db::access_mark(&app.db, 10, 42).await.unwrap(), 1);
+
+        // SQLite has its own clock. Age one persisted row without sleeping
+        // and leave the other mark fresh.
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "UPDATE meta SET value = '1:1' WHERE key = 'access_mark:10:42'",
+                    64 * 1024 * 1024,
+                )
+            })
+            .await
+            .unwrap();
+        tokio::time::advance(MAINTENANCE_INTERVAL).await;
+        flush(&app, &mut next_maintenance).await.unwrap();
+        assert_eq!(db::access_mark(&app.db, 10, 42).await.unwrap(), 0, "pruned");
+        assert_eq!(
+            db::access_mark(&app.db, 20, 7).await.unwrap(),
+            1,
+            "still live"
+        );
+        assert_eq!(db::access_epoch(&app.db).await.unwrap(), 1);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

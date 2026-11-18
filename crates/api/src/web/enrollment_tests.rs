@@ -5024,7 +5024,7 @@ async fn gateway_access_marks_invalidate_only_matching_snapshots() {
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
 
     // Another member's change, or this user's change in another guild.
-    db::record_access_marks(&f.app.db, vec![], vec![(10, 99), (20, 42)], None)
+    db::record_access_marks(&f.app.db, vec![], vec![(10, 99), (20, 42)])
         .await
         .unwrap();
     assert_eq!(
@@ -5035,7 +5035,7 @@ async fn gateway_access_marks_invalidate_only_matching_snapshots() {
 
     // This user's roles changed in guild 10: Discord is asked at once.
     f.discord.guilds.lock().unwrap().clear();
-    db::record_access_marks(&f.app.db, vec![], vec![(10, 42)], None)
+    db::record_access_marks(&f.app.db, vec![], vec![(10, 42)])
         .await
         .unwrap();
     let (status, _) = f
@@ -5050,7 +5050,7 @@ async fn gateway_access_marks_invalidate_only_matching_snapshots() {
 
     // A guild-wide change (roles or owner) does the same for every member.
     *f.discord.guilds.lock().unwrap() = vec![managed_guild(10), managed_guild(20)];
-    db::record_access_marks(&f.app.db, vec![10], vec![], None)
+    db::record_access_marks(&f.app.db, vec![10], vec![])
         .await
         .unwrap();
     assert_eq!(
@@ -8875,7 +8875,7 @@ async fn role_mapped_moderator_reaches_only_that_guild_at_its_level() {
         .lock()
         .unwrap()
         .insert(10, Vec::new());
-    db::record_access_marks(&f.app.db, vec![], vec![(10, 42)], None)
+    db::record_access_marks(&f.app.db, vec![], vec![(10, 42)])
         .await
         .unwrap();
     let (status, denied) = f.request("POST", "/api/guilds/10/stats", "").await;

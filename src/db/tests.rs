@@ -6493,17 +6493,17 @@ async fn a_newer_leave_supersedes_a_blocked_older_one_because_redeparture_is_ide
 }
 
 #[tokio::test]
-async fn access_marks_advance_one_epoch_per_batch_and_prune_old_marks() {
+async fn access_marks_advance_one_epoch_per_batch() {
     let tmp = tmp_db_path("access_marks");
     let db = Db::open(&tmp, 2).unwrap();
     assert_eq!(access_epoch(&db).await.unwrap(), 0);
     assert_eq!(access_mark(&db, 10, 42).await.unwrap(), 0);
 
-    let first = record_access_marks(&db, vec![], vec![(10, 42)], None)
+    let first = record_access_marks(&db, vec![], vec![(10, 42)])
         .await
         .unwrap();
     assert_eq!(first, 1);
-    let second = record_access_marks(&db, vec![20], vec![(10, 7)], None)
+    let second = record_access_marks(&db, vec![20], vec![(10, 7)])
         .await
         .unwrap();
     assert_eq!(second, 2);
@@ -6513,32 +6513,80 @@ async fn access_marks_advance_one_epoch_per_batch_and_prune_old_marks() {
     assert_eq!(access_mark(&db, 20, 42).await.unwrap(), 2, "guild mark");
     assert_eq!(access_mark(&db, 30, 42).await.unwrap(), 0);
 
-    // Pruning removes marks at or below the given epoch, never the epoch row.
-    let third = record_access_marks(&db, vec![], vec![(30, 42)], Some(1))
-        .await
-        .unwrap();
-    assert_eq!(third, 3);
-    assert_eq!(access_mark(&db, 10, 42).await.unwrap(), 0);
-    assert_eq!(access_mark(&db, 10, 7).await.unwrap(), 2);
-    let fourth = record_access_marks(&db, vec![], vec![], Some(99))
-        .await
-        .unwrap();
-    assert_eq!(fourth, 4, "the epoch survives pruning");
-    assert_eq!(access_mark(&db, 30, 42).await.unwrap(), 0);
-    assert_eq!(access_mark(&db, 20, 1).await.unwrap(), 0);
-
-    assert!(
-        record_access_marks(&db, vec![0], vec![], None)
-            .await
-            .is_err()
-    );
+    assert!(record_access_marks(&db, vec![0], vec![]).await.is_err());
     let too_many = (1..=ACCESS_MARK_BATCH_MEMBERS as i64 + 1)
         .map(|user| (10, user))
         .collect();
-    assert!(
-        record_access_marks(&db, vec![], too_many, None)
-            .await
-            .is_err()
+    assert!(record_access_marks(&db, vec![], too_many).await.is_err());
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[tokio::test]
+async fn access_mark_maintenance_preserves_legacy_and_live_marks_until_they_expire() {
+    let tmp = tmp_db_path("access_mark_maintenance");
+    let db = Db::open(&tmp, 2).unwrap();
+    let first = record_access_marks(&db, vec![10], vec![(20, 42)])
+        .await
+        .unwrap();
+    db.with_conn(|conn| {
+        conn.execute_batch_bounded(
+            "UPDATE meta SET value='1' WHERE key='access_mark:10';
+             UPDATE meta SET value='1:1' WHERE key='access_mark:20:42';",
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+    maintain_access_marks(&db).await.unwrap();
+    assert_eq!(
+        access_mark(&db, 10, 42).await.unwrap(),
+        first,
+        "legacy mark is still live"
+    );
+    assert_eq!(
+        access_mark(&db, 20, 42).await.unwrap(),
+        0,
+        "expired member mark"
+    );
+
+    let second = record_access_marks(&db, vec![], vec![(20, 42)])
+        .await
+        .unwrap();
+    // Verify the adopted mark has a durable expiry and age it past that point.
+    db.with_conn(|conn| {
+        let dated: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='access_mark:10'",
+            (),
+            |r| Ok(r.get(0)?),
+        )?;
+        let (epoch, expiry) = dated
+            .split_once(':')
+            .expect("legacy mark must get an expiry");
+        assert_eq!(epoch, "1");
+        assert!(expiry.parse::<i64>().unwrap() > 1);
+        conn.execute_batch_bounded(
+            "UPDATE meta SET value='1:1' WHERE key='access_mark:10'",
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+    maintain_access_marks(&db).await.unwrap();
+    assert_eq!(
+        access_mark(&db, 10, 42).await.unwrap(),
+        0,
+        "adopted mark is reclaimed"
+    );
+    assert_eq!(
+        access_mark(&db, 20, 42).await.unwrap(),
+        second,
+        "fresh mark is kept"
+    );
+    assert_eq!(
+        access_epoch(&db).await.unwrap(),
+        second,
+        "epoch survives maintenance"
     );
     drop(db);
     cleanup_db(&tmp);

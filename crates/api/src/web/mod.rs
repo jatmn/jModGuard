@@ -1073,10 +1073,10 @@ enum DisplayIdentitySource {
 ///
 /// The fresh profile cache is used as-is. Otherwise live `/users/@me` still
 /// runs. When that call is rate-limited, the profile still stored after the
-/// 60s TTL — or the session Discord user id — is enough to return the guild
-/// list. Other `me` failures still fail the request. The fallback is not
-/// written back into `user_cache`, so the next display read tries `me` again
-/// once Discord is no longer limiting it.
+/// five-minute profile TTL — or the session Discord user id — is enough to
+/// return the display list. Other `me` failures still fail the request.
+/// The fallback does not renew `user_cache`, so the next display read tries
+/// `me` again once Discord is no longer limiting it.
 async fn display_identity(
     app: &ApiState,
     user_id: u64,
@@ -1110,7 +1110,8 @@ fn display_user_during_limit(app: &ApiState, user_id: u64) -> DiscordUser {
 
 /// Selects the display list and its discovery status. A lookup blocked by a
 /// rate limit can fall back to an empty list if there is no cached entry.
-/// `MustRefresh` uses only the separate short session/token snapshot.
+/// `MustRefresh` uses only the separate session/token snapshot subject to
+/// the authorization age limit and checks for newer access marks.
 fn take_cached_guilds(
     mode: GuildListMode,
     app: &ApiState,
@@ -2167,7 +2168,7 @@ pub(super) fn check_page_enrollment(
     )
 }
 
-/// Authorize Discord MANAGE_GUILD for a real guild id with a **fresh** guild list.
+/// Authorize Discord MANAGE_GUILD for a real guild id using its checked OAuth snapshot.
 ///
 /// This is the only safe entry point for `AuthCtx::can_manage` decisions.
 /// `guild_id=0` is not a Discord guild — callers that mean global must use
@@ -2180,7 +2181,9 @@ pub async fn authorize_manage_guild(
     authorize_guild(app, session, guild_id, GuildAccess::Manage).await
 }
 
-/// Authorize `need` in a real guild with a **fresh** guild list.
+/// Authorize `need` in a real guild using its checked OAuth snapshot.
+/// The snapshot is reused for up to four minutes (five during a Discord
+/// rate limit) and refetched when a newer access mark applies.
 ///
 /// Manage Server (or ownership) satisfies every level. Otherwise a member who
 /// currently holds a Discord role the guild mapped to at least `need` is

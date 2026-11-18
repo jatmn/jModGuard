@@ -1816,16 +1816,13 @@ impl EventHandler for Handler {
     async fn guild_update(
         &self,
         _ctx: Context,
-        old_data_if_available: Option<Guild>,
+        _old_data_if_available: Option<Guild>,
         new_data: PartialGuild,
     ) {
         crate::resources::gateway_event("guild_update");
-        if old_data_if_available
-            .as_ref()
-            .is_none_or(|old| old.owner_id != new_data.owner_id)
-        {
-            self.app.access_marks.guild(new_data.id.get());
-        }
+        // Serenity 0.12.5 does not refresh its cached owner on GuildUpdate.
+        // The cached value can match the incoming owner after a real transfer.
+        self.app.access_marks.guild(new_data.id.get());
     }
 
     async fn guild_role_create(&self, ctx: Context, new: Role) {

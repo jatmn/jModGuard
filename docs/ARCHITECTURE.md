@@ -243,18 +243,22 @@ operations now use API admission and bot dispatch.
   `jmodguard_session`; lost on API restart).
 - Guild admins need Discord `MANAGE_GUILD`. A guild may map Discord roles to a
   read-only `dashboard` or `settings` level for that guild only; the API reads
-  the user's roles with their OAuth token (30 s reuse, fail closed) and the bot
-  rechecks settings edits from its own member data
+  the user's roles with their OAuth token and reuses the answer for up to
+  4 minutes or until a newer gateway access mark applies. The API fails closed
+  when roles cannot be verified. The bot rechecks settings edits from its own
+  member data
   ([WEBUI.md](WEBUI.md#access-by-discord-role)).
 - Global edits (`guild_id=0` or body `scope: "global"`) require `bot.owner_id`.
   That check uses the session user id and does not fetch the guild list.
 - Guild-scoped authorization uses the login's own Discord guild-list snapshot
   (`authorize_manage_guild`). It is reused for up to 4 minutes and refreshed in the
-  background, so page loads do not wait for Discord. The bot writes gateway role,
-  member and owner changes as access marks in `meta`, and a snapshot older than a
-  matching mark is fetched again before it is used (#653). The guild-list display
-  cache is display-only (`/api/me`) and may serve the last good list while Discord
-  is rate-limiting.
+  background. If Discord rate-limits the refresh, the snapshot can be used for up
+  to 5 minutes, then authorization fails closed. The bot writes access marks in
+  `meta` for gateway member and role changes and for guild updates, which can
+  include ownership changes. A snapshot older than a matching mark is fetched
+  again before use (#653). The bot reclaims expired marks even when there are no
+  new gateway events. The guild-list display cache serves `/api/me` and can keep
+  the last good list while Discord is rate-limiting.
 
 ## Source layout
 
