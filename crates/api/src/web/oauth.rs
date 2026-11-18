@@ -434,6 +434,7 @@ impl OAuthClient {
         let url = "https://discord.com/api/oauth2/token";
         #[cfg(test)]
         let url = self.token_endpoint.as_deref().unwrap_or(url);
+        jmodguard::resources::count("discord_rest", 1);
         let resp = self
             .http
             .post(url)
@@ -502,6 +503,7 @@ impl OAuthClient {
         let url = "https://discord.com/api/users/@me";
         #[cfg(test)]
         let url = self.me_endpoint.as_deref().unwrap_or(url);
+        jmodguard::resources::count("discord_rest", 1);
         let resp = self
             .http
             .get(url)
@@ -542,6 +544,7 @@ impl OAuthClient {
         let base = "https://discord.com/api/users/@me/guilds";
         #[cfg(test)]
         let base = self.member_endpoint.as_deref().unwrap_or(base);
+        jmodguard::resources::count("discord_rest", 1);
         let resp = self
             .http
             .get(format!("{base}/{guild_id}/member"))
@@ -658,6 +661,7 @@ impl OAuthClient {
                 url.push_str("&after=");
                 url.push_str(cursor);
             }
+            jmodguard::resources::count("discord_rest", 1);
             let resp = match self.http.get(&url).bearer_auth(access_token).send().await {
                 Ok(resp) => resp,
                 Err(error) => {
@@ -789,7 +793,6 @@ impl OAuthClient {
         response: reqwest::Response,
     ) -> Result<Vec<u8>> {
         let status = response.status();
-        jmodguard::resources::count("discord_rest", 1);
         if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Ok(response.bytes().await?.to_vec());
         }

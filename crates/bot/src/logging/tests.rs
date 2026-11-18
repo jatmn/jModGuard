@@ -3877,6 +3877,83 @@ async fn scripted_discord_proxy(
 }
 
 #[tokio::test]
+async fn discord_rest_counts_logical_requests_across_delivery_paths() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // Use the process subscriber and exact counter deltas without parallel test traffic.
+    const CHILD: &str = "JMODGUARD_TEST_REST_COUNTS";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "logging::tests::discord_rest_counts_logical_requests_across_delivery_paths",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    jmodguard::init_tracing(
+        &jmodguard::LogConfig {
+            directory: Default::default(),
+            ..Default::default()
+        },
+        "bot",
+    );
+    let limited = || ScriptedHttpReply {
+        status: 429,
+        headers: "retry-after: 0\r\n",
+        body: "{}",
+    };
+    let ok = || ScriptedHttpReply {
+        status: 200,
+        headers: "",
+        body: "{}",
+    };
+    let (mut http, calls, server) =
+        scripted_discord_proxy(vec![limited(), ok(), limited(), ok()]).await;
+    let channel = ChannelId::new(456);
+    let send = |current| {
+        crate::discord::send_discord_log_after_rate_limit(
+            &http,
+            channel,
+            CreateMessage::new().content("fixture"),
+            current,
+            &crate::discord::ignore_global_rate_limit,
+        )
+    };
+    let counter = || jmodguard::resources::peek_counter("discord_rest");
+    assert!(send(&|| true).await.unwrap());
+    assert_eq!((calls.load(Ordering::SeqCst), counter()), (2, 1));
+
+    let current = Arc::new(AtomicBool::new(true));
+    let flag = Arc::clone(&current);
+    let hook = Arc::new(move || flag.store(false, Ordering::SeqCst));
+    let still_current = || current.load(Ordering::SeqCst);
+    assert!(
+        !crate::discord::with_rate_limit_wait_hook(hook, send(&still_current))
+            .await
+            .unwrap()
+    );
+    assert_eq!((calls.load(Ordering::SeqCst), counter()), (3, 2));
+
+    // A normal Serenity request is counted by its span.
+    http.ratelimiter = None;
+    http.request(serenity::http::Request::new(
+        serenity::http::Route::Channel {
+            channel_id: channel,
+        },
+        serenity::http::LightMethod::Get,
+    ))
+    .await
+    .unwrap();
+    assert_eq!((calls.load(Ordering::SeqCst), counter()), (4, 3));
+    server.abort();
+}
+
+#[tokio::test]
 async fn stale_incomplete_notice_is_dropped_after_preemptive_rate_limit_wait() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let f = Fixture::with_timeout(5);

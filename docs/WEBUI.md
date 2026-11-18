@@ -369,11 +369,13 @@ cgroup quota (with the quota and schedulable CPUs), program memory against
 directories it writes; the container's root filesystem is not measured because its
 totals belong to the host; database size is on Database Usage), and process facts
 (version, commit, uptime, last restart, restarts in the range, pod, region, ready).
-Below are bot activity (Gateway events per minute and by type, Discord REST calls,
+Below are bot activity (Gateway events per minute and by type, logical Discord REST requests,
 429s and rate-limit waits by bucket, shard latency, writer-lease generation and margin,
 guilds, capture queue), API activity (requests per minute, p50/p95 latency, 4xx/5xx,
 active sessions, OAuth and Discord 429s) and cost drivers per minute (database round
-trips, read and write transactions, Discord calls, log output, API response bytes).
+trips, read and write transactions, Discord requests, log output, API response bytes).
+Each logical Discord request counts once, including direct bot log deliveries. Internal
+rate-limit retries share the original request count.
 Database rows read and Bunny billing are shown as unavailable: the database client does
 not report rows read, and no scoped read-only provider key exists. The API's values are
 live (5-second samples); the bot saves its status and both processes' history once a

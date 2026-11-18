@@ -92,14 +92,19 @@ async fn writer_keeps_each_minute_once_and_merges_it_into_its_hour() {
     // The API keeps recent minutes; collecting them again changes nothing.
     let again = record_resource_rollups(
         &f.db,
-        vec![(ResourceProcess::Api, minute(HOUR + 60, 999, 999))],
+        vec![
+            (ResourceProcess::Api, minute(HOUR, 999, 999)),
+            (ResourceProcess::Api, minute(HOUR + 60, 999, 999)),
+            (ResourceProcess::Bot, minute(HOUR, 999, 999)),
+        ],
         Some((ResourceProcess::Bot, status(now * 1000 + 60_000, 5))),
         now + 60,
     )
     .await
     .unwrap();
     assert_eq!(again.minute_rows_inserted, 0);
-    assert!(again.api_minute_starts.is_empty());
+    assert_eq!(again.api_minute_starts, [HOUR, HOUR + 60]);
+    assert_eq!(again.bot_minute_starts, [HOUR]);
 
     let minutes = resource_records(&f.db, MINUTE_SECS, HOUR, HOUR + HOUR_SECS)
         .await
@@ -161,8 +166,7 @@ async fn writes_prune_expired_rows_and_refuse_out_of_window_minutes() {
     .await
     .unwrap();
     assert_eq!(
-        added.minute_rows_inserted,
-        1,
+        added.minute_rows_inserted, 1,
         "only the in-window, aligned minute is stored"
     );
     assert_eq!(added.bot_minute_starts, vec![later - 60]);

@@ -13,7 +13,7 @@ use anyhow::Result;
 pub const RESOURCE_MINUTE_RETENTION_SECS: i64 = 48 * 3600;
 /// Hour rows serve the 7-day and 30-day ranges.
 pub const RESOURCE_HOUR_RETENTION_SECS: i64 = 31 * 86_400;
-/// Which minute rows were newly inserted in one `record_resource_rollups` call.
+/// Committed minute keys (including existing rows) and the number newly inserted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResourceRollupWrite {
     pub minute_rows_inserted: usize,
@@ -88,7 +88,7 @@ fn rollup_json(rollup: &Rollup) -> Result<String> {
 
 /// Saves completed minutes (new ones only; a repeated minute is ignored),
 /// merges each new minute into its hour, replaces `status`, and prunes rows
-/// past retention. Returns which minute rows were newly inserted.
+/// past retention. Acknowledges accepted minutes only after commit.
 pub async fn record_resource_rollups(
     db: &Db,
     minutes: Vec<(ResourceProcess, Rollup)>,
@@ -129,14 +129,14 @@ pub async fn record_resource_rollups(
                 params![process.as_str(), MINUTE_SECS, rollup.start_secs, text],
                 1,
             )?;
-            if inserted == 0 {
-                continue;
-            }
-            write.minute_rows_inserted += 1;
             match process {
                 ResourceProcess::Bot => write.bot_minute_starts.push(rollup.start_secs),
                 ResourceProcess::Api => write.api_minute_starts.push(rollup.start_secs),
             }
+            if inserted == 0 {
+                continue;
+            }
+            write.minute_rows_inserted += 1;
             let hour_start = rollup.start_secs - rollup.start_secs.rem_euclid(HOUR_SECS);
             let existing: Option<String> = tx
                 .query_row(

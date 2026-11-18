@@ -163,10 +163,12 @@ pub(crate) async fn send_discord_log_after_rate_limit(
     let token = reqwest::header::HeaderValue::from_str(http.token())
         .map_err(|_| anyhow!("discord log delivery failed"))?;
 
+    if !still_current() {
+        return Ok(false);
+    }
+    // This path bypasses Serenity's request span. Count the logical send once.
+    jmodguard::resources::count("discord_rest", 1);
     loop {
-        if !still_current() {
-            return Ok(false);
-        }
         let routes = ratelimiter.routes();
         let bucket = {
             let mut routes = routes.write().await;

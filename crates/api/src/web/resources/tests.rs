@@ -2,7 +2,7 @@ use super::*;
 use axum::body::Body;
 use axum::http::HeaderValue;
 use axum::http::header::ORIGIN;
-use jmodguard::db::{Db, ResourceProcess, ResourceRecords};
+use jmodguard::db::{Db, ResourceProcess};
 use tower::ServiceExt;
 use tower_sessions::Session;
 
@@ -295,30 +295,53 @@ async fn unavailable_history_still_returns_live_api_values() {
 }
 
 #[tokio::test]
-async fn degraded_history_cache_stays_stale_within_ttl() {
+async fn failed_history_reads_are_reused_until_the_next_refresh() {
     let f = fixture();
-    let picked = ResourceRange::Day;
-    let now_secs = resources::unix_ms_now() / 1000;
-    let (_, _, bucket) = picked.shape();
-    let to_secs = now_secs - now_secs.rem_euclid(bucket) + bucket;
-    {
-        let mut cache = f.app.resource_cache.entries.lock().await;
-        cache.insert(
-            picked,
-            super::CachedHistory {
-                read_at: Instant::now(),
-                to_secs,
-                records: ResourceRecords::default(),
-                stale: true,
-            },
-        );
-    }
-    let owner = signed_in(&f.app, 99).await;
-    let value = overview(State(f.app.clone()), owner, origin(&f.app), range("24h"))
+    let now = 1_800_000_000;
+    let warm = ResourceRange::Day;
+    let cold = ResourceRange::Week;
+    assert_eq!(history(&f.app, warm, now).await.1, "available");
+    f.app
+        .resource_cache
+        .entries
+        .lock()
         .await
+        .get_mut(&warm)
         .unwrap()
-        .0;
-    assert_eq!(value["history_status"], "stale");
+        .checked_at -= HISTORY_TTL;
+
+    let rename = |sql: &'static str| {
+        f.app
+            .db
+            .with_conn(move |conn| conn.execute_batch_bounded(sql, 64 * 1024 * 1024))
+    };
+    rename("ALTER TABLE resource_rollups RENAME TO offline_rollups")
+        .await
+        .unwrap();
+    assert_eq!(history(&f.app, warm, now).await.1, "stale");
+    assert_eq!(history(&f.app, cold, now).await.1, "unavailable");
+    rename("ALTER TABLE offline_rollups RENAME TO resource_rollups")
+        .await
+        .unwrap();
+
+    // Even with the database healthy, concurrent callers reuse the failed attempt.
+    for (range, status, has_snapshot) in [(warm, "stale", true), (cold, "unavailable", false)] {
+        let (first, second) =
+            tokio::join!(history(&f.app, range, now), history(&f.app, range, now));
+        for (records, actual) in [first, second] {
+            assert_eq!(actual, status);
+            assert_eq!(records.is_some(), has_snapshot);
+        }
+        f.app
+            .resource_cache
+            .entries
+            .lock()
+            .await
+            .get_mut(&range)
+            .unwrap()
+            .checked_at -= HISTORY_TTL;
+        assert_eq!(history(&f.app, range, now).await.1, "available");
+    }
 }
 
 #[tokio::test]

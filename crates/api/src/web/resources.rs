@@ -77,12 +77,22 @@ impl ResourceRange {
 }
 
 struct CachedHistory {
-    read_at: Instant,
-    /// The window end the rows were read for.
+    /// Completion time of the last read attempt, including failures.
+    checked_at: Instant,
     to_secs: i64,
-    records: ResourceRecords,
-    /// Set when a refresh could not reach the database; stays until a successful read.
+    records: Option<ResourceRecords>,
     stale: bool,
+}
+
+impl CachedHistory {
+    fn result(&self) -> (Option<ResourceRecords>, &'static str) {
+        let status = match (&self.records, self.stale) {
+            (None, _) => "unavailable",
+            (Some(_), true) => "stale",
+            (Some(_), false) => "available",
+        };
+        (self.records.clone(), status)
+    }
 }
 
 #[derive(Default)]
@@ -137,11 +147,10 @@ async fn history(
     {
         let cache = app.resource_cache.entries.lock().await;
         if let Some(entry) = cache.get(&range)
-            && entry.read_at.elapsed() < HISTORY_TTL
+            && entry.checked_at.elapsed() < HISTORY_TTL
             && entry.to_secs == to_secs
         {
-            let status = if entry.stale { "stale" } else { "available" };
-            return (Some(entry.records.clone()), status);
+            return entry.result();
         }
     }
     // One history read at a time; a waiting refresh reuses its result.
@@ -149,11 +158,10 @@ async fn history(
     {
         let cache = app.resource_cache.entries.lock().await;
         if let Some(entry) = cache.get(&range)
-            && entry.read_at.elapsed() < HISTORY_TTL
+            && entry.checked_at.elapsed() < HISTORY_TTL
             && entry.to_secs == to_secs
         {
-            let status = if entry.stale { "stale" } else { "available" };
-            return (Some(entry.records.clone()), status);
+            return entry.result();
         }
     }
     let read = tokio::time::timeout(
@@ -162,38 +170,22 @@ async fn history(
     )
     .await;
     let mut cache = app.resource_cache.entries.lock().await;
-    match read {
-        Ok(Ok(records)) => {
-            cache.insert(
-                range,
-                CachedHistory {
-                    read_at: Instant::now(),
-                    to_secs,
-                    records: records.clone(),
-                    stale: false,
-                },
-            );
-            (Some(records), "available")
-        }
+    let (records, stale) = match read {
+        Ok(Ok(records)) => (Some(records), false),
         _ => {
-            let stale_entry = cache
-                .get(&range)
-                .filter(|entry| entry.to_secs == to_secs)
-                .map(|entry| CachedHistory {
-                    read_at: entry.read_at,
-                    to_secs: entry.to_secs,
-                    records: entry.records.clone(),
-                    stale: true,
-                });
-            if let Some(entry) = stale_entry {
-                let records = entry.records.clone();
-                cache.insert(range, entry);
-                (Some(records), "stale")
-            } else {
-                (None, "unavailable")
-            }
+            let last = cache
+                .remove(&range)
+                .filter(|entry| entry.to_secs == to_secs);
+            (last.and_then(|entry| entry.records), true)
         }
-    }
+    };
+    let entry = cache.entry(range).insert_entry(CachedHistory {
+        checked_at: Instant::now(),
+        to_secs,
+        records,
+        stale,
+    });
+    entry.get().result()
 }
 
 fn build_response(

@@ -176,8 +176,6 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DiscordActivity {
         match message.0.as_deref() {
             Some(text) if text.starts_with("Ratelimited on route") => {
                 resources::count("discord_429", 1);
-                // Serenity retries inside one request span; count the follow-up attempt.
-                resources::count("discord_rest", 1);
             }
             Some(text) if text.starts_with("Pre-emptive ratelimit") => {
                 resources::count("discord_rate_limit_waits", 1)
