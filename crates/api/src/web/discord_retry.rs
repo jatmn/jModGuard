@@ -9,13 +9,17 @@ pub(crate) const META_KEY: &str = "discord_oauth_retry_until";
 const MAX_BYTES: usize = 8192;
 
 pub(crate) fn durable_key(key: &str) -> bool {
-    if key == "global" || key == "token" {
-        return true;
+    fn snowflake(id: &str) -> bool {
+        !id.is_empty() && id.len() <= 20 && id.bytes().all(|byte| byte.is_ascii_digit())
     }
-    let Some(rest) = key.strip_prefix("g:").or_else(|| key.strip_prefix("m:")) else {
-        return false;
-    };
-    !rest.is_empty() && rest.len() <= 20 && rest.bytes().all(|byte| byte.is_ascii_digit())
+
+    match key.split_once(':') {
+        Some(("g" | "m" | "t", user)) => snowflake(user),
+        Some(("r", pair)) => pair
+            .split_once(':')
+            .is_some_and(|(user, guild)| snowflake(user) && snowflake(guild)),
+        _ => key == "global",
+    }
 }
 
 pub(crate) fn parse_deadlines(raw: &str) -> BTreeMap<String, i64> {
@@ -100,14 +104,15 @@ mod tests {
         runtime.block_on(async {
             store_deadlines(
                 &db,
-                r#"{"g:7":1710000000000,"token":1710000001000,"nope":5,"m:bad":9}"#.into(),
+                r#"{"g:7":1710000000000,"t:7":1710000001000,"token":1710000001000,"nope":5,"m:bad":9}"#.into(),
             )
             .await
             .unwrap();
         });
         let loaded = load_deadlines_sync(&Db::open(&path, 2).unwrap()).unwrap();
         assert_eq!(loaded.get("g:7"), Some(&1_710_000_000_000));
-        assert_eq!(loaded.get("token"), Some(&1_710_000_001_000));
+        assert_eq!(loaded.get("t:7"), Some(&1_710_000_001_000));
+        assert!(!loaded.contains_key("token"));
         assert!(!loaded.contains_key("nope"));
         assert!(!loaded.contains_key("m:bad"));
         drop(db);

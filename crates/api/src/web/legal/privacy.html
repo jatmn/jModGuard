@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy Policy · jModGuard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="legal-page">
+    <nav aria-label="jModGuard">
+      <a href="/">jModGuard</a>
+      <a href="/terms">Terms of Service</a>
+    </nav>
+    <h1>Privacy Policy</h1>
+    <p>This policy covers the hosted jModGuard Discord bot and its dashboard. We use the data below to moderate servers, keep moderation records, and show server settings and reports to people with access.</p>
+
+    <h2>What we receive from Discord</h2>
+    <p>The bot requests the Guilds, Server Members, Guild Messages, Message Content, Guild Moderation, and Guild Voice States gateway intents. Server Members lets us maintain the member directory and report membership changes. Message Content lets us check messages for spam and other rule violations and provide the message logs a server enables. We do not request the Presence intent.</p>
+    <p>If you sign in to the dashboard, Discord provides your account identity and server list. We check server permissions and, where configured, your roles in that server. A session cookie keeps you signed in.</p>
+
+    <h2>What we keep</h2>
+    <ul>
+      <li><strong>Dashboard sessions.</strong> While you are signed in, the API keeps your Discord user ID, OAuth access token, and refresh token (when Discord issues one) in a server-side session in memory keyed by your session cookie. We use the access token to look up your servers and check your permissions, and the refresh token to renew access if needed. Signing out clears the session. After 7 days of inactivity the session expires and can no longer be used. Expired records can remain in memory until the API restarts. Restarting the API clears all sessions.</li>
+      <li><strong>Member directory.</strong> We keep Discord user IDs, the latest observed usernames, display names and server nicknames, known join and leave dates, membership stays, and links to selected moderation cases. We keep current members in the directory while they are in the server. If you leave without confirmed ban history, your entry becomes eligible for cleanup after five minutes. Verification or an outage can delay cleanup. Confirmed ban history and known membership context can stay through an unban, rejoin, and later departure.</li>
+      <li><strong>Message snapshots.</strong> If a server has a destination for message-edit, message-delete, bulk-delete, or automod-delete logs, the bot can keep the latest observed text, message and author details, and attachment details such as filenames, sizes and Discord links for eligible human messages. Snapshot data expires within 24 hours of the original post. Edits never extend that window, and expired rows are removed by a cleanup job. A short-lived copy in memory follows the same expiry. Snapshots contain no attachment file bytes. There is no general message archive.</li>
+      <li><strong>Exact-image spam.</strong> The bot reads image files to calculate hashes for exact matches. It keeps hashes as image evidence, without storing the image files. A related moderation case can also keep text excerpts from the messages.</li>
+      <li><strong>Moderation records.</strong> We keep selected moderation events, warnings, bans, cases, and case history for server moderation. Cases can include Discord IDs, the action and reason, case notes, and evidence. Cases and their history have no automatic age limit and are kept until removed by someone with permission or erased with the server.</li>
+      <li><strong>Analytics.</strong> Membership analytics keep daily join and leave totals per server, without user IDs. When a server’s counters are updated, totals more than 92 days old are pruned. The dashboard also summarizes existing moderation records, including action counts by moderator.</li>
+      <li><strong>Server settings.</strong> We keep server settings and the latest role and channel names and IDs, along with display details such as order and role colors, for the rule editor.</li>
+    </ul>
+
+    <h2>Who can see data and what servers control</h2>
+    <p>Access to the member directory, moderation cases, and settings in the dashboard requires Discord sign-in and permission for that server. Reports sent to a configured Discord log channel are visible to people with access to that channel. Server administrators can choose log destinations and set ignored users and source channels for each event. Those lists filter delivery to Discord. Snapshot capture, rule enforcement, and moderation records are handled separately.</p>
+    <p>The Discord platform provides the server, bot, and sign-in services and receives actions and reports sent there. The operator’s subprocessors may provide hosting, storage, content delivery, and database services. Apart from the server access described above, we share this data only with the providers we use to operate jModGuard. We do not sell this data or use it to train AI or machine-learning models.</p>
+
+    <h2>When the bot is removed</h2>
+    <p>After jModGuard confirms it has been removed from a server, an erasure job removes the departed installation’s live cases, snapshots, member directory, configuration, and stored evidence. Reports already posted to Discord follow Discord’s retention and the server’s own handling. Hosting-provider backup copies may persist for the provider’s retention period, which we do not control.</p>
+
+    <!-- operator-details -->
+
+    <h2 id="deletion">Request deletion or ask a privacy question</h2>
+    <ol>
+      <li>Follow the operator’s deletion instructions above.</li>
+      <li>We aim to respond within 30 days. Before we act, we’ll verify that you control the Discord account whose data you want removed.</li>
+      <li>After verification, we look for the Discord user ID across the servers we host and manually remove matching member-directory entries and saved message snapshots. We keep cases and their history when a server needs them for moderation. We tell you what we removed and what we retained. If you stay in or rejoin a server using jModGuard, new activity or a member sync can create new entries.</li>
+    </ol>
+
+    <details>
+      <summary>Sources for the dashboard session disclosure</summary>
+      <ul>
+        <li>Session contents, sign-out, inactivity and restart are defined in <code>crates/api/src/web/mod.rs</code> by <code>store_login_session</code>, <code>logout</code>, <code>router</code> and <code>router_with_store</code>.</li>
+        <li>Permission checks and token renewal use the session in <code>crates/api/src/web/mod.rs</code>. The Discord guild and member-role calls are in <code>crates/api/src/web/oauth.rs</code>.</li>
+        <li>The in-memory store, <code>tower-sessions-memory-store</code>, is pinned in <code>Cargo.lock</code>. Its <code>MemoryStore::load</code> stops returning expired records. The API also expires its in-memory authentication state through <code>sweep_auth_sessions</code> in <code>crates/api/src/web/state.rs</code>.</li>
+      </ul>
+    </details>
+  </main>
+</body>
+</html>

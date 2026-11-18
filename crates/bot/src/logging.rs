@@ -1,9 +1,7 @@
 //! Event routing: renders a template for an event type and posts it to the
 //! configured guild-scoped log channel. Routine delivery never archives an event.
 
-use serenity::builder::{
-    CreateActionRow, CreateAllowedMentions, CreateAttachment, CreateEmbed, CreateMessage,
-};
+use serenity::builder::{CreateAllowedMentions, CreateAttachment, CreateEmbed, CreateMessage};
 use serenity::client::Context;
 use serenity::model::event::MessageUpdateEvent;
 use serenity::model::guild::audit_log::{Action, AuditLogs, MemberAction};
@@ -1342,7 +1340,6 @@ pub(crate) async fn emit_to_if(
         Admission::Immediate,
         commit,
         false,
-        Vec::new(),
         None,
     )
     .await
@@ -1368,7 +1365,6 @@ pub(crate) async fn emit_to_if_after_rate_limit(
         Admission::Immediate,
         commit,
         true,
-        Vec::new(),
         None,
     )
     .await
@@ -1394,77 +1390,10 @@ async fn emit_to_observed(
         admission,
         || true,
         false,
-        Vec::new(),
         None,
     )
     .await
     .0
-}
-
-pub(crate) async fn emit_with_components(
-    app: &Arc<BotState>,
-    sink: &impl LogDelivery,
-    guild_id: GuildId,
-    event: &str,
-    vars: BTreeMap<String, String>,
-    components: Vec<CreateActionRow>,
-    commit: impl Fn() -> bool + Sync,
-) -> Delivery {
-    emit_to_observed_with_audit(
-        app,
-        sink,
-        guild_id,
-        event,
-        vars,
-        None,
-        Admission::Immediate,
-        commit,
-        true,
-        components,
-        None,
-    )
-    .await
-    .0
-}
-
-pub(crate) async fn preview_automod(
-    app: &Arc<BotState>,
-    guild_id: GuildId,
-    vars: &mut BTreeMap<String, String>,
-) -> String {
-    let template = match app.configs.get(&app.db, guild_id.get()).await {
-        Ok(cfg) => cfg
-            .templates
-            .get("automod")
-            .cloned()
-            .unwrap_or_else(|| default_template("automod").to_string()),
-        Err(_) => default_template("automod").to_string(),
-    };
-    vars.insert("event".into(), "automod".into());
-    vars.entry("time".into())
-        .or_insert_with(|| chrono::Utc::now().to_rfc3339());
-    vars.insert("guild".into(), guild_id.get().to_string());
-    let mut owned = jmodguard::emoji::with_var("automod", vars).unwrap_or_else(|| vars.clone());
-    templates::format_log_timestamps(&mut owned);
-    let rendered = render_log_template("automod", &template, &mut owned);
-    if template == default_template("automod") {
-        // The shipped body carries the embed's map emoji; vars are already bounded.
-        let decorated = jmodguard::emoji::decorate_template(
-            jmodguard::emoji::title("automod", &owned),
-            &template,
-        );
-        return templates::render_bounded(&decorated, &owned, 2000);
-    }
-    // Fresh reviews use the shipped heading spelling that decision_edit promotes.
-    // Canonicalize only its separator; preserve custom headings and all body bytes.
-    let title = jmodguard::log_embeds::style("automod").title;
-    for separator in ["\r\n\r\n", "\r\n\n", "\n\r\n"] {
-        let heading = format!("{title}{separator}");
-        if let Some(body) = rendered.strip_prefix(&heading) {
-            return format!("{title}\n\n{body}");
-        }
-    }
-    rendered
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1478,7 +1407,6 @@ async fn emit_to_observed_with_audit(
     admission: Admission,
     commit: impl Fn() -> bool + Sync,
     after_rate_limit: bool,
-    components: Vec<CreateActionRow>,
     rejoin_enrich_user: Option<&serenity::model::user::User>,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
@@ -1637,18 +1565,17 @@ async fn emit_to_observed_with_audit(
                 crate::handlers::observe_member_sync_rate_limit_wait(&app, wait);
             }
         };
-        let rows = components.clone();
         let call = crate::discord::race_discord_call(&app.activation, async {
             if after_rate_limit {
                 sink.send_after_rate_limit(
                     channel_id,
-                    log_message_with(event, template, &vars, &rows),
+                    log_message(event, template, &vars),
                     &commit,
                     &on_global_rate_limit,
                 )
                 .await
             } else {
-                sink.send(channel_id, log_message_with(event, template, &vars, &rows))
+                sink.send(channel_id, log_message(event, template, &vars))
                     .await?;
                 Ok(true)
             }
@@ -1793,16 +1720,7 @@ pub(crate) fn discord_embed(embed: jmodguard::log_embeds::LogEmbed) -> CreateEmb
 }
 
 fn log_message(event: &str, template: &str, vars: &BTreeMap<String, String>) -> CreateMessage {
-    log_message_with(event, template, vars, &[])
-}
-
-fn log_message_with(
-    event: &str,
-    template: &str,
-    vars: &BTreeMap<String, String>,
-    components: &[CreateActionRow],
-) -> CreateMessage {
-    let message = CreateMessage::new()
+    CreateMessage::new()
         .embed(discord_embed(jmodguard::log_embeds::render(
             event, template, vars,
         )))
@@ -1812,12 +1730,7 @@ fn log_message_with(
                 .all_roles(false)
                 .everyone(false)
                 .replied_user(false),
-        );
-    if components.is_empty() {
-        message
-    } else {
-        message.components(components.to_vec())
-    }
+        )
 }
 
 /// Bound UTF-16 units too, so astral characters cannot exceed Discord's limit.
@@ -3755,7 +3668,6 @@ pub(crate) async fn emit_member_event(
         Admission::Immediate,
         || true,
         false,
-        Vec::new(),
         if event == "member_rejoin" {
             Some(user)
         } else {
@@ -3788,7 +3700,6 @@ pub(crate) async fn emit_verified_member_departure(
         Admission::Immediate,
         || true,
         false,
-        Vec::new(),
         None,
     )
     .await;
