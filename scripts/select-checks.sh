@@ -140,9 +140,15 @@ classify() {
       all_rust
       return
       ;;
-    dylint.toml|scripts/dylint.sh|scripts/dylint-test.sh|scripts/ci-dylint-libs.sh)
+    dylint.toml|tools/dylint/*|scripts/dylint.sh|scripts/dylint-test.sh|scripts/ci-dylint-libs.sh)
       dylint_full=1
       add dylint
+      return
+      ;;
+    scripts/check-test-flakes*.mjs|tools/test-flake-allowlist.tsv)
+      add frontend
+      add dylint
+      dylint_full=1
       return
       ;;
     scripts/ci-ensure-cargo-tool.sh)
