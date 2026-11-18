@@ -74,7 +74,7 @@ build. It checks every source before writing and fails the job, writing
 nothing, when it cannot publish the complete layout, because a saved primary
 key is never re-saved. A cold 6.1.0 driver build wants rust-clippy
 `master`, so the script maps upstream `main` to it for `cargo dylint` only.
-Node 24 satisfies both npm projects.
+CI and Publish use Node 26 LTS for both npm projects.
 Cargo deny 0.20.2 and cargo audit 0.22.2 remain pinned in `scripts/ci-ensure-cargo-tool.sh`,
 which the tool cache key hashes. The local complete gate is:
 
