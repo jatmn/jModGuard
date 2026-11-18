@@ -5,6 +5,7 @@ pub mod api;
 pub mod cases;
 mod directory;
 mod discord_retry;
+mod legal;
 pub mod list_controls;
 pub mod members;
 pub mod oauth;
@@ -261,6 +262,7 @@ pub struct AuthCtx {
     enrollment: Option<crate::db::GuildEnrollment>,
     /// Role-mapped access verified for one guild during this request.
     role_access: Option<(u64, AccessLevel)>,
+    guild_discovery_incomplete: bool,
 }
 
 impl AuthCtx {
@@ -371,6 +373,7 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
         guilds: Vec::new(),
         enrollment: None,
         role_access: None,
+        guild_discovery_incomplete: false,
     })
 }
 
@@ -684,7 +687,7 @@ async fn require_auth_with(
     let refresh_wait = state.refresh_wait().or_else(|| {
         // A refresh 429 may outlive the capped session hold. Do not spend
         // another guild/profile request on the rejected access token while
-        // the shared token route still prevents recovery.
+        // the user's token route still prevents recovery.
         let RefreshHold {
             cause: RefreshFailure::RateLimited,
             ..
@@ -693,22 +696,22 @@ async fn require_auth_with(
             return None;
         };
         app.oauth
-            .route_remaining("token")
+            .refresh_remaining(user_id)
             .map(|wait| (wait, RefreshFailure::RateLimited))
     });
     if let Some((retry_after, cause)) = refresh_wait {
         // A hold never renews a successful snapshot, and permission checks
         // cannot borrow the longer display cache while refresh is unavailable.
-        let guilds = if guild_list_cache_allowed(guild_mode) {
-            take_cached_guilds(guild_mode, app, user_id)
+        let cached = if guild_list_cache_allowed(guild_mode) {
+            take_cached_guilds(guild_mode, app, user_id, false)
         } else {
             state.guilds.as_ref().and_then(|(at, guilds)| {
                 GuildSnapshotAge::from_age(at.elapsed())
                     .permits(cause)
-                    .then(|| guilds.clone())
+                    .then(|| (guilds.clone(), false))
             })
         };
-        if let Some(guilds) = guilds
+        if let Some((guilds, guild_discovery_incomplete)) = cached
             && let Some(user) = cached_user(app, user_id)
         {
             let mut auth = AuthCtx {
@@ -716,6 +719,7 @@ async fn require_auth_with(
                 guilds,
                 enrollment: None,
                 role_access: None,
+                guild_discovery_incomplete,
             };
             preview::apply_overlay(&mut auth)?;
             return Ok(auth);
@@ -740,7 +744,7 @@ async fn require_auth_with(
     }
     let refresh = state.refresh.clone();
     let refreshed = match &refresh {
-        Some(refresh) => app.oauth.refresh(refresh).await,
+        Some(refresh) => app.oauth.refresh(user_id, refresh).await,
         None => Err(anyhow::anyhow!("session expired")),
     };
     if let Err(error) = &refreshed
@@ -810,20 +814,8 @@ async fn load_auth(
     // Display path only: serve a fresh list, or the last good list while
     // Discord is still cooling down. Authorization never takes this branch.
     // A rate-limited profile lookup must not drop that list.
-    if let Some(guilds) = take_cached_guilds(guild_mode, app, user_id) {
-        let (user, source) = display_identity(app, user_id, token, cached_user).await?;
-        if source == DisplayIdentitySource::Live {
-            app.user_cache
-                .insert(user_id, (std::time::Instant::now(), user.clone()));
-        }
-        let mut auth = AuthCtx {
-            user,
-            guilds,
-            enrollment: None,
-            role_access: None,
-        };
-        preview::apply_overlay(&mut auth)?;
-        return Ok(auth);
+    if let Some((guilds, incomplete)) = take_cached_guilds(guild_mode, app, user_id, false) {
+        return display_auth(app, user_id, token, cached_user, guilds, incomplete).await;
     }
 
     let guilds = if let Some((at, guilds)) = &state.guilds
@@ -862,6 +854,7 @@ async fn load_auth(
         guilds,
         enrollment: None,
         role_access: None,
+        guild_discovery_incomplete: false,
     };
     preview::apply_overlay(&mut auth)?;
     Ok(auth)
@@ -875,37 +868,22 @@ async fn finish_guild_list(
     cached_user: Option<DiscordUser>,
     error: oauth::GuildListError,
 ) -> ApiResult<AuthCtx> {
-    if matches!(guild_mode, GuildListMode::CachedOk)
-        && let Some(auth) =
-            cached_display_during_limit(app, user_id, token, cached_user, &error).await?
+    if matches!(error, oauth::GuildListError::RateLimited { .. })
+        && let Some((guilds, incomplete)) = take_cached_guilds(guild_mode, app, user_id, true)
     {
-        return Ok(auth);
+        return display_auth(app, user_id, token, cached_user, guilds, incomplete).await;
     }
     Err(guild_list_failure(user_id, error))
 }
 
-async fn cached_display_during_limit(
+async fn display_auth(
     app: &ApiState,
     user_id: u64,
     token: &str,
     cached_user: Option<DiscordUser>,
-    error: &oauth::GuildListError,
-) -> ApiResult<Option<AuthCtx>> {
-    let oauth::GuildListError::RateLimited { fresh, .. } = error else {
-        return Ok(None);
-    };
-    let Some(guilds) = app
-        .guild_cache
-        .get(&user_id)
-        .map(|entry| entry.value().1.clone())
-    else {
-        return Ok(None);
-    };
-    if *fresh {
-        tracing::warn!("webui auth: discord rate limited guild checks for user {user_id}");
-    } else {
-        tracing::debug!("webui auth: discord guild-list cooldown still active for user {user_id}");
-    }
+    guilds: Vec<DiscordGuild>,
+    guild_discovery_incomplete: bool,
+) -> ApiResult<AuthCtx> {
     let (user, source) = display_identity(app, user_id, token, cached_user).await?;
     if source == DisplayIdentitySource::Live {
         app.user_cache
@@ -916,21 +894,15 @@ async fn cached_display_during_limit(
         guilds,
         enrollment: None,
         role_access: None,
+        guild_discovery_incomplete,
     };
     preview::apply_overlay(&mut auth)?;
-    Ok(Some(auth))
+    Ok(auth)
 }
 
 fn guild_list_failure(user_id: u64, error: oauth::GuildListError) -> ApiError {
     match error {
-        oauth::GuildListError::RateLimited { retry_after, fresh } => {
-            if fresh {
-                tracing::warn!("webui auth: discord rate limited guild checks for user {user_id}");
-            } else {
-                tracing::debug!(
-                    "webui auth: discord guild-list cooldown still active for user {user_id}"
-                );
-            }
+        oauth::GuildListError::RateLimited { retry_after, .. } => {
             ApiError(oauth::DiscordRateLimit { retry_after }.into())
         }
         oauth::GuildListError::Unauthorized => {
@@ -999,27 +971,32 @@ fn display_user_during_limit(app: &ApiState, user_id: u64) -> DiscordUser {
     }
 }
 
-/// Returns cached guilds only when the mode permits it (display path).
+/// Selects the display list and its discovery status. A lookup blocked by a
+/// rate limit can fall back to an empty list if there is no cached entry.
 /// `MustRefresh` uses only the separate short session/token snapshot.
 fn take_cached_guilds(
     mode: GuildListMode,
     app: &ApiState,
     user_id: u64,
-) -> Option<Vec<DiscordGuild>> {
+    lookup_rate_limited: bool,
+) -> Option<(Vec<DiscordGuild>, bool)> {
     if !guild_list_cache_allowed(mode) {
         return None;
     }
-    let entry = app.guild_cache.get(&user_id)?;
-    let (fetched_at, guilds) = entry.value();
-    if guild_display_usable(
-        fetched_at.elapsed(),
-        GUILD_DISPLAY_CACHE_TTL,
-        app.oauth.guild_route_limited(user_id),
-    ) {
-        Some(guilds.clone())
-    } else {
-        None
-    }
+    let incomplete = lookup_rate_limited || app.oauth.guild_route_limited(user_id);
+    let guilds = app
+        .guild_cache
+        .get(&user_id)
+        .filter(|entry| {
+            guild_display_usable(
+                entry.value().0.elapsed(),
+                GUILD_DISPLAY_CACHE_TTL,
+                incomplete,
+            )
+        })
+        .map(|entry| entry.value().1.clone())
+        .or_else(|| lookup_rate_limited.then(Vec::new))?;
+    Some((guilds, incomplete))
 }
 
 /// A display list is usable while it is younger than the TTL, or while Discord
@@ -1347,6 +1324,42 @@ async fn callback_response(
         tracing::warn!("oauth callback: {error}");
         return finish(error_page("failed to rotate session"));
     }
+    if let Some(app) = app {
+        app.user_cache
+            .insert(uid, (std::time::Instant::now(), user));
+        // Only a complete guild list enters either cache. A 429 leaves any
+        // previous display list intact and the cooldown guides the next /api/me.
+        if let Ok(guilds) = oauth.my_guilds(uid, &tok.access_token).await {
+            let observed_at = std::time::Instant::now();
+            // Rotation leaves the session without an ID until the store creates
+            // the new record. Publish the permission snapshot before the
+            // middleware returns the new session cookie.
+            if let Err(error) = session.save().await {
+                tracing::warn!("oauth callback: failed to save rotated session: {error}");
+                return finish(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to save login session",
+                    )
+                        .into_response(),
+                );
+            }
+            if let Some(id) = session.id() {
+                app.sweep_auth_sessions(observed_at);
+                app.auth_sessions.insert(
+                    id,
+                    Arc::new(tokio::sync::Mutex::new(SessionAuth {
+                        token: Some(tok.access_token),
+                        refresh: tok.refresh_token,
+                        guilds: Some((observed_at, guilds.clone())),
+                        last_used: Some(observed_at),
+                        ..SessionAuth::default()
+                    })),
+                );
+            }
+            app.guild_cache.insert(uid, (observed_at, guilds));
+        }
+    }
     let requested_return_to = cookie_value(&headers, COOKIE_OAUTH_RETURN_TO);
     let return_to = return_to_or_root(cfg, requested_return_to.as_deref());
     finish(axum::response::Redirect::to(&return_to).into_response())
@@ -1456,7 +1469,7 @@ async fn api_me(
         },
         "guilds": guilds,
         "role_scope_missing": role_scope_missing,
-        "role_discovery_incomplete": role_discovery_incomplete,
+        "role_discovery_incomplete": auth.guild_discovery_incomplete || role_discovery_incomplete,
         "is_bot_owner": is_bot_owner(&state, &auth),
         "preview": preview::current().map(|preview| serde_json::json!({
             "guild_id": preview.guild_id.to_string(),
@@ -1902,6 +1915,9 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             .route("/health/", get(health))
             .route("/ready", get(ready))
             .route("/ready/", get(ready))
+            .route("/privacy", get(legal::privacy))
+            .route("/terms", get(legal::terms))
+            .route("/api/legal", get(legal::details))
             .merge(sessioned),
     )
     .with_state(app.clone())
@@ -2421,14 +2437,18 @@ mod tests {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn test_app() -> Router {
+        router(test_app_with_config(Default::default()))
+    }
+
+    fn test_app_with_config(cfg: crate::config::ApiProcessConfig) -> Arc<ApiState> {
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let tmp =
             std::env::temp_dir().join(format!("jmodguard_web_{}_{}.db", std::process::id(), n));
         let db = crate::db::Db::open(&tmp, 2).unwrap();
-        let app = crate::web::state::ApiState::new(Default::default(), db).unwrap();
+        let app = crate::web::state::ApiState::new(cfg, db).unwrap();
         std::fs::remove_file(&tmp).ok();
         crate::tenant::remove_sidecars(&tmp);
-        router(app)
+        app
     }
 
     #[tokio::test]
@@ -2663,6 +2683,237 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["error"], "not authenticated", "{method} {uri}");
+    }
+
+    async fn public_legal_response(app: Router, path: &str, cookie: Option<&str>) -> Response {
+        let mut builder = Request::builder().uri(path);
+        if let Some(cookie) = cookie {
+            builder = builder.header(COOKIE, cookie);
+        }
+        let response = app
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert!(!response.headers().contains_key(SET_COOKIE), "{path}");
+        super::assert_uncacheable_headers(response.headers());
+        response
+    }
+
+    async fn public_legal_html(app: Router, path: &str) -> String {
+        let response = public_legal_response(app, path, None).await;
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/html; charset=utf-8"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn assert_public_legal_page(
+        app: Router,
+        path: &str,
+        heading: &str,
+        text: &str,
+        related_link: &str,
+    ) {
+        let html = public_legal_html(app, path).await;
+        assert!(html.contains(&format!("<h1>{heading}</h1>")), "{path}");
+        assert!(html.contains(text), "{path}");
+        assert!(html.contains(related_link), "{path}");
+        assert!(
+            html.contains("This instance’s operator has not configured contact details."),
+            "{path}"
+        );
+        assert!(!html.contains("<script"), "{path}");
+    }
+
+    #[tokio::test]
+    async fn legal_pages_privacy_discloses_dashboard_session_inventory() {
+        let html = public_legal_html(test_app(), "/privacy").await;
+        for disclosure in [
+            "Discord user ID, OAuth access token, and refresh token",
+            "a server-side session in memory",
+            "keyed by your session cookie",
+            "look up your servers and check your permissions",
+            "Signing out clears the session",
+            "7 days of inactivity",
+            "Expired records can remain in memory until the API restarts",
+            "Restarting the API clears all sessions",
+        ] {
+            assert!(
+                html.contains(disclosure),
+                "missing disclosure: {disclosure}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legal_pages_privacy_is_public_without_a_session() {
+        let app = test_app();
+        assert_public_legal_page(
+            app.clone(),
+            "/privacy",
+            "Privacy Policy",
+            "Request deletion or ask a privacy question",
+            r#"href="/terms""#,
+        )
+        .await;
+        assert_unauthenticated(app, "GET", "/api/me", "").await;
+    }
+
+    #[tokio::test]
+    async fn legal_pages_terms_are_public_without_a_session() {
+        assert_public_legal_page(
+            test_app(),
+            "/terms",
+            "Terms of Service",
+            "Using jModGuard",
+            r#"href="/privacy""#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn legal_pages_use_dashboard_origin_for_style_home_and_cross_links() {
+        let app = test_app();
+        for (path, other) in [("/privacy", "/terms"), ("/terms", "/privacy")] {
+            let html = public_legal_html(app.clone(), path).await;
+            assert!(
+                html.contains(r#"<link rel="stylesheet" href="/style.css">"#),
+                "{path}"
+            );
+            assert!(html.contains(r#"<a href="/">jModGuard</a>"#), "{path}");
+            assert!(html.contains(&format!(r#"href="{other}""#)), "{path}");
+        }
+
+        // In split deployments the dashboard origin serves these two assets
+        // and forwards the policy paths to this router.
+        for path in ["/", "/style.css"] {
+            let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let expected = if cfg!(feature = "embed-ui") {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
+
+    async fn public_legal_json(app: Router, cookie: Option<&str>) -> serde_json::Value {
+        let response = public_legal_response(app, "/api/legal", cookie).await;
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn legal_pages_publish_configured_details_without_exposing_session_or_guild_data() {
+        let mut cfg = crate::config::ApiProcessConfig {
+            legal: crate::config::LegalConfig {
+                operator_name: " Specimen & Sample ".into(),
+                privacy_contact: "Sample Privacy Desk".into(),
+                deletion_instructions: "Ask for <data removal>".into(),
+                subprocessors: vec![
+                    "Hosting by Specimen".into(),
+                    " ".into(),
+                    "Sample CDN".into(),
+                    "Sample Database".into(),
+                ],
+                jurisdiction: "Sample Region".into(),
+                effective_date: "2030-02-03".into(),
+            },
+            ..Default::default()
+        };
+        cfg.web.oauth_client_secret = "nonpublic-secret".into();
+        let state = test_app_with_config(cfg);
+        let store = MemoryStore::default();
+        let session = Session::new(None, Arc::new(store.clone()), None);
+        store_login_session(&session, 42, "nonpublic-access", Some("nonpublic-refresh"))
+            .await
+            .unwrap();
+        session.save().await.unwrap();
+        let cookie = format!("{SESSION_COOKIE_NAME}={}", session.id().unwrap());
+        let app = router_with_store(state, store);
+        let expected = serde_json::json!({
+            "operator_name": "Specimen & Sample",
+            "privacy_contact": "Sample Privacy Desk",
+            "deletion_instructions": "Ask for <data removal>",
+            "subprocessors": ["Hosting by Specimen", "Sample CDN", "Sample Database"],
+            "jurisdiction": "Sample Region",
+            "effective_date": "2030-02-03"
+        });
+        assert_eq!(public_legal_json(app.clone(), None).await, expected);
+        assert_eq!(
+            public_legal_json(app.clone(), Some(&cookie)).await,
+            expected
+        );
+        for path in ["/privacy", "/terms"] {
+            let html = public_legal_html(app.clone(), path).await;
+            for value in [
+                "Specimen &amp; Sample",
+                "Sample Privacy Desk",
+                "Ask for &lt;data removal&gt;",
+                "Hosting by Specimen",
+                "Sample CDN",
+                "Sample Database",
+                "Sample Region",
+                "2030-02-03",
+            ] {
+                assert!(html.contains(value), "{path}: missing {value}");
+            }
+            assert!(
+                !html.contains("has not configured contact details"),
+                "{path}"
+            );
+            assert!(!html.contains("<data removal>"), "{path}");
+            assert!(!html.contains("nonpublic-"), "{path}");
+        }
+        assert_unauthenticated(app, "GET", "/api/me", "").await;
+    }
+
+    #[tokio::test]
+    async fn legal_pages_report_blank_or_unset_details_without_fallback_values() {
+        for legal in [
+            crate::config::LegalConfig::default(),
+            crate::config::LegalConfig {
+                operator_name: " ".into(),
+                privacy_contact: " ".into(),
+                deletion_instructions: " ".into(),
+                subprocessors: vec![" ".into()],
+                jurisdiction: " ".into(),
+                effective_date: " ".into(),
+            },
+        ] {
+            let app = router(test_app_with_config(crate::config::ApiProcessConfig {
+                legal,
+                ..Default::default()
+            }));
+            assert_eq!(
+                public_legal_json(app.clone(), None).await,
+                serde_json::json!({
+                    "operator_name": null,
+                    "privacy_contact": null,
+                    "deletion_instructions": null,
+                    "subprocessors": [],
+                    "jurisdiction": null,
+                    "effective_date": null
+                })
+            );
+            for path in ["/privacy", "/terms"] {
+                let html = public_legal_html(app.clone(), path).await;
+                assert!(
+                    html.contains("This instance’s operator has not configured contact details."),
+                    "{path}"
+                );
+                assert_eq!(html.matches("<dd>Not configured</dd>").count(), 6, "{path}");
+            }
+        }
     }
 
     #[tokio::test]
@@ -3166,6 +3417,7 @@ mod tests {
         AuthCtx {
             enrollment: None,
             role_access: None,
+            guild_discovery_incomplete: false,
             user: crate::web::oauth::DiscordUser {
                 id: discord_id.to_string(),
                 username: "tester".into(),
@@ -3376,6 +3628,7 @@ mod tests {
         let stale = AuthCtx {
             enrollment: None,
             role_access: None,
+            guild_discovery_incomplete: false,
             user: crate::web::oauth::DiscordUser {
                 id: "99".into(),
                 username: "owner".into(),

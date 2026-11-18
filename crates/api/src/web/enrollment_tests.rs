@@ -34,8 +34,42 @@ struct DiscordStub {
     member_roles: std::sync::Mutex<std::collections::HashMap<u64, Vec<String>>>,
     member_unauthorized: AtomicBool,
     member_failed: AtomicBool,
+    member_rate_limited: AtomicBool,
     member_delay: std::sync::atomic::AtomicU64,
     member_calls: AtomicUsize,
+}
+
+impl DiscordStub {
+    fn rate_limit_response(&self) -> Response {
+        let global = self.global_scope.load(Ordering::SeqCst);
+        let mut headers = HeaderMap::new();
+        let retry_after = self.retry_after.lock().unwrap().clone();
+        if !retry_after.is_empty() {
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                retry_after.parse().unwrap(),
+            );
+        }
+        headers.insert(
+            "x-ratelimit-scope",
+            HeaderValue::from_static(if global { "global" } else { "user" }),
+        );
+        if global {
+            headers.insert("x-ratelimit-global", HeaderValue::from_static("true"));
+        }
+        headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        headers.insert("x-ratelimit-reset-after", HeaderValue::from_static("945"));
+        headers.insert(
+            "x-ratelimit-bucket",
+            HeaderValue::from_static("fixture-bucket"),
+        );
+        let body = serde_json::json!({
+            "global": global,
+            "retry_after": *self.body_retry_after.lock().unwrap(),
+            "message": "PRIVATE_DISCORD_RESPONSE",
+        });
+        (StatusCode::TOO_MANY_REQUESTS, headers, Json(body)).into_response()
+    }
 }
 #[derive(Clone, Copy)]
 enum TokenTransport {
@@ -99,6 +133,7 @@ impl Fixture {
             member_roles: std::sync::Mutex::new(std::collections::HashMap::new()),
             member_unauthorized: AtomicBool::new(false),
             member_failed: AtomicBool::new(false),
+            member_rate_limited: AtomicBool::new(false),
             member_delay: std::sync::atomic::AtomicU64::new(0),
             member_calls: AtomicUsize::new(0),
         });
@@ -116,6 +151,9 @@ impl Fixture {
                     async move {
                         handler.member_calls.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(std::time::Duration::from_millis(handler.member_delay.load(Ordering::SeqCst))).await;
+                        if handler.member_rate_limited.load(Ordering::SeqCst) {
+                            return handler.rate_limit_response();
+                        }
                         if handler.member_failed.load(Ordering::SeqCst) {
                             return StatusCode::SERVICE_UNAVAILABLE.into_response();
                         }
@@ -171,15 +209,22 @@ impl Fixture {
             )
             .route(
                 "/me",
-                get(move || {
+                get(move |headers: HeaderMap| {
                     let handler = Arc::clone(&me_handler);
                     async move {
                         handler.me_calls.fetch_add(1, Ordering::SeqCst);
                         if handler.me_unauthorized.load(Ordering::SeqCst) {
                             return StatusCode::FORBIDDEN.into_response();
                         }
+                        let id = if headers.get("authorization").and_then(|value| value.to_str().ok())
+                            == Some("Bearer other-user-token")
+                        {
+                            "99"
+                        } else {
+                            "42"
+                        };
                         Json(serde_json::json!({
-                            "id": "42",
+                            "id": id,
                             "username": "live-profile",
                             "global_name": null,
                             "avatar": null
@@ -209,7 +254,7 @@ impl Fixture {
                             .into_response();
                     }
                     assert!(
-                        bearer == "Bearer fixture-token" || bearer == "Bearer refreshed-token",
+                        matches!(bearer, "Bearer fixture-token" | "Bearer refreshed-token" | "Bearer other-user-token"),
                         "{bearer}"
                     );
                     let call = handler.calls.fetch_add(1, Ordering::SeqCst);
@@ -238,28 +283,7 @@ impl Fixture {
                     if handler.limit_on_next_page.load(Ordering::SeqCst) && query.contains_key("after")
                         || handler.rate_limited.load(Ordering::SeqCst)
                     {
-                        let mut headers = axum::http::HeaderMap::new();
-                        let retry_after = handler.retry_after.lock().unwrap().clone();
-                        if !retry_after.is_empty() {
-                            headers.insert(
-                                axum::http::header::RETRY_AFTER,
-                                retry_after.parse().unwrap(),
-                            );
-                        }
-                        if handler.global_scope.load(Ordering::SeqCst) {
-                            headers.insert(
-                                axum::http::HeaderName::from_static("x-ratelimit-scope"),
-                                axum::http::HeaderValue::from_static("global"),
-                            );
-                        }
-                        let mut body = serde_json::json!({"message": "You are being rate limited."});
-                        if handler.global_scope.load(Ordering::SeqCst) {
-                            body["global"] = serde_json::json!(true);
-                        }
-                        if let Some(seconds) = *handler.body_retry_after.lock().unwrap() {
-                            body["retry_after"] = serde_json::json!(seconds);
-                        }
-                        return (StatusCode::TOO_MANY_REQUESTS, headers, Json(body)).into_response();
+                        return handler.rate_limit_response();
                     }
                     let guilds = if handler.limit_on_next_page.load(Ordering::SeqCst) {
                         (0..200).map(managed_guild).collect::<Vec<_>>()
@@ -977,6 +1001,7 @@ async fn display_keeps_cached_guilds_when_the_user_cache_is_cold_during_a_global
     assert!(!body["guilds"].as_array().unwrap().is_empty());
     assert_eq!(body["user"]["id"], "42");
     assert_eq!(body["user"]["username"], "tester");
+    assert_eq!(body["role_discovery_incomplete"], true);
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), guild_calls);
     assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
 
@@ -1016,27 +1041,42 @@ async fn display_refreshes_a_cold_user_when_discord_is_not_rate_limited() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(!body["guilds"].as_array().unwrap().is_empty());
     assert_eq!(body["user"]["username"], "live-profile");
+    assert_eq!(body["role_discovery_incomplete"], false);
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 0);
     assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn stale_display_fetches_once_then_serves_the_cached_list() {
+async fn stale_display_discovery_stays_incomplete_until_cooldown_expires() {
     let f = Fixture::new(false).await;
-    let stale = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(120))
-        .expect("display cooldown test needs a monotonic clock older than the cache ttl");
-    f.app
-        .guild_cache
-        .insert(42, (stale, vec![managed_guild(10)]));
+    age_guild_cache(&f.app, 42);
+    *f.discord.retry_after.lock().unwrap() = "120".into();
     f.discord.rate_limited.store(true, Ordering::SeqCst);
-    let (status, body) = f.request("POST", "/api/me", "").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["guilds"][0]["id"], "10");
-    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
-    let (again, _) = f.request("POST", "/api/me", "").await;
-    assert_eq!(again, StatusCode::OK);
-    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+
+    for attempt in 1..=2 {
+        let (status, me) = f.request("POST", "/api/me", "").await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["guilds"][0]["id"], "10");
+        assert_eq!(
+            me["role_discovery_incomplete"], true,
+            "stale cooldown response on discovery attempt {attempt}"
+        );
+        assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Shorten the stored deadline to simulate elapsed cooldown time without a
+    // two-minute wait. The production gate must evict it when the time passes.
+    f.discord.rate_limited.store(false, Ordering::SeqCst);
+    *f.discord.guilds.lock().unwrap() = vec![managed_guild(20)];
+    f.app
+        .oauth
+        .restore_deadlines([("g:42".into(), chrono::Utc::now().timestamp_millis() + 50)].into());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["role_discovery_incomplete"], false);
+    assert_eq!(me["guilds"][0]["id"], "20");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -4877,11 +4917,11 @@ async fn temporary_refresh_body_retry_after_and_local_budget_keep_sessions() {
         *f.discord.retry_after.lock().unwrap() = String::new();
         *f.discord.body_retry_after.lock().unwrap() = Some(30.0);
         if local_budget {
-            // Another session spent the shared token budget before this request.
+            // Another session spent the same user's token budget before this request.
             assert!(
                 f.app
                     .oauth
-                    .refresh("fixture-refresh")
+                    .refresh(42, "fixture-refresh")
                     .await
                     .unwrap_err()
                     .is::<oauth::DiscordRateLimit>()
@@ -5086,11 +5126,11 @@ async fn temporary_refresh_server_retry_after_overrides_default_backoff() {
     );
     assert_refresh_wait(&f, std::time::Duration::from_secs(30)).await;
     assert_refresh_session_kept(&f).await;
-    // Other sessions still obey the token endpoint's existing shared budget.
+    // Other sessions for the same user still obey the token endpoint's budget.
     assert!(
         f.app
             .oauth
-            .refresh("fixture-refresh")
+            .refresh(42, "fixture-refresh")
             .await
             .unwrap_err()
             .is::<oauth::DiscordRateLimit>()
@@ -5744,6 +5784,249 @@ async fn oauth_callback_request(f: &Fixture, cookie: &str) -> Response {
         .unwrap()
 }
 
+async fn login_without_cached_discord_data(f: &mut Fixture) {
+    f.app.user_cache.clear();
+    f.app.guild_cache.clear();
+    let callback = oauth_callback_request(f, "").await;
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    f.cookie = callback
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .map(|header| header.to_str().unwrap())
+        .find_map(|cookie| cookie.strip_prefix(SESSION_COOKIE_NAME))
+        .map(|value| format!("{SESSION_COOKIE_NAME}{}", value.split(';').next().unwrap()))
+        .expect("callback sets the session cookie");
+}
+
+#[tokio::test]
+async fn fresh_login_reuses_callback_guild_list_for_me() {
+    let mut f = Fixture::new(false).await;
+    login_without_cached_discord_data(&mut f).await;
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["user"]["username"], "live-profile");
+    assert_eq!(me["guilds"][0]["id"], "10");
+    assert_eq!(me["role_discovery_incomplete"], false);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn fresh_login_config_reuses_callback_snapshot_when_bucket_is_exhausted() {
+    let mut f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.discord.spent_budget.store(true, Ordering::SeqCst);
+    login_without_cached_discord_data(&mut f).await;
+    let observed_at = f.app.guild_cache.get(&42).unwrap().value().0;
+
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["guilds"][0]["id"], "10");
+    let (status, config) = f.request("POST", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::OK, "first config read: {config}");
+    assert_eq!(me["role_discovery_incomplete"], true);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+
+    let state = refresh_state(&f).await;
+    {
+        let state = state.lock().await;
+        assert_eq!(state.token.as_deref(), Some("refreshed-token"));
+        assert_eq!(state.guilds.as_ref().unwrap().0, observed_at);
+    }
+
+    let login_cookie = f.cookie.clone();
+    for token in ["fixture-token", "refreshed-token"] {
+        let other = Session::new(None, Arc::new(f.store.clone()), None);
+        other.insert(SESSION_USER, 42u64).await.unwrap();
+        other.insert(SESSION_TOKEN, token).await.unwrap();
+        other.save().await.unwrap();
+        f.cookie = format!("{SESSION_COOKIE_NAME}={}", other.id().unwrap());
+        let (status, me) = f.request("POST", "/api/me", "").await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["guilds"][0]["id"], "10");
+        let (status, body) = f.request("POST", "/api/guilds/10/config", "").await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["code"], "discord_rate_limited");
+    }
+
+    f.cookie = login_cookie;
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    let (status, config) = f.request("POST", "/api/guilds/10/config", "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "short rate-limit fallback: {config}"
+    );
+    expire_auth_cache(&f.app, GUILD_AUTH_MAX_STALE).await;
+    let (status, body) = f.request("POST", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "discord_rate_limited");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn fresh_login_config_refetches_only_after_callback_snapshot_freshness_expires() {
+    let mut f = Fixture::new(false).await;
+    f.enroll(10).await;
+    login_without_cached_discord_data(&mut f).await;
+
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let (status, config) = f.request("POST", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(
+        f.discord.calls.load(Ordering::SeqCst),
+        1,
+        "callback and first config read must share one guild lookup"
+    );
+
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    let (status, config) = f.request("POST", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[derive(Clone, Default)]
+struct DiscordRateLimitLog(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for DiscordRateLimitLog {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if event.fields().any(|field| field.name() == "route_key") {
+            self.0.lock().unwrap().push(format!("{event:?}"));
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[tokio::test]
+async fn fresh_login_during_discord_429_has_identity_and_retries_discovery() {
+    let mut f = Fixture::new(false).await;
+    f.enroll(10).await;
+    *f.discord.retry_after.lock().unwrap() = "120".into();
+    *f.discord.body_retry_after.lock().unwrap() = Some(119.25);
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+
+    let logs = DiscordRateLimitLog::default();
+    let before = chrono::Utc::now().timestamp_millis();
+    let guard = tracing::subscriber::set_default(logs.clone());
+    login_without_cached_discord_data(&mut f).await;
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    let (again, _) = f.request("POST", "/api/me", "").await;
+    drop(guard);
+    let after = chrono::Utc::now().timestamp_millis();
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(again, StatusCode::OK);
+    assert_eq!(me["user"]["username"], "live-profile");
+    assert_eq!(me["guilds"], serde_json::json!([]));
+    assert_eq!(me["role_discovery_incomplete"], true);
+    assert!(f.app.guild_cache.is_empty());
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
+    let records = logs.0.lock().unwrap().clone();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let event = &records[0];
+    for field in [
+        r#"route_key: "/users/@me/guilds""#,
+        "status: 429",
+        r#"retry_after: Some("120")"#,
+        "body_retry_after: Some(119.25)",
+        r#"rate_limit_bucket: Some("fixture-bucket")"#,
+        r#"rate_limit_scope: Some("user")"#,
+        "rate_limit_global: None",
+        "body_global: Some(false)",
+        "global: false",
+        r#"rate_limit_reset_after: Some("945")"#,
+    ] {
+        assert!(event.contains(field), "missing {field}: {event}");
+    }
+    for secret in [
+        "PRIVATE_DISCORD_RESPONSE",
+        "refreshed-token",
+        "refreshed-refresh",
+    ] {
+        assert!(!event.contains(secret), "{event}");
+    }
+
+    let deadlines = super::discord_retry::load_deadlines(&f.app.db).unwrap();
+    assert_eq!(deadlines.len(), 1, "{deadlines:?}");
+    assert!((before + 119_250..=after + 119_250).contains(&deadlines["g:42"]));
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+    );
+
+    f.discord.rate_limited.store(false, Ordering::SeqCst);
+    clear_oauth_budget(&f);
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["role_discovery_incomplete"], false);
+    assert_eq!(me["guilds"][0]["id"], "10");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn restarted_api_preserves_scoped_discord_wait_and_displays_new_sessions() {
+    for global in [false, true] {
+        let mut f = Fixture::new(false).await;
+        *f.discord.retry_after.lock().unwrap() = "120".into();
+        f.discord.rate_limited.store(true, Ordering::SeqCst);
+        f.discord.global_scope.store(global, Ordering::SeqCst);
+        login_without_cached_discord_data(&mut f).await;
+        let deadlines = super::discord_retry::load_deadlines(&f.app.db).unwrap();
+        let expected = if global { "global" } else { "g:42" };
+        assert_eq!(
+            deadlines.keys().map(String::as_str).collect::<Vec<_>>(),
+            [expected]
+        );
+
+        let db = db::Db::open(&f.path, 2).unwrap();
+        let mut restarted = ApiState::new((*f.app.cfg).clone(), db).unwrap();
+        let oauth = Arc::get_mut(&mut Arc::get_mut(&mut restarted).unwrap().oauth).unwrap();
+        oauth.guilds_endpoint = f.app.oauth.guilds_endpoint.clone();
+        oauth.me_endpoint = f.app.oauth.me_endpoint.clone();
+        assert!(restarted.guild_cache.is_empty());
+        assert!(restarted.user_cache.is_empty());
+        // Sessions are in-memory. Use a new test store with authenticated
+        // records to exercise the first display read after state restoration.
+        f.store = MemoryStore::default();
+        f.router = router_with_store(Arc::clone(&restarted), f.store.clone());
+        f.app = restarted;
+        f.discord.rate_limited.store(false, Ordering::SeqCst);
+        for (id, token) in [(42u64, "refreshed-token"), (99, "other-user-token")] {
+            let session = Session::new(None, Arc::new(f.store.clone()), None);
+            session.insert(SESSION_USER, id).await.unwrap();
+            session.insert(SESSION_TOKEN, token).await.unwrap();
+            session.save().await.unwrap();
+            f.cookie = format!("{SESSION_COOKIE_NAME}={}", session.id().unwrap());
+            let (status, me) = f.request("POST", "/api/me", "").await;
+            assert_eq!(status, StatusCode::OK, "{me}");
+            let limited = id == 42 || global;
+            assert_eq!(me["role_discovery_incomplete"], limited);
+            assert_eq!(me["guilds"].as_array().unwrap().is_empty(), limited);
+            assert_eq!(me["user"]["id"], id.to_string());
+        }
+        assert_eq!(
+            f.discord.calls.load(Ordering::SeqCst),
+            if global { 1 } else { 2 }
+        );
+        assert_eq!(
+            f.discord.me_calls.load(Ordering::SeqCst),
+            if global { 1 } else { 3 }
+        );
+    }
+}
+
 async fn recovery_rejects_late_save(definitive_refusal: bool) {
     use tower_sessions::SessionStore as _;
     for (method, route, body) in [
@@ -5851,13 +6134,12 @@ async fn review_blocker_oauth_rotation_rejects_late_save() {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert_eq!(body["code"], "auth_lost");
     assert!(f.store.load(&id).await.unwrap().is_none());
-    assert!(f.app.auth_sessions.is_empty());
+    let new_id = new_cookie.split_once('=').unwrap().1.parse().unwrap();
+    assert!(!f.app.auth_sessions.contains_key(&id));
+    assert_eq!(f.app.auth_sessions.len(), 1);
+    assert!(f.app.auth_sessions.contains_key(&new_id));
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), calls);
-    let current = Session::new(
-        Some(new_cookie.split_once('=').unwrap().1.parse().unwrap()),
-        Arc::new(f.store.clone()),
-        None,
-    );
+    let current = Session::new(Some(new_id), Arc::new(f.store.clone()), None);
     require_auth_fresh(&f.app, &current).await.ok().unwrap();
 }
 
@@ -7841,6 +8123,60 @@ async fn role_discovery_reports_failure_and_recovers_without_signing_out() {
     assert_eq!(status, StatusCode::OK, "{me}");
     assert_eq!(me["role_discovery_incomplete"], false);
     assert_eq!(me["guilds"][0]["id"], "10");
+}
+
+#[tokio::test]
+async fn role_discovery_retries_member_429_after_cooldown_and_keeps_manage_access_visible() {
+    let mut f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app.tenant.activate(enrollment).await.unwrap().unwrap();
+    set_access_roles(
+        &f,
+        10,
+        vec![db::guild_data::AccessRole {
+            role_id: 555,
+            level: db::guild_data::AccessLevel::Dashboard,
+        }],
+    )
+    .await;
+    *f.discord.guilds.lock().unwrap() = vec![member_guild(10), managed_guild(20)];
+    f.discord
+        .member_roles
+        .lock()
+        .unwrap()
+        .insert(10, vec!["555".into()]);
+    *f.discord.retry_after.lock().unwrap() = "120".into();
+    f.discord.member_rate_limited.store(true, Ordering::SeqCst);
+
+    login_without_cached_discord_data(&mut f).await;
+    for _ in 0..2 {
+        let (status, me) = f.request("POST", "/api/me", "").await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["role_discovery_incomplete"], true);
+        assert_eq!(me["guilds"].as_array().unwrap().len(), 1);
+        assert_eq!(me["guilds"][0]["id"], "20");
+    }
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.member_calls.load(Ordering::SeqCst), 1);
+    let deadlines = super::discord_retry::load_deadlines(&f.app.db).unwrap();
+    assert_eq!(
+        deadlines.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["r:42:10"]
+    );
+    assert_eq!(
+        f.request("POST", "/api/guilds/10/stats", "").await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+    );
+
+    clear_oauth_budget(&f);
+    f.discord.member_rate_limited.store(false, Ordering::SeqCst);
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["role_discovery_incomplete"], false);
+    assert_eq!(me["guilds"][0]["id"], "10");
+    assert_eq!(me["guilds"][0]["access"], "dashboard");
+    assert_eq!(f.discord.member_calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

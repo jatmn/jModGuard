@@ -4980,6 +4980,31 @@ test('loadConfig reads guild config with POST', async () => {
   assert.deepEqual(calls[0], { url: `/api/guilds/${app.state.guildId}/config`, method: 'POST' });
 });
 
+test('signed-out dashboard links to public policies on the page origin', async () => {
+  const dashboard = fs.readFileSync(new URL('../dist/frontend/index.html', import.meta.url), 'utf8');
+  const stylesheet = fs.readFileSync(new URL('../dist/frontend/style.css', import.meta.url), 'utf8');
+  assert.match(dashboard, /id="app"/);
+  assert.match(stylesheet, /\.legal-page\b/);
+  for (const splitOrigin of [false, true]) {
+    const h = harness(async () => ({
+      ok: false,
+      status: 401,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ error: 'not authenticated' }),
+    }));
+    const apiOrigin = new URL(h.document.URL);
+    apiOrigin.hostname = `api.${apiOrigin.hostname}`;
+    h.window.JMODGUARD_API_BASE = splitOrigin ? apiOrigin.origin : '';
+    await h.app.init();
+    await settle();
+    const links = h.document.querySelectorAll('#login-view nav[aria-label="Policies"] a');
+    assert.deepEqual(Array.from(links, link => [link.textContent, link.getAttribute('href')]), [
+      ['Privacy Policy', '/privacy'],
+      ['Terms of Service', '/terms'],
+    ]);
+  }
+});
+
 test('unauthenticated settings save returns to login', async () => {
   const h = harness(async () => ({
     ok: false,
@@ -8528,18 +8553,29 @@ test('incomplete server discovery offers retry and recovers the server list', as
   const guild = { id: '987654321098765432', name: 'First', access: 'dashboard' };
   const cfg = { enrollment_id: 'membership', settings: { prefix: '!' }, rules: [], commands: [], log_channels: [], badwords: [] };
   const h = harness(async (url) => {
-    if (url.endsWith('/api/me')) return response({ user: { id: '123456789012345678' }, guilds: attempts++ === 0 ? [] : [guild], role_discovery_incomplete: attempts === 1 });
+    if (url.endsWith('/api/me')) {
+      attempts++;
+      return response({ user: { id: '123456789012345678' }, guilds: attempts === 1 ? [] : [guild], role_discovery_incomplete: attempts < 3 });
+    }
     if (url.endsWith('/config')) return response(cfg);
     return response({});
   });
   await h.app.init(); h.app.renderTab(); await settle();
+  assert.equal(h.app.state.me.user.id, '123456789012345678');
   assert.match(h.document.querySelector('#content').textContent, /Server discovery incomplete/);
   assert.doesNotMatch(h.document.querySelector('#content').textContent, /No servers to manage yet/);
-  await fire(Array.from(h.document.querySelectorAll('button')).find(n => n.textContent === 'Retry server discovery'), 'click');
+  const retry = () => Array.from(h.document.querySelectorAll('button')).find(n => n.textContent === 'Retry server discovery');
+  await fire(retry(), 'click');
   assert.equal(attempts, 2);
+  assert.equal(h.app.state.guildId, guild.id);
+  assert.ok(h.document.body.textContent.includes('Some server access checks could not finish'));
+  assert.ok(retry());
+  await fire(retry(), 'click');
+  assert.equal(attempts, 3);
   assert.equal(h.app.state.guildId, guild.id);
   assert.equal(h.document.querySelector('#guild-select .server-picker-name').textContent, guild.name);
   assert.ok(!h.document.body.textContent.includes('Some server access checks could not finish'));
+  assert.equal(retry(), undefined);
 });
 
 test('access-role fields stay locked until a delayed save acknowledgement settles', async () => {

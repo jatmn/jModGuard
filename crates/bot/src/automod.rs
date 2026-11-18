@@ -553,6 +553,7 @@ async fn automod_try_delete_message(
     };
     match raced {
         Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {
+            app.recent_messages.forget(guild_id, channel, message);
             logging::complete_prepared_automod_delete(
                 app, http, guild_id, channel, message, &prepared, rule_id, rule_name, reason,
             )
@@ -1341,6 +1342,22 @@ pub(crate) async fn execute_pending_with(
                                         .ok()
                                         .flatten()
                                         .is_some();
+                                        if let Some(enrollment) = &enrollment
+                                            && rule.ban_delete_message_seconds() > 0
+                                        {
+                                            let deleted = crate::recent_messages::sweep_after_ban(
+                                                app,
+                                                http,
+                                                enrollment,
+                                                target.id.get(),
+                                                rule.ban_delete_message_seconds(),
+                                            )
+                                            .await;
+                                            vars.insert(
+                                                "action".into(),
+                                                format!("ban, deleted {deleted} tracked messages"),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -2708,6 +2725,13 @@ mod tests {
                 let mut user = User::default();
                 user.id = UserId::new(99);
                 user.name = "member".into();
+                app.recent_messages.remember(
+                    10,
+                    99,
+                    71,
+                    41,
+                    chrono::Utc::now().timestamp_millis() - 1_800_000,
+                );
                 let stub = DiscordStub::start();
                 execute_pending_with(
                     &app,
@@ -2738,12 +2762,14 @@ mod tests {
                         1,
                         "{id} purge={stored_purge:?}, days={days}: {seen:?}"
                     );
-                    assert!(
-                        bans[0].ends_with(&format!("delete_message_seconds={seconds} HTTP/1.1"))
-                            || bans[0].ends_with(&format!("delete_message_seconds={seconds}")),
-                        "{seen:?}"
-                    );
+                    crate::spam_actions::tests::assert_ban_request(bans[0], 10, 99, seconds);
                 }
+                assert_eq!(
+                    seen.iter()
+                        .any(|line| line == "DELETE /api/v10/channels/71/messages/41"),
+                    !dry && seconds > 0,
+                    "{seen:?}"
+                );
                 assert!(
                     !seen
                         .iter()
@@ -2943,7 +2969,7 @@ mod tests {
                         .filter(|s| s.starts_with("PUT ") && s.contains("/bans/99"))
                         .collect();
                     assert_eq!(bans.len(), 1, "{seen:?}");
-                    assert!(bans[0].contains("delete_message_seconds=3600"), "{seen:?}");
+                    crate::spam_actions::tests::assert_ban_request(bans[0], 10, 99, 3600);
                     assert!(
                         !seen
                             .iter()
@@ -3012,43 +3038,10 @@ mod tests {
 
     impl DiscordStub {
         fn bind() -> Self {
-            use std::io::{Read, Write};
+            use crate::spam_actions::tests::read_http_request;
+            use std::io::Write;
             use std::sync::Arc;
             use std::sync::atomic::{AtomicBool, Ordering};
-
-            fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String)> {
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                    .ok()?;
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 1024];
-                loop {
-                    match stream.read(&mut tmp) {
-                        Ok(0) => break,
-                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                        Err(error)
-                            if error.kind() == std::io::ErrorKind::WouldBlock
-                                || error.kind() == std::io::ErrorKind::TimedOut =>
-                        {
-                            break;
-                        }
-                        Err(_) => return None,
-                    }
-                    if buf.windows(4).any(|window| window == b"\r\n\r\n") || buf.len() > 65_536 {
-                        break;
-                    }
-                }
-                let header_end = buf.windows(4).position(|window| window == b"\r\n\r\n")?;
-                let header = String::from_utf8_lossy(&buf[..header_end]);
-                let mut parts = header.lines().next()?.split_whitespace();
-                let reason = header
-                    .lines()
-                    .filter_map(|line| line.split_once(':'))
-                    .find(|(key, _)| key.eq_ignore_ascii_case("x-audit-log-reason"))
-                    .map(|(_, value)| value.trim().to_owned())
-                    .unwrap_or_default();
-                Some((parts.next()?.to_string(), parts.next()?.to_string(), reason))
-            }
 
             let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
             let ban_reasons = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3064,17 +3057,14 @@ mod tests {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             let _ = stream.set_nonblocking(false);
-                            let Some((method, path, reason)) = read_request(&mut stream) else {
+                            let Some(request) = read_http_request(&mut stream) else {
                                 continue;
                             };
-                            if method == "PUT" && path.contains("/bans/") {
-                                server_reasons.lock().unwrap().push(reason);
+                            server_lines.lock().unwrap().push(request.summary());
+                            if request.method == "PUT" && request.path.contains("/bans/") {
+                                server_reasons.lock().unwrap().push(request.reason);
                             }
-                            server_lines
-                                .lock()
-                                .unwrap()
-                                .push(format!("{method} {path}"));
-                            let response = if method == "GET" {
+                            let response = if request.method == "GET" {
                                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                             } else {
                                 "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

@@ -766,9 +766,7 @@ impl EventHandler for Handler {
         self.app.snapshots.clear_guild(incomplete.id.get());
         self.app.member_joins.clear_guild(incomplete.id.get());
         self.app.image_spam.invalidate_guild(incomplete.id.get());
-        self.app
-            .attachment_burst
-            .invalidate_guild(incomplete.id.get());
+        self.app.recent_messages.forget_guild(incomplete.id.get());
         self.app.text_spam.invalidate_guild(incomplete.id.get());
         if incomplete.unavailable {
             crate::member_directory::mark_guild_gap(
@@ -890,9 +888,6 @@ impl EventHandler for Handler {
         let _rule_hold = self.app.activation.hold_rule();
         self.app
             .image_spam
-            .invalidate_author(guild_id.get(), user.id.get());
-        self.app
-            .attachment_burst
             .invalidate_author(guild_id.get(), user.id.get());
         self.app
             .text_spam
@@ -1244,7 +1239,6 @@ impl EventHandler for Handler {
         let received = std::time::Instant::now();
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
-        let burst_revision = self.app.attachment_burst.revision();
         let text_revision = self.app.text_spam.revision();
         let app = Arc::clone(self.app());
         let Some(guild_id) = msg.guild_id else { return };
@@ -1256,6 +1250,16 @@ impl EventHandler for Handler {
             msg.author.id.get(),
             msg.member.as_ref().and_then(|member| member.joined_at),
         );
+
+        if msg.webhook_id.is_none() && msg.author.id != ctx.cache.current_user().id {
+            app.recent_messages.remember(
+                guild_id.get(),
+                msg.author.id.get(),
+                msg.channel_id.get(),
+                msg.id.get(),
+                msg.timestamp.timestamp_millis(),
+            );
+        }
 
         // Capture the already-delivered identity before configuration loading
         // yields, so a fast partial edit can still apply its user-ID filter.
@@ -1303,7 +1307,7 @@ impl EventHandler for Handler {
             &msg,
             received,
             received_at,
-            (image_revision, burst_revision),
+            image_revision,
         );
         crate::text_spam::observe(&app, &ctx, &cfg, &msg, received, received_at, text_revision);
         // Generic rules and prefix commands retain their existing bot exemption.
@@ -1403,7 +1407,6 @@ impl EventHandler for Handler {
         let received = std::time::Instant::now();
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
-        let burst_revision = self.app.attachment_burst.revision();
         let text_revision = self.app.text_spam.revision();
         let (known_author_id, detector_update_author_id) = event
             .guild_id
@@ -1457,7 +1460,7 @@ impl EventHandler for Handler {
                         &cfg,
                         &event,
                         &update,
-                        (image_revision, burst_revision),
+                        image_revision,
                     );
                     crate::text_spam::observe_update(
                         &self.app,
@@ -1474,15 +1477,6 @@ impl EventHandler for Handler {
                         .image_spam
                         .invalidate(guild.get(), channel, message);
                     self.app.text_spam.invalidate(guild.get(), channel, message);
-                    if event.attachments.is_some() {
-                        self.app.attachment_burst.invalidate_message_at(
-                            guild.get(),
-                            channel,
-                            message,
-                            false,
-                            event.edited_timestamp.map(|stamp| stamp.timestamp_millis()),
-                        );
-                    }
                 }
             }
         }
@@ -1513,11 +1507,9 @@ impl EventHandler for Handler {
         self.app
             .image_spam
             .deleted(guild_id.get(), channel_id.get(), deleted_message_id.get());
-        self.app.attachment_burst.forget_message(
-            guild_id.get(),
-            channel_id.get(),
-            deleted_message_id.get(),
-        );
+        self.app
+            .recent_messages
+            .forget(guild_id.get(), channel_id.get(), deleted_message_id.get());
         self.app
             .text_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
@@ -1556,11 +1548,11 @@ impl EventHandler for Handler {
         }
         for id in &multiple_deleted_messages_ids {
             self.app
+                .recent_messages
+                .forget(guild_id.get(), channel_id.get(), id.get());
+            self.app
                 .image_spam
                 .invalidate(guild_id.get(), channel_id.get(), id.get());
-            self.app
-                .attachment_burst
-                .forget_message(guild_id.get(), channel_id.get(), id.get());
             self.app
                 .text_spam
                 .invalidate(guild_id.get(), channel_id.get(), id.get());

@@ -30,15 +30,15 @@ fn rule(id: &str) -> RuleDef {
         ),
         "attachment_flood" => (
             "Exact image spam",
-            "The same distinct image files posted by one author across channels. Dry-run logs only; normal mode deletes the matched messages and bans. Extra images are allowed. Configure an automod log channel.",
+            "Repeated images by one author across channels. Matches identical bytes or a quick cross-channel repost with matching image metadata. Dry-run logs only. Configure an automod log channel.",
             json!({"mode":"exact_image_test", "window_secs": 60, "min_attachments": 2, "min_channels": 3}),
-            vec![action(1, "log", "Exact image spam test", 0, 0)],
+            vec![spam_test_action("Exact image spam test")],
         ),
         "repeat_text" => (
             "Repeated text",
             "The same trimmed text posted by one author across channels. Matching is exact after leading/trailing whitespace only. Dry-run logs only; normal mode deletes the matched messages and bans.",
             json!({"mode":"exact_text", "window_secs": 60, "min_channels": 3, "min_length": 20}),
-            vec![action(1, "log", "Repeated text test", 0, 0)],
+            vec![spam_test_action("Repeated text test")],
         ),
         "new_member_url" => (
             "New-member URL",
@@ -110,6 +110,14 @@ fn rule(id: &str) -> RuleDef {
         include_channels: vec![],
         log_automod: true,
         open_case: true,
+    }
+}
+
+fn spam_test_action(reason: &str) -> ActionDef {
+    // The editor carries the saved deletion choice between dry-run and enforcement.
+    ActionDef {
+        purge_last_hour: true,
+        ..action(1, "log", reason, 0, 0)
     }
 }
 
@@ -905,18 +913,9 @@ pub fn default_templates() -> Vec<(&'static str, &'static str)> {
 /// `!userinfo` / `/userinfo` reply body (rendered and clipped to 2000 UTF-16 units).
 pub const USER_INFO_TEMPLATE: &str = "**User info**\n**ID:** `{user_id}`\n**Username:** {username}\n**Global name:** {global_name}\n**Nick:** {nick}\n**Account:** {account_created} ({account_age})\n**Joined:** {joined_at}\n**Roles:** {roles}\n**Voice:** {voice}\n**Warnings:** {warns}\n**Cases:**\n{cases}{clipped}";
 
-/// Appended to an attachment-burst review after a moderator uses a button.
-pub const ATTACHMENT_BURST_DECISION: &str = "{body}\n\n**Review:** {decision} by {actor}";
-pub const ATTACHMENT_BURST_REASON: &str = "Same attachment in {channels} channels within {window}";
-pub const ATTACHMENT_BURST_TIMEOUT_ACTION: &str = "timeout {duration}";
-pub const ATTACHMENT_BURST_TIMEOUT_MISSED: &str = "timeout not applied; awaiting review";
-pub const ATTACHMENT_BURST_TIMEOUT_UNCERTAIN: &str = "timeout outcome uncertain; awaiting review";
-pub const ATTACHMENT_BURST_DENIED: &str = "That review action is not available to you.";
-pub const ATTACHMENT_BURST_HANDLED: &str = "That review was already handled.";
-pub const ATTACHMENT_BURST_FAILED: &str = "could not apply that action";
-pub const ATTACHMENT_BURST_RELEASED: &str = "timeout removed";
-pub const ATTACHMENT_BURST_BANNED: &str = "banned";
-pub const ATTACHMENT_BURST_REVIEW_REASON: &str = "attachment burst review";
+/// Acknowledge a button on a moderation card posted by an older version.
+pub const RETIRED_IMAGE_REVIEW: &str =
+    "This review has expired. Use the current automod settings or moderation commands.";
 
 /// DM body when a moderator uses kick/ban with `--dm` or slash `dm`.
 pub const MOD_REASON_DM_TEMPLATE: &str = "A moderator has requested your removal from **{guild}**.\nAction: {action}\nReason: {reason}\n— {actor}";

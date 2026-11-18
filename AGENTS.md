@@ -179,15 +179,18 @@ must not be reported as live Bunny proof or measured resource usage.
 The attachment and repeated-text rules now use bounded Gateway exact-image and
 exact-trimmed-text paths, in test or delete-and-ban mode; see `docs/IMAGE-SPAM.md`.
 Never restore the count-only trigger or route matches into the generic punishment
-executor. The separate attachment burst times out the same attachment across
-channels and posts a Release/Ban review; it is not count-only detection, does
-not use account age, and does not change the exact-image size check. Require an exact common distinct-hash set or exact trimmed text across
-channels, preserve original observation time and invalidation/replay guards, and
-keep work/metadata bounds with no background task queue. Test reports are Discord
+executor. Exact image spam also recognizes matching image attachment metadata
+in two channels within 10 seconds (bounded by the rule window), using the same
+rule scope and action. Require an exact common distinct-hash set for byte matches
+or exact trimmed text across channels. Preserve original observation time,
+invalidation and replay guards, and work and metadata bounds without a background
+task queue. Test reports are Discord
 logs only, with no SQL cases. Enforcement rechecks membership/exemptions, deletes
-matched messages and bans with truthful separate outcomes, and records selected
-case text (hashes/message IDs/trimmed excerpts). Exact-image spam retains hashes and safe case metadata only, with no attachment
-byte capture. Operator-managed guild-local known-bad digests use the existing
+matched messages and bans with truthful separate outcomes. Automod bans use
+the saved Discord deletion window and sweep the matching tracked Gateway IDs
+across channels. Enforcement records selected case text (hashes, message IDs or
+trimmed excerpts). Exact-image spam retains hashes and safe case metadata, with
+no attachment byte capture. Operator-managed guild-local known-bad digests use the existing
 configuration version and bot writer control path. Process image budgets belong
 only to bot config.
 Owner-selected image updates use the existing WebUI/API; see `docs/BUNNY-UPDATES.md`.

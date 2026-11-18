@@ -41,6 +41,24 @@ Per-message and per-guild diagnostics require `debug`.
 Enable it only briefly: diagnostic metadata can reveal per-user activity even
 though the per-message line omits author IDs and message text. Restrict log access.
 
+### Public legal details
+
+Operators must fill in `[legal]` in the API's configuration before publishing
+the policy URLs. The pages and the signed-out `GET /api/legal` endpoint publish
+these values, so use text intended for the public. List each applicable
+subprocessor with its role, such as hosting, CDN, or database. Blank or
+omitted values appear as unconfigured on the pages. Restart the API to apply
+changes.
+
+| `[legal]` field | API environment override |
+|---|---|
+| `operator_name` | `JMODGUARD_LEGAL_OPERATOR_NAME` |
+| `privacy_contact` | `JMODGUARD_LEGAL_PRIVACY_CONTACT` |
+| `deletion_instructions` | `JMODGUARD_LEGAL_DELETION_INSTRUCTIONS` |
+| `subprocessors` | `JMODGUARD_LEGAL_SUBPROCESSORS` (JSON array of strings) |
+| `jurisdiction` | `JMODGUARD_LEGAL_JURISDICTION` |
+| `effective_date` | `JMODGUARD_LEGAL_EFFECTIVE_DATE` |
+
 Administrative policy (`[actions]`) is shared by bot/API; scheduling (`[action_worker]`)
 is bot-only. See [all action defaults and environment overrides](BOT-ACTIONS.md#runtime-controls).
 Bot-only `[member_sync]` config sets `page_size = 100` (allowed 1–500),

@@ -1073,7 +1073,26 @@ struct SlashCtx {
 
 pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction: Interaction) {
     if let Interaction::Component(interaction) = interaction {
-        crate::attachment_burst::handle_component(app, ctx, interaction).await;
+        // Acknowledge already-posted cards without loading or applying an action.
+        if interaction.data.custom_id.starts_with("jmgburst:") {
+            use serenity::builder::{
+                Builder, CreateInteractionResponse, CreateInteractionResponseMessage,
+            };
+            let content = crate::templates::render(
+                crate::defaults::RETIRED_IMAGE_REVIEW,
+                &std::collections::BTreeMap::new(),
+            );
+            if let Err(error) = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(content)
+                    .ephemeral(true),
+            )
+            .execute(&ctx.http, (interaction.id, interaction.token.as_str()))
+            .await
+            {
+                tracing::debug!(%error, "could not acknowledge retired image review");
+            }
+        }
         return;
     }
     let Interaction::Command(interaction) = interaction else {
