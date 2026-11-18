@@ -82,6 +82,15 @@ pub struct CaseListPosition {
     case_id: CaseId,
 }
 
+impl CaseListPosition {
+    pub fn from_case_id(case_id: CaseId) -> Self {
+        Self {
+            value: CaseSortValue::Text(case_id.as_str().to_owned()),
+            case_id,
+        }
+    }
+}
+
 pub struct CaseListQuery {
     pub filter: CaseFilter,
     pub search: Option<String>,

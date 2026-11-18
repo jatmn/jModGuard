@@ -6,6 +6,7 @@ const SEARCH_LIMIT = 200;
 const SEARCH_DELAY_MS = 300;
 const savedListLocation = "jmodguard.list-before-login";
 const commonKeys = ["q", "from", "to"];
+let pendingListSearch = null;
 
 function filterKeys(config) {
   return [...config.filters.map(({ key }) => key), ...commonKeys];
@@ -18,6 +19,12 @@ function emptyFilters(config) {
 export function readListLocation() {
   const query = new URLSearchParams(location.search);
   return { list: query.get("list"), guild: query.get("guild") };
+}
+
+export function flushPendingListSearch(list, guildId) {
+  if (pendingListSearch?.list === list && pendingListSearch.guildId === guildId) {
+    pendingListSearch.flush();
+  }
 }
 
 function listLocation(query) {
@@ -110,9 +117,16 @@ export function useListControls(config, guildId, onChange, canChange = () => tru
   guard.current = canChange;
   const [drafts, setDrafts] = useState({});
   const timers = useRef(new Map());
-  useEffect(() => () => {
-    for (const timer of timers.current.values()) clearTimeout(timer);
-  }, []);
+  const cancelText = (key) => {
+    const timer = timers.current.get(key);
+    clearTimeout(timer);
+    if (pendingListSearch?.timer === timer) pendingListSearch = null;
+    timers.current.delete(key);
+  };
+  const cancelTexts = () => {
+    for (const key of timers.current.keys()) cancelText(key);
+  };
+  useEffect(() => cancelTexts, []);
 
   const commit = (next) => {
     if (!guard.current()) return;
@@ -122,8 +136,7 @@ export function useListControls(config, guildId, onChange, canChange = () => tru
     onChange();
   };
   const setFilter = (key, value) => {
-    clearTimeout(timers.current.get(key));
-    timers.current.delete(key);
+    cancelText(key);
     setDrafts((previous) => {
       const remaining = { ...previous };
       delete remaining[key];
@@ -135,8 +148,7 @@ export function useListControls(config, guildId, onChange, canChange = () => tru
   };
   const withFilters = (filters) => ({ ...current.current, filters: { ...emptyFilters(config), ...filters } });
   const replaceFilters = (filters = {}) => {
-    for (const timer of timers.current.values()) clearTimeout(timer);
-    timers.current.clear();
+    cancelTexts();
     setDrafts({});
     commit(withFilters(filters));
   };
@@ -150,9 +162,23 @@ export function useListControls(config, guildId, onChange, canChange = () => tru
   });
   const setText = (key, value) => {
     const text = boundedSearch(value);
+    const trimmed = text.trim();
     setDrafts((previous) => ({ ...previous, [key]: text }));
-    clearTimeout(timers.current.get(key));
-    timers.current.set(key, setTimeout(() => setFilter(key, text.trim()), SEARCH_DELAY_MS));
+    cancelText(key);
+    const timer = setTimeout(() => setFilter(key, trimmed), SEARCH_DELAY_MS);
+    timers.current.set(key, timer);
+    if (key === "q") {
+      pendingListSearch = {
+        list: config.list, guildId, timer,
+        flush: () => {
+          cancelText(key);
+          const previous = current.current;
+          replaceListLocation(viewQuery(config, guildId, {
+            ...previous, filters: { ...previous.filters, q: trimmed },
+          }));
+        },
+      };
+    }
   };
   const sortBy = (column) => {
     const previous = current.current;

@@ -41,7 +41,7 @@ modified or used to establish provider-specific behavior.
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
 binaries. Start the bot to initialize it, then the API. The current baseline contains
-migrations 0001–0020. Do not add or edit the family marker on an old database to bypass
+migrations 0001–0027. Do not add or edit the family marker on an old database to bypass
 the guard; the version number alone cannot establish compatibility.
 
 Keep a backup with the binaries/images that support its family and version. A backup from an unsupported
@@ -111,8 +111,8 @@ across guilds ([MEMBERS.md](MEMBERS.md)).
 
 ## Separate guild-store family
 
-The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version20,
-using `migrations/guild/0001_identity.sql` through `0019_server_names.sql`. Version 16
+The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version 21,
+using `migrations/guild/0001_identity.sql` through `0020_case_list_orders.sql`. Version 16
 adds optional immutable ban attempt tags to case payloads without changing tables or
 rewriting legacy cases. Version 17 adds durable `guild_member_pending_rejoin_notes` so
 member-rejoin log delivery can survive restarts and member-sync ahead of gateway joins.
@@ -122,14 +122,15 @@ Version 19 adds `guild_tenant_settings.access_roles` (WebUI role -> access level
 mappings); existing rows keep none.
 Version 20 adds `guild_server_names` (the bot's latest role and channel names for
 WebUI pickers, display only); upgraded stores start empty until the bot's next
-Gateway snapshot.
-Earlier binaries must not read version16+ case tags, version17 pending receipts, version18 gap flags, version19 access roles, or version20 server names. This separate
+Gateway snapshot. Version 21 adds virtual keys and scoped indexes for case list sorting.
+Earlier binaries must not open stores that use a newer guild schema. This separate
 database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings, bounded latest-message snapshots and the bounded
 [member directory](MEMBERS.md). Initialize verifies and upgrades a matching earlier
-store atomically; open requires 14. See [tenant runtime](TENANT-RUNTIME.md). Core is at
-migration 0020. Each opener refuses the other family. No records are moved by startup.
+store atomically. Opening an initialized store requires version 21. See
+[tenant runtime](TENANT-RUNTIME.md). Core is at migration 0027. Each opener refuses
+the other family. No records are moved by startup.
 Guild migration 0009 adds bounded latest-message snapshots with fixed 24-hour expiry
 and store-level capture health. Guild migration 0010 adds the member directory,
 stays, case projection, sync state and immutable initial-seed completion.
@@ -158,7 +159,7 @@ index for the bot-action poll. Core migration 0018 deletes surplus active ban
 rows for the same guild and user, keeping the row that already has an actor or
 a real reason, otherwise the earliest id. Inactive history stays. A unique index
 then rejects a second active row. Upgrade the bot and API together through the
-existing paired schema protocol; their exact core runtime schema is now 20. Migration 0020 adds the gateway ban delivery inbox: full received ban/unban/audit facts and stable retry results, scoped to the captured guild membership.
+existing paired schema protocol. Migration 0020 adds the gateway ban delivery inbox: full received ban/unban/audit facts and stable retry results, scoped to the captured guild membership.
 Migration 0015 adds `guild_local_write_fence` so a member-sync status read can see a fence inside the guild transaction, and `guild_writer_epoch` so a leased guild commit must match the holder's generation before it lands. Core fences remain in the other database. A newer holder raises that epoch in the guild store before it acts. The core writer lock is not held across the guild commit.
 
 ## Known spam configuration extension

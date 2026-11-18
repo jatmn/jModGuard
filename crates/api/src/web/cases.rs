@@ -12,11 +12,20 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
-use serde::Deserialize;
+use jmodguard_updater::oci::sha256_hex;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_sessions::Session;
 
 const CASE_LIST: &str = "cases";
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CaseCursor {
+    context: String,
+    position: CaseListPosition,
+    legacy_id_order: bool,
+}
 
 #[derive(Deserialize)]
 pub struct CasePage {
@@ -140,10 +149,8 @@ async fn list_cases_inner(
 ) -> ApiResult<Json<serde_json::Value>> {
     let (auth, enrollment) =
         scoped(app, session, headers, guild_id, GuildAccess::Dashboard).await?;
-    let limit = page
-        .limit
-        .unwrap_or(50)
-        .clamp(1, tenant::case_limits().max_page_size);
+    let limits = tenant::case_limits();
+    let limit = page.limit.unwrap_or(50).clamp(1, limits.max_page_size);
     let explicit_sort = page.list.sort.is_some() || page.list.dir.is_some();
     let list = page.list.validate(CaseSort::Date, SortDirection::Desc)?;
     let filter = CaseFilter {
@@ -172,22 +179,44 @@ async fn list_cases_inner(
             )));
         }
         let after = list.after.as_deref().map(parse_case_id).transpose()?;
-        let ids = store
-            .removed_case_ids(scope.clone(), after, limit, tenant::case_limits())
+        let (ids, next) = store
+            .removed_case_page(scope.clone(), after, limit, limits)
             .await?;
-        let next = ids
-            .last()
-            .filter(|_| ids.len() == limit as usize)
-            .map(|id| id.as_str().to_owned());
-        (ids, next)
+        (ids, next.map(String::from))
     } else {
+        let context = sha256_hex(&serde_json::to_vec(&(
+            guild_id,
+            &filter.action,
+            &filter.outcome,
+            filter.subject_id,
+            filter.actor_id,
+            list.q.as_deref().map(str::to_ascii_lowercase),
+            list.from_ms,
+            list.until_ms,
+        ))?);
         let after = list
             .after
             .as_deref()
             .map(|token| {
-                decode_cursor::<_, CaseListPosition>(token, CASE_LIST, list.sort, list.dir)
+                // The old endpoint used bare case IDs and always paged in ascending ID order.
+                if !explicit_sort && let Ok(id) = parse_case_id(token) {
+                    return Ok((CaseListPosition::from_case_id(id), true));
+                }
+                let cursor: CaseCursor = decode_cursor(token, CASE_LIST, list.sort, list.dir)?;
+                if cursor.context != context {
+                    return Err(ApiError(anyhow::anyhow!(
+                        "list cursor does not match the guild or filters"
+                    )));
+                }
+                if cursor.legacy_id_order && explicit_sort {
+                    return Err(ApiError(anyhow::anyhow!(
+                        "list cursor does not match the requested sort"
+                    )));
+                }
+                Ok((cursor.position, cursor.legacy_id_order))
             })
             .transpose()?;
+        let legacy_id_order = after.as_ref().is_some_and(|(_, legacy)| *legacy);
         let page = store
             .list_cases(
                 scope.clone(),
@@ -196,17 +225,32 @@ async fn list_cases_inner(
                     search: list.q,
                     from_ms: list.from_ms,
                     until_ms: list.until_ms,
-                    sort: list.sort,
-                    descending: list.dir == SortDirection::Desc,
-                    after,
+                    sort: if legacy_id_order {
+                        CaseSort::Case
+                    } else {
+                        list.sort
+                    },
+                    descending: !legacy_id_order && list.dir == SortDirection::Desc,
+                    after: after.map(|(position, _)| position),
                 },
                 limit,
-                tenant::case_limits(),
+                limits,
             )
             .await?;
         let next = page
             .next
-            .map(|position| encode_cursor(CASE_LIST, list.sort, list.dir, position))
+            .map(|position| {
+                encode_cursor(
+                    CASE_LIST,
+                    list.sort,
+                    list.dir,
+                    CaseCursor {
+                        context,
+                        position,
+                        legacy_id_order,
+                    },
+                )
+            })
             .transpose()?;
         let ids = page
             .entries
