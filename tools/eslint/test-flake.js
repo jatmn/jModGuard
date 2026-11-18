@@ -32,23 +32,28 @@ function importDefinition(source, node, modules) {
 }
 
 function hostTimer(source, node) {
-    if (globalName(source, node, "setTimeout") || globalMember(source, node, "setTimeout")) return true;
+    if (globalName(source, node, "setTimeout") || globalMember(source, node, "setTimeout")) return "replaceable";
     const imported = importDefinition(source, node, timerModules);
-    if (imported?.imported?.name === "setTimeout") return true;
-    const namespace = property(node, "setTimeout") && importDefinition(source, node.object, timerModules);
-    return namespace?.type === "ImportNamespaceSpecifier" || namespace?.type === "ImportDefaultSpecifier";
+    if (imported?.imported?.name === "setTimeout") return "captured";
+    const object = property(node, "setTimeout") && importDefinition(source, node.object, timerModules);
+    if (object?.type === "ImportNamespaceSpecifier") return "captured";
+    if (object?.type === "ImportDefaultSpecifier") return "replaceable";
+    return undefined;
 }
 
-function clockControl(source, node) {
-    const timers = node?.object;
-    if (!property(timers, "timers")) return false;
-    const mock = timers.object;
+function mockTracker(source, mock) {
     if (importDefinition(source, mock, testModules)?.imported?.name === "mock") return true;
     if (!property(mock, "mock")) return false;
     const [def] = binding(source, mock.object)?.defs ?? [];
     return def?.type === "Parameter" && def.node.parent?.type === "CallExpression" &&
         def.node.parent.arguments.includes(def.node) &&
         isTest(source, def.node.parent.callee);
+}
+
+function clockControl(source, node) {
+    const receiver = node?.object;
+    if (property(node, "reset") && mockTracker(source, receiver)) return true;
+    return property(receiver, "timers") && mockTracker(source, receiver.object);
 }
 
 function isTest(source, callee) {
@@ -114,10 +119,48 @@ export default {
             node, messageId, data: { test: testName(source, node) },
         });
         const hostDate = (node) => globalName(source, node, "Date") || globalMember(source, node, "Date");
+        const retryCandidates = [];
+        const swallowingCatches = new Set();
+        let path;
+
+        // A jump can swallow an assertion without reaching the end of its catch.
+        // Count only catches it leaves, within the current function.
+        function recordCatchEscape(node) {
+            if (!path.reachable.size) return;
+            for (const ancestor of source.getAncestors(node).reverse()) {
+                if (ancestor === path.node) break;
+                if (node.type !== "ReturnStatement") {
+                    const target = node.label
+                        ? ancestor.type === "LabeledStatement" && ancestor.label.name === node.label.name
+                        : loopTypes.has(ancestor.type) ||
+                            (node.type === "BreakStatement" && ancestor.type === "SwitchStatement");
+                    if (target) break;
+                }
+                if (ancestor.type === "CatchClause") swallowingCatches.add(ancestor);
+            }
+        }
+
         return {
+            onCodePathStart(_codePath, node) {
+                path = { node, parent: path, reachable: new Set() };
+            },
+            onCodePathEnd() {
+                path = path.parent;
+            },
+            onCodePathSegmentStart(segment) {
+                if (segment.reachable) path.reachable.add(segment);
+            },
+            onCodePathSegmentEnd(segment) {
+                path.reachable.delete(segment);
+            },
+            "CatchClause:exit"(node) {
+                if (path.reachable.size) swallowingCatches.add(node);
+            },
+            "BreakStatement, ContinueStatement, ReturnStatement": recordCatchEscape,
             CallExpression(node) {
                 const { callee } = node;
-                if (hostTimer(source, callee) && !clockIsMocked(source, node, "setTimeout")) {
+                const timer = hostTimer(source, callee);
+                if (timer === "captured" || (timer === "replaceable" && !clockIsMocked(source, node, "setTimeout"))) {
                     report(node, "sleep");
                 }
                 if ((hostDate(callee) || (property(callee, "now") && hostDate(callee.object))) &&
@@ -127,15 +170,21 @@ export default {
                 if (!assertion(source, callee)) return;
                 const ancestors = source.getAncestors(node);
                 const loop = ancestors.findLastIndex((ancestor) => loopTypes.has(ancestor.type));
-                if (loop >= 0 && ancestors.slice(loop + 1).some((ancestor, index, inner) =>
+                if (loop < 0) return;
+                const handlers = ancestors.slice(loop + 1).flatMap((ancestor, index, inner) =>
                     ancestor.type === "TryStatement" && ancestor.handler && ancestor.block === inner[index + 1]
-                )) {
-                    report(node, "retry");
-                }
+                        ? [ancestor.handler] : []
+                );
+                if (handlers.length) retryCandidates.push({ node, handlers });
             },
             NewExpression(node) {
                 if (!node.arguments.length && hostDate(node.callee) && !clockIsMocked(source, node, "Date")) {
                     report(node, "clock");
+                }
+            },
+            "Program:exit"() {
+                for (const { node, handlers } of retryCandidates) {
+                    if (handlers.some((handler) => swallowingCatches.has(handler))) report(node, "retry");
                 }
             },
         };
