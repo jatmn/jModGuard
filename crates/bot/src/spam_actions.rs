@@ -524,9 +524,6 @@ async fn punish_proven_match(
         .await;
         return ReportDisposition::Consumed;
     }
-    if withhold_ban && matches!(&found.policy, MatchPolicy::ImageMetadata { .. }) {
-        return ReportDisposition::Consumed;
-    }
     let now = Instant::now();
     let mut deleted_count = 0;
     let mut delete_notes = Vec::new();

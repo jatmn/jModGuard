@@ -43,7 +43,9 @@ whitelist cannot be evaluated without roles, so that update is not admitted.
 Delete and ban claims are reserved while Discord work is in flight and committed
 only after success, so a failed or timed-out attempt can be retried in the same
 window. If membership cannot be confirmed at enforcement time, the bot logs the
-skip and does not punish.
+skip and does not punish. With **Skip moderators** enabled and membership
+confirmed, unknown cached moderator status allows matched-message deletes and
+withholds the ban for both metadata and byte-hash matches.
 
 ## Matching
 

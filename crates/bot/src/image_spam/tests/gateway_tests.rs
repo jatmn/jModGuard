@@ -253,6 +253,32 @@ async fn assert_ban_and_sweep(cfg: jmodguard::config::BotProcessConfig) {
 }
 
 #[tokio::test]
+async fn gateway_fast_image_deletes_without_banning_when_moderator_status_is_unknown() {
+    let mut rule = live_rule();
+    rule.skip_moderators = true;
+    let fixture = Fixture::new(Default::default(), rule).await;
+    // The member lookup succeeds, but the Gateway cache has no guild roles.
+    fixture.burst().await;
+    assert_eq!(
+        *fixture.discord.requests.lock(),
+        [
+            "GET /api/v10/guilds/1/members/99",
+            "DELETE /api/v10/channels/101/messages/1010",
+            "DELETE /api/v10/channels/102/messages/1011",
+            "POST /api/v10/channels/999/messages",
+        ]
+    );
+    let reports = fixture.discord.reports.lock();
+    assert_eq!(reports.len(), 1);
+    let text = crate::logging::tests::log_text(&reports[0]);
+    assert!(
+        text.contains("Matching image attachment metadata"),
+        "{text}"
+    );
+    assert!(text.contains("moderator status unknown"), "{text}");
+}
+
+#[tokio::test]
 async fn gateway_fast_image_dry_run_logs_without_mutations_or_components() {
     let mut rule = live_rule();
     rule.dry_run = true;
