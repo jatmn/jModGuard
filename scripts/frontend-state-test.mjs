@@ -8453,6 +8453,7 @@ test('incomplete server discovery offers retry and recovers the server list', as
     return response({});
   });
   await h.app.init(); h.app.renderTab(); await settle();
+  assert.equal(h.app.state.me.user.id, '123456789012345678');
   assert.match(h.document.querySelector('#content').textContent, /Server discovery incomplete/);
   assert.doesNotMatch(h.document.querySelector('#content').textContent, /No servers to manage yet/);
   await fire(Array.from(h.document.querySelectorAll('button')).find(n => n.textContent === 'Retry server discovery'), 'click');

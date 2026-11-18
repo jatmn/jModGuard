@@ -83,34 +83,46 @@ impl GuildListGate {
             Cooldown::Until(until) => until > now,
         });
         match self.cooldowns.get(token).copied()? {
-            Cooldown::RestOfProcess | Cooldown::AwaitingBody => Some(Duration::MAX),
+            Cooldown::RestOfProcess => Some(Duration::MAX),
+            Cooldown::AwaitingBody => Some(Duration::from_secs(1)),
             Cooldown::Until(until) => Some(until.saturating_duration_since(now)),
         }
     }
 
-    fn block_until(&mut self, token: &str, retry_after: Duration) {
-        let next = cooldown_deadline(Instant::now(), retry_after);
-        let replace = match self.cooldowns.get(token).copied() {
-            Some(Cooldown::RestOfProcess) => false,
-            Some(Cooldown::AwaitingBody) => true,
-            Some(Cooldown::Until(existing)) => match next {
-                Cooldown::RestOfProcess => true,
-                Cooldown::Until(until) => until > existing,
-                Cooldown::AwaitingBody => true,
-            },
-            None => true,
-        };
-        if replace {
-            self.cooldowns.insert(token.to_owned(), next);
-            if super::discord_retry::durable_key(token) {
-                let millis = wall_deadline_ms(retry_after);
-                let previous = self.deadlines_ms.get(token).copied().unwrap_or(0);
-                if millis > previous {
-                    self.deadlines_ms.insert(token.to_owned(), millis);
-                    self.generation = self.generation.saturating_add(1);
-                }
+    fn record_429(
+        &mut self,
+        route_key: &str,
+        global: bool,
+        received: Instant,
+        received_ms: i64,
+        retry_after: Option<Duration>,
+    ) -> bool {
+        let key = if global {
+            if self.cooldowns.get(route_key) == Some(&Cooldown::AwaitingBody) {
+                self.cooldowns.remove(route_key);
             }
+            "global"
+        } else {
+            route_key
+        };
+        // The 429's retry time supersedes any earlier bucket reset for this
+        // scope. Anchor it to receipt so reading the body cannot add extra wait.
+        let wait = retry_after.unwrap_or(Duration::from_secs(1));
+        self.cooldowns
+            .insert(key.to_owned(), cooldown_deadline(received, wait));
+        if !super::discord_retry::durable_key(key) {
+            return false;
         }
+        if let Some(wait_ms) = retry_after.and_then(|wait| i64::try_from(wait.as_millis()).ok())
+            && let Some(deadline_ms) = received_ms.checked_add(wait_ms)
+        {
+            self.deadlines_ms.insert(key.to_owned(), deadline_ms);
+        } else if self.deadlines_ms.remove(key).is_none() {
+            // An absent or unrepresentable wait has no durable deadline.
+            return false;
+        }
+        self.generation = self.generation.saturating_add(1);
+        true
     }
 
     fn durable_snapshot(&mut self) -> RetryDeadlineSnapshot {
@@ -137,12 +149,6 @@ impl GuildListGate {
                 .collect(),
         }
     }
-}
-
-fn wall_deadline_ms(retry_after: Duration) -> i64 {
-    let now = chrono::Utc::now().timestamp_millis();
-    let extra = i64::try_from(retry_after.as_millis().min(i64::MAX as u128)).unwrap_or(i64::MAX);
-    now.saturating_add(extra)
 }
 
 pub(crate) fn cooldown_deadline(now: Instant, retry_after: Duration) -> Cooldown {
@@ -211,8 +217,10 @@ impl std::error::Error for DiscordRetryAfter {}
 /// impose a one-second floor so callers do not hammer immediately. The HTTP
 /// handler returns immediately; this number is not a sleep.
 pub(crate) fn retry_after_header_secs(retry_after: Duration) -> u64 {
-    let seconds = retry_after.as_millis().div_ceil(1000);
-    u64::try_from(seconds).unwrap_or(u64::MAX).max(1)
+    retry_after
+        .as_secs()
+        .saturating_add(u64::from(retry_after.subsec_nanos() > 0))
+        .max(1)
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -368,21 +376,26 @@ impl OAuthClient {
     }
 
     pub async fn exchange_code(&self, code: &str) -> Result<TokenResponse> {
-        self.token_request("authorization_code", code, None).await
+        let key = format!("t:login:{:016x}", token_fingerprint(code));
+        self.token_request("authorization_code", code, &key).await
     }
 
-    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse> {
-        self.token_request("refresh_token", refresh_token, None)
+    pub async fn refresh(&self, user_id: u64, refresh_token: &str) -> Result<TokenResponse> {
+        self.token_request("refresh_token", refresh_token, &format!("t:{user_id}"))
             .await
+    }
+
+    pub(super) fn refresh_remaining(&self, user_id: u64) -> Option<Duration> {
+        self.route_remaining(&format!("t:{user_id}"))
     }
 
     async fn token_request(
         &self,
         grant_type: &str,
         value: &str,
-        _code_verifier: Option<&str>,
+        key: &str,
     ) -> Result<TokenResponse> {
-        if let Some(retry_after) = self.route_remaining("token") {
+        if let Some(retry_after) = self.route_remaining(key) {
             return Err(DiscordRateLimit { retry_after }.into());
         }
         let url = "https://discord.com/api/oauth2/token";
@@ -416,10 +429,7 @@ impl OAuthClient {
         } else {
             None
         };
-        let bytes = match self
-            .read_limited_body("token", status, &headers, resp)
-            .await
-        {
+        let bytes = match self.read_response_body(key, "/oauth2/token", resp).await {
             Ok(bytes) => bytes,
             Err(error) if error.downcast_ref::<DiscordRateLimit>().is_some() => return Err(error),
             Err(error) => {
@@ -434,18 +444,12 @@ impl OAuthClient {
                 return Err(error.context("oauth token response body failed"));
             }
         };
-        self.observe_route("token", status, &headers, &bytes).await;
+        self.note_bucket_reset(key, &headers);
         if refused {
             return Err(DiscordUnauthorized.into());
         }
         if let Some(retry_after) = server_retry_after {
             return Err(DiscordRetryAfter { retry_after }.into());
-        }
-        if status.as_u16() == 429 {
-            return Err(DiscordRateLimit {
-                retry_after: discord_retry_after(header_retry_after(&headers), &bytes),
-            }
-            .into());
         }
         if !status.is_success() {
             anyhow::bail!("discord oauth error {status}: {}", token_error_code(&bytes));
@@ -477,18 +481,12 @@ impl OAuthClient {
         if matches!(status.as_u16(), 401 | 403) {
             return Err(DiscordUnauthorized.into());
         }
-        let bytes = match self.read_limited_body(&key, status, &headers, resp).await {
+        let bytes = match self.read_response_body(&key, "/users/@me", resp).await {
             Ok(bytes) => bytes,
             Err(error) if error.downcast_ref::<DiscordRateLimit>().is_some() => return Err(error),
             Err(error) => return Err(error.context("discord me response body failed")),
         };
-        self.observe_route(&key, status, &headers, &bytes).await;
-        if status.as_u16() == 429 {
-            return Err(DiscordRateLimit {
-                retry_after: discord_retry_after(header_retry_after(&headers), &bytes),
-            }
-            .into());
-        }
+        self.note_bucket_reset(&key, &headers);
         if !status.is_success() {
             anyhow::bail!("discord me request failed with {status}");
         }
@@ -528,7 +526,10 @@ impl OAuthClient {
         if status.as_u16() == 404 {
             return Ok(Vec::new());
         }
-        let bytes = match self.read_limited_body(&key, status, &headers, resp).await {
+        let bytes = match self
+            .read_response_body(&key, "/users/@me/guilds/{id}/member", resp)
+            .await
+        {
             Ok(bytes) => bytes,
             Err(error) => {
                 return Err(match error.downcast_ref::<DiscordRateLimit>() {
@@ -541,12 +542,7 @@ impl OAuthClient {
                 });
             }
         };
-        self.observe_route(&key, status, &headers, &bytes).await;
-        if status.as_u16() == 429 {
-            return Err(MemberRolesError::RateLimited {
-                retry_after: discord_retry_after(header_retry_after(&headers), &bytes),
-            });
-        }
+        self.note_bucket_reset(&key, &headers);
         if !status.is_success() {
             return Err(MemberRolesError::Failed(anyhow::anyhow!(
                 "discord member request failed with {status}"
@@ -597,9 +593,6 @@ impl OAuthClient {
                 }
                 let result = self.fetch_guild_pages(&user_key, access_token).await;
                 guard.finish(&shared_outcome(&result));
-                if matches!(result, Err(GuildListError::RateLimited { fresh: true, .. })) {
-                    self.persist_deadlines().await;
-                }
                 result
             }
         }
@@ -645,60 +638,29 @@ impl OAuthClient {
             if matches!(status.as_u16(), 401 | 403) {
                 return Err(GuildListError::Unauthorized);
             }
-            if status.as_u16() == 429 {
-                let header = header_retry_after(&headers).map(str::to_owned);
-                let header_global = limit_scope_is_global(&headers);
-                let gate = std::sync::Arc::clone(&self.guild_list);
-                let cooldown_key = user_key.to_owned();
-                self.hold_for_body(user_key);
-                let header_for_response = header.clone();
-                let finish = tokio::spawn(async move {
-                    let (retry_after, body_global) = match resp.bytes().await {
-                        Ok(bytes) => (
-                            discord_retry_after(header.as_deref(), &bytes),
-                            body_is_global(&bytes),
-                        ),
-                        Err(_) if header.is_some() => {
-                            (discord_retry_after(header.as_deref(), b"{}"), false)
-                        }
-                        Err(_) => {
-                            gate.lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .block_until(&cooldown_key, Duration::MAX);
-                            return Duration::MAX;
-                        }
-                    };
-                    let mut gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if header_global || body_global {
-                        gate.block_until("global", retry_after);
-                    }
-                    gate.block_until(&cooldown_key, retry_after);
-                    retry_after
-                });
-                let retry_after = finish
-                    .await
-                    .unwrap_or_else(|_| discord_retry_after(header_for_response.as_deref(), b"{}"));
-                return Err(GuildListError::RateLimited {
-                    retry_after,
-                    fresh: true,
-                });
-            }
-            if !status.is_success() {
+            if !status.is_success() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
                 return Err(GuildListError::Failed(anyhow::anyhow!(
                     "discord guilds request failed with {status}"
                 )));
             }
-            let bytes = match resp.bytes().await {
+            let bytes = match self
+                .read_response_body(user_key, "/users/@me/guilds", resp)
+                .await
+            {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    return Err(GuildListError::Failed(anyhow::anyhow!(
-                        "invalid discord guilds response: {error}"
-                    )));
+                    return Err(match error.downcast_ref::<DiscordRateLimit>() {
+                        Some(limit) => GuildListError::RateLimited {
+                            retry_after: limit.retry_after,
+                            fresh: true,
+                        },
+                        None => {
+                            GuildListError::Failed(error.context("invalid discord guilds response"))
+                        }
+                    });
                 }
             };
-            if self.note_bucket_reset(user_key, &headers, &bytes) {
-                self.persist_deadlines().await;
-            }
+            self.note_bucket_reset(user_key, &headers);
             let page: Vec<DiscordGuild> = match serde_json::from_slice(&bytes) {
                 Ok(page) => page,
                 Err(error) => {
@@ -786,70 +748,101 @@ impl OAuthClient {
         }
     }
 
-    /// A 429 whose body cannot be read still has its headers. Record that
-    /// cooldown and return the rate limit, instead of dropping it on `?`.
-    async fn read_limited_body(
+    /// Capture real 429s, including responses whose bodies cannot be read.
+    async fn read_response_body(
         &self,
         key: &str,
-        status: reqwest::StatusCode,
-        headers: &reqwest::header::HeaderMap,
+        route: &'static str,
         response: reqwest::Response,
     ) -> Result<Vec<u8>> {
-        match response.bytes().await {
-            Ok(body) => Ok(body.to_vec()),
-            Err(_error) if status.as_u16() == 429 => {
-                self.observe_route(key, status, headers, b"{}").await;
-                Err(DiscordRateLimit {
-                    retry_after: discord_retry_after(header_retry_after(headers), b"{}"),
-                }
-                .into())
-            }
-            Err(error) => Err(error.into()),
+        let status = response.status();
+        if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Ok(response.bytes().await?.to_vec());
         }
-    }
-
-    async fn observe_route(
-        &self,
-        key: &str,
-        status: reqwest::StatusCode,
-        headers: &reqwest::header::HeaderMap,
-        body: &[u8],
-    ) {
-        if status.as_u16() == 429 {
-            let retry_after = discord_retry_after(header_retry_after(headers), body);
-            self.apply_limit(key, retry_after);
-            if limit_scope_is_global(headers) || body_is_global(body) {
-                self.apply_limit("global", retry_after);
-            }
-            self.persist_deadlines().await;
-            return;
-        }
-        if self.note_bucket_reset(key, headers, body) {
-            self.persist_deadlines().await;
-        }
-    }
-
-    fn note_bucket_reset(
-        &self,
-        key: &str,
-        headers: &reqwest::header::HeaderMap,
-        body: &[u8],
-    ) -> bool {
-        let Some(retry_after) = bucket_reset_after(headers) else {
-            return false;
-        };
-        self.apply_limit(key, retry_after);
-        if limit_scope_is_global(headers) || body_is_global(body) {
-            self.apply_limit("global", retry_after);
-        }
-        true
-    }
-
-    fn apply_limit(&self, key: &str, retry_after: Duration) {
-        self.guild_list
+        let received = Instant::now();
+        let received_ms = chrono::Utc::now().timestamp_millis();
+        let headers = response.headers().clone();
+        let key = key.to_owned();
+        let gate = std::sync::Arc::clone(&self.guild_list);
+        let db = self
+            .retry_db
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .block_until(key, retry_after);
+            .clone();
+        let writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.hold_for_body(&key);
+        // Finish recording and logging the response even if its browser
+        // request is dropped (including the member discovery time budget).
+        use tracing::instrument::WithSubscriber as _;
+        let retry_after = tokio::spawn(
+            async move {
+                let body = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap_or_default();
+                let body_retry_after = body.get("retry_after").and_then(serde_json::Value::as_f64);
+                let body_global = body.get("global").and_then(serde_json::Value::as_bool);
+                let retry_header = header_retry_after(&headers);
+                let reset_after = rate_limit_header(&headers, "x-ratelimit-reset-after");
+                let global = limit_scope_is_global(&headers) || body_global.unwrap_or(false);
+                // Discord's body can be more precise than the rounded header.
+                // A bucket reset can describe a different window (for example,
+                // when the 429 is global or shared).
+                let retry_after = body_retry_after
+                    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                    .or_else(|| retry_header.and_then(parse_retry_seconds))
+                    .map(|seconds| retry_duration(seconds).unwrap_or(Duration::MAX));
+                tracing::warn!(
+                    route_key = route,
+                    status = status.as_u16(),
+                    retry_after = ?retry_header,
+                    body_retry_after = ?body_retry_after,
+                    rate_limit_bucket = ?rate_limit_header(&headers, "x-ratelimit-bucket"),
+                    rate_limit_scope = ?rate_limit_header(&headers, "x-ratelimit-scope"),
+                    rate_limit_global = ?rate_limit_header(&headers, "x-ratelimit-global"),
+                    body_global = ?body_global,
+                    global,
+                    rate_limit_reset_after = ?reset_after,
+                    "Discord rate limited webui authentication"
+                );
+                let durable = gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .record_429(&key, global, received, received_ms, retry_after);
+                if durable && let Some(db) = db {
+                    Self::persist_deadlines(&gate, db, writer).await;
+                }
+                retry_after
+                    .unwrap_or(Duration::from_secs(1))
+                    .saturating_sub(received.elapsed())
+            }
+            .with_current_subscriber(),
+        )
+        .await
+        .context("discord rate limit observation failed")?;
+        Err(DiscordRateLimit { retry_after }.into())
+    }
+
+    fn note_bucket_reset(&self, key: &str, headers: &reqwest::header::HeaderMap) {
+        let Some(retry_after) = bucket_reset_after(headers) else {
+            return;
+        };
+        let mut gate = self
+            .guild_list
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A depleted bucket can pace this process. Only explicit 429 waits
+        // become durable or supersede a cooldown already in effect.
+        if gate.remaining(key).is_none() {
+            gate.cooldowns.insert(
+                key.to_owned(),
+                cooldown_deadline(Instant::now(), retry_after),
+            );
+        }
     }
 
     pub(crate) fn restore_deadlines(&self, deadlines: std::collections::BTreeMap<String, i64>) {
@@ -860,7 +853,7 @@ impl OAuthClient {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (key, millis) in deadlines {
-            if millis <= now_ms || !super::discord_retry::durable_key(&key) {
+            if millis <= now_ms || millis == i64::MAX || !super::discord_retry::durable_key(&key) {
                 continue;
             }
             let retry_after =
@@ -885,21 +878,14 @@ impl OAuthClient {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(db);
     }
 
-    async fn persist_deadlines(&self) {
-        let Some(db) = self
-            .retry_db
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        else {
-            return;
-        };
-        // Kept on this call so a restart still sees the deadline. The API pool
-        // bounds the write, so a locked database fails the record inside the
-        // interactive deadline instead of the bot's. The request continues.
+    async fn persist_deadlines(
+        gate: &std::sync::Mutex<GuildListGate>,
+        db: crate::db::Db,
+        writer: Option<jmodguard::control::WriterLink>,
+    ) {
+        // The API pool bounds the write when the local database is busy.
         for _ in 0..4 {
-            let snapshot = self
-                .guild_list
+            let snapshot = gate
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .durable_snapshot();
@@ -911,12 +897,7 @@ impl OAuthClient {
                 return;
             }
             let stored = if db.is_read_only() {
-                let link = self
-                    .writer
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                let Some(link) = link else {
+                let Some(link) = &writer else {
                     tracing::warn!("discord retry deadline is waiting for the bot writer");
                     return;
                 };
@@ -949,8 +930,7 @@ impl OAuthClient {
                 }
                 Ok(DeadlinePersistence::Recorded) => {}
             }
-            let current = self
-                .guild_list
+            let current = gate
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .generation;
@@ -1074,28 +1054,32 @@ fn limit_scope_is_global(headers: &reqwest::header::HeaderMap) -> bool {
             .is_some_and(|value| value == "true" || value == "1")
 }
 
-fn body_is_global(body: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| value.get("global").and_then(|flag| flag.as_bool()))
-        .unwrap_or(false)
+fn rate_limit_header<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 fn bucket_reset_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let remaining = headers
-        .get("x-ratelimit-remaining")
-        .and_then(|value| value.to_str().ok())?
+    if rate_limit_header(headers, "x-ratelimit-remaining")?
         .trim()
         .parse::<u64>()
-        .ok()?;
-    if remaining > 0 {
+        .ok()?
+        != 0
+    {
         return None;
     }
-    let header = headers
-        .get("x-ratelimit-reset-after")
-        .and_then(|value| value.to_str().ok())?;
-    let wait = discord_retry_after(Some(header), b"{}");
-    Some(wait)
+    retry_duration(parse_retry_seconds(rate_limit_header(
+        headers,
+        "x-ratelimit-reset-after",
+    )?)?)
+}
+
+fn retry_duration(seconds: f64) -> Option<Duration> {
+    let duration = Duration::try_from_secs_f64(seconds).ok()?;
+    // The same wait must fit both the monotonic clock and the durable UTC deadline.
+    let wait_ms = i64::try_from(duration.as_millis()).ok()?;
+    chrono::Utc::now().timestamp_millis().checked_add(wait_ms)?;
+    Instant::now().checked_add(duration)?;
+    Some(duration)
 }
 
 fn token_fingerprint(token: &str) -> u64 {
@@ -1105,7 +1089,7 @@ fn token_fingerprint(token: &str) -> u64 {
     hasher.finish()
 }
 
-/// Discord's rate-limit docs: use `Retry-After` or JSON `retry_after` (seconds).
+/// Parse the legacy wait used for token-server availability errors.
 /// Prefer the longer of the two when both are present. Missing, zero, or
 /// unparseable values still wait one second. The parsed wait is kept; only
 /// adding it to the process clock can saturate, and that stays blocked.
@@ -1616,7 +1600,7 @@ mod tests {
         );
         assert!(
             client
-                .refresh("one")
+                .refresh(4, "one")
                 .await
                 .unwrap_err()
                 .downcast_ref::<DiscordRateLimit>()
@@ -1624,13 +1608,21 @@ mod tests {
         );
         assert!(
             client
-                .refresh("two")
+                .refresh(4, "two")
                 .await
                 .unwrap_err()
                 .downcast_ref::<DiscordRateLimit>()
                 .is_some()
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            client
+                .refresh(5, "other-user")
+                .await
+                .unwrap_err()
+                .is::<DiscordRateLimit>()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     fn guild_page(count: usize, first_id: u64) -> Vec<serde_json::Value> {
@@ -1793,7 +1785,7 @@ mod tests {
         let client = test_oauth(reqwest::Client::new(), None, Some(endpoint), None);
         assert!(
             client
-                .refresh("one")
+                .refresh(4, "one")
                 .await
                 .unwrap_err()
                 .downcast_ref::<DiscordRateLimit>()
@@ -1801,7 +1793,7 @@ mod tests {
         );
         assert!(
             client
-                .refresh("two")
+                .refresh(4, "two")
                 .await
                 .unwrap_err()
                 .downcast_ref::<DiscordRateLimit>()

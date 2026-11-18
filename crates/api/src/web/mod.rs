@@ -260,6 +260,7 @@ pub struct AuthCtx {
     enrollment: Option<crate::db::GuildEnrollment>,
     /// Role-mapped access verified for one guild during this request.
     role_access: Option<(u64, AccessLevel)>,
+    guild_discovery_incomplete: bool,
 }
 
 impl AuthCtx {
@@ -370,6 +371,7 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
         guilds: Vec::new(),
         enrollment: None,
         role_access: None,
+        guild_discovery_incomplete: false,
     })
 }
 
@@ -683,7 +685,7 @@ async fn require_auth_with(
     let refresh_wait = state.refresh_wait().or_else(|| {
         // A refresh 429 may outlive the capped session hold. Do not spend
         // another guild/profile request on the rejected access token while
-        // the shared token route still prevents recovery.
+        // the user's token route still prevents recovery.
         let RefreshHold {
             cause: RefreshFailure::RateLimited,
             ..
@@ -692,7 +694,7 @@ async fn require_auth_with(
             return None;
         };
         app.oauth
-            .route_remaining("token")
+            .refresh_remaining(user_id)
             .map(|wait| (wait, RefreshFailure::RateLimited))
     });
     if let Some((retry_after, cause)) = refresh_wait {
@@ -715,6 +717,7 @@ async fn require_auth_with(
                 guilds,
                 enrollment: None,
                 role_access: None,
+                guild_discovery_incomplete: false,
             };
             preview::apply_overlay(&mut auth)?;
             return Ok(auth);
@@ -739,7 +742,7 @@ async fn require_auth_with(
     }
     let refresh = state.refresh.clone();
     let refreshed = match &refresh {
-        Some(refresh) => app.oauth.refresh(refresh).await,
+        Some(refresh) => app.oauth.refresh(user_id, refresh).await,
         None => Err(anyhow::anyhow!("session expired")),
     };
     if let Err(error) = &refreshed
@@ -810,19 +813,7 @@ async fn load_auth(
     // Discord is still cooling down. Authorization never takes this branch.
     // A rate-limited profile lookup must not drop that list.
     if let Some(guilds) = take_cached_guilds(guild_mode, app, user_id) {
-        let (user, source) = display_identity(app, user_id, token, cached_user).await?;
-        if source == DisplayIdentitySource::Live {
-            app.user_cache
-                .insert(user_id, (std::time::Instant::now(), user.clone()));
-        }
-        let mut auth = AuthCtx {
-            user,
-            guilds,
-            enrollment: None,
-            role_access: None,
-        };
-        preview::apply_overlay(&mut auth)?;
-        return Ok(auth);
+        return display_auth(app, user_id, token, cached_user, guilds, false).await;
     }
 
     let guilds = if let Some((at, guilds)) = &state.guilds
@@ -861,6 +852,7 @@ async fn load_auth(
         guilds,
         enrollment: None,
         role_access: None,
+        guild_discovery_incomplete: false,
     };
     preview::apply_overlay(&mut auth)?;
     Ok(auth)
@@ -875,36 +867,26 @@ async fn finish_guild_list(
     error: oauth::GuildListError,
 ) -> ApiResult<AuthCtx> {
     if matches!(guild_mode, GuildListMode::CachedOk)
-        && let Some(auth) =
-            cached_display_during_limit(app, user_id, token, cached_user, &error).await?
+        && matches!(error, oauth::GuildListError::RateLimited { .. })
     {
-        return Ok(auth);
+        let guilds = app
+            .guild_cache
+            .get(&user_id)
+            .map(|entry| entry.value().1.clone())
+            .unwrap_or_default();
+        return display_auth(app, user_id, token, cached_user, guilds, true).await;
     }
     Err(guild_list_failure(user_id, error))
 }
 
-async fn cached_display_during_limit(
+async fn display_auth(
     app: &ApiState,
     user_id: u64,
     token: &str,
     cached_user: Option<DiscordUser>,
-    error: &oauth::GuildListError,
-) -> ApiResult<Option<AuthCtx>> {
-    let oauth::GuildListError::RateLimited { fresh, .. } = error else {
-        return Ok(None);
-    };
-    let Some(guilds) = app
-        .guild_cache
-        .get(&user_id)
-        .map(|entry| entry.value().1.clone())
-    else {
-        return Ok(None);
-    };
-    if *fresh {
-        tracing::warn!("webui auth: discord rate limited guild checks for user {user_id}");
-    } else {
-        tracing::debug!("webui auth: discord guild-list cooldown still active for user {user_id}");
-    }
+    guilds: Vec<DiscordGuild>,
+    guild_discovery_incomplete: bool,
+) -> ApiResult<AuthCtx> {
     let (user, source) = display_identity(app, user_id, token, cached_user).await?;
     if source == DisplayIdentitySource::Live {
         app.user_cache
@@ -915,21 +897,15 @@ async fn cached_display_during_limit(
         guilds,
         enrollment: None,
         role_access: None,
+        guild_discovery_incomplete,
     };
     preview::apply_overlay(&mut auth)?;
-    Ok(Some(auth))
+    Ok(auth)
 }
 
 fn guild_list_failure(user_id: u64, error: oauth::GuildListError) -> ApiError {
     match error {
-        oauth::GuildListError::RateLimited { retry_after, fresh } => {
-            if fresh {
-                tracing::warn!("webui auth: discord rate limited guild checks for user {user_id}");
-            } else {
-                tracing::debug!(
-                    "webui auth: discord guild-list cooldown still active for user {user_id}"
-                );
-            }
+        oauth::GuildListError::RateLimited { retry_after, .. } => {
             ApiError(oauth::DiscordRateLimit { retry_after }.into())
         }
         oauth::GuildListError::Unauthorized => {
@@ -1346,6 +1322,16 @@ async fn callback_response(
         tracing::warn!("oauth callback: {error}");
         return finish(error_page("failed to rotate session"));
     }
+    if let Some(app) = app {
+        app.user_cache
+            .insert(uid, (std::time::Instant::now(), user));
+        // Only a complete guild list enters the display cache. A 429 leaves
+        // any previous list intact and the cooldown guides the next /api/me.
+        if let Ok(guilds) = oauth.my_guilds(uid, &tok.access_token).await {
+            app.guild_cache
+                .insert(uid, (std::time::Instant::now(), guilds));
+        }
+    }
     let requested_return_to = cookie_value(&headers, COOKIE_OAUTH_RETURN_TO);
     let return_to = return_to_or_root(cfg, requested_return_to.as_deref());
     finish(axum::response::Redirect::to(&return_to).into_response())
@@ -1455,7 +1441,7 @@ async fn api_me(
         },
         "guilds": guilds,
         "role_scope_missing": role_scope_missing,
-        "role_discovery_incomplete": role_discovery_incomplete,
+        "role_discovery_incomplete": auth.guild_discovery_incomplete || role_discovery_incomplete,
         "is_bot_owner": is_bot_owner(&state, &auth),
         "preview": preview::current().map(|preview| serde_json::json!({
             "guild_id": preview.guild_id.to_string(),
@@ -3165,6 +3151,7 @@ mod tests {
         AuthCtx {
             enrollment: None,
             role_access: None,
+            guild_discovery_incomplete: false,
             user: crate::web::oauth::DiscordUser {
                 id: discord_id.to_string(),
                 username: "tester".into(),
@@ -3375,6 +3362,7 @@ mod tests {
         let stale = AuthCtx {
             enrollment: None,
             role_access: None,
+            guild_discovery_incomplete: false,
             user: crate::web::oauth::DiscordUser {
                 id: "99".into(),
                 username: "owner".into(),
