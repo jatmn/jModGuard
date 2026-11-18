@@ -1970,7 +1970,7 @@ function handleAuthLoss(error) {
     return true;
   }
   if (ui.getSnapshot().view !== "login-view") {
-    if (["cases", "members"].includes(state.tab) && state.guildId) flushPendingListSearch(state.tab, state.guildId);
+    if (WORKSPACE_LISTS.has(state.tab) && state.guildId) flushPendingListSearch(state.tab, state.guildId);
     state.me = null;
     state.guilds = [];
     state.guildId = null;
