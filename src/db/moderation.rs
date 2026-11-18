@@ -13,9 +13,18 @@ const EVENT_STATS_SQL: &str = "SELECT COUNT(*) FROM events WHERE guild_id = ?1 A
 const BAN_PAGE_SQL: &str = "SELECT id, guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name
              FROM bans WHERE guild_id = ?1 ORDER BY id DESC LIMIT ?2";
 use super::*;
+use ring::digest::{SHA256, SHA256_OUTPUT_LEN, digest};
 
 mod ban_list;
 pub use ban_list::*;
+mod event_list;
+pub use event_list::*;
+
+fn text_key_digest(key: &str) -> [u8; SHA256_OUTPUT_LEN] {
+    let mut bytes = [0; SHA256_OUTPUT_LEN];
+    bytes.copy_from_slice(digest(&SHA256, key.as_bytes()).as_ref());
+    bytes
+}
 
 // ---------------------------------------------------------------------------
 // events (audit log)
@@ -108,11 +117,22 @@ fn event_query(
     user_id: Option<i64>,
     limit: i64,
 ) -> (String, Vec<Value>) {
-    let limit = limit.clamp(1, 200);
-    let mut sql = String::from(
-        "SELECT id, guild_id, event_type, user_id, actor_id, data, created_at
-         FROM events",
-    );
+    let mut sql = format!("SELECT {EVENT_COLUMNS}");
+    let mut args = event_filters(&mut sql, guild_id, event_type, user_id);
+    sql.push_str(" ORDER BY id DESC LIMIT ?");
+    args.push(limit.clamp(1, 200).into());
+    (sql, args)
+}
+
+const EVENT_COLUMNS: &str = "id, guild_id, event_type, user_id, actor_id, data, created_at";
+
+fn event_filters(
+    sql: &mut String,
+    guild_id: i64,
+    event_type: Option<&str>,
+    user_id: Option<i64>,
+) -> Vec<Value> {
+    sql.push_str(" FROM events");
     // Keep sparse/absent-user lookups selective instead of walking the guild's
     // ordered history and applying user_id as a residual filter.
     if user_id.is_some() {
@@ -120,7 +140,7 @@ fn event_query(
     }
     sql.push_str(" WHERE guild_id = ?1");
     let mut args: Vec<Value> = vec![guild_id.into()];
-    if let Some(et) = &event_type {
+    if let Some(et) = event_type {
         sql.push_str(" AND event_type = ?");
         args.push(et.to_string().into());
     }
@@ -128,10 +148,7 @@ fn event_query(
         sql.push_str(" AND user_id = ?");
         args.push(uid.into());
     }
-    sql.push_str(" ORDER BY id DESC LIMIT ?");
-    args.push(limit.into());
-
-    (sql, args)
+    args
 }
 
 fn query_events_conn(
@@ -143,28 +160,23 @@ fn query_events_conn(
 ) -> Result<Vec<EventRow>> {
     let (sql, args) = event_query(guild_id, event_type, user_id, limit);
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(args), |r| {
-        Ok(EventRow {
-            id: r.get(0)?,
-            guild_id: r.get(1)?,
-            event_type: r.get(2)?,
-            user_id: r.get(3)?,
-            actor_id: r.get(4)?,
-            data: r.get(5)?,
-            created_at: r.get(6)?,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let mut row = row?;
+    conn.prepare(&sql)?
+        .query_map(params_from_iter(args), decode_event_row)?
+        .collect()
+}
+
+fn decode_event_row(r: &Row) -> Result<EventRow> {
+    let data: Option<String> = r.get(5)?;
+    Ok(EventRow {
+        id: r.get(0)?,
+        guild_id: r.get(1)?,
+        event_type: r.get(2)?,
+        user_id: r.get(3)?,
+        actor_id: r.get(4)?,
         // Heal legacy rows that stored snowflakes as JSON numbers.
-        if let Some(raw) = row.data.take() {
-            row.data = Some(crate::ids::wire_safe_event_data_json(&raw));
-        }
-        out.push(row);
-    }
-    Ok(out)
+        data: data.map(|raw| crate::ids::wire_safe_event_data_json(&raw)),
+        created_at: r.get(6)?,
+    })
 }
 
 // ---------------------------------------------------------------------------

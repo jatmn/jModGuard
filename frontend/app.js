@@ -16,7 +16,7 @@ import {
   sumSeries,
 } from "./charts.js";
 import {
-  clearListLocation, ListControls, ListEmptyRow, ListLoadProgress, ListSortHeading, readListLocation,
+  clearListLocation, ListControls, ListEmptyRow, ListLoadProgress, ListPageSize, ListSortHeading, readListLocation,
   flushPendingListSearch, listLoadProgress, readListPage, rememberListLocation, restoreListLocation, useListControls,
 } from "./list-controls.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
@@ -7963,7 +7963,20 @@ const MEMBERS_LIST = {
     { key: "status", label: "Status" },
   ],
 };
-const WORKSPACE_LISTS = new Map([CASE_LIST, BANS_LIST, MEMBERS_LIST].map((config) => [config.list, config]));
+const EVENTS_LIST = {
+  list: "events",
+  defaultSort: "date",
+  defaultDir: "desc",
+  commonFilters: false,
+  filters: [{ key: "event" }, { key: "user" }],
+  columns: [
+    { key: "date", label: "Time", initialDir: "desc", orderLabels: { desc: "Newest first", asc: "Oldest first" } },
+    { key: "event", label: "Event" },
+    { key: "user", label: "User ID" },
+    { key: "actor", label: "Actor ID" },
+  ],
+};
+const WORKSPACE_LISTS = new Map([CASE_LIST, BANS_LIST, MEMBERS_LIST, EVENTS_LIST].map((config) => [config.list, config]));
 
 function tabCases() {
   const guildId = state.guildId;
@@ -9127,17 +9140,42 @@ function TableWindow({ rows, renderRow, canMove = () => true, table }) {
   );
 }
 function tabEvents() {
-  const [type, setType] = useState("");
-  const [user, setUser] = useState("");
+  const guildId = state.guildId;
+  const [after, setAfter] = useState("");
   const input = useRef(null);
-  const result = useApiRead(
-    `/api/guilds/${state.guildId}/events?limit=100` +
-      (type ? `&event=${encodeURIComponent(type)}` : "") +
-      (user ? `&user=${encodeURIComponent(user)}` : ""),
-  );
+  const controls = useListControls(EVENTS_LIST, guildId, () => setAfter(""));
+  const query = controls.query();
+  if (after) query.set("after", after);
+  const result = useApiRead(`/api/guilds/${guildId}/events?${query}`, {
+    retainData: true, collection: "events", listSize: controls.view.pageSize,
+  });
+  const rows = result.data?.events;
+  const next = result.data?.next_cursor;
   const refresh = () => {
-    setUser(parseSnowflake(input.current.value));
+    controls.setFilter("user", parseSnowflake(input.current.value), true);
     result.refresh();
+  };
+  const fallback = result.canceled
+    ? "Loading canceled. Refresh to try again."
+    : result.error
+      ? "Could not load records: " + result.error.message
+      : result.loading ? "Loading…" : rows?.length ? null : "No matching records.";
+  const renderRow = (record, i) => {
+    let data;
+    try {
+      data = JSON.stringify(JSON.parse(record.data || "{}"), null, 1);
+    } catch (_) {
+      data = record.data || "";
+    }
+    return h(
+      "tr",
+      { key: record.id ?? i },
+      h("td", { className: "muted" }, new Date(record.created_at).toLocaleString()),
+      h("td", null, record.event_type),
+      h("td", { className: "mono" }, record.user_id || "-"),
+      h("td", { className: "mono" }, record.actor_id || "-"),
+      h("td", { className: "mono", style: { fontSize: "11px" } }, data),
+    );
   };
   return h(
     "div",
@@ -9151,11 +9189,10 @@ function tabEvents() {
         {
           className: "select",
           "aria-label": "Event type",
-          value: type,
-          onChange: (event) => {
-            setType(event.target.value);
-            setUser(parseSnowflake(input.current.value));
-          },
+          value: controls.view.filters.event,
+          onChange: (event) => controls.replaceFilters({
+            event: event.target.value, user: parseSnowflake(input.current.value),
+          }),
         },
         h("option", { value: "" }, "all types"),
         ...state.config.event_types.map((value) => h("option", { key: value, value }, value)),
@@ -9165,47 +9202,33 @@ function tabEvents() {
         type: "text",
         className: "input",
         placeholder: "user id",
+        defaultValue: controls.view.filters.user,
         onKeyDown: (event) => {
           if (event.key === "Enter") refresh();
         },
       }),
       h(ActionButton, { className: "btn", onClick: refresh }, "Refresh"),
+      h(ListPageSize, { controls }),
     ),
-    h(
-      DataTable,
-      { headings: ["Time", "Event", "User ID", "Actor ID", "Details"] },
-      result.loading || result.error || !result.data?.length
-        ? h(
-            "tr",
-            null,
-            h(
-              "td",
-              { colSpan: 5, className: result.error ? "err" : result.loading ? "" : "muted" },
-              result.loading
-                ? "Loading…"
-                : result.error
-                  ? "Could not load records: " + result.error.message
-                  : "No matching records.",
-            ),
-          )
-        : result.data.map((record, i) => {
-            let data;
-            try {
-              data = JSON.stringify(JSON.parse(record.data || "{}"), null, 1);
-            } catch (_) {
-              data = record.data || "";
-            }
-            return h(
-              "tr",
-              { key: record.id ?? i },
-              h("td", { className: "muted" }, new Date(record.created_at).toLocaleString()),
-              h("td", null, record.event_type),
-              h("td", { className: "mono" }, record.user_id || "-"),
-              h("td", { className: "mono" }, record.actor_id || "-"),
-              h("td", { className: "mono", style: { fontSize: "11px" } }, data),
-            );
-          }),
+    h("div", { className: "row list-pagination" },
+      h(ActionButton, { type: "button", className: "btn", disabled: !after || result.loading, onClick: () => setAfter("") }, "First page"),
+      h(ActionButton, { type: "button", className: "btn", disabled: !next || !!fallback, onClick: () => setAfter(next) }, "Next page"),
     ),
+    result.progress !== null ? h(ListLoadProgress, { loaded: result.progress, onCancel: result.cancel }) : null,
+    h(PagedTable, {
+      headings: [
+        ...EVENTS_LIST.columns.map((column) => h(ListSortHeading, { key: column.key, column, controls })),
+        "Details",
+      ],
+      rows: fallback ? null : rows,
+      renderRow,
+      fallback: fallback
+        ? h("tr", null, h("td", {
+          colSpan: EVENTS_LIST.columns.length + 1,
+          className: result.error ? "err" : result.loading ? "" : "muted",
+        }, fallback))
+        : null,
+    }),
   );
 }
 const STOCKS_SPAM_EXAMPLE = "📈 **Looking for a community focused on stocks and trading?**\n\nJoin our growing community to learn from experienced investors, share market insights, discuss stock ideas, and exchange trading strategies.\nNo spam or aggressive promotion—just practical market discussions.\nWe welcome active investors and value your thoughts and feedback.\n👇 Interested? Join us here:";

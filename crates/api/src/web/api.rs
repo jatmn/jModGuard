@@ -1312,6 +1312,16 @@ pub struct EventsQuery {
     #[serde(default, deserialize_with = "crate::ids::de_opt_u64")]
     user: Option<u64>,
     limit: Option<i64>,
+    sort: Option<db::EventListSort>,
+    dir: Option<super::list_controls::SortDirection>,
+    after: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EventCursor {
+    context: String,
+    anchor: db::EventListAnchor,
 }
 
 pub async fn events(
@@ -1321,22 +1331,72 @@ pub async fn events(
     Path(guild_id): Path<u64>,
     Query(query): Query<EventsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Dashboard).await?;
-    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    super::list_controls::within_list_deadline(
+        "Audit Log",
+        events_inner(&app, &session, &headers, guild_id, query),
+    )
+    .await
+}
+
+async fn events_inner(
+    app: &Arc<ApiState>,
+    session: &Session,
+    headers: &axum::http::HeaderMap,
+    guild_id: u64,
+    query: EventsQuery,
+) -> ApiResult<Json<serde_json::Value>> {
+    use super::list_controls::{
+        SortDirection, check_cursor_context, cursor_context, decode_cursor, encode_cursor,
+    };
+    let auth = real_guild_scope(app, session, guild_id, GuildAccess::Dashboard).await?;
+    super::check_page_enrollment(&auth, guild_id, headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
-    let rows = db::query_enrolled_events(
+    let user_id = query
+        .user
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| ApiError(anyhow::anyhow!("invalid user id")))?;
+    let limit = query.limit.unwrap_or(50);
+    // Older dashboards request only filters and a limit and expect an array.
+    if query.sort.is_none() && query.dir.is_none() && query.after.is_none() {
+        let rows =
+            db::query_enrolled_events(&app.db, enrollment, query.event.as_deref(), user_id, limit)
+                .await?;
+        return Ok(Json(serde_json::json!(rows)));
+    }
+    let sort = query.sort.unwrap_or(db::EventListSort::Date);
+    let dir = query.dir.unwrap_or(SortDirection::Desc);
+    let context = cursor_context((&enrollment, &query.event, user_id))?;
+    let after = query
+        .after
+        .as_deref()
+        .map(|token| {
+            let cursor: EventCursor = decode_cursor(token, "events", sort, dir)?;
+            check_cursor_context(&cursor.context, &context)?;
+            Ok::<_, ApiError>(cursor.anchor)
+        })
+        .transpose()?;
+    let page = db::page_enrolled_events(
         &app.db,
         enrollment,
-        query.event.as_deref(),
-        query
-            .user
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|_| ApiError(anyhow::anyhow!("invalid user id")))?,
-        query.limit.unwrap_or(50),
+        db::EventListRequest {
+            event_type: query.event,
+            user_id,
+            sort,
+            descending: dir == SortDirection::Desc,
+            after,
+            limit,
+        },
     )
     .await?;
-    Ok(Json(serde_json::json!(rows)))
+    let next = page
+        .next
+        .map(|anchor| encode_cursor("events", sort, dir, EventCursor { context, anchor }))
+        .transpose()?;
+    Ok(Json(serde_json::json!({
+        "events": page.rows,
+        "next_cursor": next,
+    })))
 }
 
 pub async fn bans(

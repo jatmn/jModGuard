@@ -9227,12 +9227,105 @@ test('Shared list controls restore, debounce, sort, clear and write the list URL
   assert.equal(root.querySelector('tbody').textContent, 'No entries.');
 });
 
+function auditLogView(h) {
+  h.app.state.config = { enrollment_id: 'membership', event_types: ['member_ban', 'member_kick'] };
+  h.app.navigate('events');
+  return h.document.querySelector('#content');
+}
+
+test('Audit Log restores list links and resets the cursor when filters, size or sort change', async () => {
+  const storage = new Map();
+  const requests = [];
+  const fixture = pageSizeFixture('events', 137);
+  const fetchPage = async (url) => {
+    const { searchParams, pathname } = new URL(url, 'file:///');
+    if (!pathname.endsWith('/events')) return response({});
+    requests.push(searchParams);
+    return response(fixture(searchParams));
+  };
+  const h = harness(fetchPage, storage);
+  const root = auditLogView(h);
+  await settle();
+  const size = () => memberLabelled(root, 'Rows per page');
+  const button = (label) => findNode(root, node => node.localName === 'button' && node.textContent === label);
+  const sort = (label) => findNode(root, node => node.classList.contains('list-sort') && node.firstChild.textContent === label);
+  const input = root.querySelector('input[placeholder="user id"]');
+  const type = root.querySelector('select[aria-label="Event type"]');
+  const latest = () => requests.at(-1);
+  assert.deepEqual([...size().options].map(option => option.textContent), ['50', '100', '250', '500', '1000', 'All']);
+  assert.equal(latest().get('limit'), '50');
+  assert.equal(root.querySelector('th[aria-sort="descending"] button'), sort('Time'));
+  assert.equal(sort('Details'), null);
+  assert.equal(root.querySelector('input[type="search"], input[type="date"]'), null);
+  await fire(button('Next page'), 'click');
+  assert.equal(latest().get('after'), 'cursor:50');
+
+  size().value = '100';
+  await fire(size(), 'change');
+  assert.equal(latest().get('after'), null);
+  assert.equal(latest().get('limit'), '100');
+  await fire(button('Next page'), 'click');
+  assert.equal(latest().get('after'), 'cursor:100');
+  await fire(sort('Actor ID'), 'click');
+  assert.equal(latest().get('after'), null);
+  assert.equal(latest().get('sort'), 'actor');
+  assert.equal(latest().get('dir'), 'asc');
+  await fire(sort('Actor ID'), 'click');
+  assert.equal(latest().get('dir'), 'desc');
+
+  await fire(button('Next page'), 'click');
+  const beforeDraft = requests.length;
+  input.value = '<@42>';
+  await fire(input, 'input');
+  assert.equal(requests.length, beforeDraft);
+  type.value = 'member_ban';
+  await fire(type, 'change');
+  assert.equal(latest().get('after'), null);
+  assert.equal(latest().get('event'), 'member_ban');
+  assert.equal(latest().get('user'), '42');
+  await fire(button('Next page'), 'click');
+  input.value = '43';
+  await fire(input, 'keydown', { key: 'Enter' });
+  assert.equal(latest().get('after'), null);
+  assert.equal(latest().get('user'), '43');
+
+  const link = new URLSearchParams(h.location.search);
+  assert.equal(link.get('list'), 'events');
+  assert.equal(link.get('page_size'), '100');
+  assert.equal(link.get('sort'), 'actor');
+  assert.equal(link.get('dir'), 'desc');
+  assert.equal(link.get('event'), 'member_ban');
+  assert.equal(link.get('user'), '43');
+  assert.equal(link.has('after'), false);
+
+  const restored = harness(fetchPage, storage);
+  auditLogView(restored);
+  await settle();
+  assert.equal(latest().get('limit'), '100', 'Audit Log browser preference');
+  assert.equal(memberLabelled(await bansView(restored), 'Rows per page').value, '50');
+
+  const bookmarked = harness(fetchPage, storage);
+  link.set('page_size', '250');
+  bookmarked.location.search = '?' + link;
+  bookmarked.app.restoreWorkspace();
+  assert.equal(bookmarked.app.state.tab, 'events');
+  const reopened = auditLogView(bookmarked);
+  await settle();
+  assert.equal(memberLabelled(reopened, 'Rows per page').value, '250');
+  assert.equal(reopened.querySelector('input[placeholder="user id"]').value, '43');
+  assert.equal(reopened.querySelector('select[aria-label="Event type"]').value, 'member_ban');
+  assert.equal(latest().get('sort'), 'actor');
+  assert.equal(latest().get('dir'), 'desc');
+  assert.equal(latest().get('limit'), '250');
+});
+
 function pageSizeFixture(list, count = 1037) {
   return (query) => {
     const offset = Number(query.get('after')?.split(':')[1] || 0);
     const end = Math.min(count, offset + Number(query.get('limit')));
     const rows = Array.from({ length: end - offset }, (_, i) => {
       const id = offset + i + 1;
+      if (list === 'events') return { id, user_id: String(id), event_type: 'member_ban', created_at: '2026-01-01T00:00:00Z' };
       return list === 'cases' ? id.toString(16).padStart(32, '0') : {
         id, user_id: String(id), display_name: `Member ${id}`, user_name: `User ${id}`, is_current: true,
       };
@@ -9241,8 +9334,9 @@ function pageSizeFixture(list, count = 1037) {
   };
 }
 
-for (const [list, view] of [['cases', casesView], ['bans', bansView], ['members', memberView]]) {
-  const listTable = (root) => root.querySelector('table:has(th[aria-sort])');
+const listTable = (root) => root.querySelector('table:has(th[aria-sort])');
+const moderationListViews = [['cases', casesView], ['bans', bansView], ['members', memberView]];
+for (const [list, view] of moderationListViews) {
   test(`${list} page size persists across search, sort, filters, paging and navigation`, async () => {
     const storage = new Map();
     const requests = [];
@@ -9303,6 +9397,9 @@ for (const [list, view] of [['cases', casesView], ['bans', bansView], ['members'
     assert.equal(memberLabelled(other, 'Rows per page').value, '50');
   });
 
+}
+
+for (const [list, view] of [...moderationListViews, ['events', auditLogView]]) {
   test(`${list} windows large selections and loads All in bounded cursor pages`, async () => {
     const requests = [];
     const fixture = pageSizeFixture(list);
