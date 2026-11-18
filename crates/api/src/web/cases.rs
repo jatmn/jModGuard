@@ -216,7 +216,9 @@ async fn list_cases_inner(
                 Ok((cursor.position, cursor.legacy_id_order))
             })
             .transpose()?;
-        let legacy_id_order = after.as_ref().is_some_and(|(_, legacy)| *legacy);
+        // Start unsorted requests in legacy ID order. Existing opaque cursors
+        // keep the order that was used to produce them.
+        let legacy_id_order = after.as_ref().map_or(!explicit_sort, |(_, legacy)| *legacy);
         let page = store
             .list_cases(
                 scope.clone(),
