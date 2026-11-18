@@ -420,8 +420,48 @@ pub enum MemberStatusFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemberSort {
-    JoinedNewest,
-    JoinedOldest,
+    Name,
+    UserId,
+    Joined,
+    Status,
+}
+
+impl MemberSort {
+    fn column(self) -> &'static str {
+        match self {
+            Self::Name => "name_sort_key",
+            Self::UserId => "user_id",
+            Self::Joined => "joined_sort_key",
+            Self::Status => "status_sort_key",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MemberSortValue {
+    Text(String),
+    Integer(i64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberListAnchor {
+    pub value: MemberSortValue,
+    pub user_id: i64,
+}
+
+impl MemberListAnchor {
+    pub fn matches(&self, sort: MemberSort) -> bool {
+        self.user_id > 0
+            && match (&self.value, sort) {
+                (MemberSortValue::Text(_), MemberSort::Name)
+                | (MemberSortValue::Integer(_), MemberSort::Joined) => true,
+                (MemberSortValue::Integer(key), MemberSort::UserId) => *key == self.user_id,
+                (MemberSortValue::Integer(key), MemberSort::Status) => (0..=3).contains(key),
+                _ => false,
+            }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -431,8 +471,61 @@ pub struct MemberQuery {
     pub joined_from_ms: Option<i64>,
     pub joined_to_ms: Option<i64>,
     pub sort: MemberSort,
-    pub after: Option<String>,
+    pub descending: bool,
+    pub after: Option<MemberListAnchor>,
     pub limit: u32,
+}
+
+impl MemberQuery {
+    pub(super) fn sql(&self) -> String {
+        let (status, filter) = match self.status {
+            MemberStatusFilter::Current => ("current", "is_current=1"),
+            MemberStatusFilter::Banned => ("banned", "is_banned=1"),
+            MemberStatusFilter::PreviouslyBanned => ("previous", "ever_banned=1 AND is_banned=0"),
+            MemberStatusFilter::All => ("all", "1=1"),
+        };
+        let column = self.sort.column();
+        let suffix = match self.sort {
+            MemberSort::Name => "name",
+            MemberSort::UserId => "id",
+            MemberSort::Joined => "joined",
+            MemberSort::Status => "status",
+        };
+        let index = if self.status == MemberStatusFilter::All && self.sort == MemberSort::UserId {
+            "sqlite_autoindex_guild_member_directory_1".to_owned()
+        } else {
+            format!("guild_member_sort_{status}_{suffix}")
+        };
+        let (op, dir) = if self.descending {
+            ("<", "DESC")
+        } else {
+            (">", "ASC")
+        };
+        let (seek, order) = if self.sort == MemberSort::UserId {
+            (
+                format!("user_id {op} ?8 AND ?7 IS NOT NULL"),
+                format!("user_id {dir}"),
+            )
+        } else {
+            (
+                format!("({column},user_id) {op} (?7,?8)"),
+                format!("{column} {dir},user_id {dir}"),
+            )
+        };
+        let seek = if self.after.is_some() {
+            seek.as_str()
+        } else {
+            "?7 IS NULL AND ?8 IS NULL"
+        };
+        format!(
+            "SELECT {PROFILE_SQL},{column} FROM guild_member_directory INDEXED BY {index}
+             WHERE guild_id=?1 AND enrollment_id=?2 AND {filter}
+               AND (?3='' OR user_id=?4 OR instr(search_text,?3)>0)
+               AND (?5 IS NULL OR joined_at_ms>=?5) AND (?6 IS NULL OR joined_at_ms<=?6)
+               AND {seek}
+             ORDER BY {order} LIMIT ?9"
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -452,10 +545,10 @@ pub struct MemberProfile {
     pub revision: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct MemberPage {
     pub members: Vec<MemberProfile>,
-    pub next_cursor: Option<String>,
+    pub next_cursor: Option<MemberListAnchor>,
 }
 
 /// Largest ID set one directory name lookup accepts.
@@ -3565,45 +3658,73 @@ impl GuildDataStore {
     ) -> Result<MemberPage> {
         checked_scope(self, &scope)?;
         anyhow::ensure!(
-            query.limit > 0
-                && query.limit <= 100
+            (1..=100).contains(&query.limit)
                 && query.q.as_ref().is_none_or(|q| q.len() <= 128)
-                && query.after.as_ref().is_none_or(|v| v.len() <= 64),
+                && query
+                    .after
+                    .as_ref()
+                    .is_none_or(|anchor| anchor.matches(query.sort)),
             MemberSyncError::Invalid
         );
         let raw_q = query.q.as_deref().unwrap_or("").trim();
         let search = raw_q.to_lowercase();
         let mention_id = member_search_user_id(raw_q);
-        let (after_join, after_id) = if let Some(cursor) = &query.after {
-            let (j, id) = cursor.split_once(':').ok_or(MemberSyncError::Invalid)?;
-            (j.parse::<i64>()?, id.parse::<i64>()?)
-        } else {
-            (
-                if query.sort == MemberSort::JoinedNewest {
-                    i64::MAX
-                } else {
-                    i64::MIN
-                },
-                if query.sort == MemberSort::JoinedNewest {
-                    i64::MAX
-                } else {
-                    i64::MIN
-                },
-            )
-        };
+        let sql = query.sql();
+        let (after_key, after_id) = query.after.map_or((Value::Null, None), |anchor| {
+            let key = match anchor.value {
+                MemberSortValue::Text(name) => Value::Text(name),
+                MemberSortValue::Integer(number) => Value::Integer(number),
+            };
+            (key, Some(anchor.user_id))
+        });
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn| {
-            let tx=conn.transaction_primary_snapshot()?; verify_scope(&tx,&expected,&scope,true)?;
-            let status=match query.status { MemberStatusFilter::Current=>"is_current=1",MemberStatusFilter::Banned=>"is_banned=1",MemberStatusFilter::PreviouslyBanned=>"ever_banned=1 AND is_banned=0",MemberStatusFilter::All=>"1=1" };
-            let order=if query.sort==MemberSort::JoinedNewest { ("<", "DESC") } else { (">", "ASC") };
-            let sql=format!("SELECT {PROFILE_SQL} FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND {status} AND (?3='' OR user_id=?4 OR instr(search_text,?3)>0) AND (?5 IS NULL OR joined_at_ms>=?5) AND (?6 IS NULL OR joined_at_ms<=?6) AND (coalesce(joined_at_ms,0),user_id) {} (?7,?8) ORDER BY coalesce(joined_at_ms,0) {},user_id {} LIMIT ?9",order.0,order.1,order.1);
-            let mut stmt=tx.prepare(&sql)?;
-            let rows=stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),search,mention_id,query.joined_from_ms,query.joined_to_ms,after_join,after_id,query.limit as i64+1],profile)?;
-            let mut members=Vec::new(); for row in rows { members.push(row?); } drop(stmt);
-            let more=members.len()>query.limit as usize; if more { members.pop(); }
-            let next_cursor=if more { members.last().map(|p|format!("{}:{}",p.joined_at_ms.unwrap_or(0),p.user_id)) } else {None};
-            tx.finish_read()?; Ok(MemberPage{members,next_cursor})
-        }).await
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let mut stmt = tx.prepare(&sql)?;
+                let rows = stmt.query_map(
+                    params![
+                        scope.guild_id(),
+                        scope.enrollment.id.as_str(),
+                        search,
+                        mention_id,
+                        query.joined_from_ms,
+                        query.joined_to_ms,
+                        after_key,
+                        after_id,
+                        i64::from(query.limit) + 1
+                    ],
+                    |row| {
+                        let value = match query.sort {
+                            MemberSort::Name => MemberSortValue::Text(row.get(12)?),
+                            _ => MemberSortValue::Integer(row.get(12)?),
+                        };
+                        let anchor = MemberListAnchor {
+                            value,
+                            user_id: row.get(0)?,
+                        };
+                        Ok((profile(row)?, anchor))
+                    },
+                )?;
+                let mut rows = rows.collect::<Result<Vec<_>>>()?;
+                drop(stmt);
+                let more = rows.len() > query.limit as usize;
+                if more {
+                    rows.pop();
+                }
+                let next_cursor = rows
+                    .last()
+                    .filter(|_| more)
+                    .map(|(_, anchor)| anchor.clone());
+                let members = rows.into_iter().map(|(profile, _)| profile).collect();
+                tx.finish_read()?;
+                Ok(MemberPage {
+                    members,
+                    next_cursor,
+                })
+            })
+            .await
     }
 
     pub async fn get_member(

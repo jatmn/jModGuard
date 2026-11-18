@@ -1988,7 +1988,8 @@ test('Members labels its filters and counts first, middle, last and empty pages'
   assert.equal(status.localName, 'select');
   assert.equal(memberLabelled(panel, 'Joined from (UTC)').type, 'date');
   assert.equal(memberLabelled(panel, 'Joined to (UTC)').type, 'date');
-  assert.equal(memberLabelled(panel, 'Sort').localName, 'select');
+  assert.match(textOf(panel), /Default order: newest join first/);
+  assert.equal(panel.querySelector('th[aria-sort="descending"] button').textContent, 'Joined');
   const count = () => textOf(findNode(panel, n => n.getAttribute?.('aria-live') === 'polite'));
   const button = (label) => findNode(panel, n => n.localName === 'button' && textOf(n) === label);
   assert.equal(count(), 'Page 1 · 1–50');
@@ -2004,6 +2005,77 @@ test('Members labels its filters and counts first, middle, last and empty pages'
   assert.equal(count(), 'No results');
   assert.deepEqual(calls.filter(url => url.includes('/members?')).map(url => new URL(url, 'https://fixture.test').searchParams.get('after')),
     [null, 'c1', 'c2', null, null]);
+});
+
+test('Members maps its headers, search and filters to the shared list and restores its URL', async () => {
+  const calls = [];
+  const fetchMembers = async (url) => {
+    if (url.endsWith('/member-sync')) return response({ status: 'complete', phase: 'complete' });
+    const query = new URL(url, 'https://fixture.test').searchParams;
+    calls.push(query);
+    return response({ members: [{ user_id: '10006', display_name: 'Alpha' }], next_cursor: 'opaque-page' });
+  };
+  const h = harness(fetchMembers);
+  const panel = memberView(h);
+  await settle();
+  const latest = () => calls.at(-1);
+  assert.equal(latest().get('sort'), 'joined');
+  assert.equal(latest().get('dir'), 'desc');
+  assert.equal(panel.querySelectorAll('thead th button').length, 4);
+  assert.equal(panel.querySelector('th:has(> .list-sort)').closest('tr').lastElementChild.textContent, 'History');
+
+  const status = memberLabelled(panel, 'Status');
+  status.value = 'all';
+  await fire(status, 'change');
+  const from = memberLabelled(panel, 'Joined from (UTC)');
+  from.value = '2026-09-01';
+  await fire(from, 'input');
+  const to = memberLabelled(panel, 'Joined to (UTC)');
+  to.value = '2026-09-30';
+  await fire(to, 'input');
+
+  const next = findNode(panel, n => n.localName === 'button' && textOf(n) === 'Next page');
+  await fire(next, 'click');
+  assert.equal(latest().get('after'), 'opaque-page');
+
+  // Sorting while text is still debouncing applies the text in the same read.
+  const search = memberLabelled(panel, 'Search');
+  search.value = ' Alpha ';
+  fire(search, 'input');
+  for (const [label, key, firstDir] of [
+    ['Member', 'name', 'asc'], ['User ID', 'user_id', 'asc'],
+    ['Joined', 'joined', 'desc'], ['Status', 'status', 'asc'],
+  ]) {
+    const button = [...panel.querySelectorAll('thead th button')].find(n => textOf(n) === label);
+    for (const dir of [firstDir, firstDir === 'asc' ? 'desc' : 'asc']) {
+      await fire(button, 'click');
+      assert.equal(latest().get('sort'), key);
+      assert.equal(latest().get('dir'), dir);
+      assert.equal(latest().has('after'), false);
+      assert.equal(button.closest('th').getAttribute('aria-sort'), dir === 'asc' ? 'ascending' : 'descending');
+      assert.ok(button.querySelector('.list-sort-mark'));
+      assert.equal(latest().get('q'), 'Alpha');
+      assert.equal(latest().get('status'), 'all');
+      assert.equal(latest().get('from'), '2026-09-01');
+      assert.equal(latest().get('to'), '2026-09-30');
+    }
+  }
+
+  const shared = new URL(h.historyUrls.at(-1), 'https://fixture.test');
+  const reopened = harness(fetchMembers);
+  reopened.location.search = shared.search;
+  reopened.app.state.guildId = reopened.app.state.guilds[1].id;
+  reopened.app.restoreWorkspace();
+  assert.equal(reopened.app.state.tab, 'members');
+  assert.equal(reopened.app.state.guildId, h.app.state.guildId);
+  reopened.app.state.config = { enrollment_id: 'membership' };
+  const restored = reopened.app.tabMembers();
+  await settle();
+  assert.equal(restored.querySelector('th[aria-sort="descending"] button').textContent, 'Status');
+  assert.equal(memberLabelled(restored, 'Search').value, 'Alpha');
+  assert.equal(latest().get('from'), '2026-09-01');
+  assert.equal(latest().get('to'), '2026-09-30');
+  assert.equal(latest().get('status'), 'all');
 });
 
 test('Members shows a live rate-limit countdown, separate progress time, and a prior successful run', async () => {
@@ -2129,13 +2201,11 @@ test('Members filter, date, and sort changes discard old history and list respon
   oldList.resolve(response({ members: [{ user_id: '10002', display_name: 'Wrong Filter' }] }));
   await settle();
   assert.doesNotMatch(textOf(panel), /Wrong Filter/);
-  const sort = memberLabelled(panel, 'Sort');
-  sort.value = 'joined_oldest';
-  fire(sort, 'change');
+  fire(panel.querySelector('th[aria-sort="descending"] button'), 'click');
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 300).length, 0);
   const newList = pending.filter(item => item.type === 'list').at(-1);
-  assert.match(newList.url, /joined_from=2026-09-01/);
-  assert.match(newList.url, /sort=joined_oldest/);
+  assert.match(newList.url, /from=2026-09-01/);
+  assert.match(newList.url, /sort=joined&dir=asc/);
   newList.resolve(response({ members: [{ user_id: '10007', display_name: 'Right Filter' }] }));
   await settle();
   assert.match(textOf(panel), /Right Filter/);

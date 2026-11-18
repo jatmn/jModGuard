@@ -6311,6 +6311,32 @@ const memberSyncStatusLabels = {
   complete: "Complete",
 };
 
+const MEMBER_LIST = {
+  list: "members",
+  defaultSort: "joined",
+  defaultDir: "desc",
+  filterLabel: "Member filters",
+  searchPlaceholder: "User ID, mention, display name or username",
+  searchLimit: 120,
+  dateLabels: { from: "Joined from (UTC)", to: "Joined to (UTC)" },
+  filters: [{
+    key: "status",
+    label: "Status",
+    emptyLabel: "Current members",
+    options: {
+      banned: { label: "Currently banned" },
+      previously_banned: { label: "Previously banned" },
+      all: { label: "All retained" },
+    },
+  }],
+  columns: [
+    { key: "name", label: "Member" },
+    { key: "user_id", label: "User ID" },
+    { key: "joined", label: "Joined", initialDir: "desc" },
+    { key: "status", label: "Status" },
+  ],
+};
+
 function tabMembers() {
   const guildId = state.guildId;
   const enrollmentId = state.config?.enrollment_id;
@@ -6331,58 +6357,11 @@ function tabMembers() {
     pendingMember = null;
     return next;
   });
-  const searchRef = useRef(null);
-  const search = h(Input, {
-    ref: searchRef,
-    defaultValue: memberHandoff?.userId,
-    onInput: () => handlers.current.queueFilteredList?.(),
-    onBlur: () => handlers.current.loadChangedFilters?.(),
-    type: "search",
-    placeholder: "User ID, mention, display name or username",
-    className: "input",
-  });
-  const statusFilterRef = useRef(null);
-  const statusFilter = h(
-    Select,
-    {
-      ref: statusFilterRef,
-      defaultValue: memberHandoff ? "all" : undefined,
-      onChange: () => handlers.current.loadChangedFilters?.(),
-      className: "select",
-    },
-    ...[
-      ["current", "Current members"],
-      ["banned", "Currently banned"],
-      ["previously_banned", "Previously banned"],
-      ["all", "All retained"],
-    ].map(([value, label]) => h("option", { value: value }, label)),
-  );
-  const joinedFromRef = useRef(null);
-  const joinedFrom = h(Input, {
-    ref: joinedFromRef,
-    onInput: () => handlers.current.queueFilteredList?.(),
-    onBlur: () => handlers.current.loadChangedFilters?.(),
-    type: "date",
-    className: "input",
-  });
-  const joinedToRef = useRef(null);
-  const joinedTo = h(Input, {
-    ref: joinedToRef,
-    onInput: () => handlers.current.queueFilteredList?.(),
-    onBlur: () => handlers.current.loadChangedFilters?.(),
-    type: "date",
-    className: "input",
-  });
-  const sortRef = useRef(null);
-  const sort = h(
-    Select,
-    {
-      ref: sortRef,
-      onChange: () => handlers.current.loadChangedFilters?.(),
-      className: "select",
-    },
-    h("option", { value: "joined_newest" }, "Newest join first"),
-    h("option", { value: "joined_oldest" }, "Oldest join first"),
+  const controls = useListControls(
+    MEMBER_LIST,
+    guildId,
+    () => handlers.current.loadChangedFilters?.(),
+    () => handlers.current.invalidateResults?.(),
   );
   useEffect(() => {
     const alive = () =>
@@ -6395,7 +6374,6 @@ function tabMembers() {
       detailAbort = null;
     let timer = null,
       countdownTimer = null,
-      debounce = null,
       lifecycle = "active",
       after = "",
       nextAfter = null;
@@ -7021,16 +6999,8 @@ function tabMembers() {
       setPagination((current) => ({ ...current, label: "" }));
       setMemberRows([h("tr", {}, h("td", { colSpan: 5 }, "Loading members…"))]);
       try {
-        const q = new URLSearchParams({
-          limit: "50",
-          status: statusFilterRef.current.value,
-          sort: sortRef.current.value,
-        });
-        const rawSearch = String(searchRef.current.value || "").trim();
-        const mention = rawSearch.match(/^<@!?(\d+)>$/);
-        if (rawSearch) q.set("q", mention ? mention[1] : rawSearch);
-        if (joinedFromRef.current.value) q.set("joined_from", joinedFromRef.current.value);
-        if (joinedToRef.current.value) q.set("joined_to", joinedToRef.current.value);
+        const q = controls.query();
+        q.set("limit", "50");
         if (after) q.set("after", after);
         const page = await apiRead(`/api/guilds/${guildId}/members?${q}`, listAbort.signal);
         if (!aliveHere() || request !== listRequest) return;
@@ -7207,6 +7177,7 @@ function tabMembers() {
       }
     };
     const invalidateResults = () => {
+      if (!aliveHere()) return;
       ++listRequest;
       listAbort?.abort();
       emptyMembersCell = null;
@@ -7220,25 +7191,13 @@ function tabMembers() {
       setMemberRows([h("tr", {}, h("td", { colSpan: 5 }, "Loading members…"))]);
       setDetailParts([]);
     };
-    const queueFilteredList = () => {
-      if (!aliveHere()) return;
-      invalidateResults();
-      clearTimeout(debounce);
-      debounce = setTimeout(() => {
-        debounce = null;
-        if (aliveHere()) loadMembers();
-      }, 300);
-    };
-    const loadChangedFilters = () => {
-      if (!aliveHere()) return;
-      clearTimeout(debounce);
-      debounce = null;
-      invalidateResults();
-      loadMembers();
-    };
     handlers.current = {
-      queueFilteredList,
-      loadChangedFilters,
+      invalidateResults,
+      loadChangedFilters: () => {
+        if (!aliveHere()) return;
+        invalidateResults();
+        loadMembers();
+      },
       first: () => {
         after = "";
         requestedPage = { number: 1, offset: 0 };
@@ -7272,7 +7231,6 @@ function tabMembers() {
       lifecycle = "disposed";
       clearTimer();
       clearCountdown();
-      clearTimeout(debounce);
       listAbort?.abort();
       statusAbort?.abort();
       detailAbort?.abort();
@@ -7280,7 +7238,8 @@ function tabMembers() {
     };
     authLossCleanups.add(dispose);
     loadStatus();
-    loadMembers();
+    if (memberHandoff) controls.replaceFilters({ q: memberHandoff.userId, status: "all" });
+    else loadMembers();
     return dispose;
   }, [guildId, enrollmentId]);
   return h(
@@ -7308,15 +7267,8 @@ function tabMembers() {
       h(
         "div",
         { className: "card-body" },
-        h(
-          "div",
-          { className: "row form-row" },
-          field("Search", search),
-          field("Status", statusFilter),
-          field("Joined from (UTC)", joinedFrom),
-          field("Joined to (UTC)", joinedTo),
-          field("Sort", sort),
-        ),
+        h(ListControls, { controls }),
+        h("p", { className: "muted" }, "Default order: newest join first."),
         h(
           "div",
           { className: "row" },
@@ -7333,7 +7285,12 @@ function tabMembers() {
           ),
           h("span", { className: "muted", "aria-live": "polite" }, pagination.label),
         ),
-        h(DataTable, { headings: ["Member", "User ID", "Joined", "Status", "History"] }, memberRows),
+        h(DataTable, {
+          headings: [
+            ...MEMBER_LIST.columns.map((column) => h(ListSortHeading, { key: column.key, column, controls })),
+            "History",
+          ],
+        }, memberRows),
       ),
     ),
     detailParts.length
@@ -7913,7 +7870,7 @@ const CASE_LIST = {
     { key: "date", label: "When", initialDir: "desc", orderLabels: { desc: "Newest first", asc: "Oldest first" } },
   ],
 };
-const WORKSPACE_LISTS = new Map([[CASE_LIST.list, CASE_LIST]]);
+const WORKSPACE_LISTS = new Map([[CASE_LIST.list, CASE_LIST], [MEMBER_LIST.list, MEMBER_LIST]]);
 
 function tabCases() {
   const guildId = state.guildId;

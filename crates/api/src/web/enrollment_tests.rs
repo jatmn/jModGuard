@@ -5951,6 +5951,157 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
 }
 
 #[tokio::test]
+async fn members_sort_columns_and_page_across_ties_with_shared_cursors() {
+    use db::guild_data::{MemberListAnchor, MemberObservation, MemberSort, MemberSortValue};
+    use list_controls::{SortDirection, encode_cursor};
+
+    const PATH: &str = "/api/guilds/10/members";
+    const ZULU: i64 = 9_007_199_254_740_993;
+    const ALPHA: i64 = ZULU + 1;
+    const BANNED: i64 = ZULU + 2;
+    const PREVIOUS: i64 = ZULU + 3;
+    const OLDER_ALPHA: i64 = ZULU + 4;
+    let jan_1 = 1_767_225_600_000_i64;
+    let jan_2 = jan_1 + 86_400_000;
+    let observed = jan_2 + 86_400_000;
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, observed)
+        .await
+        .unwrap();
+    for (user_id, nickname, username, joined) in [
+        (ZULU, Some("Zulu"), "aardvark", jan_2),
+        (ALPHA, Some("Alpha"), "zebra", jan_2),
+        (OLDER_ALPHA, None, "alpha", jan_1),
+    ] {
+        store
+            .observe_member(
+                scope.clone(),
+                MemberObservation {
+                    user_id,
+                    username: Some(Some(username.into())),
+                    global_name: None,
+                    nickname: Some(nickname.map(str::to_owned)),
+                    joined_at_ms: Some(joined),
+                    observed_at_ms: observed,
+                    is_join: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    store
+        .observe_ban(scope.clone(), BANNED, observed)
+        .await
+        .unwrap();
+    store
+        .observe_ban(scope.clone(), PREVIOUS, observed)
+        .await
+        .unwrap();
+    store
+        .observe_unban(scope.clone(), PREVIOUS, observed + 1)
+        .await
+        .unwrap();
+
+    let ids = |page: &serde_json::Value| {
+        page["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["user_id"].as_str().unwrap().parse::<i64>().unwrap())
+            .collect::<Vec<_>>()
+    };
+    let (status, default) = f.request("GET", PATH, "").await;
+    assert_eq!(status, StatusCode::OK, "{default}");
+    assert_eq!(ids(&default), [ALPHA, ZULU, OLDER_ALPHA]);
+
+    for (sort, ascending) in [
+        ("name", [BANNED, PREVIOUS, ALPHA, OLDER_ALPHA, ZULU]),
+        ("user_id", [ZULU, ALPHA, BANNED, PREVIOUS, OLDER_ALPHA]),
+        ("joined", [BANNED, PREVIOUS, OLDER_ALPHA, ZULU, ALPHA]),
+        ("status", [ZULU, ALPHA, OLDER_ALPHA, BANNED, PREVIOUS]),
+    ] {
+        for dir in ["asc", "desc"] {
+            let mut actual = Vec::new();
+            let mut after = String::new();
+            for page in 0..ascending.len() {
+                let path = format!("{PATH}?status=all&sort={sort}&dir={dir}&limit=1{after}");
+                let (status, body) = f.request("POST", &path, "").await;
+                assert_eq!(status, StatusCode::OK, "{path}: {body}");
+                assert_eq!(ids(&body).len(), 1, "{sort} {dir} page {page}");
+                actual.extend(ids(&body));
+                if page + 1 == ascending.len() {
+                    assert!(body["next_cursor"].is_null(), "{sort} {dir}: {body}");
+                } else {
+                    let cursor = body["next_cursor"].as_str().unwrap();
+                    after = format!("&after={cursor}");
+                }
+            }
+            let mut expected = ascending;
+            if dir == "desc" {
+                expected.reverse();
+            }
+            assert_eq!(actual, expected, "{sort} {dir}");
+        }
+    }
+    let combined =
+        "sort=name&dir=desc&status=current&q=+ALP+&from=2026-01-01&to=2026-01-02&limit=1";
+    let (status, first) = f.request("POST", &format!("{PATH}?{combined}"), "").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(ids(&first), [OLDER_ALPHA]);
+    let after = first["next_cursor"].as_str().unwrap();
+    let (status, second) = f
+        .request("POST", &format!("{PATH}?{combined}&after={after}"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(ids(&second), [ALPHA]);
+    assert!(second["next_cursor"].is_null());
+
+    for (status, expected) in [("current", vec![ALPHA]), ("banned", vec![])] {
+        let path = format!(
+            "{PATH}?sort=name&dir=desc&status={status}&q=alp&from=2026-01-02&to=2026-01-02"
+        );
+        let (status, filtered) = f.request("POST", &path, "").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {filtered}");
+        assert_eq!(ids(&filtered), expected);
+    }
+    let legacy = format!("{PATH}?sort=joined_oldest&joined_from=2026-01-02&joined_to=2026-01-02");
+    let (status, filtered) = f.request("GET", &legacy, "").await;
+    assert_eq!(status, StatusCode::OK, "{filtered}");
+    assert_eq!(ids(&filtered), [ZULU, ALPHA]);
+    let forged = encode_cursor(
+        "members",
+        MemberSort::Status,
+        SortDirection::Asc,
+        MemberListAnchor {
+            value: MemberSortValue::Integer(4),
+            user_id: ZULU,
+        },
+    )
+    .unwrap_or_else(|_| panic!("encode out-of-range status anchor"));
+    for query in [
+        "sort=missing".to_owned(),
+        "dir=sideways".to_owned(),
+        "after=broken".to_owned(),
+        format!("sort=name&dir=asc&after={after}"),
+        format!("sort=joined&dir=desc&after={after}"),
+        format!("sort=status&dir=asc&after={forged}"),
+    ] {
+        let (status, body) = f.request("POST", &format!("{PATH}?{query}"), "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn case_reads_filter_the_list_and_name_known_members() {
     use crate::db::guild_data::{
         CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource, TextEvidence,

@@ -13,6 +13,54 @@ fn remote_options() -> GuildStoreOptions {
     }
 }
 
+async fn sorted_members_page_over_remote_store(
+    writer: &GuildDataStore,
+    reader: &GuildDataStore,
+    scope: &GuildDataScope,
+) {
+    writer
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    for (user_id, username) in [(10, "ALPHA"), (11, "zulu"), (12, "alpha")] {
+        writer
+            .observe_member(
+                scope.clone(),
+                MemberObservation {
+                    user_id,
+                    username: Some(Some(username.into())),
+                    global_name: None,
+                    nickname: None,
+                    joined_at_ms: None,
+                    observed_at_ms: 1_001,
+                    is_join: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let mut query = MemberQuery {
+        q: Some("alpha".into()),
+        status: MemberStatusFilter::Current,
+        joined_from_ms: None,
+        joined_to_ms: None,
+        sort: MemberSort::Name,
+        descending: true,
+        after: None,
+        limit: 1,
+    };
+    for expected in ["12", "10"] {
+        let page = reader
+            .list_members(scope.clone(), query.clone())
+            .await
+            .unwrap();
+        assert_eq!(page.members.len(), 1);
+        assert_eq!(page.members[0].user_id, expected);
+        assert_eq!(page.next_cursor.is_some(), expected == "12");
+        query.after = page.next_cursor;
+    }
+}
+
 async fn retained_messages_survive_remote_reopen(
     store: &GuildDataStore,
     reopened: &GuildDataStore,
@@ -243,6 +291,7 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .is_err()
     );
     retained_messages_survive_remote_reopen(&store, &reopened, &scoped, &probe).await;
+    sorted_members_page_over_remote_store(&store, &reopened, &scoped).await;
     let case_id = CaseId::new();
     let limits = CaseLimits::default();
     let facts = CaseData {

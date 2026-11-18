@@ -40,6 +40,7 @@ const MEMBER_GAP_AUTO_CLEAR_SCHEMA: &str =
 const ACCESS_ROLES_SCHEMA: &str = include_str!("../../migrations/guild/0018_access_roles.sql");
 const SERVER_NAMES_SCHEMA: &str = include_str!("../../migrations/guild/0019_server_names.sql");
 const CASE_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0020_case_list_orders.sql");
+const MEMBER_SORT_SCHEMA: &str = include_str!("../../migrations/guild/0021_member_sort.sql");
 mod bunny_transfer;
 #[cfg(unix)]
 pub(crate) use bunny_transfer::*;
@@ -554,6 +555,26 @@ fn initialize_store(
                 .saturating_add(32_000_000);
             tx.execute_batch_bounded(CASE_LIST_SCHEMA, index_bound)?;
         }
+        if version < 22 {
+            // Each row has an all-status index set and may also be current and
+            // either banned or previously banned. Budget for each set's keys
+            // and page overhead using directory data only.
+            let index_keys: i64 = tx.query_row(
+                "SELECT coalesce(sum(
+                    (1 + is_current + (is_banned OR ever_banned)) *
+                    (4 * (48 + length(CAST(enrollment_id AS BLOB))) +
+                     length(CAST(coalesce(nickname,'') AS BLOB)) +
+                     length(CAST(coalesce(global_name,'') AS BLOB)) +
+                     length(CAST(coalesce(username,'') AS BLOB)))
+                 ),0) FROM guild_member_directory",
+                (),
+                |row| Ok(row.get(0)?),
+            )?;
+            let index_bound = u64::try_from(index_keys)?
+                .saturating_mul(2)
+                .saturating_add(32_000_000);
+            tx.execute_batch_bounded(MEMBER_SORT_SCHEMA, index_bound)?;
+        }
         // Version 16 adds the optional immutable ban_attempt_tag to case JSON.
         // No DDL or rewrite of legacy cases: their absent tags must remain absent.
         tx.pragma_update(None, "user_version", VERSION)?;
@@ -584,6 +605,7 @@ fn initialize_store(
     tx.execute_batch_bounded(ACCESS_ROLES_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(SERVER_NAMES_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(CASE_LIST_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_SORT_SCHEMA, 32_000_000)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",
@@ -673,6 +695,7 @@ impl GuildDataStore {
                     (ACCESS_ROLES_SCHEMA, 19),
                     (SERVER_NAMES_SCHEMA, 20),
                     (CASE_LIST_SCHEMA, 21),
+                    (MEMBER_SORT_SCHEMA, 22),
                 ];
                 for (sql, at) in batches {
                     if *at <= version {

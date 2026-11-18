@@ -1,30 +1,104 @@
 //! Captured-enrollment member directory reads and administrator sync controls.
 use super::api;
+use super::list_controls::{ListQuery, SortDirection, decode_cursor, encode_cursor};
 use super::state::ApiState;
 use super::{ApiError, ApiResult, AuthCtx, GuildAccess, authorize_guild};
 use crate::bot_actions::{Action, MemberSyncOperation};
 use crate::db;
 use crate::db::guild_data::{
-    GuildDataScope, MemberQuery, MemberSort, MemberStatusFilter, MemberSyncStatus,
+    GuildDataScope, MemberListAnchor, MemberProfile, MemberQuery, MemberSort, MemberStatusFilter,
+    MemberSyncStatus,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use chrono::{NaiveDate, TimeZone, Utc};
-use serde::Deserialize;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_sessions::Session;
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MemberSortParam {
+    Name,
+    UserId,
+    Joined,
+    Status,
+    // Keep the previous sort values usable by an already-open dashboard.
+    JoinedNewest,
+    JoinedOldest,
+}
+
 #[derive(Deserialize)]
 pub struct MembersQuery {
-    q: Option<String>,
-    status: Option<String>,
+    #[serde(flatten)]
+    list: ListQuery<MemberSortParam, MemberStatusFilter>,
     joined_from: Option<String>,
     joined_to: Option<String>,
-    sort: Option<String>,
-    after: Option<String>,
     limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct MembersResponse {
+    members: Vec<MemberProfile>,
+    next_cursor: Option<String>,
+}
+
+impl MembersQuery {
+    fn validate(mut self) -> ApiResult<(MemberQuery, SortDirection)> {
+        self.list.from = self.list.from.or(self.joined_from);
+        self.list.to = self.list.to.or(self.joined_to);
+        let default_dir = match self.list.sort {
+            Some(
+                MemberSortParam::JoinedOldest
+                | MemberSortParam::Name
+                | MemberSortParam::UserId
+                | MemberSortParam::Status,
+            ) => SortDirection::Asc,
+            _ => SortDirection::Desc,
+        };
+        let controls = self.list.validate(MemberSortParam::Joined, default_dir)?;
+        let sort = match controls.sort {
+            MemberSortParam::Name => MemberSort::Name,
+            MemberSortParam::UserId => MemberSort::UserId,
+            MemberSortParam::Joined
+            | MemberSortParam::JoinedNewest
+            | MemberSortParam::JoinedOldest => MemberSort::Joined,
+            MemberSortParam::Status => MemberSort::Status,
+        };
+        if controls
+            .q
+            .as_ref()
+            .is_some_and(|q| q.len() > 128 || q.chars().count() > 120)
+        {
+            return Err(ApiError(anyhow::anyhow!("search is too long")));
+        }
+        if controls.subject.is_some() || controls.actor.is_some() {
+            return Err(ApiError(anyhow::anyhow!("use member search for user IDs")));
+        }
+        let after = controls
+            .after
+            .as_deref()
+            .map(|raw| decode_cursor::<_, MemberListAnchor>(raw, "members", sort, controls.dir))
+            .transpose()?;
+        if after.as_ref().is_some_and(|anchor| !anchor.matches(sort)) {
+            return Err(ApiError(anyhow::anyhow!("invalid list cursor")));
+        }
+        Ok((
+            MemberQuery {
+                q: controls.q,
+                status: controls.outcome.unwrap_or(MemberStatusFilter::Current),
+                joined_from_ms: controls.from_ms,
+                joined_to_ms: controls.until_ms.map(|until| until - 1),
+                sort,
+                descending: controls.dir == SortDirection::Desc,
+                after,
+                limit: self.limit.unwrap_or(50).clamp(1, 100),
+            },
+            controls.dir,
+        ))
+    }
 }
 
 #[derive(Deserialize)]
@@ -105,67 +179,27 @@ fn parse_user_id(raw: &str) -> ApiResult<i64> {
         .ok_or_else(|| ApiError(anyhow::anyhow!("invalid user id")))
 }
 
-fn date_ms(raw: Option<String>, end: bool) -> ApiResult<Option<i64>> {
-    raw.map(|value| {
-        let date = NaiveDate::parse_from_str(&value, "%Y-%m-%d")
-            .map_err(|_| ApiError(anyhow::anyhow!("invalid joined date")))?;
-        let time = if end {
-            date.and_hms_milli_opt(23, 59, 59, 999)
-        } else {
-            date.and_hms_milli_opt(0, 0, 0, 0)
-        }
-        .ok_or_else(|| ApiError(anyhow::anyhow!("invalid joined date")))?;
-        Ok(Utc.from_utc_datetime(&time).timestamp_millis())
-    })
-    .transpose()
-}
-
 pub async fn list_members(
     State(app): State<Arc<ApiState>>,
     session: Session,
     headers: HeaderMap,
     Path(guild_id): Path<u64>,
     Query(query): Query<MembersQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<MembersResponse>> {
     let (_, enrollment) =
         scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
+    let (query, dir) = query.validate()?;
+    let sort = query.sort;
     let (store, scope) = app.tenant.live(enrollment).await?;
-    let q = query.q.map(|value| value.trim().to_owned());
-    if q.as_ref()
-        .is_some_and(|value| value.chars().count() > 120 || value.len() > 128)
-    {
-        return Err(ApiError(anyhow::anyhow!("search is too long")));
-    }
-    if query.after.as_ref().is_some_and(|value| value.len() > 64) {
-        return Err(ApiError(anyhow::anyhow!("cursor is too long")));
-    }
-    let status = match query.status.as_deref().unwrap_or("current") {
-        "current" => MemberStatusFilter::Current,
-        "banned" => MemberStatusFilter::Banned,
-        "previously_banned" => MemberStatusFilter::PreviouslyBanned,
-        "all" => MemberStatusFilter::All,
-        _ => return Err(ApiError(anyhow::anyhow!("invalid member status"))),
-    };
-    let sort = match query.sort.as_deref().unwrap_or("joined_newest") {
-        "joined_newest" => MemberSort::JoinedNewest,
-        "joined_oldest" => MemberSort::JoinedOldest,
-        _ => return Err(ApiError(anyhow::anyhow!("invalid member sort"))),
-    };
-    let page = store
-        .list_members(
-            scope,
-            MemberQuery {
-                q,
-                status,
-                joined_from_ms: date_ms(query.joined_from, false)?,
-                joined_to_ms: date_ms(query.joined_to, true)?,
-                sort,
-                after: query.after,
-                limit: query.limit.unwrap_or(50).clamp(1, 100),
-            },
-        )
-        .await?;
-    Ok(Json(serde_json::to_value(page)?))
+    let page = store.list_members(scope, query).await?;
+    let next_cursor = page
+        .next_cursor
+        .map(|anchor| encode_cursor("members", sort, dir, anchor))
+        .transpose()?;
+    Ok(Json(MembersResponse {
+        members: page.members,
+        next_cursor,
+    }))
 }
 
 pub async fn get_member(

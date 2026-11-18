@@ -11,8 +11,8 @@ function filterKeys(config) {
   return [...config.filters.map(({ key }) => key), ...commonKeys];
 }
 
-function boundedSearch(value) {
-  return Array.from(value).slice(0, SEARCH_LIMIT).join("");
+function boundedSearch(value, limit = SEARCH_LIMIT) {
+  return Array.from(value).slice(0, limit).join("");
 }
 
 function emptyFilters(config) {
@@ -69,8 +69,12 @@ function readView(config, guildId) {
   const filters = emptyFilters(config);
   const initial = { filters, sort: config.defaultSort, dir: config.defaultDir };
   if (query.get("list") !== config.list || query.get("guild") !== guildId) return initial;
-  for (const key of filterKeys(config)) filters[key] = query.get(key) || "";
-  filters.q = boundedSearch(filters.q.trim());
+  for (const key of commonKeys) filters[key] = query.get(key) || "";
+  for (const { key, options } of config.filters) {
+    const value = query.get(key);
+    if (value && (!options || Object.hasOwn(options, value))) filters[key] = value;
+  }
+  filters.q = boundedSearch(filters.q.trim(), config.searchLimit);
   const sort = query.get("sort");
   const dir = query.get("dir");
   return {
@@ -97,14 +101,23 @@ function hasFilters(view) {
   return Object.values(view.filters).some(Boolean);
 }
 
-export function useListControls(config, guildId, onChange) {
+export function useListControls(config, guildId, onChange, onSearchPending) {
   const [view, setView] = useState(() => readView(config, guildId));
   const current = useRef(view);
   const [searchText, setSearchText] = useState(view.filters.q);
-  const searchTimer = useRef(null);
-  useEffect(() => () => clearTimeout(searchTimer.current), []);
+  const pendingSearch = useRef(null);
+  useEffect(() => () => clearTimeout(pendingSearch.current?.timer), []);
 
+  const takeSearch = () => {
+    const pending = pendingSearch.current;
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pendingSearch.current = null;
+    return pending.value;
+  };
   const commit = (next) => {
+    const q = takeSearch();
+    if (q !== undefined) next = { ...next, filters: { ...next.filters, q } };
     current.current = next;
     setView(next);
     writeView(config, guildId, next);
@@ -116,15 +129,24 @@ export function useListControls(config, guildId, onChange) {
     commit({ ...previous, filters: { ...previous.filters, [key]: value } });
   };
   const replaceFilters = (filters = {}) => {
-    clearTimeout(searchTimer.current);
+    takeSearch();
     setSearchText(filters.q || "");
     commit({ ...current.current, filters: { ...emptyFilters(config), ...filters } });
   };
+  const flushSearch = () => {
+    const q = takeSearch();
+    if (q === undefined) return;
+    // A list that aborted its previous read when typing began must reload
+    // even if the text was edited back to the last committed search.
+    if (q === current.current.filters.q && onSearchPending) onChange();
+    else setFilter("q", q);
+  };
   const setSearch = (value) => {
-    const text = boundedSearch(value);
+    const text = boundedSearch(value, config.searchLimit);
     setSearchText(text);
-    clearTimeout(searchTimer.current);
-    searchTimer.current = setTimeout(() => setFilter("q", text.trim()), SEARCH_DELAY_MS);
+    takeSearch();
+    pendingSearch.current = { value: text.trim(), timer: setTimeout(flushSearch, SEARCH_DELAY_MS) };
+    onSearchPending?.();
   };
   const sortBy = (column) => {
     const previous = current.current;
@@ -138,17 +160,21 @@ export function useListControls(config, guildId, onChange) {
     return new URLSearchParams({ sort, dir, ...Object.fromEntries(Object.entries(filters).filter(([, value]) => value)) });
   };
   return {
-    config, view, searchText, setSearch, setFilter, replaceFilters, sortBy, query,
+    config, view, searchText, setSearch, flushSearch, setFilter, replaceFilters, sortBy, query,
     filtered: () => hasFilters(current.current),
   };
 }
 
 function ListField({ label, children }) {
-  return h("div", { className: "field" }, h("label", null, label, children));
+  const inputId = React.useId();
+  return h("div", { className: "field" },
+    h("label", { htmlFor: inputId }, label),
+    React.cloneElement(children, { id: inputId }),
+  );
 }
 
 export function ListControls({ controls, UserPicker, userPickerProps }) {
-  const { config, view, searchText, setSearch, setFilter, replaceFilters } = controls;
+  const { config, view, searchText, setSearch, flushSearch, setFilter, replaceFilters } = controls;
   const { filters } = view;
   const date = (key, label, bounds) => h(ListField, { label },
     h("input", {
@@ -156,11 +182,12 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
       type: "date",
       value: filters[key],
       ...bounds,
+      onInput: (event) => setFilter(key, event.target.value),
       onChange: (event) => setFilter(key, event.target.value),
     }),
   );
   return h("div", { className: "list-filters", "data-no-draft": true, role: "group", "aria-label": config.filterLabel },
-    ...config.filters.map(({ key, label, options, kind, idLabel, render }) => {
+    ...config.filters.map(({ key, label, options, kind, idLabel, render, emptyLabel }) => {
       if (kind === "user") {
         const ids = filters[key] ? [filters[key]] : [];
         return h(UserPicker, {
@@ -179,7 +206,7 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
           value: filters[key],
           onChange: (event) => setFilter(key, event.target.value),
         },
-        h("option", { value: "" }, `Any ${label.toLowerCase()}`),
+        h("option", { value: "" }, emptyLabel || `Any ${label.toLowerCase()}`),
         ...Object.entries(options).map(([value, entry]) => h("option", { key: value, value }, entry.label)),
         ),
       );
@@ -190,12 +217,13 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
         type: "search",
         value: searchText,
         placeholder: config.searchPlaceholder,
-        maxLength: SEARCH_LIMIT * 2,
-        onChange: (event) => setSearch(event.target.value),
+        maxLength: (config.searchLimit || SEARCH_LIMIT) * 2,
+        onInput: (event) => setSearch(event.target.value),
+        onBlur: flushSearch,
       }),
     ),
-    date("from", "From (UTC)", { max: filters.to || undefined }),
-    date("to", "To (UTC)", { min: filters.from || undefined }),
+    date("from", config.dateLabels?.from || "From (UTC)", { max: filters.to || undefined }),
+    date("to", config.dateLabels?.to || "To (UTC)", { min: filters.from || undefined }),
     hasFilters(view) || searchText
       ? h("button", { type: "button", className: "btn btn-sm", onClick: () => replaceFilters() }, "Clear filters")
       : null,
