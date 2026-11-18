@@ -112,6 +112,10 @@ stay aligned with `rust-toolchain.toml`, the root Cargo version requirements,
 and the CI toolchain. `Dockerfile.{bot,api}` pin
 `rust:1.100.0-bookworm` and `debian:bookworm-slim` by linux/amd64 digest. There is
 no Docker Dependabot job; bump those digests together with the toolchain pin.
+Moving the application images to Debian 13 (Trixie) requires a rollout plan
+for installed Bookworm releases. The launcher checks the base ABI when
+restoring a release, and the publisher validates that ABI before promotion
+([dependency tracker](https://github.com/jatmn/jModGuard/issues/668)).
 
 Dependabot version updates are supported on this private GitHub.com
 repository. GitHub enqueues those jobs as **Actions → Dependabot Updates**

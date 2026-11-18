@@ -8,7 +8,7 @@ for TEST_TARGET in remote_database_smoke guild_store_smoke bunny_evidence; do
   NAME="jmodguard-ci-${RANDOM}-$$-${TEST_TARGET}"
   trap 'docker rm -f "$NAME"' EXIT
   docker run -d --name "$NAME" -p 127.0.0.1::8080 \
-    ghcr.io/tursodatabase/libsql-server@sha256:1bc51611928ccc51229bdc40ca0defcb915907f8f9f6a664b43529de0ca45fab
+    ghcr.io/tursodatabase/libsql-server@sha256:6dd3eb276d9d3604e4a48ac4a999a2e267814732d57d7e94c04ba71482333a67
   HOST_PORT=$(docker port "$NAME" 8080/tcp | tail -1 | cut -d: -f2)
   if [ -z "$HOST_PORT" ]; then
     echo "failed to resolve host port for $NAME" >&2
