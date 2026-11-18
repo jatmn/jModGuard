@@ -1,6 +1,7 @@
 //! Private selected-case and evidence administration for an enrolled guild.
 use super::list_controls::{
-    ListQuery, SortDirection, decode_cursor, encode_cursor, within_list_deadline,
+    ListQuery, SortDirection, check_cursor_context, cursor_context, decode_cursor, encode_cursor,
+    within_list_deadline,
 };
 use super::state::ApiState;
 use super::{ApiError, ApiResult, AuthCtx, GuildAccess, authorize_guild};
@@ -14,7 +15,6 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
-use jmodguard_updater::oci::sha256_hex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_sessions::Session;
@@ -184,7 +184,7 @@ async fn list_cases_inner(
             .await?;
         (ids, next.map(String::from), None)
     } else {
-        let context = sha256_hex(&serde_json::to_vec(&(
+        let context = cursor_context((
             guild_id,
             &filter.action,
             &filter.outcome,
@@ -193,7 +193,7 @@ async fn list_cases_inner(
             list.q.as_deref().map(str::to_ascii_lowercase),
             list.from_ms,
             list.until_ms,
-        ))?);
+        ))?;
         let after = list
             .after
             .as_deref()
@@ -203,11 +203,7 @@ async fn list_cases_inner(
                     return Ok((CaseListPosition::from_case_id(id), true));
                 }
                 let cursor: CaseCursor = decode_cursor(token, CASE_LIST, list.sort, list.dir)?;
-                if cursor.context != context {
-                    return Err(ApiError(anyhow::anyhow!(
-                        "list cursor does not match the guild or filters"
-                    )));
-                }
+                check_cursor_context(&cursor.context, &context)?;
                 if cursor.legacy_id_order && explicit_sort {
                     return Err(ApiError(anyhow::anyhow!(
                         "list cursor does not match the requested sort"
