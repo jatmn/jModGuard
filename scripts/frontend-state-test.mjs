@@ -10710,7 +10710,11 @@ function resourceSnapshot({ bot = {}, api = {}, ...overrides } = {}) {
     history_status: 'available',
     processes: {
       bot: { current: resourceCurrent({ interval_ms: 60000, stale_after_ms: 125000, age_ms: 20000 }), history: resourceHistory(), ...bot },
-      api: { current: resourceCurrent(), history: resourceHistory(), ...api },
+      api: {
+        current: resourceCurrent(),
+        history: resourceHistory({ breakdowns: { discord_rest_routes: [['/users/@me/guilds', 40], ['/users/@me', 20]], discord_429_routes: [['/users/@me/guilds', 2]] } }),
+        ...api,
+      },
     },
     rows_read: { status: 'unavailable', reason: 'not_reported_by_database_client' },
     provider: { status: 'not_configured', reason: 'no_scoped_read_only_key' },
@@ -10760,6 +10764,10 @@ test('Bot Resources shows both processes against their limits with activity and 
   assert.equal(resourceTileValue(h, 'p95 latency'), '100 ms');
   assert.equal(resourceTileValue(h, 'Active sessions'), '1');
   assert.equal(resourceTileValue(h, 'OAuth 429s'), '1');
+  const ranks = (label) => [...page.querySelector(`ol[aria-label="${label}"]`).querySelectorAll('li')]
+    .map((row) => [row.querySelector('.an-rank-label').textContent, row.querySelector('.an-rank-count').textContent]);
+  assert.deepEqual(ranks('Discord requests by route'), [['/users/@me/guilds', '40'], ['/users/@me', '20']]);
+  assert.deepEqual(ranks('Discord 429s by route'), [['/users/@me/guilds', '2']]);
   const costs = Object.fromEntries([...page.querySelectorAll('.br-costs tbody tr')].map((row) => [row.querySelector('th').textContent, [...row.querySelectorAll('td')].map((cell) => cell.textContent)]));
   assert.deepEqual(costs['Database round trips'], ['20.0', '20.0']);
   assert.deepEqual(costs['API response bytes'], ['—', '200.0 KB/min']);

@@ -249,6 +249,13 @@ impl std::error::Error for DiscordRetryAfter {}
 /// Seconds advertised to the browser. Missing or zero Discord values still
 /// impose a one-second floor so callers do not hammer immediately. The HTTP
 /// handler returns immediately; this number is not a sleep.
+/// Counts one Discord REST request at dispatch, in total and by route, so
+/// Bot Resources can show which OAuth routes the API spends.
+fn count_request(route: &'static str) {
+    jmodguard::resources::count("discord_rest", 1);
+    jmodguard::resources::count_labelled("discord_rest_routes", route, 1);
+}
+
 pub(crate) fn retry_after_header_secs(retry_after: Duration) -> u64 {
     retry_after
         .as_secs()
@@ -434,7 +441,7 @@ impl OAuthClient {
         let url = "https://discord.com/api/oauth2/token";
         #[cfg(test)]
         let url = self.token_endpoint.as_deref().unwrap_or(url);
-        jmodguard::resources::count("discord_rest", 1);
+        count_request("/oauth2/token");
         let resp = self
             .http
             .post(url)
@@ -503,7 +510,7 @@ impl OAuthClient {
         let url = "https://discord.com/api/users/@me";
         #[cfg(test)]
         let url = self.me_endpoint.as_deref().unwrap_or(url);
-        jmodguard::resources::count("discord_rest", 1);
+        count_request("/users/@me");
         let resp = self
             .http
             .get(url)
@@ -544,7 +551,7 @@ impl OAuthClient {
         let base = "https://discord.com/api/users/@me/guilds";
         #[cfg(test)]
         let base = self.member_endpoint.as_deref().unwrap_or(base);
-        jmodguard::resources::count("discord_rest", 1);
+        count_request("/users/@me/guilds/{id}/member");
         let resp = self
             .http
             .get(format!("{base}/{guild_id}/member"))
@@ -661,7 +668,7 @@ impl OAuthClient {
                 url.push_str("&after=");
                 url.push_str(cursor);
             }
-            jmodguard::resources::count("discord_rest", 1);
+            count_request("/users/@me/guilds");
             let resp = match self.http.get(&url).bearer_auth(access_token).send().await {
                 Ok(resp) => resp,
                 Err(error) => {
