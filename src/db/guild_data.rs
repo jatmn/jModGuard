@@ -19,6 +19,8 @@ const ACCESS_ROLES_SCHEMA: &str = include_str!("../../migrations/guild/0018_acce
 const SERVER_NAMES_SCHEMA: &str = include_str!("../../migrations/guild/0019_server_names.sql");
 const CASE_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0020_case_list_orders.sql");
 const MEMBER_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0021_member_list_orders.sql");
+const MEMBER_NAME_SCHEMA: &str =
+    include_str!("../../migrations/guild/0022_member_name_sort_key.sql");
 mod bunny_transfer;
 #[cfg(any(test, feature = "test-support"))]
 mod historical_schema;
@@ -497,7 +499,7 @@ fn initialize_store(
                 .saturating_add(1024 * 1024);
             tx.execute_batch_bounded(CASE_LIST_SCHEMA, index_bound)?;
         }
-        if version < 22 {
+        if version < 23 {
             let (all, current, banned, previous): (u64, u64, u64, u64) = tx.query_row(
                 "SELECT COUNT(*), COUNT(*) FILTER (WHERE is_current=1),
                         COUNT(*) FILTER (WHERE is_banned=1),
@@ -513,16 +515,23 @@ fn initialize_store(
                     ))
                 },
             )?;
-            // Every row enters three indexes, plus four for each matching filter.
-            // Reserve 1 KiB for each name and numeric index set (including page
-            // overhead and a name up to 256 bytes), plus 1 MiB for the DDL.
-            let index_bound = all
+            let name_index_entries = all
                 .saturating_add(current)
                 .saturating_add(banned)
-                .saturating_add(previous)
-                .saturating_mul(1024)
+                .saturating_add(previous);
+            if version < 22 {
+                // Reserve 1 KiB per name and numeric index set, plus 1 MiB for DDL.
+                let index_bound = name_index_entries
+                    .saturating_mul(1024)
+                    .saturating_add(1024 * 1024);
+                tx.execute_batch_bounded(MEMBER_LIST_SCHEMA, index_bound)?;
+            }
+            // Only name indexes are rebuilt. Allow 512 bytes per entry
+            // (including names up to 256 bytes and B-tree overhead).
+            let name_index_bound = name_index_entries
+                .saturating_mul(512)
                 .saturating_add(1024 * 1024);
-            tx.execute_batch_bounded(MEMBER_LIST_SCHEMA, index_bound)?;
+            tx.execute_batch_bounded(MEMBER_NAME_SCHEMA, name_index_bound)?;
         }
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
@@ -538,6 +547,7 @@ fn initialize_store(
     tx.execute_batch_bounded(SERVER_NAMES_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(CASE_LIST_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_LIST_SCHEMA, 32_000_000)?;
+    tx.execute_batch_bounded(MEMBER_NAME_SCHEMA, 1024 * 1024)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",

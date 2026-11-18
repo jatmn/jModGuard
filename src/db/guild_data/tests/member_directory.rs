@@ -146,6 +146,54 @@ async fn member_orders_seek_the_scoped_indexes_after_schema_21_upgrade() {
 }
 
 #[tokio::test]
+async fn member_name_sort_key_skips_empty_names_after_schema_22_upgrade() {
+    use crate::db_compat::Connection;
+
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    GuildDataStore::create_historical_store(f.options(), reg.clone(), 22).unwrap();
+    let raw = Connection::open(&f.store_path).unwrap();
+    raw.execute_batch_bounded(
+        "INSERT INTO guild_member_directory (
+            guild_id, enrollment_id, user_id, username, global_name, nickname,
+            is_current, observed_at_ms
+         ) VALUES
+            (10, 'members', 11, 'Zulu', 'Alpha', '', 1, 3000),
+            (10, 'members', 12, 'Bravo', '', NULL, 1, 3000),
+            (10, 'members', 13, '', '', '', 1, 3000)",
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    drop(raw);
+
+    let store = GuildDataStore::initialize(f.options(), reg).unwrap();
+    store
+        .db
+        .with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT user_id, name_sort_key FROM guild_member_directory
+                 INDEXED BY guild_member_sort_current_name
+                 WHERE guild_id=10 AND enrollment_id='members' AND is_current=1
+                 ORDER BY name_sort_key, user_id",
+            )?;
+            let rows = stmt
+                .query_map((), |row| Ok((row.get::<i64>(0)?, row.get::<String>(1)?)))?
+                .collect::<Result<Vec<_>>>()?;
+            assert_eq!(
+                rows,
+                [
+                    (13, "13".into()),
+                    (11, "alpha".into()),
+                    (12, "bravo".into())
+                ]
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn version_eight_upgrade_admits_existing_enrollment_once() {
     use crate::db_compat::Connection;
     let f = Fixture::new();

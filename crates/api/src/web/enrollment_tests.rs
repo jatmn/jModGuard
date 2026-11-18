@@ -7146,14 +7146,15 @@ async fn members_sort_and_filter_before_paging() {
     const DAY: i64 = 1_767_312_000_000; // 2026-01-02 UTC
     const NEXT_DAY: i64 = DAY + 86_400_000;
     let f = Fixture::new(false).await;
-    f.enroll(10).await;
+    for guild in [10, 20] {
+        f.enroll(guild).await;
+        let enrollment = db::guild_enrollment(&f.app.db, guild)
+            .await
+            .unwrap()
+            .unwrap();
+        f.app.tenant.activate(enrollment).await.unwrap().unwrap();
+    }
     let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
-    f.app
-        .tenant
-        .activate(enrollment.clone())
-        .await
-        .unwrap()
-        .unwrap();
     let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
     store
         .initialize_member_directory(scope.clone(), 42, NEXT_DAY)
@@ -7161,8 +7162,8 @@ async fn members_sort_and_filter_before_paging() {
         .unwrap();
     for (id, username, global_name, nickname, joined_at_ms) in [
         (11, "aardvark", None, Some("Zulu"), NEXT_DAY),
-        (12, "zebra", Some("Alpha"), None, NEXT_DAY),
-        (15, "alpha", None, None, DAY),
+        (12, "zebra", Some("Alpha"), Some(""), NEXT_DAY),
+        (15, "alpha", Some(""), Some(""), DAY),
         (16, "alphabet", None, None, NEXT_DAY),
     ] {
         store
@@ -7203,6 +7204,8 @@ async fn members_sort_and_filter_before_paging() {
     let (status, default) = f.request("GET", PATH, "").await;
     assert_eq!(status, StatusCode::OK, "{default}");
     assert_eq!(ids(&default), [16, 12, 11, 15]);
+    assert_eq!(default["members"][1]["display_name"], "Alpha");
+    assert_eq!(default["members"][3]["display_name"], "alpha");
 
     for (sort, ascending) in [
         ("name", [13, 14, 12, 15, 16, 11]),
@@ -7247,13 +7250,55 @@ async fn members_sort_and_filter_before_paging() {
     assert_eq!(ids(&second), [12]);
     assert_eq!(second["total"], 2);
     assert!(second["next_cursor"].is_null());
+
+    let equivalent = "sort=name&dir=desc&q=alp&joined_from=2026-01-03&joined_to=2026-01-03&limit=2";
+    let (status, second) = f
+        .request("GET", &format!("{PATH}?{equivalent}&after={after}"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(ids(&second), [12]);
+    assert!(second["total"].is_null());
+
+    for (path, filters) in [
+        (PATH, "status=all&q=alp&from=2026-01-03&to=2026-01-03"),
+        (PATH, "q=zebra&from=2026-01-03&to=2026-01-03"),
+        (PATH, "q=alp&from=2026-01-02&to=2026-01-03"),
+        (PATH, "q=alp&from=2026-01-03&to=2026-01-04"),
+        (
+            "/api/guilds/20/members",
+            "q=alp&from=2026-01-03&to=2026-01-03",
+        ),
+    ] {
+        let uri = format!("{path}?sort=name&dir=desc&{filters}&after={after}");
+        let (status, body) = f.request("GET", &uri, "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        assert_eq!(
+            body["error"], "list cursor does not match the guild or filters",
+            "{uri}"
+        );
+    }
+
+    let (status, body) = f
+        .request("GET", &format!("{PATH}?status=unknown"), "")
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("status")),
+        "{body}"
+    );
     for (query, expected) in [
         ("sort=name&dir=desc&status=previously_banned", vec![14]),
         (
             "sort=joined_oldest&joined_from=2026-01-03&joined_to=2026-01-03",
             vec![11, 12, 16],
         ),
-        ("sort=joined_newest&after=1767398400000:12", vec![11, 15]),
+        ("sort=joined_newest", vec![16, 12, 11, 15]),
+        ("sort=joined", vec![16, 12, 11, 15]),
+        ("sort=name", vec![12, 15, 16, 11]),
+        ("sort=user_id", vec![11, 12, 15, 16]),
+        ("sort=status&status=all", vec![11, 12, 15, 16, 13, 14]),
         ("sort=user_id&dir=desc&q=%3C%40%2111%3E", vec![11]),
     ] {
         let (status, body) = f.request("GET", &format!("{PATH}?{query}"), "").await;
@@ -7264,6 +7309,7 @@ async fn members_sort_and_filter_before_paging() {
         "sort=missing".to_owned(),
         "dir=sideways".to_owned(),
         "after=broken".to_owned(),
+        "sort=joined_newest&after=1767398400000:12".to_owned(),
         format!("sort=name&dir=asc&after={after}"),
         format!("sort=joined&dir=desc&after={after}"),
     ] {

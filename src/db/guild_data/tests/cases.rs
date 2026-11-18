@@ -886,7 +886,7 @@ async fn check_case_listing_migration_with_snapshot_allocation(delete_snapshots:
         .db
         .with_conn(|conn| {
             let version: i64 = conn.query_row("PRAGMA user_version", (), |r| Ok(r.get(0)?))?;
-            assert_eq!(version, 22);
+            assert_eq!(version, SCHEMA_VERSION);
             let indexes: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND tbl_name='guild_cases'
                  AND name IN ('guild_cases_list_date','guild_cases_list_action','guild_cases_list_outcome',

@@ -72,6 +72,7 @@ pub(super) fn apply(tx: &crate::db_compat::Transaction, from: i64, to: i64) -> R
         (20, SERVER_NAMES_SCHEMA),
         (21, CASE_LIST_SCHEMA),
         (22, MEMBER_LIST_SCHEMA),
+        (23, MEMBER_NAME_SCHEMA),
     ];
     for &(version, sql) in steps {
         if (from + 1..=to).contains(&version) {
