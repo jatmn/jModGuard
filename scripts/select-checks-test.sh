@@ -209,8 +209,7 @@ assert.equal(docs[0].rust, false);
 const core = read("core").include;
 assert.deepEqual(core.filter(j => j.lane.startsWith("rust-")).map(j => [j.lane, j.groups]), [
   ["rust-api", "api boundaries"],
-  ["rust-bot", "bot"],
-  ["rust-integration", "integration"],
+  ["rust-bot", "bot integration"],
   ["rust-core", "updater core"],
 ]);
 assert.equal(new Set(core.flatMap(j => j.groups.split(" "))).size, core.flatMap(j => j.groups.split(" ")).length);

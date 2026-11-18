@@ -33,12 +33,13 @@ commit's checks. New commits and reopened PRs still run affected checks.
 | CI runner scripts or the Rust toolchain pin | The runner regression suites (`runner-tests`), plus all Rust gates for the toolchain |
 | Unknown paths or CI orchestration | All checks |
 
-Selected groups run in up to nine jobs: quick contracts/shell checks/formatting,
-frontend, four Rust jobs, Dylint, supply chain and remote databases. Rust work is
-split into API/boundaries, bot, integration, and core/updater/runtime. The API job
-checks the production feature sets with `cargo check`. The integration job builds
-both service binaries for the executable smoke test. Each job has its own Cargo
-target directory. The Rust jobs restore the existing shared dependency cache
+Selected groups run in up to eight jobs: quick contracts/shell checks/formatting,
+frontend, three Rust jobs, Dylint, supply chain and remote databases. Rust work is
+split into API/boundaries, bot/integration, and core/updater/runtime. The API job
+checks the production feature sets with `cargo check`. Bot and integration share
+a Cargo target directory, including the bot binary used by the executable smoke
+test. Integration also builds the API binary for that test. The Rust jobs
+restore the shared dependency cache
 and use pinned sccache 0.18.0 to share compiler outputs through GitHub's cache.
 Source, feature, compiler and embedded-file changes invalidate compiler entries;
 cache hits never skip tests. Linking and check-only compiler calls still run,

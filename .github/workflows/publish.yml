@@ -67,7 +67,7 @@ jobs:
     name: Pin publication source
     needs: release
     if: >-
-      !cancelled() && (!github.event.repository.private || vars.JMODGUARD_ENABLE_PRIVATE_CI == 'true') &&
+      always() && !cancelled() && (!github.event.repository.private || vars.JMODGUARD_ENABLE_PRIVATE_CI == 'true') &&
       (needs.release.result == 'success' || needs.release.result == 'skipped') &&
       github.repository == 'jatmn/jModGuard' &&
       ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
@@ -116,8 +116,10 @@ jobs:
   # at that exact commit because the triggering event's diff does not cover it.
   release-ci:
     name: Validate release source
-    needs: prepare-publication
+    needs: [release, prepare-publication]
     if: >-
+      always() && !cancelled() &&
+      (needs.release.result == 'success' || needs.release.result == 'skipped') &&
       needs.prepare-publication.result == 'success' &&
       needs.prepare-publication.outputs.release_sha != '' &&
       needs.prepare-publication.outputs.release_sha != github.sha
@@ -127,8 +129,10 @@ jobs:
 
   publish-build:
     name: Publish build / ${{ matrix.component }}
-    needs: prepare-publication
+    needs: [release, prepare-publication]
     if: >-
+      always() && !cancelled() &&
+      (needs.release.result == 'success' || needs.release.result == 'skipped') &&
       needs.prepare-publication.result == 'success' &&
       github.repository == 'jatmn/jModGuard' && github.event_name != 'pull_request'
     strategy:

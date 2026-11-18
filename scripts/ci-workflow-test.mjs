@@ -14,6 +14,7 @@ const jobs = new Map([...combined.matchAll(/^  ([a-z][a-z-]*):\n([\s\S]*?)(?=^  
 for (const name of ["plan", "checks", "ci", "release", "prepare-publication", "publish-build", "publish-promote"]) {
   assert.ok(jobs.has(name), "missing job: " + name);
 }
+const releaseCI = jobs.get("release-ci");
 const publishBuild = jobs.get("publish-build");
 const publishPromote = jobs.get("publish-promote");
 assert.equal(jobs.has("publish-sign"), false, "promotion must not stay in the per-component sign matrix");
@@ -31,9 +32,14 @@ assert.match(jobs.get("ci"), /if: .*always\(\)/);
 assert.match(jobs.get("ci"), /test "\$PLAN_RESULT" = success && test "\$CHECK_RESULT" = success/);
 assert.doesNotMatch(jobs.get("release"), /^    needs:/m);
 assert.match(jobs.get("prepare-publication"), /^    needs: release$/m);
-assert.match(jobs.get("release-ci"), /^    needs: prepare-publication$/m);
-assert.match(publishBuild, /^    needs: prepare-publication$/m);
+assert.match(releaseCI, /^    needs: \[release, prepare-publication\]$/m);
+assert.match(publishBuild, /^    needs: \[release, prepare-publication\]$/m);
 assert.match(publishPromote, /^    needs: \[ci, prepare-publication, release-ci, publish-build\]$/m);
+// GitHub implicitly adds success() without a status check. A skipped
+// Release Please ancestor must not suppress jobs after successful preparation.
+for (const job of [jobs.get("prepare-publication"), releaseCI, publishBuild]) {
+  assert.match(job, /^    if: >-\n      always\(\) &&/m);
+}
 assert.match(jobs.get("prepare-publication"), /github\.actor_id == '12479882'/);
 assert.match(jobs.get("prepare-publication"), /github\.triggering_actor == 'jatmn'/);
 assert.match(publishBuild, /needs\.prepare-publication\.result == 'success'/);
@@ -200,7 +206,9 @@ for (const [event, ref, expected] of [
 ]) {
   assert.equal(Function("github", `return (${cacheMode});`)({ event_name: event, ref }), expected);
 }
-const rustLanes = ["rust-api", "rust-bot", "rust-integration", "rust-core"];
+const workflowEnv = workflow.match(/^env:\n((?:  [^\n]+\n)+)/m)?.[1] ?? "";
+assert.match(workflowEnv, /^  CARGO_BUILD_JOBS: '2'$/m, "preserve the Rust dependency cache key");
+const rustLanes = ["rust-api", "rust-bot", "rust-core"];
 for (const lane of [...rustLanes, "quick", "frontend", "dylint", "supply-chain", "remote-database"]) {
   const evaluate = (key, block = jobs.get("checks")) => {
     const match = block.match(new RegExp(`${key}: \\$\\{\\{ (.+) \\}\\}`));
@@ -389,7 +397,7 @@ try {
     assert.equal(binding(jobs.get("checks"), "ref", context), source);
     assert.equal(binding(jobs.get("checks"), "JMODGUARD_DIFF_BASE", context), "");
     assert.equal(binding(jobs.get("checks"), "JMODGUARD_DIFF_HEAD", context), source);
-    assert.equal(matrix().include.length, 9, "a different source requires all nine lanes");
+    assert.equal(matrix().include.length, 8, "a different source requires all eight lanes");
     assert.equal(git("rev-parse", "HEAD"), source);
     // Staging is independent of validation. Promotion requires both CI
     // results and all builds to succeed, including on retries.
@@ -431,9 +439,31 @@ try {
     context.needs["prepare-publication"].outputs.release_sha = source;
     for (const attempt of [1, 2, 3]) {
       context.github.run_attempt = attempt;
-      assert.equal(condition(jobs.get("release"), context), attempt === 1, "reruns must not consume another release");
+      const runRelease = condition(jobs.get("release"), context);
+      assert.equal(runRelease, attempt === 1, "reruns must not consume another release");
+      context.needs.release.result = runRelease ? "success" : "skipped";
+      assert.ok(condition(jobs.get("prepare-publication"), context), "reruns can restore the publication plan");
+      assert.ok(condition(publishBuild, context), "successful preparation permits staging when release skips");
+      assert.equal(condition(releaseCI, context), source === release,
+        "a restored differing source still requires validation");
     }
   }
+  for (const result of ["failure", "cancelled"]) {
+    context.needs.release.result = result;
+    assert.equal(condition(jobs.get("prepare-publication"), context), false, "preparation requires release success or skip");
+    assert.equal(condition(publishBuild, context), false, "staging requires release success or skip");
+    assert.equal(condition(releaseCI, context), false, "pinned-source CI requires release success or skip");
+  }
+  context.needs.release.result = "skipped";
+  for (const result of ["failure", "cancelled", "skipped"]) {
+    context.needs["prepare-publication"].result = result;
+    assert.equal(condition(publishBuild, context), false, "staging requires successful preparation");
+    assert.equal(condition(releaseCI, context), false, "pinned-source CI requires successful preparation");
+  }
+  context.needs["prepare-publication"].result = "success";
+  context.cancelled = true;
+  assert.equal(condition(publishBuild, context), false, "cancellation blocks staging");
+  assert.equal(condition(releaseCI, context), false, "cancellation blocks pinned-source CI");
 } finally {
   fs.rmSync(scratch, { recursive: true, force: true });
 }
