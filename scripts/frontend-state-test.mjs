@@ -74,7 +74,10 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   activate(win);
   Object.defineProperty(document, 'visibilityState', {value: 'visible', writable: true});
   Object.defineProperty(win, 'localStorage', {value: { getItem: k => storage.get(k) ?? null, setItem: (k,v) => storage.set(k,v) }, configurable: true});
-  Object.defineProperty(win, 'sessionStorage', {value: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, configurable: true});
+  Object.defineProperty(win, 'sessionStorage', {value: {
+    getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k),
+    key: i => [...session.keys()][i] ?? null, get length() { return session.size; },
+  }, configurable: true});
   win.matchMedia = () => ({matches: false, addEventListener() {}, removeEventListener() {}});
   const roots = [], timers = new Map(), documentListeners = new Map(), opened = [], historyUrls = [];
   let nextTimer = 1, clockOffsetMs = 0, rendering = false;
@@ -9863,6 +9866,116 @@ test('the Web UI draws SVG icons, never emoji or glyph icons', () => {
   }
 });
 
+// #653: display reads render this tab's cached copy at once, then revalidate.
+const statValue = (h, label) => [...h.nodes.get('#content').querySelectorAll('.dashboard-stats > .stat')]
+  .find((tile) => tile.querySelector('.stat-title').textContent.startsWith(label)).querySelector('.stat-value').textContent;
+const lastUpdated = (h) => h.nodes.get('#content').querySelector('.last-updated')?.textContent ?? null;
+const readCacheKeys = (session) => [...session.keys()].filter((key) => key.startsWith('jmodguard.read:'));
+
+test('Dashboard counts render from the tab cache on return and reload, then revalidate in the background', async () => {
+  const session = new Map();
+  let reads = 0, release = null, fail = false;
+  const fetchImpl = async (url) => {
+    assert.match(url, /\/stats$/);
+    reads += 1;
+    if (reads > 1) await new Promise((resolve) => { release = resolve; });
+    if (fail) throw new Error('offline');
+    return response({ events: reads, warns: 0, bans: 0, cases: 0 });
+  };
+  const h = harness(fetchImpl, new Map(), session);
+  h.app.state.config = configuredDashboard();
+  h.app.state.tab = 'dashboard';
+  h.app.renderTab();
+  await settle();
+  assert.equal(statValue(h, 'Moderation records'), '1');
+  assert.match(lastUpdated(h), /^Last updated /);
+  assert.equal(readCacheKeys(session).length, 1, 'this tab keeps the response');
+
+  // Returning shows the cached counts at once while the same read revalidates.
+  h.app.navigate('rules');
+  await settle();
+  h.app.navigate('dashboard');
+  await settle();
+  assert.equal(reads, 2);
+  assert.equal(statValue(h, 'Moderation records'), '1', 'no Loading… flash');
+  assert.equal(lastUpdated(h), 'Refreshing…');
+  release();
+  await settle();
+  assert.equal(statValue(h, 'Moderation records'), '2');
+  assert.match(lastUpdated(h), /^Last updated /);
+
+  // A failed revalidation keeps the last good copy on screen.
+  fail = true;
+  await fire(h.nodes.get('#refresh-dashboard'), 'click');
+  assert.equal(reads, 3);
+  release();
+  await settle();
+  assert.equal(statValue(h, 'Moderation records'), '2');
+  assert.match(lastUpdated(h), /^Last updated /);
+
+  // A reload in this tab starts from the stored copy, not from Loading….
+  fail = false;
+  const reloaded = harness(fetchImpl, new Map(), session);
+  reloaded.app.state.config = configuredDashboard();
+  reloaded.app.state.tab = 'dashboard';
+  reloaded.app.renderTab();
+  await settle();
+  assert.equal(reads, 4);
+  assert.equal(statValue(reloaded, 'Moderation records'), '2');
+  assert.equal(lastUpdated(reloaded), 'Refreshing…');
+  release();
+  await settle();
+  assert.equal(statValue(reloaded, 'Moderation records'), '4');
+
+  // Another account in the same tab never sees it, and auth loss clears it.
+  const other = harness(fetchImpl, new Map(), session);
+  other.app.state.me = { user: { id: '223456789012345678' } };
+  other.app.state.config = configuredDashboard();
+  other.app.state.tab = 'dashboard';
+  other.app.renderTab();
+  await settle();
+  assert.equal(statValue(other, 'Moderation records'), 'Loading…');
+  release();
+  await settle();
+  assert.equal(readCacheKeys(session).length, 2);
+  other.app.handleAuthLoss(new Error('not authenticated'));
+  assert.deepEqual(readCacheKeys(session), []);
+});
+
+test('cached reads revalidate every few minutes only while the page is visible', async () => {
+  let reads = 0;
+  const h = harness(async () => { reads += 1; return response({ events: reads, warns: 0, bans: 0, cases: 0 }); });
+  h.app.state.config = configuredDashboard();
+  h.app.state.tab = 'dashboard';
+  h.app.renderTab();
+  await settle();
+  assert.equal(reads, 1);
+  const intervals = () => [...h.timers.values()].filter((timer) => timer.repeating && timer.delay === 180000);
+  assert.equal(intervals().length, 1);
+  const [timer] = intervals();
+
+  h.document.visibilityState = 'hidden';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  h.advanceTime(10 * 60000);
+  await timer.fn();
+  assert.equal(reads, 1, 'a hidden page does not refresh');
+
+  h.document.visibilityState = 'visible';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(reads, 2, 'showing an outdated page refreshes it once');
+  await timer.fn();
+  assert.equal(reads, 2, 'a just-refreshed page waits for the next interval');
+  h.advanceTime(180000);
+  await timer.fn();
+  assert.equal(reads, 3);
+  assert.equal(statValue(h, 'Moderation records'), '3');
+
+  h.app.navigate('rules');
+  await settle();
+  assert.equal(intervals().length, 0, 'leaving the page stops its refresh');
+});
+
 // #608: every Dashboard Overview tile and Getting started link shows one decorative icon from the
 // shared map, in the color of the page or action it summarizes, with its label unchanged.
 // [label, DASHBOARD_ICONS key, icon, color, sidebar item with the same meaning]
@@ -10594,7 +10707,8 @@ test('Database Usage polls only while visible, ages retained samples and cleans 
   assert.equal(usageCards(h)[0].dataset.usageStale, undefined);
   assert.equal(poll().length, 1);
   const pendingTimer = poll()[0][1];
-  h.app.navigate('servers');
+  // Bot servers revalidates its own cached list while visible; leave for a page that does not.
+  h.app.navigate('resources');
   await settle();
   assert.equal(poll().length, 0);
   assert.equal(h.documentListeners.has('visibilitychange'), false);

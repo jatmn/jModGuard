@@ -304,6 +304,19 @@ server is selected. Browser storage is optional; if blocked, the app still works
 but selection will not survive a reload. Settings themselves always come from the
 API and are never restored from browser storage.
 
+The Dashboard overview counts, Audit log, Bans and owner Bot servers lists keep
+their last response in memory and in this tab's `sessionStorage`, per signed-in
+account and API origin. Returning to one of these pages, or reloading the tab,
+shows that copy at once and asks the API again in the background; the page shows
+**Refreshing…** and then **Last updated** with the time of the last good response.
+If that request fails, the last good copy stays on screen. While the page is
+visible it asks again every 3 minutes, and when you return to a hidden tab after
+that long; a hidden page makes no requests. **Refresh** always asks the API. The
+API keeps its own Discord refresh interval, so neither a reload nor Refresh makes
+an extra Discord request. Signing out, losing the session and View as… previews
+do not use or keep these copies. Settings, bot-action receipts and other pages are
+not cached.
+
 Use **Save** in an editor to apply changes. While an action is running, controls
 are disabled to prevent duplicate saves or switching its target server. If a
 configuration refresh fails, the workspace shows **Retry** instead of stale

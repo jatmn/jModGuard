@@ -371,7 +371,7 @@ function clearOwnerLeaveRequest(server) {
 }
 
 function TabOwnerServers() {
-  const result = useApiRead("/api/owner-servers");
+  const result = useApiRead("/api/owner-servers", { cache: true });
   const [receipts, setReceipts] = useState({});
   const timers = useRef(new Set());
   const mounted = useRef(true);
@@ -506,6 +506,7 @@ function TabOwnerServers() {
       "div",
       { className: "row", style: { marginBottom: "12px" } },
       h(ActionButton, { className: "btn", onClick: () => result.refresh() }, "Refresh"),
+      h(LastUpdated, { result }),
     ),
     h(
       DataTable,
@@ -2359,6 +2360,7 @@ function isUnauthenticated(err) {
 
 function stopPrivateWatchers() {
   analyticsCache.clear();
+  clearReadCache();
   for (const dispose of authLossCleanups) dispose();
   for (const key of pendingLogChannelActions.keys()) clearPendingLogChannelEntry(key);
 }
@@ -3303,7 +3305,7 @@ function tabDashboard() {
   const rulesDry = rules.filter((r) => r.effective?.dry_run).length;
   const commandsOn = commands.filter((c) => c.effective?.enabled).length;
   const chans = (cfg.log_channels ?? []).filter((l) => l.effective && String(l.effective) !== "0").length;
-  const result = useApiRead(`/api/guilds/${guildId}/stats`);
+  const result = useApiRead(`/api/guilds/${guildId}/stats`, { cache: true });
   const count = (key) =>
     result.loading ? "Loading…" : result.data?.[key] == null ? "Unavailable" : String(result.data[key]);
   return h(
@@ -3352,7 +3354,13 @@ function tabDashboard() {
     h(
       "section",
       { className: "dashboard-section", "aria-labelledby": "dashboard-overview" },
-      h("h3", { className: "card-title", id: "dashboard-overview" }, "Overview"),
+      h(
+        "div",
+        { className: "row dashboard-overview-head" },
+        h("h3", { className: "card-title", id: "dashboard-overview" }, "Overview"),
+        h(LastUpdated, { result }),
+        h(ActionButton, { id: "refresh-dashboard", className: "btn btn-sm", onClick: () => result.refresh() }, "Refresh"),
+      ),
       h(
         "div",
         { className: "stats bg-base-100 w-full dashboard-stats" },
@@ -9432,16 +9440,88 @@ function CommandStep({ step, index, names, pending, onChange, remove }) {
   );
 }
 
-function useApiRead(path, { retainData = false, listSize, collection } = {}) {
+// Display reads opted into `cache` are kept per signed-in user in memory and in
+// this tab's sessionStorage. A cached copy renders at once on navigation or
+// reload while the same read revalidates it, and visible pages revalidate every
+// few minutes. The server still decides freshness: a refresh always asks the API,
+// whose Discord data has its own refresh interval. Sign-out and auth loss clear it.
+const READ_CACHE_PREFIX = "jmodguard.read:";
+const READ_CACHE_ENTRIES = 32;
+const READ_REFRESH_MS = 3 * 60 * 1000;
+const readCache = new Map();
+
+function readCacheKey(path) {
+  const user = state.me?.user?.id;
+  return user && !isPreview() ? `${READ_CACHE_PREFIX}${apiBase()}:${user}:${path}` : null;
+}
+
+function cachedRead(path) {
+  const key = readCacheKey(path);
+  if (!key) return null;
+  if (readCache.has(key)) return readCache.get(key);
+  try {
+    const saved = JSON.parse(window.sessionStorage.getItem(key));
+    if (saved && Number.isFinite(saved.at) && saved.data != null) {
+      readCache.set(key, saved);
+      return saved;
+    }
+  } catch (_) { /* An unreadable copy is only a cache miss. */ }
+  return null;
+}
+
+function storeRead(path, data, at) {
+  const key = readCacheKey(path);
+  if (!key) return;
+  const entry = { at, data };
+  readCache.delete(key);
+  readCache.set(key, entry);
+  while (readCache.size > READ_CACHE_ENTRIES) readCache.delete(readCache.keys().next().value);
+  try {
+    window.sessionStorage.setItem(key, JSON.stringify(entry));
+  } catch (_) {
+    try { window.sessionStorage.removeItem(key); } catch (__) { /* Memory still holds this tab's copy. */ }
+  }
+}
+
+function clearReadCache() {
+  readCache.clear();
+  try {
+    for (let i = window.sessionStorage.length - 1; i >= 0; i -= 1) {
+      const key = window.sessionStorage.key(i);
+      if (key?.startsWith(READ_CACHE_PREFIX)) window.sessionStorage.removeItem(key);
+    }
+  } catch (_) { /* Nothing readable is left to clear. */ }
+}
+
+function useApiRead(path, { retainData = false, listSize, collection, cache = false } = {}) {
   const [revision, setRevision] = useState(0);
   const [result, setResult] = useState({ kind: "loading" });
   const cancel = useRef(null);
+  const updatedAt = useRef(0);
+  useEffect(() => {
+    if (!cache) return undefined;
+    const due = () => document.visibilityState === "visible" && Date.now() - updatedAt.current >= READ_REFRESH_MS;
+    const revalidate = () => { if (due()) setRevision((value) => value + 1); };
+    const timer = setInterval(revalidate, READ_REFRESH_MS);
+    document.addEventListener("visibilitychange", revalidate);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", revalidate);
+    };
+  }, [cache, path]);
   useEffect(() => {
     const controller = new AbortController();
     let publication = "current";
     const timeout = collection ? null : setTimeout(() => controller.abort(), 30000);
+    const cached = cache ? cachedRead(path) : null;
     setResult((current) => {
-      const retained = retainData && current.path === path && current.data != null;
+      const kept = current.path === path && current.data != null ? current : null;
+      if (cache && (kept || cached)) {
+        const shown = (kept?.updatedAt ?? -1) >= (cached?.at ?? -1) ? kept : { data: cached.data, updatedAt: cached.at };
+        updatedAt.current = shown.updatedAt;
+        return { kind: "loaded", path, data: shown.data, updatedAt: shown.updatedAt, revalidating: true, error: null, progress: null };
+      }
+      const retained = retainData && kept;
       // A pending retry does not make the retained snapshot fresh again.
       return {
         kind: "loading", path, data: retained ? current.data : null, error: retained ? current.error : null,
@@ -9462,18 +9542,21 @@ function useApiRead(path, { retainData = false, listSize, collection } = {}) {
     };
     read
       .then((data) => {
-        if (publication === "current") setResult({ kind: "loaded", path, data });
+        if (publication !== "current") return;
+        const at = Date.now();
+        updatedAt.current = at;
+        if (cache) storeRead(path, data, at);
+        setResult({ kind: "loaded", path, data, updatedAt: at });
       })
       .catch((error) => {
-        if (publication === "current")
-          setResult((current) => ({
-            ...current,
-            kind: "failed",
-            progress: null,
-            error: controller.signal.aborted
-              ? apiError("Request timed out. Refresh to verify saved state before trying again.")
-              : error,
-          }));
+        if (publication !== "current") return;
+        const failure = controller.signal.aborted
+          ? apiError("Request timed out. Refresh to verify saved state before trying again.")
+          : error;
+        // A failed revalidation keeps the cached copy on screen, marked with the error.
+        setResult((current) => current.revalidating && current.path === path
+          ? { ...current, revalidating: false, error: failure }
+          : { ...current, kind: "failed", progress: null, error: failure });
       })
       .finally(() => { if (timeout !== null) clearTimeout(timeout); });
     return () => {
@@ -9481,16 +9564,29 @@ function useApiRead(path, { retainData = false, listSize, collection } = {}) {
       if (timeout !== null) clearTimeout(timeout);
       controller.abort();
     };
-  }, [path, revision, retainData, collection, listSize]);
+  }, [path, revision, retainData, collection, listSize, cache]);
+  const current = result.path === path;
   return {
     loading: result.kind === "loading",
-    data: retainData ? (result.path === path ? result.data ?? null : null) : result.kind === "loaded" ? result.data : null,
-    error: retainData ? (result.path === path ? result.error ?? null : null) : result.kind === "failed" ? result.error : null,
+    data: retainData || cache ? (current ? result.data ?? null : null) : result.kind === "loaded" ? result.data : null,
+    error: retainData || cache ? (current ? result.error ?? null : null) : result.kind === "failed" ? result.error : null,
     progress: result.progress ?? null,
     canceled: result.kind === "canceled",
+    updatedAt: current ? result.updatedAt ?? null : null,
+    revalidating: current && Boolean(result.revalidating),
     cancel: () => cancel.current?.(),
     refresh: () => setRevision((value) => value + 1),
   };
+}
+
+// When a cached display read was last confirmed by the API.
+function LastUpdated({ result }) {
+  const text = result.revalidating
+    ? "Refreshing…"
+    : result.updatedAt
+      ? `Last updated ${new Date(result.updatedAt).toLocaleTimeString()}`
+      : null;
+  return text ? h("span", { className: "muted last-updated", role: "status" }, text) : null;
 }
 function DataTable({ headings, children, className = "table table-zebra", rowCount }) {
   return h(
@@ -9548,7 +9644,7 @@ function tabEvents() {
   const query = controls.query();
   if (after) query.set("after", after);
   const result = useApiRead(`/api/guilds/${guildId}/events?${query}`, {
-    retainData: true, collection: "events", listSize: controls.view.pageSize,
+    retainData: true, collection: "events", listSize: controls.view.pageSize, cache: true,
   });
   const rows = result.data?.events;
   const next = result.data?.next_cursor;
@@ -10249,7 +10345,7 @@ function tabBans() {
   const query = controls.query();
   if (after) query.set("after", after);
   const result = useApiRead(`/api/guilds/${guildId}/bans?${query}`, {
-    retainData: true, collection: "bans", listSize: controls.view.pageSize,
+    retainData: true, collection: "bans", listSize: controls.view.pageSize, cache: true,
   });
   const rows = Array.isArray(result.data?.bans) ? result.data.bans : [];
   const names = result.data?.names || {};
@@ -10346,6 +10442,7 @@ function tabBans() {
             "Ban user",
           ),
       h(ActionButton, { type: "button", className: "btn", onClick: result.refresh }, "Refresh"),
+      h(LastUpdated, { result }),
     ),
     h(ListControls, { controls, filterOptions: { actor: moderators } }),
     h("div", { className: "row list-pagination" },
