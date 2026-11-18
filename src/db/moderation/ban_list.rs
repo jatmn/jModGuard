@@ -1,6 +1,7 @@
 use super::{decode_ban_row, enrolled_moderation_read};
 use crate::db::{
-    BanRow, Db, GuildEnrollment, OptionalExtension, SqlExecutor, Value, params, params_from_iter,
+    BanRow, DASHBOARD_LIST_PAGE_LIMIT, Db, GuildEnrollment, OptionalExtension, SqlExecutor, Value,
+    params, params_from_iter,
 };
 use anyhow::{Context as _, Result};
 use ring::digest::{SHA256, SHA256_OUTPUT_LEN, digest};
@@ -116,6 +117,7 @@ pub struct BanListRequest {
     pub descending: bool,
     pub after: Option<BanListAnchor>,
     pub limit: i64,
+    pub skip_metadata: bool,
 }
 
 #[derive(Serialize)]
@@ -128,7 +130,7 @@ pub struct BanListModerator {
 pub struct BanListPage {
     pub rows: Vec<BanRow>,
     pub next: Option<BanListAnchor>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub moderators: Vec<BanListModerator>,
 }
 
@@ -150,13 +152,17 @@ fn list_page(conn: &impl SqlExecutor, guild: i64, request: BanListRequest) -> Re
         .map(|anchor| anchor.seek_value(conn, guild, request.sort))
         .transpose()?;
     let (predicate, values) = filters_sql(guild, &request.filters);
-    let total = conn.query_row(
-        &format!("SELECT COUNT(*) FROM bans WHERE {predicate}"),
-        params_from_iter(values.iter().cloned()),
-        |r| Ok(r.get::<i64>(0)?),
-    )?;
+    let total = (!request.skip_metadata)
+        .then(|| {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM bans WHERE {predicate}"),
+                params_from_iter(values.iter().cloned()),
+                |r| Ok(r.get::<i64>(0)?),
+            )
+        })
+        .transpose()?;
     let (sql, params) = page_sql(&request, &predicate, values, after);
-    let limit = request.limit.clamp(1, 200) as usize;
+    let limit = request.limit.clamp(1, i64::from(DASHBOARD_LIST_PAGE_LIMIT)) as usize;
     let mut seen = 0;
     let mut boundary = None;
     let mut rows = conn
@@ -182,8 +188,10 @@ fn list_page(conn: &impl SqlExecutor, guild: i64, request: BanListRequest) -> Re
 
     let next = if rows.len() > limit { boundary } else { None };
     rows.truncate(limit);
-    let moderators = conn
-        .prepare(
+    let moderators = if request.skip_metadata {
+        Vec::new()
+    } else {
+        conn.prepare(
             "SELECT moderator_id, MAX(NULLIF(moderator_name, '')) FROM bans
              WHERE guild_id = ?1 AND moderator_id > 0 GROUP BY moderator_id",
         )?
@@ -193,7 +201,8 @@ fn list_page(conn: &impl SqlExecutor, guild: i64, request: BanListRequest) -> Re
                 name: r.get(1)?,
             })
         })?
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()?
+    };
     Ok(BanListPage {
         rows,
         next,
@@ -276,7 +285,9 @@ fn page_sql(
         sql.push_str(&format!(" AND ({key}, id) {seek} (?{key_arg}, ?{id_arg})"));
         values.extend([value, Value::Integer(id)]);
     }
-    values.push(Value::Integer(request.limit.clamp(1, 200) + 1));
+    values.push(Value::Integer(
+        request.limit.clamp(1, i64::from(DASHBOARD_LIST_PAGE_LIMIT)) + 1,
+    ));
     sql.push_str(&format!(
         " ORDER BY {key} {dir}, id {dir} LIMIT ?{}",
         values.len()
@@ -321,10 +332,11 @@ mod tests {
                 descending: false,
                 after: None,
                 limit: 50,
+                skip_metadata: false,
             },
         )
         .unwrap();
-        assert_eq!(page.total, 1);
+        assert_eq!(page.total, Some(1));
         let row = &page.rows[0];
         assert_eq!(row.reason.as_deref(), Some("original"));
         assert_eq!(row.edited_reason.as_deref(), Some("latest"));
@@ -364,6 +376,7 @@ mod tests {
                         descending,
                         after: None,
                         limit: 50,
+                        skip_metadata: false,
                     };
                     let (sql, args) = page_sql(&request, &predicate, values.clone(), None);
                     crate::db::tests::assert_index_plan(conn, &sql, params_from_iter(args), true);

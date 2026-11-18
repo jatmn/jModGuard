@@ -98,6 +98,7 @@ async fn member_orders_seek_the_scoped_indexes_after_schema_21_upgrade() {
                                     user_id: 2048,
                                 }),
                                 limit: 50,
+                                include_total: false,
                             };
                             let mut stmt =
                                 conn.prepare(&format!("EXPLAIN QUERY PLAN {}", query.sql()))?;
@@ -399,6 +400,7 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
                 descending: true,
                 after: None,
                 limit: 50,
+                include_total: false,
             },
         )
         .await
@@ -417,6 +419,7 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
                 descending: true,
                 after: None,
                 limit: 50,
+                include_total: false,
             },
         )
         .await
@@ -435,6 +438,7 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
                 descending: true,
                 after: None,
                 limit: 50,
+                include_total: false,
             },
         )
         .await
@@ -487,6 +491,7 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
                 descending: true,
                 after: None,
                 limit: 50,
+                include_total: false,
             },
         )
         .await
@@ -2312,6 +2317,7 @@ async fn previously_banned_excludes_current_and_pending_success_respects_newer_u
                 descending: true,
                 after: None,
                 limit: 50,
+                include_total: false,
             },
         )
         .await
@@ -3154,6 +3160,7 @@ async fn old_stay_payload_cannot_replace_new_stay_name_or_search() {
         descending: true,
         after: None,
         limit: 10,
+        include_total: false,
     };
     assert_eq!(
         store
@@ -5258,6 +5265,7 @@ async fn gateway_ban_identity_updates_saved_names_without_losing_nickname_or_ord
         descending: true,
         after: None,
         limit: 10,
+        include_total: false,
     };
 
     // The user was absent from the seed. A later Gateway ban supplies real

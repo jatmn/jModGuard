@@ -42,6 +42,47 @@ fn resume_failure() {
 }
 
 #[test]
+fn bound_unwrap_propagates_failure() {
+    for input in ["1", "2"] {
+        let result = catch_unwind(|| parse(input));
+        result.unwrap();
+    }
+}
+
+#[test]
+fn bound_expect_propagates_failure() {
+    for input in ["1", "2"] {
+        let result = catch_unwind(|| parse(input));
+        result.expect(input);
+    }
+}
+
+#[test]
+fn bound_question_mark_propagates_failure() -> std::thread::Result<()> {
+    for input in ["1", "2"] {
+        let result = catch_unwind(|| parse(input));
+        result?;
+    }
+    Ok(())
+}
+
+#[test]
+fn bound_resume_unwind_propagates_failure() {
+    for input in ["1", "2"] {
+        let result = catch_unwind(|| parse(input));
+        result.unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+    }
+}
+
+#[test]
+fn bound_fallback_swallows_failure() {
+    for input in ["1", "2"] {
+        let result = catch_unwind(|| parse(input));
+        result.unwrap_or_else(|_| ());
+    }
+}
+
+#[test]
 fn fallback_after_failure() {
     for input in ["1", "2"] {
         catch_unwind(|| parse(input)).unwrap_or_else(|_| ());

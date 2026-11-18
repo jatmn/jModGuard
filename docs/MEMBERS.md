@@ -123,14 +123,16 @@ Current members and newest join first are the defaults. The Member, User ID,
 Joined and Status headings each toggle between ascending and descending.
 Member names are ordered by the displayed name with ASCII case ignored.
 Unknown join dates use zero for ordering and stay outside date filters.
-Ties use numeric user ID in the selected direction. The URL saves the sort and
-filters. Changes restart pagination from the first page.
+Ties use numeric user ID in the selected direction. The URL saves the sort,
+filters and page size. Changes restart pagination from the first page.
 
 The Members API accepts `sort=name|user_id|joined|status` and `dir=asc|desc`.
 Use `from` and `to` for inclusive UTC join dates. The existing `joined_from`,
 `joined_to`, `joined_newest` and `joined_oldest` inputs are still accepted.
 Each page returns an opaque `next_cursor` bound to its sort and direction.
-Use that value as `after` with the same filters. Paging reads the current saved
+Use that value as `after` with the same filters. Each request defaults to 50
+members and caps the response at 250. With `include_total=true`, the response
+includes the number of matches across all pages. Paging reads the current saved
 directory, so changes to a member's sort value between requests can move it
 across the cursor. The sort and status filters use scoped indexes. Substring
 search and join-date restrictions can examine additional rows in that index.

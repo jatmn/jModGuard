@@ -149,46 +149,7 @@ fn masks_panic_in_loop(cx: &LateContext<'_>, callee: &Expr<'_>) -> bool {
 
 fn checks_caught_result(cx: &LateContext<'_>, value: &Expr<'_>) -> bool {
     match cx.tcx.parent_hir_node(value.hir_id) {
-        Node::Expr(parent) => match parent.kind {
-            ExprKind::MethodCall(method, receiver, args, _) if receiver.hir_id == value.hir_id => {
-                match method.ident.name.as_str() {
-                    "unwrap" | "expect" | "unwrap_err" | "expect_err" => true,
-                    "unwrap_or_else" => matches!(
-                        args,
-                        [Expr { kind: ExprKind::Closure(handler), .. }]
-                            if resumes_unwind(cx, cx.tcx.hir_body(handler.body).value)
-                    ),
-                    "is_ok" | "is_err" => cx
-                        .tcx
-                        .hir_parent_iter(parent.hir_id)
-                        .map_while(|(_, node)| match node {
-                            Node::Expr(expr) => Some(expr),
-                            _ => None,
-                        })
-                        .find(|expr| {
-                            !matches!(
-                                expr.kind,
-                                ExprKind::Unary(UnOp::Not, _) | ExprKind::DropTemps(_)
-                            )
-                        })
-                        .and_then(|expr| assertion_condition(cx, expr))
-                        .is_some_and(|condition| condition.hir_id == parent.hir_id),
-                    _ => false,
-                }
-            }
-            ExprKind::Ret(Some(returned)) => returned.hir_id == value.hir_id,
-            // The compiler lowers `value?` to a match over Try::branch(value).
-            ExprKind::Call(_, [argument]) if argument.hir_id == value.hir_id => {
-                matches!(
-                    cx.tcx.parent_hir_node(parent.hir_id),
-                    Node::Expr(Expr {
-                        kind: ExprKind::Match(_, _, MatchSource::TryDesugar(scrutinee)),
-                        ..
-                    }) if *scrutinee == parent.hir_id
-                )
-            }
-            _ => false,
-        },
+        Node::Expr(_) => checks_result_use(cx, value),
         Node::LetStmt(binding) if binding.init.is_some_and(|init| init.hir_id == value.hir_id) => {
             let PatKind::Binding(_, local, _, None) = binding.pat.kind else {
                 return false;
@@ -209,12 +170,69 @@ fn checks_caught_result(cx: &LateContext<'_>, value: &Expr<'_>) -> bool {
                 None => block.expr,
                 _ => None,
             };
+            let Some(next) = next else {
+                return false;
+            };
+            // Only follow the resolved binding when the next expression
+            // checks or propagates it directly.
+            let use_expr = assertion_condition(cx, next).unwrap_or(next);
+            let operand = match use_expr.kind {
+                ExprKind::MethodCall(_, receiver, _, _) | ExprKind::Ret(Some(receiver)) => receiver,
+                ExprKind::Match(branch, _, MatchSource::TryDesugar(_))
+                    if let ExprKind::Call(_, [argument]) = branch.kind =>
+                {
+                    argument
+                }
+                _ => return false,
+            };
+            matches!(operand.kind, ExprKind::Path(QPath::Resolved(_, path))
+                if path.res == Res::Local(local))
+                && checks_result_use(cx, operand)
+        }
+        _ => false,
+    }
+}
+
+fn checks_result_use(cx: &LateContext<'_>, value: &Expr<'_>) -> bool {
+    let Node::Expr(parent) = cx.tcx.parent_hir_node(value.hir_id) else {
+        return false;
+    };
+    match parent.kind {
+        ExprKind::MethodCall(method, receiver, args, _) if receiver.hir_id == value.hir_id => {
+            match method.ident.name.as_str() {
+                "unwrap" | "expect" | "unwrap_err" | "expect_err" => true,
+                "unwrap_or_else" => matches!(
+                    args,
+                    [Expr { kind: ExprKind::Closure(handler), .. }]
+                        if resumes_unwind(cx, cx.tcx.hir_body(handler.body).value)
+                ),
+                "is_ok" | "is_err" => cx
+                    .tcx
+                    .hir_parent_iter(parent.hir_id)
+                    .map_while(|(_, node)| match node {
+                        Node::Expr(expr) => Some(expr),
+                        _ => None,
+                    })
+                    .find(|expr| {
+                        !matches!(
+                            expr.kind,
+                            ExprKind::Unary(UnOp::Not, _) | ExprKind::DropTemps(_)
+                        )
+                    })
+                    .and_then(|expr| assertion_condition(cx, expr))
+                    .is_some_and(|condition| condition.hir_id == parent.hir_id),
+                _ => false,
+            }
+        }
+        ExprKind::Ret(Some(returned)) => returned.hir_id == value.hir_id,
+        // The compiler lowers `value?` to a match over Try::branch(value).
+        ExprKind::Call(_, [argument]) if argument.hir_id == value.hir_id => {
             matches!(
-                next.and_then(|expr| assertion_condition(cx, expr)).map(|expr| expr.kind),
-                Some(ExprKind::MethodCall(method, receiver, _, _))
-                    if matches!(method.ident.name.as_str(), "is_ok" | "is_err")
-                        && matches!(receiver.kind, ExprKind::Path(QPath::Resolved(_, path))
-                            if path.res == Res::Local(local))
+                cx.tcx.parent_hir_node(parent.hir_id),
+                Node::Expr(Expr {
+                    kind: ExprKind::Match(_, _, MatchSource::TryDesugar(scrutinee)),
+                    ..
+                }) if *scrutinee == parent.hir_id
             )
         }
         _ => false,

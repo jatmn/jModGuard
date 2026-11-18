@@ -71,6 +71,9 @@ pub mod usage;
 mod write_budget;
 use write_budget::BoundedWrites;
 
+/// Maximum rows in one live dashboard list response.
+pub const DASHBOARD_LIST_PAGE_LIMIT: u32 = 250;
+
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_config_version.sql"),

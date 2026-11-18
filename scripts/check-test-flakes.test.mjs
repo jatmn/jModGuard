@@ -55,7 +55,7 @@ function fixture(t) {
     git("add", ".");
     git("-c", "user.name=Fixture", "-c", "user.email=fixture", "commit", "-qm", "base");
     git("update-ref", "refs/remotes/origin/main", "HEAD");
-    return { cwd, write, run: (mode, options, ...args) => run(process.execPath, [script, mode, ...args], options) };
+    return { cwd, git, write, run: (mode, options, ...args) => run(process.execPath, [script, mode, ...args], options) };
 }
 
 test("the contracts gate rejects a budget increase, runner retries, and allowlist growth", (t) => {
@@ -77,6 +77,39 @@ test("a shorter test budget and allowlist and ordinary production budget changes
     write(allowlist, entry.replace("\t2\t", "\t1\t"));
     const result = run("contracts");
     assert.equal(result.status, 0, result.stderr);
+});
+
+test("a verified GitHub merge checkout uses its main parent even with a stale event base", (t) => {
+    const { git, write, run } = fixture(t);
+    const base = git("rev-parse", "HEAD");
+    const asAuthor = (...args) => git("-c", "user.name=Fixture", "-c", "user.email=fixture", ...args);
+    git("switch", "-qc", "updated-main");
+    write("src/service.rs", sample("1_001"));
+    asAuthor("commit", "-qam", "main updates timeout");
+    git("switch", "-qc", "feature", base);
+    write("feature.txt", "feature change\n");
+    git("add", "feature.txt");
+    asAuthor("commit", "-qm", "feature change");
+    const feature = git("rev-parse", "HEAD");
+    git("switch", "-q", "updated-main");
+    asAuthor("merge", "--no-ff", "-q", "-m", "GitHub merge checkout", feature);
+    const env = {
+        GITHUB_EVENT_NAME: "pull_request",
+        GITHUB_REF: "refs/pull/1/merge",
+        GITHUB_SHA: git("rev-parse", "HEAD"),
+        JMODGUARD_DIFF_BASE: base,
+        JMODGUARD_DIFF_HEAD: feature,
+    };
+    const inherited = run("contracts", { env });
+    assert.equal(inherited.status, 0, inherited.stderr);
+    const ordinary = run("contracts", { env: { ...env, GITHUB_REF: "refs/heads/feature" } });
+    assert.equal(ordinary.status, 1);
+    assert.match(ordinary.stderr, /timeout increased/);
+
+    write("src/service.rs", sample("1_002"));
+    const introduced = run("contracts", { env });
+    assert.equal(introduced.status, 1);
+    assert.match(introduced.stderr, /timeout increased/);
 });
 
 test("inline Rust test ranges follow attributes and use the marker's closing indent", () => {

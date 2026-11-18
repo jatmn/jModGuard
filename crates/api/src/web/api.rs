@@ -1255,6 +1255,8 @@ pub async fn test_regex(
 pub struct BansQuery {
     limit: Option<i64>,
     reason: Option<String>,
+    #[serde(default)]
+    skip_metadata: bool,
     #[serde(flatten)]
     list: super::list_controls::ListQuery<db::BanListSort, db::BanListStatus>,
 }
@@ -1310,8 +1312,22 @@ pub async fn bans(
     Path(guild_id): Path<u64>,
     Query(query): Query<BansQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Dashboard).await?;
-    super::check_page_enrollment(&auth, guild_id, &headers)?;
+    super::list_controls::within_list_deadline(
+        "Bans",
+        bans_inner(&app, &session, &headers, guild_id, query),
+    )
+    .await
+}
+
+async fn bans_inner(
+    app: &Arc<ApiState>,
+    session: &Session,
+    headers: &axum::http::HeaderMap,
+    guild_id: u64,
+    query: BansQuery,
+) -> ApiResult<Json<serde_json::Value>> {
+    let auth = real_guild_scope(app, session, guild_id, GuildAccess::Dashboard).await?;
+    super::check_page_enrollment(&auth, guild_id, headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
     use super::list_controls::{SortDirection, bounded_list_text, decode_cursor, encode_cursor};
     let list = query.list.validate_with_subject(
@@ -1341,6 +1357,7 @@ pub async fn bans(
             descending: list.dir == SortDirection::Desc,
             after,
             limit: query.limit.unwrap_or(100),
+            skip_metadata: query.skip_metadata,
         },
     )
     .await?;

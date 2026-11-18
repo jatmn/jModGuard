@@ -27,8 +27,16 @@ function baseRevision() {
         throw new Error("Cannot verify the CI base for the test flake checks");
     }
     const head = rev("HEAD");
-    if (base && process.env.GITHUB_EVENT_NAME === "pull_request" && rev("HEAD^1") === base &&
-        rev("HEAD^2") === process.env.JMODGUARD_DIFF_HEAD) return base;
+    if (base && process.env.GITHUB_EVENT_NAME === "pull_request" &&
+        rev("HEAD^2") === process.env.JMODGUARD_DIFF_HEAD) {
+        const mainParent = rev("HEAD^1");
+        // GitHub can regenerate the merge checkout after main advances while
+        // still supplying the earlier base SHA in the pull request event.
+        const checkedOutMerge = head === process.env.GITHUB_SHA &&
+            /^refs\/pull\/[1-9]\d*\/merge$/.test(process.env.GITHUB_REF ?? "");
+        if (mainParent === base ||
+            checkedOutMerge && git("merge-base", base, mainParent).trim() === base) return mainParent;
+    }
     if (base && eventBase && !/^0+$/.test(eventBase) &&
         process.env.GITHUB_EVENT_NAME !== "pull_request") return base;
     if (base && base !== head) return git("merge-base", base, head).trim();
@@ -364,7 +372,8 @@ async function main() {
         const root = fileURLToPath(new URL("../tools/dylint/test-flake", import.meta.url));
         const findings = await runTestFlakeDylint(root, library, ["--test", "catch_unwind"]);
         const retries = [
-            "fallback_after_failure", "retry_until_success", "swallow_failure", "swallow_failure_inside_assertion",
+            "bound_fallback_swallows_failure", "fallback_after_failure", "retry_until_success",
+            "swallow_failure", "swallow_failure_inside_assertion",
         ];
         const actual = findings.map(({ kind, file, test }) => `${kind}:${file}:${test}`).sort();
         const expected = retries.map((test) => `retry:tests/catch_unwind.rs:${test}`);
