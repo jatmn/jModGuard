@@ -14,15 +14,15 @@ on:
 permissions:
   contents: read
 
-# PRs cancel obsolete work. Trusted callers own their publication queue.
+# PRs cancel obsolete work. Event and pinned-source validation can overlap.
 concurrency:
-  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}-${{ inputs.source_sha || 'event' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
-  CARGO_BUILD_JOBS: '2'
+  CARGO_BUILD_JOBS: '4'
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
   CARGO_PROFILE_DEV_CODEGEN_UNITS: '16'

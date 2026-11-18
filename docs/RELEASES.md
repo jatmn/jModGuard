@@ -18,11 +18,12 @@ publish all eligible components; sources predating the WebUI package skip that i
 
 ## Publication
 
-GitHub Actions runs the pinned Release Please action after trusted main checks.
-It opens/updates release PRs; the owner merges them. The resulting release tag
-is published in the same workflow using the release's reported source SHA,
-which need not equal the workflow's triggering commit. If it differs, all existing
-CI check groups must pass at that pinned source before any component publishes.
+GitHub Actions runs the pinned Release Please action alongside trusted main checks.
+It opens or updates release PRs for the owner to merge. The resulting release
+image build uses the release's reported source SHA, which can differ from the
+workflow's triggering commit. Staging builds run alongside CI. If the SHAs
+differ, all CI check groups must also pass at the pinned release source before
+any component image is promoted to the release tag.
 The retained plan preserves that tag and source on retries, with the same validation
 rule. Release Please runs only on the first attempt; retries never create another
 release. Owner-pushed `v*` tags also publish after checks. Creating a GitHub Release manually does not start a separate build;

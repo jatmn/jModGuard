@@ -372,14 +372,15 @@ if [ "$dylint_full" -eq 0 ]; then
 fi
 
 # Balance the measured Rust work across runners without combining package
-# feature configurations. Bot/integration share their service builds locally.
+# feature configurations. Integration builds both services for its smoke test.
 SELECTED="$selected" LINT_PACKAGES="$dylint_packages" node --input-type=module - <<'JS'
 const selected = new Set(process.env.SELECTED.trim().split(/\s+/));
 const lanes = {
   quick: ["contracts", "fmt", "publish-tests", "bootstrap", "pullfrog", "runner-tests"],
   frontend: ["frontend"],
   "rust-api": ["api", "api-embed", "boundaries"],
-  "rust-bot": ["bot", "integration"],
+  "rust-bot": ["bot"],
+  "rust-integration": ["integration"],
   "rust-core": ["runtime", "updater", "core"],
   dylint: ["dylint"],
   "supply-chain": ["supply-chain"],

@@ -902,11 +902,12 @@ else
       echo 'ci-preflight: cargo test --locked -p jmodguard-api --no-default-features --lib'
       run_timed_cargo_test cargo test --locked -p jmodguard-api --no-default-features --lib || exit $?
     fi
-    echo 'ci-preflight: cargo build --locked -p jmodguard-api'
-    cargo build --locked -p jmodguard-api
+    # Check the production feature sets without linking unused binaries.
+    echo 'ci-preflight: cargo check --locked -p jmodguard-api'
+    cargo check --locked -p jmodguard-api
     if should_run api; then
-      echo 'ci-preflight: cargo build --locked -p jmodguard-api --no-default-features'
-      cargo build --locked -p jmodguard-api --no-default-features
+      echo 'ci-preflight: cargo check --locked -p jmodguard-api --no-default-features'
+      cargo check --locked -p jmodguard-api --no-default-features
     fi
   fi
   if should_run bot; then

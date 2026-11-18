@@ -40,9 +40,12 @@ jobs:
 
   release:
     name: Stable release
-    needs: ci
+    # Resolve the release source before building; promotion waits for validation.
     # Retries restore their original plan; they must never create another release.
-    if: github.run_attempt == 1 && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'jatmn/jModGuard'
+    if: >-
+      (!github.event.repository.private || vars.JMODGUARD_ENABLE_PRIVATE_CI == 'true') &&
+      github.run_attempt == 1 && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      github.repository == 'jatmn/jModGuard'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -62,9 +65,9 @@ jobs:
 
   prepare-publication:
     name: Pin publication source
-    needs: [ci, release]
+    needs: release
     if: >-
-      always() && needs.ci.result == 'success' &&
+      !cancelled() && (!github.event.repository.private || vars.JMODGUARD_ENABLE_PRIVATE_CI == 'true') &&
       (needs.release.result == 'success' || needs.release.result == 'skipped') &&
       github.repository == 'jatmn/jModGuard' &&
       ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
@@ -113,9 +116,9 @@ jobs:
   # at that exact commit because the triggering event's diff does not cover it.
   release-ci:
     name: Validate release source
-    needs: [ci, prepare-publication]
+    needs: prepare-publication
     if: >-
-      always() && needs.ci.result == 'success' && needs.prepare-publication.result == 'success' &&
+      needs.prepare-publication.result == 'success' &&
       needs.prepare-publication.outputs.release_sha != '' &&
       needs.prepare-publication.outputs.release_sha != github.sha
     uses: ./.github/workflows/ci.yml
@@ -124,14 +127,10 @@ jobs:
 
   publish-build:
     name: Publish build / ${{ matrix.component }}
-    needs: [ci, release, prepare-publication, release-ci]
+    needs: prepare-publication
     if: >-
-      always() && needs.ci.result == 'success' && needs.prepare-publication.result == 'success' &&
-      github.repository == 'jatmn/jModGuard' && github.event_name != 'pull_request' &&
-      (needs.release-ci.result == 'success' ||
-       (needs.release-ci.result == 'skipped' &&
-        (needs.prepare-publication.outputs.release_sha == '' ||
-         needs.prepare-publication.outputs.release_sha == github.sha)))
+      needs.prepare-publication.result == 'success' &&
+      github.repository == 'jatmn/jModGuard' && github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -191,7 +190,7 @@ jobs:
 
   publish-promote:
     name: Promote images
-    needs: [ci, release, prepare-publication, release-ci, publish-build]
+    needs: [ci, prepare-publication, release-ci, publish-build]
     if: >-
       always() && needs.ci.result == 'success' && needs.prepare-publication.result == 'success' &&
       needs.publish-build.result == 'success' &&

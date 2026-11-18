@@ -2,7 +2,8 @@
 
 `.github/workflows/ci.yml` validates PRs and runs on standard ephemeral `ubuntu-24.04` runners.
 `.github/workflows/publish.yml` queues trusted events and calls the same validation
-workflow before release/publication. CI and publication stay inactive while the repository is private. The owner can
+workflow alongside image staging. Image promotion requires successful validation.
+CI and publication stay inactive while the repository is private. The owner can
 set repository variable `JMODGUARD_ENABLE_PRIVATE_CI=true` for an explicit trial;
 it is not needed after publication. Pullfrog and Socket retain their separate triggers.
 
@@ -32,12 +33,12 @@ commit's checks. New commits and reopened PRs still run affected checks.
 | CI runner scripts or the Rust toolchain pin | The runner regression suites (`runner-tests`), plus all Rust gates for the toolchain |
 | Unknown paths or CI orchestration | All checks |
 
-Selected groups run in up to eight jobs: quick contracts/shell checks/formatting,
-frontend, three Rust jobs, Dylint, supply chain and remote databases. Rust work is
-split into API/boundaries, bot/integration, and core/updater/runtime. Each selected
-group still runs its existing independent package commands and feature variants.
-Bot and integration share their service builds on one runner; each job has its own
-Cargo target directory. The Rust jobs restore the existing shared dependency cache
+Selected groups run in up to nine jobs: quick contracts/shell checks/formatting,
+frontend, four Rust jobs, Dylint, supply chain and remote databases. Rust work is
+split into API/boundaries, bot, integration, and core/updater/runtime. The API job
+checks the production feature sets with `cargo check`. The integration job builds
+both service binaries for the executable smoke test. Each job has its own Cargo
+target directory. The Rust jobs restore the existing shared dependency cache
 and use pinned sccache 0.18.0 to share compiler outputs through GitHub's cache.
 Source, feature, compiler and embedded-file changes invalidate compiler entries;
 cache hits never skip tests. Linking and check-only compiler calls still run,
@@ -210,8 +211,9 @@ serialize per component, and trusted workflow runs share a concurrency group.
 ## Releases
 
 The pinned Release Please action uses `release-please-config.json` and
-`.release-please-manifest.json` after trusted main checks pass. It opens/updates
-Stable release PRs and creates releases after the owner merges them. It never
+`.release-please-manifest.json` alongside trusted main checks. It opens/updates
+Stable release PRs and creates GitHub releases after the owner merges them.
+Those release records can exist before their images are promoted. It never
 merges a PR. Enable GitHub Actions permission to create pull requests if using
 the default token. PRs created with `GITHUB_TOKEN` do not automatically trigger
 new PR workflows: the owner must close/reopen the release PR to start CI before
@@ -219,13 +221,12 @@ merging it. A release created by this action is published within the same truste
 workflow, since tags created with `GITHUB_TOKEN` do not trigger another run.
 The plan binds the action's release tag to its reported source SHA, which can
 differ from the workflow's triggering commit. When it differs, the same reusable
-CI workflow checks out that exact pinned source and runs every check group before
-any component can publish; the triggering commit's affected diff is not reused.
-A failed, cancelled, or skipped source-validation gate blocks all three publishers.
-Same-source releases reuse the checks already passed. Retries skip Release Please,
-restore the original tag/source, and apply the same source-validation rule.
-Owner-selected historical/manual publication keeps its existing policy: validate
-the current workflow commit, then build and verify the selected historical source.
+CI workflow checks out that exact pinned source and runs every check group
+alongside staging. Promotion requires green event CI and green validation of any
+differing release source. Same-source releases use the event checks. Retries skip
+Release Please, restore the original tag/source, and apply the same validation rule.
+Owner-selected historical/manual publication stages the selected source while CI
+validates the current workflow commit, then promotes once validation succeeds.
 See [RELEASES.md](RELEASES.md).
 
 ## Dependency tools

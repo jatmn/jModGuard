@@ -29,7 +29,11 @@ assert.match(jobs.get("checks"), /bash scripts\/ci-remote-database\.sh/);
 assert.match(jobs.get("ci"), /needs: \[plan, checks\]/);
 assert.match(jobs.get("ci"), /if: .*always\(\)/);
 assert.match(jobs.get("ci"), /test "\$PLAN_RESULT" = success && test "\$CHECK_RESULT" = success/);
-assert.match(jobs.get("prepare-publication"), /needs\.ci\.result == 'success'/);
+assert.doesNotMatch(jobs.get("release"), /^    needs:/m);
+assert.match(jobs.get("prepare-publication"), /^    needs: release$/m);
+assert.match(jobs.get("release-ci"), /^    needs: prepare-publication$/m);
+assert.match(publishBuild, /^    needs: prepare-publication$/m);
+assert.match(publishPromote, /^    needs: \[ci, prepare-publication, release-ci, publish-build\]$/m);
 assert.match(jobs.get("prepare-publication"), /github\.actor_id == '12479882'/);
 assert.match(jobs.get("prepare-publication"), /github\.triggering_actor == 'jatmn'/);
 assert.match(publishBuild, /needs\.prepare-publication\.result == 'success'/);
@@ -124,6 +128,7 @@ assert.match(workflow, /^  pull_request:/m);
 assert.match(workflow, /^    types: \[opened, synchronize, reopened\]$/m);
 assert.match(workflow, /^  workflow_call:/m);
 assert.doesNotMatch(workflow, /(?:contents|packages|pull-requests): write/);
+assert.match(workflow, /^  group: ci-.*-\$\{\{ inputs\.source_sha \|\| 'event' \}\}$/m);
 assert.match(workflow, /cancel-in-progress: \$\{\{ github.event_name == 'pull_request' \}\}/);
 assert.match(publication, /^  queue: max$/m);
 assert.match(publication, /^  cancel-in-progress: false$/m);
@@ -132,8 +137,9 @@ assert.doesNotMatch(publication, /secrets: inherit/);
 // Evaluate the actual workflow guards and bindings using only their JS-compatible
 // expression subset. This is a local workflow contract, not a hosted Actions run.
 function expression(text, context) {
-  return Function("github", "needs", "inputs", "always", `return (${text.replace(/needs\.([a-z-]+)/g, 'needs["$1"]')});`)(
-    context.github, context.needs, context.inputs, () => true);
+  return Function("github", "needs", "inputs", "vars", "always", "cancelled",
+    `return (${text.replace(/needs\.([a-z-]+)/g, 'needs["$1"]')});`)(
+    context.github, context.needs, context.inputs, context.vars ?? {}, () => true, () => context.cancelled ?? false);
 }
 function condition(job, context) {
   const match = job.match(/^    if: (?:>-\n([\s\S]*?)(?=^    \S)|([^\n]+))/m);
@@ -194,13 +200,14 @@ for (const [event, ref, expected] of [
 ]) {
   assert.equal(Function("github", `return (${cacheMode});`)({ event_name: event, ref }), expected);
 }
-for (const lane of ["rust-api", "rust-bot", "rust-core", "quick", "frontend", "dylint", "supply-chain", "remote-database"]) {
+const rustLanes = ["rust-api", "rust-bot", "rust-integration", "rust-core"];
+for (const lane of [...rustLanes, "quick", "frontend", "dylint", "supply-chain", "remote-database"]) {
   const evaluate = (key, block = jobs.get("checks")) => {
     const match = block.match(new RegExp(`${key}: \\$\\{\\{ (.+) \\}\\}`));
     assert.ok(match, `missing ${key} workflow binding`);
     return Function("matrix", "startsWith", `return (${match[1]});`)({ lane }, (value, prefix) => value.startsWith(prefix));
   };
-  const rustTests = ["rust-api", "rust-bot", "rust-core"].includes(lane);
+  const rustTests = rustLanes.includes(lane);
   assert.equal(Function("matrix", "startsWith", `return (${compilerGuard});`)({ lane }, (value, prefix) => value.startsWith(prefix)), rustTests);
   assert.equal(evaluate("RUSTC_WRAPPER", selectedChecks), rustTests ? "sccache" : "");
   assert.equal(evaluate("NEED_NEXTEST", configureEnv), rustTests);
@@ -350,7 +357,7 @@ try {
   const release = git("rev-parse", "HEAD");
   const context = {
     github: { sha: head, event_name: "push", ref: "refs/heads/main", repository: "jatmn/jModGuard", run_attempt: 1,
-      event: { before: base, pull_request: { base: { sha: "" }, head: { sha: "" } } } },
+      event: { repository: { private: false }, before: base, pull_request: { base: { sha: "" }, head: { sha: "" } } } },
     inputs: { source_sha: "" },
     needs: { ci: { result: "success" }, release: { result: "success" },
       "prepare-publication": { result: "success", outputs: { release_sha: release } },
@@ -364,14 +371,16 @@ try {
       JMODGUARD_DIFF_HEAD: binding(jobs.get("plan"), "JMODGUARD_DIFF_HEAD", context),
     } }));
   }
-  context.needs["release-ci"].result = "failure";
-  assert.equal(condition(publishBuild, context), false, "failed differing source must block publication");
-  context.needs["release-ci"].result = "success";
+  for (const name of ["release", "prepare-publication"]) {
+    context.github.event.repository.private = true;
+    assert.equal(condition(jobs.get(name), context), false, `${name} requires private CI opt-in`);
+    context.vars = { JMODGUARD_ENABLE_PRIVATE_CI: "true" };
+    assert.ok(condition(jobs.get(name), context), `${name} accepts the explicit opt-in`);
+    context.vars = {};
+    context.github.event.repository.private = false;
+  }
   assert.deepEqual(matrix().include.map(item => item.groups), ["contracts"]);
-  assert.ok(jobs.has("release-ci"), "differing release source requires validation");
   assert.match(jobs.get("release-ci"), /uses: \.\/\.github\/workflows\/ci\.yml/);
-  assert.match(publishBuild, /needs: \[.*release-ci.*\]/);
-  assert.match(publishPromote, /needs: \[.*release-ci.*\]/);
   for (const source of [release, base]) {
     context.needs["prepare-publication"].outputs.release_sha = source;
     assert.ok(condition(jobs.get("release-ci"), context));
@@ -380,21 +389,25 @@ try {
     assert.equal(binding(jobs.get("checks"), "ref", context), source);
     assert.equal(binding(jobs.get("checks"), "JMODGUARD_DIFF_BASE", context), "");
     assert.equal(binding(jobs.get("checks"), "JMODGUARD_DIFF_HEAD", context), source);
-    assert.equal(matrix().include.length, 8, "a different source requires all eight lanes");
+    assert.equal(matrix().include.length, 9, "a different source requires all nine lanes");
     assert.equal(git("rev-parse", "HEAD"), source);
-    // The provider gate result is simulated; the production job guard must
-    // withhold the entire bot/API/WebUI matrix for every unsuccessful R check.
+    // Staging is independent of validation. Promotion requires both CI
+    // results and all builds to succeed, including on retries.
+    const results = ["failure", "cancelled", "skipped", "success"];
     for (const attempt of [1, 2]) {
       context.github.run_attempt = attempt;
-      for (const result of ["failure", "cancelled", "skipped", "success"]) {
-        context.needs["release-ci"].result = result;
-        assert.equal(condition(publishBuild, context), result === "success");
-        context.needs["publish-build"] = { result: result, outputs: {} };
-        assert.equal(
-          condition(publishPromote, context),
-          result === "success",
-          "promotion must follow a successful build matrix",
-        );
+      for (const eventCI of results) {
+        context.needs.ci.result = eventCI;
+        for (const sourceCI of results) {
+          context.needs["release-ci"].result = sourceCI;
+          assert.ok(condition(publishBuild, context), "CI must not delay staging");
+          for (const builds of results) {
+            context.needs["publish-build"] = { result: builds };
+            assert.equal(condition(publishPromote, context),
+              eventCI === "success" && sourceCI === "success" && builds === "success",
+              `promotion with event CI ${eventCI}, release CI ${sourceCI}, and builds ${builds}`);
+          }
+        }
       }
     }
   }
@@ -402,11 +415,14 @@ try {
     context.needs["prepare-publication"].outputs.release_sha = source;
     assert.equal(condition(jobs.get("release-ci"), context), false);
     context.needs["release-ci"].result = "skipped";
-    assert.ok(condition(publishBuild, context), "same-source and manual routes keep original checks");
+    assert.ok(condition(publishBuild, context), "same-source and manual routes allow staging");
     context.needs["publish-build"] = { result: "failure", outputs: {} };
     assert.equal(condition(publishPromote, context), false, "failed build must not promote");
     context.needs["publish-build"].result = "success";
-    assert.ok(condition(publishPromote, context), "successful builds must allow promotion");
+    context.needs.ci.result = "failure";
+    assert.equal(condition(publishPromote, context), false, "failed event CI must block promotion");
+    context.needs.ci.result = "success";
+    assert.ok(condition(publishPromote, context), "same-source and manual routes require green event CI");
   }
 
   // Saved main and release plans both skip release creation before restoration,
