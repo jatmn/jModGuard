@@ -1,6 +1,6 @@
 # GitHub Actions CI and image publishing
 
-`.github/workflows/ci.yml` validates PRs and runs on standard ephemeral `ubuntu-24.04` runners.
+`.github/workflows/ci.yml` validates PRs and runs on standard ephemeral `ubuntu-26.04` runners.
 `.github/workflows/publish.yml` queues trusted events and calls the same validation
 workflow before release/publication. CI and publication stay inactive while the repository is private. The owner can
 set repository variable `JMODGUARD_ENABLE_PRIVATE_CI=true` for an explicit trial;
@@ -38,7 +38,7 @@ split into API/boundaries, bot/integration, and core/updater/runtime. Each selec
 group still runs its existing independent package commands and feature variants.
 Bot and integration share their service builds on one runner; each job has its own
 Cargo target directory. The Rust jobs restore the existing shared dependency cache
-and use pinned sccache 0.18.0 to share compiler outputs through GitHub's cache.
+and use pinned sccache 0.19.0 to share compiler outputs through GitHub's cache.
 Source, feature, compiler and embedded-file changes invalidate compiler entries;
 cache hits never skip tests. Linking and check-only compiler calls still run,
 and simultaneous cold misses can compile the same input before either saves it.
@@ -74,7 +74,11 @@ build. It checks every source before writing and fails the job, writing
 nothing, when it cannot publish the complete layout, because a saved primary
 key is never re-saved.
 CI and Publish use Node 26 LTS for both npm projects.
-Cargo deny 0.20.2 and cargo audit 0.22.2 remain pinned in `scripts/ci-ensure-cargo-tool.sh`,
+Both workflows install Cosign 2.6.5 through the SHA-pinned v4 installer. The
+updater reads the v2 simple-signing envelope from the digest's signature tag.
+Switching to the v3 default bundle format requires an updater migration
+([dependency tracker](https://github.com/jatmn/jModGuard/issues/668)).
+Cargo deny 0.21.0 and cargo audit 0.23.0 remain pinned in `scripts/ci-ensure-cargo-tool.sh`,
 which the tool cache key hashes. The local complete gate is:
 
 ```bash
@@ -87,7 +91,7 @@ untracked files, and the full suite when every group is selected. Preflight
 builds without debug info unless the caller sets `CARGO_PROFILE_DEV_DEBUG` or
 `CARGO_PROFILE_TEST_DEBUG`, matching the hosted jobs.
 
-The hosted Rust jobs install checksum-pinned cargo-nextest 0.9.148. Preflight uses
+The hosted Rust jobs install checksum-pinned cargo-nextest 0.9.152. Preflight uses
 it to run tests in parallel, in a separate process per test, without launching
 Cargo for every test. It runs two tests per available CPU, because the slow
 cases wait on timers and deadlines rather than the CPU; set

@@ -731,7 +731,7 @@ EOF
   run_timed_cargo_test_gnu "${cargo_args[@]}" -- "${harness[@]}"
 }
 
-# cargo-audit 0.22.2 uses exit 1 for both advisory reports and some operational
+# cargo-audit uses exit 1 for both advisory reports and some operational
 # failures (for example advisory DB fetch/load). Classify from JSON stdout and
 # stderr instead of trusting exit 1 alone.
 run_cargo_audit_gate() {

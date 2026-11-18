@@ -91,7 +91,7 @@ socket_workflow=".github/workflows/socket.yml"
 for needle in \
   "name: socket-security-workflow" \
   "SOCKET_SECURITY_API_KEY" \
-  "socketsecurity==2.10.2" \
+  "socketsecurity==2.12.1" \
   "socketcli" \
   "--scm github" \
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" \

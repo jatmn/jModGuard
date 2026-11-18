@@ -158,7 +158,7 @@ const configureEnv = configure.match(/^        env:\n((?:          [^\n]+\n)+)/m
 assert.ok(configureEnv, "Configure runner must receive its setup flags");
 const compilerCache = jobs.get("checks").match(/^      - name: Cache Rust compiler outputs\n([\s\S]*?)(?=^      - |$(?![\s\S]))/m)?.[1];
 assert.ok(compilerCache, "missing compiler cache setup");
-assert.match(compilerCache, /version: v0\.18\.0/);
+assert.match(compilerCache, /version: v0\.19\.0/);
 const compilerGuard = compilerCache.match(/^        if: (.+)$/m)?.[1];
 assert.ok(compilerGuard);
 // actions/cache never re-saves a primary-key hit, so the pinned tool cache key

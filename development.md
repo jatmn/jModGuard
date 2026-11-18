@@ -69,7 +69,7 @@ just because a commit or push occurred. Do not omit a distinct regression merely
 to lower the test count.
 
 Install cargo-nextest for local Rust runs (`cargo install cargo-nextest --locked
---version 0.9.148`, the CI pin). Preflight uses it automatically. Without nextest,
+--version 0.9.152`, the CI pin). Preflight uses it automatically. Without nextest,
 the GNU timeout fallback invokes Cargo separately for each test and runs them
 sequentially; thousands of cases make this much slower. Both paths retain per-test
 timeouts. A cold install/build is setup cost, not application-test execution time.
