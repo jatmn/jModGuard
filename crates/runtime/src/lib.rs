@@ -2,6 +2,7 @@
 
 pub mod cgroup;
 pub mod health;
+pub mod resources;
 
 /// The launcher uses this separate signal after database/bootstrap work has
 /// completed. `/health` is intentionally live earlier and cannot prove that a

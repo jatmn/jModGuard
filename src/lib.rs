@@ -22,6 +22,7 @@ pub use jmodguard_runtime::health;
 pub use jmodguard_runtime::log_shutdown_finished;
 pub use jmodguard_runtime::mark_child_ready;
 pub use jmodguard_runtime::process_ready;
+pub use jmodguard_runtime::resources;
 pub use jmodguard_runtime::set_process_ready;
 pub use jmodguard_runtime::set_shutdown_context;
 pub mod emoji;
@@ -56,24 +57,19 @@ pub fn init_tracing(cfg: &LogConfig, process: &str) {
     let dir = cfg.directory.clone();
     // The loader already applies JMODGUARD_LOG_LEVEL over log.level. Do not
     // override that configuration with RUST_LOG or crate-specific directives.
-    let filter = logging_filter(&cfg.level);
-
-    let fmt = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_ansi(false);
+    use tracing_subscriber::util::SubscriberInitExt as _;
 
     if dir.as_os_str().is_empty() {
-        fmt.try_init().ok();
+        log_subscriber(&cfg.level, std::io::stdout).try_init().ok();
         return;
     }
 
     if let Err(e) = std::fs::create_dir_all(&dir) {
+        log_subscriber(&cfg.level, std::io::stdout).try_init().ok();
         tracing::warn!(
             "failed to create log dir {}: {e}; falling back to console",
             dir.display()
         );
-        fmt.try_init().ok();
         return;
     }
     let file_stem = format!("jmodguard-{process}.log");
@@ -82,7 +78,111 @@ pub fn init_tracing(cfg: &LogConfig, process: &str) {
     // The guard must live for the process lifetime: dropping it shuts down
     // the writer thread and silently loses all log output.
     std::mem::forget(guard);
-    fmt.with_writer(non_blocking).try_init().ok();
+    log_subscriber(&cfg.level, non_blocking).try_init().ok();
+}
+
+/// The process log output plus the resource counters derived from tracing:
+/// written log bytes and Discord REST calls. The counter layer has its own
+/// filter, so it never widens what the log output records and never formats
+/// span fields (request routes or bodies).
+fn log_subscriber<W>(level: &str, writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let output = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(CountedWriter(writer))
+        .with_filter(logging_filter(level));
+    let activity = DiscordActivity.with_filter(
+        tracing_subscriber::filter::filter_fn(DiscordActivity::wanted)
+            .with_max_level_hint(tracing::Level::DEBUG),
+    );
+    tracing_subscriber::registry().with(output).with(activity)
+}
+
+/// Counts bytes the log output writes as `log_bytes`.
+struct CountedWriter<M>(M);
+
+impl<'a, M: tracing_subscriber::fmt::MakeWriter<'a>> tracing_subscriber::fmt::MakeWriter<'a>
+    for CountedWriter<M>
+{
+    type Writer = Counted<M::Writer>;
+    fn make_writer(&'a self) -> Self::Writer {
+        Counted(self.0.make_writer())
+    }
+}
+
+struct Counted<W>(W);
+
+impl<W: std::io::Write> std::io::Write for Counted<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.0.write(bytes)?;
+        resources::count("log_bytes", written as u64);
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// Serenity's instrumented REST entry point opens one `request` span per
+/// Discord call; its rate limiter logs real 429s and pre-emptive bucket waits
+/// at debug level. Only those callsites reach this layer.
+struct DiscordActivity;
+
+const DISCORD_REST_TARGET: &str = "serenity::http::client";
+const DISCORD_LIMIT_TARGET: &str = "serenity::http::ratelimiting";
+
+impl DiscordActivity {
+    fn wanted(meta: &tracing::Metadata<'_>) -> bool {
+        (meta.is_span() && meta.target() == DISCORD_REST_TARGET && meta.name() == "request")
+            || (meta.is_event() && meta.target() == DISCORD_LIMIT_TARGET)
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DiscordActivity {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _id: &tracing::span::Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if Self::wanted(attrs.metadata()) {
+            resources::count("discord_rest", 1);
+        }
+    }
+
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Message(Option<String>);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        if event.metadata().target() != DISCORD_LIMIT_TARGET {
+            return;
+        }
+        let mut message = Message(None);
+        event.record(&mut message);
+        match message.0.as_deref() {
+            Some(text) if text.starts_with("Ratelimited on route") => {
+                resources::count("discord_429", 1);
+            }
+            Some(text) if text.starts_with("Pre-emptive ratelimit") => {
+                resources::count("discord_rate_limit_waits", 1)
+            }
+            _ => {}
+        }
+    }
 }
 
 // Accept an application level, not arbitrary target directives that could
@@ -107,7 +207,7 @@ fn logging_filter(level: &str) -> tracing_subscriber::EnvFilter {
 
 #[cfg(test)]
 mod logging_tests {
-    use super::logging_filter;
+    use super::resources;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -136,12 +236,7 @@ mod logging_tests {
         ] {
             let bytes = Capture(Arc::new(Mutex::new(Vec::new())));
             let writer = bytes.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_env_filter(logging_filter(level))
-                .without_time()
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
+            let subscriber = super::log_subscriber(level, move || writer.clone());
             tracing::subscriber::with_default(subscriber, || {
                 tracing::debug!(target: "jmodguard_bot", "app debug");
                 tracing::info!(target: "jmodguard_api", "app info");
@@ -172,5 +267,38 @@ mod logging_tests {
             );
             assert_eq!(logs.contains("gateway error"), level != "off");
         }
+    }
+
+    #[test]
+    fn log_output_and_discord_calls_are_counted_without_recording_their_fields() {
+        let bytes = Capture(Arc::new(Mutex::new(Vec::new())));
+        let writer = bytes.clone();
+        let subscriber = super::log_subscriber("info", move || writer.clone());
+        let before = (
+            resources::peek_counter("discord_rest"),
+            resources::peek_counter("discord_429"),
+            resources::peek_counter("discord_rate_limit_waits"),
+            resources::peek_counter("log_bytes"),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::span!(
+                target: "serenity::http::client",
+                tracing::Level::INFO,
+                "request",
+                req = "PRIVATE route"
+            );
+            drop(span);
+            tracing::debug!(target: "serenity::http::ratelimiting", "Ratelimited on route PRIVATE for 1s");
+            tracing::debug!(target: "serenity::http::ratelimiting", "Pre-emptive ratelimit on route PRIVATE for 5ms");
+            tracing::info!(target: "jmodguard_bot", "counted line");
+        });
+        let logs = String::from_utf8(bytes.0.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains("PRIVATE"), "{logs}");
+        assert!(logs.contains("counted line"));
+        // Other tests may count concurrently; these only ever grow.
+        assert!(resources::peek_counter("discord_rest") > before.0);
+        assert!(resources::peek_counter("discord_429") > before.1);
+        assert!(resources::peek_counter("discord_rate_limit_waits") > before.2);
+        assert!(resources::peek_counter("log_bytes") >= before.3 + logs.len() as u64);
     }
 }

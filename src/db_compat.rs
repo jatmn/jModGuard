@@ -422,6 +422,7 @@ impl DbRuntime {
         if let Some(probe) = &self.startup_probe {
             probe.record_query();
         }
+        jmodguard_runtime::resources::count("db_ops", 1);
         let watch = if honor_caller {
             active_caller_abandon()
         } else {
@@ -1156,6 +1157,7 @@ fn require_reclaim_sql(sql: &str) -> Result<()> {
                     | "webui_managed_assets"
                     | "component_updates"
                     | "mutation_receipts"
+                    | "resource_rollups"
             ),
         "reclaim table is not approved"
     );
@@ -1383,6 +1385,7 @@ impl Connection {
                 probe.record_immediate();
             }
         }
+        jmodguard_runtime::resources::count(if immediate { "db_writes" } else { "db_reads" }, 1);
         Ok((inner, read_budget.map(|budget| started + budget)))
     }
 

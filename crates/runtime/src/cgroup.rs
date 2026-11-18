@@ -11,10 +11,11 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const MAX_CGROUP_FILE_BYTES: usize = 64 * 1024;
-const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the background sampler publishes [`latest_container_sample`].
+pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 /// cgroup v1 reports "no limit" as a page-rounded value at least this large.
 const V1_UNLIMITED_BYTES: u64 = 1 << 62;
 const TRUNCATED: &str = "…(truncated)";
@@ -35,6 +36,7 @@ const KEY_CPU_FILES: [&str; 5] = [
 const LAYOUT_LINE_BYTES: usize = 2048;
 
 static LATEST: Mutex<ContainerSample> = Mutex::new(ContainerSample::unavailable());
+static LATEST_AT: Mutex<Option<SystemTime>> = Mutex::new(None);
 
 /// Memory in use, and which input measured it (see [`MemorySource`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +71,15 @@ pub enum MemoryLimit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuCounter {
     pub usage: Duration,
+}
+
+/// The CPU quota from `cpu.max` (v2) or `cpu.cfs_quota_us` and
+/// `cpu.cfs_period_us` (v1). `max` or a negative v1 quota means no quota.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CpuLimit {
+    /// Quota in thousandths of one CPU (`1500` is 1.5 CPUs).
+    Millicores(u64),
+    Unlimited,
 }
 
 /// One directory's memory and CPU counters. `None` means that file set was not readable.
@@ -124,6 +135,21 @@ fn read_proc_cgroup(proc: &Path, mount_root: &Path) -> CgroupReading {
     read_mounted_cgroup(&text, &mountinfo, host_total)
 }
 
+/// This process's cgroup CPU quota. `None` when no quota file is readable.
+/// The host's processor count is never used in its place.
+pub fn read_process_cpu_limit() -> Option<CpuLimit> {
+    read_proc_cpu_limit(Path::new("/proc"), Path::new("/sys/fs/cgroup"))
+}
+
+fn read_proc_cpu_limit(proc: &Path, mount_root: &Path) -> Option<CpuLimit> {
+    let Some(text) = read_limited(&proc.join("self/cgroup")) else {
+        return read_cpu_limit(mount_root);
+    };
+    let mountinfo = read_limited(&proc.join("self/mountinfo"))?;
+    let (_, cpu_dirs) = cgroup_dirs(&text, &mountinfo);
+    first_reading(&cpu_dirs, read_cpu_limit).map(|(_, limit)| limit)
+}
+
 // `MemTotal` in bytes, only to recognise a v1 limit that caps nothing. It is
 // never reported. Unreadable or malformed means unknown, not a cap.
 fn host_memory_total(proc: &Path) -> Option<u64> {
@@ -144,6 +170,13 @@ pub fn latest_container_sample() -> ContainerSample {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard
+}
+
+/// When the sampler last published, `None` before its first pass.
+pub fn latest_container_sample_at() -> Option<SystemTime> {
+    *LATEST_AT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Start the process-local sampler. Later calls do nothing.
@@ -242,6 +275,10 @@ fn publish(sample: ContainerSample) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = sample;
+    drop(guard);
+    *LATEST_AT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SystemTime::now());
 }
 
 fn observe_process() -> Observation {
@@ -784,6 +821,42 @@ fn read_cpu(dir: &Path) -> Option<CpuCounter> {
     Some(CpuCounter {
         usage: Duration::from_nanos(nanos),
     })
+}
+
+fn read_cpu_limit(dir: &Path) -> Option<CpuLimit> {
+    if let Some(text) = read_limited(&dir.join("cpu.max")) {
+        return parse_cpu_max(&text);
+    }
+    let quota: i64 = read_limited(&dir.join("cpu.cfs_quota_us"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    if quota < 0 {
+        return Some(CpuLimit::Unlimited);
+    }
+    let period = parse_u64_token(&read_limited(&dir.join("cpu.cfs_period_us"))?)?;
+    cpu_millicores(u64::try_from(quota).ok()?, period)
+}
+
+fn parse_cpu_max(text: &str) -> Option<CpuLimit> {
+    let mut parts = text.split_whitespace();
+    let quota = parts.next()?;
+    let period = match parts.next() {
+        Some(period) => period.parse().ok()?,
+        None => 100_000,
+    };
+    if quota == "max" {
+        return Some(CpuLimit::Unlimited);
+    }
+    cpu_millicores(quota.parse().ok()?, period)
+}
+
+fn cpu_millicores(quota: u64, period: u64) -> Option<CpuLimit> {
+    if quota == 0 || period == 0 {
+        return None;
+    }
+    Some(CpuLimit::Millicores(quota.saturating_mul(1000) / period))
 }
 
 fn read_limited(path: &Path) -> Option<String> {
@@ -1534,6 +1607,64 @@ mod tests {
     #[test]
     fn process_cgroup_read_does_not_panic() {
         let _ = read_process_cgroup();
+        let _ = read_process_cpu_limit();
+    }
+
+    #[test]
+    fn cpu_limit_reads_v2_cpu_max_and_v1_cfs_quota() {
+        let v2 = temp_tree();
+        write_files(&v2.path, &[("cpu.max", "150000 100000\n")]);
+        assert_eq!(read_cpu_limit(&v2.path), Some(CpuLimit::Millicores(1500)));
+        write_files(&v2.path, &[("cpu.max", "max 100000\n")]);
+        assert_eq!(read_cpu_limit(&v2.path), Some(CpuLimit::Unlimited));
+
+        let v1 = temp_tree();
+        write_files(
+            &v1.path,
+            &[
+                ("cpu.cfs_quota_us", "50000\n"),
+                ("cpu.cfs_period_us", "100000\n"),
+            ],
+        );
+        assert_eq!(read_cpu_limit(&v1.path), Some(CpuLimit::Millicores(500)));
+        write_files(&v1.path, &[("cpu.cfs_quota_us", "-1\n")]);
+        assert_eq!(read_cpu_limit(&v1.path), Some(CpuLimit::Unlimited));
+
+        let missing = temp_tree();
+        assert_eq!(
+            read_cpu_limit(&missing.path),
+            None,
+            "no quota file is unknown, not unlimited"
+        );
+        assert_eq!(parse_cpu_max("0 100000"), None);
+    }
+
+    #[test]
+    fn cpu_limit_follows_the_process_cgroup_directory() {
+        let tree = temp_tree();
+        let proc = tree.path.join("proc");
+        let mount = tree.path.join("cgroup");
+        write_files(
+            &mount,
+            &[
+                ("cpu.max", "max 100000\n"),
+                ("app/cpu.max", "200000 100000\n"),
+            ],
+        );
+        write_files(
+            &proc,
+            &[
+                ("self/cgroup", "0::/app\n"),
+                (
+                    "self/mountinfo",
+                    &format!("{}\n", v2_mount_line("/", &mount)),
+                ),
+            ],
+        );
+        assert_eq!(
+            read_proc_cpu_limit(&proc, &mount),
+            Some(CpuLimit::Millicores(2000))
+        );
     }
 
     #[test]

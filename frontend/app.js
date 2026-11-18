@@ -9,6 +9,9 @@ import {
   MembershipChart,
   RangeSelector,
   RankList,
+  RESOURCE_RANGES,
+  ResourceChart,
+  ResourceRangeSelector,
   ShareBar,
   formatCount,
   formatDelta,
@@ -1292,6 +1295,394 @@ function PlatformAnalytics() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Bot Resources (#652): system status for the bot and API processes. One
+// owner-only read per range or Refresh. Values the processes could not read
+// say "Unavailable"; values older than about two sample intervals are marked
+// stale. Nothing is drawn as 0 unless it was measured as 0.
+// ---------------------------------------------------------------------------
+
+const RESOURCES_HELP = [
+  "CPU and memory come from each process's own container limits (cgroup), never host totals.",
+  "The API is sampled every 5 seconds; the bot saves its status and both processes' history once a minute.",
+  "1h and 24h use minute rollups kept 48 hours; 7d and 30d use hourly rollups kept 31 days.",
+  "Counts are this application's own work. Database rows read and provider billing are not shown because they cannot be read safely.",
+];
+
+const RESOURCE_PROCESSES = [
+  ["bot", "Bot"],
+  ["api", "API"],
+];
+
+const UNAVAILABLE = "Unavailable";
+
+function formatBytes(bytes) {
+  if (bytes == null || !Number.isFinite(bytes)) return null;
+  const units = [[1e9, "GB"], [1e6, "MB"], [1e3, "KB"]];
+  for (const [size, unit] of units) if (Math.abs(bytes) >= size) return `${(bytes / size).toFixed(1)} ${unit}`;
+  return `${Math.round(bytes)} B`;
+}
+
+function formatRate(value) {
+  if (value == null || !Number.isFinite(value)) return null;
+  if (value === 0) return "0";
+  return value >= 100 ? formatExact(Math.round(value)) : value >= 10 ? value.toFixed(1) : value.toFixed(2);
+}
+
+function formatDuration(ms) {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return null;
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return `${Math.floor(ms / 1000)} s`;
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} h ${minutes % 60} min`;
+  return `${Math.floor(hours / 24)} d ${hours % 24} h`;
+}
+
+function formatInstant(ms) {
+  return ms ? new Date(ms).toLocaleString(undefined, { timeZoneName: "short" }) : null;
+}
+
+// CPU as a percentage of the container quota when one exists, otherwise of
+// one CPU. Tenths of a percent of one CPU come from the API.
+function cpuScale(limit) {
+  const millicores = limit?.Millicores;
+  return millicores > 0 ? { divisor: millicores / 1000, of: `of ${formatRate(millicores / 1000)} CPU limit`, max: 100 } : { divisor: 1, of: limit === "Unlimited" ? "of one CPU (no CPU limit)" : "of one CPU (limit unavailable)", max: null };
+}
+
+function cpuPercent(tenths, scale) {
+  return tenths == null ? null : tenths / 10 / scale.divisor;
+}
+
+function memoryLimitBytes(memory) {
+  return memory?.limit?.Bytes ?? null;
+}
+
+// The snapshot is fresh only while the response itself is recent.
+function resourceFreshness(current, generatedAtMs, nowMs = Date.now()) {
+  if (!current || current.availability !== "available") return "unavailable";
+  const drift = generatedAtMs ? Math.max(0, nowMs - generatedAtMs) : 0;
+  return current.stale || (current.age_ms ?? Infinity) + drift > (current.stale_after_ms ?? 0) ? "stale" : "fresh";
+}
+
+function resourceValue(text) {
+  return text == null ? h("span", { className: "br-unavailable" }, UNAVAILABLE) : text;
+}
+
+function resourceMetric(label, value, caption, chart) {
+  return h(
+    "div",
+    { className: "du-metric br-metric" },
+    h("span", { className: "du-metric-label" }, label),
+    h("strong", { className: "br-value" }, resourceValue(value)),
+    caption ? h("span", { className: "du-metric-caption" }, caption) : null,
+    chart || null,
+  );
+}
+
+function resourceFacts(rows) {
+  const known = rows.filter(([, value]) => value != null && value !== "");
+  const unknown = rows.filter(([, value]) => value == null || value === "").map(([label]) => label);
+  return [
+    h("dl", { key: "facts", className: "du-facts" }, ...known.map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, value)))),
+    unknown.length ? h("p", { key: "unknown", className: "du-unknown" }, `Unavailable: ${unknown.join(", ")}.`) : null,
+  ];
+}
+
+function diskRows(disks) {
+  const labels = { container_root: "Container filesystem", tmp: "Temporary files", logs: "Log files" };
+  if (!disks?.length) return [["Container filesystem", null], ["Temporary files", null]];
+  return disks.map((disk) => {
+    const label = labels[disk.kind] || disk.kind;
+    if (disk.kind === "container_root") return [label, "Not measured: its totals are the host's disk"];
+    if (disk.bytes == null) return [label, null];
+    const limit = disk.limit_bytes != null ? ` of ${formatBytes(disk.limit_bytes)}` : "";
+    return [label, `${formatBytes(disk.bytes)}${limit}${disk.path ? ` in ${disk.path}` : ""}${disk.complete ? "" : " (at least; too many files to count)"}`];
+  });
+}
+
+function ResourceCard({ id, title, process, generatedAtMs, nowMs, range, chartFrom, chartTo }) {
+  const current = process?.current;
+  const history = process?.history;
+  const points = history?.points ?? [];
+  const freshness = resourceFreshness(current, generatedAtMs, nowMs);
+  const info = current?.info;
+  const badge =
+    freshness === "unavailable"
+      ? { label: "Unavailable", tone: "neutral" }
+      : freshness === "stale"
+      ? { label: "Stale", tone: "warning" }
+      : info?.ready
+      ? { label: "Ready", tone: "success" }
+      : { label: "Not ready", tone: "warning" };
+  const scale = cpuScale(info?.cpu_limit);
+  const memoryLimit = memoryLimitBytes(current?.memory);
+  const memory = current?.memory?.program_bytes ?? null;
+  const cpu = cpuPercent(current?.cpu_tenths, scale);
+  const sampleAgeMs = current?.age_ms != null && generatedAtMs != null
+    ? current.age_ms + Math.max(0, nowMs - generatedAtMs)
+    : null;
+  const sampled = sampleAgeMs != null ? `Sampled ${formatDuration(sampleAgeMs)} ago` : "Not sampled";
+  const headingId = `resources-${id}`;
+  const percent = (value) => (value == null ? "—" : `${formatRate(value)}%`);
+  const cores = info?.schedulable_cpus != null ? `${info.schedulable_cpus} schedulable CPU${info.schedulable_cpus === 1 ? "" : "s"}` : "schedulable CPUs unavailable";
+  const source = current?.memory?.source === "CgroupUsage" ? "cgroup usage (includes page cache)" : current?.memory ? "cgroup stat (excludes reclaimable cache)" : null;
+  return h(
+    "section",
+    { className: "card bg-base-100 card-border du-card br-card", "aria-labelledby": headingId, "data-freshness": freshness },
+    h(
+      "div",
+      { className: "card-body" },
+      h(
+        "header",
+        { className: "du-head" },
+        h("h3", { id: headingId, className: "du-title" }, title),
+        h("span", { className: `badge badge-soft badge-sm badge-${badge.tone} du-health` }, badge.label),
+        h("span", { className: "du-chip", title: formatInstant(current?.sampled_at_ms) ?? "Not sampled" }, sampled),
+      ),
+      freshness === "stale" && h("p", { className: "du-stale" }, `Stale: older than ${formatDuration(current?.stale_after_ms) ?? "two sample intervals"}. These are not current values.`),
+      freshness === "unavailable" && h("p", { className: "du-stale" }, id === "bot" ? "The bot has not saved a status yet, or it could not be read." : "This process has not sampled itself yet."),
+      h(
+        "div",
+        { className: "du-metrics br-metrics" },
+        resourceMetric(
+          "CPU",
+          cpu == null ? null : `${formatRate(cpu)}% ${scale.of}`,
+          [h("span", { key: "c" }, cores), history?.cpu_peak_tenths != null ? h("span", { key: "p" }, `peak ${percent(cpuPercent(history.cpu_peak_tenths, scale))} in ${range}`) : null],
+          h(ResourceChart, {
+            points, label: `${title} CPU`, from: chartFrom, to: chartTo, max: scale.max, format: percent,
+            series: [
+              { key: "avg", label: "Average", tone: "br-tone-avg", value: (p) => cpuPercent(p.cpu_avg_tenths, scale) },
+              { key: "max", label: "Peak", tone: "br-tone-max", value: (p) => cpuPercent(p.cpu_max_tenths, scale) },
+            ],
+          }),
+        ),
+        resourceMetric(
+          "Memory",
+          memory == null ? null : `${formatBytes(memory)}${memoryLimit ? ` of ${formatBytes(memoryLimit)} (${formatRate((memory * 100) / memoryLimit)}%)` : current?.memory?.limit === "Unlimited" ? " (no memory limit)" : ""}`,
+          [source ? h("span", { key: "s" }, `Source: ${source}`) : null, h("span", { key: "p" }, `peak ${formatBytes(history?.memory_peak_bytes) ?? "unavailable"} in ${range}`)],
+          h(ResourceChart, {
+            points, label: `${title} memory`, from: chartFrom, to: chartTo, max: memoryLimit, format: (value) => formatBytes(value) ?? "—",
+            series: [
+              { key: "avg", label: "Average", tone: "br-tone-avg", value: (p) => p.memory_avg_bytes },
+              { key: "max", label: "Peak", tone: "br-tone-max", value: (p) => p.memory_max_bytes },
+            ],
+          }),
+        ),
+      ),
+      h(
+        "div",
+        { className: "br-section" },
+        h("h4", { className: "du-metric-label" }, "Disk"),
+        ...resourceFacts(diskRows(current?.disk)),
+        h("p", { className: "du-metric-caption" }, "Database size: ", h("button", { type: "button", className: "btn btn-xs btn-link br-link", onClick: () => navigate("usage") }, "Database Usage")),
+      ),
+      h(
+        "div",
+        { className: "br-section" },
+        h("h4", { className: "du-metric-label" }, "Process"),
+        ...resourceFacts([
+          ["Version", info?.version],
+          ["Commit", info?.commit ? info.commit.slice(0, 12) : null],
+          ["Uptime", formatDuration(current?.uptime_ms)],
+          ["Last restart", formatInstant(info?.started_at_ms)],
+          [`Restarts in ${range}`, history?.restarts == null ? null : formatExact(history.restarts)],
+          ["Pod", info?.pod],
+          ["Region", info?.region],
+          ["Ready", info ? (info.ready ? "Ready" : "Not ready") : null],
+        ]),
+      ),
+    ),
+  );
+}
+
+// A counter from the range: measured zero when the process reported minutes
+// without it, unavailable when there is no history at all.
+function rangeRate(history, name) {
+  if (!history || !history.minutes) return null;
+  return history.per_minute?.[name] ?? 0;
+}
+
+function rangeTotal(history, name) {
+  if (!history || !history.minutes) return null;
+  return history.totals?.[name] ?? 0;
+}
+
+// `meaning` spells out a short label for the tooltip and accessible name.
+function resourceTile(label, value, meaning) {
+  const name = meaning ?? label;
+  return h(
+    "div",
+    { key: label, className: "an-kpi br-kpi", role: "group", "aria-label": `${name}: ${value ?? "unavailable"}` },
+    h("div", { className: "an-kpi-head" }, h("span", { className: "an-kpi-label", title: name }, label)),
+    h("div", { className: "an-kpi-body" }, h("span", { className: "an-kpi-value", title: value ?? UNAVAILABLE }, value ?? "—")),
+  );
+}
+
+function breakdownRows(history, family) {
+  return (history?.breakdowns?.[family] ?? []).map(([label, count]) => ({ key: label, label, count }));
+}
+
+function rateChart(points, title, name, from, to) {
+  return h(ResourceChart, {
+    points, label: title, from, to, format: (value) => formatRate(value) ?? "—",
+    series: [{ key: name, label: title, tone: "br-tone-avg", value: (p) => (p.minutes ? p.rates?.[name] ?? 0 : null) }],
+  });
+}
+
+function gaugeChart(points, title, name, from, to, format) {
+  return h(ResourceChart, {
+    points, label: title, from, to, format,
+    series: [{ key: name, label: title, tone: "br-tone-avg", value: (p) => (p.minutes ? p.gauges?.[name] ?? null : null) }],
+  });
+}
+
+function TabBotResources() {
+  return isBotOwner() ? h(BotResources) : ownerAccessRequired();
+}
+
+function BotResources() {
+  const [range, setRange] = useState("24h");
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 5000);
+    return () => window.clearInterval(id);
+  }, []);
+  const result = useApiRead(`/api/owner/resources?range=${range}`, { retainData: true });
+  const snapshot = result.data;
+  const bot = snapshot?.processes?.bot;
+  const api = snapshot?.processes?.api;
+  const botHistory = bot?.history;
+  const apiHistory = api?.history;
+  const from = snapshot?.from_secs;
+  const to = snapshot?.to_secs;
+  const gauge = (process, name) => (resourceFreshness(process?.current, snapshot?.generated_at_ms, nowMs) === "unavailable" ? null : process?.current?.gauges?.[name] ?? null);
+  const rangeLabel = RESOURCE_RANGES.find(([value]) => value === range)?.[1].toLowerCase() ?? range;
+  const note = result.error
+    ? h("p", { id: "resources-status", className: "alert alert-soft alert-warning", role: "status" }, snapshot
+        ? `Refresh failed: ${result.error.message}. Showing the last successful response (stale).`
+        : `Bot Resources unavailable: ${result.error.message}`)
+    : snapshot && snapshot.history_status !== "available"
+    ? h("p", { id: "resources-status", className: "alert alert-soft alert-warning", role: "status" }, snapshot.history_status === "stale"
+        ? "History could not be refreshed; trends are from the last successful read (stale)."
+        : "History is unavailable: the database could not be read. Current API values are live.")
+    : null;
+  // Latency percentiles are the upper bound of the histogram bucket they fall in.
+  const latency = (ms) => (ms == null ? null : `${formatExact(ms)} ms`);
+  const bytesPerMinute = (value) => (value == null ? null : `${formatBytes(value)}/min`);
+  const panelBody = (render) => (snapshot ? render() : h("p", { className: "an-empty muted", "aria-busy": result.loading ? "true" : "false" }, result.error ? UNAVAILABLE : "Loading…"));
+  const costRow = (label, name, format = formatRate) =>
+    h("tr", { key: name }, h("th", { scope: "row" }, label), ...[botHistory, apiHistory].map((history, i) => h("td", { key: i }, resourceValue(format(rangeRate(history, name))))));
+  return h(
+    "div",
+    { className: "contents analytics-page resources-page" },
+    pageHeader(
+      "Bot Resources",
+      snapshot ? `Bot and API · ${rangeLabel} (UTC) · response ${formatDuration(Math.max(0, Date.now() - snapshot.generated_at_ms)) ?? "just now"} old` : "Bot and API",
+      h(ResourceRangeSelector, { value: range, onChange: setRange }),
+      h(ActionButton, { id: "refresh-resources", className: "btn btn-sm", onClick: () => result.refresh() }, "Refresh"),
+      h(InfoTip, { id: "resources-help", label: "About these figures" }, RESOURCES_HELP),
+    ),
+    note,
+    !snapshot && !result.error && h("p", { className: "muted", role: "status", "aria-busy": "true" }, "Loading Bot Resources…"),
+    snapshot &&
+      h(
+        "div",
+        { id: "resources-cards", className: "du-grid" },
+        ...RESOURCE_PROCESSES.map(([id, title]) =>
+          h(ResourceCard, { key: id, id, title, process: snapshot.processes?.[id], generatedAtMs: snapshot.generated_at_ms, nowMs, range: rangeLabel, chartFrom: from, chartTo: to }),
+        ),
+      ),
+    h(
+      "div",
+      { className: "an-grid" },
+      analyticsPanel(
+        "Bot activity",
+        "resources-bot-activity",
+        panelBody(() => [
+          h(
+            "section",
+            { key: "tiles", className: "an-kpis", "aria-label": "Bot activity" },
+            resourceTile("Gateway/min", formatRate(rangeRate(botHistory, "gateway_events")), "Gateway events per minute"),
+            resourceTile("REST requests/min", formatRate(rangeRate(botHistory, "discord_rest")), "Logical Discord REST requests per minute, including log deliveries. Retries count once."),
+            resourceTile("Discord 429s", rangeTotal(botHistory, "discord_429") == null ? null : formatExact(rangeTotal(botHistory, "discord_429"))),
+            resourceTile("Rate-limit waits", rangeTotal(botHistory, "discord_rate_limit_events") == null ? null : formatExact(rangeTotal(botHistory, "discord_rate_limit_events")), "Discord rate-limit waits (429s and pre-emptive bucket waits)"),
+            resourceTile("Shard latency", gauge(bot, "shard_latency_ms") == null ? null : `${formatExact(gauge(bot, "shard_latency_ms"))} ms`),
+            resourceTile("Shards up", gauge(bot, "shards") == null ? null : `${formatExact(gauge(bot, "shards_connected"))} of ${formatExact(gauge(bot, "shards"))}`),
+            resourceTile("Lease gen.", gauge(bot, "lease_generation") == null ? null : formatExact(gauge(bot, "lease_generation")), "Writer-lease generation"),
+            resourceTile("Lease margin", gauge(bot, "lease_margin_ms") == null ? null : formatDuration(gauge(bot, "lease_margin_ms"))),
+            resourceTile("Guilds", gauge(bot, "guilds") == null ? null : formatExact(gauge(bot, "guilds"))),
+            resourceTile("Capture queue", gauge(bot, "capture_queue_items") == null ? null : `${formatExact(gauge(bot, "capture_queue_items"))} · ${formatBytes(gauge(bot, "capture_queue_bytes")) ?? "?"}`),
+          ),
+          h("div", { key: "charts", className: "br-pair" },
+            h("div", null, h("h4", { className: "du-metric-label" }, "Gateway events per minute"), rateChart(botHistory?.points ?? [], "Gateway events per minute", "gateway_events", from, to)),
+            h("div", null, h("h4", { className: "du-metric-label" }, "Shard latency (peak)"), gaugeChart(botHistory?.points ?? [], "Shard latency", "shard_latency_ms", from, to, (value) => `${formatExact(value)} ms`)),
+          ),
+          h("div", { key: "ranks", className: "br-pair" },
+            h("div", null, h("h4", { className: "du-metric-label" }, "Gateway events by type"), h(RankList, { rows: breakdownRows(botHistory, "gateway"), label: "Gateway events by type", empty: botHistory?.minutes ? "No events in this range." : UNAVAILABLE })),
+            h("div", null, h("h4", { className: "du-metric-label" }, "Rate-limit waits by bucket"), h(RankList, { rows: breakdownRows(botHistory, "discord_rate_limits"), label: "Rate-limit waits by bucket", color: "an-bans", empty: botHistory?.minutes ? "No rate-limit waits in this range." : UNAVAILABLE })),
+          ),
+        ]),
+        "an-span-12",
+      ),
+      analyticsPanel(
+        "API activity",
+        "resources-api-activity",
+        panelBody(() => [
+          h(
+            "section",
+            { key: "tiles", className: "an-kpis", "aria-label": "API activity" },
+            resourceTile("Requests/min", formatRate(rangeRate(apiHistory, "api_requests"))),
+            resourceTile("p50 latency", latency(apiHistory?.p50_ms), "p50 latency (upper bound of its bucket)"),
+            resourceTile("p95 latency", latency(apiHistory?.p95_ms), "p95 latency (upper bound of its bucket)"),
+            resourceTile("4xx", rangeTotal(apiHistory, "api_4xx") == null ? null : formatExact(rangeTotal(apiHistory, "api_4xx"))),
+            resourceTile("5xx", rangeTotal(apiHistory, "api_5xx") == null ? null : formatExact(rangeTotal(apiHistory, "api_5xx"))),
+            resourceTile("Active sessions", gauge(api, "sessions_active") == null ? null : formatExact(gauge(api, "sessions_active"))),
+            resourceTile("OAuth 429s", rangeTotal(apiHistory, "oauth_429") == null ? null : formatExact(rangeTotal(apiHistory, "oauth_429"))),
+            resourceTile("Discord 429s", rangeTotal(apiHistory, "discord_429") == null ? null : formatExact(rangeTotal(apiHistory, "discord_429"))),
+          ),
+          h("div", { key: "charts", className: "br-pair" },
+            h("div", null, h("h4", { className: "du-metric-label" }, "Requests per minute"), rateChart(apiHistory?.points ?? [], "Requests per minute", "api_requests", from, to)),
+            h("div", null, h("h4", { className: "du-metric-label" }, "p95 latency"), h(ResourceChart, {
+              points: apiHistory?.points ?? [], label: "p95 latency", from, to, format: (value) => `${formatExact(value)} ms`,
+              series: [{ key: "p95", label: "p95 latency", tone: "br-tone-max", value: (p) => p.p95_ms ?? null }],
+            })),
+          ),
+        ]),
+        "an-span-12",
+      ),
+      analyticsPanel(
+        "Cost drivers",
+        "resources-costs",
+        panelBody(() => [
+          h(
+            "div",
+            { key: "table", className: "table-scroll rounded-box", tabIndex: 0, role: "region", "aria-label": "Cost drivers per minute" },
+            h(
+              "table",
+              { className: "table table-sm br-costs" },
+              h("thead", null, h("tr", null, h("th", { scope: "col" }, `Average per minute, ${rangeLabel}`), h("th", { scope: "col" }, "Bot"), h("th", { scope: "col" }, "API"))),
+              h(
+                "tbody",
+                null,
+                costRow("Database round trips", "db_ops"),
+                costRow("Database read transactions", "db_reads"),
+                costRow("Database write transactions", "db_writes"),
+                costRow("Logical Discord REST requests", "discord_rest"),
+                costRow("Log output", "log_bytes", (value) => bytesPerMinute(value)),
+                h("tr", { key: "bytes" }, h("th", { scope: "row" }, "API response bytes"), h("td", null, "—"), h("td", null, resourceValue(bytesPerMinute(rangeRate(apiHistory, "api_bytes_out"))))),
+                h("tr", { key: "rows" }, h("th", { scope: "row" }, "Database rows read"), h("td", { colSpan: 2 }, resourceValue(null), " — the database client does not report rows read.")),
+              ),
+            ),
+          ),
+          h("p", { key: "provider", className: "an-note muted" }, "Provider billing (Bunny) is not shown: no scoped read-only key is configured, and nothing is estimated. API response bytes count responses with a known length."),
+        ]),
+        "an-span-12",
+      ),
+    ),
+  );
+}
+
 function PolicyLinks() {
   return h(
     "nav",
@@ -1336,7 +1727,7 @@ function App() {
   // Owner sections live in the main interface, not on the separate
   // /administration page (Updates only). They appear only for the bot owner.
   const navigation = isBotOwner()
-    ? [...navigationBase, ["servers", "Bot servers"], ["usage", "Database Usage"], ["platform-analytics", "Platform analytics"]]
+    ? [...navigationBase, ["servers", "Bot servers"], ["usage", "Database Usage"], ["platform-analytics", "Platform analytics"], ["resources", "Bot Resources"]]
     : navigationBase;
   return h(
     BusyContext.Provider,
@@ -1587,7 +1978,7 @@ function Content() {
   };
   // Owner sections cover every server the bot serves; they need no selected
   // guild or loaded configuration.
-  const ownerSections = { servers: TabOwnerServers, usage: TabDatabaseUsage, "platform-analytics": TabPlatformAnalytics };
+  const ownerSections = { servers: TabOwnerServers, usage: TabDatabaseUsage, "platform-analytics": TabPlatformAnalytics, resources: TabBotResources };
   if (Object.hasOwn(ownerSections, state.tab)) return h(ownerSections[state.tab]);
   if (!state.guildId)
     return emptyPanel(
@@ -1744,6 +2135,7 @@ const tabs = [
   "servers",
   "usage",
   "platform-analytics",
+  "resources",
 ];
 
 let pendingCase = null;

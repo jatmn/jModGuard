@@ -12,6 +12,7 @@ pub mod oauth;
 pub mod platform;
 pub mod preview;
 pub mod recovery;
+pub mod resources;
 mod save;
 pub mod server_names;
 pub mod state;
@@ -1658,7 +1659,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
     }
     let cross_origin = !cors_origins.is_empty();
     let same_site = session_same_site(cross_origin, secure);
-    let session_layer = SessionManagerLayer::new(session_store)
+    let session_layer = SessionManagerLayer::new(resources::CountedStore(session_store))
         .with_name(SESSION_COOKIE_NAME)
         .with_secure(secure)
         .with_same_site(same_site)
@@ -1693,6 +1694,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         )
         .route("/api/updates", get_post(updates::status))
         .route("/api/database-usage", axum::routing::post(usage::overview))
+        .route("/api/owner/resources", get_post(resources::overview))
         .route(
             "/api/platform/analytics",
             axum::routing::post(platform::analytics),
@@ -1920,6 +1922,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             .route("/api/legal", get(legal::details))
             .merge(sessioned),
     )
+    .layer(axum::middleware::from_fn(resources::count_request))
     .with_state(app.clone())
 }
 

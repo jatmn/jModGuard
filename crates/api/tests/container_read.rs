@@ -3,7 +3,10 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use jmodguard::config::ControlSecret;
-use jmodguard::read_link::{CONTAINER_READ_PATH, seal_read, spawn_container_read_listener};
+use jmodguard::read_link::{
+    CONTAINER_READ_PATH, RESOURCE_READ_PATH, seal_read, spawn_container_read_listener,
+    try_read_link,
+};
 use jmodguard::set_process_ready;
 use jmodguard_api::config::ApiProcessConfig;
 use jmodguard_api::process_ready_test_lock::ProcessReadyTestGuard;
@@ -133,4 +136,42 @@ async fn private_container_use_accepts_a_delayed_body() {
     response_read.unwrap();
     let (_, json) = text.split_once("\r\n\r\n").expect("http body");
     let _: jmodguard::read_link::ContainerReadResponse = serde_json::from_str(json).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_resource_rollups_reach_the_bot_only_with_a_route_bound_request() {
+    let secret = "r".repeat(32);
+    let addr = spawn_container_read_listener("127.0.0.1:0", &secret).expect("listener");
+    let _ready_guard = ProcessReadyTestGuard::acquire().await;
+    set_process_ready(true);
+    let mut minute = jmodguard::resources::Rollup::empty(1_800_000_000 / 60 * 60, 60);
+    minute.data.counters.insert("api_requests".into(), 7);
+    jmodguard::resources::publish_recent(minute.clone());
+
+    let link = try_read_link(&addr.to_string(), &secret)
+        .unwrap()
+        .expect("read link");
+    let fetched = tokio::task::spawn_blocking(move || link.fetch_resource_rollups_blocking())
+        .await
+        .unwrap()
+        .expect("resource rollups");
+    assert!(fetched.minutes.contains(&minute), "{fetched:?}");
+    assert_eq!(fetched.copy, format!("api pid {}", std::process::id()));
+
+    // A body sealed for the container-use route is refused on this route.
+    let body = seal_read(secret.as_bytes()).unwrap();
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let request = format!(
+        "POST {RESOURCE_READ_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len(),
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.write_all(&body).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 401"), "{text}");
 }

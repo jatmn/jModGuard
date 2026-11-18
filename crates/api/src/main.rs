@@ -15,6 +15,7 @@ async fn main() -> Result<()> {
 
     init_tracing(&cfg.log, "api");
     jmodguard::set_shutdown_context("api");
+    jmodguard::resources::process_started_at_ms();
     if let Some(message) = jmodguard::launcher_child::refusal_message() {
         tracing::error!("{message}");
         let listener = tokio::net::TcpListener::bind(&cfg.web.bind)
@@ -103,6 +104,9 @@ async fn main() -> Result<()> {
                 // Runtime work starts only after the serving artifact exists.
                 // Starting the poller before `web::router` succeeded would leave
                 // a background task on a process that then failed to listen.
+                let log_dir = (!app.cfg.log.directory.as_os_str().is_empty())
+                    .then(|| app.cfg.log.directory.clone());
+                tokio::spawn(web::resources::run_rollups(log_dir));
                 let poll_secs = app.cfg.bot.config_poll_secs.max(1);
                 let update_app = Arc::clone(&app);
                 let release_check = tokio::spawn(async move {

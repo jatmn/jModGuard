@@ -69,6 +69,7 @@ export const ICON_PATHS = {
   briefcase: ["M4 8h16v11H4z", "M9 8V5h6v3", "M4 13h16"],
   sliders: ["M4 6h9", "M17 6h3", "M15 4v4", "M4 12h3", "M11 12h9", "M9 10v4", "M4 18h11", "M19 18h1", "M17 16v4"],
   server: ["M4 4h16v6H4z", "M4 14h16v6H4z", "M8 7v.01", "M8 17v.01"],
+  activity: ["M3 12h4l3-8l4 16l3-8h4"],
   crown: ["M3 17l2-10l5 4l2-6l2 6l5-4l2 10z", "M3 21h18"],
   database: [
     "M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3s-3.6 3-8 3s-8-1.3-8-3z",
@@ -122,6 +123,7 @@ export const NAV_ICONS = {
   servers: { icon: "server", intent: "members" },
   usage: { icon: "database", intent: "neutral" },
   "platform-analytics": { icon: "bar-chart", intent: "analytics" },
+  resources: { icon: "activity", intent: "info" },
   // The sidebar's own buttons: owner tools, preview exit and the account footer.
   administration: { icon: "crown", intent: "info" },
   "view-as": { icon: "eye", intent: "info" },

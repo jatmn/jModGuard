@@ -270,8 +270,8 @@ contains_arg "ghcr.io/jatmn/jmodguard-bot:stable" "${stable_args[@]}" \
 for component in bot api webui; do
   readarray -d '' -t schema_args < <(build_args "$component" "$HEAD_SHA" "" . "" current "$(staging_ref "$component")")
   for field in min-schema max-schema result-schema; do
-    contains_arg "io.jmodguard.${field}=27" "${schema_args[@]}" \
-      || fail "${component} must advertise current schema27 (${field})"
+    contains_arg "io.jmodguard.${field}=28" "${schema_args[@]}" \
+      || fail "${component} must advertise current schema28 (${field})"
   done
 done
 

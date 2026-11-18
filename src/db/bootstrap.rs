@@ -117,6 +117,8 @@ fn read_core_baseline(conn: &impl SqlExecutor) -> Result<CoreBaseline> {
     })
 }
 
+const RESOURCE_TABLES_MIGRATION_GROWTH: u64 = 1024 * 1024;
+
 fn ban_list_migration_growth(tx: &impl SqlExecutor) -> Result<u64> {
     // Match 0027's latest valid edit per guild and ban. Every ban adds six
     // index entries, and a backfilled ban also rewrites the full table record.
@@ -195,6 +197,9 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
         if version < target {
             let growth = if target == 27 {
                 ban_list_migration_growth(&tx).context("measure migration 27 growth")?
+            } else if target == 28 {
+                // Two empty tables: a few schema and root pages, no row copies.
+                RESOURCE_TABLES_MIGRATION_GROWTH
             } else {
                 // Historical migrations can copy existing rows and build indexes.
                 // Reserve their complete conservative rebuild allowance under the

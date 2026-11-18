@@ -443,6 +443,14 @@ impl Default for SnapshotIngress {
 }
 
 impl SnapshotIngress {
+    /// Queued capture items and their reserved bytes, for Bot Resources.
+    pub fn pending(&self) -> (usize, usize) {
+        (
+            self.sender.max_capacity() - self.sender.capacity(),
+            self.bytes.load(Ordering::Acquire),
+        )
+    }
+
     /// Called before the first await in READY/RESUME. Serenity invokes this
     /// callback on the shard runner before spawning either event handler.
     pub fn install_collector(&self, app: &Arc<BotState>, context: &Context) {

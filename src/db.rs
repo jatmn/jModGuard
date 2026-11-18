@@ -67,7 +67,9 @@ mod updates;
 pub use updates::*;
 mod update_control;
 pub use update_control::*;
+mod resources;
 pub mod usage;
+pub use resources::*;
 mod write_budget;
 use write_budget::BoundedWrites;
 
@@ -90,6 +92,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (26, include_str!("../migrations/0026_guild_join_info.sql")),
     (27, include_str!("../migrations/0027_ban_list.sql")),
+    (28, include_str!("../migrations/0028_resource_rollups.sql")),
 ];
 
 /// Completed core schema required by service startup and release observations.

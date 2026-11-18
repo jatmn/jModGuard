@@ -11,6 +11,7 @@ default = ["embed-ui"]
 embed-ui = []
 
 [dependencies]
+async-trait = "0.1"
 rand = "0.10"
 jmodguard = { path = "../.." }
 jmodguard-updater = { path = "../updater" }
@@ -31,7 +32,6 @@ tracing = "0.1"
 [dev-dependencies]
 jmodguard = { path = "../..", features = ["test-support"] }
 tower = "0.5.3"
-async-trait = "0.1"
 jmodguard-bot = { path = "../bot" } # HTTP-to-worker regression fixtures only
 libsql = { version = "0.10.0", default-features = false, features = ["core"] }
 libc = "0.2"
