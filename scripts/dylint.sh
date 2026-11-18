@@ -343,6 +343,8 @@ host=$(rustc "+$channel" --print host-tuple)
 local_lint="$local_lint_target/debug/libtest_flake@$channel-$host.so"
 [ -s "$local_lint" ] || { echo "dylint: missing repo-owned lint library" >&2; exit 1; }
 
+TMPDIR="$dylint_tmpdir" node scripts/check-test-flakes.mjs rust-fixture "$local_lint"
+
 if [ "$use_prebuilt" -eq 1 ]; then
   echo "dylint: using prebuilt libs at $lib_dir"
   lib_toolchain=$(dylint_lib_toolchain_from_key "$dylint_build_key")
@@ -359,4 +361,4 @@ env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
   TMPDIR="$dylint_tmpdir" DYLINT_RUSTFLAGS="$dylint_rustflags" \
   cargo dylint "${selection[@]}" --fail-on-no-libraries --lib-path "$local_lint" \
     -- --locked --all-targets --message-format=json "${package_args[@]}" \
-  | node scripts/check-test-flakes.mjs rust
+  | TMPDIR="$dylint_tmpdir" node scripts/check-test-flakes.mjs rust "$local_lint" "${package_args[@]}"

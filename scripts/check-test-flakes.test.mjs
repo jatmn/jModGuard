@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -36,6 +36,7 @@ function fixture(t) {
             JMODGUARD_DIFF_BASE: "",
             JMODGUARD_DIFF_HEAD: "",
             JMODGUARD_PREFLIGHT_BASE: "",
+            ...options?.env,
         },
     });
     function git(...args) {
@@ -50,11 +51,11 @@ function fixture(t) {
     git("init", "-q");
     write(allowlist, entry);
     write("src/service.rs", sample("1_000"));
-    write("src/test.rs", "fn first() {}\nfn legacy() {}\n");
+    write("src/test.rs", "fn first() {}\nfn legacy() {}\nfn unpaused() {}\n");
     git("add", ".");
     git("-c", "user.name=Fixture", "-c", "user.email=fixture", "commit", "-qm", "base");
     git("update-ref", "refs/remotes/origin/main", "HEAD");
-    return { write, run: (mode, options) => run(process.execPath, [script, mode], options) };
+    return { cwd, write, run: (mode, options, ...args) => run(process.execPath, [script, mode, ...args], options) };
 }
 
 test("the contracts gate rejects a budget increase, runner retries, and allowlist growth", (t) => {
@@ -110,20 +111,32 @@ test("the contracts gate finishes on a long malformed Rust attribute run", (t) =
     assert.match(result.stderr, /timeout increased/);
 });
 
-test("the compiler gate distinguishes a new finding from inherited unlisted debt", (t) => {
-    const { write, run } = fixture(t);
-    write("src/test.rs", "fn first() {}\nfn legacy() {}\nfn added() {}\n");
+test("the compiler gate requires a matching base diagnostic for unchanged findings", (t) => {
+    const { cwd, write, run } = fixture(t);
+    write("src/test.rs", "\nfn first() {}\nfn legacy() {}\nfn unpaused() {}\nfn added() {}\n");
     const record = (line, name) => JSON.stringify({
         reason: "compiler-message",
         message: {
             code: { code: "test_flake" },
-            message: `clock in test ${name}: use an injected or paused clock`,
+            message: `clock in test ${name}: use an injected or paused clock (tokio::time::Instant::now)`,
             spans: [{ file_name: "src/test.rs", is_primary: true, column_start: 1, line_start: line, line_end: line }],
         },
     });
-    const result = run("rust", { input: [record(1, "first"), record(2, "tests::legacy"), record(3, "added")].join("\n") });
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /Inherited test flake: .*clock in test first/);
-    assert.match(result.stderr, /src\/test.rs:3:1: clock in test added/);
+    write("bin/cargo", `#!/usr/bin/env node
+const assert = require("node:assert/strict");
+const { readFileSync } = require("node:fs");
+assert.equal(readFileSync("src/test.rs", "utf8"), ${JSON.stringify("fn first() {}\nfn legacy() {}\nfn unpaused() {}\n")});
+assert.deepEqual(process.argv.slice(-2), ["-p", "fixture"]);
+console.log(${JSON.stringify(record(1, "first"))});
+`);
+    chmodSync(join(cwd, "bin/cargo"), 0o755);
+    const result = run("rust", {
+        input: [record(2, "first"), record(3, "tests::legacy"), record(4, "unpaused"), record(5, "added")].join("\n"),
+        env: { PATH: `${join(cwd, "bin")}:${process.env.PATH}` },
+    }, "test-flake-fixture.so", "-p", "fixture");
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /Inherited test flake: .*src\/test.rs:2:1: clock in test first/);
+    assert.match(result.stderr, /^src\/test.rs:4:1: clock in test unpaused/m);
+    assert.match(result.stderr, /^src\/test.rs:5:1: clock in test added/m);
     assert.doesNotMatch(result.stderr, /tests::legacy/);
 });

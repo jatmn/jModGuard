@@ -13,8 +13,13 @@ mkdir -p "$fixture/project/scripts" "$fixture/project/tools/dylint/test-flake" "
 cat >"$fixture/bin/node" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ "$*" == 'scripts/check-test-flakes.mjs rust' ]]
-cat >/dev/null
+[[ "$1" == scripts/check-test-flakes.mjs && -s "$3" ]]
+shift
+case "$1" in
+  rust) [[ "$#" -ge 3 ]]; cat >/dev/null ;;
+  rust-fixture) [[ "$#" -eq 2 ]] ;;
+  *) exit 1 ;;
+esac
 SH
 chmod +x "$fixture/bin/node"
 git init -q "$fixture/project"

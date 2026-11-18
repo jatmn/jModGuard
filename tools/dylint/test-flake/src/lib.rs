@@ -8,8 +8,11 @@ extern crate rustc_span;
 use std::collections::HashMap;
 
 use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic};
+use rustc_hir::def::Res;
 use rustc_hir::def_id::{DefId, LocalModId};
-use rustc_hir::{Expr, ExprKind, ItemKind, Node, StmtKind, find_attr};
+use rustc_hir::{
+    Expr, ExprKind, ItemKind, MatchSource, Node, PatKind, QPath, StmtKind, UnOp, find_attr,
+};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::ty;
 use rustc_span::Symbol;
@@ -92,17 +95,7 @@ impl<'tcx> LateLintPass<'tcx> for TestFlake {
         if path.starts_with("tokio::") && paused(cx, expr, starts_paused) {
             return;
         }
-        if kind == "retry"
-            && !cx.tcx.hir_parent_iter(expr.hir_id).any(|(_, node)| {
-                matches!(
-                    node,
-                    Node::Expr(Expr {
-                        kind: ExprKind::Loop(..),
-                        ..
-                    })
-                )
-            })
-        {
+        if kind == "retry" && !masks_panic_in_loop(cx, expr) {
             return;
         }
 
@@ -131,6 +124,137 @@ fn function(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<DefId> {
         ty::FnDef(id, _) => Some(id),
         _ => None,
     }
+}
+
+fn masks_panic_in_loop(cx: &LateContext<'_>, callee: &Expr<'_>) -> bool {
+    if !cx.tcx.hir_parent_iter(callee.hir_id).any(|(_, node)| {
+        matches!(
+            node,
+            Node::Expr(Expr {
+                kind: ExprKind::Loop(..),
+                ..
+            })
+        )
+    }) {
+        return false;
+    }
+    let Node::Expr(call) = cx.tcx.parent_hir_node(callee.hir_id) else {
+        return true;
+    };
+    let ExprKind::Call(function, _) = call.kind else {
+        return true;
+    };
+    function.hir_id != callee.hir_id || !checks_caught_result(cx, call)
+}
+
+fn checks_caught_result(cx: &LateContext<'_>, value: &Expr<'_>) -> bool {
+    match cx.tcx.parent_hir_node(value.hir_id) {
+        Node::Expr(parent) => match parent.kind {
+            ExprKind::MethodCall(method, receiver, args, _) if receiver.hir_id == value.hir_id => {
+                match method.ident.name.as_str() {
+                    "unwrap" | "expect" | "unwrap_err" | "expect_err" => true,
+                    "unwrap_or_else" => matches!(
+                        args,
+                        [Expr { kind: ExprKind::Closure(handler), .. }]
+                            if resumes_unwind(cx, cx.tcx.hir_body(handler.body).value)
+                    ),
+                    "is_ok" | "is_err" => cx
+                        .tcx
+                        .hir_parent_iter(parent.hir_id)
+                        .map_while(|(_, node)| match node {
+                            Node::Expr(expr) => Some(expr),
+                            _ => None,
+                        })
+                        .find(|expr| {
+                            !matches!(
+                                expr.kind,
+                                ExprKind::Unary(UnOp::Not, _) | ExprKind::DropTemps(_)
+                            )
+                        })
+                        .and_then(|expr| assertion_condition(cx, expr))
+                        .is_some_and(|condition| condition.hir_id == parent.hir_id),
+                    _ => false,
+                }
+            }
+            ExprKind::Ret(Some(returned)) => returned.hir_id == value.hir_id,
+            // The compiler lowers `value?` to a match over Try::branch(value).
+            ExprKind::Call(_, [argument]) if argument.hir_id == value.hir_id => {
+                matches!(
+                    cx.tcx.parent_hir_node(parent.hir_id),
+                    Node::Expr(Expr {
+                        kind: ExprKind::Match(_, _, MatchSource::TryDesugar(scrutinee)),
+                        ..
+                    }) if *scrutinee == parent.hir_id
+                )
+            }
+            _ => false,
+        },
+        Node::LetStmt(binding) if binding.init.is_some_and(|init| init.hir_id == value.hir_id) => {
+            let PatKind::Binding(_, local, _, None) = binding.pat.kind else {
+                return false;
+            };
+            let Node::Stmt(statement) = cx.tcx.parent_hir_node(binding.hir_id) else {
+                return false;
+            };
+            let Node::Block(block) = cx.tcx.parent_hir_node(statement.hir_id) else {
+                return false;
+            };
+            let mut statements = block
+                .stmts
+                .iter()
+                .skip_while(|stmt| stmt.hir_id != statement.hir_id);
+            statements.next();
+            let next = match statements.next().map(|stmt| stmt.kind) {
+                Some(StmtKind::Expr(next) | StmtKind::Semi(next)) => Some(next),
+                None => block.expr,
+                _ => None,
+            };
+            matches!(
+                next.and_then(|expr| assertion_condition(cx, expr)).map(|expr| expr.kind),
+                Some(ExprKind::MethodCall(method, receiver, _, _))
+                    if matches!(method.ident.name.as_str(), "is_ok" | "is_err")
+                        && matches!(receiver.kind, ExprKind::Path(QPath::Resolved(_, path))
+                            if path.res == Res::Local(local))
+            )
+        }
+        _ => false,
+    }
+}
+
+fn resumes_unwind(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
+    if let ExprKind::Call(callee, _) = expr.kind
+        && let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind
+        && let Res::Def(_, id) = path.res
+    {
+        return ty::print::with_no_trimmed_paths!(cx.tcx.def_path_str(id))
+            == "std::panic::resume_unwind";
+    }
+    false
+}
+
+fn assertion_condition<'hir>(
+    cx: &LateContext<'_>,
+    mut expr: &'hir Expr<'hir>,
+) -> Option<&'hir Expr<'hir>> {
+    while let ExprKind::DropTemps(inner) = expr.kind {
+        expr = inner;
+    }
+    let ExprKind::If(condition, ..) = expr.kind else {
+        return None;
+    };
+    if !expr.span.macro_backtrace().any(|expansion| {
+        expansion.macro_def_id.is_some_and(|id| {
+            cx.tcx.crate_name(id.krate).as_str() == "core"
+                && cx.tcx.item_name(id).as_str() == "assert"
+        })
+    }) {
+        return None;
+    }
+    let mut condition = condition;
+    while let ExprKind::DropTemps(inner) | ExprKind::Unary(UnOp::Not, inner) = condition.kind {
+        condition = inner;
+    }
+    Some(condition)
 }
 
 fn paused(cx: &LateContext<'_>, expr: &Expr<'_>, starts_paused: bool) -> bool {

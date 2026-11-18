@@ -1,12 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
-import { relative } from "node:path";
+import { tmpdir } from "node:os";
+import { join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { pathToFileURL } from "node:url";
+import { Readable } from "node:stream";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const allowlistPath = "tools/test-flake-allowlist.tsv";
-const git = (...args) => execFileSync("git", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+const maxBuffer = 64 * 1024 * 1024;
+const git = (...args) => execFileSync("git", args, { encoding: "utf8", maxBuffer });
 const rev = (ref) => {
     try {
         return git("rev-parse", "--verify", "--quiet", ref + "^{commit}").trim();
@@ -81,6 +84,15 @@ function repository(base) {
         before,
         after: (file) => existsSync(file) ? readFileSync(file, "utf8") : "",
         original,
+        baseLine(file, line) {
+            let offset = 0;
+            for (const { oldCount, start, count } of files.get(file) ?? []) {
+                // A delete-only hunk starts at the preceding line on the head side.
+                if (line < start + (count || 1)) break;
+                offset += oldCount - count;
+            }
+            return line + offset;
+        },
         modified(file, start, end = start) {
             return !original.has(file) || files.get(file)?.some((hunk) =>
                 hunk.count && hunk.start <= end && hunk.start + hunk.count > start
@@ -222,15 +234,15 @@ function contracts(repo, beforeList, afterList) {
     return errors;
 }
 
-function finding(file, start, end, column, message) {
+function finding(root, file, start, end, column, message) {
     const match = /^(sleep|clock|retry) in test (.*): /.exec(message);
     if (!match) throw new Error(`Unrecognized test flake diagnostic: ${message}`);
-    return { file: relative(process.cwd(), file), start, end, column, message, kind: match[1], test: match[2] };
+    return { file: relative(root, resolve(root, file)), start, end, column, message, kind: match[1], test: match[2] };
 }
 
-async function rustFindings() {
+async function rustFindings(input = process.stdin, root = process.cwd()) {
     const findings = [];
-    for await (const line of createInterface({ input: process.stdin, crlfDelay: Infinity })) {
+    for await (const line of createInterface({ input, crlfDelay: Infinity })) {
         if (!line.startsWith("{")) {
             console.log(line);
             continue;
@@ -244,28 +256,71 @@ async function rustFindings() {
         }
         const span = message.spans.find((entry) => entry.is_primary);
         if (!span) throw new Error("Rust test flake diagnostic has no primary span");
-        findings.push(finding(span.file_name, span.line_start, span.line_end, span.column_start, message.message));
+        findings.push(finding(root, span.file_name, span.line_start, span.line_end, span.column_start, message.message));
     }
     return findings;
 }
 
-async function eslintFindings() {
+async function runTestFlakeDylint(root, library, args) {
+    if (!library) throw new Error("The Rust baseline check needs the current test_flake library");
+    const env = { ...process.env };
+    env.DYLINT_RUSTFLAGS = [env.RUSTFLAGS, "--force-warn=test_flake"].filter(Boolean).join(" ");
+    delete env.RUSTFLAGS;
+    delete env.CARGO_ENCODED_RUSTFLAGS;
+    if (env.CARGO_TARGET_DIR) env.CARGO_TARGET_DIR = resolve(env.CARGO_TARGET_DIR);
+    const output = execFileSync("cargo", [
+        "dylint", "--no-metadata", "--fail-on-no-libraries", "--lib-path", resolve(library),
+        "--", "--locked", "--message-format=json", ...args,
+    ], { cwd: root, env, encoding: "utf8", maxBuffer, stdio: ["ignore", "pipe", "inherit"] });
+    return rustFindings(Readable.from([output]), root);
+}
+
+async function rustBaseline(base, library, packages) {
+    const scratch = mkdtempSync(join(tmpdir(), "test-flake-base-"));
+    try {
+        const archive = join(scratch, "base.tar");
+        const root = join(scratch, "source");
+        mkdirSync(root);
+        git("archive", "--format=tar", `--output=${archive}`, base);
+        execFileSync("tar", ["-xf", archive, "-C", root]);
+        // The API embeds generated frontend files, which are outside Git.
+        if (existsSync("dist/frontend")) {
+            cpSync("dist/frontend", join(root, "dist/frontend"), { recursive: true });
+        }
+        return await runTestFlakeDylint(root, library, ["--all-targets", ...packages]);
+    } finally {
+        rmSync(scratch, { recursive: true, force: true });
+    }
+}
+
+async function eslintRunner() {
     const { ESLint } = createRequire(new URL("../tools/eslint/package.json", import.meta.url))("eslint");
     const { frontendTests } = await import("../tools/eslint/eslint.config.js");
-    const lint = new ESLint({ overrideConfigFile: "tools/eslint/eslint.config.js" });
-    const results = await lint.lintFiles(frontendTests);
-    return results.flatMap((file) => file.messages.map((message) => {
+    const root = process.cwd();
+    const lint = new ESLint({
+        overrideConfigFile: fileURLToPath(new URL("../tools/eslint/eslint.config.js", import.meta.url)),
+    });
+    const findings = (results) => results.flatMap((file) => file.messages.map((message) => {
         if (message.ruleId !== "jmodguard/test-flake") {
             throw new Error(`${file.filePath}:${message.line}: ${message.message}`);
         }
-        return finding(file.filePath, message.line, message.endLine, message.column, message.message);
+        return finding(root, file.filePath, message.line, message.endLine, message.column, message.message);
     }));
+    return {
+        current: async () => findings(await lint.lintFiles(frontendTests)),
+        baseline: async (repo, files) => findings((await Promise.all(
+            files.map((file) => lint.lintText(repo.before(file), { filePath: file }))
+        )).flat()),
+    };
 }
 
-function enforce(repo, beforeList, afterList, findings) {
+const occurrence = ({ file, start, end, column, message }) => JSON.stringify([file, start, end, column, message]);
+
+async function enforce(repo, beforeList, afterList, findings, baseline) {
     const errors = [];
     const seen = new Set();
     const used = new Map();
+    const pending = [];
     for (const hit of findings.sort((a, b) => a.file.localeCompare(b.file) || a.start - b.start || a.column - b.column)) {
         const key = keyOf(hit);
         // A library and its test binary can report the same source location.
@@ -282,20 +337,57 @@ function enforce(repo, beforeList, afterList, findings) {
         } else if (hit.kind === "retry") {
             errors.push(diagnostic);
         } else {
-            console.error(`Inherited test flake: ${diagnostic}`);
+            pending.push({ hit, diagnostic });
+        }
+    }
+    if (pending.length) {
+        const files = [...new Set(pending.map(({ hit }) => hit.file))];
+        const inherited = new Set((await baseline(files)).map(occurrence));
+        // Map the whole unchanged span back to the base. A second occurrence
+        // of the same call in the test cannot stand in for a newly unmocked one.
+        for (const { hit, diagnostic } of pending) {
+            const previous = {
+                ...hit,
+                start: repo.baseLine(hit.file, hit.start),
+                end: repo.baseLine(hit.file, hit.end),
+            };
+            if (inherited.has(occurrence(previous))) console.error(`Inherited test flake: ${diagnostic}`);
+            else errors.push(diagnostic);
         }
     }
     return errors;
 }
 
 async function main() {
-    const mode = process.argv[2];
+    const [mode, library, ...packages] = process.argv.slice(2);
+    if (mode === "rust-fixture") {
+        const root = fileURLToPath(new URL("../tools/dylint/test-flake", import.meta.url));
+        const findings = await runTestFlakeDylint(root, library, ["--test", "catch_unwind"]);
+        const retries = [
+            "fallback_after_failure", "retry_until_success", "swallow_failure", "swallow_failure_inside_assertion",
+        ];
+        const actual = findings.map(({ kind, file, test }) => `${kind}:${file}:${test}`).sort();
+        const expected = retries.map((test) => `retry:tests/catch_unwind.rs:${test}`);
+        if (actual.join("\n") !== expected.join("\n")) {
+            throw new Error(`Unexpected catch_unwind fixture diagnostics:\n${actual.join("\n")}`);
+        }
+        console.log("dylint: catch_unwind fixtures passed");
+        return;
+    }
     if (!["contracts", "rust", "eslint"].includes(mode)) throw new Error("Select contracts, rust or eslint");
-    const repo = repository(baseRevision());
+    const base = baseRevision();
+    const repo = repository(base);
     const before = repo.original.has(allowlistPath) ? readAllowlist(repo.before(allowlistPath)) : undefined;
     const after = readAllowlist(repo.after(allowlistPath));
-    const errors = mode === "contracts" ? contracts(repo, before, after) :
-        enforce(repo, before, after, await (mode === "rust" ? rustFindings() : eslintFindings()));
+    let errors;
+    if (mode === "contracts") {
+        errors = contracts(repo, before, after);
+    } else if (mode === "rust") {
+        errors = await enforce(repo, before, after, await rustFindings(), () => rustBaseline(base, library, packages));
+    } else {
+        const lint = await eslintRunner();
+        errors = await enforce(repo, before, after, await lint.current(), (files) => lint.baseline(repo, files));
+    }
     for (const error of errors) console.error(error);
     if (errors.length) process.exitCode = 1;
 }
