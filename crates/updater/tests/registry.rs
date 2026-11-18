@@ -7,6 +7,7 @@ use axum::{
     routing::get,
 };
 use jmodguard::db::ComponentRelease;
+use jmodguard_updater::http_client_builder;
 // The source modules compile with cfg(test), keeping fixture trust out of the
 // normal library that the production-trust regression also exercises below.
 #[path = "../src/oci.rs"]

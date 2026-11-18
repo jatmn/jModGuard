@@ -13,6 +13,12 @@ mod compatible_control_tests;
 use anyhow::{Context, Result, ensure};
 use jmodguard::db::{self, ComponentRelease, Db};
 
+/// Creates a reqwest builder after installing the workspace's Rustls provider.
+pub fn http_client_builder() -> reqwest::ClientBuilder {
+    jmodguard::init_tls_provider();
+    reqwest::Client::builder()
+}
+
 /// Apply the same schema/counterpart gate at owner admission and again at the
 /// launcher immediately before a switch. An unobserved service cannot prove
 /// that the new binary and the retained rollback binary share an ABI.

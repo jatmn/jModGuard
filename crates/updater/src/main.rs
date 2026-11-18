@@ -6,6 +6,8 @@ use jmodguard::db::{self, ComponentObservation, ComponentRelease};
 #[cfg(test)]
 use jmodguard_updater::compatible;
 use jmodguard_updater::compatible_control;
+#[cfg(test)]
+use jmodguard_updater::http_client_builder;
 #[cfg(not(test))]
 use jmodguard_updater::oci::{Registry, registry_unreachable, sha256_hex};
 // Compile the registry with its test-only trust fixture for controller tests.

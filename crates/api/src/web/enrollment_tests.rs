@@ -3,6 +3,7 @@ use super::*;
 use crate::db;
 use axum::body::Body;
 use axum::http::Request;
+use jmodguard_updater::http_client_builder;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tower::ServiceExt;
 
@@ -351,12 +352,13 @@ impl Fixture {
             .unwrap()
             .member_endpoint = Some(format!("http://{address}/members"));
         if matches!(token_transport, TokenTransport::Timeout) {
-            Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth)
-                .unwrap()
-                .http = crate::http_client_builder()
+            let http = http_client_builder()
                 .timeout(std::time::Duration::from_secs(1))
                 .build()
                 .unwrap();
+            Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth)
+                .unwrap()
+                .set_http_client_for_test(http);
         }
         tests::seed_auth_caches(&app, 42, vec![managed_guild(10), managed_guild(20)]);
         let store = MemoryStore::default();

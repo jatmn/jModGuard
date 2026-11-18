@@ -1,6 +1,7 @@
 //! Scoped WebUI publication using a Bunny Storage Zone password. This never
 //! calls the account API or recursively deletes a Storage directory.
-use crate::oci::{Registry, http_client_builder, sha256_hex};
+use crate::http_client_builder;
+use crate::oci::{Registry, sha256_hex};
 use anyhow::{Context, Result, ensure};
 use jmodguard::db::ComponentRelease;
 use reqwest::StatusCode;
