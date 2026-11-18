@@ -994,6 +994,7 @@ async fn case_listing_migration_indexes_existing_guild_rows_for_every_seek() {
                 sort,
                 descending,
                 after,
+                include_total: false,
             };
             let first = store
                 .list_cases(scope.clone(), query(None), 50, limits)

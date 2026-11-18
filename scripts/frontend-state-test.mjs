@@ -33,7 +33,7 @@ const chartsSource = fs.readFileSync(new URL('../frontend/charts.js', import.met
 const iconsSource = fs.readFileSync(new URL('../frontend/icons.js', import.meta.url), 'utf8')
   .replace(/^import .*;$/gm, '').replaceAll('export const', 'const').replaceAll('export function', 'function');
 const listControlsSource = fs.readFileSync(new URL('../frontend/list-controls.js', import.meta.url), 'utf8')
-  .replace(/^import .*;$/gm, '').replace(/^const h = React\.createElement;$/m, '').replaceAll('export function', 'function');
+  .replace(/^import .*;$/gm, '').replace(/^const h = React\.createElement;$/m, '').replace(/^export /gm, '');
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
   .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, '\n');
 const pages = [];
@@ -9066,6 +9066,156 @@ test('Shared list controls restore, debounce, sort, clear and write the list URL
   assert.equal(controls.query().toString(), 'sort=reason&dir=asc');
   assert.equal(root.querySelector('tbody').textContent, 'No entries.');
 });
+
+function pageSizeFixture(list, count = 1037) {
+  return (query) => {
+    const offset = Number(query.get('after')?.split(':')[1] || 0);
+    const end = Math.min(count, offset + Number(query.get('limit')));
+    const rows = Array.from({ length: end - offset }, (_, i) => {
+      const id = offset + i + 1;
+      return list === 'cases' ? id.toString(16).padStart(32, '0') : {
+        id, user_id: String(id), display_name: `Member ${id}`, user_name: `User ${id}`, is_current: true,
+      };
+    });
+    return { [list]: rows, total: count, next_cursor: end < count ? `cursor:${end}` : null };
+  };
+}
+
+for (const [list, view] of [['cases', casesView], ['bans', bansView], ['members', memberView]]) {
+  const listTable = (root) => root.querySelector('table:has(th[aria-sort])');
+  test(`${list} page size persists across search, sort, filters, paging and navigation`, async () => {
+    const storage = new Map();
+    const requests = [];
+    const fixture = pageSizeFixture(list, 137);
+    const fetchPage = async (url) => {
+      const { searchParams, pathname } = new URL(url, 'file:///');
+      if (!pathname.endsWith(`/${list}`)) return response({});
+      requests.push(searchParams);
+      return response(fixture(searchParams));
+    };
+    const h = harness(fetchPage, storage);
+    const root = await view(h);
+    await settle();
+    const size = () => memberLabelled(root, 'Rows per page');
+    const button = (label) => [...root.querySelectorAll('button')].find(node => node.textContent === label);
+    const selectedUrlSize = () => new URLSearchParams(h.location.search).get('page_size');
+    assert.deepEqual([...size().options].map(option => option.textContent), ['50', '100', '250', '500', '1000', 'All']);
+    assert.equal(requests.at(-1).get('limit'), '50');
+    size().value = '100';
+    await fire(size(), 'change');
+    assert.equal(requests.at(-1).get('limit'), '100');
+    assert.equal(listTable(root).tBodies[0].rows.length, 100);
+    assert.equal(selectedUrlSize(), '100');
+    await fire(button('Next page'), 'click');
+    assert.equal(requests.at(-1).get('after'), 'cursor:100');
+    assert.equal(listTable(root).tBodies[0].rows.length, 37);
+    assert.equal(size().value, '100');
+
+    await fire(listTable(root).querySelector('thead button'), 'click');
+    assert.equal(requests.at(-1).get('after'), null);
+    const date = root.querySelector('input[type="date"]');
+    date.value = '2026-01-02';
+    await fire(date, 'change');
+    assert.equal(requests.at(-1).get('from'), date.value);
+    const search = root.querySelector('input[type="search"]');
+    search.value = 'fixture';
+    await fire(search, 'input');
+    await [...h.timers.values()].find(timer => timer.delay === 300).fn();
+    assert.equal(requests.at(-1).get('q'), 'fixture');
+    await fire(button('Clear filters'), 'click');
+    assert.equal(requests.at(-1).get('q'), null);
+    assert.equal(requests.at(-1).get('limit'), '100');
+    assert.equal(selectedUrlSize(), '100');
+    assert.equal(size().value, '100');
+
+    const restored = harness(fetchPage, storage);
+    await view(restored);
+    await settle();
+    assert.equal(requests.at(-1).get('limit'), '100', 'local preference');
+    assert.equal(new URLSearchParams(restored.location.search).get('page_size'), '100');
+    const bookmarked = harness(fetchPage, storage);
+    bookmarked.location.search = `?list=${list}&guild=${bookmarked.app.state.guildId}&page_size=250`;
+    await view(bookmarked);
+    await settle();
+    assert.equal(requests.at(-1).get('limit'), '250', 'URL overrides saved preference');
+    const otherList = list === 'bans' ? casesView : bansView;
+    const other = await otherList(restored);
+    assert.equal(memberLabelled(other, 'Rows per page').value, '50');
+  });
+
+  test(`${list} windows large selections and loads All in bounded cursor pages`, async () => {
+    const requests = [];
+    const fixture = pageSizeFixture(list);
+    const h = harness(async (url) => {
+      const { pathname, searchParams } = new URL(url, 'file:///');
+      if (!pathname.endsWith(`/${list}`)) return response({});
+      requests.push([Number(searchParams.get('limit')), searchParams.get('after')]);
+      return response(fixture(searchParams));
+    });
+    h.location.search = `?list=${list}&guild=${h.app.state.guildId}&page_size=500`;
+    const root = await view(h);
+    await settle();
+    const table = () => listTable(root);
+    const button = (label) => [...root.querySelectorAll('button')].find(node => node.textContent === label);
+    const size = memberLabelled(root, 'Rows per page');
+    assert.deepEqual(requests.splice(0), [[250, null], [250, 'cursor:250']]);
+    assert.equal(table().getAttribute('aria-rowcount'), '501');
+    assert.equal(table().tBodies[0].rows.length, 100);
+    await fire(button('Next page'), 'click');
+    assert.deepEqual(requests.splice(0), [[250, 'cursor:500'], [250, 'cursor:750']]);
+    assert.equal(table().getAttribute('aria-rowcount'), '501');
+    size.value = '1000';
+    await fire(size, 'change');
+    assert.deepEqual(requests.splice(0), [[250, null], [250, 'cursor:250'], [250, 'cursor:500'], [250, 'cursor:750']]);
+    assert.equal(table().getAttribute('aria-rowcount'), '1001');
+    size.value = 'all';
+    await fire(size, 'change');
+    assert.deepEqual(requests.splice(0),
+      [[250, null], [250, 'cursor:250'], [250, 'cursor:500'], [250, 'cursor:750'], [250, 'cursor:1000']]);
+    assert.match(root.textContent, /1,037/);
+    assert.equal(table().getAttribute('aria-rowcount'), '1038');
+    assert.equal(button('Next page').disabled, true);
+    const positions = [...table().tBodies[0].rows].map(row => Number(row.getAttribute('aria-rowindex')));
+    for (let offset = 100; offset < 1037; offset += 100) {
+      await fire(button('Next rows'), 'click');
+      positions.push(...[...table().tBodies[0].rows].map(row => Number(row.getAttribute('aria-rowindex'))));
+    }
+    assert.deepEqual(positions, Array.from({ length: 1037 }, (_, i) => i + 2));
+    assert.equal(button('Next rows').getAttribute('aria-disabled'), 'true');
+    assert.equal(table().tBodies[0].rows.length, 37);
+    await fire(button('Previous rows'), 'click');
+    assert.equal(table().tBodies[0].rows[0].getAttribute('aria-rowindex'), '902');
+  });
+
+  test(`${list} cancels a partially loaded page and ignores the late response`, async () => {
+    const fixture = pageSizeFixture(list, 251);
+    let unblock, pendingSignal;
+    const h = harness(async (url, options) => {
+      const { pathname, searchParams } = new URL(url, 'file:///');
+      if (!pathname.endsWith(`/${list}`)) return response({});
+      const page = response(fixture(searchParams));
+      if (searchParams.has('after') && !unblock) {
+        pendingSignal = options.signal;
+        return new Promise(resolve => { unblock = () => resolve(page); });
+      }
+      return page;
+    });
+    h.location.search = `?list=${list}&guild=${h.app.state.guildId}&page_size=all`;
+    const root = await view(h);
+    await settle();
+    const button = (label) => [...root.querySelectorAll('button')].find(node => node.textContent === label);
+    assert.match(root.textContent, /250 rows loaded/);
+    await fire(button('Cancel loading'), 'click');
+    assert.equal(pendingSignal.aborted, true);
+    assert.match(root.textContent, /Loading canceled/);
+    unblock();
+    await settle();
+    assert.match(root.textContent, /Loading canceled/);
+    assert.equal(button('Next page').disabled, true);
+    await fire(button('Refresh'), 'click');
+    assert.equal(listTable(root).tBodies[0].rows.length, 251);
+  });
+}
 
 test('Cases rows open on click while their own buttons keep their action', async () => {
   const { calls, fetchImpl } = caseFixture();

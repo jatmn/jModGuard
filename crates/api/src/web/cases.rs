@@ -1,5 +1,7 @@
 //! Private selected-case and evidence administration for an enrolled guild.
-use super::list_controls::{ListQuery, SortDirection, decode_cursor, encode_cursor};
+use super::list_controls::{
+    ListQuery, SortDirection, decode_cursor, encode_cursor, within_list_deadline,
+};
 use super::state::ApiState;
 use super::{ApiError, ApiResult, AuthCtx, GuildAccess, authorize_guild};
 use crate::db::guild_data::{
@@ -30,6 +32,8 @@ struct CaseCursor {
 #[derive(Deserialize)]
 pub struct CasePage {
     limit: Option<u32>,
+    #[serde(default)]
+    include_total: bool,
     #[serde(default)]
     removed: bool,
     action: Option<CaseAction>,
@@ -126,18 +130,11 @@ pub async fn list_cases(
     Path(guild_id): Path<u64>,
     Query(page): Query<CasePage>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    // Cover authorization, pool checkout and a cold guild-store open as well as
-    // both snapshots. Dropping the inner future signals database cancellation.
-    tokio::time::timeout(
-        std::time::Duration::from_secs(20),
+    within_list_deadline(
+        "Cases",
         list_cases_inner(&app, &session, &headers, guild_id, page),
     )
     .await
-    .map_err(|_| {
-        ApiError(anyhow::anyhow!(
-            "Cases request timed out. Please try again."
-        ))
-    })?
 }
 
 async fn list_cases_inner(
@@ -149,7 +146,10 @@ async fn list_cases_inner(
 ) -> ApiResult<Json<serde_json::Value>> {
     let (auth, enrollment) =
         scoped(app, session, headers, guild_id, GuildAccess::Dashboard).await?;
-    let limits = tenant::case_limits();
+    let mut limits = tenant::case_limits();
+    if !page.removed {
+        limits.max_page_size = crate::db::DASHBOARD_LIST_PAGE_LIMIT;
+    }
     let limit = page.limit.unwrap_or(50).clamp(1, limits.max_page_size);
     let explicit_sort = page.list.sort.is_some() || page.list.dir.is_some();
     let list = page.list.validate(CaseSort::Date, SortDirection::Desc)?;
@@ -162,7 +162,7 @@ async fn list_cases_inner(
     let can_delete = can_delete_cases(&auth, guild_id);
     let (store, scope) = live(app, enrollment).await?;
     let mut summaries = std::collections::BTreeMap::new();
-    let (ids, next_cursor) = if page.removed {
+    let (ids, next_cursor, total) = if page.removed {
         if filter != CaseFilter::default()
             || list.q.is_some()
             || list.from_ms.is_some()
@@ -182,7 +182,7 @@ async fn list_cases_inner(
         let (ids, next) = store
             .removed_case_page(scope.clone(), after, limit, limits)
             .await?;
-        (ids, next.map(String::from))
+        (ids, next.map(String::from), None)
     } else {
         let context = sha256_hex(&serde_json::to_vec(&(
             guild_id,
@@ -234,6 +234,7 @@ async fn list_cases_inner(
                     },
                     descending: !legacy_id_order && list.dir == SortDirection::Desc,
                     after: after.map(|(position, _)| position),
+                    include_total: page.include_total,
                 },
                 limit,
                 limits,
@@ -262,7 +263,7 @@ async fn list_cases_inner(
                 id
             })
             .collect();
-        (ids, next)
+        (ids, next, page.total)
     };
     let people = summaries
         .values()
@@ -276,6 +277,7 @@ async fn list_cases_inner(
         "names": names,
         "can_delete": can_delete,
         "next_cursor": next_cursor,
+        "total": total,
     })))
 }
 

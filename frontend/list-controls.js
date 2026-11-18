@@ -6,6 +6,9 @@ const SEARCH_LIMIT = 200;
 const SEARCH_DELAY_MS = 300;
 const savedListLocation = "jmodguard.list-before-login";
 const commonKeys = ["q", "from", "to"];
+const PAGE_SIZES = ["50", "100", "250", "500", "1000", "all"];
+const REQUEST_PAGE_SIZE = 250;
+const PAGE_TIMEOUT_MS = 30000;
 let pendingListSearch = null;
 
 function filterKeys(config) {
@@ -54,7 +57,7 @@ export function restoreListLocation(configs, guilds) {
     const config = configs.get(list);
     if (!current.list && config && guilds.some(({ id }) => id === guild)) {
       const restored = new URLSearchParams(location.search);
-      for (const key of ["list", "guild", "sort", "dir", ...filterKeys(config)]) {
+      for (const key of ["list", "guild", "sort", "dir", "page_size", ...filterKeys(config)]) {
         if (remembered.has(key)) restored.set(key, remembered.get(key));
       }
       replaceListLocation(restored);
@@ -67,7 +70,7 @@ export function restoreListLocation(configs, guilds) {
 export function clearListLocation(config) {
   const query = new URLSearchParams(location.search);
   if (query.get("list") !== config.list) return;
-  for (const key of ["list", "guild", "sort", "dir", ...filterKeys(config)]) query.delete(key);
+  for (const key of ["list", "guild", "sort", "dir", "page_size", ...filterKeys(config)]) query.delete(key);
   replaceListLocation(query);
 }
 
@@ -75,10 +78,22 @@ function boundedSearch(value) {
   return Array.from(value).slice(0, SEARCH_LIMIT).join("");
 }
 
+function pageSizePreference(config) {
+  return `jmodguard.list-page-size.${config.list}`;
+}
+
+function preferredPageSize(config) {
+  try {
+    const stored = window.localStorage.getItem(pageSizePreference(config));
+    if (PAGE_SIZES.includes(stored)) return stored;
+  } catch (_) {}
+  return PAGE_SIZES[0];
+}
+
 function readView(config, guildId) {
   const query = new URLSearchParams(location.search);
   const filters = emptyFilters(config);
-  const initial = { filters, sort: config.defaultSort, dir: config.defaultDir };
+  const initial = { filters, sort: config.defaultSort, dir: config.defaultDir, pageSize: preferredPageSize(config) };
   if (query.get("list") !== config.list || query.get("guild") !== guildId) return initial;
   for (const key of filterKeys(config)) filters[key] = query.get(key) || "";
   for (const key of ["q", ...config.filters.filter(({ kind }) => kind === "text").map(({ key }) => key)]) {
@@ -86,10 +101,12 @@ function readView(config, guildId) {
   }
   const sort = query.get("sort");
   const dir = query.get("dir");
+  const pageSize = query.get("page_size");
   return {
     filters,
     sort: config.columns.some((column) => column.key === sort) ? sort : initial.sort,
     dir: dir === "asc" || dir === "desc" ? dir : initial.dir,
+    pageSize: PAGE_SIZES.includes(pageSize) ? pageSize : initial.pageSize,
   };
 }
 
@@ -99,6 +116,7 @@ function viewQuery(config, guildId, view) {
   query.set("guild", guildId);
   query.set("sort", view.sort);
   query.set("dir", view.dir);
+  query.set("page_size", view.pageSize);
   for (const [key, value] of Object.entries(view.filters)) {
     if (value) query.set(key, value);
     else query.delete(key);
@@ -127,13 +145,27 @@ export function useListControls(config, guildId, onChange, canChange = () => tru
     for (const key of timers.current.keys()) cancelText(key);
   };
   useEffect(() => cancelTexts, []);
+  useEffect(() => {
+    // Include a non-default saved preference in links copied before any interaction.
+    if (current.current.pageSize !== PAGE_SIZES[0] && guard.current()) {
+      replaceListLocation(viewQuery(config, guildId, current.current));
+    }
+  }, [config, guildId]);
 
   const commit = (next) => {
-    if (!guard.current()) return;
+    if (!guard.current()) return false;
     current.current = next;
     setView(next);
     replaceListLocation(viewQuery(config, guildId, next));
     onChange();
+    return true;
+  };
+  const setPageSize = (pageSize) => {
+    const previous = current.current;
+    if (!PAGE_SIZES.includes(pageSize) || previous.pageSize === pageSize) return;
+    if (commit({ ...previous, pageSize })) {
+      try { window.localStorage.setItem(pageSizePreference(config), pageSize); } catch (_) {}
+    }
   };
   const setFilter = (key, value, reload = false) => {
     cancelText(key);
@@ -194,7 +226,8 @@ export function useListControls(config, guildId, onChange, canChange = () => tru
     return new URLSearchParams({ sort, dir, ...Object.fromEntries(Object.entries(filters).filter(([, value]) => value)) });
   };
   return {
-    config, view, drafts, setText, setFilter, replaceFilters, filterLink, sortBy, query,
+    config, view, drafts, setText, setFilter, replaceFilters, filterLink, sortBy, query, setPageSize,
+    pageSize: () => current.current.pageSize,
     filtered: () => hasFilters(current.current),
   };
 }
@@ -204,7 +237,7 @@ function ListField({ label, children }) {
 }
 
 export function ListControls({ controls, UserPicker, userPickerProps, filterOptions = {} }) {
-  const { config, view, drafts, setText, setFilter, replaceFilters } = controls;
+  const { config, view, drafts, setText, setFilter, replaceFilters, setPageSize } = controls;
   const { filters } = view;
   const { from: fromLabel = "From", to: toLabel = "To" } = config.dateLabels ?? {};
   const date = (key, label, bounds) => h(ListField, { label },
@@ -268,6 +301,13 @@ export function ListControls({ controls, UserPicker, userPickerProps, filterOpti
     text("q", "Search", config.searchPlaceholder, "search"),
     date("from", `${fromLabel} (UTC)`, { max: filters.to || undefined }),
     date("to", `${toLabel} (UTC)`, { min: filters.from || undefined }),
+    h(ListField, { label: "Rows per page" },
+      h("select", {
+        className: "select select-sm",
+        value: view.pageSize,
+        onChange: (event) => setPageSize(event.target.value),
+      }, ...PAGE_SIZES.map((size) => h("option", { key: size, value: size }, size === "all" ? "All" : size))),
+    ),
     hasFilters(view) || Object.values(drafts).some(Boolean)
       ? h("button", { type: "button", className: "btn btn-sm", onClick: () => replaceFilters() }, "Clear filters")
       : null,
@@ -293,4 +333,70 @@ export function ListSortHeading({ column, controls }) {
 
 export function ListEmptyRow({ controls, empty, filtered, colSpan }) {
   return h("tr", null, h("td", { colSpan, className: "muted" }, controls.filtered() ? filtered : empty));
+}
+
+async function readListChunk(read, path, signal) {
+  signal.throwIfAborted();
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal.addEventListener("abort", abort, { once: true });
+  const timeout = setTimeout(abort, PAGE_TIMEOUT_MS);
+  try {
+    const payload = await read(path, controller.signal);
+    controller.signal.throwIfAborted();
+    return payload;
+  } catch (error) {
+    if (!signal.aborted && controller.signal.aborted) {
+      throw new Error("Request timed out. Refresh to try again.");
+    }
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", abort);
+    clearTimeout(timeout);
+  }
+}
+
+export async function readListPage({ read, path, query, collection, size, signal, onProgress }) {
+  const target = size === "all" ? Infinity : Number(size);
+  const params = new URLSearchParams(query);
+  const seen = new Set([params.get("after")]);
+  const rows = [];
+  const names = {};
+  const summaries = {};
+  let first, next;
+  do {
+    params.set("limit", String(Math.min(target - rows.length, REQUEST_PAGE_SIZE)));
+    if (collection === "bans") {
+      if (first) params.set("skip_metadata", "true");
+    } else if (params.get("removed") !== "true") {
+      if (first) params.delete("include_total");
+      else params.set("include_total", "true");
+    }
+    const page = await readListChunk(read, `${path}?${params}`, signal);
+    first ??= page;
+    const batch = page[collection] || [];
+    rows.push(...batch);
+    Object.assign(names, page.names);
+    Object.assign(summaries, page.summaries);
+    next = page.next_cursor || null;
+    if (!next || target <= REQUEST_PAGE_SIZE || rows.length >= target) break;
+    if (!batch.length || seen.has(next)) throw new Error("The list cursor did not advance. Refresh to try again.");
+    seen.add(next);
+    params.set("after", next);
+    onProgress(rows.length);
+  } while (next);
+  return { ...first, [collection]: rows, names, summaries, next_cursor: next };
+}
+
+export function listLoadProgress(size) {
+  return size === "all" || Number(size) > REQUEST_PAGE_SIZE ? 0 : null;
+}
+
+export function ListLoadProgress({ loaded, onCancel }) {
+  return h("div", { className: "row" },
+    h("span", { className: "muted", role: "status" },
+      loaded === 0 ? "Loading rows…" : `${loaded.toLocaleString()} rows loaded…`,
+    ),
+    h("button", { type: "button", className: "btn btn-sm", onClick: onCancel }, "Cancel loading"),
+  );
 }

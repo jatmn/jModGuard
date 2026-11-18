@@ -16,8 +16,8 @@ import {
   sumSeries,
 } from "./charts.js";
 import {
-  clearListLocation, ListControls, ListEmptyRow, ListSortHeading, readListLocation,
-  flushPendingListSearch, rememberListLocation, restoreListLocation, useListControls,
+  clearListLocation, ListControls, ListEmptyRow, ListLoadProgress, ListSortHeading, readListLocation,
+  flushPendingListSearch, listLoadProgress, readListPage, rememberListLocation, restoreListLocation, useListControls,
 } from "./list-controls.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import React, { useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
@@ -6302,11 +6302,10 @@ function memberDuration(ms) {
   return `${Math.floor(minutes / 60)} h${rest ? ` ${rest} min` : ""}`;
 }
 
-// Cursor pages have no total; the last page reveals it.
-function memberPageLabel(number, offset, rows, last) {
+function memberPageLabel(number, offset, rows, total) {
   if (!rows) return number === 1 ? "No results" : `Page ${number} · no results`;
   const end = (offset + rows).toLocaleString();
-  return `Page ${number} · ${(offset + 1).toLocaleString()}–${end}${last ? ` of ${end}` : ""}`;
+  return `Page ${number} · ${(offset + 1).toLocaleString()}–${end}${Number.isInteger(total) ? ` of ${total.toLocaleString()}` : ""}`;
 }
 
 const memberSyncStatusLabels = {
@@ -6329,7 +6328,8 @@ function tabMembers() {
     details: null,
     error: null,
   });
-  const [memberRows, setMemberRows] = useState([]);
+  const [memberRows, setMemberRows] = useState({});
+  const [progress, setProgress] = useState(null);
   const [detailParts, setDetailParts] = useState([]);
   const [pagination, setPagination] = useState({ first: true, next: true, label: "" });
   // A case file's "Member page" link opens this list searched to that member.
@@ -6925,7 +6925,7 @@ function tabMembers() {
         latestStatusRevision = revision;
         latestStatusReceivedAt = Date.now();
         if (emptyMembersCell)
-          setMemberRows([h("tr", null, h("td", { colSpan: 5, className: "muted" }, emptyMembersText()))]);
+          setMemberRows({ fallback: h("tr", null, h("td", { colSpan: 5, className: "muted" }, emptyMembersText())) });
         renderStatus(sync);
         schedulePoll();
         if (controlPending()) {
@@ -6975,28 +6975,34 @@ function tabMembers() {
     const loadMembers = async () => {
       const request = ++listRequest;
       listAbort?.abort();
-      listAbort = new AbortController();
+      const controller = new AbortController();
+      listAbort = controller;
       emptyMembersCell = null;
       const target = requestedPage;
-      setPagination((current) => ({ ...current, label: "" }));
-      setMemberRows([h("tr", {}, h("td", { colSpan: 5 }, "Loading members…"))]);
+      const size = controls.pageSize();
+      setProgress(listLoadProgress(size));
+      setPagination({ first: true, next: true, label: "" });
+      setMemberRows({ fallback: h("tr", {}, h("td", { colSpan: 5 }, "Loading members…")) });
       try {
         const q = controls.query();
-        q.set("limit", "50");
         if (after) q.set("after", after);
-        const page = await apiRead(`/api/guilds/${guildId}/members?${q}`, listAbort.signal);
+        const page = await readListPage({
+          read: apiRead, path: `/api/guilds/${guildId}/members`, query: q,
+          collection: "members", size, signal: controller.signal, onProgress: setProgress,
+        });
         if (!aliveHere() || request !== listRequest) return;
         nextAfter = page.next_cursor || null;
         shownPage = { ...target, rows: (page.members || []).length };
         setPagination({
           first: !after,
           next: !nextAfter,
-          label: memberPageLabel(shownPage.number, shownPage.offset, shownPage.rows, !nextAfter),
+          label: memberPageLabel(shownPage.number, shownPage.offset, shownPage.rows,
+            page.total ?? (nextAfter ? null : shownPage.offset + shownPage.rows)),
         });
-        const rows = (page.members || []).map((member) =>
+        const renderRow = (member) =>
           h(
             "tr",
-            {},
+            { key: member.user_id },
             h(
               "td",
               {},
@@ -7038,17 +7044,21 @@ function tabMembers() {
                 onClick: () => openMember(member.user_id, member.display_name),
               }),
             ),
-          ),
-        );
-        emptyMembersCell = rows.length
+          );
+        emptyMembersCell = page.members.length
           ? null
           : h("td", { colSpan: 5, className: "muted" }, emptyMembersText());
-        setMemberRows(rows.length ? rows : [h("tr", {}, emptyMembersCell)]);
+        setMemberRows(page.members.length
+          ? { rows: page.members, renderRow }
+          : { fallback: h("tr", {}, emptyMembersCell) });
       } catch (error) {
-        if (!aliveHere() || request !== listRequest || error.message === "Failed to fetch") return;
-        setMemberRows([
-          h("tr", {}, h("td", { colSpan: 5, className: "err" }, "Could not load members. Refresh to retry.")),
-        ]);
+        if (!aliveHere() || request !== listRequest) return;
+        setPagination({ first: !after, next: true, label: "" });
+        setMemberRows({ fallback:
+          h("tr", {}, h("td", { colSpan: 5, className: "err", role: "alert" }, "Could not load members. Refresh to retry.")),
+        });
+      } finally {
+        if (aliveHere() && request === listRequest) setProgress(null);
       }
     };
     const openMember = async (userId, displayName) => {
@@ -7169,7 +7179,8 @@ function tabMembers() {
       requestedPage = { number: 1, offset: 0 };
       shownPage = { number: 1, offset: 0, rows: 0 };
       setPagination({ first: true, next: true, label: "" });
-      setMemberRows([h("tr", {}, h("td", { colSpan: 5 }, "Loading members…"))]);
+      setProgress(null);
+      setMemberRows({ fallback: h("tr", {}, h("td", { colSpan: 5 }, "Loading members…")) });
       setDetailParts([]);
     };
     handlers.current = {
@@ -7196,6 +7207,15 @@ function tabMembers() {
       refresh: () => {
         loadStatus();
         loadMembers();
+      },
+      cancel: () => {
+        ++listRequest;
+        listAbort?.abort();
+        setProgress(null);
+        setPagination({ first: !after, next: true, label: "" });
+        setMemberRows({ fallback:
+          h("tr", null, h("td", { colSpan: 5, role: "status" }, "Loading canceled. Refresh to try again.")),
+        });
       },
     };
     const visibility = () => {
@@ -7267,12 +7287,14 @@ function tabMembers() {
           ),
           h("span", { className: "muted", "aria-live": "polite" }, pagination.label),
         ),
-        h(DataTable, {
+        progress !== null ? h(ListLoadProgress, { loaded: progress, onCancel: () => handlers.current.cancel?.() }) : null,
+        h(PagedTable, {
           headings: [
             ...MEMBERS_LIST.columns.map((column) => h(ListSortHeading, { key: column.key, column, controls })),
             "History",
           ],
-        }, memberRows),
+          ...memberRows,
+        }),
       ),
     ),
     detailParts.length
@@ -7907,6 +7929,8 @@ function tabCases() {
   const handlers = useRef({});
   const [rows, setRows] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [progress, setProgress] = useState(null);
+  const [total, setTotal] = useState(null);
   const [pagination, setPagination] = useState({ first: true, next: true });
   const [canDelete, setCanDelete] = useState(false);
   const [removedView, setRemovedView] = useState(false);
@@ -7926,7 +7950,6 @@ function tabCases() {
     let after = "";
     let listMode = "live";
     let nextAfter = "";
-    const pageSize = 50;
     const open = (id) => openCaseView({
       guildId,
       caseId: id,
@@ -7941,20 +7964,23 @@ function tabCases() {
       listController?.abort();
       const controller = new AbortController();
       listController = controller;
-      const signal = controller.signal;
-      const timeout = setTimeout(() => controller.abort(), 30000);
+      const size = listMode === "live" ? controls.pageSize() : "50";
       setLoading(true);
-      setPagination((value) => ({ ...value, next: true }));
+      setProgress(listLoadProgress(size));
+      setTotal(null);
+      setPagination({ next: true, first: true });
       try {
         const query = listMode === "live" ? controls.query() : new URLSearchParams();
-        query.set("limit", String(pageSize));
         query.set("removed", String(listMode === "removed"));
         if (after) query.set("after", after);
-        const payload = await apiRead(`/api/guilds/${guildId}/cases?${query}`, signal);
+        const payload = await readListPage({
+          read: apiRead, path: `/api/guilds/${guildId}/cases`, query,
+          collection: "cases", size, signal: controller.signal, onProgress: setProgress,
+        });
         if (lifecycle === "disposed" || current !== request || state.guildId !== guildId) return;
         setCanDelete(!!payload.can_delete);
-        const ids = payload.cases || [];
-        const names = payload.names || {};
+        const ids = payload.cases;
+        const names = payload.names;
         if (Object.keys(names).length)
           setPickerNames((value) => {
             const users = new Map(value.users);
@@ -7963,23 +7989,21 @@ function tabCases() {
           });
         nextAfter = payload.next_cursor || "";
         setPagination({ next: !nextAfter, first: !after });
+        setTotal(payload.total ?? null);
         if (!ids.length) {
-          setRows([listMode === "removed"
+          setRows({ fallback: listMode === "removed"
             ? h("tr", null, h("td", { colSpan: 6, className: "muted" }, "No more removed records."))
             : h(ListEmptyRow, {
                 controls, colSpan: 6,
                 empty: "No selected cases on this page.",
                 filtered: "No cases match these filters.",
-              })]);
+              }) });
           return;
         }
-        const rows = [];
-        for (const id of ids) {
-          if (listMode === "removed") {
-            rows.push(
-              h(
+        const renderRow = listMode === "removed"
+          ? (id) => h(
                 "tr",
-                {},
+                { key: id },
                 h("td", {}, id),
                 h(
                   "td",
@@ -8001,15 +8025,13 @@ function tabCases() {
                     },
                   ),
                 ),
-              ),
-            );
-            continue;
-          }
-          const c = payload.summaries?.[id];
-          rows.push(
-            h(
+              )
+          : (id) => {
+            const c = payload.summaries?.[id];
+            return h(
               "tr",
               {
+                key: id,
                 className: "case-row",
                 // The whole row opens the case; its own controls keep their action.
                 onClick: (event) => {
@@ -8028,32 +8050,40 @@ function tabCases() {
               h("td", {}, c?.subject_id ? h(CasePersonCell, { id: String(c.subject_id), names }) : ""),
               h("td", {}, c ? h(CasePersonCell, { id: c.actor_id ? String(c.actor_id) : null, names, empty: caseAutomatic(c.actor_id, c.source_kind) ? "jModGuard automod" : "Not recorded" }) : ""),
               h("td", { className: "muted" }, c?.occurred_at_ms ? h(CaseTime, { ms: c.occurred_at_ms }) : ""),
-            ),
-          );
-        }
-        setRows(rows);
+            );
+          };
+        setRows({ rows: ids, renderRow });
       } catch (e) {
         if (lifecycle === "disposed" || current !== request || state.guildId !== guildId) return;
-        setRows([
-          h(
+        setPagination({ first: !after, next: true });
+        setRows({ fallback: h(
             "tr",
             {},
             h(
               "td",
               { colSpan: 6, className: "err", role: "alert" },
-              "Could not load cases: " + (signal.aborted
-                ? "Request timed out. Refresh to verify saved state before trying again."
-                : e.message || String(e)),
+              "Could not load cases: " + (e.message || String(e)),
             ),
-          ),
-        ]);
+          ) });
       } finally {
-        clearTimeout(timeout);
-        if (lifecycle === "active" && current === request && state.guildId === guildId) setLoading(false);
+        if (lifecycle === "active" && current === request && state.guildId === guildId) {
+          setLoading(false);
+          setProgress(null);
+        }
       }
     };
     handlers.current = {
       run,
+      cancel: () => {
+        ++request;
+        listController?.abort();
+        setLoading(false);
+        setProgress(null);
+        setPagination({ first: !after, next: true });
+        setRows({ fallback:
+          h("tr", null, h("td", { colSpan: 6, role: "status" }, "Loading canceled. Refresh to try again.")),
+        });
+      },
       first: () => {
         after = "";
         run();
@@ -8119,18 +8149,21 @@ function tabCases() {
         },
         removedView ? "Back to cases" : "Removed records / retry cleanup",
       ),
+      Number.isInteger(total)
+        ? h("span", { className: "muted", role: "status" }, `${total.toLocaleString()} matching cases`)
+        : null,
     ),
+    progress !== null ? h(ListLoadProgress, { loaded: progress, onCancel: () => handlers.current.cancel?.() }) : null,
     rows === null ? h(
       "div",
       { className: "card bg-base-100 card-border", role: "status", "aria-live": "polite" },
       h("div", { className: "card-body" }, "Loading cases…"),
-    ) : h(DataTable, {
+    ) : h(PagedTable, {
       headings: CASE_LIST.columns.map((column) =>
         removedView ? column.label : h(ListSortHeading, { key: column.key, column, controls })),
       className: "table table-zebra case-table",
-    }, loading
-      ? h("tr", null, h("td", { colSpan: 6, role: "status" }, "Loading cases…"))
-      : rows),
+      ...(loading ? { fallback: h("tr", null, h("td", { colSpan: 6, role: "status" }, "Loading cases…")) } : rows),
+    }),
   );
 }
 
@@ -8944,19 +8977,35 @@ function CommandStep({ step, index, names, pending, onChange, remove }) {
   );
 }
 
-function useApiRead(path, { retainData = false } = {}) {
+function useApiRead(path, { retainData = false, listSize, collection } = {}) {
   const [revision, setRevision] = useState(0);
   const [result, setResult] = useState({ kind: "loading" });
+  const cancel = useRef(null);
   useEffect(() => {
     const controller = new AbortController();
     let publication = "current";
-    const timeout = setTimeout(() => controller.abort(), 30000);
+    const timeout = collection ? null : setTimeout(() => controller.abort(), 30000);
     setResult((current) => {
       const retained = retainData && current.path === path && current.data != null;
       // A pending retry does not make the retained snapshot fresh again.
-      return { kind: "loading", path, data: retained ? current.data : null, error: retained ? current.error : null };
+      return {
+        kind: "loading", path, data: retained ? current.data : null, error: retained ? current.error : null,
+        progress: listLoadProgress(listSize),
+      };
     });
-    apiRead(path, controller.signal)
+    const [endpoint, query] = path.split("?", 2);
+    const read = collection ? readListPage({
+      read: apiRead, path: endpoint, query, collection, size: listSize, signal: controller.signal,
+      onProgress: (progress) => {
+        if (publication === "current") setResult((current) => ({ ...current, progress }));
+      },
+    }) : apiRead(path, controller.signal);
+    cancel.current = () => {
+      publication = "disposed";
+      controller.abort();
+      setResult({ kind: "canceled", path });
+    };
+    read
       .then((data) => {
         if (publication === "current") setResult({ kind: "loaded", path, data });
       })
@@ -8965,26 +9014,30 @@ function useApiRead(path, { retainData = false } = {}) {
           setResult((current) => ({
             ...current,
             kind: "failed",
+            progress: null,
             error: controller.signal.aborted
               ? apiError("Request timed out. Refresh to verify saved state before trying again.")
               : error,
           }));
       })
-      .finally(() => clearTimeout(timeout));
+      .finally(() => { if (timeout !== null) clearTimeout(timeout); });
     return () => {
       publication = "disposed";
-      clearTimeout(timeout);
+      if (timeout !== null) clearTimeout(timeout);
       controller.abort();
     };
-  }, [path, revision, retainData]);
+  }, [path, revision, retainData, collection, listSize]);
   return {
     loading: result.kind === "loading",
     data: retainData ? (result.path === path ? result.data ?? null : null) : result.kind === "loaded" ? result.data : null,
     error: retainData ? (result.path === path ? result.error ?? null : null) : result.kind === "failed" ? result.error : null,
+    progress: result.progress ?? null,
+    canceled: result.kind === "canceled",
+    cancel: () => cancel.current?.(),
     refresh: () => setRevision((value) => value + 1),
   };
 }
-function DataTable({ headings, children, className = "table table-zebra" }) {
+function DataTable({ headings, children, className = "table table-zebra", rowCount }) {
   return h(
     "div",
     {
@@ -8995,9 +9048,40 @@ function DataTable({ headings, children, className = "table table-zebra" }) {
     },
     h(
       "table",
-      { className },
-      h("thead", null, h("tr", null, ...headings.map((heading) => typeof heading === "string" ? h("th", { key: heading, scope: "col" }, heading) : heading))),
+      { className, "aria-rowcount": rowCount },
+      h("thead", null, h("tr", { "aria-rowindex": rowCount ? 1 : undefined }, ...headings.map((heading) => typeof heading === "string" ? h("th", { key: heading, scope: "col" }, heading) : heading))),
       h("tbody", null, ...React.Children.toArray(children)),
+    ),
+  );
+}
+
+const TABLE_WINDOW_SIZE = 100;
+
+function PagedTable({ rows, renderRow, fallback, canMove, ...table }) {
+  if (rows?.length >= 500) return h(TableWindow, { rows, renderRow, canMove, table });
+  return h(DataTable, table, rows?.map(renderRow) ?? fallback);
+}
+
+function TableWindow({ rows, renderRow, canMove = () => true, table }) {
+  const [offset, setOffset] = useState(0);
+  const end = Math.min(offset + TABLE_WINDOW_SIZE, rows.length);
+  // Keep the navigation buttons focusable at the ends of the table.
+  const move = (label, available, next) => h("button", {
+    type: "button", className: "btn btn-sm", "aria-disabled": !available,
+    onClick: () => { if (available && canMove()) setOffset(next); },
+  }, label);
+  return h(React.Fragment, null,
+    h("div", { className: "row list-pagination" },
+      move("Previous rows", offset > 0, offset - TABLE_WINDOW_SIZE),
+      move("Next rows", end < rows.length, end),
+      h("span", { className: "muted", role: "status" },
+        `Showing rows ${(offset + 1).toLocaleString()}–${end.toLocaleString()} of ${rows.length.toLocaleString()} on this page`,
+      ),
+    ),
+    h(DataTable, { ...table, rowCount: rows.length + 1 },
+      rows.slice(offset, end).map((row, i) =>
+        React.cloneElement(renderRow(row, offset + i), { "aria-rowindex": offset + i + 2 }),
+      ),
     ),
   );
 }
@@ -9698,9 +9782,10 @@ function tabBans() {
   };
   const controls = useListControls(BANS_LIST, guildId, () => setAfter(""), leaveReasonEditor);
   const query = controls.query();
-  query.set("limit", "50");
   if (after) query.set("after", after);
-  const result = useApiRead(`/api/guilds/${guildId}/bans?${query}`, { retainData: true });
+  const result = useApiRead(`/api/guilds/${guildId}/bans?${query}`, {
+    retainData: true, collection: "bans", listSize: controls.view.pageSize,
+  });
   const rows = Array.isArray(result.data?.bans) ? result.data.bans : [];
   const names = result.data?.names || {};
   const availableModerators = result.data?.moderators;
@@ -9713,6 +9798,66 @@ function tabBans() {
   const changePage = (cursor) => {
     if (leaveReasonEditor()) setAfter(cursor);
   };
+  const renderRow = (record, i) => {
+    const user = banPerson(record.user_id, record.user_name, record.user_display_name, names);
+    const { rule } = banReasonParts(record.reason);
+    return h(
+      "tr",
+      { key: record.id ?? i },
+      h("td", null, h(BanPersonCell, { person: user, label: "user", showId: false,
+        filterLink: (id) => controls.filterLink({ subject: id }) })),
+      h("td", null, h(IdChip, { id: user.id, label: "user" })),
+      h(
+        "td",
+        null,
+        h(
+          "span",
+          { className: `badge badge-soft badge-sm ${record.active ? "badge-error" : "badge-success"}` },
+          record.active ? "Banned" : "Unbanned",
+        ),
+      ),
+      h("td", null, h(BanModeratorCell, { record, names, rule, filterLink: (id) => controls.filterLink({ actor: id }) })),
+      h(
+        "td",
+        null,
+        h(BanReasonCell, {
+          record,
+          names,
+          guildId,
+          editor: reasonEditor,
+          onEdit: (draft) => leaveReasonEditor() && setReasonEditor({ id: record.id, draft }),
+          onDraft: (draft) => setReasonEditor((current) => (current?.id === record.id ? { ...current, draft } : current)),
+          onClose: closeReasonEditor,
+          onSaved: result.refresh,
+        }),
+      ),
+      h("td", { className: "muted" }, h(CaseTime, { ms: memberInstant(record.created_at)?.getTime() })),
+      h(
+        "td",
+        null,
+        record.active &&
+          h(IconButton, {
+            action: "unban",
+            label: `Unban ${banPersonText(user)}`,
+            onClick: async () => {
+              if (confirm(`Unban ${banPersonText(user)}?`))
+                await submitBotAction(`/api/guilds/${guildId}/unban`, "POST", {
+                  user_id: String(record.user_id),
+                  reason: "unbanned via WebUI",
+                });
+            },
+          }),
+      ),
+    );
+  };
+  const fallback = result.canceled
+    ? h("tr", null, h("td", { colSpan: 7, role: "status" }, "Loading canceled. Refresh to try again."))
+    : result.loading || result.error
+      ? h("tr", null, h("td", { colSpan: 7, className: result.error ? "err" : "", role: result.error ? "alert" : undefined },
+          result.error ? "Could not load records: " + result.error.message : "Loading…"))
+      : !rows.length
+        ? h(ListEmptyRow, { controls, colSpan: 7, empty: "No bans recorded.", filtered: "No bans match these filters." })
+        : null;
   return h(
     "div",
     null,
@@ -9740,78 +9885,23 @@ function tabBans() {
     h(ListControls, { controls, filterOptions: { actor: moderators } }),
     h("div", { className: "row list-pagination" },
       h(ActionButton, { type: "button", className: "btn", disabled: !after || result.loading, onClick: () => changePage("") }, "First page"),
-      h(ActionButton, { type: "button", className: "btn", disabled: !next || result.loading, onClick: () => changePage(next) }, "Next page"),
+      h(ActionButton, { type: "button", className: "btn", disabled: !next || !!fallback, onClick: () => changePage(next) }, "Next page"),
       Number.isInteger(result.data?.total)
         ? h("span", { className: "muted", role: "status" }, `${result.data.total.toLocaleString()} matching bans`)
         : null,
     ),
-    h(
-      DataTable,
-      {
-        headings: [
-          ...BANS_LIST.columns.map((column) => h(ListSortHeading, { key: column.key, column, controls })),
-          "Actions",
-        ],
-        className: "table table-zebra ban-table",
-      },
-      result.loading || result.error
-        ? h("tr", null, h("td", { colSpan: 7, className: result.error ? "err" : "" },
-            result.error ? "Could not load records: " + result.error.message : "Loading…"))
-        : !rows.length
-          ? h(ListEmptyRow, { controls, colSpan: 7, empty: "No bans recorded.", filtered: "No bans match these filters." })
-        : rows.map((record, i) => {
-            const user = banPerson(record.user_id, record.user_name, record.user_display_name, names);
-            const { rule } = banReasonParts(record.reason);
-            return h(
-              "tr",
-              { key: record.id ?? i },
-              h("td", null, h(BanPersonCell, { person: user, label: "user", showId: false,
-                filterLink: (id) => controls.filterLink({ subject: id }) })),
-              h("td", null, h(IdChip, { id: user.id, label: "user" })),
-              h(
-                "td",
-                null,
-                h(
-                  "span",
-                  { className: `badge badge-soft badge-sm ${record.active ? "badge-error" : "badge-success"}` },
-                  record.active ? "Banned" : "Unbanned",
-                ),
-              ),
-              h("td", null, h(BanModeratorCell, { record, names, rule, filterLink: (id) => controls.filterLink({ actor: id }) })),
-              h(
-                "td",
-                null,
-                h(BanReasonCell, {
-                  record,
-                  names,
-                  guildId,
-                  editor: reasonEditor,
-                  onEdit: (draft) => leaveReasonEditor() && setReasonEditor({ id: record.id, draft }),
-                  onDraft: (draft) => setReasonEditor((current) => (current?.id === record.id ? { ...current, draft } : current)),
-                  onClose: closeReasonEditor,
-                  onSaved: result.refresh,
-                }),
-              ),
-              h("td", { className: "muted" }, h(CaseTime, { ms: memberInstant(record.created_at)?.getTime() })),
-              h(
-                "td",
-                null,
-                record.active &&
-                  h(IconButton, {
-                    action: "unban",
-                    label: `Unban ${banPersonText(user)}`,
-                    onClick: async () => {
-                      if (confirm(`Unban ${banPersonText(user)}?`))
-                        await submitBotAction(`/api/guilds/${guildId}/unban`, "POST", {
-                          user_id: String(record.user_id),
-                          reason: "unbanned via WebUI",
-                        });
-                    },
-                  }),
-              ),
-            );
-          }),
-    ),
+    result.progress !== null ? h(ListLoadProgress, { loaded: result.progress, onCancel: result.cancel }) : null,
+    h(PagedTable, {
+      headings: [
+        ...BANS_LIST.columns.map((column) => h(ListSortHeading, { key: column.key, column, controls })),
+        "Actions",
+      ],
+      className: "table table-zebra ban-table",
+      rows: fallback ? null : rows,
+      renderRow,
+      fallback,
+      canMove: leaveReasonEditor,
+    }),
   );
 }
 function tabActions() {
