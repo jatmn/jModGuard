@@ -546,12 +546,17 @@ impl SnapshotIngress {
                     )
                 });
                 let report = PendingEditReport::from_gateway(app, &context, event, known);
-                let queued = self.edit(app, context.clone(), event, &observation, report.clone());
-                if !queued
-                    && let Some(report) = report
-                    && let Some(report) = self.admit_unqueued_edit(&observation, report)
-                {
-                    submit_report(app, &context, report);
+                let scope = event.guild_id.and_then(|guild| self.scope(guild.get()));
+                let queued = self.edit(
+                    app,
+                    context.clone(),
+                    event,
+                    &observation,
+                    report.clone(),
+                    scope.as_ref(),
+                );
+                if !queued && let Some(report) = report {
+                    self.submit_unqueued_edit(app, &context, scope, observation, report, false);
                 }
             }
             Event::MessageDelete(event) => {
@@ -1136,6 +1141,7 @@ impl SnapshotIngress {
         event: &MessageUpdateEvent,
         observation: &SnapshotObservation,
         report: Option<PendingEditReport>,
+        scope: Option<&GuildDataScope>,
     ) -> bool {
         if !app.cfg.bot.message_capture_enabled
             || app.db.capacity_runtime_status().startup_deferred
@@ -1159,60 +1165,122 @@ impl SnapshotIngress {
         if allow_insert {
             self.remember_human(key);
         }
-        let Some(scope) = self.scope(guild.get()) else {
+        let Some(scope) = scope else {
             self.gap();
             return false;
         };
         self.enqueue(
             app,
             context,
-            scope,
+            scope.clone(),
             Body::Edit(observation.clone(), report, allow_insert),
         )
     }
 
-    pub(crate) fn unhooked_edit_report(
+    pub(crate) fn report_unhooked_edit(
         &self,
-        app: &BotState,
+        app: &Arc<BotState>,
         context: &Context,
         event: &MessageUpdateEvent,
         known_author_id: Option<u64>,
         received_at: chrono::DateTime<chrono::Utc>,
-    ) -> Option<MessageReport> {
-        let report = PendingEditReport::from_gateway(app, context, event, known_author_id)?;
-        let observation = edit_observation(event, received_at)?;
-        self.admit_unqueued_edit(&observation, report)
+    ) {
+        if let Some(report) = PendingEditReport::from_gateway(app, context, event, known_author_id)
+            && let Some(observation) = edit_observation(event, received_at)
+        {
+            let scope = self.scope(report.report.guild_id.get());
+            self.submit_unqueued_edit(app, context, scope, observation, report, true);
+        }
     }
 
-    fn admit_unqueued_edit(
+    fn submit_unqueued_edit(
         &self,
-        observation: &SnapshotObservation,
+        app: &Arc<BotState>,
+        context: &Context,
+        scope: Option<GuildDataScope>,
+        observation: SnapshotObservation,
         pending: PendingEditReport,
-    ) -> Option<MessageReport> {
+        unhooked: bool,
+    ) {
         let guild = pending.report.guild_id.get();
-        let key = (
-            guild,
-            observation.channel_id as u64,
-            observation.message_id as u64,
-        );
-        let prior = self.scope(guild).and_then(|scope| {
-            if !self.content_access.lock().contains(&guild) {
-                return None;
+        let channel = observation.channel_id;
+        let message = observation.message_id;
+        let key = (guild, channel as u64, message as u64);
+        let scope = scope.filter(|_| self.content_access.lock().contains(&guild));
+        let received_at_ms = observation.observed_at_ms;
+        let within_retention =
+            observation.created_at_ms.saturating_add(RECENT_LIFETIME_MS) > received_at_ms;
+        let recent = self.recent.lock();
+        let scope = scope.filter(|scope| self.scope_is_current(scope) && !self.deleted(key));
+        let prior = scope
+            .as_ref()
+            .and_then(|scope| recent.get(key, scope, observation.observed_at_ms));
+        drop(recent);
+
+        let finish = move |ingress: &SnapshotIngress, prior: Option<&MessageSnapshot>| {
+            let mut report = ingress.admit_edit_report(&observation, prior, pending)?;
+            if let Some(before) = prior {
+                logging::apply_retained_edit(&mut report, Some(before), None);
             }
-            let recent = self.recent.lock();
-            if !self.scope_is_current(&scope) || self.deleted.lock().knowledge(key).blocks_capture()
+            if unhooked {
+                ingress.gap();
+            }
+            Some(report)
+        };
+        let Some(scope) = scope.filter(|_| {
+            prior.is_none()
+                && within_retention
+                && app.cfg.bot.message_capture_enabled
+                && !app.db.capacity_runtime_status().startup_deferred
+        }) else {
+            if let Some(report) = finish(self, prior.as_ref()) {
+                submit_report(app, context, report);
+            }
+            return;
+        };
+
+        // A rejected capture must never write out of Gateway order. Read the
+        // original membership's row inside an already bounded report task.
+        let state = Arc::clone(app);
+        dispatch_report_when_ready(app, context, async move {
+            let read = async {
+                let config = state.configs.get(&state.db, guild).await?;
+                if !config.log_channels.contains_key("message_edit") {
+                    return Ok(None);
+                }
+                let store = state.tenant.store(&scope).await?;
+                store
+                    .retained_snapshot(scope.clone(), channel, message)
+                    .await
+            };
+            let prior = match tokio::time::timeout(
+                Duration::from_secs(state.cfg.log.discord_timeout_secs),
+                read,
+            )
+            .await
+            {
+                Ok(Ok(row)) => row,
+                Ok(Err(error)) => {
+                    tracing::debug!(
+                        guild_id = guild,
+                        "edit report snapshot unavailable: {error:#}"
+                    );
+                    None
+                }
+                Err(_) => None,
+            };
+            // A newer observation cannot establish what was known at receipt.
+            // Millisecond ties are also unordered outside the capture worker.
+            if !state.snapshots.scope_is_current(&scope)
+                || state.snapshots.deleted(key)
+                || prior
+                    .as_ref()
+                    .is_some_and(|row| row.last_observed_at_ms >= received_at_ms)
             {
                 return None;
             }
-            recent
-                .get(key, &scope, observation.observed_at_ms)
-                .filter(|row| row.edit_at_ms <= observation.edit_at_ms)
+            finish(&state.snapshots, prior.as_ref())
         });
-        let mut report = self.admit_edit_report(observation, prior.as_ref(), pending)?;
-        if let Some(before) = prior.as_ref() {
-            logging::apply_retained_edit(&mut report, Some(before), None);
-        }
-        Some(report)
     }
 
     fn admit_edit_report(
@@ -2259,16 +2327,33 @@ fn observe_unadmitted_bulk_delete(
 }
 
 fn dispatch_observed_report(app: &Arc<BotState>, context: &Context, report: MessageReport) {
-    if let Ok(permit) = Arc::clone(&app.snapshots.report_slots).try_acquire_owned() {
-        let app = Arc::clone(app);
-        let context = context.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            logging::emit_message_report(&app, context.http.as_ref(), report, None).await;
-        });
-        return;
-    }
-    dispatch_delivery_admitted_report(app, context, report);
+    dispatch_report_when_ready(app, context, std::future::ready(Some(report)));
+}
+
+fn dispatch_report_when_ready(
+    app: &Arc<BotState>,
+    context: &Context,
+    report: impl Future<Output = Option<MessageReport>> + Send + 'static,
+) {
+    let slot = Arc::clone(&app.snapshots.report_slots)
+        .try_acquire_owned()
+        .ok();
+    let reservation = if slot.is_none() {
+        let Some(reservation) = logging::reserve_log_delivery(app) else {
+            return;
+        };
+        Some(reservation)
+    } else {
+        None
+    };
+    let app = Arc::clone(app);
+    let context = context.clone();
+    tokio::spawn(async move {
+        let _slot = slot;
+        if let Some(report) = report.await {
+            logging::emit_message_report(&app, context.http.as_ref(), report, reservation).await;
+        }
+    });
 }
 
 fn dispatch_delivery_admitted_report(
@@ -3414,7 +3499,8 @@ mod tests {
         let changed = snowflake(created, 2);
         let partial = snowflake(created, 3);
         let described = snowflake(now, 4);
-        for id in [unchanged, changed, partial] {
+        let metadata_refresh = snowflake(created, 5);
+        for id in [unchanged, changed, partial, metadata_refresh] {
             let mut prior =
                 cache_observation(id.get() as i64, created.timestamp_millis(), "retained text");
             prior.fields.attachments = Some(vec![SnapshotAttachment {
@@ -3422,7 +3508,7 @@ mod tests {
                 id: 10,
                 filename: "old.png".into(),
                 size: 10,
-                content_type: None,
+                content_type: Some("application/octet-stream".into()),
                 url: "https://cdn.discordapp.com/old.png?ex=old".into(),
             }]);
             store.observe_snapshot(scope.clone(), prior).await.unwrap();
@@ -3439,6 +3525,8 @@ mod tests {
                 "proxy_url": format!("https://cdn.discordapp.com/{filename}?ex=refreshed")
             }])
         };
+        let mut refreshed = attachment("10", "old.png");
+        refreshed[0]["content_type"] = "image/png".into();
         let mut create = message_json(described, "retained text");
         create["attachments"] = attachment("10", "old.png");
         app.snapshots.on_gateway_event(
@@ -3460,20 +3548,44 @@ mod tests {
             }))
             .unwrap()
         };
-        assert!(
-            app.snapshots
-                .unhooked_edit_report(
-                    &app,
-                    &ctx,
-                    &update(no_prior, 456, before_start, Some("before startup"), None),
-                    None,
-                    before_start + chrono::Duration::milliseconds(2)
-                )
-                .is_none()
-        );
         let report_slots = app.snapshots.report_slots.available_permits() as u32;
+        // The read may begin after a later observation reached storage, or
+        // after a delete invalidated the captured message.
+        let later = snowflake(created, 6);
+        let mut row = cache_observation(
+            later.get() as i64,
+            created.timestamp_millis(),
+            "later observation",
+        );
+        row.observed_at_ms = now.timestamp_millis();
+        store.observe_snapshot(scope.clone(), row).await.unwrap();
+        app.snapshots.report_unhooked_edit(
+            &app,
+            &ctx,
+            &update(later, 456, stale, Some("earlier replay"), None),
+            None,
+            now,
+        );
+        let deleted = snowflake(created, 7);
+        app.snapshots.report_unhooked_edit(
+            &app,
+            &ctx,
+            &update(deleted, 456, now, Some("invalidated"), None),
+            None,
+            now,
+        );
+        app.snapshots
+            .mark_deleted(GuildId::new(789), ChannelId::new(456), &[deleted]);
+        app.snapshots.report_unhooked_edit(
+            &app,
+            &ctx,
+            &update(no_prior, 456, before_start, Some("before startup"), None),
+            None,
+            before_start + chrono::Duration::milliseconds(2),
+        );
         for event in [
             update(changed, 456, stale, Some("changed text"), None),
+            update(metadata_refresh, 456, stale, None, Some(refreshed)),
             update(no_prior, 456, very_old, Some("very old replay"), None),
             update(
                 unchanged,
@@ -4228,6 +4340,94 @@ mod tests {
         assert!(stored.vars["coverage"].starts_with("last retained observation"));
         let stored = report_for(SnapshotOutcome::Stored, Some(row(3, "stored")), None);
         assert!(stored.vars["before"].contains("stored"));
+    }
+
+    #[tokio::test]
+    async fn unqueued_edits_compare_with_durable_snapshots_on_a_memory_miss() {
+        use serenity::client::EventHandler;
+
+        let (app, path) = temp_app("snapshot_unqueued_edits");
+        app.activation.note_discord_connected();
+        assert!(app.activation.allows_rule_trigger());
+        let scope = cache_scope(&app, 100).await;
+        let store = app.tenant.store(&scope).await.unwrap();
+        crate::db::upsert_log_channel(&app.db, 789, "message_edit", 901)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        app.snapshots.content_access.lock().insert(789);
+        let (http, bodies, server) = recording_delete_proxy().await;
+        let ctx = test_delete_context_with(http).await;
+        let handler = crate::handlers::Handler {
+            app: Arc::clone(&app),
+        };
+        // Refuse capture on the collector route, leaving only the report path.
+        app.snapshots
+            .bytes
+            .store(MAX_PENDING_BYTES, Ordering::Release);
+        let now = chrono::DateTime::from_timestamp_millis(app.snapshots.started_at_ms).unwrap();
+        let created = now - chrono::Duration::minutes(2);
+        let mut expected = Vec::new();
+        for (index, (unhooked, changed)) in
+            [(true, false), (true, true), (false, false), (false, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let id =
+                (((created.timestamp_millis() as u64) - 1_420_070_400_000) << 22) + index as u64;
+            store
+                .observe_snapshot(
+                    scope.clone(),
+                    cache_observation(id as i64, created.timestamp_millis(), "retained original"),
+                )
+                .await
+                .unwrap();
+            let (edit, text) = if changed {
+                expected.push(id);
+                (created + chrono::Duration::seconds(10), "real change")
+            } else {
+                (now, "retained original")
+            };
+            let event: MessageUpdateEvent = serde_json::from_value(serde_json::json!({
+                "id": id.to_string(), "guild_id": "789", "channel_id": "456",
+                "content": text, "edited_timestamp": edit.to_rfc3339()
+            }))
+            .unwrap();
+            if unhooked {
+                handler.message_update(ctx.clone(), None, None, event).await;
+            } else {
+                app.snapshots
+                    .on_gateway_event(&app, ctx.clone(), &Event::MessageUpdate(event));
+            }
+        }
+        let _drained = Arc::clone(&app.snapshots.report_slots)
+            .acquire_many_owned(32)
+            .await
+            .unwrap();
+        let requests = bodies.lock().unwrap();
+        let reports: Vec<_> = requests
+            .iter()
+            .filter(|body| body.starts_with("POST ") && body.contains("Message edited"))
+            .collect();
+        assert_eq!(reports.len(), expected.len(), "{reports:#?}");
+        for id in expected {
+            assert!(
+                reports
+                    .iter()
+                    .any(|body| body.contains(&format!("/456/{id}"))
+                        && body.contains("retained original")
+                        && body.contains("real change")
+                        && body.contains("Observed at")),
+                "missing changed edit for {id}: {reports:#?}"
+            );
+        }
+        drop(requests);
+        server.abort();
+        drop(store);
+        drop(handler);
+        drop(ctx);
+        drop(app);
+        remove_db_and_store(&path);
     }
 
     /// The create write was lost; the store is healthy again and has no row.

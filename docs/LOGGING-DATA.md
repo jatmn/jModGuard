@@ -181,8 +181,10 @@ marked. Pending observations are capped at 4096 items and 16 MiB; overflow marks
 coverage gap. Snapshots do not guarantee Discord report replay. Failed delivery is
 not reconstructed from Discord or SQL.
 The shard collector admits observations in Gateway order before Serenity spawns
-ordinary callbacks. It cannot cover events delivered before collector registration;
-those reports state that content is unavailable. A verified cleanup or measurement
+ordinary callbacks. For an edit received before collector registration or refused
+by the queue, the report can still use the eligible memory copy or, on a cache
+miss, an unexpired snapshot in the same guild membership. This lookup leaves
+the snapshot at its last captured revision. A verified cleanup or measurement
 failure pauses growing capture for that physical store while bounded deletion and
 cleanup continue. Capture resumes only after a successful cleanup, fresh measurement
 and normal admission. Turning capture off still consumes confirmed deletions.

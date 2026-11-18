@@ -714,6 +714,27 @@ impl GuildDataStore {
         }).await
     }
 
+    /// Read a retained observation for a report when ordered capture missed the edit.
+    pub async fn retained_snapshot(
+        &self,
+        scope: GuildDataScope,
+        channel_id: i64,
+        message_id: i64,
+    ) -> Result<Option<MessageSnapshot>> {
+        self.check_target(&scope.placement)?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let row = load(&tx, &scope, channel_id, message_id)?;
+                let now = write_time_ms()?;
+                tx.finish_read()?;
+                Ok(row.filter(|row| row.expires_at_ms > now))
+            })
+            .await
+    }
+
     /// Reads and writes one accepted edit in one primary transaction. Equal-version
     /// partial fields may fill unknowns but cannot claim another before/after edit.
     pub async fn apply_snapshot_edit(
