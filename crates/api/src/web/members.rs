@@ -1,6 +1,8 @@
 //! Captured-enrollment member directory reads and administrator sync controls.
 use super::api;
-use super::list_controls::{SortDirection, bounded_list_text, decode_cursor, encode_cursor};
+use super::list_controls::{
+    SortDirection, bounded_list_text, decode_cursor, encode_cursor, within_list_deadline,
+};
 use super::state::ApiState;
 use super::{ApiError, ApiResult, AuthCtx, GuildAccess, authorize_guild};
 use crate::bot_actions::{Action, MemberSyncOperation};
@@ -30,6 +32,8 @@ pub struct MembersQuery {
     dir: Option<SortDirection>,
     after: Option<String>,
     limit: Option<u32>,
+    #[serde(default)]
+    include_total: bool,
 }
 
 #[derive(Deserialize)]
@@ -132,8 +136,21 @@ pub async fn list_members(
     Path(guild_id): Path<u64>,
     Query(query): Query<MembersQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (_, enrollment) =
-        scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
+    within_list_deadline(
+        "Members",
+        list_members_inner(&app, &session, &headers, guild_id, query),
+    )
+    .await
+}
+
+async fn list_members_inner(
+    app: &Arc<ApiState>,
+    session: &Session,
+    headers: &HeaderMap,
+    guild_id: u64,
+    query: MembersQuery,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (_, enrollment) = scoped(app, session, headers, guild_id, GuildAccess::Dashboard).await?;
     let (store, scope) = app.tenant.live(enrollment).await?;
     let q = bounded_list_text(query.q.as_deref())?;
     let (sort, default_dir) = match query.sort.as_deref() {
@@ -186,7 +203,11 @@ pub async fn list_members(
                 sort,
                 descending: dir == SortDirection::Desc,
                 after,
-                limit: query.limit.unwrap_or(50).clamp(1, 100),
+                limit: query
+                    .limit
+                    .unwrap_or(50)
+                    .clamp(1, db::DASHBOARD_LIST_PAGE_LIMIT),
+                include_total: query.include_total,
             },
         )
         .await?;
@@ -197,6 +218,7 @@ pub async fn list_members(
     Ok(Json(serde_json::json!({
         "members": page.members,
         "next_cursor": next_cursor,
+        "total": page.total,
     })))
 }
 

@@ -3,10 +3,27 @@ use super::{ApiError, ApiResult};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::future::Future;
+use std::time::Duration;
 
 const MAX_SEARCH_CHARS: usize = 200;
 const MAX_CURSOR_BYTES: usize = 4096;
 const CURSOR_VERSION: u8 = 1;
+
+pub(super) async fn within_list_deadline<T>(
+    label: &str,
+    read: impl Future<Output = ApiResult<T>>,
+) -> ApiResult<T> {
+    // Cover authorization, pool checkout and all snapshots, including metadata.
+    // Dropping the inner future signals database cancellation.
+    tokio::time::timeout(Duration::from_secs(20), read)
+        .await
+        .map_err(|_| {
+            ApiError(anyhow::anyhow!(
+                "{label} request timed out. Please try again."
+            ))
+        })?
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]

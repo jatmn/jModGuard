@@ -69,6 +69,11 @@ response's opaque `next_cursor` as the URL-encoded `after` with the same sort an
 filters. A null cursor marks the final page. Removed-case recovery keeps its
 ID-order paging.
 
+The live Cases endpoint defaults to 50 summaries and caps each request at 250.
+With `include_total=true`, it counts matching cases across all pages in the
+same read snapshot.
+The dashboard can load several cursor pages for one selection.
+
 Exact filters are `action`, `outcome` (also accepted as `status`), `subject` and
 `actor`. The `from` and `to` dates are inclusive UTC calendar days in
 `YYYY-MM-DD` form. Search `q` matches a literal substring in the case ID, user

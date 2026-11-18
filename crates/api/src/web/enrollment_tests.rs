@@ -6808,16 +6808,18 @@ async fn members_sort_and_filter_before_paging() {
         }
     }
 
-    let filters = "sort=name&dir=desc&status=current&q=+ALP+&from=2026-01-03&to=2026-01-03&limit=1";
+    let filters = "sort=name&dir=desc&status=current&q=+ALP+&from=2026-01-03&to=2026-01-03&limit=1&include_total=true";
     let (status, first) = f.request("POST", &format!("{PATH}?{filters}"), "").await;
     assert_eq!(status, StatusCode::OK, "{first}");
     assert_eq!(ids(&first), [16]);
+    assert_eq!(first["total"], 2);
     let after = first["next_cursor"].as_str().unwrap();
     let (status, second) = f
         .request("POST", &format!("{PATH}?{filters}&after={after}"), "")
         .await;
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(ids(&second), [12]);
+    assert_eq!(second["total"], 2);
     assert!(second["next_cursor"].is_null());
     for (query, expected) in [
         ("sort=name&dir=desc&status=previously_banned", vec![14]),
@@ -7000,14 +7002,16 @@ async fn case_list_orders_and_filters_are_applied_before_paging() {
         }
     }
 
-    let filters = "sort=action&dir=desc&subject=2&status=succeeded&q=review%25_&from=2026-01-02&to=2026-01-02&limit=1";
+    let filters = "sort=action&dir=desc&subject=2&status=succeeded&q=review%25_&from=2026-01-02&to=2026-01-02&limit=1&include_total=true";
     let (status, filtered) = list(filters.into()).await;
     assert_eq!(status, StatusCode::OK, "{filtered}");
     assert_eq!(filtered["cases"], expect_ids(&[2]));
+    assert_eq!(filtered["total"], 2);
     let cursor = filtered["next_cursor"].as_str().unwrap();
     let (status, next) = list(format!("{filters}&after={cursor}")).await;
     assert_eq!(status, StatusCode::OK, "{next}");
     assert_eq!(next["cases"], expect_ids(&[5]));
+    assert_eq!(next["total"], 2);
     assert!(next["next_cursor"].is_null());
 
     let normalized = "sort=action&dir=desc&subject=02&outcome=succeeded&q=+REVIEW%25_+&from=2026-01-02&to=2026-01-02&limit=2";
@@ -7080,6 +7084,130 @@ async fn case_list_orders_and_filters_are_applied_before_paging() {
     ] {
         let (status, body) = list(query.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn dashboard_lists_bound_each_page_and_follow_cursors_through_all_matches() {
+    use db::guild_data::{
+        CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource, MemberObservation,
+    };
+
+    const ROWS: i64 = 1_037;
+    const CAP: usize = 250;
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    for id in 1..=ROWS {
+        store
+            .record_case(
+                scope.clone(),
+                CaseId::try_from(format!("{id:032x}")).unwrap(),
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::DiscordAudit { entry_id: id },
+                    action: CaseAction::Ban,
+                    outcome: CaseOutcome::Succeeded,
+                    subject_id: id,
+                    actor_id: None,
+                    occurred_at_ms: 10,
+                    reason: Some("fixture".into()),
+                    evidence: CaseEvidence::Unavailable,
+                },
+                crate::tenant::case_limits(),
+            )
+            .await
+            .unwrap();
+        store
+            .observe_member(
+                scope.clone(),
+                MemberObservation {
+                    user_id: id,
+                    username: Some(Some("fixture".into())),
+                    global_name: None,
+                    nickname: None,
+                    joined_at_ms: Some(10),
+                    observed_at_ms: 20,
+                    is_join: true,
+                },
+            )
+            .await
+            .unwrap();
+        db::record_ban(&f.app.db, 10, id, None, "fixture")
+            .await
+            .unwrap();
+    }
+
+    for (list, sort) in [("cases", "date"), ("bans", "id"), ("members", "joined")] {
+        let route = format!("/api/guilds/10/{list}?sort={sort}&dir=asc&q=fixture");
+        let metadata = if list == "bans" {
+            ""
+        } else {
+            "&include_total=true"
+        };
+        let expected = (1..=ROWS)
+            .map(|id| {
+                if list == "cases" {
+                    format!("{id:032x}")
+                } else {
+                    id.to_string()
+                }
+            })
+            .collect::<Vec<_>>();
+        let ids = |body: &serde_json::Value| {
+            body[list]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    row.as_str()
+                        .or_else(|| row["user_id"].as_str())
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        for limit in [50, 100, CAP, 500, 1_000, 5_000] {
+            let (status, page) = f
+                .request("POST", &format!("{route}&limit={limit}{metadata}"), "")
+                .await;
+            assert_eq!(status, StatusCode::OK, "{list}: {page}");
+            assert_eq!(page["total"], ROWS, "{list}");
+            assert_eq!(ids(&page), expected[..limit.min(CAP)], "{list}");
+            assert!(page["next_cursor"].is_string(), "{list}");
+        }
+        let mut cursor = String::new();
+        for (index, batch) in expected.chunks(CAP).enumerate() {
+            let options = if index == 0 {
+                metadata
+            } else if list == "bans" {
+                "&skip_metadata=true"
+            } else {
+                ""
+            };
+            let (status, page) = f
+                .request("POST", &format!("{route}&limit={CAP}{options}{cursor}"), "")
+                .await;
+            assert_eq!(status, StatusCode::OK, "{list}: {page}");
+            assert_eq!(ids(&page), batch, "{list} batch {index}");
+            if index == 0 {
+                assert_eq!(page["total"], ROWS, "{list}");
+            } else {
+                assert!(page["total"].is_null(), "{list}");
+            }
+            if batch.len() == CAP {
+                cursor = format!("&after={}", page["next_cursor"].as_str().unwrap());
+            } else {
+                assert!(page["next_cursor"].is_null(), "{list}");
+            }
+        }
     }
 }
 

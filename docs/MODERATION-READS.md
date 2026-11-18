@@ -15,6 +15,8 @@ membership and the `x-jmodguard-enrollment` value from the page's loaded configu
   timestamp and row ID. `sort` accepts `subject`, `id` (Discord user ID),
   `reason`, `actor`, `date`, and `status`. Set `dir=asc|desc` and pass `next_cursor`
   as the following request's `after` with the same order and filters.
+  Each request caps the response at 250 ban records. Dashboard continuation
+  requests can use `skip_metadata=true` to omit the count and moderator lookup.
   `total` counts all matching rows. `moderators` contains actors from the
   guild's full ban history. The filters are `subject` (name or positive
   Discord ID), `actor` (ID), `reason` (literal substring of the current

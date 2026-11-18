@@ -474,16 +474,31 @@ pub struct MemberQuery {
     pub descending: bool,
     pub after: Option<MemberListAnchor>,
     pub limit: u32,
+    pub include_total: bool,
 }
 
 impl MemberQuery {
-    pub(super) fn sql(&self) -> String {
-        let (status, filter) = match self.status {
+    fn status_filter(&self) -> (&'static str, &'static str) {
+        match self.status {
             MemberStatusFilter::Current => ("current", "is_current=1"),
             MemberStatusFilter::Banned => ("banned", "is_banned=1"),
             MemberStatusFilter::PreviouslyBanned => ("previous", "ever_banned=1 AND is_banned=0"),
             MemberStatusFilter::All => ("all", "1=1"),
-        };
+        }
+    }
+
+    fn predicate(&self) -> String {
+        let (_, filter) = self.status_filter();
+        format!(
+            "guild_id=?1 AND enrollment_id=?2 AND {filter}
+               AND (?3='' OR user_id=?4 OR instr(search_text,?3)>0)
+               AND (?5 IS NULL OR joined_at_ms>=?5) AND (?6 IS NULL OR joined_at_ms<=?6)"
+        )
+    }
+
+    pub(super) fn sql(&self) -> String {
+        let (status, _) = self.status_filter();
+        let predicate = self.predicate();
         let (column, index_suffix) = self.sort.column_and_index();
         let index = if self.status == MemberStatusFilter::All && self.sort == MemberSort::UserId {
             "sqlite_autoindex_guild_member_directory_1".to_owned()
@@ -507,9 +522,7 @@ impl MemberQuery {
         };
         format!(
             "SELECT {PROFILE_SQL}, {column} FROM guild_member_directory INDEXED BY {index}
-             WHERE guild_id=?1 AND enrollment_id=?2 AND {filter}
-               AND (?3='' OR user_id=?4 OR instr(search_text,?3)>0)
-               AND (?5 IS NULL OR joined_at_ms>=?5) AND (?6 IS NULL OR joined_at_ms<=?6)
+             WHERE {predicate}
                {seek}
              ORDER BY {order} LIMIT ?9"
         )
@@ -537,14 +550,15 @@ pub struct MemberProfile {
 pub struct MemberPage {
     pub members: Vec<MemberProfile>,
     pub next_anchor: Option<MemberListAnchor>,
+    pub total: Option<i64>,
 }
 
 /// Largest ID set one directory name lookup accepts.
 pub const DIRECTORY_NAME_LOOKUP_LIMIT: usize = 32;
 
 /// Largest ID set one [`GuildDataStore::member_profiles`] lookup accepts: the
-/// subjects and moderators of one full case page.
-pub const DIRECTORY_PROFILE_LOOKUP_LIMIT: usize = 200;
+/// subjects, moderators and reason editors of one full moderation page.
+pub const DIRECTORY_PROFILE_LOOKUP_LIMIT: usize = DASHBOARD_LIST_PAGE_LIMIT as usize * 3;
 
 /// Bounded directory counts for the analytics views. `known` includes
 /// departed members still retained by ban history.
@@ -3646,7 +3660,7 @@ impl GuildDataStore {
     ) -> Result<MemberPage> {
         checked_scope(self, &scope)?;
         anyhow::ensure!(
-            (1..=100).contains(&query.limit)
+            (1..=DASHBOARD_LIST_PAGE_LIMIT).contains(&query.limit)
                 && query.q.as_ref().is_none_or(|q| q.chars().count() <= 200)
                 && query
                     .after
@@ -3658,6 +3672,12 @@ impl GuildDataStore {
         let search = raw_q.to_lowercase();
         let mention_id = member_search_user_id(raw_q);
         let sql = query.sql();
+        let count_sql = query.include_total.then(|| {
+            format!(
+                "SELECT COUNT(*) FROM guild_member_directory WHERE {}",
+                query.predicate()
+            )
+        });
         let (after_key, after_id) = query.after.map_or((Value::Null, None), |anchor| {
             let key = match anchor.key {
                 MemberSortValue::Name(name) => Value::Text(name),
@@ -3670,6 +3690,22 @@ impl GuildDataStore {
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
+                let total = count_sql
+                    .map(|sql| {
+                        tx.query_row(
+                            &sql,
+                            params![
+                                scope.guild_id(),
+                                scope.enrollment.id.as_str(),
+                                search.as_str(),
+                                mention_id,
+                                query.joined_from_ms,
+                                query.joined_to_ms
+                            ],
+                            |row| Ok(row.get(0)?),
+                        )
+                    })
+                    .transpose()?;
                 let mut stmt = tx.prepare(&sql)?;
                 let rows = stmt.query_map(
                     params![
@@ -3709,6 +3745,7 @@ impl GuildDataStore {
                 Ok(MemberPage {
                     members: rows.into_iter().map(|(member, _)| member).collect(),
                     next_anchor,
+                    total,
                 })
             })
             .await

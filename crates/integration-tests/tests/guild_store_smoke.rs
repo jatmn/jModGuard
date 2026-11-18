@@ -684,6 +684,7 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
         sort: CaseSort::Date,
         descending: true,
         after,
+        include_total: false,
     };
     let first = reopened
         .list_cases(scoped.clone(), query(None), 1, limits)
