@@ -887,7 +887,7 @@ pub struct BotState {
     pub configs: ConfigCache,
     pub automod: AutomodEngine,
     pub image_spam: crate::image_spam::Detector,
-    pub attachment_burst: crate::attachment_burst::Tracker,
+    pub(crate) recent_messages: crate::recent_messages::RecentMessages,
     pub text_spam: crate::text_spam::Detector,
     pub spam_gate: crate::spam_actions::Gate,
     pub log_snippets: crate::logging::SnippetCache,
@@ -965,6 +965,10 @@ pub struct BotState {
 }
 
 impl BotState {
+    pub fn prune_recent_messages(&self) {
+        self.recent_messages.prune();
+    }
+
     pub fn new(cfg: BotProcessConfig, db: Db) -> Result<Arc<Self>> {
         anyhow::ensure!(
             cfg.log.discord_concurrency > 0
@@ -979,7 +983,6 @@ impl BotState {
             "log.discord_timeout_secs must be positive"
         );
         let image_spam = crate::image_spam::Detector::new(cfg.image_spam.clone())?;
-        let attachment_burst = crate::attachment_burst::Tracker::new(cfg.attachment_burst.clone())?;
         let tenant =
             crate::tenant::TenantRuntime::open(&db, &cfg.db, &cfg.guild_stores, &cfg.evidence)?;
         let log_delivery_slots =
@@ -1009,7 +1012,7 @@ impl BotState {
             configs: ConfigCache::new(primed.config, primed.config_revision.clone()),
             automod: AutomodEngine::new(),
             image_spam,
-            attachment_burst,
+            recent_messages: Default::default(),
             text_spam: crate::text_spam::Detector::default(),
             spam_gate: crate::spam_actions::Gate::default(),
             log_snippets: crate::logging::SnippetCache::default(),

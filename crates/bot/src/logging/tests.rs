@@ -1242,7 +1242,6 @@ async fn member_rejoin_delivers_when_indexed_case_exceeds_read_budget() {
         Admission::Immediate,
         || true,
         false,
-        Vec::new(),
         Some(&user),
     )
     .await;
@@ -1856,7 +1855,6 @@ async fn ban_report_returns_late_audit_for_its_stored_row() {
         Admission::Immediate,
         || true,
         false,
-        Vec::new(),
         None,
     )
     .await;
@@ -5315,21 +5313,6 @@ async fn delivery_renders_custom_template_as_description_with_event_accent_and_c
     assert_eq!(payload["embeds"][0]["color"], jmodguard::log_embeds::RED);
     assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
     assert!(payload.get("content").is_none());
-    let rows = [CreateActionRow::Buttons(vec![
-        serenity::builder::CreateButton::new("review").label("Review"),
-    ])];
-    let component_payload = serde_json::to_value(log_message_with(
-        "message_delete",
-        "My custom log: {mention} | {content}",
-        &vars,
-        &rows,
-    ))
-    .unwrap();
-    assert_eq!(component_payload["embeds"], payload["embeds"]);
-    assert_eq!(
-        component_payload["components"][0]["components"][0]["custom_id"],
-        "review"
-    );
 }
 
 #[test]

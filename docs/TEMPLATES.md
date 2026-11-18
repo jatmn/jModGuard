@@ -166,9 +166,7 @@ with their command's emoji (for example `🔨 Banned {target} | {reason}`, 📛
 📝 Reason; the follow-up after a failed removal starts with ⚠️. `!userinfo`
 starts with 👤 and labels 🆔 ID · 🔤 Username · 🪪 Global name · 📛 Nick ·
 📅 Account · ⏰ Joined · 🏷️ Roles · 🔊 Voice · ⚠️ Warnings · 📋 Cases. `!voice`
-replies start with 🔊. Attachment-burst review buttons answer with ⛔ (not
-allowed), ℹ️ (already handled) or ⚠️ (failed); a shipped review keeps 🛡️ and
-gains 🧑‍⚖️ Review after a decision. Error replies (`error: …`) and lists built by
+replies start with 🔊. Error replies (`error: …`) and lists built by
 commands such as `!help`, `!warns` and `!banlist` stay plain.
 
 Limits count UTF-16 units: title 256, description 4096, at most 25 fields, field

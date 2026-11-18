@@ -38,10 +38,13 @@ pub(crate) async fn automod_ban(
         serenity::http::LightMethod::Put,
     )
     .headers(Some(headers))
-    .params(Some(vec![(
-        "delete_message_seconds",
-        action.ban_delete_message_seconds().to_string(),
-    )]));
+    .body(Some(
+        serde_json::json!({
+            "delete_message_seconds": action.ban_delete_message_seconds()
+        })
+        .to_string()
+        .into_bytes(),
+    ));
     http.request(request).await.map(|_| ())
 }
 

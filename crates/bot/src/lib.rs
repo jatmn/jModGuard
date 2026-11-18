@@ -7,7 +7,6 @@ pub use jmodguard::{
 pub mod action_worker;
 pub mod activation;
 pub mod activity_log;
-pub mod attachment_burst;
 pub mod automod;
 pub(crate) mod automod_delete_marks;
 pub mod boot_mismatch_alert;
@@ -25,6 +24,7 @@ pub mod member_directory;
 pub mod member_rejoin;
 pub mod member_sync;
 pub mod nickname_worker;
+mod recent_messages;
 pub mod recovery;
 pub mod server_names;
 pub mod snapshot_capture;

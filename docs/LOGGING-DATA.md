@@ -14,8 +14,8 @@ Joining, leaving and talking still do not maintain a general activity archive.
 
 ## Log presentation
 
-All log-channel paths send colored embeds, including bulk transcript summaries,
-attachment-permission fallback chunks and attachment-burst review decisions.
+All log-channel paths send colored embeds, including bulk transcript summaries and
+attachment-permission fallback chunks.
 Shipped templates render as fields; customized strings render as descriptions.
 User mentions never ping. Explicit embeds keep links clickable without content
 unfurls. Log channels need Embed Links permission. See [templates](TEMPLATES.md)
