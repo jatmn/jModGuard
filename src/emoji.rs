@@ -3,7 +3,7 @@
 //! Standard Unicode emoji only, never custom server emotes, so every guild can
 //! render them. Discord output built from a shipped template gets one emoji
 //! before its title and one before each field label: log embeds, command
-//! replies, reason DMs, `!userinfo`, `!voice`, `!status` and review notices. Stored
+//! replies, reason DMs, `!userinfo`, `!voice`, `!status` and notices. Stored
 //! templates and WebUI chrome stay emoji-free; the WebUI's Discord preview
 //! receives this map from the API. Custom templates are unchanged unless they
 //! opt in with `{emoji}`.
@@ -62,8 +62,6 @@ pub const REPLIES: &[(&str, &str)] = &[
     ("prefix", "⚙️"),
     ("userinfo", "👤"),
     ("voice", "🔊"),
-    ("denied", "⛔"),
-    ("handled", "ℹ️"),
     ("failed", "⚠️"),
 ];
 
@@ -81,7 +79,6 @@ pub const LABELS: &[(&str, &str)] = &[
     ("Roles", "🏷️"),
     ("Voice", "🔊"),
     ("Warnings", "⚠️"),
-    ("Review", "🧑‍⚖️"),
     ("Author", "👤"),
     ("Owner", "👤"),
     ("User ID", "🆔"),
@@ -381,16 +378,9 @@ mod tests {
         for (template, kind) in [
             (d::MOD_REASON_DM_MODERATION_FAILED_TEMPLATE, "failed"),
             (d::USER_INFO_TEMPLATE, "userinfo"),
-            (d::ATTACHMENT_BURST_DENIED, "denied"),
-            (d::ATTACHMENT_BURST_HANDLED, "handled"),
-            (d::ATTACHMENT_BURST_FAILED, "failed"),
         ] {
             assert_one_per_title_and_label(template, reply(kind).unwrap());
         }
-        assert_eq!(
-            decorate_template(None, d::ATTACHMENT_BURST_DECISION),
-            "{body}\n\n**🧑‍⚖️ Review:** {decision} by {actor}"
-        );
         assert_eq!(
             decorate_template(Some("👤"), d::USER_INFO_TEMPLATE)
                 .lines()

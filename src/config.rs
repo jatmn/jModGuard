@@ -15,7 +15,6 @@ struct Config {
     pub member_sync: MemberSyncConfig,
     pub enrollment: EnrollmentConfig,
     pub image_spam: crate::image_spam::Limits,
-    pub attachment_burst: crate::attachment_burst::Settings,
     pub discord: DiscordConfig,
     pub db: DbConfig,
     pub guild_stores: GuildStoresConfig,
@@ -461,7 +460,6 @@ pub struct BotProcessConfig {
     pub member_sync: MemberSyncConfig,
     pub enrollment: EnrollmentConfig,
     pub image_spam: crate::image_spam::Limits,
-    pub attachment_burst: crate::attachment_burst::Settings,
     pub discord: DiscordConfig,
     pub db: DbConfig,
     pub guild_stores: GuildStoresConfig,
@@ -494,7 +492,6 @@ impl From<Config> for BotProcessConfig {
             member_sync: c.member_sync,
             enrollment: c.enrollment,
             image_spam: c.image_spam,
-            attachment_burst: c.attachment_burst,
             discord: c.discord,
             db: c.db,
             guild_stores: c.guild_stores,
@@ -525,7 +522,6 @@ impl From<BotProcessConfig> for Config {
             member_sync: c.member_sync,
             enrollment: c.enrollment,
             image_spam: c.image_spam,
-            attachment_burst: c.attachment_burst,
             discord: c.discord,
             db: c.db,
             guild_stores: c.guild_stores,
@@ -544,7 +540,6 @@ impl From<ApiProcessConfig> for Config {
             member_sync: MemberSyncConfig::default(),
             enrollment: EnrollmentConfig::default(),
             image_spam: crate::image_spam::Limits::default(),
-            attachment_burst: crate::attachment_burst::Settings::default(),
             discord: DiscordConfig::default(),
             db: c.db,
             guild_stores: c.guild_stores,
@@ -618,7 +613,6 @@ impl Config {
         if !api {
             cfg.enrollment.validate()?;
             cfg.image_spam.validate()?;
-            cfg.attachment_burst.validate()?;
             cfg.action_worker.validate()?;
             cfg.member_sync.validate()?;
         }
@@ -759,11 +753,6 @@ impl Config {
                 self.image_spam = serde_json::from_str(&raw)
                     .context("invalid JMODGUARD_IMAGE_SPAM_LIMITS JSON")?;
                 self.image_spam.validate()?;
-            }
-            if let Ok(raw) = env::var("JMODGUARD_ATTACHMENT_BURST") {
-                self.attachment_burst = serde_json::from_str(&raw)
-                    .context("invalid JMODGUARD_ATTACHMENT_BURST JSON")?;
-                self.attachment_burst.validate()?;
             }
             self.enrollment.apply_env()?;
             self.action_worker.apply_env()?;
@@ -1173,26 +1162,6 @@ mod tests {
             std::env::set_var("JMODGUARD_IMAGE_SPAM_LIMITS", r#"{"concurrency":0}"#);
         }
         assert!(Config::default().apply_env_for(false).is_err());
-    }
-
-    #[test]
-    fn attachment_burst_settings_parse_for_the_bot() {
-        let bot = Config::parse_file(
-            "[attachment_burst]\nenabled=false\nmin_channels=3\nwindow_secs=5\ntimeout_secs=120\n",
-            false,
-        )
-        .unwrap();
-        assert!(!bot.attachment_burst.enabled);
-        assert_eq!(bot.attachment_burst.min_channels, 3);
-        assert_eq!(bot.attachment_burst.window_secs, 5);
-        assert_eq!(bot.attachment_burst.timeout_secs, 120);
-        let one_channel =
-            Config::parse_file("[attachment_burst]\nmin_channels=1\n", false).unwrap();
-        assert!(one_channel.attachment_burst.validate().is_err());
-        // The API process keeps the default and does not apply this section.
-        let api = Config::parse_file("[attachment_burst]\nenabled=false\n", true).unwrap();
-        assert!(api.attachment_burst.enabled);
-        assert_eq!(api.attachment_burst.min_channels, 2);
     }
 
     #[test]

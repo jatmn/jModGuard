@@ -584,7 +584,7 @@ async fn main() -> Result<()> {
                 interval.tick().await;
                 app.automod.prune();
                 app.image_spam.prune();
-                app.attachment_burst.prune();
+                app.prune_recent_messages();
                 app.text_spam.prune();
             }
         });

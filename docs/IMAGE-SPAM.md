@@ -81,24 +81,32 @@ not retried.
 
 ## Enforcement
 
-A verified match in delete-and-ban mode rechecks current configuration, enrollment
-and exemptions, then deletes each matched message and bans the author. Deletion and
-ban outcomes are recorded separately. Each rule exposes **Ban** (default, no
-history deletion) or **Ban and purge (previous hour)**. Purge sends
-`delete_message_seconds=3600` on the Ban Member request for a server-wide sweep
-of that member’s messages. Ban sends `0`; the bot does not fetch or scan channel
-history. Matched-message deletes still happen in either mode. Dry-run never
-bans or purges. Existing configurations stay unchanged until an operator selects
-purge. Legacy whole-day ban values remain supported as described in
-[AUTOMOD.md](AUTOMOD.md). A 404 on delete is treated as already gone.
+A match in delete-and-ban mode rechecks current configuration, enrollment and
+exemptions, then deletes each matched message and bans the author. Fresh spam
+defaults select **Ban and purge (previous hour)**. This sends
+`delete_message_seconds=3600` on the Ban Member request. After Discord confirms
+the ban, the bot also sweeps the author's remaining tracked messages across
+guild channels within the same window. **Ban** keeps the zero-second Discord
+window. Matched-message deletes happen in both modes. Dry-run never bans or
+purges. Saved keep-messages and legacy day windows still apply. See
+[AUTOMOD.md](AUTOMOD.md). The log counts successful individual deletes. A 404
+means the message is already gone, and Discord does not return a count for its
+ban purge.
+
+The sweep uses in-process Gateway message identities and creation timestamps.
+It retains no text or attachments, keeps up to 32,768 messages process-wide,
+and expires entries after the maximum seven-day ban window. Coverage depends
+on messages the bot observed and retained. Discord permissions, API failures
+or the sweep deadline can limit delivery. There is no channel history fetch.
+
 If both rules match the same author in a short window, only one ban is attempted;
 remaining matched messages can still be deleted. Cases store proving message IDs,
 hashes or trimmed text. Test reports stay Discord logs only, with no SQL cases and no
 object capture.
 
-A verified image match, in either mode, uses a reason that describes the
-identical-image match. The automod Evidence field lists the matched channel and
-message ids and the proving SHA-256 hashes. It does not include image bytes or
+The image match reason identifies whether the bot compared bytes or used
+attachment metadata. The Evidence field lists the matched channel and message
+IDs and any proving SHA-256 hashes. It does not include image bytes or
 the attachment address. If a download, request budget, or comparison work budget stops analysis before a
 match is proven, the automod title is **Exact image check incomplete**, the action
 is **no action; check did not finish**, and the Evidence field names the stopping
@@ -162,27 +170,15 @@ cannot punish. Normal cross-process configuration polling delay still applies.
 Learning is explicit: confirm a digest, then add it in the WebUI. A dry-run match
 never adds a digest automatically.
 
-## Cross-channel attachment burst
+## Fast cross-channel image matching
 
-Process settings `[attachment_burst]` and `JMODGUARD_ATTACHMENT_BURST` watch
-one member posting the same attachment in several channels a few seconds
-apart. The default is 2 channels inside 10 seconds, then a 10 minute timeout
-and a mod-log post with Release and Ban buttons. A finished check matches the
-exact content hash. An unfinished check matches size, filename, and content
-type, so a body-length mismatch still counts. This does not change the
-exact-image size check, does not use that rule's 3-channel exact-hash
-threshold, and does not look at account age. Repeats in one channel, posts
-outside the window, and other members do not count. A repeated delivery of
-the same message does not time the member out again. The timeout is the only
-automatic action; the buttons reuse the existing timeout removal, ban, and
-case paths. A button posted before a restart does not apply to a later review.
-Before applying the automatic timeout, the bot reads the member's current timeout
-from Discord and preserves an equal or longer timeout already in place.
-Automatic timeout reads and writes are serialized per member within the existing
-four admitted burst actions, so overlapping bursts read the preceding action's
-settled timeout. Waiting observes the same deadline and shutdown cutoff as other
-Discord work. The REST read and write are not atomic against external moderators
-or a remote request whose outcome remains uncertain.
+Exact image spam also matches an image posted by the same author in two
+distinct channels within 10 seconds, or less if the rule window is shorter.
+Before the byte comparison finishes, matching filename, declared size and
+media type can establish this match. The log identifies when metadata supplied
+the match. Different files can share that metadata. The configured channel and
+file-count thresholds still apply to the byte-hash comparison. The rule's
+Enabled, Dry-run, scope and exemptions apply to both match paths.
 
 ## Resource controls
 

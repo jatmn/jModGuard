@@ -3432,7 +3432,7 @@ const RULE_TRIGGERS = {
       { key: "min_channels", label: "Distinct channels", fallback: 3, min: 2, max: 10, after: "channels within" },
       { key: "window_secs", label: "Window (seconds)", fallback: 60, after: "seconds" },
     ],
-    hint: "Matches identical image files. Extra images in a message are fine.",
+    hint: "These thresholds apply to identical image files. The rule also matches the same filename, size and media type in two channels up to 10 seconds apart, within the rule window.",
     phrase: (v) =>
       `When someone posts the same ${v.min_attachments} or more images in ${v.min_channels} or more channels within ${v.window_secs} seconds`,
   },
@@ -3529,7 +3529,7 @@ function setSpamRuleMode(rule, ruleId, punish, number, ban) {
 
 // The ban step a spam rule keeps across test and enforce modes.
 function spamRuleBan(rule) {
-  return (rule.actions || []).find((action) => action.action === "ban") || (rule.actions || [])[0] || {};
+  return (rule.actions || []).find((action) => action.action === "ban") || (rule.actions || [])[0] || { purge_last_hour: true };
 }
 
 // The "then" half of a rule summary, in the bot's terms.
@@ -5683,7 +5683,7 @@ const TEMPLATE_VARIABLE_GAPS = {
   },
   message_delete: { mention: NOT_SEEN, content: NOT_SEEN, attachments: NOT_SEEN },
   automod: {
-    channel: "Only filled in by the exact-image, repeated-text and attachment-burst rules. Other rules leave it as typed.",
+    channel: "Only filled in by the exact-image and repeated-text rules. Other rules leave it as typed.",
     content: "Empty for the honeypot role rule, which acts on a role change rather than a message.",
   },
   timeout_add: { actor: "Only filled in when a bot command gave the timeout. For a timeout given in Discord, it stays as typed." },

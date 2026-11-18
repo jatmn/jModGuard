@@ -33,6 +33,10 @@ pub(crate) enum ReportDisposition {
 #[derive(Clone)]
 pub enum MatchPolicy {
     Image(jmodguard::image_spam::Policy),
+    ImageMetadata {
+        policy: jmodguard::image_spam::Policy,
+        serials: [u64; 2],
+    },
     Text(jmodguard::text_spam::Policy),
 }
 
@@ -50,7 +54,7 @@ impl MatchPolicy {
 
     fn enforce(&self) -> bool {
         match self {
-            Self::Image(policy) => policy.enforce,
+            Self::Image(policy) | Self::ImageMetadata { policy, .. } => policy.enforce,
             Self::Text(policy) => policy.enforce,
         }
     }
@@ -67,7 +71,7 @@ impl MatchPolicy {
         own_deletes: &[crate::image_spam::OwnDelete],
     ) -> bool {
         match self {
-            Self::Image(policy) => {
+            Self::Image(policy) | Self::ImageMetadata { policy, .. } => {
                 let proof = crate::image_spam::MatchProof {
                     token: found.token,
                     messages: &found.messages,
@@ -75,7 +79,15 @@ impl MatchPolicy {
                     policy,
                     now,
                 };
-                if own_deletes.is_empty() {
+                if let Self::ImageMetadata { serials, .. } = self {
+                    app.image_spam.metadata_still_proving(
+                        found.guild,
+                        found.author,
+                        proof,
+                        own_deletes,
+                        *serials,
+                    )
+                } else if own_deletes.is_empty() {
                     app.image_spam
                         .match_still_proving(found.guild, found.author, proof)
                 } else {
@@ -296,7 +308,15 @@ pub(crate) async fn enforce(
         return ReportDisposition::Consumed;
     };
     let policy = match found.kind {
-        Kind::Image => crate::image_spam::policy_for_config(&cfg, rule_def).map(MatchPolicy::Image),
+        Kind::Image => {
+            crate::image_spam::policy_for_config(&cfg, rule_def).map(|policy| match &found.policy {
+                MatchPolicy::ImageMetadata { serials, .. } => MatchPolicy::ImageMetadata {
+                    policy,
+                    serials: *serials,
+                },
+                _ => MatchPolicy::Image(policy),
+            })
+        }
         Kind::Text => MatchPolicy::parse(found.kind, rule_def),
     };
     let Some(policy) = policy else {
@@ -504,7 +524,11 @@ async fn punish_proven_match(
         .await;
         return ReportDisposition::Consumed;
     }
+    if withhold_ban && matches!(&found.policy, MatchPolicy::ImageMetadata { .. }) {
+        return ReportDisposition::Consumed;
+    }
     let now = Instant::now();
+    let mut deleted_count = 0;
     let mut delete_notes = Vec::new();
     let mut own_deletes = Vec::new();
     let mut proof_stale = false;
@@ -580,6 +604,8 @@ async fn punish_proven_match(
         }
         let outcome = match result {
             Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
+                deleted_count += 1;
+                app.recent_messages.forget(found.guild, *channel, *message);
                 crate::logging::spawn_prepared_automod_delete(
                     std::sync::Arc::clone(app),
                     Arc::clone(&http),
@@ -723,7 +749,13 @@ async fn punish_proven_match(
             "{}",
             jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING
         );
-    } else if !proof_stale && app.spam_gate.claim_ban(found.guild, found.author, now) {
+    } else if !proof_stale
+        && let Some(ban_action) = rule_def
+            .actions
+            .iter()
+            .find(|action| action.action == "ban")
+        && app.spam_gate.claim_ban(found.guild, found.author, now)
+    {
         let decision = crate::member_directory::observe_ban_handoff(
             app,
             http.as_ref(),
@@ -806,16 +838,22 @@ async fn punish_proven_match(
                                     http.as_ref(),
                                     GuildId::new(found.guild),
                                     UserId::new(found.author),
-                                    rule_def
-                                        .actions
-                                        .iter()
-                                        .find(|a| a.action == "ban")
-                                        .expect("validated spam policy requires a ban action"),
+                                    ban_action,
                                     &discord_reason,
                                 ),
                             )
                             .await
                             {
+                                if outcome == CaseOutcome::Succeeded {
+                                    deleted_count += crate::recent_messages::sweep_after_ban(
+                                        app,
+                                        http.as_ref(),
+                                        &enrollment,
+                                        found.author,
+                                        ban_action.ban_delete_message_seconds(),
+                                    )
+                                    .await;
+                                }
                                 ban_outcome = Some(outcome);
                             }
                         }
@@ -834,7 +872,7 @@ async fn punish_proven_match(
     } else {
         match ban_outcome {
             None => "delete remaining; ban already applied this window".into(),
-            Some(outcome) => format!("delete matched messages; ban {outcome:?}"),
+            Some(outcome) => format!("ban {outcome:?}, deleted {deleted_count} messages"),
         }
     };
     let notes = delete_notes.join("; ");
@@ -1487,7 +1525,32 @@ pub(crate) mod tests {
         "avatar_decoration_data": null
     }"#;
 
-    fn read_http_request(stream: &mut std::net::TcpStream) -> Option<(String, String, String)> {
+    pub(crate) struct DiscordRequest {
+        pub method: String,
+        pub path: String,
+        pub body: String,
+        pub reason: String,
+    }
+
+    impl DiscordRequest {
+        pub(crate) fn summary(&self) -> String {
+            if self.method == "PUT" && self.path.contains("/bans/") {
+                return format!("{} {} {}", self.method, self.path, self.body);
+            }
+            format!("{} {}", self.method, self.path)
+        }
+    }
+
+    pub(crate) fn assert_ban_request(request: &str, guild: u64, user: u64, seconds: u32) {
+        let path = format!("PUT /api/v10/guilds/{guild}/bans/{user} ");
+        let body = request
+            .strip_prefix(&path)
+            .unwrap_or_else(|| panic!("{request}"));
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body, serde_json::json!({"delete_message_seconds": seconds}));
+    }
+
+    pub(crate) fn read_http_request(stream: &mut std::net::TcpStream) -> Option<DiscordRequest> {
         use std::io::Read;
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
         let mut buf = Vec::new();
@@ -1511,6 +1574,12 @@ pub(crate) mod tests {
         let header_end = buf.windows(4).position(|window| window == b"\r\n\r\n")?;
         let header = String::from_utf8_lossy(&buf[..header_end]);
         let mut parts = header.lines().next()?.split_whitespace();
+        let reason = header
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.eq_ignore_ascii_case("x-audit-log-reason"))
+            .map(|(_, value)| value.trim().to_owned())
+            .unwrap_or_default();
         let method = parts.next()?.to_string();
         let path = parts.next()?.to_string();
         let length = header
@@ -1530,7 +1599,12 @@ pub(crate) mod tests {
             buf.extend_from_slice(&tmp[..n]);
         }
         let body = String::from_utf8(buf[header_end + 4..header_end + 4 + length].to_vec()).ok()?;
-        Some((method, path, body))
+        Some(DiscordRequest {
+            method,
+            path,
+            body,
+            reason,
+        })
     }
 
     pub(crate) fn serve_discord_stub<F>(
@@ -1551,11 +1625,16 @@ pub(crate) mod tests {
                     let lines = Arc::clone(&lines);
                     let before_response = Arc::clone(&before_response);
                     std::thread::spawn(move || {
-                        let Some((method, path, request_body)) = read_http_request(&mut stream)
-                        else {
+                        let Some(request) = read_http_request(&mut stream) else {
                             return;
                         };
-                        lines.lock().push(format!("{method} {path}"));
+                        lines.lock().push(request.summary());
+                        let DiscordRequest {
+                            method,
+                            path,
+                            body: request_body,
+                            ..
+                        } = request;
                         let status_override = before_response.lock()(&method, &path, &request_body);
                         let body = if method == "GET" && path.contains("/members/") {
                             MEMBER_JSON
@@ -1695,10 +1774,7 @@ pub(crate) mod tests {
                     .filter(|line| line.starts_with("PUT ") && line.contains("/bans/99"))
                     .collect();
                 assert_eq!(bans.len(), 1, "{seen:?}");
-                assert!(
-                    bans[0].ends_with(&format!("delete_message_seconds={expected}")),
-                    "{seen:?}"
-                );
+                assert_ban_request(bans[0], 10, 99, expected);
                 let deletes: Vec<_> = seen
                     .iter()
                     .filter(|line| line.starts_with("DELETE "))

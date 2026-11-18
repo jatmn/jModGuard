@@ -31,10 +31,9 @@ escalation accurate without false positives.
   rule editor. Test mode logs only; enforcement deletes matched messages and bans.
   Creates and attachment-changing edits participate.
 - See [exact-image and repeated-text settings](IMAGE-SPAM.md).
-- A separate attachment burst can time out the same image posted in two or
-  more channels within a few seconds, then ask moderators to release or ban.
-  It does not use the exact-image thresholds or account age. See
-  [IMAGE-SPAM.md](IMAGE-SPAM.md).
+- The same author posting matching image attachment metadata in two channels
+  within 10 seconds can trigger this rule immediately. The selected rule window
+  can shorten that interval. The same action and exceptions apply.
 
 ### 3. `repeat_text` — exact trimmed text
 - The same author posts the same trimmed string across distinct channels.
@@ -86,7 +85,10 @@ own path.
 Every ban action offers **Ban** (no history deletion) or **Ban and purge
 (previous hour)** in the WebUI. Purge asks Discord's Ban Member API to delete
 that member's messages across the server from the previous hour, using
-`delete_message_seconds=3600`. Ban sends `0`. The bot never scans channel history.
+`delete_message_seconds=3600` in the JSON body. Ban sends `0`. After a successful
+ban with a deletion window, the bot sweeps the author's remaining tracked
+messages within that window. Coverage depends on
+[the bot's bounded Gateway observations](IMAGE-SPAM.md#enforcement).
 This applies to built-in generic rules, custom rules, Exact image spam and
 Repeated text. Matched spam-message deletes still run separately.
 
@@ -96,7 +98,8 @@ seconds, through `delete_days: 7` for seven days. The shipped Mention spam defau
 stays one day. The WebUI shows **Keep existing: delete N day(s)** for these legacy
 values and preserves them on an unchanged save. Explicitly selecting Ban or
 Ban and purge clears the old days value. `purge_last_hour: true` takes precedence
-if a stored action includes both fields. No purge is enabled automatically.
+if a stored action includes both fields. For new Exact image spam and Repeated
+text rules, the editor preselects the previous hour when enabling enforcement.
 
 Example stored ban actions (inside a rule's `actions` array):
 
