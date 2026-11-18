@@ -21,7 +21,7 @@ use [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). For EC2, [DEPLOY-AWS.md](DEPLOY-AWS.md)
   via `rust-toolchain.toml` (same as `Cargo.toml` `rust-version` and the
   Docker builder images). `rustup` will select that pin automatically in this
   directory.
-- Node.js ^22.22.2 or 26+ and npm for the embedded WebUI build (see `tools/webui/package.json`).
+- Node.js ^22.22.2 or 24+ and npm for the embedded WebUI build (see `tools/webui/package.json`).
 - A Discord account (the bot owner).
 - Somewhere to run it: a Linux machine that stays online (VPS, home
   server, Raspberry Pi class box is fine).
@@ -103,7 +103,7 @@ cd jModGuard
 # rust-toolchain.toml selects Rust 1.96.0 via rustup.
 # Independent bot package (no dashboard stack).
 cargo build --locked --release -p jmodguard-bot
-# API with the default embedded frontend (Node.js ^22.22.2 or 26+).
+# API with the default embedded frontend (Node.js ^22.22.2 or 24+).
 npm ci --ignore-scripts --prefix tools/webui
 npm run build --prefix tools/webui
 cargo build --locked --release -p jmodguard-api
