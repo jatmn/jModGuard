@@ -5126,7 +5126,7 @@ test('signed-in dashboard footer links to public policies on the page origin', a
   h.window.JMODGUARD_API_BASE = 'https://api.example.test';
   await h.app.init();
   await settle();
-  const links = h.document.querySelectorAll('#main-view footer nav[aria-label="Policies"] a');
+  const links = h.document.querySelectorAll('#main-view footer.workspace-footer nav[aria-label="Policies"] a');
   assert.deepEqual(Array.from(links, link => [link.textContent, link.href]), [
     ['Privacy Policy', `${h.window.location.origin}/privacy`],
     ['Terms of Service', `${h.window.location.origin}/terms`],
