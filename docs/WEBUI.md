@@ -246,10 +246,12 @@ the Owner sections (Bot servers, Database Usage, Platform analytics, Bot Resourc
 stay with the configured bot owner. Ban, unban and ban-reason edits keep
 their own Discord **Ban Members** requirement.
 
-The API checks the user's current roles with Discord on every guild request
+The API checks the user's current roles with Discord
 (`guilds.members.read`, `GET /users/@me/guilds/{id}/member` with the user's own
-OAuth token) and reuses an answer for at most 30 seconds, so a removed role stops
-working within 30 seconds. If Discord cannot confirm the roles, the request is
+OAuth token) and reuses an answer for at most 4 minutes. When the bot sees that
+member's roles change, a server role's permissions change or the role is deleted, or the server owner change, it records that in the
+database and the next request asks Discord again, so a removed role usually stops
+working within a few seconds and always within 4 minutes. If Discord cannot confirm the roles, the request is
 refused. Accounts that signed in before this scope was requested must sign out
 and sign in again before role access works. The bot rechecks the actor's roles
 from its own Discord data before applying a settings edit or a log-channel

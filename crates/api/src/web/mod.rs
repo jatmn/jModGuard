@@ -288,7 +288,7 @@ impl AuthCtx {
     /// True when this auth context's guild list includes Manage Guild for `guild_id`.
     ///
     /// **Invariant:** only call this on an `AuthCtx` produced by
-    /// [`require_auth_fresh`] / [`authorize_manage_guild`]. Never on a
+    /// [`require_auth_for_guilds`] for that guild / [`authorize_manage_guild`]. Never on a
     /// display-cached (`CachedOk`) context — that reopens the post-demotion
     /// window (see `copy_config` → source guild).
     pub fn can_manage(&self, guild_id: u64) -> bool {
@@ -401,34 +401,66 @@ pub fn require_bot_owner(app: &ApiState, auth: &AuthCtx) -> ApiResult<()> {
 
 /// How guild membership/permissions may be sourced for this auth call.
 ///
-/// Display (`/api/me`) may use a short in-memory cache to spare Discord rate
-/// limits, and may keep showing the last good list while that route is cooling
-/// down. Authorization uses a separate session/token snapshot bounded to seconds.
+/// Display (`/api/me`) may use the per-user display cache to spare Discord
+/// rate limits, and may keep showing the last good list while that route is
+/// cooling down. Authorization uses the separate session/token snapshot,
+/// which gateway access marks can invalidate before it expires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GuildListMode {
-    /// Prefer cache ≤60s (sidebar / profile listing only).
+    /// Prefer the display cache (sidebar / profile listing only).
     CachedOk,
-    /// Reuse only the short session/token authorization snapshot.
+    /// Reuse only the session/token authorization snapshot.
     MustRefresh,
 }
 
-const USER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-const GUILD_DISPLAY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const USER_CACHE_TTL: std::time::Duration = GUILD_AUTH_MAX_STALE;
+const GUILD_DISPLAY_CACHE_TTL: std::time::Duration = GUILD_AUTH_MAX_STALE;
 
 /// Loads the authenticated Discord user + guilds for **display** (cached OK).
 pub async fn require_auth(app: &Arc<ApiState>, session: &Session) -> ApiResult<AuthCtx> {
-    require_auth_with(app, session, GuildListMode::CachedOk).await
+    require_auth_with(app, session, GuildListMode::CachedOk, &[]).await
 }
 
-/// Loads auth with a **fresh** Discord guild list for authorization decisions.
+/// The authorization snapshot without any guild's access marks. Tests only:
+/// production decisions must name their guilds ([`require_auth_for_guilds`]).
+#[cfg(test)]
 pub async fn require_auth_fresh(app: &Arc<ApiState>, session: &Session) -> ApiResult<AuthCtx> {
-    require_auth_with(app, session, GuildListMode::MustRefresh).await
+    require_auth_with(app, session, GuildListMode::MustRefresh, &[]).await
 }
 
-// Authorization never uses the 60s display cache. Even during rate limits,
-// permissions may be stale for at most five seconds after a successful fetch.
-const GUILD_AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
-const GUILD_AUTH_MAX_STALE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Loads auth from the session's authorization snapshot for decisions about
+/// `guilds`: a gateway access mark recorded for one of them (or for this user
+/// in one) since the snapshot was fetched makes the snapshot too old, and
+/// Discord is asked again.
+pub async fn require_auth_for_guilds(
+    app: &Arc<ApiState>,
+    session: &Session,
+    guilds: &[u64],
+) -> ApiResult<AuthCtx> {
+    require_auth_with(app, session, GuildListMode::MustRefresh, guilds).await
+}
+
+// Authorization never uses the display cache. A successful snapshot is reused
+// for minutes and refreshed in the background after GUILD_REFRESH_AFTER (plus
+// per-user jitter), so active pages do not wait for Discord. It is never used
+// past GUILD_AUTH_CACHE_TTL, or past GUILD_AUTH_MAX_STALE while Discord is
+// rate-limiting the refresh. Gateway role/member/owner updates the bot records
+// as access marks invalidate it for that guild on the next request.
+const GUILD_REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+const GUILD_REFRESH_JITTER_MS: u64 = 30_000;
+const GUILD_AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(240);
+const GUILD_AUTH_MAX_STALE: std::time::Duration = std::time::Duration::from_secs(300);
+const _: () = assert!(
+    GUILD_AUTH_MAX_STALE.as_secs() < crate::db::ACCESS_MARK_RETENTION.as_secs(),
+    "the bot must keep access marks longer than any snapshot is used"
+);
+
+/// When this user's snapshot is refreshed in the background. The per-user
+/// offset spreads refreshes for users who signed in together.
+fn guild_refresh_after(user_id: u64) -> std::time::Duration {
+    let spread = (user_id ^ (user_id >> 22)) % GUILD_REFRESH_JITTER_MS;
+    GUILD_REFRESH_AFTER + std::time::Duration::from_millis(spread)
+}
 
 const REFRESH_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(5);
 const REFRESH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
@@ -497,6 +529,10 @@ pub(super) struct SessionAuth {
     token: Option<String>,
     refresh: Option<String>,
     guilds: Option<(std::time::Instant, Vec<DiscordGuild>)>,
+    /// Access epoch read before `guilds` was fetched.
+    guilds_epoch: i64,
+    /// A background refresh of `guilds` is running.
+    refreshing: bool,
     lifecycle: SessionLifecycle,
     last_used: Option<std::time::Instant>,
     refresh_hold: Option<RefreshHold>,
@@ -610,6 +646,7 @@ async fn require_auth_with(
     app: &Arc<ApiState>,
     session: &Session,
     guild_mode: GuildListMode,
+    check: &[u64],
 ) -> ApiResult<AuthCtx> {
     reject_retired_session(app, session).await?;
     let Some(user_id) = session
@@ -643,14 +680,14 @@ async fn require_auth_with(
             Some(state)
         }
     };
-    let Some(state) = state else {
+    let Some(shared) = state else {
         session
             .flush()
             .await
             .map_err(|error| anyhow::Error::new(error).context(SessionStoreUnavailable))?;
         return Err(AuthLost.into());
     };
-    let mut state = state.lock().await;
+    let mut state = shared.lock().await;
     reject_retired_session(app, session).await?;
     if state.lifecycle.is_retired() {
         session
@@ -660,6 +697,12 @@ async fn require_auth_with(
         return Err(AuthLost.into());
     }
     state.last_used = Some(std::time::Instant::now());
+    if state.guilds.is_some()
+        && !check.is_empty()
+        && guild_access_mark(app, user_id, check).await? > state.guilds_epoch
+    {
+        state.guilds = None;
+    }
     let token = match &state.token {
         Some(token) => token.clone(),
         None => session
@@ -733,7 +776,7 @@ async fn require_auth_with(
             ))
         });
     }
-    let first = load_auth(app, user_id, &token, guild_mode, &mut state).await;
+    let first = load_auth(app, user_id, &token, guild_mode, &mut state, &shared).await;
     if !first
         .as_ref()
         .is_err_and(|error| error.0.is::<oauth::DiscordUnauthorized>())
@@ -780,6 +823,7 @@ async fn require_auth_with(
             &refreshed.access_token,
             guild_mode,
             &mut state,
+            &shared,
         )
         .await;
         if !result
@@ -808,9 +852,18 @@ async fn load_auth(
     token: &str,
     guild_mode: GuildListMode,
     state: &mut SessionAuth,
+    shared: &Arc<tokio::sync::Mutex<SessionAuth>>,
 ) -> ApiResult<AuthCtx> {
     let now = std::time::Instant::now();
     let cached_user = cached_user(app, user_id);
+    if let Some((at, _)) = &state.guilds {
+        let age = at.elapsed();
+        if age >= guild_refresh_after(user_id)
+            && GuildSnapshotAge::from_age(age) == GuildSnapshotAge::Fresh
+        {
+            start_guild_refresh(app, shared, state, user_id, token);
+        }
+    }
 
     // Display path only: serve a fresh list, or the last good list while
     // Discord is still cooling down. Authorization never takes this branch.
@@ -824,9 +877,11 @@ async fn load_auth(
     {
         guilds.clone()
     } else {
-        match app.oauth.my_guilds(user_id, token).await {
+        let epoch = current_access_epoch(app).await;
+        match app.oauth.my_guilds_at(user_id, token, epoch).await {
             Ok(guilds) => {
                 state.guilds = Some((std::time::Instant::now(), guilds.clone()));
+                state.guilds_epoch = epoch;
                 guilds
             }
             Err(oauth::GuildListError::RateLimited { .. })
@@ -859,6 +914,87 @@ async fn load_auth(
     };
     preview::apply_overlay(&mut auth)?;
     Ok(auth)
+}
+
+/// Serves the current snapshot while one background request replaces it.
+/// The result is kept only if this login still uses the same token and no
+/// newer snapshot arrived meanwhile. Failures leave the snapshot to expire.
+fn start_guild_refresh(
+    app: &Arc<ApiState>,
+    shared: &Arc<tokio::sync::Mutex<SessionAuth>>,
+    state: &mut SessionAuth,
+    user_id: u64,
+    token: &str,
+) {
+    if state.refreshing {
+        return;
+    }
+    state.refreshing = true;
+    let refresh_profile = app
+        .user_cache
+        .get(&user_id)
+        .is_none_or(|entry| entry.value().0.elapsed() >= guild_refresh_after(user_id));
+    let app = Arc::clone(app);
+    let shared = Arc::clone(shared);
+    let token = token.to_owned();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let epoch = current_access_epoch(&app).await;
+        let guilds = app.oauth.my_guilds_at(user_id, &token, epoch).await;
+        let user = match (&guilds, refresh_profile) {
+            (Ok(_), true) => app.oauth.me(user_id, &token).await.ok(),
+            _ => None,
+        };
+        let mut state = shared.lock().await;
+        state.refreshing = false;
+        if state.lifecycle.is_retired() || state.token.as_deref() != Some(token.as_str()) {
+            return;
+        }
+        if let Ok(guilds) = guilds
+            && state.guilds.as_ref().is_none_or(|(at, _)| *at <= started)
+        {
+            state.guilds = Some((started, guilds.clone()));
+            state.guilds_epoch = epoch;
+            app.guild_cache.insert(user_id, (started, guilds));
+        }
+        if let Some(user) = user {
+            app.user_cache.insert(user_id, (started, user));
+        }
+    });
+}
+
+/// The access epoch to keep with a snapshot fetched after this call. An
+/// unreadable epoch is 0, so any kept mark invalidates that snapshot early.
+async fn current_access_epoch(app: &ApiState) -> i64 {
+    match crate::db::access_epoch(&app.db).await {
+        Ok(epoch) => epoch,
+        Err(error) => {
+            tracing::warn!("access epoch unavailable: {error:#}");
+            0
+        }
+    }
+}
+
+/// The newest gateway access mark for `user_id` in any of `guilds`.
+/// Unreadable marks deny: the snapshot cannot be shown to be current.
+async fn guild_access_mark(app: &ApiState, user_id: u64, guilds: &[u64]) -> ApiResult<i64> {
+    let Ok(user) = i64::try_from(user_id) else {
+        return Ok(0);
+    };
+    let mut newest = 0;
+    for guild in guilds.iter().filter_map(|guild| i64::try_from(*guild).ok()) {
+        if guild <= 0 {
+            continue;
+        }
+        match crate::db::access_mark(&app.db, guild, user).await {
+            Ok(mark) => newest = newest.max(mark),
+            Err(error) => {
+                tracing::warn!(guild_id = guild, "access marks unavailable: {error:#}");
+                return Err(ApiError(GuildAccessError::Unverified.into()));
+            }
+        }
+    }
+    Ok(newest)
 }
 
 async fn finish_guild_list(
@@ -937,10 +1073,10 @@ enum DisplayIdentitySource {
 ///
 /// The fresh profile cache is used as-is. Otherwise live `/users/@me` still
 /// runs. When that call is rate-limited, the profile still stored after the
-/// 60s TTL — or the session Discord user id — is enough to return the guild
-/// list. Other `me` failures still fail the request. The fallback is not
-/// written back into `user_cache`, so the next display read tries `me` again
-/// once Discord is no longer limiting it.
+/// five-minute profile TTL — or the session Discord user id — is enough to
+/// return the display list. Other `me` failures still fail the request.
+/// The fallback does not renew `user_cache`, so the next display read tries
+/// `me` again once Discord is no longer limiting it.
 async fn display_identity(
     app: &ApiState,
     user_id: u64,
@@ -974,7 +1110,8 @@ fn display_user_during_limit(app: &ApiState, user_id: u64) -> DiscordUser {
 
 /// Selects the display list and its discovery status. A lookup blocked by a
 /// rate limit can fall back to an empty list if there is no cached entry.
-/// `MustRefresh` uses only the separate short session/token snapshot.
+/// `MustRefresh` uses only the separate session/token snapshot subject to
+/// the authorization age limit and checks for newer access marks.
 fn take_cached_guilds(
     mode: GuildListMode,
     app: &ApiState,
@@ -1330,7 +1467,8 @@ async fn callback_response(
             .insert(uid, (std::time::Instant::now(), user));
         // Only a complete guild list enters either cache. A 429 leaves any
         // previous display list intact and the cooldown guides the next /api/me.
-        if let Ok(guilds) = oauth.my_guilds(uid, &tok.access_token).await {
+        let epoch = current_access_epoch(app).await;
+        if let Ok(guilds) = oauth.my_guilds_at(uid, &tok.access_token, epoch).await {
             let observed_at = std::time::Instant::now();
             // Rotation leaves the session without an ID until the store creates
             // the new record. Publish the permission snapshot before the
@@ -1353,6 +1491,7 @@ async fn callback_response(
                         token: Some(tok.access_token),
                         refresh: tok.refresh_token,
                         guilds: Some((observed_at, guilds.clone())),
+                        guilds_epoch: epoch,
                         last_used: Some(observed_at),
                         ..SessionAuth::default()
                     })),
@@ -2029,7 +2168,7 @@ pub(super) fn check_page_enrollment(
     )
 }
 
-/// Authorize Discord MANAGE_GUILD for a real guild id with a **fresh** guild list.
+/// Authorize Discord MANAGE_GUILD for a real guild id using its checked OAuth snapshot.
 ///
 /// This is the only safe entry point for `AuthCtx::can_manage` decisions.
 /// `guild_id=0` is not a Discord guild — callers that mean global must use
@@ -2042,12 +2181,15 @@ pub async fn authorize_manage_guild(
     authorize_guild(app, session, guild_id, GuildAccess::Manage).await
 }
 
-/// Authorize `need` in a real guild with a **fresh** guild list.
+/// Authorize `need` in a real guild using its checked OAuth snapshot.
+/// The snapshot is reused for up to four minutes (five during a Discord
+/// rate limit) and refetched when a newer access mark applies.
 ///
 /// Manage Server (or ownership) satisfies every level. Otherwise a member who
 /// currently holds a Discord role the guild mapped to at least `need` is
-/// admitted to that guild only. Roles are read live with the user's OAuth
-/// token and reused for at most [`MEMBER_ROLES_TTL`]; failures deny.
+/// admitted to that guild only. Roles are read with the user's OAuth token
+/// and reused for at most [`MEMBER_ROLES_TTL`] unless a gateway access mark
+/// replaces them sooner; failures deny.
 pub async fn authorize_guild(
     app: &Arc<ApiState>,
     session: &Session,
@@ -2062,8 +2204,9 @@ pub async fn authorize_guild(
     // Discord permission and database membership are independent admission
     // inputs. Fetch them concurrently so remote deployments do not pay both
     // network round trips serially before every guild operation.
+    let checked = [guild_id];
     let (auth, enrollment) = tokio::join!(
-        require_auth_fresh(app, session),
+        require_auth_for_guilds(app, session, &checked),
         require_active_enrollment(app, guild_id)
     );
     let mut auth = auth?;
@@ -2089,7 +2232,7 @@ pub(super) async fn authorize_actions(
     guild: u64,
     denied: &'static str,
 ) -> ApiResult<AuthCtx> {
-    let mut auth = require_auth_fresh(app, session).await?;
+    let mut auth = require_auth_for_guilds(app, session, &[guild]).await?;
     if guild == 0 {
         return Err(ApiError(anyhow::anyhow!(denied)));
     }
@@ -2183,8 +2326,9 @@ impl std::fmt::Display for MemberScopeMissing {
 impl std::error::Error for MemberScopeMissing {}
 
 /// How long a user's guild roles are reused. Removing a mapped role ends
-/// access after at most this long.
-pub const MEMBER_ROLES_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// access after at most this long, or on the next request once the bot has
+/// recorded the change from the gateway.
+pub const MEMBER_ROLES_TTL: std::time::Duration = GUILD_AUTH_CACHE_TTL;
 const MEMBER_ROLES_MAX_ENTRIES: usize = 10_000;
 const ROLE_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -2250,12 +2394,14 @@ async fn member_roles(
         }
     };
     let mut slot = slot.lock().await;
-    if let Some((at, roles)) = slot.as_ref()
+    if let Some((at, roles, epoch)) = slot.as_ref()
         && at.elapsed() < MEMBER_ROLES_TTL
+        && guild_access_mark(app, user_id, &[guild_id]).await? <= *epoch
     {
         return Ok(roles.clone());
     }
     *slot = None;
+    let epoch = current_access_epoch(app).await;
     let token = session
         .get::<String>(SESSION_TOKEN)
         .await
@@ -2263,7 +2409,7 @@ async fn member_roles(
         .ok_or_else(|| ApiError(anyhow::Error::new(NotAuthenticated)))?;
     match app.oauth.member_roles(user_id, guild_id, &token).await {
         Ok(roles) => {
-            *slot = Some((std::time::Instant::now(), roles.clone()));
+            *slot = Some((std::time::Instant::now(), roles.clone(), epoch));
             Ok(roles)
         }
         Err(oauth::MemberRolesError::MissingScope) => Err(ApiError(MemberScopeMissing.into())),
@@ -2355,8 +2501,9 @@ pub async fn authorize_ban_members(
             "this operation requires a Discord server"
         )));
     }
+    let checked = [guild_id];
     let (auth, enrollment) = tokio::join!(
-        require_auth_fresh(app, session),
+        require_auth_for_guilds(app, session, &checked),
         require_active_enrollment(app, guild_id)
     );
     let mut auth = auth?;
@@ -3626,7 +3773,7 @@ mod tests {
         // Regression: guild_scope(0) returns an owner identity with no guild
         // list. A caller that stuffed a stale guild onto that context must not
         // authorize a copy source from it. copy_config must obtain one
-        // require_auth_fresh snapshot for both servers, never use the
+        // require_auth_for_guilds snapshot for both servers, never use the
         // owner-only destination AuthCtx for the source.
         let stale = AuthCtx {
             enrollment: None,

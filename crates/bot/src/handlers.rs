@@ -8,7 +8,7 @@ use serenity::http::{LightMethod, RatelimitInfo};
 use serenity::model::channel::{GuildChannel, Message, PartialGuildChannel};
 use serenity::model::event::{GuildMemberUpdateEvent, MessageUpdateEvent, ResumedEvent};
 use serenity::model::gateway::Ready;
-use serenity::model::guild::{Guild, Member, Role, UnavailableGuild};
+use serenity::model::guild::{Guild, Member, PartialGuild, Role, UnavailableGuild};
 use serenity::model::id::{GuildId, MessageId, RoleId};
 use serenity::model::prelude::{ChannelId, User};
 use serenity::model::voice::VoiceState;
@@ -254,6 +254,16 @@ pub(crate) fn clear_remembered_if_bot_roles_changed(
     if old != new_roles {
         app.remembered_discord_targets.clear_guild(guild_id);
     }
+}
+
+/// Whether a member update can change their WebUI access: their role set
+/// changed, or the previous roles are unknown.
+fn member_roles_may_have_changed(old: Option<&Member>, roles: &[RoleId]) -> bool {
+    old.is_none_or(|old| {
+        let before: std::collections::HashSet<RoleId> = old.roles.iter().copied().collect();
+        let after: std::collections::HashSet<RoleId> = roles.iter().copied().collect();
+        before != after
+    })
 }
 
 pub(crate) fn clear_remembered_if_subject_roles_changed(
@@ -893,6 +903,7 @@ impl EventHandler for Handler {
         member_data: Option<Member>,
     ) {
         crate::resources::gateway_event("guild_member_removal");
+        self.app.access_marks.member(guild_id.get(), user.id.get());
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1636,6 +1647,11 @@ impl EventHandler for Handler {
         event: GuildMemberUpdateEvent,
     ) {
         crate::resources::gateway_event("guild_member_update");
+        if member_roles_may_have_changed(old_if_available.as_ref(), &event.roles) {
+            self.app
+                .access_marks
+                .member(event.guild_id.get(), event.user.id.get());
+        }
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1798,6 +1814,18 @@ impl EventHandler for Handler {
         }
     }
 
+    async fn guild_update(
+        &self,
+        _ctx: Context,
+        _old_data_if_available: Option<Guild>,
+        new_data: PartialGuild,
+    ) {
+        crate::resources::gateway_event("guild_update");
+        // Serenity 0.12.5 does not refresh its cached owner on GuildUpdate.
+        // The cached value can match the incoming owner after a real transfer.
+        self.app.access_marks.guild(new_data.id.get());
+    }
+
     async fn guild_role_create(&self, ctx: Context, new: Role) {
         crate::resources::gateway_event("guild_role_create");
         if !self.app.activation.allows_rule_trigger() {
@@ -1822,6 +1850,7 @@ impl EventHandler for Handler {
         removed_role_data_if_available: Option<Role>,
     ) {
         crate::resources::gateway_event("guild_role_delete");
+        self.app.access_marks.guild(guild_id.get());
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1848,6 +1877,12 @@ impl EventHandler for Handler {
         new: Role,
     ) {
         crate::resources::gateway_event("guild_role_update");
+        if old_data_if_available
+            .as_ref()
+            .is_none_or(|old| old.permissions != new.permissions)
+        {
+            self.app.access_marks.guild(new.guild_id.get());
+        }
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1986,6 +2021,23 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_role_set_changes_or_unknown_roles_mark_webui_access() {
+        use super::{Member, RoleId, member_roles_may_have_changed};
+        let mut old = Member::default();
+        old.roles = vec![RoleId::new(1), RoleId::new(2)];
+        assert!(!member_roles_may_have_changed(
+            Some(&old),
+            &[RoleId::new(2), RoleId::new(1)]
+        ));
+        assert!(member_roles_may_have_changed(Some(&old), &[RoleId::new(1)]));
+        assert!(member_roles_may_have_changed(
+            Some(&old),
+            &[RoleId::new(1), RoleId::new(2), RoleId::new(3)]
+        ));
+        assert!(member_roles_may_have_changed(None, &[RoleId::new(1)]));
+    }
+
     #[test]
     fn message_diagnostics_respect_configured_level() {
         const CHILD_LEVEL: &str = "JMODGUARD_TEST_MESSAGE_LOG_LEVEL";

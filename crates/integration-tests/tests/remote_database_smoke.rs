@@ -1,7 +1,8 @@
 use jmodguard::db::{
-    Db, DbOpenOptions, add_badword, add_warn, bump_config_version, get_config_version,
-    get_settings_primary, insert_event, list_badwords, list_warns, load_config_parts_with_version,
-    patch_settings, query_events, test_drop_next_commit_response,
+    Db, DbOpenOptions, access_epoch, access_mark, add_badword, add_warn, bump_config_version,
+    get_config_version, get_settings_primary, insert_event, list_badwords, list_warns,
+    load_config_parts_with_version, maintain_access_marks, patch_settings, query_events,
+    record_access_marks, test_drop_next_commit_response,
 };
 use jmodguard_bot::state::ConfigCache;
 use std::path::PathBuf;
@@ -162,6 +163,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     exercise_configuration_reads(&bot, &api).await;
     exercise_guild_store_catalog(&bot, &api).await;
     exercise_resource_rollups(&bot, &api).await;
+    exercise_access_mark_retention(&bot).await;
 
     // The fresh schema must not grow a chat or member archive on remote SQL.
     // Exercise the same check on the remote transport as on local SQLite.
@@ -176,6 +178,33 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     }).await.unwrap();
 
     exercise_remote_capacity_race(&bot, &api).await;
+}
+
+async fn exercise_access_mark_retention(bot: &Db) {
+    let api = Db::open_with(DbOpenOptions {
+        read_only: true,
+        ..remote_options(false)
+    })
+    .unwrap();
+
+    let epoch = record_access_marks(bot, vec![6100], vec![(6200, 42)])
+        .await
+        .unwrap();
+    assert_eq!(access_mark(&api, 6100, 42).await.unwrap(), epoch);
+    assert_eq!(access_mark(&api, 6200, 42).await.unwrap(), epoch);
+
+    bot.with_conn(|conn| {
+        conn.execute_batch_bounded(
+            "UPDATE meta SET value=CAST(value AS INTEGER) || ':1' WHERE key='access_mark:6100'",
+            64 * 1024 * 1024,
+        )
+    })
+    .await
+    .unwrap();
+    maintain_access_marks(bot).await.unwrap();
+    assert_eq!(access_mark(&api, 6100, 42).await.unwrap(), 0);
+    assert_eq!(access_mark(&api, 6200, 42).await.unwrap(), epoch);
+    assert_eq!(access_epoch(&api).await.unwrap(), epoch);
 }
 
 // Bot Resources: the bot writes minutes, their hour and its status in one

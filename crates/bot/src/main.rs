@@ -295,6 +295,7 @@ async fn main() -> Result<()> {
     app.install_discord_cache(Arc::clone(&cache));
     app.install_http_member_lookup(Arc::clone(&http));
 
+    tokio::spawn(jmodguard_bot::access_marks::run(Arc::clone(&app)));
     tokio::spawn(jmodguard_bot::resources::run(
         Arc::clone(&app),
         client.shard_manager.clone(),

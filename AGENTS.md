@@ -366,21 +366,29 @@ authorize live provider calls or require a Codex skill to contribute.
   check that identity use the session user id and do not fetch the Discord
   guild list.
 - Guild-scoped WebUI authorization (`guild_scope` for real guild ids) always
-  checks a session/token-bound successful Discord guild snapshot before `can_manage`: 3s reuse,
-  at most 5s fallback only on rate limits, then fail closed. The 60s guild
-  cache is **display-only** (`/api/me`). While Discord is rate-limiting that
-  user, display may keep serving the last good list. Never authorize mutations
-  from the display cache (post-demotion access window).
+  checks a session/token-bound successful Discord guild snapshot before `can_manage`
+  (#653): reused up to `GUILD_AUTH_CACHE_TTL` (4 min), refreshed in the background
+  (one request per login) after about 2 min, at most `GUILD_AUTH_MAX_STALE` (5 min)
+  only on rate limits, then fail closed. The bot records gateway role, member and
+  owner changes as `meta` access marks under a monotonic `access_epoch`
+  (`src/db/access_marks.rs`); a snapshot whose epoch predates a mark for that guild,
+  or for that user in it, is refetched before use, and an unreadable mark denies.
+  Callers pass the guilds they decide on (`require_auth_for_guilds`). Keep the bot's
+  mark retention longer than `GUILD_AUTH_MAX_STALE`. The guild display cache is
+  **display-only** (`/api/me`). While Discord is rate-limiting that user, display
+  may keep serving the last good list. Never authorize mutations from the display
+  cache (post-demotion access window).
 - `AuthCtx` from `guild_scope(0)` is the session owner only and has no guild
   list. Any secondary Discord guild check (e.g. `copy_config` source) must use
-  `authorize_manage_guild` / `require_auth_fresh` — never `auth.can_manage`
+  `authorize_manage_guild` / `require_auth_for_guilds` naming that guild — never `auth.can_manage`
   on that context.
 - WebUI access roles (`guild_tenant_settings.access_roles`) map Discord roles to
   `dashboard` (read-only) or `settings` for one guild. `guild_scope` stays Manage
   Server; a route opts a lower level in with `guild_scope_at` / `authorize_guild`.
   Command edits (plans can grant roles), copy, member-sync actions, case notes,
   case removal, role mappings, global and owner routes never accept a role level. Roles come from the user's OAuth token
-  (`guilds.members.read`), reused at most `MEMBER_ROLES_TTL`, and fail closed. The
+  (`guilds.members.read`), reused at most `MEMBER_ROLES_TTL` or until a newer access
+  mark, and fail closed. The
   bot independently accepts a settings role only for single-guild configuration
   ops (`settings_role_scope`) and log-channel actions, from its own member data.
 - Badword delete is exact-scope: guild admins delete only their guild's rows;

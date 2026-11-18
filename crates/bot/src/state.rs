@@ -958,6 +958,8 @@ pub struct BotState {
     member_lookup: Mutex<Option<Arc<MemberLookup>>>,
     discord_cache: Mutex<Option<Arc<serenity::cache::Cache>>>,
     pub(crate) remembered_discord_targets: crate::discord::RememberedDiscordTargets,
+    /// Gateway access changes queued for the WebUI (#653).
+    pub access_marks: crate::access_marks::AccessMarks,
     #[cfg(test)]
     gateway_ban_path_phases: Mutex<Vec<&'static str>>,
     #[cfg(test)]
@@ -1074,6 +1076,7 @@ impl BotState {
             member_lookup: Mutex::new(None),
             discord_cache: Mutex::new(None),
             remembered_discord_targets: crate::discord::RememberedDiscordTargets::default(),
+            access_marks: Default::default(),
             #[cfg(test)]
             gateway_ban_path_phases: Mutex::new(Vec::new()),
             #[cfg(test)]

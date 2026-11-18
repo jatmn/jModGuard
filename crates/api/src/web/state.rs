@@ -30,8 +30,9 @@ impl ConfigObservation {
     }
 }
 
-/// One user's role IDs in one guild and when Discord returned them.
-pub(super) type MemberRolesSlot = Option<(Instant, Vec<u64>)>;
+/// One user's role IDs in one guild, when Discord returned them, and the
+/// access epoch read before that request.
+pub(super) type MemberRolesSlot = Option<(Instant, Vec<u64>, i64)>;
 type MemberRolesCache =
     std::collections::HashMap<(u64, u64), Arc<tokio::sync::Mutex<MemberRolesSlot>>>;
 
@@ -132,7 +133,8 @@ pub struct ApiState {
     pub(super) auth_sessions_swept_at: std::sync::Mutex<Option<Instant>>,
     pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
     /// Discord role IDs per (user, guild) for Web UI access roles. Each slot is
-    /// filled by one request at a time and expires after a short TTL.
+    /// filled by one request at a time, expires after `MEMBER_ROLES_TTL` and is
+    /// dropped early by a newer gateway access mark for that user or guild.
     pub(super) member_roles: std::sync::Mutex<MemberRolesCache>,
     pub preview: DashMap<String, crate::web::preview::PreviewGrant>,
     pub usage_cache: crate::web::usage::UsageCache,
