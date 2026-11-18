@@ -495,6 +495,7 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+export JMODGUARD_PREFLIGHT_BASE="$base_ref"
 
 if [ "$affected" -eq 1 ]; then
   if [ -n "$only_names" ]; then
@@ -548,6 +549,8 @@ should_run() {
 
 if should_run contracts; then
   node scripts/ci-workflow-test.mjs
+  node --test scripts/check-test-flakes.test.mjs
+  node scripts/check-test-flakes.mjs contracts
 fi
 
 if should_run contracts; then
@@ -998,6 +1001,8 @@ if should_run frontend; then
 
   echo 'ci-preflight: bash tools/eslint-web-selftest.sh'
   bash tools/eslint-web-selftest.sh
+  node --test tools/eslint/test-flake.test.js
+  node scripts/check-test-flakes.mjs eslint
 
   echo 'ci-preflight: node --test scripts/frontend-state-test.mjs'
   node --test scripts/frontend-state-test.mjs

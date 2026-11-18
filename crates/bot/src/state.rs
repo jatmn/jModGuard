@@ -2231,6 +2231,15 @@ impl BotState {
     }
 
     #[cfg(test)]
+    pub(crate) fn slash_retry_deadline_for_test(&self, guild: u64) -> Instant {
+        self.slash_retries
+            .lock()
+            .get(&guild)
+            .and_then(|retry| retry.retry.deadline())
+            .expect("expected a pending slash retry deadline")
+    }
+
+    #[cfg(test)]
     pub(crate) fn elapse_slash_retry_backoff_for_test(&self, guild: u64, elapsed: Duration) {
         self.slash_retries
             .lock()

@@ -291,7 +291,9 @@ fi
 
 # DYLINT_RUSTFLAGS reaches rustc only for workspace packages through
 # RUSTC_WORKSPACE_WRAPPER. Set the warning level after any caller flags.
-dylint_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-D warnings"
+# Keep test-flake diagnostics visible even with an inline allow. The policy
+# gate below decides which exact findings can be carried as existing debt.
+dylint_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-D warnings --force-warn=test_flake"
 
 ensure_dylint_toolchain
 
@@ -327,6 +329,22 @@ else
   fi
 fi
 
+# Build the repo-owned library from this checkout. The existing published
+# cache continues to contain only the six upstream libraries.
+local_lint_target="$(realpath -m "$CARGO_TARGET_DIR/dylint/test-flake")"
+channel=$(printf '%s\n' "$dylint_lib_metadata" | sed -n 's/^toolchain=//p')
+(
+  cd tools/dylint/test-flake
+  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+    PATH="$PATH:$CARGO_HOME/bin" CARGO_TARGET_DIR="$local_lint_target" \
+    cargo "+$channel" build --locked
+)
+host=$(rustc "+$channel" --print host-tuple)
+local_lint="$local_lint_target/debug/libtest_flake@$channel-$host.so"
+[ -s "$local_lint" ] || { echo "dylint: missing repo-owned lint library" >&2; exit 1; }
+
+TMPDIR="$dylint_tmpdir" node scripts/check-test-flakes.mjs rust-fixture "$local_lint"
+
 if [ "$use_prebuilt" -eq 1 ]; then
   echo "dylint: using prebuilt libs at $lib_dir"
   lib_toolchain=$(dylint_lib_toolchain_from_key "$dylint_build_key")
@@ -334,13 +352,13 @@ if [ "$use_prebuilt" -eq 1 ]; then
   for name in "${dylint_lib_names[@]}"; do
     lib_args+=(--lib-path "$lib_dir/lib${name}@${lib_toolchain}.so")
   done
-  echo "dylint: cargo dylint --no-metadata --fail-on-no-libraries ${lib_args[*]} -- --locked --all-targets ${package_args[*]}"
-  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
-    TMPDIR="$dylint_tmpdir" DYLINT_RUSTFLAGS="$dylint_rustflags" \
-    cargo dylint --no-metadata --fail-on-no-libraries "${lib_args[@]}" -- --locked --all-targets "${package_args[@]}"
+  selection=(--no-metadata "${lib_args[@]}")
 else
-  echo "dylint: cargo dylint --all --fail-on-no-libraries -- --locked --all-targets ${package_args[*]}"
-  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
-    TMPDIR="$dylint_tmpdir" DYLINT_RUSTFLAGS="$dylint_rustflags" \
-    cargo dylint --all --fail-on-no-libraries -- --locked --all-targets "${package_args[@]}"
+  selection=(--all)
 fi
+echo "dylint: cargo dylint ${selection[*]} --lib-path $local_lint -- --locked --all-targets ${package_args[*]}"
+env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+  TMPDIR="$dylint_tmpdir" DYLINT_RUSTFLAGS="$dylint_rustflags" \
+  cargo dylint "${selection[@]}" --fail-on-no-libraries --lib-path "$local_lint" \
+    -- --locked --all-targets --message-format=json "${package_args[@]}" \
+  | TMPDIR="$dylint_tmpdir" node scripts/check-test-flakes.mjs rust "$local_lint" "${package_args[@]}"

@@ -1110,8 +1110,11 @@ try {
   const record = name => `printf '%s\\n' ${name} >>"$AFFECTED_CALLS"\n`;
   const contractGates = ["select-checks-test.sh", "public-install-acceptance-test.sh", "dependabot-config-test.sh"];
   for (const gate of contractGates) fs.writeFileSync(path.join(repo, "scripts", gate), record(gate));
-  fs.writeFileSync(path.join(repo, "scripts/ci-workflow-test.mjs"),
-    'import fs from "node:fs";\nfs.appendFileSync(process.env.AFFECTED_CALLS, "ci-workflow-test.mjs\\n");\n');
+  const nodeContractGates = ["ci-workflow-test.mjs", "check-test-flakes.test.mjs", "check-test-flakes.mjs"];
+  for (const gate of nodeContractGates) {
+    fs.writeFileSync(path.join(repo, "scripts", gate),
+      `import fs from "node:fs";\nfs.appendFileSync(process.env.AFFECTED_CALLS, ${JSON.stringify(gate + "\n")});\n`);
+  }
   // The first browser gate stops the run once the selection has been reported.
   fs.writeFileSync(path.join(repo, "scripts/require-host-eslint-node.sh"), record("require-host-eslint-node.sh") + "exit 7\n");
   fs.mkdirSync(path.join(repo, "docs"));
@@ -1140,7 +1143,7 @@ try {
   const docsOnly = preflight("--affected", "--base", "main");
   assert.equal(docsOnly.status, 0, docsOnly.stderr);
   assert.match(docsOnly.stdout, /^ci-preflight: affected groups: contracts$/m);
-  assert.deepEqual(docsOnly.calls, ["ci-workflow-test.mjs", ...contractGates]);
+  assert.deepEqual(docsOnly.calls, [...nodeContractGates, ...contractGates]);
   // An untracked browser file adds its gates, without the API built without the UI.
   fs.mkdirSync(path.join(repo, "frontend"));
   fs.writeFileSync(path.join(repo, "frontend/app.js"), "// new\n");

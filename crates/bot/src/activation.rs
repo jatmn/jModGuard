@@ -1072,15 +1072,10 @@ mod tests {
             while activation.renewal_attempts.load(Ordering::Acquire) < 2 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            // The retry is running on the separate SQLite executor. Keep the
-            // virtual clock at this point while waiting for its real result.
-            let database_deadline = Instant::now() + Duration::from_secs(5);
+            // Keep the paused clock at the retry while SQLite finishes on
+            // its own executor.
             while activation.authority_deadline() == Some(before) && !activation.recording_cut_off()
             {
-                assert!(
-                    Instant::now() < database_deadline,
-                    "SQLite renewal did not finish"
-                );
                 tokio::task::yield_now().await;
             }
         })

@@ -5,6 +5,13 @@
 import js from "@eslint/js";
 import { defineConfig } from "eslint/config";
 import globals from "globals";
+import testFlake from "./test-flake.js";
+
+export const frontendTests = [
+    "scripts/frontend*-test.mjs",
+    "scripts/administration-state-test.mjs",
+    "scripts/package-webui-test.mjs",
+];
 
 export default defineConfig([
     {
@@ -28,5 +35,12 @@ export default defineConfig([
             "no-empty": ["error", { allowEmptyCatch: true }],
             "preserve-caught-error": "off",
         },
+    },
+    {
+        files: frontendTests,
+        linterOptions: { noInlineConfig: true },
+        languageOptions: { globals: globals.node },
+        plugins: { jmodguard: { rules: { "test-flake": testFlake } } },
+        rules: { "jmodguard/test-flake": "error" },
     },
 ]);

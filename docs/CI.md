@@ -123,6 +123,27 @@ there; any other unfixable advisory is handled by pinning or dropping that
 package. Preflight fails on the expiry date while the ignore remains. Scheduled
 runs still fail closed on every other advisory.
 
+### Test flake checks
+
+The Dylint lane builds the repo-owned `test_flake` lint from the checkout.
+The frontend lane applies the corresponding ESLint rule to the Node frontend
+test files. Use signals and fixture clocks to control timing. The Rust lint
+resolves standard-library, Tokio, and Chrono calls through the compiler, and
+accepts Tokio time in a paused runtime. The ESLint rule recognizes fixed dates,
+fixture bindings, and Node mock timers in the scope where they are enabled.
+
+The contracts group compares test timeout literals and runner settings with
+the Git base and rejects nextest retry settings. The two language lints also
+flag assertion failures caught inside loops. The checks cover direct patterns
+in test source. Timing behavior hidden in shared helpers, evaluated browser
+scripts, or computed budgets still needs review.
+
+`tools/test-flake-allowlist.tsv` records pre-existing debt by test, pattern,
+maximum occurrence count, and backlog issue. CI rejects new or larger entries
+and newly introduced findings. Unlisted inherited findings are reported so
+parallel fixture work can remove them without adding exceptions. Remove or
+lower a row when its test stops needing the exception.
+
 ## Publication and trust
 
 PR jobs use `pull_request`, `contents: read`, and no repository publishing secrets.

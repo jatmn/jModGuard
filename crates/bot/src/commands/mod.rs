@@ -2461,17 +2461,18 @@ mod tests {
                     panic!("expected retry");
                 };
                 assert_eq!(guilds, vec![10]);
+                let retry_at = app.slash_retry_deadline_for_test(guild.get());
+                assert!(app.slash_sync_due(
+                    guild.get(),
+                    changed,
+                    &app.slash_registry_revision(),
+                    retry_at,
+                ));
                 // The first retry waits 30 seconds plus up to 7 seconds of jitter.
                 app.elapse_slash_retry_backoff_for_test(
                     guild.get(),
                     std::time::Duration::from_secs(38),
                 );
-                assert!(app.slash_sync_due(
-                    guild.get(),
-                    changed,
-                    &app.slash_registry_revision(),
-                    std::time::Instant::now(),
-                ));
                 assert!(
                     sync_slash_commands_versioned_http(&app, &http, guild, changed).await,
                     "HTTP sync must retry after the backoff elapses",

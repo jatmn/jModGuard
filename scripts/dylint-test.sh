@@ -9,7 +9,19 @@ unset RUSTUP_AUTO_INSTALL
 root="$(git rev-parse --show-toplevel)"
 fixture="$(mktemp -d "${TMPDIR:-/tmp}/jmodguard-dylint-test.XXXXXX")"
 trap 'rm -rf "$fixture"' EXIT
-mkdir -p "$fixture/project/scripts" "$fixture/bin" "$fixture/external"
+mkdir -p "$fixture/project/scripts" "$fixture/project/tools/dylint/test-flake" "$fixture/bin" "$fixture/external"
+cat >"$fixture/bin/node" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == scripts/check-test-flakes.mjs && -s "$3" ]]
+shift
+case "$1" in
+  rust) [[ "$#" -ge 3 ]]; cat >/dev/null ;;
+  rust-fixture) [[ "$#" -eq 2 ]] ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$fixture/bin/node"
 git init -q "$fixture/project"
 cp "$root/scripts/dylint.sh" "$fixture/project/scripts/dylint.sh"
 cat > "$fixture/project/dylint.toml" <<'EOF'
@@ -63,6 +75,10 @@ elif [ "${1:-}" = install ]; then
     field CARGO_ENCODED_RUSTFLAGS
     printf 'argv=%s\n' "$*"
   } > "$DYLINT_TEST_INSTALL_CAPTURE"
+elif [ "${1:-}" = '+nightly-2026-08-20' ] && [ "${2:-}" = build ]; then
+  [ "$*" = '+nightly-2026-08-20 build --locked' ]
+  mkdir -p "$CARGO_TARGET_DIR/debug"
+  printf 'x' >"$CARGO_TARGET_DIR/debug/libtest_flake@nightly-2026-08-20-x86_64-unknown-linux-gnu.so"
 elif [ "${1:-}" = dylint ]; then
   if [ "${2:-}" = --help ]; then
     if [ "${DYLINT_TEST_HELP_NO_METADATA:-1}" = 0 ]; then
@@ -123,15 +139,17 @@ cat > "$fixture/bin/rustc" <<'SH'
 set -euo pipefail
 # shellcheck source=/dev/null
 [ -z "${DYLINT_TEST_RECORDER:-}" ] || source "$DYLINT_TEST_RECORDER"
-if [ "${DYLINT_TEST_RUSTC_FAIL:-0}" = 1 ]; then
-  exit 1
-fi
 if [ -n "${DYLINT_TEST_TOOLCHAIN_STATE:-}" ] && [ ! -f "$DYLINT_TEST_TOOLCHAIN_STATE" ]; then
   echo 'dylint test rustc: toolchain is not installed (auto-install disabled)' >&2
   exit 1
 fi
 if [ "${1:-}" = '+nightly-2026-08-20' ] && [ "${2:-}" = -vV ]; then
+  [ "${DYLINT_TEST_RUSTC_FAIL:-0}" != 1 ] || exit 1
   printf '%s\n' 'commit-hash: abcdefabcdefabcdefabcdefabcdefabcdefabcd' 'host: x86_64-unknown-linux-gnu'
+  exit 0
+fi
+if [ "$*" = '+nightly-2026-08-20 --print host-tuple' ]; then
+  printf '%s\n' 'x86_64-unknown-linux-gnu'
   exit 0
 fi
 echo "dylint test rustc: unexpected invocation: $*" >&2
@@ -200,6 +218,9 @@ expect() {
   fi
 }
 
+expected_local_lib="$fixture/project/target-dylint/dylint/test-flake/debug/libtest_flake@nightly-2026-08-20-x86_64-unknown-linux-gnu.so"
+metadata_args="dylint --all --fail-on-no-libraries --lib-path $expected_local_lib -- --locked --all-targets --message-format=json"
+
 run_dylint() {
   local tmpdir="$1"
   shift
@@ -230,7 +251,7 @@ expect "$capture" TMPDIR /tmp
 expect "$capture" CARGO_HOME "$inside/cargo-home"
 expect "$capture" RUSTFLAGS unset
 expect "$capture" CARGO_ENCODED_RUSTFLAGS unset
-expect "$capture" DYLINT_RUSTFLAGS '-C debuginfo=0 -D warnings'
+expect "$capture" DYLINT_RUSTFLAGS '-C debuginfo=0 -D warnings --force-warn=test_flake'
 expect "$capture" CARGO_TARGET_DIR target-dylint
 
 run_dylint "$fixture/external" \
@@ -247,8 +268,8 @@ expect "$capture" CARGO_HOME "$fixture/hosted-cache"
 caller_flags='-D warnings -A warnings'
 run_dylint "$fixture/external" RUSTFLAGS="$caller_flags"
 expect "$capture" RUSTFLAGS unset
-expect "$capture" DYLINT_RUSTFLAGS "$caller_flags -D warnings"
-expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
+expect "$capture" DYLINT_RUSTFLAGS "$caller_flags -D warnings --force-warn=test_flake"
+expect "$capture" argv "$metadata_args --workspace"
 
 # A mismatched installed version must run `cargo install` without cargo's
 # rustc-flag variables. The workspace policy still travels in DYLINT_RUSTFLAGS.
@@ -260,15 +281,15 @@ expect "$install_capture" RUSTFLAGS unset
 expect "$install_capture" CARGO_ENCODED_RUSTFLAGS unset
 expect "$install_capture" argv 'install cargo-dylint dylint-link --locked --version 6.4.0 --force'
 expect "$capture" RUSTFLAGS unset
-expect "$capture" DYLINT_RUSTFLAGS '-Z unstable-options -D warnings'
+expect "$capture" DYLINT_RUSTFLAGS '-Z unstable-options -D warnings --force-warn=test_flake'
 # A scoped CI lint must check the selected targets, not the whole workspace.
 run_dylint "$fixture/external" JMODGUARD_DYLINT_PACKAGES='jmodguard-api jmodguard-integration-tests'
-expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets -p jmodguard-api -p jmodguard-integration-tests'
+expect "$capture" argv "$metadata_args -p jmodguard-api -p jmodguard-integration-tests"
 if run_dylint "$fixture/external" JMODGUARD_DYLINT_PACKAGES='--workspace' >/dev/null 2>&1; then
   fail 'invalid package scope must fail, not become Cargo options'
 fi
 run_dylint "$fixture/external" JMODGUARD_DYLINT_PACKAGES=''
-expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
+expect "$capture" argv "$metadata_args --workspace"
 
 # Listings larger than a pipe buffer, with the wanted entries first. If a
 # listing is piped into a reader that stops at the first match, the stub is
@@ -332,7 +353,7 @@ case "$path_prefix" in
   "$pinned_root/bin:"*) ;;
   *) fail "PATH must start with pinned bin: $path_prefix" ;;
 esac
-expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
+expect "$capture" argv "$metadata_args --workspace"
 
 rm -f "$install_capture"
 run_dylint "$fixture/external" \
@@ -389,11 +410,11 @@ for name in "${lib_names[@]}"; do
 done
 prebuilt_args() {
   local dir=$1 name
-  printf '%s' 'dylint --no-metadata --fail-on-no-libraries'
+  printf '%s' 'dylint --no-metadata'
   for name in "${lib_names[@]}"; do
     printf ' --lib-path %s/lib%s@%s.so' "$dir" "$name" "$tc"
   done
-  printf '%s' ' -- --locked --all-targets --workspace'
+  printf ' --fail-on-no-libraries --lib-path %s -- --locked --all-targets --message-format=json --workspace' "$expected_local_lib"
 }
 
 run_dylint "$fixture/external"
@@ -403,19 +424,19 @@ grep -Fq 'using prebuilt libs at' "$stdout_file" || fail 'missing prebuilt libs 
 printf 'x' >"$lib_dir/libextra@${tc}.so"
 run_dylint "$fixture/external"
 grep -Fq 'does not contain exactly the 6 libraries' "$stdout_file" || fail 'missing extra library message'
-expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
+expect "$capture" argv "$metadata_args --workspace"
 rm -f "$lib_dir/libextra@${tc}.so"
 
 printf 'wrong\n' >"$lib_dir/key.txt"
 run_dylint "$fixture/external"
 grep -Fq 'missing or key.txt mismatch' "$stdout_file" || fail 'missing key mismatch message'
-expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
+expect "$capture" argv "$metadata_args --workspace"
 cp "$key_body_file" "$lib_dir/key.txt"
 
 rm -f "$lib_dir/libwrong_serialize_struct_arg@${tc}.so"
 run_dylint "$fixture/external"
 grep -Fq 'does not contain exactly the 6 libraries' "$stdout_file" || fail 'missing six libraries message'
-expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
+expect "$capture" argv "$metadata_args --workspace"
 printf 'x' >"$lib_dir/libwrong_serialize_struct_arg@${tc}.so"
 
 printf '' >"$lib_dir/libbasic_dead_store@${tc}.so"
@@ -425,14 +446,14 @@ printf 'x' >"$lib_dir/libbasic_dead_store@${tc}.so"
 
 run_dylint "$fixture/external" DYLINT_TEST_HELP_NO_METADATA=0
 grep -Fq 'cargo dylint --help has no --no-metadata' "$stdout_file" || fail 'missing no-metadata help fallback'
-expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
+expect "$capture" argv "$metadata_args --workspace"
 
 run_dylint "$fixture/external" DYLINT_TEST_RUSTC_FAIL=1
 grep -Fq 'key lookup failed' "$stdout_file" || fail 'missing key lookup failed message'
 grep -Fq 'library key unavailable' "$stdout_file" || fail 'missing unrecorded library key message'
 [ ! -e "$fixture/project/target-dylint/dylint/jmodguard-lib-key.txt" ] \
   || fail 'a failed compiler lookup must not record a library key'
-expect "$capture" argv 'dylint --all --fail-on-no-libraries -- --locked --all-targets --workspace'
+expect "$capture" argv "$metadata_args --workspace"
 
 if run_dylint "$fixture/external" DYLINT_TEST_CURL_FAIL=1 >/dev/null 2>&1; then
   fail 'dylint toolchain lookup failure must abort'
