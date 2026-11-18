@@ -94,7 +94,7 @@ for needle in \
   "socketsecurity==2.10.2" \
   "socketcli" \
   "--scm github" \
-  "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803" \
+  "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" \
   "--exit-code-on-api-error 0" \
   "persist-credentials: false" \
   "fetch-depth: 0" \

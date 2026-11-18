@@ -53,7 +53,7 @@ jobs:
       sha: ${{ steps.release.outputs.sha }}
       created: ${{ steps.release.outputs.release_created }}
     steps:
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
           config-file: release-please-config.json
@@ -88,11 +88,11 @@ jobs:
       JMODGUARD_RELEASE_TAG: ${{ needs.release.outputs.created == 'true' && needs.release.outputs.tag || '' }}
       JMODGUARD_RELEASE_SHA: ${{ needs.release.outputs.created == 'true' && needs.release.outputs.sha || '' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '26'
           package-manager-cache: false
@@ -101,7 +101,7 @@ jobs:
         run: bash scripts/prepare-publication.sh
       - name: Retain immutable plan for retries
         if: steps.prepare.outputs.reused != 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: publication-plan
           path: ${{ runner.temp }}/publication/plan.json
@@ -153,15 +153,15 @@ jobs:
       JMODGUARD_RELEASE_TAG: ${{ needs.prepare-publication.outputs.release_tag }}
       JMODGUARD_RELEASE_SHA: ${{ needs.prepare-publication.outputs.release_sha }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '26'
           package-manager-cache: false
-      - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
       - name: Build and verify component image
         env:
           COMPONENT: ${{ matrix.component }}
@@ -175,13 +175,13 @@ jobs:
           dir="${RUNNER_TEMP}/publish-build-ok"
           mkdir -p "$dir"
           printf '%s\n' "$COMPONENT" > "$dir/ok"
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: publish-build-ok-${{ matrix.component }}
           path: ${{ runner.temp }}/publish-build-ok/ok
           if-no-files-found: error
           retention-days: 1
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: publish-state-${{ matrix.component }}
@@ -217,15 +217,15 @@ jobs:
       JMODGUARD_RELEASE_TAG: ${{ needs.prepare-publication.outputs.release_tag }}
       JMODGUARD_RELEASE_SHA: ${{ needs.prepare-publication.outputs.release_sha }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '26'
           package-manager-cache: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: publish-build-ok-*
           path: ${{ runner.temp }}/publish-build-ok
@@ -235,11 +235,11 @@ jobs:
           for component in bot api webui; do
             test -s "${RUNNER_TEMP}/publish-build-ok/publish-build-ok-${component}/ok"
           done
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: publish-state-*
           path: ${{ runner.temp }}/publish-states
-      - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
       - name: Sign and promote every component
         env:
           JMODGUARD_PUBLISH_PHASE: sign
