@@ -1076,13 +1076,15 @@ fn profile(row: &Row) -> Result<MemberProfile> {
     let username: Option<String> = row.get(1)?;
     let global_name: Option<String> = row.get(2)?;
     let nickname: Option<String> = row.get(3)?;
+    let display_name = [&nickname, &global_name, &username]
+        .into_iter()
+        .flatten()
+        .find(|name| !name.is_empty())
+        .cloned()
+        .unwrap_or_else(|| id.to_string());
     Ok(MemberProfile {
         user_id: id.to_string(),
-        display_name: nickname
-            .clone()
-            .or(global_name.clone())
-            .or(username.clone())
-            .unwrap_or_else(|| id.to_string()),
+        display_name,
         username,
         global_name,
         nickname,

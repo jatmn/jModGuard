@@ -1,22 +1,22 @@
 //! Captured-enrollment member directory reads and administrator sync controls.
 use super::api;
 use super::list_controls::{
-    SortDirection, bounded_list_text, decode_cursor, encode_cursor, within_list_deadline,
+    SortDirection, bounded_list_text, check_cursor_context, cursor_context, decode_cursor,
+    encode_cursor, within_list_deadline,
 };
 use super::state::ApiState;
 use super::{ApiError, ApiResult, AuthCtx, GuildAccess, authorize_guild};
 use crate::bot_actions::{Action, MemberSyncOperation};
 use crate::db;
 use crate::db::guild_data::{
-    GuildDataScope, MemberListAnchor, MemberQuery, MemberSort, MemberSortValue, MemberStatusFilter,
-    MemberSyncStatus,
+    GuildDataScope, MemberListAnchor, MemberQuery, MemberSort, MemberStatusFilter, MemberSyncStatus,
 };
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, State, rejection::QueryRejection};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{NaiveDate, TimeZone, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_sessions::Session;
 
@@ -34,6 +34,13 @@ pub struct MembersQuery {
     limit: Option<u32>,
     #[serde(default)]
     include_total: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MembersCursor {
+    context: String,
+    anchor: MemberListAnchor,
 }
 
 #[derive(Deserialize)]
@@ -134,8 +141,9 @@ pub async fn list_members(
     session: Session,
     headers: HeaderMap,
     Path(guild_id): Path<u64>,
-    Query(query): Query<MembersQuery>,
+    query: Result<Query<MembersQuery>, QueryRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let Query(query) = query.map_err(|err| ApiError(anyhow::Error::msg(err.body_text())))?;
     within_list_deadline(
         "Members",
         list_members_inner(&app, &session, &headers, guild_id, query),
@@ -162,34 +170,27 @@ async fn list_members_inner(
         _ => return Err(ApiError(anyhow::anyhow!("invalid member sort"))),
     };
     let dir = query.dir.unwrap_or(default_dir);
+    let status = query.status.unwrap_or(MemberStatusFilter::Current);
+    let joined_from_ms = date_ms(query.joined_from, false)?;
+    let joined_to_ms = date_ms(query.joined_to, true)?;
+    // The directory lowercases search text before matching it.
+    let context = cursor_context((
+        scope.enrollment(),
+        q.as_deref().map(str::to_lowercase),
+        status,
+        joined_from_ms,
+        joined_to_ms,
+    ))?;
     let after = query
         .after
         .as_deref()
-        .map(|raw| {
-            let invalid = || ApiError(anyhow::anyhow!("invalid list cursor"));
-            // Existing join-only callers may still have an in-flight timestamp:ID
-            // cursor. New sorts and explicit directions always use the shared codec.
-            let anchor = if query.dir.is_none()
-                && matches!(
-                    query.sort.as_deref(),
-                    None | Some("joined_newest" | "joined_oldest")
-                )
-                && let Some((joined, id)) = raw.split_once(':')
-            {
-                if raw.len() > 64 {
-                    return Err(invalid());
-                }
-                MemberListAnchor {
-                    key: MemberSortValue::Number(joined.parse().map_err(|_| invalid())?),
-                    user_id: id.parse().map_err(|_| invalid())?,
-                }
-            } else {
-                decode_cursor(raw, "members", sort, dir)?
-            };
-            if !anchor.matches(sort) {
-                return Err(invalid());
+        .map(|token| {
+            let cursor: MembersCursor = decode_cursor(token, "members", sort, dir)?;
+            check_cursor_context(&cursor.context, &context)?;
+            if !cursor.anchor.matches(sort) {
+                return Err(ApiError(anyhow::anyhow!("invalid list cursor")));
             }
-            Ok(anchor)
+            Ok(cursor.anchor)
         })
         .transpose()?;
     let page = store
@@ -197,9 +198,9 @@ async fn list_members_inner(
             scope,
             MemberQuery {
                 q,
-                status: query.status.unwrap_or(MemberStatusFilter::Current),
-                joined_from_ms: date_ms(query.joined_from, false)?,
-                joined_to_ms: date_ms(query.joined_to, true)?,
+                status,
+                joined_from_ms,
+                joined_to_ms,
                 sort,
                 descending: dir == SortDirection::Desc,
                 after,
@@ -213,7 +214,7 @@ async fn list_members_inner(
         .await?;
     let next_cursor = page
         .next_anchor
-        .map(|anchor| encode_cursor("members", sort, dir, anchor))
+        .map(|anchor| encode_cursor("members", sort, dir, MembersCursor { context, anchor }))
         .transpose()?;
     Ok(Json(serde_json::json!({
         "members": page.members,

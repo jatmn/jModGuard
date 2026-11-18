@@ -115,10 +115,11 @@ A later exact case or audit action remains a separate canonical history entry.
 
 ## Search and history
 
-The page searches saved user IDs, pasted mentions, display names, and usernames;
-no per-search Discord request runs. Name fallback is server nickname, global
-display name, username, then ID. Results can be filtered by current membership,
-current ban, previous ban, and known join-date range (UTC calendar dates).
+The page searches saved user IDs, pasted mentions, display names, and usernames
+without making a Discord request. The displayed name uses the first nonempty
+server nickname, global display name, or username, then falls back to the ID.
+Results can be filtered by current membership, current ban, previous ban, and
+known join-date range (UTC calendar dates).
 Current members and newest join first are the defaults. The Member, User ID,
 Joined and Status headings each toggle between ascending and descending.
 Member names are ordered by the displayed name with ASCII case ignored.
@@ -127,11 +128,18 @@ Ties use numeric user ID in the selected direction. The URL saves the sort,
 filters and page size. Changes restart pagination from the first page.
 
 The Members API accepts `sort=name|user_id|joined|status` and `dir=asc|desc`.
-Use `from` and `to` for inclusive UTC join dates. The existing `joined_from`,
-`joined_to`, `joined_newest` and `joined_oldest` inputs are still accepted.
-Each page returns an opaque `next_cursor` bound to its sort and direction.
-Use that value as `after` with the same filters. Each request defaults to 50
-members and caps the response at 250. With `include_total=true`, the response
+If `dir` is omitted, `joined` defaults to descending and the other sorts
+default to ascending. Use `from` and `to` for inclusive UTC join dates.
+The API also accepts the `joined_from` and `joined_to` date aliases and the
+`joined_newest` (descending) and `joined_oldest` (ascending) sort aliases.
+An unknown `status` returns HTTP 400 with a JSON `error` field.
+
+Use the opaque `next_cursor` as `after` with the same guild enrollment, search,
+status, join dates, sort, and direction. A mismatch returns HTTP 400. Cursors
+issued before filter binding, including timestamp-and-ID cursors, require a
+restart without `after`. Clients can change the page limit and total-count
+option between requests. Each request defaults to 50 members and caps the response
+at 250. With `include_total=true`, the response
 includes the number of matches across all pages. Paging reads the current saved
 directory, so changes to a member's sort value between requests can move it
 across the cursor. The sort and status filters use scoped indexes. Substring
@@ -234,3 +242,13 @@ ordinary and 3.26 MB Unicode figures excluded final stays and indexes; the
 historical v12 fixtures above include those rows and indexes. The earlier candidate
 measurements used a different row shape and name generator, so their difference
 from these figures is not a pure schema overhead estimate.
+
+For the v22 sort-index migration, local SQLite 3.46.1 with 4 KiB
+pages measured 22.1 MiB of file growth for short names and 34.7 MiB
+for long Unicode names. Both synthetic fixtures had 50,000 rows in one
+enrollment (45,000 current, 2,500 banned, 2,500 previously banned), with
+empty nicknames on half the rows. The migration reserved 98.7 MiB for
+each fixture. The v23 rebuild of the four name indexes added 0.2 MiB
+and 12.8 MiB, respectively, after reusing pages from the dropped indexes.
+These measurements cover database pages on local SQLite. They exclude
+WAL and provider storage.
