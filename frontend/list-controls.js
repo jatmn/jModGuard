@@ -75,6 +75,22 @@ export function clearListLocation(config) {
   replaceListLocation(query);
 }
 
+// Leave list `from` for list `config` with only these filters. The location is
+// restored when `open` declines, for example when the user keeps unsaved changes.
+export function openFilteredList(from, config, guildId, filters, open) {
+  const previous = location.search;
+  clearListLocation(from);
+  replaceListLocation(viewQuery(config, guildId, {
+    filters: { ...emptyFilters(config), ...filters },
+    sort: config.defaultSort,
+    dir: config.defaultDir,
+    pageSize: preferredPageSize(config),
+  }));
+  if (open()) return true;
+  replaceListLocation(new URLSearchParams(previous));
+  return false;
+}
+
 function boundedSearch(value) {
   return Array.from(value).slice(0, SEARCH_LIMIT).join("");
 }

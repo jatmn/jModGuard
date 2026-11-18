@@ -3552,6 +3552,133 @@ async fn audit_log_event_page_size_clamps_and_keeps_legacy_array_reads() {
     }
 }
 
+#[tokio::test]
+async fn audit_log_event_search_combines_filters_and_matches_reasons_and_names() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    for (user_id, username, nickname) in [(20, "spammer", Some("Spammy")), (9, "kit.mod", None)] {
+        store
+            .observe_member(
+                scope.clone(),
+                db::guild_data::MemberObservation {
+                    user_id,
+                    username: Some(Some(username.into())),
+                    global_name: Some(None),
+                    nickname: Some(nickname.map(str::to_owned)),
+                    joined_at_ms: Some(900),
+                    observed_at_ms: 1_500,
+                    is_join: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                r#"INSERT INTO events (id, guild_id, event_type, user_id, actor_id, data, created_at) VALUES
+                    (21, 10, 'member_ban', 20, 9, '{"reason":"Posted phishing","source":"bot","audit_after_ms":5}', '2026-01-02T00:00:00Z'),
+                    (22, 10, 'member_kick', 20, NULL, '{"reason":"spam"}', '2026-01-03T00:00:00Z'),
+                    (23, 10, 'member_ban', 30, 9, '{"reason":"raid"}', '2026-01-03T12:00:00Z'),
+                    (24, 10, 'automod', 30, NULL, 'not json', '2026-01-04T00:00:00Z'),
+                    (25, 10, 'member_unban', 30, 31, '{"source":"phishing"}', '2026-01-05T00:00:00Z'),
+                    (26, 20, 'member_ban', 20, 9, '{"reason":"Posted phishing"}', '2026-01-02T00:00:00Z');"#,
+                1024 * 1024,
+            )
+        })
+        .await
+        .unwrap();
+    let request = |query: &str| {
+        let path = format!("/api/guilds/10/events?{query}");
+        let f = &f;
+        async move { f.request("POST", &path, "").await }
+    };
+    let ids = |page: &serde_json::Value| {
+        page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    for (query, expected) in [
+        // Reasons match without case; internal payload fields do not.
+        ("q=phishing", vec![21]),
+        ("q=PHISH", vec![21]),
+        // Directory names match the user and the actor.
+        ("q=spammy", vec![22, 21]),
+        ("q=kit.mod", vec![23, 21]),
+        ("q=member_kick", vec![22]),
+        ("q=31", vec![25]),
+        ("subject=spammer", vec![22, 21]),
+        ("subject=20", vec![22, 21]),
+        ("user=20&sort=date", vec![22, 21]),
+        ("actor=kit", vec![23, 21]),
+        ("actor=9", vec![23, 21]),
+        ("subject=nobody", vec![]),
+        ("from=2026-01-03&to=2026-01-04", vec![24, 23, 22]),
+        (
+            "event=member_ban&subject=spammer&actor=9&q=phish&from=2026-01-02&to=2026-01-02",
+            vec![21],
+        ),
+        ("event=member_ban&subject=spammer&q=raid", vec![]),
+    ] {
+        let (status, page) = request(query).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {page}");
+        assert_eq!(ids(&page), expected, "{query}");
+    }
+
+    let (status, page) = request("subject=spammer").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["names"]["20"]["display_name"], "Spammy");
+    assert_eq!(page["names"]["9"]["username"], "kit.mod");
+
+    // The cursor keeps its place under each sort with the filters applied.
+    let filter = "q=9&from=2026-01-02";
+    let (status, first) = request(&format!("{filter}&sort=user&dir=asc&limit=1")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(ids(&first), [21]);
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let (status, next) = request(&format!("{filter}&sort=user&dir=asc&after={cursor}")).await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(ids(&next), [23]);
+    assert!(next["next_cursor"].is_null());
+    for changed in [
+        "q=8&from=2026-01-02&sort=user&dir=asc",
+        "q=9&from=2026-01-03&sort=user&dir=asc",
+        "q=9&from=2026-01-02&actor=9&sort=user&dir=asc",
+        "q=9&from=2026-01-02&sort=date&dir=asc",
+    ] {
+        let (status, body) = request(&format!("{changed}&after={cursor}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{changed}: {body}");
+        assert!(body["error"].as_str().unwrap().contains("list cursor"));
+    }
+
+    for query in [
+        "user=20&subject=20",
+        "actor=0",
+        "from=2026-01-05&to=2026-01-04",
+        "from=2026-1-05",
+    ] {
+        let (status, body) = request(query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+}
+
 fn configuration_read_routes() -> Vec<String> {
     vec![
         format!("rules/{}", crate::types::RULE_IDS[0]),

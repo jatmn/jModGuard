@@ -796,6 +796,12 @@ svg.icon-neutral { color: var(--icon-neutral); }
   .case-file { width: 100%; }
 }
 /* ==== end Cases (#624) ==== */
+/* ==== Audit log (#649): readable details with an owner-only Raw toggle ==== */
+.audit-table td { vertical-align: top; }
+.audit-details { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; min-width: 12rem; max-width: 32rem; overflow-wrap: anywhere; }
+.audit-raw { flex-basis: 100%; }
+.audit-raw summary { cursor: pointer; color: var(--muted); font-size: var(--ui-font-size-sm); }
+.audit-raw pre { margin: 4px 0 0; font-size: .6875rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 /* ==== Bans (#625): person cells, ID chips, clamped reasons and the ban dialog ==== */
 .ban-table td { vertical-align: top; }
 .ban-person { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }

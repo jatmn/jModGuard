@@ -10,14 +10,25 @@ The following GET routes require fresh Discord Manage Guild permissions, active 
 membership and the `x-jmodguard-enrollment` value from the page's loaded configuration:
 
 - `/api/guilds/{id}/events` (also POST for the browser). It retains the `event`
-  and `user` filters. Supply `sort`, `dir`, or `after` to get
-  `{events, next_cursor}`. Sort keys are `date`, `event`, `user`, and `actor`.
+  and `user` filters. Supply any shared list parameter (`sort`, `dir`, `after`,
+  `subject`, `actor`, `q`, `from`, `to`) to get `{events, names, next_cursor}`.
+  Sort keys are `date`, `event`, `user`, and `actor`.
   The default page order is `date` with `dir=desc` (newest first). Row ID breaks
   ties in the selected direction. Missing user and actor IDs come first in
   ascending order. Pass `next_cursor` as `after` with the same guild, membership,
   filters, sort, and direction. Each request defaults to 50 rows and caps at 250.
   Requests with only the original filters or limit still get an array ordered by
-  descending row ID, capped at 200 rows.
+  descending row ID, capped at 200 rows. `subject` (the event user; `user` is
+  its older ID-only form, and both together are refused) and `actor` accept a
+  positive Discord ID or a name. Events store only IDs, so a name matches the
+  member directory's users (nickname, global name, username or mention), at
+  most 250 of them; a name filter returns HTTP 400 when the directory is
+  unavailable. `q` matches the event name, user and actor IDs, the readable
+  `reason`, `previous_reason`, `rule` and `command` payload fields, and up to
+  250 directory users whose names match. It does not match other payload
+  fields. `from` and `to` are inclusive UTC calendar dates. `names` holds
+  directory names for the users and actors on the page and is empty when the
+  directory is unavailable.
 - `/api/guilds/{id}/bans` (also POST for the browser). It answers
   `{bans, names, total, next_cursor, moderators}`. The default is newest first by ban
   timestamp and row ID. `sort` accepts `subject`, `id` (Discord user ID),
@@ -69,7 +80,8 @@ change, new table, dependency, cache, connection pool or polling task is added.
 Statistics retain their existing definitions, with all three counts in one
 snapshot. Counts use guild-scoped index searches.
 Legacy event reads use guild/ID indexes (guild/type/ID for type-only event filters).
-The sorted Audit Log may sort the matching guild rows for the selected column.
+The sorted Audit Log may sort the matching guild rows for the selected column;
+its text and date filters are checked against each matching guild row.
 Ban pages use guild-prefixed indexes for their selected order. Event queries with a
 user filter use the existing user index for both user-only and type-plus-user
 lookups, retaining guild and type checks. Counting work still grows with the
