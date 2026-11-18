@@ -3338,7 +3338,12 @@ async fn moderation_pages_require_loaded_membership_and_current_permissions() {
     db::record_ban(&f.app.db, 10, 123, None, "fixture")
         .await
         .unwrap();
-    for path in ["events?user=123&limit=1", "bans?limit=1", "stats"] {
+    for path in [
+        "events?user=123&limit=1",
+        "events?user=123&limit=1&sort=date",
+        "bans?limit=1",
+        "stats",
+    ] {
         let path = format!("/api/guilds/10/{path}");
         let (status, body) = f.request_token("GET", &path, "", None).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -3383,6 +3388,164 @@ async fn moderation_event_user_filter_rejects_ids_outside_database_range() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "invalid user id");
+}
+
+#[tokio::test]
+async fn audit_log_event_pages_sort_seek_and_preserve_filters() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "INSERT INTO events (id, guild_id, event_type, user_id, actor_id, created_at) VALUES
+                    (11, 10, 'member_kick', 20, NULL, '2026-01-02T00:00:00Z'),
+                    (12, 10, 'member_ban', 3, 9, '2026-01-01T16:00:00-08:00'),
+                    (13, 10, 'member_ban', 3, 10, '2026-01-01T23:59:00Z'),
+                    (14, 10, 'member_kick', NULL, 9, '2026-01-01T00:00:00Z'),
+                    (15, 10, 'member_ban', 20, NULL, '2026-01-02T00:00:00.100Z'),
+                    (16, 20, 'member_ban', 3, 9, '2026-01-02T10:00:00Z');",
+                1024 * 1024,
+            )
+        })
+        .await
+        .unwrap();
+    let route = "/api/guilds/10/events";
+    let request = |query: String| {
+        let f = &f;
+        async move { f.request("POST", &format!("{route}?{query}"), "").await }
+    };
+    let ids = |page: &serde_json::Value| {
+        page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    let (status, page) = request("limit=5&dir=desc".into()).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(ids(&page), [15, 12, 11, 13, 14]);
+    assert!(page["next_cursor"].is_null());
+
+    for (sort, ascending) in [
+        ("date", [14, 13, 11, 12, 15]),
+        ("event", [12, 13, 15, 11, 14]),
+        ("user", [14, 12, 13, 11, 15]),
+        ("actor", [11, 15, 12, 14, 13]),
+    ] {
+        for dir in ["asc", "desc"] {
+            let mut expected = ascending;
+            if dir == "desc" {
+                expected.reverse();
+            }
+            let mut after = String::new();
+            for id in expected {
+                let (status, page) = request(format!("sort={sort}&dir={dir}&limit=1{after}")).await;
+                assert_eq!(status, StatusCode::OK, "{sort} {dir}: {page}");
+                assert_eq!(ids(&page), [id], "{sort} {dir}");
+                after = page["next_cursor"]
+                    .as_str()
+                    .map(|cursor| format!("&after={cursor}"))
+                    .unwrap_or_default();
+                assert_eq!(after.is_empty(), id == expected[4], "{sort} {dir}");
+            }
+        }
+    }
+
+    let filter = "event=member_ban&user=3&sort=event&dir=asc";
+    let (status, first) = request(format!("{filter}&limit=1")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(ids(&first), [12]);
+    assert_eq!(first["events"][0]["user_id"], "3");
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let (status, next) = request(format!("{filter}&after={cursor}&limit=50")).await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(ids(&next), [13]);
+    assert!(next["next_cursor"].is_null());
+    for query in [
+        "event=member_kick&user=3&sort=event&dir=asc",
+        "event=member_ban&user=20&sort=event&dir=asc",
+        "event=member_ban&user=3&sort=actor&dir=asc",
+        "event=member_ban&user=3&sort=event&dir=desc",
+    ] {
+        let (status, body) = request(format!("{query}&after={cursor}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert!(body["error"].as_str().unwrap().contains("list cursor"));
+    }
+    for query in ["sort=details", "dir=sideways", "after=invalid"] {
+        let (status, body) = request(query.into()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+
+    // An older row can have an event name too large to include in a cursor.
+    let long_type = "z".repeat(4096);
+    let long_id = db::insert_event(
+        &f.app.db,
+        10,
+        &long_type,
+        None,
+        None,
+        &serde_json::Value::Null,
+    )
+    .await
+    .unwrap();
+    let (status, page) = request("sort=event&limit=1".into()).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(ids(&page), [long_id]);
+    let long_cursor = page["next_cursor"].as_str().unwrap();
+    let (status, page) = request(format!("sort=event&limit=1&after={long_cursor}")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(ids(&page), [14]);
+
+    db::enroll_guild(&f.app.db, 10, 101).await.unwrap();
+    let (status, body) = request(format!("{filter}&after={cursor}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("list cursor"));
+}
+
+#[tokio::test]
+async fn audit_log_event_page_size_clamps_and_keeps_legacy_array_reads() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "WITH RECURSIVE sequence(n) AS (
+                    VALUES (1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 251
+                )
+                INSERT INTO events (id, guild_id, event_type, created_at)
+                SELECT n, 10, 'member_ban', '2026-01-01T00:00:00Z' FROM sequence",
+                1024 * 1024,
+            )
+        })
+        .await
+        .unwrap();
+    let (status, legacy) = f
+        .request("GET", "/api/guilds/10/events?limit=1000", "")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(legacy.as_array().unwrap().len(), 200);
+    assert_eq!(legacy[0]["id"], 251);
+    for (limit, expected) in [(0, 1), (1000, 250)] {
+        let route = "/api/guilds/10/events?sort=date";
+        let (status, page) = f
+            .request("GET", &format!("{route}&limit={limit}"), "")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = page["events"].as_array().unwrap();
+        assert_eq!(rows.len(), expected);
+        assert_eq!(rows[0]["id"], 251);
+        let cursor = page["next_cursor"].as_str().unwrap();
+        let (status, next) = f
+            .request("GET", &format!("{route}&after={cursor}&limit={limit}"), "")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(next["events"][0]["id"], 251 - expected);
+        assert_eq!(next["next_cursor"].is_null(), limit == 1000);
+    }
 }
 
 fn configuration_read_routes() -> Vec<String> {

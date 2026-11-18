@@ -1,10 +1,10 @@
-use super::{decode_ban_row, enrolled_moderation_read};
+use super::{decode_ban_row, enrolled_moderation_read, text_key_digest};
 use crate::db::{
     BanRow, DASHBOARD_LIST_PAGE_LIMIT, Db, GuildEnrollment, OptionalExtension, SqlExecutor, Value,
     params, params_from_iter,
 };
 use anyhow::{Context as _, Result};
-use ring::digest::{SHA256, SHA256_OUTPUT_LEN, digest};
+use ring::digest::SHA256_OUTPUT_LEN;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -103,12 +103,6 @@ impl BanListAnchor {
         };
         Ok((value, self.id))
     }
-}
-
-fn text_key_digest(key: &str) -> [u8; SHA256_OUTPUT_LEN] {
-    let mut bytes = [0; SHA256_OUTPUT_LEN];
-    bytes.copy_from_slice(digest(&SHA256, key.as_bytes()).as_ref());
-    bytes
 }
 
 pub struct BanListRequest {

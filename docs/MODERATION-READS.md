@@ -9,7 +9,15 @@ API admission and that read rejects the original request instead of rebinding it
 The following GET routes require fresh Discord Manage Guild permissions, active bot
 membership and the `x-jmodguard-enrollment` value from the page's loaded configuration:
 
-- `/api/guilds/{id}/events`, including event/user/limit filters.
+- `/api/guilds/{id}/events` (also POST for the browser). It retains the `event`
+  and `user` filters. Supply `sort`, `dir`, or `after` to get
+  `{events, next_cursor}`. Sort keys are `date`, `event`, `user`, and `actor`.
+  The default page order is `date` with `dir=desc` (newest first). Row ID breaks
+  ties in the selected direction. Missing user and actor IDs come first in
+  ascending order. Pass `next_cursor` as `after` with the same guild, membership,
+  filters, sort, and direction. Each request defaults to 50 rows and caps at 250.
+  Requests with only the original filters or limit still get an array ordered by
+  descending row ID, capped at 200 rows.
 - `/api/guilds/{id}/bans` (also POST for the browser). It answers
   `{bans, names, total, next_cursor, moderators}`. The default is newest first by ban
   timestamp and row ID. `sort` accepts `subject`, `id` (Discord user ID),
@@ -47,7 +55,8 @@ event user IDs outside the signed database range are rejected rather than wrappe
 
 ## Database contract and limits
 
-`query_enrolled_events`, `page_enrolled_bans` and `enrolled_guild_stats` take the captured
+`query_enrolled_events`, `page_enrolled_events`, `page_enrolled_bans` and
+`enrolled_guild_stats` take the captured
 `GuildEnrollment`. These values are internal scope, not credentials; callers must authorize
 the user before using them. The API service guard rejects the old guild-ID moderation reads.
 Bot callers retain those helpers. The Bans API page shares the ban row decoder.
@@ -56,12 +65,14 @@ Membership verification and data queries share one deferred primary snapshot (`B
 DEFERRED`) and close it with ROLLBACK after the read. That snapshot is still routed to the
 primary, and it does not take the writer lock, so a bot write is not queued behind the
 read and a held writer does not stall the read. No recovery receipt, configuration version
-change, new table, dependency, cache, connection pool or polling task is added. Event/ban
-results retain their 1–200 row clamp. Statistics retain their existing definitions,
-with all three counts in one snapshot. Counts use guild-scoped index searches.
-Ordered event pages use guild/ID indexes (guild/type/ID for type-only event filters).
-Ban pages use guild-prefixed indexes for their selected order. Event queries with a user filter use the existing user index for both
-user-only and type-plus-user lookups, retaining guild and type checks. Counting work still grows with the
+change, new table, dependency, cache, connection pool or polling task is added.
+Statistics retain their existing definitions, with all three counts in one
+snapshot. Counts use guild-scoped index searches.
+Legacy event reads use guild/ID indexes (guild/type/ID for type-only event filters).
+The sorted Audit Log may sort the matching guild rows for the selected column.
+Ban pages use guild-prefixed indexes for their selected order. Event queries with a
+user filter use the existing user index for both user-only and type-plus-user
+lookups, retaining guild and type checks. Counting work still grows with the
 guild’s retained records; this change does not establish large-database performance or
 distributed read scaling.
 

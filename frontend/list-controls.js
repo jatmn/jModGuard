@@ -12,7 +12,8 @@ const PAGE_TIMEOUT_MS = 30000;
 let pendingListSearch = null;
 
 function filterKeys(config) {
-  return [...config.filters.map(({ key }) => key), ...commonKeys];
+  const keys = config.filters.map(({ key }) => key);
+  return config.commonFilters === false ? keys : [...keys, ...commonKeys];
 }
 
 function emptyFilters(config) {
@@ -96,7 +97,9 @@ function readView(config, guildId) {
   const initial = { filters, sort: config.defaultSort, dir: config.defaultDir, pageSize: preferredPageSize(config) };
   if (query.get("list") !== config.list || query.get("guild") !== guildId) return initial;
   for (const key of filterKeys(config)) filters[key] = query.get(key) || "";
-  for (const key of ["q", ...config.filters.filter(({ kind }) => kind === "text").map(({ key }) => key)]) {
+  const textKeys = config.filters.filter(({ kind }) => kind === "text").map(({ key }) => key);
+  if (config.commonFilters !== false) textKeys.push("q");
+  for (const key of textKeys) {
     filters[key] = boundedSearch(filters[key].trim());
   }
   const sort = query.get("sort");
@@ -236,8 +239,18 @@ function ListField({ label, children }) {
   return h("div", { className: "field" }, h("label", null, label, children));
 }
 
+export function ListPageSize({ controls }) {
+  return h(ListField, { label: "Rows per page" },
+    h("select", {
+      className: "select select-sm",
+      value: controls.view.pageSize,
+      onChange: (event) => controls.setPageSize(event.target.value),
+    }, ...PAGE_SIZES.map((size) => h("option", { key: size, value: size }, size === "all" ? "All" : size))),
+  );
+}
+
 export function ListControls({ controls, UserPicker, userPickerProps, filterOptions = {} }) {
-  const { config, view, drafts, setText, setFilter, replaceFilters, setPageSize } = controls;
+  const { config, view, drafts, setText, setFilter, replaceFilters } = controls;
   const { filters } = view;
   const { from: fromLabel = "From", to: toLabel = "To" } = config.dateLabels ?? {};
   const date = (key, label, bounds) => h(ListField, { label },
@@ -301,13 +314,7 @@ export function ListControls({ controls, UserPicker, userPickerProps, filterOpti
     text("q", "Search", config.searchPlaceholder, "search"),
     date("from", `${fromLabel} (UTC)`, { max: filters.to || undefined }),
     date("to", `${toLabel} (UTC)`, { min: filters.from || undefined }),
-    h(ListField, { label: "Rows per page" },
-      h("select", {
-        className: "select select-sm",
-        value: view.pageSize,
-        onChange: (event) => setPageSize(event.target.value),
-      }, ...PAGE_SIZES.map((size) => h("option", { key: size, value: size }, size === "all" ? "All" : size))),
-    ),
+    h(ListPageSize, { controls }),
     hasFilters(view) || Object.values(drafts).some(Boolean)
       ? h("button", { type: "button", className: "btn btn-sm", onClick: () => replaceFilters() }, "Clear filters")
       : null,
