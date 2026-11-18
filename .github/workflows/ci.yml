@@ -52,7 +52,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: '24'
+          node-version: '26'
           package-manager-cache: false
       - id: select
         name: Select affected jobs
@@ -85,7 +85,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: '24'
+          node-version: '26'
           package-manager-cache: false
           cache: ${{ matrix.lane != 'quick' && 'npm' || '' }}
           cache-dependency-path: |
