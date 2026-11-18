@@ -6483,7 +6483,8 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
         expected.push(id.as_str().to_owned());
     }
     expected.reverse();
-    let (status, first) = f.request("POST", "/api/guilds/10/cases?limit=50", "").await;
+    let list_url = "/api/guilds/10/cases?sort=date&dir=desc";
+    let (status, first) = f.request("POST", &format!("{list_url}&limit=50"), "").await;
     assert_eq!(status, StatusCode::OK, "{first}");
     assert_eq!(first["cases"], serde_json::json!(expected[..50]));
     assert_eq!(first["summaries"].as_object().unwrap().len(), 50);
@@ -6500,7 +6501,7 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
         let (status, page) = f
             .request(
                 "POST",
-                &format!("/api/guilds/10/cases?limit={limit}&removed=false"),
+                &format!("{list_url}&limit={limit}&removed=false"),
                 "",
             )
             .await;
@@ -6539,11 +6540,7 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
     }
     let cursor = first["next_cursor"].as_str().unwrap();
     let (status, next) = f
-        .request(
-            "POST",
-            &format!("/api/guilds/10/cases?after={cursor}&limit=50"),
-            "",
-        )
+        .request("POST", &format!("{list_url}&after={cursor}&limit=50"), "")
         .await;
     assert_eq!(status, StatusCode::OK, "{next}");
     assert_eq!(
@@ -6672,7 +6669,7 @@ async fn case_reads_filter_the_list_and_name_known_members() {
         ),
         ("subject=&actor=".to_owned(), vec![&failed, &kick, &ban]),
     ] {
-        let (status, page) = list(query.clone()).await;
+        let (status, page) = list(format!("{query}&sort=date&dir=desc")).await;
         assert_eq!(status, StatusCode::OK, "{query}: {page}");
         let expected: Vec<&str> = expected.iter().map(|id| id.as_str()).collect();
         assert_eq!(page["cases"], serde_json::json!(expected), "{query}");
@@ -6824,9 +6821,22 @@ async fn case_list_orders_and_filters_are_applied_before_paging() {
         )
     };
 
-    let (status, default) = list(String::new()).await;
-    assert_eq!(status, StatusCode::OK, "{default}");
-    assert_eq!(default["cases"], expect_ids(&[4, 1, 6, 3, 2, 5]));
+    // Legacy clients start without sort or a cursor and page by the last visible ID.
+    let expected = [1, 2, 3, 4, 5, 6];
+    let page_size = 2;
+    let mut seen = Vec::new();
+    let mut after = String::new();
+    for _ in 0..=expected.len().div_ceil(page_size) {
+        let (status, page) = list(format!("limit={page_size}{after}")).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let ids = page["cases"].as_array().unwrap();
+        seen.extend_from_slice(ids);
+        if ids.len() < page_size {
+            break;
+        }
+        after = format!("&after={}", ids.last().unwrap().as_str().unwrap());
+    }
+    assert_eq!(serde_json::json!(seen), expect_ids(&expected));
 
     for (sort, ascending) in [
         ("date", [5, 2, 3, 6, 1, 4]),
@@ -6923,7 +6933,7 @@ async fn case_list_orders_and_filters_are_applied_before_paging() {
     assert_eq!(literal["cases"], expect_ids(&[2, 3, 4, 5]));
     let (status, day) = list("from=2026-01-02&to=2026-01-02".into()).await;
     assert_eq!(status, StatusCode::OK, "{day}");
-    assert_eq!(day["cases"], expect_ids(&[6, 3, 2, 5]));
+    assert_eq!(day["cases"], expect_ids(&[2, 3, 5, 6]));
     for query in [
         "sort=reason".into(),
         "dir=sideways".into(),
