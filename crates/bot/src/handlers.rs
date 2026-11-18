@@ -1441,14 +1441,15 @@ impl EventHandler for Handler {
             })
             .unwrap_or_default();
         logging::remember_message_update(&self.app, &event, known_author_id);
-        let bot_user_id = ctx.cache.current_user().id.get();
-        let hooked = self.app.snapshots.collector_active(&ctx);
-        let retained_report = (!hooked)
-            .then(|| {
-                logging::message_update_report(&event, known_author_id, Some(bot_user_id))
-                    .filter(|_| self.app.edit_reports.should_report(&event))
-            })
-            .flatten();
+        if !self.app.snapshots.collector_active(&ctx) {
+            self.app.snapshots.report_unhooked_edit(
+                &self.app,
+                &ctx,
+                &event,
+                known_author_id,
+                received_at,
+            );
+        }
         if let Some(guild) = event.guild_id {
             if let Some(author) = known_author_id {
                 self.app.member_joins.remember(
@@ -1495,10 +1496,6 @@ impl EventHandler for Handler {
                     self.app.text_spam.invalidate(guild.get(), channel, message);
                 }
             }
-        }
-        if !hooked && let Some(report) = retained_report {
-            self.app.snapshots.gap();
-            logging::emit(&self.app, &ctx, report.guild_id, report.event, report.vars).await;
         }
     }
 

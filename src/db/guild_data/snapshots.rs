@@ -31,9 +31,18 @@ pub(super) fn growth_reserve(tx: &impl SqlExecutor) -> Result<u64> {
 pub struct SnapshotAttachment {
     pub id: i64,
     pub filename: String,
+    /// Missing in snapshots from before description capture. An empty string
+    /// records that the attachment had no alt text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub size: u64,
     pub content_type: Option<String>,
     pub url: String,
+}
+
+impl SnapshotAttachment {
+    /// Discord allows up to 1024 Unicode characters of alt text.
+    pub const MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -59,6 +68,55 @@ pub struct SnapshotObservation {
     pub edit_at_ms: Option<i64>,
     pub coverage_epoch: u64,
     pub fields: SnapshotFields,
+}
+
+impl SnapshotObservation {
+    /// Compare supplied fields with known retained values. At the same edit
+    /// timestamp only a complementary field can still change the snapshot.
+    pub fn changes_retained_edit(&self, prior: &MessageSnapshot) -> bool {
+        if self.edit_at_ms < prior.edit_at_ms {
+            return false;
+        }
+        let same_edit = self.edit_at_ms == prior.edit_at_ms;
+        let fields = &self.fields;
+        let previous = &prior.fields;
+        let content_changed = (!same_edit || !prior.content_supplied)
+            && fields
+                .content
+                .as_ref()
+                .zip(previous.content.as_ref())
+                .is_some_and(|(current, old)| {
+                    current != old
+                        || fields
+                            .content_original_bytes
+                            .unwrap_or(current.len() as i64)
+                            != previous.content_original_bytes.unwrap_or(old.len() as i64)
+                });
+        content_changed
+            || ((!same_edit || !prior.attachments_supplied)
+                && fields
+                    .attachments
+                    .as_ref()
+                    .zip(previous.attachments.as_ref())
+                    .is_some_and(|(current, old)| {
+                        let current_count = (current.len() as i64)
+                            .saturating_add(fields.attachments_omitted.unwrap_or(0));
+                        let old_count = (old.len() as i64)
+                            .saturating_add(previous.attachments_omitted.unwrap_or(0));
+                        // Signed CDN URLs change when Discord refreshes an attachment.
+                        current_count != old_count
+                            || current.iter().zip(old).any(|(item, prior)| {
+                                item.id != prior.id
+                                    || item.filename != prior.filename
+                                    || item.size != prior.size
+                                    || item
+                                        .description
+                                        .as_ref()
+                                        .zip(prior.description.as_ref())
+                                        .is_some_and(|(current, old)| current != old)
+                            })
+                    }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +155,9 @@ pub struct SnapshotTransition {
     pub outcome: SnapshotOutcome,
     pub before: Option<MessageSnapshot>,
     pub after: Option<MessageSnapshot>,
+    /// A same-timestamp partial may fill an inherited field. This row is for
+    /// the last observation before that partial, within the current revision.
+    pub same_revision_before: Option<MessageSnapshot>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -170,6 +231,10 @@ fn bound_fields(fields: &mut SnapshotFields) -> Result<usize> {
         for attachment in attachments.iter_mut() {
             clipped_metadata |= truncate_utf8(&mut attachment.filename, 256);
             clipped_metadata |= truncate_utf8(&mut attachment.url, 1024);
+            if let Some(description) = &mut attachment.description {
+                clipped_metadata |=
+                    truncate_utf8(description, SnapshotAttachment::MAX_DESCRIPTION_BYTES);
+            }
             if let Some(content_type) = &mut attachment.content_type {
                 clipped_metadata |= truncate_utf8(content_type, 128);
             }
@@ -649,6 +714,27 @@ impl GuildDataStore {
         }).await
     }
 
+    /// Read a retained observation for a report when ordered capture missed the edit.
+    pub async fn retained_snapshot(
+        &self,
+        scope: GuildDataScope,
+        channel_id: i64,
+        message_id: i64,
+    ) -> Result<Option<MessageSnapshot>> {
+        self.check_target(&scope.placement)?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let row = load(&tx, &scope, channel_id, message_id)?;
+                let now = write_time_ms()?;
+                tx.finish_read()?;
+                Ok(row.filter(|row| row.expires_at_ms > now))
+            })
+            .await
+    }
+
     /// Reads and writes one accepted edit in one primary transaction. Equal-version
     /// partial fields may fill unknowns but cannot claim another before/after edit.
     pub async fn apply_snapshot_edit(
@@ -687,16 +773,16 @@ impl GuildDataStore {
             let observation = observation.clone();
             let mut tx = capture_transaction(conn, immediate)?;
             verify_scope(&tx, &expected, &scope, true)?;
-            if observation.observed_at_ms >= expires || write_time_ms()? >= expires { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Expired, before: None, after: None }); }
+            if observation.observed_at_ms >= expires || write_time_ms()? >= expires { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Expired, before: None, after: None, same_revision_before: None }); }
             let old = load(&tx, &scope, observation.channel_id, observation.message_id)?;
             if (old.is_none() && observation.fields.author_id.is_none())
                 || (!allow_insert && old.as_ref().and_then(|row| row.fields.author_id).is_none()) {
                 tx.finish_read()?;
-                return Ok(SnapshotTransition { outcome: SnapshotOutcome::Missing, before: None, after: None });
+                return Ok(SnapshotTransition { outcome: SnapshotOutcome::Missing, before: None, after: None, same_revision_before: None });
             }
             if let Some(prior) = &old {
-                if prior.expires_at_ms <= observation.observed_at_ms || prior.expires_at_ms <= write_time_ms()? { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Expired, before: None, after: None }); }
-                if prior.edit_at_ms.is_some_and(|at| edit < at) { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Stale, before: None, after: Some(prior.clone()) }); }
+                if prior.expires_at_ms <= observation.observed_at_ms || prior.expires_at_ms <= write_time_ms()? { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Expired, before: None, after: None, same_revision_before: None }); }
+                if prior.edit_at_ms.is_some_and(|at| edit < at) { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Stale, before: None, after: Some(prior.clone()), same_revision_before: None }); }
             }
             let equal = old.as_ref().is_some_and(|prior| prior.edit_at_ms == Some(edit));
             let inserted_content = FieldSupply::from_flag(observation.fields.content.is_some());
@@ -707,21 +793,29 @@ impl GuildDataStore {
             };
             let mut bounded = fields;
             let bytes = bound_fields(&mut bounded)?;
-            let changed = old.as_ref().is_none_or(|prior| prior.fields != bounded || (!equal && prior.edit_at_ms != Some(edit)) || prior.coverage_epoch != observation.coverage_epoch);
-            if !changed { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Duplicate, before: None, after: old }); }
+            let changed = old.as_ref().is_none_or(|prior| prior.fields != bounded || !equal
+                || prior.content_supplied != content_supplied.is_supplied()
+                || prior.attachments_supplied != attachments_supplied.is_supplied()
+                || prior.coverage_epoch != observation.coverage_epoch);
+            if !changed { tx.finish_read()?; return Ok(SnapshotTransition { outcome: SnapshotOutcome::Duplicate, before: None, after: old, same_revision_before: None }); }
             let old_bytes = if old.is_some() { tx.query_row("SELECT encoded_bytes FROM guild_message_snapshots WHERE guild_id=?1 AND enrollment_id=?2 AND channel_id=?3 AND message_id=?4", params![scope.guild_id(),scope.enrollment.id.as_str(),observation.channel_id,observation.message_id], |r| Ok(r.get::<i64>(0)?))? as u64 } else { 0 };
             let reserve = growth_reserve(&tx)?;
             let admission = admit_snapshot(&mut tx, bytes as u64, old_bytes, reserve, observation.observed_at_ms, u64::from(old.is_none()))?;
             if !admission.allowed {
                 if admission.wrote_health { tx.commit()?; } else { tx.finish_read()?; }
-                return Ok(SnapshotTransition { outcome: SnapshotOutcome::CapacityRefused, before: None, after: old });
+                return Ok(SnapshotTransition { outcome: SnapshotOutcome::CapacityRefused, before: None, after: old, same_revision_before: None });
             }
             tx.ensure_mutation_receipt()?;
-            let before = if equal { None } else { old.clone().map(|mut row| { row.reconcile_coverage(observation.coverage_epoch); row }) };
             let row = MessageSnapshot { guild_id: scope.guild_id(), channel_id: observation.channel_id, message_id: observation.message_id, fields: bounded, created_at_ms: old.as_ref().map_or(observation.created_at_ms, |r| r.created_at_ms), first_observed_at_ms: old.as_ref().map_or(observation.observed_at_ms, |r| r.first_observed_at_ms), last_observed_at_ms: observation.observed_at_ms, edit_at_ms: Some(edit), expires_at_ms: old.as_ref().map_or(expires, |r| r.expires_at_ms), generation: old.as_ref().map_or(1, |r| r.generation.saturating_add(1)), coverage_epoch: observation.coverage_epoch, continuous: old.as_ref().is_some_and(|r| r.continuity_at(observation.coverage_epoch) == SnapshotContinuity::Continuous), content_supplied: content_supplied.is_supplied(), attachments_supplied: attachments_supplied.is_supplied() };
             if old.is_some() { update(&tx, &scope, &row, bytes)?; } else { insert(&tx, &scope, &row, incoming_bytes)?; }
             tx.commit()?;
-            Ok(SnapshotTransition { outcome: if equal { SnapshotOutcome::Duplicate } else { SnapshotOutcome::Stored }, before, after: Some(row) })
+            let old = old.map(|mut row| { row.reconcile_coverage(observation.coverage_epoch); row });
+            let (before, same_revision_before) = if equal {
+                (None, old)
+            } else {
+                (old, None)
+            };
+            Ok(SnapshotTransition { outcome: if equal { SnapshotOutcome::Duplicate } else { SnapshotOutcome::Stored }, before, after: Some(row), same_revision_before })
         }).await
     }
 

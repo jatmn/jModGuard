@@ -2998,6 +2998,7 @@ async fn queued_prebuilt_report_drops_expired_fields() {
             let mut retained = sample_retained("expired-snapshot-secret");
             retained.expires_at_ms = chrono::Utc::now().timestamp_millis() + 1_500;
             retained.fields.attachments = Some(vec![db::guild_data::SnapshotAttachment {
+                description: None,
                 id: 1,
                 filename: "expired-attachment".into(),
                 size: 1,

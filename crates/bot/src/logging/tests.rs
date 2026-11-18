@@ -290,6 +290,7 @@ fn shipped_edit_template_keeps_both_long_unicode_sides_and_coverage() {
     let mut after = before.clone();
     after.fields.content = Some("🌕".repeat(700));
     after.fields.attachments = Some(vec![crate::db::guild_data::SnapshotAttachment {
+        description: None,
         id: 1,
         filename: "f".repeat(256),
         size: 5,
@@ -554,8 +555,17 @@ fn edited_at(mut fields: serde_json::Value, timestamp: &str) -> MessageUpdateEve
     update(fields)
 }
 
+fn dedup_report(dedup: &EditReportDedup, event: &MessageUpdateEvent) -> bool {
+    let Some((guild, at)) = event.guild_id.zip(event.edited_timestamp) else {
+        return false;
+    };
+    dedup
+        .window((guild, event.channel_id, event.id))
+        .is_some_and(|window| window.claim(at.timestamp_millis()))
+}
+
 fn edit_report(event: &MessageUpdateEvent, known_author_id: Option<u64>) -> Option<MessageReport> {
-    message_update_report(event, known_author_id, None)
+    message_update_report(event, known_author_id, None, None)
 }
 
 #[test]
@@ -597,14 +607,17 @@ fn untimestamped_unfurls_and_empty_attachments_are_not_edits() {
     assert!(edit_report(&update(serde_json::json!({"content":"new text"})), None).is_none());
     assert!(edit_report(&update(serde_json::json!({"attachments":[]})), None).is_none());
     let dedup = EditReportDedup::default();
-    assert!(!dedup.should_report(&gif));
-    assert!(!dedup.should_report(&update(serde_json::json!({"content":"new text"}))));
+    assert!(!dedup_report(&dedup, &gif));
+    assert!(!dedup_report(
+        &dedup,
+        &update(serde_json::json!({"content":"new text"}))
+    ));
     let real = edited(serde_json::json!({"content":"actually edited"}));
     assert_eq!(
         edit_report(&real, None).unwrap().vars["after"],
         "actually edited"
     );
-    assert!(dedup.should_report(&real));
+    assert!(dedup_report(&dedup, &real));
 }
 
 #[test]
@@ -622,7 +635,7 @@ fn untimestamped_reply_refreshes_are_not_edits() {
     }));
     assert!(edit_report(&reply, None).is_none());
     let dedup = EditReportDedup::default();
-    assert!(!dedup.should_report(&reply));
+    assert!(!dedup_report(&dedup, &reply));
     let edited_reply = edited(serde_json::json!({
         "content":"edited the reply",
         "type": 19,
@@ -636,7 +649,7 @@ fn untimestamped_reply_refreshes_are_not_edits() {
         edit_report(&edited_reply, None).unwrap().vars["after"],
         "edited the reply"
     );
-    assert!(dedup.should_report(&edited_reply));
+    assert!(dedup_report(&dedup, &edited_reply));
 }
 
 #[test]
@@ -648,14 +661,14 @@ fn bot_own_log_updates_do_not_stack_prior_reports() {
     author.id = serenity::model::id::UserId::new(99);
     author.name = "jModGuard".into();
     log_update.author = Some(author);
-    assert!(message_update_report(&log_update, None, Some(99)).is_none());
-    let reported = message_update_report(&log_update, None, Some(1)).unwrap();
+    assert!(message_update_report(&log_update, None, Some(99), None).is_none());
+    let reported = message_update_report(&log_update, None, Some(1), None).unwrap();
     assert_eq!(reported.vars["after"], nested);
     let mut anonymous = edited(serde_json::json!({"content": nested}));
     anonymous.author = None;
-    assert!(message_update_report(&anonymous, Some(99), Some(99)).is_none());
+    assert!(message_update_report(&anonymous, Some(99), Some(99), None).is_none());
     assert_eq!(
-        message_update_report(&anonymous, Some(99), Some(1))
+        message_update_report(&anonymous, Some(99), Some(1), None)
             .unwrap()
             .vars["user_id"],
         "99"
@@ -666,22 +679,41 @@ fn bot_own_log_updates_do_not_stack_prior_reports() {
 fn repeated_edit_observations_emit_once_but_changed_content_emits_again() {
     let dedup = EditReportDedup::default();
     let first = edited(serde_json::json!({"content":"first"}));
-    assert!(dedup.should_report(&first));
-    assert!(!dedup.should_report(&first));
-    assert!(!dedup.should_report(&first));
+    assert!(dedup_report(&dedup, &first));
+    assert!(!dedup_report(&dedup, &first));
+    assert!(!dedup_report(&dedup, &first));
     let changed = edited_at(
         serde_json::json!({"content":"second"}),
         "2026-09-21T00:00:02.000Z",
     );
-    assert!(dedup.should_report(&changed));
-    assert!(!dedup.should_report(&changed));
+    assert!(dedup_report(&dedup, &changed));
+    assert!(!dedup_report(&dedup, &changed));
     assert!(
-        !dedup.should_report(&first),
+        !dedup_report(&dedup, &first),
         "a replay of an earlier timestamp is still the same reported edit"
     );
     let mut other_channel = first.clone();
     other_channel.channel_id = ChannelId::new(999);
-    assert!(dedup.should_report(&other_channel));
+    assert!(dedup_report(&dedup, &other_channel));
+}
+
+#[tokio::test(start_paused = true)]
+async fn edit_window_capacity_preserves_pending_claims_and_reuses_idle_slots() {
+    let dedup = EditReportDedup::default();
+    let key = |id| (GuildId::new(7), ChannelId::new(8), MessageId::new(id));
+    let mut pending: Vec<_> = (1..=EDIT_REPORT_LIMIT as u64)
+        .map(|id| dedup.window(key(id)).unwrap())
+        .collect();
+    assert!(pending[0].claim(42));
+    let new_key = key(EDIT_REPORT_LIMIT as u64 + 1);
+    assert!(dedup.window(new_key).is_none());
+    pending.pop();
+    assert!(dedup.window(new_key).unwrap().claim(42));
+    assert!(!dedup.window(key(1)).unwrap().claim(42));
+
+    drop(pending);
+    tokio::time::advance(EDIT_REPORT_KEEP).await;
+    assert!(dedup.window(key(1)).unwrap().claim(42));
 }
 
 #[test]
@@ -690,22 +722,28 @@ fn partial_fields_for_one_edit_are_one_observation() {
     let content = edited(serde_json::json!({"content":"edited"}));
     let attachments = edited(serde_json::json!({"attachments":[]}));
     let combined = edited(serde_json::json!({"content":"edited","attachments":[]}));
-    assert!(dedup.should_report(&content));
-    assert!(!dedup.should_report(&attachments));
-    assert!(!dedup.should_report(&combined));
-    assert!(dedup.should_report(&edited_at(
-        serde_json::json!({"content":"edited again"}),
-        "2026-09-21T00:00:02.000Z"
-    )));
+    assert!(dedup_report(&dedup, &content));
+    assert!(!dedup_report(&dedup, &attachments));
+    assert!(!dedup_report(&dedup, &combined));
+    assert!(dedup_report(
+        &dedup,
+        &edited_at(
+            serde_json::json!({"content":"edited again"}),
+            "2026-09-21T00:00:02.000Z"
+        )
+    ));
 
     let reverse = EditReportDedup::default();
-    assert!(reverse.should_report(&attachments));
-    assert!(!reverse.should_report(&content));
-    assert!(!reverse.should_report(&combined));
-    assert!(reverse.should_report(&edited_at(
-        serde_json::json!({"content":"edited again"}),
-        "2026-09-21T00:00:02.000Z"
-    )));
+    assert!(dedup_report(&reverse, &attachments));
+    assert!(!dedup_report(&reverse, &content));
+    assert!(!dedup_report(&reverse, &combined));
+    assert!(dedup_report(
+        &reverse,
+        &edited_at(
+            serde_json::json!({"content":"edited again"}),
+            "2026-09-21T00:00:02.000Z"
+        )
+    ));
 }
 
 #[test]
@@ -723,38 +761,53 @@ fn distinct_edit_timestamps_and_attachment_descriptions_are_reported() {
         "attachments":[],
         "edited_timestamp":"2026-09-21T00:00:02.000Z"
     }));
-    assert!(dedup.should_report(&content));
-    assert!(!dedup.should_report(&same_edit));
-    assert!(!dedup.should_report(&update(serde_json::json!({
-        "content":"edited field supplied again",
-        "edited_timestamp":"2026-09-21T00:00:01.000Z"
-    }))));
-    assert!(dedup.should_report(&next_edit));
-    assert!(!dedup.should_report(&next_edit));
+    assert!(dedup_report(&dedup, &content));
+    assert!(!dedup_report(&dedup, &same_edit));
+    assert!(!dedup_report(
+        &dedup,
+        &update(serde_json::json!({
+            "content":"edited field supplied again",
+            "edited_timestamp":"2026-09-21T00:00:01.000Z"
+        }))
+    ));
+    assert!(dedup_report(&dedup, &next_edit));
+    assert!(!dedup_report(&dedup, &next_edit));
     assert!(
-        !dedup.should_report(&content),
+        !dedup_report(&dedup, &content),
         "a replay of T1 after T2 is still the same reported edit"
     );
-    assert!(dedup.should_report(&update(serde_json::json!({
-        "content":"third edit",
-        "edited_timestamp":"2026-09-21T00:00:03.000Z"
-    }))));
+    assert!(dedup_report(
+        &dedup,
+        &update(serde_json::json!({
+            "content":"third edit",
+            "edited_timestamp":"2026-09-21T00:00:03.000Z"
+        }))
+    ));
 
     let two_fields = EditReportDedup::default();
-    assert!(two_fields.should_report(&update(serde_json::json!({
-        "content":"before", "attachments":[],
-        "edited_timestamp":"2026-09-21T00:00:01.000Z"
-    }))));
-    assert!(two_fields.should_report(&update(serde_json::json!({
-        "content":"after",
-        "edited_timestamp":"2026-09-21T00:00:02.000Z"
-    }))));
-    assert!(!two_fields.should_report(&update(serde_json::json!({
-        "attachments":[{"id":"555", "filename":"image.png", "description":"new",
-            "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
-            "size":100}],
-        "edited_timestamp":"2026-09-21T00:00:02.000Z"
-    }))));
+    assert!(dedup_report(
+        &two_fields,
+        &update(serde_json::json!({
+            "content":"before", "attachments":[],
+            "edited_timestamp":"2026-09-21T00:00:01.000Z"
+        }))
+    ));
+    assert!(dedup_report(
+        &two_fields,
+        &update(serde_json::json!({
+            "content":"after",
+            "edited_timestamp":"2026-09-21T00:00:02.000Z"
+        }))
+    ));
+    assert!(!dedup_report(
+        &two_fields,
+        &update(serde_json::json!({
+            "attachments":[{"id":"555", "filename":"image.png", "description":"new",
+                "proxy_url":"https://cdn.example/proxy", "url":"https://cdn.example/image",
+                "size":100}],
+            "edited_timestamp":"2026-09-21T00:00:02.000Z"
+        }))
+    ));
 
     let attachment = |description: &str, timestamp: &str| {
         edited_at(
@@ -767,27 +820,42 @@ fn distinct_edit_timestamps_and_attachment_descriptions_are_reported() {
         )
     };
     let metadata = EditReportDedup::default();
-    assert!(metadata.should_report(&attachment("before", EDITED)));
-    assert!(!metadata.should_report(&attachment("before", EDITED)));
-    assert!(metadata.should_report(&attachment("after", "2026-09-21T00:00:02.000Z")));
+    assert!(dedup_report(&metadata, &attachment("before", EDITED)));
+    assert!(!dedup_report(&metadata, &attachment("before", EDITED)));
+    assert!(dedup_report(
+        &metadata,
+        &attachment("after", "2026-09-21T00:00:02.000Z")
+    ));
 }
 
 #[test]
 fn untimestamped_refresh_does_not_hide_a_later_timestamped_edit() {
     let dedup = EditReportDedup::default();
-    assert!(!dedup.should_report(&update(serde_json::json!({"content":"after"}))));
-    assert!(dedup.should_report(&edited_at(
-        serde_json::json!({"content":"after"}),
-        "2026-09-21T00:00:02.000Z"
-    )));
-    assert!(!dedup.should_report(&edited_at(
-        serde_json::json!({"attachments":[]}),
-        "2026-09-21T00:00:02.000Z"
-    )));
-    assert!(dedup.should_report(&edited_at(
-        serde_json::json!({"content":"third"}),
-        "2026-09-21T00:00:03.000Z"
-    )));
+    assert!(!dedup_report(
+        &dedup,
+        &update(serde_json::json!({"content":"after"}))
+    ));
+    assert!(dedup_report(
+        &dedup,
+        &edited_at(
+            serde_json::json!({"content":"after"}),
+            "2026-09-21T00:00:02.000Z"
+        )
+    ));
+    assert!(!dedup_report(
+        &dedup,
+        &edited_at(
+            serde_json::json!({"attachments":[]}),
+            "2026-09-21T00:00:02.000Z"
+        )
+    ));
+    assert!(dedup_report(
+        &dedup,
+        &edited_at(
+            serde_json::json!({"content":"third"}),
+            "2026-09-21T00:00:03.000Z"
+        )
+    ));
 }
 
 #[test]
