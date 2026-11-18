@@ -3878,11 +3878,22 @@ mod tests {
         control.arm_launcher_fence(&"a".repeat(32));
         assert!(control.renew_launcher_fence().await.unwrap());
         let before = control.launcher_fence_deadline().unwrap();
-        tokio::time::sleep_until(tokio::time::Instant::from_std(
-            before + Duration::from_millis(50),
-        ))
-        .await;
+        tokio::time::sleep_until(tokio::time::Instant::from_std(before)).await;
         let other_db = Db::open(&path, 2).unwrap();
+        // The stored expiry is wall-clock time read at commit, so it trails the
+        // monotonic horizon above by however long that acquisition took. End
+        // the stored window here instead of racing the two clocks.
+        other_db
+            .with_conn_sync(|conn| {
+                let tx = conn.transaction_immediate()?;
+                db::write_meta_string_conn(
+                    &tx,
+                    "launcher_lease",
+                    &format!("{} 0", "a".repeat(32)),
+                )?;
+                tx.commit()
+            })
+            .unwrap();
         let other = UpdateControl::from_application(&other_db);
         other.arm_launcher_fence(&"b".repeat(32));
         assert!(other.renew_launcher_fence().await.unwrap());
@@ -3897,10 +3908,26 @@ mod tests {
             .unwrap()
         };
         let held = row();
-        let renewal = spawn_launcher_fence_renewal(control.clone());
-        tokio::time::sleep(POLL + Duration::from_millis(500)).await;
+        let (mut logs, _capture) = super::controller_tests::capture_all_logs();
+        let mut renewal = spawn_launcher_fence_renewal(control.clone());
+        // The expired horizon wakes the worker immediately. The next refusal
+        // must come from a regular poll while the other launcher still owns the row.
+        let refusals = logs.wait_for(|bytes| {
+            String::from_utf8_lossy(bytes)
+                .matches("bot launcher fence is held by another launcher")
+                .nth(1)
+                .is_some()
+        });
+        tokio::select! {
+            result = &mut renewal => panic!("periodic renewal exited early: {result:?}"),
+            result = tokio::time::timeout(2 * POLL, refusals) => {
+                result
+                    .expect("periodic recovery must observe the foreign owner on both attempts")
+                    .expect("launcher log capture closed");
+            }
+        }
         renewal.abort();
-        let _ = renewal.await;
+        assert!(renewal.await.unwrap_err().is_cancelled());
         assert_eq!(
             row(),
             held,

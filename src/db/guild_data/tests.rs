@@ -106,6 +106,40 @@ async fn separate_store_initialization_reopen_and_no_core_tables() {
 }
 
 #[tokio::test]
+async fn writable_store_queues_for_the_writer_lock_like_the_bot_core() {
+    async fn busy_timeout_ms(db: &Db) -> i64 {
+        db.with_conn(|conn| {
+            conn.query_row("SELECT * FROM pragma_busy_timeout", (), |row| {
+                Ok(row.get(0)?)
+            })
+        })
+        .await
+        .unwrap()
+    }
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+    let core = busy_timeout_ms(&f.catalog).await;
+    assert_eq!(
+        busy_timeout_ms(&store.db).await,
+        core,
+        "concurrent bot writes to one guild store must wait for each other like core writes"
+    );
+    let reader = GuildDataStore::open(
+        GuildStoreOptions {
+            read_only: true,
+            ..f.options()
+        },
+        reg,
+    )
+    .unwrap();
+    assert!(
+        busy_timeout_ms(&reader.db).await < core,
+        "a read-only store keeps the short API wait"
+    );
+}
+
+#[tokio::test]
 async fn existing_registration_reads_stamped_identity_without_creating() {
     let f = Fixture::new();
     assert!(

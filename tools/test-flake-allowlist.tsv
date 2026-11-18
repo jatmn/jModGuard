@@ -440,7 +440,6 @@ clock	crates/updater/src/main.rs	tests::auth_fallback_doubles_to_six_hours_and_r
 clock	crates/updater/src/main.rs	tests::crash_restarts_back_off_and_a_stable_child_resets_the_delay	1	#666
 clock	crates/updater/src/main.rs	tests::instant_launcher_errors_stop_before_the_deadline_with_the_last_error	2	#666
 clock	crates/updater/src/main.rs	tests::launcher_fence_retries_a_transient_failure_promptly_and_stops_at_zero_rows	3	#666
-sleep	crates/updater/src/main.rs	tests::launcher_periodic_tick_never_steals_a_live_foreign_fence_after_expiry	1	#666
 sleep	crates/updater/src/main.rs	tests::launcher_reclaims_an_already_expired_window_without_waiting_for_a_tick	1	#666
 clock	crates/updater/src/main.rs	tests::launcher_rejects_ready_late_reply	1	#666
 sleep	crates/updater/src/main.rs	tests::launcher_rejects_ready_late_reply	1	#666

@@ -5122,7 +5122,7 @@ test('loadConfig reads guild config with POST', async () => {
   assert.deepEqual(calls[0], { url: `/api/guilds/${app.state.guildId}/config`, method: 'POST' });
 });
 
-test('signed-out dashboard links to public policies on the page origin', async () => {
+test('signed-out landing footer links to public policies on the page origin', async () => {
   const dashboard = fs.readFileSync(new URL('../dist/frontend/index.html', import.meta.url), 'utf8');
   const stylesheet = fs.readFileSync(new URL('../dist/frontend/style.css', import.meta.url), 'utf8');
   assert.match(dashboard, /id="app"/);
@@ -5139,12 +5139,24 @@ test('signed-out dashboard links to public policies on the page origin', async (
     h.window.JMODGUARD_API_BASE = splitOrigin ? apiOrigin.origin : '';
     await h.app.init();
     await settle();
-    const links = h.document.querySelectorAll('#login-view nav[aria-label="Policies"] a');
-    assert.deepEqual(Array.from(links, link => [link.textContent, link.getAttribute('href')]), [
-      ['Privacy Policy', '/privacy'],
-      ['Terms of Service', '/terms'],
+    const links = h.document.querySelectorAll('#login-view footer nav[aria-label="Policies"] a');
+    assert.deepEqual(Array.from(links, link => [link.textContent, link.href]), [
+      ['Privacy Policy', `${h.window.location.origin}/privacy`],
+      ['Terms of Service', `${h.window.location.origin}/terms`],
     ]);
   }
+});
+
+test('signed-in dashboard footer links to public policies on the page origin', async () => {
+  const h = harness(async () => response({ user: { id: '123456789012345678' }, guilds: [] }));
+  h.window.JMODGUARD_API_BASE = 'https://api.example.test';
+  await h.app.init();
+  await settle();
+  const links = h.document.querySelectorAll('#main-view footer.workspace-footer nav[aria-label="Policies"] a');
+  assert.deepEqual(Array.from(links, link => [link.textContent, link.href]), [
+    ['Privacy Policy', `${h.window.location.origin}/privacy`],
+    ['Terms of Service', `${h.window.location.origin}/terms`],
+  ]);
 });
 
 test('unauthenticated settings save returns to login', async () => {

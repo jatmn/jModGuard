@@ -1683,6 +1683,15 @@ function BotResources() {
   );
 }
 
+function PolicyLinks() {
+  return h(
+    "nav",
+    { className: "legal-links", "aria-label": "Policies" },
+    h("a", { href: "/privacy" }, "Privacy Policy"),
+    h("a", { href: "/terms" }, "Terms of Service"),
+  );
+}
+
 function App() {
   const appearance = useAppearance();
   const display = useStore(ui);
@@ -1841,6 +1850,7 @@ function App() {
               "footer",
               { className: "workspace-footer" },
               "jModGuard ",
+              h(PolicyLinks),
               h("span", null, "Built for better communities."),
             ),
           ),
@@ -1883,12 +1893,7 @@ function App() {
                       h(Icon, { name: "external-link" }),
                     ),
                     h("small", null, "For server managers and community builders."),
-                    h(
-                      "nav",
-                      { className: "legal-links", "aria-label": "Policies" },
-                      h("a", { href: "/privacy" }, "Privacy Policy"),
-                      h("a", { href: "/terms" }, "Terms of Service"),
-                    ),
+                    h("footer", null, h(PolicyLinks)),
                   )
                 : h(
                     React.Fragment,
