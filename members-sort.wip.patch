@@ -1,0 +1,1177 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 8f6bf1bc6bb819f963eb7de735b3d9b034f010dd..9e8417febf74f8eea7d8bad535fc96c4ff046090 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -114 +114 @@ nonsecret. Credentials stay in process configuration. Never run core migrations/
+-store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 21. Ban recovery uses immutable opaque attempt tags,
++store or adopt a foreign/unmarked schema. `jmodguard-guild-1` is at version 22. Ban recovery uses immutable opaque attempt tags,
+diff --git a/crates/api/src/web/enrollment_tests.rs b/crates/api/src/web/enrollment_tests.rs
+index b77c56f28ebf56a76d16d2b5ade8824efb4bd225..6e4335ff5b77c6ae44aa6c3a69f4a00dd48df5df 100644
+--- a/crates/api/src/web/enrollment_tests.rs
++++ b/crates/api/src/web/enrollment_tests.rs
+@@ -5952,0 +5953,151 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
++#[tokio::test]
++async fn members_sort_columns_and_page_across_ties_with_shared_cursors() {
++    use db::guild_data::{MemberListAnchor, MemberObservation, MemberSort, MemberSortValue};
++    use list_controls::{SortDirection, encode_cursor};
++
++    const PATH: &str = "/api/guilds/10/members";
++    const ZULU: i64 = (1_i64 << 53) + 1;
++    const ALPHA: i64 = ZULU + 1;
++    const BANNED: i64 = ZULU + 2;
++    const PREVIOUS: i64 = ZULU + 3;
++    const OLDER_ALPHA: i64 = ZULU + 4;
++    let jan_1 = 1_767_225_600_000_i64;
++    let jan_2 = jan_1 + 86_400_000;
++    let observed = jan_2 + 86_400_000;
++    let f = Fixture::new(false).await;
++    f.enroll(10).await;
++    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
++    f.app
++        .tenant
++        .activate(enrollment.clone())
++        .await
++        .unwrap()
++        .unwrap();
++    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
++    store
++        .initialize_member_directory(scope.clone(), 42, observed)
++        .await
++        .unwrap();
++    for (user_id, nickname, username, joined) in [
++        (ZULU, Some("Zulu"), "aardvark", jan_2),
++        (ALPHA, Some("Alpha"), "zebra", jan_2),
++        (OLDER_ALPHA, None, "alpha", jan_1),
++    ] {
++        store
++            .observe_member(
++                scope.clone(),
++                MemberObservation {
++                    user_id,
++                    username: Some(Some(username.into())),
++                    global_name: None,
++                    nickname: Some(nickname.map(str::to_owned)),
++                    joined_at_ms: Some(joined),
++                    observed_at_ms: observed,
++                    is_join: true,
++                },
++            )
++            .await
++            .unwrap();
++    }
++    store
++        .observe_ban(scope.clone(), BANNED, observed)
++        .await
++        .unwrap();
++    store
++        .observe_ban(scope.clone(), PREVIOUS, observed)
++        .await
++        .unwrap();
++    store
++        .observe_unban(scope.clone(), PREVIOUS, observed + 1)
++        .await
++        .unwrap();
++
++    let ids = |page: &serde_json::Value| {
++        page["members"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .map(|row| row["user_id"].as_str().unwrap().parse::<i64>().unwrap())
++            .collect::<Vec<_>>()
++    };
++    let (status, default) = f.request("GET", PATH, "").await;
++    assert_eq!(status, StatusCode::OK, "{default}");
++    assert_eq!(ids(&default), [ALPHA, ZULU, OLDER_ALPHA]);
++
++    for (sort, ascending) in [
++        ("name", [BANNED, PREVIOUS, ALPHA, OLDER_ALPHA, ZULU]),
++        ("user_id", [ZULU, ALPHA, BANNED, PREVIOUS, OLDER_ALPHA]),
++        ("joined", [BANNED, PREVIOUS, OLDER_ALPHA, ZULU, ALPHA]),
++        ("status", [ZULU, ALPHA, OLDER_ALPHA, BANNED, PREVIOUS]),
++    ] {
++        for dir in ["asc", "desc"] {
++            let mut actual = Vec::new();
++            let mut after = String::new();
++            for page in 0..ascending.len() {
++                let path = format!("{PATH}?status=all&sort={sort}&dir={dir}&limit=1{after}");
++                let (status, body) = f.request("POST", &path, "").await;
++                assert_eq!(status, StatusCode::OK, "{path}: {body}");
++                assert_eq!(ids(&body).len(), 1, "{sort} {dir} page {page}");
++                actual.extend(ids(&body));
++                if page + 1 == ascending.len() {
++                    assert!(body["next_cursor"].is_null(), "{sort} {dir}: {body}");
++                } else {
++                    let cursor = body["next_cursor"].as_str().unwrap();
++                    after = format!("&after={cursor}");
++                }
++            }
++            let mut expected = ascending;
++            if dir == "desc" {
++                expected.reverse();
++            }
++            assert_eq!(actual, expected, "{sort} {dir}");
++        }
++    }
++    let combined =
++        "sort=name&dir=desc&status=current&q=+ALP+&from=2026-01-01&to=2026-01-02&limit=1";
++    let (status, first) = f.request("POST", &format!("{PATH}?{combined}"), "").await;
++    assert_eq!(status, StatusCode::OK, "{first}");
++    assert_eq!(ids(&first), [OLDER_ALPHA]);
++    let after = first["next_cursor"].as_str().unwrap();
++    let (status, second) = f
++        .request("POST", &format!("{PATH}?{combined}&after={after}"), "")
++        .await;
++    assert_eq!(status, StatusCode::OK, "{second}");
++    assert_eq!(ids(&second), [ALPHA]);
++    assert!(second["next_cursor"].is_null());
++
++    for (status, expected) in [("current", vec![ALPHA]), ("banned", vec![])] {
++        let path = format!(
++            "{PATH}?sort=name&dir=desc&status={status}&q=alp&from=2026-01-02&to=2026-01-02"
++        );
++        let (status, filtered) = f.request("POST", &path, "").await;
++        assert_eq!(status, StatusCode::OK, "{path}: {filtered}");
++        assert_eq!(ids(&filtered), expected);
++    }
++    let legacy = format!("{PATH}?sort=joined_oldest&joined_from=2026-01-02&joined_to=2026-01-02");
++    let (status, filtered) = f.request("GET", &legacy, "").await;
++    assert_eq!(status, StatusCode::OK, "{filtered}");
++    assert_eq!(ids(&filtered), [ZULU, ALPHA]);
++    let forged = encode_cursor(
++        "members",
++        MemberSort::Status,
++        SortDirection::Asc,
++        MemberListAnchor {
++            value: MemberSortValue::Integer(4),
++            user_id: ZULU,
++        },
++    )
++    .unwrap_or_else(|_| panic!("encode out-of-range status anchor"));
++    for query in [
++        "sort=missing".to_owned(),
++        "dir=sideways".to_owned(),
++        "after=broken".to_owned(),
++        format!("sort=name&dir=asc&after={after}"),
++        format!("sort=joined&dir=desc&after={after}"),
++        format!("sort=status&dir=asc&after={forged}"),
++    ] {
++        let (status, body) = f.request("POST", &format!("{PATH}?{query}"), "").await;
++        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
++    }
++}
++
+diff --git a/crates/api/src/web/members.rs b/crates/api/src/web/members.rs
+index 70489e005302b2185e42ed7b2a9c228b44765f6f..c1d1ef464b4fb01a0c491fee8093c281f138d3db 100644
+--- a/crates/api/src/web/members.rs
++++ b/crates/api/src/web/members.rs
+@@ -2,0 +3 @@ use super::api;
++use super::list_controls::{ListQuery, SortDirection, decode_cursor, encode_cursor};
+@@ -8 +9,2 @@ use crate::db::guild_data::{
+-    GuildDataScope, MemberQuery, MemberSort, MemberStatusFilter, MemberSyncStatus,
++    GuildDataScope, MemberListAnchor, MemberProfile, MemberQuery, MemberSort, MemberStatusFilter,
++    MemberSyncStatus,
+@@ -14,2 +16,2 @@ use axum::response::{IntoResponse, Response};
+-use chrono::{NaiveDate, TimeZone, Utc};
+-use serde::Deserialize;
++use chrono::Utc;
++use serde::{Deserialize, Serialize};
+@@ -18,0 +21,12 @@ use tower_sessions::Session;
++#[derive(Clone, Copy, Deserialize)]
++#[serde(rename_all = "snake_case")]
++enum MemberSortParam {
++    Name,
++    UserId,
++    Joined,
++    Status,
++    // Keep the previous sort values usable by an already-open dashboard.
++    JoinedNewest,
++    JoinedOldest,
++}
++
+@@ -21,2 +35,2 @@ pub struct MembersQuery {
+-    q: Option<String>,
+-    status: Option<String>,
++    #[serde(flatten)]
++    list: ListQuery<MemberSortParam, MemberStatusFilter>,
+@@ -25,2 +38,0 @@ pub struct MembersQuery {
+-    sort: Option<String>,
+-    after: Option<String>,
+@@ -29,0 +42,62 @@ pub struct MembersQuery {
++#[derive(Serialize)]
++pub struct MembersResponse {
++    members: Vec<MemberProfile>,
++    next_cursor: Option<String>,
++}
++
++impl MembersQuery {
++    fn validate(mut self) -> ApiResult<(MemberQuery, SortDirection)> {
++        self.list.from = self.list.from.or(self.joined_from);
++        self.list.to = self.list.to.or(self.joined_to);
++        let default_dir = match self.list.sort {
++            Some(
++                MemberSortParam::JoinedOldest
++                | MemberSortParam::Name
++                | MemberSortParam::UserId
++                | MemberSortParam::Status,
++            ) => SortDirection::Asc,
++            _ => SortDirection::Desc,
++        };
++        let controls = self.list.validate(MemberSortParam::Joined, default_dir)?;
++        let sort = match controls.sort {
++            MemberSortParam::Name => MemberSort::Name,
++            MemberSortParam::UserId => MemberSort::UserId,
++            MemberSortParam::Joined
++            | MemberSortParam::JoinedNewest
++            | MemberSortParam::JoinedOldest => MemberSort::Joined,
++            MemberSortParam::Status => MemberSort::Status,
++        };
++        if controls
++            .q
++            .as_ref()
++            .is_some_and(|q| q.len() > 128 || q.chars().count() > 120)
++        {
++            return Err(ApiError(anyhow::anyhow!("search is too long")));
++        }
++        if controls.subject.is_some() || controls.actor.is_some() {
++            return Err(ApiError(anyhow::anyhow!("use member search for user IDs")));
++        }
++        let after = controls
++            .after
++            .as_deref()
++            .map(|raw| decode_cursor::<_, MemberListAnchor>(raw, "members", sort, controls.dir))
++            .transpose()?;
++        if after.as_ref().is_some_and(|anchor| !anchor.matches(sort)) {
++            return Err(ApiError(anyhow::anyhow!("invalid list cursor")));
++        }
++        Ok((
++            MemberQuery {
++                q: controls.q,
++                status: controls.outcome.unwrap_or(MemberStatusFilter::Current),
++                joined_from_ms: controls.from_ms,
++                joined_to_ms: controls.until_ms.map(|until| until - 1),
++                sort,
++                descending: controls.dir == SortDirection::Desc,
++                after,
++                limit: self.limit.unwrap_or(50).clamp(1, 100),
++            },
++            controls.dir,
++        ))
++    }
++}
++
+@@ -108,15 +181,0 @@ fn parse_user_id(raw: &str) -> ApiResult<i64> {
+-fn date_ms(raw: Option<String>, end: bool) -> ApiResult<Option<i64>> {
+-    raw.map(|value| {
+-        let date = NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+-            .map_err(|_| ApiError(anyhow::anyhow!("invalid joined date")))?;
+-        let time = if end {
+-            date.and_hms_milli_opt(23, 59, 59, 999)
+-        } else {
+-            date.and_hms_milli_opt(0, 0, 0, 0)
+-        }
+-        .ok_or_else(|| ApiError(anyhow::anyhow!("invalid joined date")))?;
+-        Ok(Utc.from_utc_datetime(&time).timestamp_millis())
+-    })
+-    .transpose()
+-}
+-
+@@ -129 +188 @@ pub async fn list_members(
+-) -> ApiResult<Json<serde_json::Value>> {
++) -> ApiResult<Json<MembersResponse>> {
+@@ -131,0 +191,2 @@ pub async fn list_members(
++    let (query, dir) = query.validate()?;
++    let sort = query.sort;
+@@ -133,36 +194,9 @@ pub async fn list_members(
+-    let q = query.q.map(|value| value.trim().to_owned());
+-    if q.as_ref()
+-        .is_some_and(|value| value.chars().count() > 120 || value.len() > 128)
+-    {
+-        return Err(ApiError(anyhow::anyhow!("search is too long")));
+-    }
+-    if query.after.as_ref().is_some_and(|value| value.len() > 64) {
+-        return Err(ApiError(anyhow::anyhow!("cursor is too long")));
+-    }
+-    let status = match query.status.as_deref().unwrap_or("current") {
+-        "current" => MemberStatusFilter::Current,
+-        "banned" => MemberStatusFilter::Banned,
+-        "previously_banned" => MemberStatusFilter::PreviouslyBanned,
+-        "all" => MemberStatusFilter::All,
+-        _ => return Err(ApiError(anyhow::anyhow!("invalid member status"))),
+-    };
+-    let sort = match query.sort.as_deref().unwrap_or("joined_newest") {
+-        "joined_newest" => MemberSort::JoinedNewest,
+-        "joined_oldest" => MemberSort::JoinedOldest,
+-        _ => return Err(ApiError(anyhow::anyhow!("invalid member sort"))),
+-    };
+-    let page = store
+-        .list_members(
+-            scope,
+-            MemberQuery {
+-                q,
+-                status,
+-                joined_from_ms: date_ms(query.joined_from, false)?,
+-                joined_to_ms: date_ms(query.joined_to, true)?,
+-                sort,
+-                after: query.after,
+-                limit: query.limit.unwrap_or(50).clamp(1, 100),
+-            },
+-        )
+-        .await?;
+-    Ok(Json(serde_json::to_value(page)?))
++    let page = store.list_members(scope, query).await?;
++    let next_cursor = page
++        .next_cursor
++        .map(|anchor| encode_cursor("members", sort, dir, anchor))
++        .transpose()?;
++    Ok(Json(MembersResponse {
++        members: page.members,
++        next_cursor,
++    }))
+diff --git a/crates/integration-tests/tests/guild_store_smoke.rs b/crates/integration-tests/tests/guild_store_smoke.rs
+index 19b7044e689875f7ecba35f00c77b6d337ae15b6..3c8173d6c8f48feadb0aac10cef2254a8ec07546 100644
+--- a/crates/integration-tests/tests/guild_store_smoke.rs
++++ b/crates/integration-tests/tests/guild_store_smoke.rs
+@@ -15,0 +16,48 @@ fn remote_options() -> GuildStoreOptions {
++async fn sorted_members_page_over_remote_store(
++    writer: &GuildDataStore,
++    reader: &GuildDataStore,
++    scope: &GuildDataScope,
++) {
++    writer
++        .initialize_member_directory(scope.clone(), 42, 1_000)
++        .await
++        .unwrap();
++    for (user_id, username) in [(10, "ALPHA"), (11, "zulu"), (12, "alpha")] {
++        writer
++            .observe_member(
++                scope.clone(),
++                MemberObservation {
++                    user_id,
++                    username: Some(Some(username.into())),
++                    global_name: None,
++                    nickname: None,
++                    joined_at_ms: None,
++                    observed_at_ms: 1_001,
++                    is_join: true,
++                },
++            )
++            .await
++            .unwrap();
++    }
++    let mut query = MemberQuery {
++        q: Some("alpha".into()),
++        status: MemberStatusFilter::Current,
++        joined_from_ms: None,
++        joined_to_ms: None,
++        sort: MemberSort::Name,
++        descending: true,
++        after: None,
++        limit: 1,
++    };
++    for expected in ["12", "10"] {
++        let page = reader
++            .list_members(scope.clone(), query.clone())
++            .await
++            .unwrap();
++        assert_eq!(page.members.len(), 1);
++        assert_eq!(page.members[0].user_id, expected);
++        assert_eq!(page.next_cursor.is_some(), expected == "12");
++        query.after = page.next_cursor;
++    }
++}
++
+@@ -245,0 +294 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
++    sorted_members_page_over_remote_store(&store, &reopened, &scoped).await;
+diff --git a/docs/DATABASE-BASELINE.md b/docs/DATABASE-BASELINE.md
+index 7b5ac862a2d9fa4d9061bdd6fce5bb0fe1a1c89a..3ee0aed5b170acad358778888fc86fe783fe8feb 100644
+--- a/docs/DATABASE-BASELINE.md
++++ b/docs/DATABASE-BASELINE.md
+@@ -114,2 +114,2 @@ across guilds ([MEMBERS.md](MEMBERS.md)).
+-The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version20,
+-using `migrations/guild/0001_identity.sql` through `0019_server_names.sql`. Version 16
++The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version 22,
++using `migrations/guild/0001_identity.sql` through `0021_member_sort.sql`. Version 16
+@@ -126,3 +126,4 @@ Gateway snapshot.
+-Earlier binaries must not read version16+ case tags, version17 pending receipts, version18 gap flags, version19 access roles, or version20 server names. This separate
+-database holds identity, placement bindings, receipts, membership/log-channel
+-settings, selected cases, history, sources, evidence ownership, Bunny transfer
++Version 21 indexes the Cases list. Version 22 indexes the member directory for
++column sorting. Earlier binaries refuse newer guild schemas. This database holds
++identity, placement bindings, receipts, membership/log-channel settings, selected
++cases, history, sources, evidence ownership, Bunny transfer
+@@ -131,2 +132,2 @@ progress, tenant settings, bounded latest-message snapshots and the bounded
+-store atomically; open requires 14. See [tenant runtime](TENANT-RUNTIME.md). Core is at
+-migration 0020. Each opener refuses the other family. No records are moved by startup.
++store atomically; open requires the current version. See [tenant runtime](TENANT-RUNTIME.md).
++Core is at migration 0020. Each opener refuses the other family. No records are moved by startup.
+diff --git a/docs/GUILD-STORES.md b/docs/GUILD-STORES.md
+index 2faf7a40390a69916aa9af4cd324761bc008ffab..f8131e88932349c81ceff7096c78ac1f4e6c1046 100644
+--- a/docs/GUILD-STORES.md
++++ b/docs/GUILD-STORES.md
+@@ -58 +58 @@ on a startup or blocking worker, like core database opening.
+-The separate `jmodguard-guild-1` family uses migrations 0001–0020. Version1 introduced
++The separate `jmodguard-guild-1` family uses migrations 0001–0021. Version1 introduced
+@@ -91,0 +92 @@ adds virtual sort keys and scoped indexes for the [Cases list](TENANT-CASES.md).
++Version 22 adds virtual keys and scoped indexes for the [Members list](MEMBERS.md).
+@@ -96,2 +97,2 @@ Core bootstrap never applies this schema; the existing core version is 17.
+-| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to schema 21, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+-| `open` | Verify the current schema 21 identity and ownership; create no schema or binding. |
++| `initialize` | Initialize an empty database atomically, upgrade a matching earlier store to schema 22, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
++| `open` | Verify the current schema 22 identity and ownership; create no schema or binding. |
+diff --git a/frontend/app.js b/frontend/app.js
+index 77d54ab2f3ca593ac04091c7071208c4fffe6b04..551a09a66843f59d71a9c0f8ad1d719807797630 100644
+--- a/frontend/app.js
++++ b/frontend/app.js
+@@ -6313,0 +6314,26 @@ const memberSyncStatusLabels = {
++const MEMBER_LIST = {
++  list: "members",
++  defaultSort: "joined",
++  defaultDir: "desc",
++  filterLabel: "Member filters",
++  searchPlaceholder: "User ID, mention, display name or username",
++  searchLimit: 120,
++  dateLabels: { from: "Joined from (UTC)", to: "Joined to (UTC)" },
++  filters: [{
++    key: "status",
++    label: "Status",
++    emptyLabel: "Current members",
++    options: {
++      banned: { label: "Currently banned" },
++      previously_banned: { label: "Previously banned" },
++      all: { label: "All retained" },
++    },
++  }],
++  columns: [
++    { key: "name", label: "Member" },
++    { key: "user_id", label: "User ID" },
++    { key: "joined", label: "Joined", initialDir: "desc" },
++    { key: "status", label: "Status" },
++  ],
++};
++
+@@ -6334,52 +6360,5 @@ function tabMembers() {
+-  const searchRef = useRef(null);
+-  const search = h(Input, {
+-    ref: searchRef,
+-    defaultValue: memberHandoff?.userId,
+-    onInput: () => handlers.current.queueFilteredList?.(),
+-    onBlur: () => handlers.current.loadChangedFilters?.(),
+-    type: "search",
+-    placeholder: "User ID, mention, display name or username",
+-    className: "input",
+-  });
+-  const statusFilterRef = useRef(null);
+-  const statusFilter = h(
+-    Select,
+-    {
+-      ref: statusFilterRef,
+-      defaultValue: memberHandoff ? "all" : undefined,
+-      onChange: () => handlers.current.loadChangedFilters?.(),
+-      className: "select",
+-    },
+-    ...[
+-      ["current", "Current members"],
+-      ["banned", "Currently banned"],
+-      ["previously_banned", "Previously banned"],
+-      ["all", "All retained"],
+-    ].map(([value, label]) => h("option", { value: value }, label)),
+-  );
+-  const joinedFromRef = useRef(null);
+-  const joinedFrom = h(Input, {
+-    ref: joinedFromRef,
+-    onInput: () => handlers.current.queueFilteredList?.(),
+-    onBlur: () => handlers.current.loadChangedFilters?.(),
+-    type: "date",
+-    className: "input",
+-  });
+-  const joinedToRef = useRef(null);
+-  const joinedTo = h(Input, {
+-    ref: joinedToRef,
+-    onInput: () => handlers.current.queueFilteredList?.(),
+-    onBlur: () => handlers.current.loadChangedFilters?.(),
+-    type: "date",
+-    className: "input",
+-  });
+-  const sortRef = useRef(null);
+-  const sort = h(
+-    Select,
+-    {
+-      ref: sortRef,
+-      onChange: () => handlers.current.loadChangedFilters?.(),
+-      className: "select",
+-    },
+-    h("option", { value: "joined_newest" }, "Newest join first"),
+-    h("option", { value: "joined_oldest" }, "Oldest join first"),
++  const controls = useListControls(
++    MEMBER_LIST,
++    guildId,
++    () => handlers.current.loadChangedFilters?.(),
++    () => handlers.current.invalidateResults?.(),
+@@ -6398 +6376,0 @@ function tabMembers() {
+-      debounce = null,
+@@ -7024,10 +7002,2 @@ function tabMembers() {
+-        const q = new URLSearchParams({
+-          limit: "50",
+-          status: statusFilterRef.current.value,
+-          sort: sortRef.current.value,
+-        });
+-        const rawSearch = String(searchRef.current.value || "").trim();
+-        const mention = rawSearch.match(/^<@!?(\d+)>$/);
+-        if (rawSearch) q.set("q", mention ? mention[1] : rawSearch);
+-        if (joinedFromRef.current.value) q.set("joined_from", joinedFromRef.current.value);
+-        if (joinedToRef.current.value) q.set("joined_to", joinedToRef.current.value);
++        const q = controls.query();
++        q.set("limit", "50");
+@@ -7209,0 +7180 @@ function tabMembers() {
++      if (!aliveHere()) return;
+@@ -7223,16 +7193,0 @@ function tabMembers() {
+-    const queueFilteredList = () => {
+-      if (!aliveHere()) return;
+-      invalidateResults();
+-      clearTimeout(debounce);
+-      debounce = setTimeout(() => {
+-        debounce = null;
+-        if (aliveHere()) loadMembers();
+-      }, 300);
+-    };
+-    const loadChangedFilters = () => {
+-      if (!aliveHere()) return;
+-      clearTimeout(debounce);
+-      debounce = null;
+-      invalidateResults();
+-      loadMembers();
+-    };
+@@ -7240,2 +7195,6 @@ function tabMembers() {
+-      queueFilteredList,
+-      loadChangedFilters,
++      invalidateResults,
++      loadChangedFilters: () => {
++        if (!aliveHere()) return;
++        invalidateResults();
++        loadMembers();
++      },
+@@ -7275 +7233,0 @@ function tabMembers() {
+-      clearTimeout(debounce);
+@@ -7283 +7241,2 @@ function tabMembers() {
+-    loadMembers();
++    if (memberHandoff) controls.replaceFilters({ q: memberHandoff.userId, status: "all" });
++    else loadMembers();
+@@ -7311,9 +7270,2 @@ function tabMembers() {
+-        h(
+-          "div",
+-          { className: "row form-row" },
+-          field("Search", search),
+-          field("Status", statusFilter),
+-          field("Joined from (UTC)", joinedFrom),
+-          field("Joined to (UTC)", joinedTo),
+-          field("Sort", sort),
+-        ),
++        h(ListControls, { controls }),
++        h("p", { className: "muted" }, "Default order: newest join first."),
+@@ -7336 +7288,6 @@ function tabMembers() {
+-        h(DataTable, { headings: ["Member", "User ID", "Joined", "Status", "History"] }, memberRows),
++        h(DataTable, {
++          headings: [
++            ...MEMBER_LIST.columns.map((column) => h(ListSortHeading, { key: column.key, column, controls })),
++            "History",
++          ],
++        }, memberRows),
+@@ -7916 +7873 @@ const CASE_LIST = {
+-const WORKSPACE_LISTS = new Map([[CASE_LIST.list, CASE_LIST]]);
++const WORKSPACE_LISTS = new Map([[CASE_LIST.list, CASE_LIST], [MEMBER_LIST.list, MEMBER_LIST]]);
+diff --git a/frontend/list-controls.js b/frontend/list-controls.js
+index d38c932f5175b52e6f43d9238d868455533b26bb..221021b8704e189955e353a2be9fccd4861f7818 100644
+--- a/frontend/list-controls.js
++++ b/frontend/list-controls.js
+@@ -14,2 +14,2 @@ function filterKeys(config) {
+-function boundedSearch(value) {
+-  return Array.from(value).slice(0, SEARCH_LIMIT).join("");
++function boundedSearch(value, limit = SEARCH_LIMIT) {
++  return Array.from(value).slice(0, limit).join("");
+@@ -72,2 +72,6 @@ function readView(config, guildId) {
+-  for (const key of filterKeys(config)) filters[key] = query.get(key) || "";
+-  filters.q = boundedSearch(filters.q.trim());
++  for (const key of commonKeys) filters[key] = query.get(key) || "";
++  for (const { key, options } of config.filters) {
++    const value = query.get(key);
++    if (value && (!options || Object.hasOwn(options, value))) filters[key] = value;
++  }
++  filters.q = boundedSearch(filters.q.trim(), config.searchLimit);
+@@ -100 +104 @@ function hasFilters(view) {
+-export function useListControls(config, guildId, onChange) {
++export function useListControls(config, guildId, onChange, onSearchPending) {
+@@ -104,3 +108,10 @@ export function useListControls(config, guildId, onChange) {
+-  const searchTimer = useRef(null);
+-  useEffect(() => () => clearTimeout(searchTimer.current), []);
+-
++  const pendingSearch = useRef(null);
++  useEffect(() => () => clearTimeout(pendingSearch.current?.timer), []);
++
++  const takeSearch = () => {
++    const pending = pendingSearch.current;
++    if (!pending) return;
++    clearTimeout(pending.timer);
++    pendingSearch.current = null;
++    return pending.value;
++  };
+@@ -107,0 +119,2 @@ export function useListControls(config, guildId, onChange) {
++    const q = takeSearch();
++    if (q !== undefined) next = { ...next, filters: { ...next.filters, q } };
+@@ -119 +132 @@ export function useListControls(config, guildId, onChange) {
+-    clearTimeout(searchTimer.current);
++    takeSearch();
+@@ -122,0 +136,8 @@ export function useListControls(config, guildId, onChange) {
++  const flushSearch = () => {
++    const q = takeSearch();
++    if (q === undefined) return;
++    // A list that aborted its previous read when typing began must reload
++    // even if the text was edited back to the last committed search.
++    if (q === current.current.filters.q && onSearchPending) onChange();
++    else setFilter("q", q);
++  };
+@@ -124 +145 @@ export function useListControls(config, guildId, onChange) {
+-    const text = boundedSearch(value);
++    const text = boundedSearch(value, config.searchLimit);
+@@ -126,2 +147,3 @@ export function useListControls(config, guildId, onChange) {
+-    clearTimeout(searchTimer.current);
+-    searchTimer.current = setTimeout(() => setFilter("q", text.trim()), SEARCH_DELAY_MS);
++    takeSearch();
++    pendingSearch.current = { value: text.trim(), timer: setTimeout(flushSearch, SEARCH_DELAY_MS) };
++    onSearchPending?.();
+@@ -141 +163 @@ export function useListControls(config, guildId, onChange) {
+-    config, view, searchText, setSearch, setFilter, replaceFilters, sortBy, query,
++    config, view, searchText, setSearch, flushSearch, setFilter, replaceFilters, sortBy, query,
+@@ -147 +169,5 @@ function ListField({ label, children }) {
+-  return h("div", { className: "field" }, h("label", null, label, children));
++  const inputId = React.useId();
++  return h("div", { className: "field" },
++    h("label", { htmlFor: inputId }, label),
++    React.cloneElement(children, { id: inputId }),
++  );
+@@ -151 +177 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
+-  const { config, view, searchText, setSearch, setFilter, replaceFilters } = controls;
++  const { config, view, searchText, setSearch, flushSearch, setFilter, replaceFilters } = controls;
+@@ -158,0 +185 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
++      onInput: (event) => setFilter(key, event.target.value),
+@@ -163 +190 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
+-    ...config.filters.map(({ key, label, options, kind, idLabel, render }) => {
++    ...config.filters.map(({ key, label, options, kind, idLabel, render, emptyLabel }) => {
+@@ -182 +209 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
+-        h("option", { value: "" }, `Any ${label.toLowerCase()}`),
++        h("option", { value: "" }, emptyLabel || `Any ${label.toLowerCase()}`),
+@@ -193,2 +220,3 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
+-        maxLength: SEARCH_LIMIT * 2,
+-        onChange: (event) => setSearch(event.target.value),
++        maxLength: (config.searchLimit || SEARCH_LIMIT) * 2,
++        onInput: (event) => setSearch(event.target.value),
++        onBlur: flushSearch,
+@@ -197,2 +225,2 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
+-    date("from", "From (UTC)", { max: filters.to || undefined }),
+-    date("to", "To (UTC)", { min: filters.from || undefined }),
++    date("from", config.dateLabels?.from || "From (UTC)", { max: filters.to || undefined }),
++    date("to", config.dateLabels?.to || "To (UTC)", { min: filters.from || undefined }),
+diff --git a/migrations/guild/0021_member_sort.sql b/migrations/guild/0021_member_sort.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..bbe8fcdc405e041b9ee35c608c89714ca98e2bf1
+--- /dev/null
++++ b/migrations/guild/0021_member_sort.sql
+@@ -0,0 +1,43 @@
++-- Virtual keys match the values displayed in Members, with a numeric key for
++-- status labels and 0 for an unknown join date (the existing default order).
++-- Using columns lets SQLite seek to both values in a keyset boundary.
++ALTER TABLE guild_member_directory ADD COLUMN name_sort_key TEXT AS (
++    lower(coalesce(nullif(coalesce(nickname,global_name,username),''),nullif(username,''),CAST(user_id AS TEXT)))
++) VIRTUAL;
++ALTER TABLE guild_member_directory ADD COLUMN joined_sort_key INTEGER AS (coalesce(joined_at_ms,0)) VIRTUAL;
++ALTER TABLE guild_member_directory ADD COLUMN status_sort_key INTEGER AS (
++    CASE WHEN is_banned=1 THEN 1 WHEN is_current=1 THEN 0 WHEN ever_banned=1 THEN 3 ELSE 2 END
++) VIRTUAL;
++
++-- Partial indexes let each filtered list page through just its eligible rows.
++-- The directory primary key supplies the all-status user ID order.
++CREATE INDEX guild_member_sort_all_name
++    ON guild_member_directory(guild_id,enrollment_id,name_sort_key,user_id);
++CREATE INDEX guild_member_sort_all_joined
++    ON guild_member_directory(guild_id,enrollment_id,joined_sort_key,user_id);
++CREATE INDEX guild_member_sort_all_status
++    ON guild_member_directory(guild_id,enrollment_id,status_sort_key,user_id);
++CREATE INDEX guild_member_sort_current_name
++    ON guild_member_directory(guild_id,enrollment_id,name_sort_key,user_id) WHERE is_current=1;
++CREATE INDEX guild_member_sort_current_id
++    ON guild_member_directory(guild_id,enrollment_id,user_id) WHERE is_current=1;
++CREATE INDEX guild_member_sort_current_joined
++    ON guild_member_directory(guild_id,enrollment_id,joined_sort_key,user_id) WHERE is_current=1;
++CREATE INDEX guild_member_sort_current_status
++    ON guild_member_directory(guild_id,enrollment_id,status_sort_key,user_id) WHERE is_current=1;
++CREATE INDEX guild_member_sort_banned_name
++    ON guild_member_directory(guild_id,enrollment_id,name_sort_key,user_id) WHERE is_banned=1;
++CREATE INDEX guild_member_sort_banned_id
++    ON guild_member_directory(guild_id,enrollment_id,user_id) WHERE is_banned=1;
++CREATE INDEX guild_member_sort_banned_joined
++    ON guild_member_directory(guild_id,enrollment_id,joined_sort_key,user_id) WHERE is_banned=1;
++CREATE INDEX guild_member_sort_banned_status
++    ON guild_member_directory(guild_id,enrollment_id,status_sort_key,user_id) WHERE is_banned=1;
++CREATE INDEX guild_member_sort_previous_name
++    ON guild_member_directory(guild_id,enrollment_id,name_sort_key,user_id) WHERE ever_banned=1 AND is_banned=0;
++CREATE INDEX guild_member_sort_previous_id
++    ON guild_member_directory(guild_id,enrollment_id,user_id) WHERE ever_banned=1 AND is_banned=0;
++CREATE INDEX guild_member_sort_previous_joined
++    ON guild_member_directory(guild_id,enrollment_id,joined_sort_key,user_id) WHERE ever_banned=1 AND is_banned=0;
++CREATE INDEX guild_member_sort_previous_status
++    ON guild_member_directory(guild_id,enrollment_id,status_sort_key,user_id) WHERE ever_banned=1 AND is_banned=0;
+diff --git a/migrations/guild/current_version.txt b/migrations/guild/current_version.txt
+index aabe6ec3909c9d4871f8f89ef88ca3b6795ebd29..2bd5a0a98a36cc08ada88b804d3be047e6aa5b8a 100644
+--- a/migrations/guild/current_version.txt
++++ b/migrations/guild/current_version.txt
+@@ -1 +1 @@
+-21
++22
+diff --git a/scripts/frontend-state-test.mjs b/scripts/frontend-state-test.mjs
+index 7d5e57c3e4653dcf555a5cc10d939c0747a2c664..ba6b9b489df8ff4db7d307347456ae230ff55233 100644
+--- a/scripts/frontend-state-test.mjs
++++ b/scripts/frontend-state-test.mjs
+@@ -1991 +1991,2 @@ test('Members labels its filters and counts first, middle, last and empty pages'
+-  assert.equal(memberLabelled(panel, 'Sort').localName, 'select');
++  assert.match(textOf(panel), /Default order: newest join first/);
++  assert.equal(panel.querySelector('th[aria-sort="descending"] button').textContent, 'Joined');
+@@ -2008,0 +2010,71 @@ test('Members labels its filters and counts first, middle, last and empty pages'
++test('Members maps its headers, search and filters to the shared list and restores its URL', async () => {
++  const calls = [];
++  const fetchMembers = async (url) => {
++    if (url.endsWith('/member-sync')) return response({ status: 'complete', phase: 'complete' });
++    const query = new URLSearchParams(url.split("?")[1]);
++    calls.push(query);
++    return response({ members: [{ user_id: '10006', display_name: 'Alpha' }], next_cursor: 'opaque-page' });
++  };
++  const h = harness(fetchMembers);
++  const panel = memberView(h);
++  await settle();
++  const latest = () => calls.at(-1);
++  assert.equal(latest().get('sort'), 'joined');
++  assert.equal(latest().get('dir'), 'desc');
++  assert.equal(panel.querySelectorAll('thead th button').length, 4);
++  assert.equal(panel.querySelector('th:has(> .list-sort)').closest('tr').lastElementChild.textContent, 'History');
++
++  const status = memberLabelled(panel, 'Status');
++  status.value = 'all';
++  await fire(status, 'change');
++  const from = memberLabelled(panel, 'Joined from (UTC)');
++  from.value = '2026-09-01';
++  await fire(from, 'input');
++  const to = memberLabelled(panel, 'Joined to (UTC)');
++  to.value = '2026-09-30';
++  await fire(to, 'input');
++
++  const next = findNode(panel, n => n.localName === 'button' && textOf(n) === 'Next page');
++  await fire(next, 'click');
++  assert.equal(latest().get('after'), 'opaque-page');
++
++  // Sorting while text is still debouncing applies the text in the same read.
++  const search = memberLabelled(panel, 'Search');
++  search.value = ' Alpha ';
++  fire(search, 'input');
++  for (const [label, key, firstDir] of [
++    ['Member', 'name', 'asc'], ['User ID', 'user_id', 'asc'],
++    ['Joined', 'joined', 'desc'], ['Status', 'status', 'asc'],
++  ]) {
++    const button = [...panel.querySelectorAll('thead th button')].find(n => textOf(n) === label);
++    for (const dir of [firstDir, firstDir === 'asc' ? 'desc' : 'asc']) {
++      await fire(button, 'click');
++      assert.equal(latest().get('sort'), key);
++      assert.equal(latest().get('dir'), dir);
++      assert.equal(latest().has('after'), false);
++      assert.equal(button.closest('th').getAttribute('aria-sort'), dir === 'asc' ? 'ascending' : 'descending');
++      assert.ok(button.querySelector('.list-sort-mark'));
++      assert.equal(latest().get('q'), 'Alpha');
++      assert.equal(latest().get('status'), 'all');
++      assert.equal(latest().get('from'), '2026-09-01');
++      assert.equal(latest().get('to'), '2026-09-30');
++    }
++  }
++
++  const [, sharedQuery] = h.historyUrls.at(-1).split("?");
++  const reopened = harness(fetchMembers);
++  reopened.location.search = "?" + sharedQuery;
++  reopened.app.state.guildId = reopened.app.state.guilds[1].id;
++  reopened.app.restoreWorkspace();
++  assert.equal(reopened.app.state.tab, 'members');
++  assert.equal(reopened.app.state.guildId, h.app.state.guildId);
++  reopened.app.state.config = { enrollment_id: 'membership' };
++  const restored = reopened.app.tabMembers();
++  await settle();
++  assert.equal(restored.querySelector('th[aria-sort="descending"] button').textContent, 'Status');
++  assert.equal(memberLabelled(restored, 'Search').value, 'Alpha');
++  assert.equal(latest().get('from'), '2026-09-01');
++  assert.equal(latest().get('to'), '2026-09-30');
++  assert.equal(latest().get('status'), 'all');
++});
++
+@@ -2132,3 +2204 @@ test('Members filter, date, and sort changes discard old history and list respon
+-  const sort = memberLabelled(panel, 'Sort');
+-  sort.value = 'joined_oldest';
+-  fire(sort, 'change');
++  fire(panel.querySelector('th[aria-sort="descending"] button'), 'click');
+@@ -2137,2 +2207,2 @@ test('Members filter, date, and sort changes discard old history and list respon
+-  assert.match(newList.url, /joined_from=2026-09-01/);
+-  assert.match(newList.url, /sort=joined_oldest/);
++  assert.match(newList.url, /from=2026-09-01/);
++  assert.match(newList.url, /sort=joined&dir=asc/);
+diff --git a/scripts/publish-image-test.sh b/scripts/publish-image-test.sh
+index ad185568eb5153fb9a9bbde351300a0436c456f8..33e505b92b270aaac6fd3d6983324c523e0d4770 100755
+--- a/scripts/publish-image-test.sh
++++ b/scripts/publish-image-test.sh
+@@ -240 +240 @@ done
+-for field in update-control=3 upgrade-min-core=15 upgrade-min-guild=1 guild-schema=21; do
++for field in update-control=3 upgrade-min-core=15 upgrade-min-guild=1 guild-schema=22; do
+diff --git a/src/db/guild_data.rs b/src/db/guild_data.rs
+index 3d77f7457f769dc8bea04ee305b1590a51eeba1e..4382111c8e9310a55e7f5f38c587f358c99290b3 100644
+--- a/src/db/guild_data.rs
++++ b/src/db/guild_data.rs
+@@ -42,0 +43 @@ const CASE_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0020_case_li
++const MEMBER_SORT_SCHEMA: &str = include_str!("../../migrations/guild/0021_member_sort.sql");
+@@ -556,0 +558,20 @@ fn initialize_store(
++        if version < 22 {
++            // Each row has an all-status index set and may also be current and
++            // either banned or previously banned. Budget for each set's keys
++            // and page overhead using directory data only.
++            let index_keys: i64 = tx.query_row(
++                "SELECT coalesce(sum(
++                    (1 + is_current + (is_banned OR ever_banned)) *
++                    (4 * (48 + length(CAST(enrollment_id AS BLOB))) +
++                     length(CAST(coalesce(nickname,'') AS BLOB)) +
++                     length(CAST(coalesce(global_name,'') AS BLOB)) +
++                     length(CAST(coalesce(username,'') AS BLOB)))
++                 ),0) FROM guild_member_directory",
++                (),
++                |row| Ok(row.get(0)?),
++            )?;
++            let index_bound = u64::try_from(index_keys)?
++                .saturating_mul(2)
++                .saturating_add(32_000_000);
++            tx.execute_batch_bounded(MEMBER_SORT_SCHEMA, index_bound)?;
++        }
+@@ -586,0 +608 @@ fn initialize_store(
++    tx.execute_batch_bounded(MEMBER_SORT_SCHEMA, 32_000_000)?;
+@@ -675,0 +698 @@ impl GuildDataStore {
++                    (MEMBER_SORT_SCHEMA, 22),
+diff --git a/src/db/guild_data/member_directory.rs b/src/db/guild_data/member_directory.rs
+index c92039f86968b31c2fa8c197d36660901a3c7011..a9f9f4abf29ae2d62cdb08d2b24fa569a881d84c 100644
+--- a/src/db/guild_data/member_directory.rs
++++ b/src/db/guild_data/member_directory.rs
+@@ -423,2 +423,42 @@ pub enum MemberSort {
+-    JoinedNewest,
+-    JoinedOldest,
++    Name,
++    UserId,
++    Joined,
++    Status,
++}
++
++impl MemberSort {
++    fn column(self) -> &'static str {
++        match self {
++            Self::Name => "name_sort_key",
++            Self::UserId => "user_id",
++            Self::Joined => "joined_sort_key",
++            Self::Status => "status_sort_key",
++        }
++    }
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(untagged)]
++pub enum MemberSortValue {
++    Text(String),
++    Integer(i64),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct MemberListAnchor {
++    pub value: MemberSortValue,
++    pub user_id: i64,
++}
++
++impl MemberListAnchor {
++    pub fn matches(&self, sort: MemberSort) -> bool {
++        self.user_id > 0
++            && match (&self.value, sort) {
++                (MemberSortValue::Text(_), MemberSort::Name)
++                | (MemberSortValue::Integer(_), MemberSort::Joined) => true,
++                (MemberSortValue::Integer(key), MemberSort::UserId) => *key == self.user_id,
++                (MemberSortValue::Integer(key), MemberSort::Status) => (0..=3).contains(key),
++                _ => false,
++            }
++    }
+@@ -434 +474,2 @@ pub struct MemberQuery {
+-    pub after: Option<String>,
++    pub descending: bool,
++    pub after: Option<MemberListAnchor>,
+@@ -437,0 +479,52 @@ pub struct MemberQuery {
++impl MemberQuery {
++    pub(super) fn sql(&self) -> String {
++        let (status, filter) = match self.status {
++            MemberStatusFilter::Current => ("current", "is_current=1"),
++            MemberStatusFilter::Banned => ("banned", "is_banned=1"),
++            MemberStatusFilter::PreviouslyBanned => ("previous", "ever_banned=1 AND is_banned=0"),
++            MemberStatusFilter::All => ("all", "1=1"),
++        };
++        let column = self.sort.column();
++        let suffix = match self.sort {
++            MemberSort::Name => "name",
++            MemberSort::UserId => "id",
++            MemberSort::Joined => "joined",
++            MemberSort::Status => "status",
++        };
++        let index = if self.status == MemberStatusFilter::All && self.sort == MemberSort::UserId {
++            "sqlite_autoindex_guild_member_directory_1".to_owned()
++        } else {
++            format!("guild_member_sort_{status}_{suffix}")
++        };
++        let (op, dir) = if self.descending {
++            ("<", "DESC")
++        } else {
++            (">", "ASC")
++        };
++        let (seek, order) = if self.sort == MemberSort::UserId {
++            (
++                format!("user_id {op} ?8 AND ?7 IS NOT NULL"),
++                format!("user_id {dir}"),
++            )
++        } else {
++            (
++                format!("({column},user_id) {op} (?7,?8)"),
++                format!("{column} {dir},user_id {dir}"),
++            )
++        };
++        let seek = if self.after.is_some() {
++            seek.as_str()
++        } else {
++            "?7 IS NULL AND ?8 IS NULL"
++        };
++        format!(
++            "SELECT {PROFILE_SQL},{column} FROM guild_member_directory INDEXED BY {index}
++             WHERE guild_id=?1 AND enrollment_id=?2 AND {filter}
++               AND (?3='' OR user_id=?4 OR instr(search_text,?3)>0)
++               AND (?5 IS NULL OR joined_at_ms>=?5) AND (?6 IS NULL OR joined_at_ms<=?6)
++               AND {seek}
++             ORDER BY {order} LIMIT ?9"
++        )
++    }
++}
++
+@@ -455 +548 @@ pub struct MemberProfile {
+-#[derive(Debug, Clone, Serialize)]
++#[derive(Debug, Clone)]
+@@ -458 +551 @@ pub struct MemberPage {
+-    pub next_cursor: Option<String>,
++    pub next_cursor: Option<MemberListAnchor>,
+@@ -3568,2 +3661 @@ impl GuildDataStore {
+-            query.limit > 0
+-                && query.limit <= 100
++            (1..=100).contains(&query.limit)
+@@ -3571 +3663,4 @@ impl GuildDataStore {
+-                && query.after.as_ref().is_none_or(|v| v.len() <= 64),
++                && query
++                    .after
++                    .as_ref()
++                    .is_none_or(|anchor| anchor.matches(query.sort)),
+@@ -3577,17 +3672,8 @@ impl GuildDataStore {
+-        let (after_join, after_id) = if let Some(cursor) = &query.after {
+-            let (j, id) = cursor.split_once(':').ok_or(MemberSyncError::Invalid)?;
+-            (j.parse::<i64>()?, id.parse::<i64>()?)
+-        } else {
+-            (
+-                if query.sort == MemberSort::JoinedNewest {
+-                    i64::MAX
+-                } else {
+-                    i64::MIN
+-                },
+-                if query.sort == MemberSort::JoinedNewest {
+-                    i64::MAX
+-                } else {
+-                    i64::MIN
+-                },
+-            )
+-        };
++        let sql = query.sql();
++        let (after_key, after_id) = query.after.map_or((Value::Null, None), |anchor| {
++            let key = match anchor.value {
++                MemberSortValue::Text(name) => Value::Text(name),
++                MemberSortValue::Integer(number) => Value::Integer(number),
++            };
++            (key, Some(anchor.user_id))
++        });
+@@ -3595,12 +3681,47 @@ impl GuildDataStore {
+-        self.db.with_conn(move |conn| {
+-            let tx=conn.transaction_primary_snapshot()?; verify_scope(&tx,&expected,&scope,true)?;
+-            let status=match query.status { MemberStatusFilter::Current=>"is_current=1",MemberStatusFilter::Banned=>"is_banned=1",MemberStatusFilter::PreviouslyBanned=>"ever_banned=1 AND is_banned=0",MemberStatusFilter::All=>"1=1" };
+-            let order=if query.sort==MemberSort::JoinedNewest { ("<", "DESC") } else { (">", "ASC") };
+-            let sql=format!("SELECT {PROFILE_SQL} FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND {status} AND (?3='' OR user_id=?4 OR instr(search_text,?3)>0) AND (?5 IS NULL OR joined_at_ms>=?5) AND (?6 IS NULL OR joined_at_ms<=?6) AND (coalesce(joined_at_ms,0),user_id) {} (?7,?8) ORDER BY coalesce(joined_at_ms,0) {},user_id {} LIMIT ?9",order.0,order.1,order.1);
+-            let mut stmt=tx.prepare(&sql)?;
+-            let rows=stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),search,mention_id,query.joined_from_ms,query.joined_to_ms,after_join,after_id,query.limit as i64+1],profile)?;
+-            let mut members=Vec::new(); for row in rows { members.push(row?); } drop(stmt);
+-            let more=members.len()>query.limit as usize; if more { members.pop(); }
+-            let next_cursor=if more { members.last().map(|p|format!("{}:{}",p.joined_at_ms.unwrap_or(0),p.user_id)) } else {None};
+-            tx.finish_read()?; Ok(MemberPage{members,next_cursor})
+-        }).await
++        self.db
++            .with_conn(move |conn| {
++                let tx = conn.transaction_primary_snapshot()?;
++                verify_scope(&tx, &expected, &scope, true)?;
++                let mut stmt = tx.prepare(&sql)?;
++                let rows = stmt.query_map(
++                    params![
++                        scope.guild_id(),
++                        scope.enrollment.id.as_str(),
++                        search,
++                        mention_id,
++                        query.joined_from_ms,
++                        query.joined_to_ms,
++                        after_key,
++                        after_id,
++                        i64::from(query.limit) + 1
++                    ],
++                    |row| {
++                        let value = match query.sort {
++                            MemberSort::Name => MemberSortValue::Text(row.get(12)?),
++                            _ => MemberSortValue::Integer(row.get(12)?),
++                        };
++                        let anchor = MemberListAnchor {
++                            value,
++                            user_id: row.get(0)?,
++                        };
++                        Ok((profile(row)?, anchor))
++                    },
++                )?;
++                let mut rows = rows.collect::<Result<Vec<_>>>()?;
++                drop(stmt);
++                let more = rows.len() > query.limit as usize;
++                if more {
++                    rows.pop();
++                }
++                let next_cursor = rows
++                    .last()
++                    .filter(|_| more)
++                    .map(|(_, anchor)| anchor.clone());
++                let members = rows.into_iter().map(|(profile, _)| profile).collect();
++                tx.finish_read()?;
++                Ok(MemberPage {
++                    members,
++                    next_cursor,
++                })
++            })
++            .await
+diff --git a/src/db/guild_data/tests/member_directory.rs b/src/db/guild_data/tests/member_directory.rs
+index 446e779022ea8d871aa1b60b8057799f4ecf0526..19877dce3e9cc3ef0deed109b66e86d5f27d133a 100644
+--- a/src/db/guild_data/tests/member_directory.rs
++++ b/src/db/guild_data/tests/member_directory.rs
+@@ -27,0 +28,79 @@ async fn ready() -> (Fixture, GuildDataStore, GuildDataScope) {
++#[tokio::test]
++async fn member_sort_upgrade_seeks_scoped_indexes_for_first_and_later_pages() {
++    use crate::db_compat::Connection;
++
++    let f = Fixture::new();
++    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
++    GuildDataStore::create_historical_store(f.options(), reg.clone(), 21).unwrap();
++    let raw = Connection::open(&f.store_path).unwrap();
++    raw.execute_batch_bounded(
++        "WITH RECURSIVE users(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM users WHERE id<30000)
++         INSERT INTO guild_member_directory(guild_id,enrollment_id,user_id,username,search_text,
++                                               is_current,is_banned,ever_banned,joined_at_ms,observed_at_ms)
++         SELECT CASE WHEN id<=20000 THEN 10 ELSE 20 END,'scope',id,'Member '||id,'member '||id,
++                id%30!=0,id%60=0,id%30=0,
++                CASE WHEN id%2=0 THEN NULL ELSE id%100 END,id
++         FROM users",
++        SCHEMA_BATCH_LIMIT,
++    ).unwrap();
++    drop(raw);
++    let store = GuildDataStore::initialize(f.options(), reg).unwrap();
++    store.db.with_conn(move |conn| {
++        let (count, name, joined, status) = conn.query_row(
++            "SELECT (SELECT count(*) FROM guild_member_directory),
++                    name_sort_key,joined_sort_key,status_sort_key
++             FROM guild_member_directory WHERE guild_id=10 AND enrollment_id='scope' AND user_id=60",
++            (), |row| Ok((row.get::<i64>(0)?, row.get::<String>(1)?, row.get::<i64>(2)?, row.get::<i64>(3)?)),
++        )?;
++        assert_eq!((count, name.as_str(), joined, status), (30000, "member 60", 0, 1));
++
++        for status in [MemberStatusFilter::Current, MemberStatusFilter::Banned,
++                       MemberStatusFilter::PreviouslyBanned, MemberStatusFilter::All] {
++            for (sort, key, seek) in [
++                (MemberSort::Name, Value::Text("member 60".into()), "(name_sort_key,user_id)"),
++                (MemberSort::UserId, Value::Integer(60), "user_id"),
++                (MemberSort::Joined, Value::Integer(0), "(joined_sort_key,user_id)"),
++                (MemberSort::Status, Value::Integer(1), "(status_sort_key,user_id)"),
++            ] {
++                for descending in [false, true] {
++                    for continuation in [false, true] {
++                        let query = MemberQuery {
++                            q: Some("member".into()),
++                            status,
++                            joined_from_ms: Some(1),
++                            joined_to_ms: Some(80),
++                            sort,
++                            descending,
++                            after: continuation.then_some(MemberListAnchor {
++                                value: if let Value::Text(name) = &key {
++                                    MemberSortValue::Text(name.clone())
++                                } else {
++                                    MemberSortValue::Integer(60)
++                                },
++                                user_id: 60,
++                            }),
++                            limit: 50,
++                        };
++                        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {}", query.sql()))?;
++                        let plan = stmt.query_map(
++                            params![10_i64, "scope", "member", Option::<i64>::None, 1_i64, 80_i64,
++                                if continuation { key.clone() } else { Value::Null },
++                                continuation.then_some(60_i64), 51_i64],
++                            |row| Ok(row.get::<String>(3)?),
++                        )?.collect::<Result<Vec<_>>>()?;
++                        assert_eq!(plan.len(), 1, "{status:?} {sort:?}: {plan:?}");
++                        let detail = &plan[0];
++                        assert!(detail.starts_with("SEARCH guild_member_directory USING INDEX ")
++                            && detail.contains("guild_id=? AND enrollment_id=?"), "{detail}");
++                        if continuation {
++                            let op = if descending { "<" } else { ">" };
++                            assert!(detail.contains(&format!("{seek}{op}")), "{detail}");
++                        }
++                    }
++                }
++            }
++        }
++        Ok(())
++    }).await.unwrap();
++}
++
+@@ -279 +358,2 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
+-                sort: MemberSort::JoinedNewest,
++                sort: MemberSort::Joined,
++                descending: true,
+@@ -296 +376,2 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
+-                sort: MemberSort::JoinedNewest,
++                sort: MemberSort::Joined,
++                descending: true,
+@@ -313 +394,2 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
+-                sort: MemberSort::JoinedNewest,
++                sort: MemberSort::Joined,
++                descending: true,
+@@ -364 +446,2 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
+-                sort: MemberSort::JoinedNewest,
++                sort: MemberSort::Joined,
++                descending: true,
+@@ -2188 +2271,2 @@ async fn previously_banned_excludes_current_and_pending_success_respects_newer_u
+-                sort: MemberSort::JoinedNewest,
++                sort: MemberSort::Joined,
++                descending: true,
+@@ -3029 +3113,2 @@ async fn old_stay_payload_cannot_replace_new_stay_name_or_search() {
+-        sort: MemberSort::JoinedNewest,
++        sort: MemberSort::Joined,
++        descending: true,
+@@ -5132 +5217,2 @@ async fn gateway_ban_identity_updates_saved_names_without_losing_nickname_or_ord
+-        sort: MemberSort::JoinedNewest,
++        sort: MemberSort::Joined,
++        descending: true,
