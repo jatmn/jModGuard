@@ -258,7 +258,7 @@ no-default-features API tests, service boundaries (`bash scripts/check-service-b
 (`bash scripts/dependabot-config-test.sh`), host ESLint for the browser pages
 (`bash scripts/require-host-eslint-node.sh`, then `npm ci --ignore-scripts --prefix tools/eslint`,
 then `npm audit --prefix tools/eslint --audit-level=high`,
-then `bash tools/eslint-web-selftest.sh`; Node `^20.19.0`, `^22.13.0`, or `>=24` per
+then `bash tools/eslint-web-selftest.sh`; Node `^20.19.0`, `^22.13.0`, or `>=26` per
 `tools/eslint/package.json` `engines`),
 frontend Node tests,
 independent `jmodguard-bot` / `jmodguard-api` builds, then `dual_process_smoke`

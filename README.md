@@ -53,7 +53,7 @@ git clone https://github.com/jatmn/jModGuard.git
 cd jModGuard
 # Independent bot package (no dashboard stack).
 cargo build --locked --release -p jmodguard-bot
-# API with the default embedded frontend (Node.js 22.13+).
+# API with the default embedded frontend (Node.js ^22.22.2 or 26+).
 npm ci --ignore-scripts --prefix tools/webui
 npm run build --prefix tools/webui
 cargo build --locked --release -p jmodguard-api

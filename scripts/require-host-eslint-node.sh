@@ -9,7 +9,7 @@ fail() {
 }
 
 if ! command -v node >/dev/null 2>&1; then
-  fail "missing node; install Node.js ^20.19.0, ^22.13.0, or >=24 for host ESLint"
+  fail "missing node; install Node.js ^20.19.0, ^22.13.0, or >=26 for host ESLint"
 fi
 if ! command -v npm >/dev/null 2>&1; then
   fail "missing npm; install npm alongside Node for: npm ci --ignore-scripts --prefix tools/eslint"
@@ -18,13 +18,13 @@ fi
 if ! node -e '
 const [major, minor, patch] = process.versions.node.split(".").map((part) => Number(part));
 const supported =
-  major >= 24
+  major >= 26
   || (major === 22 && minor >= 13)
   || (major === 20 && minor >= 19);
 if (!supported) {
   console.error(
     "unsupported Node.js " + process.version
-      + " (host ESLint needs ^20.19.0, ^22.13.0, or >=24)"
+      + " (host ESLint needs ^20.19.0, ^22.13.0, or >=26)"
   );
   process.exit(1);
 }

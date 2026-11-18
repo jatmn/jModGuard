@@ -93,7 +93,12 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     } };
   }
   const appWindow = new Proxy(win, {
-    get(target, key) { return key === 'location' ? location : Reflect.get(target, key); },
+    get(target, key) {
+      if (key === 'location') return location;
+      // jsdom requires the real Window receiver for EventTarget methods.
+      if (key === 'addEventListener' || key === 'removeEventListener') return target[key].bind(target);
+      return Reflect.get(target, key);
+    },
     set(target, key, value) { if (key === 'location') { location.href = value; return true; } return Reflect.set(target, key, value); },
   });
   const context = vm.createContext({ document, window: appWindow, location, history: { replaceState(_state, _unused, url) { historyUrls.push(url); } },
@@ -5412,7 +5417,7 @@ test('server switcher name truncation keeps open rows inside the list and reuses
   // daisyUI menu items wrap, which sizes a row to its full text width; open rows must stay
   // single-line and as wide as the list so the name ellipsis can apply.
   const menu = fs.readFileSync(new URL('../tools/webui/node_modules/daisyui/components/menu.css', import.meta.url), 'utf8');
-  assert.match(menu, /\.menu :where\(li\)\{flex-flow:column wrap/);
+  assert.match(menu, /& :where\(li\)\{flex-flow:column wrap/);
   assert.match(rule('.server-picker-list > li'), /flex-wrap:\s*nowrap/);
   assert.match(rule('.server-picker-list > li'), /(?:^|;)\s*min-width:\s*0/);
   for (const declaration of [/(?:^|;)\s*width:\s*100%/, /max-width:\s*100%/, /(?:^|;)\s*min-width:\s*0/, /display:\s*flex/])
