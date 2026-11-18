@@ -354,7 +354,7 @@ function ownerLeaveRequestId(server) {
     let requestId = window.sessionStorage.getItem(key);
     if (typeof requestId !== "string" || !requestId) {
       requestId = `${Math.floor(Date.now() / 1000)}_${crypto.randomUUID()}`;
-      window.sessionStorage.setItem(key, requestId);
+      setSessionItemWithReadCacheFallback(window.sessionStorage, key, requestId);
     }
     return requestId;
   } catch (_) {
@@ -2526,7 +2526,7 @@ async function submitSave(path, method, body, signal, reconcileRecovered) {
       enrollment,
       ...(roleSave ? { revision: body.revision } : {}),
     };
-    window.sessionStorage.setItem(key, JSON.stringify(saved));
+    setSessionItemWithReadCacheFallback(window.sessionStorage, key, JSON.stringify(saved));
   } catch (_) {
     throw new Error("Browser session storage must be available and valid to safely save changes.");
   }
@@ -2656,7 +2656,7 @@ async function submitBotAction(path, method, body) {
           request_id: `${Math.floor(Date.now() / 1000)}_${crypto.randomUUID()}`,
           enrollment_id: enrollmentId,
         };
-    window.sessionStorage.setItem(key, JSON.stringify(saved));
+    setSessionItemWithReadCacheFallback(window.sessionStorage, key, JSON.stringify(saved));
   } catch (_) {
     throw new Error("Browser session storage must be available and valid to safely submit bot actions.");
   }
@@ -9447,53 +9447,103 @@ function CommandStep({ step, index, names, pending, onChange, remove }) {
 // whose Discord data has its own refresh interval. Sign-out and auth loss clear it.
 const READ_CACHE_PREFIX = "jmodguard.read:";
 const READ_CACHE_ENTRIES = 32;
+// Bound the combined length of stored keys and values to leave room for request identities.
+const READ_CACHE_STORAGE_LIMIT = 1024 * 1024;
 const READ_REFRESH_MS = 3 * 60 * 1000;
 const readCache = new Map();
+let readCacheGeneration = 0;
 
-function readCacheKey(path) {
+function readCacheKey(path, listSize) {
   const user = state.me?.user?.id;
-  return user && !isPreview() ? `${READ_CACHE_PREFIX}${apiBase()}:${user}:${path}` : null;
+  return user && !isPreview() ? READ_CACHE_PREFIX + JSON.stringify([apiBase(), user, path, listSize]) : null;
 }
 
-function cachedRead(path) {
-  const key = readCacheKey(path);
-  if (!key) return null;
+function rememberRead(key, entry) {
+  readCache.delete(key);
+  readCache.set(key, entry);
+  if (readCache.size > READ_CACHE_ENTRIES) readCache.delete(readCache.keys().next().value);
+}
+
+function cachedRead(key) {
   if (readCache.has(key)) return readCache.get(key);
   try {
     const saved = JSON.parse(window.sessionStorage.getItem(key));
     if (saved && Number.isFinite(saved.at) && saved.data != null) {
-      readCache.set(key, saved);
+      rememberRead(key, saved);
       return saved;
     }
   } catch (_) { /* An unreadable copy is only a cache miss. */ }
   return null;
 }
 
-function storeRead(path, data, at) {
-  const key = readCacheKey(path);
-  if (!key) return;
-  const entry = { at, data };
-  readCache.delete(key);
-  readCache.set(key, entry);
-  while (readCache.size > READ_CACHE_ENTRIES) readCache.delete(readCache.keys().next().value);
+function storedReadKeys(storage) {
+  const keys = [];
+  for (let i = 0; i < storage.length; i += 1) {
+    const key = storage.key(i);
+    if (key?.startsWith(READ_CACHE_PREFIX)) keys.push(key);
+  }
+  return keys;
+}
+
+function setSessionItemWithReadCacheFallback(storage, key, value) {
   try {
-    window.sessionStorage.setItem(key, JSON.stringify(entry));
-  } catch (_) {
-    try { window.sessionStorage.removeItem(key); } catch (__) { /* Memory still holds this tab's copy. */ }
+    storage.setItem(key, value);
+  } catch (error) {
+    // Request identities must be persisted before dispatch. Display copies can be fetched again.
+    if (error.name !== "QuotaExceededError") throw error;
+    for (const oldKey of storedReadKeys(storage)) storage.removeItem(oldKey);
+    storage.setItem(key, value);
   }
 }
 
+function storeRead(key, data, at) {
+  const entry = { at, data };
+  rememberRead(key, entry);
+  try {
+    const storage = window.sessionStorage;
+    const value = JSON.stringify(entry);
+    const size = key.length + value.length;
+    if (size > READ_CACHE_STORAGE_LIMIT) {
+      storage.removeItem(key);
+      return;
+    }
+    const others = storedReadKeys(storage).filter((oldKey) => oldKey !== key).map((oldKey) => ({
+      key: oldKey, size: oldKey.length + storage.getItem(oldKey).length,
+    }));
+    let used = others.reduce((total, item) => total + item.size, size);
+    for (const [index, old] of others.entries()) {
+      if (others.length - index < READ_CACHE_ENTRIES && used <= READ_CACHE_STORAGE_LIMIT) break;
+      storage.removeItem(old.key);
+      used -= old.size;
+    }
+    setSessionItemWithReadCacheFallback(storage, key, value);
+  } catch (_) { /* Memory still holds this tab's copy. */ }
+}
+
+function discardRead(key) {
+  readCache.delete(key);
+  try {
+    window.sessionStorage.removeItem(key);
+  } catch (_) { /* Optional storage can be unavailable. */ }
+}
+
+function readAccessFailed(error) {
+  return isUnauthenticated(error) || error.status === 403 || error.status === 409 ||
+    error.code === "guild_access_unverified";
+}
+
 function clearReadCache() {
+  readCacheGeneration += 1;
   readCache.clear();
   try {
-    for (let i = window.sessionStorage.length - 1; i >= 0; i -= 1) {
-      const key = window.sessionStorage.key(i);
-      if (key?.startsWith(READ_CACHE_PREFIX)) window.sessionStorage.removeItem(key);
-    }
+    const storage = window.sessionStorage;
+    for (const key of storedReadKeys(storage)) storage.removeItem(key);
   } catch (_) { /* Nothing readable is left to clear. */ }
 }
 
 function useApiRead(path, { retainData = false, listSize, collection, cache = false } = {}) {
+  const cacheKey = cache ? readCacheKey(path, listSize) : null;
+  const identity = cacheKey ?? path;
   const [revision, setRevision] = useState(0);
   const [result, setResult] = useState({ kind: "loading" });
   const cancel = useRef(null);
@@ -9511,20 +9561,21 @@ function useApiRead(path, { retainData = false, listSize, collection, cache = fa
   }, [cache, path]);
   useEffect(() => {
     const controller = new AbortController();
+    const generation = readCacheGeneration;
     let publication = "current";
     const timeout = collection ? null : setTimeout(() => controller.abort(), 30000);
-    const cached = cache ? cachedRead(path) : null;
+    const cached = cacheKey ? cachedRead(cacheKey) : null;
     setResult((current) => {
-      const kept = current.path === path && current.data != null ? current : null;
-      if (cache && (kept || cached)) {
+      const kept = current.identity === identity && current.data != null ? current : null;
+      if (cacheKey && (kept || cached)) {
         const shown = (kept?.updatedAt ?? -1) >= (cached?.at ?? -1) ? kept : { data: cached.data, updatedAt: cached.at };
         updatedAt.current = shown.updatedAt;
-        return { kind: "loaded", path, data: shown.data, updatedAt: shown.updatedAt, revalidating: true, error: null, progress: null };
+        return { kind: "loaded", identity, data: shown.data, updatedAt: shown.updatedAt, revalidating: true, progress: null };
       }
       const retained = retainData && kept;
       // A pending retry does not make the retained snapshot fresh again.
       return {
-        kind: "loading", path, data: retained ? current.data : null, error: retained ? current.error : null,
+        kind: "loading", identity, data: retained ? current.data : null, error: retained ? current.error : null,
         progress: listLoadProgress(listSize),
       };
     });
@@ -9538,25 +9589,33 @@ function useApiRead(path, { retainData = false, listSize, collection, cache = fa
     cancel.current = () => {
       publication = "disposed";
       controller.abort();
-      setResult({ kind: "canceled", path });
+      setResult({ kind: "canceled", identity });
     };
     read
       .then((data) => {
-        if (publication !== "current") return;
+        if (publication !== "current" || (cacheKey && generation !== readCacheGeneration)) return;
         const at = Date.now();
         updatedAt.current = at;
-        if (cache) storeRead(path, data, at);
-        setResult({ kind: "loaded", path, data, updatedAt: at });
+        if (cacheKey) storeRead(cacheKey, data, at);
+        setResult({ kind: "loaded", identity, data, updatedAt: at });
       })
       .catch((error) => {
         if (publication !== "current") return;
         const failure = controller.signal.aborted
           ? apiError("Request timed out. Refresh to verify saved state before trying again.")
           : error;
-        // A failed revalidation keeps the cached copy on screen, marked with the error.
-        setResult((current) => current.revalidating && current.path === path
-          ? { ...current, revalidating: false, error: failure }
-          : { ...current, kind: "failed", progress: null, error: failure });
+        if (cacheKey) {
+          const accessFailed = readAccessFailed(failure);
+          const { status } = failure;
+          const canKeep = !accessFailed && (!status || status === 408 || status === 429 || status >= 500);
+          if (accessFailed) clearReadCache();
+          else if (!canKeep) discardRead(cacheKey);
+          setResult((current) => current.identity === identity && current.revalidating && canKeep
+            ? { ...current, revalidating: false, progress: null, refreshError: failure }
+            : { kind: "failed", identity, error: failure });
+        } else {
+          setResult((current) => ({ ...current, kind: "failed", progress: null, error: failure }));
+        }
       })
       .finally(() => { if (timeout !== null) clearTimeout(timeout); });
     return () => {
@@ -9564,16 +9623,17 @@ function useApiRead(path, { retainData = false, listSize, collection, cache = fa
       if (timeout !== null) clearTimeout(timeout);
       controller.abort();
     };
-  }, [path, revision, retainData, collection, listSize, cache]);
-  const current = result.path === path;
+  }, [path, identity, cacheKey, revision, retainData, collection, listSize]);
+  const current = result.identity === identity;
   return {
-    loading: result.kind === "loading",
+    loading: result.kind === "loading" || (Boolean(cacheKey) && !current),
     data: retainData || cache ? (current ? result.data ?? null : null) : result.kind === "loaded" ? result.data : null,
     error: retainData || cache ? (current ? result.error ?? null : null) : result.kind === "failed" ? result.error : null,
-    progress: result.progress ?? null,
-    canceled: result.kind === "canceled",
+    progress: cacheKey && !current ? null : result.progress ?? null,
+    canceled: (!cacheKey || current) && result.kind === "canceled",
     updatedAt: current ? result.updatedAt ?? null : null,
     revalidating: current && Boolean(result.revalidating),
+    refreshError: current ? result.refreshError ?? null : null,
     cancel: () => cancel.current?.(),
     refresh: () => setRevision((value) => value + 1),
   };
@@ -9586,7 +9646,12 @@ function LastUpdated({ result }) {
     : result.updatedAt
       ? `Last updated ${new Date(result.updatedAt).toLocaleTimeString()}`
       : null;
-  return text ? h("span", { className: "muted last-updated", role: "status" }, text) : null;
+  return h(React.Fragment, null,
+    text ? h("span", { className: "muted last-updated", role: "status" }, text) : null,
+    result.refreshError ? h("span", { className: "err", role: "alert" },
+      `Refresh failed: ${result.refreshError.message}. Showing the last successful response (stale).`,
+    ) : null,
+  );
 }
 function DataTable({ headings, children, className = "table table-zebra", rowCount }) {
   return h(
@@ -9705,6 +9770,7 @@ function tabEvents() {
         },
       }),
       h(ActionButton, { className: "btn", onClick: refresh }, "Refresh"),
+      h(LastUpdated, { result }),
       h(ListPageSize, { controls }),
     ),
     h("div", { className: "row list-pagination" },

@@ -74,7 +74,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   activate(win);
   Object.defineProperty(document, 'visibilityState', {value: 'visible', writable: true});
   Object.defineProperty(win, 'localStorage', {value: { getItem: k => storage.get(k) ?? null, setItem: (k,v) => storage.set(k,v) }, configurable: true});
-  Object.defineProperty(win, 'sessionStorage', {value: {
+  if (session) Object.defineProperty(win, 'sessionStorage', {value: {
     getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k),
     key: i => [...session.keys()][i] ?? null, get length() { return session.size; },
   }, configurable: true});
@@ -9974,6 +9974,156 @@ test('cached reads revalidate every few minutes only while the page is visible',
   h.app.navigate('rules');
   await settle();
   assert.equal(intervals().length, 0, 'leaving the page stops its refresh');
+});
+
+function cacheRefreshButton(panel) {
+  return [...panel.querySelectorAll('button')].find((button) => button.textContent === 'Refresh');
+}
+
+test('display snapshots stay within the session storage budget across different list filters', async () => {
+  const session = new Map();
+  let extraSize = 0;
+  const h = harness(async (url) => {
+    assert.match(url, /\/bans\?/);
+    return response({ ...banRows(), details: 'x'.repeat(extraSize) });
+  }, new Map(), session);
+  const panel = await bansView(h);
+  const changeDate = async (day) => {
+    const date = panel.querySelector('input[type="date"]');
+    date.value = new Date(Date.UTC(2026, 0, day)).toISOString().slice(0, 10);
+    await fire(date, 'change');
+  }
+  for (let day = 1; day <= 33; day++) await changeDate(day);
+  assert.equal(readCacheKeys(session).length, 32);
+  extraSize = 600_000;
+  await changeDate(34);
+  await changeDate(35);
+  assert.equal(readCacheKeys(session).length, 1, 'two individually cacheable responses exceed the combined budget');
+  const recentKey = readCacheKeys(session).at(-1);
+  extraSize = 1_100_000;
+  await fire(cacheRefreshButton(panel), 'click');
+  assert.match(panel.querySelector('tbody').textContent, /Test-User-1/);
+  assert.equal(session.has(recentKey), false, 'an oversized response does not persist or leave its superseded copy');
+});
+
+test('a configuration save reclaims display copies when real session storage is full', async () => {
+  let saves = 0;
+  const h = harness(async (url, opts) => {
+    if (url.includes('/bans?')) return response(banRows());
+    assert.match(url, /\/settings$/);
+    assert.match(opts.headers['x-jmodguard-save'], /^[a-f0-9]{64}$/);
+    assert.equal(opts.headers['x-jmodguard-save-lookup'], '0');
+    saves++;
+    return response({ ok: true });
+  }, new Map(), null);
+  await bansView(h);
+  const storage = h.window.sessionStorage;
+  assert.ok(storage.key(0).startsWith('jmodguard.read:'));
+  const used = storage.key(0).length + storage.getItem(storage.key(0)).length;
+  const receipt = 'unresolved-request-identity';
+  storage.setItem(receipt, 'x'.repeat(5_000_000 - used - receipt.length));
+  assert.throws(() => storage.setItem('extra', '1'), { name: 'QuotaExceededError' });
+  await h.app.api(`/api/guilds/${h.app.state.guildId}/settings`, 'POST', { prefix: '!' });
+  assert.equal(saves, 1);
+  assert.equal(storage.length, 1);
+  assert.equal(storage.key(0), receipt, 'only disposable display copies are evicted');
+});
+
+for (const [list, view] of [['bans', bansView], ['events', auditLogView]]) {
+  test(`${list} cached rows and cursors belong to the requested page size`, async () => {
+    const requests = [];
+    const fixture = pageSizeFixture(list, 137);
+    let hold = false, release;
+    const h = harness(async (url) => {
+      const query = new URL(url, 'https://fixture.test').searchParams;
+      requests.push(query);
+      if (hold && !query.has('after')) await new Promise((resolve) => { release = resolve; });
+      return response(fixture(query));
+    });
+    const panel = await view(h);
+    await settle();
+    const changeSize = async (value) => {
+      const size = memberLabelled(panel, 'Rows per page');
+      size.value = value;
+      await fire(size, 'change');
+    };
+    const rows = () => listTable(panel).tBodies[0].rows.length;
+    assert.equal(rows(), 50);
+    await changeSize('100');
+    assert.equal(rows(), 100);
+    await changeSize('all');
+    assert.equal(rows(), 137);
+    assert.equal(readCacheKeys(h.session).length, 3);
+    hold = true;
+    await changeSize('50');
+    assert.equal(rows(), 50);
+    assert.equal(lastUpdated(h), 'Refreshing…');
+    await fire([...panel.querySelectorAll('button')].find((button) => button.textContent === 'Next page'), 'click');
+    assert.equal(requests.at(-1).get('after'), 'cursor:50');
+    release();
+    await settle();
+    const userId = list === 'bans' ? 1 : 2;
+    assert.equal(listTable(panel).tBodies[0].rows[0].cells[userId].textContent, '51',
+      'a late response from the first page does not replace the current page');
+  });
+}
+
+for (const [title, view, data, row] of [
+  ['Bans', bansView, banRows(), /Test-User-1/],
+  ['Audit log', auditLogView, pageSizeFixture('events', 1)(new URLSearchParams({ limit: '50' })), /member_ban/],
+  ['Bot servers', (h) => h.app.TabOwnerServers(), { servers: [directoryServer] }, /Alpha/],
+]) {
+  test(`${title} preserves cached rows on transient refresh errors and drops them on access denial`, async () => {
+    let fail = false, release;
+    const h = harness(async () => {
+      if (fail === 'offline') {
+        await new Promise((resolve) => { release = resolve; });
+        throw new Error('offline');
+      }
+      if (fail === 'denied') {
+        const inactive = title === 'Bans';
+        return { ok: false, status: inactive ? 409 : 403, headers: { get: () => null },
+          text: async () => JSON.stringify({ error: 'Access denied', code: inactive ? 'guild_enrollment_inactive' : undefined }) };
+      }
+      return response(data);
+    });
+    h.app.state.me.is_bot_owner = true;
+    const panel = await view(h);
+    await settle();
+    const table = () => panel.querySelector('tbody').textContent;
+    const status = () => panel.querySelector('.last-updated')?.textContent;
+    assert.match(table(), row);
+    fail = 'offline';
+    await fire(cacheRefreshButton(panel), 'click');
+    assert.match(table(), row);
+    assert.equal(status(), 'Refreshing…');
+    release();
+    await settle();
+    assert.match(table(), row);
+    assert.match(panel.querySelector('[role="alert"]').textContent, /Refresh failed: offline/);
+    assert.match(status(), /^Last updated /);
+    fail = 'denied';
+    await fire(cacheRefreshButton(panel), 'click');
+    assert.doesNotMatch(table(), row);
+    assert.match(table(), /Access denied/);
+    assert.equal(status(), undefined);
+    assert.deepEqual(readCacheKeys(h.session), []);
+  });
+}
+
+test('sign-out prevents an in-flight display read from restoring the cleared cache', async () => {
+  let release;
+  const h = harness(async (url) => {
+    if (url === '/logout') return { json: async () => ({ return_to: '/' }) };
+    assert.match(url, /\/bans\?/);
+    return new Promise((resolve) => { release = () => resolve(response(banRows())); });
+  });
+  await bansView(h);
+  assert.ok(release);
+  await h.app.logout();
+  release();
+  await settle();
+  assert.deepEqual(readCacheKeys(h.session), []);
 });
 
 // #608: every Dashboard Overview tile and Getting started link shows one decorative icon from the
