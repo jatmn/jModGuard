@@ -9005,6 +9005,61 @@ test('Cases maps sortable headers and a bookmarked filtered view to the API', as
   })) assert.equal(lists().at(-1).get(key), value, key);
 });
 
+test('Cases resets its filters, sort and pending search on a server switch', async () => {
+  const { h, calls, trigger, options } = await switcherHarness(switcherGuilds);
+  const [first, second] = switcherGuilds;
+  h.location.search = `?list=cases&guild=${first.id}&sort=action&dir=asc&q=first&outcome=failed`;
+  const root = await casesView(h);
+  const search = root.querySelector('input[type="search"]');
+  assert.equal(search.value, 'first');
+  search.value = 'pending first';
+  await fire(search, 'input');
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 300));
+
+  await fire(trigger(), 'click');
+  await fire(options()[1], 'click');
+  const request = calls.findLast(call => call.startsWith(`POST /api/guilds/${second.id}/cases?`));
+  assert.ok(request, 'the new guild loads Cases');
+  const query = new URLSearchParams(request.split('?')[1]);
+  assert.equal(query.get('sort'), 'date');
+  assert.equal(query.get('dir'), 'desc');
+  assert.equal(query.has('q'), false);
+  assert.equal(query.has('outcome'), false);
+  assert.equal(h.document.querySelector('#content input[type="search"]').value, '');
+  assert.equal(new URLSearchParams(h.location.search).has('list'), false);
+  assert.equal([...h.timers.values()].some(timer => timer.delay === 300), false);
+});
+
+test('Cases restores pending search after reauthentication before debounce', async () => {
+  const { calls, fetchImpl } = caseFixture();
+  const h = harness(fetchImpl);
+  const { me, guilds, guildId } = h.app.state;
+  h.location.search = `?list=cases&guild=${guildId}&q=previous&outcome=failed`;
+  const root = await casesView(h);
+  const search = root.querySelector('input[type="search"]');
+  assert.equal(search.value, 'previous');
+  search.value = '  pending review %  ';
+  await fire(search, 'input');
+  const listRequests = () => calls.map(call => new URL(call.url, 'https://fixture.test'))
+    .filter(url => url.pathname.endsWith('/cases'));
+  assert.equal(listRequests().length, 1, 'typing has not issued a request yet');
+
+  h.app.handleAuthLoss({ status: 401 });
+  await settle();
+  const login = h.document.getElementById('login-link');
+  login.addEventListener('click', event => event.preventDefault());
+  await fire(login, 'click', { button: 0 });
+  assert.equal(listRequests().length, 1, 'saving the search does not request a page');
+  h.location.search = '';
+  Object.assign(h.app.state, { me, guilds });
+  h.app.restoreWorkspace();
+  const restored = await casesView(h);
+  assert.equal(restored.querySelector('input[type="search"]').value, 'pending review %');
+  const query = listRequests().at(-1).searchParams;
+  assert.equal(query.get('q'), 'pending review %');
+  assert.equal(query.get('outcome'), 'failed');
+});
+
 test('Case file links filter to the member\'s other cases and open their Members page', async () => {
   const { calls, fetchImpl } = caseFixture({ '/members': () => response({ members: [], next_cursor: null }), '/member-sync': () => response({ status: 'complete' }) });
   const h = harness(fetchImpl);

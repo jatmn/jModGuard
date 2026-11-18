@@ -564,7 +564,7 @@ impl GuildDataStore {
         count: u32,
         limits: CaseLimits,
     ) -> Result<Vec<CaseId>> {
-        self.case_ids_by_removal(scope, after, count, limits, false, CaseFilter::default())
+        self.matching_case_ids(scope, after, count, CaseFilter::default(), limits)
             .await
     }
 
@@ -579,7 +579,8 @@ impl GuildDataStore {
         filter: CaseFilter,
         limits: CaseLimits,
     ) -> Result<Vec<CaseId>> {
-        self.case_ids_by_removal(scope, after, count, limits, false, filter)
+        limits.page(count)?;
+        self.case_ids_by_removal(scope, after, i64::from(count), false, filter)
             .await
     }
 
@@ -591,21 +592,47 @@ impl GuildDataStore {
         count: u32,
         limits: CaseLimits,
     ) -> Result<Vec<CaseId>> {
-        self.case_ids_by_removal(scope, after, count, limits, true, CaseFilter::default())
+        limits.page(count)?;
+        self.case_ids_by_removal(scope, after, i64::from(count), true, CaseFilter::default())
             .await
+    }
+
+    /// Page retained removal identities with one extra row to detect continuation.
+    pub async fn removed_case_page(
+        &self,
+        scope: GuildDataScope,
+        after: Option<CaseId>,
+        count: u32,
+        limits: CaseLimits,
+    ) -> Result<(Vec<CaseId>, Option<CaseId>)> {
+        limits.page(count)?;
+        let mut ids = self
+            .case_ids_by_removal(
+                scope,
+                after,
+                i64::from(count) + 1,
+                true,
+                CaseFilter::default(),
+            )
+            .await?;
+        let next = if ids.len() > count as usize {
+            ids.pop();
+            ids.last().cloned()
+        } else {
+            None
+        };
+        Ok((ids, next))
     }
 
     async fn case_ids_by_removal(
         &self,
         scope: GuildDataScope,
         after: Option<CaseId>,
-        count: u32,
-        limits: CaseLimits,
+        count: i64,
         removed: bool,
         filter: CaseFilter,
     ) -> Result<Vec<CaseId>> {
         self.check_target(&scope.placement)?;
-        limits.page(count)?;
         let [action, outcome, subject, actor] = filter.sql_values()?;
         let expected = self.expected.clone();
         self.db.with_conn(move |conn| {
@@ -618,7 +645,7 @@ impl GuildDataStore {
                 AND (?8 IS NULL OR json_extract(payload,'$.subject_id')=?8)
                 AND (?9 IS NULL OR json_extract(payload,'$.actor_id')=?9)
                 ORDER BY case_id LIMIT ?4")?;
-            let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_ref().map_or("",CaseId::as_str),count as i64,removed,action,outcome,subject,actor], |r| Ok(r.get::<String>(0)?))?;
+            let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),after.as_ref().map_or("",CaseId::as_str),count,removed,action,outcome,subject,actor], |r| Ok(r.get::<String>(0)?))?;
             let mut ids = Vec::new();
             for row in rows { ids.push(CaseId::try_from(row?)?); }
             drop(stmt);

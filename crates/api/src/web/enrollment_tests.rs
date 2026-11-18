@@ -6264,6 +6264,57 @@ async fn case_list_orders_and_filters_are_applied_before_paging() {
     assert_eq!(status, StatusCode::OK, "{next}");
     assert_eq!(next["cases"], expect_ids(&[5]));
     assert!(next["next_cursor"].is_null());
+
+    let normalized = "sort=action&dir=desc&subject=02&outcome=succeeded&q=+REVIEW%25_+&from=2026-01-02&to=2026-01-02&limit=2";
+    let (status, next) = list(format!("{normalized}&after={cursor}")).await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(next["cases"], expect_ids(&[5]));
+    assert!(cursor.len() <= 4096);
+    for changed in [
+        filters.replace("subject=2", "subject=3"),
+        filters.replace("status=succeeded", "status=failed"),
+        filters.replace("q=review%25_", "q=review"),
+        filters.replace("from=2026-01-02", "from=2026-01-01"),
+        filters.replace("to=2026-01-02", "to=2026-01-03"),
+        format!("{filters}&action=ban"),
+        format!("{filters}&actor=10"),
+    ] {
+        let (status, body) = list(format!("{changed}&after={cursor}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{changed}: {body}");
+        assert_eq!(
+            body["error"],
+            "list cursor does not match the guild or filters"
+        );
+    }
+    f.enroll(20).await;
+    let other = db::guild_enrollment(&f.app.db, 20).await.unwrap().unwrap();
+    f.app.tenant.activate(other).await.unwrap().unwrap();
+    let (status, body) = f
+        .request(
+            "GET",
+            &format!("/api/guilds/20/cases?{filters}&after={cursor}"),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        "list cursor does not match the guild or filters"
+    );
+
+    // The old client sent the last visible ID and expected an ascending ID seek.
+    let (status, legacy) = list(format!("after={:032x}&limit=1", 2)).await;
+    assert_eq!(status, StatusCode::OK, "{legacy}");
+    assert_eq!(legacy["cases"], expect_ids(&[3]));
+    let legacy_cursor = legacy["next_cursor"].as_str().unwrap();
+    assert_ne!(legacy_cursor, format!("{:032x}", 3));
+    let (status, next) = list(format!("after={legacy_cursor}&limit=3")).await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(next["cases"], expect_ids(&[4, 5, 6]));
+    assert!(next["next_cursor"].is_null());
+    let (status, body) = list(format!("sort=date&dir=desc&after={legacy_cursor}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
     let (status, literal) = list("q=review%25_&sort=case&dir=asc".into()).await;
     assert_eq!(status, StatusCode::OK, "{literal}");
     assert_eq!(literal["cases"], expect_ids(&[2, 3, 4, 5]));
@@ -6278,13 +6329,86 @@ async fn case_list_orders_and_filters_are_applied_before_paging() {
         "from=2026-01-03&to=2026-01-02".into(),
         "removed=true&sort=date".into(),
         "removed=true&q=reason".into(),
-        format!("after={:032x}", 3),
+        format!("sort=date&dir=desc&after={:032x}", 3),
         format!("sort=action&dir=asc&after={cursor}"),
         format!("sort=date&dir=desc&after={cursor}"),
     ] {
         let (status, body) = list(query.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
     }
+}
+
+#[tokio::test]
+async fn removed_case_list_checks_for_a_row_past_the_maximum_page() {
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource,
+    };
+    let f = Fixture::new(false).await;
+    let mut admin = managed_guild(10);
+    admin.owner = true;
+    *f.discord.guilds.lock().unwrap() = vec![admin.clone()];
+    tests::seed_auth_caches(&f.app, 42, vec![admin]);
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    let limits = crate::tenant::case_limits();
+    let max = limits.max_page_size;
+    let mut ids = Vec::new();
+    for n in 1..=max + 1 {
+        let id = CaseId::try_from(format!("{n:032x}")).unwrap();
+        store
+            .record_case(
+                scope.clone(),
+                id.clone(),
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::DiscordAudit {
+                        entry_id: i64::from(n),
+                    },
+                    action: CaseAction::Ban,
+                    outcome: CaseOutcome::Succeeded,
+                    subject_id: 42,
+                    actor_id: Some(42),
+                    occurred_at_ms: i64::from(n),
+                    reason: None,
+                    evidence: CaseEvidence::Unavailable,
+                },
+                limits,
+            )
+            .await
+            .unwrap();
+        assert!(store.remove_case(scope.clone(), id.clone()).await.unwrap());
+        ids.push(id.as_str().to_owned());
+    }
+    let list = |query: String| {
+        let f = &f;
+        async move {
+            f.request(
+                "POST",
+                &format!("/api/guilds/10/cases?removed=true&{query}"),
+                "",
+            )
+            .await
+        }
+    };
+    let (status, first) = list(format!("limit={max}")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["cases"], serde_json::json!(ids[..max as usize]));
+    let cursor = first["next_cursor"].as_str().unwrap();
+    assert_eq!(cursor, ids[max as usize - 1]);
+    let (status, last) = list(format!("limit=1&after={cursor}")).await;
+    assert_eq!(status, StatusCode::OK, "{last}");
+    assert_eq!(last["cases"], serde_json::json!(ids[max as usize..]));
+    assert!(
+        last["next_cursor"].is_null(),
+        "a full final page ends the list"
+    );
 }
 
 #[tokio::test]

@@ -6,6 +6,7 @@ const SEARCH_LIMIT = 200;
 const SEARCH_DELAY_MS = 300;
 const savedListLocation = "jmodguard.list-before-login";
 const commonKeys = ["q", "from", "to"];
+let pendingListSearch = null;
 
 function filterKeys(config) {
   return [...config.filters.map(({ key }) => key), ...commonKeys];
@@ -22,6 +23,12 @@ function emptyFilters(config) {
 export function readListLocation() {
   const query = new URLSearchParams(location.search);
   return { list: query.get("list"), guild: query.get("guild") };
+}
+
+export function flushPendingListSearch(list, guildId) {
+  if (pendingListSearch?.list === list && pendingListSearch.guildId === guildId) {
+    pendingListSearch.flush();
+  }
 }
 
 function replaceListLocation(query) {
@@ -102,7 +109,12 @@ export function useListControls(config, guildId, onChange) {
   const current = useRef(view);
   const [searchText, setSearchText] = useState(view.filters.q);
   const searchTimer = useRef(null);
-  useEffect(() => () => clearTimeout(searchTimer.current), []);
+  const cancelSearch = () => {
+    clearTimeout(searchTimer.current);
+    if (pendingListSearch?.timer === searchTimer.current) pendingListSearch = null;
+    searchTimer.current = null;
+  };
+  useEffect(() => cancelSearch, []);
 
   const commit = (next) => {
     current.current = next;
@@ -116,15 +128,27 @@ export function useListControls(config, guildId, onChange) {
     commit({ ...previous, filters: { ...previous.filters, [key]: value } });
   };
   const replaceFilters = (filters = {}) => {
-    clearTimeout(searchTimer.current);
+    cancelSearch();
     setSearchText(filters.q || "");
     commit({ ...current.current, filters: { ...emptyFilters(config), ...filters } });
   };
   const setSearch = (value) => {
     const text = boundedSearch(value);
+    const q = text.trim();
     setSearchText(text);
-    clearTimeout(searchTimer.current);
-    searchTimer.current = setTimeout(() => setFilter("q", text.trim()), SEARCH_DELAY_MS);
+    cancelSearch();
+    searchTimer.current = setTimeout(() => {
+      cancelSearch();
+      setFilter("q", q);
+    }, SEARCH_DELAY_MS);
+    pendingListSearch = {
+      list: config.list, guildId, timer: searchTimer.current,
+      flush: () => {
+        cancelSearch();
+        const view = current.current;
+        writeView(config, guildId, { ...view, filters: { ...view.filters, q } });
+      },
+    };
   };
   const sortBy = (column) => {
     const previous = current.current;

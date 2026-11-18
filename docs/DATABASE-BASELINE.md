@@ -111,8 +111,8 @@ across guilds ([MEMBERS.md](MEMBERS.md)).
 
 ## Separate guild-store family
 
-The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version20,
-using `migrations/guild/0001_identity.sql` through `0019_server_names.sql`. Version 16
+The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version 21,
+using `migrations/guild/0001_identity.sql` through `0020_case_list_orders.sql`. Version 16
 adds optional immutable ban attempt tags to case payloads without changing tables or
 rewriting legacy cases. Version 17 adds durable `guild_member_pending_rejoin_notes` so
 member-rejoin log delivery can survive restarts and member-sync ahead of gateway joins.
@@ -122,14 +122,15 @@ Version 19 adds `guild_tenant_settings.access_roles` (WebUI role -> access level
 mappings); existing rows keep none.
 Version 20 adds `guild_server_names` (the bot's latest role and channel names for
 WebUI pickers, display only); upgraded stores start empty until the bot's next
-Gateway snapshot.
-Earlier binaries must not read version16+ case tags, version17 pending receipts, version18 gap flags, version19 access roles, or version20 server names. This separate
+Gateway snapshot. Version 21 adds virtual keys and scoped indexes for case list sorting.
+Earlier binaries must not open stores that use a newer guild schema. This separate
 database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings, bounded latest-message snapshots and the bounded
 [member directory](MEMBERS.md). Initialize verifies and upgrades a matching earlier
-store atomically; open requires 14. See [tenant runtime](TENANT-RUNTIME.md). Core is at
-migration 0020. Each opener refuses the other family. No records are moved by startup.
+store atomically. Opening an initialized store requires version 21. See
+[tenant runtime](TENANT-RUNTIME.md). Core is at migration 0020. Each opener refuses
+the other family. No records are moved by startup.
 Guild migration 0009 adds bounded latest-message snapshots with fixed 24-hour expiry
 and store-level capture health. Guild migration 0010 adds the member directory,
 stays, case projection, sync state and immutable initial-seed completion.

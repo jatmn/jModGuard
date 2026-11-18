@@ -17,7 +17,7 @@ import {
 } from "./charts.js";
 import {
   clearListLocation, ListControls, ListEmptyRow, ListSortHeading, readListLocation,
-  rememberListLocation, restoreListLocation, useListControls,
+  flushPendingListSearch, rememberListLocation, restoreListLocation, useListControls,
 } from "./list-controls.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import React, { useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
@@ -1964,6 +1964,7 @@ function handleAuthLoss(error) {
     return true;
   }
   if (ui.getSnapshot().view !== "login-view") {
+    if (state.guildId) flushPendingListSearch(state.tab, state.guildId);
     state.me = null;
     state.guilds = [];
     state.guildId = null;
