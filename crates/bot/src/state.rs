@@ -1166,14 +1166,10 @@ impl BotState {
         }
         self.member_sync_rate_limit_persist_running
             .swap(false, Ordering::AcqRel);
-        if self.member_sync_rate_limit_should_keep_persisting()
-            && !self
+        !self.member_sync_rate_limit_should_keep_persisting()
+            || self
                 .member_sync_rate_limit_persist_running
                 .swap(true, Ordering::AcqRel)
-        {
-            return false;
-        }
-        true
     }
 
     async fn member_sync_rate_limit_persist_loop(self: Arc<Self>) {

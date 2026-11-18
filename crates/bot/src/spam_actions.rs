@@ -1033,7 +1033,7 @@ async fn dispatch_spam_ban<B>(
     ban: B,
 ) -> Option<CaseOutcome>
 where
-    B: std::future::Future<Output = Result<(), serenity::Error>>,
+    B: std::future::Future<Output = Result<(), Box<serenity::Error>>>,
 {
     let operation_id = pending_ban.operation_id().to_owned();
     let suppression = app.suppress_next_gateway_case(

@@ -228,12 +228,10 @@ async fn smoke_dual_process_config_sync() {
     cleanup_db(&tmp);
 }
 
-fn service_bin(name: &str) -> std::path::PathBuf {
-    let mut path = std::env::current_exe().expect("test executable");
-    path.pop();
-    path.pop();
-    path.push(format!("{}{}", name, std::env::consts::EXE_SUFFIX));
-    path
+fn service_bin(variable: &str) -> std::path::PathBuf {
+    std::env::var_os(variable)
+        .unwrap_or_else(|| panic!("set {variable} or run integration preflight"))
+        .into()
 }
 
 fn wait_status(
@@ -263,10 +261,10 @@ fn wait_status(
     }
 }
 
-/// Requires `jmodguard-bot` and `jmodguard-api` in the same cargo profile
-/// directory as this test. `cargo test --workspace` does not build those
-/// bins; `scripts/ci-preflight.sh` builds them and passes `--ignored`, after
-/// covering the ordinary in-process cases in its workspace or integration run.
+/// Preflight builds each service independently, passes their executable paths
+/// from Cargo's build messages, and runs this test with `--ignored`.
+/// To run it directly, set `JMODGUARD_SMOKE_BOT_BIN` and
+/// `JMODGUARD_SMOKE_API_BIN` to the two built executables.
 #[tokio::test]
 #[ignore = "needs the built jmodguard-bot and jmodguard-api binaries"]
 async fn smoke_bot_and_api_executables_share_sqlite() {
@@ -283,8 +281,8 @@ async fn smoke_bot_and_api_executables_share_sqlite() {
         ),
     )
     .unwrap();
-    let bot_bin = service_bin("jmodguard-bot");
-    let api_bin = service_bin("jmodguard-api");
+    let bot_bin = service_bin("JMODGUARD_SMOKE_BOT_BIN");
+    let api_bin = service_bin("JMODGUARD_SMOKE_API_BIN");
     assert!(
         bot_bin.is_file(),
         "build jmodguard-bot before this test: {}",

@@ -16,7 +16,7 @@ pub(crate) async fn automod_ban(
     user_id: serenity::model::id::UserId,
     action: &crate::types::ActionDef,
     reason: &str,
-) -> serenity::Result<()> {
+) -> Result<(), Box<serenity::Error>> {
     // Match Serenity's audit reason encoding (percent-encoded UTF-8).
     let mut encoded = String::new();
     for byte in reason.bytes() {
@@ -31,7 +31,8 @@ pub(crate) async fn automod_ban(
     headers.insert(
         "X-Audit-Log-Reason",
         reqwest::header::HeaderValue::from_str(&encoded)
-            .map_err(serenity::http::HttpError::InvalidHeader)?,
+            .map_err(serenity::http::HttpError::InvalidHeader)
+            .map_err(serenity::Error::from)?,
     );
     let request = serenity::http::Request::new(
         serenity::http::Route::GuildBan { guild_id, user_id },
@@ -45,7 +46,7 @@ pub(crate) async fn automod_ban(
         .to_string()
         .into_bytes(),
     ));
-    http.request(request).await.map(|_| ())
+    http.request(request).await.map(|_| ()).map_err(Box::new)
 }
 
 pub(crate) type OnGlobalRateLimitCallback = dyn Fn(crate::handlers::RateLimitWait) + Send + Sync;

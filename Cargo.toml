@@ -7,7 +7,7 @@ default-members = [".", "crates/runtime", "crates/bot", "crates/api", "crates/up
 [workspace.package]
 version = "0.2.1"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.100"
 license = "LicenseRef-Apache-2.0-with-Commons-Clause-1.0"
 
 [package]
@@ -17,7 +17,7 @@ edition = "2024"
 description = "Shared jModGuard configuration, data model and database access"
 license = "LicenseRef-Apache-2.0-with-Commons-Clause-1.0"
 autobins = false
-rust-version = "1.96"
+rust-version = "1.100"
 
 [features]
 test-support = []
