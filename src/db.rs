@@ -937,6 +937,18 @@ impl Db {
         initialize: impl FnOnce(&mut Connection) -> Result<()>,
         ready: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<Self> {
+        Self::open_pool(opts, opts.migrate, initialize, ready)
+    }
+
+    // `bot_writer` selects how long local pooled connections wait for the
+    // SQLite writer lock. Guild stores never set `migrate`, but only the bot
+    // opens one writable, so its writes queue like the bot's core writes.
+    fn open_pool(
+        opts: &DbOpenOptions,
+        bot_writer: bool,
+        initialize: impl FnOnce(&mut Connection) -> Result<()>,
+        ready: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<Self> {
         let remote = !opts.url.trim().is_empty();
         if remote && opts.token.trim().is_empty() {
             anyhow::bail!("db.token / JMODGUARD_DB_TOKEN is required when db.url is set");
@@ -1020,7 +1032,7 @@ impl Db {
             } else {
                 runtime.clone()
             };
-            let busy_timeout_ms = if opts.migrate {
+            let busy_timeout_ms = if bot_writer {
                 BOT_LOCAL_BUSY_TIMEOUT_MS
             } else {
                 API_LOCAL_BUSY_TIMEOUT_MS

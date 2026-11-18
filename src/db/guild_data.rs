@@ -675,8 +675,9 @@ impl GuildDataStore {
             default_prefix: String::new(),
             retention_days: 0,
         };
-        let db = Db::open_with_bootstrap(
+        let db = Db::open_pool(
             &opts,
+            !opts.read_only,
             |conn| initialize_store(conn, &expected, create),
             |_| Ok(()),
         )?;
