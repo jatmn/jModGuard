@@ -545,6 +545,11 @@ fn warn_empty_content_once(msg: &Message, last_warn: &parking_lot::Mutex<Option<
 #[async_trait]
 impl EventHandler for Handler {
     async fn ratelimit(&self, data: RatelimitInfo) {
+        crate::resources::rate_limit_wait(
+            &format!("{:?}", data.method),
+            &redact_rate_limit_path(&data.path),
+            data.global,
+        );
         self.record_rate_limit_wait(RateLimitWait {
             timeout: data.timeout,
             limit: data.limit,
@@ -556,6 +561,7 @@ impl EventHandler for Handler {
     }
 
     async fn resume(&self, _ctx: Context, _event: ResumedEvent) {
+        crate::resources::gateway_event("resume");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -565,6 +571,7 @@ impl EventHandler for Handler {
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
+        crate::resources::gateway_event("ready");
         self.app.activation.note_discord_connected();
         self.app.activation.publish_process_ready();
         if !self.app.activation.allows_started_notice() {
@@ -675,6 +682,7 @@ impl EventHandler for Handler {
     }
 
     async fn guild_create(&self, ctx: Context, guild: Guild, is_new: Option<bool>) {
+        crate::resources::gateway_event("guild_create");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -755,6 +763,7 @@ impl EventHandler for Handler {
     }
 
     async fn guild_delete(&self, _ctx: Context, incomplete: UnavailableGuild, full: Option<Guild>) {
+        crate::resources::gateway_event("guild_delete");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -797,6 +806,7 @@ impl EventHandler for Handler {
     }
 
     async fn guild_member_addition(&self, ctx: Context, new_member: Member) {
+        crate::resources::gateway_event("guild_member_addition");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -882,6 +892,7 @@ impl EventHandler for Handler {
         user: User,
         member_data: Option<Member>,
     ) {
+        crate::resources::gateway_event("guild_member_removal");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -943,6 +954,7 @@ impl EventHandler for Handler {
     }
 
     async fn guild_ban_addition(&self, ctx: Context, guild_id: GuildId, banned_user: User) {
+        crate::resources::gateway_event("guild_ban_addition");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1061,6 +1073,7 @@ impl EventHandler for Handler {
     }
 
     async fn guild_ban_removal(&self, ctx: Context, guild_id: GuildId, unbanned_user: User) {
+        crate::resources::gateway_event("guild_ban_removal");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1126,6 +1139,7 @@ impl EventHandler for Handler {
         entry: serenity::model::guild::audit_log::AuditLogEntry,
         guild_id: GuildId,
     ) {
+        crate::resources::gateway_event("guild_audit_log_entry_create");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1232,6 +1246,7 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
+        crate::resources::gateway_event("message");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1400,6 +1415,7 @@ impl EventHandler for Handler {
         _new: Option<Message>,
         event: MessageUpdateEvent,
     ) {
+        crate::resources::gateway_event("message_update");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1493,6 +1509,7 @@ impl EventHandler for Handler {
         deleted_message_id: MessageId,
         guild_id: Option<GuildId>,
     ) {
+        crate::resources::gateway_event("message_delete");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1533,6 +1550,7 @@ impl EventHandler for Handler {
         multiple_deleted_messages_ids: Vec<MessageId>,
         guild_id: Option<GuildId>,
     ) {
+        crate::resources::gateway_event("message_delete_bulk");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1620,6 +1638,7 @@ impl EventHandler for Handler {
         new_if_available: Option<Member>,
         event: GuildMemberUpdateEvent,
     ) {
+        crate::resources::gateway_event("guild_member_update");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1764,6 +1783,7 @@ impl EventHandler for Handler {
     }
 
     async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
+        crate::resources::gateway_event("voice_state_update");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1781,6 +1801,7 @@ impl EventHandler for Handler {
     }
 
     async fn guild_role_create(&self, ctx: Context, new: Role) {
+        crate::resources::gateway_event("guild_role_create");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1802,6 +1823,7 @@ impl EventHandler for Handler {
         removed_role_id: RoleId,
         removed_role_data_if_available: Option<Role>,
     ) {
+        crate::resources::gateway_event("guild_role_delete");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1827,6 +1849,7 @@ impl EventHandler for Handler {
         old_data_if_available: Option<Role>,
         new: Role,
     ) {
+        crate::resources::gateway_event("guild_role_update");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1848,6 +1871,7 @@ impl EventHandler for Handler {
     }
 
     async fn channel_create(&self, ctx: Context, channel: GuildChannel) {
+        crate::resources::gateway_event("channel_create");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1855,6 +1879,7 @@ impl EventHandler for Handler {
     }
 
     async fn category_create(&self, ctx: Context, category: GuildChannel) {
+        crate::resources::gateway_event("category_create");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1862,6 +1887,7 @@ impl EventHandler for Handler {
     }
 
     async fn category_delete(&self, ctx: Context, category: GuildChannel) {
+        crate::resources::gateway_event("category_delete");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1869,6 +1895,7 @@ impl EventHandler for Handler {
     }
 
     async fn channel_update(&self, ctx: Context, old: Option<GuildChannel>, new: GuildChannel) {
+        crate::resources::gateway_event("channel_update");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1888,6 +1915,7 @@ impl EventHandler for Handler {
         channel: GuildChannel,
         _messages: Option<Vec<Message>>,
     ) {
+        crate::resources::gateway_event("channel_delete");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1895,6 +1923,7 @@ impl EventHandler for Handler {
     }
 
     async fn thread_create(&self, ctx: Context, thread: GuildChannel) {
+        crate::resources::gateway_event("thread_create");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1907,6 +1936,7 @@ impl EventHandler for Handler {
     }
 
     async fn thread_update(&self, ctx: Context, old: Option<GuildChannel>, new: GuildChannel) {
+        crate::resources::gateway_event("thread_update");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1927,6 +1957,7 @@ impl EventHandler for Handler {
         thread: PartialGuildChannel,
         full_thread_data: Option<GuildChannel>,
     ) {
+        crate::resources::gateway_event("thread_delete");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -1945,6 +1976,7 @@ impl EventHandler for Handler {
         ctx: Context,
         interaction: serenity::model::prelude::Interaction,
     ) {
+        crate::resources::gateway_event("interaction_create");
         if !self.app.activation.allows_rule_trigger() {
             return;
         }

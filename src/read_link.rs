@@ -1,5 +1,7 @@
 //! Authenticated container-use readings on a dedicated loopback TCP listener
-//! (`JMODGUARD_READ_BIND`). The route is not mounted on the public WebUI router.
+//! (`JMODGUARD_READ_BIND`). The routes are not mounted on the public WebUI router.
+//! Each signed request names its route inside the MAC, so a body sealed for
+//! one route never opens on another.
 
 use crate::cgroup::ContainerSample;
 use crate::control::{
@@ -16,6 +18,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 pub const CONTAINER_READ_PATH: &str = "/private/container-use";
+/// The API's recent minute rollups, collected by the bot for Bot Resources.
+pub const RESOURCE_READ_PATH: &str = "/private/resource-rollups";
 pub const CONTAINER_READ_DIRECTION: &str = "api-container-read";
 const MAC_HEX: usize = 64;
 const BODY_LIMIT: usize = 4096;
@@ -28,6 +32,11 @@ pub const STATS_FETCH_TIMEOUT: Duration = Duration::from_millis(500);
 /// Bytes of the HTTP response, headers included. A real reading is a small JSON
 /// document; anything larger is not a container-use response.
 const RESPONSE_LIMIT: usize = 4096;
+/// Recent minute rollups are bounded by `resources::RECENT_MINUTES` and
+/// `resources::MAX_LABELS`; a larger response is refused.
+const RESOURCE_RESPONSE_LIMIT: usize = 512 * 1024;
+/// Deadline for the bot's once-a-minute rollup collection.
+pub const RESOURCE_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_READ_BIND: &str = "127.0.0.1:8083";
 /// In-flight private reads. Each one holds a blocking thread until its socket
@@ -62,6 +71,13 @@ pub struct ContainerReadResponse {
     pub copy: String,
 }
 
+/// The API's completed minutes. `copy` identifies the answering process.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceReadResponse {
+    pub minutes: Vec<crate::resources::Rollup>,
+    pub copy: String,
+}
+
 /// Loopback-only bind for the API container-read listener.
 pub fn parse_loopback_bind(raw: &str) -> Result<SocketAddr> {
     let addr = parse_private_bind(raw)?;
@@ -91,6 +107,18 @@ impl ReadLink {
     /// Blocking fetch for use from `spawn_blocking` during `!stats` only.
     pub fn fetch_container_use_blocking(&self) -> Option<ContainerReadResponse> {
         fetch_blocking(self.addr, &self.key)
+    }
+
+    /// Blocking fetch of the API's recent minute rollups (call from
+    /// `spawn_blocking`). `None` when the API is unreachable or not ready.
+    pub fn fetch_resource_rollups_blocking(&self) -> Option<ResourceReadResponse> {
+        fetch_route_blocking(
+            self.addr,
+            &self.key,
+            RESOURCE_READ_PATH,
+            RESOURCE_FETCH_TIMEOUT,
+            RESOURCE_RESPONSE_LIMIT,
+        )
     }
 }
 
@@ -200,10 +228,13 @@ fn serve_read_connection(mut stream: std::net::TcpStream, key: &[u8]) -> Result<
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1));
-    if path != Some(CONTAINER_READ_PATH) {
+    let Some(route) = [CONTAINER_READ_PATH, RESOURCE_READ_PATH]
+        .into_iter()
+        .find(|route| path == Some(*route))
+    else {
         write_http_response(&mut stream, 404, "text/plain", b"not found")?;
         return Ok(());
-    }
+    };
     let content_length = head
         .lines()
         .find_map(|line| {
@@ -234,7 +265,7 @@ fn serve_read_connection(mut stream: std::net::TcpStream, key: &[u8]) -> Result<
     }
     let body = &request[body_start..body_start + content_length];
     let nonces = nonce_window();
-    if open_read(key, body, nonces).is_err() {
+    if open_read_route(key, body, nonces, route).is_err() {
         write_http_response(&mut stream, 401, "text/plain", b"unauthorized")?;
         return Ok(());
     }
@@ -242,7 +273,12 @@ fn serve_read_connection(mut stream: std::net::TcpStream, key: &[u8]) -> Result<
         write_http_response(&mut stream, 503, "text/plain", b"not ready")?;
         return Ok(());
     }
-    let json = serde_json::to_vec(&container_read_response()).context("read failed")?;
+    let json = if route == RESOURCE_READ_PATH {
+        serde_json::to_vec(&resource_read_response())
+    } else {
+        serde_json::to_vec(&container_read_response())
+    }
+    .context("read failed")?;
     write_http_response(&mut stream, 200, "application/json", &json)?;
     Ok(())
 }
@@ -279,8 +315,24 @@ fn nonce_window() -> &'static Mutex<NonceWindow> {
 }
 
 pub fn fetch_blocking(addr: SocketAddr, key: &[u8]) -> Option<ContainerReadResponse> {
-    let deadline = Instant::now() + STATS_FETCH_TIMEOUT;
-    let body = match seal_read(key) {
+    fetch_route_blocking(
+        addr,
+        key,
+        CONTAINER_READ_PATH,
+        STATS_FETCH_TIMEOUT,
+        RESPONSE_LIMIT,
+    )
+}
+
+fn fetch_route_blocking<T: serde::de::DeserializeOwned>(
+    addr: SocketAddr,
+    key: &[u8],
+    route: &'static str,
+    timeout: Duration,
+    limit: usize,
+) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    let body = match seal_read_route(key, route) {
         Ok(body) => body,
         Err(_) => return None,
     };
@@ -290,7 +342,7 @@ pub fn fetch_blocking(addr: SocketAddr, key: &[u8]) -> Option<ContainerReadRespo
     };
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
-        path = CONTAINER_READ_PATH,
+        path = route,
         host = host,
         port = addr.port(),
         len = body.len(),
@@ -299,7 +351,7 @@ pub fn fetch_blocking(addr: SocketAddr, key: &[u8]) -> Option<ContainerReadRespo
     let mut stream = TcpStream::connect_timeout(&addr, connect_for).ok()?;
     write_within_deadline(&mut stream, request.as_bytes(), deadline)?;
     write_within_deadline(&mut stream, &body, deadline)?;
-    let response = read_capped_response(&mut stream, deadline, RESPONSE_LIMIT)?;
+    let response = read_capped_response(&mut stream, deadline, limit)?;
     let text = String::from_utf8_lossy(&response);
     let (_, body) = text.split_once("\r\n\r\n").unwrap_or(("", ""));
     if !text.contains("HTTP/1.1 200") {
@@ -346,9 +398,14 @@ fn read_capped_response(
 }
 
 pub fn seal_read(key: &[u8]) -> Result<Vec<u8>> {
+    seal_read_route(key, CONTAINER_READ_PATH)
+}
+
+/// Seal a read request for `route`. The route is covered by the MAC.
+pub fn seal_read_route(key: &[u8], route: &str) -> Result<Vec<u8>> {
     let wire = ReadWire {
         direction: CONTAINER_READ_DIRECTION.to_owned(),
-        route: CONTAINER_READ_PATH.to_owned(),
+        route: route.to_owned(),
         nonce: random_nonce()?,
         expires_ms: now_ms().saturating_add(CONTROL_REQUEST_LIFETIME_MS),
     };
@@ -361,6 +418,16 @@ pub fn seal_read(key: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn open_read(key: &[u8], body: &[u8], nonces: &Mutex<NonceWindow>) -> Result<()> {
+    open_read_route(key, body, nonces, CONTAINER_READ_PATH)
+}
+
+/// Verify a sealed read for the HTTP `route` it arrived on.
+pub fn open_read_route(
+    key: &[u8],
+    body: &[u8],
+    nonces: &Mutex<NonceWindow>,
+    route: &str,
+) -> Result<()> {
     if body.len() < MAC_HEX || body.len() > BODY_LIMIT {
         anyhow::bail!("read failed");
     }
@@ -374,7 +441,7 @@ pub fn open_read(key: &[u8], body: &[u8], nonces: &Mutex<NonceWindow>) -> Result
     if wire.direction != CONTAINER_READ_DIRECTION {
         anyhow::bail!("read failed: direction binding");
     }
-    if wire.route != CONTAINER_READ_PATH {
+    if wire.route != route {
         anyhow::bail!("read failed: route binding");
     }
     let now = now_ms();
@@ -396,6 +463,13 @@ pub fn open_read(key: &[u8], body: &[u8], nonces: &Mutex<NonceWindow>) -> Result
 pub fn container_read_response() -> ContainerReadResponse {
     ContainerReadResponse {
         sample: crate::cgroup::latest_container_sample(),
+        copy: format!("api pid {}", std::process::id()),
+    }
+}
+
+pub fn resource_read_response() -> ResourceReadResponse {
+    ResourceReadResponse {
+        minutes: crate::resources::recent_rollups(),
         copy: format!("api pid {}", std::process::id()),
     }
 }
@@ -501,6 +575,26 @@ mod tests {
             err.to_string(),
             "read failed: direction binding",
             "control-bound wire must not open on the read route"
+        );
+    }
+
+    #[test]
+    fn resource_and_container_reads_do_not_open_on_each_other() {
+        let key = load_writer_key(&"x".repeat(32)).unwrap();
+        let nonces = Mutex::new(NonceWindow::new());
+        let resource = seal_read_route(&key, RESOURCE_READ_PATH).unwrap();
+        assert_eq!(
+            open_read(&key, &resource, &nonces).unwrap_err().to_string(),
+            "read failed: route binding"
+        );
+        open_read_route(&key, &resource, &nonces, RESOURCE_READ_PATH)
+            .expect("resource route accepts its own frame");
+        let container = seal_read(&key).unwrap();
+        assert_eq!(
+            open_read_route(&key, &container, &nonces, RESOURCE_READ_PATH)
+                .unwrap_err()
+                .to_string(),
+            "read failed: route binding"
         );
     }
 

@@ -283,7 +283,8 @@ bot health on port 8081 (`JMODGUARD_HEALTH_BIND`); bot control on loopback
 `127.0.0.1:8084` (`JMODGUARD_LAUNCHER_CONTROL_BIND`). The control and read binds are
 loopback-only. Wildcard or non-loopback read binds are refused. Neither
 private listener is a public or CDN endpoint. `POST /private/container-use`
-is served only on the read listener, not on port 8080.
+and `POST /private/resource-rollups` are served only on the read listener, not
+on port 8080.
 
 Set `JMODGUARD_CONTROL_SECRET` on both containers to the same value of at
 least 32 bytes for the control link. It is independent of both database
@@ -320,7 +321,9 @@ The bot control listener is `JMODGUARD_CONTROL_BIND` (default
 `127.0.0.1:8082`). A refused bind disables the control link; the bot keeps
 its lease and moderates. Bot health is `JMODGUARD_HEALTH_BIND` (port 8081).
 `JMODGUARD_READ_TARGET` (default empty in config; use `127.0.0.1:8083` in
-this layout) dials the API container-read listener for `!stats` only.
+this layout) dials the API container-read listener for `!stats` and, once a
+minute, for the API's resource rollups shown on **Bot Resources**. Without it
+the page still shows live API values, but no API history is saved.
 
 Optional when you have no `config.toml` on the bot container (typical):
 `JMODGUARD_DB_POOL_SIZE` (this process's pool), `JMODGUARD_DEFAULT_PREFIX`,
@@ -399,8 +402,8 @@ stopped, so paired bot and API upgrades and their owner recovery go there.
 Unset, a paired upgrade stays pending before anything stops.
 
 The API container-read listener is `JMODGUARD_READ_BIND` (default
-`127.0.0.1:8083`). A refused bind disables container readings for `!stats`;
-the public web listener keeps serving. It is loopback-only and is not
+`127.0.0.1:8083`). A refused bind disables container readings for `!stats`
+and API history on **Bot Resources**; the public web listener keeps serving. It is loopback-only and is not
 proxied by the admin Pull Zone.
 
 The API listens on port 8080, including `/health` and `/ready`. It does not

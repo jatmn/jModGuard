@@ -368,7 +368,7 @@ fn ban_list_migration_admits_core_store_with_large_reusable_allocation() {
     let db = Db::open(&path, 2).expect("core-26 store with reusable pages should upgrade");
     db.with_conn_sync(|conn| {
         let version: i64 = conn.query_row("PRAGMA user_version", (), |row| Ok(row.get(0)?))?;
-        assert_eq!(version, 27);
+        assert_eq!(version, CORE_SCHEMA_VERSION);
         let edited: (String, String, i64, String, String) = conn.query_row(
             "SELECT reason, list_edited_reason, list_reason_edited_by, list_reason_edited_at, list_reason
              FROM bans WHERE id=7",
@@ -441,7 +441,8 @@ fn ban_list_migration_rejects_payload_beyond_growth_budget_before_ddl() {
 
 fn open_core_26(path: &Path) -> Connection {
     let conn = Connection::open(path).unwrap();
-    apply_core_steps(&conn, &MIGRATIONS[..MIGRATIONS.len() - 1]);
+    let through_26 = MIGRATIONS.partition_point(|(version, _)| *version <= 26);
+    apply_core_steps(&conn, &MIGRATIONS[..through_26]);
     write_meta_string_conn(&conn, META_BOOTSTRAP_COMPLETE, "26").unwrap();
     conn
 }

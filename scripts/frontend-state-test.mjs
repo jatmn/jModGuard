@@ -9780,7 +9780,7 @@ test('every sidebar item shows its colored SVG icon beside its unchanged label',
     'known-bad-images': 'Known-bad images', commands: 'Commands', templates: 'Templates', logchannels: 'Log Channels',
     analytics: 'Analytics', events: 'Audit Log', members: 'Members', bans: 'Bans', actions: 'Bot actions',
     cases: 'Cases', settings: 'Settings', servers: 'Bot servers', usage: 'Database Usage',
-    'platform-analytics': 'Platform analytics',
+    'platform-analytics': 'Platform analytics', resources: 'Bot Resources',
   };
   const h = ownerHarness(async () => response({ servers: [] }));
   h.app.navigate('bans');
@@ -10017,22 +10017,22 @@ const usageFigures = (card) => [...card.querySelectorAll('.du-figures > *')].map
 const usageFacts = (card) => Object.fromEntries([...card.querySelectorAll('.du-facts > div')].map(row => [row.querySelector('dt').textContent, row.querySelector('dd').textContent]));
 const metricLabels = (card) => [...card.querySelectorAll('.du-metric-label')].map(node => node.textContent);
 
-test('owner sections list Database Usage and Platform analytics; others get no read and no section', async () => {
+test('owner sections list Database Usage, Platform analytics and Bot Resources; others get no read and no section', async () => {
   const navLabels = (h) => [...h.document.querySelectorAll('#tabs li')].map(n => n.textContent.trim());
   const owner = ownerHarness(async () => new Promise(() => {}));
   owner.app.navigate('dashboard');
   const labels = navLabels(owner);
-  assert.deepEqual(labels.slice(labels.indexOf('Owner')), ['Owner', 'Bot servers', 'Database Usage', 'Platform analytics']);
+  assert.deepEqual(labels.slice(labels.indexOf('Owner')), ['Owner', 'Bot servers', 'Database Usage', 'Platform analytics', 'Bot Resources']);
   const calls = [];
   const nonOwner = harness(async (url) => { calls.push(url); return new Promise(() => {}); });
   nonOwner.app.navigate('dashboard');
-  assert.ok(!navLabels(nonOwner).some(label => /Owner|Database Usage|Platform analytics/.test(label)));
-  for (const tab of ['usage', 'platform-analytics']) {
+  assert.ok(!navLabels(nonOwner).some(label => /Owner|Database Usage|Platform analytics|Bot Resources/.test(label)));
+  for (const tab of ['usage', 'platform-analytics', 'resources']) {
     nonOwner.app.navigate(tab);
     await settle();
     assert.match(textOf(nonOwner.document.querySelector('#content')), /Owner access required/, tab);
   }
-  assert.ok(!calls.some(url => /database-usage|platform/.test(url)), 'a non-owner never requests owner data');
+  assert.ok(!calls.some(url => /database-usage|platform|resources/.test(url)), 'a non-owner never requests owner data');
 });
 
 test('Database Usage shows size, limit share, next threshold, health and freshness without expanding anything', async () => {
@@ -10630,4 +10630,153 @@ test('a pending breakdown disables repeated clicks across overview refreshes and
   await settle();
   assert.equal(button().disabled, false);
   assert.equal(usageFigures(usageCards(h)[0])[0], '8.19 MB allocated');
+});
+
+// Bot Resources (#652).
+const RESOURCE_NOW_MS = fixtureClockEpoch();
+const RESOURCE_TO = Math.floor(RESOURCE_NOW_MS / 1000 / 600) * 600 + 600;
+function resourcePoints(values) {
+  return values.map((value, i) => value == null
+    ? { t: RESOURCE_TO - 86400 + i * 600, minutes: 0 }
+    : { t: RESOURCE_TO - 86400 + i * 600, minutes: 10, cpu_avg_tenths: value, cpu_max_tenths: value * 2, memory_avg_bytes: 200e6, memory_max_bytes: 300e6,
+        rates: { gateway_events: 12, api_requests: 4 }, p95_ms: 100, gauges: { shard_latency_ms: 45 } });
+}
+function resourceCurrent(overrides = {}) {
+  return {
+    availability: 'available', stale: false, age_ms: 2000, stale_after_ms: 15000, interval_ms: 5000, sampled_at_ms: RESOURCE_NOW_MS - 2000,
+    uptime_ms: 3 * 3600e3, cpu_tenths: 125, memory: { program_bytes: 256e6, limit: { Bytes: 512e6 }, source: 'CgroupStat' },
+    info: { version: '0.2.1', commit: '0123456789abcdef0123', started_at_ms: RESOURCE_NOW_MS - 3 * 3600e3, pod: 'pod-7', region: 'DE', ready: true, cpu_limit: { Millicores: 500 }, schedulable_cpus: 2 },
+    disk: [
+      { kind: 'container_root', path: '/', bytes: null, limit_bytes: null, complete: false, reason: 'host_filesystem' },
+      { kind: 'tmp', path: '/tmp', bytes: 4096, limit_bytes: 64e6, complete: true, reason: null },
+    ],
+    gauges: { guilds: 3, shard_latency_ms: 45, shards: 1, shards_connected: 1, lease_generation: 9, lease_margin_ms: 50000, capture_queue_items: 2, capture_queue_bytes: 2048, sessions_active: 1 },
+    ...overrides,
+  };
+}
+function resourceHistory(overrides = {}) {
+  return {
+    points: resourcePoints([100, 200, null, 300]), minutes: 30, coverage: 0.02, cpu_avg_tenths: 200, cpu_peak_tenths: 600,
+    memory_avg_bytes: 200e6, memory_peak_bytes: 300e6,
+    totals: { gateway_events: 360, discord_rest: 60, discord_429: 2, discord_rate_limit_events: 5, api_requests: 120, api_4xx: 3, oauth_429: 1, db_ops: 600, db_reads: 90, db_writes: 30, log_bytes: 30e3, api_bytes_out: 6e6 },
+    per_minute: { gateway_events: 12, discord_rest: 2, api_requests: 4, db_ops: 20, db_reads: 3, db_writes: 1, log_bytes: 1000, api_bytes_out: 200e3 },
+    p50_ms: 25, p95_ms: 100, latency_requests: 120,
+    breakdowns: { gateway: [['message', 300], ['guild_member_addition', 60]], discord_rate_limits: [['Post /channels/{channel_id}/messages', 5]] },
+    gauges_peak: {}, restarts: 1, starts: [RESOURCE_NOW_MS - 3 * 3600e3],
+    ...overrides,
+  };
+}
+function resourceSnapshot({ bot = {}, api = {}, ...overrides } = {}) {
+  return {
+    generated_at_ms: RESOURCE_NOW_MS, range: '24h', span_secs: 60, bucket_secs: 600, from_secs: RESOURCE_TO - 86400, to_secs: RESOURCE_TO,
+    history_status: 'available',
+    processes: {
+      bot: { current: resourceCurrent({ interval_ms: 60000, stale_after_ms: 125000, age_ms: 20000 }), history: resourceHistory(), ...bot },
+      api: { current: resourceCurrent(), history: resourceHistory(), ...api },
+    },
+    rows_read: { status: 'unavailable', reason: 'not_reported_by_database_client' },
+    provider: { status: 'not_configured', reason: 'no_scoped_read_only_key' },
+    ...overrides,
+  };
+}
+const resourceCards = (h) => [...h.nodes.get('#content').querySelectorAll('.br-card')];
+const resourceMetricValue = (card, label) => [...card.querySelectorAll('.br-metric')]
+  .find((metric) => metric.querySelector('.du-metric-label').textContent === label).querySelector('.br-value').textContent;
+const resourceFact = (card, label) => [...card.querySelectorAll('.du-facts > div')]
+  .find((row) => row.querySelector('dt').textContent === label)?.querySelector('dd').textContent;
+const resourceTileValue = (h, label) => [...h.nodes.get('#content').querySelectorAll('.br-kpi')]
+  .find((tile) => tile.querySelector('.an-kpi-label').textContent === label).querySelector('.an-kpi-value').textContent;
+
+test('Bot Resources shows both processes against their limits with activity and cost drivers', async () => {
+  const calls = [];
+  const h = ownerHarness(async (url, options) => { calls.push([url, options.method]); return response(resourceSnapshot()); });
+  h.app.navigate('resources');
+  await settle();
+  assert.deepEqual(calls, [['/api/owner/resources?range=24h', 'POST']], 'one owner read');
+  const page = h.nodes.get('#content');
+  assert.equal(page.querySelector('.page-header h2').textContent, 'Bot Resources');
+  assert.equal(page.querySelector('[aria-label="Last 24 hours"]').getAttribute('aria-pressed'), 'true');
+  const [bot, api] = resourceCards(h);
+  assert.equal(bot.querySelector('.du-title').textContent, 'Bot');
+  assert.equal(api.querySelector('.du-title').textContent, 'API');
+  assert.equal(bot.querySelector('.du-health').textContent, 'Ready');
+  assert.equal(resourceMetricValue(bot, 'CPU'), '25.0% of 0.50 CPU limit');
+  assert.match(textOf(bot.querySelector('.br-metric')), /2 schedulable CPUs/);
+  assert.equal(resourceMetricValue(api, 'Memory'), '256.0 MB of 512.0 MB (50.0%)');
+  assert.match(textOf(api), /Source: cgroup stat/);
+  assert.match(textOf(api), /peak 300\.0 MB in last 24 hours/);
+  assert.equal(resourceFact(bot, 'Commit'), '0123456789ab');
+  assert.equal(resourceFact(bot, 'Pod'), 'pod-7');
+  assert.equal(resourceFact(bot, 'Uptime'), '3 h 0 min');
+  assert.equal(resourceFact(bot, 'Restarts in last 24 hours'), '1');
+  assert.equal(resourceFact(bot, 'Container filesystem'), 'Not measured: its totals are the host\'s disk');
+  assert.equal(resourceFact(bot, 'Temporary files'), '4.1 KB of 64.0 MB in /tmp');
+  assert.ok(findNode(bot, n => n.localName === 'button' && n.textContent === 'Database Usage'), 'links to Database Usage for database size');
+  assert.equal(resourceTileValue(h, 'Gateway/min'), '12.0');
+  assert.equal(resourceTileValue(h, 'Discord 429s'), '2');
+  assert.equal(resourceTileValue(h, 'Shard latency'), '45 ms');
+  assert.equal(resourceTileValue(h, 'Lease gen.'), '9');
+  assert.equal(resourceTileValue(h, 'Guilds'), '3');
+  assert.equal(resourceTileValue(h, 'Capture queue'), '2 · 2.0 KB');
+  assert.equal(resourceTileValue(h, 'Requests/min'), '4.00');
+  assert.equal(resourceTileValue(h, 'p95 latency'), '100 ms');
+  assert.equal(resourceTileValue(h, 'Active sessions'), '1');
+  assert.equal(resourceTileValue(h, 'OAuth 429s'), '1');
+  const costs = Object.fromEntries([...page.querySelectorAll('.br-costs tbody tr')].map((row) => [row.querySelector('th').textContent, [...row.querySelectorAll('td')].map((cell) => cell.textContent)]));
+  assert.deepEqual(costs['Database round trips'], ['20.0', '20.0']);
+  assert.deepEqual(costs['API response bytes'], ['—', '200.0 KB/min']);
+  assert.match(costs['Database rows read'][0], /^Unavailable/);
+  assert.match(textOf(page), /Provider billing \(Bunny\) is not shown/);
+  // A bucket without samples breaks the line; it is not drawn at zero.
+  const cpuChart = bot.querySelector('.br-metric svg');
+  assert.equal(cpuChart.querySelectorAll('polyline.br-tone-avg').length, 1, 'the two samples before the gap');
+  assert.equal(cpuChart.querySelectorAll('circle.br-tone-avg').length, 1, 'the lone sample after the gap');
+  assert.equal(page.querySelector('.br-chart svg').getAttribute('aria-label').includes('CPU'), true);
+});
+
+test('Bot Resources says Unavailable for unread values and never shows them as zero', async () => {
+  const snapshot = resourceSnapshot({
+    history_status: 'unavailable',
+    bot: { current: { availability: 'unavailable', stale: false }, history: null },
+    api: {
+      current: resourceCurrent({ cpu_tenths: null, memory: null, disk: [], gauges: {}, info: { ...resourceCurrent().info, cpu_limit: null, schedulable_cpus: null, commit: null, pod: null, region: null } }),
+      history: null,
+    },
+  });
+  const h = ownerHarness(async () => response(snapshot));
+  h.app.navigate('resources');
+  await settle();
+  const [bot, api] = resourceCards(h);
+  assert.equal(bot.querySelector('.du-health').textContent, 'Unavailable');
+  assert.match(textOf(bot), /has not saved a status yet/);
+  assert.equal(resourceMetricValue(bot, 'CPU'), 'Unavailable');
+  assert.equal(resourceMetricValue(api, 'CPU'), 'Unavailable');
+  assert.equal(resourceMetricValue(api, 'Memory'), 'Unavailable');
+  assert.match(textOf(api), /peak unavailable/);
+  assert.match(textOf(api), /Unavailable: Commit, Restarts in last 24 hours, Pod, Region\./);
+  assert.match(h.nodes.get('#resources-status').textContent, /History is unavailable/);
+  for (const label of ['Gateway/min', 'Discord 429s', 'Shard latency', 'Guilds', 'Requests/min', 'p95 latency', 'Active sessions', '5xx']) {
+    assert.equal(resourceTileValue(h, label), '—', `${label} is unavailable, not 0`);
+  }
+  const costs = [...h.nodes.get('#content').querySelectorAll('.br-costs tbody tr')].map((row) => textOf(row));
+  assert.ok(costs.every((row) => !/\b0(\.0+)?\b/.test(row)), costs.join(' | '));
+  assert.ok([...h.nodes.get('#content').querySelectorAll('.br-chart-empty')].length >= 4, 'empty charts say so');
+});
+
+test('Bot Resources marks an old status stale and re-reads on range change and Refresh', async () => {
+  const calls = [];
+  const old = resourceSnapshot({ bot: { current: resourceCurrent({ interval_ms: 60000, stale_after_ms: 125000, age_ms: 300000 }), history: resourceHistory() } });
+  const h = ownerHarness(async (url) => { calls.push(url); return response(old); });
+  h.app.navigate('resources');
+  await settle();
+  const [bot, api] = resourceCards(h);
+  assert.equal(bot.querySelector('.du-health').textContent, 'Stale');
+  assert.match(bot.querySelector('.du-stale').textContent, /^Stale: older than 2 min/);
+  assert.equal(bot.getAttribute('data-freshness'), 'stale');
+  assert.equal(api.querySelector('.du-health').textContent, 'Ready');
+  await fire(h.nodes.get('#content').querySelector('[aria-label="Last 7 days"]'), 'click');
+  await settle();
+  await fire(h.nodes.get('#refresh-resources'), 'click');
+  await settle();
+  assert.deepEqual(calls, ['/api/owner/resources?range=24h', '/api/owner/resources?range=7d', '/api/owner/resources?range=7d']);
 });

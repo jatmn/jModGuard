@@ -789,9 +789,19 @@ impl OAuthClient {
         response: reqwest::Response,
     ) -> Result<Vec<u8>> {
         let status = response.status();
+        jmodguard::resources::count("discord_rest", 1);
         if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Ok(response.bytes().await?.to_vec());
         }
+        jmodguard::resources::count(
+            if route == "/oauth2/token" {
+                "oauth_429"
+            } else {
+                "discord_429"
+            },
+            1,
+        );
+        jmodguard::resources::count_labelled("discord_429_routes", route, 1);
         let received = Instant::now();
         let received_ms = chrono::Utc::now().timestamp_millis();
         let headers = response.headers().clone();

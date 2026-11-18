@@ -136,6 +136,7 @@ pub struct ApiState {
     pub(super) member_roles: std::sync::Mutex<MemberRolesCache>,
     pub preview: DashMap<String, crate::web::preview::PreviewGrant>,
     pub usage_cache: crate::web::usage::UsageCache,
+    pub resource_cache: crate::web::resources::ResourceCache,
     pub analytics_cache: AnalyticsCache,
     config_observation: tokio::sync::Mutex<ConfigObservation>,
     /// Replaces the in-memory session store for one `web::router` build.
@@ -186,6 +187,7 @@ impl ApiState {
             member_roles: std::sync::Mutex::new(std::collections::HashMap::new()),
             preview: DashMap::new(),
             usage_cache: crate::web::usage::UsageCache::default(),
+            resource_cache: crate::web::resources::ResourceCache::default(),
             analytics_cache: AnalyticsCache::default(),
             config_observation: tokio::sync::Mutex::new(ConfigObservation::from_primary(primed)),
             session_store: std::sync::Mutex::new(None),

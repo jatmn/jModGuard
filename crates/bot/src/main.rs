@@ -168,6 +168,7 @@ async fn main() -> Result<()> {
 
     init_tracing(&cfg.log, "bot");
     jmodguard::set_shutdown_context("bot");
+    jmodguard::resources::process_started_at_ms();
 
     // Liveness must accept before database retry. Platform probes hit this
     // port while `open_with_until_ready` waits on a waking database or a
@@ -293,6 +294,12 @@ async fn main() -> Result<()> {
     let cache = Arc::clone(&client.cache);
     app.install_discord_cache(Arc::clone(&cache));
     app.install_http_member_lookup(Arc::clone(&http));
+
+    tokio::spawn(jmodguard_bot::resources::run(
+        Arc::clone(&app),
+        client.shard_manager.clone(),
+        Arc::clone(&cache),
+    ));
 
     // One process-wide importer shares its Discord request budget across all
     // enrolled guilds. The job claim/cursor lives in the guild store.

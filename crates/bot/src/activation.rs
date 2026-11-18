@@ -405,6 +405,12 @@ impl Activation {
         }
     }
 
+    /// Time left before the confirmed writer-lease authority ends, if held.
+    pub fn authority_remaining(&self) -> Option<Duration> {
+        self.authority_deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
     fn authority_deadline(&self) -> Option<Instant> {
         self.authority
             .lock()

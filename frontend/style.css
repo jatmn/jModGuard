@@ -818,3 +818,24 @@ svg.icon-neutral { color: var(--icon-neutral); }
 .ban-form .input, .ban-form .select { width: 100%; }
 .ban-receipt p { margin: 0 0 8px; }
 /* ==== end Bans (#625) ==== */
+
+/* ==== Bot Resources (#652): process cards and time lines with gaps for missing samples ==== */
+.br-metrics { grid-template-columns: minmax(0, 1fr); }
+.br-value { font-size: .9375rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.br-unavailable { color: var(--muted); font-weight: 500; }
+.br-section { border-top: 1px solid var(--shell-border); padding-top: 6px; font-size: .75rem; }
+.br-link { min-height: 0; height: auto; padding: 0; vertical-align: baseline; }
+.br-chart { display: block; margin: 0; min-width: 0; }
+.br-chart svg { display: block; width: 100%; height: auto; }
+.br-chart-empty p { margin: 0; padding: 8px 0; font-size: .75rem; }
+.br-line { fill: none; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
+.br-tone-avg { --br-tone: var(--accent); } .br-tone-max { --br-tone: var(--warn); }
+.br-line.br-tone-avg, .br-line.br-tone-max { stroke: var(--br-tone); }
+.br-dot.br-tone-avg, .br-dot.br-tone-max { fill: var(--br-tone); }
+.br-legend { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: .75rem; }
+.br-legend-item { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.br-swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: var(--br-tone); }
+.br-pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(20rem, 100%), 1fr)); gap: 8px 16px; margin-top: 8px; }
+.br-pair h4 { margin: 0 0 2px; }
+.br-costs th[scope="row"] { font-weight: 500; }
+/* ==== end Bot Resources (#652) ==== */

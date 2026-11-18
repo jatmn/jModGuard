@@ -41,7 +41,7 @@ modified or used to establish provider-specific behavior.
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
 binaries. Start the bot to initialize it, then the API. Core migration
-`0023_baseline.sql` creates the v0.2.0 schema and migrations 0024–0027 run after it.
+`0023_baseline.sql` creates the v0.2.0 schema and migrations 0024–0028 run after it.
 Guild stores start from `0016_baseline.sql` at schema version 17 and run migrations
 0017–0021 after it. Existing installations at or past those baseline versions
 resume from their recorded version. For a recognized earlier database, upgrade
@@ -138,7 +138,7 @@ settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings, bounded latest-message snapshots and the bounded
 [member directory](MEMBERS.md). Initialize verifies and upgrades a matching earlier
 store atomically. Opening an initialized store requires version 23. See
-[tenant runtime](TENANT-RUNTIME.md). Core is at migration 0027. Each opener refuses
+[tenant runtime](TENANT-RUNTIME.md). Core is at migration 0028. Each opener refuses
 the other family. No records are moved by startup.
 Guild migration 0009 adds bounded latest-message snapshots with fixed 24-hour expiry
 and store-level capture health. Guild migration 0010 adds the member directory,
@@ -205,3 +205,16 @@ Migration 0027 adds guild-scoped Bans list indexes and copies the latest reason
 edits from the existing audit trail into the indexed list data. The core schema
 becomes 27. Deploy matching bot and API builds through the paired update protocol.
 Rollback requires the pre-upgrade database backup.
+
+## Bot Resources rollups
+
+Migration 0028 adds two empty tables for the owner **Bot Resources** page.
+`resource_rollups` holds per-process (bot or API) CPU, memory and activity
+rollups: minute rows kept 48 hours and hour rows kept 31 days, keyed by process,
+span and start. `resource_status` holds the bot's latest status. Only the bot
+writes them, once a minute in one transaction that also prunes expired rows by
+primary-key range. Each row is bounded to 16 KiB, so the tables stay near a few
+thousand rows. They hold this application's own measurements, never provider
+billing data, user IDs or message content. The core schema becomes 28; the guild
+schema does not change. Deploy matching bot and API builds through the paired
+update protocol. Rollback requires the pre-upgrade database backup.

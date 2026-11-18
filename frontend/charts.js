@@ -582,3 +582,124 @@ export function ShareBar({ parts, total, summary, unknown }) {
       .map((part) => h("span", { key: part.key, className: `du-share-part du-tone-${part.tone}`, style: { width: `${sharePercent(part.value, total).toFixed(2)}%` } })),
   );
 }
+
+// ---------------------------------------------------------------------------
+// Bot Resources (#652). Time lines on a fixed grid of buckets. A bucket with
+// no sample is null: it breaks the line and is never drawn as zero.
+// ---------------------------------------------------------------------------
+
+function utcClock(seconds, withDay) {
+  const date = new Date(seconds * 1000);
+  const time = `${String(date.getUTCHours()).padStart(2, "0")}:${String(date.getUTCMinutes()).padStart(2, "0")}`;
+  if (!withDay) return time;
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${months[date.getUTCMonth()]} ${date.getUTCDate()} ${time}`;
+}
+
+// `series` entries: { key, label, tone, value(point) -> number | null }.
+// `max` fixes the top of the scale (for example 100 for a percentage of a limit).
+export function ResourceChart({ points, series, max, format, label, from, to }) {
+  const width = 480;
+  const height = 92;
+  const padLeft = 62;
+  const padRight = 8;
+  const padTop = 6;
+  const axis = 14;
+  const innerWidth = width - padLeft - padRight;
+  const innerHeight = height - padTop - axis;
+  const lines = series.map((line) => ({ ...line, values: points.map((point) => {
+    const value = line.value(point);
+    return value == null || !Number.isFinite(value) ? null : value;
+  }) }));
+  const known = lines.flatMap((line) => line.values.filter((value) => value != null));
+  const withDay = to - from >= 86400;
+  const range = `${utcClock(from, withDay)} to ${utcClock(to, withDay)} UTC`;
+  if (!known.length) {
+    return h(
+      "figure",
+      { className: "br-chart br-chart-empty" },
+      h("p", { className: "muted", role: "img", "aria-label": `${label}: no samples ${range}.` }, "No samples in this range"),
+    );
+  }
+  const top = max ?? (Math.max(...known) * 1.1 || 1);
+  const count = points.length;
+  const x = (index) => padLeft + (count <= 1 ? innerWidth / 2 : (index * innerWidth) / (count - 1));
+  const y = (value) => padTop + innerHeight - Math.min(1, Math.max(0, value / top)) * innerHeight;
+  const runs = (values) => {
+    const out = [];
+    let run = [];
+    values.forEach((value, index) => {
+      if (value == null) {
+        if (run.length) out.push(run);
+        run = [];
+      } else run.push([index, value]);
+    });
+    if (run.length) out.push(run);
+    return out;
+  };
+  const latest = (values) => [...values].reverse().find((value) => value != null);
+  const summary = lines
+    .map((line) => {
+      const values = line.values.filter((value) => value != null);
+      return values.length ? `${line.label} latest ${format(latest(line.values))}, peak ${format(Math.max(...values))}` : `${line.label} no samples`;
+    })
+    .join("; ");
+  return h(
+    "figure",
+    { className: "br-chart" },
+    h(
+      "svg",
+      { viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": `${label}, ${range}: ${summary}.` },
+      ...[top, 0].map((value) =>
+        h("g", { key: `g${value}`, className: "an-gridline" },
+          h("line", { x1: padLeft, x2: width - padRight, y1: y(value).toFixed(1), y2: y(value).toFixed(1) }),
+          h("text", { x: padLeft - 4, y: (y(value) + 3).toFixed(1), textAnchor: "end" }, format(value)),
+        ),
+      ),
+      ...lines.flatMap((line) =>
+        runs(line.values).map((run, i) =>
+          run.length === 1
+            ? h("circle", { key: `${line.key}-${i}`, className: `br-dot ${line.tone}`, cx: x(run[0][0]).toFixed(1), cy: y(run[0][1]).toFixed(1), r: 1.8 })
+            : h("polyline", { key: `${line.key}-${i}`, className: `br-line ${line.tone}`, points: run.map(([index, value]) => `${x(index).toFixed(1)},${y(value).toFixed(1)}`).join(" ") }),
+        ),
+      ),
+      h("text", { className: "an-axis-day", x: padLeft, y: height - 2, textAnchor: "start" }, utcClock(from, withDay)),
+      h("text", { className: "an-axis-day", x: width - padRight, y: height - 2, textAnchor: "end" }, utcClock(to, withDay)),
+    ),
+    lines.length > 1 &&
+      h(
+        "figcaption",
+        { className: "br-legend" },
+        ...lines.map((line) => h("span", { key: line.key, className: `br-legend-item ${line.tone}` }, h("i", { className: "br-swatch", "aria-hidden": "true" }), line.label)),
+      ),
+  );
+}
+
+// Range choices for Bot Resources, matching the API's `range` values.
+export const RESOURCE_RANGES = [
+  ["1h", "Last hour"],
+  ["24h", "Last 24 hours"],
+  ["7d", "Last 7 days"],
+  ["30d", "Last 30 days"],
+];
+
+export function ResourceRangeSelector({ value, onChange }) {
+  return h(
+    "div",
+    { className: "an-range", role: "group", "aria-label": "Resource range" },
+    ...RESOURCE_RANGES.map(([range, label]) =>
+      h(
+        "button",
+        {
+          key: range,
+          type: "button",
+          className: `btn btn-sm an-range-btn${value === range ? " an-range-active" : ""}`,
+          "aria-pressed": value === range ? "true" : "false",
+          "aria-label": label,
+          onClick: () => onChange(range),
+        },
+        range,
+      ),
+    ),
+  );
+}

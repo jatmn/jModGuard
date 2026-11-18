@@ -3008,6 +3008,7 @@ async fn superseded_clear_receipt_retires_when_no_row_matches() {
 }
 
 const QUEUED_RELEASED_CORE: i64 = 23;
+const BEFORE_CORE_28: &str = "DROP TABLE resource_rollups; DROP TABLE resource_status;";
 const BEFORE_CORE_24: &str = "DROP TABLE known_spam;
     DROP INDEX idx_analytics_warns_time;
     DROP INDEX idx_analytics_bans_time;
@@ -3032,6 +3033,7 @@ async fn baked_bot_migrates_queued_protocol3_core_baseline_without_starting_api_
             serde_json::from_str(include_str!("fixtures/queued-core16.json")).unwrap();
         db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(BEFORE_CORE_28, 1024 * 1024)?;
             tx.execute_batch_bounded(
                 include_str!("../../../tests/fixtures/before-core-0027.sql"),
                 1024 * 1024,
@@ -3372,6 +3374,7 @@ async fn stale_schema_selections_without_upgrade_are_refused_once_after_migratio
         let fixture = fixture.clone();
         move |conn| {
             let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(BEFORE_CORE_28, 1024 * 1024)?;
             tx.execute_batch_bounded(
                 include_str!("../../../tests/fixtures/before-core-0027.sql"),
                 1024 * 1024,

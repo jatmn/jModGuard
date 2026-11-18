@@ -242,7 +242,7 @@ bans, kicks and timeouts through the bot), copying configuration, member import 
 (Pause, Resume, Retry, **Reconcile from Discord**), case notes and the role list
 itself. Case removal, the Removed records view and case-removal role IDs stay with
 Administrators and the server owner. Global configuration, Administration (Updates),
-the Owner sections (Bot servers, Database Usage, Platform analytics) and **View as…**
+the Owner sections (Bot servers, Database Usage, Platform analytics, Bot Resources) and **View as…**
 stay with the configured bot owner. Ban, unban and ban-reason edits keep
 their own Discord **Ban Members** requirement.
 
@@ -344,8 +344,8 @@ the workspace then refreshes current configuration. If that refresh fails, use
 | **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; transient failures use persisted bounded backoff and permanent failures are shown for operator action; empty / `!setname` with no args / `/setname` without `name` all clear); global prefix (owner only); **copy config from another server** |
 
 The **Owner** sidebar group appears only for the configured bot owner and needs no
-selected server: **Bot servers** (the server directory), **Database Usage** and
-**Platform analytics**. Database Usage shows one card per physical database (core and
+selected server: **Bot servers** (the server directory), **Database Usage**,
+**Platform analytics** and **Bot Resources**. Database Usage shows one card per physical database (core and
 each guild store): a health badge from its operating state (OK, Pressure, Capture paused,
 Growth stopped, Writes paused, Stale or Unknown), allocated size, share of the 1,000 MB
 limit and distance to the next threshold, a 0–1,000 MB bar with the 700/800/900/1,000 MB
@@ -360,6 +360,27 @@ previous range and daily sparklines, every enforcement metric and fleet membersh
 at once, the most and least active servers, the biggest movers, each server's share of
 bans, spam hits and mod actions, and a sortable, filterable server table with names, icons,
 per-metric share bars and member directory status (importing, unverified or unavailable).
+
+**Bot Resources** is the system status view for the bot and API processes over a
+1-hour, 24-hour, 7-day or 30-day range (`GET` or `POST /api/owner/resources?range=`,
+owner only; others get 401 or 403). Each process has a card with CPU as a share of its
+cgroup quota (with the quota and schedulable CPUs), program memory against
+`memory.max` with its source and the range peak, disk (the temporary and file-log
+directories it writes; the container's root filesystem is not measured because its
+totals belong to the host; database size is on Database Usage), and process facts
+(version, commit, uptime, last restart, restarts in the range, pod, region, ready).
+Below are bot activity (Gateway events per minute and by type, Discord REST calls,
+429s and rate-limit waits by bucket, shard latency, writer-lease generation and margin,
+guilds, capture queue), API activity (requests per minute, p50/p95 latency, 4xx/5xx,
+active sessions, OAuth and Discord 429s) and cost drivers per minute (database round
+trips, read and write transactions, Discord calls, log output, API response bytes).
+Database rows read and Bunny billing are shown as unavailable: the database client does
+not report rows read, and no scoped read-only provider key exists. The API's values are
+live (5-second samples); the bot saves its status and both processes' history once a
+minute (the API's minutes reach it over the private read link). A value older than two
+sample intervals is marked **Stale**, one that could not be read says **Unavailable**,
+and a missing sample is a gap in a chart, never 0. History reads are cached for 20
+seconds. See [Bot Resources rollups](DATABASE-BASELINE.md#bot-resources-rollups).
 
 The retired general message/member activity archive and chat-retention controls remain
 removed. Saved Members selections reopen the bounded directory described above.

@@ -161,6 +161,7 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     exercise_received_gateway_ban_delivery(&bot).await;
     exercise_configuration_reads(&bot, &api).await;
     exercise_guild_store_catalog(&bot, &api).await;
+    exercise_resource_rollups(&bot, &api).await;
 
     // The fresh schema must not grow a chat or member archive on remote SQL.
     // Exercise the same check on the remote transport as on local SQLite.
@@ -175,6 +176,46 @@ async fn bot_bootstrap_and_api_share_remote_database() {
     }).await.unwrap();
 
     exercise_remote_capacity_race(&bot, &api).await;
+}
+
+// Bot Resources: the bot writes minutes, their hour and its status in one
+// remote transaction; the read-only API reads them back in one statement.
+async fn exercise_resource_rollups(bot: &Db, api: &Db) {
+    use jmodguard::db::{ResourceProcess, record_resource_rollups, resource_records};
+    use jmodguard::resources::{HOUR_SECS, MINUTE_SECS, ProcessStatus, Rollup};
+    let now = chrono::Utc::now().timestamp();
+    let minute = now - now.rem_euclid(MINUTE_SECS) - MINUTE_SECS;
+    let mut rollup = Rollup::empty(minute, MINUTE_SECS);
+    rollup.data.minutes = 1;
+    rollup.data.counters.insert("db_ops".into(), 3);
+    let status = ProcessStatus {
+        sampled_at_ms: Some(now * 1000),
+        interval_ms: 60_000,
+        ..ProcessStatus::default()
+    };
+    let added = record_resource_rollups(
+        bot,
+        vec![
+            (ResourceProcess::Bot, rollup.clone()),
+            (ResourceProcess::Api, rollup.clone()),
+        ],
+        Some((ResourceProcess::Bot, status)),
+        now,
+    )
+    .await
+    .expect("bot should save resource rollups on remote libSQL");
+    assert_eq!(added, 2);
+    let minutes = resource_records(api, MINUTE_SECS, minute, minute + MINUTE_SECS)
+        .await
+        .expect("API should read resource rollups on remote libSQL");
+    assert_eq!(minutes.bot, vec![rollup.clone()]);
+    assert_eq!(minutes.api, vec![rollup]);
+    assert_eq!(minutes.statuses.len(), 1);
+    let hour = minute - minute.rem_euclid(HOUR_SECS);
+    let hours = resource_records(api, HOUR_SECS, hour, hour + HOUR_SECS)
+        .await
+        .unwrap();
+    assert_eq!(hours.bot[0].data.counters["db_ops"], 3);
 }
 
 // This uses two independently opened Db pools and the normal 900 MB application
