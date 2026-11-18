@@ -188,3 +188,10 @@ rows are display data only and never authorize access. Deploy matching bot/API b
 using the existing paired update protocol; older binaries reject schema26. Rollback
 requires the pre-upgrade database backup. See
 [the owner server directory](OVERHAUL.md#implemented-owner-server-directory).
+
+## Bans list ordering
+
+Migration 0027 adds guild-scoped Bans list indexes and copies the latest reason
+edits from the existing audit trail into the indexed list data. The core schema
+becomes 27. Deploy matching bot and API builds through the paired update protocol.
+Rollback requires the pre-upgrade database backup.

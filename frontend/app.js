@@ -7913,7 +7913,29 @@ const CASE_LIST = {
     { key: "date", label: "When", initialDir: "desc", orderLabels: { desc: "Newest first", asc: "Oldest first" } },
   ],
 };
-const WORKSPACE_LISTS = new Map([[CASE_LIST.list, CASE_LIST]]);
+const BANS_LIST = {
+  list: "bans",
+  filterLabel: "Filter bans",
+  defaultSort: "date",
+  defaultDir: "desc",
+  searchPlaceholder: "User, ID, reason or moderator",
+  columns: [
+    { key: "subject", label: "Banned user" },
+    { key: "id", label: "ID" },
+    { key: "status", label: "Status" },
+    { key: "actor", label: "Moderator" },
+    { key: "reason", label: "Reason" },
+    { key: "date", label: "Time", initialDir: "desc", orderLabels: { desc: "Newest first", asc: "Oldest first" } },
+  ],
+  filters: [
+    { key: "subject", label: "User", kind: "text", placeholder: "Name or ID" },
+    { key: "actor", label: "Moderator" },
+    { key: "reason", label: "Reason contains", kind: "text" },
+    { key: "status", label: "Status", options: { active: { label: "Active" }, unbanned: { label: "Unbanned" } } },
+  ],
+};
+
+const WORKSPACE_LISTS = new Map([[CASE_LIST.list, CASE_LIST], [BANS_LIST.list, BANS_LIST]]);
 
 function tabCases() {
   const guildId = state.guildId;
@@ -9368,7 +9390,7 @@ function IdChip({ id, label }) {
   );
 }
 
-function BanPersonCell({ person, label }) {
+function BanPersonCell({ person, label, filterLink, showId = true }) {
   return h(
     "div",
     { className: "ban-person" },
@@ -9376,16 +9398,19 @@ function BanPersonCell({ person, label }) {
     h(
       "div",
       { className: "ban-person-text" },
-      h("strong", { className: "ban-person-name" }, person.name || "Unknown user"),
+      h("strong", { className: "ban-person-name" }, person.id && filterLink
+        ? h("a", { ...filterLink(String(person.id)), className: "list-person-filter",
+          "aria-label": `Filter by ${label} ${banPersonText(person)}` }, person.name || "Unknown user")
+        : person.name || "Unknown user"),
       person.handle && person.handle !== person.name ? h("span", { className: "muted" }, `@${person.handle}`) : null,
-      h(IdChip, { id: person.id, label }),
+      showId ? h(IdChip, { id: person.id, label }) : null,
     ),
   );
 }
 
-function BanModeratorCell({ record, names, rule }) {
+function BanModeratorCell({ record, names, rule, filterLink }) {
   if (record.moderator_id) {
-    const moderator = h(BanPersonCell, { person: banPerson(record.moderator_id, record.moderator_name, null, names), label: "moderator" });
+    const moderator = h(BanPersonCell, { person: banPerson(record.moderator_id, record.moderator_name, null, names), label: "moderator", filterLink });
     // The reason cell drops the automod prefix, so its rule is named here
     // beside the person who acted rather than replacing them.
     return rule
@@ -9691,10 +9716,9 @@ function openBanDialog(guildId, onDone) {
 
 function tabBans() {
   const guildId = state.guildId;
-  const result = useApiRead(`/api/guilds/${guildId}/bans?limit=200`);
-  const rows = Array.isArray(result.data?.bans) ? result.data.bans : [];
-  const names = result.data?.names || {};
   const [reasonEditor, setReasonEditor] = useState(null);
+  const [after, setAfter] = useState("");
+  const [moderators, setModerators] = useState({});
   // Closing the open reason editor for another task asks before discarding its draft.
   const leaveReasonEditor = () => {
     if (!reasonEditor) return true;
@@ -9706,6 +9730,23 @@ function tabBans() {
   const closeReasonEditor = () => {
     setReasonEditor(null);
     ui.set({ edits: "clean" });
+  };
+  const controls = useListControls(BANS_LIST, guildId, () => setAfter(""), leaveReasonEditor);
+  const query = controls.query();
+  query.set("limit", "50");
+  if (after) query.set("after", after);
+  const result = useApiRead(`/api/guilds/${guildId}/bans?${query}`, { retainData: true });
+  const rows = Array.isArray(result.data?.bans) ? result.data.bans : [];
+  const names = result.data?.names || {};
+  const availableModerators = result.data?.moderators;
+  useEffect(() => {
+    if (Array.isArray(availableModerators)) setModerators(Object.fromEntries(availableModerators.map(({ id, name }) =>
+      [id, { label: name ? `${name} (${id})` : id }],
+    )));
+  }, [availableModerators]);
+  const next = result.data?.next_cursor;
+  const changePage = (cursor) => {
+    if (leaveReasonEditor()) setAfter(cursor);
   };
   return h(
     "div",
@@ -9731,30 +9772,37 @@ function tabBans() {
           ),
       h(ActionButton, { type: "button", className: "btn", onClick: result.refresh }, "Refresh"),
     ),
+    h(ListControls, { controls, filterOptions: { actor: moderators } }),
+    h("div", { className: "row list-pagination" },
+      h(ActionButton, { type: "button", className: "btn", disabled: !after || result.loading, onClick: () => changePage("") }, "First page"),
+      h(ActionButton, { type: "button", className: "btn", disabled: !next || result.loading, onClick: () => changePage(next) }, "Next page"),
+      Number.isInteger(result.data?.total)
+        ? h("span", { className: "muted", role: "status" }, `${result.data.total.toLocaleString()} matching bans`)
+        : null,
+    ),
     h(
       DataTable,
-      { headings: ["Banned user", "Status", "Moderator", "Reason", "Time", "Actions"], className: "table table-zebra ban-table" },
-      result.loading || result.error || !rows.length
-        ? h(
-            "tr",
-            null,
-            h(
-              "td",
-              { colSpan: 6, className: result.error ? "err" : result.loading ? "" : "muted" },
-              result.loading
-                ? "Loading…"
-                : result.error
-                  ? "Could not load records: " + result.error.message
-                  : "No matching records.",
-            ),
-          )
+      {
+        headings: [
+          ...BANS_LIST.columns.map((column) => h(ListSortHeading, { key: column.key, column, controls })),
+          "Actions",
+        ],
+        className: "table table-zebra ban-table",
+      },
+      result.loading || result.error
+        ? h("tr", null, h("td", { colSpan: 7, className: result.error ? "err" : "" },
+            result.error ? "Could not load records: " + result.error.message : "Loading…"))
+        : !rows.length
+          ? h(ListEmptyRow, { controls, colSpan: 7, empty: "No bans recorded.", filtered: "No bans match these filters." })
         : rows.map((record, i) => {
             const user = banPerson(record.user_id, record.user_name, record.user_display_name, names);
             const { rule } = banReasonParts(record.reason);
             return h(
               "tr",
               { key: record.id ?? i },
-              h("td", null, h(BanPersonCell, { person: user, label: "user" })),
+              h("td", null, h(BanPersonCell, { person: user, label: "user", showId: false,
+                filterLink: (id) => controls.filterLink({ subject: id }) })),
+              h("td", null, h(IdChip, { id: user.id, label: "user" })),
               h(
                 "td",
                 null,
@@ -9764,7 +9812,7 @@ function tabBans() {
                   record.active ? "Banned" : "Unbanned",
                 ),
               ),
-              h("td", null, h(BanModeratorCell, { record, names, rule })),
+              h("td", null, h(BanModeratorCell, { record, names, rule, filterLink: (id) => controls.filterLink({ actor: id }) })),
               h(
                 "td",
                 null,

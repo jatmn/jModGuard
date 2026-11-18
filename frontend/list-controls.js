@@ -11,10 +11,6 @@ function filterKeys(config) {
   return [...config.filters.map(({ key }) => key), ...commonKeys];
 }
 
-function boundedSearch(value) {
-  return Array.from(value).slice(0, SEARCH_LIMIT).join("");
-}
-
 function emptyFilters(config) {
   return Object.fromEntries(filterKeys(config).map((key) => [key, ""]));
 }
@@ -24,9 +20,13 @@ export function readListLocation() {
   return { list: query.get("list"), guild: query.get("guild") };
 }
 
-function replaceListLocation(query) {
+function listLocation(query) {
   const search = query.toString();
-  history.replaceState(history.state, "", location.pathname + (search ? "?" + search : "") + location.hash);
+  return location.pathname + (search ? "?" + search : "") + location.hash;
+}
+
+function replaceListLocation(query) {
+  history.replaceState(history.state, "", listLocation(query));
 }
 
 // OAuth returns to the workspace root. Preserve a list link in this browser tab.
@@ -64,13 +64,19 @@ export function clearListLocation(config) {
   replaceListLocation(query);
 }
 
+function boundedSearch(value) {
+  return Array.from(value).slice(0, SEARCH_LIMIT).join("");
+}
+
 function readView(config, guildId) {
   const query = new URLSearchParams(location.search);
   const filters = emptyFilters(config);
   const initial = { filters, sort: config.defaultSort, dir: config.defaultDir };
   if (query.get("list") !== config.list || query.get("guild") !== guildId) return initial;
   for (const key of filterKeys(config)) filters[key] = query.get(key) || "";
-  filters.q = boundedSearch(filters.q.trim());
+  for (const key of ["q", ...config.filters.filter(({ kind }) => kind === "text").map(({ key }) => key)]) {
+    filters[key] = boundedSearch(filters[key].trim());
+  }
   const sort = query.get("sort");
   const dir = query.get("dir");
   return {
@@ -80,7 +86,7 @@ function readView(config, guildId) {
   };
 }
 
-function writeView(config, guildId, view) {
+function viewQuery(config, guildId, view) {
   const query = new URLSearchParams(location.search);
   query.set("list", config.list);
   query.set("guild", guildId);
@@ -90,41 +96,63 @@ function writeView(config, guildId, view) {
     if (value) query.set(key, value);
     else query.delete(key);
   }
-  replaceListLocation(query);
+  return query;
 }
 
 function hasFilters(view) {
   return Object.values(view.filters).some(Boolean);
 }
 
-export function useListControls(config, guildId, onChange) {
+export function useListControls(config, guildId, onChange, canChange = () => true) {
   const [view, setView] = useState(() => readView(config, guildId));
   const current = useRef(view);
-  const [searchText, setSearchText] = useState(view.filters.q);
-  const searchTimer = useRef(null);
-  useEffect(() => () => clearTimeout(searchTimer.current), []);
+  const guard = useRef(canChange);
+  guard.current = canChange;
+  const [drafts, setDrafts] = useState({});
+  const timers = useRef(new Map());
+  useEffect(() => () => {
+    for (const timer of timers.current.values()) clearTimeout(timer);
+  }, []);
 
   const commit = (next) => {
+    if (!guard.current()) return;
     current.current = next;
     setView(next);
-    writeView(config, guildId, next);
+    replaceListLocation(viewQuery(config, guildId, next));
     onChange();
   };
   const setFilter = (key, value) => {
+    clearTimeout(timers.current.get(key));
+    timers.current.delete(key);
+    setDrafts((previous) => {
+      const remaining = { ...previous };
+      delete remaining[key];
+      return remaining;
+    });
     const previous = current.current;
     if (previous.filters[key] === value) return;
     commit({ ...previous, filters: { ...previous.filters, [key]: value } });
   };
+  const withFilters = (filters) => ({ ...current.current, filters: { ...emptyFilters(config), ...filters } });
   const replaceFilters = (filters = {}) => {
-    clearTimeout(searchTimer.current);
-    setSearchText(filters.q || "");
-    commit({ ...current.current, filters: { ...emptyFilters(config), ...filters } });
+    for (const timer of timers.current.values()) clearTimeout(timer);
+    timers.current.clear();
+    setDrafts({});
+    commit(withFilters(filters));
   };
-  const setSearch = (value) => {
+  const filterLink = (filters) => ({
+    href: listLocation(viewQuery(config, guildId, withFilters(filters))),
+    onClick: (event) => {
+      if (event.button || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      event.preventDefault();
+      replaceFilters(filters);
+    },
+  });
+  const setText = (key, value) => {
     const text = boundedSearch(value);
-    setSearchText(text);
-    clearTimeout(searchTimer.current);
-    searchTimer.current = setTimeout(() => setFilter("q", text.trim()), SEARCH_DELAY_MS);
+    setDrafts((previous) => ({ ...previous, [key]: text }));
+    clearTimeout(timers.current.get(key));
+    timers.current.set(key, setTimeout(() => setFilter(key, text.trim()), SEARCH_DELAY_MS));
   };
   const sortBy = (column) => {
     const previous = current.current;
@@ -138,7 +166,7 @@ export function useListControls(config, guildId, onChange) {
     return new URLSearchParams({ sort, dir, ...Object.fromEntries(Object.entries(filters).filter(([, value]) => value)) });
   };
   return {
-    config, view, searchText, setSearch, setFilter, replaceFilters, sortBy, query,
+    config, view, drafts, setText, setFilter, replaceFilters, filterLink, sortBy, query,
     filtered: () => hasFilters(current.current),
   };
 }
@@ -147,8 +175,8 @@ function ListField({ label, children }) {
   return h("div", { className: "field" }, h("label", null, label, children));
 }
 
-export function ListControls({ controls, UserPicker, userPickerProps }) {
-  const { config, view, searchText, setSearch, setFilter, replaceFilters } = controls;
+export function ListControls({ controls, UserPicker, userPickerProps, filterOptions = {} }) {
+  const { config, view, drafts, setText, setFilter, replaceFilters } = controls;
   const { filters } = view;
   const date = (key, label, bounds) => h(ListField, { label },
     h("input", {
@@ -159,8 +187,31 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
       onChange: (event) => setFilter(key, event.target.value),
     }),
   );
+  const text = (key, label, placeholder, type = "text") => h(ListField, { key, label },
+    h("input", {
+      className: "input input-sm",
+      type,
+      value: drafts[key] ?? filters[key],
+      placeholder,
+      maxLength: SEARCH_LIMIT * 2,
+      onChange: (event) => setText(key, event.target.value),
+    }),
+  );
+  const chips = [
+    ...config.filters.filter(({ kind }) => kind !== "user"),
+    { key: "q", label: "Search" },
+    { key: "from", label: "From" },
+    { key: "to", label: "To" },
+  ].filter(({ key }) => filters[key]).map(({ key, label, options }) => {
+    const value = (filterOptions[key] ?? options)?.[filters[key]]?.label ?? filters[key];
+    return h("button", {
+      key, type: "button", className: "btn btn-xs btn-outline",
+      "aria-label": `Remove ${label.toLowerCase()} filter`,
+      onClick: () => setFilter(key, ""),
+    }, `${label}: ${value}`, " ×");
+  });
   return h("div", { className: "list-filters", "data-no-draft": true, role: "group", "aria-label": config.filterLabel },
-    ...config.filters.map(({ key, label, options, kind, idLabel, render }) => {
+    ...config.filters.map(({ key, label, options, kind, idLabel, render, placeholder }) => {
       if (kind === "user") {
         const ids = filters[key] ? [filters[key]] : [];
         return h(UserPicker, {
@@ -172,6 +223,7 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
           onChange: () => setFilter(key, ids[0] || ""),
         });
       }
+      if (kind === "text") return text(key, label, placeholder);
       if (render) return h(ListField, { key, label }, render(filters[key], (value) => setFilter(key, value)));
       return h(ListField, { key, label },
         h("select", {
@@ -180,25 +232,17 @@ export function ListControls({ controls, UserPicker, userPickerProps }) {
           onChange: (event) => setFilter(key, event.target.value),
         },
         h("option", { value: "" }, `Any ${label.toLowerCase()}`),
-        ...Object.entries(options).map(([value, entry]) => h("option", { key: value, value }, entry.label)),
+        ...Object.entries(filterOptions[key] ?? options ?? {}).map(([value, entry]) => h("option", { key: value, value }, entry.label)),
         ),
       );
     }),
-    h(ListField, { label: "Search" },
-      h("input", {
-        className: "input input-sm",
-        type: "search",
-        value: searchText,
-        placeholder: config.searchPlaceholder,
-        maxLength: SEARCH_LIMIT * 2,
-        onChange: (event) => setSearch(event.target.value),
-      }),
-    ),
+    text("q", "Search", config.searchPlaceholder, "search"),
     date("from", "From (UTC)", { max: filters.to || undefined }),
     date("to", "To (UTC)", { min: filters.from || undefined }),
-    hasFilters(view) || searchText
+    hasFilters(view) || Object.values(drafts).some(Boolean)
       ? h("button", { type: "button", className: "btn btn-sm", onClick: () => replaceFilters() }, "Clear filters")
       : null,
+    chips.length ? h("div", { className: "row list-filter-chips" }, ...chips) : null,
   );
 }
 

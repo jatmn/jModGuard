@@ -29,9 +29,9 @@ pub struct ListQuery<S, O> {
     pub dir: Option<SortDirection>,
 }
 
-pub struct ListControls<S, O> {
+pub struct ListControls<S, O, T = i64> {
     pub after: Option<String>,
-    pub subject: Option<i64>,
+    pub subject: Option<T>,
     pub actor: Option<i64>,
     pub outcome: Option<O>,
     pub q: Option<String>,
@@ -47,15 +47,21 @@ impl<S, O> ListQuery<S, O> {
         default_sort: S,
         default_dir: SortDirection,
     ) -> ApiResult<ListControls<S, O>> {
+        self.validate_with_subject(default_sort, default_dir, parse_user_id)
+    }
+
+    pub fn validate_with_subject<T>(
+        self,
+        default_sort: S,
+        default_dir: SortDirection,
+        subject: impl FnOnce(Option<&str>) -> ApiResult<Option<T>>,
+    ) -> ApiResult<ListControls<S, O, T>> {
         let from = parse_date(self.from.as_deref())?;
         let to = parse_date(self.to.as_deref())?;
         if matches!((from, to), (Some(from), Some(to)) if from > to) {
             return Err(invalid("from date must be on or before to date"));
         }
-        let q = self.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
-        if q.is_some_and(|q| q.chars().count() > MAX_SEARCH_CHARS) {
-            return Err(invalid("search is limited to 200 characters"));
-        }
+        let q = bounded_list_text(self.q.as_deref())?;
         let midnight = |date: NaiveDate| {
             date.and_time(chrono::NaiveTime::MIN)
                 .and_utc()
@@ -63,10 +69,10 @@ impl<S, O> ListQuery<S, O> {
         };
         Ok(ListControls {
             after: self.after,
-            subject: parse_user_id(self.subject.as_deref())?,
+            subject: subject(self.subject.as_deref())?,
             actor: parse_user_id(self.actor.as_deref())?,
             outcome: self.outcome,
-            q: q.map(str::to_owned),
+            q,
             from_ms: from.map(midnight),
             until_ms: to.map(|date| midnight(date) + 86_400_000),
             sort: self.sort.unwrap_or(default_sort),
@@ -75,7 +81,17 @@ impl<S, O> ListQuery<S, O> {
     }
 }
 
-fn parse_user_id(raw: Option<&str>) -> ApiResult<Option<i64>> {
+pub fn bounded_list_text(raw: Option<&str>) -> ApiResult<Option<String>> {
+    let text = raw.map(str::trim).filter(|text| !text.is_empty());
+    if text.is_some_and(|text| text.chars().count() > MAX_SEARCH_CHARS || text.contains('\0')) {
+        return Err(invalid(
+            "list search and text filters must be at most 200 characters without NUL",
+        ));
+    }
+    Ok(text.map(str::to_owned))
+}
+
+pub fn parse_user_id(raw: Option<&str>) -> ApiResult<Option<i64>> {
     raw.filter(|raw| !raw.is_empty())
         .map(|raw| {
             raw.parse::<i64>()

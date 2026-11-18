@@ -2193,6 +2193,221 @@ async fn ban_and_reason_edit_routes_require_ban_members_and_page_membership() {
 }
 
 #[tokio::test]
+async fn ban_list_filters_and_orders_use_the_same_cursor_page() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let scope = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let a = 9_007_199_254_740_999;
+    let b = 100;
+    let c = 200;
+    let d = 300;
+    let e = 999;
+    let bans = [
+        (
+            a,
+            Some("zed"),
+            Some("alpha"),
+            Some(9),
+            Some("Zulu"),
+            "invite %",
+            "2026-01-04T00:00:00Z",
+        ),
+        (
+            b,
+            Some("bravo"),
+            None,
+            Some(8),
+            Some("Alpha"),
+            "other",
+            "2026-01-02T00:00:00Z",
+        ),
+        (
+            c,
+            Some("cider-invite"),
+            Some("Alpha"),
+            Some(8),
+            Some("Alpha"),
+            "invite",
+            "2026-01-03T20:00:00-04:00",
+        ),
+        (d, None, None, None, None, "", "2026-01-03T00:00:00Z"),
+        (
+            e,
+            Some("Delta"),
+            None,
+            Some(5),
+            None,
+            "Other",
+            "2026-01-01T00:00:00Z",
+        ),
+    ];
+    for (user, name, display, actor, actor_name, reason, at) in bans {
+        db::record_enrolled_ban_with_identity(
+            &f.app.db,
+            Some(scope.clone()),
+            user,
+            name,
+            display,
+            actor,
+            actor_name,
+            reason,
+            Some(at),
+        )
+        .await
+        .unwrap();
+    }
+    let other = db::guild_enrollment(&f.app.db, 20).await.unwrap().unwrap();
+    db::record_enrolled_ban(&f.app.db, Some(other), a, Some(7), "invite")
+        .await
+        .unwrap();
+    for user in [b, e] {
+        db::mark_unbanned(&f.app.db, 10, user).await.unwrap();
+    }
+    let initial = ban_page(&f, "").await;
+    let edited = initial["bans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["user_id"].as_str().and_then(|id| id.parse().ok()) == Some(d))
+        .unwrap();
+    let row_id = edited["id"].as_i64().unwrap();
+    let edited_path = format!("/api/guilds/10/bans/{row_id}/reason");
+    let (status, body) = f
+        .request("PUT", &edited_path, r#"{"reason":"zeta invite"}"#)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let default = ban_page(&f, "").await;
+    assert_eq!(ban_user_ids(&default), [c, a, d, b, e]);
+    assert_eq!(default["total"], 5);
+    assert_eq!(
+        default["moderators"],
+        serde_json::json!([
+            {"id": "5", "name": null}, {"id": "8", "name": "Alpha"}, {"id": "9", "name": "Zulu"},
+        ])
+    );
+
+    for (sort, ascending) in [
+        ("subject", [d, a, c, b, e]),
+        ("id", [b, c, d, e, a]),
+        ("status", [b, e, a, c, d]),
+        ("actor", [d, e, b, c, a]),
+        ("reason", [c, a, b, e, d]),
+        ("date", [e, b, d, a, c]),
+    ] {
+        for dir in ["asc", "desc"] {
+            let mut expected = ascending;
+            if dir == "desc" {
+                expected.reverse();
+            }
+            let query = format!("limit=1&sort={sort}&dir={dir}");
+            assert_eq!(walk_ban_pages(&f, &query, 5).await, expected, "{query}");
+        }
+    }
+
+    for (query, expected) in [
+        ("subject=ALPHA", vec![c, a]),
+        ("subject=cider", vec![c]),
+        ("subject=9007199254740999", vec![a]),
+        ("actor=8", vec![c, b]),
+        ("reason=invite", vec![c, a, d]),
+        ("reason=%25", vec![a]),
+        ("status=active", vec![c, a, d]),
+        ("status=unbanned", vec![b, e]),
+        ("from=2026-01-04&to=2026-01-04", vec![c, a]),
+        ("q=ZULU", vec![a]),
+        ("q=cider", vec![c]),
+        ("q=ALPHA", vec![c, a, b]),
+        ("q=9007199254740999", vec![a]),
+        ("q=zeta", vec![d]),
+        ("q=%25", vec![a]),
+        (
+            "subject=alpha&actor=8&reason=invite&status=active&q=cider&from=2026-01-04&to=2026-01-04",
+            vec![c],
+        ),
+        ("q=%27%20OR%201%3D1", vec![]),
+        ("status=unbanned&reason=invite", vec![]),
+    ] {
+        let page = ban_page(&f, query).await;
+        assert_eq!(ban_user_ids(&page), expected, "{query}");
+        assert_eq!(page["total"], expected.len(), "{query}");
+        assert!(page["next_cursor"].is_null(), "{query}");
+        assert_eq!(page["moderators"], default["moderators"], "{query}");
+    }
+    assert_eq!(
+        walk_ban_pages(&f, "q=invite&limit=1&sort=reason&dir=asc", 3).await,
+        [c, a, d]
+    );
+
+    let first = ban_page(&f, "limit=1&sort=reason&dir=asc").await;
+    let cursor = ban_page_cursor(&first);
+    for query in [
+        format!("sort=reason&dir=desc&after={cursor}"),
+        "sort=elsewhere".into(),
+        "actor=%2B8".into(),
+        "subject=9223372036854775808".into(),
+        "from=2026-02-30".into(),
+        format!("q={}", "x".repeat(201)),
+        format!("reason={}", "x".repeat(201)),
+    ] {
+        let (status, body) = f
+            .request("POST", &format!("/api/guilds/10/bans?{query}"), "")
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+
+    // A 512-character non-ASCII edit still fits in a portable next-page token.
+    let long_reason = serde_json::json!({"reason": "🪐".repeat(512)}).to_string();
+    assert_eq!(
+        f.request("PUT", &edited_path, &long_reason).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        walk_ban_pages(&f, "limit=1&sort=reason&dir=desc", 5).await,
+        [d, e, b, a, c]
+    );
+}
+
+async fn ban_page(f: &Fixture, query: &str) -> serde_json::Value {
+    let (status, body) = f
+        .request("POST", &format!("/api/guilds/10/bans?{query}"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{query}: {body}");
+    body
+}
+
+fn ban_user_ids(page: &serde_json::Value) -> Vec<i64> {
+    page["bans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["user_id"].as_str().unwrap().parse().unwrap())
+        .collect()
+}
+
+fn ban_page_cursor(page: &serde_json::Value) -> &str {
+    page["next_cursor"].as_str().unwrap()
+}
+
+async fn walk_ban_pages(f: &Fixture, query: &str, total: usize) -> Vec<i64> {
+    let mut ids = Vec::new();
+    let mut page = ban_page(f, query).await;
+    for index in 0..total {
+        assert_eq!(page["total"], total);
+        let user_ids = ban_user_ids(&page);
+        assert_eq!(user_ids.len(), 1, "{query}: {page}");
+        ids.extend(user_ids);
+        if index + 1 == total {
+            assert!(page["next_cursor"].is_null(), "{query}: {page}");
+        } else {
+            page = ban_page(f, &format!("{query}&after={}", ban_page_cursor(&page))).await;
+        }
+    }
+    ids
+}
+
+#[tokio::test]
 async fn queued_ban_handoff_lists_the_ban_after_the_bot_confirms_it() {
     use jmodguard_bot::action_worker::{DiscordActions, Outcome, WorkerLimits};
 
