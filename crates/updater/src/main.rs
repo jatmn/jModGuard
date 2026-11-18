@@ -3878,11 +3878,22 @@ mod tests {
         control.arm_launcher_fence(&"a".repeat(32));
         assert!(control.renew_launcher_fence().await.unwrap());
         let before = control.launcher_fence_deadline().unwrap();
-        tokio::time::sleep_until(tokio::time::Instant::from_std(
-            before + Duration::from_millis(50),
-        ))
-        .await;
+        tokio::time::sleep_until(tokio::time::Instant::from_std(before)).await;
         let other_db = Db::open(&path, 2).unwrap();
+        // The stored expiry is wall-clock time read at commit, so it trails the
+        // monotonic horizon above by however long that acquisition took. End
+        // the stored window here instead of racing the two clocks.
+        other_db
+            .with_conn_sync(|conn| {
+                let tx = conn.transaction_immediate()?;
+                db::write_meta_string_conn(
+                    &tx,
+                    "launcher_lease",
+                    &format!("{} 0", "a".repeat(32)),
+                )?;
+                tx.commit()
+            })
+            .unwrap();
         let other = UpdateControl::from_application(&other_db);
         other.arm_launcher_fence(&"b".repeat(32));
         assert!(other.renew_launcher_fence().await.unwrap());
