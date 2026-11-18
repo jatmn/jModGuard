@@ -1748,7 +1748,6 @@ pub fn observe(
         msg.author.id.get(),
         &roles,
     );
-    let metadata_allowed = !rule.skip_moderators || status == ModeratorStatus::Member;
     if !eligible(
         rule,
         msg.author.id.get(),
@@ -1803,9 +1802,7 @@ pub fn observe(
         };
         if !files.iter().any(|f: &Attachment| f.id == file.id) {
             files.push(file);
-            if metadata_allowed {
-                metadata.extend(ImageMetadata::from_attachment(a));
-            }
+            metadata.extend(ImageMetadata::from_attachment(a));
         }
     }
     if files.len() < minimum_files(&policy)
@@ -1890,7 +1887,6 @@ pub(crate) fn observe_update(
     let status = roles.as_deref().map_or(ModeratorStatus::Unknown, |roles| {
         crate::commands::cached_moderator_status(app, &ctx.cache, guild, author, roles)
     });
-    let metadata_allowed = !rule.skip_moderators || status == ModeratorStatus::Member;
     if !may_admit(
         rule,
         author,
@@ -1938,9 +1934,7 @@ pub(crate) fn observe_update(
         };
         if !files.iter().any(|f: &Attachment| f.id == file.id) {
             files.push(file);
-            if metadata_allowed {
-                metadata.extend(ImageMetadata::from_attachment(a));
-            }
+            metadata.extend(ImageMetadata::from_attachment(a));
         }
     }
     let edited_ms = event
