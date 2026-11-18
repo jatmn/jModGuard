@@ -2,7 +2,7 @@ use super::*;
 use axum::body::Body;
 use axum::http::HeaderValue;
 use axum::http::header::ORIGIN;
-use jmodguard::db::{Db, ResourceProcess};
+use jmodguard::db::{Db, ResourceProcess, ResourceRecords};
 use tower::ServiceExt;
 use tower_sessions::Session;
 
@@ -292,6 +292,50 @@ async fn unavailable_history_still_returns_live_api_values() {
     );
     assert_eq!(value["rows_read"]["status"], "unavailable");
     assert_eq!(value["provider"]["status"], "not_configured");
+}
+
+#[tokio::test]
+async fn degraded_history_cache_stays_stale_within_ttl() {
+    let f = fixture();
+    let picked = ResourceRange::Day;
+    let now_secs = resources::unix_ms_now() / 1000;
+    let (_, _, bucket) = picked.shape();
+    let to_secs = now_secs - now_secs.rem_euclid(bucket) + bucket;
+    {
+        let mut cache = f.app.resource_cache.entries.lock().await;
+        cache.insert(
+            picked,
+            super::CachedHistory {
+                read_at: Instant::now(),
+                to_secs,
+                records: ResourceRecords::default(),
+                stale: true,
+            },
+        );
+    }
+    let owner = signed_in(&f.app, 99).await;
+    let value = overview(State(f.app.clone()), owner, origin(&f.app), range("24h"))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(value["history_status"], "stale");
+}
+
+#[tokio::test]
+async fn session_load_counts_toward_active_sessions() {
+    use tower_sessions::cookie::time::Duration as CookieDuration;
+    let inner = MemoryStore::default();
+    let store = CountedStore(inner.clone());
+    let mut record = tower_sessions::session::Record {
+        id: tower_sessions::session::Id::default(),
+        data: std::collections::HashMap::new(),
+        expiry_date: tower_sessions::cookie::time::OffsetDateTime::now_utc()
+            + CookieDuration::hours(1),
+    };
+    inner.create(&mut record).await.unwrap();
+    assert_eq!(super::active_sessions(), 0);
+    store.load(&record.id).await.unwrap();
+    assert_eq!(super::active_sessions(), 1);
 }
 
 #[tokio::test]

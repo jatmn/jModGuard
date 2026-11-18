@@ -81,6 +81,8 @@ struct CachedHistory {
     /// The window end the rows were read for.
     to_secs: i64,
     records: ResourceRecords,
+    /// Set when a refresh could not reach the database; stays until a successful read.
+    stale: bool,
 }
 
 #[derive(Default)]
@@ -138,7 +140,8 @@ async fn history(
             && entry.read_at.elapsed() < HISTORY_TTL
             && entry.to_secs == to_secs
         {
-            return (Some(entry.records.clone()), "available");
+            let status = if entry.stale { "stale" } else { "available" };
+            return (Some(entry.records.clone()), status);
         }
     }
     // One history read at a time; a waiting refresh reuses its result.
@@ -149,7 +152,8 @@ async fn history(
             && entry.read_at.elapsed() < HISTORY_TTL
             && entry.to_secs == to_secs
         {
-            return (Some(entry.records.clone()), "available");
+            let status = if entry.stale { "stale" } else { "available" };
+            return (Some(entry.records.clone()), status);
         }
     }
     let read = tokio::time::timeout(
@@ -166,14 +170,29 @@ async fn history(
                     read_at: Instant::now(),
                     to_secs,
                     records: records.clone(),
+                    stale: false,
                 },
             );
             (Some(records), "available")
         }
-        _ => match cache.get(&range) {
-            Some(entry) => (Some(entry.records.clone()), "stale"),
-            None => (None, "unavailable"),
-        },
+        _ => {
+            let stale_entry = cache
+                .get(&range)
+                .filter(|entry| entry.to_secs == to_secs)
+                .map(|entry| CachedHistory {
+                    read_at: entry.read_at,
+                    to_secs: entry.to_secs,
+                    records: entry.records.clone(),
+                    stale: true,
+                });
+            if let Some(entry) = stale_entry {
+                let records = entry.records.clone();
+                cache.insert(range, entry);
+                (Some(records), "stale")
+            } else {
+                (None, "unavailable")
+            }
+        }
     }
 }
 
@@ -421,8 +440,9 @@ impl SessionStore for CountedStore {
 
     async fn load(&self, id: &Id) -> session_store::Result<Option<Record>> {
         let record = self.0.load(id).await?;
-        if record.is_none() {
-            forget_session(id);
+        match &record {
+            None => forget_session(id),
+            Some(record) => track_session(record),
         }
         Ok(record)
     }

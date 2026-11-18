@@ -204,7 +204,7 @@ async fn exercise_resource_rollups(bot: &Db, api: &Db) {
     )
     .await
     .expect("bot should save resource rollups on remote libSQL");
-    assert_eq!(added, 2);
+    assert_eq!(added.minute_rows_inserted, 2);
     let minutes = resource_records(api, MINUTE_SECS, minute, minute + MINUTE_SECS)
         .await
         .expect("API should read resource rollups on remote libSQL");

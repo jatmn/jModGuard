@@ -143,7 +143,6 @@ pub async fn run(app: Arc<BotState>, shards: Arc<ShardManager>, cache: Arc<Cache
             .into_iter()
             .filter(|rollup| rollup.start_secs > api_saved_through)
             .collect();
-        let api_through = api.iter().map(|rollup| rollup.start_secs).max();
         let mut minutes: Vec<(ResourceProcess, Rollup)> = backlog
             .iter()
             .cloned()
@@ -162,12 +161,14 @@ pub async fn run(app: Arc<BotState>, shards: Arc<ShardManager>, cache: Arc<Cache
         )
         .await
         {
-            Ok(Ok(_)) => {
-                backlog.clear();
-                failing = false;
-                if let Some(through) = api_through {
+            Ok(Ok(write)) => {
+                let saved: std::collections::HashSet<i64> =
+                    write.bot_minute_starts.iter().copied().collect();
+                backlog.retain(|rollup| !saved.contains(&rollup.start_secs));
+                if let Some(through) = write.api_minute_starts.iter().copied().max() {
                     api_saved_through = through;
                 }
+                failing = false;
             }
             Ok(Err(error)) if !failing => {
                 failing = true;

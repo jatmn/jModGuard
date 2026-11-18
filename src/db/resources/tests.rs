@@ -86,7 +86,9 @@ async fn writer_keeps_each_minute_once_and_merges_it_into_its_hour() {
     )
     .await
     .unwrap();
-    assert_eq!(added, 3);
+    assert_eq!(added.minute_rows_inserted, 3);
+    assert_eq!(added.bot_minute_starts, vec![HOUR]);
+    assert_eq!(added.api_minute_starts, vec![HOUR, HOUR + 60]);
     // The API keeps recent minutes; collecting them again changes nothing.
     let again = record_resource_rollups(
         &f.db,
@@ -96,7 +98,8 @@ async fn writer_keeps_each_minute_once_and_merges_it_into_its_hour() {
     )
     .await
     .unwrap();
-    assert_eq!(again, 0);
+    assert_eq!(again.minute_rows_inserted, 0);
+    assert!(again.api_minute_starts.is_empty());
 
     let minutes = resource_records(&f.db, MINUTE_SECS, HOUR, HOUR + HOUR_SECS)
         .await
@@ -157,7 +160,13 @@ async fn writes_prune_expired_rows_and_refuse_out_of_window_minutes() {
     )
     .await
     .unwrap();
-    assert_eq!(added, 1, "only the in-window, aligned minute is stored");
+    assert_eq!(
+        added.minute_rows_inserted,
+        1,
+        "only the in-window, aligned minute is stored"
+    );
+    assert_eq!(added.bot_minute_starts, vec![later - 60]);
+    assert!(added.api_minute_starts.is_empty());
     let later_hour = (later - 60) - (later - 60).rem_euclid(HOUR_SECS);
     assert_eq!(
         f.rows(),
@@ -176,6 +185,23 @@ async fn writes_prune_expired_rows_and_refuse_out_of_window_minutes() {
         !f.rows().contains(&("bot".into(), HOUR_SECS, first)),
         "hours older than the retention are pruned"
     );
+}
+
+#[tokio::test]
+async fn rejected_minutes_do_not_appear_in_write_result() {
+    let f = Fixture::new("rejected");
+    let now = HOUR + 600;
+    let future = now + 10 * MINUTE_SECS;
+    let write = record_resource_rollups(
+        &f.db,
+        vec![(ResourceProcess::Api, minute(future, 1, 1))],
+        None,
+        now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(write.minute_rows_inserted, 0);
+    assert!(write.api_minute_starts.is_empty());
 }
 
 #[tokio::test]
