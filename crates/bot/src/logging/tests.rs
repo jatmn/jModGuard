@@ -561,7 +561,7 @@ fn dedup_report(dedup: &EditReportDedup, event: &MessageUpdateEvent) -> bool {
     };
     dedup
         .window((guild, event.channel_id, event.id))
-        .claim(at.timestamp_millis())
+        .is_some_and(|window| window.claim(at.timestamp_millis()))
 }
 
 fn edit_report(event: &MessageUpdateEvent, known_author_id: Option<u64>) -> Option<MessageReport> {
@@ -695,6 +695,25 @@ fn repeated_edit_observations_emit_once_but_changed_content_emits_again() {
     let mut other_channel = first.clone();
     other_channel.channel_id = ChannelId::new(999);
     assert!(dedup_report(&dedup, &other_channel));
+}
+
+#[tokio::test(start_paused = true)]
+async fn edit_window_capacity_preserves_pending_claims_and_reuses_idle_slots() {
+    let dedup = EditReportDedup::default();
+    let key = |id| (GuildId::new(7), ChannelId::new(8), MessageId::new(id));
+    let mut pending: Vec<_> = (1..=EDIT_REPORT_LIMIT as u64)
+        .map(|id| dedup.window(key(id)).unwrap())
+        .collect();
+    assert!(pending[0].claim(42));
+    let new_key = key(EDIT_REPORT_LIMIT as u64 + 1);
+    assert!(dedup.window(new_key).is_none());
+    pending.pop();
+    assert!(dedup.window(new_key).unwrap().claim(42));
+    assert!(!dedup.window(key(1)).unwrap().claim(42));
+
+    drop(pending);
+    tokio::time::advance(EDIT_REPORT_KEEP).await;
+    assert!(dedup.window(key(1)).unwrap().claim(42));
 }
 
 #[test]

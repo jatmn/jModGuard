@@ -43,8 +43,11 @@ and persistence contracts below are unchanged.
   Edit reports look up the channel or thread name in cache and then via a
   bounded Discord request. The message link always uses the event IDs.
   Updates to the bot's own messages never produce edit reports.
-  A bounded 10-second window at Gateway receipt coalesces reports at the same timestamp. The
-  stored snapshot does the same: a field inherited from an earlier observation
+  For each message, the bot remembers up to 64 reported edit timestamps for 10 seconds
+  after the latest eligible Gateway receipt. Pending comparisons keep that window
+  available through admission. If all 4,096 windows have pending comparisons, the bot
+  counts a dropped report for a new message ID and continues processing its snapshot.
+  In the stored snapshot, a field inherited from an earlier observation
   is not treated as already supplied at the new timestamp, so a complementary
   partial can fill it. A different value for a field already supplied at that
   timestamp does not replace the first. A complementary partial can trigger the

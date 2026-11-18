@@ -802,25 +802,29 @@ pub struct EditReportDedup {
 impl EditReportDedup {
     /// Partials received together share a window even if a queued store read
     /// delays admission. Only a report with a qualifying change claims its timestamp.
-    pub(crate) fn window(&self, key: EditKey) -> Arc<EditReportWindow> {
+    pub(crate) fn window(&self, key: EditKey) -> Option<Arc<EditReportWindow>> {
         let mut entries = self.inner.lock();
         let now = tokio::time::Instant::now();
-        entries.retain(|_, (at, _)| now.duration_since(*at) < EDIT_REPORT_KEEP);
+        // Pending admissions hold a window from receipt through the timestamp
+        // claim. Evicting it early would let a replay claim in a second window.
+        entries.retain(|_, (at, window)| {
+            now.duration_since(*at) < EDIT_REPORT_KEEP || Arc::strong_count(window) > 1
+        });
         if let Some((at, window)) = entries.get_mut(&key) {
             *at = now;
-            return Arc::clone(window);
+            return Some(Arc::clone(window));
         }
-        if entries.len() >= EDIT_REPORT_LIMIT
-            && let Some(oldest) = entries
+        if entries.len() >= EDIT_REPORT_LIMIT {
+            let oldest_idle = entries
                 .iter()
+                .filter(|(_, (_, window))| Arc::strong_count(window) == 1)
                 .min_by_key(|(_, (at, _))| *at)
-                .map(|(key, _)| *key)
-        {
-            entries.remove(&oldest);
+                .map(|(key, _)| *key)?;
+            entries.remove(&oldest_idle);
         }
         let window = Arc::new(EditReportWindow::default());
         entries.insert(key, (now, Arc::clone(&window)));
-        window
+        Some(window)
     }
 }
 

@@ -379,9 +379,13 @@ impl PendingEditReport {
             Some(context.cache.current_user().id.get()),
             Some(&context.cache),
         )?;
-        let window = app
+        let Some(window) = app
             .edit_reports
-            .window((report.guild_id, event.channel_id, event.id));
+            .window((report.guild_id, event.channel_id, event.id))
+        else {
+            logging::record_delivery_failure(app);
+            return None;
+        };
         Some(Self { report, window })
     }
 }
@@ -4361,15 +4365,12 @@ mod tests {
         let handler = crate::handlers::Handler {
             app: Arc::clone(&app),
         };
-        // Refuse capture on the collector route, leaving only the report path.
-        app.snapshots
-            .bytes
-            .store(MAX_PENDING_BYTES, Ordering::Release);
+        let mut receiver = app.snapshots.receiver.lock().start().unwrap();
         let now = chrono::DateTime::from_timestamp_millis(app.snapshots.started_at_ms).unwrap();
         let created = now - chrono::Duration::minutes(2);
         let mut expected = Vec::new();
         for (index, (unhooked, changed)) in
-            [(true, false), (true, true), (false, false), (false, true)]
+            [(false, true), (true, false), (true, true), (false, false)]
                 .into_iter()
                 .enumerate()
         {
@@ -4393,6 +4394,19 @@ mod tests {
                 "content": text, "edited_timestamp": edit.to_rfc3339()
             }))
             .unwrap();
+            if index == 0 {
+                // Stall the worker before admission. The closed queue routes the
+                // next receipt through a read-only lookup of the same prior.
+                app.snapshots.on_gateway_event(
+                    &app,
+                    ctx.clone(),
+                    &Event::MessageUpdate(event.clone()),
+                );
+                receiver.close();
+                tokio::time::pause();
+                tokio::time::advance(logging::EDIT_REPORT_KEEP + Duration::from_secs(1)).await;
+                tokio::time::resume();
+            }
             if unhooked {
                 handler.message_update(ctx.clone(), None, None, event).await;
             } else {
@@ -4400,6 +4414,14 @@ mod tests {
                     .on_gateway_event(&app, ctx.clone(), &Event::MessageUpdate(event));
             }
         }
+        // Let the unqueued read claim first, then admit the older queued receipt.
+        drop(
+            Arc::clone(&app.snapshots.report_slots)
+                .acquire_many_owned(32)
+                .await
+                .unwrap(),
+        );
+        run(Arc::clone(&app), receiver).await;
         let _drained = Arc::clone(&app.snapshots.report_slots)
             .acquire_many_owned(32)
             .await
