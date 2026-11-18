@@ -22,7 +22,7 @@ Bot/API  →  separate core and guild SQLite files or libSQL URLs (not RDS)
 
 ## VM
 
-1. Use Ubuntu/Debian x86-64 with the pinned Rust **1.96.0** toolchain, or pull
+1. Use Ubuntu/Debian x86-64 with the pinned Rust **1.100.0** toolchain, or pull
    verified public GHCR bot/API images (`jmodguard-bot`, `jmodguard-api`).
    See [INSTALL.md](INSTALL.md) for source and image selection.
 2. Open only the HTTPS reverse-proxy port to the internet. Keep service binds

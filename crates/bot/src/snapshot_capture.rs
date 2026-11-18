@@ -1035,7 +1035,7 @@ impl SnapshotIngress {
     fn reserve_bytes(&self, bytes: usize) -> ByteAdmission {
         if self
             .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
                 old.checked_add(bytes)
                     .filter(|next| *next <= MAX_PENDING_BYTES)
             })

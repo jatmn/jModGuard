@@ -1,4 +1,4 @@
-# cargo-dylint 6.1.0 reads [workspace.metadata.dylint] from this standalone file
+# cargo-dylint 6.4.0 reads [workspace.metadata.dylint] from this standalone file
 # (see from_dylint_toml in the pinned release). Keeping the pin here leaves
 # Cargo.toml cargo-native.
 #
@@ -6,12 +6,12 @@
 # different dylint_linting version is refused.
 #
 # These are individual Trail of Bits general lints. They share the toolchain
-# in examples/general/rust-toolchain.toml (nightly-2026-08-20 at v6.1.0).
+# in examples/general/rust-toolchain.toml (nightly-2026-08-20 at v6.4.0).
 # `cargo dylint` runs one workspace `cargo check --all-targets` under that
 # nightly (into `target-dylint`; see scripts/dylint.sh and with-cargo-auth.sh).
 # Clippy, tests, and images
-# stay on rust-toolchain.toml (1.96.0). scripts/dylint.sh passes
-# `-D warnings -A deprecated` through DYLINT_RUSTFLAGS, which the driver
+# stay on rust-toolchain.toml (1.100.0). scripts/dylint.sh passes
+# `-D warnings` through DYLINT_RUSTFLAGS, which the driver
 # applies only while it is RUSTC_WORKSPACE_WRAPPER. The script unsets
 # RUSTFLAGS for that run so the flag cannot reach the driver build or
 # dependency crates. Lint-library builds also clear RUSTFLAGS.
@@ -25,7 +25,7 @@
 # Run: bash scripts/dylint.sh
 [[workspace.metadata.dylint.libraries]]
 git = "https://github.com/trailofbits/dylint"
-tag = "v6.1.0"
+tag = "v6.4.0"
 pattern = [
     "examples/general/abs_home_path",
     "examples/general/await_holding_span_guard",

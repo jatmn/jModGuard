@@ -17,7 +17,7 @@ use [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md). For EC2, [DEPLOY-AWS.md](DEPLOY-AWS.md)
 
 ## 1. Prerequisites
 
-- Rust toolchain (rustup): <https://rustup.rs> — the repo pins **Rust 1.96.0**
+- Rust toolchain (rustup): <https://rustup.rs> — the repo pins **Rust 1.100.0**
   via `rust-toolchain.toml` (same as `Cargo.toml` `rust-version` and the
   Docker builder images). `rustup` will select that pin automatically in this
   directory.
@@ -100,7 +100,7 @@ gh auth setup-git
 
 git clone https://github.com/jatmn/jModGuard.git
 cd jModGuard
-# rust-toolchain.toml selects Rust 1.96.0 via rustup.
+# rust-toolchain.toml selects Rust 1.100.0 via rustup.
 # Independent bot package (no dashboard stack).
 cargo build --locked --release -p jmodguard-bot
 # API with the default embedded frontend (Node.js ^22.22.2, ^24.15.0, or 26+).

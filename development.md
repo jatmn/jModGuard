@@ -110,7 +110,7 @@ The vendored `tokio-tungstenite` compatibility patch also requires manual
 maintenance. Container images remain manual: Rust builder versions must
 stay aligned with `rust-toolchain.toml`, the root Cargo version requirements,
 and the CI toolchain. `Dockerfile.{bot,api}` pin
-`rust:1.96-bookworm` and `debian:bookworm-slim` by linux/amd64 digest. There is
+`rust:1.100.0-bookworm` and `debian:bookworm-slim` by linux/amd64 digest. There is
 no Docker Dependabot job; bump those digests together with the toolchain pin.
 
 Dependabot version updates are supported on this private GitHub.com

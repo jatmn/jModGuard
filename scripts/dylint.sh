@@ -289,38 +289,9 @@ else
   fi
 fi
 
-# `-D warnings` is a rustc flag. Arguments after `--` are forwarded to
-# `cargo check`, which rejects it. `RUSTFLAGS` is the wrong channel:
-# cargo-dylint 6.1.0 prepends it onto the temporary driver build, and the
-# workspace `cargo check` applies it to every crate. Lint-library builds
-# clear it, so they are not the leak. `DYLINT_RUSTFLAGS` reaches rustc only
-# for workspace packages, because `cargo dylint` sets
-# `RUSTC_WORKSPACE_WRAPPER`.
-# `cargo dylint` checks the workspace with the lint libraries' nightly
-# (nightly-2026-08-20 at the pinned tag). Allow `deprecated` on that check
-# so a nightly-only rename does not fail a tree that still builds on 1.96.0
-# under Clippy and release builds.
-# Apply the gate's lint levels last: a caller may have an earlier copy of
-# either flag followed by an overriding `-A warnings` or `-D deprecated`.
-dylint_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-D warnings -A deprecated"
-
-# A cold dylint 6.1.0 driver build runs `git clone` on rust-lang/rust-clippy
-# and checks out `master`, which upstream renamed to `main`. Give only the
-# `cargo dylint` process an extra fetch refspec that also stores `main` as tag
-# `master`. Append it after caller entries such as the CI credential helper.
-# The pattern matches nothing in a clone without `main`, so other clones
-# still succeed, and Cargo fetches lint libraries by URL, not via `origin`.
-# Remove when the dylint pin moves to 6.3.0 or later, which uses `main`.
-git_config_count="${GIT_CONFIG_COUNT:-0}"
-case "$git_config_count" in
-  *[!0-9]*) echo "dylint: GIT_CONFIG_COUNT is not a number: $git_config_count" >&2; exit 2 ;;
-esac
-git_config_count=$((10#$git_config_count))
-clippy_master_env=(
-  "GIT_CONFIG_COUNT=$((git_config_count + 1))"
-  "GIT_CONFIG_KEY_${git_config_count}=remote.origin.fetch"
-  "GIT_CONFIG_VALUE_${git_config_count}=+refs/heads/main*:refs/tags/master*"
-)
+# DYLINT_RUSTFLAGS reaches rustc only for workspace packages through
+# RUSTC_WORKSPACE_WRAPPER. Set the warning level after any caller flags.
+dylint_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-D warnings"
 
 ensure_dylint_toolchain
 
@@ -358,15 +329,18 @@ fi
 
 if [ "$use_prebuilt" -eq 1 ]; then
   echo "dylint: using prebuilt libs at $lib_dir"
-  echo "dylint: DYLINT_LIBRARY_PATH=$lib_dir"
-  echo "dylint: cargo dylint --all --no-metadata --fail-on-no-libraries -- --locked --all-targets ${package_args[*]}"
-  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS "${clippy_master_env[@]}" \
+  lib_toolchain=$(dylint_lib_toolchain_from_key "$dylint_build_key")
+  lib_args=()
+  for name in "${dylint_lib_names[@]}"; do
+    lib_args+=(--lib-path "$lib_dir/lib${name}@${lib_toolchain}.so")
+  done
+  echo "dylint: cargo dylint --no-metadata --fail-on-no-libraries ${lib_args[*]} -- --locked --all-targets ${package_args[*]}"
+  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
     TMPDIR="$dylint_tmpdir" DYLINT_RUSTFLAGS="$dylint_rustflags" \
-    DYLINT_LIBRARY_PATH="$lib_dir" \
-    cargo dylint --all --no-metadata --fail-on-no-libraries -- --locked --all-targets "${package_args[@]}"
+    cargo dylint --no-metadata --fail-on-no-libraries "${lib_args[@]}" -- --locked --all-targets "${package_args[@]}"
 else
   echo "dylint: cargo dylint --all --fail-on-no-libraries -- --locked --all-targets ${package_args[*]}"
-  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS "${clippy_master_env[@]}" \
+  env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
     TMPDIR="$dylint_tmpdir" DYLINT_RUSTFLAGS="$dylint_rustflags" \
     cargo dylint --all --fail-on-no-libraries -- --locked --all-targets "${package_args[@]}"
 fi
