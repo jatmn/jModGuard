@@ -6,6 +6,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use jmodguard::db::{self, ComponentObservation, ComponentRelease, Db};
+use jmodguard_updater::http_client_builder;
 use jmodguard_updater::oci::{Registry, sha256_hex};
 use jmodguard_updater::storage::Storage;
 use serde::Deserialize;
@@ -329,7 +330,7 @@ async fn purge_webui_cache(
         );
         return Ok(false);
     };
-    let http = crate::http_client_builder()
+    let http = http_client_builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;

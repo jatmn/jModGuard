@@ -1,4 +1,5 @@
 use jmodguard::db::Db;
+use jmodguard_updater::http_client_builder;
 use std::path::PathBuf;
 
 fn tmp_db_path(label: &str) -> PathBuf {
@@ -51,8 +52,7 @@ async fn api_process_waits_for_first_boot_with_overlapping_read_bind_without_a_b
             .unwrap(),
         root,
     };
-    jmodguard::init_tls_provider();
-    let client = reqwest::Client::builder()
+    let client = http_client_builder()
         .timeout(Duration::from_secs(1))
         .build()
         .unwrap();

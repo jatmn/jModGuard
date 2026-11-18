@@ -1265,6 +1265,7 @@ dependencies = [
  "rand 0.10.4",
  "reqwest 0.13.5",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
  "tar",

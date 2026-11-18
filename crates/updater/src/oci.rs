@@ -1,6 +1,6 @@
 //! Anonymous, digest-pinned reads of the project's public GHCR OCI images.
 //! Registry tags are discovery pointers; a queued install keeps its digest.
-use crate::signature;
+use crate::{http_client_builder, signature};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use jmodguard::db::ComponentRelease;
@@ -18,11 +18,6 @@ const MAX_LAYER: usize = 128 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 256 * 1024 * 1024;
 const MAX_FILE: u64 = 64 * 1024 * 1024;
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
-
-pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
-    jmodguard::init_tls_provider();
-    reqwest::Client::builder()
-}
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     digest(&SHA256, bytes)
