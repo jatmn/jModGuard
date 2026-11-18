@@ -281,6 +281,15 @@ test('Bans maps its columns, filters, row people, and paging onto the shared lis
   assert.equal(request().get('after'), next);
   assert.equal(request().get('q'), 'seed');
   assert.equal(button('Next page').disabled, true);
+  const search = root.querySelector('input[type="search"]');
+  search.value = '  updated search  ';
+  const requestCount = requests.length;
+  await fire(search, 'input');
+  assert.equal(requests.length, requestCount, 'typing waits for the debounce');
+  await [...f.timers.values()].find(timer => timer.delay === 300).fn();
+  assert.equal(request().get('q'), 'updated search');
+  assert.equal(request().has('after'), false);
+  assert.equal(new URLSearchParams(f.location.search).get('q'), 'updated search');
   await fire(button('ID'), 'click');
   assert.equal(request().get('sort'), 'id');
   assert.equal(request().get('dir'), 'asc');
@@ -319,6 +328,67 @@ test('Bans maps its columns, filters, row people, and paging onto the shared lis
   for (const key of ['subject', 'reason', 'actor', 'status', 'q', 'after']) assert.equal(request().get(key), null);
   assert.equal(reason.value, '');
   assert.ok(root.querySelector('a[aria-label^="Filter by user Test-User-1"]'));
+});
+
+test('Bans restores pending search after reauthentication before debounce', async () => {
+  const requests = [];
+  let expired = false;
+  const fetchImpl = async (path) => {
+    if (path === '/api/me') return response({ ...me, guilds });
+    if (path.endsWith('/config')) return response({ enrollment_id: 'membership' });
+    if (!path.startsWith(`/api/guilds/${guildId}/bans?`)) return response({});
+    const query = new URLSearchParams(path.split('?')[1]);
+    requests.push(query);
+    if (expired) return {
+      ok: false, status: 401, headers: { get: () => null },
+      text: async () => JSON.stringify({ error: 'not authenticated' }),
+    };
+    return response({ ...banRows(), next_cursor: query.has('after') ? null : 'next-page' });
+  };
+  const h = harness(fetchImpl);
+  const { me, guilds } = h.app.state;
+  const guildId = guilds[1].id;
+  const controls = { sort: 'reason', dir: 'asc', status: 'unbanned', reason: 'invite' };
+  const view = { list: 'bans', guild: guildId, ...controls, page_size: '100' };
+  h.location.search = '?' + new URLSearchParams({ ...view, q: 'old search' });
+  h.app.restoreWorkspace();
+  const root = await bansView(h);
+  const button = (label) => findNode(root, n => n.localName === 'button' && n.textContent === label);
+  await fire(button('Next page'), 'click');
+  assert.equal(requests.at(-1).get('after'), 'next-page');
+
+  const search = root.querySelector('input[type="search"]');
+  search.value = '  pending invite %  ';
+  const requestCount = requests.length;
+  await fire(search, 'input');
+  assert.ok([...h.timers.values()].some(timer => timer.delay === 300));
+  assert.equal(requests.length, requestCount);
+  assert.equal(new URLSearchParams(h.location.search).get('q'), 'old search');
+
+  expired = true;
+  await fire(button('Refresh'), 'click');
+  const login = h.document.getElementById('login-link');
+  assert.ok(login, 'the Bans request returned 401 and prompted sign-in');
+  assert.equal(new URLSearchParams(h.location.search).get('q'), 'pending invite %');
+  assert.equal([...h.timers.values()].some(timer => timer.delay === 300), false);
+  login.addEventListener('click', event => event.preventDefault());
+  await fire(login, 'click', { button: 0 });
+  assert.equal(requests.length, requestCount + 1, 'only the refresh request ran before sign-in');
+
+  expired = false;
+  const returning = harness(fetchImpl, h.storage, h.session);
+  await returning.app.init();
+  await settle();
+  const restored = returning.document.querySelector('#content');
+  assert.equal(restored.querySelector('input[type="search"]').value, 'pending invite %');
+  assert.equal(restored.querySelector('th[aria-sort="ascending"]').textContent, 'Reason');
+  assert.equal(memberLabelled(restored, 'Rows per page').value, '100');
+  const location = new URLSearchParams(returning.location.search);
+  for (const [key, value] of Object.entries({ ...view, q: 'pending invite %' })) assert.equal(location.get(key), value, key);
+  assert.equal(requests.length, requestCount + 2, 'the restored list loaded once');
+  const request = requests.at(-1);
+  for (const [key, value] of Object.entries({ ...controls, q: 'pending invite %', limit: '100' })) assert.equal(request.get(key), value, key);
+  assert.equal(request.has('after'), false);
 });
 
 test('editing a ban reason saves the jModGuard reason and reloads the list', async () => {
