@@ -248,9 +248,13 @@ operations now use API admission and bot dispatch.
   ([WEBUI.md](WEBUI.md#access-by-discord-role)).
 - Global edits (`guild_id=0` or body `scope: "global"`) require `bot.owner_id`.
   That check uses the session user id and does not fetch the guild list.
-- Guild-scoped authorization always re-fetches Discord guild membership
-  (`authorize_manage_guild`); the short guild-list cache is display-only
-  (`/api/me`) and may serve the last good list while Discord is rate-limiting.
+- Guild-scoped authorization uses the login's own Discord guild-list snapshot
+  (`authorize_manage_guild`). It is reused for up to 4 minutes and refreshed in the
+  background, so page loads do not wait for Discord. The bot writes gateway role,
+  member and owner changes as access marks in `meta`, and a snapshot older than a
+  matching mark is fetched again before it is used (#653). The guild-list display
+  cache is display-only (`/api/me`) and may serve the last good list while Discord
+  is rate-limiting.
 
 ## Source layout
 

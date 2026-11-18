@@ -4,6 +4,7 @@ pub use jmodguard::{
     process_ready, set_process_ready, set_shutdown_context, shutdown_signal, templates, tenant,
     types,
 };
+pub mod access_marks;
 pub mod action_worker;
 pub mod activation;
 pub mod activity_log;

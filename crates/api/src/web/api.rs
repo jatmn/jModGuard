@@ -1129,7 +1129,8 @@ pub async fn copy_config(
 ) -> ApiResult<Json<serde_json::Value>> {
     // One permission snapshot checks both servers; global destinations still
     // require the independent session-owner gate.
-    let auth = super::require_auth_fresh(&app, &session).await?;
+    let auth =
+        super::require_auth_for_guilds(&app, &session, &[guild_id, body.from_guild_id]).await?;
     let dest = if guild_id == 0 {
         super::session_owner(&app, &session).await?
     } else {

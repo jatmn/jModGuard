@@ -601,10 +601,24 @@ impl OAuthClient {
             })
     }
 
+    #[cfg(test)]
     pub async fn my_guilds(
         &self,
         user_id: u64,
         access_token: &str,
+    ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
+        self.my_guilds_at(user_id, access_token, 0).await
+    }
+
+    /// The user's guild list. `access_epoch` is the gateway access epoch the
+    /// caller read before this call: only lookups that read the same epoch
+    /// share one request, so no caller keeps a result that started before a
+    /// change its own epoch already includes.
+    pub async fn my_guilds_at(
+        &self,
+        user_id: u64,
+        access_token: &str,
+        access_epoch: i64,
     ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
         let user_key = format!("g:{user_id}");
         if let Some(retry_after) = self.route_remaining(&user_key) {
@@ -615,7 +629,7 @@ impl OAuthClient {
         }
         // Only identical user/token lookups share a result. Cooldowns remain
         // per user, so rotating a token cannot bypass the Discord budget.
-        let flight_key = format!("{user_key}:{access_token}");
+        let flight_key = format!("{user_key}:{access_epoch}:{access_token}");
         match self.begin_flight(&flight_key) {
             FlightJoin::Follow(receiver) => self.wait_for_flight(receiver).await,
             FlightJoin::Lead(mut guard) => {

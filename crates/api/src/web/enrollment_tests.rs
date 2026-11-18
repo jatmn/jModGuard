@@ -939,8 +939,10 @@ async fn display_keeps_the_last_guild_list_while_discord_is_rate_limited() {
 
 fn profile_older_than_user_ttl() -> std::time::Instant {
     std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(120))
-        .expect("profile cache must be older than the 60s user ttl")
+        .checked_sub(
+            USER_CACHE_TTL.max(GUILD_DISPLAY_CACHE_TTL) + std::time::Duration::from_secs(60),
+        )
+        .expect("profile cache must be older than the user and display ttl")
 }
 
 fn age_user_cache(app: &ApiState, user_id: u64) {
@@ -994,7 +996,7 @@ async fn display_keeps_cached_guilds_when_the_user_cache_is_cold_during_a_global
             .value()
             .0
             .elapsed()
-            < std::time::Duration::from_secs(60)
+            < GUILD_DISPLAY_CACHE_TTL
     );
 
     let guild_calls = f.discord.calls.load(Ordering::SeqCst);
@@ -4904,6 +4906,168 @@ async fn session_guild_requests_reuse_coalesce_and_refetch_after_expiry() {
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
 }
 
+/// Waits until no session has a background guild refresh running.
+async fn background_refreshes_finished(app: &ApiState) {
+    let finished = async {
+        loop {
+            let sessions: Vec<_> = app
+                .auth_sessions
+                .iter()
+                .map(|e| Arc::clone(e.value()))
+                .collect();
+            let mut running = false;
+            for session in sessions {
+                running |= session.lock().await.refreshing;
+            }
+            if !running {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), finished)
+        .await
+        .expect("background guild refresh finished");
+}
+
+/// Snapshot age that is past every user's background refresh point but
+/// still inside the authorization TTL.
+fn revalidating_age() -> std::time::Duration {
+    let age = GUILD_REFRESH_AFTER + std::time::Duration::from_millis(GUILD_REFRESH_JITTER_MS);
+    assert!(age < GUILD_AUTH_CACHE_TTL);
+    age
+}
+
+#[tokio::test]
+async fn guild_reads_reuse_the_snapshot_for_minutes_and_refresh_it_in_the_background() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    for path in [
+        "/api/guilds/10/config",
+        "/api/guilds/10/stats",
+        "/api/guilds/10/config",
+        "/api/guilds/10/stats",
+    ] {
+        let (status, body) = f.request("POST", path, "").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    }
+    assert_eq!(
+        f.discord.calls.load(Ordering::SeqCst),
+        1,
+        "page loads within the interval reuse one guild list"
+    );
+    let me_calls = f.discord.me_calls.load(Ordering::SeqCst);
+
+    // Discord has removed Manage Server. Requests past the refresh point
+    // still get the cached answer at once, and share one background request.
+    expire_auth_cache(&f.app, revalidating_age()).await;
+    f.discord.guilds.lock().unwrap().clear();
+    let (a, b, c) = tokio::join!(
+        f.request("GET", "/api/guilds/10/config", ""),
+        f.request("POST", "/api/guilds/10/stats", ""),
+        f.request("GET", "/api/guilds/10/config", ""),
+    );
+    for (status, body) in [a, b, c] {
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    background_refreshes_finished(&f.app).await;
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), me_calls);
+
+    // The refreshed list applies without another Discord request.
+    let (status, _) = f.request("GET", "/api/guilds/10/config", "").await;
+    assert!(
+        !status.is_success(),
+        "lost permission applies after refresh"
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn rate_limited_background_refresh_serves_the_snapshot_until_the_cooldown_ends() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    expire_auth_cache(&f.app, revalidating_age()).await;
+    *f.discord.retry_after.lock().unwrap() = "120".into();
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    background_refreshes_finished(&f.app).await;
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+    for _ in 0..3 {
+        let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    background_refreshes_finished(&f.app).await;
+    assert_eq!(
+        f.discord.calls.load(Ordering::SeqCst),
+        2,
+        "the cooldown blocks further refreshes without failing reads"
+    );
+}
+
+#[tokio::test]
+async fn gateway_access_marks_invalidate_only_matching_snapshots() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+
+    // Another member's change, or this user's change in another guild.
+    db::record_access_marks(&f.app.db, vec![], vec![(10, 99), (20, 42)], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+
+    // This user's roles changed in guild 10: Discord is asked at once.
+    f.discord.guilds.lock().unwrap().clear();
+    db::record_access_marks(&f.app.db, vec![], vec![(10, 42)], None)
+        .await
+        .unwrap();
+    let (status, _) = f
+        .request("PUT", "/api/guilds/10/settings", r#"{"prefix":"nope"}"#)
+        .await;
+    assert!(!status.is_success());
+    assert_ne!(
+        db::get_settings(&f.app.db, 10).await.unwrap().prefix,
+        "nope"
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+
+    // A guild-wide change (roles or owner) does the same for every member.
+    *f.discord.guilds.lock().unwrap() = vec![managed_guild(10), managed_guild(20)];
+    db::record_access_marks(&f.app.db, vec![10], vec![], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.discord.calls.load(Ordering::SeqCst),
+        3,
+        "a mark invalidates once; the refreshed snapshot postdates it"
+    );
+}
+
 #[tokio::test]
 async fn bounded_auth_snapshot_handles_discord_and_local_rate_limits() {
     for budget in [false, true] {
@@ -8504,7 +8668,7 @@ async fn expire_member_roles(app: &ApiState) {
         .map(Arc::clone)
         .collect();
     for slot in slots {
-        if let Some((at, _)) = &mut *slot.lock().await {
+        if let Some((at, ..)) = &mut *slot.lock().await {
             *at = std::time::Instant::now()
                 .checked_sub(MEMBER_ROLES_TTL)
                 .unwrap();
@@ -8695,6 +8859,28 @@ async fn role_mapped_moderator_reaches_only_that_guild_at_its_level() {
     let (status, denied) = f.request("POST", "/api/guilds/10/stats", "").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{denied}");
     assert_eq!(f.discord.member_calls.load(Ordering::SeqCst), calls + 1);
+
+    // A gateway role change for this member reads the roles again at once.
+    f.discord
+        .member_roles
+        .lock()
+        .unwrap()
+        .insert(10, vec!["555".into()]);
+    expire_member_roles(&f.app).await;
+    let (status, body) = f.request("POST", "/api/guilds/10/stats", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.discord.member_calls.load(Ordering::SeqCst), calls + 2);
+    f.discord
+        .member_roles
+        .lock()
+        .unwrap()
+        .insert(10, Vec::new());
+    db::record_access_marks(&f.app.db, vec![], vec![(10, 42)], None)
+        .await
+        .unwrap();
+    let (status, denied) = f.request("POST", "/api/guilds/10/stats", "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{denied}");
+    assert_eq!(f.discord.member_calls.load(Ordering::SeqCst), calls + 3);
 }
 
 #[tokio::test]
@@ -8826,6 +9012,7 @@ async fn role_cache_stays_bounded_with_live_entries() {
             Arc::new(tokio::sync::Mutex::new(Some((
                 std::time::Instant::now(),
                 vec![555],
+                0,
             )))),
         );
     }

@@ -6491,3 +6491,55 @@ async fn a_newer_leave_supersedes_a_blocked_older_one_because_redeparture_is_ide
 
     cleanup_db(&tmp);
 }
+
+#[tokio::test]
+async fn access_marks_advance_one_epoch_per_batch_and_prune_old_marks() {
+    let tmp = tmp_db_path("access_marks");
+    let db = Db::open(&tmp, 2).unwrap();
+    assert_eq!(access_epoch(&db).await.unwrap(), 0);
+    assert_eq!(access_mark(&db, 10, 42).await.unwrap(), 0);
+
+    let first = record_access_marks(&db, vec![], vec![(10, 42)], None)
+        .await
+        .unwrap();
+    assert_eq!(first, 1);
+    let second = record_access_marks(&db, vec![20], vec![(10, 7)], None)
+        .await
+        .unwrap();
+    assert_eq!(second, 2);
+    assert_eq!(access_epoch(&db).await.unwrap(), 2);
+    assert_eq!(access_mark(&db, 10, 42).await.unwrap(), 1);
+    assert_eq!(access_mark(&db, 10, 7).await.unwrap(), 2);
+    assert_eq!(access_mark(&db, 20, 42).await.unwrap(), 2, "guild mark");
+    assert_eq!(access_mark(&db, 30, 42).await.unwrap(), 0);
+
+    // Pruning removes marks at or below the given epoch, never the epoch row.
+    let third = record_access_marks(&db, vec![], vec![(30, 42)], Some(1))
+        .await
+        .unwrap();
+    assert_eq!(third, 3);
+    assert_eq!(access_mark(&db, 10, 42).await.unwrap(), 0);
+    assert_eq!(access_mark(&db, 10, 7).await.unwrap(), 2);
+    let fourth = record_access_marks(&db, vec![], vec![], Some(99))
+        .await
+        .unwrap();
+    assert_eq!(fourth, 4, "the epoch survives pruning");
+    assert_eq!(access_mark(&db, 30, 42).await.unwrap(), 0);
+    assert_eq!(access_mark(&db, 20, 1).await.unwrap(), 0);
+
+    assert!(
+        record_access_marks(&db, vec![0], vec![], None)
+            .await
+            .is_err()
+    );
+    let too_many = (1..=ACCESS_MARK_BATCH_MEMBERS as i64 + 1)
+        .map(|user| (10, user))
+        .collect();
+    assert!(
+        record_access_marks(&db, vec![], too_many, None)
+            .await
+            .is_err()
+    );
+    drop(db);
+    cleanup_db(&tmp);
+}

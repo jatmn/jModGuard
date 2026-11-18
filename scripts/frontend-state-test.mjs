@@ -8647,7 +8647,7 @@ test('access-role saves send string role IDs, levels and the loaded revision', a
     const body = options.body ? JSON.parse(options.body) : null;
     calls.push({ url, method: options.method, body });
     if (url.endsWith('/access-roles') && options.method === 'POST') {
-      return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], revision: 'revision-1', ttl_secs: 30 });
+      return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], revision: 'revision-1', ttl_secs: 240 });
     }
     if (url.endsWith('/access-roles') && options.method === 'PUT') {
       return response({ revision: 'revision-2', roles: body.roles });
@@ -8659,7 +8659,7 @@ test('access-role saves send string role IDs, levels and the loaded revision', a
   h.app.state.tab = 'settings';
   h.app.tabSettings();
   await settle();
-  assert.match(h.document.querySelector('.test-panel').textContent, /stops working within 30 seconds/);
+  assert.match(h.document.querySelector('.test-panel').textContent, /stops working as soon as the bot sees the change, and within 4 minutes at most/);
   const add = h.elements.find((n) => n.localName === 'button' && n.textContent === 'Add role');
   await fire(add, 'click', {});
   const inputs = h.elements.filter((n) => n.localName === 'input' && /Discord role/.test(n.getAttribute('placeholder') || ''));

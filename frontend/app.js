@@ -9062,7 +9062,7 @@ function AccessRolesCard({ revision, generation }) {
           "Dashboard access is view-only.",
           "Settings access can also edit rules, badwords, known spam and images, templates, log channels and bot settings.",
           "Commands, copying configuration, member import controls, case notes, case removal and this list need Manage Server.",
-          `A removed role stops working within ${ttl} seconds.`,
+          `A removed role stops working as soon as the bot sees the change, and within ${ttl >= 120 ? `${Math.round(ttl / 60)} minutes` : `${ttl} seconds`} at most.`,
         ],
       }),
       rows === null
