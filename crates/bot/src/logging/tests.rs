@@ -2172,6 +2172,21 @@ impl LogDelivery for UnavailableAuditSink {
 
 #[tokio::test]
 async fn delayed_audit_after_unknown_or_skipped_report_cannot_explain_repeat_action() {
+    async fn emit_with_paused_clock(
+        f: &Fixture,
+        sink: &impl LogDelivery,
+        event: &str,
+        vars: BTreeMap<String, String>,
+    ) -> Delivery {
+        let guild = GuildId::new(789);
+        // Load configuration on real time because the DB runs on a separate runtime.
+        f.app.configs.get(&f.app.db, guild.get()).await.unwrap();
+        tokio::time::pause();
+        let delivery = emit_to(&f.app, sink, guild, event, vars).await;
+        tokio::time::resume();
+        delivery
+    }
+
     for event in ["member_ban", "member_unban"] {
         for mode in [
             "empty",
@@ -2211,13 +2226,12 @@ async fn delayed_audit_after_unknown_or_skipped_report_cannot_explain_repeat_act
             } else {
                 None
             };
-            let delivery = emit_to(
-                &f.app,
+            let delivery = emit_with_paused_clock(
+                &f,
                 &UnavailableAuditSink {
                     mode,
                     observed: prior.timestamp_millis(),
                 },
-                GuildId::new(789),
                 event,
                 vars.clone(),
             )
@@ -2263,7 +2277,7 @@ async fn delayed_audit_after_unknown_or_skipped_report_cannot_explain_repeat_act
             };
             vars.insert("time".into(), now.to_rfc3339());
             assert_eq!(
-                emit_to(&f.app, &sink, GuildId::new(789), event, vars).await,
+                emit_with_paused_clock(&f, &sink, event, vars).await,
                 Delivery::Sent
             );
             let messages = sink.sink.messages.lock().unwrap();

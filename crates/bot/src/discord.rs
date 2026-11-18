@@ -938,6 +938,14 @@ impl RestRetry {
         !self.is_stopped() && self.deadline().is_none_or(|next| now >= next)
     }
 
+    #[cfg(test)]
+    pub(crate) fn elapse_backoff_for_test(&mut self, elapsed: Duration) {
+        let RetryWait::Until(deadline) = &mut self.wait else {
+            panic!("expected a pending retry deadline");
+        };
+        *deadline -= elapsed;
+    }
+
     pub fn fail(&mut self, class: RetryClass, now: std::time::Instant, base_secs: u64) {
         if class != RetryClass::Transient {
             self.admission = RetryAdmission::Stopped;

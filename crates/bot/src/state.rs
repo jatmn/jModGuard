@@ -2230,6 +2230,16 @@ impl BotState {
         retry.retry.fail(class, Instant::now(), 30);
     }
 
+    #[cfg(test)]
+    pub(crate) fn elapse_slash_retry_backoff_for_test(&self, guild: u64, elapsed: Duration) {
+        self.slash_retries
+            .lock()
+            .get_mut(&guild)
+            .expect("expected a slash retry entry")
+            .retry
+            .elapse_backoff_for_test(elapsed);
+    }
+
     pub(crate) fn reset_slash_guild_retry(&self, guild: u64) {
         self.slash_retries.lock().remove(&guild);
     }

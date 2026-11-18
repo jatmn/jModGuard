@@ -2449,7 +2449,8 @@ mod tests {
                 assert!(!app.finish_slash_resync(changed, [10].into_iter().collect()));
                 response_status.store(200, Ordering::SeqCst);
                 requests.lock().clear();
-                tokio::time::sleep(std::time::Duration::from_secs(38)).await;
+                assert!(!sync_slash_commands_versioned_http(&app, &http, guild, changed).await);
+                assert!(requests.lock().is_empty(), "backoff must suppress the PUT");
                 assert_eq!(
                     app.pending_slash_registry_version().await.unwrap(),
                     Some(changed)
@@ -2460,7 +2461,21 @@ mod tests {
                     panic!("expected retry");
                 };
                 assert_eq!(guilds, vec![10]);
-                assert!(sync_slash_commands_versioned_http(&app, &http, guild, changed).await);
+                // The first retry waits 30 seconds plus up to 7 seconds of jitter.
+                app.elapse_slash_retry_backoff_for_test(
+                    guild.get(),
+                    std::time::Duration::from_secs(38),
+                );
+                assert!(app.slash_sync_due(
+                    guild.get(),
+                    changed,
+                    &app.slash_registry_revision(),
+                    std::time::Instant::now(),
+                ));
+                assert!(
+                    sync_slash_commands_versioned_http(&app, &http, guild, changed).await,
+                    "HTTP sync must retry after the backoff elapses",
+                );
                 assert!(app.finish_slash_resync(changed, Default::default()));
                 assert_eq!(
                     requests
