@@ -6713,6 +6713,138 @@ async fn case_reads_filter_the_list_and_name_known_members() {
 }
 
 #[tokio::test]
+async fn members_sort_and_filter_before_paging() {
+    use db::guild_data::MemberObservation;
+
+    const PATH: &str = "/api/guilds/10/members";
+    const DAY: i64 = 1_767_312_000_000; // 2026-01-02 UTC
+    const NEXT_DAY: i64 = DAY + 86_400_000;
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, NEXT_DAY)
+        .await
+        .unwrap();
+    for (id, username, global_name, nickname, joined_at_ms) in [
+        (11, "aardvark", None, Some("Zulu"), NEXT_DAY),
+        (12, "zebra", Some("Alpha"), None, NEXT_DAY),
+        (15, "alpha", None, None, DAY),
+        (16, "alphabet", None, None, NEXT_DAY),
+    ] {
+        store
+            .observe_member(
+                scope.clone(),
+                MemberObservation {
+                    user_id: id,
+                    username: Some(Some(username.into())),
+                    global_name: Some(global_name.map(str::to_owned)),
+                    nickname: Some(nickname.map(str::to_owned)),
+                    joined_at_ms: Some(joined_at_ms),
+                    observed_at_ms: NEXT_DAY + 1,
+                    is_join: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    for id in [13, 14] {
+        store
+            .observe_ban(scope.clone(), id, NEXT_DAY)
+            .await
+            .unwrap();
+    }
+    store
+        .observe_unban(scope.clone(), 14, NEXT_DAY + 1)
+        .await
+        .unwrap();
+
+    let ids = |body: &serde_json::Value| {
+        body["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["user_id"].as_str().unwrap().parse::<i64>().unwrap())
+            .collect::<Vec<_>>()
+    };
+    let (status, default) = f.request("GET", PATH, "").await;
+    assert_eq!(status, StatusCode::OK, "{default}");
+    assert_eq!(ids(&default), [16, 12, 11, 15]);
+
+    for (sort, ascending) in [
+        ("name", [13, 14, 12, 15, 16, 11]),
+        ("user_id", [11, 12, 13, 14, 15, 16]),
+        ("joined", [13, 14, 15, 11, 12, 16]),
+        ("status", [11, 12, 15, 16, 13, 14]),
+    ] {
+        for dir in ["asc", "desc"] {
+            let mut actual = Vec::new();
+            let mut after = String::new();
+            for page in 1..=ascending.len() {
+                let path = format!("{PATH}?status=all&sort={sort}&dir={dir}&limit=1{after}");
+                let (status, body) = f.request("POST", &path, "").await;
+                assert_eq!(status, StatusCode::OK, "{path}: {body}");
+                let members = ids(&body);
+                assert_eq!(members.len(), 1, "{sort} {dir} page {page}");
+                actual.extend(members);
+                if page == ascending.len() {
+                    assert!(body["next_cursor"].is_null(), "{path}: {body}");
+                } else {
+                    after = format!("&after={}", body["next_cursor"].as_str().unwrap());
+                }
+            }
+            let mut expected = ascending;
+            if dir == "desc" {
+                expected.reverse();
+            }
+            assert_eq!(actual, expected, "{sort} {dir}");
+        }
+    }
+
+    let filters = "sort=name&dir=desc&status=current&q=+ALP+&from=2026-01-03&to=2026-01-03&limit=1";
+    let (status, first) = f.request("POST", &format!("{PATH}?{filters}"), "").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(ids(&first), [16]);
+    let after = first["next_cursor"].as_str().unwrap();
+    let (status, second) = f
+        .request("POST", &format!("{PATH}?{filters}&after={after}"), "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(ids(&second), [12]);
+    assert!(second["next_cursor"].is_null());
+    for (query, expected) in [
+        ("sort=name&dir=desc&status=previously_banned", vec![14]),
+        (
+            "sort=joined_oldest&joined_from=2026-01-03&joined_to=2026-01-03",
+            vec![11, 12, 16],
+        ),
+        ("sort=joined_newest&after=1767398400000:12", vec![11, 15]),
+        ("sort=user_id&dir=desc&q=%3C%40%2111%3E", vec![11]),
+    ] {
+        let (status, body) = f.request("GET", &format!("{PATH}?{query}"), "").await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(ids(&body), expected, "{query}");
+    }
+    for query in [
+        "sort=missing".to_owned(),
+        "dir=sideways".to_owned(),
+        "after=broken".to_owned(),
+        format!("sort=name&dir=asc&after={after}"),
+        format!("sort=joined&dir=desc&after={after}"),
+    ] {
+        let (status, body) = f.request("POST", &format!("{PATH}?{query}"), "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn case_list_orders_and_filters_are_applied_before_paging() {
     use crate::db::guild_data::{
         CaseAction as Action, CaseData, CaseEvidence, CaseId, CaseOutcome as Outcome, CaseSource,

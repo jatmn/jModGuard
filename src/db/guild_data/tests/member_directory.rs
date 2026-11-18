@@ -26,6 +26,125 @@ async fn ready() -> (Fixture, GuildDataStore, GuildDataScope) {
 }
 
 #[tokio::test]
+async fn member_orders_seek_the_scoped_indexes_after_schema_21_upgrade() {
+    use crate::db_compat::Connection;
+
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    GuildDataStore::create_historical_store(f.options(), reg.clone(), 21).unwrap();
+    let raw = Connection::open(&f.store_path).unwrap();
+    raw.execute_batch_bounded(
+        "WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM ids WHERE id<4096)
+         INSERT INTO guild_member_directory (
+             guild_id, enrollment_id, user_id, username, search_text, is_current, is_banned,
+             ever_banned, joined_at_ms, observed_at_ms
+         ) SELECT 10, 'members', id, printf('Member %04d', id), printf('member %04d', id),
+             id%4=0, id%4=1, id%4 IN (1,2), 1000+id/4, 3000 FROM ids",
+        SCHEMA_BATCH_LIMIT,
+    )
+    .unwrap();
+    drop(raw);
+
+    let store = GuildDataStore::initialize(f.options(), reg).unwrap();
+    store
+        .db
+        .with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM guild_member_directory WHERE name_sort_key LIKE 'member %'",
+                (),
+                |row| Ok(row.get(0)?),
+            )?;
+            assert_eq!(count, 4096);
+
+            for status in [
+                MemberStatusFilter::All,
+                MemberStatusFilter::Current,
+                MemberStatusFilter::Banned,
+                MemberStatusFilter::PreviouslyBanned,
+            ] {
+                for (sort, key, boundary) in [
+                    (
+                        MemberSort::Name,
+                        Value::Text("member 2048".into()),
+                        "(name_sort_key,user_id)",
+                    ),
+                    (MemberSort::UserId, Value::Integer(2048), "user_id"),
+                    (
+                        MemberSort::Joined,
+                        Value::Integer(1512),
+                        "(joined_sort_key,user_id)",
+                    ),
+                    (
+                        MemberSort::Status,
+                        Value::Integer(1),
+                        "(status_sort_key,user_id)",
+                    ),
+                ] {
+                    for descending in [false, true] {
+                        for has_after in [false, true] {
+                            let query = MemberQuery {
+                                q: Some("member".into()),
+                                status,
+                                joined_from_ms: Some(1000),
+                                joined_to_ms: Some(2200),
+                                sort,
+                                descending,
+                                after: has_after.then(|| MemberListAnchor {
+                                    key: match &key {
+                                        Value::Text(name) => MemberSortValue::Name(name.clone()),
+                                        Value::Integer(number) => MemberSortValue::Number(*number),
+                                        _ => unreachable!(),
+                                    },
+                                    user_id: 2048,
+                                }),
+                                limit: 50,
+                            };
+                            let mut stmt =
+                                conn.prepare(&format!("EXPLAIN QUERY PLAN {}", query.sql()))?;
+                            let plan = stmt
+                                .query_map(
+                                    params![
+                                        10,
+                                        "members",
+                                        "member",
+                                        None::<i64>,
+                                        1000,
+                                        2200,
+                                        key.clone(),
+                                        2048,
+                                        51
+                                    ],
+                                    |row| Ok(row.get::<String>(3)?),
+                                )?
+                                .collect::<Result<Vec<_>>>()?;
+                            assert_eq!(plan.len(), 1, "{query:?}: {plan:?}");
+                            let detail = &plan[0];
+                            assert!(
+                                detail.starts_with("SEARCH guild_member_directory USING INDEX "),
+                                "{query:?}: {detail}"
+                            );
+                            assert!(
+                                detail.contains("guild_id=? AND enrollment_id=?"),
+                                "{query:?}: {detail}"
+                            );
+                            if has_after {
+                                let op = if descending { '<' } else { '>' };
+                                assert!(
+                                    detail.contains(&format!("{boundary}{op}")),
+                                    "{query:?}: {detail}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn version_eight_upgrade_admits_existing_enrollment_once() {
     use crate::db_compat::Connection;
     let f = Fixture::new();
@@ -276,7 +395,8 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
                 status: MemberStatusFilter::Current,
                 joined_from_ms: None,
                 joined_to_ms: None,
-                sort: MemberSort::JoinedNewest,
+                sort: MemberSort::Joined,
+                descending: true,
                 after: None,
                 limit: 50,
             },
@@ -293,7 +413,8 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
                 status: MemberStatusFilter::Current,
                 joined_from_ms: None,
                 joined_to_ms: None,
-                sort: MemberSort::JoinedNewest,
+                sort: MemberSort::Joined,
+                descending: true,
                 after: None,
                 limit: 50,
             },
@@ -310,7 +431,8 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
                 status: MemberStatusFilter::Current,
                 joined_from_ms: None,
                 joined_to_ms: None,
-                sort: MemberSort::JoinedNewest,
+                sort: MemberSort::Joined,
+                descending: true,
                 after: None,
                 limit: 50,
             },
@@ -361,7 +483,8 @@ async fn one_time_seed_batch_search_and_missing_checkpoint_fail_closed() {
                 status: MemberStatusFilter::Banned,
                 joined_from_ms: None,
                 joined_to_ms: None,
-                sort: MemberSort::JoinedNewest,
+                sort: MemberSort::Joined,
+                descending: true,
                 after: None,
                 limit: 50,
             },
@@ -2185,7 +2308,8 @@ async fn previously_banned_excludes_current_and_pending_success_respects_newer_u
                 status: MemberStatusFilter::PreviouslyBanned,
                 joined_from_ms: None,
                 joined_to_ms: None,
-                sort: MemberSort::JoinedNewest,
+                sort: MemberSort::Joined,
+                descending: true,
                 after: None,
                 limit: 50,
             },
@@ -3026,7 +3150,8 @@ async fn old_stay_payload_cannot_replace_new_stay_name_or_search() {
         status: MemberStatusFilter::Current,
         joined_from_ms: None,
         joined_to_ms: None,
-        sort: MemberSort::JoinedNewest,
+        sort: MemberSort::Joined,
+        descending: true,
         after: None,
         limit: 10,
     };
@@ -5129,7 +5254,8 @@ async fn gateway_ban_identity_updates_saved_names_without_losing_nickname_or_ord
         status,
         joined_from_ms: None,
         joined_to_ms: None,
-        sort: MemberSort::JoinedNewest,
+        sort: MemberSort::Joined,
+        descending: true,
         after: None,
         limit: 10,
     };

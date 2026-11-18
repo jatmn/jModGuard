@@ -1,11 +1,13 @@
 //! Captured-enrollment member directory reads and administrator sync controls.
 use super::api;
+use super::list_controls::{SortDirection, bounded_list_text, decode_cursor, encode_cursor};
 use super::state::ApiState;
 use super::{ApiError, ApiResult, AuthCtx, GuildAccess, authorize_guild};
 use crate::bot_actions::{Action, MemberSyncOperation};
 use crate::db;
 use crate::db::guild_data::{
-    GuildDataScope, MemberQuery, MemberSort, MemberStatusFilter, MemberSyncStatus,
+    GuildDataScope, MemberListAnchor, MemberQuery, MemberSort, MemberSortValue, MemberStatusFilter,
+    MemberSyncStatus,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -19,10 +21,13 @@ use tower_sessions::Session;
 #[derive(Deserialize)]
 pub struct MembersQuery {
     q: Option<String>,
-    status: Option<String>,
+    status: Option<MemberStatusFilter>,
+    #[serde(alias = "from")]
     joined_from: Option<String>,
+    #[serde(alias = "to")]
     joined_to: Option<String>,
     sort: Option<String>,
+    dir: Option<SortDirection>,
     after: Option<String>,
     limit: Option<u32>,
 }
@@ -130,42 +135,69 @@ pub async fn list_members(
     let (_, enrollment) =
         scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
     let (store, scope) = app.tenant.live(enrollment).await?;
-    let q = query.q.map(|value| value.trim().to_owned());
-    if q.as_ref()
-        .is_some_and(|value| value.chars().count() > 120 || value.len() > 128)
-    {
-        return Err(ApiError(anyhow::anyhow!("search is too long")));
-    }
-    if query.after.as_ref().is_some_and(|value| value.len() > 64) {
-        return Err(ApiError(anyhow::anyhow!("cursor is too long")));
-    }
-    let status = match query.status.as_deref().unwrap_or("current") {
-        "current" => MemberStatusFilter::Current,
-        "banned" => MemberStatusFilter::Banned,
-        "previously_banned" => MemberStatusFilter::PreviouslyBanned,
-        "all" => MemberStatusFilter::All,
-        _ => return Err(ApiError(anyhow::anyhow!("invalid member status"))),
-    };
-    let sort = match query.sort.as_deref().unwrap_or("joined_newest") {
-        "joined_newest" => MemberSort::JoinedNewest,
-        "joined_oldest" => MemberSort::JoinedOldest,
+    let q = bounded_list_text(query.q.as_deref())?;
+    let (sort, default_dir) = match query.sort.as_deref() {
+        None | Some("joined" | "joined_newest") => (MemberSort::Joined, SortDirection::Desc),
+        Some("joined_oldest") => (MemberSort::Joined, SortDirection::Asc),
+        Some("name") => (MemberSort::Name, SortDirection::Asc),
+        Some("user_id") => (MemberSort::UserId, SortDirection::Asc),
+        Some("status") => (MemberSort::Status, SortDirection::Asc),
         _ => return Err(ApiError(anyhow::anyhow!("invalid member sort"))),
     };
+    let dir = query.dir.unwrap_or(default_dir);
+    let after = query
+        .after
+        .as_deref()
+        .map(|raw| {
+            let invalid = || ApiError(anyhow::anyhow!("invalid list cursor"));
+            // Existing join-only callers may still have an in-flight timestamp:ID
+            // cursor. New sorts and explicit directions always use the shared codec.
+            let anchor = if query.dir.is_none()
+                && matches!(
+                    query.sort.as_deref(),
+                    None | Some("joined_newest" | "joined_oldest")
+                )
+                && let Some((joined, id)) = raw.split_once(':')
+            {
+                if raw.len() > 64 {
+                    return Err(invalid());
+                }
+                MemberListAnchor {
+                    key: MemberSortValue::Number(joined.parse().map_err(|_| invalid())?),
+                    user_id: id.parse().map_err(|_| invalid())?,
+                }
+            } else {
+                decode_cursor(raw, "members", sort, dir)?
+            };
+            if !anchor.matches(sort) {
+                return Err(invalid());
+            }
+            Ok(anchor)
+        })
+        .transpose()?;
     let page = store
         .list_members(
             scope,
             MemberQuery {
                 q,
-                status,
+                status: query.status.unwrap_or(MemberStatusFilter::Current),
                 joined_from_ms: date_ms(query.joined_from, false)?,
                 joined_to_ms: date_ms(query.joined_to, true)?,
                 sort,
-                after: query.after,
+                descending: dir == SortDirection::Desc,
+                after,
                 limit: query.limit.unwrap_or(50).clamp(1, 100),
             },
         )
         .await?;
-    Ok(Json(serde_json::to_value(page)?))
+    let next_cursor = page
+        .next_anchor
+        .map(|anchor| encode_cursor("members", sort, dir, anchor))
+        .transpose()?;
+    Ok(Json(serde_json::json!({
+        "members": page.members,
+        "next_cursor": next_cursor,
+    })))
 }
 
 pub async fn get_member(

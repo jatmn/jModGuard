@@ -110,7 +110,7 @@ function hasFilters(view) {
   return Object.values(view.filters).some(Boolean);
 }
 
-export function useListControls(config, guildId, onChange, canChange = () => true) {
+export function useListControls(config, guildId, onChange, canChange = () => true, onSearchInput) {
   const [view, setView] = useState(() => readView(config, guildId));
   const current = useRef(view);
   const guard = useRef(canChange);
@@ -135,7 +135,7 @@ export function useListControls(config, guildId, onChange, canChange = () => tru
     replaceListLocation(viewQuery(config, guildId, next));
     onChange();
   };
-  const setFilter = (key, value) => {
+  const setFilter = (key, value, reload = false) => {
     cancelText(key);
     setDrafts((previous) => {
       const remaining = { ...previous };
@@ -143,7 +143,7 @@ export function useListControls(config, guildId, onChange, canChange = () => tru
       return remaining;
     });
     const previous = current.current;
-    if (previous.filters[key] === value) return;
+    if (previous.filters[key] === value && !reload) return;
     commit({ ...previous, filters: { ...previous.filters, [key]: value } });
   };
   const withFilters = (filters) => ({ ...current.current, filters: { ...emptyFilters(config), ...filters } });
@@ -165,7 +165,9 @@ export function useListControls(config, guildId, onChange, canChange = () => tru
     const trimmed = text.trim();
     setDrafts((previous) => ({ ...previous, [key]: text }));
     cancelText(key);
-    const timer = setTimeout(() => setFilter(key, trimmed), SEARCH_DELAY_MS);
+    const reload = key === "q" && !!onSearchInput;
+    if (reload) onSearchInput();
+    const timer = setTimeout(() => setFilter(key, trimmed, reload), SEARCH_DELAY_MS);
     timers.current.set(key, timer);
     if (key === "q") {
       pendingListSearch = {
@@ -204,6 +206,7 @@ function ListField({ label, children }) {
 export function ListControls({ controls, UserPicker, userPickerProps, filterOptions = {} }) {
   const { config, view, drafts, setText, setFilter, replaceFilters } = controls;
   const { filters } = view;
+  const { from: fromLabel = "From", to: toLabel = "To" } = config.dateLabels ?? {};
   const date = (key, label, bounds) => h(ListField, { label },
     h("input", {
       className: "input input-sm",
@@ -226,8 +229,8 @@ export function ListControls({ controls, UserPicker, userPickerProps, filterOpti
   const chips = [
     ...config.filters.filter(({ kind }) => kind !== "user"),
     { key: "q", label: "Search" },
-    { key: "from", label: "From" },
-    { key: "to", label: "To" },
+    { key: "from", label: fromLabel },
+    { key: "to", label: toLabel },
   ].filter(({ key }) => filters[key]).map(({ key, label, options }) => {
     const value = (filterOptions[key] ?? options)?.[filters[key]]?.label ?? filters[key];
     return h("button", {
@@ -237,7 +240,7 @@ export function ListControls({ controls, UserPicker, userPickerProps, filterOpti
     }, `${label}: ${value}`, " ×");
   });
   return h("div", { className: "list-filters", "data-no-draft": true, role: "group", "aria-label": config.filterLabel },
-    ...config.filters.map(({ key, label, options, kind, idLabel, render, placeholder }) => {
+    ...config.filters.map(({ key, label, options, kind, idLabel, render, placeholder, emptyLabel }) => {
       if (kind === "user") {
         const ids = filters[key] ? [filters[key]] : [];
         return h(UserPicker, {
@@ -257,14 +260,14 @@ export function ListControls({ controls, UserPicker, userPickerProps, filterOpti
           value: filters[key],
           onChange: (event) => setFilter(key, event.target.value),
         },
-        h("option", { value: "" }, `Any ${label.toLowerCase()}`),
+        h("option", { value: "" }, emptyLabel ?? `Any ${label.toLowerCase()}`),
         ...Object.entries(filterOptions[key] ?? options ?? {}).map(([value, entry]) => h("option", { key: value, value }, entry.label)),
         ),
       );
     }),
     text("q", "Search", config.searchPlaceholder, "search"),
-    date("from", "From (UTC)", { max: filters.to || undefined }),
-    date("to", "To (UTC)", { min: filters.from || undefined }),
+    date("from", `${fromLabel} (UTC)`, { max: filters.to || undefined }),
+    date("to", `${toLabel} (UTC)`, { min: filters.from || undefined }),
     hasFilters(view) || Object.values(drafts).some(Boolean)
       ? h("button", { type: "button", className: "btn btn-sm", onClick: () => replaceFilters() }, "Clear filters")
       : null,
