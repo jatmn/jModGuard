@@ -421,6 +421,9 @@ impl ConfigurationWriteScope {
     pub fn guild_id(&self) -> i64 {
         self.target.guild_id()
     }
+    pub(super) fn request_guild_id(&self) -> i64 {
+        self.request.guild_id()
+    }
     pub(super) fn verify_conn(&self, conn: &impl SqlExecutor) -> Result<()> {
         let ConfigurationScope::Guild(expected) = &self.request else {
             return Ok(());

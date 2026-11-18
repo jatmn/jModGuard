@@ -106,6 +106,13 @@ pub enum ControlOp {
         name: String,
         command: CommandDef,
     },
+    SetCommandEnabled {
+        request: ScopeWire,
+        target: ScopeWire,
+        name: String,
+        enabled: bool,
+        actor_id: i64,
+    },
     DeleteCommand {
         request: ScopeWire,
         target: ScopeWire,
@@ -405,6 +412,7 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         | ControlOp::AddBadwords { target, .. }
         | ControlOp::DeleteBadword { target, .. }
         | ControlOp::UpsertCommand { target, .. }
+        | ControlOp::SetCommandEnabled { target, .. }
         | ControlOp::DeleteCommand { target, .. }
         | ControlOp::UpsertTemplate { target, .. }
         | ControlOp::DeleteTemplate { target, .. }
@@ -492,6 +500,9 @@ pub fn control_actor_needs(op: &ControlOp) -> Vec<ControlActorNeed> {
             request, target, ..
         }
         | ControlOp::UpsertCommand {
+            request, target, ..
+        }
+        | ControlOp::SetCommandEnabled {
             request, target, ..
         }
         | ControlOp::DeleteCommand {
@@ -837,6 +848,23 @@ async fn apply_control_inner(
             command,
         } => {
             upsert_enrolled_command(db, write_scope(request, target)?, &name, &command).await?;
+            saved_null()
+        }
+        ControlOp::SetCommandEnabled {
+            request,
+            target,
+            name,
+            enabled,
+            actor_id,
+        } => {
+            set_enrolled_command_enabled(
+                db,
+                write_scope(request, target)?,
+                name,
+                enabled,
+                actor_id,
+            )
+            .await?;
             saved_null()
         }
         ControlOp::DeleteCommand {

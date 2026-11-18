@@ -1,5 +1,6 @@
 use super::*;
 use serde::Deserialize;
+use std::borrow::Cow;
 
 /// Guild-local exclusions for one log event. Both lists contain canonical
 /// decimal Discord snowflake IDs, serialized as strings for the WebUI.
@@ -101,24 +102,25 @@ pub fn resolve<T: Clone>(guild_row: &Option<T>, global_row: &Option<T>, default:
 // generic scope row helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn load_rows<T: DeserializeOwned + Send + 'static>(
-    db: &Db,
-    guild_id: i64,
-    table: &'static str,
-    key_col: &'static str,
-    key_value: Option<&str>,
-) -> Result<Vec<(String, T)>> {
-    let key_value = key_value.map(str::to_owned);
-    db.with_conn(move |conn| load_rows_conn(conn, guild_id, table, key_col, key_value.as_deref()))
-        .await
-}
-
 fn load_rows_conn<T: DeserializeOwned>(
     conn: &impl SqlExecutor,
     guild_id: i64,
     table: &'static str,
     key_col: &'static str,
     key_value: Option<&str>,
+) -> Result<Vec<(String, T)>> {
+    load_rows_conn_with(conn, guild_id, table, key_col, key_value, |_, raw| {
+        read_json(raw, table)
+    })
+}
+
+fn load_rows_conn_with<T>(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    table: &'static str,
+    key_col: &'static str,
+    key_value: Option<&str>,
+    parse: impl Fn(&str, &str) -> Result<T>,
 ) -> Result<Vec<(String, T)>> {
     let sql = if key_value.is_some() {
         format!("SELECT {key_col}, data FROM {table} WHERE guild_id = ?1 AND {key_col} = ?2")
@@ -136,7 +138,8 @@ fn load_rows_conn<T: DeserializeOwned>(
     let mut out = Vec::new();
     for row in rows {
         let (k, v) = row?;
-        out.push((k, read_json(&v, table)?));
+        let value = parse(&k, &v)?;
+        out.push((k, value));
     }
     Ok(out)
 }
@@ -441,17 +444,57 @@ fn command_delete_keys(name: &str) -> &'static str {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BuiltinEnabledOverride {
+    enabled: bool,
+}
+
+fn read_command_json(name: &str, raw: &str) -> Result<CommandDef> {
+    let full = read_json(raw, "commands");
+    if full.is_ok() {
+        return full;
+    }
+    // Earlier toggle builds wrote compact overrides. Keep those rows readable.
+    if let Ok(patch) = serde_json::from_str::<BuiltinEnabledOverride>(raw)
+        && let Some(mut command) = crate::defaults::effective_builtin_command(name, None)
+    {
+        command.enabled = patch.enabled;
+        command.builtin_override = true;
+        return Ok(command);
+    }
+    full
+}
+
+fn command_query_key(name: &str) -> &'static str {
+    if crate::defaults::is_builtin_primary_command_name(name) {
+        "name COLLATE NOCASE"
+    } else {
+        "name"
+    }
+}
+
+fn load_command_rows_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    name: Option<&str>,
+) -> Result<Vec<(String, CommandDef)>> {
+    load_rows_conn_with(
+        conn,
+        guild_id,
+        "commands",
+        name.map_or("name", command_query_key),
+        name,
+        read_command_json,
+    )
+}
+
 fn load_command_row_conn(
     conn: &impl SqlExecutor,
     guild_id: i64,
     name: &str,
 ) -> Result<Option<CommandDef>> {
-    let key = if crate::defaults::is_builtin_primary_command_name(name) {
-        "name COLLATE NOCASE"
-    } else {
-        "name"
-    };
-    let rows = load_rows_conn::<CommandDef>(conn, guild_id, "commands", key, Some(name))?;
+    let rows = load_command_rows_conn(conn, guild_id, Some(name))?;
     let canonical = command_storage_key(name);
     // Raw reads preserve an explicitly requested old key. Otherwise use the
     // canonical writer key, with a stable fallback for earlier case variants.
@@ -464,7 +507,8 @@ fn load_command_row_conn(
 }
 
 pub async fn list_commands(db: &Db, guild_id: i64) -> Result<Vec<(String, CommandDef)>> {
-    load_rows(db, guild_id, "commands", "name", None).await
+    db.with_conn(move |conn| load_command_rows_conn(conn, guild_id, None))
+        .await
 }
 
 pub async fn get_command_row(db: &Db, guild_id: i64, name: &str) -> Result<Option<CommandDef>> {
@@ -1332,29 +1376,6 @@ pub struct WebConfigSnapshot {
     pub guild_log_filters: std::collections::HashMap<String, LogFilter>,
 }
 
-/// Loads `(key, value)` rows where the value column holds JSON-serialized
-/// config (rules, commands). The value column name varies per table.
-fn rows_map_json<T: DeserializeOwned + Send + 'static>(
-    conn: &impl SqlExecutor,
-    table: &str,
-    key_col: &str,
-    value_col: &str,
-    guild_id: i64,
-) -> Result<std::collections::HashMap<String, T>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {key_col}, {value_col} FROM {table} WHERE guild_id = ?1"
-    ))?;
-    let rows = stmt.query_map(params![guild_id], |r| {
-        Ok((r.get::<String>(0)?, r.get::<String>(1)?))
-    })?;
-    let mut out = std::collections::HashMap::new();
-    for row in rows {
-        let (k, v) = row?;
-        out.insert(k, read_json(&v, table)?);
-    }
-    Ok(out)
-}
-
 /// One Hrana statement for every configuration collection in a snapshot.
 /// Bunny Database / Turso closes interactive transactions after a few seconds;
 /// the previous per-table prepare+query loop exceeded that on Magic Containers.
@@ -1433,12 +1454,21 @@ fn parse_json_encoded_map<T: DeserializeOwned>(
     raw: Option<String>,
     what: &str,
 ) -> Result<std::collections::HashMap<String, T>> {
+    parse_json_encoded_map_with(raw, what, |_, value| read_json(value, what))
+}
+
+fn parse_json_encoded_map_with<T>(
+    raw: Option<String>,
+    what: &str,
+    parse: impl Fn(&str, &str) -> Result<T>,
+) -> Result<std::collections::HashMap<String, T>> {
     let encoded: std::collections::HashMap<String, String> =
         serde_json::from_str(&json_agg_text(raw, "{}"))
             .with_context(|| format!("corrupt JSON object in {what}"))?;
     let mut out = std::collections::HashMap::new();
     for (key, value) in encoded {
-        out.insert(key, read_json(&value, what)?);
+        let parsed = parse(&key, &value)?;
+        out.insert(key, parsed);
     }
     Ok(out)
 }
@@ -1518,8 +1548,16 @@ fn load_configuration_snapshot_conn(
                 global_settings_raw,
                 guild_rules,
                 global_rules,
-                guild_commands: parse_json_encoded_map(row.get(9)?, "commands")?,
-                global_commands: parse_json_encoded_map(row.get(10)?, "commands")?,
+                guild_commands: parse_json_encoded_map_with(
+                    row.get(9)?,
+                    "commands",
+                    read_command_json,
+                )?,
+                global_commands: parse_json_encoded_map_with(
+                    row.get(10)?,
+                    "commands",
+                    read_command_json,
+                )?,
                 guild_templates: parse_json_map(row.get(11)?, "templates")?,
                 global_templates: parse_json_map(row.get(12)?, "templates")?,
                 guild_log_channels: parse_json_map(row.get(13)?, "log_channels")?,
@@ -1766,10 +1804,14 @@ pub async fn load_slash_commands_with_version(
         let guild: std::collections::HashMap<String, CommandDef> = if guild_id == GLOBAL_SCOPE {
             std::collections::HashMap::new()
         } else {
-            rows_map_json(&tx, "commands", "name", "data", guild_id)?
+            load_command_rows_conn(&tx, guild_id, None)?
+                .into_iter()
+                .collect()
         };
         let global: std::collections::HashMap<String, CommandDef> =
-            rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
+            load_command_rows_conn(&tx, GLOBAL_SCOPE, None)?
+                .into_iter()
+                .collect();
         let commands = crate::defaults::effective_command_registry(&global, &guild);
         tx.finish_read()?;
         Ok((versions.slash, versions.slash_revision, commands))
@@ -1787,10 +1829,14 @@ pub async fn load_slash_commands_with_version_primary(
         let guild: std::collections::HashMap<String, CommandDef> = if guild_id == GLOBAL_SCOPE {
             std::collections::HashMap::new()
         } else {
-            rows_map_json(&tx, "commands", "name", "data", guild_id)?
+            load_command_rows_conn(&tx, guild_id, None)?
+                .into_iter()
+                .collect()
         };
         let global: std::collections::HashMap<String, CommandDef> =
-            rows_map_json(&tx, "commands", "name", "data", GLOBAL_SCOPE)?;
+            load_command_rows_conn(&tx, GLOBAL_SCOPE, None)?
+                .into_iter()
+                .collect();
         let commands = crate::defaults::effective_command_registry(&global, &guild);
         tx.finish_read()?;
         Ok((versions.slash, versions.slash_revision, commands))
@@ -1941,6 +1987,94 @@ pub async fn delete_enrolled_command(
     )
     .await
 }
+
+pub(super) async fn set_enrolled_command_enabled(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    name: String,
+    enabled: bool,
+    actor_id: i64,
+) -> Result<()> {
+    let guild_id = scope.guild_id();
+    let shipped = crate::defaults::effective_builtin_command(&name, None);
+    if guild_id == GLOBAL_SCOPE && shipped.is_some() {
+        anyhow::bail!("built-in command `{name}` can only be changed for one server");
+    }
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        scope.verify_conn(&tx)?;
+        let request_guild = scope.request_guild_id();
+        if guild_id == GLOBAL_SCOPE && request_guild != GLOBAL_SCOPE {
+            // The Audit log entry is recorded in the server that made the edit.
+            super::guild_stores::refuse_fenced_write(&tx, request_guild)?;
+            let has_override = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE guild_id = ?1 AND name = ?2)",
+                params![request_guild, name.as_str()],
+                |row| Ok(row.get::<bool>(0)?),
+            )?;
+            anyhow::ensure!(!has_override, "command scope changed; refresh the page");
+        }
+        let rows = load_rows_conn_with(
+            &tx,
+            guild_id,
+            "commands",
+            command_query_key(&name),
+            Some(&name),
+            |key, raw| Ok((read_command_json(key, raw)?, raw.to_owned())),
+        )?;
+        let stored = rows
+            .iter()
+            .filter(|(_, (command, _))| shipped.is_none() || command.builtin_override)
+            .min_by_key(|(key, _)| (key != &name, key));
+        let (key, raw, previous) = match (stored, shipped) {
+            (Some((key, (command, raw))), _) => {
+                (key.as_str(), Cow::Borrowed(raw.as_str()), command.enabled)
+            }
+            (None, Some(command)) => {
+                // Schema-compatible fallback binaries decode full CommandDef rows.
+                let row = crate::defaults::command_row_for_storage(&name, &command);
+                let raw = serde_json::to_string(&row)?;
+                (name.as_str(), Cow::Owned(raw), command.enabled)
+            }
+            (None, None) => anyhow::bail!("command not found in the requested scope"),
+        };
+        if previous != enabled {
+            tx.execute_rows(
+                "INSERT INTO commands (guild_id, name, data)
+                 VALUES (?1, ?2, json_set(?3, '$.enabled', json(?4)))
+                 ON CONFLICT(guild_id, name) DO UPDATE SET data = excluded.data",
+                params![
+                    guild_id,
+                    key,
+                    raw.as_ref(),
+                    if enabled { "true" } else { "false" }
+                ],
+                1,
+            )?;
+            let audit = serde_json::json!({
+                "command": name,
+                "scope": if guild_id == GLOBAL_SCOPE { "global" } else { "guild" },
+                "previous_enabled": previous,
+                "enabled": enabled,
+            });
+            super::moderation::insert_event_conn(
+                &tx,
+                request_guild,
+                "command_enabled",
+                None,
+                Some(actor_id),
+                Some(audit.to_string()),
+                now_str(),
+            )?;
+            bump_config_version_conn(&tx)?;
+            bump_slash_registry_version_conn(&tx)?;
+        }
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+}
+
 pub async fn upsert_enrolled_template(
     db: &Db,
     scope: ConfigurationWriteScope,
@@ -2062,7 +2196,7 @@ pub async fn list_enrolled_commands(
     scope: ConfigurationScope,
 ) -> Result<ConfigurationLayers<Vec<(String, CommandDef)>>> {
     configuration_read(db, scope, |tx, guild| {
-        read_layers(guild, |g| load_rows_conn(tx, g, "commands", "name", None))
+        read_layers(guild, |g| load_command_rows_conn(tx, g, None))
     })
     .await
 }

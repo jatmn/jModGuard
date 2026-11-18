@@ -5864,6 +5864,95 @@ async function typeValue(control, value) {
   await fire(control, 'input');
 }
 
+test('command switches submit only enabled, disable during save, and roll back on the affected row', async () => {
+  const builtin = commandFixture('ban', { kind: 'ban', params: { default_reason: 'r', delete_days: 0 } });
+  const custom = commandFixture('greet', { kind: 'plan', params: { steps: [] } });
+  const commands = [
+    builtinRecord(builtin),
+    { name: custom.name, scope: 'global', effective: custom, guild_override: custom, global: custom },
+  ];
+  const writes = [];
+  let served = commands;
+  const h = harness((url, options) => {
+    if (url.endsWith('/config')) return response({ enrollment_id: 'page-membership', commands: served });
+    if (url.includes('/commands/')) return new Promise(resolve => writes.push({ url, options, resolve }));
+    return response({});
+  });
+  h.app.state.config = { enrollment_id: 'page-membership', commands };
+  h.app.state.tab = 'commands';
+  h.app.renderTab();
+  const toggle = name => h.nodes.get(`input[role="switch"][aria-label="Enable /${name}"]`);
+  const ban = toggle('ban');
+  assert.equal(ban.type, 'checkbox');
+  assert.equal(ban.tabIndex, 0);
+  assert.equal(ban.checked, true);
+  await fire(ban, 'change', { target: { checked: false } });
+  assert.equal(ban.checked, false);
+  assert.equal(ban.disabled, true);
+  await fire(ban, 'click');
+  assert.equal(writes.length, 1);
+  assert.equal(ban.checked, false);
+  assert.equal(writes[0].url, `/api/guilds/${h.app.state.guildId}/commands/ban`);
+  assert.equal(writes[0].options.method, 'PUT');
+  assert.deepEqual(JSON.parse(writes[0].options.body), { scope: 'guild', enabled: false });
+  assert.equal(writes[0].options.headers['x-jmodguard-enrollment'], 'page-membership');
+  writes[0].resolve({
+    ok: false,
+    status: 400,
+    headers: { get: () => null },
+    text: async () => '{"error":"Command save refused"}',
+  });
+  await settle();
+  assert.equal(ban.checked, true);
+  assert.equal(ban.disabled, false);
+  assert.equal(ban.closest('tr').querySelector('[role="alert"]').textContent, 'Command save refused');
+  assert.equal(toggle('greet').closest('tr').querySelector('[role="alert"]'), null);
+  assert.equal(h.app.isDirty(), false);
+
+  await fire(toggle('greet'), 'change', { target: { checked: false } });
+  assert.deepEqual(JSON.parse(writes[1].options.body), { scope: 'guild', enabled: false });
+  served = [commands[0], { ...commands[1], effective: { ...custom, enabled: false } }];
+  writes[1].resolve(response({ ok: true }));
+  await settle();
+  assert.equal(toggle('greet').checked, false);
+  assert.equal(toggle('greet').disabled, false);
+  h.app.navigate('dashboard');
+  assert.match(h.nodes.get('#content').textContent, /Commands enabled1 \/ 2/);
+});
+
+test('command state stays read-only without the permission to change its scope', async () => {
+  const builtin = commandFixture('ban', { kind: 'ban', params: { default_reason: 'r', delete_days: 0 } });
+  const global = commandFixture('greet', { kind: 'plan', params: { steps: [] } }, { enabled: false });
+  const commands = [
+    builtinRecord(builtin),
+    { name: global.name, scope: 'global', effective: global, global, guild_override: null },
+  ];
+  const writes = [];
+  const h = harness((url, options) => {
+    if (url.endsWith('/config')) return response({ enrollment_id: 'page-membership', commands });
+    writes.push({ url, options });
+    return response({ ok: true });
+  });
+  h.app.state.config = { enrollment_id: 'page-membership', commands };
+  h.app.state.tab = 'commands';
+  h.app.state.guilds[0].access = 'settings';
+  h.app.renderTab();
+  assert.equal(h.nodes.get('input[role="switch"]'), null);
+  assert.deepEqual([...h.document.querySelectorAll('.commands-table tbody tr')].map(row => row.cells[4].textContent), ['enabled', 'disabled']);
+  assert.equal(writes.length, 0);
+
+  h.app.state.guilds[0].access = 'manage';
+  h.app.renderTab();
+  const toggle = () => h.nodes.get('input[aria-label="Enable /greet"]');
+  assert.equal(toggle().disabled, true);
+  assert.equal(h.nodes.get('input[aria-label="Enable /ban"]').disabled, false);
+  h.app.state.me.is_bot_owner = true;
+  h.app.renderTab();
+  assert.equal(toggle().disabled, false);
+  await fire(toggle(), 'change', { target: { checked: true } });
+  assert.deepEqual(JSON.parse(writes[0].options.body), { scope: 'global', enabled: true });
+});
+
 test('every built-in command edits its behavior through typed fields and saves the same shape', async () => {
   for (const [name, behavior, edits = [], params] of BUILTIN_COMMAND_FIXTURES) {
     const { h, writes } = commandEditorHarness();
