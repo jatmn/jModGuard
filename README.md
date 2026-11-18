@@ -44,9 +44,9 @@ path.
 
 The dashboard serves the [Privacy Policy](crates/api/src/web/legal/privacy.html)
 at `/privacy` and the [Terms of Service](crates/api/src/web/legal/terms.html)
-at `/terms`. Both are available without signing in. For privacy questions or deletion requests, send
-a direct message on Discord to `jatmn`. See [WebUI policy pages](docs/WEBUI.md#public-policy-pages)
-for hosting and rollout details.
+at `/terms`. Both are available without signing in. See your instance’s Privacy Policy
+for its operator’s contact details and deletion request instructions.
+See [WebUI policy pages](docs/WEBUI.md#public-policy-pages) for hosting and rollout.
 
 ## Quick start
 

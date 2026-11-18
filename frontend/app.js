@@ -1487,8 +1487,8 @@ function App() {
                     h(
                       "nav",
                       { className: "legal-links", "aria-label": "Policies" },
-                      h("a", { href: apiUrl("/privacy") }, "Privacy Policy"),
-                      h("a", { href: apiUrl("/terms") }, "Terms of Service"),
+                      h("a", { href: "/privacy" }, "Privacy Policy"),
+                      h("a", { href: "/terms" }, "Terms of Service"),
                     ),
                   )
                 : h(

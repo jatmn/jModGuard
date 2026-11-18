@@ -4900,21 +4900,27 @@ test('loadConfig reads guild config with POST', async () => {
   assert.deepEqual(calls[0], { url: `/api/guilds/${app.state.guildId}/config`, method: 'POST' });
 });
 
-test('signed-out dashboard links to public policies on the API origin', async () => {
-  for (const base of ['', 'https://api.example.test']) {
+test('signed-out dashboard links to public policies on the page origin', async () => {
+  const dashboard = fs.readFileSync(new URL('../dist/frontend/index.html', import.meta.url), 'utf8');
+  const stylesheet = fs.readFileSync(new URL('../dist/frontend/style.css', import.meta.url), 'utf8');
+  assert.match(dashboard, /id="app"/);
+  assert.match(stylesheet, /\.legal-page\b/);
+  for (const splitOrigin of [false, true]) {
     const h = harness(async () => ({
       ok: false,
       status: 401,
       headers: { get: () => null },
       text: async () => JSON.stringify({ error: 'not authenticated' }),
     }));
-    h.window.JMODGUARD_API_BASE = base;
+    const apiOrigin = new URL(h.document.URL);
+    apiOrigin.hostname = `api.${apiOrigin.hostname}`;
+    h.window.JMODGUARD_API_BASE = splitOrigin ? apiOrigin.origin : '';
     await h.app.init();
     await settle();
     const links = h.document.querySelectorAll('#login-view nav[aria-label="Policies"] a');
     assert.deepEqual(Array.from(links, link => [link.textContent, link.getAttribute('href')]), [
-      ['Privacy Policy', `${base}/privacy`],
-      ['Terms of Service', `${base}/terms`],
+      ['Privacy Policy', '/privacy'],
+      ['Terms of Service', '/terms'],
     ]);
   }
 });

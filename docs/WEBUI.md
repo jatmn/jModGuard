@@ -23,21 +23,23 @@ Start `jmodguard-bot` once first so the database is migrated, then start
 [Privacy Policy](../crates/api/src/web/legal/privacy.html) is served at
 `/privacy` and [Terms of Service](../crates/api/src/web/legal/terms.html) at
 `/terms`. The API serves both in either build. They return HTML without
-sign-in or JavaScript and use the dashboard’s stylesheet when available.
-The signed-out dashboard links to both.
+sign-in or JavaScript. Both pages and the dashboard use the same public origin
+for navigation and styling. The API fills in the operator details at request
+time. It also exposes them in the public `GET /api/legal` response.
 
-When the dashboard is hosted separately, forward both paths to the API
-alongside the existing proxied paths, or use the API origin in a split-origin
-setup. See [Bunny edge rules](DEPLOY-BUNNY.md#5-point-api-paths-on-the-pull-zone-at-the-api-container).
+When the dashboard is hosted separately, forward `/privacy` and `/terms`
+from the public dashboard origin to the API, including when
+`JMODGUARD_API_BASE` is set. Keep serving the home page and stylesheet on
+the dashboard origin. See the [edge rule example](DEPLOY-BUNNY.md#5-point-api-paths-on-the-pull-zone-at-the-api-container).
 Before registering the URLs with Discord, deploy the API and WebUI, then
-open both paths on the public origin in a signed-out window. Check that each
-returns its own HTML with HTTP 200 and that both sign-in links reach it.
+verify that the public `/privacy` and `/terms` URLs each return their own HTML
+with HTTP 200 in a signed-out window. Follow each page’s link to the other.
 
-For privacy questions or deletion requests, send a direct message on Discord
-to `jatmn` from the account the request is about. Before acting on a deletion
-request, verify the sender’s Discord account and use its Discord user ID.
-Review that account’s live
-member-directory and message-snapshot data across the hosted guild stores.
+Fill in the API’s [`[legal]` configuration](CONFIGURATION.md#public-legal-details)
+before publishing the policy URLs. Before acting on a deletion request, verify
+that the requester controls the Discord account the request is about and use
+that account’s Discord user ID. Review its live member-directory and message-snapshot data
+across the hosted guild stores.
 Coordinate the manual removal with the operator responsible for the bot’s
 guild-store writes so queued work and member sync are accounted for. Preserve
 moderation cases and their history. Confirm what was removed and what was
@@ -472,10 +474,13 @@ bot owner).
 
 ## Auth & sessions
 
-- Discord OAuth2 (scopes `identify guilds guilds.members.read`), sessions last 7 days of
-  inactivity. Sessions use an **in-memory store on the single API process**
-  (`jmodguard_session` cookie): re-login after an API restart. A shared
-  session store is required only if you run multiple API replicas.
+- Discord OAuth2 uses the scopes `identify guilds guilds.members.read`. The
+  API stores the Discord user ID, OAuth access token, and refresh token
+  (when issued) in a server-side session in memory keyed by the
+  `jmodguard_session` cookie. The API uses the session to look up servers and check permissions.
+  Signing out clears the session. After 7 days of inactivity a session
+  expires and can no longer be used. Expired records can remain in the API
+  process’s memory until a restart clears all sessions.
 - OAuth CSRF is a host-only cookie compared to Discord's echoed `state`
   (empty or mismatched state is rejected). Successful login rotates the
   session id.
