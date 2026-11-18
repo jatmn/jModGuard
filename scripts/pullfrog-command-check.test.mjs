@@ -230,7 +230,7 @@ test('fixed admin authorPermission stays coupled to the owner checks', () => {
 test('workflow uses the verified payload, matching pinned action, and owner-only trigger', () => {
   const workflow = readFileSync(new URL('../.github/workflows/pullfrog.yml', import.meta.url), 'utf8');
   assert.ok(workflow.includes('prompt: ${{ steps.authorize.outputs.payload }}'));
-  assert.ok(workflow.includes(`uses: pullfrog/pullfrog@0613df0079954102a9727e833b1e4da229b8f440 # v${PULLFROG_VERSION}`));
+  assert.ok(workflow.includes(`uses: pullfrog/pullfrog@9eb4e93d38160a21b0e85b759ab8ea9fecaf5e58 # v${PULLFROG_VERSION}`));
   assert.match(workflow, /status_checks: enabled/);
   assert.match(workflow, /github\.run_attempt == 1/);
   assert.match(workflow, /if: steps\.authorize\.outputs\.authorized == 'true'/);
