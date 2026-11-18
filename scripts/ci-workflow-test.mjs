@@ -768,12 +768,12 @@ function runRegistryDelete(tag, responses, options = {}) {
   fs.writeFileSync(responsesFile, JSON.stringify(responses));
   const timeoutCommand = spawnSync("bash", ["-c", "command -v timeout"], { encoding: "utf8" });
   assert.equal(timeoutCommand.status, 0, timeoutCommand.stderr);
-  fs.symlinkSync(timeoutCommand.stdout.trim(), path.join(bin, "real-timeout"));
   // Record production arguments in every case; shorten only the stalling cases.
   fs.writeFileSync(path.join(bin, "timeout"), `#!/bin/bash
 set -euo pipefail
 printf '%s\\n' "$*" >>${JSON.stringify(timeoutLog)}
-${options.stallFrom ? 'shift 2\nexec real-timeout --kill-after=1s 1s "$@"' : 'exec real-timeout "$@"'}
+${options.stallFrom ? 'shift 2\nset -- --kill-after=1s 1s "$@"' : ""}
+exec "$REAL_TIMEOUT" "$@"
 `);
   fs.chmodSync(path.join(bin, "timeout"), 0o755);
   fs.writeFileSync(path.join(dir, "emit-pages.mjs"), [
@@ -843,6 +843,7 @@ exit 0
     env: {
       ...process.env,
       PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+      REAL_TIMEOUT: timeoutCommand.stdout.trim(),
       IMAGE_TAG: `ghcr.io/jatmn/jmodguard-bot:${tag}`,
       STATUS: statusFile,
       GHCR_TOKEN: "promote-job-token",
