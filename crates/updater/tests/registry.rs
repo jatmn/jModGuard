@@ -93,7 +93,7 @@ fn image(fixture: &mut RegistryFixture, source: char, binary: &[u8], channel: &s
             "io.jmodguard.min-schema":"15","io.jmodguard.max-schema":"15",
             "io.jmodguard.result-schema":"15","io.jmodguard.min-api":"1",
             "io.jmodguard.max-api":"1","io.jmodguard.launcher-protocol":"1",
-            "io.jmodguard.base-abi":"debian-bookworm-amd64",
+            "io.jmodguard.base-abi":"debian-trixie-amd64",
             "io.jmodguard.update-control":"3", "io.jmodguard.upgrade-min-core":"15",
             "io.jmodguard.upgrade-min-guild":"1", "io.jmodguard.guild-schema":"14",
             "io.jmodguard.launcher-revision":"7", "io.jmodguard.min-launcher-revision":"4",
@@ -255,7 +255,7 @@ fn api_release(digest: &str, source: char) -> ComponentRelease {
             revision: 7,
             min_revision: 4,
         }),
-        base_abi: "debian-bookworm-amd64".into(),
+        base_abi: "debian-trixie-amd64".into(),
         upgrade: Some(jmodguard::db::UpgradeCompatibility {
             control_protocol: 3,
             min_core: 15,

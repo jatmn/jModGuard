@@ -213,6 +213,9 @@ pub enum ControlOp {
     ObserveLauncher {
         component: String,
         revision: u32,
+        /// The launcher's container runtime. Older senders omit it.
+        #[serde(default)]
+        base_abi: Option<String>,
     },
     ClearSupersededLauncher {
         component: String,
@@ -1013,8 +1016,9 @@ async fn apply_control_inner(
         ControlOp::ObserveLauncher {
             component,
             revision,
+            base_abi,
         } => {
-            record_launcher_observation(db, &component, revision).await?;
+            record_launcher_observation(db, &component, revision, base_abi).await?;
             saved_null()
         }
         ControlOp::ClearSupersededLauncher { component, release } => {

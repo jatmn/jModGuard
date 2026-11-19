@@ -2797,7 +2797,7 @@ mod tests {
         };
         let before = control.component("api").await.unwrap();
         for result in [
-            control.observe_launcher("api", 1).await,
+            control.observe_launcher("api", 1, None).await,
             control.baked_launcher("api", "hash", 1).await,
             control.launcher_running("api", &release, "hash", 1).await,
             control.launcher_failed("api", &release.digest, "err").await,

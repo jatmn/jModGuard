@@ -2,9 +2,9 @@
 # Multi-stage build for jmodguard-api.
 # Pins Rust 1.100 (lockfile MSRV; edition 2024). JSON API + OAuth only: do not
 # embed frontend/ (Bunny serves that from Storage/CDN). linux/amd64 manifest
-# digest for rust:1.100.0-bookworm (must match the FROM line below).
+# digest for rust:1.100.0-trixie (must match the FROM line below).
 # Local: docker build --secret id=github_token,env=GITHUB_TOKEN -f Dockerfile.api .
-FROM rust:1.100.0-bookworm@sha256:198cd28b4ba92b20fe849d5d8b119ace1bd28423d9e82e9c4de5ee1300d453a0 AS builder
+FROM rust:1.100.0-trixie@sha256:ebc54bef33ec8f9a5cd05799366010f35efbb73b354fb4f2cb086ec6b9460ef5 AS builder
 WORKDIR /app
 # git and the rust-toolchain.toml toolchain are installed before source COPY
 # so those layers stay cached when only application source changes.
@@ -39,7 +39,7 @@ RUN JMODGUARD_BUILD_SHA=${SOURCE_SHA} CARGO_NET_GIT_FETCH_WITH_CLI=true \
     && cp -a bin/. /app/oci-layer/usr/local/bin/ \
     && cp -a share/jmodguard/. /app/oci-layer/usr/local/share/jmodguard/
 
-FROM debian:bookworm-slim@sha256:c67e92c8099ba22853ab4cfda7cfb494d253d6012ca82dee98ba8976772af018
+FROM debian:trixie-slim@sha256:7378260c0a098d27ac206225db5e7d92b8c7c84ea7afccc86eeb513756bbd392
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
@@ -58,7 +58,7 @@ ENV JMODGUARD_LOG_DIRECTORY=""
 # Fail closed unless Bunny/portable remote credentials are present.
 ENV JMODGUARD_REQUIRE_REMOTE_DB=1
 ENV JMODGUARD_BASE_SHA=${SOURCE_SHA}
-ENV JMODGUARD_BASE_ABI=debian-bookworm-amd64
+ENV JMODGUARD_BASE_ABI=debian-trixie-amd64
 ENV JMODGUARD_ROLE=api
 ENV JMODGUARD_SELF_UPDATE=0
 EXPOSE 8080

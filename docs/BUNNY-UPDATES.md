@@ -197,6 +197,41 @@ and the signature-verifier threshold remains 19; neither establishes that the
 baked launcher supports expiry-safe cold boot. New installs and launcher handoffs
 continue to enforce signature expiry.
 
+### Debian 13 (Trixie) base-image rollout
+
+Bot and API images now run on Debian 13 (Trixie) and carry
+`io.jmodguard.base-abi=debian-trixie-amd64`. Earlier images ran on Bookworm
+(`debian-bookworm-amd64`). Runtime updates cannot change a container's base OS, so a
+Bookworm container refuses Trixie releases; its update check reports
+`unsupported base ABI`. Reach Trixie by replacing both base images, bot first and
+then API, under [Rollout after the PR](#rollout-after-the-pr). The API judges whether
+the bot's built-in application will migrate the database by the bot's recorded base
+ABI, so a Trixie API started before the bot keeps its installed Bookworm application
+instead of waiting for that migration.
+
+From launcher revision 47, each launcher records its container's base ABI when it
+starts, before any application is ready, and an independent update for another base
+ABI is recorded as failed. The baked launcher supersedes any installed Bookworm
+launcher, which has a lower revision.
+
+On a Trixie container, an installed Bookworm application counts as not installed for
+the built-in restore checks, because its code cannot check for Trixie releases. The
+built-in application starts when its schemas match, and the built-in bot can migrate
+an older database under the usual rules for a container with nothing installed. When
+the built-in application is ready, the launcher clears the installed and previous
+selections, and later updates install Trixie releases as usual. If the built-in
+application cannot start, the launcher logs `built-in application cannot open the
+database; keeping the installed debian-bookworm-amd64 application` and keeps running
+that application, which works on Trixie's newer glibc, but it cannot install Trixie
+releases. To avoid that, update both services to a Bookworm release with the same core
+and guild schemas as the Trixie images before replacing the base images. A paired
+upgrade that failed with Bookworm targets cannot be retried on Trixie. The recovery
+page can confirm a Trixie pair at the database's current schema instead, because
+admission uses the base ABI the Trixie launchers recorded.
+
+Moving back to Bookworm images after a Trixie release is installed leaves those
+services stopped, because Bookworm launchers refuse the installed Trixie application.
+
 ## Schema upgrades and recovery
 
 Independent application switches require the current application, candidate, and counterpart to share compatible **core and guild** schemas. Published runtime ranges remain exact; separate migration-origin labels describe which older stores the new bot can upgrade. Schema changes never run unattended.

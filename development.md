@@ -110,14 +110,15 @@ The vendored `tokio-tungstenite` compatibility patch also requires manual
 maintenance. Container images remain manual: Rust builder versions must
 stay aligned with `rust-toolchain.toml`, the root Cargo version requirements,
 and the CI toolchain. `Dockerfile.{bot,api}` pin
-`rust:1.100.0-bookworm` and `debian:bookworm-slim` by linux/amd64 digest. There is
+`rust:1.100.0-trixie` and `debian:trixie-slim` by linux/amd64 digest. There is
 no Docker Dependabot job; bump those digests together with the toolchain pin.
-Moving the application images to Debian 13 (Trixie) requires a rollout plan
-for installed Bookworm releases. The launcher checks the base ABI when
-restoring a release. Publication stamps the declared `io.jmodguard.base-abi`
-label from the pinned Dockerfile base and release admission enforces that
-metadata before promotion; it does not independently verify the image OS
-([dependency tracker](https://github.com/jatmn/jModGuard/issues/668)).
+Publication stamps `io.jmodguard.base-abi` from the selected source's
+`JMODGUARD_BASE_ABI` (`debian-trixie-amd64`; older sources without it are
+`debian-bookworm-amd64`), and release admission enforces that metadata before
+promotion; it does not independently verify the image OS. A Bookworm container
+refuses Trixie releases. A Trixie container replaces an installed Bookworm
+application with its built-in one when that fits the database, and otherwise keeps
+running it; see the base-image rollout in `docs/BUNNY-UPDATES.md`.
 
 Dependabot version updates are supported on this private GitHub.com
 repository. GitHub enqueues those jobs as **Actions → Dependabot Updates**

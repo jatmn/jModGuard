@@ -15,7 +15,7 @@ pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 46;
+pub const LAUNCHER_REVISION: u32 = 47;
 // Selected bots need the auth-exit hold before the readiness deadline check.
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 /// First launcher that verifies an image signature before staging.
@@ -418,7 +418,15 @@ pub(super) fn ensure_no_service_upgrade(conn: &impl SqlExecutor) -> Result<()> {
     Ok(())
 }
 
-pub async fn record_launcher_observation(db: &Db, role: &str, revision: u32) -> Result<()> {
+/// `base_abi` is the launcher's own container runtime. A redeployed base image
+/// can change it before any application reports readiness, and paired-upgrade
+/// admission compares it with the target release.
+pub async fn record_launcher_observation(
+    db: &Db,
+    role: &str,
+    revision: u32,
+    base_abi: Option<String>,
+) -> Result<()> {
     anyhow::ensure!(matches!(role, "bot" | "api"), "invalid launcher role");
     let role = role.to_owned();
     db.with_conn(move |conn| {
@@ -431,6 +439,9 @@ pub async fn record_launcher_observation(db: &Db, role: &str, revision: u32) -> 
         if let Some(raw) = raw {
             let mut seen: ComponentObservation = serde_json::from_str(&raw)?;
             seen.launcher_revision = revision;
+            if let Some(base_abi) = base_abi {
+                seen.base_abi = base_abi;
+            }
             // Preserve pre-protocol baseline adoption until the baked app
             // reports readiness; a legacy schema15 row may describe DB16.
             if seen.update_protocol != 0 {
@@ -1308,16 +1319,23 @@ impl UpdateControl {
     }
 
     /// Refresh actual controller capability without an application heartbeat.
-    pub async fn observe_launcher(&self, role: &str, revision: u32) -> Result<()> {
+    pub async fn observe_launcher(
+        &self,
+        role: &str,
+        revision: u32,
+        base_abi: Option<&str>,
+    ) -> Result<()> {
+        let base_abi = base_abi.map(str::to_owned);
         if !self.writes_locally() {
             return self
                 .forward_process(ControlOp::ObserveLauncher {
                     component: role.to_owned(),
                     revision,
+                    base_abi,
                 })
                 .await;
         }
-        record_launcher_observation(&self.db, role, revision).await
+        record_launcher_observation(&self.db, role, revision, base_abi).await
     }
 
     pub async fn clear_superseded_launcher(
@@ -2327,7 +2345,7 @@ mod tests {
                 .await
                 .map(|_| ()),
             reader.baked_running("api", observed.clone(), 300).await,
-            reader.observe_launcher("api", 1).await,
+            reader.observe_launcher("api", 1, None).await,
             reader.launcher_failed("api", "sha256:aa", "dropped").await,
             reader
                 .failed("api", &upgrade.api.release, "compatibility: dropped")
@@ -2489,7 +2507,7 @@ mod tests {
             let old = old.clone();
             tokio::spawn(async move {
                 start.wait();
-                old.observe_launcher("bot", 11).await
+                old.observe_launcher("bot", 11, None).await
             })
         };
         let new_task = {
@@ -2497,7 +2515,7 @@ mod tests {
             let new = new.clone();
             tokio::spawn(async move {
                 start.wait();
-                new.observe_launcher("bot", 22).await
+                new.observe_launcher("bot", 22, None).await
             })
         };
         let (left, right) = tokio::join!(old_task, new_task);
@@ -2590,7 +2608,7 @@ mod tests {
             holder.renew_launcher_fence().await.unwrap(),
             "the holder renews after the original window"
         );
-        let blocked = other.observe_launcher("bot", 22).await.unwrap_err();
+        let blocked = other.observe_launcher("bot", 22, None).await.unwrap_err();
         assert!(
             launcher_fence_held(&blocked),
             "a renewed fence still blocks the other launcher: {blocked:#}"
@@ -2630,7 +2648,7 @@ mod tests {
             acquired,
             "the waiting launcher takes the fence after expiry"
         );
-        let blocked = holder.observe_launcher("bot", 11).await.unwrap_err();
+        let blocked = holder.observe_launcher("bot", 11, None).await.unwrap_err();
         assert!(
             launcher_fence_held(&blocked),
             "the old launcher's next write fails: {blocked:#}"
@@ -2650,8 +2668,8 @@ mod tests {
         other.arm_launcher_fence(&other_id);
         assert!(holder.renew_launcher_fence().await.unwrap());
         rewrite_launcher_expiry(&f.control, &holder_id, crate::control::now_ms() - 1_000).await;
-        other.observe_launcher("bot", 22).await.unwrap();
-        let blocked = holder.observe_launcher("bot", 11).await.unwrap_err();
+        other.observe_launcher("bot", 22, None).await.unwrap();
+        let blocked = holder.observe_launcher("bot", 11, None).await.unwrap_err();
         assert!(
             launcher_fence_held(&blocked),
             "the old launcher's next write fails: {blocked:#}"
@@ -2679,7 +2697,7 @@ mod tests {
             now: 200,
         };
         f.control
-            .observe_launcher("api", PAIRED_LAUNCHER_REVISION - 1)
+            .observe_launcher("api", PAIRED_LAUNCHER_REVISION - 1, None)
             .await
             .unwrap();
         let refused = crate::db::apply_control(&f.control.db, None, op.clone(), None)
@@ -2691,7 +2709,7 @@ mod tests {
         );
         assert!(f.control.upgrade().await.unwrap().is_none());
         f.control
-            .observe_launcher("api", PAIRED_LAUNCHER_REVISION)
+            .observe_launcher("api", PAIRED_LAUNCHER_REVISION, None)
             .await
             .unwrap();
         let reply = crate::db::apply_control(&f.control.db, None, op, None)
@@ -2700,6 +2718,39 @@ mod tests {
         assert!(matches!(reply, crate::db::ControlReply::Saved { .. }));
         let queued = f.control.upgrade().await.unwrap().unwrap();
         assert_eq!(queued.phase, UpgradePhase::Preparing);
+    }
+
+    /// Redeployed Trixie launchers report their runtime before any application
+    /// is ready, so owner recovery can admit a Trixie pair over Bookworm history.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn launcher_base_abi_admits_a_pair_for_a_redeployed_runtime() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        for role in ["bot", "api"] {
+            let mut release = f.control.component(role).await.unwrap().candidate.unwrap();
+            release.base_abi = "debian-trixie-amd64".into();
+            f.control
+                .checked(role, "latest", Some(release), None, 100)
+                .await
+                .unwrap();
+        }
+        let refused = f.queue(true, 200).await.unwrap_err();
+        assert!(
+            refused.to_string().contains("coordinated-update baseline"),
+            "{refused:#}"
+        );
+        for role in ["bot", "api"] {
+            let op = crate::db::ControlOp::ObserveLauncher {
+                component: role.into(),
+                revision: LAUNCHER_REVISION,
+                base_abi: Some("debian-trixie-amd64".into()),
+            };
+            crate::db::apply_control(&f.control.db, None, op, None)
+                .await
+                .unwrap();
+        }
+        let queued = f.queue(true, 200).await.unwrap();
+        assert_eq!(queued.bot.release.base_abi, "debian-trixie-amd64");
+        assert_eq!(queued.api.release.base_abi, "debian-trixie-amd64");
     }
 
     /// A launcher-only update can put revision-38 launchers on an older image.
@@ -2947,6 +2998,7 @@ mod tests {
             ControlOp::ObserveLauncher {
                 component: "api".into(),
                 revision: 1,
+                base_abi: None,
             },
         ] {
             let refused = link.submit(op, 0).await.unwrap();

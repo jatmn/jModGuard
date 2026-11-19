@@ -282,17 +282,18 @@ done
 
 # Capability labels come from the selected source, independently of SHA.
 readarray -d '' -t launcher_args < <(build_args bot "$HEAD_SHA" "" . "" current "$(staging_ref bot)")
-for field in launcher-revision=46 min-launcher-revision=7; do
+for field in launcher-revision=47 min-launcher-revision=7 base-abi=debian-trixie-amd64; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "missing launcher requirement ${field}"
 done
 launcher_source="$(mktemp -d)"
 mkdir -p "$launcher_source/src/db" "$launcher_source/migrations/guild"
 cp src/db.rs "$launcher_source/src/db.rs"
 cp migrations/guild/current_version.txt "$launcher_source/migrations/guild/current_version.txt"
-sed -e 's/^pub const LAUNCHER_REVISION: u32 = 46;$/pub const LAUNCHER_REVISION: u32 = 47;/' \
+sed -e 's/^pub const LAUNCHER_REVISION: u32 = 47;$/pub const LAUNCHER_REVISION: u32 = 48;/' \
     src/db/update_control.rs >"$launcher_source/src/db/update_control.rs"
 readarray -d '' -t launcher_args < <(build_args api "$HEAD_SHA" "" "$launcher_source" "" current "$(staging_ref api)")
-for field in launcher-revision=47 min-launcher-revision=7; do
+# A selected service source without a declared runtime predates Trixie.
+for field in launcher-revision=48 min-launcher-revision=7 base-abi=debian-bookworm-amd64; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "selected source lost ${field}"
 done
 
