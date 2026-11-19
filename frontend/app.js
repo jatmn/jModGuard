@@ -9876,9 +9876,10 @@ function TableWindow({ rows, renderRow, canMove = () => true, table }) {
 }
 // Audit Log events written outside the log-channel routes in event_types.
 const AUDIT_EXTRA_EVENT_TYPES = ["ban_reason_edit", "command_enabled"];
-const AUTOMOD_ACTION_VERBS = { warn: "warned", timeout: "timed out", kick: "kicked", ban: "banned" };
+// Command rows are written after the command succeeds, but `!timeout` stores
+// "timeout" both when it adds and when it removes a timeout.
 const AUDIT_MOD_ACTION_DONE = {
-  ban: "Banned", kick: "Kicked", softban: "Softbanned", unban: "Unbanned", timeout: "Timed out",
+  ban: "Banned", kick: "Kicked", softban: "Softbanned", unban: "Unbanned", timeout: "Timeout changed",
   warn: "Warned", warnclear: "Warnings cleared", purge: "Purged", slowmode: "Slowmode set",
 };
 
@@ -9919,8 +9920,9 @@ const AUDIT_EVENT_SUMMARIES = {
   message_edit: () => ["Message edited"],
   message_delete: () => ["Message deleted"],
   message_bulk_delete: () => ["Messages deleted in bulk"],
+  // Automod rows store the rule's action, also after a failed or skipped attempt.
   automod: (data) => [
-    auditReason(`Automod ${AUTOMOD_ACTION_VERBS[data.action] ?? "acted"}`, data),
+    auditReason(auditText(data.action) ? `Automod ${auditText(data.action)} action` : "Automod action", data),
     auditText(data.rule) ? `Rule: ${data.rule}` : null,
   ],
   mod_action: (data) => [

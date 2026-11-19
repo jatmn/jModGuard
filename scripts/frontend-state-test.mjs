@@ -9503,7 +9503,7 @@ const AUDIT_SAMPLES = {
   message_edit: [{}, /^Message edited$/],
   message_delete: [{}, /^Message deleted$/],
   message_bulk_delete: [{}, /^Messages deleted in bulk$/],
-  automod: [{ rule: 'invite', action: 'timeout', reason: 'Invite link', evidence: { content: 'x', attachments: 0 } }, /^Automod timed out: Invite link · Rule: invite$/],
+  automod: [{ rule: 'invite', action: 'timeout', reason: 'Invite link', evidence: { content: 'x', attachments: 0 } }, /^Automod timeout action: Invite link · Rule: invite$/],
   mod_action: [{ action: 'warn', reason: 'Be nice' }, /^Warned: Be nice · via command$/],
   timeout_add: [{ until: '2026-11-14T04:05:00Z' }, /^Timed out until \S.*\d:05/],
   timeout_remove: [{}, /^Timeout removed$/],
@@ -9559,6 +9559,24 @@ test('Audit Log Details summarize every event type without internal fields', asy
     assert.ok(shown.includes(value), `timeout ${part} ${value} in ${shown}`);
   }
   assert.ok(shown.includes(until.getHours()) || shown.includes(until.getHours() % 12 || 12), `timeout hour in ${shown}`);
+});
+
+test('Audit Log Details name automod and timeout command actions without claiming their result', async () => {
+  // Producer payloads: automod.rs writes this row after a failed or skipped kick,
+  // and `!timeout <user> 0` writes action "timeout" after removing the timeout.
+  const rows = [
+    auditRow(1, 'automod', { rule: 'spam', action: 'kick', reason: 'spam', evidence: {} }),
+    auditRow(2, 'automod', { rule: 'spam', action: 'warn', reason: 'spam', evidence: {} }),
+    auditRow(3, 'mod_action', { action: 'timeout', reason: 'appeal approved' }),
+  ];
+  const { details } = await auditDetailsView(rows);
+  const summaries = details.map(detail => detail.firstChild.textContent);
+  assert.deepEqual(summaries, [
+    'Automod kick action: spam · Rule: spam',
+    'Automod warn action: spam · Rule: spam',
+    'Timeout changed: appeal approved · via command',
+  ]);
+  for (const summary of summaries) assert.doesNotMatch(summary, /kicked|warned|timed out/i, summary);
 });
 
 test('Audit Log keeps raw JSON behind a collapsed owner-only Raw toggle and falls back to it for unknown types', async () => {
