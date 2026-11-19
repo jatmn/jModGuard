@@ -102,13 +102,13 @@ impl ComponentRelease {
         anyhow::ensure!(
             matches!(
                 self.base_abi.as_str(),
-                "debian-bookworm-amd64" | "static-webui-v1"
+                "debian-bookworm-amd64" | "debian-trixie-amd64" | "static-webui-v1"
             ),
             "unsupported base ABI"
         );
         anyhow::ensure!(
             (self.component == "webui" && self.base_abi == "static-webui-v1")
-                || (self.component != "webui" && self.base_abi == "debian-bookworm-amd64"),
+                || (self.component != "webui" && self.base_abi.starts_with("debian-")),
             "base ABI does not match component"
         );
         anyhow::ensure!(

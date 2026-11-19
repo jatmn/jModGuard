@@ -1366,7 +1366,11 @@ impl Supervisor {
             }
             StartupReceipt::ObserveLauncher => {
                 self.control
-                    .observe_launcher(&self.role, db::LAUNCHER_REVISION)
+                    .observe_launcher(
+                        &self.role,
+                        db::LAUNCHER_REVISION,
+                        Some(self.base_abi.as_str()).filter(|abi| *abi != "unknown"),
+                    )
                     .await
             }
             StartupReceipt::LauncherFailed { digest, message } => {
@@ -2222,6 +2226,48 @@ impl Supervisor {
         self.start(&path, &sha, None).await
     }
 
+    /// The base ABI of the container whose launcher owns `state`: this one, or
+    /// the bot's recorded one when the API judges the bot's restore. None when
+    /// it is not known, which leaves that container's selections as they are.
+    fn container_abi<'a>(&'a self, role: &str, state: &'a db::ComponentUpdate) -> Option<&'a str> {
+        let abi = if role == self.role {
+            self.base_abi.as_str()
+        } else {
+            state
+                .observed
+                .as_ref()
+                .map_or("", |seen| seen.base_abi.as_str())
+        };
+        (!abi.is_empty() && abi != "unknown").then_some(abi)
+    }
+
+    /// Whether `release` is a Bookworm build on that Trixie container. Its code
+    /// cannot check for Trixie releases, so it is not that container's
+    /// selection. Every other base ABI keeps the usual refusal.
+    fn superseded_on_container(
+        &self,
+        role: &str,
+        state: &db::ComponentUpdate,
+        release: &ComponentRelease,
+    ) -> bool {
+        self.container_abi(role, state)
+            .is_some_and(|abi| bookworm_release_on_trixie(abi, &release.base_abi))
+    }
+
+    /// The installed release unless a Trixie container supersedes it. The
+    /// built-in application replaces a superseded one when it fits, and its
+    /// readiness receipt clears that selection.
+    fn installed_here<'a>(
+        &self,
+        role: &str,
+        state: &'a db::ComponentUpdate,
+    ) -> Option<&'a ComponentRelease> {
+        state
+            .installed
+            .as_ref()
+            .filter(|release| !self.superseded_on_container(role, state, release))
+    }
+
     /// Preserve the legacy baseline and uninstalled bot migration exceptions.
     /// Re-evaluate them with fresh state before a built-in restore spawns.
     /// `role` and `state` name the launcher whose built-in restore is judged;
@@ -2235,13 +2281,27 @@ impl Supervisor {
         if schema < self.baked_compatibility.migration_min_core {
             return Ok(false);
         }
+        // The built-in API cannot open guild stores the bot has not migrated
+        // to its guild schema, while the superseded release still can.
+        if role == "api"
+            && state.installed.is_some()
+            && self.installed_here(role, state).is_none()
+            && self
+                .control
+                .component("bot")
+                .await?
+                .observed
+                .and_then(|seen| seen.guild_schema)
+                != Some(self.baked_compatibility.guild)
+        {
+            return Ok(false);
+        }
         let legacy_baseline = state
             .observed
             .as_ref()
             .is_none_or(|seen| seen.update_protocol == 0)
-            && state
-                .installed
-                .as_ref()
+            && self
+                .installed_here(role, state)
                 .is_none_or(|release| release.upgrade.is_none())
             && self.control.upgrade().await?.is_none();
         if legacy_baseline
@@ -2250,14 +2310,17 @@ impl Supervisor {
         {
             return Ok(true);
         }
-        if state.installed.is_some() {
+        if self.installed_here(role, state).is_some() {
             return Ok(false);
         }
         // A baked bot owns migrations only without managed history or a
         // durable paired operation. The API still requires its exact schema.
         let baked_migration = role == "bot"
             && schema <= self.baked_compatibility.core
-            && state.previous.is_none()
+            && state
+                .previous
+                .as_ref()
+                .is_none_or(|release| self.superseded_on_container(role, state, release))
             && (state.desired.is_none() || state.state == "queued")
             && state
                 .observed
@@ -2279,7 +2342,7 @@ impl Supervisor {
         // Any other database keeps the owner recovery refusal below.
         let bot_migrates = !baked_fits
             && self.role == "api"
-            && state.installed.is_none()
+            && self.installed_here(&self.role, state).is_none()
             && schema < self.baked_compatibility.core
             && {
                 let bot = self.control.component("bot").await?;
@@ -2293,12 +2356,21 @@ impl Supervisor {
             let sha = self.base_sha.clone();
             return self.start(&path, &sha, None).await;
         }
-        if let Some(release) = &state.installed {
+        // Bookworm builds still run on Trixie. Keep that installed application
+        // when the built-in one cannot replace it; refuse any other runtime.
+        if let Some(release) = state.installed.as_ref().filter(|_| !bot_migrates) {
             let schema = self.control.schema_version().await?;
             ensure!(
-                release.base_abi == self.base_abi,
+                release.base_abi == self.base_abi
+                    || bookworm_release_on_trixie(&self.base_abi, &release.base_abi),
                 "installed application requires a different base ABI"
             );
+            if release.base_abi != self.base_abi {
+                tracing::warn!(
+                    "built-in application cannot open the database; keeping the installed {} application",
+                    release.base_abi
+                );
+            }
             let path = match stage(
                 &self.registry,
                 release,
@@ -2832,7 +2904,15 @@ impl Supervisor {
         {
             return Ok(false);
         }
-        if let Err(error) = compatible_control(&self.control, &candidate, now()).await {
+        // The stored observation can predate a redeployed base image.
+        let compatible = if candidate.base_abi == self.base_abi {
+            compatible_control(&self.control, &candidate, now()).await
+        } else {
+            Err(anyhow::anyhow!(
+                "candidate needs a different base runtime ABI"
+            ))
+        };
+        if let Err(error) = compatible {
             self.record_component_failure(candidate, format!("compatibility: {error:#}"))
                 .await?;
             return Ok(false);
@@ -3087,6 +3167,12 @@ impl Supervisor {
     }
 }
 
+/// The one cross-runtime pair a launcher accepts: a Bookworm build still runs
+/// on Trixie's newer glibc. Bookworm containers refuse Trixie builds.
+fn bookworm_release_on_trixie(container: &str, release: &str) -> bool {
+    container == "debian-trixie-amd64" && release == "debian-bookworm-amd64"
+}
+
 async fn activate_launcher(
     control: &UpdateControl,
     role: &str,
@@ -3195,7 +3281,10 @@ async fn establish_launcher(
     {
         control.baked_launcher(role, hash, now()).await?;
     }
-    control.observe_launcher(role, db::LAUNCHER_REVISION).await
+    let base_abi = std::env::var("JMODGUARD_BASE_ABI").ok();
+    control
+        .observe_launcher(role, db::LAUNCHER_REVISION, base_abi.as_deref())
+        .await
 }
 
 async fn stop_pre_supervisor(

@@ -197,6 +197,46 @@ and the signature-verifier threshold remains 19; neither establishes that the
 baked launcher supports expiry-safe cold boot. New installs and launcher handoffs
 continue to enforce signature expiry.
 
+### Debian 13 (Trixie) base-image rollout
+
+Bot and API images now run on Debian 13 (Trixie) and carry
+`io.jmodguard.base-abi=debian-trixie-amd64`. Earlier images ran on Bookworm
+(`debian-bookworm-amd64`). Runtime updates cannot change a container's base OS, so a
+Bookworm container refuses Trixie releases; its update check reports
+`unsupported base ABI`. Reach Trixie by replacing both base images, bot first and
+then API, under [Rollout after the PR](#rollout-after-the-pr). The API judges whether
+the bot's built-in application will migrate the database by the bot's recorded base
+ABI, so a Trixie API started before the bot keeps its installed Bookworm application
+instead of waiting for that migration. A bot with no recorded base ABI keeps its
+installed application for that judgement too.
+
+From launcher revision 47, each launcher records its container's base ABI when it
+starts, before any application is ready, and an independent update for another base
+ABI is recorded as failed. The read-only API launcher sends that record, with its
+launcher activation, to the bot process; while the bot process cannot save it, as
+after a failed pair, it sends them to the bot launcher link instead. The baked
+launcher supersedes any installed Bookworm launcher, which has a lower revision.
+
+On a Trixie container, an installed Bookworm application counts as not installed for
+the built-in restore checks, because its code cannot check for Trixie releases. The
+built-in application starts when its schemas match, and the built-in bot can migrate
+an older database under the usual rules for a container with nothing installed. The
+built-in API also needs the guild schema the bot recorded to equal its own, because
+it cannot open guild stores the bot has not migrated. When
+the built-in application is ready, the launcher clears the installed and previous
+selections, and later updates install Trixie releases as usual. If the built-in
+application cannot start, the launcher logs `built-in application cannot open the
+database; keeping the installed debian-bookworm-amd64 application` and keeps running
+that application, which works on Trixie's newer glibc, but it cannot install Trixie
+releases. To avoid that, update both services to a Bookworm release with the same core
+and guild schemas as the Trixie images before replacing the base images. A paired
+upgrade that failed with Bookworm targets cannot be retried on Trixie. The recovery
+page can confirm a Trixie pair at the database's current schema instead, because
+admission uses the base ABI the Trixie launchers recorded.
+
+Moving back to Bookworm images after a Trixie release is installed leaves those
+services stopped, because Bookworm launchers refuse the installed Trixie application.
+
 ## Schema upgrades and recovery
 
 Independent application switches require the current application, candidate, and counterpart to share compatible **core and guild** schemas. Published runtime ranges remain exact; separate migration-origin labels describe which older stores the new bot can upgrade. Schema changes never run unattended.
@@ -212,7 +252,7 @@ the control-link values. An updated API continues to send frames that a previous
 bot can read, because that bot ignores the added fields after verifying the signed
 payload. Container-read requests remain separate from control requests.
 
-For a core or guild schema change, use **Update bot and API together / recovery** in Administration. Both containers must run revision-38 or newer launchers, and the API container's own image must also be revision 38 or newer: after a failed pair the maintenance page runs from that image's baked API, so a launcher-only update is not enough. The API launcher reports its image's own build, and an older API image refuses Apply with a message to install a new API image. The read-only API launcher sends its paired steps, and the API sends owner recovery Check, Apply and Cancel, to the bot launcher link (`JMODGUARD_LAUNCHER_CONTROL_BIND` on the bot, default `127.0.0.1:8084`; `JMODGUARD_LAUNCHER_CONTROL_TARGET` on the API, no default). The bot launcher keeps running while the bot process is stopped and writes those steps under its own launcher fence, so a pair can pass the API prepared step and owner recovery still works after a failed pair stops both applications. That link accepts only API paired steps and recovery Check, Apply and Cancel; Check takes and releases both update leases there. Without the API target, a pair stays pending before anything stops, and Cancel still works through the bot. Schema changes ship in new images. This opens `/api/service-upgrade/recovery` through the existing `/api*` proxy on the public WebUI host and uses the existing Discord owner login. Check a matching pair, inspect its source SHA and two pinned image digests, and confirm the interruption. Ordinary main pushes publish services independently: an API-only or bot-only fix may have no counterpart image at that SHA. Shared/schema inputs select both services; an owner-dispatched publication of an exact source builds all eligible components. The API resolves the counterpart from the same full source-SHA tag. The channel and checked candidate for both services are stored in one step, and that check holds both update leases so it cannot overlap Administration discovery. If either image is missing, neither selection changes and nothing is stopped.
+For a core or guild schema change, use **Update bot and API together / recovery** in Administration. Both containers must run revision-38 or newer launchers, and the API container's own image must also be revision 38 or newer: after a failed pair the maintenance page runs from that image's baked API, so a launcher-only update is not enough. The API launcher reports its image's own build, and an older API image refuses Apply with a message to install a new API image. The read-only API launcher sends its paired steps, and the API sends owner recovery Check, Apply and Cancel, to the bot launcher link (`JMODGUARD_LAUNCHER_CONTROL_BIND` on the bot, default `127.0.0.1:8084`; `JMODGUARD_LAUNCHER_CONTROL_TARGET` on the API, no default). The bot launcher keeps running while the bot process is stopped and writes those steps under its own launcher fence, so a pair can pass the API prepared step and owner recovery still works after a failed pair stops both applications. That link accepts only API paired steps, recovery Check, Apply and Cancel, and the API launcher's own activation and observation; Check takes and releases both update leases there. Without the API target, a pair stays pending before anything stops, and Cancel still works through the bot. Schema changes ship in new images. This opens `/api/service-upgrade/recovery` through the existing `/api*` proxy on the public WebUI host and uses the existing Discord owner login. Check a matching pair, inspect its source SHA and two pinned image digests, and confirm the interruption. Ordinary main pushes publish services independently: an API-only or bot-only fix may have no counterpart image at that SHA. Shared/schema inputs select both services; an owner-dispatched publication of an exact source builds all eligible components. The API resolves the counterpart from the same full source-SHA tag. The channel and checked candidate for both services are stored in one step, and that check holds both update leases so it cannot overlap Administration discovery. If either image is missing, neither selection changes and nothing is stopped.
 
 The durable operation first hands off any required launcher before that role acknowledges preparation, then prepares and verifies both application executables, stops and reaps the old API, stops and reaps the old bot, records an irreversible migration boundary, starts the new bot, then starts the matching API only after bot readiness. Completion requires both readiness markers. Closing the browser does not cancel it. A restarted controller invalidates its local staging/stop acknowledgements and resumes the operation; heartbeat expiry is never evidence of shutdown. Run **one container per role** against the shared core and guild stores; overlapping replicas or other writers are not supported by this protocol.
 

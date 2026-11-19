@@ -319,7 +319,7 @@ async fn read_only_api_stores_required_launcher_selection_and_applies_every_rece
         .unwrap();
     linked
         .reader
-        .observe_launcher("api", db::LAUNCHER_REVISION)
+        .observe_launcher("api", db::LAUNCHER_REVISION, None)
         .await
         .unwrap();
     let observed = linked.reader.component("api").await.unwrap();

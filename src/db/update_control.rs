@@ -15,7 +15,7 @@ pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 46;
+pub const LAUNCHER_REVISION: u32 = 47;
 // Selected bots need the auth-exit hold before the readiness deadline check.
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 /// First launcher that verifies an image signature before staging.
@@ -418,7 +418,15 @@ pub(super) fn ensure_no_service_upgrade(conn: &impl SqlExecutor) -> Result<()> {
     Ok(())
 }
 
-pub async fn record_launcher_observation(db: &Db, role: &str, revision: u32) -> Result<()> {
+/// `base_abi` is the launcher's own container runtime. A redeployed base image
+/// can change it before any application reports readiness, and paired-upgrade
+/// admission compares it with the target release.
+pub async fn record_launcher_observation(
+    db: &Db,
+    role: &str,
+    revision: u32,
+    base_abi: Option<String>,
+) -> Result<()> {
     anyhow::ensure!(matches!(role, "bot" | "api"), "invalid launcher role");
     let role = role.to_owned();
     db.with_conn(move |conn| {
@@ -431,6 +439,9 @@ pub async fn record_launcher_observation(db: &Db, role: &str, revision: u32) -> 
         if let Some(raw) = raw {
             let mut seen: ComponentObservation = serde_json::from_str(&raw)?;
             seen.launcher_revision = revision;
+            if let Some(base_abi) = base_abi {
+                seen.base_abi = base_abi;
+            }
             // Preserve pre-protocol baseline adoption until the baked app
             // reports readiness; a legacy schema15 row may describe DB16.
             if seen.update_protocol != 0 {
@@ -689,9 +700,10 @@ impl UpdateControl {
         self
     }
 
-    /// Bot-launcher side of the launcher link. Only API paired-upgrade steps
-    /// and owner upgrade recovery (Check, Apply, Cancel) are accepted. Every
-    /// write runs under this launcher's fence, never the bot process's writer lease.
+    /// Bot-launcher side of the launcher link. Only API paired-upgrade steps,
+    /// owner upgrade recovery (Check, Apply, Cancel) and the API launcher's own
+    /// activation and observation are accepted. Every write runs under this
+    /// launcher's fence, never the bot process's writer lease.
     pub async fn apply_launcher_op(&self, op: ControlOp) -> Result<ControlReply> {
         if matches!(op, ControlOp::LookupResult) {
             // Results are not cached. Every accepted step is safe to resend.
@@ -765,6 +777,35 @@ impl UpdateControl {
             }
             ControlOp::ReleasePairCheck { owner } => {
                 self.release_pair_check(&owner).await?;
+                serde_json::Value::Null
+            }
+            // The API launcher's activation and observation, in its startup
+            // order, so its runtime is recorded while the bot process is stopped.
+            ControlOp::RecordBakedLauncher {
+                component,
+                hash,
+                now,
+            } if component == "api" => {
+                self.baked_launcher(&component, &hash, now).await?;
+                serde_json::Value::Null
+            }
+            ControlOp::RecordLauncherRunning {
+                component,
+                release,
+                hash,
+                now,
+            } if component == "api" => {
+                self.launcher_running(&component, &release, &hash, now)
+                    .await?;
+                serde_json::Value::Null
+            }
+            ControlOp::ObserveLauncher {
+                component,
+                revision,
+                base_abi,
+            } if component == "api" => {
+                self.observe_launcher(&component, revision, base_abi.as_deref())
+                    .await?;
                 serde_json::Value::Null
             }
             _ => anyhow::bail!("write failed"),
@@ -1216,6 +1257,30 @@ impl UpdateControl {
         forward(self.writer.as_ref(), op).await.map(|_| ())
     }
 
+    /// The API launcher's activation and observation go to the bot process like
+    /// its other receipts. While that process cannot save them, as after a
+    /// failed pair stops it, the bot launcher stores them instead, so owner
+    /// recovery can compare the API launcher's runtime. Any launcher-link
+    /// refusal, including from an older bot launcher, keeps the process error
+    /// and its retry.
+    async fn forward_launcher_receipt(&self, op: ControlOp) -> Result<()> {
+        let error = match self.forward_process(op.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let Some(link) = self
+            .launcher
+            .as_ref()
+            .filter(|_| error.downcast_ref::<ReceiptNotSaved>().is_some())
+        else {
+            return Err(error);
+        };
+        match link.submit(op, 0).await {
+            Ok(ControlReply::Saved { .. } | ControlReply::Unchanged { .. }) => Ok(()),
+            _ => Err(error),
+        }
+    }
+
     /// Paired-upgrade steps from the read-only API launcher, sent to the bot
     /// launcher. A changed operation keeps its type so the caller retries from
     /// durable state instead of failing the upgrade.
@@ -1308,16 +1373,23 @@ impl UpdateControl {
     }
 
     /// Refresh actual controller capability without an application heartbeat.
-    pub async fn observe_launcher(&self, role: &str, revision: u32) -> Result<()> {
+    pub async fn observe_launcher(
+        &self,
+        role: &str,
+        revision: u32,
+        base_abi: Option<&str>,
+    ) -> Result<()> {
+        let base_abi = base_abi.map(str::to_owned);
         if !self.writes_locally() {
             return self
-                .forward_process(ControlOp::ObserveLauncher {
+                .forward_launcher_receipt(ControlOp::ObserveLauncher {
                     component: role.to_owned(),
                     revision,
+                    base_abi,
                 })
                 .await;
         }
-        record_launcher_observation(&self.db, role, revision).await
+        record_launcher_observation(&self.db, role, revision, base_abi).await
     }
 
     pub async fn clear_superseded_launcher(
@@ -1362,7 +1434,7 @@ impl UpdateControl {
     ) -> Result<()> {
         if !self.writes_locally() {
             return self
-                .forward_process(ControlOp::RecordLauncherRunning {
+                .forward_launcher_receipt(ControlOp::RecordLauncherRunning {
                     component: role.to_owned(),
                     release: release.clone(),
                     hash: hash.to_owned(),
@@ -1376,7 +1448,7 @@ impl UpdateControl {
     pub async fn baked_launcher(&self, role: &str, hash: &str, now: i64) -> Result<()> {
         if !self.writes_locally() {
             return self
-                .forward_process(ControlOp::RecordBakedLauncher {
+                .forward_launcher_receipt(ControlOp::RecordBakedLauncher {
                     component: role.to_owned(),
                     hash: hash.to_owned(),
                     now,
@@ -2327,7 +2399,7 @@ mod tests {
                 .await
                 .map(|_| ()),
             reader.baked_running("api", observed.clone(), 300).await,
-            reader.observe_launcher("api", 1).await,
+            reader.observe_launcher("api", 1, None).await,
             reader.launcher_failed("api", "sha256:aa", "dropped").await,
             reader
                 .failed("api", &upgrade.api.release, "compatibility: dropped")
@@ -2489,7 +2561,7 @@ mod tests {
             let old = old.clone();
             tokio::spawn(async move {
                 start.wait();
-                old.observe_launcher("bot", 11).await
+                old.observe_launcher("bot", 11, None).await
             })
         };
         let new_task = {
@@ -2497,7 +2569,7 @@ mod tests {
             let new = new.clone();
             tokio::spawn(async move {
                 start.wait();
-                new.observe_launcher("bot", 22).await
+                new.observe_launcher("bot", 22, None).await
             })
         };
         let (left, right) = tokio::join!(old_task, new_task);
@@ -2590,7 +2662,7 @@ mod tests {
             holder.renew_launcher_fence().await.unwrap(),
             "the holder renews after the original window"
         );
-        let blocked = other.observe_launcher("bot", 22).await.unwrap_err();
+        let blocked = other.observe_launcher("bot", 22, None).await.unwrap_err();
         assert!(
             launcher_fence_held(&blocked),
             "a renewed fence still blocks the other launcher: {blocked:#}"
@@ -2630,7 +2702,7 @@ mod tests {
             acquired,
             "the waiting launcher takes the fence after expiry"
         );
-        let blocked = holder.observe_launcher("bot", 11).await.unwrap_err();
+        let blocked = holder.observe_launcher("bot", 11, None).await.unwrap_err();
         assert!(
             launcher_fence_held(&blocked),
             "the old launcher's next write fails: {blocked:#}"
@@ -2650,8 +2722,8 @@ mod tests {
         other.arm_launcher_fence(&other_id);
         assert!(holder.renew_launcher_fence().await.unwrap());
         rewrite_launcher_expiry(&f.control, &holder_id, crate::control::now_ms() - 1_000).await;
-        other.observe_launcher("bot", 22).await.unwrap();
-        let blocked = holder.observe_launcher("bot", 11).await.unwrap_err();
+        other.observe_launcher("bot", 22, None).await.unwrap();
+        let blocked = holder.observe_launcher("bot", 11, None).await.unwrap_err();
         assert!(
             launcher_fence_held(&blocked),
             "the old launcher's next write fails: {blocked:#}"
@@ -2679,7 +2751,7 @@ mod tests {
             now: 200,
         };
         f.control
-            .observe_launcher("api", PAIRED_LAUNCHER_REVISION - 1)
+            .observe_launcher("api", PAIRED_LAUNCHER_REVISION - 1, None)
             .await
             .unwrap();
         let refused = crate::db::apply_control(&f.control.db, None, op.clone(), None)
@@ -2691,7 +2763,7 @@ mod tests {
         );
         assert!(f.control.upgrade().await.unwrap().is_none());
         f.control
-            .observe_launcher("api", PAIRED_LAUNCHER_REVISION)
+            .observe_launcher("api", PAIRED_LAUNCHER_REVISION, None)
             .await
             .unwrap();
         let reply = crate::db::apply_control(&f.control.db, None, op, None)
@@ -2700,6 +2772,97 @@ mod tests {
         assert!(matches!(reply, crate::db::ControlReply::Saved { .. }));
         let queued = f.control.upgrade().await.unwrap().unwrap();
         assert_eq!(queued.phase, UpgradePhase::Preparing);
+    }
+
+    /// After a failed Bookworm pair stops both applications, redeployed Trixie
+    /// launchers report their runtime before any application is ready: the bot
+    /// launcher locally, the read-only API launcher through the bot launcher
+    /// link. Owner recovery then admits a Trixie pair over Bookworm history.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn launcher_base_abi_admits_recovery_of_a_pair_for_a_redeployed_runtime() {
+        const TRIXIE: &str = "debian-trixie-amd64";
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        // No bot process link: the bot application is stopped.
+        let (api, link) = launcher_linked(&f).await;
+        let upgrade = f.queue(false, 200).await.unwrap();
+        f.control
+            .join_upgrade(&upgrade.id, "bot", "bot")
+            .await
+            .unwrap();
+        api.join_upgrade(&upgrade.id, "api", "api").await.unwrap();
+        api.upgrade_error(&upgrade.id, "api: staged binary failed")
+            .await
+            .unwrap();
+        api.acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap();
+        f.control
+            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap();
+        let submit = async |op: ControlOp| link.submit(op, 0).await.unwrap();
+        let ControlReply::Saved { body } = submit(ControlOp::AcquirePairCheck { now: 300 }).await
+        else {
+            panic!("recovery Check was not saved");
+        };
+        let owner: String = serde_json::from_value(body).unwrap();
+        let trixie = |role: &str, digit: char| {
+            let mut release = upgrade.service(role).unwrap().release.clone();
+            release.source_sha = "9".repeat(40);
+            release.digest = format!("sha256:{}", digit.to_string().repeat(64));
+            release.base_abi = TRIXIE.into();
+            release
+        };
+        let (bot, api_release) = (trixie("bot", 'e'), trixie("api", 'f'));
+        for op in [
+            ControlOp::RecordPairCheck {
+                owner: owner.clone(),
+                channel: "latest".into(),
+                bot: bot.clone(),
+                api: api_release.clone(),
+                now: 300,
+            },
+            ControlOp::ReleasePairCheck { owner },
+        ] {
+            let reply = submit(op).await;
+            assert!(matches!(reply, ControlReply::Saved { .. }), "{reply:?}");
+        }
+        let recover = || ControlOp::RequestUpgrade {
+            bot_digest: bot.digest.clone(),
+            api_digest: api_release.digest.clone(),
+            recover: true,
+            now: 300,
+        };
+        let refused = submit(recover()).await;
+        assert!(
+            matches!(&refused, ControlReply::Failed { message, .. }
+                if message.contains("coordinated-update baseline")),
+            "{refused:?}"
+        );
+        f.control
+            .observe_launcher("bot", LAUNCHER_REVISION, Some(TRIXIE))
+            .await
+            .unwrap();
+        // The API launcher's startup receipts, in order, without the bot process.
+        api.baked_launcher("api", &"ab".repeat(32), 300)
+            .await
+            .unwrap();
+        api.observe_launcher("api", LAUNCHER_REVISION, Some(TRIXIE))
+            .await
+            .unwrap();
+        let state = f.control.component("api").await.unwrap();
+        assert_eq!(
+            state.launcher_sha256.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+        assert_eq!(state.observed.unwrap().base_abi, TRIXIE);
+        let ControlReply::Saved { body } = submit(recover()).await else {
+            panic!("recovery of the Trixie pair was not admitted");
+        };
+        let recovered: ServiceUpgrade = serde_json::from_value(body).unwrap();
+        assert_ne!(recovered.id, upgrade.id);
+        assert_eq!(recovered.bot.release.base_abi, TRIXIE);
+        assert_eq!(recovered.api.release.base_abi, TRIXIE);
     }
 
     /// A launcher-only update can put revision-38 launchers on an older image.
@@ -2936,7 +3099,8 @@ mod tests {
         assert_ne!(recovered.id, upgrade.id);
         assert!(recovered.error.is_none());
         assert_eq!(recovered.phase, UpgradePhase::Preparing);
-        // The link refuses bot-role steps and every non-upgrade write.
+        // The link refuses bot-role steps and every other non-upgrade write,
+        // including the API launcher's failure receipts.
         for op in [
             ControlOp::AcknowledgeUpgrade {
                 id: recovered.id.clone(),
@@ -2945,8 +3109,14 @@ mod tests {
                 action: UpgradeAcknowledgement::Prepared,
             },
             ControlOp::ObserveLauncher {
-                component: "api".into(),
+                component: "bot".into(),
                 revision: 1,
+                base_abi: None,
+            },
+            ControlOp::RecordLauncherFailure {
+                component: "api".into(),
+                digest: upgrade.api.release.digest.clone(),
+                error: "dropped".into(),
             },
         ] {
             let refused = link.submit(op, 0).await.unwrap();
@@ -2959,7 +3129,7 @@ mod tests {
         assert!(current.bot.prepared == UpgradeProof::Missing);
         assert_eq!(
             f.control
-                .component("api")
+                .component("bot")
                 .await
                 .unwrap()
                 .observed

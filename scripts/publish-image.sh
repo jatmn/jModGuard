@@ -382,6 +382,18 @@ if (source.includes("const CORE_BASELINE_VERSION:")) {
 }
 JS
 ) || publish_fail 'cannot determine selected source core schema'
+    # Label the runtime the selected source's image declares. Service sources
+    # from before the Trixie move ran on Bookworm.
+    local base_abi=static-webui-v1 dockerfile="${context}/Dockerfile.${component}"
+    if [[ "$component" != webui ]]; then
+      base_abi=
+      [[ ! -f "$dockerfile" ]] || base_abi="$(sed -n 's/^ENV JMODGUARD_BASE_ABI=//p' "$dockerfile")"
+      : "${base_abi:=debian-bookworm-amd64}"
+      case "$base_abi" in
+        debian-bookworm-amd64 | debian-trixie-amd64) ;;
+        *) publish_fail 'selected source declares an unsupported base ABI' ;;
+      esac
+    fi
     args+=(
       --label "io.jmodguard.component=${component}"
       --label "io.jmodguard.channel=${release_channel}"
@@ -392,7 +404,7 @@ JS
       --label "io.jmodguard.result-schema=${schema}"
       --label "io.jmodguard.min-api=1"
       --label "io.jmodguard.max-api=1"
-      --label "io.jmodguard.base-abi=$([[ "$component" == webui ]] && echo static-webui-v1 || echo debian-bookworm-amd64)"
+      --label "io.jmodguard.base-abi=${base_abi}"
     )
     if [[ -f "$context/src/db/update_control.rs" ]]; then
       local guild_schema guild_schema_file control_protocol launcher_revision min_launcher_revision
