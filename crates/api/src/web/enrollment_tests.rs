@@ -7482,6 +7482,78 @@ async fn members_sort_and_filter_before_paging() {
     }
 }
 
+// The Ban user dialog's member picker sends exactly this read (#664).
+#[tokio::test]
+async fn member_picker_search_matches_current_member_names_ignoring_case() {
+    use db::guild_data::MemberObservation;
+
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    for (id, username, global_name, nickname) in [
+        (11, "jatmn", None, None),
+        (12, "someone", Some("Jatmn Global"), None),
+        (13, "other", None, Some("JATMN nick")),
+        (14, "unrelated", Some("Nobody"), None),
+    ] {
+        store
+            .observe_member(
+                scope.clone(),
+                MemberObservation {
+                    user_id: id,
+                    username: Some(Some(username.into())),
+                    global_name: Some(global_name.map(str::to_owned)),
+                    nickname: Some(nickname.map(str::to_owned)),
+                    joined_at_ms: Some(1_000 + id),
+                    observed_at_ms: 2_000,
+                    is_join: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    // Banned and not in the server: not offered as a current member.
+    store.observe_ban(scope.clone(), 15, 2_000).await.unwrap();
+
+    let search = |q: &str| format!("/api/guilds/10/members?q={q}&limit=8&status=current");
+    let ids = |body: &serde_json::Value| {
+        let mut ids = body["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member["user_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    for q in ["jatmn", "JaTmN", "jat"] {
+        let (status, body) = f.request("POST", &search(q), "").await;
+        assert_eq!(status, StatusCode::OK, "{q}: {body}");
+        assert_eq!(ids(&body), ["11", "12", "13"], "{q}");
+    }
+    let (status, body) = f.request("POST", &search("jatmn%20nick"), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ids(&body), ["13"]);
+    assert_eq!(body["members"][0]["display_name"], "JATMN nick");
+    let (status, body) = f.request("POST", &search("nobody"), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ids(&body), ["14"]);
+    let (status, body) = f.request("POST", &search("15"), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ids(&body), Vec::<String>::new());
+}
+
 #[tokio::test]
 async fn case_list_orders_and_filters_are_applied_before_paging() {
     use crate::db::guild_data::{

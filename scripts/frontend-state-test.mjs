@@ -555,6 +555,68 @@ test('the ban dialog queues a real ban with its options and shows the refusal', 
   assert.match(textOf(h.document.querySelector('.ban-receipt')), /Refused: this member's highest role is not below yours\./);
 });
 
+test('the ban dialog finds current members by name and says when the search failed', async () => {
+  const calls = [];
+  let search = () => response({ members: [{ user_id: '9007199254740993', display_name: 'JATMN' }], next_cursor: null, total: null });
+  const h = harness(async (url, opts) => {
+    calls.push({ url, opts });
+    if (url.includes('/members?')) return search(opts.signal);
+    if (url.endsWith('/ban')) return response({ id: 'ban-job', guild_id: h.app.state.guildId, actor_id: '123456789012345678', enrollment_id: 'membership', state: 'failed', outcome: 'target_role_not_below_moderator', action: { kind: 'ban', user_id: '9007199254740993' } });
+    return response({ bans: [], names: {} });
+  }, new Map(), new Map(), () => true);
+  const root = await bansView(h);
+  await fire(findNode(root, n => n.localName === 'button' && n.textContent === 'Ban user'), 'click');
+  const dialog = h.document.querySelector('.ban-dialog');
+  const idBox = dialog.querySelector('input[placeholder="Search members by name, or paste an ID"]');
+  const type = async value => {
+    idBox.value = value;
+    await fire(idBox, 'input', { target: { value } });
+    await settle();
+  };
+  const results = () => textOf(dialog.querySelector('ul.picker-results'));
+  await type('jatmn');
+  const read = calls.filter(call => call.url.includes('/members?')).at(-1);
+  assert.equal(read.url, `/api/guilds/${h.app.state.guildId}/members?q=jatmn&limit=8&status=current`);
+  assert.equal(read.opts.method, 'POST');
+  assert.equal(read.opts.headers['x-jmodguard-enrollment'], 'membership');
+  assert.equal(results(), 'JATMN9007199254740993');
+  search = () => response({ members: [], next_cursor: null, total: null });
+  await type('nobody');
+  assert.equal(results(), 'No matching members.');
+  search = () => ({ ok: false, status: 503, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'Members request timed out. Please try again.' }) });
+  await type('jatm');
+  assert.equal(results(), "Couldn't search members: Members request timed out. Please try again. Paste their ID instead.");
+  assert.equal(dialog.querySelector('ul.picker-results [role="alert"]') !== null, true);
+  search = () => { throw new TypeError('Failed to fetch'); };
+  await type('offline');
+  assert.equal(results(), "Couldn't search members: Failed to fetch. Paste their ID instead.");
+
+  let cancelledSignal;
+  search = signal => new Promise((_, reject) => {
+    cancelledSignal = signal;
+    signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+  });
+  await type('jatmn');
+  assert.equal(cancelledSignal.aborted, false);
+  await type('');
+  assert.equal(cancelledSignal.aborted, true);
+
+  let resolveRetry;
+  const retry = new Promise(resolve => { resolveRetry = resolve; });
+  search = () => retry;
+  await type('jatmn');
+  assert.equal(dialog.querySelector('ul.picker-results')?.textContent, undefined,
+    'a cancelled search should leave no results while the same query is retried');
+  resolveRetry(response({ members: [{ user_id: '9007199254740993', display_name: 'JATMN' }], next_cursor: null, total: null }));
+  await settle();
+  await fire(findNode(dialog, n => n.localName === 'button' && textOf(n).startsWith('JATMN')), 'click');
+  assert.deepEqual([...dialog.querySelectorAll('ul.picker-chips .picker-chip-text')].map(textOf), ['JATMN']);
+  await fire(findNode(dialog, n => n.localName === 'button' && n.textContent === 'Ban user'), 'click');
+  await settle();
+  const post = calls.find(call => call.url.endsWith('/ban'));
+  assert.equal(JSON.parse(post.opts.body).user_id, '9007199254740993');
+});
+
 test('the ban dialog locks all submitted options until acknowledgment or failure', async t => {
   for (const acknowledged of [true, false]) await t.test(acknowledged ? 'acknowledged' : 'failed request', async () => {
     const calls = [];
