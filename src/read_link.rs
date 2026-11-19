@@ -900,8 +900,9 @@ mod tests {
             }
         }
         let _clear_ready = ClearReady;
-        std::thread::sleep(Duration::from_millis(50));
 
+        // The listener is already bound and accepts in arrival order, so
+        // these connections take every permit before the probe below.
         // Fill the slots without successful probes: response EOF can arrive
         // before a probe's blocking handler releases its permit.
         let mut held = Vec::new();

@@ -665,10 +665,8 @@ mod tests {
                                         .header("content-encoding", "gzip")
                                         .body(Body::from("abc"))
                                         .unwrap(),
-                                    "/slow" => {
-                                        tokio::time::sleep(Duration::from_secs(2)).await;
-                                        Response::new(Body::from("abc"))
-                                    }
+                                    // Never answers, so only the caller's deadline ends it.
+                                    "/slow" => std::future::pending().await,
                                     _ => Response::new(Body::from("abc")),
                                 };
                                 Ok::<_, std::convert::Infallible>(response)

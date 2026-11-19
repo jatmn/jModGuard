@@ -744,7 +744,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    // Paused time ends the server's sleep only once the client has read
+    // everything sent and is waiting for the rest of the body.
+    #[tokio::test(start_paused = true)]
     async fn registry_truncated_body_is_not_unreachable() {
         for reset in [false, true] {
             let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
