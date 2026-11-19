@@ -9870,6 +9870,7 @@ test('the Web UI draws SVG icons, never emoji or glyph icons', () => {
 const statValue = (h, label) => [...h.nodes.get('#content').querySelectorAll('.dashboard-stats > .stat')]
   .find((tile) => tile.querySelector('.stat-title').textContent.startsWith(label)).querySelector('.stat-value').textContent;
 const lastUpdated = (h) => h.nodes.get('#content').querySelector('.last-updated')?.textContent ?? null;
+const dashboardCacheConfig = () => ({ ...configuredDashboard(), enrollment_id: 'membership' });
 const readCacheKeys = (session) => [...session.keys()].filter((key) => key.startsWith('jmodguard.read:'));
 
 test('Dashboard counts render from the tab cache on return and reload, then revalidate in the background', async () => {
@@ -9883,7 +9884,7 @@ test('Dashboard counts render from the tab cache on return and reload, then reva
     return response({ events: reads, warns: 0, bans: 0, cases: 0 });
   };
   const h = harness(fetchImpl, new Map(), session);
-  h.app.state.config = configuredDashboard();
+  h.app.state.config = dashboardCacheConfig();
   h.app.state.tab = 'dashboard';
   h.app.renderTab();
   await settle();
@@ -9895,6 +9896,7 @@ test('Dashboard counts render from the tab cache on return and reload, then reva
   h.app.navigate('rules');
   await settle();
   h.app.navigate('dashboard');
+  assert.equal(statValue(h, 'Moderation records'), '1', 'the first view commit restores the snapshot');
   await settle();
   assert.equal(reads, 2);
   assert.equal(statValue(h, 'Moderation records'), '1', 'no Loading… flash');
@@ -9916,7 +9918,7 @@ test('Dashboard counts render from the tab cache on return and reload, then reva
   // A reload in this tab starts from the stored copy, not from Loading….
   fail = false;
   const reloaded = harness(fetchImpl, new Map(), session);
-  reloaded.app.state.config = configuredDashboard();
+  reloaded.app.state.config = dashboardCacheConfig();
   reloaded.app.state.tab = 'dashboard';
   reloaded.app.renderTab();
   await settle();
@@ -9930,7 +9932,7 @@ test('Dashboard counts render from the tab cache on return and reload, then reva
   // Another account in the same tab never sees it, and auth loss clears it.
   const other = harness(fetchImpl, new Map(), session);
   other.app.state.me = { user: { id: '223456789012345678' } };
-  other.app.state.config = configuredDashboard();
+  other.app.state.config = dashboardCacheConfig();
   other.app.state.tab = 'dashboard';
   other.app.renderTab();
   await settle();
@@ -9942,38 +9944,71 @@ test('Dashboard counts render from the tab cache on return and reload, then reva
   assert.deepEqual(readCacheKeys(session), []);
 });
 
-test('cached reads revalidate every few minutes only while the page is visible', async () => {
-  let reads = 0;
-  const h = harness(async () => { reads += 1; return response({ events: reads, warns: 0, bans: 0, cases: 0 }); });
-  h.app.state.config = configuredDashboard();
-  h.app.state.tab = 'dashboard';
+const readRefreshTimers = h => [...h.timers].filter(([, timer]) => timer.delay === 180000);
+async function runReadRefresh(h, advanceMs) {
+  const [entry] = readRefreshTimers(h);
+  assert.ok(entry, 'expected an armed display refresh');
+  if (!entry[1].repeating) h.timers.delete(entry[0]);
+  h.advanceTime(advanceMs);
+  await entry[1].fn();
+}
+
+test('cached reads schedule from completion and defer warm hidden revalidation', async () => {
+  let reads = 0, release;
+  const fetchStats = async () => {
+    reads += 1;
+    if (reads === 1) await new Promise(resolve => { release = resolve; });
+    return response({ events: reads, warns: 0, bans: 0 });
+  };
+  const h = harness(fetchStats);
+  h.app.state.config = dashboardCacheConfig();
   h.app.renderTab();
   await settle();
-  assert.equal(reads, 1);
-  const intervals = () => [...h.timers.values()].filter((timer) => timer.repeating && timer.delay === 180000);
-  assert.equal(intervals().length, 1);
-  const [timer] = intervals();
-
-  h.document.visibilityState = 'hidden';
-  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
-  h.advanceTime(10 * 60000);
-  await timer.fn();
-  assert.equal(reads, 1, 'a hidden page does not refresh');
-
-  h.document.visibilityState = 'visible';
-  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  h.advanceTime(100);
+  release();
   await settle();
-  assert.equal(reads, 2, 'showing an outdated page refreshes it once');
-  await timer.fn();
-  assert.equal(reads, 2, 'a just-refreshed page waits for the next interval');
-  h.advanceTime(180000);
-  await timer.fn();
+  await runReadRefresh(h, 180000);
+  assert.equal(reads, 2, 'ordinary response latency does not skip the refresh deadline');
+
+  const restored = harness(fetchStats, new Map(), h.session);
+  restored.app.state.config = dashboardCacheConfig();
+  restored.document.visibilityState = 'hidden';
+  restored.app.renderTab();
+  await settle();
+  assert.equal(statValue(restored, 'Moderation records'), '2');
+  assert.equal(reads, 2, 'a warm hidden view renders without starting a refresh');
+  restored.document.visibilityState = 'visible';
+  restored.document.dispatchEvent(new restored.window.Event('visibilitychange'));
+  await settle();
   assert.equal(reads, 3);
-  assert.equal(statValue(h, 'Moderation records'), '3');
-
-  h.app.navigate('rules');
+  restored.app.navigate('rules');
   await settle();
-  assert.equal(intervals().length, 0, 'leaving the page stops its refresh');
+  assert.equal(readRefreshTimers(restored).length, 0, 'leaving the view clears its refresh');
+});
+
+test('a preview keeps live refresh while bypassing the owner display snapshots', async () => {
+  const session = new Map();
+  const owner = harness(async () => response({ events: 3, warns: 0, bans: 0 }), new Map(), session);
+  owner.app.state.config = dashboardCacheConfig();
+  owner.app.renderTab();
+  await settle();
+  const saved = [...session];
+  let reads = 0, release;
+  const preview = harness(async () => {
+    if (++reads === 1) await new Promise(resolve => { release = resolve; });
+    return response({ events: 7, warns: 0, bans: 0 });
+  }, new Map(), session);
+  preview.app.state.me.preview = {};
+  preview.app.state.config = dashboardCacheConfig();
+  preview.app.renderTab();
+  await settle();
+  assert.equal(statValue(preview, 'Moderation records'), 'Loading…');
+  release();
+  await settle();
+  assert.equal(statValue(preview, 'Moderation records'), '7');
+  await runReadRefresh(preview, 180000);
+  assert.equal(reads, 2);
+  assert.deepEqual([...session], saved);
 });
 
 function cacheRefreshButton(panel) {
@@ -10122,6 +10157,257 @@ test('sign-out prevents an in-flight display read from restoring the cleared cac
   assert.ok(release);
   await h.app.logout();
   release();
+  await settle();
+  assert.deepEqual(readCacheKeys(h.session), []);
+});
+
+const readFailure = (status, error, code) => ({
+  ok: false, status, headers: { get: () => null }, text: async () => JSON.stringify({ error, code }),
+});
+
+test('a new enrollment cannot restore the previous Bans rows or their actions', async () => {
+  const session = new Map();
+  const previous = harness(async () => response(banRows()), new Map(), session);
+  previous.app.state.config = { enrollment_id: 'previous' };
+  await bansView(previous);
+  assert.equal(readCacheKeys(session).length, 1);
+
+  const current = harness(async (url, opts) => {
+    assert.match(url, /\/bans\?/);
+    assert.equal(opts.headers['x-jmodguard-enrollment'], 'replacement');
+    throw new Error('offline');
+  }, new Map(), session);
+  current.app.state.config = { enrollment_id: 'replacement' };
+  const panel = await bansView(current);
+  assert.match(panel.querySelector('tbody').textContent, /offline/);
+  assert.doesNotMatch(panel.querySelector('tbody').textContent, /Test-User-1/);
+  assert.equal(panel.querySelector('button[aria-label^="Unban"]'), null);
+});
+
+test('a real guild denial purges sibling copies and restored moderator identities', async () => {
+  const session = new Map();
+  const data = { ...banRows(), moderators: [{ id: '1234', name: 'Cached moderator' }] };
+  const previous = harness(async (url) => url.endsWith('/stats')
+    ? response({ events: 3, warns: 0, bans: 0 })
+    : response(data), new Map(), session);
+  previous.app.state.config = dashboardCacheConfig();
+  previous.app.renderTab();
+  await settle();
+  await bansView(previous);
+  assert.equal(readCacheKeys(session).length, 2);
+
+  let deny;
+  const current = harness(async () => new Promise((resolve) => { deny = resolve; }), new Map(), session);
+  const panel = await bansView(current);
+  const moderator = memberLabelled(panel, 'Moderator');
+  assert.match(moderator.textContent, /Cached moderator/);
+  deny(readFailure(400, 'you cannot manage this server (needs MANAGE_GUILD permission)', 'guild_access_denied'));
+  await settle();
+  assert.match(panel.querySelector('tbody').textContent, /cannot manage this server/);
+  assert.doesNotMatch(moderator.textContent, /Cached moderator|1234/);
+  assert.deepEqual(readCacheKeys(session), []);
+});
+
+test('an authorization-only Discord rate limit removes the guild copy', async () => {
+  let limited = false;
+  const h = harness(async () => limited
+    ? readFailure(429, 'Discord rate limited', 'discord_rate_limited')
+    : response(banRows()));
+  const panel = await bansView(h);
+  assert.match(panel.querySelector('tbody').textContent, /Test-User-1/);
+  limited = true;
+  await fire(cacheRefreshButton(panel), 'click');
+  assert.match(panel.querySelector('tbody').textContent, /Discord rate limited/);
+  assert.doesNotMatch(panel.querySelector('tbody').textContent, /Test-User-1/);
+  assert.deepEqual(readCacheKeys(h.session), []);
+});
+
+test('a malformed successful direct read cannot publish a fresh snapshot', async () => {
+  let malformed = false;
+  const h = harness(async () => malformed ? response({ events: 'invalid' }) : response({ events: 3, warns: 0, bans: 0 }));
+  h.app.state.config = dashboardCacheConfig();
+  h.app.renderTab();
+  await settle();
+  const saved = [...h.session];
+  const stamp = lastUpdated(h);
+  malformed = true;
+  await fire(h.nodes.get('#refresh-dashboard'), 'click');
+  assert.equal(statValue(h, 'Moderation records'), '3');
+  assert.equal(lastUpdated(h), stamp);
+  assert.deepEqual([...h.session], saved);
+  assert.match(h.nodes.get('#content').querySelector('[role="alert"]').textContent, /invalid display response/);
+
+  const [key] = readCacheKeys(h.session);
+  h.session.set(key, JSON.stringify({ at: fixtureClockEpoch(), data: { events: 'invalid' } }));
+  const restored = harness(async () => {
+    throw new Error('offline');
+  }, new Map(), h.session);
+  restored.app.state.config = dashboardCacheConfig();
+  restored.app.renderTab();
+  assert.equal(statValue(restored, 'Moderation records'), 'Loading…', 'an invalid persisted shape is a cache miss');
+  await settle();
+  assert.equal(statValue(restored, 'Moderation records'), 'Unavailable');
+});
+
+for (const [list, view] of [['bans', bansView], ['events', auditLogView]]) {
+  test(`${list} retains the last usable snapshot on the API deadline and malformed chunks`, async () => {
+    let failure;
+    const fixture = pageSizeFixture(list, 1);
+    const h = harness(async url => failure ?? response(fixture(new URL(url, 'https://fixture.test').searchParams)));
+    const panel = await view(h);
+    await settle();
+    const table = () => listTable(panel).tBodies[0].textContent;
+    const original = table();
+    const saved = [...h.session];
+    assert.equal(readCacheKeys(h.session).length, 1);
+    for (const [badResponse, message] of [
+      [readFailure(400, 'List request timed out. Please try again.', 'list_deadline'), /timed out/],
+      [{ ok: true, text: async () => '<!doctype html><title>Web UI</title>' }, /invalid display response/],
+      [response({ [list]: {} }), /invalid display response/],
+    ]) {
+      failure = badResponse;
+      await fire(cacheRefreshButton(panel), 'click');
+      assert.equal(table(), original);
+      assert.deepEqual([...h.session], saved);
+      assert.match(panel.querySelector('[role="alert"]').textContent, message);
+    }
+  });
+
+  test(`${list} clamps retained row windows and offers Cancel before the first refresh chunk`, async () => {
+    let count = 600, hold = false, finish, canceledSignal;
+    const h = harness(async (url, opts) => {
+      const query = new URL(url, 'https://fixture.test').searchParams;
+      if (hold && !query.has('after')) {
+        canceledSignal = opts.signal;
+        await new Promise(resolve => { finish = resolve; });
+      }
+      return response(pageSizeFixture(list, count)(query));
+    });
+    const panel = await view(h);
+    await settle();
+    const size = memberLabelled(panel, 'Rows per page');
+    size.value = 'all';
+    await fire(size, 'change');
+    const button = label => [...panel.querySelectorAll('button')].find(node => node.textContent === label);
+    for (let step = 0; step < 5; step++) await fire(button('Next rows'), 'click');
+    assert.match(panel.textContent, /Showing rows 501–600/);
+    hold = true;
+    count = 500;
+    await fire(button('Refresh'), 'click');
+    assert.ok(button('Cancel loading'), 'the first pending chunk can be canceled');
+    finish();
+    await settle();
+    assert.match(panel.textContent, /Showing rows 401–500/);
+    assert.equal(listTable(panel).tBodies[0].rows.length, 100);
+
+    await fire(button('Refresh'), 'click');
+    await fire(button('Cancel loading'), 'click');
+    assert.equal(canceledSignal.aborted, true);
+    finish();
+    await settle();
+    assert.match(panel.textContent, /Loading canceled/);
+  });
+}
+
+test('automatic Bans pagination preserves active progress and pauses between hidden chunks', async () => {
+  let background = false;
+  const pending = [];
+  const h = harness(async (url, opts) => {
+    const query = new URL(url, 'https://fixture.test').searchParams;
+    const all = query.get('limit') === '250';
+    const payload = pageSizeFixture('bans', background ? 2551 : 260)(query);
+    if (background && all) await new Promise(resolve => pending.push({ resolve, signal: opts.signal, after: query.get('after') }));
+    return response(payload);
+  });
+  const panel = await bansView(h);
+  const size = memberLabelled(panel, 'Rows per page');
+  size.value = 'all';
+  await fire(size, 'change');
+  background = true;
+  await runReadRefresh(h, 180000);
+  assert.equal(pending.length, 1);
+  for (let page = 0; page < 9; page += 1) {
+    h.advanceTime(20000);
+    pending[page].resolve();
+    await settle();
+    assert.equal(pending.length, page + 2);
+  }
+  const last = pending[9];
+  assert.equal(last.after, 'cursor:2250');
+  // There must be no second due refresh while the original is making progress.
+  assert.equal(readRefreshTimers(h).length, 0);
+  h.document.visibilityState = 'hidden';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  h.document.visibilityState = 'visible';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(last.signal.aborted, false);
+  assert.equal(pending.length, 10);
+
+  h.document.visibilityState = 'hidden';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  // The in-flight chunk may finish, but the next one waits for visibility.
+  last.resolve();
+  await settle();
+  assert.equal(pending.length, 10);
+  h.document.visibilityState = 'visible';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(pending.length, 11);
+  assert.equal(pending[10].after, 'cursor:2500');
+  pending[10].resolve();
+  await settle();
+  assert.equal(listTable(panel).getAttribute('aria-rowcount'), '2552');
+});
+
+test('a background Bans refresh keeps an open reason draft reachable', async () => {
+  let unbanned = false;
+  const h = harness(async (url) => {
+    const query = new URL(url, 'https://fixture.test').searchParams;
+    const data = banRows();
+    if (unbanned) data.bans[0].active = false;
+    if (query.get('status') === 'active') data.bans = data.bans.filter(row => row.active);
+    return response(data);
+  });
+  const panel = await bansView(h);
+  const status = memberLabelled(panel, 'Status');
+  status.value = 'active';
+  await fire(status, 'change');
+  await fire(panel.querySelector('button[aria-label="Edit reason"]'), 'click');
+  const editor = () => panel.querySelector('textarea[aria-label="jModGuard reason"]');
+  editor().value = 'Unsaved reason';
+  await fire(editor(), 'input');
+  unbanned = true;
+  await runReadRefresh(h, 180000);
+  assert.equal(editor().value, 'Unsaved reason');
+  assert.equal(h.app.isDirty(), true);
+});
+
+test('a due owner refresh cannot repopulate the cache while sign-out is pending', async () => {
+  let releaseLogout, reads = 0;
+  const h = harness(async url => {
+    if (url === '/logout') {
+      await new Promise(resolve => { releaseLogout = resolve; });
+      return { json: async () => ({ return_to: '/' }) };
+    }
+    assert.match(url, /\/owner-servers$/);
+    reads += 1;
+    return response({ servers: [directoryServer] });
+  });
+  h.app.state.me.is_bot_owner = true;
+  h.app.navigate('servers');
+  await settle();
+  assert.equal(readCacheKeys(h.session).length, 1);
+  await fire(h.document.querySelector('#logout-btn'), 'click');
+  assert.ok(releaseLogout);
+  h.advanceTime(180000);
+  h.document.visibilityState = 'hidden';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  h.document.visibilityState = 'visible';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(reads, 1);
+  releaseLogout();
   await settle();
   assert.deepEqual(readCacheKeys(h.session), []);
 });

@@ -371,7 +371,7 @@ function clearOwnerLeaveRequest(server) {
 }
 
 function TabOwnerServers() {
-  const result = useApiRead("/api/owner-servers", { cache: true });
+  const result = useCachedApiRead("/api/owner-servers", "servers");
   const [receipts, setReceipts] = useState({});
   const timers = useRef(new Set());
   const mounted = useRef(true);
@@ -2064,6 +2064,7 @@ function editCommand(record) {
 async function init() {
   try {
     state.me = await waitForApiMe();
+    readSessionEnding = false;
     state.guilds = state.me.guilds;
     restoreWorkspace();
     showView("main-view");
@@ -2359,6 +2360,7 @@ function isUnauthenticated(err) {
 }
 
 function stopPrivateWatchers() {
+  readSessionEnding = true;
   analyticsCache.clear();
   clearReadCache();
   for (const dispose of authLossCleanups) dispose();
@@ -3305,7 +3307,7 @@ function tabDashboard() {
   const rulesDry = rules.filter((r) => r.effective?.dry_run).length;
   const commandsOn = commands.filter((c) => c.effective?.enabled).length;
   const chans = (cfg.log_channels ?? []).filter((l) => l.effective && String(l.effective) !== "0").length;
-  const result = useApiRead(`/api/guilds/${guildId}/stats`, { cache: true });
+  const result = useCachedApiRead(`/api/guilds/${guildId}/stats`, "stats");
   const count = (key) =>
     result.loading ? "Loading…" : result.data?.[key] == null ? "Unavailable" : String(result.data[key]);
   return h(
@@ -9451,11 +9453,12 @@ const READ_CACHE_ENTRIES = 32;
 const READ_CACHE_STORAGE_LIMIT = 1024 * 1024;
 const READ_REFRESH_MS = 3 * 60 * 1000;
 const readCache = new Map();
-let readCacheGeneration = 0;
+let readSessionEnding = false;
 
-function readCacheKey(path, listSize) {
+function readCacheKey(path, listSize, enrollment) {
   const user = state.me?.user?.id;
-  return user && !isPreview() ? READ_CACHE_PREFIX + JSON.stringify([apiBase(), user, path, listSize]) : null;
+  if (!user || isPreview() || readSessionEnding || (path.startsWith("/api/guilds/") && !enrollment)) return null;
+  return READ_CACHE_PREFIX + JSON.stringify([apiBase(), user, path, listSize, enrollment]);
 }
 
 function rememberRead(key, entry) {
@@ -9464,12 +9467,11 @@ function rememberRead(key, entry) {
   if (readCache.size > READ_CACHE_ENTRIES) readCache.delete(readCache.keys().next().value);
 }
 
-function cachedRead(key) {
+function cachedRead(key, shape) {
   if (readCache.has(key)) return readCache.get(key);
   try {
     const saved = JSON.parse(window.sessionStorage.getItem(key));
-    if (saved && Number.isFinite(saved.at) && saved.data != null) {
-      rememberRead(key, saved);
+    if (saved && Number.isSafeInteger(saved.at) && saved.at >= 0 && saved.at <= 8.64e15 && validDisplayRead(saved.data, shape)) {
       return saved;
     }
   } catch (_) { /* An unreadable copy is only a cache miss. */ }
@@ -9527,13 +9529,13 @@ function discardRead(key) {
   } catch (_) { /* Optional storage can be unavailable. */ }
 }
 
-function readAccessFailed(error) {
+function readAccessFailed(error, enrollment) {
   return isUnauthenticated(error) || error.status === 403 || error.status === 409 ||
-    error.code === "guild_access_unverified";
+    error.code === "guild_access_denied" || error.code === "guild_access_unverified" ||
+    (enrollment && error.code === "discord_rate_limited");
 }
 
 function clearReadCache() {
-  readCacheGeneration += 1;
   readCache.clear();
   try {
     const storage = window.sessionStorage;
@@ -9541,41 +9543,209 @@ function clearReadCache() {
   } catch (_) { /* Nothing readable is left to clear. */ }
 }
 
-function useApiRead(path, { retainData = false, listSize, collection, cache = false } = {}) {
-  const cacheKey = cache ? readCacheKey(path, listSize) : null;
-  const identity = cacheKey ?? path;
+function isReadObject(data) {
+  return data != null && typeof data === "object" && !Array.isArray(data);
+}
+
+function validDisplayRead(data, shape) {
+  if (!isReadObject(data)) return false;
+  if (shape === "stats") {
+    return ["events", "warns", "bans"].every((key) => Number.isSafeInteger(data[key]) && data[key] >= 0) &&
+      (data.cases == null || (Number.isSafeInteger(data.cases) && data.cases >= 0));
+  }
+  return Array.isArray(data[shape]) && data[shape].every(isReadObject) &&
+    (data.next_cursor == null || typeof data.next_cursor === "string") &&
+    (data.names == null || isReadObject(data.names)) &&
+    (data.moderators == null || (Array.isArray(data.moderators) && data.moderators.every(isReadObject)));
+}
+
+// Running chunks can finish while hidden. A background read waits here before
+// dispatching another chunk, outside that chunk's network deadline.
+function waitForReadVisibility(signal) {
+  signal.throwIfAborted();
+  if (document.visibilityState === "visible") return;
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      document.removeEventListener("visibilitychange", visible);
+      signal.removeEventListener("abort", abort);
+    };
+    const visible = () => {
+      if (document.visibilityState !== "visible") return;
+      cleanup();
+      resolve();
+    };
+    const abort = () => {
+      cleanup();
+      reject(signal.reason);
+    };
+    document.addEventListener("visibilitychange", visible);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function useCachedApiRead(path, shape, { listSize, holdBackgroundResult = false } = {}) {
+  const enrollment = pageEnrollment(path, "POST");
+  const cacheKey = readCacheKey(path, listSize, enrollment);
+  const identity = cacheKey ?? JSON.stringify([path, listSize, enrollment]);
+  const poll = Boolean(cacheKey) || isPreview();
+  const [result, setResult] = useState(null);
+  const controls = useRef(null);
+  const holdResult = useRef(holdBackgroundResult);
+  useLayoutEffect(() => { holdResult.current = holdBackgroundResult; }, [holdBackgroundResult]);
+
+  // Read a matching snapshot before the first output. The effect owns all
+  // further publication and storage changes for this identity.
+  const initialCopy = result?.identity !== identity && cacheKey ? cachedRead(cacheKey, shape) : null;
+  const shown = result?.identity === identity ? result : initialCopy
+    ? { data: initialCopy.data, updatedAt: initialCopy.at }
+    : { loading: true };
+
+  useEffect(() => {
+    if (readSessionEnding) return undefined;
+    const [endpoint, query] = path.split("?", 2);
+    let snapshot = cacheKey ? cachedRead(cacheKey, shape) : null;
+    if (snapshot) rememberRead(cacheKey, snapshot);
+    let active = null;
+    let timer = null;
+    let nextAt = Date.now();
+    let disposed = false;
+    const show = (fields = {}) => setResult({
+      identity, data: snapshot?.data, updatedAt: snapshot?.at, ...fields,
+    });
+    const clearTimer = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    };
+    const cancelActive = () => {
+      const request = active;
+      active = null;
+      request?.cancel();
+    };
+    const schedule = () => {
+      clearTimer();
+      if (disposed || !poll || active || document.visibilityState !== "visible" || !Number.isFinite(nextAt)) return;
+      const delay = nextAt - Date.now();
+      if (delay <= 0) void start(true);
+      else timer = setTimeout(schedule, delay);
+    };
+    async function start(background) {
+      if (disposed || (background && active)) return;
+      clearTimer();
+      cancelActive();
+      const controller = new AbortController();
+      const { signal } = controller;
+      const timeout = listSize === undefined ? setTimeout(() => controller.abort(), 30000) : null;
+      const request = { cancel() {
+        if (timeout !== null) clearTimeout(timeout);
+        controller.abort();
+      } };
+      active = request;
+      const copy = cacheKey ? snapshot : null;
+      show({
+        data: copy?.data, updatedAt: copy?.at, loading: !copy,
+        revalidating: Boolean(copy), progress: listLoadProgress(listSize),
+      });
+      const read = async (url, requestSignal) => {
+        const data = await apiRequest(url, "POST", null, requestSignal,
+          enrollment ? { "x-jmodguard-enrollment": enrollment } : {});
+        if (!validDisplayRead(data, shape)) throw new Error("The API returned an invalid display response.");
+        return data;
+      };
+      try {
+        const data = listSize === undefined ? await read(path, signal) : await readListPage({
+          read, path: endpoint, query, collection: shape, size: listSize, signal,
+          beforeChunk: background ? () => waitForReadVisibility(signal) : undefined,
+          onProgress: (progress) => {
+            if (active === request) setResult((current) => ({ ...current, progress }));
+          },
+        });
+        if (active !== request) return;
+        signal.throwIfAborted();
+        // A normal data refresh must not remove an inline reason editor. The
+        // access-failure path below still clears the restricted snapshot.
+        if (!(background && snapshot && holdResult.current)) {
+          const at = Date.now();
+          snapshot = { at, data };
+          if (cacheKey) storeRead(cacheKey, data, at);
+        }
+        show();
+      } catch (error) {
+        if (active !== request) return;
+        const failure = signal.aborted
+          ? apiError("Request timed out. Refresh to verify saved state before trying again.")
+          : error;
+        const accessFailed = readAccessFailed(failure, enrollment);
+        const { status, code } = failure;
+        const canKeep = cacheKey && !accessFailed &&
+          (!status || status === 408 || status === 429 || status >= 500 || code === "list_deadline");
+        if (cacheKey && accessFailed) clearReadCache();
+        if (snapshot && canKeep) {
+          show({ refreshError: failure });
+        } else {
+          if (cacheKey && !accessFailed) discardRead(cacheKey);
+          snapshot = null;
+          show({ error: failure, accessFailed });
+        }
+      } finally {
+        if (timeout !== null) clearTimeout(timeout);
+        if (active === request) {
+          active = null;
+          nextAt = Date.now() + READ_REFRESH_MS;
+          schedule();
+        }
+      }
+    }
+
+    const dispose = () => {
+      disposed = true;
+      clearTimer();
+      cancelActive();
+      document.removeEventListener("visibilitychange", schedule);
+      authLossCleanups.delete(stop);
+      controls.current = null;
+    };
+    const stop = () => {
+      dispose();
+      snapshot = null;
+      show({ loading: true });
+    };
+    controls.current = {
+      cancel: () => {
+        cancelActive();
+        clearTimer();
+        nextAt = Infinity;
+        setResult({ identity, canceled: true });
+      },
+      refresh: () => { void start(false); },
+    };
+    authLossCleanups.add(stop);
+    if (poll) document.addEventListener("visibilitychange", schedule);
+    if (snapshot) schedule();
+    else void start(false);
+    return dispose;
+  }, [path, shape, listSize, enrollment, cacheKey, identity, poll]);
+
+  return {
+    ...shown,
+    progress: shown.progress ?? null,
+    cancel: () => controls.current?.cancel(),
+    refresh: () => controls.current?.refresh(),
+  };
+}
+
+function useApiRead(path, { retainData = false, listSize, collection } = {}) {
   const [revision, setRevision] = useState(0);
   const [result, setResult] = useState({ kind: "loading" });
   const cancel = useRef(null);
-  const updatedAt = useRef(0);
-  useEffect(() => {
-    if (!cache) return undefined;
-    const due = () => document.visibilityState === "visible" && Date.now() - updatedAt.current >= READ_REFRESH_MS;
-    const revalidate = () => { if (due()) setRevision((value) => value + 1); };
-    const timer = setInterval(revalidate, READ_REFRESH_MS);
-    document.addEventListener("visibilitychange", revalidate);
-    return () => {
-      clearInterval(timer);
-      document.removeEventListener("visibilitychange", revalidate);
-    };
-  }, [cache, path]);
   useEffect(() => {
     const controller = new AbortController();
-    const generation = readCacheGeneration;
     let publication = "current";
     const timeout = collection ? null : setTimeout(() => controller.abort(), 30000);
-    const cached = cacheKey ? cachedRead(cacheKey) : null;
     setResult((current) => {
-      const kept = current.identity === identity && current.data != null ? current : null;
-      if (cacheKey && (kept || cached)) {
-        const shown = (kept?.updatedAt ?? -1) >= (cached?.at ?? -1) ? kept : { data: cached.data, updatedAt: cached.at };
-        updatedAt.current = shown.updatedAt;
-        return { kind: "loaded", identity, data: shown.data, updatedAt: shown.updatedAt, revalidating: true, progress: null };
-      }
-      const retained = retainData && kept;
+      const retained = retainData && current.path === path && current.data != null;
       // A pending retry does not make the retained snapshot fresh again.
       return {
-        kind: "loading", identity, data: retained ? current.data : null, error: retained ? current.error : null,
+        kind: "loading", path, data: retained ? current.data : null, error: retained ? current.error : null,
         progress: listLoadProgress(listSize),
       };
     });
@@ -9589,33 +9759,22 @@ function useApiRead(path, { retainData = false, listSize, collection, cache = fa
     cancel.current = () => {
       publication = "disposed";
       controller.abort();
-      setResult({ kind: "canceled", identity });
+      setResult({ kind: "canceled", path });
     };
     read
       .then((data) => {
-        if (publication !== "current" || (cacheKey && generation !== readCacheGeneration)) return;
-        const at = Date.now();
-        updatedAt.current = at;
-        if (cacheKey) storeRead(cacheKey, data, at);
-        setResult({ kind: "loaded", identity, data, updatedAt: at });
+        if (publication === "current") setResult({ kind: "loaded", path, data });
       })
       .catch((error) => {
-        if (publication !== "current") return;
-        const failure = controller.signal.aborted
-          ? apiError("Request timed out. Refresh to verify saved state before trying again.")
-          : error;
-        if (cacheKey) {
-          const accessFailed = readAccessFailed(failure);
-          const { status } = failure;
-          const canKeep = !accessFailed && (!status || status === 408 || status === 429 || status >= 500);
-          if (accessFailed) clearReadCache();
-          else if (!canKeep) discardRead(cacheKey);
-          setResult((current) => current.identity === identity && current.revalidating && canKeep
-            ? { ...current, revalidating: false, progress: null, refreshError: failure }
-            : { kind: "failed", identity, error: failure });
-        } else {
-          setResult((current) => ({ ...current, kind: "failed", progress: null, error: failure }));
-        }
+        if (publication === "current")
+          setResult((current) => ({
+            ...current,
+            kind: "failed",
+            progress: null,
+            error: controller.signal.aborted
+              ? apiError("Request timed out. Refresh to verify saved state before trying again.")
+              : error,
+          }));
       })
       .finally(() => { if (timeout !== null) clearTimeout(timeout); });
     return () => {
@@ -9623,17 +9782,13 @@ function useApiRead(path, { retainData = false, listSize, collection, cache = fa
       if (timeout !== null) clearTimeout(timeout);
       controller.abort();
     };
-  }, [path, identity, cacheKey, revision, retainData, collection, listSize]);
-  const current = result.identity === identity;
+  }, [path, revision, retainData, collection, listSize]);
   return {
-    loading: result.kind === "loading" || (Boolean(cacheKey) && !current),
-    data: retainData || cache ? (current ? result.data ?? null : null) : result.kind === "loaded" ? result.data : null,
-    error: retainData || cache ? (current ? result.error ?? null : null) : result.kind === "failed" ? result.error : null,
-    progress: cacheKey && !current ? null : result.progress ?? null,
-    canceled: (!cacheKey || current) && result.kind === "canceled",
-    updatedAt: current ? result.updatedAt ?? null : null,
-    revalidating: current && Boolean(result.revalidating),
-    refreshError: current ? result.refreshError ?? null : null,
+    loading: result.kind === "loading",
+    data: retainData ? (result.path === path ? result.data ?? null : null) : result.kind === "loaded" ? result.data : null,
+    error: retainData ? (result.path === path ? result.error ?? null : null) : result.kind === "failed" ? result.error : null,
+    progress: result.progress ?? null,
+    canceled: result.kind === "canceled",
     cancel: () => cancel.current?.(),
     refresh: () => setRevision((value) => value + 1),
   };
@@ -9679,7 +9834,9 @@ function PagedTable({ rows, renderRow, fallback, canMove, ...table }) {
 }
 
 function TableWindow({ rows, renderRow, canMove = () => true, table }) {
-  const [offset, setOffset] = useState(0);
+  const [requestedOffset, setOffset] = useState(0);
+  const lastOffset = Math.floor((rows.length - 1) / TABLE_WINDOW_SIZE) * TABLE_WINDOW_SIZE;
+  const offset = Math.min(requestedOffset, lastOffset);
   const end = Math.min(offset + TABLE_WINDOW_SIZE, rows.length);
   // Keep the navigation buttons focusable at the ends of the table.
   const move = (label, available, next) => h("button", {
@@ -9708,9 +9865,7 @@ function tabEvents() {
   const controls = useListControls(EVENTS_LIST, guildId, () => setAfter(""));
   const query = controls.query();
   if (after) query.set("after", after);
-  const result = useApiRead(`/api/guilds/${guildId}/events?${query}`, {
-    retainData: true, collection: "events", listSize: controls.view.pageSize, cache: true,
-  });
+  const result = useCachedApiRead(`/api/guilds/${guildId}/events?${query}`, "events", { listSize: controls.view.pageSize });
   const rows = result.data?.events;
   const next = result.data?.next_cursor;
   const refresh = () => {
@@ -10410,17 +10565,18 @@ function tabBans() {
   const controls = useListControls(BANS_LIST, guildId, () => setAfter(""), leaveReasonEditor);
   const query = controls.query();
   if (after) query.set("after", after);
-  const result = useApiRead(`/api/guilds/${guildId}/bans?${query}`, {
-    retainData: true, collection: "bans", listSize: controls.view.pageSize, cache: true,
+  const result = useCachedApiRead(`/api/guilds/${guildId}/bans?${query}`, "bans", {
+    listSize: controls.view.pageSize, holdBackgroundResult: reasonEditor !== null,
   });
   const rows = Array.isArray(result.data?.bans) ? result.data.bans : [];
   const names = result.data?.names || {};
   const availableModerators = result.data?.moderators;
   useEffect(() => {
-    if (Array.isArray(availableModerators)) setModerators(Object.fromEntries(availableModerators.map(({ id, name }) =>
+    if (result.accessFailed) setModerators({});
+    else if (Array.isArray(availableModerators)) setModerators(Object.fromEntries(availableModerators.map(({ id, name }) =>
       [id, { label: name ? `${name} (${id})` : id }],
     )));
-  }, [availableModerators]);
+  }, [availableModerators, result.accessFailed]);
   const next = result.data?.next_cursor;
   const changePage = (cursor) => {
     if (leaveReasonEditor()) setAfter(cursor);
@@ -10510,7 +10666,7 @@ function tabBans() {
       h(ActionButton, { type: "button", className: "btn", onClick: result.refresh }, "Refresh"),
       h(LastUpdated, { result }),
     ),
-    h(ListControls, { controls, filterOptions: { actor: moderators } }),
+    h(ListControls, { controls, filterOptions: { actor: result.accessFailed ? {} : moderators } }),
     h("div", { className: "row list-pagination" },
       h(ActionButton, { type: "button", className: "btn", disabled: !after || result.loading, onClick: () => changePage("") }, "First page"),
       h(ActionButton, { type: "button", className: "btn", disabled: !next || !!fallback, onClick: () => changePage(next) }, "Next page"),

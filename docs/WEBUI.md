@@ -305,21 +305,24 @@ but selection will not survive a reload. Settings themselves always come from th
 API and are never restored from browser storage.
 
 The Dashboard overview counts, Audit log, Bans and owner Bot servers lists keep
-their last response in memory and in this tab's `sessionStorage`, per signed-in
-account and API origin. List copies also match the selected page size. When a
-copy is available, returning to the page or reloading the tab shows it at once
-and asks the API again in the background. The page shows
-**Refreshing…** and then **Last updated** with the time of the last good response.
-On a temporary failure, the last good copy stays on screen with a stale notice.
-If the API denies access, the page discards the cached copy. Tab storage for
-display copies is limited and yields space to save and moderation request
-identities. Large responses can still be kept in memory. While the page is
-visible it asks again every 3 minutes, and when you return to a hidden tab after
-that long; a hidden page makes no requests. **Refresh** always asks the API. The
-API keeps its own Discord refresh interval, so neither a reload nor Refresh makes
-an extra Discord request. Signing out, losing the session and View as… previews
-do not use or keep these copies. Settings, bot-action receipts and other pages are
-not cached.
+their last usable response in memory and in this tab's `sessionStorage`, per
+signed-in account and API origin. Guild copies also match the loaded bot
+enrollment. Lists match the filters, cursor and selected page size. When a copy
+is available, returning to the page or reloading shows it at once. The page
+shows **Refreshing…** during revalidation and **Last updated** with the time of
+the last good response. On a temporary failure, the copy stays on screen with
+a stale notice. If guild access is denied or cannot be verified, the page
+discards the cached data. Tab storage for display copies is limited and yields
+space to save and moderation request identities. Large responses can still be
+kept in memory.
+
+Automatic revalidation runs on visible pages, about every 3 minutes after a
+read completes. Returning to a hidden tab starts a refresh if one is due.
+Automatic list loads pause between requests while hidden. **Refresh** asks
+the API, which can reuse a fresh Discord snapshot and can call Discord when
+its refresh or authorization rules require it. Signing out, losing the session
+and View as… previews do not use or keep these copies. Settings, bot-action
+receipts and other pages are not cached.
 
 Use **Save** in an editor to apply changes. While an action is running, controls
 are disabled to prevent duplicate saves or switching its target server. If a
