@@ -304,6 +304,26 @@ server is selected. Browser storage is optional; if blocked, the app still works
 but selection will not survive a reload. Settings themselves always come from the
 API and are never restored from browser storage.
 
+The Dashboard overview counts, Audit log, Bans and owner Bot servers lists keep
+their last usable response in memory and in this tab's `sessionStorage`, per
+signed-in account and API origin. Guild copies also match the loaded bot
+enrollment. Lists match the filters, cursor and selected page size. When a copy
+is available, returning to the page or reloading shows it at once. The page
+shows **Refreshing…** during revalidation and **Last updated** with the time of
+the last good response. On a temporary failure, the copy stays on screen with
+a stale notice. If guild access is denied or cannot be verified, the page
+discards the cached data. Tab storage for display copies is limited and yields
+space to save and moderation request identities. Large responses can still be
+kept in memory.
+
+Automatic revalidation runs on visible pages, about every 3 minutes after a
+read completes. Returning to a hidden tab starts a refresh if one is due.
+Automatic list loads pause between requests while hidden. **Refresh** asks
+the API, which can reuse a fresh Discord snapshot and can call Discord when
+its refresh or authorization rules require it. Signing out, losing the session
+and View as… previews do not use or keep these copies. Settings, bot-action
+receipts and other pages are not cached.
+
 Use **Save** in an editor to apply changes. While an action is running, controls
 are disabled to prevent duplicate saves or switching its target server. If a
 configuration refresh fails, the workspace shows **Retry** instead of stale

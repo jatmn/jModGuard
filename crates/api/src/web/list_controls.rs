@@ -11,19 +11,26 @@ const MAX_SEARCH_CHARS: usize = 200;
 const MAX_CURSOR_BYTES: usize = 4096;
 const CURSOR_VERSION: u8 = 1;
 
+#[derive(Debug)]
+pub(super) struct ListDeadline(&'static str);
+
+impl std::fmt::Display for ListDeadline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} request timed out. Please try again.", self.0)
+    }
+}
+
+impl std::error::Error for ListDeadline {}
+
 pub(super) async fn within_list_deadline<T>(
-    label: &str,
+    label: &'static str,
     read: impl Future<Output = ApiResult<T>>,
 ) -> ApiResult<T> {
     // Cover authorization, pool checkout and all snapshots, including metadata.
     // Dropping the inner future signals database cancellation.
     tokio::time::timeout(Duration::from_secs(20), read)
         .await
-        .map_err(|_| {
-            ApiError(anyhow::anyhow!(
-                "{label} request timed out. Please try again."
-            ))
-        })?
+        .map_err(|_| ApiError::from(ListDeadline(label)))?
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -204,6 +211,20 @@ fn invalid(message: &'static str) -> ApiError {
 mod tests {
     use super::*;
     use axum::extract::Query;
+
+    #[tokio::test]
+    async fn list_deadline_wire_response_distinguishes_a_retryable_read() {
+        use axum::response::IntoResponse;
+
+        let response = ApiError::from(ListDeadline("Bans")).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "list_deadline");
+        assert_eq!(body["error"], "Bans request timed out. Please try again.");
+    }
 
     #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(rename_all = "snake_case")]

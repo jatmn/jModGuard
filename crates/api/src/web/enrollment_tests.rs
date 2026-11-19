@@ -8783,6 +8783,9 @@ async fn role_mapped_moderator_reaches_only_that_guild_at_its_level() {
         let (status, body) = f.request(method, path, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
         assert_eq!(body["error"], error, "{path}");
+        if path == "/api/guilds/20/stats" {
+            assert_eq!(body["code"], "guild_access_denied");
+        }
     }
     let (status, body) = f.request("POST", "/api/updates", "").await;
     assert!(

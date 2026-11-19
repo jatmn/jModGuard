@@ -354,7 +354,7 @@ function ownerLeaveRequestId(server) {
     let requestId = window.sessionStorage.getItem(key);
     if (typeof requestId !== "string" || !requestId) {
       requestId = `${Math.floor(Date.now() / 1000)}_${crypto.randomUUID()}`;
-      window.sessionStorage.setItem(key, requestId);
+      setSessionItemWithReadCacheFallback(window.sessionStorage, key, requestId);
     }
     return requestId;
   } catch (_) {
@@ -371,7 +371,7 @@ function clearOwnerLeaveRequest(server) {
 }
 
 function TabOwnerServers() {
-  const result = useApiRead("/api/owner-servers");
+  const result = useCachedApiRead("/api/owner-servers", "servers");
   const [receipts, setReceipts] = useState({});
   const timers = useRef(new Set());
   const mounted = useRef(true);
@@ -506,6 +506,7 @@ function TabOwnerServers() {
       "div",
       { className: "row", style: { marginBottom: "12px" } },
       h(ActionButton, { className: "btn", onClick: () => result.refresh() }, "Refresh"),
+      h(LastUpdated, { result }),
     ),
     h(
       DataTable,
@@ -2063,6 +2064,7 @@ function editCommand(record) {
 async function init() {
   try {
     state.me = await waitForApiMe();
+    readSessionEnding = false;
     state.guilds = state.me.guilds;
     restoreWorkspace();
     showView("main-view");
@@ -2358,7 +2360,9 @@ function isUnauthenticated(err) {
 }
 
 function stopPrivateWatchers() {
+  readSessionEnding = true;
   analyticsCache.clear();
+  clearReadCache();
   for (const dispose of authLossCleanups) dispose();
   for (const key of pendingLogChannelActions.keys()) clearPendingLogChannelEntry(key);
 }
@@ -2524,7 +2528,7 @@ async function submitSave(path, method, body, signal, reconcileRecovered) {
       enrollment,
       ...(roleSave ? { revision: body.revision } : {}),
     };
-    window.sessionStorage.setItem(key, JSON.stringify(saved));
+    setSessionItemWithReadCacheFallback(window.sessionStorage, key, JSON.stringify(saved));
   } catch (_) {
     throw new Error("Browser session storage must be available and valid to safely save changes.");
   }
@@ -2654,7 +2658,7 @@ async function submitBotAction(path, method, body) {
           request_id: `${Math.floor(Date.now() / 1000)}_${crypto.randomUUID()}`,
           enrollment_id: enrollmentId,
         };
-    window.sessionStorage.setItem(key, JSON.stringify(saved));
+    setSessionItemWithReadCacheFallback(window.sessionStorage, key, JSON.stringify(saved));
   } catch (_) {
     throw new Error("Browser session storage must be available and valid to safely submit bot actions.");
   }
@@ -3303,7 +3307,7 @@ function tabDashboard() {
   const rulesDry = rules.filter((r) => r.effective?.dry_run).length;
   const commandsOn = commands.filter((c) => c.effective?.enabled).length;
   const chans = (cfg.log_channels ?? []).filter((l) => l.effective && String(l.effective) !== "0").length;
-  const result = useApiRead(`/api/guilds/${guildId}/stats`);
+  const result = useCachedApiRead(`/api/guilds/${guildId}/stats`, "stats");
   const count = (key) =>
     result.loading ? "Loading…" : result.data?.[key] == null ? "Unavailable" : String(result.data[key]);
   return h(
@@ -3352,7 +3356,13 @@ function tabDashboard() {
     h(
       "section",
       { className: "dashboard-section", "aria-labelledby": "dashboard-overview" },
-      h("h3", { className: "card-title", id: "dashboard-overview" }, "Overview"),
+      h(
+        "div",
+        { className: "row dashboard-overview-head" },
+        h("h3", { className: "card-title", id: "dashboard-overview" }, "Overview"),
+        h(LastUpdated, { result }),
+        h(ActionButton, { id: "refresh-dashboard", className: "btn btn-sm", onClick: () => result.refresh() }, "Refresh"),
+      ),
       h(
         "div",
         { className: "stats bg-base-100 w-full dashboard-stats" },
@@ -9432,6 +9442,297 @@ function CommandStep({ step, index, names, pending, onChange, remove }) {
   );
 }
 
+// Display reads opted into `cache` are kept per signed-in user in memory and in
+// this tab's sessionStorage. A cached copy renders at once on navigation or
+// reload while the same read revalidates it, and visible pages revalidate every
+// few minutes. The server still decides freshness: a refresh always asks the API,
+// whose Discord data has its own refresh interval. Sign-out and auth loss clear it.
+const READ_CACHE_PREFIX = "jmodguard.read:";
+const READ_CACHE_ENTRIES = 32;
+// Bound the combined length of stored keys and values to leave room for request identities.
+const READ_CACHE_STORAGE_LIMIT = 1024 * 1024;
+const READ_REFRESH_MS = 3 * 60 * 1000;
+const readCache = new Map();
+let readSessionEnding = false;
+
+function readCacheKey(path, listSize, enrollment) {
+  const user = state.me?.user?.id;
+  if (!user || isPreview() || readSessionEnding || (path.startsWith("/api/guilds/") && !enrollment)) return null;
+  return READ_CACHE_PREFIX + JSON.stringify([apiBase(), user, path, listSize, enrollment]);
+}
+
+function rememberRead(key, entry) {
+  readCache.delete(key);
+  readCache.set(key, entry);
+  if (readCache.size > READ_CACHE_ENTRIES) readCache.delete(readCache.keys().next().value);
+}
+
+function cachedRead(key, shape) {
+  if (readCache.has(key)) return readCache.get(key);
+  try {
+    const saved = JSON.parse(window.sessionStorage.getItem(key));
+    if (saved && Number.isSafeInteger(saved.at) && saved.at >= 0 && saved.at <= 8.64e15 && validDisplayRead(saved.data, shape)) {
+      return saved;
+    }
+  } catch (_) { /* An unreadable copy is only a cache miss. */ }
+  return null;
+}
+
+function storedReadKeys(storage) {
+  const keys = [];
+  for (let i = 0; i < storage.length; i += 1) {
+    const key = storage.key(i);
+    if (key?.startsWith(READ_CACHE_PREFIX)) keys.push(key);
+  }
+  return keys;
+}
+
+function setSessionItemWithReadCacheFallback(storage, key, value) {
+  try {
+    storage.setItem(key, value);
+  } catch (error) {
+    // Request identities must be persisted before dispatch. Display copies can be fetched again.
+    if (error.name !== "QuotaExceededError") throw error;
+    for (const oldKey of storedReadKeys(storage)) storage.removeItem(oldKey);
+    storage.setItem(key, value);
+  }
+}
+
+function storeRead(key, data, at) {
+  const entry = { at, data };
+  rememberRead(key, entry);
+  try {
+    const storage = window.sessionStorage;
+    const value = JSON.stringify(entry);
+    const size = key.length + value.length;
+    if (size > READ_CACHE_STORAGE_LIMIT) {
+      storage.removeItem(key);
+      return;
+    }
+    const others = storedReadKeys(storage).filter((oldKey) => oldKey !== key).map((oldKey) => ({
+      key: oldKey, size: oldKey.length + storage.getItem(oldKey).length,
+    }));
+    let used = others.reduce((total, item) => total + item.size, size);
+    for (const [index, old] of others.entries()) {
+      if (others.length - index < READ_CACHE_ENTRIES && used <= READ_CACHE_STORAGE_LIMIT) break;
+      storage.removeItem(old.key);
+      used -= old.size;
+    }
+    setSessionItemWithReadCacheFallback(storage, key, value);
+  } catch (_) { /* Memory still holds this tab's copy. */ }
+}
+
+function discardRead(key) {
+  readCache.delete(key);
+  try {
+    window.sessionStorage.removeItem(key);
+  } catch (_) { /* Optional storage can be unavailable. */ }
+}
+
+function readAccessFailed(error, enrollment) {
+  return isUnauthenticated(error) || error.status === 403 || error.status === 409 ||
+    error.code === "guild_access_denied" || error.code === "guild_access_unverified" ||
+    (enrollment && error.code === "discord_rate_limited");
+}
+
+function clearReadCache() {
+  readCache.clear();
+  try {
+    const storage = window.sessionStorage;
+    for (const key of storedReadKeys(storage)) storage.removeItem(key);
+  } catch (_) { /* Nothing readable is left to clear. */ }
+}
+
+function isReadObject(data) {
+  return data != null && typeof data === "object" && !Array.isArray(data);
+}
+
+function validDisplayRead(data, shape) {
+  if (!isReadObject(data)) return false;
+  if (shape === "stats") {
+    return ["events", "warns", "bans"].every((key) => Number.isSafeInteger(data[key]) && data[key] >= 0) &&
+      (data.cases == null || (Number.isSafeInteger(data.cases) && data.cases >= 0));
+  }
+  return Array.isArray(data[shape]) && data[shape].every(isReadObject) &&
+    (data.next_cursor == null || typeof data.next_cursor === "string") &&
+    (data.names == null || isReadObject(data.names)) &&
+    (data.moderators == null || (Array.isArray(data.moderators) && data.moderators.every(isReadObject)));
+}
+
+// Running chunks can finish while hidden. A background read waits here before
+// dispatching another chunk, outside that chunk's network deadline.
+function waitForReadVisibility(signal) {
+  signal.throwIfAborted();
+  if (document.visibilityState === "visible") return;
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      document.removeEventListener("visibilitychange", visible);
+      signal.removeEventListener("abort", abort);
+    };
+    const visible = () => {
+      if (document.visibilityState !== "visible") return;
+      cleanup();
+      resolve();
+    };
+    const abort = () => {
+      cleanup();
+      reject(signal.reason);
+    };
+    document.addEventListener("visibilitychange", visible);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function useCachedApiRead(path, shape, { listSize, holdBackgroundResult = false } = {}) {
+  const enrollment = pageEnrollment(path, "POST");
+  const cacheKey = readCacheKey(path, listSize, enrollment);
+  const identity = cacheKey ?? JSON.stringify([path, listSize, enrollment]);
+  const poll = Boolean(cacheKey) || isPreview();
+  const [result, setResult] = useState(null);
+  const controls = useRef(null);
+  const holdResult = useRef(holdBackgroundResult);
+  useLayoutEffect(() => { holdResult.current = holdBackgroundResult; }, [holdBackgroundResult]);
+
+  // Read a matching snapshot before the first output. The effect owns all
+  // further publication and storage changes for this identity.
+  const initialCopy = result?.identity !== identity && cacheKey ? cachedRead(cacheKey, shape) : null;
+  const shown = result?.identity === identity ? result : initialCopy
+    ? { data: initialCopy.data, updatedAt: initialCopy.at }
+    : { loading: true };
+
+  useEffect(() => {
+    if (readSessionEnding) return undefined;
+    const [endpoint, query] = path.split("?", 2);
+    let snapshot = cacheKey ? cachedRead(cacheKey, shape) : null;
+    if (snapshot) rememberRead(cacheKey, snapshot);
+    let active = null;
+    let timer = null;
+    let nextAt = Date.now();
+    let disposed = false;
+    const show = (fields = {}) => setResult({
+      identity, data: snapshot?.data, updatedAt: snapshot?.at, ...fields,
+    });
+    const clearTimer = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    };
+    const cancelActive = () => {
+      const request = active;
+      active = null;
+      request?.cancel();
+    };
+    const schedule = () => {
+      clearTimer();
+      if (disposed || !poll || active || document.visibilityState !== "visible" || !Number.isFinite(nextAt)) return;
+      const delay = nextAt - Date.now();
+      if (delay <= 0) void start(true);
+      else timer = setTimeout(schedule, delay);
+    };
+    async function start(background) {
+      if (disposed || (background && active)) return;
+      clearTimer();
+      cancelActive();
+      const controller = new AbortController();
+      const { signal } = controller;
+      const timeout = listSize === undefined ? setTimeout(() => controller.abort(), 30000) : null;
+      const request = { cancel() {
+        if (timeout !== null) clearTimeout(timeout);
+        controller.abort();
+      } };
+      active = request;
+      const copy = cacheKey ? snapshot : null;
+      show({
+        data: copy?.data, updatedAt: copy?.at, loading: !copy,
+        revalidating: Boolean(copy), progress: listLoadProgress(listSize),
+      });
+      const read = async (url, requestSignal) => {
+        const data = await apiRequest(url, "POST", null, requestSignal,
+          enrollment ? { "x-jmodguard-enrollment": enrollment } : {});
+        if (!validDisplayRead(data, shape)) throw new Error("The API returned an invalid display response.");
+        return data;
+      };
+      try {
+        const data = listSize === undefined ? await read(path, signal) : await readListPage({
+          read, path: endpoint, query, collection: shape, size: listSize, signal,
+          beforeChunk: background ? () => waitForReadVisibility(signal) : undefined,
+          onProgress: (progress) => {
+            if (active === request) setResult((current) => ({ ...current, progress }));
+          },
+        });
+        if (active !== request) return;
+        signal.throwIfAborted();
+        // A normal data refresh must not remove an inline reason editor. The
+        // access-failure path below still clears the restricted snapshot.
+        if (!(background && snapshot && holdResult.current)) {
+          const at = Date.now();
+          snapshot = { at, data };
+          if (cacheKey) storeRead(cacheKey, data, at);
+        }
+        show();
+      } catch (error) {
+        if (active !== request) return;
+        const failure = signal.aborted
+          ? apiError("Request timed out. Refresh to verify saved state before trying again.")
+          : error;
+        const accessFailed = readAccessFailed(failure, enrollment);
+        const { status, code } = failure;
+        const canKeep = cacheKey && !accessFailed &&
+          (!status || status === 408 || status === 429 || status >= 500 || code === "list_deadline");
+        if (cacheKey && accessFailed) clearReadCache();
+        if (snapshot && canKeep) {
+          show({ refreshError: failure });
+        } else {
+          if (cacheKey && !accessFailed) discardRead(cacheKey);
+          snapshot = null;
+          show({ error: failure, accessFailed });
+        }
+      } finally {
+        if (timeout !== null) clearTimeout(timeout);
+        if (active === request) {
+          active = null;
+          nextAt = Date.now() + READ_REFRESH_MS;
+          schedule();
+        }
+      }
+    }
+
+    const dispose = () => {
+      disposed = true;
+      clearTimer();
+      cancelActive();
+      document.removeEventListener("visibilitychange", schedule);
+      authLossCleanups.delete(stop);
+      controls.current = null;
+    };
+    const stop = () => {
+      dispose();
+      snapshot = null;
+      show({ loading: true });
+    };
+    controls.current = {
+      cancel: () => {
+        cancelActive();
+        clearTimer();
+        nextAt = Infinity;
+        setResult({ identity, canceled: true });
+      },
+      refresh: () => { void start(false); },
+    };
+    authLossCleanups.add(stop);
+    if (poll) document.addEventListener("visibilitychange", schedule);
+    if (snapshot) schedule();
+    else void start(false);
+    return dispose;
+  }, [path, shape, listSize, enrollment, cacheKey, identity, poll]);
+
+  return {
+    ...shown,
+    progress: shown.progress ?? null,
+    cancel: () => controls.current?.cancel(),
+    refresh: () => controls.current?.refresh(),
+  };
+}
+
 function useApiRead(path, { retainData = false, listSize, collection } = {}) {
   const [revision, setRevision] = useState(0);
   const [result, setResult] = useState({ kind: "loading" });
@@ -9492,6 +9793,21 @@ function useApiRead(path, { retainData = false, listSize, collection } = {}) {
     refresh: () => setRevision((value) => value + 1),
   };
 }
+
+// When a cached display read was last confirmed by the API.
+function LastUpdated({ result }) {
+  const text = result.revalidating
+    ? "Refreshing…"
+    : result.updatedAt
+      ? `Last updated ${new Date(result.updatedAt).toLocaleTimeString()}`
+      : null;
+  return h(React.Fragment, null,
+    text ? h("span", { className: "muted last-updated", role: "status" }, text) : null,
+    result.refreshError ? h("span", { className: "err", role: "alert" },
+      `Refresh failed: ${result.refreshError.message}. Showing the last successful response (stale).`,
+    ) : null,
+  );
+}
 function DataTable({ headings, children, className = "table table-zebra", rowCount }) {
   return h(
     "div",
@@ -9518,7 +9834,9 @@ function PagedTable({ rows, renderRow, fallback, canMove, ...table }) {
 }
 
 function TableWindow({ rows, renderRow, canMove = () => true, table }) {
-  const [offset, setOffset] = useState(0);
+  const [requestedOffset, setOffset] = useState(0);
+  const lastOffset = Math.floor((rows.length - 1) / TABLE_WINDOW_SIZE) * TABLE_WINDOW_SIZE;
+  const offset = Math.min(requestedOffset, lastOffset);
   const end = Math.min(offset + TABLE_WINDOW_SIZE, rows.length);
   // Keep the navigation buttons focusable at the ends of the table.
   const move = (label, available, next) => h("button", {
@@ -9547,9 +9865,7 @@ function tabEvents() {
   const controls = useListControls(EVENTS_LIST, guildId, () => setAfter(""));
   const query = controls.query();
   if (after) query.set("after", after);
-  const result = useApiRead(`/api/guilds/${guildId}/events?${query}`, {
-    retainData: true, collection: "events", listSize: controls.view.pageSize,
-  });
+  const result = useCachedApiRead(`/api/guilds/${guildId}/events?${query}`, "events", { listSize: controls.view.pageSize });
   const rows = result.data?.events;
   const next = result.data?.next_cursor;
   const refresh = () => {
@@ -9609,6 +9925,7 @@ function tabEvents() {
         },
       }),
       h(ActionButton, { className: "btn", onClick: refresh }, "Refresh"),
+      h(LastUpdated, { result }),
       h(ListPageSize, { controls }),
     ),
     h("div", { className: "row list-pagination" },
@@ -10248,17 +10565,18 @@ function tabBans() {
   const controls = useListControls(BANS_LIST, guildId, () => setAfter(""), leaveReasonEditor);
   const query = controls.query();
   if (after) query.set("after", after);
-  const result = useApiRead(`/api/guilds/${guildId}/bans?${query}`, {
-    retainData: true, collection: "bans", listSize: controls.view.pageSize,
+  const result = useCachedApiRead(`/api/guilds/${guildId}/bans?${query}`, "bans", {
+    listSize: controls.view.pageSize, holdBackgroundResult: reasonEditor !== null,
   });
   const rows = Array.isArray(result.data?.bans) ? result.data.bans : [];
   const names = result.data?.names || {};
   const availableModerators = result.data?.moderators;
   useEffect(() => {
-    if (Array.isArray(availableModerators)) setModerators(Object.fromEntries(availableModerators.map(({ id, name }) =>
+    if (result.accessFailed) setModerators({});
+    else if (Array.isArray(availableModerators)) setModerators(Object.fromEntries(availableModerators.map(({ id, name }) =>
       [id, { label: name ? `${name} (${id})` : id }],
     )));
-  }, [availableModerators]);
+  }, [availableModerators, result.accessFailed]);
   const next = result.data?.next_cursor;
   const changePage = (cursor) => {
     if (leaveReasonEditor()) setAfter(cursor);
@@ -10346,8 +10664,9 @@ function tabBans() {
             "Ban user",
           ),
       h(ActionButton, { type: "button", className: "btn", onClick: result.refresh }, "Refresh"),
+      h(LastUpdated, { result }),
     ),
-    h(ListControls, { controls, filterOptions: { actor: moderators } }),
+    h(ListControls, { controls, filterOptions: { actor: result.accessFailed ? {} : moderators } }),
     h("div", { className: "row list-pagination" },
       h(ActionButton, { type: "button", className: "btn", disabled: !after || result.loading, onClick: () => changePage("") }, "First page"),
       h(ActionButton, { type: "button", className: "btn", disabled: !next || !!fallback, onClick: () => changePage(next) }, "Next page"),

@@ -134,6 +134,9 @@ impl IntoResponse for ApiError {
         }
         if let Some(error) = self.0.downcast_ref::<GuildAccessError>() {
             let (status, code) = match error {
+                GuildAccessError::PermissionRequired => {
+                    (StatusCode::BAD_REQUEST, "guild_access_denied")
+                }
                 GuildAccessError::Inactive => (StatusCode::CONFLICT, "guild_enrollment_inactive"),
                 GuildAccessError::Unverified => {
                     (StatusCode::SERVICE_UNAVAILABLE, "guild_access_unverified")
@@ -208,6 +211,13 @@ impl IntoResponse for ApiError {
             return (
                 status,
                 Json(serde_json::json!({ "error": key_error.to_string(), "code": code })),
+            )
+                .into_response();
+        }
+        if let Some(error) = self.0.downcast_ref::<list_controls::ListDeadline>() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error.to_string(), "code": "list_deadline"})),
             )
                 .into_response();
         }
@@ -2068,12 +2078,16 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
 /// Membership admission failures contain no database diagnostics or tenant data.
 #[derive(Debug)]
 enum GuildAccessError {
+    PermissionRequired,
     Inactive,
     Unverified,
 }
 impl std::fmt::Display for GuildAccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::PermissionRequired => {
+                "you cannot manage this server (needs MANAGE_GUILD permission)"
+            }
             Self::Inactive => "The bot has no active enrollment in this server.",
             Self::Unverified => "Server access could not be verified. Try again shortly.",
         })
@@ -2215,9 +2229,7 @@ pub async fn authorize_guild(
         return Ok(auth);
     }
     if need == GuildAccess::Manage || !role_access_possible(&auth, guild_id) {
-        return Err(ApiError(anyhow::anyhow!(
-            "you cannot manage this server (needs MANAGE_GUILD permission)"
-        )));
+        return Err(GuildAccessError::PermissionRequired.into());
     }
     let enrollment = enrollment?;
     let level = guild_role_level(app, session, &auth, &enrollment).await?;
@@ -2277,9 +2289,7 @@ fn admit_role_level(
     need: GuildAccess,
 ) -> ApiResult<AuthCtx> {
     let Some(level) = level else {
-        return Err(ApiError(anyhow::anyhow!(
-            "you cannot manage this server (needs MANAGE_GUILD permission)"
-        )));
+        return Err(GuildAccessError::PermissionRequired.into());
     };
     if GuildAccess::from_level(level) < need {
         return Err(ApiError(GuildAccessDenied { have: level, need }.into()));

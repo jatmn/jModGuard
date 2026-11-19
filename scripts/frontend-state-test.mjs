@@ -74,7 +74,10 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   activate(win);
   Object.defineProperty(document, 'visibilityState', {value: 'visible', writable: true});
   Object.defineProperty(win, 'localStorage', {value: { getItem: k => storage.get(k) ?? null, setItem: (k,v) => storage.set(k,v) }, configurable: true});
-  Object.defineProperty(win, 'sessionStorage', {value: { getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k) }, configurable: true});
+  if (session) Object.defineProperty(win, 'sessionStorage', {value: {
+    getItem: k => session.get(k) ?? null, setItem: (k,v) => session.set(k,v), removeItem: k => session.delete(k),
+    key: i => [...session.keys()][i] ?? null, get length() { return session.size; },
+  }, configurable: true});
   win.matchMedia = () => ({matches: false, addEventListener() {}, removeEventListener() {}});
   const roots = [], timers = new Map(), documentListeners = new Map(), opened = [], historyUrls = [];
   let nextTimer = 1, clockOffsetMs = 0, rendering = false;
@@ -9863,6 +9866,552 @@ test('the Web UI draws SVG icons, never emoji or glyph icons', () => {
   }
 });
 
+// #653: display reads render this tab's cached copy at once, then revalidate.
+const statValue = (h, label) => [...h.nodes.get('#content').querySelectorAll('.dashboard-stats > .stat')]
+  .find((tile) => tile.querySelector('.stat-title').textContent.startsWith(label)).querySelector('.stat-value').textContent;
+const lastUpdated = (h) => h.nodes.get('#content').querySelector('.last-updated')?.textContent ?? null;
+const dashboardCacheConfig = () => ({ ...configuredDashboard(), enrollment_id: 'membership' });
+const readCacheKeys = (session) => [...session.keys()].filter((key) => key.startsWith('jmodguard.read:'));
+
+test('Dashboard counts render from the tab cache on return and reload, then revalidate in the background', async () => {
+  const session = new Map();
+  let reads = 0, release = null, fail = false;
+  const fetchImpl = async (url) => {
+    assert.match(url, /\/stats$/);
+    reads += 1;
+    if (reads > 1) await new Promise((resolve) => { release = resolve; });
+    if (fail) throw new Error('offline');
+    return response({ events: reads, warns: 0, bans: 0, cases: 0 });
+  };
+  const h = harness(fetchImpl, new Map(), session);
+  h.app.state.config = dashboardCacheConfig();
+  h.app.state.tab = 'dashboard';
+  h.app.renderTab();
+  await settle();
+  assert.equal(statValue(h, 'Moderation records'), '1');
+  assert.match(lastUpdated(h), /^Last updated /);
+  assert.equal(readCacheKeys(session).length, 1, 'this tab keeps the response');
+
+  // Returning shows the cached counts at once while the same read revalidates.
+  h.app.navigate('rules');
+  await settle();
+  h.app.navigate('dashboard');
+  assert.equal(statValue(h, 'Moderation records'), '1', 'the first view commit restores the snapshot');
+  await settle();
+  assert.equal(reads, 2);
+  assert.equal(statValue(h, 'Moderation records'), '1', 'no Loading… flash');
+  assert.equal(lastUpdated(h), 'Refreshing…');
+  release();
+  await settle();
+  assert.equal(statValue(h, 'Moderation records'), '2');
+  assert.match(lastUpdated(h), /^Last updated /);
+
+  // A failed revalidation keeps the last good copy on screen.
+  fail = true;
+  await fire(h.nodes.get('#refresh-dashboard'), 'click');
+  assert.equal(reads, 3);
+  release();
+  await settle();
+  assert.equal(statValue(h, 'Moderation records'), '2');
+  assert.match(lastUpdated(h), /^Last updated /);
+
+  // A reload in this tab starts from the stored copy, not from Loading….
+  fail = false;
+  const reloaded = harness(fetchImpl, new Map(), session);
+  reloaded.app.state.config = dashboardCacheConfig();
+  reloaded.app.state.tab = 'dashboard';
+  reloaded.app.renderTab();
+  await settle();
+  assert.equal(reads, 4);
+  assert.equal(statValue(reloaded, 'Moderation records'), '2');
+  assert.equal(lastUpdated(reloaded), 'Refreshing…');
+  release();
+  await settle();
+  assert.equal(statValue(reloaded, 'Moderation records'), '4');
+
+  // Another account in the same tab never sees it, and auth loss clears it.
+  const other = harness(fetchImpl, new Map(), session);
+  other.app.state.me = { user: { id: '223456789012345678' } };
+  other.app.state.config = dashboardCacheConfig();
+  other.app.state.tab = 'dashboard';
+  other.app.renderTab();
+  await settle();
+  assert.equal(statValue(other, 'Moderation records'), 'Loading…');
+  release();
+  await settle();
+  assert.equal(readCacheKeys(session).length, 2);
+  other.app.handleAuthLoss(new Error('not authenticated'));
+  assert.deepEqual(readCacheKeys(session), []);
+});
+
+const readRefreshTimers = h => [...h.timers].filter(([, timer]) => timer.delay === 180000);
+async function runReadRefresh(h, advanceMs) {
+  const [entry] = readRefreshTimers(h);
+  assert.ok(entry, 'expected an armed display refresh');
+  if (!entry[1].repeating) h.timers.delete(entry[0]);
+  h.advanceTime(advanceMs);
+  await entry[1].fn();
+}
+
+test('cached reads schedule from completion and defer warm hidden revalidation', async () => {
+  let reads = 0, release;
+  const fetchStats = async () => {
+    reads += 1;
+    if (reads === 1) await new Promise(resolve => { release = resolve; });
+    return response({ events: reads, warns: 0, bans: 0 });
+  };
+  const h = harness(fetchStats);
+  h.app.state.config = dashboardCacheConfig();
+  h.app.renderTab();
+  await settle();
+  h.advanceTime(100);
+  release();
+  await settle();
+  await runReadRefresh(h, 180000);
+  assert.equal(reads, 2, 'ordinary response latency does not skip the refresh deadline');
+
+  const restored = harness(fetchStats, new Map(), h.session);
+  restored.app.state.config = dashboardCacheConfig();
+  restored.document.visibilityState = 'hidden';
+  restored.app.renderTab();
+  await settle();
+  assert.equal(statValue(restored, 'Moderation records'), '2');
+  assert.equal(reads, 2, 'a warm hidden view renders without starting a refresh');
+  restored.document.visibilityState = 'visible';
+  restored.document.dispatchEvent(new restored.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(reads, 3);
+  restored.app.navigate('rules');
+  await settle();
+  assert.equal(readRefreshTimers(restored).length, 0, 'leaving the view clears its refresh');
+});
+
+test('a preview keeps live refresh while bypassing the owner display snapshots', async () => {
+  const session = new Map();
+  const owner = harness(async () => response({ events: 3, warns: 0, bans: 0 }), new Map(), session);
+  owner.app.state.config = dashboardCacheConfig();
+  owner.app.renderTab();
+  await settle();
+  const saved = [...session];
+  let reads = 0, release;
+  const preview = harness(async () => {
+    if (++reads === 1) await new Promise(resolve => { release = resolve; });
+    return response({ events: 7, warns: 0, bans: 0 });
+  }, new Map(), session);
+  preview.app.state.me.preview = {};
+  preview.app.state.config = dashboardCacheConfig();
+  preview.app.renderTab();
+  await settle();
+  assert.equal(statValue(preview, 'Moderation records'), 'Loading…');
+  release();
+  await settle();
+  assert.equal(statValue(preview, 'Moderation records'), '7');
+  await runReadRefresh(preview, 180000);
+  assert.equal(reads, 2);
+  assert.deepEqual([...session], saved);
+});
+
+function cacheRefreshButton(panel) {
+  return [...panel.querySelectorAll('button')].find((button) => button.textContent === 'Refresh');
+}
+
+test('display snapshots stay within the session storage budget across different list filters', async () => {
+  const session = new Map();
+  let extraSize = 0;
+  const h = harness(async (url) => {
+    assert.match(url, /\/bans\?/);
+    return response({ ...banRows(), details: 'x'.repeat(extraSize) });
+  }, new Map(), session);
+  const panel = await bansView(h);
+  const changeDate = async (day) => {
+    const date = panel.querySelector('input[type="date"]');
+    date.value = new Date(Date.UTC(2026, 0, day)).toISOString().slice(0, 10);
+    await fire(date, 'change');
+  }
+  for (let day = 1; day <= 33; day++) await changeDate(day);
+  assert.equal(readCacheKeys(session).length, 32);
+  extraSize = 600_000;
+  await changeDate(34);
+  await changeDate(35);
+  assert.equal(readCacheKeys(session).length, 1, 'two individually cacheable responses exceed the combined budget');
+  const recentKey = readCacheKeys(session).at(-1);
+  extraSize = 1_100_000;
+  await fire(cacheRefreshButton(panel), 'click');
+  assert.match(panel.querySelector('tbody').textContent, /Test-User-1/);
+  assert.equal(session.has(recentKey), false, 'an oversized response does not persist or leave its superseded copy');
+});
+
+test('a configuration save reclaims display copies when real session storage is full', async () => {
+  let saves = 0;
+  const h = harness(async (url, opts) => {
+    if (url.includes('/bans?')) return response(banRows());
+    assert.match(url, /\/settings$/);
+    assert.match(opts.headers['x-jmodguard-save'], /^[a-f0-9]{64}$/);
+    assert.equal(opts.headers['x-jmodguard-save-lookup'], '0');
+    saves++;
+    return response({ ok: true });
+  }, new Map(), null);
+  await bansView(h);
+  const storage = h.window.sessionStorage;
+  assert.ok(storage.key(0).startsWith('jmodguard.read:'));
+  const used = storage.key(0).length + storage.getItem(storage.key(0)).length;
+  const receipt = 'unresolved-request-identity';
+  storage.setItem(receipt, 'x'.repeat(5_000_000 - used - receipt.length));
+  assert.throws(() => storage.setItem('extra', '1'), { name: 'QuotaExceededError' });
+  await h.app.api(`/api/guilds/${h.app.state.guildId}/settings`, 'POST', { prefix: '!' });
+  assert.equal(saves, 1);
+  assert.equal(storage.length, 1);
+  assert.equal(storage.key(0), receipt, 'only disposable display copies are evicted');
+});
+
+for (const [list, view] of [['bans', bansView], ['events', auditLogView]]) {
+  test(`${list} cached rows and cursors belong to the requested page size`, async () => {
+    const requests = [];
+    const fixture = pageSizeFixture(list, 137);
+    let hold = false, release;
+    const h = harness(async (url) => {
+      const query = new URL(url, 'https://fixture.test').searchParams;
+      requests.push(query);
+      if (hold && !query.has('after')) await new Promise((resolve) => { release = resolve; });
+      return response(fixture(query));
+    });
+    const panel = await view(h);
+    await settle();
+    const changeSize = async (value) => {
+      const size = memberLabelled(panel, 'Rows per page');
+      size.value = value;
+      await fire(size, 'change');
+    };
+    const rows = () => listTable(panel).tBodies[0].rows.length;
+    assert.equal(rows(), 50);
+    await changeSize('100');
+    assert.equal(rows(), 100);
+    await changeSize('all');
+    assert.equal(rows(), 137);
+    assert.equal(readCacheKeys(h.session).length, 3);
+    hold = true;
+    await changeSize('50');
+    assert.equal(rows(), 50);
+    assert.equal(lastUpdated(h), 'Refreshing…');
+    await fire([...panel.querySelectorAll('button')].find((button) => button.textContent === 'Next page'), 'click');
+    assert.equal(requests.at(-1).get('after'), 'cursor:50');
+    release();
+    await settle();
+    const userId = list === 'bans' ? 1 : 2;
+    assert.equal(listTable(panel).tBodies[0].rows[0].cells[userId].textContent, '51',
+      'a late response from the first page does not replace the current page');
+  });
+}
+
+for (const [title, view, data, row] of [
+  ['Bans', bansView, banRows(), /Test-User-1/],
+  ['Audit log', auditLogView, pageSizeFixture('events', 1)(new URLSearchParams({ limit: '50' })), /member_ban/],
+  ['Bot servers', (h) => h.app.TabOwnerServers(), { servers: [directoryServer] }, /Alpha/],
+]) {
+  test(`${title} preserves cached rows on transient refresh errors and drops them on access denial`, async () => {
+    let fail = false, release;
+    const h = harness(async () => {
+      if (fail === 'offline') {
+        await new Promise((resolve) => { release = resolve; });
+        throw new Error('offline');
+      }
+      if (fail === 'denied') {
+        const inactive = title === 'Bans';
+        return { ok: false, status: inactive ? 409 : 403, headers: { get: () => null },
+          text: async () => JSON.stringify({ error: 'Access denied', code: inactive ? 'guild_enrollment_inactive' : undefined }) };
+      }
+      return response(data);
+    });
+    h.app.state.me.is_bot_owner = true;
+    const panel = await view(h);
+    await settle();
+    const table = () => panel.querySelector('tbody').textContent;
+    const status = () => panel.querySelector('.last-updated')?.textContent;
+    assert.match(table(), row);
+    fail = 'offline';
+    await fire(cacheRefreshButton(panel), 'click');
+    assert.match(table(), row);
+    assert.equal(status(), 'Refreshing…');
+    release();
+    await settle();
+    assert.match(table(), row);
+    assert.match(panel.querySelector('[role="alert"]').textContent, /Refresh failed: offline/);
+    assert.match(status(), /^Last updated /);
+    fail = 'denied';
+    await fire(cacheRefreshButton(panel), 'click');
+    assert.doesNotMatch(table(), row);
+    assert.match(table(), /Access denied/);
+    assert.equal(status(), undefined);
+    assert.deepEqual(readCacheKeys(h.session), []);
+  });
+}
+
+test('sign-out prevents an in-flight display read from restoring the cleared cache', async () => {
+  let release;
+  const h = harness(async (url) => {
+    if (url === '/logout') return { json: async () => ({ return_to: '/' }) };
+    assert.match(url, /\/bans\?/);
+    return new Promise((resolve) => { release = () => resolve(response(banRows())); });
+  });
+  await bansView(h);
+  assert.ok(release);
+  await h.app.logout();
+  release();
+  await settle();
+  assert.deepEqual(readCacheKeys(h.session), []);
+});
+
+const readFailure = (status, error, code) => ({
+  ok: false, status, headers: { get: () => null }, text: async () => JSON.stringify({ error, code }),
+});
+
+test('a new enrollment cannot restore the previous Bans rows or their actions', async () => {
+  const session = new Map();
+  const previous = harness(async () => response(banRows()), new Map(), session);
+  previous.app.state.config = { enrollment_id: 'previous' };
+  await bansView(previous);
+  assert.equal(readCacheKeys(session).length, 1);
+
+  const current = harness(async (url, opts) => {
+    assert.match(url, /\/bans\?/);
+    assert.equal(opts.headers['x-jmodguard-enrollment'], 'replacement');
+    throw new Error('offline');
+  }, new Map(), session);
+  current.app.state.config = { enrollment_id: 'replacement' };
+  const panel = await bansView(current);
+  assert.match(panel.querySelector('tbody').textContent, /offline/);
+  assert.doesNotMatch(panel.querySelector('tbody').textContent, /Test-User-1/);
+  assert.equal(panel.querySelector('button[aria-label^="Unban"]'), null);
+});
+
+test('a real guild denial purges sibling copies and restored moderator identities', async () => {
+  const session = new Map();
+  const data = { ...banRows(), moderators: [{ id: '1234', name: 'Cached moderator' }] };
+  const previous = harness(async (url) => url.endsWith('/stats')
+    ? response({ events: 3, warns: 0, bans: 0 })
+    : response(data), new Map(), session);
+  previous.app.state.config = dashboardCacheConfig();
+  previous.app.renderTab();
+  await settle();
+  await bansView(previous);
+  assert.equal(readCacheKeys(session).length, 2);
+
+  let deny;
+  const current = harness(async () => new Promise((resolve) => { deny = resolve; }), new Map(), session);
+  const panel = await bansView(current);
+  const moderator = memberLabelled(panel, 'Moderator');
+  assert.match(moderator.textContent, /Cached moderator/);
+  deny(readFailure(400, 'you cannot manage this server (needs MANAGE_GUILD permission)', 'guild_access_denied'));
+  await settle();
+  assert.match(panel.querySelector('tbody').textContent, /cannot manage this server/);
+  assert.doesNotMatch(moderator.textContent, /Cached moderator|1234/);
+  assert.deepEqual(readCacheKeys(session), []);
+});
+
+test('an authorization-only Discord rate limit removes the guild copy', async () => {
+  let limited = false;
+  const h = harness(async () => limited
+    ? readFailure(429, 'Discord rate limited', 'discord_rate_limited')
+    : response(banRows()));
+  const panel = await bansView(h);
+  assert.match(panel.querySelector('tbody').textContent, /Test-User-1/);
+  limited = true;
+  await fire(cacheRefreshButton(panel), 'click');
+  assert.match(panel.querySelector('tbody').textContent, /Discord rate limited/);
+  assert.doesNotMatch(panel.querySelector('tbody').textContent, /Test-User-1/);
+  assert.deepEqual(readCacheKeys(h.session), []);
+});
+
+test('a malformed successful direct read cannot publish a fresh snapshot', async () => {
+  let malformed = false;
+  const h = harness(async () => malformed ? response({ events: 'invalid' }) : response({ events: 3, warns: 0, bans: 0 }));
+  h.app.state.config = dashboardCacheConfig();
+  h.app.renderTab();
+  await settle();
+  const saved = [...h.session];
+  const stamp = lastUpdated(h);
+  malformed = true;
+  await fire(h.nodes.get('#refresh-dashboard'), 'click');
+  assert.equal(statValue(h, 'Moderation records'), '3');
+  assert.equal(lastUpdated(h), stamp);
+  assert.deepEqual([...h.session], saved);
+  assert.match(h.nodes.get('#content').querySelector('[role="alert"]').textContent, /invalid display response/);
+
+  const [key] = readCacheKeys(h.session);
+  h.session.set(key, JSON.stringify({ at: fixtureClockEpoch(), data: { events: 'invalid' } }));
+  const restored = harness(async () => {
+    throw new Error('offline');
+  }, new Map(), h.session);
+  restored.app.state.config = dashboardCacheConfig();
+  restored.app.renderTab();
+  assert.equal(statValue(restored, 'Moderation records'), 'Loading…', 'an invalid persisted shape is a cache miss');
+  await settle();
+  assert.equal(statValue(restored, 'Moderation records'), 'Unavailable');
+});
+
+for (const [list, view] of [['bans', bansView], ['events', auditLogView]]) {
+  test(`${list} retains the last usable snapshot on the API deadline and malformed chunks`, async () => {
+    let failure;
+    const fixture = pageSizeFixture(list, 1);
+    const h = harness(async url => failure ?? response(fixture(new URL(url, 'https://fixture.test').searchParams)));
+    const panel = await view(h);
+    await settle();
+    const table = () => listTable(panel).tBodies[0].textContent;
+    const original = table();
+    const saved = [...h.session];
+    assert.equal(readCacheKeys(h.session).length, 1);
+    for (const [badResponse, message] of [
+      [readFailure(400, 'List request timed out. Please try again.', 'list_deadline'), /timed out/],
+      [{ ok: true, text: async () => '<!doctype html><title>Web UI</title>' }, /invalid display response/],
+      [response({ [list]: {} }), /invalid display response/],
+    ]) {
+      failure = badResponse;
+      await fire(cacheRefreshButton(panel), 'click');
+      assert.equal(table(), original);
+      assert.deepEqual([...h.session], saved);
+      assert.match(panel.querySelector('[role="alert"]').textContent, message);
+    }
+  });
+
+  test(`${list} clamps retained row windows and offers Cancel before the first refresh chunk`, async () => {
+    let count = 600, hold = false, finish, canceledSignal;
+    const h = harness(async (url, opts) => {
+      const query = new URL(url, 'https://fixture.test').searchParams;
+      if (hold && !query.has('after')) {
+        canceledSignal = opts.signal;
+        await new Promise(resolve => { finish = resolve; });
+      }
+      return response(pageSizeFixture(list, count)(query));
+    });
+    const panel = await view(h);
+    await settle();
+    const size = memberLabelled(panel, 'Rows per page');
+    size.value = 'all';
+    await fire(size, 'change');
+    const button = label => [...panel.querySelectorAll('button')].find(node => node.textContent === label);
+    for (let step = 0; step < 5; step++) await fire(button('Next rows'), 'click');
+    assert.match(panel.textContent, /Showing rows 501–600/);
+    hold = true;
+    count = 500;
+    await fire(button('Refresh'), 'click');
+    assert.ok(button('Cancel loading'), 'the first pending chunk can be canceled');
+    finish();
+    await settle();
+    assert.match(panel.textContent, /Showing rows 401–500/);
+    assert.equal(listTable(panel).tBodies[0].rows.length, 100);
+
+    await fire(button('Refresh'), 'click');
+    await fire(button('Cancel loading'), 'click');
+    assert.equal(canceledSignal.aborted, true);
+    finish();
+    await settle();
+    assert.match(panel.textContent, /Loading canceled/);
+  });
+}
+
+test('automatic Bans pagination preserves active progress and pauses between hidden chunks', async () => {
+  let background = false;
+  const pending = [];
+  const h = harness(async (url, opts) => {
+    const query = new URL(url, 'https://fixture.test').searchParams;
+    const all = query.get('limit') === '250';
+    const payload = pageSizeFixture('bans', background ? 2551 : 260)(query);
+    if (background && all) await new Promise(resolve => pending.push({ resolve, signal: opts.signal, after: query.get('after') }));
+    return response(payload);
+  });
+  const panel = await bansView(h);
+  const size = memberLabelled(panel, 'Rows per page');
+  size.value = 'all';
+  await fire(size, 'change');
+  background = true;
+  await runReadRefresh(h, 180000);
+  assert.equal(pending.length, 1);
+  for (let page = 0; page < 9; page += 1) {
+    h.advanceTime(20000);
+    pending[page].resolve();
+    await settle();
+    assert.equal(pending.length, page + 2);
+  }
+  const last = pending[9];
+  assert.equal(last.after, 'cursor:2250');
+  // There must be no second due refresh while the original is making progress.
+  assert.equal(readRefreshTimers(h).length, 0);
+  h.document.visibilityState = 'hidden';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  h.document.visibilityState = 'visible';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(last.signal.aborted, false);
+  assert.equal(pending.length, 10);
+
+  h.document.visibilityState = 'hidden';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  // The in-flight chunk may finish, but the next one waits for visibility.
+  last.resolve();
+  await settle();
+  assert.equal(pending.length, 10);
+  h.document.visibilityState = 'visible';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(pending.length, 11);
+  assert.equal(pending[10].after, 'cursor:2500');
+  pending[10].resolve();
+  await settle();
+  assert.equal(listTable(panel).getAttribute('aria-rowcount'), '2552');
+});
+
+test('a background Bans refresh keeps an open reason draft reachable', async () => {
+  let unbanned = false;
+  const h = harness(async (url) => {
+    const query = new URL(url, 'https://fixture.test').searchParams;
+    const data = banRows();
+    if (unbanned) data.bans[0].active = false;
+    if (query.get('status') === 'active') data.bans = data.bans.filter(row => row.active);
+    return response(data);
+  });
+  const panel = await bansView(h);
+  const status = memberLabelled(panel, 'Status');
+  status.value = 'active';
+  await fire(status, 'change');
+  await fire(panel.querySelector('button[aria-label="Edit reason"]'), 'click');
+  const editor = () => panel.querySelector('textarea[aria-label="jModGuard reason"]');
+  editor().value = 'Unsaved reason';
+  await fire(editor(), 'input');
+  unbanned = true;
+  await runReadRefresh(h, 180000);
+  assert.equal(editor().value, 'Unsaved reason');
+  assert.equal(h.app.isDirty(), true);
+});
+
+test('a due owner refresh cannot repopulate the cache while sign-out is pending', async () => {
+  let releaseLogout, reads = 0;
+  const h = harness(async url => {
+    if (url === '/logout') {
+      await new Promise(resolve => { releaseLogout = resolve; });
+      return { json: async () => ({ return_to: '/' }) };
+    }
+    assert.match(url, /\/owner-servers$/);
+    reads += 1;
+    return response({ servers: [directoryServer] });
+  });
+  h.app.state.me.is_bot_owner = true;
+  h.app.navigate('servers');
+  await settle();
+  assert.equal(readCacheKeys(h.session).length, 1);
+  await fire(h.document.querySelector('#logout-btn'), 'click');
+  assert.ok(releaseLogout);
+  h.advanceTime(180000);
+  h.document.visibilityState = 'hidden';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  h.document.visibilityState = 'visible';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(reads, 1);
+  releaseLogout();
+  await settle();
+  assert.deepEqual(readCacheKeys(h.session), []);
+});
+
 // #608: every Dashboard Overview tile and Getting started link shows one decorative icon from the
 // shared map, in the color of the page or action it summarizes, with its label unchanged.
 // [label, DASHBOARD_ICONS key, icon, color, sidebar item with the same meaning]
@@ -10594,7 +11143,8 @@ test('Database Usage polls only while visible, ages retained samples and cleans 
   assert.equal(usageCards(h)[0].dataset.usageStale, undefined);
   assert.equal(poll().length, 1);
   const pendingTimer = poll()[0][1];
-  h.app.navigate('servers');
+  // Bot servers revalidates its own cached list while visible; leave for a page that does not.
+  h.app.navigate('resources');
   await settle();
   assert.equal(poll().length, 0);
   assert.equal(h.documentListeners.has('visibilitychange'), false);

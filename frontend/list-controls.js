@@ -363,7 +363,7 @@ async function readListChunk(read, path, signal) {
   }
 }
 
-export async function readListPage({ read, path, query, collection, size, signal, onProgress }) {
+export async function readListPage({ read, path, query, collection, size, signal, onProgress, beforeChunk }) {
   const target = size === "all" ? Infinity : Number(size);
   const params = new URLSearchParams(query);
   const seen = new Set([params.get("after")]);
@@ -379,6 +379,7 @@ export async function readListPage({ read, path, query, collection, size, signal
       if (first) params.delete("include_total");
       else params.set("include_total", "true");
     }
+    if (beforeChunk) await beforeChunk();
     const page = await readListChunk(read, `${path}?${params}`, signal);
     first ??= page;
     const batch = page[collection] || [];
