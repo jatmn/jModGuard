@@ -392,7 +392,9 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
+    // Paused time fires the sleep below only after every ready accept and
+    // handler has run, so all held peers own permits before they close.
+    #[tokio::test(start_paused = true)]
     async fn health_listener_resumes_accept_after_saturated_handlers_finish() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

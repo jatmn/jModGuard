@@ -222,12 +222,13 @@ fn cancelled_caller_does_not_release_blocking_task_permit() {
         );
 
         release_tx.send(()).unwrap();
-        for _ in 0..200 {
-            if db.permits.available_permits() == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // The blocking task returns its connection before it drops the permit.
+        drop(
+            tokio::time::timeout(Duration::from_secs(2), db.permits.acquire_many(2))
+                .await
+                .expect("released blocking work must return its permit")
+                .unwrap(),
+        );
         assert_eq!(db.permits.available_permits(), 2);
         assert_eq!(db.connections.idle.lock().unwrap().len(), 2);
     });

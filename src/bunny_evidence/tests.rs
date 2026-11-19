@@ -19,6 +19,8 @@ struct Remote {
     put_status: Option<StatusCode>,
     drop_put: bool,
     delay_put: Option<Arc<Notify>>,
+    /// Notified after the PUT count or the stored objects change.
+    changed: Arc<Notify>,
     fail_get: bool,
     keep_deleted: bool,
     marker_redirect: bool,
@@ -212,23 +214,31 @@ async fn respond(
             .await
             .map_err(std::io::Error::other)?
             .to_vec();
-        let (delay, status, drop_put) = {
+        let (delay, status, drop_put, changed) = {
             let mut state = remote.lock().unwrap();
             state.puts += 1;
             state.last_checksum = checksum;
-            (state.delay_put.clone(), state.put_status, state.drop_put)
+            (
+                state.delay_put.clone(),
+                state.put_status,
+                state.drop_put,
+                state.changed.clone(),
+            )
         };
+        changed.notify_one();
         if let Some(delay) = delay {
             let state = remote.clone();
             // Provider-side work may outlive the HTTP connection after client timeout.
             tokio::spawn(async move {
                 delay.notified().await;
                 state.lock().unwrap().objects.insert(path, bytes);
+                changed.notify_one();
             })
             .await
             .unwrap();
         } else {
             remote.lock().unwrap().objects.insert(path, bytes);
+            changed.notify_one();
         }
         if drop_put {
             return Err(std::io::Error::other("lost PUT response"));
@@ -420,10 +430,11 @@ async fn timed_out_put_cannot_be_erased_before_a_late_write() {
     f.remove().await;
     assert!(f.backend.reconcile(f.db.clone(), t.clone()).await.is_err());
     assert!(f.backend.cleanup(f.db.clone(), t.clone()).await.is_err());
+    let changed = f.remote.lock().unwrap().changed.clone();
     release.notify_one();
     tokio::time::timeout(Duration::from_secs(5), async {
         while f.remote.lock().unwrap().objects.is_empty() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            changed.notified().await;
         }
     })
     .await
@@ -442,6 +453,7 @@ async fn cancellation_keeps_started_transfer_alive_and_independent_cleanup_block
     let t = upload.target.clone();
     let backend = f.backend.clone();
     let db = f.db.clone();
+    let changed = f.remote.lock().unwrap().changed.clone();
     let task = tokio::spawn(async move {
         backend
             .capture(db, upload, Cursor::new(b"abc".to_vec()))
@@ -449,7 +461,7 @@ async fn cancellation_keeps_started_transfer_alive_and_independent_cleanup_block
     });
     tokio::time::timeout(Duration::from_secs(5), async {
         while f.remote.lock().unwrap().puts == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            changed.notified().await;
         }
     })
     .await
