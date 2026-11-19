@@ -4198,10 +4198,14 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
     searchAbort.current = controller;
     try {
       const page = await apiRead(`/api/guilds/${state.guildId}/members?${new URLSearchParams({ q, limit: "8", status: memberStatus })}`, controller.signal);
-      if (searchAbort.current === controller) setFound({ query: q, members: Array.isArray(page?.members) ? page.members : [] });
+      if (searchAbort.current === controller && !controller.signal.aborted) {
+        setFound({ query: q, members: Array.isArray(page?.members) ? page.members : [] });
+      }
     } catch (error) {
       // A failed search is not an empty one: say why, so an ID can be pasted instead.
-      if (searchAbort.current === controller) setFound({ query: q, members: [], error: String(error?.message || error).replace(/[.\s]+$/, "") });
+      if (searchAbort.current === controller && !controller.signal.aborted) {
+        setFound({ query: q, members: [], error: String(error?.message || error).replace(/[.\s]+$/, "") });
+      }
     }
   };
   useEffect(() => () => searchAbort.current?.abort(), []);

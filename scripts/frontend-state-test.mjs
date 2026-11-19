@@ -560,7 +560,7 @@ test('the ban dialog finds current members by name and says when the search fail
   let search = () => response({ members: [{ user_id: '9007199254740993', display_name: 'JATMN' }], next_cursor: null, total: null });
   const h = harness(async (url, opts) => {
     calls.push({ url, opts });
-    if (url.includes('/members?')) return search();
+    if (url.includes('/members?')) return search(opts.signal);
     if (url.endsWith('/ban')) return response({ id: 'ban-job', guild_id: h.app.state.guildId, actor_id: '123456789012345678', enrollment_id: 'membership', state: 'failed', outcome: 'target_role_not_below_moderator', action: { kind: 'ban', user_id: '9007199254740993' } });
     return response({ bans: [], names: {} });
   }, new Map(), new Map(), () => true);
@@ -587,8 +587,28 @@ test('the ban dialog finds current members by name and says when the search fail
   await type('jatm');
   assert.equal(results(), "Couldn't search members: Members request timed out. Please try again. Paste their ID instead.");
   assert.equal(dialog.querySelector('ul.picker-results [role="alert"]') !== null, true);
-  search = () => response({ members: [{ user_id: '9007199254740993', display_name: 'JATMN' }], next_cursor: null, total: null });
+  search = () => { throw new TypeError('Failed to fetch'); };
+  await type('offline');
+  assert.equal(results(), "Couldn't search members: Failed to fetch. Paste their ID instead.");
+
+  let cancelledSignal;
+  search = signal => new Promise((_, reject) => {
+    cancelledSignal = signal;
+    signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+  });
   await type('jatmn');
+  assert.equal(cancelledSignal.aborted, false);
+  await type('');
+  assert.equal(cancelledSignal.aborted, true);
+
+  let resolveRetry;
+  const retry = new Promise(resolve => { resolveRetry = resolve; });
+  search = () => retry;
+  await type('jatmn');
+  assert.equal(dialog.querySelector('ul.picker-results')?.textContent, undefined,
+    'a cancelled search should leave no results while the same query is retried');
+  resolveRetry(response({ members: [{ user_id: '9007199254740993', display_name: 'JATMN' }], next_cursor: null, total: null }));
+  await settle();
   await fire(findNode(dialog, n => n.localName === 'button' && textOf(n).startsWith('JATMN')), 'click');
   assert.deepEqual([...dialog.querySelectorAll('ul.picker-chips .picker-chip-text')].map(textOf), ['JATMN']);
   await fire(findNode(dialog, n => n.localName === 'button' && n.textContent === 'Ban user'), 'click');
