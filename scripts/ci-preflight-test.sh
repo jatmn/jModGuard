@@ -241,15 +241,16 @@ set -euo pipefail
 case "$1" in
   -p) printf '%s\n' "$CI_PREFLIGHT_TEST_NODE_MAJOR" ;;
   -e|scripts/check-test-flakes.mjs) ;;
-  --test)
-    if [ "${*: -1}" = scripts/frontend-state-test.mjs ]; then
-      printf '%s\n' "$@" >>"$CI_PREFLIGHT_TEST_NODE_LOG"
-    fi
-    ;;
+  --test) printf '%s\n' "$@" >>"$CI_PREFLIGHT_TEST_NODE_LOG" ;;
   *) exit 1 ;;
 esac
 SH
 chmod +x "$fixture/bin/npm" "$fixture/bin/node"
+
+# Compare all observed invocations with the files routed through the helper.
+# A direct node --test call will still be recorded and fail the comparison.
+frontend_test_files="$(sed -nE 's/^[[:blank:]]*run_frontend_node_test[[:blank:]]+([^[:blank:]]+).*/\1/p' "$root/scripts/ci-preflight.sh")"
+[ -n "$frontend_test_files" ] || fail 'no frontend test files found in preflight'
 
 check_node_timeout_flag() {
   local major="$1" expected_timeout="$2"
@@ -263,11 +264,14 @@ check_node_timeout_flag() {
     cat "$fixture/frontend.log" >&2
     fail "Node major '${major}': frontend preflight failed"
   fi
-  local -a expected=(--test)
+  local -a test_args=(--test) expected=()
   if [ -n "$expected_timeout" ]; then
-    expected+=("$expected_timeout")
+    test_args+=("$expected_timeout")
   fi
-  expected+=(scripts/frontend-state-test.mjs)
+  local file
+  while IFS= read -r file; do
+    expected+=("${test_args[@]}" "$file")
+  done <<<"$frontend_test_files"
   if ! diff -u <(printf '%s\n' "${expected[@]}") "$node_log"; then
     fail "Node major '${major}': unexpected frontend test arguments"
   fi
