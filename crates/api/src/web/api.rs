@@ -1444,7 +1444,8 @@ async fn events_inner(
         )));
     }
     let subject = list.subject.or(user_id.map(db::BanListSubject::Id));
-    // Match the directory's and SQLite's case folding for the text filters.
+    // Fold names as the directory does. `q` also matches event text with
+    // SQLite's ASCII-only folding, so it keeps every non-ASCII case difference.
     let person_key = |person: &Option<db::BanListSubject>| match person {
         Some(db::BanListSubject::Id(id)) => (Some(*id), None),
         Some(db::BanListSubject::Name(name)) => (None, Some(name.to_lowercase())),
@@ -1455,7 +1456,7 @@ async fn events_inner(
         &event,
         person_key(&subject),
         person_key(&actor),
-        list.q.as_deref().map(str::to_lowercase),
+        list.q.as_deref().map(str::to_ascii_lowercase),
         list.from_ms,
         list.until_ms,
     ))?;
@@ -1474,7 +1475,13 @@ async fn events_inner(
     let q_people = match &list.q {
         Some(q) => directory_user_ids(app, enrollment.clone(), q)
             .await
-            .unwrap_or_default(),
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    guild_id,
+                    "Audit Log search left out directory names: {error:#}"
+                );
+                Vec::new()
+            }),
         None => Vec::new(),
     };
     let page = db::page_enrolled_events(

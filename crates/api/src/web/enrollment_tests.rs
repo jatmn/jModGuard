@@ -3595,7 +3595,9 @@ async fn audit_log_event_search_combines_filters_and_matches_reasons_and_names()
                     (23, 10, 'member_ban', 30, 9, '{"reason":"raid"}', '2026-01-03T12:00:00Z'),
                     (24, 10, 'automod', 30, NULL, 'not json', '2026-01-04T00:00:00Z'),
                     (25, 10, 'member_unban', 30, 31, '{"source":"phishing"}', '2026-01-05T00:00:00Z'),
-                    (26, 20, 'member_ban', 20, 9, '{"reason":"Posted phishing"}', '2026-01-02T00:00:00Z');"#,
+                    (26, 20, 'member_ban', 20, 9, '{"reason":"Posted phishing"}', '2026-01-02T00:00:00Z'),
+                    (27, 10, 'system', NULL, NULL, '{"reason":"Élan"}', '2026-01-06T00:00:00Z'),
+                    (28, 10, 'system', NULL, NULL, '{"reason":"Éclair"}', '2026-01-07T00:00:00Z');"#,
                 1024 * 1024,
             )
         })
@@ -3667,6 +3669,19 @@ async fn audit_log_event_search_combines_filters_and_matches_reasons_and_names()
         assert_eq!(status, StatusCode::BAD_REQUEST, "{changed}: {body}");
         assert!(body["error"].as_str().unwrap().contains("list cursor"));
     }
+
+    // SQLite folds only ASCII letters, so `É` and `é` are different searches
+    // and a cursor from one does not continue the other.
+    let (status, first) = request("q=%C3%89&limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(ids(&first), [28]);
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let (status, next) = request(&format!("q=%C3%89&after={cursor}")).await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(ids(&next), [27]);
+    let (status, body) = request(&format!("q=%C3%A9&after={cursor}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("list cursor"));
 
     for query in [
         "user=20&subject=20",

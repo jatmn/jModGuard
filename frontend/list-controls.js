@@ -16,6 +16,11 @@ function filterKeys(config) {
   return config.commonFilters === false ? keys : [...keys, ...commonKeys];
 }
 
+// Filter keys older links used, mapped to their current key.
+function legacyFilterKeys(config) {
+  return Object.keys(config.legacyFilters ?? {});
+}
+
 function emptyFilters(config) {
   return Object.fromEntries(filterKeys(config).map((key) => [key, ""]));
 }
@@ -58,7 +63,7 @@ export function restoreListLocation(configs, guilds) {
     const config = configs.get(list);
     if (!current.list && config && guilds.some(({ id }) => id === guild)) {
       const restored = new URLSearchParams(location.search);
-      for (const key of ["list", "guild", "sort", "dir", "page_size", ...filterKeys(config)]) {
+      for (const key of ["list", "guild", "sort", "dir", "page_size", ...filterKeys(config), ...legacyFilterKeys(config)]) {
         if (remembered.has(key)) restored.set(key, remembered.get(key));
       }
       replaceListLocation(restored);
@@ -71,7 +76,9 @@ export function restoreListLocation(configs, guilds) {
 export function clearListLocation(config) {
   const query = new URLSearchParams(location.search);
   if (query.get("list") !== config.list) return;
-  for (const key of ["list", "guild", "sort", "dir", "page_size", ...filterKeys(config)]) query.delete(key);
+  for (const key of ["list", "guild", "sort", "dir", "page_size", ...filterKeys(config), ...legacyFilterKeys(config)]) {
+    query.delete(key);
+  }
   replaceListLocation(query);
 }
 
@@ -113,6 +120,9 @@ function readView(config, guildId) {
   const initial = { filters, sort: config.defaultSort, dir: config.defaultDir, pageSize: preferredPageSize(config) };
   if (query.get("list") !== config.list || query.get("guild") !== guildId) return initial;
   for (const key of filterKeys(config)) filters[key] = query.get(key) || "";
+  for (const [legacy, key] of Object.entries(config.legacyFilters ?? {})) {
+    filters[key] ||= query.get(legacy) || "";
+  }
   const textKeys = config.filters.filter(({ kind }) => kind === "text").map(({ key }) => key);
   if (config.commonFilters !== false) textKeys.push("q");
   for (const key of textKeys) {
@@ -136,6 +146,7 @@ function viewQuery(config, guildId, view) {
   query.set("sort", view.sort);
   query.set("dir", view.dir);
   query.set("page_size", view.pageSize);
+  for (const key of legacyFilterKeys(config)) query.delete(key);
   for (const [key, value] of Object.entries(view.filters)) {
     if (value) query.set(key, value);
     else query.delete(key);

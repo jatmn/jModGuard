@@ -9445,11 +9445,51 @@ test('Audit Log restores list links and resets the cursor when filters, size, se
   for (const key of ['event', 'subject', 'actor', 'q', 'from', 'after']) assert.equal(latest().get(key), null, key);
 });
 
+test('older Audit Log links keep their user filter as the User filter', async () => {
+  const requests = [];
+  const fetchPage = async (url) => {
+    const { searchParams, pathname } = new URL(url, 'file:///');
+    if (!pathname.endsWith('/events')) return response({});
+    requests.push(searchParams);
+    return response({ events: [], names: {}, next_cursor: null });
+  };
+  const old = (guild) => new URLSearchParams({ list: 'events', guild, sort: 'date', dir: 'desc', event: 'member_ban', user: '42' });
+  const opened = async (h) => {
+    h.app.restoreWorkspace();
+    assert.equal(h.app.state.tab, 'events');
+    const root = auditLogView(h);
+    await settle();
+    assert.equal(memberLabelled(root, 'User').value, '42');
+    const request = requests.at(-1);
+    assert.equal(request.get('subject'), '42');
+    assert.equal(request.has('user'), false);
+    assert.equal(request.get('event'), 'member_ban');
+    // The next generated link names the filter by its current key only.
+    const type = memberLabelled(root, 'Event');
+    type.value = 'member_kick';
+    await fire(type, 'change');
+    const link = new URLSearchParams(h.location.search);
+    assert.equal(link.get('subject'), '42');
+    assert.equal(link.has('user'), false);
+    assert.equal(requests.at(-1).get('subject'), '42');
+  };
+
+  const bookmarked = harness(fetchPage);
+  bookmarked.location.search = '?' + old(bookmarked.app.state.guildId);
+  await opened(bookmarked);
+
+  // Sign-in returns to the workspace root and restores the saved link.
+  const session = new Map();
+  const returning = harness(fetchPage, new Map(), session);
+  session.set('jmodguard.list-before-login', '?' + old(returning.app.state.guildId));
+  await opened(returning);
+});
+
 // Every event type the server can list, plus the two audit-only types its writers add.
 const SERVER_EVENT_TYPES = [...fs.readFileSync(new URL('../src/types.rs', import.meta.url), 'utf8').match(/pub const EVENT_TYPES: \[&str; \d+\] = \[([^\]]*)\]/)[1].matchAll(/"([a-z_]+)"/g)].map(match => match[1]);
 // Internal payload fields (#649) that the readable Details must never show.
 const AUDIT_INTERNAL = {
-  source: 'discord', audit_after_ms: 1767312000000, ban_id: 7, audit_entry_id: '1300000000000000001',
+  source: 'discord', audit_after_ms: 1767312000000, ban_id: 731337, audit_entry_id: '1300000000000000001',
   action_id: 'f'.repeat(32), gateway_delivery_id: 'e'.repeat(32), gateway_observations: [{ at_ms: 1, audit_after_ms: 2 }],
   pending_gateway_echo: { ban_id: 7, enrollment_id: 'membership', expires_at: null }, case_history: null,
   channel_id: '1300000000000000002', message_id: '1300000000000000003', moderation: true,
@@ -9507,10 +9547,18 @@ test('Audit Log Details summarize every event type without internal fields', asy
     assert.equal(details[i].querySelector('details, pre'), null, `${type} has no Raw toggle for a non-owner`);
     for (const [key, value] of Object.entries(AUDIT_INTERNAL)) {
       assert.equal(details[i].textContent.includes(key), false, `${type} hides ${key}`);
-      if (typeof value === 'string' && value.length > 8) assert.equal(details[i].textContent.includes(value), false, `${type} hides ${key} value`);
+      if (['string', 'number', 'boolean'].includes(typeof value)) {
+        assert.equal(details[i].textContent.includes(String(value)), false, `${type} hides ${key} value`);
+      }
     }
-    assert.equal(details[i].textContent.includes('1767312000000'), false, `${type} hides audit_after_ms`);
   });
+  // The timeout end shows its own local month, day, hour and minute.
+  const until = new Date(AUDIT_SAMPLES.timeout_add[0].until);
+  const shown = details[types.indexOf('timeout_add')].firstChild.textContent.match(/\d+/g).map(Number);
+  for (const [part, value] of [['month', until.getMonth() + 1], ['day', until.getDate()], ['minute', until.getMinutes()]]) {
+    assert.ok(shown.includes(value), `timeout ${part} ${value} in ${shown}`);
+  }
+  assert.ok(shown.includes(until.getHours()) || shown.includes(until.getHours() % 12 || 12), `timeout hour in ${shown}`);
 });
 
 test('Audit Log keeps raw JSON behind a collapsed owner-only Raw toggle and falls back to it for unknown types', async () => {

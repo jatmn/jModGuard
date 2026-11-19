@@ -8394,6 +8394,8 @@ const EVENTS_LIST = {
     { key: "subject", label: "User", kind: "text", placeholder: "Name or ID" },
     { key: "actor", label: "Actor", kind: "text", placeholder: "Name or ID" },
   ],
+  // Older Audit Log links name the user ID filter `user`.
+  legacyFilters: { user: "subject" },
   columns: [
     { key: "date", label: "Time", initialDir: "desc", orderLabels: { desc: "Newest first", asc: "Oldest first" } },
     { key: "event", label: "Event" },

@@ -26,9 +26,11 @@ membership and the `x-jmodguard-enrollment` value from the page's loaded configu
   unavailable. `q` matches the event name, user and actor IDs, the readable
   `reason`, `previous_reason`, `rule` and `command` payload fields, and up to
   250 directory users whose names match. It does not match other payload
-  fields. `from` and `to` are inclusive UTC calendar dates. `names` holds
-  directory names for the users and actors on the page and is empty when the
-  directory is unavailable.
+  fields. When the directory is unavailable, `q` still matches the other
+  fields without directory names, and the API logs a warning. Letter case is
+  ignored for ASCII letters in event text. `from` and `to` are inclusive UTC
+  calendar dates. `names` holds directory names for the users and actors on
+  the page and is empty when the directory is unavailable.
 - `/api/guilds/{id}/bans` (also POST for the browser). It answers
   `{bans, names, total, next_cursor, moderators}`. The default is newest first by ban
   timestamp and row ID. `sort` accepts `subject`, `id` (Discord user ID),
