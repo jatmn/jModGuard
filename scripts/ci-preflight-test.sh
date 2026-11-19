@@ -222,4 +222,64 @@ grep -Fxq 'ci-preflight: frontend Node tests require setsid (install util-linux)
   || fail 'missing setsid: frontend preflight must explain the prerequisite'
 echo 'ci-preflight test: missing setsid rejected before frontend setup'
 
+# Run the real frontend preflight and session runner with stubbed Node and
+# dependency setup. Keep the fixture independent of installed npm packages.
+frontend_root="$fixture/frontend"
+mkdir -p "$frontend_root/scripts" "$frontend_root/tools"
+git init -q "$frontend_root"
+for helper in ci-ensure-cargo-tool.sh ci-run-timed-cargo-test.sh ci-cargo-log.sh require-host-eslint-node.sh; do
+  ln -s "$root/scripts/$helper" "$frontend_root/scripts/$helper"
+done
+printf 'exit 0\n' >"$frontend_root/tools/eslint-web-selftest.sh"
+cat >"$fixture/bin/npm" <<'SH'
+#!/bin/bash
+exit 0
+SH
+cat >"$fixture/bin/node" <<'SH'
+#!/bin/bash
+set -euo pipefail
+case "$1" in
+  -p) printf '%s\n' "$CI_PREFLIGHT_TEST_NODE_MAJOR" ;;
+  -e|scripts/check-test-flakes.mjs) ;;
+  --test)
+    if [ "${*: -1}" = scripts/frontend-state-test.mjs ]; then
+      printf '%s\n' "$@" >>"$CI_PREFLIGHT_TEST_NODE_LOG"
+    fi
+    ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "$fixture/bin/npm" "$fixture/bin/node"
+
+check_node_timeout_flag() {
+  local major="$1" expected_timeout="$2"
+  local node_log="$fixture/node-argv"
+  : >"$node_log"
+  if ! (
+    cd "$frontend_root"
+    PATH="$fixture/bin:$PATH" CI_PREFLIGHT_TEST_NODE_MAJOR="$major" CI_PREFLIGHT_TEST_NODE_LOG="$node_log" \
+      /bin/bash "$root/scripts/ci-preflight.sh" --only frontend
+  ) >"$fixture/frontend.log" 2>&1; then
+    cat "$fixture/frontend.log" >&2
+    fail "Node major '${major}': frontend preflight failed"
+  fi
+  local -a expected=(--test)
+  if [ -n "$expected_timeout" ]; then
+    expected+=("$expected_timeout")
+  fi
+  expected+=(scripts/frontend-state-test.mjs)
+  if ! diff -u <(printf '%s\n' "${expected[@]}") "$node_log"; then
+    fail "Node major '${major}': unexpected frontend test arguments"
+  fi
+}
+
+check_node_timeout_flag 20 ''
+check_node_timeout_flag 22 ''
+check_node_timeout_flag 23 ''
+check_node_timeout_flag 24 --test-timeout=60000
+check_node_timeout_flag 26 --test-timeout=60000
+check_node_timeout_flag '24junk' ''
+check_node_timeout_flag '' ''
+echo 'ci-preflight test: frontend Node timeout flag gating verified'
+
 bash "$root/scripts/ci-preflight.sh" --audit-expiry-self-check
