@@ -1313,9 +1313,63 @@ pub struct EventsQuery {
     #[serde(default, deserialize_with = "crate::ids::de_opt_u64")]
     user: Option<u64>,
     limit: Option<i64>,
-    sort: Option<db::EventListSort>,
-    dir: Option<super::list_controls::SortDirection>,
-    after: Option<String>,
+    // The Audit Log has no outcome filter; the shared parameter is ignored.
+    #[serde(flatten)]
+    list: super::list_controls::ListQuery<db::EventListSort, serde::de::IgnoredAny>,
+}
+
+/// Directory members whose names or IDs match `text`, for the Audit Log's
+/// name search. Events store only IDs, so names resolve here first.
+async fn directory_user_ids(
+    app: &ApiState,
+    enrollment: db::GuildEnrollment,
+    text: &str,
+) -> anyhow::Result<Vec<i64>> {
+    use crate::db::guild_data::{MemberQuery, MemberSort, MemberStatusFilter};
+    let (store, scope) = app.tenant.live(enrollment).await?;
+    let page = store
+        .list_members(
+            scope,
+            MemberQuery {
+                q: Some(text.to_owned()),
+                status: MemberStatusFilter::All,
+                joined_from_ms: None,
+                joined_to_ms: None,
+                sort: MemberSort::UserId,
+                descending: false,
+                after: None,
+                limit: db::DASHBOARD_LIST_PAGE_LIMIT,
+                include_total: false,
+            },
+        )
+        .await?;
+    Ok(page
+        .members
+        .iter()
+        .filter_map(|member| member.user_id.parse().ok())
+        .collect())
+}
+
+/// An Audit Log person filter: the typed ID, or every directory member the
+/// name matches.
+async fn event_person_ids(
+    app: &ApiState,
+    enrollment: &db::GuildEnrollment,
+    person: Option<db::BanListSubject>,
+    label: &str,
+) -> ApiResult<Option<Vec<i64>>> {
+    match person {
+        None => Ok(None),
+        Some(db::BanListSubject::Id(id)) => Ok(Some(vec![id])),
+        Some(db::BanListSubject::Name(name)) => directory_user_ids(app, enrollment.clone(), &name)
+            .await
+            .map(Some)
+            .map_err(|_| {
+                ApiError(anyhow::anyhow!(
+                    "{label} names need the member directory, which is unavailable. Filter by user ID instead."
+                ))
+            }),
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1358,33 +1412,93 @@ async fn events_inner(
         .transpose()
         .map_err(|_| ApiError(anyhow::anyhow!("invalid user id")))?;
     let limit = query.limit.unwrap_or(50);
-    // Older dashboards request only filters and a limit and expect an array.
-    if query.sort.is_none() && query.dir.is_none() && query.after.is_none() {
-        let rows =
-            db::query_enrolled_events(&app.db, enrollment, query.event.as_deref(), user_id, limit)
-                .await?;
+    let EventsQuery {
+        event,
+        list: mut raw,
+        ..
+    } = query;
+    // Older dashboards request only `event`, `user` and a limit and expect an array.
+    let shared = [
+        &raw.after,
+        &raw.subject,
+        &raw.actor,
+        &raw.q,
+        &raw.from,
+        &raw.to,
+    ];
+    if raw.sort.is_none() && raw.dir.is_none() && shared.iter().all(|value| value.is_none()) {
+        let rows = db::query_enrolled_events(&app.db, enrollment, event.as_deref(), user_id, limit)
+            .await?;
         return Ok(Json(serde_json::json!(rows)));
     }
-    let sort = query.sort.unwrap_or(db::EventListSort::Date);
-    let dir = query.dir.unwrap_or(SortDirection::Desc);
-    let context = cursor_context((&enrollment, &query.event, user_id))?;
-    let after = query
+    // Both people accept a user ID or a directory name.
+    let actor = ban_list_subject(raw.actor.take().as_deref())?;
+    let list = raw.validate_with_subject(
+        db::EventListSort::Date,
+        SortDirection::Desc,
+        ban_list_subject,
+    )?;
+    if user_id.is_some() && list.subject.is_some() {
+        return Err(ApiError(anyhow::anyhow!(
+            "use either user or subject, not both"
+        )));
+    }
+    let subject = list.subject.or(user_id.map(db::BanListSubject::Id));
+    // Fold names as the directory does. `q` also matches event text with
+    // SQLite's ASCII-only folding, so it keeps every non-ASCII case difference.
+    let person_key = |person: &Option<db::BanListSubject>| match person {
+        Some(db::BanListSubject::Id(id)) => (Some(*id), None),
+        Some(db::BanListSubject::Name(name)) => (None, Some(name.to_lowercase())),
+        None => (None, None),
+    };
+    let context = cursor_context((
+        &enrollment,
+        &event,
+        person_key(&subject),
+        person_key(&actor),
+        list.q.as_deref().map(str::to_ascii_lowercase),
+        list.from_ms,
+        list.until_ms,
+    ))?;
+    let after = list
         .after
         .as_deref()
         .map(|token| {
-            let cursor: EventCursor = decode_cursor(token, "events", sort, dir)?;
+            let cursor: EventCursor = decode_cursor(token, "events", list.sort, list.dir)?;
             check_cursor_context(&cursor.context, &context)?;
             Ok::<_, ApiError>(cursor.anchor)
         })
         .transpose()?;
+    let subject = event_person_ids(app, &enrollment, subject, "User").await?;
+    let actor = event_person_ids(app, &enrollment, actor, "Actor").await?;
+    // An unavailable directory still searches IDs, event names and reasons.
+    let q_people = match &list.q {
+        Some(q) => directory_user_ids(app, enrollment.clone(), q)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    guild_id,
+                    "Audit Log search left out directory names: {error:#}"
+                );
+                Vec::new()
+            }),
+        None => Vec::new(),
+    };
     let page = db::page_enrolled_events(
         &app.db,
-        enrollment,
+        enrollment.clone(),
         db::EventListRequest {
-            event_type: query.event,
-            user_id,
-            sort,
-            descending: dir == SortDirection::Desc,
+            filters: db::EventListFilters {
+                event_type: event,
+                subject,
+                actor,
+                q: list.q,
+                q_people,
+                from_ms: list.from_ms,
+                until_ms: list.until_ms,
+            },
+            sort: list.sort,
+            descending: list.dir == SortDirection::Desc,
             after,
             limit,
         },
@@ -1392,10 +1506,30 @@ async fn events_inner(
     .await?;
     let next = page
         .next
-        .map(|anchor| encode_cursor("events", sort, dir, EventCursor { context, anchor }))
+        .map(|anchor| {
+            encode_cursor(
+                "events",
+                list.sort,
+                list.dir,
+                EventCursor { context, anchor },
+            )
+        })
         .transpose()?;
+    // Presentation only, as on Bans: directory names for the people on these
+    // rows. An unavailable directory leaves them out instead of failing the read.
+    let people = page
+        .rows
+        .iter()
+        .flat_map(|row| [row.user_id, row.actor_id])
+        .flatten()
+        .collect::<Vec<_>>();
+    let names = match app.tenant.live(enrollment).await {
+        Ok((store, scope)) => super::cases::directory_names(&store, scope, people).await,
+        Err(_) => serde_json::Map::new(),
+    };
     Ok(Json(serde_json::json!({
         "events": page.rows,
+        "names": names,
         "next_cursor": next,
     })))
 }

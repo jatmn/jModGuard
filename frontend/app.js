@@ -19,8 +19,9 @@ import {
   sumSeries,
 } from "./charts.js";
 import {
-  clearListLocation, ListControls, ListEmptyRow, ListLoadProgress, ListPageSize, ListSortHeading, readListLocation,
-  flushPendingListSearch, listLoadProgress, readListPage, rememberListLocation, restoreListLocation, useListControls,
+  clearListLocation, ListControls, ListEmptyRow, ListLoadProgress, ListSortHeading, readListLocation,
+  flushPendingListSearch, listLoadProgress, openFilteredList, readListPage, rememberListLocation, restoreListLocation,
+  useListControls,
 } from "./list-controls.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import React, { useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
@@ -8384,15 +8385,22 @@ const MEMBERS_LIST = {
 };
 const EVENTS_LIST = {
   list: "events",
+  filterLabel: "Filter the audit log",
+  searchPlaceholder: "Reason, name, ID or event",
   defaultSort: "date",
   defaultDir: "desc",
-  commonFilters: false,
-  filters: [{ key: "event" }, { key: "user" }],
+  filters: [
+    { key: "event", label: "Event", emptyLabel: "All events" },
+    { key: "subject", label: "User", kind: "text", placeholder: "Name or ID" },
+    { key: "actor", label: "Actor", kind: "text", placeholder: "Name or ID" },
+  ],
+  // Older Audit Log links name the user ID filter `user`.
+  legacyFilters: { user: "subject" },
   columns: [
     { key: "date", label: "Time", initialDir: "desc", orderLabels: { desc: "Newest first", asc: "Oldest first" } },
     { key: "event", label: "Event" },
-    { key: "user", label: "User ID" },
-    { key: "actor", label: "Actor ID" },
+    { key: "user", label: "User", title: "Sort by user ID" },
+    { key: "actor", label: "Actor", title: "Sort by actor ID" },
   ],
 };
 const WORKSPACE_LISTS = new Map([CASE_LIST, BANS_LIST, MEMBERS_LIST, EVENTS_LIST].map((config) => [config.list, config]));
@@ -9866,42 +9874,152 @@ function TableWindow({ rows, renderRow, canMove = () => true, table }) {
     ),
   );
 }
+// Audit Log events written outside the log-channel routes in event_types.
+const AUDIT_EXTRA_EVENT_TYPES = ["ban_reason_edit", "command_enabled"];
+// Command rows are written after the command succeeds, but `!timeout` stores
+// "timeout" both when it adds and when it removes a timeout.
+const AUDIT_MOD_ACTION_DONE = {
+  ban: "Banned", kick: "Kicked", softban: "Softbanned", unban: "Unbanned", timeout: "Timeout changed",
+  warn: "Warned", warnclear: "Warnings cleared", purge: "Purged", slowmode: "Slowmode set",
+};
+
+function auditText(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : typeof value === "number" ? String(value) : null;
+}
+
+function auditReason(label, data, empty = "No reason given") {
+  return `${label}: ${auditText(data.reason) ?? empty}`;
+}
+
+function auditSource(data) {
+  return data.source === "discord" ? "via Discord" : data.source === "webui" ? "via the Web UI" : null;
+}
+
+function auditTime(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? null
+    : date.toLocaleString(undefined, { month: "numeric", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+// One readable line per event type. Each returns only fields people need:
+// internal payload fields such as audit_after_ms or action_id stay in Raw.
+const AUDIT_EVENT_SUMMARIES = {
+  member_join: () => ["Joined the server"],
+  member_leave: () => ["Left the server"],
+  member_ban: (data) => [
+    auditReason("Banned", data, "Reason unavailable"),
+    auditSource(data),
+  ],
+  member_unban: (data) => [
+    auditText(data.reason) ? auditReason("Unbanned", data) : "Unbanned",
+    auditSource(data),
+    data.outcome === "already_unbanned" ? "Already unbanned" : null,
+  ],
+  member_kick: (data) => [auditReason("Kicked", data)],
+  message_edit: () => ["Message edited"],
+  message_delete: () => ["Message deleted"],
+  message_bulk_delete: () => ["Messages deleted in bulk"],
+  // Automod rows store the rule's action, also after a failed or skipped attempt.
+  automod: (data) => [
+    auditReason(auditText(data.action) ? `Automod ${auditText(data.action)} action` : "Automod action", data),
+    auditText(data.rule) ? `Rule: ${data.rule}` : null,
+  ],
+  mod_action: (data) => [
+    auditReason(AUDIT_MOD_ACTION_DONE[data.action] ?? "Moderation command", data),
+    "via command",
+  ],
+  timeout_add: (data) => [auditTime(data.until) ? `Timed out until ${auditTime(data.until)}` : "Timed out"],
+  timeout_remove: () => ["Timeout removed"],
+  plan_executed: (data) => [
+    auditText(data.command) ? `Ran command ${data.command}` : "Ran a command",
+    Number.isInteger(data.steps) ? `${data.steps} ${data.steps === 1 ? "step" : "steps"}` : null,
+  ],
+  system: (data) => ["System event", auditText(data.message) ?? auditText(data.reason)],
+  ban_reason_edit: (data) => [
+    `Ban reason changed from “${auditText(data.previous_reason) ?? "No reason given"}” to “${auditText(data.reason) ?? "No reason given"}”`,
+  ],
+  command_enabled: (data) => [
+    `Command ${auditText(data.command) ?? "unknown"} turned ${data.enabled ? "on" : "off"}`,
+    data.scope === "global" ? "for every server" : "for this server",
+  ],
+};
+
+// The readable summary, or null when the type is unknown or the data is not a JSON object.
+function auditEventSummary(record) {
+  const format = Object.hasOwn(AUDIT_EVENT_SUMMARIES, record.event_type) ? AUDIT_EVENT_SUMMARIES[record.event_type] : null;
+  if (!format) return null;
+  let data;
+  try {
+    data = JSON.parse(record.data || "{}");
+  } catch (_) {
+    return null;
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  return { text: format(data).filter(Boolean).join(" · "), banId: data.ban_id ?? null };
+}
+
+function AuditEventDetails({ record, guildId }) {
+  const summary = auditEventSummary(record);
+  let raw = null;
+  if (isBotOwner() && record.data) {
+    try {
+      raw = JSON.stringify(JSON.parse(record.data), null, 1);
+    } catch (_) {
+      raw = record.data;
+    }
+  }
+  const openBan = () => openFilteredList(EVENTS_LIST, BANS_LIST, guildId, { subject: String(record.user_id) }, () => navigate("bans"));
+  return h(
+    "div",
+    { className: "audit-details" },
+    h("span", { className: summary ? null : "muted" }, summary ? summary.text : "No readable summary for this event."),
+    summary?.banId != null && record.user_id
+      ? h("button", { type: "button", className: "btn btn-xs btn-link", onClick: openBan }, "View ban")
+      : null,
+    raw === null
+      ? null
+      : h("details", { className: "audit-raw" }, h("summary", null, "Raw"), h("pre", { className: "mono" }, raw)),
+  );
+}
+
+function AuditPersonCell({ id, names, label, filterLink }) {
+  if (!id) return h("span", { className: "muted" }, "-");
+  return h(BanPersonCell, { person: banPerson(id, null, null, names), label, filterLink });
+}
+
 function tabEvents() {
   const guildId = state.guildId;
   const [after, setAfter] = useState("");
-  const input = useRef(null);
   const controls = useListControls(EVENTS_LIST, guildId, () => setAfter(""));
   const query = controls.query();
   if (after) query.set("after", after);
   const result = useCachedApiRead(`/api/guilds/${guildId}/events?${query}`, "events", { listSize: controls.view.pageSize });
   const rows = result.data?.events;
+  const names = result.data?.names || {};
   const next = result.data?.next_cursor;
-  const refresh = () => {
-    controls.setFilter("user", parseSnowflake(input.current.value), true);
-    result.refresh();
-  };
+  const eventTypes = Object.fromEntries([...new Set([...state.config.event_types, ...AUDIT_EXTRA_EVENT_TYPES])]
+    .map((value) => [value, { label: value }]));
   const fallback = result.canceled
     ? "Loading canceled. Refresh to try again."
     : result.error
       ? "Could not load records: " + result.error.message
-      : result.loading ? "Loading…" : rows?.length ? null : "No matching records.";
-  const renderRow = (record, i) => {
-    let data;
-    try {
-      data = JSON.stringify(JSON.parse(record.data || "{}"), null, 1);
-    } catch (_) {
-      data = record.data || "";
-    }
-    return h(
-      "tr",
-      { key: record.id ?? i },
-      h("td", { className: "muted" }, new Date(record.created_at).toLocaleString()),
-      h("td", null, record.event_type),
-      h("td", { className: "mono" }, record.user_id || "-"),
-      h("td", { className: "mono" }, record.actor_id || "-"),
-      h("td", { className: "mono", style: { fontSize: "11px" } }, data),
-    );
-  };
+      : result.loading
+        ? "Loading…"
+        : rows?.length ? null : controls.filtered() ? "No events match these filters." : "No events recorded.";
+  const renderRow = (record, i) => h(
+    "tr",
+    { key: record.id ?? i },
+    h("td", { className: "muted" }, new Date(record.created_at).toLocaleString()),
+    h("td", null, record.event_type),
+    h("td", null, h(AuditPersonCell, {
+      id: record.user_id, names, label: "user", filterLink: (id) => controls.filterLink({ subject: id }),
+    })),
+    h("td", null, h(AuditPersonCell, {
+      id: record.actor_id, names, label: "actor", filterLink: (id) => controls.filterLink({ actor: id }),
+    })),
+    h("td", null, h(AuditEventDetails, { record, guildId })),
+  );
   return h(
     "div",
     null,
@@ -9909,33 +10027,10 @@ function tabEvents() {
     h(
       "div",
       { className: "row", style: { marginBottom: "12px" } },
-      h(
-        Select,
-        {
-          className: "select",
-          "aria-label": "Event type",
-          value: controls.view.filters.event,
-          onChange: (event) => controls.replaceFilters({
-            event: event.target.value, user: parseSnowflake(input.current.value),
-          }),
-        },
-        h("option", { value: "" }, "all types"),
-        ...state.config.event_types.map((value) => h("option", { key: value, value }, value)),
-      ),
-      h(Input, {
-        ref: input,
-        type: "text",
-        className: "input",
-        placeholder: "user id",
-        defaultValue: controls.view.filters.user,
-        onKeyDown: (event) => {
-          if (event.key === "Enter") refresh();
-        },
-      }),
-      h(ActionButton, { className: "btn", onClick: refresh }, "Refresh"),
+      h(ActionButton, { type: "button", className: "btn", onClick: result.refresh }, "Refresh"),
       h(LastUpdated, { result }),
-      h(ListPageSize, { controls }),
     ),
+    h(ListControls, { controls, filterOptions: { event: eventTypes } }),
     h("div", { className: "row list-pagination" },
       h(ActionButton, { type: "button", className: "btn", disabled: !after || result.loading, onClick: () => setAfter("") }, "First page"),
       h(ActionButton, { type: "button", className: "btn", disabled: !next || !!fallback, onClick: () => setAfter(next) }, "Next page"),
@@ -9946,6 +10041,7 @@ function tabEvents() {
         ...EVENTS_LIST.columns.map((column) => h(ListSortHeading, { key: column.key, column, controls })),
         "Details",
       ],
+      className: "table table-zebra audit-table",
       rows: fallback ? null : rows,
       renderRow,
       fallback: fallback

@@ -1,7 +1,4 @@
-use super::{
-    EVENT_COLUMNS, EventRow, decode_event_row, enrolled_moderation_read, event_filters,
-    text_key_digest,
-};
+use super::{EVENT_COLUMNS, EventRow, decode_event_row, enrolled_moderation_read, text_key_digest};
 use crate::db::{
     DASHBOARD_LIST_PAGE_LIMIT, Db, GuildEnrollment, OptionalExtension, SqlExecutor, Value, params,
     params_from_iter,
@@ -48,9 +45,25 @@ pub struct EventListAnchor {
     id: i64,
 }
 
-pub struct EventListRequest {
+/// Readable `data` text the Audit Log search matches, as its Details show it.
+const EVENT_SEARCH_TEXT_KEYS: &[&str] = &["reason", "previous_reason", "rule", "command"];
+
+/// Audit Log filters. A person filter holds every user ID it matched, so a
+/// name the member directory resolves and a typed ID filter the same way.
+#[derive(Default)]
+pub struct EventListFilters {
     pub event_type: Option<String>,
-    pub user_id: Option<i64>,
+    pub subject: Option<Vec<i64>>,
+    pub actor: Option<Vec<i64>>,
+    pub q: Option<String>,
+    /// Users whose directory names match `q`.
+    pub q_people: Vec<i64>,
+    pub from_ms: Option<i64>,
+    pub until_ms: Option<i64>,
+}
+
+pub struct EventListRequest {
+    pub filters: EventListFilters,
     pub sort: EventListSort,
     pub descending: bool,
     pub after: Option<EventListAnchor>,
@@ -85,13 +98,19 @@ fn event_page(
     } else {
         ("ASC", ">")
     };
-    let mut sql = format!("SELECT {EVENT_COLUMNS}, {key}");
-    let mut args = event_filters(
-        &mut sql,
-        guild,
-        request.event_type.as_deref(),
-        request.user_id,
-    );
+    let filters = &request.filters;
+    // A person filter that matched nobody matches no event.
+    if [&filters.subject, &filters.actor]
+        .into_iter()
+        .any(|ids| ids.as_ref().is_some_and(Vec::is_empty))
+    {
+        return Ok(EventListPage {
+            rows: Vec::new(),
+            next: None,
+        });
+    }
+    let mut sql = format!("SELECT {EVENT_COLUMNS}, {key} FROM events");
+    let mut args = filters_sql(&mut sql, guild, filters)?;
     if let Some(anchor) = request.after {
         anyhow::ensure!(anchor.id > 0, "invalid list cursor");
         let value = match (request.sort, anchor.value) {
@@ -149,4 +168,59 @@ fn event_page(
     };
     rows.truncate(limit as usize);
     Ok(EventListPage { rows, next })
+}
+
+fn filters_sql(sql: &mut String, guild: i64, filters: &EventListFilters) -> Result<Vec<Value>> {
+    // Keep sparse/absent-user lookups selective, as the unsorted read does.
+    if filters.subject.is_some() {
+        sql.push_str(" INDEXED BY idx_events_user");
+    }
+    sql.push_str(" WHERE guild_id = ?");
+    let mut args = vec![Value::Integer(guild)];
+    let ids = |ids: &[i64]| serde_json::to_string(ids).map(Value::Text);
+    if let Some(event_type) = &filters.event_type {
+        sql.push_str(" AND event_type = ?");
+        args.push(Value::Text(event_type.clone()));
+    }
+    if let Some(subject) = &filters.subject {
+        sql.push_str(" AND user_id IN (SELECT value FROM json_each(?))");
+        args.push(ids(subject)?);
+    }
+    if let Some(actor) = &filters.actor {
+        sql.push_str(" AND actor_id IN (SELECT value FROM json_each(?))");
+        args.push(ids(actor)?);
+    }
+    if let Some(q) = &filters.q {
+        // Each search parameter is used more than once, so number them after
+        // the ones already bound.
+        let (q_arg, people_arg) = (args.len() + 1, args.len() + 2);
+        args.extend([Value::Text(q.clone()), ids(&filters.q_people)?]);
+        // Match the readable parts only: IDs, the event name, reasons and
+        // directory names. Internal payload fields are not searched.
+        let text = EVENT_SEARCH_TEXT_KEYS
+            .iter()
+            .map(|key| {
+                format!(
+                    " OR instr(lower(CASE WHEN json_valid(data) THEN json_extract(data, '$.{key}') END), lower(?{q_arg})) > 0"
+                )
+            })
+            .collect::<String>();
+        sql.push_str(&format!(
+            " AND (instr(lower(event_type), lower(?{q_arg})) > 0
+                OR instr(CAST(user_id AS TEXT), ?{q_arg}) > 0
+                OR instr(CAST(actor_id AS TEXT), ?{q_arg}) > 0{text}
+                OR user_id IN (SELECT value FROM json_each(?{people_arg}))
+                OR actor_id IN (SELECT value FROM json_each(?{people_arg})))"
+        ));
+    }
+    let date = EventListSort::Date.key();
+    if let Some(from) = filters.from_ms {
+        sql.push_str(&format!(" AND {date} >= ?"));
+        args.push(Value::Integer(from));
+    }
+    if let Some(until) = filters.until_ms {
+        sql.push_str(&format!(" AND {date} < ?"));
+        args.push(Value::Integer(until));
+    }
+    Ok(args)
 }

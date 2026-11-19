@@ -9330,13 +9330,15 @@ test('Shared list controls restore, debounce, sort, clear and write the list URL
   assert.equal(root.querySelector('tbody').textContent, 'No entries.');
 });
 
-function auditLogView(h) {
-  h.app.state.config = { enrollment_id: 'membership', event_types: ['member_ban', 'member_kick'] };
+function auditLogView(h, eventTypes = ['member_ban', 'member_kick']) {
+  h.app.state.config = { enrollment_id: 'membership', event_types: eventTypes };
   h.app.navigate('events');
   return h.document.querySelector('#content');
 }
 
-test('Audit Log restores list links and resets the cursor when filters, size or sort change', async () => {
+const auditDebounce = (h) => [...h.timers.values()].find(timer => timer.delay === 300).fn();
+
+test('Audit Log restores list links and resets the cursor when filters, size, search or sort change', async () => {
   const storage = new Map();
   const requests = [];
   const fixture = pageSizeFixture('events', 137);
@@ -9352,14 +9354,20 @@ test('Audit Log restores list links and resets the cursor when filters, size or 
   const size = () => memberLabelled(root, 'Rows per page');
   const button = (label) => findNode(root, node => node.localName === 'button' && node.textContent === label);
   const sort = (label) => findNode(root, node => node.classList.contains('list-sort') && node.firstChild.textContent === label);
-  const input = root.querySelector('input[placeholder="user id"]');
-  const type = root.querySelector('select[aria-label="Event type"]');
+  const type = memberLabelled(root, 'Event');
+  const user = memberLabelled(root, 'User');
+  const actor = memberLabelled(root, 'Actor');
+  const search = memberLabelled(root, 'Search');
   const latest = () => requests.at(-1);
+  assert.equal(root.querySelector('[aria-label="Filter the audit log"]') !== null, true, 'shared list controls');
   assert.deepEqual([...size().options].map(option => option.textContent), ['50', '100', '250', '500', '1000', 'All']);
+  assert.deepEqual([...type.options].map(option => option.value), ['', 'member_ban', 'member_kick', 'ban_reason_edit', 'command_enabled']);
+  assert.equal(user.placeholder, 'Name or ID');
+  assert.equal(actor.placeholder, 'Name or ID');
+  assert.equal(root.querySelectorAll('input[type="date"]').length, 2);
   assert.equal(latest().get('limit'), '50');
   assert.equal(root.querySelector('th[aria-sort="descending"] button'), sort('Time'));
   assert.equal(sort('Details'), null);
-  assert.equal(root.querySelector('input[type="search"], input[type="date"]'), null);
   await fire(button('Next page'), 'click');
   assert.equal(latest().get('after'), 'cursor:50');
 
@@ -9369,36 +9377,47 @@ test('Audit Log restores list links and resets the cursor when filters, size or 
   assert.equal(latest().get('limit'), '100');
   await fire(button('Next page'), 'click');
   assert.equal(latest().get('after'), 'cursor:100');
-  await fire(sort('Actor ID'), 'click');
+  await fire(sort('Actor'), 'click');
   assert.equal(latest().get('after'), null);
   assert.equal(latest().get('sort'), 'actor');
   assert.equal(latest().get('dir'), 'asc');
-  await fire(sort('Actor ID'), 'click');
+  await fire(sort('Actor'), 'click');
   assert.equal(latest().get('dir'), 'desc');
 
   await fire(button('Next page'), 'click');
   const beforeDraft = requests.length;
-  input.value = '<@42>';
-  await fire(input, 'input');
-  assert.equal(requests.length, beforeDraft);
+  user.value = 'spammer';
+  await fire(user, 'input');
+  assert.equal(requests.length, beforeDraft, 'typing waits for the debounce');
+  await auditDebounce(h);
+  assert.equal(latest().get('after'), null);
+  assert.equal(latest().get('subject'), 'spammer');
   type.value = 'member_ban';
   await fire(type, 'change');
-  assert.equal(latest().get('after'), null);
   assert.equal(latest().get('event'), 'member_ban');
-  assert.equal(latest().get('user'), '42');
+  assert.equal(latest().get('subject'), 'spammer');
   await fire(button('Next page'), 'click');
-  input.value = '43';
-  await fire(input, 'keydown', { key: 'Enter' });
+  actor.value = '43';
+  await fire(actor, 'input');
+  await auditDebounce(h);
+  search.value = '  phishing  ';
+  await fire(search, 'input');
+  await auditDebounce(h);
+  const from = root.querySelector('input[type="date"]');
+  from.value = '2026-01-02';
+  await fire(from, 'change');
   assert.equal(latest().get('after'), null);
-  assert.equal(latest().get('user'), '43');
+  for (const [key, value] of [['actor', '43'], ['q', 'phishing'], ['from', '2026-01-02'], ['subject', 'spammer'], ['event', 'member_ban']]) {
+    assert.equal(latest().get(key), value, key);
+  }
+  assert.equal(latest().has('user'), false);
 
   const link = new URLSearchParams(h.location.search);
   assert.equal(link.get('list'), 'events');
   assert.equal(link.get('page_size'), '100');
   assert.equal(link.get('sort'), 'actor');
   assert.equal(link.get('dir'), 'desc');
-  assert.equal(link.get('event'), 'member_ban');
-  assert.equal(link.get('user'), '43');
+  for (const key of ['event', 'subject', 'actor', 'q', 'from']) assert.equal(link.get(key), latest().get(key), key);
   assert.equal(link.has('after'), false);
 
   const restored = harness(fetchPage, storage);
@@ -9415,11 +9434,210 @@ test('Audit Log restores list links and resets the cursor when filters, size or 
   const reopened = auditLogView(bookmarked);
   await settle();
   assert.equal(memberLabelled(reopened, 'Rows per page').value, '250');
-  assert.equal(reopened.querySelector('input[placeholder="user id"]').value, '43');
-  assert.equal(reopened.querySelector('select[aria-label="Event type"]').value, 'member_ban');
+  assert.equal(memberLabelled(reopened, 'User').value, 'spammer');
+  assert.equal(memberLabelled(reopened, 'Actor').value, '43');
+  assert.equal(memberLabelled(reopened, 'Search').value, 'phishing');
+  assert.equal(memberLabelled(reopened, 'Event').value, 'member_ban');
   assert.equal(latest().get('sort'), 'actor');
   assert.equal(latest().get('dir'), 'desc');
   assert.equal(latest().get('limit'), '250');
+  await fire(findNode(reopened, node => node.localName === 'button' && node.textContent === 'Clear filters'), 'click');
+  for (const key of ['event', 'subject', 'actor', 'q', 'from', 'after']) assert.equal(latest().get(key), null, key);
+});
+
+test('older Audit Log links keep their user filter as the User filter', async () => {
+  const requests = [];
+  const fetchPage = async (url) => {
+    const { searchParams, pathname } = new URL(url, 'file:///');
+    if (!pathname.endsWith('/events')) return response({});
+    requests.push(searchParams);
+    return response({ events: [], names: {}, next_cursor: null });
+  };
+  const old = (guild) => new URLSearchParams({ list: 'events', guild, sort: 'date', dir: 'desc', event: 'member_ban', user: '42' });
+  const opened = async (h) => {
+    h.app.restoreWorkspace();
+    assert.equal(h.app.state.tab, 'events');
+    const root = auditLogView(h);
+    await settle();
+    assert.equal(memberLabelled(root, 'User').value, '42');
+    const request = requests.at(-1);
+    assert.equal(request.get('subject'), '42');
+    assert.equal(request.has('user'), false);
+    assert.equal(request.get('event'), 'member_ban');
+    // The next generated link names the filter by its current key only.
+    const type = memberLabelled(root, 'Event');
+    type.value = 'member_kick';
+    await fire(type, 'change');
+    const link = new URLSearchParams(h.location.search);
+    assert.equal(link.get('subject'), '42');
+    assert.equal(link.has('user'), false);
+    assert.equal(requests.at(-1).get('subject'), '42');
+  };
+
+  const bookmarked = harness(fetchPage);
+  bookmarked.location.search = '?' + old(bookmarked.app.state.guildId);
+  await opened(bookmarked);
+
+  // Sign-in returns to the workspace root and restores the saved link.
+  const session = new Map();
+  const returning = harness(fetchPage, new Map(), session);
+  session.set('jmodguard.list-before-login', '?' + old(returning.app.state.guildId));
+  await opened(returning);
+});
+
+// Every event type the server can list, plus the two audit-only types its writers add.
+const SERVER_EVENT_TYPES = [...fs.readFileSync(new URL('../src/types.rs', import.meta.url), 'utf8').match(/pub const EVENT_TYPES: \[&str; \d+\] = \[([^\]]*)\]/)[1].matchAll(/"([a-z_]+)"/g)].map(match => match[1]);
+// Internal payload fields (#649) that the readable Details must never show.
+const AUDIT_INTERNAL = {
+  source: 'discord', audit_after_ms: 1767312000000, ban_id: 731337, audit_entry_id: '1300000000000000001',
+  action_id: 'f'.repeat(32), gateway_delivery_id: 'e'.repeat(32), gateway_observations: [{ at_ms: 1, audit_after_ms: 2 }],
+  pending_gateway_echo: { ban_id: 7, enrollment_id: 'membership', expires_at: null }, case_history: null,
+  channel_id: '1300000000000000002', message_id: '1300000000000000003', moderation: true,
+};
+const AUDIT_SAMPLES = {
+  member_join: [{}, /^Joined the server$/],
+  member_leave: [{}, /^Left the server$/],
+  member_ban: [{ reason: 'Reason unavailable' }, /^Banned: Reason unavailable · via Discord$/],
+  member_unban: [{ reason: 'appeal', outcome: 'already_unbanned' }, /^Unbanned: appeal · via Discord · Already unbanned$/],
+  member_kick: [{ reason: 'raid' }, /^Kicked: raid$/],
+  message_edit: [{}, /^Message edited$/],
+  message_delete: [{}, /^Message deleted$/],
+  message_bulk_delete: [{}, /^Messages deleted in bulk$/],
+  automod: [{ rule: 'invite', action: 'timeout', reason: 'Invite link', evidence: { content: 'x', attachments: 0 } }, /^Automod timeout action: Invite link · Rule: invite$/],
+  mod_action: [{ action: 'warn', reason: 'Be nice' }, /^Warned: Be nice · via command$/],
+  timeout_add: [{ until: '2026-11-14T04:05:00Z' }, /^Timed out until \S.*\d:05/],
+  timeout_remove: [{}, /^Timeout removed$/],
+  plan_executed: [{ command: 'nuke', steps: 3 }, /^Ran command nuke · 3 steps$/],
+  system: [{ message: 'Bot restarted' }, /^System event · Bot restarted$/],
+  ban_reason_edit: [{ previous_reason: null, reason: 'Spam' }, /^Ban reason changed from “No reason given” to “Spam”$/],
+  command_enabled: [{ command: 'ban', scope: 'guild', previous_enabled: true, enabled: false }, /^Command ban turned off · for this server$/],
+};
+
+async function auditDetailsView(rows, { owner = false, names = {} } = {}) {
+  const requests = [];
+  const h = harness(async (url) => {
+    const { searchParams, pathname } = new URL(url, 'file:///');
+    if (!pathname.endsWith('/events')) return response({});
+    requests.push(searchParams);
+    return response({ events: rows, names, next_cursor: null });
+  });
+  h.app.state.me.is_bot_owner = owner;
+  const root = auditLogView(h, SERVER_EVENT_TYPES);
+  await settle();
+  const details = [...root.querySelectorAll('tbody tr')].map(row => row.querySelector('.audit-details'));
+  return { h, root, details, requests };
+}
+
+const auditRow = (id, eventType, data, extra = {}) => ({
+  id, guild_id: '987654321098765432', event_type: eventType, user_id: '42', actor_id: null,
+  data: JSON.stringify(data), created_at: '2026-01-02T00:00:00Z', ...extra,
+});
+
+test('Audit Log Details summarize every event type without internal fields', async () => {
+  assert.ok(SERVER_EVENT_TYPES.length >= 14, 'read the server event types');
+  const types = [...new Set([...SERVER_EVENT_TYPES, 'ban_reason_edit', 'command_enabled'])];
+  for (const type of types) assert.ok(Object.hasOwn(AUDIT_SAMPLES, type), `sample for ${type}`);
+  const rows = types.map((type, i) => auditRow(i + 1, type, { ...AUDIT_INTERNAL, ...AUDIT_SAMPLES[type][0] }));
+  const { details } = await auditDetailsView(rows);
+  assert.equal(details.length, types.length);
+  types.forEach((type, i) => {
+    const summary = details[i].firstChild.textContent;
+    assert.match(summary, AUDIT_SAMPLES[type][1], type);
+    assert.doesNotMatch(details[i].textContent, /No readable summary/, type);
+    assert.equal(details[i].querySelector('details, pre'), null, `${type} has no Raw toggle for a non-owner`);
+    for (const [key, value] of Object.entries(AUDIT_INTERNAL)) {
+      assert.equal(details[i].textContent.includes(key), false, `${type} hides ${key}`);
+      if (['string', 'number', 'boolean'].includes(typeof value)) {
+        assert.equal(details[i].textContent.includes(String(value)), false, `${type} hides ${key} value`);
+      }
+    }
+  });
+  // The timeout end shows its own local month, day, hour and minute.
+  const until = new Date(AUDIT_SAMPLES.timeout_add[0].until);
+  const shown = details[types.indexOf('timeout_add')].firstChild.textContent.match(/\d+/g).map(Number);
+  for (const [part, value] of [['month', until.getMonth() + 1], ['day', until.getDate()], ['minute', until.getMinutes()]]) {
+    assert.ok(shown.includes(value), `timeout ${part} ${value} in ${shown}`);
+  }
+  assert.ok(shown.includes(until.getHours()) || shown.includes(until.getHours() % 12 || 12), `timeout hour in ${shown}`);
+});
+
+test('Audit Log Details name automod and timeout command actions without claiming their result', async () => {
+  // Producer payloads: automod.rs writes this row after a failed or skipped kick,
+  // and `!timeout <user> 0` writes action "timeout" after removing the timeout.
+  const rows = [
+    auditRow(1, 'automod', { rule: 'spam', action: 'kick', reason: 'spam', evidence: {} }),
+    auditRow(2, 'automod', { rule: 'spam', action: 'warn', reason: 'spam', evidence: {} }),
+    auditRow(3, 'mod_action', { action: 'timeout', reason: 'appeal approved' }),
+  ];
+  const { details } = await auditDetailsView(rows);
+  const summaries = details.map(detail => detail.firstChild.textContent);
+  assert.deepEqual(summaries, [
+    'Automod kick action: spam · Rule: spam',
+    'Automod warn action: spam · Rule: spam',
+    'Timeout changed: appeal approved · via command',
+  ]);
+  for (const summary of summaries) assert.doesNotMatch(summary, /kicked|warned|timed out/i, summary);
+});
+
+test('Audit Log keeps raw JSON behind a collapsed owner-only Raw toggle and falls back to it for unknown types', async () => {
+  const rows = [
+    auditRow(1, 'member_ban', { reason: 'Spam', source: 'webui', audit_after_ms: 5 }),
+    auditRow(2, 'future_event', { audit_after_ms: 5, detail: 'new' }),
+    auditRow(3, 'member_kick', null, { data: 'not json' }),
+  ];
+  const owner = await auditDetailsView(rows, { owner: true });
+  const [known, unknown, broken] = owner.details;
+  assert.match(known.firstChild.textContent, /^Banned: Spam · via the Web UI$/);
+  const raw = known.querySelector('details.audit-raw');
+  assert.ok(raw, 'owners get the Raw toggle');
+  assert.equal(raw.open, false, 'Raw starts collapsed');
+  assert.equal(raw.querySelector('summary').textContent, 'Raw');
+  assert.match(raw.querySelector('pre').textContent, /"audit_after_ms": 5/);
+  assert.equal(unknown.firstChild.textContent, 'No readable summary for this event.');
+  assert.match(unknown.querySelector('details.audit-raw pre').textContent, /"detail": "new"/);
+  assert.equal(broken.firstChild.textContent, 'No readable summary for this event.');
+  assert.equal(broken.querySelector('details.audit-raw pre').textContent, 'not json');
+
+  const member = await auditDetailsView(rows);
+  assert.equal(member.root.querySelector('details.audit-raw'), null, 'only owners see raw JSON');
+  assert.equal(member.details[1].textContent, 'No readable summary for this event.');
+  assert.doesNotMatch(member.root.querySelector('tbody').textContent, /audit_after_ms/);
+});
+
+test('Audit Log names known users and actors beside copyable IDs and filters by them', async () => {
+  const rows = [auditRow(1, 'member_ban', { reason: 'Spam', ban_id: 7 }, { user_id: '9007199254740993', actor_id: '77' })];
+  const names = { '9007199254740993': { display_name: 'Spammy', username: 'spammer' } };
+  const { root, requests } = await auditDetailsView(rows, { names });
+  const [, , user, actor] = root.querySelectorAll('tbody tr td');
+  assert.equal(user.querySelector('.case-avatar').textContent, 'S');
+  assert.match(user.textContent, /Spammy/);
+  assert.match(user.textContent, /@spammer/);
+  assert.equal(user.querySelector('.id-chip code').textContent, '9007199254740993');
+  assert.ok(user.querySelector('button[aria-label="Copy user ID 9007199254740993"]'));
+  assert.match(actor.textContent, /Unknown user/);
+  assert.equal(actor.querySelector('.id-chip code').textContent, '77');
+  await fire(user.querySelector('a[aria-label^="Filter by user Spammy"]'), 'click');
+  assert.equal(requests.at(-1).get('subject'), '9007199254740993');
+  await fire(root.querySelector('tbody tr td:nth-child(4) a[aria-label^="Filter by actor"]'), 'click');
+  assert.equal(requests.at(-1).get('actor'), '77');
+  assert.equal(requests.at(-1).get('subject'), null);
+
+  const bans = [];
+  const opened = harness(async (url) => {
+    const { searchParams, pathname } = new URL(url, 'file:///');
+    if (pathname.endsWith('/bans')) bans.push(searchParams);
+    return response(pathname.endsWith('/events') ? { events: rows, names, next_cursor: null } : { bans: [], moderators: [], names: {} });
+  });
+  const view = auditLogView(opened);
+  await settle();
+  await fire(findNode(view, node => node.localName === 'button' && node.textContent === 'View ban'), 'click');
+  await settle();
+  assert.equal(opened.app.state.tab, 'bans');
+  assert.equal(bans.at(-1).get('subject'), '9007199254740993');
+  const location = new URLSearchParams(opened.location.search);
+  assert.equal(location.get('list'), 'bans');
+  assert.equal(location.get('subject'), '9007199254740993');
+  assert.equal(location.has('event'), false);
 });
 
 function pageSizeFixture(list, count = 1037) {
@@ -10160,8 +10378,14 @@ for (const [list, view] of [['bans', bansView], ['events', auditLogView]]) {
     release();
     await settle();
     const userId = list === 'bans' ? 1 : 2;
-    assert.equal(listTable(panel).tBodies[0].rows[0].cells[userId].textContent, '51',
-      'a late response from the first page does not replace the current page');
+    const row = listTable(panel).tBodies[0].rows[0];
+    if (list === 'events') {
+      assert.equal(row.querySelector('code')?.textContent, '51',
+        'a late response from the first page does not replace the current page');
+    } else {
+      assert.equal(row.cells[userId].textContent, '51',
+        'a late response from the first page does not replace the current page');
+    }
   });
 }
 
