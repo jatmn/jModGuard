@@ -5,25 +5,66 @@
 // to gigabytes outside the JS heap without returning (#709). Object comparisons here fail
 // with a short preview instead.
 import assert from 'node:assert/strict';
-import { inspect, isDeepStrictEqual } from 'node:util';
+import { inspect, isDeepStrictEqual, types } from 'node:util';
 
-const isObject = value => value !== null && typeof value === 'object';
+const isReference = value => (value !== null && typeof value === 'object') || typeof value === 'function';
+const maxProperties = 4;
 
-function preview(value) {
-  if (isObject(value) && value.nodeType === 1 && typeof value.localName === 'string') {
-    const className = typeof value.className === 'string' && value.className ? ` class="${value.className}"` : '';
-    return `<${value.localName}${className}> ${JSON.stringify(String(value.textContent).slice(0, 80))}`;
+function truncate(value, limit = 80) {
+  return value.length > limit ? `${value.slice(0, limit)}…` : value;
+}
+
+function previewProperty(property) {
+  if (!property) return '<empty>';
+  return 'value' in property ? preview(property.value, false) : '[Accessor]';
+}
+
+function preview(value, expand = true) {
+  if (types.isProxy(value)) return '[Proxy]';
+  if (typeof value === 'function') {
+    const name = Object.getOwnPropertyDescriptor(value, 'name')?.value;
+    return typeof name === 'string' && name ? `[Function ${truncate(name)}]` : '[Function]';
   }
-  return inspect(value, { depth: 1, maxArrayLength: 10, maxStringLength: 80, breakLength: Infinity }).slice(0, 300);
+  if (typeof value === 'string') return JSON.stringify(truncate(value));
+  if (typeof value === 'symbol') return `Symbol(${truncate(value.description ?? '')})`;
+  if (!isReference(value)) return inspect(value);
+
+  // Expand only the outer object. Descriptors keep getters and inspection hooks out of the preview.
+  const array = Array.isArray(value);
+  if (!expand) return array ? '[Array]' : '[Object]';
+  const Element = globalThis.window?.Element;
+  if (Element && value instanceof Element) {
+    const className = typeof value.className === 'string' && value.className ? ` class="${truncate(value.className)}"` : '';
+    return `<${truncate(value.localName)}${className}> ${JSON.stringify(truncate(value.textContent))}`;
+  }
+
+  const fields = [];
+  if (array) {
+    for (let index = 0; index < Math.min(value.length, maxProperties); index++) {
+      fields.push(previewProperty(Object.getOwnPropertyDescriptor(value, index)));
+    }
+    if (value.length > maxProperties) fields.push('…');
+    return `[${fields.join(', ')}]`;
+  }
+  for (const key in value) {
+    const property = Object.getOwnPropertyDescriptor(value, key);
+    if (!property) break;
+    if (fields.length === maxProperties) {
+      fields.push('…');
+      break;
+    }
+    fields.push(`${truncate(key)}: ${previewProperty(property)}`);
+  }
+  return `{${fields.join(', ')}}`;
 }
 
 function bounded(name, matches, relation) {
   const original = assert[name];
   return function compare(actual, expected, message) {
-    if (!isObject(actual) && !isObject(expected)) return original(actual, expected, message);
+    if (!isReference(actual) && !isReference(expected)) return original(actual, expected, message);
     if (matches(actual, expected)) return;
     if (message instanceof Error) throw message;
-    const summary = `Expected ${preview(actual)} ${relation} ${preview(expected)}`;
+    const summary = `Expected ${truncate(preview(actual), 300)} ${relation} ${truncate(preview(expected), 300)}`;
     throw new assert.AssertionError({ message: message ? `${message}\n${summary}` : summary, stackStartFn: compare });
   };
 }

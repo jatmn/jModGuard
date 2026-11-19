@@ -100,11 +100,13 @@ path, and the ignored two-process smoke still runs after building both services.
 Local preflight uses nextest when installed, with the existing GNU timeout
 fallback for unavailable nextest or unsupported arguments.
 
-Each frontend Node test file runs in its own process session with a 600-second
-limit, a 60-second default per-test timeout and a 2 GiB JS heap cap. A timeout or
-an interrupted preflight stops the whole session. The React DOM test files compare
-objects through `scripts/frontend-test-assert.mjs`, which fails with a short
-preview: `node:assert` would inspect and diff a mounted node's entire React tree.
+The frontend checks require `setsid` from util-linux. Each frontend Node test file,
+including `tools/eslint/test-flake.test.js`, runs in its own process session with a
+600-second limit, a 60-second default per-test timeout and a 2 GiB JS heap cap.
+A timeout or an interrupted preflight stops the whole session. The React DOM test
+files compare objects through `scripts/frontend-test-assert.mjs`, which reports
+a short preview. A failed `node:assert` comparison can inspect and diff a mounted
+node's entire React tree.
 
 CI passes selected groups as repeated `--only` arguments. Ordinary contributors
 run relevant local checks and rely on **CI passed** for complete affected validation;

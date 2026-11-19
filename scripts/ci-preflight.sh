@@ -547,6 +547,11 @@ should_run() {
   esac
 }
 
+if should_run frontend && ! command -v setsid >/dev/null 2>&1; then
+  echo 'ci-preflight: frontend Node tests require setsid (install util-linux)' >&2
+  exit 1
+fi
+
 if should_run contracts; then
   node scripts/ci-workflow-test.mjs
   node --test scripts/check-test-flakes.test.mjs
@@ -1013,7 +1018,7 @@ if should_run frontend; then
 
   echo 'ci-preflight: bash tools/eslint-web-selftest.sh'
   bash tools/eslint-web-selftest.sh
-  node --test tools/eslint/test-flake.test.js
+  run_frontend_node_test tools/eslint/test-flake.test.js || exit $?
   node scripts/check-test-flakes.mjs eslint
 
   run_frontend_node_test scripts/frontend-state-test.mjs || exit $?
