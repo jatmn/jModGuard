@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import assert from 'node:assert/strict';
+import assert from './frontend-test-assert.mjs';
 import fs from 'node:fs';
 import test, { afterEach, after } from 'node:test';
 import vm from 'node:vm';
@@ -615,6 +615,18 @@ test('the ban dialog finds current members by name and says when the search fail
   await settle();
   const post = calls.find(call => call.url.endsWith('/ban'));
   assert.equal(JSON.parse(post.opts.body).user_id, '9007199254740993');
+});
+
+// #709: node:assert renders a failed comparison by inspecting both values without a practical
+// depth limit. A node mounted in the page reaches React's fiber tree, and that report grew
+// without bound. This tree is tiny, so a regression fails on the message instead of running away.
+test('failed assertions on mounted nodes report a short preview', () => {
+  const h = harness();
+  const node = h.mount(() => React.createElement('p', { className: 'probe' }, 'Mounted text')).querySelector('p.probe');
+  assert.ok(Object.keys(node).some(key => key.startsWith('__reactFiber')), 'React links the node to its fiber');
+  assert.throws(() => assert.equal(node, null, 'the node is gone'),
+    { message: 'the node is gone\nExpected <p class="probe"> "Mounted text" to be null' });
+  assert.throws(() => assert.deepEqual([node], []), error => error.message.length <= 700);
 });
 
 test('the ban dialog locks all submitted options until acknowledgment or failure', async t => {
