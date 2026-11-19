@@ -700,9 +700,10 @@ impl UpdateControl {
         self
     }
 
-    /// Bot-launcher side of the launcher link. Only API paired-upgrade steps
-    /// and owner upgrade recovery (Check, Apply, Cancel) are accepted. Every
-    /// write runs under this launcher's fence, never the bot process's writer lease.
+    /// Bot-launcher side of the launcher link. Only API paired-upgrade steps,
+    /// owner upgrade recovery (Check, Apply, Cancel) and the API launcher's own
+    /// activation and observation are accepted. Every write runs under this
+    /// launcher's fence, never the bot process's writer lease.
     pub async fn apply_launcher_op(&self, op: ControlOp) -> Result<ControlReply> {
         if matches!(op, ControlOp::LookupResult) {
             // Results are not cached. Every accepted step is safe to resend.
@@ -776,6 +777,35 @@ impl UpdateControl {
             }
             ControlOp::ReleasePairCheck { owner } => {
                 self.release_pair_check(&owner).await?;
+                serde_json::Value::Null
+            }
+            // The API launcher's activation and observation, in its startup
+            // order, so its runtime is recorded while the bot process is stopped.
+            ControlOp::RecordBakedLauncher {
+                component,
+                hash,
+                now,
+            } if component == "api" => {
+                self.baked_launcher(&component, &hash, now).await?;
+                serde_json::Value::Null
+            }
+            ControlOp::RecordLauncherRunning {
+                component,
+                release,
+                hash,
+                now,
+            } if component == "api" => {
+                self.launcher_running(&component, &release, &hash, now)
+                    .await?;
+                serde_json::Value::Null
+            }
+            ControlOp::ObserveLauncher {
+                component,
+                revision,
+                base_abi,
+            } if component == "api" => {
+                self.observe_launcher(&component, revision, base_abi.as_deref())
+                    .await?;
                 serde_json::Value::Null
             }
             _ => anyhow::bail!("write failed"),
@@ -1227,6 +1257,30 @@ impl UpdateControl {
         forward(self.writer.as_ref(), op).await.map(|_| ())
     }
 
+    /// The API launcher's activation and observation go to the bot process like
+    /// its other receipts. While that process cannot save them, as after a
+    /// failed pair stops it, the bot launcher stores them instead, so owner
+    /// recovery can compare the API launcher's runtime. Any launcher-link
+    /// refusal, including from an older bot launcher, keeps the process error
+    /// and its retry.
+    async fn forward_launcher_receipt(&self, op: ControlOp) -> Result<()> {
+        let error = match self.forward_process(op.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let Some(link) = self
+            .launcher
+            .as_ref()
+            .filter(|_| error.downcast_ref::<ReceiptNotSaved>().is_some())
+        else {
+            return Err(error);
+        };
+        match link.submit(op, 0).await {
+            Ok(ControlReply::Saved { .. } | ControlReply::Unchanged { .. }) => Ok(()),
+            _ => Err(error),
+        }
+    }
+
     /// Paired-upgrade steps from the read-only API launcher, sent to the bot
     /// launcher. A changed operation keeps its type so the caller retries from
     /// durable state instead of failing the upgrade.
@@ -1328,7 +1382,7 @@ impl UpdateControl {
         let base_abi = base_abi.map(str::to_owned);
         if !self.writes_locally() {
             return self
-                .forward_process(ControlOp::ObserveLauncher {
+                .forward_launcher_receipt(ControlOp::ObserveLauncher {
                     component: role.to_owned(),
                     revision,
                     base_abi,
@@ -1380,7 +1434,7 @@ impl UpdateControl {
     ) -> Result<()> {
         if !self.writes_locally() {
             return self
-                .forward_process(ControlOp::RecordLauncherRunning {
+                .forward_launcher_receipt(ControlOp::RecordLauncherRunning {
                     component: role.to_owned(),
                     release: release.clone(),
                     hash: hash.to_owned(),
@@ -1394,7 +1448,7 @@ impl UpdateControl {
     pub async fn baked_launcher(&self, role: &str, hash: &str, now: i64) -> Result<()> {
         if !self.writes_locally() {
             return self
-                .forward_process(ControlOp::RecordBakedLauncher {
+                .forward_launcher_receipt(ControlOp::RecordBakedLauncher {
                     component: role.to_owned(),
                     hash: hash.to_owned(),
                     now,
@@ -2720,37 +2774,95 @@ mod tests {
         assert_eq!(queued.phase, UpgradePhase::Preparing);
     }
 
-    /// Redeployed Trixie launchers report their runtime before any application
-    /// is ready, so owner recovery can admit a Trixie pair over Bookworm history.
+    /// After a failed Bookworm pair stops both applications, redeployed Trixie
+    /// launchers report their runtime before any application is ready: the bot
+    /// launcher locally, the read-only API launcher through the bot launcher
+    /// link. Owner recovery then admits a Trixie pair over Bookworm history.
     #[tokio::test(flavor = "multi_thread")]
-    async fn launcher_base_abi_admits_a_pair_for_a_redeployed_runtime() {
+    async fn launcher_base_abi_admits_recovery_of_a_pair_for_a_redeployed_runtime() {
+        const TRIXIE: &str = "debian-trixie-amd64";
         let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
-        for role in ["bot", "api"] {
-            let mut release = f.control.component(role).await.unwrap().candidate.unwrap();
-            release.base_abi = "debian-trixie-amd64".into();
-            f.control
-                .checked(role, "latest", Some(release), None, 100)
-                .await
-                .unwrap();
+        // No bot process link: the bot application is stopped.
+        let (api, link) = launcher_linked(&f).await;
+        let upgrade = f.queue(false, 200).await.unwrap();
+        f.control
+            .join_upgrade(&upgrade.id, "bot", "bot")
+            .await
+            .unwrap();
+        api.join_upgrade(&upgrade.id, "api", "api").await.unwrap();
+        api.upgrade_error(&upgrade.id, "api: staged binary failed")
+            .await
+            .unwrap();
+        api.acknowledge(&upgrade.id, "api", "api", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap();
+        f.control
+            .acknowledge(&upgrade.id, "bot", "bot", UpgradeAcknowledgement::Stopped)
+            .await
+            .unwrap();
+        let submit = async |op: ControlOp| link.submit(op, 0).await.unwrap();
+        let ControlReply::Saved { body } = submit(ControlOp::AcquirePairCheck { now: 300 }).await
+        else {
+            panic!("recovery Check was not saved");
+        };
+        let owner: String = serde_json::from_value(body).unwrap();
+        let trixie = |role: &str, digit: char| {
+            let mut release = upgrade.service(role).unwrap().release.clone();
+            release.source_sha = "9".repeat(40);
+            release.digest = format!("sha256:{}", digit.to_string().repeat(64));
+            release.base_abi = TRIXIE.into();
+            release
+        };
+        let (bot, api_release) = (trixie("bot", 'e'), trixie("api", 'f'));
+        for op in [
+            ControlOp::RecordPairCheck {
+                owner: owner.clone(),
+                channel: "latest".into(),
+                bot: bot.clone(),
+                api: api_release.clone(),
+                now: 300,
+            },
+            ControlOp::ReleasePairCheck { owner },
+        ] {
+            let reply = submit(op).await;
+            assert!(matches!(reply, ControlReply::Saved { .. }), "{reply:?}");
         }
-        let refused = f.queue(true, 200).await.unwrap_err();
+        let recover = || ControlOp::RequestUpgrade {
+            bot_digest: bot.digest.clone(),
+            api_digest: api_release.digest.clone(),
+            recover: true,
+            now: 300,
+        };
+        let refused = submit(recover()).await;
         assert!(
-            refused.to_string().contains("coordinated-update baseline"),
-            "{refused:#}"
+            matches!(&refused, ControlReply::Failed { message, .. }
+                if message.contains("coordinated-update baseline")),
+            "{refused:?}"
         );
-        for role in ["bot", "api"] {
-            let op = crate::db::ControlOp::ObserveLauncher {
-                component: role.into(),
-                revision: LAUNCHER_REVISION,
-                base_abi: Some("debian-trixie-amd64".into()),
-            };
-            crate::db::apply_control(&f.control.db, None, op, None)
-                .await
-                .unwrap();
-        }
-        let queued = f.queue(true, 200).await.unwrap();
-        assert_eq!(queued.bot.release.base_abi, "debian-trixie-amd64");
-        assert_eq!(queued.api.release.base_abi, "debian-trixie-amd64");
+        f.control
+            .observe_launcher("bot", LAUNCHER_REVISION, Some(TRIXIE))
+            .await
+            .unwrap();
+        // The API launcher's startup receipts, in order, without the bot process.
+        api.baked_launcher("api", &"ab".repeat(32), 300)
+            .await
+            .unwrap();
+        api.observe_launcher("api", LAUNCHER_REVISION, Some(TRIXIE))
+            .await
+            .unwrap();
+        let state = f.control.component("api").await.unwrap();
+        assert_eq!(
+            state.launcher_sha256.as_deref(),
+            Some("ab".repeat(32).as_str())
+        );
+        assert_eq!(state.observed.unwrap().base_abi, TRIXIE);
+        let ControlReply::Saved { body } = submit(recover()).await else {
+            panic!("recovery of the Trixie pair was not admitted");
+        };
+        let recovered: ServiceUpgrade = serde_json::from_value(body).unwrap();
+        assert_ne!(recovered.id, upgrade.id);
+        assert_eq!(recovered.bot.release.base_abi, TRIXIE);
+        assert_eq!(recovered.api.release.base_abi, TRIXIE);
     }
 
     /// A launcher-only update can put revision-38 launchers on an older image.
@@ -2987,7 +3099,8 @@ mod tests {
         assert_ne!(recovered.id, upgrade.id);
         assert!(recovered.error.is_none());
         assert_eq!(recovered.phase, UpgradePhase::Preparing);
-        // The link refuses bot-role steps and every non-upgrade write.
+        // The link refuses bot-role steps and every other non-upgrade write,
+        // including the API launcher's failure receipts.
         for op in [
             ControlOp::AcknowledgeUpgrade {
                 id: recovered.id.clone(),
@@ -2996,9 +3109,14 @@ mod tests {
                 action: UpgradeAcknowledgement::Prepared,
             },
             ControlOp::ObserveLauncher {
-                component: "api".into(),
+                component: "bot".into(),
                 revision: 1,
                 base_abi: None,
+            },
+            ControlOp::RecordLauncherFailure {
+                component: "api".into(),
+                digest: upgrade.api.release.digest.clone(),
+                error: "dropped".into(),
             },
         ] {
             let refused = link.submit(op, 0).await.unwrap();
@@ -3011,7 +3129,7 @@ mod tests {
         assert!(current.bot.prepared == UpgradeProof::Missing);
         assert_eq!(
             f.control
-                .component("api")
+                .component("bot")
                 .await
                 .unwrap()
                 .observed

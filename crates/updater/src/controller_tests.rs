@@ -7708,31 +7708,187 @@ async fn reopen_supervisor(mut bot: Supervisor) -> Supervisor {
     controller(&role, baked, registry, control, &root)
 }
 
+const TRIXIE: &str = "debian-trixie-amd64";
+
+/// Rewrite one recorded observation field, as a launcher of another image
+/// would have recorded it.
+async fn set_observed(db: &Db, role: &'static str, field: &'static str, value: serde_json::Value) {
+    let value = value.to_string();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            &format!(
+                "UPDATE component_updates SET observed=json_set(observed,'$.{field}',json(?1)) WHERE component=?2"
+            ),
+            params![value, role],
+            64 * 1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
 /// A Trixie API redeployed before the bot must not wait for a migration that
-/// the Bookworm bot, which restores its installed release, will never run.
+/// the Bookworm bot, which restores its installed release, will never run. A
+/// bot runtime that was never recorded keeps that installed release too.
 #[tokio::test]
 async fn api_judges_bot_built_in_restore_by_the_bot_container_abi() {
     let root = std::env::temp_dir().join(format!("bot-abi-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();
     let baked = executable(&root, "baked-api").await;
     let (db, control) = open_launcher_db(&root).await;
+    let stamp = 1_700_000_000;
+    control
+        .running("bot", None, fresh_observation(stamp), stamp)
+        .await
+        .unwrap();
+    let older = db::CORE_SCHEMA_VERSION - 1;
+    installed_state(&db, release_at("bot", 'c', older)).await;
+    set_core_schema(&db, older).await;
+    for (bot_abi, bot_migrates) in [
+        ("debian-bookworm-amd64", false),
+        ("", false),
+        ("unknown", false),
+        (TRIXIE, true),
+    ] {
+        set_observed(&db, "bot", "base_abi", json!(bot_abi)).await;
+        let registry = Registry::new("http://127.0.0.1:9").unwrap();
+        let mut api = controller("api", baked.clone(), registry, control.clone(), &root);
+        api.base_abi = TRIXIE.into();
+        let state = control.component("api").await.unwrap();
+        assert!(state.installed.is_none());
+        let result = api.restore(&state).await;
+        if bot_migrates {
+            result.unwrap();
+            assert!(api.core_migration_wait.is_some(), "{bot_abi:?}");
+        } else {
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(
+                error.contains("baked application cannot open database; use owner recovery"),
+                "{bot_abi:?}: {error}"
+            );
+            assert!(api.core_migration_wait.is_none(), "{bot_abi:?}");
+        }
+        assert!(api.running.is_none(), "{bot_abi:?}");
+        api.end_idle().await.unwrap();
+    }
+    drop((control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+/// Only a Trixie container supersedes an installed Bookworm release. A
+/// Bookworm container refuses an installed Trixie release even when its
+/// built-in application fits, so moving back leaves the service stopped.
+#[tokio::test]
+async fn bookworm_container_refuses_an_installed_trixie_release() {
+    let root = std::env::temp_dir().join(format!("bookworm-back-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
     let schema = control.schema_version().await.unwrap();
+    assert_eq!(schema, db::CORE_SCHEMA_VERSION);
+    control
+        .running("bot", None, fresh_observation(1), 1)
+        .await
+        .unwrap();
+    let mut release = release_at("bot", 'c', schema);
+    release.base_abi = TRIXIE.into();
+    let state = installed_state(&db, release.clone()).await;
     let registry = Registry::new("http://127.0.0.1:9").unwrap();
-    let mut api = controller("api", baked, registry, control, &root);
-    api.base_abi = "debian-trixie-amd64".into();
-    let mut bot = installed_state(&db, release_at("bot", 'c', schema)).await;
-    bot.observed = Some(fresh_observation(1));
+    let mut bot = controller("bot", baked, registry, control.clone(), &root);
+    assert_eq!(bot.base_abi, "debian-bookworm-amd64");
+    let error = format!("{:#}", bot.restore(&state).await.unwrap_err());
     assert!(
-        !api.baked_restore_fits("bot", &bot, schema).await.unwrap(),
-        "a Bookworm bot restores its installed release"
+        error.contains("installed application requires a different base ABI"),
+        "{error}"
     );
-    bot.observed.as_mut().unwrap().base_abi = "debian-trixie-amd64".into();
-    assert!(
-        api.baked_restore_fits("bot", &bot, schema).await.unwrap(),
-        "a Trixie bot replaces it with its built-in application"
+    assert!(bot.running.is_none());
+    let state = control.component("bot").await.unwrap();
+    assert_eq!(state.installed, Some(release));
+    bot.end_idle().await.unwrap();
+    drop((bot, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+/// The built-in Trixie API replaces an installed Bookworm API only when the
+/// guild stores, which the bot migrates, are at its guild schema. Redeployed
+/// before the bot, it keeps serving from the installed API instead.
+#[tokio::test]
+async fn trixie_api_keeps_installed_bookworm_api_until_the_bot_records_its_guild_schema() {
+    let root =
+        std::env::temp_dir().join(format!("trixie-api-guild-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-api").await;
+    let installed = executable(&root, "installed-api").await;
+    let mut objects = HashMap::new();
+    let mut release = image(
+        &mut objects,
+        "api",
+        &tokio::fs::read(installed).await.unwrap(),
     );
+    release.min_schema = db::CORE_SCHEMA_VERSION;
+    release.max_schema = db::CORE_SCHEMA_VERSION;
+    release.result_schema = db::CORE_SCHEMA_VERSION;
+    release.upgrade.as_mut().unwrap().guild_schema = db::guild_data::SCHEMA_VERSION;
+    assert_eq!(release.base_abi, "debian-bookworm-amd64");
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+    let (db, control) = open_launcher_db(&root).await;
+    let stamp = now();
+    for role in ["bot", "api"] {
+        control
+            .running(role, None, fresh_observation(stamp), stamp)
+            .await
+            .unwrap();
+    }
+    let state = installed_state(&db, release.clone()).await;
+    // The core schemas match; the Trixie image's guild schema is newer.
+    let newer_guild = db::guild_data::SCHEMA_VERSION + 1;
+    let trixie_api = || {
+        let mut api = controller(
+            "api",
+            baked.clone(),
+            Registry::new(&base).unwrap(),
+            control.clone(),
+            &root,
+        );
+        api.base_abi = TRIXIE.into();
+        api.baked_compatibility.guild = newer_guild;
+        api
+    };
+    let mut api = trixie_api();
+    api.restore(&state).await.unwrap();
+    let running = api.running.as_ref().expect("installed API restarted");
+    assert_eq!(
+        running.release.as_ref().map(|release| &release.digest),
+        Some(&release.digest)
+    );
+    api.stop_application().await.unwrap();
     api.end_idle().await.unwrap();
-    drop((api, db));
+
+    // Once the bot records the newer guild schema, the built-in API fits.
+    set_observed(&db, "bot", "guild_schema", json!(newer_guild)).await;
+    let mut api = trixie_api();
+    api.restore(&state).await.unwrap();
+    let running = api.running.as_ref().expect("built-in API started");
+    assert_eq!(running.path, baked);
+    assert!(running.release.is_none());
+    api.stop_application().await.unwrap();
+    api.end_idle().await.unwrap();
+    server.abort();
+    drop((api, control, db));
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 

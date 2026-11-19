@@ -1,7 +1,8 @@
 //! Bot-launcher update-control listener. The bot launcher keeps running, and
 //! keeps its launcher fence, while the bot process is stopped for a paired
 //! upgrade. The read-only API launcher sends its paired-upgrade steps here, and
-//! the API sends owner upgrade recovery here. Frames use the control secret.
+//! its own activation and observation while the bot process cannot save them.
+//! The API sends owner upgrade recovery here. Frames use the control secret.
 //! [`UpdateControl::apply_launcher_op`] accepts only those operations.
 
 use crate::control::{self, NonceWindow};
