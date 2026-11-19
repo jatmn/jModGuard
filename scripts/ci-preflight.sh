@@ -906,16 +906,22 @@ run_dual_process_smoke() {
     run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture
 }
 
-# Each frontend Node test file runs in its own session with a wall-clock limit, a
-# default per-test timeout and a JS heap cap, so a runaway test fails instead of
-# exhausting the host or outliving this script (#709). Tests with their own
-# timeout keep it.
+# Each frontend Node test file runs in its own session with a wall-clock limit
+# and a JS heap cap. Node 24+ also gets a default per-test timeout. Node 20/22
+# apply that CLI timeout to the whole file, so older versions rely on explicit
+# test timeouts and the session limit.
 run_frontend_node_test() {
   local file=$1
+  local node_major
+  local -a test_args=(--test)
+  if node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null)" \
+    && [[ "$node_major" =~ ^[1-9][0-9]*$ ]] && (( node_major >= 24 )); then
+    test_args+=(--test-timeout=60000)
+  fi
   echo "ci-preflight: node --test $file"
   JMODGUARD_TEST_TIMEOUT_SEC=600 run_with_test_timeout "$file" \
     env NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=2048" \
-    node --test --test-timeout=60000 "$file"
+    node "${test_args[@]}" "$file"
 }
 
 if [ -z "${only_names}" ]; then
