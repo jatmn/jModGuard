@@ -263,14 +263,6 @@ check_node_timeout_flag() {
     cat "$fixture/frontend.log" >&2
     fail "Node major '${major}': frontend preflight failed"
   fi
-
-  local -a actual_args
-  mapfile -t actual_args <"$node_log"
-  if ! diff -u <(printf 'ci-preflight: node%s\n' "$(printf ' %q' "${actual_args[@]}")") \
-    <(grep -E '^ci-preflight: node .* scripts/frontend-state-test\.mjs$' "$fixture/frontend.log"); then
-    fail "Node major '${major}': frontend command log differs from actual arguments"
-  fi
-
   local -a expected=(--test)
   if [ -n "$expected_timeout" ]; then
     expected+=("$expected_timeout")
@@ -278,6 +270,21 @@ check_node_timeout_flag() {
   expected+=(scripts/frontend-state-test.mjs)
   if ! diff -u <(printf '%s\n' "${expected[@]}") "$node_log"; then
     fail "Node major '${major}': unexpected frontend test arguments"
+  fi
+
+  # Read just the frontend-state invocation from the argument capture.
+  local arg
+  local -a actual_args=()
+  while IFS= read -r arg; do
+    if [ "$arg" = --test ]; then
+      actual_args=()
+    fi
+    actual_args+=("$arg")
+    [ "$arg" != scripts/frontend-state-test.mjs ] || break
+  done <"$node_log"
+  if ! diff -u <(printf 'ci-preflight: node%s\n' "$(printf ' %q' "${actual_args[@]}")") \
+    <(grep -E '^ci-preflight: node .* scripts/frontend-state-test\.mjs$' "$fixture/frontend.log"); then
+    fail "Node major '${major}': frontend command log differs from actual arguments"
   fi
 }
 
