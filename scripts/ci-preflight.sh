@@ -918,7 +918,9 @@ run_frontend_node_test() {
     && [[ "$node_major" =~ ^[1-9][0-9]*$ ]] && (( node_major >= 24 )); then
     test_args+=(--test-timeout=60000)
   fi
-  echo "ci-preflight: node --test $file"
+  printf 'ci-preflight: node'
+  printf ' %q' "${test_args[@]}" "$file"
+  printf '\n'
   JMODGUARD_TEST_TIMEOUT_SEC=600 run_with_test_timeout "$file" \
     env NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=2048" \
     node "${test_args[@]}" "$file"

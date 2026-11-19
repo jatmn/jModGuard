@@ -263,6 +263,14 @@ check_node_timeout_flag() {
     cat "$fixture/frontend.log" >&2
     fail "Node major '${major}': frontend preflight failed"
   fi
+
+  local -a actual_args
+  mapfile -t actual_args <"$node_log"
+  if ! diff -u <(printf 'ci-preflight: node%s\n' "$(printf ' %q' "${actual_args[@]}")") \
+    <(grep -E '^ci-preflight: node .* scripts/frontend-state-test\.mjs$' "$fixture/frontend.log"); then
+    fail "Node major '${major}': frontend command log differs from actual arguments"
+  fi
+
   local -a expected=(--test)
   if [ -n "$expected_timeout" ]; then
     expected+=("$expected_timeout")
