@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exercise ensure_cargo_tool without running supply-chain gates.
+# Exercise preflight setup and ensure_cargo_tool without running the full gates.
 # shellcheck disable=SC2030,SC2031
 set -euo pipefail
 
@@ -208,5 +208,18 @@ grep -Fq "cached $tool_root/bin/cargo-deny is version 9.9.9, need 0.20.2" "$fixt
 grep -Fq "$tool_root" "$install_log" || fail 'cached wrong: expected job-local root in install log'
 
 echo 'ci-preflight test: ensure_cargo_tool selection verified'
+
+# Expose only the tools preflight needs to locate the checkout and load its helpers.
+no_setsid_bin="$fixture/no-setsid-bin"
+mkdir -p "$no_setsid_bin"
+ln -s "$(command -v git)" "$no_setsid_bin/git"
+ln -s "$(command -v dirname)" "$no_setsid_bin/dirname"
+frontend_rc=0
+PATH="$no_setsid_bin" /bin/bash "$root/scripts/ci-preflight.sh" --only frontend >"$fixture/frontend.log" 2>&1 \
+  || frontend_rc=$?
+[ "$frontend_rc" -eq 1 ] || fail "missing setsid: expected preflight exit 1, got $frontend_rc"
+grep -Fxq 'ci-preflight: frontend Node tests require setsid (install util-linux)' "$fixture/frontend.log" \
+  || fail 'missing setsid: frontend preflight must explain the prerequisite'
+echo 'ci-preflight test: missing setsid rejected before frontend setup'
 
 bash "$root/scripts/ci-preflight.sh" --audit-expiry-self-check

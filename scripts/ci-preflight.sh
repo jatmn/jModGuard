@@ -547,6 +547,11 @@ should_run() {
   esac
 }
 
+if should_run frontend && ! command -v setsid >/dev/null 2>&1; then
+  echo 'ci-preflight: frontend Node tests require setsid (install util-linux)' >&2
+  exit 1
+fi
+
 if should_run contracts; then
   node scripts/ci-workflow-test.mjs
   node --test scripts/check-test-flakes.test.mjs
@@ -901,6 +906,18 @@ run_dual_process_smoke() {
     run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture
 }
 
+# Each frontend Node test file runs in its own session with a wall-clock limit, a
+# default per-test timeout and a JS heap cap, so a runaway test fails instead of
+# exhausting the host or outliving this script (#709). Tests with their own
+# timeout keep it.
+run_frontend_node_test() {
+  local file=$1
+  echo "ci-preflight: node --test $file"
+  JMODGUARD_TEST_TIMEOUT_SEC=600 run_with_test_timeout "$file" \
+    env NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=2048" \
+    node --test --test-timeout=60000 "$file"
+}
+
 if [ -z "${only_names}" ]; then
   echo 'ci-preflight: cargo clippy --locked --workspace --all-targets -- -D warnings'
   cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -1001,26 +1018,15 @@ if should_run frontend; then
 
   echo 'ci-preflight: bash tools/eslint-web-selftest.sh'
   bash tools/eslint-web-selftest.sh
-  node --test tools/eslint/test-flake.test.js
+  run_frontend_node_test tools/eslint/test-flake.test.js || exit $?
   node scripts/check-test-flakes.mjs eslint
 
-  echo 'ci-preflight: node --test scripts/frontend-state-test.mjs'
-  node --test scripts/frontend-state-test.mjs
-
-  echo 'ci-preflight: node --test scripts/frontend-contrast-test.mjs'
-  node --test scripts/frontend-contrast-test.mjs
-
-  echo 'ci-preflight: node --test scripts/frontend-warmup-test.mjs'
-  node --test scripts/frontend-warmup-test.mjs
-
-  echo 'ci-preflight: node --test scripts/frontend-sr-only-test.mjs'
-  node --test scripts/frontend-sr-only-test.mjs
-
-  echo 'ci-preflight: node --test scripts/package-webui-test.mjs'
-  node --test scripts/package-webui-test.mjs
-
-  echo 'ci-preflight: node --test scripts/administration-state-test.mjs'
-  node --test scripts/administration-state-test.mjs
+  run_frontend_node_test scripts/frontend-state-test.mjs || exit $?
+  run_frontend_node_test scripts/frontend-contrast-test.mjs || exit $?
+  run_frontend_node_test scripts/frontend-warmup-test.mjs || exit $?
+  run_frontend_node_test scripts/frontend-sr-only-test.mjs || exit $?
+  run_frontend_node_test scripts/package-webui-test.mjs || exit $?
+  run_frontend_node_test scripts/administration-state-test.mjs || exit $?
 fi
 
 if [ -z "${only_names}" ]; then

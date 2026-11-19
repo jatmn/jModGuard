@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import assert from 'node:assert/strict';
+import assert from './frontend-test-assert.mjs';
 import fs from 'node:fs';
 import test, { afterEach, after } from 'node:test';
 import vm from 'node:vm';
@@ -615,6 +615,42 @@ test('the ban dialog finds current members by name and says when the search fail
   await settle();
   const post = calls.find(call => call.url.endsWith('/ban'));
   assert.equal(JSON.parse(post.opts.body).user_id, '9007199254740993');
+});
+
+// #709: node:assert renders a failed comparison by inspecting both values without a practical
+// depth limit. A node mounted in the page reaches React's fiber tree, and that report grew
+// without bound. This tree is tiny, so a regression fails on the message instead of running away.
+test('failed assertions on mounted nodes report a short preview', () => {
+  const h = harness();
+  const node = h.mount(() => React.createElement('p', { className: 'probe' }, 'Mounted text')).querySelector('p.probe');
+  assert.ok(Object.keys(node).some(key => key.startsWith('__reactFiber')), 'React links the node to its fiber');
+  assert.throws(() => assert.equal(node, null, 'the node is gone'),
+    { message: 'the node is gone\nExpected <p class="probe"> "Mounted text" to be null' });
+  assert.throws(() => assert.deepEqual([node], []), error => error.message.length <= 700);
+});
+
+test('failed assertions on large objects and functions report short previews', () => {
+  let deep = { leaf: 'unvisited' };
+  for (let index = 0; index < 500; index++) deep = { next: deep };
+  const graph = {
+    deep,
+    text: 'x'.repeat(100_000),
+    get accessor() { throw new Error('assertion preview called a getter'); },
+  };
+  for (let index = 0; index < 10_000; index++) graph[`extra${index}`] = deep;
+  function withGraph() {}
+  withGraph.graph = graph;
+
+  const started = performance.now();
+  assert.throws(() => assert.equal(graph, null), {
+    name: 'AssertionError',
+    message: /^Expected \{deep: \[Object\], text: "x{80}…", accessor: \[Accessor\], extra0: \[Object\], …\} to be null$/,
+  });
+  assert.throws(() => assert.equal(withGraph, null), {
+    name: 'AssertionError',
+    message: 'Expected [Function withGraph] to be null',
+  });
+  assert.ok(performance.now() - started < 1000, 'the assertion previews should finish within a second');
 });
 
 test('the ban dialog locks all submitted options until acknowledgment or failure', async t => {

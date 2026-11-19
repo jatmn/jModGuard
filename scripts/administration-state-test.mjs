@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import assert from "node:assert/strict";
+import assert from "./frontend-test-assert.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
