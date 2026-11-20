@@ -1105,7 +1105,7 @@ const affectedDir = fs.mkdtempSync(path.join(os.tmpdir(), "jmodguard-affected-")
 try {
   const repo = path.join(affectedDir, "repo"), calls = path.join(affectedDir, "calls");
   fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
-  for (const file of ["ci-preflight.sh", "select-checks.sh", "ci-ensure-cargo-tool.sh", "ci-run-timed-cargo-test.sh", "ci-cargo-log.sh"]) {
+  for (const file of ["ci-preflight.sh", "ci-frontend-node-timeout.sh", "select-checks.sh", "ci-ensure-cargo-tool.sh", "ci-run-timed-cargo-test.sh", "ci-cargo-log.sh"]) {
     fs.copyFileSync(path.join(root, "scripts", file), path.join(repo, "scripts", file));
   }
   const record = name => `printf '%s\\n' ${name} >>"$AFFECTED_CALLS"\n`;

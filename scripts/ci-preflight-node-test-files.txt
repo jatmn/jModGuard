@@ -1,0 +1,11 @@
+# Each path is a Node suite preflight must run through run_node_test (see docs/CI.md).
+# The preflight self-test compares this list to run_node_test call sites in ci-preflight.sh.
+scripts/check-test-flakes.test.mjs
+scripts/pullfrog-command-check.test.mjs
+tools/eslint/test-flake.test.js
+scripts/frontend-state-test.mjs
+scripts/frontend-contrast-test.mjs
+scripts/frontend-warmup-test.mjs
+scripts/frontend-sr-only-test.mjs
+scripts/package-webui-test.mjs
+scripts/administration-state-test.mjs

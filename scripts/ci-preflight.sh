@@ -547,14 +547,34 @@ should_run() {
   esac
 }
 
-if should_run frontend && ! command -v setsid >/dev/null 2>&1; then
-  echo 'ci-preflight: frontend Node tests require setsid (install util-linux)' >&2
+if (should_run frontend || should_run contracts || should_run pullfrog) && ! command -v setsid >/dev/null 2>&1; then
+  echo 'ci-preflight: Node tests require setsid (install util-linux)' >&2
   exit 1
 fi
 
+# Each Node test file runs in its own session with a wall-clock limit
+# and a JS heap cap. The CLI default per-test timeout depends on the Node major.
+# shellcheck source=scripts/ci-frontend-node-timeout.sh
+source "$root/scripts/ci-frontend-node-timeout.sh"
+run_node_test() {
+  local file=$1
+  local node_major
+  local -a test_args=(--test)
+  if node_major="$(env NODE_OPTIONS= node -p 'process.versions.node.split(".")[0]' 2>/dev/null)" \
+    && [[ "$node_major" =~ ^[1-9][0-9]*$ ]] && (( node_major >= frontend_node_test_timeout_min_major )); then
+    test_args+=(--test-timeout=60000)
+  fi
+  printf 'ci-preflight: node'
+  printf ' %q' "${test_args[@]}" "$file"
+  printf '\n'
+  JMODGUARD_TEST_TIMEOUT_SEC=600 run_with_test_timeout "$file" \
+    env NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=2048" \
+    node "${test_args[@]}" "$file"
+}
+
 if should_run contracts; then
   node scripts/ci-workflow-test.mjs
-  node --test scripts/check-test-flakes.test.mjs
+  run_node_test scripts/check-test-flakes.test.mjs || exit $?
   node scripts/check-test-flakes.mjs contracts
 fi
 
@@ -906,24 +926,6 @@ run_dual_process_smoke() {
     run_timed_cargo_test cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --ignored --nocapture
 }
 
-# Each frontend Node test file runs in its own session with a wall-clock limit
-# and a JS heap cap. The CLI default per-test timeout depends on the Node major.
-run_frontend_node_test() {
-  local file=$1
-  local node_major
-  local -a test_args=(--test)
-  if node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null)" \
-    && [[ "$node_major" =~ ^[1-9][0-9]*$ ]] && (( node_major >= frontend_node_test_timeout_min_major )); then
-    test_args+=(--test-timeout=60000)
-  fi
-  printf 'ci-preflight: node'
-  printf ' %q' "${test_args[@]}" "$file"
-  printf '\n'
-  JMODGUARD_TEST_TIMEOUT_SEC=600 run_with_test_timeout "$file" \
-    env NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=2048" \
-    node "${test_args[@]}" "$file"
-}
-
 if [ -z "${only_names}" ]; then
   echo 'ci-preflight: cargo clippy --locked --workspace --all-targets -- -D warnings'
   cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -1008,14 +1010,10 @@ if should_run contracts; then
 fi
 
 if should_run pullfrog; then
-  echo 'ci-preflight: node --test scripts/pullfrog-command-check.test.mjs'
-  node --test scripts/pullfrog-command-check.test.mjs
+  run_node_test scripts/pullfrog-command-check.test.mjs || exit $?
 fi
 
 if should_run frontend; then
-  # shellcheck source=scripts/ci-frontend-node-timeout.sh
-  source "$root/scripts/ci-frontend-node-timeout.sh"
-
   echo 'ci-preflight: bash scripts/require-host-eslint-node.sh'
   bash scripts/require-host-eslint-node.sh
 
@@ -1027,15 +1025,15 @@ if should_run frontend; then
 
   echo 'ci-preflight: bash tools/eslint-web-selftest.sh'
   bash tools/eslint-web-selftest.sh
-  run_frontend_node_test tools/eslint/test-flake.test.js || exit $?
+  run_node_test tools/eslint/test-flake.test.js || exit $?
   node scripts/check-test-flakes.mjs eslint
 
-  run_frontend_node_test scripts/frontend-state-test.mjs || exit $?
-  run_frontend_node_test scripts/frontend-contrast-test.mjs || exit $?
-  run_frontend_node_test scripts/frontend-warmup-test.mjs || exit $?
-  run_frontend_node_test scripts/frontend-sr-only-test.mjs || exit $?
-  run_frontend_node_test scripts/package-webui-test.mjs || exit $?
-  run_frontend_node_test scripts/administration-state-test.mjs || exit $?
+  run_node_test scripts/frontend-state-test.mjs || exit $?
+  run_node_test scripts/frontend-contrast-test.mjs || exit $?
+  run_node_test scripts/frontend-warmup-test.mjs || exit $?
+  run_node_test scripts/frontend-sr-only-test.mjs || exit $?
+  run_node_test scripts/package-webui-test.mjs || exit $?
+  run_node_test scripts/administration-state-test.mjs || exit $?
 fi
 
 if [ -z "${only_names}" ]; then

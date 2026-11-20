@@ -100,8 +100,8 @@ path, and the ignored two-process smoke still runs after building both services.
 Local preflight uses nextest when installed, with the existing GNU timeout
 fallback for unavailable nextest or unsupported arguments.
 
-The frontend checks require `setsid` from util-linux. Each frontend Node test file,
-including `tools/eslint/test-flake.test.js`, runs in its own process session with a
+The contracts, Pullfrog, and frontend checks require `setsid` from util-linux.
+Each Node test file runs in its own process session with a
 600-second limit and a 2 GiB JS heap cap. Preflight passes `--test-timeout=60000`
 on Node 24 and later to set a default per-test timeout. Node 20 and 22 apply that
 flag to the whole file, so preflight relies on explicit per-test timeouts and
