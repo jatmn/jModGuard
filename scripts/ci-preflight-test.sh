@@ -227,7 +227,7 @@ echo 'ci-preflight test: missing setsid rejected before frontend setup'
 frontend_root="$fixture/frontend"
 mkdir -p "$frontend_root/scripts" "$frontend_root/tools"
 git init -q "$frontend_root"
-for helper in ci-ensure-cargo-tool.sh ci-run-timed-cargo-test.sh ci-cargo-log.sh require-host-eslint-node.sh; do
+for helper in ci-ensure-cargo-tool.sh ci-run-timed-cargo-test.sh ci-cargo-log.sh ci-frontend-node-timeout.sh require-host-eslint-node.sh; do
   ln -s "$root/scripts/$helper" "$frontend_root/scripts/$helper"
 done
 printf 'exit 0\n' >"$frontend_root/tools/eslint-web-selftest.sh"
@@ -291,6 +291,11 @@ check_node_timeout_flag() {
     fail "Node major '${major}': frontend command log differs from actual arguments"
   fi
 }
+
+# Pin the documented floor independently of the fixed argv cases below.
+# shellcheck source=scripts/ci-frontend-node-timeout.sh
+source "$root/scripts/ci-frontend-node-timeout.sh"
+[ "$frontend_node_test_timeout_min_major" = 24 ] || fail 'frontend Node timeout must start at Node 24 (see docs/CI.md)'
 
 check_node_timeout_flag 20 ''
 check_node_timeout_flag 22 ''

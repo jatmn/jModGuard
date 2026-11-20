@@ -907,15 +907,13 @@ run_dual_process_smoke() {
 }
 
 # Each frontend Node test file runs in its own session with a wall-clock limit
-# and a JS heap cap. Node 24+ also gets a default per-test timeout. Node 20/22
-# apply that CLI timeout to the whole file, so older versions rely on explicit
-# test timeouts and the session limit.
+# and a JS heap cap. The CLI default per-test timeout depends on the Node major.
 run_frontend_node_test() {
   local file=$1
   local node_major
   local -a test_args=(--test)
   if node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null)" \
-    && [[ "$node_major" =~ ^[1-9][0-9]*$ ]] && (( node_major >= 24 )); then
+    && [[ "$node_major" =~ ^[1-9][0-9]*$ ]] && (( node_major >= frontend_node_test_timeout_min_major )); then
     test_args+=(--test-timeout=60000)
   fi
   printf 'ci-preflight: node'
@@ -1015,6 +1013,9 @@ if should_run pullfrog; then
 fi
 
 if should_run frontend; then
+  # shellcheck source=scripts/ci-frontend-node-timeout.sh
+  source "$root/scripts/ci-frontend-node-timeout.sh"
+
   echo 'ci-preflight: bash scripts/require-host-eslint-node.sh'
   bash scripts/require-host-eslint-node.sh
 
