@@ -3,12 +3,14 @@
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 struct Running {
     child: Child,
     log: Arc<Mutex<String>>,
+    /// Disconnects once both output pipes reach end of file.
+    pipes_closed: mpsc::Receiver<()>,
 }
 
 impl Drop for Running {
@@ -33,16 +35,21 @@ fn spawn(envs: &[(&str, &str)], remove: &[&str]) -> Running {
     }
     let mut child = cmd.spawn().unwrap();
     let log = Arc::new(Mutex::new(String::new()));
+    let (open, pipes_closed) = mpsc::channel();
     if let Some(pipe) = child.stdout.take() {
-        pump(pipe, Arc::clone(&log));
+        pump(pipe, Arc::clone(&log), open.clone());
     }
     if let Some(pipe) = child.stderr.take() {
-        pump(pipe, Arc::clone(&log));
+        pump(pipe, Arc::clone(&log), open);
     }
-    Running { child, log }
+    Running {
+        child,
+        log,
+        pipes_closed,
+    }
 }
 
-fn pump<R: Read + Send + 'static>(mut pipe: R, log: Arc<Mutex<String>>) {
+fn pump<R: Read + Send + 'static>(mut pipe: R, log: Arc<Mutex<String>>, open: mpsc::Sender<()>) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
         loop {
@@ -54,6 +61,7 @@ fn pump<R: Read + Send + 'static>(mut pipe: R, log: Arc<Mutex<String>>) {
                     .push_str(&String::from_utf8_lossy(&buf[..n])),
             }
         }
+        drop(open);
     });
 }
 
@@ -69,6 +77,32 @@ fn wait_log(running: &Running, needle: &str) -> String {
             "timed out waiting for {needle}\n{text}"
         );
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Waits for the child to close its output, then reaps it within the same budget.
+fn wait_exit(running: &mut Running, failure: &str, log: &str) {
+    let budget = Duration::from_secs(10);
+    let deadline = Instant::now() + budget;
+    let closed = running.pipes_closed.recv_timeout(budget);
+    assert_eq!(
+        closed,
+        Err(mpsc::RecvTimeoutError::Disconnected),
+        "{failure}\n{log}"
+    );
+    loop {
+        match running.child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = running.child.kill();
+                    let _ = running.child.wait();
+                    panic!("{failure}: child stayed alive after output closed\n{log}");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("{failure}: try_wait failed: {error}\n{log}"),
+        }
     }
 }
 
@@ -144,17 +178,11 @@ fn revision_seven_api_child_passes_the_launcher_gate() {
     );
     let log = wait_log(&running, "Discord OAuth credentials required");
     assert!(!log.contains("requires launcher revision"));
-    let started = Instant::now();
-    loop {
-        if running.child.try_wait().unwrap().is_some() {
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "revision 7 API did not continue past the launcher gate\n{log}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_exit(
+        &mut running,
+        "revision 7 API did not continue past the launcher gate",
+        &log,
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -172,15 +200,9 @@ fn standalone_api_without_launcher_markers_is_not_gated() {
     );
     let log = wait_log(&running, "Discord OAuth credentials required");
     assert!(!log.contains("requires launcher revision"));
-    let started = Instant::now();
-    loop {
-        if running.child.try_wait().unwrap().is_some() {
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "standalone API did not continue past startup\n{log}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_exit(
+        &mut running,
+        "standalone API did not continue past startup",
+        &log,
+    );
 }

@@ -709,6 +709,16 @@ mod tests {
     }
 
     async fn wait_status(addr: std::net::SocketAddr, request: &str, want: u16) -> u16 {
+        wait_status_observed(addr, request, want, |_| {}).await
+    }
+
+    /// `wait_status` that reports each unwanted status before it polls again.
+    async fn wait_status_observed(
+        addr: std::net::SocketAddr,
+        request: &str,
+        want: u16,
+        mut missed: impl FnMut(u16),
+    ) -> u16 {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let mut seen = 0;
         while tokio::time::Instant::now() < deadline {
@@ -716,6 +726,7 @@ mod tests {
             if seen == want {
                 return seen;
             }
+            missed(seen);
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         seen
@@ -1007,7 +1018,6 @@ mod tests {
             stream.write_all(b"HTTP/1.1 ").await.unwrap();
             stream.flush().await.unwrap();
             client_read_rx.await.unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
             stream.write_all(b"200 OK\r\n\r\nok").await.unwrap();
             stream.flush().await.unwrap();
         });
@@ -1030,31 +1040,38 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn wait_status_waits_until_listener_is_bound() {
         use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let server = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            let bind_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            let listener = loop {
-                if tokio::time::Instant::now() >= bind_deadline {
-                    panic!("timed out rebinding delayed probe listener");
+        // A bound socket that is not listening keeps the port reserved while
+        // connections to it are refused.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let mut socket = Some(socket);
+        let mut server = None;
+        let mut misses = 0;
+        let status = wait_status_observed(
+            addr,
+            "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            200,
+            |seen| {
+                assert_eq!(seen, 0, "an unbound probe must not report a status");
+                misses += 1;
+                // Listen only after a probe has been refused.
+                if let Some(socket) = socket.take() {
+                    let listener = socket.listen(1).unwrap();
+                    server = Some(tokio::spawn(async move {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        drain_probe_request(&mut stream).await.unwrap();
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await
+                            .unwrap();
+                    }));
                 }
-                match TcpListener::bind(addr).await {
-                    Ok(listener) => break listener,
-                    Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
-                }
-            };
-            let (mut stream, _) = listener.accept().await.unwrap();
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                .await
-                .unwrap();
-        });
-        let status =
-            wait_status(addr, "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 200).await;
+            },
+        )
+        .await;
         assert_eq!(status, 200);
-        server.await.unwrap();
+        assert_eq!(misses, 1, "the first probe after listen must succeed");
+        server.expect("listener started").await.unwrap();
     }
 }

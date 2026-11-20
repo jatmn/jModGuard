@@ -641,12 +641,8 @@ async fn background_check_records_a_lookup_timeout_and_does_not_install() {
     assert!(
         record_release_checks(
             &app,
-            |_component, _channel| {
-                Box::pin(async move {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    Ok(test_release("bot", "latest", '2'))
-                })
-            },
+            // A lookup that never answers can only end at the lookup timeout.
+            |_component, _channel| Box::pin(std::future::pending()),
             Duration::from_millis(50),
             pending_shutdown(),
         )
@@ -1105,10 +1101,11 @@ async fn background_check_still_schedules_promoted_cadences() {
     .await
     .unwrap();
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    // The loop reports each tick it finishes, scheduled installs included.
+    let (parked_tx, mut parked_rx) = tokio::sync::watch::channel(0u32);
     let app_task = Arc::clone(&app);
     let worker = tokio::spawn(async move {
         let tick_notify = Arc::new(tokio::sync::Notify::new());
-        let (parked_tx, _parked_rx) = tokio::sync::watch::channel(0u32);
         let tick = ReleaseCheckTick::coalescing(tick_notify.clone(), parked_tx);
         tick.fire();
         run_release_check_loop(
@@ -1129,19 +1126,13 @@ async fn background_check_still_schedules_promoted_cadences() {
         )
         .await;
     });
-    let started = std::time::Instant::now();
-    loop {
-        let bot_row = db::component_update(&bot.db, "bot").await.unwrap();
-        let api_row = db::component_update(&bot.db, "api").await.unwrap();
-        if bot_row.desired.is_some() && api_row.desired.is_some() {
-            break;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "promoted cadence was not queued: bot={bot_row:?} api={api_row:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        parked_rx.wait_for(|ticks| *ticks >= 1),
+    )
+    .await
+    .expect("the release check tick did not finish")
+    .unwrap();
     let _ = stop_tx.send(true);
     worker.await.unwrap();
     let bot_row = db::component_update(&bot.db, "bot").await.unwrap();

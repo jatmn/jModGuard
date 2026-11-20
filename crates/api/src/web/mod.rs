@@ -3318,65 +3318,65 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut last_err = None;
-            for _ in 0..50 {
-                match tokio::net::TcpStream::connect(addr).await {
-                    Ok(mut stream) => {
-                        stream
-                            .write_all(
-                                format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                                    .as_bytes(),
-                            )
-                            .await
-                            .unwrap();
-                        let mut buf = vec![0u8; 1024];
-                        let n = tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
-                            stream.read(&mut buf),
-                        )
-                        .await
-                        .unwrap()
-                        .unwrap();
-                        return String::from_utf8_lossy(&buf[..n]).into_owned();
-                    }
-                    Err(error) => {
-                        last_err = Some(error);
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    }
-                }
-            }
-            panic!("never connected to {addr}: {last_err:?}");
+            // The listener is bound before the test starts, so connect is queued.
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
         }
+        // Each blocking step reports that it started, then holds until the
+        // probes release it, so every probe lands inside a running step.
+        fn blocking_step() -> (
+            impl FnOnce() + Send + 'static,
+            tokio::sync::oneshot::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let step = move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            };
+            (step, started_rx, release_tx)
+        }
+        async fn health_during(
+            addr: std::net::SocketAddr,
+            started: tokio::sync::oneshot::Receiver<()>,
+        ) {
+            started.await.unwrap();
+            let health =
+                tokio::time::timeout(std::time::Duration::from_secs(2), http_get(addr, "/health"))
+                    .await
+                    .expect("health must answer during ApiState prime and router build");
+            assert!(
+                health.starts_with("HTTP/1.1 200 OK"),
+                "startup liveness: {health}"
+            );
+        }
+        let (prime, prime_started, release_prime) = blocking_step();
+        let (build, build_started, release_build) = blocking_step();
         // Same composition as jmodguard-api: each synchronous startup step on
         // spawn_blocking so the accept loop can keep answering /health.
         let serving = crate::health::serve_while(&listener, async {
-            tokio::task::spawn_blocking(|| {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            })
-            .await
-            .unwrap();
-            tokio::task::spawn_blocking(|| {
-                std::thread::sleep(std::time::Duration::from_millis(200));
+            tokio::task::spawn_blocking(prime).await.unwrap();
+            tokio::task::spawn_blocking(move || {
+                build();
                 test_app()
             })
             .await
             .unwrap()
         });
         let probes = async {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(350);
-            while tokio::time::Instant::now() < deadline {
-                let health = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    http_get(addr, "/health"),
-                )
-                .await
-                .expect("health must answer during ApiState prime and router build");
-                assert!(
-                    health.starts_with("HTTP/1.1 200 OK"),
-                    "startup liveness: {health}"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
+            health_during(addr, prime_started).await;
+            release_prime.send(()).unwrap();
+            health_during(addr, build_started).await;
             let api = http_get(addr, "/api/me").await;
             assert!(
                 api.starts_with("HTTP/1.1 503 Service Unavailable"),
@@ -3399,6 +3399,7 @@ mod tests {
                 login.contains("Waiting for the API to finish starting"),
                 "startup /login must refresh in place: {login}"
             );
+            release_build.send(()).unwrap();
         };
         let (web_app, _) = tokio::join!(serving, probes);
         tokio::spawn(async move {

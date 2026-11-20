@@ -56,7 +56,6 @@ async fn private_container_use_returns_json_for_a_sealed_request() {
     assert_eq!(bound, addr);
     let _ready_guard = ProcessReadyTestGuard::acquire().await;
     set_process_ready(true);
-    std::thread::sleep(Duration::from_millis(50));
     let body = seal_read(secret.as_bytes()).unwrap();
     let mut stream = TcpStream::connect(addr).unwrap();
     let request = format!(
@@ -90,7 +89,6 @@ async fn loopback_listener_rejects_oversized_content_length_without_buffering_bo
     assert_eq!(bound, addr);
     let _ready_guard = ProcessReadyTestGuard::acquire().await;
     set_process_ready(true);
-    std::thread::sleep(Duration::from_millis(50));
     let mut stream = TcpStream::connect(addr).unwrap();
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n",
