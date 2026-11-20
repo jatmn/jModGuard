@@ -796,8 +796,9 @@ mod tests {
         let cache = Arc::new(Cache::new());
         remember_guild(&cache, 10, None);
         bot.install_discord_cache(cache);
+        // The lookup never answers, so only the production lookup deadline ends it.
         bot.install_member_lookup(|_, _| async {
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            std::future::pending::<()>().await;
             ControlMemberFetch::Unavailable
         });
         let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
@@ -1258,14 +1259,12 @@ mod tests {
             .await
             .unwrap()
         );
-        let started = std::time::Instant::now();
-        while !crate::recovery::pending_pause_entered() {
-            assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "recovery did not reach its first read"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::recovery::pending_pause_entered(),
+        )
+        .await
+        .expect("recovery did not reach its first read");
         let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
         allow_actor(&bot);
         let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();

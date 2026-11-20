@@ -4653,6 +4653,8 @@ mod tests {
             .unwrap();
         app.snapshots
             .on_gateway_event(&app, ctx, &Event::MessageDeleteBulk(bulk));
+        // On paused time each poll waits until the spawned bulk task is idle.
+        tokio::time::pause();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let observed = app

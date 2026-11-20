@@ -127,6 +127,25 @@ fn get(addr: &str, path: &str) -> String {
     }
 }
 
+/// Wait for the child to exit after SIGTERM. A child still running after
+/// `limit` is killed so the waiting thread ends, and the test fails.
+fn wait_exit(running: &mut Running, limit: Duration, failure: &str) -> std::process::ExitStatus {
+    let pid = running.child.id().to_string();
+    let child = &mut running.child;
+    let status = std::thread::scope(|scope| {
+        let (exited, exit) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let _ = exited.send(child.wait());
+        });
+        let status = exit.recv_timeout(limit);
+        if status.is_err() {
+            let _ = Command::new("kill").arg("-KILL").arg(&pid).status();
+        }
+        status
+    });
+    status.expect(failure).unwrap()
+}
+
 /// `Err` when the lease row cannot be read; a readable database with no lease is `Ok(false)`.
 fn read_lease(path: &Path) -> Result<bool, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -218,19 +237,16 @@ fn old_or_unknown_launcher_child_is_refused_without_readiness_and_exits_cleanly(
                 .unwrap()
                 .success()
         );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(status) = running.child.try_wait().unwrap() {
-                assert_eq!(
-                    status.code(),
-                    Some(0),
-                    "SIGTERM is an intentional clean exit"
-                );
-                break;
-            }
-            assert!(Instant::now() < deadline, "refused child did not stop");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let status = wait_exit(
+            &mut running,
+            Duration::from_secs(5),
+            "refused child did not stop",
+        );
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "SIGTERM is an intentional clean exit"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
@@ -377,14 +393,11 @@ fn guild_store_ahead_of_the_build_is_held_once_not_exited_for_a_launcher_restart
             .unwrap()
             .success()
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(status) = running.child.try_wait().unwrap() {
-            assert_eq!(status.code(), Some(0));
-            break;
-        }
-        assert!(Instant::now() < deadline, "held child did not stop");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let status = wait_exit(
+        &mut running,
+        Duration::from_secs(5),
+        "held child did not stop",
+    );
+    assert_eq!(status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&root);
 }

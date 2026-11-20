@@ -2011,6 +2011,8 @@ mod tests {
         }
         app.member_sync_rate_limit_until_ms
             .store(i64::MAX, Ordering::Relaxed);
+        // On paused time each poll waits until the worker is idle.
+        tokio::time::pause();
         let worker = tokio::spawn(run(app.clone(), Arc::new(Http::new("unused")), cache));
         let status = tokio::time::timeout(Duration::from_secs(10), async {
             loop {

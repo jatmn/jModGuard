@@ -3155,19 +3155,36 @@ async fn replay_attachment_proxy(
     Arc<Mutex<Vec<Vec<u8>>>>,
     tokio::task::JoinHandle<()>,
 ) {
+    let (http, requests, server, _) = replay_attachment_proxy_signalling(mode).await;
+    (http, requests, server)
+}
+
+/// Also returns a signal that stores a permit for each received request.
+async fn replay_attachment_proxy_signalling(
+    mode: ReplayAttachmentProxy,
+) -> (
+    serenity::http::Http,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    tokio::task::JoinHandle<()>,
+    Arc<tokio::sync::Notify>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let saved = Arc::clone(&requests);
+    let received = Arc::new(tokio::sync::Notify::new());
+    let signal = Arc::clone(&received);
     let server = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let saved = Arc::clone(&saved);
+            let signal = Arc::clone(&signal);
             tokio::spawn(async move {
                 let Some(request) = read_proxied_request(&mut stream).await else {
                     return;
                 };
                 let attachment = request_names_transcript(&request);
                 saved.lock().unwrap().push(request);
+                signal.notify_one();
                 match mode {
                     ReplayAttachmentProxy::Hang => std::future::pending::<()>().await,
                     ReplayAttachmentProxy::ServerError => {
@@ -3200,7 +3217,7 @@ async fn replay_attachment_proxy(
         .application_id(serenity::model::id::ApplicationId::new(1))
         .ratelimiter_disabled(true)
         .build();
-    (http, requests, server)
+    (http, requests, server, received)
 }
 
 fn replay_snapshot(content: &str) -> MessageSnapshot {
@@ -3415,17 +3432,12 @@ async fn replayed_bulk_attachment_timeout_or_cancel_or_server_error_is_not_resen
 
     let f = Fixture::with_timeout(30);
     prepare_replayed_automod_bulk(&f, None).await;
-    let (http, requests, server) = replay_attachment_proxy(ReplayAttachmentProxy::Hang).await;
+    let (http, requests, server, received) =
+        replay_attachment_proxy_signalling(ReplayAttachmentProxy::Hang).await;
     let app = Arc::clone(&f.app);
-    let watched = Arc::clone(&requests);
     let watcher = tokio::spawn(async move {
-        loop {
-            if !watched.lock().unwrap().is_empty() {
-                app.activation.cut_off();
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        received.notified().await;
+        app.activation.cut_off();
     });
     replay_failed_automod_bulk(&f, &http).await;
     watcher.abort();
@@ -4780,6 +4792,8 @@ async fn global_429_without_published_bot_id_still_retries() {
             > 0
     );
     assert!(member_sync_pacing_deadline(&f.app, 42).await.is_none());
+    // On paused time each poll waits until the persist task is idle.
+    tokio::time::pause();
     for _ in 0..50 {
         if !f
             .app
@@ -5114,6 +5128,8 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
         Delivery::Failed
     );
     assert!(calls.load(Ordering::SeqCst) >= 1);
+    // On paused time each poll waits until the persist task is idle.
+    tokio::time::pause();
     for _ in 0..50 {
         if f.app.member_sync_rate_limit_epoch.load(Ordering::Acquire)
             > f.app

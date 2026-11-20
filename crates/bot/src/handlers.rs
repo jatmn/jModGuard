@@ -2380,6 +2380,8 @@ mod tests {
         callback.abort();
         assert!(callback.await.unwrap_err().is_cancelled());
         let _ = release_tx.send(());
+        // On paused time each poll waits until the detached owner is idle.
+        tokio::time::pause();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while !app
                 .pending_gateway_manual_ban_audit_entries(10, 55)
@@ -4700,15 +4702,14 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         let at_exit = Arc::new(AtomicBool::new(false));
-        let release_exit = Arc::new(AtomicBool::new(false));
+        // Dropping the sender releases this and every later exit handoff.
+        let (release_exit, exit_released) = std::sync::mpsc::channel::<()>();
+        let exit_released = std::sync::Mutex::new(exit_released);
         app.set_member_sync_rate_limit_persist_exit_hook(Some(Arc::new({
             let at_exit = Arc::clone(&at_exit);
-            let release_exit = Arc::clone(&release_exit);
             move || {
                 at_exit.store(true, Ordering::SeqCst);
-                while !release_exit.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                let _ = exit_released.lock().unwrap().recv();
             }
         })));
 
@@ -4738,7 +4739,7 @@ BEGIN SELECT RAISE(ABORT, 'fixture pacing failure'); END;",
             "new pacing epoch must stay dirty while the exiting task is still marked running"
         );
 
-        release_exit.store(true, Ordering::SeqCst);
+        drop(release_exit);
         wait_epoch_persisted(&app, Duration::from_secs(5)).await;
         assert_eq!(
             pacing_deadline(&app, 42).await,

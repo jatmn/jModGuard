@@ -22,6 +22,9 @@ static HOLD_PENDING: AtomicBool = AtomicBool::new(false);
 static PENDING_ENTERED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static RELEASE_PENDING: AtomicBool = AtomicBool::new(false);
+/// Wakes waiters after `PENDING_ENTERED` or `RELEASE_PENDING` is set.
+#[cfg(test)]
+static PENDING_CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 #[cfg(test)]
 static BEFORE_COMMIT: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(None);
@@ -40,22 +43,36 @@ pub(crate) fn arm_pending_pause() {
 }
 
 #[cfg(test)]
-pub(crate) fn pending_pause_entered() -> bool {
-    PENDING_ENTERED.load(Ordering::Acquire)
+async fn wait_for_pending_flag(flag: &AtomicBool) {
+    loop {
+        let changed = PENDING_CHANGED.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if flag.load(Ordering::Acquire) {
+            return;
+        }
+        changed.await;
+    }
+}
+
+/// Resolves once the armed pending read has paused.
+#[cfg(test)]
+pub(crate) async fn pending_pause_entered() {
+    wait_for_pending_flag(&PENDING_ENTERED).await;
 }
 
 #[cfg(test)]
 pub(crate) fn release_pending_pause() {
     RELEASE_PENDING.store(true, Ordering::Release);
+    PENDING_CHANGED.notify_waiters();
 }
 
 #[cfg(test)]
 async fn pause_pending_read() {
     if HOLD_PENDING.swap(false, Ordering::AcqRel) {
         PENDING_ENTERED.store(true, Ordering::Release);
-        while !RELEASE_PENDING.load(Ordering::Acquire) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        PENDING_CHANGED.notify_waiters();
+        wait_for_pending_flag(&RELEASE_PENDING).await;
     }
 }
 
@@ -344,7 +361,8 @@ mod tests {
         cleanup(&path);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    // Paused time: the sleep ends only once the failed step is idle in its backoff.
+    #[tokio::test(start_paused = true)]
     async fn the_bot_records_a_ban_while_recovery_retries() {
         let _guard = test_lock().lock().await;
         let (path, db) = temp_db();

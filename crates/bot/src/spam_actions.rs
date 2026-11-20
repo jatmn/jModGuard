@@ -1407,6 +1407,8 @@ pub(crate) mod tests {
             )
             .await
         });
+        // On paused time each poll waits until the enforcement task is idle.
+        tokio::time::pause();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             if SPAM_PHASES.lock().contains(&"capture-start") {

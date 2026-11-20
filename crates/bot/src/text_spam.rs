@@ -1300,61 +1300,55 @@ mod tests {
         }
 
         let lines = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let started = Arc::new(AtomicBool::new(false));
-        let release = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        // A send, or dropping the sender, releases the held member lookup.
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
         let stop = Arc::new(AtomicBool::new(false));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        struct Stop(Arc<AtomicBool>);
+        // Stopping wakes the blocking accept with one connection of its own.
+        struct Stop(Arc<AtomicBool>, std::net::SocketAddr);
         impl Drop for Stop {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
+                self.0.store(true, Ordering::SeqCst);
+                let _ = std::net::TcpStream::connect(self.1);
             }
         }
-        let stop_guard = Stop(Arc::clone(&stop));
+        let stop_guard = Stop(Arc::clone(&stop), addr);
         let server_lines = Arc::clone(&lines);
         let server_started = Arc::clone(&started);
-        let server_release = Arc::clone(&release);
         let server_stop = Arc::clone(&stop);
         let server = std::thread::spawn(move || {
-            listener.set_nonblocking(true).unwrap();
-            while !server_stop.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
-                        let Some((method, path)) = read_request(&mut stream) else {
-                            continue;
-                        };
-                        server_lines.lock().push(format!("{method} {path}"));
-                        let body = if method == "GET" && path.contains("/members/") {
-                            server_started.store(true, Ordering::SeqCst);
-                            while !server_release.load(Ordering::SeqCst)
-                                && !server_stop.load(Ordering::Relaxed)
-                            {
-                                std::thread::sleep(Duration::from_millis(5));
-                            }
-                            MEMBER_JSON
-                        } else {
-                            ""
-                        };
-                        let status = if body.is_empty() {
-                            "204 No Content"
-                        } else {
-                            "200 OK"
-                        };
-                        let response = format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.flush();
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
+            for stream in listener.incoming() {
+                if server_stop.load(Ordering::SeqCst) {
+                    break;
                 }
+                let Ok(mut stream) = stream else {
+                    break;
+                };
+                let Some((method, path)) = read_request(&mut stream) else {
+                    continue;
+                };
+                server_lines.lock().push(format!("{method} {path}"));
+                let body = if method == "GET" && path.contains("/members/") {
+                    server_started.notify_one();
+                    let _ = release_rx.recv();
+                    MEMBER_JSON
+                } else {
+                    ""
+                };
+                let status = if body.is_empty() {
+                    "204 No Content"
+                } else {
+                    "200 OK"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         });
 
@@ -1460,13 +1454,11 @@ mod tests {
             )
             .await
         });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !started.load(Ordering::SeqCst) {
-            assert!(Instant::now() < deadline, "member lookup did not start");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("member lookup did not start");
         app.text_spam.invalidate(10, 11, 101);
-        release.store(true, Ordering::SeqCst);
+        release.send(()).unwrap();
         let disposition = tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .expect("enforce hung after the member lookup")
