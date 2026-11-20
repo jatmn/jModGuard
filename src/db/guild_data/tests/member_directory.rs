@@ -7103,7 +7103,7 @@ async fn remote_cleanup_lookup_takes_the_writer_lock_only_to_queue_a_check() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coverage_gap_mark_returns_rate_limit_before_begin_without_backoff() {
     use crate::db::tests::remote_stream::HranaFixture;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let _hook_lock = super::super::member_directory::test_coverage_gap_hook_lock().await;
     let (f, local, scope) = ready().await;
@@ -7117,7 +7117,6 @@ async fn coverage_gap_mark_returns_rate_limit_before_begin_without_backoff() {
     };
     fixture.fail_next_meta_probe();
     let begins = fixture.immediate_begins();
-    let started = Instant::now();
     let error = tokio::time::timeout(
         Duration::from_secs(1),
         remote.mark_member_reconciliation_needed(
@@ -7129,7 +7128,6 @@ async fn coverage_gap_mark_returns_rate_limit_before_begin_without_backoff() {
     .await
     .expect("a 429 must return instead of backing off inside the mark")
     .unwrap_err();
-    assert!(started.elapsed() < Duration::from_secs(1));
     let rendered = format!("{error:#}");
     assert!(
         rendered.contains("429"),

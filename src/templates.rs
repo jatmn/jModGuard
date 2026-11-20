@@ -1584,14 +1584,8 @@ mod presentation_tests {
 
     #[test]
     fn unreadable_cgroup_layout_renders_unavailable() {
-        let dir = std::env::temp_dir().join(format!(
-            "jmg-status-cgroup-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("jmg-status-cgroup-{:032x}", rand::random::<u128>()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("meminfo"), "MemTotal: 1\n").unwrap();
         std::fs::write(dir.join("stat"), "cpu 1 2 3\n").unwrap();
