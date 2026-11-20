@@ -3707,7 +3707,9 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[tokio::test]
+    // Paused time measures the production backoff sleep exactly. Database work
+    // runs in spawn_blocking, which holds off auto-advance until it returns.
+    #[tokio::test(start_paused = true)]
     async fn launcher_fence_retries_a_transient_failure_promptly_and_stops_at_zero_rows() {
         let path =
             std::env::temp_dir().join(format!("launcher_retry_{:032x}.db", rand::random::<u128>()));
@@ -3715,29 +3717,37 @@ mod tests {
         let control = UpdateControl::from_application(&db);
         control.arm_launcher_fence("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         assert!(control.renew_launcher_fence().await.unwrap());
-        let started = Instant::now();
+        // The confirmed fence horizon, as the periodic renewer passes it.
+        let deadline = control.launcher_fence_deadline().unwrap();
+        let started = tokio::time::Instant::now();
         let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let renewed =
-            renew_launcher_fence_promptly(Instant::now() + Duration::from_secs(10), || async {
-                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if attempt == 0 {
-                    Err(anyhow::anyhow!("connection reset"))
-                } else {
-                    control.renew_launcher_fence_cas().await
-                }
-            })
-            .await
-            .unwrap();
+        let renewed = renew_launcher_fence_promptly(deadline, || async {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                Err(anyhow::anyhow!("connection reset"))
+            } else {
+                control.renew_launcher_fence_cas().await
+            }
+        })
+        .await
+        .unwrap();
         assert!(renewed);
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "transient failure must backoff before retry"
+        );
         assert!(
             started.elapsed() < POLL,
             "retry must precede the next 5 s tick"
         );
+        // Capture the horizon refreshed by the successful retry before re-arming
+        // clears local authority and makes CAS return immediately.
+        let renewed_deadline = control.launcher_fence_deadline().unwrap();
         control.arm_launcher_fence("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         attempts.store(0, std::sync::atomic::Ordering::SeqCst);
         assert!(
-            !renew_launcher_fence_promptly(Instant::now() + Duration::from_secs(10), || async {
+            !renew_launcher_fence_promptly(renewed_deadline, || async {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 control.renew_launcher_fence_cas().await
             })
@@ -4042,10 +4052,12 @@ mod tests {
     use super::*;
     use db::{Db, SqlExecutor};
 
-    #[test]
-    fn crash_restarts_back_off_and_a_stable_child_resets_the_delay() {
+    // The restart and receipt policies take explicit instants. The paused
+    // clock supplies a fixed anchor, so no wall-clock read enters these tests.
+    #[tokio::test(start_paused = true)]
+    async fn crash_restarts_back_off_and_a_stable_child_resets_the_delay() {
         let mut policy = RestartPolicy::default();
-        let now = Instant::now();
+        let now = tokio::time::Instant::now().into_std();
         for seconds in [5, 10, 20, 40, 60, 60, 60] {
             policy.exited(true, Some(2), Duration::from_secs(1), now);
             let deadline = now + Duration::from_secs(seconds);
@@ -4062,10 +4074,10 @@ mod tests {
         assert_eq!(RestartPolicy::default().not_ready_reason(), "not ready");
     }
 
-    #[test]
-    fn retry_and_recovery_clear_the_ready_hold_reason() {
+    #[tokio::test(start_paused = true)]
+    async fn retry_and_recovery_clear_the_ready_hold_reason() {
         let mut policy = RestartPolicy::default();
-        let now = Instant::now();
+        let now = tokio::time::Instant::now().into_std();
         policy.exited(
             true,
             Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE),
@@ -4080,10 +4092,10 @@ mod tests {
         assert_eq!(policy.not_ready_reason(), "not ready");
     }
 
-    #[test]
-    fn auth_fallback_doubles_to_six_hours_and_recovery_resets_it() {
+    #[tokio::test(start_paused = true)]
+    async fn auth_fallback_doubles_to_six_hours_and_recovery_resets_it() {
         let mut policy = RestartPolicy::default();
-        let now = Instant::now();
+        let now = tokio::time::Instant::now().into_std();
         let code = Some(jmodguard::launcher_child::DISCORD_TOKEN_REJECTED_EXIT_CODE);
         for seconds in [1800, 3600, 7200, 14400, 21600, 21600] {
             policy.exited(true, code, Duration::ZERO, now);
@@ -4103,9 +4115,9 @@ mod tests {
         assert_eq!(policy.auth_retry_at, Some(now + Duration::from_secs(1800)));
     }
 
-    #[test]
-    fn lost_lease_restarts_on_the_first_poll_and_only_bot_auth_is_held() {
-        let now = Instant::now();
+    #[tokio::test(start_paused = true)]
+    async fn lost_lease_restarts_on_the_first_poll_and_only_bot_auth_is_held() {
+        let now = tokio::time::Instant::now().into_std();
         for code in [Some(1), Some(2), None] {
             let mut policy = RestartPolicy::default();
             policy.exited(true, code, Duration::ZERO, now);
@@ -4274,10 +4286,10 @@ mod tests {
     /// Issue #552: an unreachable control link is a normal rolling-swap wait
     /// for the launcher fence TTL plus a margin, so those attempts stay at
     /// INFO and only warn once the wait outlasts that bound.
-    #[test]
-    fn unreachable_link_startup_receipts_stay_quiet_until_the_fence_bound() {
+    #[tokio::test(start_paused = true)]
+    async fn unreachable_link_startup_receipts_stay_quiet_until_the_fence_bound() {
         let link = link_unavailable_error();
-        let start = Instant::now();
+        let start = tokio::time::Instant::now().into_std();
         let mut since = None;
         assert!(
             !Supervisor::startup_receipt_warns(&mut since, &link, start),
@@ -4303,11 +4315,12 @@ mod tests {
     }
 
     /// Other unsaved reasons keep warning immediately.
-    #[test]
-    fn other_unsaved_startup_receipt_reasons_still_warn() {
+    #[tokio::test(start_paused = true)]
+    async fn other_unsaved_startup_receipt_reasons_still_warn() {
+        let now = tokio::time::Instant::now().into_std();
         for status in ["waiting", "busy", "still waiting"] {
             assert!(
-                Supervisor::startup_receipt_warns(&mut None, &unsaved(status), Instant::now()),
+                Supervisor::startup_receipt_warns(&mut None, &unsaved(status), now),
                 "{status} must keep warning immediately"
             );
         }
@@ -4315,10 +4328,10 @@ mod tests {
 
     /// A reply from the link ends the outage. A later outage gets its own
     /// full window instead of inheriting the time of the first one.
-    #[test]
-    fn a_link_reply_restarts_the_startup_receipt_outage_window() {
+    #[tokio::test(start_paused = true)]
+    async fn a_link_reply_restarts_the_startup_receipt_outage_window() {
         let link = link_unavailable_error();
-        let start = Instant::now();
+        let start = tokio::time::Instant::now().into_std();
         let mut since = None;
         assert!(!Supervisor::startup_receipt_warns(&mut since, &link, start));
         let answered = start + Duration::from_secs(10);

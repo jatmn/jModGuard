@@ -475,7 +475,7 @@ mod tests {
             &digest,
             manifest,
             &serde_json::to_vec(&envelope).unwrap(),
-            Utc::now(),
+            "2026-09-23T00:00:00Z".parse().unwrap(),
             SignatureExpiry::Enforce,
         )
         .unwrap_err();

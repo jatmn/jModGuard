@@ -1236,6 +1236,7 @@ dependencies = [
  "jmodguard",
  "jmodguard-api",
  "jmodguard-bot",
+ "rand 0.10.4",
  "serde_json",
  "tokio",
 ]

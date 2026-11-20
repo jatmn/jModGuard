@@ -142,12 +142,8 @@ async fn retained_messages_survive_remote_reopen(
 #[ignore = "requires its own empty disposable libSQL server"]
 async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
     let path = std::env::temp_dir().join(format!(
-        "guild_store_catalog_{}_{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "guild_store_catalog_{:032x}.db",
+        rand::random::<u128>()
     ));
     let catalog = Db::open(&path, 2).unwrap();
     let registration = register_store(&catalog, StoreId::new(), StorePolicy::Shared)

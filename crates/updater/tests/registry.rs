@@ -477,7 +477,7 @@ fn normal_library_ignores_test_signing_pem() {
         &digest,
         manifest,
         &envelope,
-        chrono::Utc::now(),
+        "2026-09-23T00:00:00Z".parse().unwrap(),
         jmodguard_updater::signature::SignatureExpiry::Enforce,
     );
     assert_eq!(

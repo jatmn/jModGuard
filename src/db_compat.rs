@@ -3448,7 +3448,8 @@ mod tests {
         let held = writer.transaction_immediate().unwrap();
         let reader = Connection::open(&path).unwrap();
         reader.execute_batch("PRAGMA busy_timeout=5000;").unwrap();
-        let started = std::time::Instant::now();
+        // This thread holds the write lock until the end of the test, so a
+        // snapshot that waited for it could only fail with a busy error.
         let snapshot = reader.transaction_primary_snapshot().unwrap();
         let value: i64 = snapshot
             .query_row("SELECT 1", (), |row| Ok(row.get(0)?))
@@ -3456,11 +3457,6 @@ mod tests {
         assert!(!SqlExecutor::is_write_transaction(&snapshot));
         snapshot.finish_read().unwrap();
         assert_eq!(value, 1);
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "deferred primary snapshot waited on the writer lock: {:?}",
-            started.elapsed()
-        );
         let consistent = reader.transaction_consistent_read().unwrap();
         let consistent_value: i64 = consistent
             .query_row("SELECT 1", (), |row| Ok(row.get(0)?))

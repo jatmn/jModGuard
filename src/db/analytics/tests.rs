@@ -248,8 +248,19 @@ async fn guild_summary_ranks_breakdowns_and_buckets_the_heat_map() {
     );
     let json = serde_json::to_value(&summary).unwrap();
     assert_eq!(json["moderators"][0]["moderator_id"], "9007199254740993");
+    // Expect the weekday the fixture stamped on its rows, not a second clock read.
+    let stamped: String =
+        f.db.with_conn_sync(|conn| {
+            conn.query_row(
+                "SELECT created_at FROM warns WHERE guild_id=10",
+                (),
+                |row| Ok(row.get(0)?),
+            )
+        })
+        .unwrap();
     let weekday = i64::from(
-        (chrono::Utc::now().date_naive())
+        chrono::DateTime::parse_from_rfc3339(&stamped)
+            .unwrap()
             .weekday()
             .num_days_from_sunday(),
     );
@@ -373,16 +384,10 @@ async fn analytics_reads_and_writes_refuse_retired_enrollments() {
             .is::<crate::db::EnrollmentChanged>()
     );
     assert!(
-        bump_member_daily(
-            &f.db,
-            enrollment,
-            chrono::Utc::now().timestamp_millis(),
-            1,
-            0
-        )
-        .await
-        .unwrap_err()
-        .is::<crate::db::EnrollmentChanged>()
+        bump_member_daily(&f.db, enrollment, 1_790_121_600_000, 1, 0)
+            .await
+            .unwrap_err()
+            .is::<crate::db::EnrollmentChanged>()
     );
 }
 
@@ -582,7 +587,7 @@ async fn departure_erasure_removes_member_counters_before_re_enrollment() {
     // counter-only cleanup changes no configuration version.
     f.insert_raw(
         "INSERT INTO analytics_member_daily (guild_id, day, joins, leaves) VALUES (30, ?1, 3, 1)",
-        crate::db::params![chrono::Utc::now().format("%Y-%m-%d").to_string()],
+        crate::db::params!["2026-09-23"],
     );
     assert!(
         !crate::db::wipe_departed_directory_guild_data(&f.db, 20)

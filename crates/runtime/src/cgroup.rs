@@ -1202,12 +1202,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn neither_layout_readable_is_unavailable() {
+    // The paused clock supplies a fixed sample instant.
+    #[tokio::test(start_paused = true)]
+    async fn neither_layout_readable_is_unavailable() {
         let empty = temp_tree();
         let reading = read_cgroup(Some(&empty.path), Some(&empty.path));
         assert_eq!(reading, CgroupReading::default());
-        let sample = fold_sample(&mut CpuRate::default(), None, reading, Instant::now());
+        let sample = fold_sample(
+            &mut CpuRate::default(),
+            None,
+            reading,
+            tokio::time::Instant::now().into_std(),
+        );
         assert_eq!(sample, ContainerSample::unavailable());
 
         let unrelated = temp_tree();
