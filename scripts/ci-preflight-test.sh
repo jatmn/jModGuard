@@ -293,6 +293,7 @@ check_node_timeout_flag() {
     test_args+=("$expected_timeout")
   fi
   local file quoted_args
+  # Reverse the source-order expectations so a positional comparison fails.
   while IFS= read -r file; do
     printf -v quoted_args ' %q' "${test_args[@]}" "$file"
     expected+=("ci-preflight: node$quoted_args")
@@ -300,7 +301,7 @@ check_node_timeout_flag() {
       printf -v quoted_args ' %q' "${test_args[@]}" "$spaced_file"
       expected+=("ci-preflight: node$quoted_args")
     fi
-  done <<<"$frontend_test_files"
+  done < <(tac <<<"$frontend_test_files")
   # Expect one invocation per file and keep duplicates in the observed output.
   LC_ALL=C sort -o "$node_log" "$node_log"
   if ! diff -u <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort -u) "$node_log"; then
