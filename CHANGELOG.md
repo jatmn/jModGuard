@@ -4,6 +4,45 @@ Stable version notes are maintained by Release Please from Conventional Commits.
 Nightly publications use a separate `nightly-YYYYMMDD-<sha12>` identity and are
 not a Release Please baseline.
 
+## [0.2.2](https://github.com/jatmn/jModGuard/compare/v0.2.1...v0.2.2) (2026-11-20)
+
+
+### Features
+
+* **webui:** add Members list sort and controls ([#677](https://github.com/jatmn/jModGuard/issues/677)) ([2729087](https://github.com/jatmn/jModGuard/commit/27290878b2ff6ed02ab4e6e9cc2e45355b58b189))
+* **webui:** add owner Bot Resources page for bot and API resources ([#652](https://github.com/jatmn/jModGuard/issues/652)) ([#696](https://github.com/jatmn/jModGuard/issues/696)) ([43c0af8](https://github.com/jatmn/jModGuard/commit/43c0af8c4d9f6d2c73316a712b3c9bce0033ea25))
+* **webui:** add page size and column sorting to the Audit log ([#690](https://github.com/jatmn/jModGuard/issues/690)) ([9dca738](https://github.com/jatmn/jModGuard/commit/9dca7387ccc7e50e572f422bad0e08c942615a42))
+* **webui:** add page-size selector to Cases, Bans and Members ([#684](https://github.com/jatmn/jModGuard/issues/684)) ([ac50f37](https://github.com/jatmn/jModGuard/commit/ac50f37ee524c0bcc59df0510bd4a58dcb948ed8))
+* **webui:** add public Privacy Policy and Terms of Service pages with data deletion requests ([#667](https://github.com/jatmn/jModGuard/issues/667)) ([2056f3c](https://github.com/jatmn/jModGuard/commit/2056f3c232e4eca41631c65ba2d67e0e53d63893))
+* **webui:** add server-side sort, search and filters to the Bans list ([#660](https://github.com/jatmn/jModGuard/issues/660)) ([5a1ce42](https://github.com/jatmn/jModGuard/commit/5a1ce426024d54a0e535bbcd469e3fa496ac8583))
+* **webui:** search the Audit log and show readable event details ([#649](https://github.com/jatmn/jModGuard/issues/649)) ([#708](https://github.com/jatmn/jModGuard/issues/708)) ([332bae1](https://github.com/jatmn/jModGuard/commit/332bae1b6f38d6ad78fed082e7b173fb2e9d5066))
+* **webui:** sort Cases newest first with server-side column sort and shared list controls ([#657](https://github.com/jatmn/jModGuard/issues/657)) ([909be2f](https://github.com/jatmn/jModGuard/commit/909be2fcb89ec09698eec15a628839cbda58184d))
+* **webui:** toggle commands on and off from the Commands list ([#689](https://github.com/jatmn/jModGuard/issues/689)) ([39dd086](https://github.com/jatmn/jModGuard/commit/39dd08602b0b9e4ab02305c3c8e829cc767053fd))
+
+
+### Bug Fixes
+
+* **api:** bind the Bans list cursor to its filters and sort ([#686](https://github.com/jatmn/jModGuard/issues/686)) ([d92b997](https://github.com/jatmn/jModGuard/commit/d92b997b582c555c27dab5a990ab75b6bba81aa3))
+* **bot:** align image metadata enforcement with hash matches ([#691](https://github.com/jatmn/jModGuard/issues/691)) ([d3e36f5](https://github.com/jatmn/jModGuard/commit/d3e36f5789455ecd8f5dd17b0fa08a7d4a542db9))
+* **bot:** fold attachment burst into Exact image spam rule (ban + delete last hour) ([#662](https://github.com/jatmn/jModGuard/issues/662)) ([72adb06](https://github.com/jatmn/jModGuard/commit/72adb06450501f41be0894fa3d8012ee0583c2c1))
+* **bot:** keep built-in rule dry-run and exemptions when its config re-read fails ([#659](https://github.com/jatmn/jModGuard/issues/659)) ([#702](https://github.com/jatmn/jModGuard/issues/702)) ([758a07c](https://github.com/jatmn/jModGuard/commit/758a07cd99f75e3703772033dace2a1b071f05f4))
+* **bot:** suppress stale Discord message edit replays ([#694](https://github.com/jatmn/jModGuard/issues/694)) ([73150ea](https://github.com/jatmn/jModGuard/commit/73150ea5aa4b7e2994f56c44203f0b0eb3c44865))
+* correct Members name sort and bind list cursors ([#692](https://github.com/jatmn/jModGuard/issues/692)) ([5d0bde2](https://github.com/jatmn/jModGuard/commit/5d0bde21949a0070b5dec4a09fef27e1b5c11ced))
+* **db:** wait for the guild-store writer lock and fix two flaky tests ([#695](https://github.com/jatmn/jModGuard/issues/695)) ([3306883](https://github.com/jatmn/jModGuard/commit/33068837bda5227af8bf6d60baf13aa225948207))
+* **deps:** bump eslint to 10.15.0 for minimatch CVE-2026-118764 ([#654](https://github.com/jatmn/jModGuard/issues/654)) ([102ebf8](https://github.com/jatmn/jModGuard/commit/102ebf8f165bbf6cd721f9314630711c19987f16))
+* **publish:** retry staging pushes by phase, not registry error text ([#731](https://github.com/jatmn/jModGuard/issues/731)) ([f74c945](https://github.com/jatmn/jModGuard/commit/f74c945e1bf9c1e50dbc27848c8b4e69c875125c))
+* **webui:** don't lock out a fresh login on a Discord 429 during guild checks ([#655](https://github.com/jatmn/jModGuard/issues/655)) ([0bc07f2](https://github.com/jatmn/jModGuard/commit/0bc07f2e89a15a4ce1fa3f93c898273c9d2e9255))
+* **webui:** flush and restore a pending Bans search on auth loss ([#687](https://github.com/jatmn/jModGuard/issues/687)) ([e5d31a1](https://github.com/jatmn/jModGuard/commit/e5d31a14f03ddeb43a10fe9e057816573d2de6a4))
+* **webui:** link policy pages from dashboard footers ([#698](https://github.com/jatmn/jModGuard/issues/698)) ([adc2c5b](https://github.com/jatmn/jModGuard/commit/adc2c5b458f104aeb157ad44a084f02d92703716))
+* **webui:** show why a Ban user member search failed ([#664](https://github.com/jatmn/jModGuard/issues/664)) ([#707](https://github.com/jatmn/jModGuard/issues/707)) ([ffdbb92](https://github.com/jatmn/jModGuard/commit/ffdbb9292e40cdbd8e953d603241fcad5318287f))
+
+
+### Performance Improvements
+
+* **webui:** count the API's Discord requests by route on Bot Resources ([#653](https://github.com/jatmn/jModGuard/issues/653)) ([#701](https://github.com/jatmn/jModGuard/issues/701)) ([53f7ea2](https://github.com/jatmn/jModGuard/commit/53f7ea2a58004a7ee05a78bfe0b7baa2f1cfe52a))
+* **webui:** render cached display reads at once and revalidate them in the background ([#653](https://github.com/jatmn/jModGuard/issues/653)) ([#704](https://github.com/jatmn/jModGuard/issues/704)) ([5645ee3](https://github.com/jatmn/jModGuard/commit/5645ee37f78c9899a2e41474123f41c0864c7c3a))
+* **webui:** reuse Discord guild snapshots for minutes with gateway invalidation ([#653](https://github.com/jatmn/jModGuard/issues/653)) ([#706](https://github.com/jatmn/jModGuard/issues/706)) ([26072a9](https://github.com/jatmn/jModGuard/commit/26072a95b6632590627f7cd9a1b391fb9d05c6a8))
+
 ## [0.2.1](https://github.com/jatmn/jModGuard/compare/v0.2.0...v0.2.1) (2026-11-17)
 
 
