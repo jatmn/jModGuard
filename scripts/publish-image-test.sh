@@ -146,12 +146,23 @@ grep -Fq 'docker "$@" || publish_fail "docker failed: $*"' "$root/scripts/publis
 (
   push_trace="$TEST_SIGNING_DIR/push-trace"
   push_metadata="$TEST_SIGNING_DIR/build-metadata"
-  build=(buildx build --tag "$(staging_ref api)" .)
-  push=(buildx build --push --tag "$(staging_ref api)" . --metadata-file "$push_metadata")
+  build_context="$TEST_SIGNING_DIR/source context"
+  build=(buildx build --tag "$(staging_ref api)" "$build_context")
+  push=(buildx build --push --tag "$(staging_ref api)" "$build_context" --metadata-file "$push_metadata")
   push_error='ERROR: failed to push: blob unknown to registry'
+  argv_matches() {
+    local -n expected_argv="$1"
+    local expected_arg
+    shift
+    [[ $# -eq ${#expected_argv[@]} ]] || return 1
+    for expected_arg in "${expected_argv[@]}"; do
+      [[ "$1" == "$expected_arg" ]] || return 1
+      shift
+    done
+  }
   docker() {
     local attempt
-    if [[ "$*" == "${build[*]}" ]]; then
+    if argv_matches build "$@"; then
       printf 'build\n' >>"$push_trace"
       if (( build_fails )); then
         printf 'ERROR: failed to build: compiler exited with error\n' >&2
@@ -159,7 +170,7 @@ grep -Fq 'docker "$@" || publish_fail "docker failed: $*"' "$root/scripts/publis
       fi
       return 0
     fi
-    assert_eq "$*" "${push[*]}"
+    argv_matches push "$@" || fail "unexpected Docker arguments: $(printf '%q ' "$@")"
     [[ ! -s "$push_metadata" ]] || fail 'build metadata must be empty at the start of each attempt'
     printf 'push\n' >>"$push_trace"
     attempt="$(grep -c '^push$' "$push_trace")"
