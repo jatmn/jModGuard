@@ -56,6 +56,7 @@ expect "contracts fmt dylint updater api bot boundaries supply-chain" crates/upd
 expect "contracts dylint supply-chain" dylint.toml scripts/dylint.sh scripts/dylint-test.sh scripts/ci-dylint-libs.sh
 # The runner regression suites follow their own inputs, not application code.
 expect "contracts runner-tests supply-chain" scripts/ci-ensure-cargo-tool.sh
+expect "contracts frontend runner-tests" scripts/ci-frontend-node-timeout.sh
 expect "contracts runner-tests" \
   scripts/ci-cargo-log.sh \
   scripts/ci-preflight-test.sh \

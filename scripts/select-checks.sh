@@ -157,6 +157,12 @@ classify() {
       add supply-chain
       return
       ;;
+    scripts/ci-frontend-node-timeout.sh)
+      # Shared minimum for frontend --test-timeout gating and its runner self-test.
+      add frontend
+      add runner-tests
+      return
+      ;;
     scripts/ci-cargo-log.sh|scripts/ci-preflight-test.sh|scripts/ci-run-timed-cargo-test.sh|scripts/ci-timed-cargo-test.sh)
       add runner-tests
       return
