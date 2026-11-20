@@ -266,6 +266,13 @@ for required_file in "${required_frontend_test_files[@]}"; do
   grep -Fxq -- "$required_file" <<<"$frontend_test_files" || fail "missing required frontend test in preflight: $required_file"
 done
 
+# Add a fixture-only call through the real helper so that an unquoted log
+# differs from the captured argv even on Node versions without a timeout flag.
+spaced_file='scripts/argv fixture/frontend-state-test.mjs'
+sed -E '/^[[:blank:]]*run_frontend_node_test[[:blank:]]+scripts\/frontend-state-test\.mjs([[:blank:]]|$)/a\
+  run_frontend_node_test "$CI_PREFLIGHT_TEST_SPACED_FILE" || exit $?
+' "$root/scripts/ci-preflight.sh" >"$frontend_root/scripts/ci-preflight.sh"
+
 check_node_timeout_flag() {
   local major="$1" expected_timeout="$2"
   local node_log="$fixture/node-argv"
@@ -273,7 +280,7 @@ check_node_timeout_flag() {
   if ! (
     cd "$frontend_root"
     PATH="$fixture/bin:$PATH" CI_PREFLIGHT_TEST_NODE_MAJOR="$major" CI_PREFLIGHT_TEST_NODE_LOG="$node_log" \
-      /bin/bash "$root/scripts/ci-preflight.sh" --only frontend
+      CI_PREFLIGHT_TEST_SPACED_FILE="$spaced_file" /bin/bash scripts/ci-preflight.sh --only frontend
   ) >"$fixture/frontend.log" 2>&1; then
     cat "$fixture/frontend.log" >&2
     fail "Node major '${major}': frontend preflight failed"
@@ -285,12 +292,15 @@ check_node_timeout_flag() {
   local file
   while IFS= read -r file; do
     expected+=("${test_args[@]}" "$file")
+    if [ "$file" = scripts/frontend-state-test.mjs ]; then
+      expected+=("${test_args[@]}" "$spaced_file")
+    fi
   done <<<"$frontend_test_files"
   if ! diff -u <(printf '%s\n' "${expected[@]}") "$node_log"; then
     fail "Node major '${major}': unexpected frontend test arguments"
   fi
 
-  # Read just the frontend-state invocation from the argument capture.
+  # Compare both frontend-state log lines with their captured arguments.
   local arg
   local -a actual_args=()
   while IFS= read -r arg; do
@@ -298,10 +308,14 @@ check_node_timeout_flag() {
       actual_args=()
     fi
     actual_args+=("$arg")
-    [ "$arg" != scripts/frontend-state-test.mjs ] || break
-  done <"$node_log"
-  if ! diff -u <(printf 'ci-preflight: node%s\n' "$(printf ' %q' "${actual_args[@]}")") \
-    <(grep -E '^ci-preflight: node .* scripts/frontend-state-test\.mjs$' "$fixture/frontend.log"); then
+    case "$arg" in
+      scripts/frontend-state-test.mjs|"$spaced_file")
+        printf 'ci-preflight: node%s\n' "$(printf ' %q' "${actual_args[@]}")"
+        ;;
+    esac
+  done <"$node_log" >"$fixture/expected-frontend-log"
+  if ! diff -u "$fixture/expected-frontend-log" \
+    <(grep -E '^ci-preflight: node .* scripts/([^/]+/)?frontend-state-test\.mjs$' "$fixture/frontend.log"); then
     fail "Node major '${major}': frontend command log differs from actual arguments"
   fi
 }
