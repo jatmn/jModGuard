@@ -1105,7 +1105,7 @@ const affectedDir = fs.mkdtempSync(path.join(os.tmpdir(), "jmodguard-affected-")
 try {
   const repo = path.join(affectedDir, "repo"), calls = path.join(affectedDir, "calls");
   fs.mkdirSync(path.join(repo, "scripts"), { recursive: true });
-  for (const file of ["ci-preflight.sh", "select-checks.sh", "ci-ensure-cargo-tool.sh", "ci-run-timed-cargo-test.sh", "ci-cargo-log.sh"]) {
+  for (const file of ["ci-preflight.sh", "ci-frontend-node-timeout.sh", "select-checks.sh", "ci-ensure-cargo-tool.sh", "ci-run-timed-cargo-test.sh", "ci-cargo-log.sh"]) {
     fs.copyFileSync(path.join(root, "scripts", file), path.join(repo, "scripts", file));
   }
   const record = name => `printf '%s\\n' ${name} >>"$AFFECTED_CALLS"\n`;
@@ -1132,7 +1132,9 @@ try {
   const preflight = (...args) => {
     fs.rmSync(calls, { force: true });
     const result = spawnSync("bash", ["scripts/ci-preflight.sh", ...args], {
-      cwd: repo, encoding: "utf8", env: { ...process.env, AFFECTED_CALLS: calls },
+      // The stand-in Node suite in this routing fixture is independent of any
+      // preload observing real launches from the enclosing workflow check.
+      cwd: repo, encoding: "utf8", env: { ...process.env, AFFECTED_CALLS: calls, NODE_OPTIONS: "" },
     });
     assert.ifError(result.error);
     return { ...result, calls: fs.existsSync(calls) ? fs.readFileSync(calls, "utf8").trim().split("\n") : [] };

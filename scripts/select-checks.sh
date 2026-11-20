@@ -163,7 +163,7 @@ classify() {
       add runner-tests
       return
       ;;
-    scripts/ci-cargo-log.sh|scripts/ci-preflight-test.sh|scripts/ci-run-timed-cargo-test.sh|scripts/ci-timed-cargo-test.sh)
+    scripts/ci-cargo-log.sh|scripts/ci-preflight-test.sh|scripts/ci-preflight-node-test-files.txt|scripts/ci-run-timed-cargo-test.sh|scripts/ci-timed-cargo-test.sh)
       add runner-tests
       return
       ;;
