@@ -3741,13 +3741,13 @@ mod tests {
             started.elapsed() < POLL,
             "retry must precede the next 5 s tick"
         );
+        // Capture the horizon refreshed by the successful retry before re-arming
+        // clears local authority and makes CAS return immediately.
+        let renewed_deadline = control.launcher_fence_deadline().unwrap();
         control.arm_launcher_fence("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         attempts.store(0, std::sync::atomic::Ordering::SeqCst);
-        // Unconfirmed authority makes CAS return immediately; use a fresh horizon
-        // so this phase is not coupled to the first fence's wall-clock deadline.
-        let unconfirmed_deadline = std::time::Instant::now() + Duration::from_secs(10);
         assert!(
-            !renew_launcher_fence_promptly(unconfirmed_deadline, || async {
+            !renew_launcher_fence_promptly(renewed_deadline, || async {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 control.renew_launcher_fence_cas().await
             })
