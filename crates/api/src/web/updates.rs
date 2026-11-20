@@ -1987,10 +1987,14 @@ mod tests {
                     Duration::from_secs(3600),
                 );
                 // The failed-attempt warning is logged just before the retry wait.
-                tokio::select! {
+                let notified = tokio::select! {
                     _ = install => panic!("install finished instead of waiting to retry"),
-                    () = failed.0.notified() => {}
-                }
+                    result = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        failed.0.notified(),
+                    ) => result,
+                };
+                notified.expect("purge failed-attempt warning was not logged within 10s");
                 1
             } else {
                 let error = publish_then_purge(

@@ -80,15 +80,30 @@ fn wait_log(running: &Running, needle: &str) -> String {
     }
 }
 
-/// Waits for the child to close its output, then reaps it.
+/// Waits for the child to close its output, then reaps it within the same budget.
 fn wait_exit(running: &mut Running, failure: &str, log: &str) {
-    let closed = running.pipes_closed.recv_timeout(Duration::from_secs(10));
+    let budget = Duration::from_secs(10);
+    let deadline = Instant::now() + budget;
+    let closed = running.pipes_closed.recv_timeout(budget);
     assert_eq!(
         closed,
         Err(mpsc::RecvTimeoutError::Disconnected),
         "{failure}\n{log}"
     );
-    running.child.wait().unwrap();
+    loop {
+        match running.child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = running.child.kill();
+                    let _ = running.child.wait();
+                    panic!("{failure}: child stayed alive after output closed\n{log}");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("{failure}: try_wait failed: {error}\n{log}"),
+        }
+    }
 }
 
 fn health_addr(log: &str) -> String {
