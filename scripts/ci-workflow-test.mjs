@@ -1132,7 +1132,9 @@ try {
   const preflight = (...args) => {
     fs.rmSync(calls, { force: true });
     const result = spawnSync("bash", ["scripts/ci-preflight.sh", ...args], {
-      cwd: repo, encoding: "utf8", env: { ...process.env, AFFECTED_CALLS: calls },
+      // The stand-in Node suite in this routing fixture is independent of any
+      // preload observing real launches from the enclosing workflow check.
+      cwd: repo, encoding: "utf8", env: { ...process.env, AFFECTED_CALLS: calls, NODE_OPTIONS: "" },
     });
     assert.ifError(result.error);
     return { ...result, calls: fs.existsSync(calls) ? fs.readFileSync(calls, "utf8").trim().split("\n") : [] };

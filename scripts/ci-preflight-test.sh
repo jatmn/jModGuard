@@ -230,6 +230,7 @@ mkdir -p "$frontend_root/scripts" "$frontend_root/tools/eslint/node_modules/esli
 git init -q "$frontend_root"
 git -C "$frontend_root" -c user.name=Fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false \
   commit --allow-empty -qm 'Fixture base'
+fixture_base="$(git -C "$frontend_root" rev-parse HEAD)"
 cp "$root/scripts/check-test-flakes.mjs" "$frontend_root/scripts/"
 : >"$frontend_root/tools/test-flake-allowlist.tsv"
 for gate in select-checks-test.sh public-install-acceptance-test.sh dependabot-config-test.sh; do
@@ -242,16 +243,20 @@ exports.ESLint = class {
   async lintFiles() { return []; }
 };
 JS
-# Also observe nested launches that use process.execPath and bypass the PATH shim.
+# Record and stop test launches that bypass the PATH shim before their suites run.
 cat >"$fixture/node-test-probe.cjs" <<'JS'
 if (process.execArgv.includes("--test")) {
-  require("node:fs").appendFileSync(process.env.CI_PREFLIGHT_TEST_NODE_LOG, process.execArgv.join(" ") + "\n");
+  const args = [...process.execArgv, ...process.argv.slice(1)];
+  require("node:fs").appendFileSync(
+    process.env.CI_PREFLIGHT_TEST_NODE_LOG, "Unexpected real Node test: " + JSON.stringify(args) + "\n");
+  process.exit(1);
 }
 JS
 cat >"$fixture/node-noisy-preload.cjs" <<'JS'
 console.log("ci-preflight-test: noisy preload must not affect node major probe");
 JS
 export CI_PREFLIGHT_TEST_REAL_NODE CI_PREFLIGHT_TEST_ROOT="$root" CI_PREFLIGHT_TEST_REAL_PATH="$PATH"
+export CI_PREFLIGHT_TEST_NODE_PROBE="$fixture/node-test-probe.cjs"
 CI_PREFLIGHT_TEST_REAL_NODE="$(command -v node)"
 for helper in ci-ensure-cargo-tool.sh ci-run-timed-cargo-test.sh ci-cargo-log.sh ci-frontend-node-timeout.sh require-host-eslint-node.sh; do
   ln -s "$root/scripts/$helper" "$frontend_root/scripts/$helper"
@@ -265,13 +270,13 @@ cat >"$fixture/bin/node" <<'SH'
 #!/bin/bash
 set -euo pipefail
 case "$1" in
-  -p) printf '%s\n' "$CI_PREFLIGHT_TEST_NODE_MAJOR" ;;
-  -e|scripts/check-test-flakes.mjs)
-    exec "$CI_PREFLIGHT_TEST_REAL_NODE" "$@"
+  -p)
+    # Simulate the major value while preserving Node startup and preload output.
+    exec "$CI_PREFLIGHT_TEST_REAL_NODE" -p 'process.env.CI_PREFLIGHT_TEST_NODE_MAJOR'
     ;;
   scripts/ci-workflow-test.mjs)
     exec env -u JMODGUARD_DIFF_BASE -u JMODGUARD_DIFF_HEAD -u JMODGUARD_PREFLIGHT_BASE \
-      PATH="$CI_PREFLIGHT_TEST_REAL_PATH" NODE_OPTIONS= \
+      PATH="$CI_PREFLIGHT_TEST_REAL_PATH" NODE_OPTIONS="--require=\"$CI_PREFLIGHT_TEST_NODE_PROBE\"" \
       "$CI_PREFLIGHT_TEST_REAL_NODE" "$CI_PREFLIGHT_TEST_ROOT/scripts/ci-workflow-test.mjs"
     ;;
   --test)
@@ -284,7 +289,7 @@ case "$1" in
       exit 1
     fi
     ;;
-  *) exit 1 ;;
+  *) exec "$CI_PREFLIGHT_TEST_REAL_NODE" "$@" ;;
 esac
 SH
 chmod +x "$fixture/bin/npm" "$fixture/bin/node"
@@ -311,72 +316,67 @@ sed -E '/^[[:blank:]]*run_node_test[[:blank:]]+scripts\/frontend-state-test\.mjs
   run_node_test "$CI_PREFLIGHT_TEST_SPACED_FILE" || exit $?
 ' "$root/scripts/ci-preflight.sh" >"$frontend_root/scripts/ci-preflight.sh"
 
-check_contracts_and_pullfrog_node_paths() {
-  local node_log="$fixture/contracts-node-argv"
-  : >"$node_log"
-  if ! (
-    cd "$frontend_root"
-    PATH="$fixture/bin:$PATH" CI_PREFLIGHT_TEST_NODE_MAJOR=24 CI_PREFLIGHT_TEST_NODE_LOG="$node_log" \
-      NODE_OPTIONS="--require=\"$fixture/node-noisy-preload.cjs\" --require=\"$fixture/node-test-probe.cjs\"" JMODGUARD_DIFF_BASE='' \
-      /bin/bash "$root/scripts/ci-preflight.sh" --only contracts --only pullfrog
-  ) >"$fixture/contracts.log" 2>&1; then
-    cat "$fixture/contracts.log" >&2
-    fail 'contracts/pullfrog Node preflight paths failed'
-  fi
-  for path in scripts/check-test-flakes.test.mjs scripts/pullfrog-command-check.test.mjs; do
-    grep -Fq -- "$path" "$node_log" || fail "contracts/pullfrog missing node --test for $path"
-  done
-  grep -Fq 'ci-workflow-test: ok' "$fixture/contracts.log" \
-    || fail 'checked-in workflow contract script must complete'
-  echo 'ci-preflight test: contracts, pullfrog, and workflow Node paths verified'
-}
+contract_test_files=(scripts/check-test-flakes.test.mjs scripts/pullfrog-command-check.test.mjs)
 
-check_node_timeout_flag() {
-  local major="$1" expected_timeout="$2"
+run_fixture_preflight() {
+  local major="$1" label="$2"
+  shift 2
   local node_log="$fixture/node-argv"
   : >"$node_log"
   if ! (
     cd "$frontend_root"
+    # The hosted event's revisions are for the checkout, not this repository.
     PATH="$fixture/bin:$PATH" CI_PREFLIGHT_TEST_NODE_MAJOR="$major" CI_PREFLIGHT_TEST_NODE_LOG="$node_log" \
-      NODE_OPTIONS="--require=\"$fixture/node-noisy-preload.cjs\" --require=\"$fixture/node-test-probe.cjs\"" \
-      env CI_PREFLIGHT_TEST_SPACED_FILE="$spaced_file" /bin/bash scripts/ci-preflight.sh --only frontend
-  ) >"$fixture/frontend.log" 2>&1; then
-    cat "$fixture/frontend.log" >&2
-    fail "Node major '${major}': frontend preflight failed"
+      NODE_OPTIONS="--require=\"$fixture/node-noisy-preload.cjs\" --require=\"$CI_PREFLIGHT_TEST_NODE_PROBE\"" \
+      JMODGUARD_DIFF_BASE="$fixture_base" JMODGUARD_DIFF_HEAD="$fixture_base" \
+      CI_PREFLIGHT_TEST_SPACED_FILE="$spaced_file" /bin/bash scripts/ci-preflight.sh "$@"
+  ) >"$fixture/preflight.log" 2>&1; then
+    cat "$fixture/preflight.log" >&2
+    fail "$label preflight failed"
   fi
-  local frontend_test_files
-  frontend_test_files="$(
-    sed -n '/^if should_run frontend;/,/^fi$/p' "$frontend_root/scripts/ci-preflight.sh" \
-      | sed -nE 's/^[[:blank:]]*run_node_test[[:blank:]]+([^[:blank:]]+).*/\1/p' \
-      | grep -v '\$'
-  )"
+}
+
+check_node_invocations() {
+  local label="$1" expected_timeout="$2"
+  shift 2
+  local node_log="$fixture/node-argv"
   local -a test_args=(--test) expected=()
   if [ -n "$expected_timeout" ]; then
     test_args+=("$expected_timeout")
   fi
   local file quoted_args
-  # Reverse the source-order expectations so a positional comparison fails.
-  while IFS= read -r file; do
+  for file in "$@"; do
     printf -v quoted_args ' %q' "${test_args[@]}" "$file"
     expected+=("ci-preflight: node$quoted_args")
-    if [ "$file" = scripts/frontend-state-test.mjs ]; then
-      printf -v quoted_args ' %q' "${test_args[@]}" "$spaced_file"
-      expected+=("ci-preflight: node$quoted_args")
-    fi
-  done < <(tac <<<"$frontend_test_files")
+  done
   # Expect one invocation per file and keep duplicates in the observed output.
   LC_ALL=C sort -o "$node_log" "$node_log"
   if ! diff -u <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort -u) "$node_log"; then
-    fail "Node major '${major}': unexpected frontend test arguments"
+    fail "$label: unexpected Node test invocations"
   fi
 
   if ! diff -u "$node_log" \
-    <(grep -E '^ci-preflight: node --test( |$)' "$fixture/frontend.log" | LC_ALL=C sort); then
-    fail "Node major '${major}': frontend command log differs from actual arguments"
+    <(grep -E '^ci-preflight: node --test( |$)' "$fixture/preflight.log" | LC_ALL=C sort); then
+    fail "$label: command log differs from actual Node test arguments"
   fi
 }
 
-check_contracts_and_pullfrog_node_paths
+run_fixture_preflight 24 'contracts/Pullfrog' --only contracts --only pullfrog
+check_node_invocations 'contracts/Pullfrog' --test-timeout=60000 "${contract_test_files[@]}"
+grep -Fq 'ci-workflow-test: ok' "$fixture/preflight.log" \
+  || fail 'checked-in workflow contract script must complete'
+echo 'ci-preflight test: contracts, pullfrog, and workflow Node paths verified'
+
+# Reverse the manifest order so a positional comparison fails.
+mapfile -t frontend_test_files < <(
+  grep -Fvx -f <(printf '%s\n' "${contract_test_files[@]}") <<<"$required_node_test_files" | tac
+)
+
+check_node_timeout_flag() {
+  local major="$1" expected_timeout="$2" label="frontend Node major '$1'"
+  run_fixture_preflight "$major" "$label" --only frontend
+  check_node_invocations "$label" "$expected_timeout" "${frontend_test_files[@]}" "$spaced_file"
+}
 
 # shellcheck source=scripts/ci-frontend-node-timeout.sh
 source "$root/scripts/ci-frontend-node-timeout.sh"
