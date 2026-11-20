@@ -241,7 +241,10 @@ set -euo pipefail
 case "$1" in
   -p) printf '%s\n' "$CI_PREFLIGHT_TEST_NODE_MAJOR" ;;
   -e|scripts/check-test-flakes.mjs) ;;
-  --test) printf '%s\n' "$@" >>"$CI_PREFLIGHT_TEST_NODE_LOG" ;;
+  --test)
+    printf -v quoted_args ' %q' "$@"
+    printf 'ci-preflight: node%s\n' "$quoted_args" >>"$CI_PREFLIGHT_TEST_NODE_LOG"
+    ;;
   *) exit 1 ;;
 esac
 SH
@@ -289,33 +292,23 @@ check_node_timeout_flag() {
   if [ -n "$expected_timeout" ]; then
     test_args+=("$expected_timeout")
   fi
-  local file
+  local file quoted_args
   while IFS= read -r file; do
-    expected+=("${test_args[@]}" "$file")
+    printf -v quoted_args ' %q' "${test_args[@]}" "$file"
+    expected+=("ci-preflight: node$quoted_args")
     if [ "$file" = scripts/frontend-state-test.mjs ]; then
-      expected+=("${test_args[@]}" "$spaced_file")
+      printf -v quoted_args ' %q' "${test_args[@]}" "$spaced_file"
+      expected+=("ci-preflight: node$quoted_args")
     fi
   done <<<"$frontend_test_files"
-  if ! diff -u <(printf '%s\n' "${expected[@]}") "$node_log"; then
+  # Expect one invocation per file and keep duplicates in the observed output.
+  LC_ALL=C sort -o "$node_log" "$node_log"
+  if ! diff -u <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort -u) "$node_log"; then
     fail "Node major '${major}': unexpected frontend test arguments"
   fi
 
-  # Compare both frontend-state log lines with their captured arguments.
-  local arg
-  local -a actual_args=()
-  while IFS= read -r arg; do
-    if [ "$arg" = --test ]; then
-      actual_args=()
-    fi
-    actual_args+=("$arg")
-    case "$arg" in
-      scripts/frontend-state-test.mjs|"$spaced_file")
-        printf 'ci-preflight: node%s\n' "$(printf ' %q' "${actual_args[@]}")"
-        ;;
-    esac
-  done <"$node_log" >"$fixture/expected-frontend-log"
-  if ! diff -u "$fixture/expected-frontend-log" \
-    <(grep -E '^ci-preflight: node .* scripts/([^/]+/)?frontend-state-test\.mjs$' "$fixture/frontend.log"); then
+  if ! diff -u "$node_log" \
+    <(grep -E '^ci-preflight: node --test( |$)' "$fixture/frontend.log" | LC_ALL=C sort); then
     fail "Node major '${major}': frontend command log differs from actual arguments"
   fi
 }
