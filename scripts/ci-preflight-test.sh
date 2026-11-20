@@ -247,10 +247,17 @@ esac
 SH
 chmod +x "$fixture/bin/npm" "$fixture/bin/node"
 
-# Compare all observed invocations with the files routed through the helper.
-# A direct node --test call will still be recorded and fail the comparison.
-frontend_test_files="$(sed -nE 's/^[[:blank:]]*run_frontend_node_test[[:blank:]]+([^[:blank:]]+).*/\1/p' "$root/scripts/ci-preflight.sh")"
-[ -n "$frontend_test_files" ] || fail 'no frontend test files found in preflight'
+# List the expected frontend invocations independently of the helper call sites.
+# Keep this in the order frontend preflight runs the tests.
+frontend_test_files=(
+  tools/eslint/test-flake.test.js
+  scripts/frontend-state-test.mjs
+  scripts/frontend-contrast-test.mjs
+  scripts/frontend-warmup-test.mjs
+  scripts/frontend-sr-only-test.mjs
+  scripts/package-webui-test.mjs
+  scripts/administration-state-test.mjs
+)
 
 check_node_timeout_flag() {
   local major="$1" expected_timeout="$2"
@@ -269,9 +276,9 @@ check_node_timeout_flag() {
     test_args+=("$expected_timeout")
   fi
   local file
-  while IFS= read -r file; do
+  for file in "${frontend_test_files[@]}"; do
     expected+=("${test_args[@]}" "$file")
-  done <<<"$frontend_test_files"
+  done
   if ! diff -u <(printf '%s\n' "${expected[@]}") "$node_log"; then
     fail "Node major '${major}': unexpected frontend test arguments"
   fi
