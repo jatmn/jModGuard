@@ -1,8 +1,8 @@
 //! rustls 0.23 HTTPS connector for libsql's hyper 0.14 remote client.
 //!
-//! libsql 0.9.30's `tls` feature pulls `hyper-rustls 0.25` → `rustls 0.22` →
-//! `rustls-webpki 0.102.8` (GHSA-82j2-j2ch-gfr8). Building the connector here
-//! lets that feature stay off while remote HTTPS still uses rustls.
+//! The workspace disables libsql's `tls` feature to avoid its older rustls
+//! stack. This connector supplies TLS for remote HTTPS using the workspace's
+//! rustls dependency.
 
 use anyhow::{Context as _, Result, bail};
 use hyper::Uri;

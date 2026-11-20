@@ -323,8 +323,9 @@ authorize live provider calls or require a Codex skill to contribute.
 - serenity **0.12.5** — see `docs/RESEARCH.md` for the breaking 0.12.5 API
   changes (EventHandler signatures, `!Send` CacheRef, Timestamp newtype,
   `CommandInteraction` rename, `GuildId::set_commands`).
-- libsql 0.10.0 (`core`, `remote`; remote HTTPS uses in-tree rustls 0.23, not
-  libsql's `tls`/`hyper-rustls 0.25` stack; `libsql-sqlite3-parser` is
+- libsql version requirement in [Cargo.toml](Cargo.toml) and resolved version
+  in [Cargo.lock](Cargo.lock) (`core`, `remote`; remote HTTPS uses in-tree
+  rustls 0.23 with libsql's `tls` feature disabled; `libsql-sqlite3-parser` is
   git-patched from branch `vendor/libsql-sqlite3-parser-0.13.1` (rev
   `f2391d6`) for GHSA-8m95-fffc-h4c5; CI/Docker `cargo fetch` uses
   `GITHUB_TOKEN`),
