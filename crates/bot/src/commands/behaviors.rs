@@ -2378,8 +2378,9 @@ mod tests {
         let app = crate::state::BotState::new(cfg, db.clone()).unwrap();
         let progress = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let progress_flag = std::sync::Arc::clone(&progress);
+        // The test runtime has one thread, so the spawned task runs only while
+        // the stats fetch is waiting.
         let watcher = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             progress_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         let _ = tokio::time::timeout(
@@ -2387,8 +2388,11 @@ mod tests {
             stats_response(&app, 10, 5),
         )
         .await;
+        assert!(
+            progress.load(std::sync::atomic::Ordering::SeqCst),
+            "concurrent work must run while the stats fetch waits"
+        );
         watcher.await.unwrap();
-        assert!(progress.load(std::sync::atomic::Ordering::SeqCst));
         drop(app);
         let _ = std::fs::remove_file(path);
     }

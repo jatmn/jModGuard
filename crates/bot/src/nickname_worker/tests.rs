@@ -331,10 +331,9 @@ async fn cancelled_nickname_edit_is_not_done_and_the_next_pass_skips_a_repeat_ed
             .await
         })
     };
-    tokio::select! {
-        _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("edit was not polled"),
-        _ = &mut notified => {}
-    }
+    tokio::time::timeout(Duration::from_secs(2), &mut notified)
+        .await
+        .expect("edit was not polled");
     assert!(polled.load(Ordering::SeqCst));
     db::release_active_bot(&f.db, app.activation.instance())
         .await

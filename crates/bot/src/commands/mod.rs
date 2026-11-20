@@ -4292,16 +4292,15 @@ mod tests {
 
     #[tokio::test]
     async fn handle_prefix_unknown_command_reply_suppressed_when_cutoff_wins_during_await() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::io::AsyncReadExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let connected = Arc::new(AtomicBool::new(false));
+        let connected = Arc::new(tokio::sync::Notify::new());
         let flag = Arc::clone(&connected);
         let server = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
-                flag.store(true, Ordering::SeqCst);
+                flag.notify_one();
                 let mut buf = [0u8; 1024];
                 while stream.read(&mut buf).await.unwrap_or(0) > 0 {}
             }
@@ -4331,13 +4330,12 @@ mod tests {
                 .await
             }
         });
-        for _ in 0..500 {
-            if connected.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(connected.load(Ordering::SeqCst));
+        tokio::time::timeout(
+            std::time::Duration::from_millis(2_500),
+            connected.notified(),
+        )
+        .await
+        .expect("the unknown-command reply must reach Discord before the cutoff");
         app.activation.cut_off();
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
             .await

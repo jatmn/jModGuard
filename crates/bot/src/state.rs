@@ -3096,7 +3096,11 @@ mod tests {
                     .unwrap()
             })
         };
+        // Paused time ends this wait only once the pass is idle in its match window.
+        // The window itself is wall-clock time, so resume before it can elapse.
+        tokio::time::pause();
         tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::resume();
         assert!(
             !reconcile.is_finished(),
             "reconciliation must wait for delayed callbacks"

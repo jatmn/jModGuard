@@ -2069,38 +2069,37 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
-        struct Stop(Arc<AtomicBool>);
+        // Stopping wakes the blocking accept with one connection of its own.
+        struct Stop(Arc<AtomicBool>, std::net::SocketAddr);
         impl Drop for Stop {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
+                self.0.store(true, Ordering::SeqCst);
+                let _ = std::net::TcpStream::connect(self.1);
             }
         }
-        let stop_guard = Stop(Arc::clone(&stop));
+        let stop_guard = Stop(Arc::clone(&stop), addr);
         let server_lines = Arc::clone(&lines);
         let server_stop = Arc::clone(&stop);
         let server = std::thread::spawn(move || {
-            listener.set_nonblocking(true).unwrap();
-            while !server_stop.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
-                        let Some((method, path)) = read_request(&mut stream) else {
-                            continue;
-                        };
-                        server_lines
-                            .lock()
-                            .unwrap()
-                            .push(format!("{method} {path}"));
-                        let response = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                        let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.flush();
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(_) => break,
+            for stream in listener.incoming() {
+                if server_stop.load(Ordering::SeqCst) {
+                    break;
                 }
+                let Ok(mut stream) = stream else {
+                    break;
+                };
+                let Some((method, path)) = read_request(&mut stream) else {
+                    continue;
+                };
+                server_lines
+                    .lock()
+                    .unwrap()
+                    .push(format!("{method} {path}"));
+                let response =
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
             }
         });
 
@@ -4239,64 +4238,57 @@ mod tests {
         let pending = AutomodEngine::new()
             .evaluate(&cfg, &word_message(&[]))
             .expect("delete rule matches");
-        let delete_seen = Arc::new(AtomicBool::new(false));
-        let release = Arc::new(AtomicBool::new(false));
+        // The server reports whether the mark existed when the DELETE arrived,
+        // then holds the response until the test releases it.
+        let (delete_seen, mut delete_seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
         let app_for_check = Arc::clone(&app);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
-        let server_delete_seen = Arc::clone(&delete_seen);
-        let server_release = Arc::clone(&release);
         let server_app = Arc::clone(&app_for_check);
         let server = std::thread::spawn(move || {
-            listener.set_nonblocking(true).unwrap();
-            while !server_stop.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
-                        let mut buf = Vec::new();
-                        let mut tmp = [0u8; 1024];
-                        while let Ok(n) = stream.read(&mut tmp) {
-                            if n == 0 {
-                                break;
-                            }
-                            buf.extend_from_slice(&tmp[..n]);
-                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                                break;
-                            }
-                        }
-                        let header = String::from_utf8_lossy(&buf);
-                        let method = header
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("");
-                        if method == "DELETE" && header.contains("/messages/") {
-                            server_delete_seen.store(true, Ordering::Relaxed);
-                            assert!(
-                                server_app
-                                    .automod_delete_marks
-                                    .inner
-                                    .lock()
-                                    .contains(10, 70, 42)
-                            );
-                            while !server_release.load(Ordering::Relaxed) {
-                                std::thread::sleep(std::time::Duration::from_millis(2));
-                            }
-                        }
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        );
-                        let _ = stream.flush();
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
-                    Err(_) => break,
+            for stream in listener.incoming() {
+                if server_stop.load(Ordering::SeqCst) {
+                    break;
                 }
+                let Ok(mut stream) = stream else {
+                    break;
+                };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut tmp) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let header = String::from_utf8_lossy(&buf);
+                let method = header
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if method == "DELETE" && header.contains("/messages/") {
+                    let marked = server_app
+                        .automod_delete_marks
+                        .inner
+                        .lock()
+                        .contains(10, 70, 42);
+                    let _ = delete_seen.send(marked);
+                    // A send or the test dropping the sender releases the reply.
+                    let _ = release_rx.recv();
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = stream.flush();
             }
         });
         let http = serenity::http::HttpBuilder::new("token")
@@ -4322,12 +4314,18 @@ mod tests {
             )
             .await;
         });
-        while !delete_seen.load(Ordering::Relaxed) {
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        release.store(true, Ordering::Relaxed);
+        let marked = delete_seen_rx
+            .recv()
+            .await
+            .expect("the DELETE request reaches the server");
+        assert!(
+            marked,
+            "the automod delete mark must exist before the DELETE request"
+        );
+        release.send(()).unwrap();
         task.await.unwrap();
-        stop.store(true, Ordering::Relaxed);
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(addr);
         let _ = server.join();
         drop(app);
         let _ = std::fs::remove_file(&path);
@@ -4377,31 +4375,27 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let server = std::thread::spawn(move || {
-            listener.set_nonblocking(true).unwrap();
-            while !server_stop.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
-                        let mut buf = Vec::new();
-                        let mut tmp = [0u8; 1024];
-                        while let Ok(n) = stream.read(&mut tmp) {
-                            if n == 0 {
-                                break;
-                            }
-                            buf.extend_from_slice(&tmp[..n]);
-                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                                break;
-                            }
-                        }
-                        let response = b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{\"message\": \"forbidden\"}";
-                        let _ = stream.write_all(response);
-                        let _ = stream.flush();
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
-                    Err(_) => break,
+            for stream in listener.incoming() {
+                if server_stop.load(Ordering::SeqCst) {
+                    break;
                 }
+                let Ok(mut stream) = stream else {
+                    break;
+                };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                while let Ok(n) = stream.read(&mut tmp) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let response = b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{\"message\": \"forbidden\"}";
+                let _ = stream.write_all(response);
+                let _ = stream.flush();
             }
         });
         let http = serenity::http::HttpBuilder::new("token")
@@ -4424,7 +4418,8 @@ mod tests {
             &pending,
         )
         .await;
-        stop.store(true, Ordering::Relaxed);
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(addr);
         let _ = server.join();
         assert!(!app.automod_delete_marks.inner.lock().contains(10, 70, 42));
         let report = observed_delete_report(
@@ -4565,63 +4560,58 @@ mod tests {
         let server_stop = Arc::clone(&stop);
         let server_bodies = Arc::clone(&bodies);
         let server = std::thread::spawn(move || {
-            listener.set_nonblocking(true).unwrap();
-            while !server_stop.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
-                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                        let mut buf = Vec::new();
-                        let mut tmp = [0u8; 2048];
-                        loop {
-                            match stream.read(&mut tmp) {
-                                Ok(0) => break,
-                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                                Err(error)
-                                    if error.kind() == std::io::ErrorKind::WouldBlock
-                                        || error.kind() == std::io::ErrorKind::TimedOut =>
-                                {
-                                    break;
-                                }
-                                Err(_) => break,
+            for stream in listener.incoming() {
+                if server_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut stream) = stream else {
+                    break;
+                };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 2048];
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                || error.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                    if buf.len() > 65_536 {
+                        break;
+                    }
+                    if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&buf[..header_end]);
+                        let length = header.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
                             }
-                            if buf.len() > 65_536 {
+                        });
+                        if let Some(length) = length {
+                            if buf.len() >= header_end + 4 + length {
                                 break;
                             }
-                            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n")
-                            {
-                                let header = String::from_utf8_lossy(&buf[..header_end]);
-                                let length = header.lines().find_map(|line| {
-                                    let (name, value) = line.split_once(':')?;
-                                    if name.eq_ignore_ascii_case("content-length") {
-                                        value.trim().parse::<usize>().ok()
-                                    } else {
-                                        None
-                                    }
-                                });
-                                if let Some(length) = length {
-                                    if buf.len() >= header_end + 4 + length {
-                                        break;
-                                    }
-                                } else {
-                                    break;
-                                }
-                            }
+                        } else {
+                            break;
                         }
-                        server_bodies
-                            .lock()
-                            .unwrap()
-                            .push(String::from_utf8_lossy(&buf).into_owned());
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        );
-                        let _ = stream.flush();
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
-                    Err(_) => break,
                 }
+                server_bodies
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).into_owned());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = stream.flush();
             }
         });
         let http = serenity::http::HttpBuilder::new("token")
@@ -4666,7 +4656,8 @@ mod tests {
         );
         probe.release.notify_one();
         task.await.unwrap();
-        stop.store(true, Ordering::Relaxed);
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(addr);
         let _ = server.join();
         let logged = bodies.lock().unwrap().clone();
         assert!(

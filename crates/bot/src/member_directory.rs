@@ -1520,12 +1520,9 @@ mod tests {
                 .await
             }
         });
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                panic!("the discord future must be polled while it is still pending");
-            }
-            _ = &mut notified => {}
-        }
+        tokio::time::timeout(Duration::from_secs(2), &mut notified)
+            .await
+            .expect("the discord future must be polled while it is still pending");
         assert!(polled.load(Ordering::SeqCst));
         assert!(!dropped.load(Ordering::SeqCst));
         activation.cut_off();

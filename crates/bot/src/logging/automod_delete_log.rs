@@ -1006,6 +1006,8 @@ async fn saturated_report_slots_still_log_reconciled_automod_delete() {
         None,
         false,
     );
+    // On paused time each poll waits until the spawned reconcile is idle.
+    tokio::time::pause();
     let deadline = Instant::now() + Duration::from_secs(2);
     while sink.messages.lock().unwrap().len() < 2 {
         assert!(

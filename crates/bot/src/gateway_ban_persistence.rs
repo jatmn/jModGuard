@@ -597,7 +597,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn initial_capture_waits_for_missing_or_newer_pending_enrollment() {
         for older_retirement in [false, true] {
             let (dir, app, _) = setup().await;
@@ -650,6 +650,9 @@ mod tests {
         .await;
         let observation = app.begin_gateway_ban_observation(10, 55).await;
         let observed = observation.observed;
+        // Retry backoff runs on paused time: each wait below ends only once the
+        // owner has run its attempt and is idle in its next backoff.
+        tokio::time::pause();
         let task = receive_ban(
             Arc::clone(&app),
             observation,
@@ -680,6 +683,8 @@ mod tests {
         })
         .await
         .unwrap();
+        // The audit below waits out its wall-clock match window in real time.
+        tokio::time::resume();
         let rows =
             db::query_enrolled_events(&app.db, scope.clone(), Some("member_ban"), Some(55), 10)
                 .await
@@ -992,7 +997,10 @@ mod tests {
             app.consume_gateway_ban_echo(10, 55),
             Some(100),
         );
+        // Paused time ends this wait only once both owners are idle in save backoff.
+        tokio::time::pause();
         tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::resume();
         assert!(!first.is_finished() && !second.is_finished());
         sql(&app, "DROP TRIGGER fail_delivery_save").await;
         tokio::time::timeout(Duration::from_secs(10), async {
