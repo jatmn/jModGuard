@@ -182,6 +182,10 @@ for (const version of toolVersions) {
 const selectedChecks = jobs.get("checks").match(/^      - name: Run selected checks\n([\s\S]*?)(?=^      - |$(?![\s\S]))/m)?.[1];
 assert.ok(selectedChecks);
 assert.doesNotMatch(jobs.get("checks").slice(0, jobs.get("checks").indexOf("      - name: Run selected checks")), /RUSTC_WRAPPER:/);
+// The dependency cache keys on the CARGO_* environment it sees at restore, so the
+// workflow default stays two jobs and the public four-job override stays on this step.
+assert.match(workflow, /^env:\n(?:  [^\n]+\n)*?  CARGO_BUILD_JOBS: '2'$/m);
+assert.doesNotMatch(jobs.get("checks").slice(0, jobs.get("checks").indexOf("      - name: Run selected checks")), /CARGO_BUILD_JOBS:/);
 assert.match(selectedChecks, /SCCACHE_GHA_ENABLED: 'true'/);
 const cacheMode = selectedChecks.match(/SCCACHE_GHA_RW_MODE: \$\{\{ (.+) \}\}/)?.[1];
 assert.ok(cacheMode);
@@ -195,14 +199,18 @@ for (const [event, ref, expected] of [
   assert.equal(Function("github", `return (${cacheMode});`)({ event_name: event, ref }), expected);
 }
 for (const lane of ["rust-api", "rust-bot", "rust-core", "quick", "frontend", "dylint", "supply-chain", "remote-database"]) {
-  const evaluate = (key, block = jobs.get("checks")) => {
+  const evaluate = (key, block = jobs.get("checks"), github = {}) => {
     const match = block.match(new RegExp(`${key}: \\$\\{\\{ (.+) \\}\\}`));
     assert.ok(match, `missing ${key} workflow binding`);
-    return Function("matrix", "startsWith", `return (${match[1]});`)({ lane }, (value, prefix) => value.startsWith(prefix));
+    return Function("matrix", "startsWith", "github", `return (${match[1]});`)({ lane }, (value, prefix) => value.startsWith(prefix), github);
   };
   const rustTests = ["rust-api", "rust-bot", "rust-core"].includes(lane);
   assert.equal(Function("matrix", "startsWith", `return (${compilerGuard});`)({ lane }, (value, prefix) => value.startsWith(prefix)), rustTests);
   assert.equal(evaluate("RUSTC_WRAPPER", selectedChecks), rustTests ? "sccache" : "");
+  for (const isPrivate of [false, true]) {
+    assert.equal(evaluate("CARGO_BUILD_JOBS", selectedChecks, { event: { repository: { private: isPrivate } } }),
+      rustTests && !isPrivate ? "4" : "2", `${lane} Cargo build jobs (private: ${isPrivate})`);
+  }
   assert.equal(evaluate("NEED_NEXTEST", configureEnv), rustTests);
   assert.equal(evaluate("shared-key"), rustTests ? "rust" : lane, "retain the existing dependency cache");
   assert.equal(evaluate("cache-targets"), rustTests || ["dylint", "remote-database"].includes(lane));
