@@ -46,13 +46,17 @@ re-fetching. Verified against the pinned versions in `Cargo.toml`.
 - Intents used: `GUILD_MEMBERS | GUILD_MESSAGES | MESSAGE_CONTENT | GUILD_MODERATION`.
   GUILD_MEMBERS and MESSAGE_CONTENT are privileged (enable in portal).
 
-## libsql 0.9.30
+## libsql
+
+See the workspace [version requirement](../Cargo.toml) and
+[resolved version](../Cargo.lock).
 
 - Bunny Database uses the remote libSQL protocol. Build it with
-  `Builder::new_remote(url, token)` plus the in-tree rustls 0.23 connector
-  (`src/remote_https.rs`); local installs use `Builder::new_local`.
-  Do not enable libsql's `tls` feature: it pulls `hyper-rustls 0.25` /
-  `rustls 0.22` / `rustls-webpki 0.102.8` (GHSA-82j2-j2ch-gfr8).
+  `Builder::new_remote(url, token)` and pass the in-tree rustls 0.23 connector
+  ([`src/remote_https.rs`](../src/remote_https.rs)) to `.connector(...)`.
+  Local installs use `Builder::new_local`. Keep libsql's `tls` feature disabled.
+  It uses `hyper-rustls 0.25` and `rustls 0.22`, a stack that previously pulled
+  in `rustls-webpki 0.102.8` (GHSA-82j2-j2ch-gfr8).
 - `remote` still pulls `libsql-sqlite3-parser` 0.13.x. crates.io never
   published a fix for GHSA-8m95-fffc-h4c5 (CVE-2025-47736: Debug panic on
   invalid UTF-8). Git-patch it to branch `vendor/libsql-sqlite3-parser-0.13.1`
