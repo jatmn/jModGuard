@@ -1605,6 +1605,30 @@ mod tests {
         requests: Vec<(String, String, String)>,
     }
 
+    /// Notifies when a Pull Zone purge attempt is logged as failed.
+    #[derive(Clone, Default)]
+    struct PurgeAttemptFailed(Arc<tokio::sync::Notify>);
+
+    impl tracing::Subscriber for PurgeAttemptFailed {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().target() == "jmodguard_api::web::updates"
+                && event.fields().any(|field| field.name() == "attempt")
+            {
+                self.0.notify_one();
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
     /// Local Bunny API stand-in: answers scripted statuses in order, then 200.
     async fn purge_server(
         statuses: Vec<StatusCode>,
@@ -1953,6 +1977,8 @@ mod tests {
             let (api, state, server) = purge_server(failures).await;
             let configured = purge_values(Some("123"), Some("purge-only-secret"));
             let attempts = if interrupted {
+                let failed = PurgeAttemptFailed::default();
+                let _log = tracing::subscriber::set_default(failed.clone());
                 let install = publish_then_purge(
                     &app,
                     &configured,
@@ -1960,13 +1986,10 @@ mod tests {
                     &api,
                     Duration::from_secs(3600),
                 );
+                // The failed-attempt warning is logged just before the retry wait.
                 tokio::select! {
                     _ = install => panic!("install finished instead of waiting to retry"),
-                    () = async {
-                        while state.lock().await.requests.is_empty() {
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
-                    } => {}
+                    () = failed.0.notified() => {}
                 }
                 1
             } else {
@@ -2179,7 +2202,7 @@ mod tests {
         ));
         let db = jmodguard::db::Db::open(&path, 2).unwrap();
         let before = db::component_update(&db, "api").await.unwrap();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let reader = db.clone();
         let held = tokio::spawn(async move {
@@ -2203,17 +2226,10 @@ mod tests {
                 })
                 .await
         });
-        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if ready_rx.try_recv().is_ok() {
-                break;
-            }
-            assert!(
-                ready_deadline > std::time::Instant::now(),
-                "snapshot reader did not start"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx)
+            .await
+            .expect("snapshot reader did not start")
+            .unwrap();
         let written = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             db::set_update_policy(&db, "api", "stable", "daily", true),

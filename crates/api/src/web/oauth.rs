@@ -1327,8 +1327,10 @@ mod tests {
     async fn slow_guild_lookup_does_not_block_another_token() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let entered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let entered_handler = std::sync::Arc::clone(&entered);
+        // The slow lookup stays at Discord until the fast one has finished.
+        let (release_slow, slow_released) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
             let app = axum::Router::new().route(
                 "/guilds",
@@ -1338,8 +1340,9 @@ mod tests {
                         .and_then(|value| value.to_str().ok())
                         .is_some_and(|value| value.ends_with("slow"));
                     if slow {
-                        entered_handler.store(true, std::sync::atomic::Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        entered_handler.notify_one();
+                        let mut released = slow_released.clone();
+                        released.wait_for(|released| *released).await.unwrap();
                     }
                     axum::Json(serde_json::json!([{
                         "id": "1",
@@ -1368,14 +1371,17 @@ mod tests {
         });
         let slow_client = std::sync::Arc::clone(&client);
         let slow = tokio::spawn(async move { slow_client.my_guilds(1, "slow").await });
-        let wait_started = Instant::now();
-        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
-            assert!(wait_started.elapsed() < Duration::from_secs(2));
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("slow lookup did not reach Discord");
         let started = Instant::now();
-        client.my_guilds(2, "fast").await.unwrap();
+        tokio::time::timeout(Duration::from_millis(250), client.my_guilds(2, "fast"))
+            .await
+            .expect("fast lookup must not wait for the slow one")
+            .unwrap();
         assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(!slow.is_finished());
+        release_slow.send(true).unwrap();
         slow.await.unwrap().unwrap();
     }
 
@@ -1436,12 +1442,18 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let seen = std::sync::Arc::clone(&calls);
+        let headers_sent = std::sync::Arc::new(tokio::sync::Notify::new());
+        let headers_signal = std::sync::Arc::clone(&headers_sent);
+        // The body stays unsent until the test has checked the second lookup.
+        let (release_body, body_released) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
                 let seen = std::sync::Arc::clone(&seen);
+                let headers_signal = std::sync::Arc::clone(&headers_signal);
+                let mut body_released = body_released.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 2048];
                     let _ = socket.read(&mut buf).await;
@@ -1452,7 +1464,8 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    headers_signal.notify_one();
+                    let _ = body_released.wait_for(|released| *released).await;
                     let _ = socket.write_all(br#"{"retry_after":30}"#).await;
                 });
             }
@@ -1476,15 +1489,16 @@ mod tests {
         });
         let first_client = std::sync::Arc::clone(&client);
         let first = tokio::spawn(async move { first_client.my_guilds(9, "first").await });
-        let wait_started = Instant::now();
-        while calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            assert!(wait_started.elapsed() < Duration::from_secs(2));
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(2), headers_sent.notified())
+            .await
+            .expect("first lookup did not reach Discord");
+        // Outlast the header's retry-after on the gate's std::time::Instant.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         let second = client.my_guilds(9, "second").await.unwrap_err();
         assert!(matches!(second, GuildListError::RateLimited { .. }));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!first.is_finished());
+        release_body.send(true).unwrap();
         let _ = first.await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -1570,14 +1584,21 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let seen = std::sync::Arc::clone(&calls);
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let entered_handler = std::sync::Arc::clone(&entered);
+        // The leader's request stays at Discord until the follower has joined.
+        let (release_lookup, lookup_released) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
             let app = axum::Router::new().route(
                 "/guilds",
                 axum::routing::get(move || {
                     let seen = std::sync::Arc::clone(&seen);
+                    let entered = std::sync::Arc::clone(&entered_handler);
+                    let mut released = lookup_released.clone();
                     async move {
                         seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        entered.notify_one();
+                        let _ = released.wait_for(|released| *released).await;
                         axum::Json(serde_json::json!([{
                             "id": "1",
                             "name": "n",
@@ -1597,13 +1618,23 @@ mod tests {
             None,
         ));
         let left = std::sync::Arc::clone(&client);
-        let right = std::sync::Arc::clone(&client);
-        let (first, second) =
-            tokio::join!(async move { left.my_guilds(3, "one").await }, async move {
-                right.my_guilds(3, "one").await
-            },);
-        assert_eq!(first.unwrap().len(), 1);
-        assert_eq!(second.unwrap().len(), 1);
+        let first = tokio::spawn(async move { left.my_guilds(3, "one").await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("first lookup did not reach Discord");
+        // One poll runs the follower up to its wait on the leader's flight.
+        let mut second = std::pin::pin!(client.my_guilds(3, "one"));
+        std::future::poll_fn(|cx| {
+            assert!(
+                second.as_mut().poll(cx).is_pending(),
+                "the second lookup must wait for the first"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release_lookup.send(true).unwrap();
+        assert_eq!(first.await.unwrap().unwrap().len(), 1);
+        assert_eq!(second.await.unwrap().len(), 1);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
