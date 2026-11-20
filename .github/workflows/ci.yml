@@ -125,6 +125,9 @@ jobs:
           version: v0.19.0
       - name: Run selected checks
         env:
+          # Public Rust lanes have four CPUs. Override only after cache restore
+          # so the parallelism setting does not change the dependency cache key.
+          CARGO_BUILD_JOBS: ${{ !github.event.repository.private && startsWith(matrix.lane, 'rust-') && '4' || '2' }}
           # Set the wrapper after dependency restoration to preserve its cache key.
           RUSTC_WRAPPER: ${{ startsWith(matrix.lane, 'rust-') && 'sccache' || '' }}
           SCCACHE_GHA_ENABLED: 'true'
