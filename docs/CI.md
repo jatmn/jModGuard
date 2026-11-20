@@ -78,7 +78,7 @@ Both workflows install Cosign 2.6.5 through the SHA-pinned v4 installer. The
 updater reads the v2 simple-signing envelope from the digest's signature tag.
 Switching to the v3 default bundle format requires an updater migration
 ([dependency tracker](https://github.com/jatmn/jModGuard/issues/668)).
-Cargo deny 0.21.0 and cargo audit 0.23.0 remain pinned in `scripts/ci-ensure-cargo-tool.sh`,
+Cargo deny 0.22.0 and cargo audit 0.23.0 remain pinned in `scripts/ci-ensure-cargo-tool.sh`,
 which the tool cache key hashes. The local complete gate is:
 
 ```bash
