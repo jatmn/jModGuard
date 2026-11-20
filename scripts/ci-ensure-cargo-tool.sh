@@ -13,7 +13,7 @@ fi
 # a save of the newly installed binary; a pin kept elsewhere would restore the
 # old binary on every primary-key hit and reinstall each run.
 # shellcheck disable=SC2034  # read by scripts/ci-preflight.sh, which sources this file
-cargo_deny_version=0.21.0
+cargo_deny_version=0.22.0
 # shellcheck disable=SC2034
 cargo_audit_version=0.23.0
 

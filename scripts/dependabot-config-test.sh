@@ -91,7 +91,6 @@ socket_workflow=".github/workflows/socket.yml"
 for needle in \
   "name: socket-security-workflow" \
   "SOCKET_SECURITY_API_KEY" \
-  "socketsecurity==2.12.1" \
   "socketcli" \
   "--scm github" \
   "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1" \
@@ -102,6 +101,11 @@ for needle in \
 do
   require_contains "$socket_workflow" "$needle"
 done
+awk '
+  /^      - / { install_step = ($0 == "      - name: Install Socket CLI") }
+  install_step && $0 == "        run: pip install socketsecurity==2.13.0" { found = 1 }
+  END { exit !found }
+' "$root/$socket_workflow" || fail "Install Socket CLI must run pip install socketsecurity==2.13.0 in $socket_workflow"
 require_line "$socket_workflow" '    types: [opened, synchronize, reopened]'
 require_line "$socket_workflow" '    branches: [main]'
 require_line "$socket_workflow" "          EVENT_ACTION: \${{ github.event_name == 'pull_request' && github.event.action == 'reopened' && 'synchronize' || '' }}"

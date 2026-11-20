@@ -44,7 +44,7 @@ jobs:
 
       - name: Install Socket CLI
         if: steps.changes.outputs.scan == 'true'
-        run: pip install socketsecurity==2.12.1
+        run: pip install socketsecurity==2.13.0
 
       - name: Run Socket Security Scan
         if: steps.changes.outputs.scan == 'true'
