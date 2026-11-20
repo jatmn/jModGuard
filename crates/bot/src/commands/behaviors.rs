@@ -2367,7 +2367,7 @@ mod tests {
 
     // API-read blocking vs the async runtime is covered by
     // `stats_hanging_api_read_returns_within_fetch_timeout`.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn stats_api_fetch_does_not_block_concurrent_async_work() {
         let path =
             std::env::temp_dir().join(format!("stats_parallel_{:032x}.db", rand::random::<u128>()));
