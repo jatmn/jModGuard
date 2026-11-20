@@ -3734,13 +3734,20 @@ mod tests {
         assert!(renewed);
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "transient failure must backoff before retry"
+        );
+        assert!(
             started.elapsed() < POLL,
             "retry must precede the next 5 s tick"
         );
         control.arm_launcher_fence("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         attempts.store(0, std::sync::atomic::Ordering::SeqCst);
+        // Unconfirmed authority makes CAS return immediately; use a fresh horizon
+        // so this phase is not coupled to the first fence's wall-clock deadline.
+        let unconfirmed_deadline = std::time::Instant::now() + Duration::from_secs(10);
         assert!(
-            !renew_launcher_fence_promptly(deadline, || async {
+            !renew_launcher_fence_promptly(unconfirmed_deadline, || async {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 control.renew_launcher_fence_cas().await
             })
