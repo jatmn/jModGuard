@@ -140,19 +140,29 @@ grep -Fq 'run_git() { git "$@" || publish_fail "git failed: $*"; }' "$root/scrip
 grep -Fq 'docker "$@" || publish_fail "docker failed: $*"' "$root/scripts/publish-image.sh" \
   || fail 'publisher must invoke docker as an argv list'
 
-# Retry the reported registry failure with the same build arguments and fresh
-# metadata. Docker and the backoff clock are local stand-ins.
+# Build once without pushing, then retry only the push with the same build
+# arguments and fresh metadata, whatever the registry's error text says.
+# Docker and the backoff clock are local stand-ins.
 (
   push_trace="$TEST_SIGNING_DIR/push-trace"
   push_metadata="$TEST_SIGNING_DIR/build-metadata"
-  push=(buildx build --push --metadata-file "$push_metadata")
-  push_error='ERROR: failed to build: unknown blob'
+  build=(buildx build --tag "$(staging_ref api)" .)
+  push=(buildx build --push --tag "$(staging_ref api)" . --metadata-file "$push_metadata")
+  push_error='ERROR: failed to push: blob unknown to registry'
   docker() {
     local attempt
+    if [[ "$*" == "${build[*]}" ]]; then
+      printf 'build\n' >>"$push_trace"
+      if (( build_fails )); then
+        printf 'ERROR: failed to build: compiler exited with error\n' >&2
+        return 1
+      fi
+      return 0
+    fi
     assert_eq "$*" "${push[*]}"
     [[ ! -s "$push_metadata" ]] || fail 'build metadata must be empty at the start of each attempt'
-    printf 'build\n' >>"$push_trace"
-    attempt="$(grep -c '^build$' "$push_trace")"
+    printf 'push\n' >>"$push_trace"
+    attempt="$(grep -c '^push$' "$push_trace")"
     if (( attempt <= push_failures )); then
       printf 'partial\n' >"$push_metadata"
       printf '%s\n' "$push_error" >&2
@@ -162,20 +172,22 @@ grep -Fq 'docker "$@" || publish_fail "docker failed: $*"' "$root/scripts/publis
   }
   sleep() { printf 'sleep %s\n' "$1" >>"$push_trace"; }
 
+  build_fails=0
   push_failures=1
   run_docker "${push[@]}" 2>"$TEST_SIGNING_DIR/push-output"
-  assert_eq "$(<"$push_trace")" $'build\nsleep 5\nbuild'
+  assert_eq "$(<"$push_trace")" $'build\npush\nsleep 5\npush'
   assert_eq "$(<"$push_metadata")" complete
   grep -Fxq "$push_error" "$TEST_SIGNING_DIR/push-output" || fail 'failed attempt must retain its registry diagnostic'
 
   push_failures=3
   : >"$push_trace"
   if (run_docker "${push[@]}") >/dev/null 2>&1; then fail 'persistent registry errors must fail'; fi
-  assert_eq "$(<"$push_trace")" $'build\nsleep 5\nbuild\nsleep 10\nbuild'
+  assert_eq "$(<"$push_trace")" $'build\npush\nsleep 5\npush\nsleep 10\npush'
 
-  push_error='ERROR: failed to build: compiler exited with error'
+  build_fails=1
+  push_failures=0
   : >"$push_trace"
-  if (run_docker "${push[@]}") >/dev/null 2>&1; then fail 'unrelated build errors must fail'; fi
+  if (run_docker "${push[@]}") >/dev/null 2>&1; then fail 'build errors must fail'; fi
   assert_eq "$(<"$push_trace")" build
 )
 

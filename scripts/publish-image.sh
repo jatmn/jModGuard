@@ -22,19 +22,25 @@ run_docker() {
 run_cosign() { cosign "$@" || publish_fail "cosign failed: $*"; }
 
 retry_staging_push() {
-  local metadata_file="${@: -1}" attempt delay
-  local log_file="${metadata_file}.log"
+  local metadata_file="${@: -1}" attempt delay arg
+  local -a build_only=()
+  # Build without pushing first and never retry that step, so a failed build
+  # fails once whatever its message says.
+  for arg in "${@:1:$#-2}"; do
+    [[ "$arg" == --push ]] || build_only+=("$arg")
+  done
+  docker "${build_only[@]}" || publish_fail 'docker failed: buildx build'
+  # The push reuses that build's cache, so its failures are export or upload
+  # failures from the registry and are retried.
   for attempt in 1 2 3; do
     # Only a successful attempt's digest may advance to verification.
     : >"$metadata_file" || publish_fail 'cannot reset image build metadata'
-    if docker "$@" 2>&1 | tee "$log_file" >&2; then
+    if docker "$@"; then
       return 0
     fi
-    if (( attempt == 3 )) || ! grep -Fxq 'ERROR: failed to build: unknown blob' "$log_file"; then
-      publish_fail 'docker failed: buildx build'
-    fi
+    (( attempt < 3 )) || publish_fail 'docker failed: buildx build'
     delay=$((5 * attempt))
-    printf 'Staging image push reported unknown blob (attempt %d); retrying in %ds\n' "$attempt" "$delay" >&2
+    printf 'Staging image push failed (attempt %d); retrying in %ds\n' "$attempt" "$delay" >&2
     sleep "$delay"
   done
 }
