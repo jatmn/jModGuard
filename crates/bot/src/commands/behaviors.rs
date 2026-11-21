@@ -1280,12 +1280,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         }
         Behavior::About => {
             let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
-            let avatar_url = env.ctx.cache.current_user().face();
             let about = crate::templates::About {
                 version: env!("CARGO_PKG_VERSION"),
                 uptime_seconds: env.app.start.elapsed().as_secs(),
                 prefix: &cfg.settings.prefix,
-                avatar_url: Some(&avatar_url),
                 webui_url: &env.app.cfg.bot.about_webui_url,
                 instance: &env.app.cfg.bot.about_instance,
             };

@@ -113,7 +113,9 @@ owner_id = 0
 # Presence status text shown under the bot's name.
 status = "moderating"
 # `!about` always links the upstream project. Optionally link your public
-# Web UI (https DNS name only) and add one line about your instance.
+# Web UI (https DNS name only; local, internal and reserved names such as
+# .lan or .test are left out, so use a name your users can open) and add one
+# line about your instance.
 # Env: JMODGUARD_ABOUT_WEBUI_URL, JMODGUARD_ABOUT_INSTANCE.
 about_webui_url = ""
 about_instance = ""

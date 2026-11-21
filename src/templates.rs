@@ -189,7 +189,6 @@ pub fn stats_embed(
             },
         ],
         url: None,
-        thumbnail: None,
     }
     .bounded()
 }
@@ -486,13 +485,12 @@ const ABOUT_INSTANCE_MAX: usize = 200;
 /// Public facts for `!about`. It holds no Discord application, client, server
 /// or user IDs, hostnames or internal addresses; the only configured values
 /// are the Web UI URL, shown only as a public HTTPS origin, and the operator line.
+/// There is no bot avatar: Discord's custom-avatar URL contains the bot's user ID.
 pub struct About<'a> {
     pub version: &'a str,
     pub uptime_seconds: u64,
     /// Command prefix for this server.
     pub prefix: &'a str,
-    /// Discord avatar of the bot account posting the reply (thumbnail only).
-    pub avatar_url: Option<&'a str>,
     /// `bot.about_webui_url` as configured.
     pub webui_url: &'a str,
     /// `bot.about_instance` as configured.
@@ -500,8 +498,9 @@ pub struct About<'a> {
 }
 
 /// The origin of a configured Web UI URL when it is a public HTTPS address: a
-/// dotted DNS name with no credentials, IP literal or local/internal-only name.
-/// Paths are dropped so a configured URL cannot carry a server ID.
+/// dotted DNS name with no credentials, IP literal or local, internal or
+/// reserved name. Paths are dropped so a configured URL cannot carry a server ID.
+/// A name passing this check may still resolve only on a private network.
 fn public_webui_url(raw: &str) -> Option<String> {
     let url = url::Url::parse(raw.trim()).ok()?;
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
@@ -510,7 +509,20 @@ fn public_webui_url(raw: &str) -> Option<String> {
     let Some(url::Host::Domain(host)) = url.host() else {
         return None;
     };
-    let host = host.trim_end_matches('.');
+    // At most one trailing dot (the DNS root); `a.org..` has an empty label.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    // URL parsing accepts characters such as `)` and `*` in a host; a DNS name
+    // has only letters, digits and inner hyphens (IDNs arrive as punycode).
+    let dns_label = |label: &str| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    // Local/internal suffixes plus special-use names that never resolve
+    // publicly (RFC 6761, RFC 7686, RFC 9476).
     let local = [
         "localhost",
         "local",
@@ -521,8 +533,14 @@ fn public_webui_url(raw: &str) -> Option<String> {
         "home",
         "corp",
         "home.arpa",
+        "test",
+        "invalid",
+        "example",
+        "onion",
+        "alt",
     ];
     if !host.contains('.')
+        || !host.split('.').all(dns_label)
         || local
             .iter()
             .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
@@ -605,13 +623,12 @@ pub fn about_embed(about: &About<'_>) -> crate::log_embeds::LogEmbed {
         description: ABOUT_TAGLINE.into(),
         fields,
         url: Some(PROJECT_REPO_URL.into()),
-        thumbnail: about.avatar_url.map(str::to_owned),
     }
     .bounded()
 }
 
 /// Plain-text `!about` for a `{response}` template and for channels where
-/// Discord refuses embeds. Same facts as [`about_embed`], without the avatar.
+/// Discord refuses embeds. Same facts as [`about_embed`].
 pub fn about_text(about: &About<'_>) -> String {
     let mut lines = vec![
         format!("**{ABOUT_TITLE}** — {ABOUT_TAGLINE}"),
@@ -818,7 +835,6 @@ mod presentation_tests {
             version: "0.2.1",
             uptime_seconds: 342,
             prefix: "?",
-            avatar_url: Some("https://cdn.discordapp.com/embed/avatars/0.png"),
             webui_url,
             instance,
         });
@@ -833,7 +849,6 @@ mod presentation_tests {
             version: "0.2.1",
             uptime_seconds: 342,
             prefix: "?",
-            avatar_url: Some("https://cdn.discordapp.com/embed/avatars/0.png"),
             // A configured path or query could carry a server ID; only the origin is shown.
             webui_url: &format!(" https://Mod.Example.org/guilds/{id}?client_id={id} "),
             instance: "Hosted by\nExample   Community",
@@ -846,10 +861,6 @@ mod presentation_tests {
         );
         assert_eq!(embed.color, ABOUT_COLOR);
         assert_eq!(embed.description, ABOUT_TAGLINE);
-        assert_eq!(
-            embed.thumbnail.as_deref(),
-            Some("https://cdn.discordapp.com/embed/avatars/0.png")
-        );
         let fields = embed
             .fields
             .iter()
@@ -898,21 +909,15 @@ mod presentation_tests {
                  This instance: Hosted by Example Community"
             )
         );
-        // Every shown value and link is free of IDs and points only at the
-        // public project or the accepted Web UI origin.
-        let mut shown = vec![embed.title.clone(), embed.description.clone()];
-        shown.extend(embed.url.clone());
-        shown.extend(
-            embed
-                .fields
-                .iter()
-                .flat_map(|f| [f.name.clone(), f.value.clone()]),
-        );
-        shown.push(text);
+        // Everything sent is free of IDs and links only to the public project or
+        // the accepted Web UI origin. The whole serialized embed is scanned so
+        // every field it carries, including any image URL, is covered: `"`
+        // starts a JSON URL value, `(` a Markdown link and `<` a plain-text link.
+        let shown = [serde_json::to_string(&embed).unwrap(), text];
         for value in &shown {
             assert!(!has_snowflake(value), "{value}");
             for link in value
-                .split(['(', '<'])
+                .split(['(', '<', '"'])
                 .skip(1)
                 .filter(|s| s.starts_with("http"))
             {
@@ -948,6 +953,17 @@ mod presentation_tests {
             "https://bot.lan",
             "https://web.home.arpa",
             "https://user:secret@mod.example.org",
+            // Reserved special-use names never resolve publicly.
+            "https://dash.test",
+            "https://mod.invalid",
+            "https://mod.example",
+            "https://mod.onion",
+            "https://mod.alt",
+            // Not DNS names: `)` would end the Markdown link at `https://a`.
+            "https://a).evil.example.org",
+            "https://mod*x.example.org",
+            "https://-mod.example.org",
+            "https://mod.example.org..",
         ] {
             let start = about_start(internal, "");
             assert_eq!(
@@ -959,6 +975,13 @@ mod presentation_tests {
             about_start("https://mod.example.org:8443/", "")
                 .contains("(https://mod.example.org:8443)")
         );
+        // A fully qualified name with its root dot stays accepted.
+        assert!(about_start("https://mod.example.org.", "").contains("(https://mod.example.org.)"));
+        // An internationalized name arrives as punycode and stays accepted.
+        assert!(
+            about_start("https://bücher.example.org", "")
+                .contains("(https://xn--bcher-kva.example.org)")
+        );
     }
 
     #[test]
@@ -967,7 +990,6 @@ mod presentation_tests {
             version: "0.3.0-rc.1",
             uptime_seconds: 0,
             prefix: "!",
-            avatar_url: None,
             webui_url: "",
             instance: "",
         });
@@ -980,7 +1002,6 @@ mod presentation_tests {
             version.value,
             "[v0.3.0-rc.1](https://github.com/jatmn/jModGuard/blob/main/CHANGELOG.md)"
         );
-        assert_eq!(embed.thumbnail, None);
         assert!(embed.fields.iter().all(|f| f.name != ABOUT_INSTANCE));
     }
 

@@ -86,9 +86,6 @@ pub struct LogEmbed {
     /// Title link. Log reports leave it unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Thumbnail image URL. Log reports leave it unset.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thumbnail: Option<String>,
 }
 
 /// Joiners, presentation selectors and modifiers that continue an emoji sequence.
@@ -163,7 +160,6 @@ pub fn render(event: &str, template: &str, vars: &BTreeMap<String, String>) -> L
         description: String::new(),
         fields: Vec::new(),
         url: None,
-        thumbnail: None,
     };
     let shipped = crate::defaults::rendered_log_templates()
         .into_iter()
@@ -453,7 +449,6 @@ mod tests {
                     description: description.into(),
                     fields: Vec::new(),
                     url: None,
-                    thumbnail: None,
                 },
                 "{template:?}"
             );
@@ -523,7 +518,6 @@ mod tests {
                 },
             ],
             url: None,
-            thumbnail: None,
         }
         .bounded();
         let name = &embed.fields.last().unwrap().name;
@@ -544,7 +538,6 @@ mod tests {
                 })
                 .collect(),
             url: None,
-            thumbnail: None,
         };
         let result = input.clone().bounded();
         assert_eq!(input.bounded(), result);
@@ -572,7 +565,6 @@ mod tests {
                 .collect(),
             color: GREEN,
             url: None,
-            thumbnail: None,
         }
         .bounded();
         assert_eq!(many.fields.len(), 25);

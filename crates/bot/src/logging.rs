@@ -1729,9 +1729,6 @@ pub(crate) fn discord_embed(embed: jmodguard::log_embeds::LogEmbed) -> CreateEmb
     if let Some(url) = embed.url {
         builder = builder.url(url);
     }
-    if let Some(thumbnail) = embed.thumbnail {
-        builder = builder.thumbnail(thumbnail);
-    }
     for field in embed.fields {
         builder = builder.field(field.name, field.value, field.inline);
     }
