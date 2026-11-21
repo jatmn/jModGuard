@@ -1714,26 +1714,15 @@ function App() {
   }, []);
   // Each item's icon and its fixed meaning color come from NAV_ICONS (frontend/icons.js).
   const navigationBase = [
-    ["dashboard", "Dashboard"],
-    ["rules", "Automod Rules"],
-    ["badwords", "Badwords"],
-    ["known-spam", "Known spam"],
-    ["known-bad-images", "Known-bad images"],
-    ["commands", "Commands"],
-    ["templates", "Templates"],
-    ["logchannels", "Log Channels"],
-    ["analytics", "Analytics"],
-    ["events", "Audit Log"],
-    ["members", "Members"],
-    ["bans", "Bans"],
-    ["actions", "Bot actions"],
-    ["cases", "Cases"],
-    ["settings", "Settings"],
+    ["Overview", [["dashboard", "Dashboard"], ["analytics", "Analytics"]]],
+    ["Moderation", [["cases", "Cases"], ["bans", "Bans"], ["members", "Members"], ["actions", "Bot actions"], ["events", "Audit Log"]]],
+    ["Automod", [["rules", "Automod Rules"], ["badwords", "Badwords"], ["known-spam", "Known spam"], ["known-bad-images", "Known-bad images"]]],
+    ["Configuration", [["settings", "Settings"], ["logchannels", "Log Channels"], ["commands", "Commands"], ["templates", "Templates"]]],
   ];
   // Owner sections live in the main interface, not on the separate
   // /administration page (Updates only). They appear only for the bot owner.
   const navigation = isBotOwner()
-    ? [...navigationBase, ["servers", "Bot servers"], ["usage", "Database Usage"], ["platform-analytics", "Platform analytics"], ["resources", "Bot Resources"]]
+    ? [...navigationBase, ["Owner", [["servers", "Bot servers"], ["resources", "Bot Resources"], ["usage", "Database Usage"], ["platform-analytics", "Platform analytics"]]]]
     : navigationBase;
   return h(
     BusyContext.Provider,
@@ -1773,30 +1762,30 @@ function App() {
               h(
                 "ul",
                 { id: "tabs", className: "menu w-full" },
-                ...navigation.flatMap(([tab, label], i) => [
-                  (i === 0 || i === 6 || i === navigationBase.length) &&
-                    h(
-                      "li",
-                      { key: `group-${i}`, className: "nav-label menu-title" },
-                      i === 0 ? "Workspace" : i === 6 ? "Community" : "Owner",
+                ...navigation.flatMap(([group, items]) => {
+                  // Read-only access hides every Automod and Configuration page; drop the empty heading too.
+                  const allowed = items.filter(([tab]) => tabAllowed(tab));
+                  return allowed.length === 0 ? [] : [
+                    h("li", { key: `group-${group}`, className: "nav-label menu-title" }, group),
+                    ...allowed.map(([tab, label]) =>
+                      h(
+                        "li",
+                        { key: tab },
+                        h(
+                          ActionButton,
+                          {
+                            "data-tab": tab,
+                            className: state.tab === tab ? "active menu-active btn-active" : "",
+                            "aria-current": state.tab === tab ? "page" : undefined,
+                            onClick: () => navigate(tab),
+                          },
+                          h(Icon, { name: NAV_ICONS[tab].icon, intent: NAV_ICONS[tab].intent, className: "nav-icon" }),
+                          label,
+                        ),
+                      ),
                     ),
-                  tabAllowed(tab) &&
-                  h(
-                    "li",
-                    { key: tab },
-                    h(
-                      ActionButton,
-                      {
-                        "data-tab": tab,
-                        className: state.tab === tab ? "active menu-active btn-active" : "",
-                        "aria-current": state.tab === tab ? "page" : undefined,
-                        onClick: () => navigate(tab),
-                      },
-                      h(Icon, { name: NAV_ICONS[tab].icon, intent: NAV_ICONS[tab].intent, className: "nav-icon" }),
-                      label,
-                    ),
-                  ),
-                ]),
+                  ];
+                }),
               ),
             ),
             h(OwnerTools),

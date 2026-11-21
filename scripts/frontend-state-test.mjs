@@ -10133,11 +10133,11 @@ test('Bot servers removal is a red leave icon', async () => {
 
 test('every sidebar item shows its colored SVG icon beside its unchanged label', () => {
   const labels = {
-    dashboard: 'Dashboard', rules: 'Automod Rules', badwords: 'Badwords', 'known-spam': 'Known spam',
-    'known-bad-images': 'Known-bad images', commands: 'Commands', templates: 'Templates', logchannels: 'Log Channels',
-    analytics: 'Analytics', events: 'Audit Log', members: 'Members', bans: 'Bans', actions: 'Bot actions',
-    cases: 'Cases', settings: 'Settings', servers: 'Bot servers', usage: 'Database Usage',
-    'platform-analytics': 'Platform analytics', resources: 'Bot Resources',
+    dashboard: 'Dashboard', analytics: 'Analytics', cases: 'Cases', bans: 'Bans', members: 'Members',
+    actions: 'Bot actions', events: 'Audit Log', rules: 'Automod Rules', badwords: 'Badwords',
+    'known-spam': 'Known spam', 'known-bad-images': 'Known-bad images', settings: 'Settings',
+    logchannels: 'Log Channels', commands: 'Commands', templates: 'Templates', servers: 'Bot servers',
+    resources: 'Bot Resources', usage: 'Database Usage', 'platform-analytics': 'Platform analytics',
   };
   const h = ownerHarness(async () => response({ servers: [] }));
   h.app.navigate('bans');
@@ -10159,6 +10159,39 @@ test('every sidebar item shows its colored SVG icon beside its unchanged label',
   assert.equal(active.querySelector('svg.nav-icon').getAttribute('data-icon'), 'hammer', 'the active item still shows its icon');
   assert.ok(active.querySelector('svg.nav-icon').classList.contains('icon-danger'));
   assert.doesNotMatch(h.document.querySelector('#tabs').textContent, /[^\x20-\x7E]/, 'no emoji or glyph characters in the menu');
+});
+
+// #746: the sidebar groups pages by purpose; every page keeps its tab route.
+test('sidebar groups pages as Overview, Moderation, Automod, Configuration and Owner', () => {
+  const groups = (h) => {
+    const result = [];
+    for (const item of h.document.querySelectorAll('#tabs li')) {
+      if (item.classList.contains('nav-label')) result.push([item.textContent]);
+      else result.at(-1).push(item.querySelector('[data-tab]').getAttribute('data-tab'));
+    }
+    return result;
+  };
+  const owner = ownerHarness(async () => new Promise(() => {}));
+  owner.app.navigate('dashboard');
+  assert.deepEqual(groups(owner), [
+    ['Overview', 'dashboard', 'analytics'],
+    ['Moderation', 'cases', 'bans', 'members', 'actions', 'events'],
+    ['Automod', 'rules', 'badwords', 'known-spam', 'known-bad-images'],
+    ['Configuration', 'settings', 'logchannels', 'commands', 'templates'],
+    ['Owner', 'servers', 'resources', 'usage', 'platform-analytics'],
+  ]);
+  for (const tab of groups(owner).flatMap(([, ...tabs]) => tabs)) {
+    owner.app.navigate(tab);
+    assert.equal(owner.app.state.tab, tab, `${tab} stays reachable`);
+  }
+  const readOnly = harness(async () => response({}));
+  readOnly.app.state.guilds[0].access = 'dashboard';
+  readOnly.app.state.config = null;
+  readOnly.app.navigate('dashboard');
+  assert.deepEqual(groups(readOnly), [
+    ['Overview', 'dashboard', 'analytics'],
+    ['Moderation', 'cases', 'bans', 'members', 'actions', 'events'],
+  ], 'read-only access shows no empty Automod or Configuration heading');
 });
 
 test('the Web UI draws SVG icons, never emoji or glyph icons', () => {
@@ -10931,7 +10964,7 @@ test('owner sections list Database Usage, Platform analytics and Bot Resources; 
   const owner = ownerHarness(async () => new Promise(() => {}));
   owner.app.navigate('dashboard');
   const labels = navLabels(owner);
-  assert.deepEqual(labels.slice(labels.indexOf('Owner')), ['Owner', 'Bot servers', 'Database Usage', 'Platform analytics', 'Bot Resources']);
+  assert.deepEqual(labels.slice(labels.indexOf('Owner')), ['Owner', 'Bot servers', 'Bot Resources', 'Database Usage', 'Platform analytics']);
   const calls = [];
   const nonOwner = harness(async (url) => { calls.push(url); return new Promise(() => {}); });
   nonOwner.app.navigate('dashboard');
