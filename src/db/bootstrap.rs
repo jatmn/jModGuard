@@ -1100,13 +1100,14 @@ pub(super) fn invalidate_settings_heal_checksum_conn(conn: &impl SqlExecutor) ->
     Ok(())
 }
 
-const SEED_META_MARKERS: [&str; 6] = [
+const SEED_META_MARKERS: [&str; 7] = [
     "invite_description_v1",
     "readable_log_defaults_v1",
     "attachment_delete_template_v1",
     "retained_message_templates_v1",
     "retained_bulk_status_template_v1",
     "embed_log_defaults_v1",
+    "velocity_dry_run_upgrade_v1",
 ];
 
 /// Unix millis of the last gateway IDENTIFY this process was about to send.
@@ -1407,6 +1408,41 @@ pub(super) fn seed_globals_conn(
     Ok(())
 }
 
+/// Velocity now counts ordinary messages, so a stored rule that still matches
+/// the shipped default starts in dry-run once after upgrade. Rows are read
+/// before this seed inserts defaults, so a new install keeps the live default.
+/// Edited rules keep their settings; name and description are only labels.
+fn velocity_dry_run_upgrade_sql(conn: &impl SqlExecutor) -> Result<String> {
+    let index = crate::types::RULE_IDS
+        .iter()
+        .position(|id| *id == "velocity")
+        .context("shipped velocity rule")?;
+    let shipped = crate::defaults::default_rules()
+        .into_iter()
+        .nth(index)
+        .context("shipped velocity rule")?;
+    let shipped_value = serde_json::to_value(&shipped)?;
+    let mut sql = String::new();
+    let mut stmt = conn.prepare("SELECT guild_id, data FROM rules WHERE rule_id = 'velocity'")?;
+    let rows = stmt.query_map((), |row| Ok((row.get::<i64>(0)?, row.get::<String>(1)?)))?;
+    for row in rows {
+        let (guild_id, data) = row?;
+        let Ok(mut stored) = serde_json::from_str::<crate::types::RuleDef>(&data) else {
+            continue;
+        };
+        stored.name.clone_from(&shipped.name);
+        stored.description.clone_from(&shipped.description);
+        if serde_json::to_value(&stored)? == shipped_value {
+            sql.push_str(&format!(
+                "UPDATE rules SET data = json_set(data, '$.dry_run', json('true')) \
+                 WHERE guild_id = {guild_id} AND rule_id = 'velocity' AND data = {};\n",
+                sql_text(&data)
+            ));
+        }
+    }
+    Ok(sql)
+}
+
 fn seed_globals_sql(
     default_prefix: &str,
     retention_days: u32,
@@ -1451,6 +1487,10 @@ fn seed_globals_sql(
     ));
     if meta_string_conn(conn, "invite_description_v1")?.is_none() {
         markers.push("invite_description_v1");
+    }
+    if meta_string_conn(conn, "velocity_dry_run_upgrade_v1")?.is_none() {
+        body.push_str(&velocity_dry_run_upgrade_sql(conn)?);
+        markers.push("velocity_dry_run_upgrade_v1");
     }
     let upgrade_presentation = meta_string_conn(conn, "readable_log_defaults_v1")?.is_none();
     if upgrade_presentation {

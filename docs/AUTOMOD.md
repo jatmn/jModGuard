@@ -80,6 +80,11 @@ escalation accurate without false positives.
   fired, further over-limit messages in that bucket are not actioned. A kick and
   rejoin keeps the bucket until it expires after 10 minutes without a velocity
   strike.
+- Upgrading: older versions counted only messages that matched another rule.
+  On the first bot start after upgrading, a stored velocity rule that still
+  matches the shipped default switches to dry-run once, so it logs before it
+  acts. Turn off dry-run to enforce it. Edited rules and new installs keep their
+  settings.
 
 ### 8. `account_age` — brand-new accounts
 - Params: `min_age_days` (3).

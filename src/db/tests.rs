@@ -4590,6 +4590,86 @@ fn builtin_form_params_validate_through_rule_saves() {
 }
 
 #[test]
+fn velocity_default_rows_start_in_dry_run_once_after_upgrade() {
+    let tmp = tmp_db_path("velocity_dry_run_upgrade");
+    let db = Db::open(&tmp, 2).unwrap();
+    // A new install keeps the live shipped default.
+    let fresh = tokio_test_block_on(get_rule(&db, 0, "velocity"))
+        .unwrap()
+        .unwrap();
+    assert!(fresh.enabled && !fresh.dry_run);
+
+    // Model a database written before the upgrade marker existed.
+    let mut edited = fresh.clone();
+    edited.params["max_messages"] = serde_json::json!(12);
+    let mut relabeled = fresh.clone();
+    relabeled.description = "Older shipped wording".into();
+    tokio_test_block_on(async {
+        db.with_conn(|conn| {
+            conn.execute_bounded(
+                "DELETE FROM meta WHERE key = 'velocity_dry_run_upgrade_v1'",
+                (),
+                1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        old_writer_rule(
+            &db,
+            123,
+            "velocity",
+            serde_json::to_value(&relabeled).unwrap(),
+        )
+        .await;
+        old_writer_rule(&db, 124, "velocity", serde_json::to_value(&edited).unwrap()).await;
+    });
+    let before = tokio_test_block_on(get_config_version(&db)).unwrap();
+    drop(db);
+
+    let db = Db::open(&tmp, 2).unwrap();
+    for guild in [0, 123] {
+        let rule = tokio_test_block_on(get_rule(&db, guild, "velocity"))
+            .unwrap()
+            .unwrap();
+        assert!(rule.enabled && rule.dry_run, "guild {guild}");
+    }
+    assert_eq!(
+        tokio_test_block_on(get_rule(&db, 123, "velocity"))
+            .unwrap()
+            .unwrap()
+            .description,
+        "Older shipped wording"
+    );
+    let kept = tokio_test_block_on(get_rule(&db, 124, "velocity"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&kept).unwrap(),
+        serde_json::to_value(&edited).unwrap(),
+        "an edited rule keeps its settings"
+    );
+    assert!(tokio_test_block_on(get_config_version(&db)).unwrap() > before);
+
+    // The upgrade runs once: an operator who turns enforcement back on keeps it.
+    let mut live = tokio_test_block_on(get_rule(&db, 0, "velocity"))
+        .unwrap()
+        .unwrap();
+    live.dry_run = false;
+    tokio_test_block_on(upsert_rule(&db, 0, "velocity", &live)).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert!(
+        !tokio_test_block_on(get_rule(&db, 0, "velocity"))
+            .unwrap()
+            .unwrap()
+            .dry_run
+    );
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn invite_description_upgrade_is_exact_and_once() {
     use crate::defaults::OLD_INVITE_DESCRIPTION as OLD;
     let tmp = tmp_db_path("invite_description_upgrade");
