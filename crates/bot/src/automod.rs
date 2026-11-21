@@ -110,8 +110,15 @@ enum RuleRetention {
     Expired,
 }
 
+/// Strike state lives for 10 minutes after the last strike. Cleanup and
+/// strike recording both apply this, so expiry never waits for a cleanup tick.
+const STRIKE_RETENTION: Duration = Duration::from_secs(crate::types::AUTOMOD_WINDOW_MAX_SECS);
+
 impl RuleState {
     fn record_strike(&mut self, now: AutomodInstant, record_event: bool) -> u32 {
+        if self.prune(now, STRIKE_RETENTION) == RuleRetention::Expired {
+            *self = RuleState::default();
+        }
         self.strikes += 1;
         self.last_event = Some(now);
         if record_event {
@@ -225,7 +232,7 @@ impl AutomodEngine {
     /// Removes stale state. Runs on a timer from the cleanup task.
     pub fn prune(&self) {
         let now = AutomodInstant::now();
-        let keep = Duration::from_secs(crate::types::AUTOMOD_WINDOW_MAX_SECS);
+        let keep = STRIKE_RETENTION;
         self.state.retain(|_, bucket| {
             bucket
                 .rules
@@ -1685,6 +1692,31 @@ mod tests {
         message.content = "scam";
         let action = engine.evaluate(&cfg, &message).expect("live badword");
         assert_eq!(action.rule_id, "badword");
+        assert_eq!(action.action.action, "delete");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_strikes_reset_without_waiting_for_cleanup() {
+        let mut cfg = default_automod_config();
+        cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(1);
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        message.message_id += 1;
+        assert_eq!(engine.evaluate(&cfg, &message).unwrap().strikes, 1);
+
+        // Cleanup runs just before the strike expires, so it keeps the bucket.
+        let retention = crate::types::AUTOMOD_WINDOW_MAX_SECS;
+        tokio::time::advance(std::time::Duration::from_secs(retention - 1)).await;
+        engine.prune();
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+
+        // The next burst starts a new ladder before the next cleanup tick.
+        message.message_id += 1;
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        message.message_id += 1;
+        let action = engine.evaluate(&cfg, &message).expect("new burst");
+        assert_eq!(action.strikes, 1);
         assert_eq!(action.action.action, "delete");
     }
 
