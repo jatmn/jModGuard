@@ -222,6 +222,50 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn failed_flush_retries_both_access_marks() {
+        let directory =
+            std::env::temp_dir().join(format!("access_marks_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            db::Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        app.access_marks.member(10, 42);
+        app.access_marks.guild(20);
+        // Fail on the member mark, after the transaction writes the guild mark.
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "CREATE TRIGGER reject_member_mark BEFORE INSERT ON meta
+                     WHEN NEW.key = 'access_mark:10:42'
+                     BEGIN SELECT RAISE(ABORT, 'injected access mark write failure'); END;",
+                    4096,
+                )
+            })
+            .await
+            .unwrap();
+        let mut next_maintenance = Instant::now();
+        let failure = flush(&app, &mut next_maintenance).await.unwrap_err();
+        assert!(format!("{failure:#}").contains("injected access mark write failure"));
+        assert_eq!(db::access_epoch(&app.db).await.unwrap(), 0);
+        assert_eq!(db::access_mark(&app.db, 20, 7).await.unwrap(), 0);
+        assert_eq!(db::access_mark(&app.db, 10, 42).await.unwrap(), 0);
+
+        app.db
+            .with_conn(|conn| conn.execute_batch_bounded("DROP TRIGGER reject_member_mark", 4096))
+            .await
+            .unwrap();
+        flush(&app, &mut next_maintenance).await.unwrap();
+        assert_eq!(db::access_epoch(&app.db).await.unwrap(), 1);
+        assert_eq!(db::access_mark(&app.db, 20, 7).await.unwrap(), 1);
+        assert_eq!(db::access_mark(&app.db, 10, 42).await.unwrap(), 1);
+        assert_eq!(db::access_mark(&app.db, 10, 7).await.unwrap(), 0);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn idle_flush_prunes_expired_marks_after_reopening_the_database() {
         let directory =
             std::env::temp_dir().join(format!("access_marks_{:032x}", rand::random::<u128>()));

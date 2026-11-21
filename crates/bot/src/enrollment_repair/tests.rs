@@ -335,6 +335,25 @@ fn discovery_waits_for_a_real_bot_identity_in_the_gateway_cache() {
     assert!(DiscordMembership::from_cache(&http, &cache).is_none());
 }
 
+#[test]
+fn discovery_uses_the_bot_identity_from_gateway_ready() {
+    let cache = serenity::cache::Cache::default();
+    let http = serenity::http::Http::new("test-token");
+    let mut ready: serenity::model::event::ReadyEvent = serde_json::from_value(serde_json::json!({
+        "v": 10,
+        "user": {"id": "4242", "username": "test-bot", "bot": true},
+        "guilds": [],
+        "session_id": "fixture",
+        "resume_gateway_url": "wss://gateway.example.test",
+        "application": {"id": "4242", "flags": 0}
+    }))
+    .unwrap();
+    cache.update(&mut ready);
+
+    let membership = DiscordMembership::from_cache(&http, &cache).expect("READY bot identity");
+    assert_eq!(membership.bot_user_id, UserId::new(4242));
+}
+
 #[tokio::test]
 async fn bot_cache_invalidation_tracks_committed_membership_changes() {
     use std::sync::atomic::Ordering;
