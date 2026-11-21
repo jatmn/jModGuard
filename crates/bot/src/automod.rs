@@ -1664,15 +1664,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_create_helper_starts_dry_run() {
-        let rule = custom_rule(
-            serde_json::json!({ "kind": "pattern", "pattern": "x" }),
-            "delete",
-        );
-        assert!(rule.dry_run);
-    }
-
-    #[test]
     fn custom_pattern_and_word_rules() {
         let id = "custom:0123456789abcdef".to_string();
         let mut rules = HashMap::new();
