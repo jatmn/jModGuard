@@ -242,7 +242,7 @@ bans, kicks and timeouts through the bot), copying configuration, member import 
 (Pause, Resume, Retry, **Reconcile from Discord**), case notes and the role list
 itself. Case removal, the Removed records view and case-removal role IDs stay with
 Administrators and the server owner. Global configuration, Administration (Updates),
-the Owner sections (Bot servers, Database Usage, Platform analytics, Bot Resources) and **View as…**
+the Owner sections (Bot servers, Bot Resources, Database Usage, Platform analytics) and **View as…**
 stay with the configured bot owner. Ban, unban and ban-reason edits keep
 their own Discord **Ban Members** requirement.
 
@@ -270,8 +270,12 @@ the directory but cannot request Pause, Resume, Retry or **Reconcile from Discor
 
 ## Workspace and saved changes
 
-The sidebar keeps your server and all moderation sections within reach. On
-small screens, navigation becomes a horizontally scrollable bar. Tables scroll
+The sidebar keeps your server and all moderation sections within reach. It groups
+pages by purpose: **Overview** (Dashboard, Analytics), **Moderation** (Cases, Bans,
+Members, Bot actions, Audit Log), **Automod** (Automod Rules, Badwords, Known spam,
+Known-bad images), **Configuration** (Settings, Log Channels, Commands, Templates)
+and, for the bot owner, **Owner**. A group whose pages your access hides has no
+heading. On small screens, navigation becomes a horizontally scrollable bar. Tables scroll
 within the workspace, and editors support keyboard navigation.
 
 The dashboard separates setup guidance, protection settings and moderation counts.
@@ -366,8 +370,8 @@ the workspace then refreshes current configuration. If that refresh fails, use
 | **Settings** | prefix, bot nickname (persisted immediately, then asynchronously applied/cleared on Discord by the bot; transient failures use persisted bounded backoff and permanent failures are shown for operator action; empty / `!setname` with no args / `/setname` without `name` all clear); global prefix (owner only); **copy config from another server** |
 
 The **Owner** sidebar group appears only for the configured bot owner and needs no
-selected server: **Bot servers** (the server directory), **Database Usage**,
-**Platform analytics** and **Bot Resources**. Database Usage shows one card per physical database (core and
+selected server: **Bot servers** (the server directory), **Bot Resources**,
+**Database Usage** and **Platform analytics**. Database Usage shows one card per physical database (core and
 each guild store): a health badge from its operating state (OK, Pressure, Capture paused,
 Growth stopped, Writes paused, Stale or Unknown), allocated size, share of the 1,000 MB
 limit and distance to the next threshold, a 0–1,000 MB bar with the 700/800/900/1,000 MB
