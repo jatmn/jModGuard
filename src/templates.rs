@@ -561,17 +561,12 @@ fn public_webui_url(raw: &str) -> Option<String> {
     Some(url.origin().ascii_serialization())
 }
 
-/// Release page for a stable `x.y.z` version, otherwise the changelog.
-fn about_version_url(version: &str) -> String {
-    let stable = version.split('.').count() == 3
-        && version
-            .split('.')
-            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
-    if stable {
-        format!("{PROJECT_REPO_URL}/releases/tag/v{version}")
-    } else {
-        format!("{PROJECT_REPO_URL}/blob/main/CHANGELOG.md")
-    }
+/// Where the `!about` version links: the changelog. The binary only knows its
+/// Cargo version, and main and nightly images report the last stable version
+/// (docs/RELEASES.md), so a release-tag link could point at older code than the
+/// running build.
+fn about_version_url() -> String {
+    format!("{PROJECT_REPO_URL}/blob/main/CHANGELOG.md")
 }
 
 /// The `!about` help pointer, shared by the embed and the plain text. The guild
@@ -625,7 +620,7 @@ pub fn about_embed(about: &About<'_>) -> crate::log_embeds::LogEmbed {
         ),
         field(
             ABOUT_VERSION,
-            format!("[v{}]({})", about.version, about_version_url(about.version)),
+            format!("[v{}]({})", about.version, about_version_url()),
             true,
         ),
         field(
@@ -666,11 +661,7 @@ pub fn about_text(about: &About<'_>) -> String {
     let mut lines = vec![
         format!("**{ABOUT_TITLE}** — {ABOUT_TAGLINE}"),
         format!("Get it: <{PROJECT_REPO_URL}>"),
-        format!(
-            "Version: v{} (<{}>)",
-            about.version,
-            about_version_url(about.version)
-        ),
+        format!("Version: v{} (<{}>)", about.version, about_version_url()),
         format!(
             "Uptime: {}",
             inline_code(&format_duration(about.uptime_seconds))
@@ -909,7 +900,7 @@ mod presentation_tests {
                 ),
                 (
                     ABOUT_VERSION,
-                    "[v0.2.1](https://github.com/jatmn/jModGuard/releases/tag/v0.2.1)",
+                    "[v0.2.1](https://github.com/jatmn/jModGuard/blob/main/CHANGELOG.md)",
                     true
                 ),
                 (ABOUT_UPTIME, "`5m 42s`", true),
@@ -933,7 +924,7 @@ mod presentation_tests {
             format!(
                 "**🛡️ jModGuard** — {ABOUT_TAGLINE}\n\
                  Get it: <https://github.com/jatmn/jModGuard>\n\
-                 Version: v0.2.1 (<https://github.com/jatmn/jModGuard/releases/tag/v0.2.1>)\n\
+                 Version: v0.2.1 (<https://github.com/jatmn/jModGuard/blob/main/CHANGELOG.md>)\n\
                  Uptime: `5m 42s`\n\
                  {ABOUT_HIGHLIGHTS}\n\
                  `?help` lists commands.\n\
