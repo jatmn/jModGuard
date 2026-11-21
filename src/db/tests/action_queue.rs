@@ -271,6 +271,43 @@ async fn expiry_never_retries_running_work_and_pending_cancellation_releases_tar
 }
 
 #[tokio::test]
+async fn each_expiry_poll_caps_unstarted_and_running_work_separately() {
+    let f = Fixture::new().await;
+    // Spread the backlog across guilds within the normal admission limit.
+    // Leave one job claimed and the rest of the unstarted group pending.
+    for (user, guild) in (1..=130).zip([10, 20, 21, 22, 23].into_iter().cycle()) {
+        let queued = f
+            .enqueue(guild, &format!("expiry_{user}"), unban(user))
+            .await;
+        if user <= 66 {
+            let claimed = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
+            assert_eq!(claimed.id, queued.id);
+            if user <= 65 {
+                assert!(begin_bot_action(&f.db, &claimed, 1001).await.unwrap());
+            }
+        }
+    }
+
+    for expected in [(64, 64), (65, 65)] {
+        assert!(claim_bot_action(&f.db, 1300).await.unwrap().is_none());
+        let counts: (i64, i64) = f
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT count(*) FILTER (WHERE state='expired' AND outcome='expired_before_execution'),
+                            count(*) FILTER (WHERE state='uncertain' AND outcome='worker_outcome_unknown')
+                     FROM bot_actions",
+                    params![],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(counts, expected, "(expired, uncertain) after the poll");
+    }
+}
+
+#[tokio::test]
 async fn move_fence_does_not_skip_overdue_expiry_when_no_unfenced_work_is_due() {
     let f = Fixture::new().await;
     let job = f.enqueue(10, "fenced_expiry", unban(99)).await;
