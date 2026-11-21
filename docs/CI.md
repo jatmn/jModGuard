@@ -22,15 +22,20 @@ commit's checks. New commits and reopened PRs still run affected checks.
 
 | Touched surface | Checks |
 |---|---|
-| Documentation or sample configuration | Contracts only |
+| Documentation or sample configuration | Contracts, plus `runner-tests` for `AGENTS.md` and `docs/CI.md` because the audit-expiry self-check reads them |
 | Frontend | Frontend and the default-feature API that embeds the generated UI (`api-embed`); the API built without the UI cannot observe these files |
-| API or bot | That service, integration, boundaries, formatting, scoped Dylint and supply chain |
+| API or bot | That service, integration, boundaries, formatting, scoped Dylint and supply chain, plus the API and updater groups for bot changes |
 | Shared root source or migrations | Core plus bot/API/updater/integration consumers and remote databases |
 | Runtime | Runtime and its core/integration consumers, boundaries, formatting, Dylint and supply chain |
 | Updater | Updater plus bot/API consumers and boundaries, formatting, Dylint and supply chain |
 | Cargo manifests/lockfile, toolchain or vendor | Relevant Rust gates, with global inputs selecting all Rust gates |
 | CI runner scripts or the Rust toolchain pin | The runner regression suites (`runner-tests`), plus all Rust gates for the toolchain |
 | Unknown paths or CI orchestration | All checks |
+
+The updater tests also read `scripts/publish-image.sh`, core tests read the bot
+and API Dockerfiles, and frontend tests replay the API template preview golden
+cases produced by `src/log_embeds.rs`. Changes to those files select these
+consumers in addition to their usual groups.
 
 Selected groups run in up to eight jobs: quick contracts/shell checks/formatting,
 frontend, three Rust jobs, Dylint, supply chain and remote databases. Rust work is
@@ -116,11 +121,9 @@ run relevant local checks and rely on **CI passed** for complete affected valida
 see [Local validation](../development.md#local-validation). CI/build-control changes
 still require a full local preflight. Optional hooks check staged whitespace at
 commit and lightweight contracts at push, without repeating the full suite.
-The real-Cargo timeout-runner and tool-installer regression suites are the
-`runner-tests` group in the quick job. Their inputs are the runner scripts and the
-Rust toolchain pin, so they run for those changes and for full plans, not for
-application changes; documentation-only contracts do not compile their fixture
-workspace. The ordinary integration suite runs the two
+The `runner-tests` group in the quick job also runs the real-Cargo timeout-runner
+and tool-installer regressions. Those exercises use the runner scripts and the
+Rust toolchain pin. The ordinary integration suite runs the two
 in-process smoke cases; the post-build smoke invocation runs only the ignored
 executable case, so each case runs once. Separate `bash scripts/ci-remote-database.sh` starts disposable
 loopback-only libSQL containers for the existing remote database, guild store,
