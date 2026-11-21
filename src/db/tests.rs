@@ -4970,18 +4970,31 @@ fn legacy_velocity_limit_survives_saves_that_keep_it() {
 }
 
 #[test]
-fn rules_copy_keeps_a_legacy_velocity_limit() {
+fn everything_copy_keeps_a_legacy_velocity_limit() {
     let tmp = tmp_db_path("legacy_velocity_copy");
     let db = Db::open(&tmp, 2).unwrap();
     tokio_test_block_on(async {
         let mut legacy = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        legacy.enabled = false;
         legacy.params["max_messages"] = serde_json::json!(5000);
         old_writer_rule(&db, 10, "velocity", serde_json::to_value(&legacy).unwrap()).await;
-        crate::db::copy_guild_config(&db, 10, 11, vec!["rules".into()])
+        let mut ban = crate::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "ban")
+            .expect("ban");
+        ban.description = "server ban".into();
+        upsert_command(&db, 10, "ban", &ban).await.unwrap();
+        // A legacy row must not abort the whole copy of unrelated sections.
+        crate::db::copy_guild_config(&db, 10, 11, vec!["all".into()])
             .await
             .unwrap();
         let copied = get_rule(&db, 11, "velocity").await.unwrap().unwrap();
-        assert_eq!(copied.params["max_messages"], 5000);
+        assert_eq!(
+            serde_json::to_value(&copied).unwrap(),
+            serde_json::to_value(&legacy).unwrap()
+        );
+        let command = get_command_row(&db, 11, "ban").await.unwrap().unwrap();
+        assert_eq!(command.description, "server ban");
     });
     drop(db);
     cleanup_db(&tmp);
