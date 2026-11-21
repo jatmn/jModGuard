@@ -1107,8 +1107,10 @@ const SEED_META_MARKERS: [&str; 7] = [
     "retained_message_templates_v1",
     "retained_bulk_status_template_v1",
     "embed_log_defaults_v1",
-    "velocity_dry_run_upgrade_v1",
+    VELOCITY_DRY_RUN_MARKER,
 ];
+
+const VELOCITY_DRY_RUN_MARKER: &str = "velocity_dry_run_upgrade_v1";
 
 /// Unix millis of the last gateway IDENTIFY this process was about to send.
 /// A restart reads it so a crash loop cannot identify again inside the same
@@ -1408,11 +1410,24 @@ pub(super) fn seed_globals_conn(
     Ok(())
 }
 
-/// Velocity now counts ordinary messages, so a stored rule that still matches
-/// the shipped default starts in dry-run once after upgrade. Rows are read
-/// before this seed inserts defaults, so a new install keeps the live default.
-/// Edited rules keep their settings; name and description are only labels.
+/// Velocity now counts ordinary messages, so on an existing install every
+/// velocity rule that still matches the shipped default starts in dry-run
+/// once. That includes an inherited default with no stored global row, which
+/// this seed inserts live just before the update runs. A new install keeps the
+/// live default. Edited rules keep their settings (name and description are
+/// only labels), and a guild with a persisted write fence is left unchanged.
 fn velocity_dry_run_upgrade_sql(conn: &impl SqlExecutor) -> Result<String> {
+    // Every adoptable database was seeded by a binary that wrote these
+    // markers; the schema baseline does not, so a new install has none.
+    let mut existing_install = false;
+    for key in SEED_META_MARKERS {
+        if key != VELOCITY_DRY_RUN_MARKER && meta_string_conn(conn, key)?.is_some() {
+            existing_install = true;
+        }
+    }
+    if !existing_install {
+        return Ok(String::new());
+    }
     let index = crate::types::RULE_IDS
         .iter()
         .position(|id| *id == "velocity")
@@ -1423,24 +1438,38 @@ fn velocity_dry_run_upgrade_sql(conn: &impl SqlExecutor) -> Result<String> {
         .context("shipped velocity rule")?;
     let shipped_value = serde_json::to_value(&shipped)?;
     let mut sql = String::new();
+    let mut global_stored = false;
     let mut stmt = conn.prepare("SELECT guild_id, data FROM rules WHERE rule_id = 'velocity'")?;
     let rows = stmt.query_map((), |row| Ok((row.get::<i64>(0)?, row.get::<String>(1)?)))?;
     for row in rows {
         let (guild_id, data) = row?;
+        global_stored |= guild_id == GLOBAL_SCOPE;
         let Ok(mut stored) = serde_json::from_str::<crate::types::RuleDef>(&data) else {
             continue;
         };
         stored.name.clone_from(&shipped.name);
         stored.description.clone_from(&shipped.description);
         if serde_json::to_value(&stored)? == shipped_value {
-            sql.push_str(&format!(
-                "UPDATE rules SET data = json_set(data, '$.dry_run', json('true')) \
-                 WHERE guild_id = {guild_id} AND rule_id = 'velocity' AND data = {};\n",
-                sql_text(&data)
-            ));
+            sql.push_str(&velocity_dry_run_update_sql(guild_id, &data));
         }
     }
+    if !global_stored {
+        // Servers inherited the shipped default; the seed now stores it.
+        sql.push_str(&velocity_dry_run_update_sql(
+            GLOBAL_SCOPE,
+            &serde_json::to_string(&shipped)?,
+        ));
+    }
     Ok(sql)
+}
+
+fn velocity_dry_run_update_sql(guild_id: i64, data: &str) -> String {
+    format!(
+        "UPDATE rules SET data = json_set(data, '$.dry_run', json('true')) \
+         WHERE guild_id = {guild_id} AND rule_id = 'velocity' AND data = {} \
+         AND NOT EXISTS (SELECT 1 FROM guild_write_fences WHERE guild_id = {guild_id});\n",
+        sql_text(data)
+    )
 }
 
 fn seed_globals_sql(
@@ -1488,9 +1517,9 @@ fn seed_globals_sql(
     if meta_string_conn(conn, "invite_description_v1")?.is_none() {
         markers.push("invite_description_v1");
     }
-    if meta_string_conn(conn, "velocity_dry_run_upgrade_v1")?.is_none() {
+    if meta_string_conn(conn, VELOCITY_DRY_RUN_MARKER)?.is_none() {
         body.push_str(&velocity_dry_run_upgrade_sql(conn)?);
-        markers.push("velocity_dry_run_upgrade_v1");
+        markers.push(VELOCITY_DRY_RUN_MARKER);
     }
     let upgrade_presentation = meta_string_conn(conn, "readable_log_defaults_v1")?.is_none();
     if upgrade_presentation {

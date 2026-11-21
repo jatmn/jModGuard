@@ -4669,6 +4669,114 @@ fn velocity_default_rows_start_in_dry_run_once_after_upgrade() {
     cleanup_db(&tmp);
 }
 
+fn clear_velocity_upgrade_marker(db: &Db) {
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute_bounded(
+            "DELETE FROM meta WHERE key = 'velocity_dry_run_upgrade_v1'",
+            (),
+            1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn velocity_upgrade_covers_an_inherited_default_without_a_global_row() {
+    let tmp = tmp_db_path("velocity_upgrade_no_global_row");
+    let db = Db::open(&tmp, 2).unwrap();
+    clear_velocity_upgrade_marker(&db);
+    // A rules copy into global scope can leave no stored global velocity row;
+    // servers then inherit the shipped default.
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute_bounded("DELETE FROM rules WHERE rule_id = 'velocity'", (), 1024)?;
+        Ok(())
+    }))
+    .unwrap();
+    assert!(
+        !tokio_test_block_on(load_config_parts(&db, 123))
+            .unwrap()
+            .rules["velocity"]
+            .dry_run
+    );
+    drop(db);
+
+    let db = Db::open(&tmp, 2).unwrap();
+    let inherited = tokio_test_block_on(load_config_parts(&db, 123))
+        .unwrap()
+        .rules
+        .remove("velocity")
+        .unwrap();
+    assert!(inherited.enabled && inherited.dry_run);
+    assert!(
+        tokio_test_block_on(get_rule(&db, 0, "velocity"))
+            .unwrap()
+            .unwrap()
+            .dry_run
+    );
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn velocity_upgrade_leaves_a_fenced_guild_unchanged() {
+    use crate::db::guild_stores::{StoreId, StorePolicy, register_store};
+    let tmp = tmp_db_path("velocity_upgrade_fenced_guild");
+    let db = Db::open(&tmp, 2).unwrap();
+    clear_velocity_upgrade_marker(&db);
+    let shipped = tokio_test_block_on(get_rule(&db, 0, "velocity"))
+        .unwrap()
+        .unwrap();
+    tokio_test_block_on(async {
+        for guild in [123, 124] {
+            old_writer_rule(
+                &db,
+                guild,
+                "velocity",
+                serde_json::to_value(&shipped).unwrap(),
+            )
+            .await;
+        }
+        let destination = StoreId::parse(&format!("{:032x}", 9u128)).unwrap();
+        register_store(&db, destination, StorePolicy::Shared)
+            .await
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute_bounded(
+                "INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at)
+                 VALUES(123,?1,'freeze',?1,?1,unixepoch())",
+                params![format!("{:032x}", 9u128)],
+                65_536,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    });
+    drop(db);
+
+    let db = Db::open(&tmp, 2).unwrap();
+    let fenced = tokio_test_block_on(get_rule(&db, 123, "velocity"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&fenced).unwrap(),
+        serde_json::to_value(&shipped).unwrap(),
+        "a fenced guild's configuration stays frozen"
+    );
+    for guild in [0, 124] {
+        assert!(
+            tokio_test_block_on(get_rule(&db, guild, "velocity"))
+                .unwrap()
+                .unwrap()
+                .dry_run,
+            "guild {guild}"
+        );
+    }
+    drop(db);
+    cleanup_db(&tmp);
+}
+
 #[test]
 fn invite_description_upgrade_is_exact_and_once() {
     use crate::defaults::OLD_INVITE_DESCRIPTION as OLD;
