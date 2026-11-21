@@ -74,6 +74,8 @@ struct RuleState {
     strikes: u32,
     fired: ThresholdReservations,
     last_event: Option<AutomodInstant>,
+    /// Mode of the current ladder. Dry-run strikes are simulated.
+    dry_run: bool,
 }
 
 /// Reservation is independent of whether the selected Discord action runs.
@@ -115,14 +117,21 @@ enum RuleRetention {
 const STRIKE_RETENTION: Duration = Duration::from_secs(crate::types::AUTOMOD_WINDOW_MAX_SECS);
 
 impl RuleState {
-    /// Starts a new ladder when the previous one expired.
-    fn record_strike(&mut self, now: AutomodInstant, record_event: bool) -> u32 {
+    /// Starts a new ladder when the previous one expired, or when the rule
+    /// switched between dry-run and live: simulated strikes must not use up
+    /// live thresholds. Observations used by detection are kept on a switch.
+    fn record_strike(&mut self, now: AutomodInstant, dry_run: bool, record_event: bool) -> u32 {
         // Events never postdate the last strike, so it alone decides expiry.
         if self
             .last_event
             .is_some_and(|last| now.duration_since(last) >= STRIKE_RETENTION)
         {
             *self = RuleState::default();
+        }
+        if self.dry_run != dry_run {
+            self.strikes = 0;
+            self.fired = ThresholdReservations::default();
+            self.dry_run = dry_run;
         }
         self.strikes += 1;
         self.last_event = Some(now);
@@ -362,7 +371,7 @@ impl AutomodEngine {
             }
             let state = bucket.rules.entry(rule_id).or_default();
             // Only mention spam reads past strike timestamps.
-            let strikes = state.record_strike(now, rule_id == "mention_spam");
+            let strikes = state.record_strike(now, rule.dry_run, rule_id == "mention_spam");
             let fire = rule
                 .action_for_strike(strikes)
                 .filter(|a| state.fired.state(a.at) == ThresholdState::Available);
@@ -1750,6 +1759,29 @@ mod tests {
             .expect("live badword");
         assert_eq!(both.rule_id, "badword");
         assert_eq!(both.action.action, "delete");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dry_run_strikes_do_not_carry_into_live_enforcement() {
+        let mut cfg = default_automod_config();
+        cfg.rules.get_mut("velocity").unwrap().dry_run = true;
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        // Reach the final dry-run threshold (kick at strike 4).
+        for id in 1..=12 {
+            message.message_id = id;
+            let action = engine.evaluate(&cfg, &message);
+            if id == 12 {
+                assert_eq!(action.unwrap().action.action, "kick");
+            }
+        }
+        // Switching to live keeps the message history but starts a new ladder.
+        cfg.rules.get_mut("velocity").unwrap().dry_run = false;
+        message.message_id = 13;
+        let action = engine.evaluate(&cfg, &message).expect("first live action");
+        assert_eq!(action.rule_id, "velocity");
+        assert_eq!(action.strikes, 1);
+        assert_eq!(action.action.action, "delete");
     }
 
     #[test]
