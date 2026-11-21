@@ -481,6 +481,8 @@ const ABOUT_START: &str = "🧭 Get started";
 const ABOUT_LINKS: &str = "🔗 Links";
 const ABOUT_INSTANCE: &str = "🏠 This instance";
 const ABOUT_INSTANCE_MAX: usize = 200;
+/// Longest guild prefix `!about` shows in its help hint; longer ones show `/help`.
+const ABOUT_PREFIX_MAX: usize = 32;
 
 /// Public facts for `!about`. It holds no Discord application, client, server
 /// or user IDs, hostnames or internal addresses; the only configured values
@@ -489,7 +491,7 @@ const ABOUT_INSTANCE_MAX: usize = 200;
 pub struct About<'a> {
     pub version: &'a str,
     pub uptime_seconds: u64,
-    /// Command prefix for this server.
+    /// Command prefix for this server, shown only through `about_help_hint`.
     pub prefix: &'a str,
     /// `bot.about_webui_url` as configured.
     pub webui_url: &'a str,
@@ -563,6 +565,31 @@ fn about_version_url(version: &str) -> String {
     }
 }
 
+/// The `!about` help pointer, shared by the embed and the plain text. The guild
+/// prefix is free text from settings, so it is shown only when it cannot change
+/// the output: a Discord ID (a mention prefix carries the bot's application ID),
+/// a backtick (it would end the code span and let the rest render as Markdown or
+/// a link), a line break or other control character, or a prefix longer than
+/// [`ABOUT_PREFIX_MAX`] (Discord's length limits would clip the closing backtick)
+/// falls back to `/help`.
+fn about_help_hint(prefix: &str) -> String {
+    let has_id = prefix
+        .split(|c: char| !c.is_ascii_digit())
+        .any(|run| run.len() >= 17);
+    let plain = !has_id
+        && !prefix.is_empty()
+        && prefix.chars().count() <= ABOUT_PREFIX_MAX
+        && !prefix
+            .chars()
+            .any(|c| c == '`' || c.is_control() || (c.is_whitespace() && c != ' '));
+    let command = if plain {
+        format!("{prefix}help")
+    } else {
+        "/help".into()
+    };
+    format!("{} lists commands.", inline_code(&command))
+}
+
 fn about_instance_line(instance: &str) -> Option<String> {
     let line = instance.split_whitespace().collect::<Vec<_>>().join(" ");
     (!line.is_empty()).then(|| crate::log_embeds::clip(&line, ABOUT_INSTANCE_MAX))
@@ -603,7 +630,7 @@ pub fn about_embed(about: &About<'_>) -> crate::log_embeds::LogEmbed {
         field(ABOUT_HIGHLIGHTS_LABEL, ABOUT_HIGHLIGHTS.into(), false),
         field(
             ABOUT_START,
-            format!("`{}help` lists commands.\n{webui}", about.prefix),
+            format!("{}\n{webui}", about_help_hint(about.prefix)),
             false,
         ),
         field(
@@ -643,7 +670,7 @@ pub fn about_text(about: &About<'_>) -> String {
             inline_code(&format_duration(about.uptime_seconds))
         ),
         ABOUT_HIGHLIGHTS.into(),
-        format!("`{}help` lists commands.", about.prefix),
+        about_help_hint(about.prefix),
     ];
     if let Some(url) = public_webui_url(about.webui_url) {
         lines.push(format!("Web UI: <{url}>"));
@@ -913,8 +940,7 @@ mod presentation_tests {
         // the accepted Web UI origin. The whole serialized embed is scanned so
         // every field it carries, including any image URL, is covered: `"`
         // starts a JSON URL value, `(` a Markdown link and `<` a plain-text link.
-        let shown = [serde_json::to_string(&embed).unwrap(), text];
-        for value in &shown {
+        let public_only = |value: &str| {
             assert!(!has_snowflake(value), "{value}");
             for link in value
                 .split(['(', '<', '"'])
@@ -928,6 +954,48 @@ mod presentation_tests {
                     "{link}"
                 );
             }
+        };
+        public_only(&serde_json::to_string(&embed).unwrap());
+        public_only(&text);
+        // The guild prefix is free text from settings. A mention prefix carries
+        // the bot's ID, and a backtick, a line break or a prefix long enough for
+        // Discord's limits to clip the closing backtick would let the rest render
+        // as Markdown, so such prefixes point at `/help` in both formats instead.
+        let long_prefix = format!("[x](https://evil.example.org){}", "a".repeat(2000));
+        for prefix in [
+            "<@123456789012345678>",
+            "<@!123456789012345678>",
+            "1234567890123456789",
+            "a` [x](https://evil.example.org) `",
+            "a\n[x](https://evil.example.org)",
+            "a\u{2028}[x](https://evil.example.org)",
+            long_prefix.as_str(),
+        ] {
+            let about = About { prefix, ..about };
+            let embed = about_embed(&about);
+            let text = about_text(&about);
+            let start = embed.fields.iter().find(|f| f.name == ABOUT_START).unwrap();
+            assert!(
+                start.value.starts_with("`/help` lists commands.\n"),
+                "{prefix:?}: {}",
+                start.value
+            );
+            assert!(
+                text.contains("\n`/help` lists commands.\n"),
+                "{prefix:?}: {text}"
+            );
+            public_only(&serde_json::to_string(&embed).unwrap());
+            public_only(&text);
+        }
+        // Ordinary prefixes, including ones with digits or an inner space, keep
+        // the exact hint.
+        for prefix in ["!", "jm!", "mod 2"] {
+            let hint = format!("`{prefix}help` lists commands.");
+            let about = About { prefix, ..about };
+            assert!(about_text(&about).contains(&hint), "{prefix:?}");
+            let embed = about_embed(&about);
+            let start = embed.fields.iter().find(|f| f.name == ABOUT_START).unwrap();
+            assert!(start.value.starts_with(&hint), "{prefix:?}");
         }
         let long = "x".repeat(500);
         let clipped = about_embed(&About {
