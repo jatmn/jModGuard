@@ -26,7 +26,7 @@ pub struct AutomodEngine {
     /// (guild, user) -> per-rule strike buckets
     state: DashMap<(u64, u64), HashMap<&'static str, RuleState>>,
     member_joins: DashMap<(u64, u64), Instant>,
-    last_prune: Mutex<Instant>,
+    last_prune: Mutex<tokio::time::Instant>,
 }
 
 #[derive(Default)]
@@ -72,20 +72,39 @@ enum RuleRetention {
 }
 
 impl RuleState {
-    fn observe(&mut self, now: Instant) -> u32 {
+    fn strike(&mut self, now: Instant) -> u32 {
         self.strikes += 1;
         self.last_event = Some(now);
-        self.events.push_back(WindowEvent { at: now });
         self.strikes
+    }
+
+    fn observe_velocity(&mut self, rule: &RuleDef, now: Instant) -> bool {
+        let max = usize::try_from(param_u64(rule, "max_messages", 8)).unwrap_or(usize::MAX);
+        let window = Duration::from_secs(
+            param_u64(rule, "window_secs", 10).clamp(1, crate::types::AUTOMOD_WINDOW_MAX_SECS),
+        );
+        // Only the most recent max + 1 messages can decide whether the limit is exceeded.
+        self.events.drain(..self.events.len().saturating_sub(max));
+        self.events.push_back(WindowEvent { at: now });
+        self.events.len() > max
+            && self
+                .events
+                .front()
+                .is_some_and(|event| now.duration_since(event.at) < window)
     }
 
     fn prune(&mut self, now: Instant, keep: Duration) -> RuleRetention {
         self.events.retain(|e| now.duration_since(e.at) < keep);
-        if self
+        let recent_strike = self
             .last_event
-            .is_some_and(|t| now.duration_since(t) < keep)
-            || !self.events.is_empty()
-        {
+            .is_some_and(|t| now.duration_since(t) < keep);
+        if !recent_strike {
+            // Ordinary velocity observations can keep the bucket alive after its strikes expire.
+            self.last_event = None;
+            self.strikes = 0;
+            self.fired = ThresholdReservations::default();
+        }
+        if recent_strike || !self.events.is_empty() {
             RuleRetention::Retained
         } else {
             RuleRetention::Expired
@@ -157,7 +176,7 @@ impl AutomodEngine {
         Self {
             state: DashMap::new(),
             member_joins: DashMap::new(),
-            last_prune: Mutex::new(Instant::now()),
+            last_prune: Mutex::new(tokio::time::Instant::now()),
         }
     }
 
@@ -183,14 +202,14 @@ impl AutomodEngine {
 
     /// Removes stale state. Runs on a timer from the cleanup task.
     pub fn prune(&self) {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let keep = Duration::from_secs(crate::types::AUTOMOD_WINDOW_MAX_SECS);
         self.state.retain(|_, rules| {
-            rules.retain(|_, s| s.prune(now, keep) == RuleRetention::Retained);
+            rules.retain(|_, s| s.prune(now.into_std(), keep) == RuleRetention::Retained);
             !rules.is_empty()
         });
         self.member_joins
-            .retain(|_, t| now.duration_since(*t) < Duration::from_secs(24 * 3600));
+            .retain(|_, t| now.into_std().duration_since(*t) < Duration::from_secs(24 * 3600));
         *self.last_prune.lock() = now;
     }
 
@@ -203,7 +222,7 @@ impl AutomodEngine {
 
     /// Evaluates all enabled rules for a message. Returns the pending action
     pub fn evaluate(&self, cfg: &CachedGuildConfig, ctx: &MsgCtx<'_>) -> Option<PendingAction> {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now().into_std();
         let normalized = normalize::normalize_lenient(ctx.content);
         let compact = normalize::normalize_compact(ctx.content);
         let has_url = URL_RE.is_match(ctx.content);
@@ -251,7 +270,8 @@ impl AutomodEngine {
                     .known_spam
                     .matches_forms(ctx.content, &normalized, &compact),
                 "invite" => has_invite && !self.invite_allowed(rule, ctx.content),
-                "velocity" => self.trigger_velocity(rule, ctx, now),
+                // Velocity records the message before checking the threshold under the bucket lock.
+                "velocity" => true,
                 "account_age" => ctx
                     .account_age_days
                     .map(|d| d < param_u64(rule, "min_age_days", 3))
@@ -281,7 +301,22 @@ impl AutomodEngine {
 
             let mut bucket = self.state.entry((ctx.guild_id, ctx.author_id)).or_default();
             let state = bucket.entry(rule_id).or_default();
-            let strikes = state.observe(now);
+            let now = match rule_id {
+                "velocity" => {
+                    // Sample while holding the lock to keep the history in timestamp order.
+                    let now = tokio::time::Instant::now().into_std();
+                    if !state.observe_velocity(rule, now) {
+                        continue;
+                    }
+                    now
+                }
+                "mention_spam" => {
+                    state.events.push_back(WindowEvent { at: now });
+                    now
+                }
+                _ => now,
+            };
+            let strikes = state.strike(now);
             let fire = rule
                 .action_for_strike(strikes)
                 .filter(|a| state.fired.state(a.at) == ThresholdState::Available);
@@ -401,24 +436,6 @@ impl AutomodEngine {
             }
         }
         total > max_total
-    }
-
-    fn trigger_velocity(&self, rule: &RuleDef, ctx: &MsgCtx<'_>, now: Instant) -> bool {
-        let max = param_u64(rule, "max_messages", 8) as usize;
-        let window = Duration::from_secs(
-            param_u64(rule, "window_secs", 10).clamp(1, crate::types::AUTOMOD_WINDOW_MAX_SECS),
-        );
-        let mut count = 1usize;
-        if let Some(bucket) = self.state.get(&(ctx.guild_id, ctx.author_id)) {
-            for s in bucket.values() {
-                for e in s.events.iter() {
-                    if now.duration_since(e.at) < window {
-                        count += 1;
-                    }
-                }
-            }
-        }
-        count > max
     }
 
     fn invite_allowed(&self, rule: &RuleDef, content: &str) -> bool {
@@ -1443,6 +1460,99 @@ mod tests {
 
     use super::{AutomodEngine, MsgCtx, PendingAction, execute_pending_with};
 
+    #[tokio::test(start_paused = true)]
+    async fn default_velocity_counts_messages_and_escalates_past_the_limit() {
+        let engine = AutomodEngine::new();
+        let rules = crate::types::RULE_IDS
+            .into_iter()
+            .map(str::to_owned)
+            .zip(crate::defaults::default_rules())
+            .collect();
+        let mut cfg = test_cfg(&rules, &HashMap::new());
+        cfg.rules.get_mut("velocity").unwrap().whitelist_channels = vec![2];
+        let mut message = msg(2, "hello", 0, false, false);
+
+        for id in 1..=9 {
+            message.message_id = id;
+            assert!(engine.evaluate(&cfg, &message).is_none());
+        }
+        message.channel_id = 1;
+        for id in 10..=17 {
+            message.message_id = id;
+            assert!(engine.evaluate(&cfg, &message).is_none());
+        }
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        for id in 18..=25 {
+            message.message_id = id;
+            assert!(engine.evaluate(&cfg, &message).is_none());
+        }
+
+        for (id, expected) in [
+            (26, Some(("delete", 1))),
+            (27, Some(("timeout", 2))),
+            (28, None),
+            (29, Some(("kick", 4))),
+        ] {
+            message.message_id = id;
+            let pending = engine.evaluate(&cfg, &message);
+            assert_eq!(
+                pending.as_ref().map(|action| (
+                    action.rule_id.as_str(),
+                    action.action.action.as_str(),
+                    action.strikes
+                )),
+                expected.map(|(action, strikes)| ("velocity", action, strikes)),
+                "message {id}"
+            );
+        }
+        assert!(engine.state.get(&(1, 42)).unwrap()["velocity"].events.len() <= 9);
+
+        tokio::time::advance(std::time::Duration::from_secs(600)).await;
+        message.message_id = 30;
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        engine.prune();
+        for id in 31..=37 {
+            message.message_id = id;
+            assert!(engine.evaluate(&cfg, &message).is_none());
+        }
+        message.message_id = 38;
+        let pending = engine
+            .evaluate(&cfg, &message)
+            .expect("new velocity strike");
+        assert_eq!(
+            (
+                pending.rule_id.as_str(),
+                pending.action.action.as_str(),
+                pending.strikes
+            ),
+            ("velocity", "delete", 1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn velocity_counts_each_message_once_when_other_rules_also_match() {
+        let engine = AutomodEngine::new();
+        let rules = crate::types::RULE_IDS
+            .into_iter()
+            .map(str::to_owned)
+            .zip(crate::defaults::default_rules())
+            .collect();
+        let cfg = test_cfg(&rules, &HashMap::new());
+        let mut message = msg(1, "https://discord.gg/example", 0, false, false);
+        message.account_age_days = Some(1);
+
+        for id in 1..=8 {
+            message.message_id = id;
+            let pending = engine.evaluate(&cfg, &message);
+            if id == 1 {
+                assert_eq!(pending.as_ref().unwrap().rule_id, "invite");
+            }
+            assert!(pending.is_none_or(|action| action.rule_id != "velocity"));
+        }
+        message.message_id = 9;
+        assert_eq!(engine.evaluate(&cfg, &message).unwrap().rule_id, "velocity");
+    }
+
     #[test]
     fn builtin_legacy_windows_clamp_to_retained_history() {
         assert_legacy_windows(&[(0, 500, true), (0, 2000, false)]);
@@ -1463,42 +1573,49 @@ mod tests {
         use std::time::Duration;
         for id in ["mention_spam", "velocity"] {
             for &(window, age_ms, expected) in cases {
-                let engine = AutomodEngine::new();
                 let now = Instant::now();
-                let mut rule = crate::defaults::default_rules()
-                    [if id == "mention_spam" { 0 } else { 6 }]
-                .clone();
+                let mut rule = crate::types::RULE_IDS
+                    .into_iter()
+                    .zip(crate::defaults::default_rules())
+                    .find(|(rule_id, _)| *rule_id == id)
+                    .unwrap()
+                    .1;
                 rule.params = serde_json::json!({"window_secs": window, "max_mentions_in_window": 1, "max_messages": 1});
                 let at = now - Duration::from_millis(age_ms);
-                engine.state.insert(
-                    (1, 42),
-                    HashMap::from([(
-                        id,
-                        RuleState {
-                            events: std::collections::VecDeque::from([WindowEvent { at }]),
-                            last_event: Some(at),
-                            ..Default::default()
-                        },
-                    )]),
-                );
-                let mut ctx = msg(1, "", 0, false, false);
-                ctx.role_mentions = 1;
-                let triggered = if id == "mention_spam" {
-                    engine.trigger_mention_spam(&rule, &ctx, now)
-                } else {
-                    engine.trigger_velocity(&rule, &ctx, now)
-                };
-                assert_eq!(triggered, expected, "{id}: window {window}, age {age_ms}");
-                engine.prune();
-                let after = if id == "mention_spam" {
-                    engine.trigger_mention_spam(&rule, &ctx, now)
-                } else {
-                    engine.trigger_velocity(&rule, &ctx, now)
-                };
-                assert_eq!(
-                    after, expected,
-                    "pruning must agree with the effective window"
-                );
+                for pruned in [false, true] {
+                    let engine = AutomodEngine::new();
+                    engine.state.insert(
+                        (1, 42),
+                        HashMap::from([(
+                            id,
+                            RuleState {
+                                events: std::collections::VecDeque::from([WindowEvent { at }]),
+                                last_event: (id == "mention_spam").then_some(at),
+                                ..Default::default()
+                            },
+                        )]),
+                    );
+                    if pruned {
+                        engine.prune();
+                    }
+                    let triggered = if id == "mention_spam" {
+                        let mut ctx = msg(1, "", 0, false, false);
+                        ctx.role_mentions = 1;
+                        engine.trigger_mention_spam(&rule, &ctx, now)
+                    } else {
+                        engine
+                            .state
+                            .entry((1, 42))
+                            .or_default()
+                            .entry(id)
+                            .or_default()
+                            .observe_velocity(&rule, now)
+                    };
+                    assert_eq!(
+                        triggered, expected,
+                        "{id}: window {window}, age {age_ms}, pruned {pruned}"
+                    );
+                }
             }
         }
     }

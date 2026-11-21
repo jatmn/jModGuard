@@ -333,6 +333,21 @@ fn discovery_waits_for_a_real_bot_identity_in_the_gateway_cache() {
     let http = serenity::http::Http::new("test-token");
     assert_eq!(cache.current_user().id.get(), 1);
     assert!(DiscordMembership::from_cache(&http, &cache).is_none());
+
+    let mut ready: serenity::all::ReadyEvent = serde_json::from_value(serde_json::json!({
+        "v": 10,
+        "user": {"id": "4242", "username": "fixture-bot", "bot": true},
+        "guilds": [],
+        "session_id": "fixture",
+        "resume_gateway_url": "wss://gateway.example.invalid",
+        "application": {"id": "4242", "flags": 0}
+    }))
+    .unwrap();
+    cache.update(&mut ready);
+
+    let membership =
+        DiscordMembership::from_cache(&http, &cache).expect("bot identity after READY");
+    assert_eq!(membership.bot_user_id, UserId::new(4242));
 }
 
 #[tokio::test]
