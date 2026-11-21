@@ -122,6 +122,10 @@ pub struct BotConfig {
     pub owner_id: u64,
     pub retention_days: u32,
     pub status: String,
+    /// Public Web UI URL linked from `!about`. Empty or non-public URLs are not shown.
+    pub about_webui_url: String,
+    /// Optional operator line about this instance, shown by `!about`.
+    pub about_instance: String,
     /// How often the bot polls durable `config_version` for cross-process cache invalidation.
     pub config_poll_secs: u64,
     /// Automatically retain eligible guild messages unless explicitly disabled.
@@ -370,6 +374,8 @@ impl Default for BotConfig {
             owner_id: 0,
             retention_days: 7,
             status: "moderating".into(),
+            about_webui_url: String::new(),
+            about_instance: String::new(),
             config_poll_secs: 5,
             message_capture_enabled: true,
             control_bind: "127.0.0.1:8082".into(),
@@ -971,6 +977,18 @@ impl Config {
             let v = v.trim();
             if !v.is_empty() {
                 self.bot.status = v.to_string();
+            }
+        }
+        if let Ok(v) = env::var("JMODGUARD_ABOUT_WEBUI_URL") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.bot.about_webui_url = v.to_string();
+            }
+        }
+        if let Ok(v) = env::var("JMODGUARD_ABOUT_INSTANCE") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.bot.about_instance = v.to_string();
             }
         }
         if let Ok(v) = env::var("JMODGUARD_CONFIG_POLL_SECS") {
@@ -1724,6 +1742,8 @@ mod tests {
             "JMODGUARD_DEFAULT_PREFIX",
             "JMODGUARD_RETENTION_DAYS",
             "JMODGUARD_BOT_STATUS",
+            "JMODGUARD_ABOUT_WEBUI_URL",
+            "JMODGUARD_ABOUT_INSTANCE",
         ];
         let _saved = SavedEnv::capture(NAMES);
         for name in NAMES {
@@ -1734,6 +1754,8 @@ mod tests {
             std::env::set_var("JMODGUARD_DEFAULT_PREFIX", "?");
             std::env::set_var("JMODGUARD_RETENTION_DAYS", "14");
             std::env::set_var("JMODGUARD_BOT_STATUS", "watching");
+            std::env::set_var("JMODGUARD_ABOUT_WEBUI_URL", " https://mod.example.org ");
+            std::env::set_var("JMODGUARD_ABOUT_INSTANCE", "Hosted by Example");
         }
         let mut cfg = Config::default();
         cfg.apply_env().unwrap();
@@ -1741,6 +1763,8 @@ mod tests {
         assert_eq!(cfg.bot.default_prefix, "?");
         assert_eq!(cfg.bot.retention_days, 14);
         assert_eq!(cfg.bot.status, "watching");
+        assert_eq!(cfg.bot.about_webui_url, "https://mod.example.org");
+        assert_eq!(cfg.bot.about_instance, "Hosted by Example");
     }
 
     #[test]

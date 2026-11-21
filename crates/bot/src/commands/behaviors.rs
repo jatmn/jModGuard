@@ -1279,18 +1279,23 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             })
         }
         Behavior::About => {
-            let response = format!(
-                "**{}** — a data-driven Discord moderation bot.\nVersion {}\nUptime: {}\nConfig via WebUI, `!help` for commands.",
-                env.ctx.cache.current_user().name.clone(),
-                env!("CARGO_PKG_VERSION"),
-                crate::templates::format_duration(env.app.start.elapsed().as_secs())
-            );
+            let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
+            let avatar_url = env.ctx.cache.current_user().face();
+            let about = crate::templates::About {
+                version: env!("CARGO_PKG_VERSION"),
+                uptime_seconds: env.app.start.elapsed().as_secs(),
+                prefix: &cfg.settings.prefix,
+                avatar_url: Some(&avatar_url),
+                webui_url: &env.app.cfg.bot.about_webui_url,
+                instance: &env.app.cfg.bot.about_instance,
+            };
             Ok(BehaviorOutcome {
-                response: Some(response),
+                // Plain text for `{response}` templates and the Embed Links fallback.
+                response: Some(crate::templates::about_text(&about)),
                 vars,
                 emitted_log_events: Vec::new(),
                 suppress_response: false,
-                embed: None,
+                embed: Some(crate::templates::about_embed(&about)),
             })
         }
         Behavior::Stats => {

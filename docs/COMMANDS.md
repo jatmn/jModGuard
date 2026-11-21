@@ -53,7 +53,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!logchannel <list\|set\|unset> [event] [#channel]` | Admin | admin | Route events to channels |
 | `!testregex <pattern> <sample>` | Admin | admin | Test a regex against raw + normalized text |
 | `!help [command]` | Utility | everyone | List commands (`!commands`, `!h`) |
-| `!about` | Utility | everyone | Bot info |
+| `!about` | Utility | everyone | Project embed: repo link, version, uptime, highlights (plain text without Embed Links) |
 | `!stats` | Utility | admin | Uptime, this server’s retained moderation counts, release state, and this bot container’s CPU and memory (alias: `!status`) |
 
 `/kick` and `/ban` accept an optional boolean `dm` to DM the reason to the target.

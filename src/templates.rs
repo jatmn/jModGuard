@@ -188,6 +188,8 @@ pub fn stats_embed(
                 inline: false,
             },
         ],
+        url: None,
+        thumbnail: None,
     }
     .bounded()
 }
@@ -459,6 +461,185 @@ fn format_bytes(bytes: u64) -> String {
     format!("{whole}.{frac} {suffix}")
 }
 
+/// Public project repository linked from `!about`. Self-hosted copies keep it.
+const PROJECT_REPO_URL: &str = "https://github.com/jatmn/jModGuard";
+/// Brand title of the `!about` embed.
+const ABOUT_TITLE: &str = "🛡️ jModGuard";
+/// `!about` accent color.
+const ABOUT_COLOR: u32 = 0x8ab4f8;
+const ABOUT_TAGLINE: &str =
+    "A data-driven Discord moderation bot you can host for your own servers.";
+const ABOUT_HIGHLIGHTS: &str = "\
+• Automod for spam bots, floods, invites and bad words\n\
+• Moderation commands with cases and escalation\n\
+• Event logs sent to the channels you choose\n\
+• Commands, rules and messages editable without code";
+const ABOUT_GET: &str = "📥 Get jModGuard";
+const ABOUT_VERSION: &str = "🏷️ Version";
+const ABOUT_UPTIME: &str = "⏱️ Uptime";
+const ABOUT_HIGHLIGHTS_LABEL: &str = "✨ Highlights";
+const ABOUT_START: &str = "🧭 Get started";
+const ABOUT_LINKS: &str = "🔗 Links";
+const ABOUT_INSTANCE: &str = "🏠 This instance";
+const ABOUT_INSTANCE_MAX: usize = 200;
+
+/// Public facts for `!about`. It holds no Discord application, client, server
+/// or user IDs, hostnames or internal addresses; the only configured values
+/// are the Web UI URL, shown only as a public HTTPS origin, and the operator line.
+pub struct About<'a> {
+    pub version: &'a str,
+    pub uptime_seconds: u64,
+    /// Command prefix for this server.
+    pub prefix: &'a str,
+    /// Discord avatar of the bot account posting the reply (thumbnail only).
+    pub avatar_url: Option<&'a str>,
+    /// `bot.about_webui_url` as configured.
+    pub webui_url: &'a str,
+    /// `bot.about_instance` as configured.
+    pub instance: &'a str,
+}
+
+/// The origin of a configured Web UI URL when it is a public HTTPS address: a
+/// dotted DNS name with no credentials, IP literal or local/internal-only name.
+/// Paths are dropped so a configured URL cannot carry a server ID.
+fn public_webui_url(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw.trim()).ok()?;
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    let Some(url::Host::Domain(host)) = url.host() else {
+        return None;
+    };
+    let host = host.trim_end_matches('.');
+    let local = [
+        "localhost",
+        "local",
+        "localdomain",
+        "internal",
+        "intranet",
+        "lan",
+        "home",
+        "corp",
+        "home.arpa",
+    ];
+    if !host.contains('.')
+        || local
+            .iter()
+            .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+    {
+        return None;
+    }
+    Some(url.origin().ascii_serialization())
+}
+
+/// Release page for a stable `x.y.z` version, otherwise the changelog.
+fn about_version_url(version: &str) -> String {
+    let stable = version.split('.').count() == 3
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+    if stable {
+        format!("{PROJECT_REPO_URL}/releases/tag/v{version}")
+    } else {
+        format!("{PROJECT_REPO_URL}/blob/main/CHANGELOG.md")
+    }
+}
+
+fn about_instance_line(instance: &str) -> Option<String> {
+    let line = instance.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!line.is_empty()).then(|| crate::log_embeds::clip(&line, ABOUT_INSTANCE_MAX))
+}
+
+/// Branded `!about` embed: project link, version, uptime, highlights and
+/// pointers. Uses only public project URLs and the checked Web UI origin.
+pub fn about_embed(about: &About<'_>) -> crate::log_embeds::LogEmbed {
+    use crate::log_embeds::{Field, LogEmbed};
+    let field = |name: &str, value: String, inline: bool| Field {
+        name: name.into(),
+        value,
+        inline,
+    };
+    let repo_label = PROJECT_REPO_URL.trim_start_matches("https://");
+    let webui = match public_webui_url(about.webui_url) {
+        Some(url) => format!("Manage settings in the [Web UI]({url})."),
+        None => "Server admins manage settings in the Web UI.".into(),
+    };
+    let mut fields = vec![
+        field(
+            ABOUT_GET,
+            format!(
+                "**[{repo_label}]({PROJECT_REPO_URL})**\nFree to download and host for your own server."
+            ),
+            false,
+        ),
+        field(
+            ABOUT_VERSION,
+            format!("[v{}]({})", about.version, about_version_url(about.version)),
+            true,
+        ),
+        field(
+            ABOUT_UPTIME,
+            inline_code(&format_duration(about.uptime_seconds)),
+            true,
+        ),
+        field(ABOUT_HIGHLIGHTS_LABEL, ABOUT_HIGHLIGHTS.into(), false),
+        field(
+            ABOUT_START,
+            format!("`{}help` lists commands.\n{webui}", about.prefix),
+            false,
+        ),
+        field(
+            ABOUT_LINKS,
+            format!(
+                "[Docs]({PROJECT_REPO_URL}/tree/main/docs) · [Changelog]({PROJECT_REPO_URL}/blob/main/CHANGELOG.md) · [License]({PROJECT_REPO_URL}/blob/main/LICENSE.md)"
+            ),
+            false,
+        ),
+    ];
+    if let Some(line) = about_instance_line(about.instance) {
+        fields.push(field(ABOUT_INSTANCE, line, false));
+    }
+    LogEmbed {
+        title: ABOUT_TITLE.into(),
+        color: ABOUT_COLOR,
+        description: ABOUT_TAGLINE.into(),
+        fields,
+        url: Some(PROJECT_REPO_URL.into()),
+        thumbnail: about.avatar_url.map(str::to_owned),
+    }
+    .bounded()
+}
+
+/// Plain-text `!about` for a `{response}` template and for channels where
+/// Discord refuses embeds. Same facts as [`about_embed`], without the avatar.
+pub fn about_text(about: &About<'_>) -> String {
+    let mut lines = vec![
+        format!("**{ABOUT_TITLE}** — {ABOUT_TAGLINE}"),
+        format!("Get it: <{PROJECT_REPO_URL}>"),
+        format!(
+            "Version: v{} (<{}>)",
+            about.version,
+            about_version_url(about.version)
+        ),
+        format!(
+            "Uptime: {}",
+            inline_code(&format_duration(about.uptime_seconds))
+        ),
+        ABOUT_HIGHLIGHTS.into(),
+        format!("`{}help` lists commands.", about.prefix),
+    ];
+    if let Some(url) = public_webui_url(about.webui_url) {
+        lines.push(format!("Web UI: <{url}>"));
+    }
+    lines.push(format!(
+        "Docs: <{PROJECT_REPO_URL}/tree/main/docs> · License: <{PROJECT_REPO_URL}/blob/main/LICENSE.md>"
+    ));
+    if let Some(line) = about_instance_line(about.instance) {
+        lines.push(format!("This instance: {line}"));
+    }
+    lines.join("\n")
+}
+
 /// Renders a template, replacing `{variable}` tokens with values from `vars`.
 /// Unknown tokens are left untouched so template mistakes are visible.
 pub fn render(template: &str, vars: &BTreeMap<String, String>) -> String {
@@ -624,6 +805,183 @@ mod presentation_tests {
             assert_eq!(format_duration(seconds), expected, "{seconds}");
             assert_eq!(format_compact_duration(seconds), expected, "{seconds}");
         }
+    }
+
+    /// Discord snowflakes (application, client, server and user IDs) are 17+ digits.
+    fn has_snowflake(text: &str) -> bool {
+        text.split(|c: char| !c.is_ascii_digit())
+            .any(|run| run.len() >= 17)
+    }
+
+    fn about_start(webui_url: &str, instance: &str) -> String {
+        let embed = about_embed(&About {
+            version: "0.2.1",
+            uptime_seconds: 342,
+            prefix: "?",
+            avatar_url: Some("https://cdn.discordapp.com/embed/avatars/0.png"),
+            webui_url,
+            instance,
+        });
+        let start = embed.fields.iter().find(|f| f.name == ABOUT_START).unwrap();
+        start.value.clone()
+    }
+
+    #[test]
+    fn about_embed_links_the_repo_and_shows_no_deployment_identifiers() {
+        let id = "1234567890123456789";
+        let about = About {
+            version: "0.2.1",
+            uptime_seconds: 342,
+            prefix: "?",
+            avatar_url: Some("https://cdn.discordapp.com/embed/avatars/0.png"),
+            // A configured path or query could carry a server ID; only the origin is shown.
+            webui_url: &format!(" https://Mod.Example.org/guilds/{id}?client_id={id} "),
+            instance: "Hosted by\nExample   Community",
+        };
+        let embed = about_embed(&about);
+        assert_eq!(embed.title, "🛡️ jModGuard");
+        assert_eq!(
+            embed.url.as_deref(),
+            Some("https://github.com/jatmn/jModGuard")
+        );
+        assert_eq!(embed.color, ABOUT_COLOR);
+        assert_eq!(embed.description, ABOUT_TAGLINE);
+        assert_eq!(
+            embed.thumbnail.as_deref(),
+            Some("https://cdn.discordapp.com/embed/avatars/0.png")
+        );
+        let fields = embed
+            .fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.value.as_str(), f.inline))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fields,
+            [
+                (
+                    ABOUT_GET,
+                    "**[github.com/jatmn/jModGuard](https://github.com/jatmn/jModGuard)**\nFree to download and host for your own server.",
+                    false
+                ),
+                (
+                    ABOUT_VERSION,
+                    "[v0.2.1](https://github.com/jatmn/jModGuard/releases/tag/v0.2.1)",
+                    true
+                ),
+                (ABOUT_UPTIME, "`5m 42s`", true),
+                (ABOUT_HIGHLIGHTS_LABEL, ABOUT_HIGHLIGHTS, false),
+                (
+                    ABOUT_START,
+                    "`?help` lists commands.\nManage settings in the [Web UI](https://mod.example.org).",
+                    false
+                ),
+                (
+                    ABOUT_LINKS,
+                    "[Docs](https://github.com/jatmn/jModGuard/tree/main/docs) · [Changelog](https://github.com/jatmn/jModGuard/blob/main/CHANGELOG.md) · [License](https://github.com/jatmn/jModGuard/blob/main/LICENSE.md)",
+                    false
+                ),
+                (ABOUT_INSTANCE, "Hosted by Example Community", false),
+            ]
+        );
+        let text = about_text(&about);
+        assert_eq!(
+            text,
+            format!(
+                "**🛡️ jModGuard** — {ABOUT_TAGLINE}\n\
+                 Get it: <https://github.com/jatmn/jModGuard>\n\
+                 Version: v0.2.1 (<https://github.com/jatmn/jModGuard/releases/tag/v0.2.1>)\n\
+                 Uptime: `5m 42s`\n\
+                 {ABOUT_HIGHLIGHTS}\n\
+                 `?help` lists commands.\n\
+                 Web UI: <https://mod.example.org>\n\
+                 Docs: <https://github.com/jatmn/jModGuard/tree/main/docs> · License: <https://github.com/jatmn/jModGuard/blob/main/LICENSE.md>\n\
+                 This instance: Hosted by Example Community"
+            )
+        );
+        // Every shown value and link is free of IDs and points only at the
+        // public project or the accepted Web UI origin.
+        let mut shown = vec![embed.title.clone(), embed.description.clone()];
+        shown.extend(embed.url.clone());
+        shown.extend(
+            embed
+                .fields
+                .iter()
+                .flat_map(|f| [f.name.clone(), f.value.clone()]),
+        );
+        shown.push(text);
+        for value in &shown {
+            assert!(!has_snowflake(value), "{value}");
+            for link in value
+                .split(['(', '<'])
+                .skip(1)
+                .filter(|s| s.starts_with("http"))
+            {
+                assert!(
+                    link.starts_with("https://github.com/jatmn/jModGuard")
+                        || link.starts_with("https://mod.example.org)")
+                        || link.starts_with("https://mod.example.org>"),
+                    "{link}"
+                );
+            }
+        }
+        let long = "x".repeat(500);
+        let clipped = about_embed(&About {
+            instance: &long,
+            ..about
+        });
+        let line = &clipped.fields.last().unwrap().value;
+        assert_eq!(line.encode_utf16().count(), ABOUT_INSTANCE_MAX);
+    }
+
+    #[test]
+    fn about_shows_the_web_ui_link_only_for_a_public_https_url() {
+        for internal in [
+            "",
+            "not a url",
+            "http://mod.example.org",
+            "https://localhost:8080",
+            "https://127.0.0.1",
+            "https://10.0.0.5",
+            "https://[::1]:8080",
+            "https://jmodguard-api",
+            "https://api.internal",
+            "https://bot.lan",
+            "https://web.home.arpa",
+            "https://user:secret@mod.example.org",
+        ] {
+            let start = about_start(internal, "");
+            assert_eq!(
+                start, "`?help` lists commands.\nServer admins manage settings in the Web UI.",
+                "{internal}"
+            );
+        }
+        assert!(
+            about_start("https://mod.example.org:8443/", "")
+                .contains("(https://mod.example.org:8443)")
+        );
+    }
+
+    #[test]
+    fn about_links_a_prerelease_version_to_the_changelog() {
+        let embed = about_embed(&About {
+            version: "0.3.0-rc.1",
+            uptime_seconds: 0,
+            prefix: "!",
+            avatar_url: None,
+            webui_url: "",
+            instance: "",
+        });
+        let version = embed
+            .fields
+            .iter()
+            .find(|f| f.name == ABOUT_VERSION)
+            .unwrap();
+        assert_eq!(
+            version.value,
+            "[v0.3.0-rc.1](https://github.com/jatmn/jModGuard/blob/main/CHANGELOG.md)"
+        );
+        assert_eq!(embed.thumbnail, None);
+        assert!(embed.fields.iter().all(|f| f.name != ABOUT_INSTANCE));
     }
 
     /// Release status field value, with the line layout the stats embed shows.

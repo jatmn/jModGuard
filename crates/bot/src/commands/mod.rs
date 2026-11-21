@@ -1403,7 +1403,8 @@ fn raced_write_chain(first: RacedWrite, second: RacedWrite) -> RacedWrite {
 }
 
 fn suppress_untrusted_mentions(behavior: &Behavior) -> bool {
-    matches!(behavior, Behavior::UserInfo)
+    // About includes the operator's free-text instance line.
+    matches!(behavior, Behavior::UserInfo | Behavior::About)
 }
 
 fn no_mentions() -> CreateAllowedMentions {
