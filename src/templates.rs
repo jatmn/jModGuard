@@ -555,17 +555,23 @@ mod bounded_tests {
     use super::*;
     #[test]
     fn bounded_render_preserves_template_semantics() {
+        // Expected text follows docs/TEMPLATES.md: unknown variables and stray braces
+        // stay literal, and a substituted value is not rendered again. Pin both
+        // renderers to it so a change shared by both cannot pass as agreement.
         let vars = BTreeMap::from([("user".into(), "alice {unknown}".into())]);
-        for template in [
-            "hi {user}",
-            "{{user}}",
-            "{unknown} {user}",
-            "literal {",
-            "{outer {user} tail",
+        for (template, expected) in [
+            ("hi {user}", "hi alice {unknown}"),
+            ("hi {user}, {missing}!", "hi alice {unknown}, {missing}!"),
+            ("{{user}}", "{alice {unknown}}"),
+            ("{unknown} {user}", "{unknown} alice {unknown}"),
+            ("literal {", "literal {"),
+            ("{outer {user} tail", "{outer alice {unknown} tail"),
         ] {
+            assert_eq!(render(template, &vars), expected, "{template:?}");
             assert_eq!(
                 render_bounded(template, &vars, 2000),
-                render(template, &vars)
+                expected,
+                "{template:?}"
             );
         }
     }
