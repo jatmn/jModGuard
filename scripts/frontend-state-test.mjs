@@ -10162,7 +10162,7 @@ test('every sidebar item shows its colored SVG icon beside its unchanged label',
 });
 
 // #746: the sidebar groups pages by purpose; every page keeps its tab route.
-test('sidebar groups pages as Overview, Moderation, Automod, Configuration and Owner', () => {
+test('sidebar groups pages as Overview, Moderation, Automod, Configuration and Owner', async () => {
   const groups = (h) => {
     const result = [];
     for (const item of h.document.querySelectorAll('#tabs li')) {
@@ -10180,8 +10180,9 @@ test('sidebar groups pages as Overview, Moderation, Automod, Configuration and O
     ['Configuration', 'settings', 'logchannels', 'commands', 'templates'],
     ['Owner', 'servers', 'resources', 'usage', 'platform-analytics'],
   ]);
-  for (const tab of groups(owner).flatMap(([, ...tabs]) => tabs)) {
-    owner.app.navigate(tab);
+  // Dashboard is already selected. Click it last so every button must change the tab.
+  for (const tab of groups(owner).flatMap(([, ...tabs]) => tabs).reverse()) {
+    await fire(owner.document.querySelector(`#tabs [data-tab="${tab}"]`), 'click');
     assert.equal(owner.app.state.tab, tab, `${tab} stays reachable`);
   }
   const readOnly = harness(async () => response({}));
