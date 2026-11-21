@@ -115,8 +115,13 @@ enum RuleRetention {
 const STRIKE_RETENTION: Duration = Duration::from_secs(crate::types::AUTOMOD_WINDOW_MAX_SECS);
 
 impl RuleState {
+    /// Starts a new ladder when the previous one expired.
     fn record_strike(&mut self, now: AutomodInstant, record_event: bool) -> u32 {
-        if self.prune(now, STRIKE_RETENTION) == RuleRetention::Expired {
+        // Events never postdate the last strike, so it alone decides expiry.
+        if self
+            .last_event
+            .is_some_and(|last| now.duration_since(last) >= STRIKE_RETENTION)
+        {
             *self = RuleState::default();
         }
         self.strikes += 1;
@@ -356,7 +361,8 @@ impl AutomodEngine {
                 continue;
             }
             let state = bucket.rules.entry(rule_id).or_default();
-            let strikes = state.record_strike(now, rule_id != "velocity");
+            // Only mention spam reads past strike timestamps.
+            let strikes = state.record_strike(now, rule_id == "mention_spam");
             let fire = rule
                 .action_for_strike(strikes)
                 .filter(|a| state.fired.state(a.at) == ThresholdState::Available);
@@ -1744,6 +1750,25 @@ mod tests {
             .expect("live badword");
         assert_eq!(both.rule_id, "badword");
         assert_eq!(both.action.action, "delete");
+    }
+
+    #[test]
+    fn only_mention_spam_keeps_strike_timestamps() {
+        let mut cfg = default_automod_config();
+        cfg.regexes = vec![jmodguard::normalize::compile_user_regex("scam").unwrap()];
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "scam", 0, false, false);
+        for id in 1..=3 {
+            message.message_id = id;
+            engine.evaluate(&cfg, &message);
+        }
+        let bucket = engine
+            .state
+            .get(&(message.guild_id, message.author_id))
+            .unwrap();
+        let badword = &bucket.rules["badword"];
+        assert_eq!(badword.strikes, 3);
+        assert!(badword.events.is_empty());
     }
 
     fn default_automod_config() -> CachedGuildConfig {
