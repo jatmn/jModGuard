@@ -261,15 +261,6 @@ mod tests {
     }
 
     #[test]
-    fn constructing_the_connector_does_not_load_native_roots() {
-        let connector = https_connector();
-        assert!(
-            connector.tls.get().is_none(),
-            "HTTP remotes must not require a CA store at open"
-        );
-    }
-
-    #[test]
     fn http_connect_does_not_load_native_roots() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
