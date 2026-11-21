@@ -85,6 +85,26 @@ impl Policy {
     }
 }
 
+/// Saves cannot set a velocity limit above the retained history. A stored
+/// legacy limit is inert, so a save that keeps it unchanged is allowed.
+pub fn validate_velocity_limit(
+    rule: &crate::types::RuleDef,
+    stored: Option<&serde_json::Value>,
+) -> Result<()> {
+    let Some(value) = rule.params.get("max_messages") else {
+        return Ok(());
+    };
+    if stored == Some(value) {
+        return Ok(());
+    }
+    let max = crate::types::AUTOMOD_VELOCITY_MAX_MESSAGES;
+    ensure!(
+        value.as_u64().is_some_and(|count| count <= max as u64),
+        "max_messages must be 0–{max} (a whole number)"
+    );
+    Ok(())
+}
+
 /// Legacy attachment-count configurations stay inert until explicitly converted.
 pub fn validate_rule(id: &str, rule: &crate::types::RuleDef) -> Result<()> {
     match id {
@@ -96,15 +116,6 @@ pub fn validate_rule(id: &str, rule: &crate::types::RuleDef) -> Result<()> {
                         .contains(&window)),
                     "window_secs must be 1–{} seconds (a whole number)",
                     crate::types::AUTOMOD_WINDOW_MAX_SECS
-                );
-            }
-            if id == "velocity"
-                && let Some(value) = rule.params.get("max_messages")
-            {
-                let max = crate::types::AUTOMOD_VELOCITY_MAX_MESSAGES;
-                ensure!(
-                    value.as_u64().is_some_and(|count| count <= max as u64),
-                    "max_messages must be 0–{max} (a whole number)"
                 );
             }
         }

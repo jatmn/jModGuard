@@ -383,6 +383,38 @@ fn rule_json_for_save_conn(
     Ok(serde_json::to_string(rule)?)
 }
 
+/// Compare a velocity save with the row it replaces, under the writer lock.
+/// A first guild override starts from the inherited global rule.
+fn validate_velocity_limit_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    id: &str,
+    rule: &RuleDef,
+) -> Result<()> {
+    if id != "velocity" {
+        return Ok(());
+    }
+    let stored_limit = |scope: i64| -> Result<Option<Option<serde_json::Value>>> {
+        let data: Option<String> = conn
+            .query_row(
+                "SELECT data FROM rules WHERE guild_id = ?1 AND rule_id = 'velocity'",
+                params![scope],
+                |r| Ok(r.get(0)?),
+            )
+            .optional()?;
+        Ok(data.map(|json| {
+            serde_json::from_str::<serde_json::Value>(&json)
+                .ok()
+                .and_then(|row| row.get("params")?.get("max_messages").cloned())
+        }))
+    };
+    let mut stored = stored_limit(guild_id)?;
+    if stored.is_none() && guild_id != GLOBAL_SCOPE {
+        stored = stored_limit(GLOBAL_SCOPE)?;
+    }
+    crate::image_spam::validate_velocity_limit(rule, stored.flatten().as_ref())
+}
+
 async fn upsert_rule_row(
     db: &Db,
     guild_id: i64,
@@ -395,6 +427,7 @@ async fn upsert_rule_row(
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
+        validate_velocity_limit_conn(&tx, guild_id, &id, &rule)?;
         let json = rule_json_for_save_conn(&tx, guild_id, &id, &rule)?;
         let saved = serde_json::from_str(&json)?;
         tx.execute_rows(
@@ -1883,6 +1916,7 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
         global.verify_conn(&tx)?;
         // The global target's check alone does not cover the guild write fence.
         guild.verify_conn(&tx)?;
+        validate_velocity_limit_conn(&tx, GLOBAL_SCOPE, &id, &rule)?;
         let json = rule_json_for_save_conn(&tx, GLOBAL_SCOPE, &id, &rule)?;
         let saved = serde_json::from_str(&json)?;
         tx.execute_rows(

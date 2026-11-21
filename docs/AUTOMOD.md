@@ -73,9 +73,13 @@ escalation accurate without false positives.
   (default 8). An eligible message adds a strike if the count in the window,
   including that message, exceeds the limit. Previously saved integer limits
   above 1,023 do not trigger until the limit is lowered to the supported range.
+  Saves that keep such a limit unchanged, such as enabling, dry-run, or a rules
+  copy, still succeed; a save cannot set a new limit above 1,023.
 - Default escalation: `1 → delete`, `2 → timeout 30m`, `4 → kick`.
-  Each threshold fires once per strike bucket. A kick and rejoin keeps the
-  bucket until it expires after 10 minutes without a velocity strike.
+  Each threshold fires once per strike bucket. After the last threshold has
+  fired, further over-limit messages in that bucket are not actioned. A kick and
+  rejoin keeps the bucket until it expires after 10 minutes without a velocity
+  strike.
 
 ### 8. `account_age` — brand-new accounts
 - Params: `min_age_days` (3).

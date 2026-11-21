@@ -3800,6 +3800,35 @@ for (const [id, params, fields, expected] of [
   });
 }
 
+test('velocity editor keeps an unchanged legacy limit but refuses a new one above 1023', async () => {
+  const calls = [];
+  const h = harness(async (url, options) => {
+    if (options.method === 'PUT') calls.push({url, body: JSON.parse(options.body)});
+    return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+  });
+  const modal = await h.app.editRule({name: 'Message velocity', rule_id: 'velocity', effective: {
+    enabled: true, dry_run: false, params: {window_secs: 10, max_messages: 5000},
+    actions: [{at: 1, action: 'delete'}],
+  }});
+  const control = (label) => findNode(modal, n => n.localName === 'label' && textOf(n) === label).control;
+  const save = findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save');
+  const max = control('Maximum messages in window');
+  max.value = '5001';
+  await fire(max, 'input');
+  await fire(save, 'click');
+  assert.equal(calls.length, 0, 'a new oversized count must not reach the API');
+  assert.match(textOf(h.document.body), /Maximum messages in window must be 0–1023/);
+
+  max.value = '5000';
+  await fire(max, 'input');
+  const windowInput = control('Window (seconds)');
+  windowInput.value = '15';
+  await fire(windowInput, 'input');
+  await fire(save, 'click');
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].body.data.params, {window_secs: 15, max_messages: 5000});
+});
+
 for (const params of [{allowlist_guilds: ['9007199254740993']}, {allowlist_codes: []}]) {
   test(`invite editor saves an empty code list from ${Object.keys(params)[0]}`, async () => {
     let saved;

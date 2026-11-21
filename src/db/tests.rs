@@ -4898,10 +4898,14 @@ fn invite_description_old_writer_reads_are_marker_gated_without_restart() {
 
 // Exercise every built-in rule-save entry point used by callers/control dispatch.
 async fn save_invite_fixture(db: &Db, mode: &str, rule: &RuleDef) {
+    save_rule_fixture(db, mode, "invite", rule).await.unwrap();
+}
+
+async fn save_rule_fixture(db: &Db, mode: &str, id: &str, rule: &RuleDef) -> Result<()> {
     let guild = ConfigurationScope::Guild(guild_enrollment(db, 123).await.unwrap().unwrap());
     match mode {
-        "direct-global" => upsert_rule(db, 0, "invite", rule).await.unwrap(),
-        "direct-guild" => upsert_rule(db, 123, "invite", rule).await.unwrap(),
+        "direct-global" => upsert_rule(db, 0, id, rule).await,
+        "direct-guild" => upsert_rule(db, 123, id, rule).await,
         "enrolled-global" | "enrolled-guild" | "new-override" => {
             let target = if mode == "enrolled-global" {
                 ConfigurationScope::Global
@@ -4911,19 +4915,76 @@ async fn save_invite_fixture(db: &Db, mode: &str, rule: &RuleDef) {
             upsert_enrolled_rule(
                 db,
                 ConfigurationWriteScope::new(guild, target).unwrap(),
-                "invite",
+                id,
                 rule,
             )
             .await
-            .unwrap();
+            .map(|_| ())
         }
-        "global-clear" => {
-            upsert_global_rule_and_clear_enrolled_override(db, guild, "invite", rule)
-                .await
-                .unwrap();
-        }
+        "global-clear" => upsert_global_rule_and_clear_enrolled_override(db, guild, id, rule)
+            .await
+            .map(|_| ()),
         _ => panic!("unknown save fixture"),
     }
+}
+
+#[test]
+fn legacy_velocity_limit_survives_saves_that_keep_it() {
+    for mode in INVITE_SAVE_MODES {
+        let tmp = tmp_db_path("legacy_velocity_limit");
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            enroll_guild(&db, 123, 100).await.unwrap().unwrap();
+            let mut legacy = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+            legacy.params["max_messages"] = serde_json::json!(5000);
+            // Only the global row is stored, so guild modes save a first override.
+            old_writer_rule(&db, 0, "velocity", serde_json::to_value(&legacy).unwrap()).await;
+
+            legacy.enabled = false;
+            save_rule_fixture(&db, mode, "velocity", &legacy)
+                .await
+                .unwrap_or_else(|error| panic!("{mode}: unchanged limit refused: {error:#}"));
+            let target = if mode.ends_with("global") || mode == "global-clear" {
+                0
+            } else {
+                123
+            };
+            let saved = get_rule(&db, target, "velocity").await.unwrap().unwrap();
+            assert!(!saved.enabled, "{mode}");
+            assert_eq!(saved.params["max_messages"], 5000, "{mode}");
+
+            legacy.params["max_messages"] = serde_json::json!(5001);
+            let error = save_rule_fixture(&db, mode, "velocity", &legacy)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("max_messages must be"),
+                "{mode}: {error}"
+            );
+            let kept = get_rule(&db, target, "velocity").await.unwrap().unwrap();
+            assert_eq!(kept.params["max_messages"], 5000, "{mode}");
+        });
+        drop(db);
+        cleanup_db(&tmp);
+    }
+}
+
+#[test]
+fn rules_copy_keeps_a_legacy_velocity_limit() {
+    let tmp = tmp_db_path("legacy_velocity_copy");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        let mut legacy = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        legacy.params["max_messages"] = serde_json::json!(5000);
+        old_writer_rule(&db, 10, "velocity", serde_json::to_value(&legacy).unwrap()).await;
+        crate::db::copy_guild_config(&db, 10, 11, vec!["rules".into()])
+            .await
+            .unwrap();
+        let copied = get_rule(&db, 11, "velocity").await.unwrap().unwrap();
+        assert_eq!(copied.params["max_messages"], 5000);
+    });
+    drop(db);
+    cleanup_db(&tmp);
 }
 
 const INVITE_SAVE_MODES: [&str; 6] = [

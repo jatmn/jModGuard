@@ -4768,7 +4768,8 @@ function RuleEditor({ record: r }) {
                     throw new Error(`${label} must be a non-negative whole number.`);
                   if (key === "window_secs" && (value < 1 || value > 600))
                     throw new Error("Window must be 1–600 seconds.");
-                  if (max !== undefined && value > max)
+                  // A stored legacy value above the limit is inert and may be kept unchanged.
+                  if (max !== undefined && value > max && value !== rule.params?.[key])
                     throw new Error(`${label} must be 0–${max}.`);
                   params[key] = value;
                 }
