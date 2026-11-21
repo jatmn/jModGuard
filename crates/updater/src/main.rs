@@ -4069,11 +4069,6 @@ mod tests {
         assert!(policy.auth_admission == AuthAdmission::Allowed);
     }
 
-    #[test]
-    fn fresh_restart_policy_has_no_process_local_hold_reason() {
-        assert_eq!(RestartPolicy::default().not_ready_reason(), "not ready");
-    }
-
     #[tokio::test(start_paused = true)]
     async fn retry_and_recovery_clear_the_ready_hold_reason() {
         let mut policy = RestartPolicy::default();

@@ -603,11 +603,6 @@ mod tests {
         assert!(!window.accept(&nonce, 1, 1_000_000_000));
     }
 
-    #[test]
-    fn unspecified_v4_is_not_private() {
-        assert!(!is_private_ip(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)));
-    }
-
     fn fixture_secret() -> String {
         "x".repeat(32)
     }

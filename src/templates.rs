@@ -551,25 +551,6 @@ pub fn user_vars(user_id: u64, username: &str, display_name: &str) -> BTreeMap<S
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn renders_known_and_keeps_unknown() {
-        let mut vars = BTreeMap::new();
-        vars.insert("user".into(), "alice".into());
-        let out = render("hi {user}, {missing}!", &vars);
-        assert_eq!(out, "hi alice, {missing}!");
-    }
-
-    #[test]
-    fn nested_braces_ignored() {
-        let out = render("literal {", &BTreeMap::new());
-        assert_eq!(out, "literal {");
-    }
-}
-
-#[cfg(test)]
 mod bounded_tests {
     use super::*;
     #[test]

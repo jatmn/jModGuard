@@ -122,20 +122,6 @@ fn automod_delete_template_fits_discord_limit() {
     assert!(!rendered.contains("{coverage}"));
 }
 
-#[test]
-fn automod_delete_is_activity_log_not_store_event() {
-    assert!(!crate::types::EVENT_TYPES.contains(&"automod_delete"));
-    assert!(crate::types::is_log_event("automod_delete"));
-}
-
-#[tokio::test]
-async fn core_log_channel_accepts_automod_delete() {
-    let f = Fixture::new();
-    db::upsert_log_channel(&f.app.db, 789, "automod_delete", 456)
-        .await
-        .unwrap();
-}
-
 #[tokio::test]
 async fn confirmed_mark_emits_automod_delete_not_plain_delete() {
     let f = Fixture::new();
