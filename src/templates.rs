@@ -499,9 +499,17 @@ pub struct About<'a> {
     pub instance: &'a str,
 }
 
+/// Whether `text` holds a Discord ID (application, server, channel or user
+/// snowflake): a run of 17 or more ASCII digits.
+fn has_discord_id(text: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_digit())
+        .any(|run| run.len() >= 17)
+}
+
 /// The origin of a configured Web UI URL when it is a public HTTPS address: a
-/// dotted DNS name with no credentials, IP literal or local, internal or
-/// reserved name. Paths are dropped so a configured URL cannot carry a server ID.
+/// dotted DNS name with no credentials, IP literal, Discord ID or local,
+/// internal or reserved name. Paths are dropped and an ID-bearing host is
+/// refused so a configured URL cannot carry a server ID.
 /// A name passing this check may still resolve only on a private network.
 fn public_webui_url(raw: &str) -> Option<String> {
     let url = url::Url::parse(raw.trim()).ok()?;
@@ -542,6 +550,7 @@ fn public_webui_url(raw: &str) -> Option<String> {
         "alt",
     ];
     if !host.contains('.')
+        || has_discord_id(host)
         || !host.split('.').all(dns_label)
         || local
             .iter()
@@ -573,10 +582,7 @@ fn about_version_url(version: &str) -> String {
 /// [`ABOUT_PREFIX_MAX`] (Discord's length limits would clip the closing backtick)
 /// falls back to `/help`.
 fn about_help_hint(prefix: &str) -> String {
-    let has_id = prefix
-        .split(|c: char| !c.is_ascii_digit())
-        .any(|run| run.len() >= 17);
-    let plain = !has_id
+    let plain = !has_discord_id(prefix)
         && !prefix.is_empty()
         && prefix.chars().count() <= ABOUT_PREFIX_MAX
         && !prefix
@@ -1032,12 +1038,23 @@ mod presentation_tests {
             "https://mod*x.example.org",
             "https://-mod.example.org",
             "https://mod.example.org..",
+            // Dropping the path is not enough: a per-server host can carry an ID.
+            "https://123456789012345678.dash.example.org",
+            "https://g-123456789012345678.example.org/",
         ] {
             let start = about_start(internal, "");
             assert_eq!(
                 start, "`?help` lists commands.\nServer admins manage settings in the Web UI.",
                 "{internal}"
             );
+            let text = about_text(&About {
+                version: "0.2.1",
+                uptime_seconds: 342,
+                prefix: "?",
+                webui_url: internal,
+                instance: "",
+            });
+            assert!(!text.contains("Web UI"), "{internal}: {text}");
         }
         assert!(
             about_start("https://mod.example.org:8443/", "")
