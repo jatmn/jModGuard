@@ -3741,8 +3741,8 @@ for (const [id, params, fields, expected] of [
     [['Allowed invite codes (comma-separated)', ' New-Code, second-code, , ']],
     {allowlist_codes: ['New-Code', 'second-code']}],
   ['velocity', {window_secs: 10, max_messages: 8},
-    [['Window (seconds)', '15'], ['Maximum messages in window', '11']],
-    {window_secs: 15, max_messages: 11}],
+    [['Window (seconds)', '15'], ['Maximum messages in window', '1023']],
+    {window_secs: 15, max_messages: 1023}],
   ['account_age', {min_age_days: 3}, [['Minimum account age (days)', '5']], {min_age_days: 5}],
 ]) {
   test(`built-in ${id} saves typed detection fields without a JSON editor`, async () => {
@@ -3760,11 +3760,20 @@ for (const [id, params, fields, expected] of [
     assert.doesNotMatch(textOf(modal), /Parameters \(JSON\)/);
     assert.equal(modal.querySelector('textarea'), null);
     assert.ok(modal.querySelector('.escalation-step'), 'escalation rules show strike rows');
+    const save = findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save');
     for (const [label, value] of fields) {
       const labelNode = findNode(modal, n => n.localName === 'label' && textOf(n) === label);
       const input = labelNode?.control;
       assert.ok(input, label);
       assert.equal(input.type, id === 'invite' ? 'text' : 'number');
+      if (label === 'Maximum messages in window') {
+        assert.equal(input.max, '1023');
+        input.value = '1024';
+        await fire(input, 'input');
+        await fire(save, 'click');
+        assert.equal(calls.length, 0, 'oversized count must not reach the API');
+        assert.match(textOf(h.document.body), /Maximum messages in window must be 0–1023/);
+      }
       input.value = value;
       await fire(input, 'input');
     }
@@ -3772,7 +3781,7 @@ for (const [id, params, fields, expected] of [
     await fire(enabled, 'change', {target: {checked: false}});
     const dryRun = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Dry-run (log only)').control;
     await fire(dryRun, 'change', {target: {checked: false}});
-    await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+    await fire(save, 'click');
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, `/api/guilds/${h.app.state.guildId}/rules/${id}`);
     assert.equal(calls[0].body.scope, 'guild');

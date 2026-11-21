@@ -67,8 +67,15 @@ escalation accurate without false positives.
 - Default escalation: `1 → delete`, `2 → warn`, `4 → timeout 60m`.
 
 ### 7. `velocity` — message flood
-- Params: `window_secs` (10), `max_messages` (8).
+- Enabled by default. Counts eligible messages from the same author across
+  channels in a server, including ordinary messages that match no other rule.
+- Set `window_secs` to 1–600 (default 10) and `max_messages` to 0–1,023
+  (default 8). An eligible message adds a strike if the count in the window,
+  including that message, exceeds the limit. Previously saved integer limits
+  above 1,023 do not trigger until the limit is lowered to the supported range.
 - Default escalation: `1 → delete`, `2 → timeout 30m`, `4 → kick`.
+  Each threshold fires once per strike bucket. A kick and rejoin keeps the
+  bucket until it expires after 10 minutes without a velocity strike.
 
 ### 8. `account_age` — brand-new accounts
 - Params: `min_age_days` (3).

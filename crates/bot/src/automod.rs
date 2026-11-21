@@ -2,9 +2,9 @@
 //! strike buckets, 6 generic detection rules with per-rule action escalation,
 //! whitelists, and dry-run mode.
 //!
-//! All state is bounded: buckets are pruned on a timer and every event has a
-//! window, so memory stays flat regardless of user count. Lookups are O(1)
-//! per message (per-user bucket), never a scan of all tracked users.
+//! Buckets are pruned on a timer, and velocity history is bounded by time and
+//! count. Lookups are O(1) per message (per-user bucket), never a scan of all
+//! tracked users.
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -44,6 +44,11 @@ impl AuthorState {
             .velocity_events
             .back()
             .map_or(now, |last| now.max(*last));
+        // Retain enough history for the highest supported threshold so a
+        // config update can raise the threshold without losing observations.
+        if self.velocity_events.len() == crate::types::AUTOMOD_VELOCITY_MAX_MESSAGES + 1 {
+            self.velocity_events.pop_front();
+        }
         self.velocity_events.push_back(now);
         self.velocity_triggered(rule, now)
     }
@@ -55,6 +60,7 @@ impl AuthorState {
         );
         // The current message is already in the window. If the (max + 1)th
         // newest observation is recent enough, the rule is over its limit.
+        // Legacy thresholds above the supported limit have no such observation.
         usize::try_from(max)
             .ok()
             .and_then(|max| self.velocity_events.iter().nth_back(max))
@@ -224,9 +230,16 @@ impl AutomodEngine {
             bucket
                 .rules
                 .retain(|_, s| s.prune(now, keep) == RuleRetention::Retained);
-            bucket
+            while bucket
                 .velocity_events
-                .retain(|at| now.duration_since(*at) < keep);
+                .front()
+                .is_some_and(|at| now.duration_since(*at) >= keep)
+            {
+                bucket.velocity_events.pop_front();
+            }
+            if bucket.velocity_events.is_empty() {
+                bucket.velocity_events = VecDeque::new();
+            }
             !bucket.rules.is_empty() || !bucket.velocity_events.is_empty()
         });
         let joined_now = Instant::now();
@@ -1494,6 +1507,55 @@ mod tests {
                 "message {id}",
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn velocity_history_is_bounded_and_supports_threshold_changes() {
+        use std::time::Duration;
+
+        let mut cfg = default_automod_config();
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        // Seed history through a legacy rule whose threshold exceeds the supported range.
+        cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(u64::MAX);
+        for _ in 0..20 {
+            message.message_id += 1;
+            assert!(engine.evaluate(&cfg, &message).is_none());
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..1023 {
+            message.message_id += 1;
+            assert!(engine.evaluate(&cfg, &message).is_none());
+        }
+        let key = (message.guild_id, message.author_id);
+        assert_eq!(engine.state.get(&key).unwrap().velocity_events.len(), 1024);
+
+        // A legacy threshold one past the maximum must never trigger, even
+        // when the author has sent enough messages to exceed it.
+        cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(1024);
+        message.message_id += 1;
+        assert!(engine.evaluate(&cfg, &message).is_none());
+
+        // At 10s the first batch is exactly outside the window. The newest
+        // observations must survive both the cap and the configuration reload.
+        cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(1023);
+        tokio::time::advance(Duration::from_secs(9)).await;
+        message.message_id += 1;
+        let action = engine.evaluate(&cfg, &message).expect("over the limit");
+        assert_eq!(action.rule_id, "velocity");
+        assert_eq!(action.strikes, 1);
+        assert_eq!(action.action.action, "delete");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        message.message_id += 1;
+        assert!(engine.evaluate(&cfg, &message).is_none());
+
+        tokio::time::advance(Duration::from_secs(590)).await;
+        engine.prune();
+        assert_eq!(engine.state.get(&key).unwrap().velocity_events.len(), 2);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        engine.prune();
+        assert!(!engine.state.contains_key(&key));
     }
 
     #[tokio::test(start_paused = true)]

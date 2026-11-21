@@ -98,6 +98,15 @@ pub fn validate_rule(id: &str, rule: &crate::types::RuleDef) -> Result<()> {
                     crate::types::AUTOMOD_WINDOW_MAX_SECS
                 );
             }
+            if id == "velocity"
+                && let Some(value) = rule.params.get("max_messages")
+            {
+                let max = crate::types::AUTOMOD_VELOCITY_MAX_MESSAGES;
+                ensure!(
+                    value.as_u64().is_some_and(|count| count <= max as u64),
+                    "max_messages must be 0–{max} (a whole number)"
+                );
+            }
         }
         "invite" => {
             if let Some(value) = rule.params.get("allowlist_codes") {

@@ -9,6 +9,9 @@ pub const GLOBAL_SCOPE: i64 = 0;
 /// Mention/velocity history retention and maximum configurable window.
 pub const AUTOMOD_WINDOW_MAX_SECS: u64 = 600;
 
+/// Velocity retains one more observation than the highest supported threshold.
+pub const AUTOMOD_VELOCITY_MAX_MESSAGES: usize = 1_023;
+
 /// All automod rule identifiers (fixed set; per-rule behavior is configurable).
 pub const RULE_IDS: [&str; 9] = [
     "mention_spam",

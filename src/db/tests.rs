@@ -4511,31 +4511,38 @@ fn builtin_form_params_validate_through_rule_saves() {
         let scope =
             ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
                 .unwrap();
-        for id in ["mention_spam", "velocity", "invite"] {
+        let max_messages = crate::types::AUTOMOD_VELOCITY_MAX_MESSAGES;
+        for (id, key) in [
+            ("mention_spam", "window_secs"),
+            ("velocity", "window_secs"),
+            ("velocity", "max_messages"),
+            ("invite", "allowlist_codes"),
+        ] {
             let mut rule = get_rule(&db, 0, id).await.unwrap().unwrap();
             let original = serde_json::to_value(&rule).unwrap();
-            let invalid = if id == "invite" {
-                vec![
+            let invalid = match key {
+                "allowlist_codes" => vec![
                     serde_json::json!("bad"),
                     serde_json::json!(true),
                     serde_json::json!({}),
                     serde_json::json!(["ok", 42]),
                     serde_json::json!(["ok", null]),
-                ]
-            } else {
-                vec![
+                ],
+                "max_messages" => vec![
+                    serde_json::json!(max_messages + 1),
+                    serde_json::json!(u64::MAX),
+                    serde_json::json!(-1),
+                    serde_json::json!(1.5),
+                    serde_json::json!("10"),
+                ],
+                _ => vec![
                     serde_json::json!(0),
                     serde_json::json!(601),
                     serde_json::json!(u64::MAX),
                     serde_json::json!(-1),
                     serde_json::json!(1.5),
                     serde_json::json!("10"),
-                ]
-            };
-            let key = if id == "invite" {
-                "allowlist_codes"
-            } else {
-                "window_secs"
+                ],
             };
             for value in invalid {
                 rule.params[key] = value;
@@ -4543,10 +4550,10 @@ fn builtin_form_params_validate_through_rule_saves() {
                     .await
                     .unwrap_err();
                 assert!(
-                    error.to_string().contains(if id == "invite" {
-                        "array of strings"
-                    } else {
-                        "1–600 seconds"
+                    error.to_string().contains(match key {
+                        "allowlist_codes" => "array of strings",
+                        "max_messages" => "max_messages must be",
+                        _ => "1–600 seconds",
                     }),
                     "{error}"
                 );
@@ -4556,10 +4563,10 @@ fn builtin_form_params_validate_through_rule_saves() {
                     original
                 );
             }
-            let valid = if id == "invite" {
-                vec![serde_json::json!([]), serde_json::json!(["code"])]
-            } else {
-                vec![serde_json::json!(1), serde_json::json!(600)]
+            let valid = match key {
+                "allowlist_codes" => vec![serde_json::json!([]), serde_json::json!(["code"])],
+                "max_messages" => vec![serde_json::json!(0), serde_json::json!(max_messages)],
+                _ => vec![serde_json::json!(1), serde_json::json!(600)],
             };
             for value in valid {
                 rule.params[key] = value;

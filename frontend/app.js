@@ -3845,7 +3845,7 @@ const RULE_TRIGGERS = {
   },
   velocity: {
     fields: [
-      { key: "max_messages", label: "Maximum messages in window", fallback: 8, before: "More than", after: "messages in" },
+      { key: "max_messages", label: "Maximum messages in window", fallback: 8, max: 1023, before: "More than", after: "messages in" },
       { key: "window_secs", label: "Window (seconds)", fallback: 10, after: "seconds" },
     ],
     phrase: (v) => `When someone sends more than ${v.max_messages} messages within ${v.window_secs} seconds`,
@@ -4761,13 +4761,15 @@ function RuleEditor({ record: r }) {
                   );
               } else if (r.rule_id !== "badword" && !knownSpam) {
                 const params = {};
-                for (const { key, label } of fields) {
+                for (const { key, label, max } of fields) {
                   const raw = String(values[key] ?? "");
                   const value = Number(raw);
                   if (raw.trim() === "" || !Number.isSafeInteger(value) || value < 0)
                     throw new Error(`${label} must be a non-negative whole number.`);
                   if (key === "window_secs" && (value < 1 || value > 600))
                     throw new Error("Window must be 1–600 seconds.");
+                  if (max !== undefined && value > max)
+                    throw new Error(`${label} must be 0–${max}.`);
                   params[key] = value;
                 }
                 if (r.rule_id === "invite") {
