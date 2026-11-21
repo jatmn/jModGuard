@@ -41,7 +41,7 @@ fn release_status_icon(availability: &str) -> &'static str {
     match availability {
         "up to date" => "✅",
         "update available" => "⬆️",
-        "no source update (image digest unverified)" => "⚠️",
+        "source up to date (image digest unverified)" => "⚠️",
         _ => "❓",
     }
 }
@@ -58,6 +58,32 @@ fn running_short_sha(item: &crate::db::ComponentUpdate) -> Option<String> {
     is_ascii_hex_sha40(sha).then(|| sha[..7].to_string())
 }
 
+fn release_check_failure(error: &str) -> String {
+    // Persisted errors can contain provider details. Render only a known
+    // reason or a status code from the registry and reqwest error formats.
+    let status = error
+        .strip_prefix("registry returned HTTP ")
+        .or_else(|| error.strip_prefix("HTTP status client error ("))
+        .or_else(|| error.strip_prefix("HTTP status server error ("))
+        .and_then(|rest| rest.split([' ', ')']).next())
+        .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|code| code.parse::<u16>().ok())
+        .filter(|code| (100..=599).contains(code));
+    if let Some(status) = status {
+        return format!("check failed (HTTP {status})");
+    }
+    let reason = match error {
+        "release lookup timed out" | "operation timed out" => "timeout",
+        "unsupported base ABI" => "unsupported image ABI",
+        "unsigned image"
+        | "bad image signature"
+        | "expired image signature"
+        | "image signature used an untrusted key" => error,
+        _ => "release source error",
+    };
+    format!("check failed ({reason})")
+}
+
 fn release_status_reason(
     item: &crate::db::ComponentUpdate,
     component: &str,
@@ -66,8 +92,8 @@ fn release_status_reason(
     if component == "webui" && item.installed.is_none() && item.desired.is_none() {
         return Some("webui not managed by updater".into());
     }
-    if item.check_error.is_some() {
-        return Some("check failed".into());
+    if let Some(error) = item.check_error.as_deref() {
+        return Some(release_check_failure(error));
     }
     if item.candidate.is_none()
         || item
@@ -262,7 +288,11 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
             .as_ref()
             .map(|observed| observed.source_sha.as_str())
             .filter(|sha| is_ascii_hex_sha40(sha));
-        let availability = if let Some(candidate) = &item.candidate {
+        let candidate = item
+            .candidate
+            .as_ref()
+            .filter(|release| is_ascii_hex_sha40(&release.source_sha));
+        let availability = if let Some(candidate) = candidate {
             if item
                 .installed
                 .as_ref()
@@ -278,7 +308,7 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
                     .is_some_and(|observed| observed.source_sha == observed.base_image_sha)
                 && running_source == Some(candidate.source_sha.as_str())
             {
-                "no source update (image digest unverified)"
+                "source up to date (image digest unverified)"
             } else if running_source.is_some_and(|sha| sha != candidate.source_sha.as_str()) {
                 "update available"
             } else {
@@ -288,10 +318,16 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
             "not checked"
         };
         attention |= availability != "up to date";
-        let tail = if availability == "not checked" {
-            "not checked".to_string()
-        } else {
-            release_status_icon(availability).to_string()
+        let icon = release_status_icon(availability);
+        let tail = match (availability, component, candidate) {
+            ("not checked", _, _) => availability.into(),
+            (_, "bot" | "api", Some(release)) => {
+                format!(
+                    "latest `{}` · {availability} {icon}",
+                    &release.source_sha[..7]
+                )
+            }
+            _ => icon.into(),
         };
         lines.push(release_status_line(
             component,
@@ -771,8 +807,8 @@ mod presentation_tests {
         assert_eq!(
             releases,
             [
-                "**bot:** `abcdef0` · `installed 4m 10s` · ✅",
-                "**api:** `abcdef0` · `installed 4m 10s` · ✅",
+                "**bot:** `abcdef0` · `installed 4m 10s` · latest `abcdef0` · up to date ✅",
+                "**api:** `abcdef0` · `installed 4m 10s` · latest `abcdef0` · up to date ✅",
                 "**webui:** `abcdef0` · `installed 4m 10s` · ✅",
             ]
         );
@@ -937,7 +973,7 @@ mod presentation_tests {
         let fresh = release_text(&[row.clone()], 1100);
         assert!(fresh.contains("`aaaaaaa`"));
         assert!(fresh.contains("⬆️"));
-        assert!(!fresh.contains("update available"));
+        assert!(fresh.contains("latest `bbbbbbb` · update available"));
         row.channel = "nightly".into();
         let wrong_channel = release_text(&[row.clone()], 1100);
         assert!(!wrong_channel.contains("update available"));
@@ -959,10 +995,12 @@ mod presentation_tests {
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
         assert!(api_line.ends_with("⚠️"), "{api_line}");
-        assert!(!baked_current.contains("no source update"));
+        assert!(
+            api_line.contains("latest `aaaaaaa` · source up to date (image digest unverified)")
+        );
         row.channel = "nightly".into();
         let wrong_channel_current = release_text(&[row.clone()], 1100);
-        assert!(!wrong_channel_current.contains("no source update"));
+        assert!(!wrong_channel_current.contains("source up to date"));
         row.channel = "stable".into();
         // Source comparisons still use the full SHA, even when prefixes match.
         let mut same_prefix = row.clone();
@@ -1234,26 +1272,39 @@ mod presentation_tests {
     }
 
     #[test]
-    fn status_says_check_failed_when_check_error_is_set() {
+    fn status_shows_only_a_safe_reason_when_a_release_check_fails() {
         let source = "abcdef0123456789abcdef0123456789abcdef01";
-        let row = sample_api_update_row(
-            Some(sample_candidate("latest", source, &"b".repeat(64))),
-            Some(1_100),
-            Some("registry returned HTTP 429".into()),
-            Some(sample_observed(source)),
-            Some(1_000),
-            "latest",
-        );
-        let out = release_text(&[row], 1_200);
-        let api = out
-            .lines()
-            .find(|line| line.starts_with("**api:**"))
-            .unwrap();
-        assert!(api.contains("`abcdef0`"), "{api}");
-        assert!(api.contains("check failed"), "{api}");
-        assert!(!api.contains('✅'), "{api}");
-        assert!(!api.contains("⬆️"), "{api}");
-        assert!(!api.contains('❓'), "{api}");
+        for (error, reason) in [
+            ("registry returned HTTP 429 Too Many Requests", "HTTP 429"),
+            (
+                "HTTP status server error (503 Service Unavailable)",
+                "HTTP 503",
+            ),
+            ("release lookup timed out", "timeout"),
+            ("unsupported base ABI", "unsupported image ABI"),
+            (
+                "registry returned HTTP 429123 at https://private.example/192.0.2.1",
+                "release source error",
+            ),
+        ] {
+            let row = sample_api_update_row(
+                Some(sample_candidate("latest", source, &"b".repeat(64))),
+                Some(1_100),
+                Some(error.into()),
+                Some(sample_observed(source)),
+                Some(1_000),
+                "latest",
+            );
+            let out = release_text(&[row], 1_200);
+            let api = out
+                .lines()
+                .find(|line| line.starts_with("**api:**"))
+                .unwrap();
+            assert_eq!(
+                api,
+                format!("**api:** `abcdef0` · `first seen 5m` · check failed ({reason})")
+            );
+        }
     }
 
     #[test]
@@ -1386,7 +1437,7 @@ mod presentation_tests {
     }
 
     #[test]
-    fn status_shows_the_running_short_sha_after_a_fresh_check() {
+    fn status_compares_running_and_published_builds_after_a_fresh_check() {
         let source = "abcdef0123456789abcdef0123456789abcdef01";
         let candidate = sample_candidate("latest", source, &"b".repeat(64));
         let mut row = sample_api_update_row(
@@ -1404,13 +1455,13 @@ mod presentation_tests {
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
         assert!(api.contains("`abcdef0`"), "{api}");
-        assert!(api.ends_with('✅'), "{api}");
+        assert!(api.ends_with("latest `abcdef0` · up to date ✅"), "{api}");
         assert!(!api.contains("not checked"), "{api}");
         assert!(!api.contains("check stale"), "{api}");
         assert!(!api.contains("check failed"), "{api}");
         assert!(!api.contains('❓'), "{api}");
 
-        let running = "abcdef0123456789abcdef0123456789abcdef00";
+        let running = "1234567890abcdef1234567890abcdef12345678";
         let row = sample_api_update_row(
             Some(sample_candidate("latest", source, &"b".repeat(64))),
             Some(1_100),
@@ -1424,9 +1475,11 @@ mod presentation_tests {
             .lines()
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
-        assert!(api.contains("`abcdef0`"), "{api}");
-        assert!(!api.contains("`abcdef1`"), "{api}");
-        assert!(api.ends_with("⬆️"), "{api}");
+        assert!(api.starts_with("**api:** `1234567`"), "{api}");
+        assert!(
+            api.ends_with("latest `abcdef0` · update available ⬆️"),
+            "{api}"
+        );
     }
 
     #[test]

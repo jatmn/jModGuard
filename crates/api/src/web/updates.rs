@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use jmodguard::db::{self, ComponentObservation, ComponentRelease, Db};
 use jmodguard_updater::http_client_builder;
 use jmodguard_updater::oci::{Registry, sha256_hex};
-use jmodguard_updater::storage::Storage;
+use jmodguard_updater::storage::{ReleaseVerification, Storage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -80,9 +80,27 @@ async fn record_running(
 async fn record_verified(
     app: &ApiState,
     release: &ComponentRelease,
-    observation: ComponentObservation,
-    now: i64,
+    previous: Option<&ComponentObservation>,
+    root_hash: String,
+    admin_hash: String,
 ) -> anyhow::Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    let observation = ComponentObservation {
+        guild_schema: None,
+        update_protocol: 0,
+        launcher_revision: 0,
+        baked_launcher_revision: 0,
+        source_sha: release.source_sha.clone(),
+        executable_sha256: root_hash,
+        admin_sha256: Some(admin_hash),
+        base_image_sha: "Storage Zone".into(),
+        started_at: previous.map_or(now, |seen| seen.started_at),
+        min_schema: release.min_schema,
+        max_schema: release.max_schema,
+        api_capability: 1,
+        self_update_enabled: true,
+        base_abi: "static-webui-v1".into(),
+    };
     if app.db.is_read_only() {
         commit_typed(
             app,
@@ -657,7 +675,7 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
                 .any(|part| part == prefix.as_bytes())
         }) {
             let registry = Registry::ghcr()?;
-            if let jmodguard_updater::storage::ReleaseVerification::Verified {
+            if let ReleaseVerification::Verified {
                 root_hash,
                 admin_hash,
             } = storage.verify_release(&registry, release).await?
@@ -691,35 +709,19 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
     }
     if let Some(installed) = state.installed.as_ref() {
         let registry = Registry::ghcr()?;
-        if let jmodguard_updater::storage::ReleaseVerification::Verified {
+        if let ReleaseVerification::Verified {
             root_hash,
             admin_hash,
         } = storage.verify_release(&registry, installed).await?
         {
-            let now = chrono::Utc::now().timestamp();
-            record_verified(
+            return record_verified(
                 app,
                 installed,
-                ComponentObservation {
-                    guild_schema: None,
-                    update_protocol: 0,
-                    launcher_revision: 0,
-                    baked_launcher_revision: 0,
-                    source_sha: installed.source_sha.clone(),
-                    executable_sha256: root_hash,
-                    admin_sha256: Some(admin_hash),
-                    base_image_sha: "Storage Zone".into(),
-                    started_at: state.observed.as_ref().map_or(now, |seen| seen.started_at),
-                    min_schema: installed.min_schema,
-                    max_schema: installed.max_schema,
-                    api_capability: 1,
-                    self_update_enabled: true,
-                    base_abi: "static-webui-v1".into(),
-                },
-                now,
+                state.observed.as_ref(),
+                root_hash,
+                admin_hash,
             )
-            .await?;
-            return Ok(());
+            .await;
         }
     }
     if state.observed.is_some() {
@@ -825,9 +827,27 @@ async fn record_release_check(
 /// injected so tests do not call the registry.
 pub async fn record_release_checks<F>(
     app: &Arc<ApiState>,
+    discover: F,
+    lookup_timeout: Duration,
+    shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+) -> ReleaseCheckBatch
+where
+    F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
+{
+    record_release_checks_with(app, discover, lookup_timeout, shutdown, async |installed| {
+        storage()?
+            .verify_release(&Registry::ghcr()?, installed)
+            .await
+    })
+    .await
+}
+
+async fn record_release_checks_with<F>(
+    app: &Arc<ApiState>,
     mut discover: F,
     lookup_timeout: Duration,
     mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+    verify_webui: impl AsyncFn(&ComponentRelease) -> anyhow::Result<ReleaseVerification>,
 ) -> ReleaseCheckBatch
 where
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
@@ -919,6 +939,41 @@ where
                             .await
                             .inspect_err(|error| warn_record_release_check(component, error))?;
                         }
+                    }
+                }
+            }
+            if component == "webui" {
+                // Refresh the installed bytes even if the moving tag lookup
+                // failed. Keep readback under the same lease as publication.
+                let current = db::component_update(&app.db, component).await?;
+                if let Some(installed) = current.installed.as_ref() {
+                    let refresh = tokio::select! {
+                        biased;
+                        _ = &mut shutdown => anyhow::bail!("release check shutdown"),
+                        result = timeout(RELEASE_LOOKUP_TIMEOUT, verify_webui(installed)) => result,
+                    };
+                    match refresh {
+                        Ok(Ok(ReleaseVerification::Verified {
+                            root_hash,
+                            admin_hash,
+                        })) => {
+                            record_verified(
+                                app,
+                                installed,
+                                current.observed.as_ref(),
+                                root_hash,
+                                admin_hash,
+                            )
+                            .await
+                            .context("recording verified WebUI observation")?;
+                        }
+                        Ok(Ok(ReleaseVerification::Mismatch)) => {
+                            tracing::warn!("WebUI observation refresh found changed Storage files");
+                        }
+                        Ok(Err(error)) => {
+                            tracing::warn!("WebUI observation refresh failed: {error:#}")
+                        }
+                        Err(_) => tracing::warn!("WebUI observation refresh timed out"),
                     }
                 }
             }
@@ -2023,10 +2078,58 @@ mod tests {
             )
             .await
             .unwrap();
-            db::record_webui_installed_verified(&app.db, &release, observation.clone(), 103)
+            // The hourly check can verify the installed files through their
+            // pinned digest while discovery of the moving tag is unavailable.
+            let probe_lease = "ab".repeat(16);
+            let batch = record_release_checks_with(
+                &app,
+                |_, _| Box::pin(async { anyhow::bail!("registry returned HTTP 503") }),
+                RELEASE_LOOKUP_TIMEOUT,
+                Box::pin(std::future::pending()),
+                async |installed| {
+                    assert_eq!(installed, &release);
+                    let checked_at = db::component_update(&app.db, "webui")
+                        .await
+                        .unwrap()
+                        .checked_at
+                        .unwrap();
+                    assert!(
+                        !db::claim_update_lease(&app.db, "webui", &probe_lease, checked_at, 240)
+                            .await
+                            .unwrap(),
+                        "verification must hold the WebUI update lease"
+                    );
+                    Ok(ReleaseVerification::Verified {
+                        root_hash: observation.executable_sha256.clone(),
+                        admin_hash: observation.admin_sha256.clone().unwrap(),
+                    })
+                },
+            )
+            .await;
+            assert!(batch.finished);
+            let row = db::component_update(&app.db, "webui").await.unwrap();
+            assert!(
+                db::claim_update_lease(
+                    &app.db,
+                    "webui",
+                    &probe_lease,
+                    row.checked_at.unwrap(),
+                    240,
+                )
+                .await
+                .unwrap(),
+                "the hourly check must release the lease"
+            );
+            db::release_update_lease(&app.db, "webui", &probe_lease)
                 .await
                 .unwrap();
-            let row = db::component_update(&app.db, "webui").await.unwrap();
+            assert!(row.observed_at.is_some_and(|at| at > 102));
+            assert_eq!(row.installed_at, Some(102));
+            assert_eq!(row.observed.unwrap().started_at, observation.started_at);
+            assert_eq!(
+                row.check_error.as_deref(),
+                Some("registry returned HTTP 503")
+            );
             assert_eq!(row.state, "running");
             assert!(row.last_error.is_none());
             let pending = db::webui_purge_pending(&app.db).await.unwrap().unwrap();

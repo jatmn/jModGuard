@@ -1,6 +1,13 @@
 # Bunny application and WebUI updates
 
-The owner opens **Administration → Updates** at `/administration/index.html` on the existing WebUI host. The page uses the existing Discord login and the API's owner check. The page shows the observed bot, API, and WebUI source SHAs, release publication times, install ages, failures, and available candidates. `Check now` refreshes one component; the API also checks all three every hour without an open browser. Discord `!stats`, `!status`, and `/stats` use cached observations and ship with Admin permission by default.
+The owner opens **Administration → Updates** at `/administration/index.html` on the existing
+WebUI host. The page uses the existing Discord login and the API's owner check. It shows
+the observed bot, API, and WebUI source SHAs, release publication times, install ages,
+failures, and available candidates. `Check now` refreshes one component. Every hour the
+API also checks the configured channel for each component and verifies the installed
+WebUI files in Storage. Discord `!stats`, `!status`, and `/stats` use cached observations
+and ship with Admin permission by default. Bot and API status lines show the running
+and latest published source SHAs after a fresh check, or a short reason when a check fails.
 
 The page shares the workspace's Light, Dark, and System appearance preference. Each
 component has a status badge, release controls, and expandable **Version & technical
