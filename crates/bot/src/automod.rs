@@ -264,6 +264,7 @@ impl AutomodEngine {
         let has_invite = INVITE_RE.is_match(ctx.content);
 
         let mut best: Option<PendingAction> = None;
+        let mut best_dry = false;
         for rule_id in RULE_IDS {
             let Some(rule) = cfg.rules.get(rule_id) else {
                 continue;
@@ -331,7 +332,16 @@ impl AutomodEngine {
                 };
                 // This list promises the same fixed one-hour action even when
                 // another detector would also ban with a different window.
-                return Some(pending);
+                if !rule.dry_run {
+                    return Some(pending);
+                }
+                // A dry-run match is only logged, so it must not stop a live
+                // rule from acting on the same message.
+                if is_more_severe(&pending, true, &best, best_dry) {
+                    best = Some(pending);
+                    best_dry = true;
+                }
+                continue;
             }
 
             let mut bucket = self.state.entry((ctx.guild_id, ctx.author_id)).or_default();
@@ -361,8 +371,9 @@ impl AutomodEngine {
                 }),
                 matched_rule: Some(rule.clone()),
             };
-            if is_more_severe(&pending, &best) {
+            if is_more_severe(&pending, rule.dry_run, &best, best_dry) {
                 best = Some(pending);
+                best_dry = rule.dry_run;
             }
         }
 
@@ -432,8 +443,9 @@ impl AutomodEngine {
                 }),
                 matched_rule: None,
             };
-            if is_more_severe(&pending, &best) {
+            if is_more_severe(&pending, rule.dry_run, &best, best_dry) {
                 best = Some(pending);
+                best_dry = rule.dry_run;
             }
         }
         best
@@ -482,7 +494,14 @@ impl AutomodEngine {
 // action execution
 // ---------------------------------------------------------------------------
 
-fn is_more_severe(cand: &PendingAction, best: &Option<PendingAction>) -> bool {
+/// A live action outranks any dry-run one, so testing a rule in dry-run never
+/// displaces another rule's enforcement on the same message.
+fn is_more_severe(
+    cand: &PendingAction,
+    cand_dry: bool,
+    best: &Option<PendingAction>,
+    best_dry: bool,
+) -> bool {
     fn rank(a: &str) -> u8 {
         match a {
             "ban" => 6,
@@ -494,7 +513,7 @@ fn is_more_severe(cand: &PendingAction, best: &Option<PendingAction>) -> bool {
         }
     }
     best.as_ref()
-        .map(|b| rank(&cand.action.action) > rank(&b.action.action))
+        .map(|b| (!cand_dry, rank(&cand.action.action)) > (!best_dry, rank(&b.action.action)))
         .unwrap_or(true)
 }
 
@@ -1642,6 +1661,57 @@ mod tests {
             .expect("new velocity strike");
         assert_eq!(action.strikes, 1);
         assert_eq!(action.action.action, "delete");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dry_run_velocity_does_not_displace_a_live_action() {
+        let mut cfg = default_automod_config();
+        cfg.rules.get_mut("velocity").unwrap().dry_run = true;
+        cfg.regexes = vec![jmodguard::normalize::compile_user_regex("scam").unwrap()];
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        for id in 1..=9 {
+            message.message_id = id;
+            let action = engine.evaluate(&cfg, &message);
+            // A dry-run velocity match alone is still selected so it is logged.
+            assert_eq!(
+                action.map(|action| action.rule_id),
+                (id == 9).then(|| "velocity".to_owned()),
+                "message {id}",
+            );
+        }
+        // Velocity would time out (dry-run); the live badword delete must win.
+        message.message_id = 10;
+        message.content = "scam";
+        let action = engine.evaluate(&cfg, &message).expect("live badword");
+        assert_eq!(action.rule_id, "badword");
+        assert_eq!(action.action.action, "delete");
+    }
+
+    #[test]
+    fn dry_run_known_spam_does_not_displace_a_live_action() {
+        let mut cfg = default_automod_config();
+        cfg.rules.get_mut("known_spam").unwrap().dry_run = true;
+        cfg.regexes = vec![jmodguard::normalize::compile_user_regex("scam").unwrap()];
+        cfg.known_spam =
+            jmodguard::known_spam::CompiledList::new(&[jmodguard::known_spam::Entry::new(
+                "url",
+                "tinyurl.com/*",
+                None,
+            )
+            .unwrap()]);
+        let engine = AutomodEngine::new();
+        // Known spam alone in dry-run is still selected so it is logged.
+        let alone = engine
+            .evaluate(&cfg, &msg(1, "link tinyurl.com/abc", 0, false, false))
+            .expect("dry-run known spam");
+        assert_eq!(alone.rule_id, "known_spam");
+        // A live badword match on the same message wins.
+        let both = engine
+            .evaluate(&cfg, &msg(2, "scam tinyurl.com/abc", 0, false, false))
+            .expect("live badword");
+        assert_eq!(both.rule_id, "badword");
+        assert_eq!(both.action.action, "delete");
     }
 
     fn default_automod_config() -> CachedGuildConfig {

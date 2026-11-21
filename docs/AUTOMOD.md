@@ -195,6 +195,10 @@ in them never trigger.
 
 With dry-run on, generic rules evaluate normally but instead of acting post a
 `[DRY RUN] would <action>` entry to the configured automod log channel.
+When a dry-run rule and a live rule match the same message, the live rule's
+action runs and the dry-run match is not logged; a more severe dry-run action
+never replaces it. A dry-run match also never stops the member's prefix command
+in that message.
 Exact-image and repeated-text rules report their matched messages there without
 deleting or banning. Neither path creates a SQL audit row. **Recommended workflow:**
 enable the bot, set all rules to dry-run, watch for a few days, then switch them

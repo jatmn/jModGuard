@@ -68,6 +68,18 @@ pub(crate) struct RateLimitWait {
     pub global: bool,
 }
 
+/// Prefix commands stop when the member is removed or timed out. A dry-run
+/// match only logs, so the member's command still runs. This uses the same
+/// configuration snapshot that selected the action.
+fn automod_stops_prefix_commands(
+    rules: &std::collections::HashMap<String, crate::types::RuleDef>,
+    rule_id: &str,
+    action: &str,
+) -> bool {
+    matches!(action, "ban" | "kick" | "timeout")
+        && rules.get(rule_id).is_none_or(|rule| !rule.dry_run)
+}
+
 pub(crate) fn member_sync_deadline_ms(now_ms: i64, timeout: Duration) -> i64 {
     now_ms.saturating_add(timeout.as_millis().min(i64::MAX as u128) as i64)
 }
@@ -1409,7 +1421,8 @@ impl EventHandler for Handler {
                 &pending,
             )
             .await;
-            stop_commands = matches!(pending.action.action.as_str(), "ban" | "kick" | "timeout");
+            stop_commands =
+                automod_stops_prefix_commands(&cfg.rules, &pending.rule_id, &pending.action.action);
         }
 
         if !stop_commands {
@@ -2021,6 +2034,29 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dry_run_automod_matches_do_not_stop_prefix_commands() {
+        use super::automod_stops_prefix_commands;
+        let mut rules = std::collections::HashMap::new();
+        for (id, dry_run) in [("velocity", true), ("badword", false)] {
+            let mut rule = crate::defaults::default_rules()
+                .into_iter()
+                .zip(crate::types::RULE_IDS)
+                .find(|(_, rule_id)| *rule_id == id)
+                .unwrap()
+                .0;
+            rule.dry_run = dry_run;
+            rules.insert(id.to_owned(), rule);
+        }
+        for action in ["timeout", "kick", "ban"] {
+            assert!(!automod_stops_prefix_commands(&rules, "velocity", action));
+            assert!(automod_stops_prefix_commands(&rules, "badword", action));
+        }
+        for action in ["delete", "warn", "log"] {
+            assert!(!automod_stops_prefix_commands(&rules, "badword", action));
+        }
+    }
+
     #[test]
     fn only_role_set_changes_or_unknown_roles_mark_webui_access() {
         use super::{Member, RoleId, member_roles_may_have_changed};
