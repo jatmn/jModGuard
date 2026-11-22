@@ -992,31 +992,27 @@ where
                         _ = &mut shutdown => anyhow::bail!("release check shutdown"),
                         result = timeout(RELEASE_LOOKUP_TIMEOUT, verify_webui(&app.db, installed)) => result,
                     };
-                    match refresh {
+                    let observation_result = match refresh {
                         Ok(Ok(ReleaseVerification::Verified {
                             root_hash,
                             admin_hash,
-                        })) => {
-                            record_verified(
-                                app,
-                                installed,
-                                current.observed.as_ref(),
-                                root_hash,
-                                admin_hash,
-                            )
-                            .await
-                            .context("recording verified WebUI observation")?;
-                        }
+                        })) => record_verified(
+                            app,
+                            installed,
+                            current.observed.as_ref(),
+                            root_hash,
+                            admin_hash,
+                        )
+                        .await
+                        .context("recording verified WebUI observation"),
                         Ok(Ok(ReleaseVerification::Mismatch)) => {
                             // A definite mismatch invalidates the verified
                             // observation, as manual reconciliation does. A
                             // queued or failed request keeps its state and error
                             // for the manual check that adopts or settles it.
                             tracing::warn!("WebUI observation refresh found changed Storage files");
-                            // Discovery is already durable. Rejecting this
-                            // optional write must not skip an eligible install.
-                            if current.observed.is_some()
-                                && let Err(error) = via_bot!(
+                            if current.observed.is_some() {
+                                via_bot!(
                                     app,
                                     db::record_webui_drift(
                                         &app.db,
@@ -1027,14 +1023,21 @@ where
                                             .to_owned(),
                                     }
                                 )
-                            {
-                                tracing::warn!("failed to record WebUI Storage drift: {error:#}");
+                                .context("recording WebUI Storage drift")
+                            } else {
+                                Ok(())
                             }
                         }
-                        Ok(Err(error)) => {
-                            tracing::warn!("WebUI observation refresh failed: {error:#}")
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => {
+                            tracing::warn!("WebUI observation refresh timed out");
+                            Ok(())
                         }
-                        Err(_) => tracing::warn!("WebUI observation refresh timed out"),
+                    };
+                    // Discovery is already durable. Observation failures
+                    // cannot disqualify an otherwise eligible install.
+                    if let Err(error) = observation_result {
+                        tracing::warn!("WebUI observation refresh failed: {error:#}");
                     }
                 }
             }
@@ -2085,8 +2088,8 @@ mod tests {
     #[tokio::test]
     async fn legacy_writer_rejection_keeps_webui_eligible_for_scheduled_install() {
         use jmodguard::control::{NonceWindow, open_frame};
+        use jmodguard::db::SqlExecutor;
         use std::sync::Mutex;
-        use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (writer, path) = purge_test_app();
@@ -2140,6 +2143,24 @@ mod tests {
         )
         .await
         .unwrap();
+        // A legacy row is readable but no longer serializes to its stored JSON.
+        let mut legacy = serde_json::to_value(&installed).unwrap();
+        legacy.as_object_mut().unwrap().remove("upgrade");
+        let legacy = legacy.to_string();
+        let raw_installed = legacy.clone();
+        writer
+            .db
+            .with_conn(move |conn| {
+                conn.execute_bounded(
+                    "UPDATE component_updates SET installed=?1 WHERE component='webui'",
+                    [raw_installed],
+                    64 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut cfg = (*writer.cfg).clone();
         cfg.db.path = path.clone();
@@ -2149,10 +2170,9 @@ mod tests {
         let reader = Db::open_with(cfg.db_open_options()).unwrap();
         assert!(reader.is_read_only());
         let reader = ApiState::new(cfg, reader).unwrap();
-        let rejected = Arc::new(AtomicBool::new(false));
+        let (rejected, mut rejected_ops) = tokio::sync::mpsc::unbounded_channel();
         let peer = tokio::spawn({
             let writer = Arc::clone(&writer);
-            let rejected = Arc::clone(&rejected);
             async move {
                 let nonces = Mutex::new(NonceWindow::new());
                 loop {
@@ -2162,15 +2182,26 @@ mod tests {
                     stream.read_exact(&mut request).await.unwrap();
                     let (op, actor, _, _) = open_frame(key.as_bytes(), &request, &nonces).unwrap();
                     assert_eq!(actor, 0);
-                    let reply = if matches!(op, db::ControlOp::RecordHourlyWebuiDrift { .. }) {
-                        rejected.store(true, Ordering::SeqCst);
+                    let reply = match op {
                         // The older writer cannot decode this operation.
-                        db::ControlReply::Failed {
-                            message: "write failed".into(),
-                            code: None,
+                        db::ControlOp::RecordHourlyWebuiDrift { .. } => {
+                            rejected.send("mismatch").unwrap();
+                            db::ControlReply::Failed {
+                                message: "write failed".into(),
+                                code: None,
+                            }
                         }
-                    } else {
-                        db::apply_control(&writer.db, None, op, None).await.unwrap()
+                        db::ControlOp::RecordWebuiInstalledVerified { release, .. } => {
+                            // The older writer uses serialized JSON equality.
+                            assert_ne!(serde_json::to_string(&release).unwrap(), legacy);
+                            rejected.send("verified").unwrap();
+                            db::ControlReply::Failed {
+                                message: "installed WebUI release changed during verification"
+                                    .into(),
+                                code: None,
+                            }
+                        }
+                        op => db::apply_control(&writer.db, None, op, None).await.unwrap(),
                     };
                     let body = serde_json::to_vec(&reply).unwrap();
                     stream.write_u32(body.len() as u32).await.unwrap();
@@ -2184,17 +2215,24 @@ mod tests {
             digest: format!("sha256:{}", "d".repeat(64)),
             ..installed.clone()
         };
-        let batch = hourly(&reader, Some(candidate.clone()), None).await;
-        assert!(rejected.load(Ordering::SeqCst));
-        assert!(batch.finished);
-        assert!(!batch.lease_held.contains("webui"));
-        let checked = db::component_update(&reader.db, "webui").await.unwrap();
-        assert_eq!(checked.candidate.as_ref(), Some(&candidate));
-        assert!(checked.check_error.is_none());
-        assert_eq!(checked.observed_at, Some(now));
-        assert_eq!(checked.state, "running");
+        for (expected_op, hashes) in [
+            ("mismatch", None),
+            ("verified", Some(("new root".into(), "new admin".into()))),
+        ] {
+            let batch = hourly(&reader, Some(candidate.clone()), hashes).await;
+            assert_eq!(rejected_ops.try_recv().unwrap(), expected_op);
+            assert!(batch.finished);
+            assert!(!batch.lease_held.contains("webui"), "{expected_op}");
+            let checked = db::component_update(&reader.db, "webui").await.unwrap();
+            assert_eq!(checked.candidate.as_ref(), Some(&candidate));
+            assert_eq!(checked.installed.as_ref(), Some(&installed));
+            assert!(checked.check_error.is_none());
+            assert_eq!(checked.observed_at, Some(now));
+            assert_eq!(checked.state, "running");
+        }
 
         // Exercise scheduled admission without publishing to Storage.
+        let checked = db::component_update(&reader.db, "webui").await.unwrap();
         let now = checked.checked_at.unwrap();
         record_running(&writer, "api", None, observation, now)
             .await
