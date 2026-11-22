@@ -395,7 +395,7 @@ async fn capturing_proxy_for_commands(
     Arc<std::sync::Mutex<Vec<String>>>,
     tokio::task::JoinHandle<()>,
 ) {
-    capturing_proxy_with(success, false).await
+    capturing_proxy_with(success, false, None).await
 }
 
 /// `reject_embeds` answers any request carrying an embed with Discord's
@@ -403,6 +403,7 @@ async fn capturing_proxy_for_commands(
 async fn capturing_proxy_with(
     success: bool,
     reject_embeds: bool,
+    deleted: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> (
     serenity::http::Http,
     Arc<std::sync::Mutex<Vec<String>>>,
@@ -472,11 +473,12 @@ async fn capturing_proxy_with(
                 channel.id = ChannelId::new(1);
                 channel.guild_id = GuildId::new(10);
                 ("200 OK", serde_json::to_string(&channel).unwrap())
-            } else if route.starts_with("POST ") && route.contains("/messages") {
-                (
-                    "200 OK",
-                    serde_json::to_string(&serenity::model::channel::Message::default()).unwrap(),
-                )
+            } else if (route.starts_with("POST ") && route.contains("/messages"))
+                || (route.starts_with("PATCH ") && route.contains("/webhooks/"))
+            {
+                let mut message = serenity::model::channel::Message::default();
+                message.id = serenity::model::id::MessageId::new(77);
+                ("200 OK", serde_json::to_string(&message).unwrap())
             } else if route.starts_with("GET ") && route.contains("/messages") {
                 ("200 OK", "[]".into())
             } else {
@@ -487,6 +489,11 @@ async fn capturing_proxy_with(
             }
             if route.starts_with("DELETE ") && route.contains("/bans/") {
                 banned = false;
+            }
+            if route.starts_with("DELETE ")
+                && let Some(deleted) = &deleted
+            {
+                let _ = deleted.send(route.to_owned());
             }
             slot.lock().unwrap().push(request);
             let response = format!(
@@ -2660,6 +2667,7 @@ struct StatsDispatch {
     cache: Arc<Cache>,
     http: Arc<serenity::http::Http>,
     captured: Arc<std::sync::Mutex<Vec<String>>>,
+    deleted: tokio::sync::mpsc::UnboundedReceiver<String>,
     server: tokio::task::JoinHandle<()>,
     ctx: serenity::client::Context,
     cfg: Arc<crate::state::CachedGuildConfig>,
@@ -2690,7 +2698,9 @@ impl StatsDispatch {
             commands.insert(custom.name.clone(), custom);
         }
         let cache = Arc::new(Cache::new());
-        let (http, captured, server) = capturing_proxy_with(true, reject_embeds).await;
+        let (deletions, deleted) = tokio::sync::mpsc::unbounded_channel();
+        let (http, captured, server) =
+            capturing_proxy_with(true, reject_embeds, Some(deletions)).await;
         let http = Arc::new(http);
         let ctx = test_context(Arc::clone(&cache), Arc::clone(&http)).await;
         let cfg = Arc::new(crate::state::CachedGuildConfig {
@@ -2717,6 +2727,7 @@ impl StatsDispatch {
             cache,
             http,
             captured,
+            deleted,
             server,
             ctx,
             cfg,
@@ -2794,6 +2805,10 @@ impl StatsDispatch {
     }
 
     async fn slash(&self, name: &str) {
+        self.slash_with_options(name, serde_json::json!([])).await;
+    }
+
+    async fn slash_with_options(&self, name: &str, options: serde_json::Value) {
         let mut member = Member::default();
         member.user = Self::author();
         member.guild_id = GuildId::new(Self::GUILD);
@@ -2814,7 +2829,7 @@ impl StatsDispatch {
                 "attachment_size_limit": 10000000,
                 "user": Self::author(),
                 "member": member,
-                "data": {"id": "3", "name": name, "type": 1, "options": []}
+                "data": {"id": "3", "name": name, "type": 1, "options": options}
             }))
             .unwrap();
         crate::commands::handle_interaction(&self.app, &self.ctx, interaction).await;
@@ -2850,6 +2865,391 @@ impl StatsDispatch {
         crate::tenant::remove_sidecars(&self.path);
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+#[tokio::test]
+async fn malformed_moderation_commands_send_usage_in_the_invocation_channel() {
+    use serenity::model::permissions::Permissions;
+
+    for (input, problem, usage, example, help) in [
+        (
+            "!ban",
+            "I need a user",
+            "`!ban <user> [--dm] [--minutes N] [reason]`",
+            "`!ban 42 --minutes 60 repeated spam`",
+            "`!help ban`",
+        ),
+        (
+            "`b 42 --minutes later",
+            "Ban duration must be a positive whole number of minutes.",
+            "`` `b <user> [--dm] [--minutes N] [reason] ``",
+            "`` `b 42 --minutes 60 repeated spam ``",
+            "`` `help ban ``",
+        ),
+        (
+            "!purge later",
+            "`count`",
+            "`!purge [count]`",
+            "`!purge 10`",
+            "`!help purge`",
+        ),
+        (
+            "!mute 42 later",
+            "`minutes`",
+            "`!mute <user> [minutes [reason]]`",
+            "`!mute 42 60 repeated spam`",
+            "`!help timeout`",
+        ),
+        (
+            "!logchannel set mod_action",
+            "Missing argument `channel`.",
+            "`!logchannel set <event> <#channel>`",
+            "`!logchannel set mod_action <#42>`",
+            "`!help logchannel`",
+        ),
+    ] {
+        let mut fx = StatsDispatch::new(false, Vec::new()).await;
+        Arc::get_mut(&mut fx.cfg).unwrap().settings.prefix = input[..1].to_owned();
+        fx.install(Permissions::MANAGE_GUILD);
+        fx.prefix(input).await;
+        assert_eq!(fx.captured.lock().unwrap().len(), 1, "{input}");
+        let replies = fx.replies();
+        fx.finish();
+
+        let [(route, payload)] = replies.as_slice() else {
+            panic!("{input} should send one usage reply: {replies:?}");
+        };
+        assert!(route.contains("/channels/2/messages"), "{route}");
+        let content = payload["content"].as_str().unwrap();
+        assert!(content.contains(problem), "{input}: {content}");
+        assert!(content.contains(&format!("Usage: {usage}")), "{content}");
+        assert!(
+            content.contains(&format!("Example: {example}")),
+            "{content}"
+        );
+        assert!(content.contains(help), "{content}");
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+}
+
+#[tokio::test]
+async fn public_usage_replies_expire_in_prefix_and_deferred_slash_dispatch() {
+    use serenity::model::permissions::Permissions;
+
+    for slash in [false, true] {
+        let mut fx = StatsDispatch::new(false, Vec::new()).await;
+        fx.install(Permissions::BAN_MEMBERS);
+        if slash {
+            fx.slash("ban").await;
+        } else {
+            fx.prefix("!ban").await;
+        }
+        let reply = fx.sent("missing ban user");
+        let help = if slash {
+            "`/help command:ban`"
+        } else {
+            "`!help ban`"
+        };
+        assert!(reply["content"].as_str().unwrap().contains(help));
+        assert!(
+            fx.deleted.try_recv().is_err(),
+            "the reply was removed immediately"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(crate::commands::USAGE_REPLY_LIFETIME).await;
+        tokio::time::resume();
+        let route = tokio::time::timeout(std::time::Duration::from_secs(2), fx.deleted.recv())
+            .await
+            .expect("temporary reply did not expire")
+            .unwrap();
+        let path = if slash {
+            "/webhooks/1/token/messages/@original"
+        } else {
+            "/channels/2/messages/77"
+        };
+        assert!(route.contains(path), "{route}");
+        fx.finish();
+    }
+}
+
+#[tokio::test]
+async fn usage_review_rejects_zero_purge_without_fetching_messages() {
+    use serenity::model::permissions::Permissions;
+
+    for slash in [false, true] {
+        let fx = StatsDispatch::new(false, Vec::new()).await;
+        fx.install(Permissions::MANAGE_MESSAGES);
+        if slash {
+            fx.slash_with_options(
+                "purge",
+                serde_json::json!([{"name": "count", "type": 4, "value": 0}]),
+            )
+            .await;
+        } else {
+            fx.prefix("!purge 0").await;
+        }
+
+        let valid_requests_only = fx.captured.lock().unwrap().iter().all(|raw| {
+            let route = raw.lines().next().unwrap_or_default();
+            !route.starts_with("GET ") && !route.starts_with("DELETE ")
+        });
+        assert!(
+            valid_requests_only,
+            "zero count reached Discord message retrieval"
+        );
+        let reply = fx.sent("zero purge count");
+        fx.finish();
+        let content = reply["content"].as_str().unwrap();
+        assert!(content.contains("Invalid argument `count`."), "{content}");
+    }
+}
+
+#[tokio::test]
+async fn usage_review_slash_errors_and_help_show_registered_options() {
+    use serenity::model::permissions::Permissions;
+
+    let fx = StatsDispatch::new(false, Vec::new()).await;
+    fx.install(Permissions::MANAGE_GUILD);
+    fx.slash_with_options(
+        "testregex",
+        serde_json::json!([
+            {"name": "pattern", "type": 3, "value": "["},
+            {"name": "sample", "type": 3, "value": "example spam"}
+        ]),
+    )
+    .await;
+    let error = fx.sent("invalid regex");
+    fx.slash_with_options(
+        "help",
+        serde_json::json!([{"name": "command", "type": 3, "value": "testregex"}]),
+    )
+    .await;
+    let help = fx.sent("slash help");
+    fx.finish();
+
+    let content = error["content"].as_str().unwrap();
+    assert!(content.contains("Invalid argument `pattern`."), "{content}");
+    assert!(
+        content.contains("Example: `/testregex pattern:spam sample:example spam`"),
+        "{content}"
+    );
+    assert!(content.contains("`/help command:testregex`"), "{content}");
+    for payload in [&error, &help] {
+        let text = payload["content"].as_str().unwrap();
+        assert!(
+            text.contains("Usage: `/testregex pattern:<pattern> sample:<sample>`"),
+            "{text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn usage_review_prefix_timeout_requires_minutes_before_reason() {
+    use serenity::model::permissions::Permissions;
+
+    let fx = StatsDispatch::new(false, Vec::new()).await;
+    fx.install(Permissions::MODERATE_MEMBERS);
+    fx.prefix("!mute 42 repeated spam").await;
+    let reply = fx.sent("timeout reason without minutes");
+    fx.finish();
+    let content = reply["content"].as_str().unwrap();
+    assert!(content.contains("Invalid argument `minutes`."), "{content}");
+    assert!(
+        content.contains("Usage: `!mute <user> [minutes [reason]]`"),
+        "{content}"
+    );
+}
+
+#[tokio::test]
+async fn usage_review_prefix_help_agrees_with_shipped_error_syntax() {
+    use serenity::model::permissions::Permissions;
+
+    let fx = StatsDispatch::new(false, Vec::new()).await;
+    fx.install(Permissions::MANAGE_GUILD);
+    fx.prefix("!warn").await;
+    let error = fx.sent("missing warn user");
+    fx.prefix("!help warn").await;
+    let help = fx.sent("prefix help");
+    fx.finish();
+
+    for payload in [&error, &help] {
+        let text = payload["content"].as_str().unwrap();
+        assert!(text.contains("Usage: `!warn <user> [reason]`"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn usage_followup_slash_errors_keep_the_failed_action() {
+    use serenity::model::permissions::Permissions;
+
+    let fx = StatsDispatch::new(false, Vec::new()).await;
+    fx.install(Permissions::MANAGE_GUILD);
+    for (command, options, problem, usage, example) in [
+        (
+            "template",
+            serde_json::json!([
+                {"name": "action", "type": 3, "value": "set"},
+                {"name": "event", "type": 3, "value": "mod_action"}
+            ]),
+            "Missing argument `text`.",
+            "/template action:set event:<event> text:<text>",
+            "/template action:set event:mod_action text:Please read the rules",
+        ),
+        (
+            "logchannel",
+            serde_json::json!([
+                {"name": "action", "type": 3, "value": "set"},
+                {"name": "event", "type": 3, "value": "mod_action"}
+            ]),
+            "Missing argument `channel`.",
+            "/logchannel action:set event:<event> channel:<channel>",
+            "/logchannel action:set event:mod_action channel:<#42>",
+        ),
+        (
+            "rule",
+            serde_json::json!([
+                {"name": "name", "type": 3, "value": "mention_spam"},
+                {"name": "action", "type": 3, "value": "dryrun"},
+                {"name": "value", "type": 3, "value": "maybe"}
+            ]),
+            "Invalid argument `value`.",
+            "/rule name:<name> action:dryrun [value:<value>]",
+            "/rule name:mention_spam action:dryrun value:on",
+        ),
+    ] {
+        fx.slash_with_options(command, options).await;
+        let reply = fx.sent(command);
+        let text = reply["content"].as_str().unwrap();
+        assert!(text.contains(problem), "{text}");
+        assert!(text.contains(&format!("Usage: `{usage}`")), "{text}");
+        assert!(text.contains(&format!("Example: `{example}`")), "{text}");
+    }
+    fx.finish();
+}
+
+#[tokio::test]
+async fn usage_followup_custom_slash_help_matches_required_plan_target() {
+    use serenity::model::permissions::Permissions;
+
+    for saved_usage in ["!cleanup <member-name>", ""] {
+        let mut cleanup = jmodguard::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "kick")
+            .unwrap();
+        cleanup.name = "cleanup".into();
+        cleanup.aliases.clear();
+        cleanup.usage = saved_usage.into();
+        cleanup.behavior = crate::types::Behavior::Plan {
+            steps: vec![crate::types::PlanStep::Kick],
+        };
+        let fx = StatsDispatch::new(false, vec![cleanup]).await;
+        fx.install(Permissions::MANAGE_GUILD);
+        fx.slash("cleanup").await;
+        let error = fx.sent("custom slash usage error");
+        fx.slash_with_options(
+            "help",
+            serde_json::json!([{"name": "command", "type": 3, "value": "cleanup"}]),
+        )
+        .await;
+        let slash_help = fx.sent("custom slash help");
+        fx.prefix("!help cleanup").await;
+        let prefix_help = fx.sent("custom prefix help");
+        fx.finish();
+
+        let help = slash_help["content"].as_str().unwrap();
+        assert!(help.contains("Usage: `/cleanup user:<user>`"), "{help}");
+        let content = error["content"].as_str().unwrap();
+        assert!(content.contains("Missing argument `user`."), "{content}");
+        assert!(
+            content.contains("Usage: `/cleanup user:<user>`"),
+            "{content}"
+        );
+        assert!(content.contains("`/help command:cleanup`"), "{content}");
+        let help = prefix_help["content"].as_str().unwrap();
+        assert!(help.contains(&format!("Usage: `{saved_usage}`")), "{help}");
+    }
+}
+
+#[tokio::test]
+async fn usage_followup_self_service_plans_only_advertise_usable_targets() {
+    use serenity::model::permissions::Permissions;
+
+    let mut self_service = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "kick")
+        .unwrap();
+    self_service.name = "join-role".into();
+    self_service.aliases.clear();
+    self_service.permission = "everyone".into();
+    self_service.response.clear();
+    self_service.log_event.clear();
+    self_service.behavior = crate::types::Behavior::Plan {
+        steps: vec![crate::types::PlanStep::AddRole { role_id: 51 }],
+    };
+    let mut targeted = self_service.clone();
+    targeted.name = "grant-role".into();
+    targeted.permission = "mod".into();
+    let fx = StatsDispatch::new(false, vec![self_service, targeted]).await;
+    fx.install(Permissions::MANAGE_GUILD);
+
+    let mut help = Vec::new();
+    for name in ["join-role", "grant-role"] {
+        fx.slash_with_options(
+            "help",
+            serde_json::json!([{"name": "command", "type": 3, "value": name}]),
+        )
+        .await;
+        help.push(fx.sent(name));
+    }
+    fx.slash_with_options(
+        "join-role",
+        serde_json::json!([{"name": "user", "type": 6, "value": "42"}]),
+    )
+    .await;
+    assert!(
+        !fx.captured
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|raw| raw.starts_with("PUT ")),
+        "an explicit target reached role assignment"
+    );
+    let denied = fx.sent("explicit target on self-service command");
+    assert!(
+        denied["content"]
+            .as_str()
+            .unwrap()
+            .contains("targeted action plans require the command permission to be mod or higher")
+    );
+
+    fx.slash("join-role").await;
+    let writes: Vec<_> = fx
+        .captured
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|raw| {
+            raw.lines()
+                .next()
+                .filter(|route| route.starts_with("PUT "))
+                .map(str::to_owned)
+        })
+        .collect();
+    fx.finish();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert!(
+        writes[0].contains("/guilds/10/members/7/roles/51"),
+        "{writes:?}"
+    );
+
+    let self_help = help[0]["content"].as_str().unwrap();
+    assert!(self_help.contains("Usage: `/join-role`"), "{self_help}");
+    let mod_help = help[1]["content"].as_str().unwrap();
+    assert!(
+        mod_help.contains("Usage: `/grant-role [user:<user>]`"),
+        "{mod_help}"
+    );
 }
 
 /// `!status` (prefix alias) and `/stats` share one dispatch: the permission

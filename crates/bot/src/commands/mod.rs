@@ -5,6 +5,7 @@
 pub mod behaviors;
 pub mod mod_reason_dm;
 pub mod plans;
+mod usage;
 pub mod userinfo;
 pub mod voice_lookup;
 
@@ -17,6 +18,7 @@ use serenity::client::Context;
 use serenity::model::application::{CommandDataOptionValue, CommandOptionType, Interaction};
 use serenity::model::prelude::{ChannelId, GuildId, Permissions, Role, RoleId, UserId};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -55,6 +57,25 @@ impl Args {
             self.pos += 1;
         }
         v
+    }
+
+    fn required(&mut self, name: &'static str) -> Result<String, usage::ArgumentError> {
+        self.next_arg()
+            .filter(|arg| !arg.trim().is_empty())
+            .ok_or_else(|| usage::ArgumentError::missing(name))
+    }
+
+    fn number<T: std::str::FromStr>(
+        &mut self,
+        name: &'static str,
+        expected: &'static str,
+    ) -> Result<Option<T>, usage::ArgumentError> {
+        self.next_arg()
+            .map(|arg| {
+                arg.parse()
+                    .map_err(|_| usage::ArgumentError::invalid(name, expected))
+            })
+            .transpose()
     }
 
     pub fn peek(&self) -> Option<&str> {
@@ -795,16 +816,32 @@ pub async fn handle_prefix(
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("command `{}` failed: {e:#}", cmd.name);
-            send_prefix_command_error(
+            let argument = e.downcast_ref::<usage::ArgumentError>();
+            let reply = match argument {
+                Some(error) => usage::reply(error, &cfg, &cmd, usage::Invocation::Prefix(name)),
+                None => format!("error: {e:#}"),
+            };
+            let message = text_message(
+                reply,
+                argument.is_some() || suppress_untrusted_mentions(&cmd.behavior),
+            );
+            if raced_channel_message(
                 app,
                 msg.channel_id,
                 http,
                 guild_id.get(),
-                &cmd.name,
-                &e,
-                suppress_untrusted_mentions(&cmd.behavior),
+                message,
+                None,
+                argument.is_some().then_some(&ctx.http),
             )
-            .await;
+            .await
+                == RacedWrite::Cutoff
+            {
+                tracing::warn!(
+                    "command `{}` error reply suppressed after writer cutoff: {e:#}",
+                    cmd.name
+                );
+            }
             return Ok(true);
         }
     };
@@ -1257,36 +1294,35 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
             }
         }
         Err(e) => {
-            let text = format!("error: {e:#}");
-            respond(
+            let argument = e.downcast_ref::<usage::ArgumentError>();
+            let text = match argument {
+                Some(error) => {
+                    usage::reply(error, &cfg, &cmd, usage::Invocation::Slash(&slash.name))
+                }
+                None => format!("error: {e:#}"),
+            };
+            let delivery = respond(
                 &app.activation,
                 &slash,
                 ctx,
                 deferred,
                 &text,
-                suppress_untrusted_mentions(&cmd.behavior),
+                argument.is_some() || suppress_untrusted_mentions(&cmd.behavior),
             )
             .await;
+            // A public defer cannot become ephemeral. Give the caller time to
+            // read the error, then remove that original interaction response.
+            if argument.is_some()
+                && deferred == SlashResponseState::DeferredPublic
+                && delivery == RacedWrite::Finished
+            {
+                let http = Arc::clone(&ctx.http);
+                schedule_usage_cleanup(&app.activation, async move {
+                    http.delete_original_interaction_response(&slash.token)
+                        .await
+                });
+            }
         }
-    }
-}
-
-async fn send_prefix_command_error(
-    app: &Arc<BotState>,
-    channel_id: serenity::model::id::ChannelId,
-    http: &serenity::http::Http,
-    guild_id: u64,
-    command_name: &str,
-    error: &anyhow::Error,
-    suppress_mentions: bool,
-) {
-    let reply = format!("error: {error:#}");
-    if raced_channel_text(app, channel_id, http, guild_id, reply, suppress_mentions).await
-        == RacedWrite::Cutoff
-    {
-        tracing::warn!(
-            "command `{command_name}` error reply suppressed after writer cutoff: {error:#}"
-        );
     }
 }
 
@@ -1324,7 +1360,15 @@ pub(crate) fn options_to_args_with_dm(
             .unwrap_or_default();
         if !s.is_empty() {
             if matches!(cmd.behavior, Behavior::Ban { .. }) && spec.name == "minutes" {
-                out.push("--minutes".into());
+                out.push(usage::BAN_MINUTES_FLAG.into());
+            }
+            // The positional timeout parser needs the minutes slot before
+            // a slash reason, even when the moderator omits that option.
+            if let Behavior::Timeout { default_minutes } = &cmd.behavior
+                && spec.name == "reason"
+                && out.len() == 1
+            {
+                out.push(default_minutes.to_string());
             }
             out.push(s);
         }
@@ -1355,7 +1399,7 @@ async fn respond(
     deferred: SlashResponseState,
     text: &str,
     suppress_mentions: bool,
-) {
+) -> RacedWrite {
     let delivered = if deferred == SlashResponseState::DeferredPublic {
         raced_slash_edit(
             activation,
@@ -1383,6 +1427,28 @@ async fn respond(
             name = slash.name
         );
     }
+    delivered
+}
+
+const USAGE_REPLY_LIFETIME: Duration = Duration::from_secs(30);
+
+fn schedule_usage_cleanup(
+    activation: &Arc<crate::activation::Activation>,
+    delete: impl Future<Output = serenity::Result<()>> + Send + 'static,
+) {
+    let activation = Arc::clone(activation);
+    let expires = tokio::time::Instant::now() + USAGE_REPLY_LIFETIME;
+    tokio::spawn(async move {
+        tokio::select! {
+            () = tokio::time::sleep_until(expires) => {}
+            () = activation.until_cutoff() => return,
+        }
+        if let crate::discord::DiscordCall::Finished(Err(error)) =
+            crate::discord::race_discord_call(&activation, delete).await
+        {
+            tracing::debug!(%error, "could not delete temporary command usage reply");
+        }
+    });
 }
 
 /// Outcome of a cutoff-raced Discord write attempt.
@@ -1440,6 +1506,7 @@ async fn raced_channel_text(
         guild_id,
         text_message(text, suppress_mentions),
         None,
+        None,
     )
     .await
 }
@@ -1460,6 +1527,7 @@ async fn raced_channel_message(
     guild_id: u64,
     message: CreateMessage,
     fallback: Option<CreateMessage>,
+    cleanup_http: Option<&Arc<serenity::http::Http>>,
 ) -> RacedWrite {
     let target = crate::discord::DiscordRestTarget::GuildChannel {
         guild: guild_id,
@@ -1495,8 +1563,15 @@ async fn raced_channel_message(
         _ => call,
     };
     match call {
-        crate::discord::DiscordCall::Finished(Ok(_)) => {
+        crate::discord::DiscordCall::Finished(Ok(posted)) => {
             app.remembered_discord_targets.forget(target);
+            if let Some(http) = cleanup_http {
+                let http = Arc::clone(http);
+                let message_id = posted.id;
+                schedule_usage_cleanup(&app.activation, async move {
+                    channel_id.delete_message(&http, message_id).await
+                });
+            }
             RacedWrite::Finished
         }
         crate::discord::DiscordCall::Finished(Err(error)) => {
@@ -1965,7 +2040,16 @@ async fn send_outcome(
                 None => message,
             };
             let fallback = text.map(|text| text_message(text, suppress_mentions));
-            raced_channel_message(app, channel_id, http, guild_id.get(), message, fallback).await
+            raced_channel_message(
+                app,
+                channel_id,
+                http,
+                guild_id.get(),
+                message,
+                fallback,
+                None,
+            )
+            .await
         }
         (None, Some(text)) => {
             raced_channel_text(

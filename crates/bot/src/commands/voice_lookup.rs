@@ -805,7 +805,11 @@ mod tests {
             panic!("a cached guild with no matching member is not a cold cache");
         };
         assert!(
-            error.to_string().contains("could not resolve user `alice`"),
+            error.is::<crate::commands::usage::ArgumentError>(),
+            "{error:#}"
+        );
+        assert!(
+            error.to_string().contains("Invalid argument `user`"),
             "{error:#}"
         );
 

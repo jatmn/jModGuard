@@ -7,6 +7,7 @@
 use anyhow::{Result, anyhow};
 use serenity::model::id::{RoleId, UserId};
 
+use super::usage::ArgumentError;
 use super::{BehaviorOutcome, CmdEnv, PermLevel, refuse_fenced_discord_mutation};
 use crate::types::PlanStep;
 use crate::{db, logging};
@@ -69,14 +70,12 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
         None
     };
     if plan_requires_target(steps) && target.is_none() {
-        return Err(anyhow!(
-            "this action plan requires a target user for timeout, kick, or ban steps"
-        ));
+        return Err(ArgumentError::missing("user").into());
     }
     // Public plans are self-service by design. Supplying a target turns a
     // state-changing plan into a moderation operation, so never let an
     // `everyone` command grant roles, DM, or moderate another member.
-    if target.is_some() && PermLevel::parse(&env.cmd.permission) < PermLevel::Mod {
+    if target.is_some() && !plan_permission_allows_target(&env.cmd.permission) {
         return Err(anyhow!(
             "targeted action plans require the command permission to be mod or higher"
         ));
@@ -184,13 +183,17 @@ async fn record_moderation_plan(
     Ok(())
 }
 
-fn plan_requires_target(steps: &[PlanStep]) -> bool {
+pub(super) fn plan_requires_target(steps: &[PlanStep]) -> bool {
     steps.iter().any(|step| {
         matches!(
             step,
             PlanStep::Timeout { .. } | PlanStep::Kick | PlanStep::Ban { .. }
         )
     })
+}
+
+pub(super) fn plan_permission_allows_target(permission: &str) -> bool {
+    PermLevel::parse(permission) >= PermLevel::Mod
 }
 
 pub(crate) fn plan_accepts_target(steps: &[PlanStep]) -> bool {
@@ -217,7 +220,7 @@ async fn resolve_target(env: &CmdEnv<'_>) -> Result<Option<UserId>> {
     super::resolve_user(env.ctx, env.guild_id, &token)
         .await
         .map(Some)
-        .ok_or_else(|| anyhow!("could not resolve user `{token}`"))
+        .ok_or_else(|| ArgumentError::unresolved_user().into())
 }
 
 async fn target_member(env: &CmdEnv<'_>, target: UserId) -> Result<serenity::model::guild::Member> {

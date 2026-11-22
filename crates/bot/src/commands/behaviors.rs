@@ -6,6 +6,7 @@ use serenity::builder::EditChannel;
 use serenity::model::application::CommandOptionType;
 use serenity::model::prelude::{ChannelId, Timestamp};
 
+use super::usage::{ArgumentError, BAN_MINUTES_FLAG, DRYRUN, GET, LIST, RESET, SET, TOGGLE, UNSET};
 use super::{Args, BehaviorOutcome, CmdEnv, mod_reason_dm, refuse_fenced_discord_mutation};
 
 #[derive(Clone, Copy)]
@@ -647,13 +648,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         }
         Behavior::Timeout { default_minutes } => {
             let mut args = env.args.clone();
-            let target =
-                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
-                    .await?;
-            let minutes: u64 = args
-                .next_arg()
-                .and_then(|m| m.parse().ok())
-                .unwrap_or(*default_minutes as u64);
+            let target = args.required("user")?;
+            const TIMEOUT_RANGE: &str = "Enter a whole number from 0 to 40320 minutes.";
+            let minutes = args
+                .number::<u64>("minutes", TIMEOUT_RANGE)?
+                .unwrap_or(u64::from(*default_minutes));
+            if minutes > 40320 {
+                return Err(ArgumentError::invalid("minutes", TIMEOUT_RANGE).into());
+            }
+            let target = resolve_target(env, target).await?;
             let reason = if args.is_empty() {
                 "timed out".to_string()
             } else {
@@ -673,7 +676,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     Timestamp::from_unix_timestamp(
                         chrono::Utc::now().timestamp() + (minutes as i64) * 60,
                     )
-                    .map_err(|e| anyhow!("invalid timeout: {e}"))?,
+                    .map_err(|_| ArgumentError::invalid("minutes", TIMEOUT_RANGE))?,
                 )
             };
             refuse_fenced_discord_mutation(env).await?;
@@ -759,9 +762,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         }
         Behavior::Warn { default_reason } => {
             let mut args = env.args.clone();
-            let target =
-                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
-                    .await?;
+            let target = resolve_target(env, args.required("user")?).await?;
             let reason = if args.is_empty() {
                 default_reason.clone()
             } else {
@@ -826,9 +827,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         }
         Behavior::Warns => {
             let mut args = env.args.clone();
-            let target =
-                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
-                    .await?;
+            let target = resolve_target(env, args.required("user")?).await?;
             let target_user = user_lookup(env, target).await?;
             vars.insert("target".into(), target_user.name.clone());
             vars.insert("target_id".into(), target.to_string());
@@ -868,9 +867,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         Behavior::UserInfo => super::userinfo::run(env, enrollment, &mut vars).await,
         Behavior::WarnClear => {
             let mut args = env.args.clone();
-            let target =
-                resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?)
-                    .await?;
+            let target = resolve_target(env, args.required("user")?).await?;
             let target_user = user_lookup(env, target).await?;
             let n = db::clear_enrolled_warns(&env.app.db, enrollment.clone(), target.get() as i64)
                 .await?;
@@ -900,7 +897,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         }
         Behavior::Voice => {
             let mut args = env.args.clone();
-            let token = args.next_arg().ok_or_else(|| anyhow!("missing user"))?;
+            let token = args.required("user")?;
             // Ids and mentions parse before the member search. A name or nick
             // can only be searched when the guild is cached; otherwise the
             // reply is the same not-cached line as a cold id lookup.
@@ -921,12 +918,14 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                     });
                 }
                 super::UserNameMatch::NotFound => {
-                    return Err(anyhow!("could not resolve user `{token}`"));
+                    return Err(ArgumentError::unresolved_user().into());
                 }
                 super::UserNameMatch::Ambiguous => {
-                    return Err(anyhow!(
-                        "ambiguous user `{token}`; use a mention or numeric user id"
-                    ));
+                    return Err(ArgumentError::invalid(
+                        "user",
+                        "That name matches more than one user. Use a mention or numeric user ID.",
+                    )
+                    .into());
                 }
             };
             let target_user = user_lookup(env, target).await?;
@@ -979,7 +978,11 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             })
         }
         Behavior::Banlist => {
-            let limit: i64 = env.args.peek().and_then(|s| s.parse().ok()).unwrap_or(25);
+            let limit = env
+                .args
+                .clone()
+                .number::<i64>("limit", "Enter a whole number of bans to show.")?
+                .unwrap_or(25);
             let bans = db::list_bans(&env.app.db, env.guild_id.get() as i64, limit).await?;
             if bans.is_empty() {
                 return Ok(BehaviorOutcome {
@@ -1010,11 +1013,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             })
         }
         Behavior::Purge { default_count } => {
-            let count: u64 = env
+            let count = env
                 .args
-                .peek()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(*default_count as u64)
+                .clone()
+                .number::<std::num::NonZeroU64>(
+                    "count",
+                    "Enter a positive whole number of messages to delete.",
+                )?
+                .map(std::num::NonZeroU64::get)
+                .unwrap_or(u64::from(*default_count))
                 .clamp(1, 100);
             let msgs = env
                 .channel_id
@@ -1091,11 +1098,15 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             })
         }
         Behavior::Slowmode { default_seconds } => {
-            let seconds: u64 = env
+            const SLOWMODE_RANGE: &str = "Enter a whole number from 0 to 21600 seconds.";
+            let seconds = env
                 .args
-                .peek()
-                .and_then(|s| s.parse().ok())
+                .clone()
+                .number::<u64>("seconds", SLOWMODE_RANGE)?
                 .unwrap_or(*default_seconds);
+            if seconds > 21600 {
+                return Err(ArgumentError::invalid("seconds", SLOWMODE_RANGE).into());
+            }
             refuse_fenced_discord_mutation(env).await?;
             lease_held(env)?;
             match crate::discord::race_discord_call(
@@ -1143,6 +1154,8 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let clear =
                 trimmed.is_empty() || trimmed.eq_ignore_ascii_case("clear") || trimmed == "-";
             let name = if clear { "" } else { trimmed };
+            db::validate_discord_nickname(name)
+                .map_err(|error| ArgumentError::invalid("name", error.to_string()))?;
             let guild_id = env.guild_id.get();
             // Commit desired state plus a durable outbox row atomically. The
             // bot is the sole Discord side-effect worker, so bot/API writers
@@ -1173,11 +1186,7 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             })
         }
         Behavior::SetPrefix => {
-            let prefix = env
-                .args
-                .clone()
-                .next_arg()
-                .ok_or_else(|| anyhow!("missing prefix"))?;
+            let prefix = env.args.clone().required("prefix")?;
             // Patch only prefix so other fields keep inheriting from global.
             lease_held(env)?;
             db::patch_settings(
@@ -1203,16 +1212,21 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
         Behavior::Logchannel { action } => run_logchannel(env, action).await,
         Behavior::Testregex => {
             let mut args = env.args.clone();
-            let pattern = args.next_arg().ok_or_else(|| anyhow!("missing pattern"))?;
+            let pattern = args.required("pattern")?;
             let sample = args.rest();
             if sample.len() > crate::normalize::USER_REGEX_MAX_SAMPLE_BYTES {
-                return Err(anyhow!(
-                    "sample too long (max {} bytes)",
-                    crate::normalize::USER_REGEX_MAX_SAMPLE_BYTES
-                ));
+                return Err(ArgumentError::invalid(
+                    "sample",
+                    format!(
+                        "Use at most {} bytes of sample text.",
+                        crate::normalize::USER_REGEX_MAX_SAMPLE_BYTES
+                    ),
+                )
+                .into());
             }
             // Same compile budget as WebUI /api/.../testregex and add_badword.
-            let re = crate::normalize::compile_user_regex(&pattern).map_err(|e| anyhow!(e))?;
+            let re = crate::normalize::compile_user_regex(&pattern)
+                .map_err(|error| ArgumentError::invalid("pattern", error))?;
             let normalized = crate::normalize::normalize_lenient(&sample);
             let raw_match = re.is_match(&sample);
             let norm_match = re.is_match(&normalized);
@@ -1232,23 +1246,18 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let mut args = env.args.clone();
             let response = if let Some(name) = args.next_arg() {
                 match cfg.find_command(&name) {
-                    Some(c) => format!(
-                        "**!{}** {} `{}`\nAliases: {}\nUsage: `{}`\nRequires: {}",
-                        c.name,
-                        c.description,
-                        c.category,
-                        if c.aliases.is_empty() {
-                            "-".to_string()
-                        } else {
-                            c.aliases.join(", ")
-                        },
-                        c.usage,
-                        c.permission
+                    Some(c) => super::usage::help_detail(
+                        c,
+                        &cfg.settings.prefix,
+                        env.source_message.is_some(),
                     ),
-                    None => format!(
-                        "Unknown command `{name}`. Use `{}help` for the list.",
-                        cfg.settings.prefix
-                    ),
+                    None => {
+                        return Err(ArgumentError::invalid(
+                            "command",
+                            "I couldn't find that command. Run help on its own for the list.",
+                        )
+                        .into());
+                    }
                 }
             } else {
                 let mut by_cat: std::collections::BTreeMap<String, Vec<String>> =
@@ -1431,20 +1440,19 @@ fn timeout_log_vars(
 async fn resolve_target(env: &CmdEnv<'_>, token: String) -> Result<serenity::model::id::UserId> {
     super::resolve_user(env.ctx, env.guild_id, &token)
         .await
-        .ok_or_else(|| anyhow!("could not resolve user `{token}`"))
+        .ok_or_else(|| ArgumentError::unresolved_user().into())
 }
 
 fn ban_args(args: &Args, default_reason: &str) -> Result<(String, String, Option<u32>)> {
     let mut args = args.clone();
-    let target = args.next_arg().ok_or_else(|| anyhow!("missing user"))?;
-    let minutes = if args.peek() == Some("--minutes") {
+    let target = args.required("user")?;
+    let minutes = if args.peek() == Some(BAN_MINUTES_FLAG) {
         args.next_arg();
+        let expected = jmodguard::defaults::BAN_DURATION_ERROR;
         let value = args
-            .next_arg()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| *v > 0)
-            .ok_or_else(|| anyhow!(jmodguard::defaults::BAN_DURATION_ERROR))?;
-        Some(value)
+            .number::<std::num::NonZeroU32>("minutes", expected)?
+            .ok_or_else(|| ArgumentError::missing("minutes"))?;
+        Some(value.get())
     } else {
         None
     };
@@ -1461,8 +1469,7 @@ async fn target_and_reason(
     default_reason: &str,
 ) -> Result<(serenity::model::id::UserId, String)> {
     let mut args = env.args.clone();
-    let target =
-        resolve_target(env, args.next_arg().ok_or_else(|| anyhow!("missing user"))?).await?;
+    let target = resolve_target(env, args.required("user")?).await?;
     let reason = if args.is_empty() {
         default_reason.to_string()
     } else {
@@ -1580,7 +1587,7 @@ fn say_target_and_text(args: &Args, invocation: ChannelId) -> Result<(ChannelId,
     }
     let text = text.trim();
     if text.is_empty() {
-        return Err(anyhow!("nothing to say"));
+        return Err(ArgumentError::missing("text").into());
     }
     Ok((target, text.to_string()))
 }
@@ -1633,7 +1640,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
         .unwrap_or_else(|| default_action.to_string());
     let vars = std::collections::BTreeMap::new();
     match action.as_str() {
-        "list" => {
+        LIST => {
             let guild = env.guild_id.get() as i64;
             let mut tpl = db::list_templates(&env.app.db, guild).await?;
             let global = db::list_templates(&env.app.db, 0).await?;
@@ -1656,8 +1663,10 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
                 embed: None,
             })
         }
-        "get" => {
-            let event = args.next_arg().ok_or_else(|| anyhow!("missing event"))?;
+        GET => {
+            let event = args
+                .required("event")
+                .map_err(|error| error.for_action(GET))?;
             let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
             let t = cfg.templates.get(&event).cloned().unwrap_or_default();
             Ok(BehaviorOutcome {
@@ -1668,11 +1677,13 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
                 embed: None,
             })
         }
-        "set" => {
-            let event = args.next_arg().ok_or_else(|| anyhow!("missing event"))?;
+        SET => {
+            let event = args
+                .required("event")
+                .map_err(|error| error.for_action(SET))?;
             let text = args.rest();
             if text.trim().is_empty() {
-                return Err(anyhow!("missing template text"));
+                return Err(ArgumentError::missing("text").for_action(SET).into());
             }
             db::upsert_template(&env.app.db, env.guild_id.get() as i64, &event, &text).await?;
             env.app.invalidate_configs();
@@ -1684,8 +1695,10 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
                 embed: None,
             })
         }
-        "reset" => {
-            let event = args.next_arg().ok_or_else(|| anyhow!("missing event"))?;
+        RESET => {
+            let event = args
+                .required("event")
+                .map_err(|error| error.for_action(RESET))?;
             db::delete_template(&env.app.db, env.guild_id.get() as i64, &event).await?;
             env.app.invalidate_configs();
             Ok(BehaviorOutcome {
@@ -1696,7 +1709,7 @@ async fn run_template(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavior
                 embed: None,
             })
         }
-        other => Err(anyhow!("unknown template action `{other}`")),
+        _ => Err(ArgumentError::invalid("action", "Choose a template action shown below.").into()),
     }
 }
 
@@ -1706,7 +1719,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
     let vars = std::collections::BTreeMap::new();
     let guild = env.guild_id.get() as i64;
     match action.as_str() {
-        "list" => {
+        LIST => {
             let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
             let mut lines = Vec::new();
             for id in crate::types::RULE_IDS {
@@ -1735,16 +1748,15 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                 embed: None,
             })
         }
-        "toggle" => {
+        TOGGLE => {
             if rule_id.is_empty() {
-                return Err(anyhow!("missing rule"));
+                return Err(ArgumentError::missing("rule").for_action(TOGGLE).into());
             }
             let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
-            let mut rule = cfg
-                .rules
-                .get(&rule_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("unknown rule `{rule_id}`"))?;
+            let mut rule = cfg.rules.get(&rule_id).cloned().ok_or_else(|| {
+                ArgumentError::invalid("rule", "Choose a configured automod rule.")
+                    .for_action(TOGGLE)
+            })?;
             rule.enabled = !rule.enabled;
             db::upsert_rule(&env.app.db, guild, &rule_id, &rule).await?;
             env.app.invalidate_configs();
@@ -1759,21 +1771,24 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                 embed: None,
             })
         }
-        "dryrun" => {
+        DRYRUN => {
             if rule_id.is_empty() {
-                return Err(anyhow!("missing rule"));
+                return Err(ArgumentError::missing("rule").for_action(DRYRUN).into());
             }
             let on = match args.next_arg().as_deref() {
-                Some("on") | Some("true") => true,
+                None | Some("on") | Some("true") => true,
                 Some("off") | Some("false") => false,
-                _ => true,
+                Some(_) => {
+                    return Err(ArgumentError::invalid("value", "Use on or off.")
+                        .for_action(DRYRUN)
+                        .into());
+                }
             };
             let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
-            let mut rule = cfg
-                .rules
-                .get(&rule_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("unknown rule `{rule_id}`"))?;
+            let mut rule = cfg.rules.get(&rule_id).cloned().ok_or_else(|| {
+                ArgumentError::invalid("rule", "Choose a configured automod rule.")
+                    .for_action(DRYRUN)
+            })?;
             set_rule_dry_run(&rule_id, &mut rule, on)?;
             db::upsert_rule(&env.app.db, guild, &rule_id, &rule).await?;
             env.app.invalidate_configs();
@@ -1785,7 +1800,7 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                 embed: None,
             })
         }
-        other => Err(anyhow!("unknown rule action `{other}`")),
+        _ => Err(ArgumentError::invalid("action", "Choose a rule action shown below.").into()),
     }
 }
 
@@ -1855,7 +1870,7 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
     let vars = std::collections::BTreeMap::new();
     let guild = env.guild_id.get() as i64;
     match action.as_str() {
-        "list" => {
+        LIST => {
             let lc = db::list_log_channels(&env.app.db, guild).await?;
             if lc.is_empty() {
                 return Ok(BehaviorOutcome {
@@ -1882,15 +1897,27 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
                 embed: None,
             })
         }
-        "set" => {
-            let event = args.next_arg().ok_or_else(|| anyhow!("missing event"))?;
+        SET => {
+            let event = args
+                .required("event")
+                .map_err(|error| error.for_action(SET))?;
             if !crate::types::is_log_event(&event) {
-                return Err(anyhow!("unknown log event `{event}`"));
+                return Err(ArgumentError::invalid("event", "Choose a known log event.")
+                    .for_action(SET)
+                    .into());
             }
-            let token = args.next_arg().ok_or_else(|| anyhow!("missing channel"))?;
+            let token = args
+                .required("channel")
+                .map_err(|error| error.for_action(SET))?;
             let channel = parse_channel_mention(&token)
                 .or_else(|| token.parse::<ChannelId>().ok())
-                .ok_or_else(|| anyhow!("invalid channel `{token}`"))?;
+                .ok_or_else(|| {
+                    ArgumentError::invalid(
+                        "channel",
+                        "Use a channel mention or numeric channel ID.",
+                    )
+                    .for_action(SET)
+                })?;
             crate::discord::validate_log_channel_guild(&env.ctx.http, env.guild_id.get(), channel)
                 .await?;
             db::upsert_log_channel(&env.app.db, guild, &event, channel.get() as i64).await?;
@@ -1903,8 +1930,10 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
                 embed: None,
             })
         }
-        "unset" => {
-            let event = args.next_arg().ok_or_else(|| anyhow!("missing event"))?;
+        UNSET => {
+            let event = args
+                .required("event")
+                .map_err(|error| error.for_action(UNSET))?;
             db::delete_log_channel(&env.app.db, guild, &event).await?;
             env.app.invalidate_configs();
             Ok(BehaviorOutcome {
@@ -1915,7 +1944,9 @@ async fn run_logchannel(env: &CmdEnv<'_>, default_action: &str) -> Result<Behavi
                 embed: None,
             })
         }
-        other => Err(anyhow!("unknown logchannel action `{other}`")),
+        _ => {
+            Err(ArgumentError::invalid("action", "Choose a log channel action shown below.").into())
+        }
     }
 }
 

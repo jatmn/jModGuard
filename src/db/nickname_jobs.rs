@@ -146,7 +146,7 @@ impl NicknameReconcileStatus {
 
 pub const MAX_NICKNAME_RECONCILE_ATTEMPTS: u32 = 8;
 
-pub(super) fn validate_discord_nickname(nickname: &str) -> Result<()> {
+pub fn validate_discord_nickname(nickname: &str) -> Result<()> {
     anyhow::ensure!(
         nickname.chars().count() <= 32,
         "Discord nickname must be at most 32 characters"
