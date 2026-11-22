@@ -63,7 +63,8 @@ expect "contracts fmt dylint integration remote-database supply-chain" crates/in
 expect_each "contracts fmt dylint remote-database supply-chain" \
   crates/integration-tests/tests/remote_database_smoke.rs crates/integration-tests/tests/guild_store_smoke.rs
 expect "contracts frontend publish-tests supply-chain" Dockerfile.webui
-expect_each "contracts fmt dylint bot api updater boundaries integration supply-chain" crates/bot/src/main.rs crates/bot/Cargo.toml
+expect_each "contracts fmt dylint bot api updater boundaries integration supply-chain remote-database" \
+  crates/bot/src/main.rs crates/bot/src/action_worker.rs crates/bot/Cargo.toml
 expect "contracts fmt bot updater core bootstrap publish-tests supply-chain" Dockerfile.bot
 expect "contracts fmt api updater core boundaries integration bootstrap publish-tests supply-chain" Dockerfile.api
 expect_each "contracts fmt dylint runtime boundaries core integration supply-chain" crates/runtime/src/lib.rs crates/runtime/Cargo.toml
@@ -95,7 +96,7 @@ core_omits="runtime publish-tests bootstrap"
 expect "$core" src/config.rs src/db.rs
 expect "$core" config.example.toml src/config.rs
 expect "$core" migrations/guild/0016_baseline.sql
-expect "$core frontend" src/log_embeds.rs
+expect_each "$core frontend" src/log_embeds.rs src/types.rs
 for group in $rust; do
   case " $core $core_omits " in
     *" $group "*) ;;
@@ -225,7 +226,7 @@ expect_lint_packages() {
   [[ "$actual" == "$expected" ]] || fail "lint scope for $*: expected [$expected], got [$actual]"
 }
 expect_lint_packages 'jmodguard-api jmodguard-integration-tests' crates/api/src/lib.rs
-expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-updater jmodguard-integration-tests' crates/bot/src/main.rs
+expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-updater jmodguard jmodguard-integration-tests' crates/bot/src/main.rs
 expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-runtime jmodguard-updater jmodguard jmodguard-integration-tests' crates/runtime/src/lib.rs
 expect_lint_packages 'jmodguard-api jmodguard-bot jmodguard-updater jmodguard jmodguard-integration-tests' src/config.rs
 expect_lint_packages 'jmodguard jmodguard-integration-tests' crates/integration-tests/tests/remote_database_smoke.rs
@@ -252,7 +253,8 @@ assert.equal(new Set(core.flatMap(j => j.groups.split(" "))).size, core.flatMap(
 JS
 # Matrix scheduling must neither omit nor duplicate a selected gate, including
 # narrow service changes and the full fallback plan.
-for path in docs/INSTALL.md crates/api/src/lib.rs crates/bot/src/main.rs crates/runtime/src/lib.rs crates/updater/src/main.rs crates/integration-tests/src/lib.rs src/db.rs Cargo.lock mystery.bin; do
+for path in docs/INSTALL.md crates/api/src/lib.rs crates/bot/src/main.rs crates/bot/src/action_worker.rs \
+  crates/runtime/src/lib.rs crates/updater/src/main.rs crates/integration-tests/src/lib.rs src/db.rs src/types.rs Cargo.lock mystery.bin; do
   bash "$selector" plan --files "$path" >"$scratch/plan"
   bash "$selector" matrix --files "$path" >"$scratch/matrix.json"
   node --input-type=module - "$scratch" <<'JS'

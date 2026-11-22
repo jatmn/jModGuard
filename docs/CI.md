@@ -24,7 +24,7 @@ commit's checks. New commits and reopened PRs still run affected checks.
 |---|---|
 | Documentation or sample configuration | Contracts, plus `runner-tests` for `AGENTS.md` and `docs/CI.md` because the audit-expiry self-check reads them |
 | Frontend | Frontend and the default-feature API that embeds the generated UI (`api-embed`); the API built without the UI cannot observe these files |
-| API or bot | That service, integration, boundaries, formatting, scoped Dylint and supply chain, plus the API and updater groups for bot changes |
+| API or bot | That service, integration, boundaries, formatting, scoped Dylint and supply chain, plus the API, updater and remote database groups for bot changes |
 | Shared root source or migrations | Core plus bot/API/updater/integration consumers and remote databases |
 | Runtime | Runtime and its core/integration consumers, boundaries, formatting, Dylint and supply chain |
 | Updater | Updater plus bot/API consumers and boundaries, formatting, Dylint and supply chain |
@@ -32,10 +32,11 @@ commit's checks. New commits and reopened PRs still run affected checks.
 | CI runner scripts or the Rust toolchain pin | The runner regression suites (`runner-tests`), plus all Rust gates for the toolchain |
 | Unknown paths or CI orchestration | All checks |
 
-The updater tests also read `scripts/publish-image.sh`, core tests read the bot
-and API Dockerfiles, and frontend tests replay the API template preview golden
-cases produced by `src/log_embeds.rs`. Changes to those files select these
-consumers in addition to their usual groups.
+The updater tests also read `scripts/publish-image.sh` and core tests read the bot
+and API Dockerfiles. Frontend tests replay the API template preview golden cases
+produced by `src/log_embeds.rs` and read `src/types.rs` for command forms and audit
+events. Changes to those files select these consumers in addition to their usual
+groups.
 
 Selected groups run in up to eight jobs: quick contracts/shell checks/formatting,
 frontend, three Rust jobs, Dylint, supply chain and remote databases. Rust work is
