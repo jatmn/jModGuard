@@ -92,6 +92,7 @@ struct RuleState {
     events: VecDeque<WindowEvent>,
     strikes: u32,
     fired: ThresholdReservations,
+    last_velocity_fallback_delete: Option<AutomodInstant>,
     last_event: Option<AutomodInstant>,
 }
 
@@ -132,6 +133,7 @@ enum RuleRetention {
 /// Strike state lives for 10 minutes after the last strike. Cleanup and
 /// strike recording both apply this, so expiry never waits for a cleanup tick.
 const STRIKE_RETENTION: Duration = Duration::from_secs(crate::types::AUTOMOD_WINDOW_MAX_SECS);
+const VELOCITY_FALLBACK_DELETE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl RuleState {
     /// Starts a new ladder when the previous one expired.
@@ -397,16 +399,42 @@ impl AutomodEngine {
             let state = bucket.rules.entry((rule_id, rule.dry_run)).or_default();
             // Only mention spam reads past strike timestamps.
             let strikes = state.record_strike(now, rule_id == "mention_spam");
-            let fire = rule
-                .action_for_strike(strikes)
-                .filter(|a| state.fired.state(a.at) == ThresholdState::Available);
-            let Some(action) = fire else { continue };
-            state.fired.reserve(action.at);
+            let Some(step) = rule.action_for_strike(strikes) else {
+                continue;
+            };
+            let action = if state.fired.state(step.at) == ThresholdState::Available {
+                state.fired.reserve(step.at);
+                step.clone()
+            } else {
+                // Keep deliberate log/warn-only terminal steps and gaps in the ladder.
+                if rule_id != "velocity"
+                    || !matches!(step.action.as_str(), "delete" | "timeout" | "kick" | "ban")
+                    || rule.actions.iter().any(|action| action.at > step.at)
+                {
+                    continue;
+                }
+                // Reserve the cooldown under the same bucket lock as the ladder.
+                let now = AutomodInstant::now();
+                if state.last_velocity_fallback_delete.is_some_and(|last| {
+                    now.duration_since(last) < VELOCITY_FALLBACK_DELETE_INTERVAL
+                }) {
+                    continue;
+                }
+                state.last_velocity_fallback_delete = Some(now);
+                ActionDef {
+                    at: step.at,
+                    action: "delete".into(),
+                    duration_minutes: 0,
+                    delete_days: 0,
+                    purge_last_hour: false,
+                    reason: "Message velocity".into(),
+                }
+            };
 
             let pending = PendingAction {
                 rule_id: rule_id.to_string(),
                 rule_name: rule.name.clone(),
-                action: action.clone(),
+                action,
                 strikes,
                 mention_permission_unknown: false,
                 evidence: serde_json::json!({
@@ -1605,15 +1633,23 @@ mod tests {
     async fn default_velocity_counts_plain_messages_and_escalates() {
         let cfg = default_automod_config();
         let engine = AutomodEngine::new();
-        for id in 1..=12 {
+        for id in 1..=16 {
+            if id == 15 {
+                tokio::time::advance(std::time::Duration::from_millis(999)).await;
+            } else if id == 16 {
+                tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            }
             let text = format!("ordinary message {id}");
-            let mut message = msg(1, &text, 0, false, false);
+            let channel = if id == 14 { 2 } else { 1 };
+            let mut message = msg(channel, &text, 0, false, false);
             message.message_id = id;
             let action = engine.evaluate(&cfg, &message);
             let expected = match id {
                 9 => Some((1, "delete")),
                 10 => Some((2, "timeout")),
                 12 => Some((4, "kick")),
+                13 => Some((5, "delete")),
+                16 => Some((8, "delete")),
                 _ => None,
             };
             assert_eq!(
@@ -1625,6 +1661,147 @@ mod tests {
                 "message {id}",
             );
         }
+    }
+
+    #[test]
+    fn velocity_does_not_delete_after_a_terminal_log_or_warn() {
+        for terminal in ["log", "warn"] {
+            let mut cfg = default_automod_config();
+            let rule = cfg.rules.get_mut("velocity").unwrap();
+            rule.params["max_messages"] = serde_json::json!(0);
+            rule.actions.truncate(1);
+            rule.actions[0].action = terminal.into();
+            let engine = AutomodEngine::new();
+            let message = msg(1, "ordinary message", 0, false, false);
+            let step = engine.evaluate(&cfg, &message).unwrap();
+            assert_eq!(step.action.action, terminal);
+            assert!(engine.evaluate(&cfg, &message).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn velocity_fallback_after_rejoin_dispatches_only_when_live() {
+        use serenity::all::{GuildId, Member, User, UserId};
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let path = std::env::temp_dir().join(format!(
+            "velocity_rejoin_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false))
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment).await.unwrap();
+
+        let mut rule = default_automod_config().rules.remove("velocity").unwrap();
+        rule.whitelist_channels = vec![71];
+        // Leave room for real SQLite and loopback Discord I/O between bursts.
+        rule.params["window_secs"] = serde_json::json!(600);
+
+        for (dry_run, author) in [(false, 99), (true, 100)] {
+            rule.dry_run = dry_run;
+            crate::db::upsert_rule(&app.db, 10, "velocity", &rule)
+                .await
+                .unwrap();
+            app.invalidate_configs();
+            let cfg = app.configs.get(&app.db, 10).await.unwrap();
+
+            let mut user = User::default();
+            user.id = UserId::new(author);
+            user.name = "member".into();
+            let guild = GuildId::new(10);
+            let mut member = Member::default();
+            member.guild_id = guild;
+            member.user = user.clone();
+            let stub = DiscordStub::start();
+            let mut message = word_message(&[]);
+            message.author_id = author;
+            message.content = "ordinary message";
+
+            for id in 1..12 {
+                message.message_id = id;
+                app.automod.evaluate(&cfg, &message);
+            }
+            message.message_id = 12;
+            let kick = app.automod.evaluate(&cfg, &message).unwrap();
+            assert_eq!(kick.action.action, "kick");
+            assert_eq!(
+                execute_pending_with(
+                    &app,
+                    &stub.http,
+                    &stub.cache,
+                    guild,
+                    &user,
+                    Some(member.clone()),
+                    "member",
+                    Some(12),
+                    Some(70),
+                    &kick,
+                )
+                .await,
+                !dry_run,
+            );
+
+            app.automod.member_joined(10, author);
+            message.message_id = 13;
+            message.channel_id = 71;
+            assert!(app.automod.evaluate(&cfg, &message).is_none());
+
+            message.message_id = 14;
+            message.channel_id = 70;
+            let delete = app
+                .automod
+                .evaluate(&cfg, &message)
+                .expect("post-rejoin fallback");
+            assert_eq!(delete.rule_id, "velocity");
+            assert_eq!(delete.action.action, "delete");
+            assert_eq!(delete.dry_run, dry_run);
+            assert_eq!(
+                execute_pending_with(
+                    &app,
+                    &stub.http,
+                    &stub.cache,
+                    guild,
+                    &user,
+                    Some(member),
+                    "member",
+                    Some(14),
+                    Some(70),
+                    &delete,
+                )
+                .await,
+                !dry_run,
+            );
+            let seen = stub.finish();
+            if dry_run {
+                assert!(seen.is_empty(), "{seen:?}");
+            } else {
+                assert_eq!(
+                    seen,
+                    [
+                        "DELETE /api/v10/guilds/10/members/99",
+                        "DELETE /api/v10/channels/70/messages/14",
+                    ]
+                );
+            }
+        }
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
     }
 
     #[tokio::test(start_paused = true)]
