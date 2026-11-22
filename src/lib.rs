@@ -271,16 +271,41 @@ mod logging_tests {
         }
     }
 
+    #[tokio::test]
+    async fn stale_session_lookup_does_not_warn() {
+        use tower_sessions::{MemoryStore, Session};
+        use tracing::instrument::WithSubscriber as _;
+
+        let stale_id = {
+            let original = Session::new(None, Arc::new(MemoryStore::default()), None);
+            original.insert("user_id", 42_u64).await.unwrap();
+            original.save().await.unwrap();
+            original.id().expect("saved session has an id")
+        };
+        let session = Session::new(Some(stale_id), Arc::new(MemoryStore::default()), None);
+        let bytes = Capture(Arc::new(Mutex::new(Vec::new())));
+        let writer = bytes.clone();
+        let subscriber = super::log_subscriber("warn", move || writer.clone());
+        let user_id = session
+            .get::<u64>("user_id")
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+
+        assert_eq!(user_id, None);
+        let logs = String::from_utf8(bytes.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.is_empty(),
+            "unexpected stale-session diagnostics: {logs}"
+        );
+    }
+
     #[test]
-    fn stale_session_warning_is_filtered_without_hiding_other_session_events() {
+    fn other_session_warnings_and_errors_are_logged() {
         let bytes = Capture(Arc::new(Mutex::new(Vec::new())));
         let writer = bytes.clone();
         let subscriber = super::log_subscriber("warn", move || writer.clone());
         tracing::subscriber::with_default(subscriber, || {
-            tracing::warn!(
-                target: "tower_sessions_core::session",
-                "possibly suspicious activity: record not found in store"
-            );
             tracing::warn!(target: "tower_sessions_core::session", "called load with no session id");
             tracing::warn!(
                 target: "tower_sessions::service",
@@ -291,7 +316,6 @@ mod logging_tests {
         });
 
         let logs = String::from_utf8(bytes.0.lock().unwrap().clone()).unwrap();
-        assert!(!logs.contains("record not found in store"), "{logs}");
         assert!(
             logs.contains("WARN called load with no session id"),
             "{logs}"
