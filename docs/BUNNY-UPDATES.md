@@ -6,8 +6,9 @@ the observed bot, API, and WebUI source SHAs, release publication times, install
 failures, and available candidates. `Check now` refreshes one component. Every hour the
 API also checks the configured channel for each component and verifies the installed
 WebUI files in Storage. Discord `!stats`, `!status`, and `/stats` use cached observations
-and ship with Admin permission by default. Bot and API status lines show the running
-and latest published source SHAs after a fresh check, or a short reason when a check fails.
+and ship with Admin permission by default. After a fresh check, each status line shows
+the running source SHA and the source SHA its channel currently publishes, or a short
+reason when a check fails.
 
 The page shares the workspace's Light, Dark, and System appearance preference. Each
 component has a status badge, release controls, and expandable **Version & technical
@@ -126,7 +127,7 @@ that publication timestamp for signing, not updater compatibility labels. The ma
 cosign public key is committed at `deploy/update-signing.pub`. The private signing key is not stored in this
 repository; publication fails closed when that Actions secret is missing.
 
-The updater verifies that signature against this pinned key before it downloads image layers or stages an executable. Release discovery also verifies signatures and enforces expiry, regardless of the observed launcher revision. Launcher image staging verifies signatures once a revision-19 or newer launcher is running. A revision-18 launcher has no verifier and is refused that hop. The durable request requires a fresh launcher observation and clears a queued verifier-era selection on refusal. An unsigned image, a wrong signature, or a signature from an untrusted key is refused with that status: `unsigned image`, `bad image signature`, or `image signature used an untrusted key`. An expired signature (`expired image signature`) is refused for a new install. After the [expiry-safe cold-boot rollout](#expiry-safe-cold-boot-rollout), boot repair still checks the signature of an already-installed application release, and it still starts that application after `io.jmodguard.not-after`.
+The updater verifies that signature against this pinned key before it downloads image layers or stages an executable. Release discovery also verifies signatures and enforces expiry, regardless of the observed launcher revision. Launcher image staging verifies signatures once a revision-19 or newer launcher is running. A revision-18 launcher has no verifier and is refused that hop. The durable request requires a fresh launcher observation and clears a queued verifier-era selection on refusal. An unsigned image, a wrong signature, or a signature from an untrusted key is refused with that status: `unsigned image`, `bad image signature`, or `image signature used an untrusted key`. An expired signature (`expired image signature`) is refused for a new install. After the [expiry-safe cold-boot rollout](#expiry-safe-cold-boot-rollout), boot repair still checks the signature of an already-installed application release, and it still starts that application after `io.jmodguard.not-after`. The same applies when the API re-checks the installed WebUI files in Storage: the signature must verify, but `io.jmodguard.not-after` does not block the check. A new WebUI install still refuses an expired signature.
 
 ### Boot-mismatch diagnostics and mixed-fleet rollout
 

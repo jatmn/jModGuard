@@ -712,7 +712,13 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
         if let ReleaseVerification::Verified {
             root_hash,
             admin_hash,
-        } = storage.verify_release(&registry, installed).await?
+        } = storage
+            .verify_installed_release(
+                &registry,
+                &db::UpdateControl::from_application(&app.db),
+                installed,
+            )
+            .await?
         {
             return record_verified(
                 app,
@@ -834,11 +840,21 @@ pub async fn record_release_checks<F>(
 where
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
 {
-    record_release_checks_with(app, discover, lookup_timeout, shutdown, async |installed| {
-        storage()?
-            .verify_release(&Registry::ghcr()?, installed)
-            .await
-    })
+    record_release_checks_with(
+        app,
+        discover,
+        lookup_timeout,
+        shutdown,
+        async |database, installed| {
+            storage()?
+                .verify_installed_release(
+                    &Registry::ghcr()?,
+                    &db::UpdateControl::from_application(database),
+                    installed,
+                )
+                .await
+        },
+    )
     .await
 }
 
@@ -847,7 +863,7 @@ async fn record_release_checks_with<F>(
     mut discover: F,
     lookup_timeout: Duration,
     mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
-    verify_webui: impl AsyncFn(&ComponentRelease) -> anyhow::Result<ReleaseVerification>,
+    verify_webui: impl AsyncFn(&Db, &ComponentRelease) -> anyhow::Result<ReleaseVerification>,
 ) -> ReleaseCheckBatch
 where
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
@@ -950,7 +966,7 @@ where
                     let refresh = tokio::select! {
                         biased;
                         _ = &mut shutdown => anyhow::bail!("release check shutdown"),
-                        result = timeout(RELEASE_LOOKUP_TIMEOUT, verify_webui(installed)) => result,
+                        result = timeout(RELEASE_LOOKUP_TIMEOUT, verify_webui(&app.db, installed)) => result,
                     };
                     match refresh {
                         Ok(Ok(ReleaseVerification::Verified {
@@ -968,7 +984,29 @@ where
                             .context("recording verified WebUI observation")?;
                         }
                         Ok(Ok(ReleaseVerification::Mismatch)) => {
+                            // A definite mismatch invalidates the verified
+                            // observation, as manual reconciliation does. A
+                            // different pending install may own Storage; the
+                            // next manual check adopts or settles it first.
                             tracing::warn!("WebUI observation refresh found changed Storage files");
+                            let other_install_pending = current
+                                .desired
+                                .as_ref()
+                                .is_some_and(|desired| Some(desired) != current.installed.as_ref());
+                            if current.observed.is_some() && !other_install_pending {
+                                via_bot!(
+                                    app,
+                                    db::record_webui_drift(
+                                        &app.db,
+                                        "Storage files differ from the installed release"
+                                    ),
+                                    db::ControlOp::RecordWebuiDrift {
+                                        error: "Storage files differ from the installed release"
+                                            .to_owned(),
+                                    }
+                                )
+                                .context("recording WebUI Storage drift")?;
+                            }
                         }
                         Ok(Err(error)) => {
                             tracing::warn!("WebUI observation refresh failed: {error:#}")
@@ -2086,7 +2124,7 @@ mod tests {
                 |_, _| Box::pin(async { anyhow::bail!("registry returned HTTP 503") }),
                 RELEASE_LOOKUP_TIMEOUT,
                 Box::pin(std::future::pending()),
-                async |installed| {
+                async |_, installed| {
                     assert_eq!(installed, &release);
                     let checked_at = db::component_update(&app.db, "webui")
                         .await
@@ -2141,6 +2179,87 @@ mod tests {
             assert!(!pending.contains("purge-only-secret"));
             let status = status_response(&app, None).await.unwrap().0;
             assert_eq!(status["webui_purge_pending"], pending.as_str());
+            // A failed readback proves nothing about Storage and keeps the
+            // verified observation. A definite mismatch invalidates it.
+            let failed = record_release_checks_with(
+                &app,
+                |_, _| Box::pin(async { anyhow::bail!("registry returned HTTP 503") }),
+                RELEASE_LOOKUP_TIMEOUT,
+                Box::pin(std::future::pending()),
+                async |_, _| anyhow::bail!("Storage read failed"),
+            )
+            .await;
+            assert!(failed.finished);
+            let kept = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(kept.state, "running");
+            assert_eq!(kept.observed_at, row.observed_at);
+            assert!(kept.observed.is_some());
+            let changed = record_release_checks_with(
+                &app,
+                |_, _| Box::pin(async { anyhow::bail!("registry returned HTTP 503") }),
+                RELEASE_LOOKUP_TIMEOUT,
+                Box::pin(std::future::pending()),
+                async |_, _| Ok(ReleaseVerification::Mismatch),
+            )
+            .await;
+            assert!(changed.finished);
+            assert!(!changed.lease_held.contains("webui"));
+            let drift = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(drift.state, "drift");
+            assert!(drift.observed.is_none() && drift.observed_at.is_none());
+            assert_eq!(drift.installed.as_ref(), Some(&release));
+            assert_eq!(drift.installed_at, Some(102));
+            assert_eq!(
+                db::webui_purge_pending(&app.db).await.unwrap().as_deref(),
+                Some(pending.as_str())
+            );
+            // A different pending install keeps its row for the manual check
+            // that adopts or settles it.
+            record_running(
+                &app,
+                "webui",
+                Some(release.clone()),
+                observation.clone(),
+                103,
+            )
+            .await
+            .unwrap();
+            let mut next = release.clone();
+            next.source_sha = "e".repeat(40);
+            next.digest = format!("sha256:{}", "e".repeat(64));
+            let now = 104;
+            db::record_update_check(
+                &app.db,
+                "webui",
+                &next.channel,
+                Some(next.clone()),
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+            let (_, lease) = queue_webui_install(None, &app.db, &next.digest, now)
+                .await
+                .unwrap();
+            db::release_update_lease(&app.db, "webui", &lease)
+                .await
+                .unwrap();
+            let queued = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(queued.desired.as_ref(), Some(&next));
+            let skipped = record_release_checks_with(
+                &app,
+                |_, _| Box::pin(async { anyhow::bail!("registry returned HTTP 503") }),
+                RELEASE_LOOKUP_TIMEOUT,
+                Box::pin(std::future::pending()),
+                async |_, _| Ok(ReleaseVerification::Mismatch),
+            )
+            .await;
+            assert!(skipped.finished);
+            let kept = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(kept.state, queued.state);
+            assert!(kept.observed.is_some());
+            assert_eq!(kept.observed_at, queued.observed_at);
+            assert_eq!(kept.last_error, queued.last_error);
             // A check without purge values cannot resolve it.
             let delay = Duration::from_millis(1);
             retry_pending_purge(&app, purge_values(None, None), &api, delay)

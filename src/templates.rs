@@ -40,8 +40,9 @@ pub fn format_compact_duration(seconds: u64) -> String {
 fn release_status_icon(availability: &str) -> &'static str {
     match availability {
         "up to date" => "✅",
-        "update available" => "⬆️",
-        "source up to date (image digest unverified)" => "⚠️",
+        "different source" => "↔️",
+        "source up to date (image digest differs)"
+        | "source up to date (image digest unverified)" => "⚠️",
         _ => "❓",
     }
 }
@@ -61,6 +62,10 @@ fn running_short_sha(item: &crate::db::ComponentUpdate) -> Option<String> {
 fn release_check_failure(error: &str) -> String {
     // Persisted errors can contain provider details. Render only a known
     // reason or a status code from the registry and reqwest error formats.
+    // Errors are persisted as `{error:#}` chains joined by ": ", so classify
+    // the root cause, for example the "operation timed out" under reqwest's
+    // "error sending request".
+    let error = error.rsplit(": ").next().unwrap_or(error);
     let status = error
         .strip_prefix("registry returned HTTP ")
         .or_else(|| error.strip_prefix("HTTP status client error ("))
@@ -293,24 +298,31 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
             .as_ref()
             .filter(|release| is_ascii_hex_sha40(&release.source_sha));
         let availability = if let Some(candidate) = candidate {
-            if item
+            let same_source = running_source == Some(candidate.source_sha.as_str());
+            // The installed release describes the running image only when it
+            // has the running source (not a built-in fallback binary).
+            let installed_digest = item
                 .installed
                 .as_ref()
-                .is_some_and(|installed| installed.digest == candidate.digest)
-                && running_source == Some(candidate.source_sha.as_str())
-            {
+                .filter(|installed| running_source == Some(installed.source_sha.as_str()))
+                .map(|installed| installed.digest.as_str());
+            if same_source && installed_digest == Some(candidate.digest.as_str()) {
                 "up to date"
-            } else if component != "webui"
-                && item.installed.is_none()
+            } else if same_source && installed_digest.is_some() {
+                // The channel was republished at the running source.
+                "source up to date (image digest differs)"
+            } else if same_source
+                && component != "webui"
                 && item
                     .observed
                     .as_ref()
                     .is_some_and(|observed| observed.source_sha == observed.base_image_sha)
-                && running_source == Some(candidate.source_sha.as_str())
             {
                 "source up to date (image digest unverified)"
             } else if running_source.is_some_and(|sha| sha != candidate.source_sha.as_str()) {
-                "update available"
+                // A channel can be republished from older source, so a
+                // different SHA does not say which build is newer.
+                "different source"
             } else {
                 "not checked"
             }
@@ -319,15 +331,14 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
         };
         attention |= availability != "up to date";
         let icon = release_status_icon(availability);
-        let tail = match (availability, component, candidate) {
-            ("not checked", _, _) => availability.into(),
-            (_, "bot" | "api", Some(release)) => {
-                format!(
-                    "latest `{}` · {availability} {icon}",
-                    &release.source_sha[..7]
-                )
-            }
-            _ => icon.into(),
+        // Name the channel build the running build was compared with.
+        let tail = match candidate {
+            Some(release) if availability != "not checked" => format!(
+                "{} `{}` · {availability} {icon}",
+                release.channel,
+                &release.source_sha[..7]
+            ),
+            _ => availability.into(),
         };
         lines.push(release_status_line(
             component,
@@ -809,7 +820,7 @@ mod presentation_tests {
             [
                 "**bot:** `abcdef0` · `installed 4m 10s` · latest `abcdef0` · up to date ✅",
                 "**api:** `abcdef0` · `installed 4m 10s` · latest `abcdef0` · up to date ✅",
-                "**webui:** `abcdef0` · `installed 4m 10s` · ✅",
+                "**webui:** `abcdef0` · `installed 4m 10s` · latest `abcdef0` · up to date ✅",
             ]
         );
         assert_eq!(
@@ -972,18 +983,18 @@ mod presentation_tests {
         };
         let fresh = release_text(&[row.clone()], 1100);
         assert!(fresh.contains("`aaaaaaa`"));
-        assert!(fresh.contains("⬆️"));
-        assert!(fresh.contains("latest `bbbbbbb` · update available"));
+        assert!(fresh.contains("stable `bbbbbbb` · different source ↔️"));
+        assert!(!fresh.contains("update"));
         row.channel = "nightly".into();
         let wrong_channel = release_text(&[row.clone()], 1100);
-        assert!(!wrong_channel.contains("update available"));
+        assert!(!wrong_channel.contains("different source"));
         let wrong_api = wrong_channel
             .lines()
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
         assert!(wrong_api.contains("not checked"), "{wrong_api}");
         assert!(!wrong_api.contains('❓'), "{wrong_api}");
-        assert!(!wrong_api.contains("⬆️"), "{wrong_api}");
+        assert!(!wrong_api.contains("↔️"), "{wrong_api}");
         assert!(wrong_channel.contains("**bot:** not checked"));
         assert!(wrong_channel.contains("**webui:** not checked"));
         row.channel = "stable".into();
@@ -996,7 +1007,7 @@ mod presentation_tests {
             .unwrap();
         assert!(api_line.ends_with("⚠️"), "{api_line}");
         assert!(
-            api_line.contains("latest `aaaaaaa` · source up to date (image digest unverified)")
+            api_line.contains("stable `aaaaaaa` · source up to date (image digest unverified)")
         );
         row.channel = "nightly".into();
         let wrong_channel_current = release_text(&[row.clone()], 1100);
@@ -1008,7 +1019,7 @@ mod presentation_tests {
         let out = release_text(&[same_prefix], 1100);
         assert!(
             out.lines()
-                .any(|line| line.starts_with("**api:**") && line.ends_with("⬆️"))
+                .any(|line| line.starts_with("**api:**") && line.ends_with("↔️"))
         );
 
         for component in ["bot", "api", "webui"] {
@@ -1164,8 +1175,8 @@ mod presentation_tests {
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
         assert!(api.contains("not checked"), "{api}");
-        assert!(!api.contains("⬆️"), "{api}");
-        assert!(!api.contains("update available"), "{api}");
+        assert!(!api.contains("↔️"), "{api}");
+        assert!(!api.contains("different source"), "{api}");
 
         let missing = release_text(&[], 1_000);
         for component in ["bot", "api", "webui"] {
@@ -1215,7 +1226,7 @@ mod presentation_tests {
             .lines()
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
-        assert!(api.ends_with("⬆️") || api.ends_with('✅'), "{api}");
+        assert!(api.ends_with("↔️") || api.ends_with('✅'), "{api}");
         assert!(!api.contains("check stale"), "{api}");
 
         let row = sample_api_update_row(
@@ -1281,6 +1292,12 @@ mod presentation_tests {
                 "HTTP 503",
             ),
             ("release lookup timed out", "timeout"),
+            // reqwest timeouts as persisted through `{error:#}`.
+            ("error sending request: operation timed out", "timeout"),
+            (
+                "request or response body error: operation timed out",
+                "timeout",
+            ),
             ("unsupported base ABI", "unsupported image ABI"),
             (
                 "registry returned HTTP 429123 at https://private.example/192.0.2.1",
@@ -1387,7 +1404,10 @@ mod presentation_tests {
             .lines()
             .find(|line| line.starts_with("**webui:**"))
             .unwrap();
-        assert!(webui.ends_with("⬆️"), "{webui}");
+        assert!(
+            webui.ends_with("latest `ccccccc` · different source ↔️"),
+            "{webui}"
+        );
         assert!(!webui.contains("webui not managed by updater"), "{webui}");
 
         let mut api = sample_api_update_row(
@@ -1433,7 +1453,7 @@ mod presentation_tests {
             .unwrap();
         assert!(api.contains("observation stale (2h)"), "{api}");
         assert!(!api.ends_with('✅'), "{api}");
-        assert!(!api.contains("⬆️"), "{api}");
+        assert!(!api.contains("↔️"), "{api}");
     }
 
     #[test]
@@ -1477,7 +1497,50 @@ mod presentation_tests {
             .unwrap();
         assert!(api.starts_with("**api:** `1234567`"), "{api}");
         assert!(
-            api.ends_with("latest `abcdef0` · update available ⬆️"),
+            api.ends_with("latest `abcdef0` · different source ↔️"),
+            "{api}"
+        );
+
+        // The channel was republished at the running source with a new digest.
+        let mut row = sample_api_update_row(
+            Some(sample_candidate("latest", source, &"b".repeat(64))),
+            Some(1_100),
+            None,
+            Some(sample_observed(source)),
+            Some(1_000),
+            "latest",
+        );
+        row.installed = Some(sample_candidate("latest", source, &"e".repeat(64)));
+        let out = release_text(&[row], 1_200);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(
+            api.ends_with("latest `abcdef0` · source up to date (image digest differs) ⚠️"),
+            "{api}"
+        );
+        assert!(!api.contains("not checked"), "{api}");
+
+        // A built-in fallback binary runs the candidate source while the
+        // installed release names other source, so its digest is unknown.
+        let mut row = sample_api_update_row(
+            Some(sample_candidate("latest", source, &"b".repeat(64))),
+            Some(1_100),
+            None,
+            Some(sample_observed(source)),
+            Some(1_000),
+            "latest",
+        );
+        row.observed.as_mut().unwrap().base_image_sha = source.into();
+        row.installed = Some(sample_candidate("latest", &"e".repeat(40), &"e".repeat(64)));
+        let out = release_text(&[row], 1_200);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(
+            api.ends_with("latest `abcdef0` · source up to date (image digest unverified) ⚠️"),
             "{api}"
         );
     }
