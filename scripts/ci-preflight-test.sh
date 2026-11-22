@@ -419,11 +419,18 @@ case "$*" in
   'test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --list --ignored --format terse --nocapture')
     printf '%s\n' 'smoke_fixture: test'
     ;;
+  'test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --exact smoke_fixture --ignored --test-threads=1 --nocapture')
+    # The per-test launcher creates a session for the smoke process and its children.
+    read -r session < <(ps -o sid= -p "$$")
+    if [ "$session" != "$$" ]; then
+      echo 'ci-preflight test cargo: ignored smoke must run in its own timed test session' >&2
+      exit 1
+    fi
+    ;;
   'update --workspace --locked'|'clippy --locked '*|'build --locked '*|\
   'test --locked '*' --doc -- --list --format terse'|\
   'test --locked '*' --doc -- --list --ignored --format terse'|\
-  'test --locked -p jmodguard-integration-tests --test dual_process_smoke --no-run'|\
-  'test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --exact smoke_fixture --ignored --test-threads=1 --nocapture')
+  'test --locked -p jmodguard-integration-tests --test dual_process_smoke --no-run')
     ;;
   *)
     echo "ci-preflight test cargo: unexpected:$argv" >&2

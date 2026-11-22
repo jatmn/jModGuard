@@ -20,8 +20,8 @@ case "$1" in
   rust-fixture) [[ "$#" -eq 2 ]] ;;
   *) exit 1 ;;
 esac
-if [ -n "${DYLINT_TEST_NODE_LOG:-}" ]; then
-  printf '%s\n' "$1" >>"$DYLINT_TEST_NODE_LOG"
+if [ -n "${DYLINT_TEST_PHASE_LOG:-}" ]; then
+  printf '%s\n' "$1" >>"$DYLINT_TEST_PHASE_LOG"
 fi
 SH
 chmod +x "$fixture/bin/node"
@@ -90,6 +90,9 @@ elif [ "${1:-}" = dylint ]; then
       printf '%s\n' '--no-metadata'
     fi
     exit 0
+  fi
+  if [ -n "${DYLINT_TEST_PHASE_LOG:-}" ]; then
+    printf '%s\n' cargo-dylint >>"$DYLINT_TEST_PHASE_LOG"
   fi
   {
     field TMPDIR
@@ -265,14 +268,14 @@ expect "$capture" CARGO_HOME "$fixture/external/cargo-home"
 
 # Both Node checks succeed; the lint producer must still fail the pipeline.
 lint_rc=0
-node_log="$fixture/node-modes"
-run_dylint "$fixture/external" DYLINT_TEST_LINT_RC=1 DYLINT_TEST_NODE_LOG="$node_log" || lint_rc=$?
+phase_log="$fixture/phases"
+run_dylint "$fixture/external" DYLINT_TEST_LINT_RC=1 DYLINT_TEST_PHASE_LOG="$phase_log" || lint_rc=$?
 if [ "$lint_rc" -ne 1 ]; then
   cat "$stdout_file" >&2
   fail "cargo dylint exit 1 must fail the gate, got $lint_rc"
 fi
-diff -u <(printf '%s\n' rust-fixture rust) "$node_log" \
-  || fail 'the lint fixture must run before processing Rust diagnostics'
+diff -u <(printf '%s\n' rust-fixture cargo-dylint rust) "$phase_log" \
+  || fail 'the lint fixture must complete before workspace linting starts'
 
 # Hosted CI supplies a persistent cache; an explicit override still takes effect.
 run_dylint "$fixture/external" DYLINT_CARGO_HOME="$fixture/hosted-cache"
