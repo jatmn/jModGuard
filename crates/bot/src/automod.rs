@@ -195,6 +195,9 @@ pub struct PendingAction {
     /// configuration cannot be re-read before acting, these settings still
     /// decide dry-run and exemptions. Custom rules leave this empty.
     pub matched_rule: Option<RuleDef>,
+    /// Whether the rule was in dry-run when this action was selected. Its
+    /// strike ladder belongs to that mode, so execution never runs it live.
+    pub dry_run: bool,
 }
 
 static URL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
@@ -350,6 +353,7 @@ impl AutomodEngine {
                     evidence: serde_json::json!({ "content": ctx.content,
                         "channel_id": ctx.channel_id, "message_id": ctx.message_id }),
                     matched_rule: Some(rule.clone()),
+                    dry_run: rule.dry_run,
                 };
                 // This list promises the same fixed one-hour action even when
                 // another detector would also ban with a different window.
@@ -392,6 +396,7 @@ impl AutomodEngine {
                     "mentions": ctx.everyone_mentions + ctx.here_mentions + ctx.role_mentions,
                 }),
                 matched_rule: Some(rule.clone()),
+                dry_run: rule.dry_run,
             };
             if is_more_severe(&pending, rule.dry_run, &best, best_dry) {
                 best = Some(pending);
@@ -464,6 +469,7 @@ impl AutomodEngine {
                     "attachments": ctx.attachment_count,
                 }),
                 matched_rule: None,
+                dry_run: rule.dry_run,
             };
             if is_more_severe(&pending, rule.dry_run, &best, best_dry) {
                 best = Some(pending);
@@ -785,7 +791,8 @@ fn automod_remember_member_failure(
     }
 }
 
-/// Executes a decided automod action (or logs it in dry-run mode).
+/// Executes a decided automod action (or logs it in dry-run mode). Returns
+/// whether the action took the live path rather than only being logged.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_pending(
     app: &Arc<BotState>,
@@ -797,7 +804,7 @@ pub async fn execute_pending(
     msg_id: Option<u64>,
     msg_channel: Option<u64>,
     pending: &PendingAction,
-) {
+) -> bool {
     execute_pending_with(
         app,
         ctx.http.as_ref(),
@@ -826,7 +833,7 @@ pub(crate) async fn execute_pending_with(
     msg_id: Option<u64>,
     msg_channel: Option<u64>,
     pending: &PendingAction,
-) {
+) -> bool {
     let enrollment = crate::cases::capture(app, guild_id.get()).await;
     let rule = &pending.action;
     let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
@@ -843,13 +850,15 @@ pub(crate) async fn execute_pending_with(
 
     let loaded = app.configs.get(&app.db, guild_id.get()).await;
     if pending.rule_id == "known_spam" {
-        let Ok(cfg) = loaded.as_ref() else { return };
+        let Ok(cfg) = loaded.as_ref() else {
+            return false;
+        };
         let Some(current) = cfg.rules.get("known_spam") else {
-            return;
+            return false;
         };
         let content = pending.evidence["content"].as_str().unwrap_or("");
         if !current.enabled || !cfg.known_spam.matches(content) {
-            return;
+            return false;
         }
         if jmodguard::custom_rules::rule_scope_skips(
             current,
@@ -859,7 +868,7 @@ pub(crate) async fn execute_pending_with(
             false,
             true,
         ) {
-            return;
+            return false;
         }
     }
     let current = loaded
@@ -884,10 +893,11 @@ pub(crate) async fn execute_pending_with(
                 "rule configuration unavailable; skipping the action"
             }
         );
-        return;
+        return false;
     };
+    // Selected in dry-run stays log-only; switched into dry-run stops a live action.
     let (dry, log_automod, open_case, skip_moderators, skipped_roles) = (
-        settings.dry_run,
+        pending.dry_run || settings.dry_run,
         settings.log_automod,
         settings.open_case,
         settings.skip_moderators,
@@ -908,9 +918,54 @@ pub(crate) async fn execute_pending_with(
                 .to_string(),
         );
         logging::emit_to(app, http, guild_id, "automod", v).await;
-        return;
+        return false;
     }
 
+    execute_live(
+        app,
+        http,
+        cache,
+        guild_id,
+        target,
+        provided_member,
+        msg_id,
+        msg_channel,
+        pending,
+        enrollment,
+        vars,
+        reason,
+        config_unknown,
+        log_automod,
+        open_case,
+        skip_moderators,
+        skipped_roles,
+    )
+    .await;
+    true
+}
+
+/// The enforcement path of [`execute_pending_with`], after the dry-run decision.
+#[allow(clippy::too_many_arguments)]
+async fn execute_live(
+    app: &Arc<BotState>,
+    http: &serenity::http::Http,
+    cache: &serenity::cache::Cache,
+    guild_id: GuildId,
+    target: &serenity::model::user::User,
+    provided_member: Option<Member>,
+    msg_id: Option<u64>,
+    msg_channel: Option<u64>,
+    pending: &PendingAction,
+    enrollment: Option<db::GuildEnrollment>,
+    mut vars: std::collections::BTreeMap<String, String>,
+    reason: String,
+    config_unknown: bool,
+    log_automod: bool,
+    open_case: bool,
+    skip_moderators: bool,
+    skipped_roles: &[u64],
+) {
+    let rule = &pending.action;
     // A missing member is not a known member with no roles. Gateway members
     // may have no user field, but their supplied role list is still useful.
     let role_ids: Option<Vec<u64>> = provided_member
@@ -1801,6 +1856,95 @@ mod tests {
         let badword = &bucket.rules["badword"];
         assert_eq!(badword.strikes, 3);
         assert!(badword.events.is_empty());
+    }
+
+    // The mode can change while the executor awaits enrollment and reloads
+    // configuration. The action must never run more live than it was selected.
+    #[tokio::test]
+    async fn a_mode_switch_before_execution_never_makes_an_action_live() {
+        use serenity::model::id::{GuildId, UserId};
+        use serenity::model::user::User;
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        for selected_dry in [true, false] {
+            let path = std::env::temp_dir()
+                .join(format!("mode_switch_{:032x}.db", rand::random::<u128>()));
+            let app =
+                BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+            assert!(
+                crate::db::claim_active_bot(
+                    &app.db,
+                    app.activation.instance(),
+                    jmodguard::control::now_ms(),
+                    Arc::new(AtomicBool::new(false))
+                )
+                .await
+                .unwrap()
+            );
+            app.activation.mark_lock_held(true);
+            let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+                .await
+                .unwrap()
+                .unwrap();
+            app.tenant.activate(enrollment).await.unwrap();
+            let store = |dry_run: bool| {
+                let mut rule = crate::defaults::default_rules().remove(0);
+                rule.dry_run = dry_run;
+                let data = serde_json::to_string(&rule).unwrap();
+                let db = app.db.clone();
+                async move {
+                    db.with_conn(move |conn| {
+                        use crate::db::SqlExecutor;
+                        conn.execute_bounded(
+                            "INSERT OR REPLACE INTO rules(guild_id,rule_id,data) VALUES (10,'mention_spam',?1)",
+                            crate::db::params![data],
+                            1,
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                }
+            };
+            store(selected_dry).await;
+            app.invalidate_configs();
+            let cfg = app.configs.get(&app.db, 10).await.unwrap();
+            let mut message = word_message(&[]);
+            message.everyone_mentions = 6;
+            let pending = AutomodEngine::new()
+                .evaluate(&cfg, &message)
+                .expect("mention spam ban");
+            assert_eq!(pending.action.action, "ban");
+            assert_eq!(pending.dry_run, selected_dry);
+
+            store(!selected_dry).await;
+            app.invalidate_configs();
+            let mut user = User::default();
+            user.id = UserId::new(99);
+            user.name = "member".into();
+            let stub = DiscordStub::start();
+            let live = execute_pending_with(
+                &app,
+                &stub.http,
+                &stub.cache,
+                GuildId::new(10),
+                &user,
+                None,
+                "member",
+                Some(42),
+                Some(70),
+                &pending,
+            )
+            .await;
+            let seen = stub.finish();
+            assert!(!live, "selected dry-run={selected_dry}");
+            assert!(
+                seen.is_empty(),
+                "selected dry-run={selected_dry}: no Discord action: {seen:?}"
+            );
+            drop(app);
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     fn default_automod_config() -> CachedGuildConfig {
@@ -4295,6 +4439,7 @@ mod tests {
                 }),
                 mention_permission_unknown: false,
                 matched_rule: Some(matched),
+                dry_run: false,
             };
             let mut user = User::default();
             user.id = UserId::new(99);

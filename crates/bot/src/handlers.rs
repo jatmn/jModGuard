@@ -68,16 +68,11 @@ pub(crate) struct RateLimitWait {
     pub global: bool,
 }
 
-/// Prefix commands stop when the member is removed or timed out. A dry-run
-/// match only logs, so the member's command still runs. This uses the same
-/// configuration snapshot that selected the action.
-fn automod_stops_prefix_commands(
-    rules: &std::collections::HashMap<String, crate::types::RuleDef>,
-    rule_id: &str,
-    action: &str,
-) -> bool {
-    matches!(action, "ban" | "kick" | "timeout")
-        && rules.get(rule_id).is_none_or(|rule| !rule.dry_run)
+/// Prefix commands stop when the member is removed or timed out. The executor
+/// decides whether the action ran live; a dry-run action only logs, so the
+/// member's command still runs.
+fn automod_stops_prefix_commands(executed_live: bool, action: &str) -> bool {
+    executed_live && matches!(action, "ban" | "kick" | "timeout")
 }
 
 pub(crate) fn member_sync_deadline_ms(now_ms: i64, timeout: Duration) -> i64 {
@@ -1409,7 +1404,7 @@ impl EventHandler for Handler {
                 .as_ref()
                 .map(user_display)
                 .unwrap_or_else(|| msg.author.name.clone());
-            execute_pending(
+            let executed_live = execute_pending(
                 &app,
                 &ctx,
                 guild_id,
@@ -1421,8 +1416,7 @@ impl EventHandler for Handler {
                 &pending,
             )
             .await;
-            stop_commands =
-                automod_stops_prefix_commands(&cfg.rules, &pending.rule_id, &pending.action.action);
+            stop_commands = automod_stops_prefix_commands(executed_live, &pending.action.action);
         }
 
         if !stop_commands {
@@ -1783,6 +1777,7 @@ impl EventHandler for Handler {
                         .get(&rule_id)
                         .map(|r| r.name.clone())
                         .unwrap_or_else(|| rule_id.clone());
+                    let dry_run = cfg.rules.get(&rule_id).is_some_and(|rule| rule.dry_run);
                     let pending = crate::automod::PendingAction {
                         rule_id,
                         rule_name,
@@ -1791,6 +1786,7 @@ impl EventHandler for Handler {
                         evidence: serde_json::json!({}),
                         mention_permission_unknown: false,
                         matched_rule: None,
+                        dry_run,
                     };
                     execute_pending(
                         &app,
@@ -2035,25 +2031,14 @@ impl EventHandler for Handler {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn dry_run_automod_matches_do_not_stop_prefix_commands() {
+    fn only_live_member_actions_stop_prefix_commands() {
         use super::automod_stops_prefix_commands;
-        let mut rules = std::collections::HashMap::new();
-        for (id, dry_run) in [("velocity", true), ("badword", false)] {
-            let mut rule = crate::defaults::default_rules()
-                .into_iter()
-                .zip(crate::types::RULE_IDS)
-                .find(|(_, rule_id)| *rule_id == id)
-                .unwrap()
-                .0;
-            rule.dry_run = dry_run;
-            rules.insert(id.to_owned(), rule);
-        }
         for action in ["timeout", "kick", "ban"] {
-            assert!(!automod_stops_prefix_commands(&rules, "velocity", action));
-            assert!(automod_stops_prefix_commands(&rules, "badword", action));
+            assert!(!automod_stops_prefix_commands(false, action));
+            assert!(automod_stops_prefix_commands(true, action));
         }
         for action in ["delete", "warn", "log"] {
-            assert!(!automod_stops_prefix_commands(&rules, "badword", action));
+            assert!(!automod_stops_prefix_commands(true, action));
         }
     }
 
