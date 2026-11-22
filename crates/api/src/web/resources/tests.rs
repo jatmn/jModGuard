@@ -244,6 +244,32 @@ fn history_downsamples_onto_a_fixed_grid_with_gaps_not_zeros() {
 }
 
 #[test]
+fn range_breakdown_ranks_a_late_busy_label_by_count() {
+    // Each early minute is full of quiet paths; the busiest path only appears
+    // in the last minute of the range.
+    let mut rows: Vec<Rollup> = (0..30)
+        .map(|m| {
+            let mut row = minute(600 + m * 60, 100, 1, 1);
+            row.data.labelled.insert(
+                "db_primary_paths".into(),
+                (0..jmodguard::resources::MAX_LABELS)
+                    .map(|i| (format!("quiet{m:02}-{i:02}"), 2))
+                    .collect(),
+            );
+            row
+        })
+        .collect();
+    let mut last = minute(600 + 30 * 60, 100, 1, 1);
+    last.data
+        .labelled
+        .insert("db_primary_paths".into(), [("busy".to_owned(), 90)].into());
+    rows.push(last);
+    let value = history_json(&rows, 600, 600 + 3_600, 600);
+    let paths = value["breakdowns"]["db_primary_paths"].as_array().unwrap();
+    assert_eq!(paths[0], serde_json::json!(["busy", 90]));
+}
+
+#[test]
 fn freshness_marks_missing_status_unavailable_and_old_status_stale() {
     let now = 1_800_000_000_000;
     assert_eq!(current(None, now)["availability"], "unavailable");

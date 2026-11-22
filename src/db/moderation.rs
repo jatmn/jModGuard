@@ -2641,7 +2641,7 @@ impl From<bool> for ExpiryDeadlineMatch {
 /// never authorizes dispatch: selection and claim below stay on the primary.
 pub async fn expired_ban_may_be_due(db: &Db, now: i64) -> Result<bool> {
     db.with_conn(move |conn| {
-        conn.query_row(
+        conn.query_row_advisory(
             "SELECT EXISTS(SELECT 1 FROM bans WHERE active=1 AND expires_at<=?1)",
             params![now],
             |row| Ok(row.get::<bool>(0)?),

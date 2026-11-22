@@ -186,6 +186,9 @@ pub struct StartupProbe {
     transactions: AtomicU64,
     queries: AtomicU64,
     catalog: AtomicU64,
+    /// Primary statements by Bot Resources path label, as counted for the
+    /// process-wide `db_primary_paths` family.
+    primary_paths: Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
 impl StartupProbe {
@@ -203,6 +206,35 @@ impl StartupProbe {
 
     pub fn catalog(&self) -> u64 {
         self.catalog.load(Ordering::Relaxed)
+    }
+
+    /// Primary statements this probe's databases counted under `label`.
+    pub fn primary_statements(&self, label: &str) -> u64 {
+        self.primary_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Every path label with primary statements counted by this probe.
+    pub fn primary_labels(&self) -> Vec<String> {
+        self.primary_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn record_primary(&self, label: &str, statements: u64) {
+        let mut paths = self
+            .primary_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = paths.entry(label.to_owned()).or_default();
+        *count = count.saturating_add(statements);
     }
 
     pub(crate) fn record_immediate(&self) {
@@ -886,10 +918,11 @@ const PRIMARY_BEGIN_BUCKETS: [(u128, &str); 5] = [
 struct PrimaryTally {
     label: Arc<str>,
     total: &'static str,
+    probe: Option<Arc<StartupProbe>>,
 }
 
 impl PrimaryTally {
-    fn new(location: &std::panic::Location<'_>, guild_store: bool) -> Self {
+    fn new(location: &std::panic::Location<'_>, guild_store: bool, runtime: &DbRuntime) -> Self {
         Self {
             label: primary_path_label(location, guild_store).into(),
             total: if guild_store {
@@ -897,12 +930,16 @@ impl PrimaryTally {
             } else {
                 PRIMARY_STATEMENTS
             },
+            probe: runtime.startup_probe.clone(),
         }
     }
 
     fn count(&self, statements: u64) {
         jmodguard_runtime::resources::count(self.total, statements);
         jmodguard_runtime::resources::count_labelled(PRIMARY_PATHS, &self.label, statements);
+        if let Some(probe) = &self.probe {
+            probe.record_primary(&self.label, statements);
+        }
     }
 }
 
@@ -1479,7 +1516,7 @@ impl Connection {
             }
         }
         let inner = opened?;
-        let tally = primary.then(|| PrimaryTally::new(caller, self.guild_store));
+        let tally = primary.then(|| PrimaryTally::new(caller, self.guild_store, &self.runtime));
         if let Some(tally) = &tally {
             tally.count(2);
         }
@@ -1649,7 +1686,12 @@ impl Connection {
             crate::db::ACTIVE_BOT_LEASE_TTL_MS.max(crate::db::LAUNCHER_FENCE_TTL_MS) as u64,
         ));
         self.inner.busy_timeout(timeout)?;
-        PrimaryTally::new(std::panic::Location::caller(), self.guild_store).count(1);
+        PrimaryTally::new(
+            std::panic::Location::caller(),
+            self.guild_store,
+            &self.runtime,
+        )
+        .count(1);
         // In-place replacement of an existing fixed-length meta lease cannot
         // allocate pages, so it needs no capacity reservation or receipt. The
         // CAS is idempotent: a lost response is resolved by retry/re-read. Its
@@ -1660,6 +1702,29 @@ impl Connection {
             self.inner.execute(sql, params),
             true,
         )? as usize)
+    }
+
+    /// Autocommit read for an idle worker's advisory check. Remote libSQL can
+    /// serve it from a replica. It keeps the interactive read budget of the
+    /// primary snapshot it replaces, not the pool's longer operation deadline,
+    /// so a stalled read cannot hold a sequential worker for long.
+    pub fn query_row_advisory<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<T>
+    where
+        T: Send,
+        P: IntoParams + Send,
+        F: FnOnce(&Row) -> Result<T> + Send,
+    {
+        require_read_sql(sql)?;
+        self.runtime.block_on_database_within(
+            "advisory query",
+            self.interactive_read_budget(),
+            async {
+                let mut rows = self.inner.query(sql, params).await?;
+                let row = rows.next().await?.ok_or(QueryReturnedNoRows)?;
+                map(&row)
+            },
+            true,
+        )
     }
 
     pub fn is_autocommit(&self) -> bool {
@@ -3138,7 +3203,13 @@ mod tests {
     #[test]
     fn primary_statements_are_counted_under_the_opening_code_location() {
         use jmodguard_runtime::resources::{peek_counter, peek_labelled};
-        let mut connection = Connection::open(":memory:").unwrap();
+        // The probe isolates this connection's counts from other tests that
+        // share the process-wide families.
+        let probe = Arc::new(StartupProbe::default());
+        let mut connection = {
+            let _probe = enter_startup_probe(Some(probe.clone()));
+            Connection::open(":memory:").unwrap()
+        };
         let begins = || {
             PRIMARY_BEGIN_BUCKETS
                 .iter()
@@ -3152,21 +3223,18 @@ mod tests {
 
         let (tx, line) = (connection.transaction_primary_snapshot().unwrap(), line!());
         let label = format!("db_compat:{line}");
-        assert_eq!(peek_labelled(PRIMARY_PATHS, &label), 2, "BEGIN and its end");
+        assert_eq!(probe.primary_statements(&label), 2, "BEGIN and its end");
         let _: i64 = tx.query_row("SELECT 1", (), |r| Ok(r.get(0)?)).unwrap();
         let _: i64 = tx.query_row("SELECT 2", (), |r| Ok(r.get(0)?)).unwrap();
         tx.finish_read().unwrap();
-        assert_eq!(peek_labelled(PRIMARY_PATHS, &label), 4);
+        assert_eq!(probe.primary_statements(&label), 4);
         assert!(peek_counter(PRIMARY_STATEMENTS) >= core_before + 4);
         assert!(begins() > begins_before, "a primary BEGIN latency bucket");
 
         // A replica-routed read is not primary work.
         let (tx, line) = (connection.transaction_consistent_read().unwrap(), line!());
         tx.finish_read().unwrap();
-        assert_eq!(
-            peek_labelled(PRIMARY_PATHS, &format!("db_compat:{line}")),
-            0
-        );
+        assert_eq!(probe.primary_statements(&format!("db_compat:{line}")), 0);
 
         // Guild-store pools are labelled and totalled separately.
         connection.set_guild_store(true);
@@ -3174,14 +3242,56 @@ mod tests {
         let (tx, line) = (connection.transaction_primary_write().unwrap(), line!());
         tx.finish_read().unwrap();
         assert_eq!(
-            peek_labelled(PRIMARY_PATHS, &format!("guild db_compat:{line}")),
+            probe.primary_statements(&format!("guild db_compat:{line}")),
             2
         );
-        assert_eq!(
-            peek_labelled(PRIMARY_PATHS, &format!("db_compat:{line}")),
-            0
-        );
+        assert_eq!(probe.primary_statements(&format!("db_compat:{line}")), 0);
         assert!(peek_counter(GUILD_PRIMARY_STATEMENTS) >= guild_before + 2);
+        assert_eq!(probe.primary_labels().len(), 2);
+    }
+
+    #[test]
+    fn advisory_read_keeps_the_interactive_budget_not_the_pool_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let clock = ManualClock::new();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let server = {
+            let clock = Arc::clone(&clock);
+            std::thread::spawn(move || {
+                // The read has started once its request connects. Only the
+                // interactive budget then elapses; a read bound to the pool
+                // deadline is still waiting when this fixture gives up and
+                // closes the socket.
+                let (_socket, _) = listener.accept().unwrap();
+                clock.advance(INTERACTIVE_READ_BUDGET);
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            })
+        };
+        // The bot pool's long operation deadline.
+        let runtime = DbRuntime::with_operation_timeout(Some(Duration::from_secs(75))).unwrap();
+        runtime.install_manual_clock(Some(clock));
+        let connector = crate::remote_https::https_connector();
+        let database = runtime
+            .block_on(
+                libsql::Builder::new_remote(format!("http://{address}"), "test-token".into())
+                    .connector(connector)
+                    .build(),
+            )
+            .unwrap();
+        let connection = Connection::from_database(Arc::new(database), runtime).unwrap();
+        let error = connection
+            .query_row_advisory("SELECT 1", (), |row| Ok(row.get::<i64>(0)?))
+            .expect_err("a stalled advisory read must time out");
+        let _ = release_tx.send(());
+        server.join().unwrap();
+        assert!(is_database_operation_timeout(&error), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{INTERACTIVE_READ_BUDGET:?}")),
+            "{error:#}"
+        );
     }
 
     #[test]

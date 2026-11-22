@@ -628,13 +628,6 @@ impl Db {
             .owner = owner;
     }
 
-    /// Bot Resources counts this pool's primary work as a guild store's.
-    pub(crate) fn mark_guild_store(&self) {
-        self.connections
-            .guild_store
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub(crate) fn install_commit_lease_probe(&self, probe: crate::db_compat::CommitLeaseProbe) {
         *self
             .connections
@@ -701,7 +694,14 @@ struct ConnectionPool {
     launcher_fence: Arc<Mutex<Option<String>>>,
     commit_lease_probe: Arc<Mutex<Option<crate::db_compat::CommitLeaseProbe>>>,
     /// Guild-store pools count primary work apart from the core database.
-    guild_store: std::sync::atomic::AtomicBool,
+    guild_store: bool,
+}
+
+/// Which database family a pool serves, for Bot Resources accounting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PoolScope {
+    Core,
+    GuildStore,
 }
 
 enum LeasedConnection {
@@ -776,7 +776,7 @@ impl ConnectionLease {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         connection.set_commit_lease_probe(probe);
-        connection.set_guild_store(pool.guild_store.load(std::sync::atomic::Ordering::Relaxed));
+        connection.set_guild_store(pool.guild_store);
         Ok(Self {
             connection: LeasedConnection::Reusable(connection),
             pool,
@@ -947,20 +947,24 @@ impl Db {
 
     // Share transport/pool creation while keeping core and guild-store schemas separate.
     // No caller can obtain an unchecked pool before its initializer succeeds.
+    // Guild stores call `open_pool` with their own scope.
     fn open_with_bootstrap(
         opts: &DbOpenOptions,
         initialize: impl FnOnce(&mut Connection) -> Result<()>,
         ready: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<Self> {
-        Self::open_pool(opts, opts.migrate, initialize, ready)
+        Self::open_pool(opts, opts.migrate, PoolScope::Core, initialize, ready)
     }
 
     // `bot_writer` selects how long local pooled connections wait for the
     // SQLite writer lock. Guild stores never set `migrate`, but only the bot
     // opens one writable, so its writes queue like the bot's core writes.
+    // `scope` classifies every connection, including the bootstrap one,
+    // before its first statement.
     fn open_pool(
         opts: &DbOpenOptions,
         bot_writer: bool,
+        scope: PoolScope,
         initialize: impl FnOnce(&mut Connection) -> Result<()>,
         ready: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<Self> {
@@ -991,6 +995,7 @@ impl Db {
         };
         let database = Arc::new(database);
         let open_ms = u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let guild_store = scope == PoolScope::GuildStore;
 
         // Migrate / schema-check on a dedicated connection first, so no other
         // connections are racing the DDL at startup. The connection is closed
@@ -1002,6 +1007,7 @@ impl Db {
                         Connection::from_database(Arc::clone(&database), runtime.clone())
                             .context("failed to connect to database")?;
                     connection.set_read_only(opts.read_only);
+                    connection.set_guild_store(guild_store);
                     connection
                 }),
                 runtime: runtime.clone(),
@@ -1058,6 +1064,7 @@ impl Db {
                     Connection::from_database(Arc::clone(&database), pool_runtime.clone())
                         .context("failed to create pooled database connection")?;
                 connection.set_read_only(opts.read_only);
+                connection.set_guild_store(guild_store);
                 configure_connection(&connection, remote, busy_timeout_ms, opts.read_only)?;
                 connections.push(connection);
             }
@@ -1106,7 +1113,7 @@ impl Db {
                     generation_source: Mutex::new(None),
                     launcher_fence: Arc::clone(&launcher_fence),
                     commit_lease_probe,
-                    guild_store: std::sync::atomic::AtomicBool::new(false),
+                    guild_store,
                 }),
                 lease_connection: Arc::new(Mutex::new(Some(lease_connection))),
                 permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),

@@ -612,8 +612,10 @@ impl GuildDataStore {
             default_prefix: String::new(),
             retention_days: 0,
         };
-        Db::open_with_bootstrap(
+        Db::open_pool(
             &opts,
+            opts.migrate,
+            PoolScope::GuildStore,
             |conn| {
                 let mut tx = conn.transaction_immediate()?;
                 historical_schema::apply(&tx, 0, version)?;
@@ -649,8 +651,10 @@ impl GuildDataStore {
             default_prefix: String::new(),
             retention_days: 0,
         };
-        let _db = Db::open_with_bootstrap(
+        let _db = Db::open_pool(
             &opts,
+            opts.migrate,
+            PoolScope::GuildStore,
             |conn| {
                 found = read_existing_registration(conn)?;
                 Ok(())
@@ -678,10 +682,10 @@ impl GuildDataStore {
         let db = Db::open_pool(
             &opts,
             !opts.read_only,
+            PoolScope::GuildStore,
             |conn| initialize_store(conn, &expected, create),
             |_| Ok(()),
         )?;
-        db.mark_guild_store();
         Ok(Self {
             db,
             expected,

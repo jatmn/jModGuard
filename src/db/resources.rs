@@ -151,6 +151,7 @@ pub async fn record_resource_rollups(
                 .filter(|hour| hour.start_secs == hour_start && hour.span_secs == HOUR_SECS)
                 .unwrap_or_else(|| Rollup::empty(hour_start, HOUR_SECS));
             hour.absorb(&rollup);
+            hour.keep_busiest_labels();
             tx.execute_rows(
                 "INSERT INTO resource_rollups (process, span_secs, start_secs, data) \
                  VALUES (?1, ?2, ?3, ?4) ON CONFLICT(process, span_secs, start_secs) \

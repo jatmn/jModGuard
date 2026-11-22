@@ -404,12 +404,18 @@ trips, read and write transactions, primary-routed statements, Discord requests,
 output, API response bytes).
 Primary-routed statements count every statement a process sends in a transaction the
 provider routes to the primary (all but `BEGIN READONLY`), including that `BEGIN` and its
-`COMMIT` or `ROLLBACK`, plus lease and fence renewals. Core and guild-store databases are
+`COMMIT` or `ROLLBACK`, plus the bot's writer-lease renewals. Core and guild-store databases are
 totalled apart. The cost table ranks them by the code location that opened the transaction
 (for example `db/moderation:<line>`, prefixed `guild ` for a guild store) and shows coarse core
 `BEGIN` latency buckets and `BEGIN` timeouts. No SQL text or identifiers are recorded. A
-prepared query counts once, and a minute keeps at most 24 locations per process; the rest
-count as `other`. Compare the core total with the provider's primary-forwarded queries.
+prepared query counts once. Each stored minute and hour keeps its 24 busiest labels per
+family and process, ranked by count rather than arrival; the rest count as `other`. The
+1-hour and 24-hour ranges rank across every saved minute. The 7-day and 30-day ranges read
+hour rows, where a label that only becomes busy late in an hour competes with the hour's
+running totals. These totals cover only the bot and API processes. Each launcher
+(`jmodguard-updater`) also sends primary work that is not shown: its launcher fence renewal
+every 5 seconds (one statement, about 720 an hour) and its update-control reads. Add that
+separately before comparing the core total with the provider's primary-forwarded queries.
 Each logical Discord request counts once, including direct bot log deliveries. Internal
 rate-limit retries share the original request count.
 Database rows read and Bunny billing are shown as unavailable: the database client does

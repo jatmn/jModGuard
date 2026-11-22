@@ -102,7 +102,7 @@ pub async fn maintain_access_marks(db: &Db) -> Result<bool> {
         // writer lock. Replica lag only keeps a mark until a later pass, which
         // invalidates more, never less.
         let (has_expired, has_legacy): (bool, bool) =
-            conn.query_row(&pending, params![MARK_PREFIX, MARK_END], |row| {
+            conn.query_row_advisory(&pending, params![MARK_PREFIX, MARK_END], |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })?;
         if !has_expired && !has_legacy {

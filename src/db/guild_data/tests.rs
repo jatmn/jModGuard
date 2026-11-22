@@ -576,6 +576,32 @@ mod server_names;
 mod bunny_transfer;
 
 #[tokio::test]
+async fn guild_store_primary_work_is_classified_from_its_first_statement() {
+    let f = Fixture::new();
+    let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    {
+        let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
+        // Initialization and the later verified open both run their identity
+        // check and schema work on the bootstrap connection.
+        GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
+        let store = GuildDataStore::open(f.options(), reg.clone()).unwrap();
+        assert!(
+            GuildDataStore::existing_registration(f.options())
+                .unwrap()
+                .is_some()
+        );
+        store.raise_writer_epoch(1).await.unwrap();
+    }
+    let labels = probe.primary_labels();
+    assert!(!labels.is_empty());
+    assert!(
+        labels.iter().all(|label| label.starts_with("guild ")),
+        "guild-store work counted as core: {labels:?}"
+    );
+}
+
+#[tokio::test]
 async fn identity_check_runs_once_and_again_after_reconnect_or_schema_change() {
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
