@@ -20,6 +20,9 @@ case "$1" in
   rust-fixture) [[ "$#" -eq 2 ]] ;;
   *) exit 1 ;;
 esac
+if [ -n "${DYLINT_TEST_NODE_LOG:-}" ]; then
+  printf '%s\n' "$1" >>"$DYLINT_TEST_NODE_LOG"
+fi
 SH
 chmod +x "$fixture/bin/node"
 git init -q "$fixture/project"
@@ -101,6 +104,7 @@ elif [ "${1:-}" = dylint ]; then
     done
     printf 'argv=%s\n' "$*"
   } > "$DYLINT_TEST_CAPTURE"
+  exit "${DYLINT_TEST_LINT_RC:-0}"
 else
   echo "dylint test cargo: unexpected invocation: $*" >&2
   exit 1
@@ -258,6 +262,17 @@ run_dylint "$fixture/external" \
   RUSTFLAGS='-C debuginfo=0' CARGO_ENCODED_RUSTFLAGS='-D warnings'
 expect "$capture" TMPDIR "$fixture/external"
 expect "$capture" CARGO_HOME "$fixture/external/cargo-home"
+
+# Both Node checks succeed; the lint producer must still fail the pipeline.
+lint_rc=0
+node_log="$fixture/node-modes"
+run_dylint "$fixture/external" DYLINT_TEST_LINT_RC=1 DYLINT_TEST_NODE_LOG="$node_log" || lint_rc=$?
+if [ "$lint_rc" -ne 1 ]; then
+  cat "$stdout_file" >&2
+  fail "cargo dylint exit 1 must fail the gate, got $lint_rc"
+fi
+diff -u <(printf '%s\n' rust-fixture rust) "$node_log" \
+  || fail 'the lint fixture must run before processing Rust diagnostics'
 
 # Hosted CI supplies a persistent cache; an explicit override still takes effect.
 run_dylint "$fixture/external" DYLINT_CARGO_HOME="$fixture/hosted-cache"

@@ -391,4 +391,73 @@ check_node_timeout_flag '24junk' ''
 check_node_timeout_flag '' ''
 echo 'ci-preflight test: Node timeout flag, session and heap gating verified'
 
+# Drive the real API and integration lanes with tool stubs in the fixture repo.
+# Keep the Cargo stub separate from the tool-installation cases above.
+runner_bin="$fixture/runner-bin"
+mkdir -p "$runner_bin"
+printf '#!/bin/bash\nexit 0\n' >"$runner_bin/cargo-nextest"
+cat >"$runner_bin/cargo" <<'SH'
+#!/bin/bash
+set -euo pipefail
+printf -v argv ' %q' "$@"
+printf 'cargo%s\n' "$argv" >>"$CI_PREFLIGHT_TEST_CARGO_LOG"
+case "$*" in
+  'nextest run --help')
+    printf '%s\n' '--config-file' '--run-ignored' '--no-capture'
+    ;;
+  'nextest run '*)
+    if [[ " $* " == *' --no-default-features '* ]]; then
+      exit "$CI_PREFLIGHT_TEST_NEXTEST_RC"
+    fi
+    ;;
+  'metadata --no-deps --format-version 1')
+    printf '%s\n' '{"packages":[{"name":"jmodguard-api","targets":[{"kind":["lib"]}]},{"name":"jmodguard-integration-tests","targets":[{"kind":["lib"]}]}]}'
+    ;;
+  'build --locked -p jmodguard-'*' --message-format=json-render-diagnostics')
+    printf '{"reason":"compiler-artifact","target":{"name":"%s"},"executable":"/fixture/%s"}\n' "$4" "$4"
+    ;;
+  'test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --list --ignored --format terse --nocapture')
+    printf '%s\n' 'smoke_fixture: test'
+    ;;
+  'update --workspace --locked'|'clippy --locked '*|'build --locked '*|\
+  'test --locked '*' --doc -- --list --format terse'|\
+  'test --locked '*' --doc -- --list --ignored --format terse'|\
+  'test --locked -p jmodguard-integration-tests --test dual_process_smoke --no-run'|\
+  'test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --exact smoke_fixture --ignored --test-threads=1 --nocapture')
+    ;;
+  *)
+    echo "ci-preflight test cargo: unexpected:$argv" >&2
+    exit 1
+    ;;
+esac
+SH
+chmod +x "$runner_bin/cargo" "$runner_bin/cargo-nextest"
+
+cargo_log="$fixture/cargo-argv"
+run_fixture_cargo_preflight() {
+  local nextest_rc="$1"
+  shift
+  : >"$cargo_log"
+  (
+    cd "$frontend_root"
+    PATH="$runner_bin:$fixture/bin:$PATH" NEXTEST_TEST_THREADS=2 \
+      CI_PREFLIGHT_TEST_CARGO_LOG="$cargo_log" CI_PREFLIGHT_TEST_NEXTEST_RC="$nextest_rc" \
+      /bin/bash "$root/scripts/ci-preflight.sh" "$@"
+  ) >"$fixture/cargo-preflight.log" 2>&1
+}
+
+if ! run_fixture_cargo_preflight 0 --only api --only integration; then
+  cat "$fixture/cargo-preflight.log" >&2
+  fail 'nextest and ignored-smoke preflight must pass with successful tools'
+fi
+grep -Eq '^cargo nextest run .* -p jmodguard-api --no-default-features --lib$' "$cargo_log" \
+  || fail 'nextest must forward the API package, no-default-features and lib selections'
+grep -Fxq 'cargo test --locked -p jmodguard-integration-tests --test dual_process_smoke -- --exact smoke_fixture --ignored --test-threads=1 --nocapture' "$cargo_log" \
+  || fail 'the ignored dual-process smoke must use the GNU per-test runner'
+
+preflight_rc=0
+run_fixture_cargo_preflight 101 --only api || preflight_rc=$?
+[ "$preflight_rc" -eq 101 ] || fail "nextest exit 101 must reach the caller, got $preflight_rc"
+echo 'ci-preflight test: nextest argv, ignored-test fallback and failure propagation verified'
+
 bash "$root/scripts/ci-preflight.sh" --audit-expiry-self-check
