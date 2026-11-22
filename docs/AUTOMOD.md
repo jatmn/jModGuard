@@ -67,8 +67,32 @@ escalation accurate without false positives.
 - Default escalation: `1 → delete`, `2 → warn`, `4 → timeout 60m`.
 
 ### 7. `velocity` — message flood
-- Params: `window_secs` (10), `max_messages` (8).
+- Enabled by default. Counts eligible messages from the same author across
+  channels in a server, including ordinary messages that match no other rule.
+- Set `window_secs` to 1–600 (default 10) and `max_messages` to 0–1,023
+  (default 8). An eligible message adds a strike if the count in the window,
+  including that message, exceeds the limit. Messages are counted by when the
+  bot received them, so a slow configuration read cannot make spaced messages
+  look like a flood. Each message is judged on the messages that arrived before
+  it. If the bot finishes an author's messages out of arrival order, a strike
+  can be missed, but none is charged to a message that was under the limit. Previously saved integer limits
+  above 1,023 do not trigger until the limit is lowered to the supported range.
+  Saves that keep such a limit unchanged, such as enabling, dry-run, or a rules
+  copy, still succeed; a save cannot set a new limit above 1,023.
 - Default escalation: `1 → delete`, `2 → timeout 30m`, `4 → kick`.
+  Each threshold fires once per strike bucket. After the last threshold has
+  fired, further over-limit messages in that bucket are not actioned. A kick and
+  rejoin keeps the bucket until it expires after 10 minutes without a velocity
+  strike.
+- Upgrading: older versions counted only messages that matched another rule.
+  On the first bot start after upgrading, the global velocity rule and any
+  server override that still match the shipped default switch to dry-run once,
+  including a default the servers only inherited, so they log before they act.
+  Turn off dry-run to enforce. Edited rules and new installs keep their
+  settings. A server whose configuration is frozen by an interrupted guild move
+  keeps its rule unchanged. On an upgraded install, a global velocity rule that
+  is later removed (for example by copying rules into global from a server that
+  only inherits velocity) also falls back to dry-run, not to live enforcement.
 
 ### 8. `account_age` — brand-new accounts
 - Params: `min_age_days` (3).
@@ -172,11 +196,11 @@ keep their normal paths without an extra message delete. A delete action runs
 once; timeout and warn do not gain a deletion, and log never deletes.
 If a custom rule is deleted, or its configuration cannot be read, before a
 pending action runs, the bot logs a warning and takes no Discord action, including
-delete, timeout, or warn. The pending action does not carry its match-time dry-run
-state, so unavailable custom configuration cannot authorize enforcement. A failed
-configuration read for a built-in rule uses that rule's settings from when the
-message matched, so a dry-run rule stays log-only and its exemptions still apply.
-Kick or ban then uses the fallback; other actions keep their normal paths.
+delete, timeout, or warn. A pending action carries the dry-run setting from
+when the rule matched. Known spam requires the current rule and list before an
+action can proceed. For other built-in rules, a failed configuration read uses
+the rule's settings from the match, including its exemptions. A live kick or ban
+then uses the fallback. Other actions keep their normal paths.
 Whitelist your announcement channels and your mod/admin roles so @everyone pings
 in them never trigger.
 
@@ -184,6 +208,17 @@ in them never trigger.
 
 With dry-run on, generic rules evaluate normally but instead of acting post a
 `[DRY RUN] would <action>` entry to the configured automod log channel.
+When a dry-run rule and a live rule match the same message, the live rule's
+action runs and the dry-run match is not logged; a more severe dry-run action
+never replaces it. A dry-run match also never stops the member's prefix command
+in that message. Dry-run and live keep separate strike ladders, so strikes
+counted in dry-run never use up live escalation, and live strikes from before a
+dry-run trial still count afterwards within the usual 10 minutes. Message
+history used for detection, such as velocity's window and recent mentions, is
+shared by both modes. The executor checks the rule's mode once before entering
+the live path. If the action proceeds, it is log-only when it was selected in
+dry-run or the executor sees dry-run at that check. An in-flight live action
+can still run after a later switch to dry-run.
 Exact-image and repeated-text rules report their matched messages there without
 deleting or banning. Neither path creates a SQL audit row. **Recommended workflow:**
 enable the bot, set all rules to dry-run, watch for a few days, then switch them

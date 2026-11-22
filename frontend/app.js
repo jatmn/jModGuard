@@ -3834,7 +3834,7 @@ const RULE_TRIGGERS = {
   },
   velocity: {
     fields: [
-      { key: "max_messages", label: "Maximum messages in window", fallback: 8, before: "More than", after: "messages in" },
+      { key: "max_messages", label: "Maximum messages in window", fallback: 8, max: 1023, before: "More than", after: "messages in" },
       { key: "window_secs", label: "Window (seconds)", fallback: 10, after: "seconds" },
     ],
     phrase: (v) => `When someone sends more than ${v.max_messages} messages within ${v.window_secs} seconds`,
@@ -4621,6 +4621,8 @@ function RuleEditor({ record: r }) {
     if (r.rule_id === "invite") draft.allowlist_codes = inviteCodes(rule.params?.allowlist_codes).join(", ");
     return draft;
   });
+  const [initialValues] = useState(() => ({ ...values }));
+  const velocityLimitEdited = useRef(false);
   const [spamBan] = useState(() => ({ ...spamRuleBan(rule) }));
   // Inactive legacy image rows should convert to the safe dry-run mode by default.
   const [dryRun, setDryRun] = useState(() => (spam ? !spamConfigured(r.rule_id, rule) || rule.dry_run : rule.dry_run));
@@ -4630,6 +4632,7 @@ function RuleEditor({ record: r }) {
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef);
   const setValue = (key, value) => {
+    if (key === "max_messages") velocityLimitEdited.current = true;
     values[key] = value;
     refresh();
   };
@@ -4739,6 +4742,7 @@ function RuleEditor({ record: r }) {
         {
           className: "btn btn-primary",
           onClick: async () => {
+            let replaceVelocityLimit = false;
             try {
               if (spam) {
                 // The header toggle is the source of truth, including scripted checks.
@@ -4750,13 +4754,32 @@ function RuleEditor({ record: r }) {
                   );
               } else if (r.rule_id !== "badword" && !knownSpam) {
                 const params = {};
-                for (const { key, label } of fields) {
+                // `rule` is the draft; compare limits with what the target scope stores.
+                const persisted =
+                  (scopeSelRef.current?.value === "global" && state.guildId !== "0" ? r.global : r.effective)
+                    ?.params ?? {};
+                const shown = r.effective?.params ?? {};
+                for (const { key, label, max } of fields) {
                   const raw = String(values[key] ?? "");
                   const value = Number(raw);
-                  if (raw.trim() === "" || !Number.isSafeInteger(value) || value < 0)
+                  const validInteger = raw.trim() !== "" && Number.isSafeInteger(value) && value >= 0;
+                  if (max !== undefined) {
+                    // Keep an untouched limit or a restored legacy value outside the
+                    // accepted range. A valid input edit can replace a legacy value
+                    // even when both are displayed as the same number.
+                    if (raw === initialValues[key] && (!velocityLimitEdited.current || !validInteger || value > max)) {
+                      if (Object.hasOwn(shown, key)) params[key] = shown[key];
+                      continue;
+                    }
+                    replaceVelocityLimit = true;
+                  }
+                  const unchanged = max === undefined && value === persisted[key];
+                  if (raw.trim() === "" || Number.isNaN(value) || (!unchanged && !validInteger))
                     throw new Error(`${label} must be a non-negative whole number.`);
                   if (key === "window_secs" && (value < 1 || value > 600))
                     throw new Error("Window must be 1–600 seconds.");
+                  if (max !== undefined && value > max)
+                    throw new Error(`${label} must be 0–${max}.`);
                   params[key] = value;
                 }
                 if (r.rule_id === "invite") {
@@ -4777,6 +4800,7 @@ function RuleEditor({ record: r }) {
               scope,
               data: rule,
               clear_guild_override: scope === "global" && state.guildId !== "0",
+              ...(replaceVelocityLimit ? { replace_velocity_limit: true } : {}),
             });
             const savedLocally = applyConfigPatch(saved);
             if (!savedLocally && !(await loadConfig())) return;

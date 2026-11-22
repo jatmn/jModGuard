@@ -68,6 +68,12 @@ pub(crate) struct RateLimitWait {
     pub global: bool,
 }
 
+/// A ban, kick, or timeout suppresses the prefix command once it enters the
+/// live path, even if a later execution guard skips the penalty.
+fn automod_stops_prefix_commands(entered_live_path: bool, action: &str) -> bool {
+    entered_live_path && matches!(action, "ban" | "kick" | "timeout")
+}
+
 pub(crate) fn member_sync_deadline_ms(now_ms: i64, timeout: Duration) -> i64 {
     now_ms.saturating_add(timeout.as_millis().min(i64::MAX as u128) as i64)
 }
@@ -1390,6 +1396,7 @@ impl EventHandler for Handler {
             is_moderator,
             can_mention_everyone,
             mention_permission_unknown,
+            received: Some(tokio::time::Instant::from_std(received)),
         };
         let mut stop_commands = false;
         if let Some(pending) = app.automod.evaluate(&cfg, &msg_ctx) {
@@ -1397,7 +1404,7 @@ impl EventHandler for Handler {
                 .as_ref()
                 .map(user_display)
                 .unwrap_or_else(|| msg.author.name.clone());
-            execute_pending(
+            let entered_live_path = execute_pending(
                 &app,
                 &ctx,
                 guild_id,
@@ -1409,7 +1416,8 @@ impl EventHandler for Handler {
                 &pending,
             )
             .await;
-            stop_commands = matches!(pending.action.action.as_str(), "ban" | "kick" | "timeout");
+            stop_commands =
+                automod_stops_prefix_commands(entered_live_path, &pending.action.action);
         }
 
         if !stop_commands {
@@ -1770,6 +1778,7 @@ impl EventHandler for Handler {
                         .get(&rule_id)
                         .map(|r| r.name.clone())
                         .unwrap_or_else(|| rule_id.clone());
+                    let dry_run = cfg.rules.get(&rule_id).is_some_and(|rule| rule.dry_run);
                     let pending = crate::automod::PendingAction {
                         rule_id,
                         rule_name,
@@ -1778,6 +1787,7 @@ impl EventHandler for Handler {
                         evidence: serde_json::json!({}),
                         mention_permission_unknown: false,
                         matched_rule: None,
+                        dry_run,
                     };
                     execute_pending(
                         &app,
@@ -2021,6 +2031,18 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_member_actions_that_enter_the_live_path_stop_prefix_commands() {
+        use super::automod_stops_prefix_commands;
+        for action in ["timeout", "kick", "ban"] {
+            assert!(!automod_stops_prefix_commands(false, action));
+            assert!(automod_stops_prefix_commands(true, action));
+        }
+        for action in ["delete", "warn", "log"] {
+            assert!(!automod_stops_prefix_commands(true, action));
+        }
+    }
+
     #[test]
     fn only_role_set_changes_or_unknown_roles_mark_webui_access() {
         use super::{Member, RoleId, member_roles_may_have_changed};

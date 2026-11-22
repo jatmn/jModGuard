@@ -118,6 +118,12 @@ the server write fence and the configuration version update remain part of this
 operation. It sends no follow-up DELETE when retrieving an acknowledgement. Other
 PUT callers default to global-only behavior when the flag is absent.
 
+A promotion preserves an unchanged velocity limit from the effective server
+rule, including an inherited global rule. To replace `max_messages`, the editor
+sends `replace_velocity_limit: true` with an integer from 0 through 1,023.
+The writer validates that replacement even if it matches the browser's
+representation of a stored legacy value.
+
 Results remain bounded and in memory on the bot (currently up to 4096 entries and
 two minutes). Eviction, a writer restart, or an unmatched lookup returns HTTP 409
 `save_unknown`, never another mutation. The user must check the current configuration

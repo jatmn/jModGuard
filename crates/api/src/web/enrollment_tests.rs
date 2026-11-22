@@ -3064,6 +3064,60 @@ async fn invite_description_save_patch_uses_canonical_rule() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn velocity_promotion_applies_an_explicit_limit_replacement() {
+    use db::SqlExecutor;
+
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let bot = f.attach_save_writer().await;
+    let mut rule = db::get_rule(&bot.db, 0, "velocity").await.unwrap().unwrap();
+    rule.params["max_messages"] = serde_json::json!(1.0);
+    let stored_source = serde_json::to_string(&rule).unwrap();
+    bot.db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO rules (guild_id, rule_id, data) VALUES (10, 'velocity', ?1)",
+                db::params![stored_source],
+                64 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let path = "/api/guilds/10/rules/velocity";
+    let replacement = |rule: &crate::types::RuleDef| {
+        serde_json::json!({
+            "scope": "global", "data": rule, "clear_guild_override": true,
+            "replace_velocity_limit": true,
+        })
+        .to_string()
+    };
+    let (status, body) = f.request("PUT", path, &replacement(&rule)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        db::get_rule(&bot.db, 10, "velocity")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    rule.params["max_messages"] = serde_json::json!(1);
+    let (status, body) = f.request("PUT", path, &replacement(&rule)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let global = db::get_rule(&bot.db, 0, "velocity").await.unwrap().unwrap();
+    assert_eq!(global.params["max_messages"], serde_json::json!(1));
+    assert_eq!(jmodguard::types::velocity_max_messages(&global.params), 1);
+    assert_eq!(body["config_patch"]["value"]["params"], global.params);
+    assert!(
+        db::get_rule(&bot.db, 10, "velocity")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn recovered_global_rule_save_cannot_clear_a_newer_override() {
     let mut f = Fixture::new(true).await;
     f.enroll(10).await;

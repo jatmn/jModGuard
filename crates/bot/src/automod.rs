@@ -2,9 +2,9 @@
 //! strike buckets, 6 generic detection rules with per-rule action escalation,
 //! whitelists, and dry-run mode.
 //!
-//! All state is bounded: buckets are pruned on a timer and every event has a
-//! window, so memory stays flat regardless of user count. Lookups are O(1)
-//! per message (per-user bucket), never a scan of all tracked users.
+//! Buckets are pruned on a timer, and velocity history is bounded by time and
+//! count. Lookups are O(1) per message (per-user bucket), never a scan of all
+//! tracked users.
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -16,6 +16,7 @@ use serenity::model::prelude::Timestamp;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::time::Instant as AutomodInstant;
 
 use crate::normalize;
 use crate::state::{BotState, CachedGuildConfig};
@@ -23,10 +24,67 @@ use crate::types::{ActionDef, RULE_IDS, RuleDef};
 use crate::{db, logging};
 
 pub struct AutomodEngine {
-    /// (guild, user) -> per-rule strike buckets
-    state: DashMap<(u64, u64), HashMap<&'static str, RuleState>>,
+    /// (guild, user) -> window history and per-rule strike buckets
+    state: DashMap<(u64, u64), AuthorState>,
     member_joins: DashMap<(u64, u64), Instant>,
-    last_prune: Mutex<Instant>,
+    last_prune: Mutex<AutomodInstant>,
+}
+
+#[derive(Default)]
+struct AuthorState {
+    /// Strike ladders keyed by (rule, dry-run). Dry-run strikes are simulated,
+    /// so each mode keeps its own ladder: simulated strikes never use up live
+    /// escalation, and live strikes never count toward dry-run.
+    rules: HashMap<(&'static str, bool), RuleState>,
+    // Normal traffic keeps the velocity window alive without refreshing strikes.
+    velocity_events: VecDeque<AutomodInstant>,
+}
+
+impl AuthorState {
+    /// Records a message at its arrival time. Evaluations can finish out of
+    /// arrival order, so the history stays sorted rather than clamping a late
+    /// message forward.
+    fn record_velocity(&mut self, rule: &RuleDef, arrived: AutomodInstant) -> bool {
+        // Retain enough history for the highest supported threshold so a
+        // config update can raise the threshold without losing observations.
+        if self.velocity_events.len() == crate::types::AUTOMOD_VELOCITY_MAX_MESSAGES + 1 {
+            if self
+                .velocity_events
+                .front()
+                .is_some_and(|oldest| arrived < *oldest)
+            {
+                // Delayed behind the whole retained history: too old to count.
+                return false;
+            }
+            self.velocity_events.pop_front();
+        }
+        let index = self.velocity_events.partition_point(|at| *at <= arrived);
+        self.velocity_events.insert(index, arrived);
+        // Each message is judged on the messages that arrived before it, so a
+        // strike always lands on a message that is itself over the limit. If
+        // an earlier arrival is evaluated after a later one, the later
+        // message's strike can be missed, but none is charged to the wrong one.
+        self.velocity_over_limit(rule, index)
+    }
+
+    /// Counts the messages that arrived in the window ending at the message at
+    /// `index`, including it. If the (max + 1)th of them is still inside the
+    /// window, the rule is over its limit. Legacy thresholds above the
+    /// supported limit have no such observation.
+    fn velocity_over_limit(&self, rule: &RuleDef, index: usize) -> bool {
+        let max = crate::types::velocity_max_messages(&rule.params);
+        let window = velocity_window(rule);
+        let arrived = self.velocity_events[index];
+        usize::try_from(max)
+            .ok()
+            .and_then(|max| index.checked_sub(max))
+            .and_then(|first| self.velocity_events.get(first))
+            .is_some_and(|first| arrived.duration_since(*first) < window)
+    }
+}
+
+fn velocity_window(rule: &RuleDef) -> Duration {
+    Duration::from_secs(crate::types::velocity_window_secs(&rule.params))
 }
 
 #[derive(Default)]
@@ -34,7 +92,7 @@ struct RuleState {
     events: VecDeque<WindowEvent>,
     strikes: u32,
     fired: ThresholdReservations,
-    last_event: Option<Instant>,
+    last_event: Option<AutomodInstant>,
 }
 
 /// Reservation is independent of whether the selected Discord action runs.
@@ -71,15 +129,31 @@ enum RuleRetention {
     Expired,
 }
 
+/// Strike state lives for 10 minutes after the last strike. Cleanup and
+/// strike recording both apply this, so expiry never waits for a cleanup tick.
+const STRIKE_RETENTION: Duration = Duration::from_secs(crate::types::AUTOMOD_WINDOW_MAX_SECS);
+
 impl RuleState {
-    fn observe(&mut self, now: Instant) -> u32 {
+    /// Starts a new ladder when the previous one expired.
+    fn record_strike(&mut self, now: AutomodInstant, record_event: bool) -> u32 {
+        // Events never postdate the last strike, so it alone decides expiry.
+        if self
+            .last_event
+            .is_some_and(|last| now.duration_since(last) >= STRIKE_RETENTION)
+        {
+            *self = RuleState::default();
+        }
         self.strikes += 1;
-        self.last_event = Some(now);
-        self.events.push_back(WindowEvent { at: now });
+        // Concurrent evaluations can record strikes out of clock order; the
+        // retention deadline never moves backwards.
+        self.last_event = Some(self.last_event.map_or(now, |last| last.max(now)));
+        if record_event {
+            self.events.push_back(WindowEvent { at: now });
+        }
         self.strikes
     }
 
-    fn prune(&mut self, now: Instant, keep: Duration) -> RuleRetention {
+    fn prune(&mut self, now: AutomodInstant, keep: Duration) -> RuleRetention {
         self.events.retain(|e| now.duration_since(e.at) < keep);
         if self
             .last_event
@@ -95,7 +169,7 @@ impl RuleState {
 
 #[derive(Clone, Copy)]
 struct WindowEvent {
-    at: Instant,
+    at: AutomodInstant,
 }
 
 /// Everything the engine needs to know about an incoming message.
@@ -117,6 +191,9 @@ pub struct MsgCtx<'a> {
     /// Set when the channel, active thread, or thread parent was not cached.
     /// The everyone-attempt rule still matches. Kick and ban are withheld.
     pub mention_permission_unknown: bool,
+    /// When the bot received the message, before any configuration read.
+    /// Velocity counts by it; callers without one use the evaluation time.
+    pub received: Option<AutomodInstant>,
 }
 
 /// A rule fired and an action decided (highest severity across rules wins).
@@ -133,6 +210,9 @@ pub struct PendingAction {
     /// configuration cannot be re-read before acting, these settings still
     /// decide dry-run and exemptions. Custom rules leave this empty.
     pub matched_rule: Option<RuleDef>,
+    /// Whether the rule was in dry-run when this action was selected. Its
+    /// strike ladder belongs to that mode, so execution never runs it live.
+    pub dry_run: bool,
 }
 
 static URL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
@@ -157,7 +237,7 @@ impl AutomodEngine {
         Self {
             state: DashMap::new(),
             member_joins: DashMap::new(),
-            last_prune: Mutex::new(Instant::now()),
+            last_prune: Mutex::new(AutomodInstant::now()),
         }
     }
 
@@ -172,25 +252,41 @@ impl AutomodEngine {
     /// `evaluate` marks a strike fired before Discord runs. Release it only
     /// when this process did not attempt the ban, so a later message can try
     /// again. A retention-marker failure still bans and must not release.
-    pub fn release_fired(&self, guild: u64, user: u64, rule_id: &str, at: u32) {
+    pub fn release_fired(&self, guild: u64, user: u64, rule_id: &str, dry_run: bool, at: u32) {
         let Some(mut bucket) = self.state.get_mut(&(guild, user)) else {
             return;
         };
-        if let Some(state) = bucket.get_mut(rule_id) {
+        let Some(rule_id) = RULE_IDS.into_iter().find(|id| *id == rule_id) else {
+            return;
+        };
+        if let Some(state) = bucket.rules.get_mut(&(rule_id, dry_run)) {
             state.fired.release(at);
         }
     }
 
     /// Removes stale state. Runs on a timer from the cleanup task.
     pub fn prune(&self) {
-        let now = Instant::now();
-        let keep = Duration::from_secs(crate::types::AUTOMOD_WINDOW_MAX_SECS);
-        self.state.retain(|_, rules| {
-            rules.retain(|_, s| s.prune(now, keep) == RuleRetention::Retained);
-            !rules.is_empty()
+        let now = AutomodInstant::now();
+        let keep = STRIKE_RETENTION;
+        self.state.retain(|_, bucket| {
+            bucket
+                .rules
+                .retain(|_, s| s.prune(now, keep) == RuleRetention::Retained);
+            while bucket
+                .velocity_events
+                .front()
+                .is_some_and(|at| now.duration_since(*at) >= keep)
+            {
+                bucket.velocity_events.pop_front();
+            }
+            if bucket.velocity_events.is_empty() {
+                bucket.velocity_events = VecDeque::new();
+            }
+            !bucket.rules.is_empty() || !bucket.velocity_events.is_empty()
         });
+        let joined_now = Instant::now();
         self.member_joins
-            .retain(|_, t| now.duration_since(*t) < Duration::from_secs(24 * 3600));
+            .retain(|_, t| joined_now.duration_since(*t) < Duration::from_secs(24 * 3600));
         *self.last_prune.lock() = now;
     }
 
@@ -203,13 +299,17 @@ impl AutomodEngine {
 
     /// Evaluates all enabled rules for a message. Returns the pending action
     pub fn evaluate(&self, cfg: &CachedGuildConfig, ctx: &MsgCtx<'_>) -> Option<PendingAction> {
-        let now = Instant::now();
+        let now = AutomodInstant::now();
+        // Only velocity counts by arrival; other windows and strikes keep the
+        // evaluation clock, which never runs backwards for one author.
+        let arrived = ctx.received.unwrap_or(now);
         let normalized = normalize::normalize_lenient(ctx.content);
         let compact = normalize::normalize_compact(ctx.content);
         let has_url = URL_RE.is_match(ctx.content);
         let has_invite = INVITE_RE.is_match(ctx.content);
 
         let mut best: Option<PendingAction> = None;
+        let mut best_dry = false;
         for rule_id in RULE_IDS {
             let Some(rule) = cfg.rules.get(rule_id) else {
                 continue;
@@ -251,7 +351,8 @@ impl AutomodEngine {
                     .known_spam
                     .matches_forms(ctx.content, &normalized, &compact),
                 "invite" => has_invite && !self.invite_allowed(rule, ctx.content),
-                "velocity" => self.trigger_velocity(rule, ctx, now),
+                // Velocity observes each eligible message under the strike bucket lock.
+                "velocity" => true,
                 "account_age" => ctx
                     .account_age_days
                     .map(|d| d < param_u64(rule, "min_age_days", 3))
@@ -273,15 +374,29 @@ impl AutomodEngine {
                     evidence: serde_json::json!({ "content": ctx.content,
                         "channel_id": ctx.channel_id, "message_id": ctx.message_id }),
                     matched_rule: Some(rule.clone()),
+                    dry_run: rule.dry_run,
                 };
                 // This list promises the same fixed one-hour action even when
                 // another detector would also ban with a different window.
-                return Some(pending);
+                if !rule.dry_run {
+                    return Some(pending);
+                }
+                // A dry-run match is only logged, so it must not stop a live
+                // rule from acting on the same message.
+                if is_more_severe(&pending, true, &best, best_dry) {
+                    best = Some(pending);
+                    best_dry = true;
+                }
+                continue;
             }
 
             let mut bucket = self.state.entry((ctx.guild_id, ctx.author_id)).or_default();
-            let state = bucket.entry(rule_id).or_default();
-            let strikes = state.observe(now);
+            if rule_id == "velocity" && !bucket.record_velocity(rule, arrived) {
+                continue;
+            }
+            let state = bucket.rules.entry((rule_id, rule.dry_run)).or_default();
+            // Only mention spam reads past strike timestamps.
+            let strikes = state.record_strike(now, rule_id == "mention_spam");
             let fire = rule
                 .action_for_strike(strikes)
                 .filter(|a| state.fired.state(a.at) == ThresholdState::Available);
@@ -302,9 +417,11 @@ impl AutomodEngine {
                     "mentions": ctx.everyone_mentions + ctx.here_mentions + ctx.role_mentions,
                 }),
                 matched_rule: Some(rule.clone()),
+                dry_run: rule.dry_run,
             };
-            if is_more_severe(&pending, &best) {
+            if is_more_severe(&pending, rule.dry_run, &best, best_dry) {
                 best = Some(pending);
+                best_dry = rule.dry_run;
             }
         }
 
@@ -373,16 +490,18 @@ impl AutomodEngine {
                     "attachments": ctx.attachment_count,
                 }),
                 matched_rule: None,
+                dry_run: rule.dry_run,
             };
-            if is_more_severe(&pending, &best) {
+            if is_more_severe(&pending, rule.dry_run, &best, best_dry) {
                 best = Some(pending);
+                best_dry = rule.dry_run;
             }
         }
         best
     }
 
     /// Counts this message's mentions plus recent mentions in the window.
-    fn trigger_mention_spam(&self, rule: &RuleDef, ctx: &MsgCtx<'_>, now: Instant) -> bool {
+    fn trigger_mention_spam(&self, rule: &RuleDef, ctx: &MsgCtx<'_>, now: AutomodInstant) -> bool {
         let window = Duration::from_secs(
             param_u64(rule, "window_secs", 10).clamp(1, crate::types::AUTOMOD_WINDOW_MAX_SECS),
         );
@@ -390,7 +509,8 @@ impl AutomodEngine {
 
         let mut total = ctx.everyone_mentions + ctx.here_mentions + ctx.role_mentions;
         if let Some(bucket) = self.state.get(&(ctx.guild_id, ctx.author_id)) {
-            for (rid, s) in bucket.iter() {
+            // Mention counts are detection history, shared by both modes.
+            for ((rid, _), s) in bucket.rules.iter() {
                 if *rid == "mention_spam" {
                     total += s
                         .events
@@ -401,24 +521,6 @@ impl AutomodEngine {
             }
         }
         total > max_total
-    }
-
-    fn trigger_velocity(&self, rule: &RuleDef, ctx: &MsgCtx<'_>, now: Instant) -> bool {
-        let max = param_u64(rule, "max_messages", 8) as usize;
-        let window = Duration::from_secs(
-            param_u64(rule, "window_secs", 10).clamp(1, crate::types::AUTOMOD_WINDOW_MAX_SECS),
-        );
-        let mut count = 1usize;
-        if let Some(bucket) = self.state.get(&(ctx.guild_id, ctx.author_id)) {
-            for s in bucket.values() {
-                for e in s.events.iter() {
-                    if now.duration_since(e.at) < window {
-                        count += 1;
-                    }
-                }
-            }
-        }
-        count > max
     }
 
     fn invite_allowed(&self, rule: &RuleDef, content: &str) -> bool {
@@ -442,7 +544,14 @@ impl AutomodEngine {
 // action execution
 // ---------------------------------------------------------------------------
 
-fn is_more_severe(cand: &PendingAction, best: &Option<PendingAction>) -> bool {
+/// A live action outranks any dry-run one, so testing a rule in dry-run never
+/// displaces another rule's enforcement on the same message.
+fn is_more_severe(
+    cand: &PendingAction,
+    cand_dry: bool,
+    best: &Option<PendingAction>,
+    best_dry: bool,
+) -> bool {
     fn rank(a: &str) -> u8 {
         match a {
             "ban" => 6,
@@ -454,7 +563,7 @@ fn is_more_severe(cand: &PendingAction, best: &Option<PendingAction>) -> bool {
         }
     }
     best.as_ref()
-        .map(|b| rank(&cand.action.action) > rank(&b.action.action))
+        .map(|b| (!cand_dry, rank(&cand.action.action)) > (!best_dry, rank(&b.action.action)))
         .unwrap_or(true)
 }
 
@@ -704,7 +813,8 @@ fn automod_remember_member_failure(
     }
 }
 
-/// Executes a decided automod action (or logs it in dry-run mode).
+/// Executes a decided automod action. Returns true if the action entered the
+/// live path, even when an execution guard later skips the Discord action.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_pending(
     app: &Arc<BotState>,
@@ -716,7 +826,7 @@ pub async fn execute_pending(
     msg_id: Option<u64>,
     msg_channel: Option<u64>,
     pending: &PendingAction,
-) {
+) -> bool {
     execute_pending_with(
         app,
         ctx.http.as_ref(),
@@ -745,7 +855,7 @@ pub(crate) async fn execute_pending_with(
     msg_id: Option<u64>,
     msg_channel: Option<u64>,
     pending: &PendingAction,
-) {
+) -> bool {
     let enrollment = crate::cases::capture(app, guild_id.get()).await;
     let rule = &pending.action;
     let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
@@ -762,13 +872,15 @@ pub(crate) async fn execute_pending_with(
 
     let loaded = app.configs.get(&app.db, guild_id.get()).await;
     if pending.rule_id == "known_spam" {
-        let Ok(cfg) = loaded.as_ref() else { return };
+        let Ok(cfg) = loaded.as_ref() else {
+            return false;
+        };
         let Some(current) = cfg.rules.get("known_spam") else {
-            return;
+            return false;
         };
         let content = pending.evidence["content"].as_str().unwrap_or("");
         if !current.enabled || !cfg.known_spam.matches(content) {
-            return;
+            return false;
         }
         if jmodguard::custom_rules::rule_scope_skips(
             current,
@@ -778,7 +890,7 @@ pub(crate) async fn execute_pending_with(
             false,
             true,
         ) {
-            return;
+            return false;
         }
     }
     let current = loaded
@@ -803,10 +915,11 @@ pub(crate) async fn execute_pending_with(
                 "rule configuration unavailable; skipping the action"
             }
         );
-        return;
+        return false;
     };
+    // Either the selection or this configuration check can keep an action log-only.
     let (dry, log_automod, open_case, skip_moderators, skipped_roles) = (
-        settings.dry_run,
+        pending.dry_run || settings.dry_run,
         settings.log_automod,
         settings.open_case,
         settings.skip_moderators,
@@ -827,9 +940,54 @@ pub(crate) async fn execute_pending_with(
                 .to_string(),
         );
         logging::emit_to(app, http, guild_id, "automod", v).await;
-        return;
+        return false;
     }
 
+    execute_live(
+        app,
+        http,
+        cache,
+        guild_id,
+        target,
+        provided_member,
+        msg_id,
+        msg_channel,
+        pending,
+        enrollment,
+        vars,
+        reason,
+        config_unknown,
+        log_automod,
+        open_case,
+        skip_moderators,
+        skipped_roles,
+    )
+    .await;
+    true
+}
+
+/// The enforcement path of [`execute_pending_with`], after the dry-run decision.
+#[allow(clippy::too_many_arguments)]
+async fn execute_live(
+    app: &Arc<BotState>,
+    http: &serenity::http::Http,
+    cache: &serenity::cache::Cache,
+    guild_id: GuildId,
+    target: &serenity::model::user::User,
+    provided_member: Option<Member>,
+    msg_id: Option<u64>,
+    msg_channel: Option<u64>,
+    pending: &PendingAction,
+    enrollment: Option<db::GuildEnrollment>,
+    mut vars: std::collections::BTreeMap<String, String>,
+    reason: String,
+    config_unknown: bool,
+    log_automod: bool,
+    open_case: bool,
+    skip_moderators: bool,
+    skipped_roles: &[u64],
+) {
+    let rule = &pending.action;
     // A missing member is not a known member with no roles. Gateway members
     // may have no user field, but their supplied role list is still useful.
     let role_ids: Option<Vec<u64>> = provided_member
@@ -1443,6 +1601,590 @@ mod tests {
 
     use super::{AutomodEngine, MsgCtx, PendingAction, execute_pending_with};
 
+    #[tokio::test(start_paused = true)]
+    async fn default_velocity_counts_plain_messages_and_escalates() {
+        let cfg = default_automod_config();
+        let engine = AutomodEngine::new();
+        for id in 1..=12 {
+            let text = format!("ordinary message {id}");
+            let mut message = msg(1, &text, 0, false, false);
+            message.message_id = id;
+            let action = engine.evaluate(&cfg, &message);
+            let expected = match id {
+                9 => Some((1, "delete")),
+                10 => Some((2, "timeout")),
+                12 => Some((4, "kick")),
+                _ => None,
+            };
+            assert_eq!(
+                action.as_ref().map(|action| {
+                    assert_eq!(action.rule_id, "velocity");
+                    (action.strikes, action.action.action.as_str())
+                }),
+                expected,
+                "message {id}",
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn velocity_history_is_bounded_and_supports_threshold_changes() {
+        use std::time::Duration;
+
+        let mut cfg = default_automod_config();
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        // Seed history through a legacy rule whose threshold exceeds the supported range.
+        cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(u64::MAX);
+        for _ in 0..20 {
+            message.message_id += 1;
+            assert!(engine.evaluate(&cfg, &message).is_none());
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..1023 {
+            message.message_id += 1;
+            assert!(engine.evaluate(&cfg, &message).is_none());
+        }
+        let key = (message.guild_id, message.author_id);
+        assert_eq!(engine.state.get(&key).unwrap().velocity_events.len(), 1024);
+
+        // A legacy threshold one past the maximum must never trigger, even
+        // when the author has sent enough messages to exceed it.
+        cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(1024);
+        message.message_id += 1;
+        assert!(engine.evaluate(&cfg, &message).is_none());
+
+        // At 10s the first batch is exactly outside the window. The newest
+        // observations must survive both the cap and the configuration reload.
+        cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(1023);
+        tokio::time::advance(Duration::from_secs(9)).await;
+        message.message_id += 1;
+        let action = engine.evaluate(&cfg, &message).expect("over the limit");
+        assert_eq!(action.rule_id, "velocity");
+        assert_eq!(action.strikes, 1);
+        assert_eq!(action.action.action, "delete");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        message.message_id += 1;
+        assert!(engine.evaluate(&cfg, &message).is_none());
+
+        tokio::time::advance(Duration::from_secs(590)).await;
+        engine.prune();
+        assert_eq!(engine.state.get(&key).unwrap().velocity_events.len(), 2);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        engine.prune();
+        assert!(!engine.state.contains_key(&key));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn velocity_excludes_expired_and_exempt_messages_and_isolates_guilds_and_authors() {
+        let mut cfg = default_automod_config();
+        let rule = cfg.rules.get_mut("velocity").unwrap();
+        rule.whitelist_users = vec![99];
+        rule.whitelist_channels = vec![3];
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        for id in 1..=8 {
+            message.message_id = id;
+            assert!(engine.evaluate(&cfg, &message).is_none());
+        }
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+
+        for (guild, author, channel, count) in [
+            (2, 42, 1, 8),
+            (1, 50, 1, 8),
+            (1, 99, 1, 9),
+            (1, 42, 3, 9),
+            (1, 42, 1, 8),
+        ] {
+            message.guild_id = guild;
+            message.author_id = author;
+            message.channel_id = channel;
+            for _ in 0..count {
+                message.message_id += 1;
+                assert!(
+                    engine.evaluate(&cfg, &message).is_none(),
+                    "guild {guild}, author {author}, channel {channel}"
+                );
+            }
+        }
+        message.message_id += 1;
+        let action = engine
+            .evaluate(&cfg, &message)
+            .expect("ninth eligible message");
+        assert_eq!(action.rule_id, "velocity");
+        assert_eq!(action.action.action, "delete");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn velocity_counts_messages_once_when_other_rules_match() {
+        let cfg = default_automod_config();
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        message.account_age_days = Some(1);
+        for id in 1..=9 {
+            message.message_id = id;
+            let action = engine.evaluate(&cfg, &message);
+            assert_eq!(
+                action.as_ref().map(|action| action.rule_id.as_str()),
+                match id {
+                    1 => Some("account_age"),
+                    9 => Some("velocity"),
+                    _ => None,
+                },
+                "message {id}",
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_messages_do_not_keep_expired_velocity_strikes() {
+        let mut cfg = default_automod_config();
+        cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(1);
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        message.message_id += 1;
+        assert_eq!(engine.evaluate(&cfg, &message).unwrap().strikes, 1);
+
+        let retention = crate::types::AUTOMOD_WINDOW_MAX_SECS;
+        tokio::time::advance(std::time::Duration::from_secs(retention - 1)).await;
+        message.message_id += 1;
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        engine.prune();
+
+        message.message_id += 1;
+        let action = engine
+            .evaluate(&cfg, &message)
+            .expect("new velocity strike");
+        assert_eq!(action.strikes, 1);
+        assert_eq!(action.action.action, "delete");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dry_run_velocity_does_not_displace_a_live_action() {
+        let mut cfg = default_automod_config();
+        cfg.rules.get_mut("velocity").unwrap().dry_run = true;
+        cfg.regexes = vec![jmodguard::normalize::compile_user_regex("scam").unwrap()];
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        for id in 1..=9 {
+            message.message_id = id;
+            let action = engine.evaluate(&cfg, &message);
+            // A dry-run velocity match alone is still selected so it is logged.
+            assert_eq!(
+                action.map(|action| action.rule_id),
+                (id == 9).then(|| "velocity".to_owned()),
+                "message {id}",
+            );
+        }
+        // Velocity would time out (dry-run); the live badword delete must win.
+        message.message_id = 10;
+        message.content = "scam";
+        let action = engine.evaluate(&cfg, &message).expect("live badword");
+        assert_eq!(action.rule_id, "badword");
+        assert_eq!(action.action.action, "delete");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_strikes_reset_without_waiting_for_cleanup() {
+        let mut cfg = default_automod_config();
+        cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(1);
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        message.message_id += 1;
+        assert_eq!(engine.evaluate(&cfg, &message).unwrap().strikes, 1);
+
+        // Cleanup runs just before the strike expires, so it keeps the bucket.
+        let retention = crate::types::AUTOMOD_WINDOW_MAX_SECS;
+        tokio::time::advance(std::time::Duration::from_secs(retention - 1)).await;
+        engine.prune();
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+
+        // The next burst starts a new ladder before the next cleanup tick.
+        message.message_id += 1;
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        message.message_id += 1;
+        let action = engine.evaluate(&cfg, &message).expect("new burst");
+        assert_eq!(action.strikes, 1);
+        assert_eq!(action.action.action, "delete");
+    }
+
+    #[test]
+    fn dry_run_known_spam_does_not_displace_a_live_action() {
+        let mut cfg = default_automod_config();
+        cfg.rules.get_mut("known_spam").unwrap().dry_run = true;
+        cfg.regexes = vec![jmodguard::normalize::compile_user_regex("scam").unwrap()];
+        cfg.known_spam =
+            jmodguard::known_spam::CompiledList::new(&[jmodguard::known_spam::Entry::new(
+                "url",
+                "tinyurl.com/*",
+                None,
+            )
+            .unwrap()]);
+        let engine = AutomodEngine::new();
+        // Known spam alone in dry-run is still selected so it is logged.
+        let alone = engine
+            .evaluate(&cfg, &msg(1, "link tinyurl.com/abc", 0, false, false))
+            .expect("dry-run known spam");
+        assert_eq!(alone.rule_id, "known_spam");
+        // A live badword match on the same message wins.
+        let both = engine
+            .evaluate(&cfg, &msg(2, "scam tinyurl.com/abc", 0, false, false))
+            .expect("live badword");
+        assert_eq!(both.rule_id, "badword");
+        assert_eq!(both.action.action, "delete");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dry_run_strikes_do_not_carry_into_live_enforcement() {
+        let mut cfg = default_automod_config();
+        cfg.rules.get_mut("velocity").unwrap().dry_run = true;
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        // Reach the final dry-run threshold (kick at strike 4).
+        for id in 1..=12 {
+            message.message_id = id;
+            let action = engine.evaluate(&cfg, &message);
+            if id == 12 {
+                assert_eq!(action.unwrap().action.action, "kick");
+            }
+        }
+        // Switching to live keeps the message history but starts a new ladder.
+        cfg.rules.get_mut("velocity").unwrap().dry_run = false;
+        message.message_id = 13;
+        let action = engine.evaluate(&cfg, &message).expect("first live action");
+        assert_eq!(action.rule_id, "velocity");
+        assert_eq!(action.strikes, 1);
+        assert_eq!(action.action.action, "delete");
+    }
+
+    #[test]
+    fn only_mention_spam_keeps_strike_timestamps() {
+        let mut cfg = default_automod_config();
+        cfg.regexes = vec![jmodguard::normalize::compile_user_regex("scam").unwrap()];
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "scam", 0, false, false);
+        for id in 1..=3 {
+            message.message_id = id;
+            engine.evaluate(&cfg, &message);
+        }
+        let bucket = engine
+            .state
+            .get(&(message.guild_id, message.author_id))
+            .unwrap();
+        let badword = &bucket.rules[&("badword", false)];
+        assert_eq!(badword.strikes, 3);
+        assert!(badword.events.is_empty());
+    }
+
+    // The mode can change while the executor awaits enrollment and reloads
+    // configuration. The action must never run more live than it was selected.
+    #[tokio::test]
+    async fn a_mode_switch_before_execution_never_makes_an_action_live() {
+        use serenity::model::id::{GuildId, UserId};
+        use serenity::model::user::User;
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        for selected_dry in [true, false] {
+            let path = std::env::temp_dir()
+                .join(format!("mode_switch_{:032x}.db", rand::random::<u128>()));
+            let app =
+                BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+            assert!(
+                crate::db::claim_active_bot(
+                    &app.db,
+                    app.activation.instance(),
+                    jmodguard::control::now_ms(),
+                    Arc::new(AtomicBool::new(false))
+                )
+                .await
+                .unwrap()
+            );
+            app.activation.mark_lock_held(true);
+            let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+                .await
+                .unwrap()
+                .unwrap();
+            app.tenant.activate(enrollment).await.unwrap();
+            let store = |dry_run: bool| {
+                let mut rule = crate::defaults::default_rules().remove(0);
+                rule.dry_run = dry_run;
+                let data = serde_json::to_string(&rule).unwrap();
+                let db = app.db.clone();
+                async move {
+                    db.with_conn(move |conn| {
+                        use crate::db::SqlExecutor;
+                        conn.execute_bounded(
+                            "INSERT OR REPLACE INTO rules(guild_id,rule_id,data) VALUES (10,'mention_spam',?1)",
+                            crate::db::params![data],
+                            1,
+                        )?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                }
+            };
+            store(selected_dry).await;
+            app.invalidate_configs();
+            let cfg = app.configs.get(&app.db, 10).await.unwrap();
+            let mut message = word_message(&[]);
+            message.everyone_mentions = 6;
+            let pending = AutomodEngine::new()
+                .evaluate(&cfg, &message)
+                .expect("mention spam ban");
+            assert_eq!(pending.action.action, "ban");
+            assert_eq!(pending.dry_run, selected_dry);
+
+            store(!selected_dry).await;
+            app.invalidate_configs();
+            let mut user = User::default();
+            user.id = UserId::new(99);
+            user.name = "member".into();
+            let stub = DiscordStub::start();
+            let live = execute_pending_with(
+                &app,
+                &stub.http,
+                &stub.cache,
+                GuildId::new(10),
+                &user,
+                None,
+                "member",
+                Some(42),
+                Some(70),
+                &pending,
+            )
+            .await;
+            let seen = stub.finish();
+            assert!(!live, "selected dry-run={selected_dry}");
+            assert!(
+                seen.is_empty(),
+                "selected dry-run={selected_dry}: no Discord action: {seen:?}"
+            );
+            drop(app);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn velocity_counts_messages_by_arrival_time() {
+        use super::AutomodInstant;
+        use std::time::Duration;
+        let mut cfg = default_automod_config();
+        let velocity = cfg.rules.get_mut("velocity").unwrap();
+        velocity.params["max_messages"] = serde_json::json!(1);
+        velocity.params["window_secs"] = serde_json::json!(1);
+        let start = AutomodInstant::now();
+        let message = |id: u64, after_ms: u64| {
+            let mut message = msg(1, "ordinary message", 0, false, false);
+            message.message_id = id;
+            message.received = Some(start + Duration::from_millis(after_ms));
+            message
+        };
+        // A slow configuration read makes both evaluations finish together.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        for order in [[0, 1500], [1500, 0]] {
+            let engine = AutomodEngine::new();
+            for (id, after_ms) in order.into_iter().enumerate() {
+                assert!(
+                    engine
+                        .evaluate(&cfg, &message(id as u64, after_ms))
+                        .is_none(),
+                    "arrivals 1.5 s apart, evaluated in order {order:?}"
+                );
+            }
+        }
+        // Arrivals inside the window still count when evaluated in order.
+        let engine = AutomodEngine::new();
+        assert!(engine.evaluate(&cfg, &message(1, 0)).is_none());
+        let action = engine
+            .evaluate(&cfg, &message(2, 500))
+            .expect("over the limit");
+        assert_eq!(action.strikes, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dry_run_trial_neither_adds_to_nor_erases_live_strikes() {
+        use std::time::Duration;
+        let mut cfg = default_automod_config();
+        cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(1);
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        message.message_id += 1;
+        assert_eq!(engine.evaluate(&cfg, &message).unwrap().strikes, 1);
+
+        // Dry-run strikes go to their own ladder.
+        cfg.rules.get_mut("velocity").unwrap().dry_run = true;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        for strikes in [None, Some(1), Some(2)] {
+            message.message_id += 1;
+            assert_eq!(engine.evaluate(&cfg, &message).map(|a| a.strikes), strikes);
+        }
+        cfg.rules.get_mut("velocity").unwrap().dry_run = false;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        message.message_id += 1;
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        message.message_id += 1;
+        let action = engine.evaluate(&cfg, &message).expect("live escalation");
+        assert_eq!(action.strikes, 2);
+        assert_eq!(action.action.action, "timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn out_of_order_velocity_never_strikes_a_message_under_the_limit() {
+        use super::AutomodInstant;
+        use std::time::Duration;
+        let mut cfg = default_automod_config();
+        let velocity = cfg.rules.get_mut("velocity").unwrap();
+        velocity.params["max_messages"] = serde_json::json!(1);
+        velocity.params["window_secs"] = serde_json::json!(1);
+        let start = AutomodInstant::now();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        // Message IDs are the arrival times in milliseconds. In receipt order
+        // 750 and 1500 are over the limit; 0 never is.
+        let run = |order: &[u64]| {
+            let engine = AutomodEngine::new();
+            order
+                .iter()
+                .filter_map(|&after_ms| {
+                    let mut message = msg(1, "ordinary message", 0, false, false);
+                    message.message_id = after_ms;
+                    message.received = Some(start + Duration::from_millis(after_ms));
+                    engine.evaluate(&cfg, &message).map(|action| {
+                        assert_eq!(action.evidence["message_id"], after_ms);
+                        (after_ms, action.action.action)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            run(&[0, 750, 1500]),
+            [(750, "delete".to_owned()), (1500, "timeout".to_owned())]
+        );
+        for order in [
+            [750, 0, 1500],
+            [0, 1500, 750],
+            [1500, 750, 0],
+            [750, 1500, 0],
+        ] {
+            for (struck, _) in run(&order) {
+                assert_ne!(
+                    struck, 0,
+                    "order {order:?} struck a message under the limit"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mention_spam_expires_strikes_by_evaluation_time() {
+        use super::AutomodInstant;
+        use std::time::Duration;
+        let mut cfg = default_automod_config();
+        // An escalating ladder makes an extra strike visible.
+        let ladder = cfg.rules["velocity"].actions.clone();
+        let mention = cfg.rules.get_mut("mention_spam").unwrap();
+        mention.actions = ladder;
+        mention.params["window_secs"] = serde_json::json!(1);
+        mention.params["max_mentions_in_window"] = serde_json::json!(5);
+        let engine = AutomodEngine::new();
+        let start = AutomodInstant::now();
+        // The later message is evaluated first and strikes.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let mut later = msg(1, "ping", 0, false, false);
+        later.message_id = 2;
+        later.role_mentions = 6;
+        later.received = Some(start + Duration::from_secs(2));
+        assert_eq!(
+            engine.evaluate(&cfg, &later).unwrap().rule_id,
+            "mention_spam"
+        );
+        // The older message, at the limit, is evaluated two seconds later.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let mut older = msg(1, "ping", 0, false, false);
+        older.message_id = 1;
+        older.role_mentions = 5;
+        older.received = Some(start);
+        assert!(engine.evaluate(&cfg, &older).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_dry_run_evaluation_cannot_reset_the_live_ladder() {
+        let mut live = default_automod_config();
+        live.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(1);
+        let mut stale = default_automod_config();
+        let velocity = stale.rules.get_mut("velocity").unwrap();
+        velocity.params["max_messages"] = serde_json::json!(1);
+        velocity.dry_run = true;
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        assert!(engine.evaluate(&live, &message).is_none());
+        message.message_id += 1;
+        assert_eq!(engine.evaluate(&live, &message).unwrap().strikes, 1);
+        // A late evaluation still holding the older dry-run snapshot only adds
+        // a log-only strike to the dry-run ladder.
+        message.message_id += 1;
+        assert!(engine.evaluate(&stale, &message).unwrap().dry_run);
+        message.message_id += 1;
+        let action = engine.evaluate(&live, &message).expect("escalation");
+        assert_eq!(action.strikes, 2);
+        assert_eq!(action.action.action, "timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_older_strike_timestamp_cannot_shorten_retention() {
+        use super::{AutomodInstant, RuleRetention, RuleState, STRIKE_RETENTION};
+        use std::time::Duration;
+        let older = AutomodInstant::now();
+        let newer = older + Duration::from_secs(10);
+        let mut state = RuleState::default();
+        // Concurrent evaluations record the newer strike first.
+        assert_eq!(state.record_strike(newer, false), 1);
+        assert_eq!(state.record_strike(older, false), 2);
+        // The older strike has expired, the newer one has not.
+        let check = older + STRIKE_RETENTION + Duration::from_secs(5);
+        assert!(state.prune(check, STRIKE_RETENTION) == RuleRetention::Retained);
+        assert_eq!(state.record_strike(check, false), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn velocity_reads_legacy_limits_stored_as_json_floats() {
+        for (limit, first_strike) in [
+            (serde_json::json!(5000.0), None),
+            (serde_json::json!(1e30), None),
+            (serde_json::json!(1023.5), None),
+            // In-range non-integers keep their old default of 8, never stricter.
+            (serde_json::json!(8.0), Some(9)),
+            (serde_json::json!(1.0), Some(9)),
+            (serde_json::json!(8.5), Some(9)),
+            (serde_json::json!(0.5), Some(9)),
+            (serde_json::json!("3"), Some(9)),
+        ] {
+            let mut cfg = default_automod_config();
+            cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = limit.clone();
+            let engine = AutomodEngine::new();
+            let mut message = msg(1, "ordinary message", 0, false, false);
+            let struck = (1..=12).find(|id| {
+                message.message_id = *id;
+                engine.evaluate(&cfg, &message).is_some()
+            });
+            assert_eq!(struck, first_strike, "max_messages {limit}");
+        }
+    }
+
+    fn default_automod_config() -> CachedGuildConfig {
+        let rules = crate::types::RULE_IDS
+            .into_iter()
+            .zip(crate::defaults::default_rules())
+            .map(|(id, rule)| (id.into(), rule))
+            .collect();
+        test_cfg(&rules, &HashMap::new())
+    }
+
     #[test]
     fn builtin_legacy_windows_clamp_to_retained_history() {
         assert_legacy_windows(&[(0, 500, true), (0, 2000, false)]);
@@ -1459,44 +2201,47 @@ mod tests {
     }
 
     fn assert_legacy_windows(cases: &[(u64, u64, bool)]) {
-        use super::{RuleState, WindowEvent};
+        use super::{AuthorState, AutomodInstant, RuleState, WindowEvent};
         use std::time::Duration;
         for id in ["mention_spam", "velocity"] {
             for &(window, age_ms, expected) in cases {
                 let engine = AutomodEngine::new();
-                let now = Instant::now();
+                let now = AutomodInstant::now();
                 let mut rule = crate::defaults::default_rules()
                     [if id == "mention_spam" { 0 } else { 6 }]
                 .clone();
                 rule.params = serde_json::json!({"window_secs": window, "max_mentions_in_window": 1, "max_messages": 1});
                 let at = now - Duration::from_millis(age_ms);
-                engine.state.insert(
-                    (1, 42),
-                    HashMap::from([(
-                        id,
+                let mut bucket = AuthorState::default();
+                if id == "velocity" {
+                    bucket.velocity_events.extend([at, now]);
+                } else {
+                    bucket.rules.insert(
+                        (id, false),
                         RuleState {
                             events: std::collections::VecDeque::from([WindowEvent { at }]),
                             last_event: Some(at),
                             ..Default::default()
                         },
-                    )]),
-                );
+                    );
+                }
+                engine.state.insert((1, 42), bucket);
                 let mut ctx = msg(1, "", 0, false, false);
                 ctx.role_mentions = 1;
-                let triggered = if id == "mention_spam" {
-                    engine.trigger_mention_spam(&rule, &ctx, now)
-                } else {
-                    engine.trigger_velocity(&rule, &ctx, now)
+                let triggered = || {
+                    if id == "mention_spam" {
+                        engine.trigger_mention_spam(&rule, &ctx, now)
+                    } else {
+                        // The newest observation is the current message.
+                        let bucket = engine.state.get(&(1, 42)).unwrap();
+                        bucket.velocity_over_limit(&rule, bucket.velocity_events.len() - 1)
+                    }
                 };
-                assert_eq!(triggered, expected, "{id}: window {window}, age {age_ms}");
+                assert_eq!(triggered(), expected, "{id}: window {window}, age {age_ms}");
                 engine.prune();
-                let after = if id == "mention_spam" {
-                    engine.trigger_mention_spam(&rule, &ctx, now)
-                } else {
-                    engine.trigger_velocity(&rule, &ctx, now)
-                };
                 assert_eq!(
-                    after, expected,
+                    triggered(),
+                    expected,
                     "pruning must agree with the effective window"
                 );
             }
@@ -1581,11 +2326,12 @@ mod tests {
             is_moderator: false,
             can_mention_everyone: false,
             mention_permission_unknown: false,
+            received: None,
         };
         let first = engine.evaluate(&cfg, &message).expect("first ban");
         assert_eq!(first.action.action, "ban");
         assert!(engine.evaluate(&cfg, &message).is_none());
-        engine.release_fired(1, 2, &first.rule_id, first.action.at);
+        engine.release_fired(1, 2, &first.rule_id, first.dry_run, first.action.at);
         let retry = engine.evaluate(&cfg, &message).expect("retried ban");
         assert_eq!(retry.action.action, "ban");
         assert_eq!(retry.action.at, 1);
@@ -1660,6 +2406,7 @@ mod tests {
             is_moderator: is_mod,
             can_mention_everyone: can_everyone,
             mention_permission_unknown: false,
+            received: None,
         }
     }
 
@@ -2194,6 +2941,7 @@ mod tests {
             can_mention_everyone: scope.mention == crate::commands::MentionPermission::Allowed,
             mention_permission_unknown: scope.mention
                 == crate::commands::MentionPermission::Unknown,
+            received: None,
         };
         let pending = AutomodEngine::new()
             .evaluate(&cfg, &message)
@@ -2460,6 +3208,7 @@ mod tests {
             can_mention_everyone: scope.mention == crate::commands::MentionPermission::Allowed,
             mention_permission_unknown: scope.mention
                 == crate::commands::MentionPermission::Unknown,
+            received: None,
         };
         let pending = AutomodEngine::new()
             .evaluate(&cfg, &message)
@@ -2640,6 +3389,7 @@ mod tests {
             is_moderator: false,
             can_mention_everyone: true,
             mention_permission_unknown: false,
+            received: None,
         }
     }
 
@@ -3182,7 +3932,7 @@ mod tests {
         let mut event: GuildCreateEvent =
             serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
         stub.cache.update(&mut event);
-        execute_pending_with(
+        let entered_live_path = execute_pending_with(
             &app,
             &stub.http,
             &stub.cache,
@@ -3195,6 +3945,10 @@ mod tests {
             &pending,
         )
         .await;
+        assert!(
+            entered_live_path,
+            "the live path checks the cached author before deciding whether to dispatch"
+        );
         let seen = stub.finish();
         if moderator || skipped_role {
             assert!(
@@ -3921,6 +4675,7 @@ mod tests {
                 }),
                 mention_permission_unknown: false,
                 matched_rule: Some(matched),
+                dry_run: false,
             };
             let mut user = User::default();
             user.id = UserId::new(99);

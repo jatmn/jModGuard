@@ -890,6 +890,7 @@ mod tests {
         let hold = bot.activation.hold_rule();
         let op = db::ControlOp::UpsertRule {
             clear_guild_override: false,
+            replace_velocity_limit: false,
             request: scope(&enrollment),
             target: db::ScopeWire {
                 global: true,

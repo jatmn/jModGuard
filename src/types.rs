@@ -9,6 +9,37 @@ pub const GLOBAL_SCOPE: i64 = 0;
 /// Mention/velocity history retention and maximum configurable window.
 pub const AUTOMOD_WINDOW_MAX_SECS: u64 = 600;
 
+/// Velocity retains one more observation than the highest supported threshold.
+pub const AUTOMOD_VELOCITY_MAX_MESSAGES: usize = 1_023;
+
+/// Velocity's effective message limit for stored rule params, as the bot
+/// applies it. Older writers could store any JSON value, and a legacy value
+/// must never enforce more strictly than it did before: an unsigned integer
+/// is the limit; any number above the supported limit never triggers,
+/// whatever its form; anything else (such as `1.0`, `0.5`, or `"3"`) keeps
+/// the default of 8 it always resolved to.
+pub fn velocity_max_messages(params: &serde_json::Value) -> u64 {
+    let Some(value) = params.get("max_messages") else {
+        return 8;
+    };
+    if let Some(limit) = value.as_u64() {
+        return limit;
+    }
+    match value.as_f64() {
+        Some(limit) if limit > AUTOMOD_VELOCITY_MAX_MESSAGES as f64 => u64::MAX,
+        _ => 8,
+    }
+}
+
+/// Velocity's effective window in seconds, as the bot applies it.
+pub fn velocity_window_secs(params: &serde_json::Value) -> u64 {
+    params
+        .get("window_secs")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(10)
+        .clamp(1, AUTOMOD_WINDOW_MAX_SECS)
+}
+
 /// All automod rule identifiers (fixed set; per-rule behavior is configurable).
 pub const RULE_IDS: [&str; 9] = [
     "mention_spam",

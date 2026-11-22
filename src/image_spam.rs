@@ -85,6 +85,37 @@ impl Policy {
     }
 }
 
+/// Saves cannot set a velocity limit above the retained history. A stored
+/// legacy limit is inert, so a save that keeps it unchanged is allowed.
+pub fn validate_velocity_limit(
+    rule: &mut crate::types::RuleDef,
+    stored: Option<serde_json::Value>,
+) -> Result<()> {
+    let Some(value) = rule.params.get("max_messages") else {
+        return Ok(());
+    };
+    // A browser parses numbers as doubles, so an unchanged legacy value can
+    // come back in another JSON form: `1.0` as `1`, a wide integer rounded,
+    // even a number above u64::MAX. Equal as JavaScript numbers means
+    // unchanged: keep the exact stored value, so its meaning cannot change.
+    if let Some(stored) = stored.filter(|stored| {
+        stored == value
+            || matches!(
+                (stored.as_f64(), value.as_f64()),
+                (Some(kept), Some(sent)) if kept == sent
+            )
+    }) {
+        rule.params["max_messages"] = stored;
+        return Ok(());
+    }
+    let max = crate::types::AUTOMOD_VELOCITY_MAX_MESSAGES;
+    ensure!(
+        value.as_u64().is_some_and(|count| count <= max as u64),
+        "max_messages must be 0–{max} (a whole number)"
+    );
+    Ok(())
+}
+
 /// Legacy attachment-count configurations stay inert until explicitly converted.
 pub fn validate_rule(id: &str, rule: &crate::types::RuleDef) -> Result<()> {
     match id {

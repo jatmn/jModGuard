@@ -331,7 +331,7 @@ pub async fn get_rule(db: &Db, guild_id: i64, rule_id: &str) -> Result<Option<Ru
 
 pub async fn upsert_rule(db: &Db, guild_id: i64, rule_id: &str, rule: &RuleDef) -> Result<()> {
     crate::image_spam::validate_rule(rule_id, rule)?;
-    upsert_rule_row(db, guild_id, rule_id, rule, None)
+    upsert_rule_row(db, guild_id, rule_id, rule, None, false)
         .await
         .map(|_| ())
 }
@@ -383,18 +383,55 @@ fn rule_json_for_save_conn(
     Ok(serde_json::to_string(rule)?)
 }
 
+/// Compare an unchanged velocity limit with the effective source rule under
+/// the writer lock. A server override takes precedence over the global row,
+/// even when the override omits the limit and uses the built-in fallback.
+fn validate_velocity_limit_conn(
+    conn: &impl SqlExecutor,
+    source_guild: i64,
+    id: &str,
+    rule: &mut RuleDef,
+    replace_velocity_limit: bool,
+) -> Result<()> {
+    if id != "velocity" {
+        return Ok(());
+    }
+    if replace_velocity_limit {
+        anyhow::ensure!(
+            rule.params.get("max_messages").is_some(),
+            "max_messages is required when replacing the velocity limit"
+        );
+        return crate::image_spam::validate_velocity_limit(rule, None);
+    }
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT data FROM rules WHERE rule_id = 'velocity' AND guild_id IN (?1, ?2)
+             ORDER BY guild_id = ?1 DESC LIMIT 1",
+            params![source_guild, GLOBAL_SCOPE],
+            |r| Ok(r.get(0)?),
+        )
+        .optional()?;
+    let stored_limit = stored
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .and_then(|row| row.get("params")?.get("max_messages").cloned());
+    crate::image_spam::validate_velocity_limit(rule, stored_limit)
+}
+
 async fn upsert_rule_row(
     db: &Db,
     guild_id: i64,
     id: &str,
     rule: &RuleDef,
     expected: Option<ConfigurationWriteScope>,
+    replace_velocity_limit: bool,
 ) -> Result<RuleDef> {
     let id = id.to_owned();
     let rule = rule.clone();
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
+        let mut rule = rule.clone();
+        validate_velocity_limit_conn(&tx, guild_id, &id, &mut rule, replace_velocity_limit)?;
         let json = rule_json_for_save_conn(&tx, guild_id, &id, &rule)?;
         let saved = serde_json::from_str(&json)?;
         tx.execute_rows(
@@ -1374,6 +1411,8 @@ pub struct WebConfigSnapshot {
     pub global_templates: std::collections::HashMap<String, String>,
     pub guild_log_channels: std::collections::HashMap<String, i64>,
     pub guild_log_filters: std::collections::HashMap<String, LogFilter>,
+    /// Missing global velocity rows resolve to dry-run after the upgrade.
+    pub velocity_default_dry_run: bool,
 }
 
 /// One Hrana statement for every configuration collection in a snapshot.
@@ -1418,6 +1457,7 @@ SELECT
      FROM (SELECT id,guild_id,kind,value,note FROM known_spam
            WHERE guild_id = ?1 OR guild_id = ?2 ORDER BY id LIMIT 2048))
   ,EXISTS(SELECT 1 FROM meta WHERE key = 'invite_description_v1')
+  ,EXISTS(SELECT 1 FROM meta WHERE key = 'velocity_default_dry_run')
 "#;
 
 struct ConfigurationSnapshotRows {
@@ -1437,6 +1477,7 @@ struct ConfigurationSnapshotRows {
     known_bad_images: Vec<KnownBadImage>,
     known_spam: Vec<crate::known_spam::Entry>,
     nickname_reconcile: Option<NicknameReconcileStatus>,
+    velocity_default_dry_run: bool,
 }
 
 fn parse_meta_version(raw: Option<String>) -> u64 {
@@ -1569,6 +1610,7 @@ fn load_configuration_snapshot_conn(
                 )?),
                 known_spam: parse_json_vec(row.get(23)?, "known_spam")?,
                 nickname_reconcile,
+                velocity_default_dry_run: row.get::<bool>(25)?,
             })
         },
     )
@@ -1612,6 +1654,7 @@ impl ConfigurationSnapshotRows {
             global_templates: self.global_templates,
             guild_log_channels: self.guild_log_channels,
             guild_log_filters: self.guild_log_filters,
+            velocity_default_dry_run: self.velocity_default_dry_run,
         }
     }
 
@@ -1624,7 +1667,7 @@ impl ConfigurationSnapshotRows {
         let gl_settings =
             settings_override_from_raw(GLOBAL_SCOPE, self.global_settings_raw.clone());
         let settings = resolve_settings(&g_settings, &gl_settings, &self.defaults);
-        let default_rules = crate::defaults::default_rules();
+        let default_rules = crate::defaults::install_default_rules(self.velocity_default_dry_run);
         let mut rules = std::collections::HashMap::new();
         for (i, id) in crate::types::RULE_IDS.iter().enumerate() {
             let def = default_rules[i].clone();
@@ -1851,11 +1894,29 @@ pub async fn upsert_enrolled_rule(
     id: &str,
     rule: &RuleDef,
 ) -> Result<RuleDef> {
+    upsert_enrolled_rule_with_velocity_edit(db, scope, id, rule, false).await
+}
+
+pub(super) async fn upsert_enrolled_rule_with_velocity_edit(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    id: &str,
+    rule: &RuleDef,
+    replace_velocity_limit: bool,
+) -> Result<RuleDef> {
     crate::image_spam::validate_rule(id, rule)?;
     if crate::custom_rules::is_custom_id(id) {
         return upsert_enrolled_custom_rule(db, scope, id, rule).await;
     }
-    upsert_rule_row(db, scope.guild_id(), id, rule, Some(scope)).await
+    upsert_rule_row(
+        db,
+        scope.guild_id(),
+        id,
+        rule,
+        Some(scope),
+        replace_velocity_limit,
+    )
+    .await
 }
 
 /// The global rule editor's save and override clear are one captured mutation.
@@ -1864,6 +1925,16 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
     request: ConfigurationScope,
     id: &str,
     rule: &RuleDef,
+) -> Result<RuleDef> {
+    promote_enrolled_rule(db, request, id, rule, false).await
+}
+
+pub(super) async fn promote_enrolled_rule(
+    db: &Db,
+    request: ConfigurationScope,
+    id: &str,
+    rule: &RuleDef,
+    replace_velocity_limit: bool,
 ) -> Result<RuleDef> {
     anyhow::ensure!(
         request.guild_id() > 0,
@@ -1883,6 +1954,15 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
         global.verify_conn(&tx)?;
         // The global target's check alone does not cover the guild write fence.
         guild.verify_conn(&tx)?;
+        let mut rule = rule.clone();
+        // The editor showed the server's rule that this save clears.
+        validate_velocity_limit_conn(
+            &tx,
+            guild.guild_id(),
+            &id,
+            &mut rule,
+            replace_velocity_limit,
+        )?;
         let json = rule_json_for_save_conn(&tx, GLOBAL_SCOPE, &id, &rule)?;
         let saved = serde_json::from_str(&json)?;
         tx.execute_rows(
@@ -2187,6 +2267,33 @@ pub async fn get_enrolled_rule(
                 .next()
                 .map(|(_, row)| row))
         })
+    })
+    .await
+}
+
+/// A built-in rule's layers plus the default a missing global row resolves to
+/// on this install, read in one snapshot.
+pub async fn get_enrolled_builtin_rule(
+    db: &Db,
+    scope: ConfigurationScope,
+    id: &str,
+) -> Result<(ConfigurationLayers<Option<RuleDef>>, RuleDef)> {
+    let id = id.to_owned();
+    configuration_read(db, scope, move |tx, guild| {
+        let layers = read_layers(guild, |g| {
+            Ok(load_rule_rows_conn(tx, g, Some(&id))?
+                .into_iter()
+                .next()
+                .map(|(_, row)| row))
+        })?;
+        let velocity_dry_run =
+            meta_string_conn(tx, super::bootstrap::META_VELOCITY_DEFAULT_DRY_RUN)?.is_some();
+        let index = crate::types::RULE_IDS
+            .iter()
+            .position(|rule| *rule == id)
+            .context("unknown built-in rule")?;
+        let default = crate::defaults::install_default_rules(velocity_dry_run).swap_remove(index);
+        Ok((layers, default))
     })
     .await
 }

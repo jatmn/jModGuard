@@ -4511,31 +4511,38 @@ fn builtin_form_params_validate_through_rule_saves() {
         let scope =
             ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
                 .unwrap();
-        for id in ["mention_spam", "velocity", "invite"] {
+        let max_messages = crate::types::AUTOMOD_VELOCITY_MAX_MESSAGES;
+        for (id, key) in [
+            ("mention_spam", "window_secs"),
+            ("velocity", "window_secs"),
+            ("velocity", "max_messages"),
+            ("invite", "allowlist_codes"),
+        ] {
             let mut rule = get_rule(&db, 0, id).await.unwrap().unwrap();
             let original = serde_json::to_value(&rule).unwrap();
-            let invalid = if id == "invite" {
-                vec![
+            let invalid = match key {
+                "allowlist_codes" => vec![
                     serde_json::json!("bad"),
                     serde_json::json!(true),
                     serde_json::json!({}),
                     serde_json::json!(["ok", 42]),
                     serde_json::json!(["ok", null]),
-                ]
-            } else {
-                vec![
+                ],
+                "max_messages" => vec![
+                    serde_json::json!(max_messages + 1),
+                    serde_json::json!(u64::MAX),
+                    serde_json::json!(-1),
+                    serde_json::json!(1.5),
+                    serde_json::json!("10"),
+                ],
+                _ => vec![
                     serde_json::json!(0),
                     serde_json::json!(601),
                     serde_json::json!(u64::MAX),
                     serde_json::json!(-1),
                     serde_json::json!(1.5),
                     serde_json::json!("10"),
-                ]
-            };
-            let key = if id == "invite" {
-                "allowlist_codes"
-            } else {
-                "window_secs"
+                ],
             };
             for value in invalid {
                 rule.params[key] = value;
@@ -4543,10 +4550,10 @@ fn builtin_form_params_validate_through_rule_saves() {
                     .await
                     .unwrap_err();
                 assert!(
-                    error.to_string().contains(if id == "invite" {
-                        "array of strings"
-                    } else {
-                        "1–600 seconds"
+                    error.to_string().contains(match key {
+                        "allowlist_codes" => "array of strings",
+                        "max_messages" => "max_messages must be",
+                        _ => "1–600 seconds",
                     }),
                     "{error}"
                 );
@@ -4556,10 +4563,10 @@ fn builtin_form_params_validate_through_rule_saves() {
                     original
                 );
             }
-            let valid = if id == "invite" {
-                vec![serde_json::json!([]), serde_json::json!(["code"])]
-            } else {
-                vec![serde_json::json!(1), serde_json::json!(600)]
+            let valid = match key {
+                "allowlist_codes" => vec![serde_json::json!([]), serde_json::json!(["code"])],
+                "max_messages" => vec![serde_json::json!(0), serde_json::json!(max_messages)],
+                _ => vec![serde_json::json!(1), serde_json::json!(600)],
             };
             for value in valid {
                 rule.params[key] = value;
@@ -4578,6 +4585,295 @@ fn builtin_form_params_validate_through_rule_saves() {
                 .unwrap();
         }
     });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn velocity_default_rows_start_in_dry_run_once_after_upgrade() {
+    let tmp = tmp_db_path("velocity_dry_run_upgrade");
+    let db = Db::open(&tmp, 2).unwrap();
+    // A new install keeps the live shipped default.
+    let fresh = tokio_test_block_on(get_rule(&db, 0, "velocity"))
+        .unwrap()
+        .unwrap();
+    assert!(fresh.enabled && !fresh.dry_run);
+
+    // Model a database written before the upgrade marker existed.
+    let mut edited = fresh.clone();
+    edited.params["max_messages"] = serde_json::json!(12);
+    let mut relabeled = fresh.clone();
+    relabeled.description = "Older shipped wording".into();
+    // The shipped default written with its limit as a JSON float.
+    let mut float_default = fresh.clone();
+    float_default.params["max_messages"] = serde_json::json!(8.0);
+    // Defaults that resolve from an omitted or invalid legacy limit.
+    let mut omitted_limit = fresh.clone();
+    omitted_limit.params = serde_json::json!({"window_secs": 10});
+    let mut fractional_limit = fresh.clone();
+    fractional_limit.params["max_messages"] = serde_json::json!(0.5);
+    // A float limit resolves to the old default of 8, not to its value.
+    let mut float_one = fresh.clone();
+    float_one.params["max_messages"] = serde_json::json!(1.0);
+    tokio_test_block_on(async {
+        db.with_conn(|conn| {
+            conn.execute_bounded(
+                "DELETE FROM meta WHERE key = 'velocity_dry_run_upgrade_v1'",
+                (),
+                1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        old_writer_rule(
+            &db,
+            123,
+            "velocity",
+            serde_json::to_value(&relabeled).unwrap(),
+        )
+        .await;
+        old_writer_rule(&db, 124, "velocity", serde_json::to_value(&edited).unwrap()).await;
+        old_writer_rule(
+            &db,
+            125,
+            "velocity",
+            serde_json::to_value(&float_default).unwrap(),
+        )
+        .await;
+        for (guild, rule) in [
+            (126, &omitted_limit),
+            (127, &fractional_limit),
+            (128, &float_one),
+        ] {
+            old_writer_rule(&db, guild, "velocity", serde_json::to_value(rule).unwrap()).await;
+        }
+    });
+    let before = tokio_test_block_on(get_config_version(&db)).unwrap();
+    drop(db);
+
+    let db = Db::open(&tmp, 2).unwrap();
+    for guild in [0, 123, 125, 126, 127, 128] {
+        let rule = tokio_test_block_on(get_rule(&db, guild, "velocity"))
+            .unwrap()
+            .unwrap();
+        assert!(rule.enabled && rule.dry_run, "guild {guild}");
+    }
+    assert_eq!(
+        tokio_test_block_on(get_rule(&db, 123, "velocity"))
+            .unwrap()
+            .unwrap()
+            .description,
+        "Older shipped wording"
+    );
+    let kept = tokio_test_block_on(get_rule(&db, 124, "velocity"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&kept).unwrap(),
+        serde_json::to_value(&edited).unwrap(),
+        "an edited rule keeps its settings"
+    );
+    assert!(tokio_test_block_on(get_config_version(&db)).unwrap() > before);
+
+    // The upgrade runs once: an operator who turns enforcement back on keeps it.
+    let mut live = tokio_test_block_on(get_rule(&db, 0, "velocity"))
+        .unwrap()
+        .unwrap();
+    live.dry_run = false;
+    tokio_test_block_on(upsert_rule(&db, 0, "velocity", &live)).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert!(
+        !tokio_test_block_on(get_rule(&db, 0, "velocity"))
+            .unwrap()
+            .unwrap()
+            .dry_run
+    );
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+fn clear_velocity_upgrade_marker(db: &Db) {
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute_bounded(
+            "DELETE FROM meta WHERE key = 'velocity_dry_run_upgrade_v1'",
+            (),
+            1024,
+        )?;
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn velocity_upgrade_covers_an_inherited_default_without_a_global_row() {
+    let tmp = tmp_db_path("velocity_upgrade_no_global_row");
+    let db = Db::open(&tmp, 2).unwrap();
+    clear_velocity_upgrade_marker(&db);
+    // A rules copy into global scope can leave no stored global velocity row;
+    // servers then inherit the shipped default.
+    tokio_test_block_on(db.with_conn(|conn| {
+        conn.execute_bounded("DELETE FROM rules WHERE rule_id = 'velocity'", (), 1024)?;
+        Ok(())
+    }))
+    .unwrap();
+    assert!(
+        !tokio_test_block_on(load_config_parts(&db, 123))
+            .unwrap()
+            .rules["velocity"]
+            .dry_run
+    );
+    drop(db);
+
+    let db = Db::open(&tmp, 2).unwrap();
+    let inherited = tokio_test_block_on(load_config_parts(&db, 123))
+        .unwrap()
+        .rules
+        .remove("velocity")
+        .unwrap();
+    assert!(inherited.enabled && inherited.dry_run);
+    assert!(
+        tokio_test_block_on(get_rule(&db, 0, "velocity"))
+            .unwrap()
+            .unwrap()
+            .dry_run
+    );
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn global_copy_after_the_upgrade_keeps_velocity_in_dry_run() {
+    let effective = |db: &Db, guild: i64| {
+        tokio_test_block_on(load_config_parts(db, guild))
+            .unwrap()
+            .rules
+            .remove("velocity")
+            .unwrap()
+    };
+    // A new install never upgraded, so a missing global row stays live.
+    let tmp = tmp_db_path("velocity_copy_fresh");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(crate::db::copy_guild_config(
+        &db,
+        10,
+        0,
+        vec!["rules".into()],
+    ))
+    .unwrap();
+    assert!(!effective(&db, 123).dry_run);
+    drop(db);
+    cleanup_db(&tmp);
+
+    let tmp = tmp_db_path("velocity_copy_upgraded");
+    let db = Db::open(&tmp, 2).unwrap();
+    clear_velocity_upgrade_marker(&db);
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert!(effective(&db, 123).dry_run);
+    // Server 10 only inherits velocity, so the copy removes the global row.
+    tokio_test_block_on(crate::db::copy_guild_config(
+        &db,
+        10,
+        0,
+        vec!["rules".into()],
+    ))
+    .unwrap();
+    assert!(
+        tokio_test_block_on(get_rule(&db, 0, "velocity"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(effective(&db, 123).dry_run, "immediately after the copy");
+    assert!(
+        tokio_test_block_on(load_web_config_snapshot(&db, 123))
+            .unwrap()
+            .velocity_default_dry_run
+    );
+    let (layers, default) = tokio_test_block_on(get_enrolled_builtin_rule(
+        &db,
+        ConfigurationScope::Global,
+        "velocity",
+    ))
+    .unwrap();
+    assert!(layers.global.is_none() && default.dry_run);
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert!(effective(&db, 123).dry_run, "after reopen");
+    assert!(
+        tokio_test_block_on(get_rule(&db, 0, "velocity"))
+            .unwrap()
+            .unwrap()
+            .dry_run
+    );
+
+    // An explicit live setting is still honored.
+    let mut live = effective(&db, 0);
+    live.dry_run = false;
+    tokio_test_block_on(upsert_rule(&db, 0, "velocity", &live)).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert!(!effective(&db, 123).dry_run);
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn velocity_upgrade_leaves_a_fenced_guild_unchanged() {
+    use crate::db::guild_stores::{StoreId, StorePolicy, register_store};
+    let tmp = tmp_db_path("velocity_upgrade_fenced_guild");
+    let db = Db::open(&tmp, 2).unwrap();
+    clear_velocity_upgrade_marker(&db);
+    let shipped = tokio_test_block_on(get_rule(&db, 0, "velocity"))
+        .unwrap()
+        .unwrap();
+    tokio_test_block_on(async {
+        for guild in [123, 124] {
+            old_writer_rule(
+                &db,
+                guild,
+                "velocity",
+                serde_json::to_value(&shipped).unwrap(),
+            )
+            .await;
+        }
+        let destination = StoreId::parse(&format!("{:032x}", 9u128)).unwrap();
+        register_store(&db, destination, StorePolicy::Shared)
+            .await
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute_bounded(
+                "INSERT INTO guild_write_fences(guild_id,generation,phase,destination_store_id,destination_revision,created_at)
+                 VALUES(123,?1,'freeze',?1,?1,unixepoch())",
+                params![format!("{:032x}", 9u128)],
+                65_536,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    });
+    drop(db);
+
+    let db = Db::open(&tmp, 2).unwrap();
+    let fenced = tokio_test_block_on(get_rule(&db, 123, "velocity"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&fenced).unwrap(),
+        serde_json::to_value(&shipped).unwrap(),
+        "a fenced guild's configuration stays frozen"
+    );
+    for guild in [0, 124] {
+        assert!(
+            tokio_test_block_on(get_rule(&db, guild, "velocity"))
+                .unwrap()
+                .unwrap()
+                .dry_run,
+            "guild {guild}"
+        );
+    }
     drop(db);
     cleanup_db(&tmp);
 }
@@ -4891,10 +5187,14 @@ fn invite_description_old_writer_reads_are_marker_gated_without_restart() {
 
 // Exercise every built-in rule-save entry point used by callers/control dispatch.
 async fn save_invite_fixture(db: &Db, mode: &str, rule: &RuleDef) {
+    save_rule_fixture(db, mode, "invite", rule).await.unwrap();
+}
+
+async fn save_rule_fixture(db: &Db, mode: &str, id: &str, rule: &RuleDef) -> Result<()> {
     let guild = ConfigurationScope::Guild(guild_enrollment(db, 123).await.unwrap().unwrap());
     match mode {
-        "direct-global" => upsert_rule(db, 0, "invite", rule).await.unwrap(),
-        "direct-guild" => upsert_rule(db, 123, "invite", rule).await.unwrap(),
+        "direct-global" => upsert_rule(db, 0, id, rule).await,
+        "direct-guild" => upsert_rule(db, 123, id, rule).await,
         "enrolled-global" | "enrolled-guild" | "new-override" => {
             let target = if mode == "enrolled-global" {
                 ConfigurationScope::Global
@@ -4904,19 +5204,211 @@ async fn save_invite_fixture(db: &Db, mode: &str, rule: &RuleDef) {
             upsert_enrolled_rule(
                 db,
                 ConfigurationWriteScope::new(guild, target).unwrap(),
-                "invite",
+                id,
                 rule,
             )
             .await
-            .unwrap();
+            .map(|_| ())
         }
-        "global-clear" => {
-            upsert_global_rule_and_clear_enrolled_override(db, guild, "invite", rule)
-                .await
-                .unwrap();
-        }
+        "global-clear" => upsert_global_rule_and_clear_enrolled_override(db, guild, id, rule)
+            .await
+            .map(|_| ()),
         _ => panic!("unknown save fixture"),
     }
+}
+
+#[test]
+fn legacy_velocity_limit_survives_saves_that_keep_it() {
+    for mode in INVITE_SAVE_MODES {
+        let tmp = tmp_db_path("legacy_velocity_limit");
+        let db = Db::open(&tmp, 2).unwrap();
+        tokio_test_block_on(async {
+            enroll_guild(&db, 123, 100).await.unwrap().unwrap();
+            let mut legacy = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+            legacy.params["max_messages"] = serde_json::json!(5000);
+            // Only the global row is stored, so guild modes save a first override.
+            old_writer_rule(&db, 0, "velocity", serde_json::to_value(&legacy).unwrap()).await;
+
+            legacy.enabled = false;
+            save_rule_fixture(&db, mode, "velocity", &legacy)
+                .await
+                .unwrap_or_else(|error| panic!("{mode}: unchanged limit refused: {error:#}"));
+            let target = if mode.ends_with("global") || mode == "global-clear" {
+                0
+            } else {
+                123
+            };
+            let saved = get_rule(&db, target, "velocity").await.unwrap().unwrap();
+            assert!(!saved.enabled, "{mode}");
+            assert_eq!(saved.params["max_messages"], 5000, "{mode}");
+
+            legacy.params["max_messages"] = serde_json::json!(5001);
+            let error = save_rule_fixture(&db, mode, "velocity", &legacy)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("max_messages must be"),
+                "{mode}: {error}"
+            );
+            let kept = get_rule(&db, target, "velocity").await.unwrap().unwrap();
+            assert_eq!(kept.params["max_messages"], 5000, "{mode}");
+        });
+        drop(db);
+        cleanup_db(&tmp);
+    }
+}
+
+#[test]
+fn a_browser_rounded_legacy_velocity_limit_keeps_the_stored_value() {
+    let tmp = tmp_db_path("legacy_velocity_rounded");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        let scope =
+            ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+                .unwrap();
+        let mut rule = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        // 2^53 + 1 cannot round-trip through a JavaScript number.
+        rule.params["max_messages"] = serde_json::json!(9_007_199_254_740_993u64);
+        old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+
+        rule.enabled = false;
+        rule.params["max_messages"] = serde_json::json!(9_007_199_254_740_992u64);
+        upsert_enrolled_rule(&db, scope.clone(), "velocity", &rule)
+            .await
+            .unwrap();
+        let saved = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        assert!(!saved.enabled);
+        assert_eq!(saved.params["max_messages"], 9_007_199_254_740_993u64);
+
+        // A different over-limit value is still a new limit.
+        rule.params["max_messages"] = serde_json::json!(9_007_199_254_741_000u64);
+        assert!(
+            upsert_enrolled_rule(&db, scope.clone(), "velocity", &rule)
+                .await
+                .is_err()
+        );
+
+        // A stored u64::MAX comes back from a browser above u64::MAX.
+        rule.params["max_messages"] = serde_json::json!(u64::MAX);
+        old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        rule.params["max_messages"] = serde_json::from_str("18446744073709552000").unwrap();
+        upsert_enrolled_rule(&db, scope.clone(), "velocity", &rule)
+            .await
+            .unwrap();
+        let saved = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        assert_eq!(saved.params["max_messages"], u64::MAX);
+
+        // A stored 1.0 resolves to the default of 8; a browser sends it back
+        // as 1, which must not become a stricter limit.
+        rule.params["max_messages"] = serde_json::json!(1.0);
+        old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        rule.params["max_messages"] = serde_json::json!(1);
+        upsert_enrolled_rule(&db, scope.clone(), "velocity", &rule)
+            .await
+            .unwrap();
+        let saved = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        assert_eq!(saved.params["max_messages"], serde_json::json!(1.0));
+        assert_eq!(crate::types::velocity_max_messages(&saved.params), 8);
+
+        // An older writer could store an over-limit value as a JSON float.
+        rule.params["max_messages"] = serde_json::json!(1e30);
+        old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        rule.params["max_messages"] =
+            serde_json::from_str("1000000000000000000000000000000").unwrap();
+        upsert_enrolled_rule(&db, scope.clone(), "velocity", &rule)
+            .await
+            .unwrap();
+        let saved = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        assert_eq!(saved.params["max_messages"], serde_json::json!(1e30));
+    });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn saving_a_server_velocity_rule_as_global_keeps_its_legacy_limit() {
+    let tmp = tmp_db_path("legacy_velocity_promote");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        enroll_guild(&db, 123, 100).await.unwrap().unwrap();
+        let mut rule = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        let integer = serde_json::json!(1);
+        let float = serde_json::json!(1.0);
+        // Both source limits reach the writer as the same browser number.
+        let mut promoted = Vec::new();
+        for (destination, source) in [(&integer, &float), (&float, &integer)] {
+            rule.params["max_messages"] = destination.clone();
+            old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+            rule.params["max_messages"] = source.clone();
+            old_writer_rule(&db, 123, "velocity", serde_json::to_value(&rule).unwrap()).await;
+            rule.params["max_messages"] = integer.clone();
+            save_rule_fixture(&db, "global-clear", "velocity", &rule)
+                .await
+                .unwrap();
+            let global = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+            promoted.push((
+                global.params["max_messages"].clone(),
+                crate::types::velocity_max_messages(&global.params),
+            ));
+            assert!(get_rule(&db, 123, "velocity").await.unwrap().is_none());
+        }
+        assert_eq!(promoted, [(float, 8), (integer, 1)]);
+
+        // Without an override, the editor shows the global value.
+        rule.params["max_messages"] = serde_json::json!(1.0);
+        old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        rule.params["max_messages"] = serde_json::json!(1);
+        save_rule_fixture(&db, "global-clear", "velocity", &rule)
+            .await
+            .unwrap();
+        let global = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        assert_eq!(crate::types::velocity_max_messages(&global.params), 8);
+
+        // A present override can use the built-in fallback by omitting its limit.
+        rule.params["max_messages"] = serde_json::json!(1);
+        old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        rule.params.as_object_mut().unwrap().remove("max_messages");
+        old_writer_rule(&db, 123, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        save_rule_fixture(&db, "global-clear", "velocity", &rule)
+            .await
+            .unwrap();
+        let global = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        assert!(global.params.get("max_messages").is_none());
+        assert_eq!(crate::types::velocity_max_messages(&global.params), 8);
+    });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
+fn everything_copy_keeps_a_legacy_velocity_limit() {
+    let tmp = tmp_db_path("legacy_velocity_copy");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        let mut legacy = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        legacy.enabled = false;
+        legacy.params["max_messages"] = serde_json::json!(5000);
+        old_writer_rule(&db, 10, "velocity", serde_json::to_value(&legacy).unwrap()).await;
+        let mut ban = crate::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "ban")
+            .expect("ban");
+        ban.description = "server ban".into();
+        upsert_command(&db, 10, "ban", &ban).await.unwrap();
+        // A legacy row must not abort the whole copy of unrelated sections.
+        crate::db::copy_guild_config(&db, 10, 11, vec!["all".into()])
+            .await
+            .unwrap();
+        let copied = get_rule(&db, 11, "velocity").await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&copied).unwrap(),
+            serde_json::to_value(&legacy).unwrap()
+        );
+        let command = get_command_row(&db, 11, "ban").await.unwrap().unwrap();
+        assert_eq!(command.description, "server ban");
+    });
+    drop(db);
+    cleanup_db(&tmp);
 }
 
 const INVITE_SAVE_MODES: [&str; 6] = [
@@ -5285,6 +5777,7 @@ fn invite_description_first_override_inherits_global_on_stale_save() {
                                 id: "invite".into(),
                                 rule,
                                 clear_guild_override: false,
+                                replace_velocity_limit: false,
                             },
                             None,
                         )

@@ -1100,14 +1100,20 @@ pub(super) fn invalidate_settings_heal_checksum_conn(conn: &impl SqlExecutor) ->
     Ok(())
 }
 
-const SEED_META_MARKERS: [&str; 6] = [
+const SEED_META_MARKERS: [&str; 7] = [
     "invite_description_v1",
     "readable_log_defaults_v1",
     "attachment_delete_template_v1",
     "retained_message_templates_v1",
     "retained_bulk_status_template_v1",
     "embed_log_defaults_v1",
+    VELOCITY_DRY_RUN_MARKER,
 ];
+
+const VELOCITY_DRY_RUN_MARKER: &str = "velocity_dry_run_upgrade_v1";
+/// Set when the velocity upgrade ran on an existing install. Configuration
+/// reads then resolve a missing global velocity rule to dry-run.
+pub(super) const META_VELOCITY_DEFAULT_DRY_RUN: &str = "velocity_default_dry_run";
 
 /// Unix millis of the last gateway IDENTIFY this process was about to send.
 /// A restart reads it so a crash loop cannot identify again inside the same
@@ -1407,6 +1413,71 @@ pub(super) fn seed_globals_conn(
     Ok(())
 }
 
+/// Every adoptable database was seeded by a binary that wrote the earlier
+/// seed markers; the schema baseline does not, so a new install has none.
+fn existing_install_conn(conn: &impl SqlExecutor) -> Result<bool> {
+    for key in SEED_META_MARKERS {
+        if key != VELOCITY_DRY_RUN_MARKER && meta_string_conn(conn, key)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Velocity now counts ordinary messages, so on an existing install every
+/// stored velocity rule that still matches the shipped default starts in
+/// dry-run once. Edited rules keep their settings (name and description are
+/// only labels), and a guild with a persisted write fence is left unchanged.
+/// A missing global row is handled by the install default instead.
+fn velocity_dry_run_upgrade_sql(conn: &impl SqlExecutor) -> Result<String> {
+    let index = crate::types::RULE_IDS
+        .iter()
+        .position(|id| *id == "velocity")
+        .context("shipped velocity rule")?;
+    let shipped = crate::defaults::default_rules()
+        .into_iter()
+        .nth(index)
+        .context("shipped velocity rule")?;
+    let shipped_value = serde_json::to_value(&shipped)?;
+    let mut sql = String::new();
+    let mut stmt = conn.prepare("SELECT guild_id, data FROM rules WHERE rule_id = 'velocity'")?;
+    let rows = stmt.query_map((), |row| Ok((row.get::<i64>(0)?, row.get::<String>(1)?)))?;
+    for row in rows {
+        let (guild_id, data) = row?;
+        let Ok(mut stored) = serde_json::from_str::<crate::types::RuleDef>(&data) else {
+            continue;
+        };
+        stored.name.clone_from(&shipped.name);
+        stored.description.clone_from(&shipped.description);
+        // Compare behavior, not JSON: omitted and legacy values resolve as the
+        // bot reads them. Unknown extra keys still count as customized.
+        let known_keys = stored.params.as_object().is_none_or(|params| {
+            params
+                .keys()
+                .all(|key| key == "window_secs" || key == "max_messages")
+        });
+        if known_keys {
+            stored.params = serde_json::json!({
+                "window_secs": crate::types::velocity_window_secs(&stored.params),
+                "max_messages": crate::types::velocity_max_messages(&stored.params),
+            });
+        }
+        if serde_json::to_value(&stored)? == shipped_value {
+            sql.push_str(&velocity_dry_run_update_sql(guild_id, &data));
+        }
+    }
+    Ok(sql)
+}
+
+fn velocity_dry_run_update_sql(guild_id: i64, data: &str) -> String {
+    format!(
+        "UPDATE rules SET data = json_set(data, '$.dry_run', json('true')) \
+         WHERE guild_id = {guild_id} AND rule_id = 'velocity' AND data = {} \
+         AND NOT EXISTS (SELECT 1 FROM guild_write_fences WHERE guild_id = {guild_id});\n",
+        sql_text(data)
+    )
+}
+
 fn seed_globals_sql(
     default_prefix: &str,
     retention_days: u32,
@@ -1432,7 +1503,16 @@ fn seed_globals_sql(
         "INSERT OR IGNORE INTO guild_settings (guild_id, settings) VALUES ({GLOBAL_SCOPE}, {});\n",
         sql_text(&json)
     ));
-    for (i, rule) in crate::defaults::default_rules().iter().enumerate() {
+    // Decide the install's velocity default before seeding a missing global
+    // row: once an existing install upgraded, a reseeded row starts dry-run.
+    let velocity_upgrade =
+        meta_string_conn(conn, VELOCITY_DRY_RUN_MARKER)?.is_none() && existing_install_conn(conn)?;
+    let velocity_dry_default =
+        velocity_upgrade || meta_string_conn(conn, META_VELOCITY_DEFAULT_DRY_RUN)?.is_some();
+    for (i, rule) in crate::defaults::install_default_rules(velocity_dry_default)
+        .iter()
+        .enumerate()
+    {
         body.push_str(&format!(
             "INSERT OR IGNORE INTO rules (guild_id, rule_id, data) VALUES ({GLOBAL_SCOPE}, {}, {});\n",
             sql_text(crate::types::RULE_IDS[i]),
@@ -1451,6 +1531,13 @@ fn seed_globals_sql(
     ));
     if meta_string_conn(conn, "invite_description_v1")?.is_none() {
         markers.push("invite_description_v1");
+    }
+    if velocity_upgrade {
+        body.push_str(&velocity_dry_run_upgrade_sql(conn)?);
+        markers.push(META_VELOCITY_DEFAULT_DRY_RUN);
+    }
+    if meta_string_conn(conn, VELOCITY_DRY_RUN_MARKER)?.is_none() {
+        markers.push(VELOCITY_DRY_RUN_MARKER);
     }
     let upgrade_presentation = meta_string_conn(conn, "readable_log_defaults_v1")?.is_none();
     if upgrade_presentation {

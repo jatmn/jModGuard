@@ -195,6 +195,7 @@ async fn apply_control_rejects_live_create_without_row() {
     };
     let op = ControlOp::UpsertRule {
         clear_guild_override: false,
+        replace_velocity_limit: false,
         request: wire.clone(),
         target: wire,
         id: id.clone(),

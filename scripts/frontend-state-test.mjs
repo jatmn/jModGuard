@@ -3741,8 +3741,8 @@ for (const [id, params, fields, expected] of [
     [['Allowed invite codes (comma-separated)', ' New-Code, second-code, , ']],
     {allowlist_codes: ['New-Code', 'second-code']}],
   ['velocity', {window_secs: 10, max_messages: 8},
-    [['Window (seconds)', '15'], ['Maximum messages in window', '11']],
-    {window_secs: 15, max_messages: 11}],
+    [['Window (seconds)', '15'], ['Maximum messages in window', '1023']],
+    {window_secs: 15, max_messages: 1023}],
   ['account_age', {min_age_days: 3}, [['Minimum account age (days)', '5']], {min_age_days: 5}],
 ]) {
   test(`built-in ${id} saves typed detection fields without a JSON editor`, async () => {
@@ -3760,11 +3760,20 @@ for (const [id, params, fields, expected] of [
     assert.doesNotMatch(textOf(modal), /Parameters \(JSON\)/);
     assert.equal(modal.querySelector('textarea'), null);
     assert.ok(modal.querySelector('.escalation-step'), 'escalation rules show strike rows');
+    const save = findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save');
     for (const [label, value] of fields) {
       const labelNode = findNode(modal, n => n.localName === 'label' && textOf(n) === label);
       const input = labelNode?.control;
       assert.ok(input, label);
       assert.equal(input.type, id === 'invite' ? 'text' : 'number');
+      if (label === 'Maximum messages in window') {
+        assert.equal(input.max, '1023');
+        input.value = '1024';
+        await fire(input, 'input');
+        await fire(save, 'click');
+        assert.equal(calls.length, 0, 'oversized count must not reach the API');
+        assert.match(textOf(h.document.body), /Maximum messages in window must be 0–1023/);
+      }
       input.value = value;
       await fire(input, 'input');
     }
@@ -3772,10 +3781,11 @@ for (const [id, params, fields, expected] of [
     await fire(enabled, 'change', {target: {checked: false}});
     const dryRun = findNode(modal, n => n.localName === 'label' && textOf(n) === 'Dry-run (log only)').control;
     await fire(dryRun, 'change', {target: {checked: false}});
-    await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+    await fire(save, 'click');
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, `/api/guilds/${h.app.state.guildId}/rules/${id}`);
     assert.equal(calls[0].body.scope, 'guild');
+    assert.equal(calls[0].body.replace_velocity_limit, id === 'velocity' ? true : undefined);
     const saved = calls[0].body.data;
     assert.deepEqual(saved.params, expected);
     assert.deepEqual(saved.actions, [action]);
@@ -3790,6 +3800,94 @@ for (const [id, params, fields, expected] of [
     }
   });
 }
+
+test('velocity editor keeps an unchanged legacy limit but refuses a new one above 1023', async () => {
+  const calls = [];
+  const h = harness(async (url, options) => {
+    if (options.method === 'PUT') {
+      calls.push({url, body: JSON.parse(options.body)});
+      // The first save fails, so the server still stores the legacy limit.
+      if (calls.length === 1) return {ok: false, status: 400, headers: {get: () => null}, text: async () => JSON.stringify({error: 'save failed'})};
+    }
+    return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+  });
+  const modal = await h.app.editRule({name: 'Message velocity', rule_id: 'velocity', effective: {
+    enabled: true, dry_run: false, params: {window_secs: 10, max_messages: 5000},
+    actions: [{at: 1, action: 'delete'}],
+  }});
+  const control = (label) => findNode(modal, n => n.localName === 'label' && textOf(n) === label).control;
+  const save = findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save');
+  const max = control('Maximum messages in window');
+  max.value = '5001';
+  await fire(max, 'input');
+  await fire(save, 'click');
+  assert.equal(calls.length, 0, 'a new oversized count must not reach the API');
+  assert.match(textOf(h.document.body), /Maximum messages in window must be 0–1023/);
+
+  // A failed save of a valid limit leaves the stored legacy limit in place.
+  max.value = '1000';
+  await fire(max, 'input');
+  await fire(save, 'click');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].body.data.params.max_messages, 1000);
+  assert.equal(calls[0].body.replace_velocity_limit, true);
+
+  max.value = '5000';
+  await fire(max, 'input');
+  const windowInput = control('Window (seconds)');
+  windowInput.value = '15';
+  await fire(windowInput, 'input');
+  await fire(save, 'click');
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].body.data.params, {window_secs: 15, max_messages: 5000});
+  assert.equal(calls[1].body.replace_velocity_limit, undefined);
+});
+
+for (const legacy of [2 ** 53, 5000.5, '1', 1]) test(`velocity editor keeps an untouched legacy limit ${JSON.stringify(legacy)}`, async () => {
+  const calls = [];
+  const h = harness(async (url, options) => {
+    if (options.method === 'PUT') calls.push({url, body: JSON.parse(options.body)});
+    return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+  });
+  const modal = await h.app.editRule({name: 'Message velocity', rule_id: 'velocity', effective: {
+    enabled: true, dry_run: false, params: {window_secs: 10, max_messages: legacy},
+    actions: [{at: 1, action: 'delete'}],
+  }});
+  const control = (label) => findNode(modal, n => n.localName === 'label' && textOf(n) === label).control;
+  const windowInput = control('Window (seconds)');
+  windowInput.value = '15';
+  await fire(windowInput, 'input');
+  await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].body.data.params, {window_secs: 15, max_messages: legacy});
+  assert.equal(calls[0].body.replace_velocity_limit, undefined);
+});
+
+test('velocity promotion marks a replacement of the original browser number', async () => {
+  let saved;
+  const h = harness(async (_url, options) => {
+    if (options.method === 'PUT') saved = JSON.parse(options.body);
+    return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+  });
+  h.app.state.me.is_bot_owner = true;
+  const effective = {
+    enabled: true, dry_run: false, params: {window_secs: 10, max_messages: 1},
+    actions: [{at: 1, action: 'delete'}],
+  };
+  const modal = await h.app.editRule({
+    name: 'Message velocity', rule_id: 'velocity', effective, guild_override: effective,
+  });
+  const control = (label) => findNode(modal, n => n.localName === 'label' && textOf(n) === label).control;
+  control('Applies to').value = 'global';
+  const limit = control('Maximum messages in window');
+  limit.value = '1';
+  await fire(limit, 'input');
+  await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+  assert.equal(saved.scope, 'global');
+  assert.equal(saved.clear_guild_override, true);
+  assert.equal(saved.replace_velocity_limit, true);
+  assert.equal(saved.data.params.max_messages, 1);
+});
 
 for (const params of [{allowlist_guilds: ['9007199254740993']}, {allowlist_codes: []}]) {
   test(`invite editor saves an empty code list from ${Object.keys(params)[0]}`, async () => {
