@@ -72,7 +72,7 @@ impl AuthorState {
     /// window, the rule is over its limit. Legacy thresholds above the
     /// supported limit have no such observation.
     fn velocity_over_limit(&self, rule: &RuleDef, index: usize) -> bool {
-        let max = param_u64(rule, "max_messages", 8);
+        let max = velocity_max_messages(rule);
         let window = velocity_window(rule);
         let arrived = self.velocity_events[index];
         usize::try_from(max)
@@ -81,6 +81,23 @@ impl AuthorState {
             .and_then(|first| self.velocity_events.get(first))
             .is_some_and(|first| arrived.duration_since(*first) < window)
     }
+}
+
+/// Older writers could store the limit as any JSON number. A count exceeds a
+/// fractional limit exactly when it exceeds its floor, and values beyond the
+/// retained history stay inert. Other values keep the default.
+fn velocity_max_messages(rule: &RuleDef) -> u64 {
+    rule.params.get("max_messages").map_or(8, |value| {
+        value
+            .as_u64()
+            .or_else(|| {
+                value
+                    .as_f64()
+                    .filter(|limit| *limit >= 0.0)
+                    .map(|limit| limit as u64)
+            })
+            .unwrap_or(8)
+    })
 }
 
 fn velocity_window(rule: &RuleDef) -> Duration {
@@ -2151,6 +2168,26 @@ mod tests {
         let check = older + STRIKE_RETENTION + Duration::from_secs(5);
         assert!(state.prune(check, STRIKE_RETENTION) == RuleRetention::Retained);
         assert_eq!(state.record_strike(check, false), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn velocity_reads_legacy_limits_stored_as_json_floats() {
+        for (limit, first_strike) in [
+            (serde_json::json!(5000.0), None),
+            (serde_json::json!(1e30), None),
+            (serde_json::json!(8.0), Some(9)),
+            (serde_json::json!(8.5), Some(9)),
+        ] {
+            let mut cfg = default_automod_config();
+            cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = limit.clone();
+            let engine = AutomodEngine::new();
+            let mut message = msg(1, "ordinary message", 0, false, false);
+            let struck = (1..=12).find(|id| {
+                message.message_id = *id;
+                engine.evaluate(&cfg, &message).is_some()
+            });
+            assert_eq!(struck, first_strike, "max_messages {limit}");
+        }
     }
 
     fn default_automod_config() -> CachedGuildConfig {

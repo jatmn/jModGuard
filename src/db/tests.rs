@@ -4604,6 +4604,9 @@ fn velocity_default_rows_start_in_dry_run_once_after_upgrade() {
     edited.params["max_messages"] = serde_json::json!(12);
     let mut relabeled = fresh.clone();
     relabeled.description = "Older shipped wording".into();
+    // The shipped default written with its limit as a JSON float.
+    let mut float_default = fresh.clone();
+    float_default.params["max_messages"] = serde_json::json!(8.0);
     tokio_test_block_on(async {
         db.with_conn(|conn| {
             conn.execute_bounded(
@@ -4623,12 +4626,19 @@ fn velocity_default_rows_start_in_dry_run_once_after_upgrade() {
         )
         .await;
         old_writer_rule(&db, 124, "velocity", serde_json::to_value(&edited).unwrap()).await;
+        old_writer_rule(
+            &db,
+            125,
+            "velocity",
+            serde_json::to_value(&float_default).unwrap(),
+        )
+        .await;
     });
     let before = tokio_test_block_on(get_config_version(&db)).unwrap();
     drop(db);
 
     let db = Db::open(&tmp, 2).unwrap();
-    for guild in [0, 123] {
+    for guild in [0, 123, 125] {
         let rule = tokio_test_block_on(get_rule(&db, guild, "velocity"))
             .unwrap()
             .unwrap();
