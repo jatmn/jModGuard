@@ -3803,7 +3803,11 @@ for (const [id, params, fields, expected] of [
 test('velocity editor keeps an unchanged legacy limit but refuses a new one above 1023', async () => {
   const calls = [];
   const h = harness(async (url, options) => {
-    if (options.method === 'PUT') calls.push({url, body: JSON.parse(options.body)});
+    if (options.method === 'PUT') {
+      calls.push({url, body: JSON.parse(options.body)});
+      // The first save fails, so the server still stores the legacy limit.
+      if (calls.length === 1) return {ok: false, status: 400, headers: {get: () => null}, text: async () => JSON.stringify({error: 'save failed'})};
+    }
     return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
   });
   const modal = await h.app.editRule({name: 'Message velocity', rule_id: 'velocity', effective: {
@@ -3819,14 +3823,21 @@ test('velocity editor keeps an unchanged legacy limit but refuses a new one abov
   assert.equal(calls.length, 0, 'a new oversized count must not reach the API');
   assert.match(textOf(h.document.body), /Maximum messages in window must be 0–1023/);
 
+  // A failed save of a valid limit leaves the stored legacy limit in place.
+  max.value = '1000';
+  await fire(max, 'input');
+  await fire(save, 'click');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].body.data.params.max_messages, 1000);
+
   max.value = '5000';
   await fire(max, 'input');
   const windowInput = control('Window (seconds)');
   windowInput.value = '15';
   await fire(windowInput, 'input');
   await fire(save, 'click');
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].body.data.params, {window_secs: 15, max_messages: 5000});
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].body.data.params, {window_secs: 15, max_messages: 5000});
 });
 
 for (const params of [{allowlist_guilds: ['9007199254740993']}, {allowlist_codes: []}]) {

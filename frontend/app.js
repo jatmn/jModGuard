@@ -4761,6 +4761,10 @@ function RuleEditor({ record: r }) {
                   );
               } else if (r.rule_id !== "badword" && !knownSpam) {
                 const params = {};
+                // `rule` is the draft; compare limits with what the target scope stores.
+                const persisted =
+                  (scopeSelRef.current?.value === "global" && state.guildId !== "0" ? r.global : r.effective)
+                    ?.params ?? {};
                 for (const { key, label, max } of fields) {
                   const raw = String(values[key] ?? "");
                   const value = Number(raw);
@@ -4769,7 +4773,7 @@ function RuleEditor({ record: r }) {
                   if (key === "window_secs" && (value < 1 || value > 600))
                     throw new Error("Window must be 1–600 seconds.");
                   // A stored legacy value above the limit is inert and may be kept unchanged.
-                  if (max !== undefined && value > max && value !== rule.params?.[key])
+                  if (max !== undefined && value > max && value !== persisted[key])
                     throw new Error(`${label} must be 0–${max}.`);
                   params[key] = value;
                 }
