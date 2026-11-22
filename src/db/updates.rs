@@ -758,16 +758,19 @@ pub async fn record_component_rollback(
     }).await
 }
 
+/// Invalidate the WebUI observation after a definite Storage mismatch. A
+/// queued or failed request keeps its state and error for reconciliation.
 pub async fn record_webui_drift(db: &Db, error: &str) -> Result<()> {
     let error = error.chars().take(300).collect::<String>();
     db.with_conn(move |conn| {
-        conn.execute_rows("UPDATE component_updates SET observed=NULL,observed_at=NULL,state=CASE WHEN state IN ('queued','failed') THEN state ELSE 'drift' END,last_error=CASE WHEN state='failed' THEN last_error ELSE ?1 END WHERE component='webui'", params![error], 1)?;
+        conn.execute_rows("UPDATE component_updates SET observed=NULL,observed_at=NULL,state=CASE WHEN state IN ('queued','failed') THEN state ELSE 'drift' END,last_error=CASE WHEN state IN ('queued','failed') THEN last_error ELSE ?1 END WHERE component='webui'", params![error], 1)?;
         Ok(())
     }).await
 }
 
 /// Restore the installed observation only after all five Storage objects
-/// match its digest-pinned package. Preserve a separate failed desired request.
+/// match its digest-pinned package. Preserve a separate desired request; an
+/// activated install keeps `desired == installed`, which is not separate.
 pub async fn record_webui_installed_verified(
     db: &Db,
     release: &ComponentRelease,
@@ -778,7 +781,7 @@ pub async fn record_webui_installed_verified(
     let observation = serde_json::to_string(&observation)?;
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let changed = tx.execute_rows("UPDATE component_updates SET observed=?2,observed_at=?3,state=CASE WHEN desired IS NULL THEN 'running' ELSE state END,last_error=CASE WHEN desired IS NULL THEN NULL ELSE last_error END WHERE component='webui' AND installed=?1",params![installed,observation,now], 1)?;
+        let changed = tx.execute_rows("UPDATE component_updates SET observed=?2,observed_at=?3,state=CASE WHEN desired IS NULL OR desired=?1 THEN 'running' ELSE state END,last_error=CASE WHEN desired IS NULL OR desired=?1 THEN NULL ELSE last_error END WHERE component='webui' AND installed=?1",params![installed,observation,now], 1)?;
         anyhow::ensure!(changed == 1, "installed WebUI release changed during verification");
         tx.commit()?;
         Ok(())
@@ -1634,10 +1637,9 @@ mod tests {
         record_webui_drift(&db, "Storage files differ")
             .await
             .unwrap();
-        assert_eq!(
-            component_update(&db, "webui").await.unwrap().state,
-            "queued"
-        );
+        let queued = component_update(&db, "webui").await.unwrap();
+        assert_eq!(queued.state, "queued");
+        assert!(queued.last_error.is_none());
         settle_interrupted_webui(&db, &release).await.unwrap();
         let partial = component_update(&db, "webui").await.unwrap();
         assert_eq!(partial.state, "failed");

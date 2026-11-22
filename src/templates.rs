@@ -299,12 +299,22 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
             .filter(|release| is_ascii_hex_sha40(&release.source_sha));
         let availability = if let Some(candidate) = candidate {
             let same_source = running_source == Some(candidate.source_sha.as_str());
-            // The installed release describes the running image only when it
-            // has the running source (not a built-in fallback binary).
+            // The installed digest describes the running image only when the
+            // observation identifies that managed build. A built-in fallback
+            // runs its baked source (`source_sha == base_image_sha`) while the
+            // installed release is retained, and a same-source managed build
+            // looks the same. WebUI observations come from verified readback.
+            let running_managed = component == "webui"
+                || item
+                    .observed
+                    .as_ref()
+                    .is_some_and(|observed| observed.source_sha != observed.base_image_sha);
             let installed_digest = item
                 .installed
                 .as_ref()
-                .filter(|installed| running_source == Some(installed.source_sha.as_str()))
+                .filter(|installed| {
+                    running_managed && running_source == Some(installed.source_sha.as_str())
+                })
                 .map(|installed| installed.digest.as_str());
             if same_source && installed_digest == Some(candidate.digest.as_str()) {
                 "up to date"
@@ -1543,6 +1553,31 @@ mod presentation_tests {
             api.ends_with("latest `abcdef0` · source up to date (image digest unverified) ⚠️"),
             "{api}"
         );
+
+        // After a same-source rebuild, a baked fallback and the retained
+        // managed install share the source, so the retained digest does not
+        // identify the running image either way.
+        for retained in ["b", "e"] {
+            let mut row = sample_api_update_row(
+                Some(sample_candidate("latest", source, &"b".repeat(64))),
+                Some(1_100),
+                None,
+                Some(sample_observed(source)),
+                Some(1_000),
+                "latest",
+            );
+            row.observed.as_mut().unwrap().base_image_sha = source.into();
+            row.installed = Some(sample_candidate("latest", source, &retained.repeat(64)));
+            let out = release_text(&[row], 1_200);
+            let api = out
+                .lines()
+                .find(|line| line.starts_with("**api:**"))
+                .unwrap();
+            assert!(
+                api.ends_with("latest `abcdef0` · source up to date (image digest unverified) ⚠️"),
+                "{retained}: {api}"
+            );
+        }
     }
 
     #[test]
