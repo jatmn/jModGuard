@@ -5,6 +5,7 @@ use anyhow::{Result, anyhow};
 use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
 use std::collections::BTreeMap;
 
+use super::usage::ArgumentError;
 use super::{Args, BehaviorOutcome, CmdEnv};
 
 pub(crate) const CASE_LINE_LIMIT: u32 = 8;
@@ -561,7 +562,7 @@ pub(crate) async fn resolve_userinfo_target(env: &CmdEnv<'_>, args: &mut Args) -
     match args.next_arg() {
         Some(token) => super::resolve_user(env.ctx, env.guild_id, &token)
             .await
-            .ok_or_else(|| anyhow!("could not resolve user `{token}`")),
+            .ok_or_else(|| ArgumentError::unresolved_user().into()),
         None => Ok(env.actor),
     }
 }

@@ -26,7 +26,9 @@ different invocation).
   first keeps it. While a rolling update pairs this API with an older bot,
   saving an override is refused until both are updated.
 
-Prefix commands: `<prefix><name> <args>` (default prefix `!`).
+Prefix commands: `<prefix><name> <args>` (default prefix `!`). If an
+argument is missing or invalid, the bot names it and shows the command syntax,
+an example, and the help command. Public usage replies expire after 30 seconds.
 
 ## Built-in commands
 
@@ -36,14 +38,14 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!softban <user> [reason]` | Moderation | mod | Ban, delete the last 24 hours of messages, then unban so the user can rejoin |
 | `!unban <user> [reason]` | Moderation | mod | Unban a user (`!ub`) |
 | `!kick <user> [--dm] [reason]` | Moderation | mod | Kick a user; optional `--dm` DMs the reason (`!k`) |
-| `!timeout <user> <minutes> [reason]` | Moderation | mod | Timeout a user; `0` removes it (`!mute`, `!t`) |
-| `!warn <user> <reason>` | Moderation | mod | Warn a user (`!w`) |
+| `!timeout <user> [minutes] [reason]` | Moderation | mod | Timeout a user for the configured default when minutes are omitted. Use `0` to remove it (`!mute`, `!t`) |
+| `!warn <user> [reason]` | Moderation | mod | Warn a user (`!w`) |
 | `!warns <user>` | Moderation | mod | List a user's warnings |
 | `!warnclear <user>` | Moderation | mod | Clear a user's warnings |
 | `!userinfo [user]` | Moderation | mod | Cached profile, warnings, and recent cases (defaults to you). A cached voice channel is named only when the caller can view it; otherwise the voice field is `unavailable` and omits the name and id. Channel mentions in case reasons use that rule. A private thread, including an archived one, also needs Manage Threads on the parent or known thread membership; uncached membership is `unavailable` and omits the id. An archived public thread stays with parent visibility. A user, role, or channel mention whose id is zero or does not fit is `unavailable` |
 | `!purge [count]` | Moderation | mod | Delete recent messages (max 100; `!clear`, `!p`) |
 | `!say [#channel] <text>` | Moderation | mod | Post a message as the bot (`!echo`) |
-| `!slowmode <seconds>` | Moderation | mod | Set slowmode on this channel |
+| `!slowmode [seconds]` | Moderation | mod | Set slowmode on this channel. Omit seconds to use the configured default |
 | `!banlist [limit]` | Moderation | mod | Recent bans tracked by the bot (`!bans`) |
 | `!voice <user>` | Moderation | mod | Report a user's cached voice channel (`not cached` when the guild is absent from cache, for an id, mention, name, or nickname; hidden or uncached channels are reported without naming them) |
 | `!setname <name>` | Admin | admin | Queue the bot's nickname for application in this server |
@@ -51,7 +53,7 @@ Prefix commands: `<prefix><name> <args>` (default prefix `!`).
 | `!template <list\|get\|set\|reset> [event] [text]` | Admin | admin | Edit log event templates |
 | `!rule <list\|toggle\|dryrun> [rule] [on\|off]` | Admin | admin | Toggle rules or set dry-run mode (including exact-image and repeated-text rules) |
 | `!logchannel <list\|set\|unset> [event] [#channel]` | Admin | admin | Route events to channels |
-| `!testregex <pattern> <sample>` | Admin | admin | Test a regex against raw + normalized text |
+| `!testregex <pattern> [sample]` | Admin | admin | Test a regex against raw + normalized text |
 | `!help [command]` | Utility | everyone | List commands (`!commands`, `!h`) |
 | `!about` | Utility | everyone | Project embed: repo link, version, uptime, highlights (plain text without Embed Links) |
 | `!stats` | Utility | admin | Uptime, this server’s retained moderation counts, release state, and this bot container’s CPU and memory (alias: `!status`) |

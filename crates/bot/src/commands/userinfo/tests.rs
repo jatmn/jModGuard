@@ -395,7 +395,7 @@ async fn capturing_proxy_for_commands(
     Arc<std::sync::Mutex<Vec<String>>>,
     tokio::task::JoinHandle<()>,
 ) {
-    capturing_proxy_with(success, false).await
+    capturing_proxy_with(success, false, None).await
 }
 
 /// `reject_embeds` answers any request carrying an embed with Discord's
@@ -403,6 +403,7 @@ async fn capturing_proxy_for_commands(
 async fn capturing_proxy_with(
     success: bool,
     reject_embeds: bool,
+    deleted: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> (
     serenity::http::Http,
     Arc<std::sync::Mutex<Vec<String>>>,
@@ -472,11 +473,12 @@ async fn capturing_proxy_with(
                 channel.id = ChannelId::new(1);
                 channel.guild_id = GuildId::new(10);
                 ("200 OK", serde_json::to_string(&channel).unwrap())
-            } else if route.starts_with("POST ") && route.contains("/messages") {
-                (
-                    "200 OK",
-                    serde_json::to_string(&serenity::model::channel::Message::default()).unwrap(),
-                )
+            } else if (route.starts_with("POST ") && route.contains("/messages"))
+                || (route.starts_with("PATCH ") && route.contains("/webhooks/"))
+            {
+                let mut message = serenity::model::channel::Message::default();
+                message.id = serenity::model::id::MessageId::new(77);
+                ("200 OK", serde_json::to_string(&message).unwrap())
             } else if route.starts_with("GET ") && route.contains("/messages") {
                 ("200 OK", "[]".into())
             } else {
@@ -487,6 +489,11 @@ async fn capturing_proxy_with(
             }
             if route.starts_with("DELETE ") && route.contains("/bans/") {
                 banned = false;
+            }
+            if route.starts_with("DELETE ")
+                && let Some(deleted) = &deleted
+            {
+                let _ = deleted.send(route.to_owned());
             }
             slot.lock().unwrap().push(request);
             let response = format!(
@@ -2660,6 +2667,7 @@ struct StatsDispatch {
     cache: Arc<Cache>,
     http: Arc<serenity::http::Http>,
     captured: Arc<std::sync::Mutex<Vec<String>>>,
+    deleted: tokio::sync::mpsc::UnboundedReceiver<String>,
     server: tokio::task::JoinHandle<()>,
     ctx: serenity::client::Context,
     cfg: Arc<crate::state::CachedGuildConfig>,
@@ -2690,7 +2698,9 @@ impl StatsDispatch {
             commands.insert(custom.name.clone(), custom);
         }
         let cache = Arc::new(Cache::new());
-        let (http, captured, server) = capturing_proxy_with(true, reject_embeds).await;
+        let (deletions, deleted) = tokio::sync::mpsc::unbounded_channel();
+        let (http, captured, server) =
+            capturing_proxy_with(true, reject_embeds, Some(deletions)).await;
         let http = Arc::new(http);
         let ctx = test_context(Arc::clone(&cache), Arc::clone(&http)).await;
         let cfg = Arc::new(crate::state::CachedGuildConfig {
@@ -2717,6 +2727,7 @@ impl StatsDispatch {
             cache,
             http,
             captured,
+            deleted,
             server,
             ctx,
             cfg,
@@ -2849,6 +2860,107 @@ impl StatsDispatch {
         drop(self.app);
         crate::tenant::remove_sidecars(&self.path);
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[tokio::test]
+async fn malformed_moderation_commands_send_usage_in_the_invocation_channel() {
+    use serenity::model::permissions::Permissions;
+
+    for (input, problem, usage, example, help) in [
+        (
+            "!ban",
+            "I need a user",
+            "`!ban <user> [--dm] [--minutes N] [reason]`",
+            "`!ban 42 --minutes 60 repeated spam`",
+            "`!help ban`",
+        ),
+        (
+            "`b 42 --minutes later",
+            "Ban duration must be a positive whole number of minutes.",
+            "`` `b <user> [--dm] [--minutes N] [reason] ``",
+            "`` `b 42 --minutes 60 repeated spam ``",
+            "`` `help ban ``",
+        ),
+        (
+            "!purge later",
+            "`count`",
+            "`!purge [count]`",
+            "`!purge 10`",
+            "`!help purge`",
+        ),
+        (
+            "!mute 42 later",
+            "`minutes`",
+            "`!mute <user> [minutes] [reason]`",
+            "`!mute 42 60 repeated spam`",
+            "`!help timeout`",
+        ),
+        (
+            "!logchannel set mod_action",
+            "Missing argument `channel`.",
+            "`!logchannel set <event> <#channel>`",
+            "`!logchannel set mod_action <#42>`",
+            "`!help logchannel`",
+        ),
+    ] {
+        let mut fx = StatsDispatch::new(false, Vec::new()).await;
+        Arc::get_mut(&mut fx.cfg).unwrap().settings.prefix = input[..1].to_owned();
+        fx.install(Permissions::MANAGE_GUILD);
+        fx.prefix(input).await;
+        assert_eq!(fx.captured.lock().unwrap().len(), 1, "{input}");
+        let replies = fx.replies();
+        fx.finish();
+
+        let [(route, payload)] = replies.as_slice() else {
+            panic!("{input} should send one usage reply: {replies:?}");
+        };
+        assert!(route.contains("/channels/2/messages"), "{route}");
+        let content = payload["content"].as_str().unwrap();
+        assert!(content.contains(problem), "{input}: {content}");
+        assert!(content.contains(&format!("Usage: {usage}")), "{content}");
+        assert!(
+            content.contains(&format!("Example: {example}")),
+            "{content}"
+        );
+        assert!(content.contains(help), "{content}");
+        assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+    }
+}
+
+#[tokio::test]
+async fn public_usage_replies_expire_in_prefix_and_deferred_slash_dispatch() {
+    use serenity::model::permissions::Permissions;
+
+    for slash in [false, true] {
+        let mut fx = StatsDispatch::new(false, Vec::new()).await;
+        fx.install(Permissions::BAN_MEMBERS);
+        if slash {
+            fx.slash("ban").await;
+        } else {
+            fx.prefix("!ban").await;
+        }
+        let reply = fx.sent("missing ban user");
+        assert!(reply["content"].as_str().unwrap().contains("`!help ban`"));
+        assert!(
+            fx.deleted.try_recv().is_err(),
+            "the reply was removed immediately"
+        );
+
+        tokio::time::pause();
+        tokio::time::advance(crate::commands::USAGE_REPLY_LIFETIME).await;
+        tokio::time::resume();
+        let route = tokio::time::timeout(std::time::Duration::from_secs(2), fx.deleted.recv())
+            .await
+            .expect("temporary reply did not expire")
+            .unwrap();
+        let path = if slash {
+            "/webhooks/1/token/messages/@original"
+        } else {
+            "/channels/2/messages/77"
+        };
+        assert!(route.contains(path), "{route}");
+        fx.finish();
     }
 }
 

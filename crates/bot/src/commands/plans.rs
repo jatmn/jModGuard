@@ -7,6 +7,7 @@
 use anyhow::{Result, anyhow};
 use serenity::model::id::{RoleId, UserId};
 
+use super::usage::ArgumentError;
 use super::{BehaviorOutcome, CmdEnv, PermLevel, refuse_fenced_discord_mutation};
 use crate::types::PlanStep;
 use crate::{db, logging};
@@ -69,9 +70,7 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
         None
     };
     if plan_requires_target(steps) && target.is_none() {
-        return Err(anyhow!(
-            "this action plan requires a target user for timeout, kick, or ban steps"
-        ));
+        return Err(ArgumentError::missing("user").into());
     }
     // Public plans are self-service by design. Supplying a target turns a
     // state-changing plan into a moderation operation, so never let an
@@ -184,7 +183,7 @@ async fn record_moderation_plan(
     Ok(())
 }
 
-fn plan_requires_target(steps: &[PlanStep]) -> bool {
+pub(super) fn plan_requires_target(steps: &[PlanStep]) -> bool {
     steps.iter().any(|step| {
         matches!(
             step,
@@ -217,7 +216,7 @@ async fn resolve_target(env: &CmdEnv<'_>) -> Result<Option<UserId>> {
     super::resolve_user(env.ctx, env.guild_id, &token)
         .await
         .map(Some)
-        .ok_or_else(|| anyhow!("could not resolve user `{token}`"))
+        .ok_or_else(|| ArgumentError::unresolved_user().into())
 }
 
 async fn target_member(env: &CmdEnv<'_>, target: UserId) -> Result<serenity::model::guild::Member> {

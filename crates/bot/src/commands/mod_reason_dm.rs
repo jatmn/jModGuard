@@ -9,6 +9,7 @@ use super::CmdEnv;
 use crate::types::Behavior;
 
 pub(crate) const MOD_REASON_DM_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const PREFIX_DM_FLAG: &str = "--dm";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModReasonDmOutcome {
@@ -20,7 +21,7 @@ pub(crate) enum ModReasonDmOutcome {
 
 /// Recognize `--dm` only in the documented position: immediately after the target user.
 pub(crate) fn take_prefix_dm_flag(parts: &mut Vec<String>) -> bool {
-    if parts.len() >= 2 && parts[1] == "--dm" {
+    if parts.len() >= 2 && parts[1] == PREFIX_DM_FLAG {
         parts.remove(1);
         return true;
     }
