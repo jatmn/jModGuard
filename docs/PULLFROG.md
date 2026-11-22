@@ -38,8 +38,9 @@ can be a different account. The GitHub App dispatches the workflow on the
 default branch and the author check must pass before the agent starts.
 In Pullfrog settings, enable PR reviews, draft reviews, and re-reviews on new
 commits, and disable managed mentions and external-contributor reviews.
-Use a fresh owner-authored draft and push an update after the workflow is
-merged to verify live automatic dispatch.
+After merging the workflow, open a fresh owner-authored draft and push an
+update to verify live automatic dispatch. On the latest PR commit, confirm
+the completed automatic run published both native checks.
 
 ## PR checks and run diagnostics
 
