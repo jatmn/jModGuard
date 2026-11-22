@@ -813,8 +813,8 @@ fn automod_remember_member_failure(
     }
 }
 
-/// Executes a decided automod action (or logs it in dry-run mode). Returns
-/// whether the action took the live path rather than only being logged.
+/// Executes a decided automod action. Returns true if the action entered the
+/// live path, even when an execution guard later skips the Discord action.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_pending(
     app: &Arc<BotState>,
@@ -917,7 +917,7 @@ pub(crate) async fn execute_pending_with(
         );
         return false;
     };
-    // Selected in dry-run stays log-only; switched into dry-run stops a live action.
+    // Either the selection or this configuration check can keep an action log-only.
     let (dry, log_automod, open_case, skip_moderators, skipped_roles) = (
         pending.dry_run || settings.dry_run,
         settings.log_automod,
@@ -2081,7 +2081,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_delayed_message_does_not_count_later_mention_strikes() {
+    async fn mention_spam_expires_strikes_by_evaluation_time() {
         use super::AutomodInstant;
         use std::time::Duration;
         let mut cfg = default_automod_config();
@@ -3932,7 +3932,7 @@ mod tests {
         let mut event: GuildCreateEvent =
             serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
         stub.cache.update(&mut event);
-        execute_pending_with(
+        let entered_live_path = execute_pending_with(
             &app,
             &stub.http,
             &stub.cache,
@@ -3945,6 +3945,10 @@ mod tests {
             &pending,
         )
         .await;
+        assert!(
+            entered_live_path,
+            "the live path checks the cached author before deciding whether to dispatch"
+        );
         let seen = stub.finish();
         if moderator || skipped_role {
             assert!(

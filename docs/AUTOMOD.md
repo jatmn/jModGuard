@@ -196,11 +196,11 @@ keep their normal paths without an extra message delete. A delete action runs
 once; timeout and warn do not gain a deletion, and log never deletes.
 If a custom rule is deleted, or its configuration cannot be read, before a
 pending action runs, the bot logs a warning and takes no Discord action, including
-delete, timeout, or warn. The pending action does not carry its match-time dry-run
-state, so unavailable custom configuration cannot authorize enforcement. A failed
-configuration read for a built-in rule uses that rule's settings from when the
-message matched, so a dry-run rule stays log-only and its exemptions still apply.
-Kick or ban then uses the fallback; other actions keep their normal paths.
+delete, timeout, or warn. A pending action carries the dry-run setting from
+when the rule matched. Known spam requires the current rule and list before an
+action can proceed. For other built-in rules, a failed configuration read uses
+the rule's settings from the match, including its exemptions. A live kick or ban
+then uses the fallback. Other actions keep their normal paths.
 Whitelist your announcement channels and your mod/admin roles so @everyone pings
 in them never trigger.
 
@@ -215,9 +215,10 @@ in that message. Dry-run and live keep separate strike ladders, so strikes
 counted in dry-run never use up live escalation, and live strikes from before a
 dry-run trial still count afterwards within the usual 10 minutes. Message
 history used for detection, such as velocity's window and recent mentions, is
-shared by both modes. An action chosen
-in dry-run stays log-only even if the rule goes live before it runs, and an
-action chosen live only logs if the rule switches to dry-run first.
+shared by both modes. The executor checks the rule's mode once before entering
+the live path. If the action proceeds, it is log-only when it was selected in
+dry-run or the executor sees dry-run at that check. An in-flight live action
+can still run after a later switch to dry-run.
 Exact-image and repeated-text rules report their matched messages there without
 deleting or banning. Neither path creates a SQL audit row. **Recommended workflow:**
 enable the bot, set all rules to dry-run, watch for a few days, then switch them

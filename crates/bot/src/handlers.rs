@@ -68,11 +68,10 @@ pub(crate) struct RateLimitWait {
     pub global: bool,
 }
 
-/// Prefix commands stop when the member is removed or timed out. The executor
-/// decides whether the action ran live; a dry-run action only logs, so the
-/// member's command still runs.
-fn automod_stops_prefix_commands(executed_live: bool, action: &str) -> bool {
-    executed_live && matches!(action, "ban" | "kick" | "timeout")
+/// A ban, kick, or timeout suppresses the prefix command once it enters the
+/// live path, even if a later execution guard skips the penalty.
+fn automod_stops_prefix_commands(entered_live_path: bool, action: &str) -> bool {
+    entered_live_path && matches!(action, "ban" | "kick" | "timeout")
 }
 
 pub(crate) fn member_sync_deadline_ms(now_ms: i64, timeout: Duration) -> i64 {
@@ -1405,7 +1404,7 @@ impl EventHandler for Handler {
                 .as_ref()
                 .map(user_display)
                 .unwrap_or_else(|| msg.author.name.clone());
-            let executed_live = execute_pending(
+            let entered_live_path = execute_pending(
                 &app,
                 &ctx,
                 guild_id,
@@ -1417,7 +1416,8 @@ impl EventHandler for Handler {
                 &pending,
             )
             .await;
-            stop_commands = automod_stops_prefix_commands(executed_live, &pending.action.action);
+            stop_commands =
+                automod_stops_prefix_commands(entered_live_path, &pending.action.action);
         }
 
         if !stop_commands {
@@ -2032,7 +2032,7 @@ impl EventHandler for Handler {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn only_live_member_actions_stop_prefix_commands() {
+    fn only_member_actions_that_enter_the_live_path_stop_prefix_commands() {
         use super::automod_stops_prefix_commands;
         for action in ["timeout", "kick", "ban"] {
             assert!(!automod_stops_prefix_commands(false, action));
