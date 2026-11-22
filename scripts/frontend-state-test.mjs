@@ -3785,6 +3785,7 @@ for (const [id, params, fields, expected] of [
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, `/api/guilds/${h.app.state.guildId}/rules/${id}`);
     assert.equal(calls[0].body.scope, 'guild');
+    assert.equal(calls[0].body.replace_velocity_limit, id === 'velocity' ? true : undefined);
     const saved = calls[0].body.data;
     assert.deepEqual(saved.params, expected);
     assert.deepEqual(saved.actions, [action]);
@@ -3829,6 +3830,7 @@ test('velocity editor keeps an unchanged legacy limit but refuses a new one abov
   await fire(save, 'click');
   assert.equal(calls.length, 1);
   assert.equal(calls[0].body.data.params.max_messages, 1000);
+  assert.equal(calls[0].body.replace_velocity_limit, true);
 
   max.value = '5000';
   await fire(max, 'input');
@@ -3838,6 +3840,7 @@ test('velocity editor keeps an unchanged legacy limit but refuses a new one abov
   await fire(save, 'click');
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[1].body.data.params, {window_secs: 15, max_messages: 5000});
+  assert.equal(calls[1].body.replace_velocity_limit, undefined);
 });
 
 for (const legacy of [2 ** 53, 5000.5, '1', 1]) test(`velocity editor keeps an untouched legacy limit ${JSON.stringify(legacy)}`, async () => {
@@ -3857,6 +3860,33 @@ for (const legacy of [2 ** 53, 5000.5, '1', 1]) test(`velocity editor keeps an u
   await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].body.data.params, {window_secs: 15, max_messages: legacy});
+  assert.equal(calls[0].body.replace_velocity_limit, undefined);
+});
+
+test('velocity promotion marks a replacement of the original browser number', async () => {
+  let saved;
+  const h = harness(async (_url, options) => {
+    if (options.method === 'PUT') saved = JSON.parse(options.body);
+    return response({settings: {}, rules: [], commands: [], log_channels: [], badwords: []});
+  });
+  h.app.state.me.is_bot_owner = true;
+  const effective = {
+    enabled: true, dry_run: false, params: {window_secs: 10, max_messages: 1},
+    actions: [{at: 1, action: 'delete'}],
+  };
+  const modal = await h.app.editRule({
+    name: 'Message velocity', rule_id: 'velocity', effective, guild_override: effective,
+  });
+  const control = (label) => findNode(modal, n => n.localName === 'label' && textOf(n) === label).control;
+  control('Applies to').value = 'global';
+  const limit = control('Maximum messages in window');
+  limit.value = '1';
+  await fire(limit, 'input');
+  await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+  assert.equal(saved.scope, 'global');
+  assert.equal(saved.clear_guild_override, true);
+  assert.equal(saved.replace_velocity_limit, true);
+  assert.equal(saved.data.params.max_messages, 1);
 });
 
 for (const params of [{allowlist_guilds: ['9007199254740993']}, {allowlist_codes: []}]) {

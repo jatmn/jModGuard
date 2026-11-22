@@ -4633,6 +4633,7 @@ function RuleEditor({ record: r }) {
     return draft;
   });
   const [initialValues] = useState(() => ({ ...values }));
+  const velocityLimitEdited = useRef(false);
   const [spamBan] = useState(() => ({ ...spamRuleBan(rule) }));
   // Inactive legacy image rows should convert to the safe dry-run mode by default.
   const [dryRun, setDryRun] = useState(() => (spam ? !spamConfigured(r.rule_id, rule) || rule.dry_run : rule.dry_run));
@@ -4642,6 +4643,7 @@ function RuleEditor({ record: r }) {
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef);
   const setValue = (key, value) => {
+    if (key === "max_messages") velocityLimitEdited.current = true;
     values[key] = value;
     refresh();
   };
@@ -4751,6 +4753,7 @@ function RuleEditor({ record: r }) {
         {
           className: "btn btn-primary",
           onClick: async () => {
+            let replaceVelocityLimit = false;
             try {
               if (spam) {
                 // The header toggle is the source of truth, including scripted checks.
@@ -4769,26 +4772,24 @@ function RuleEditor({ record: r }) {
                 const shown = r.effective?.params ?? {};
                 for (const { key, label, max } of fields) {
                   const raw = String(values[key] ?? "");
-                  // An untouched limit sends back the stored value exactly,
-                  // whatever its JSON form, so a legacy value keeps its meaning.
-                  if (max !== undefined && raw === initialValues[key] && Object.hasOwn(shown, key)) {
-                    params[key] = shown[key];
-                    continue;
-                  }
                   const value = Number(raw);
-                  // An untouched legacy value (fractional, or beyond the safe
-                  // integer range) is kept; the server keeps its exact value.
-                  const unchanged = value === persisted[key];
-                  if (
-                    raw.trim() === "" ||
-                    Number.isNaN(value) ||
-                    (!unchanged && (!Number.isSafeInteger(value) || value < 0))
-                  )
+                  const validInteger = raw.trim() !== "" && Number.isSafeInteger(value) && value >= 0;
+                  if (max !== undefined) {
+                    // Keep an untouched limit or a restored legacy value outside the
+                    // accepted range. A valid input edit can replace a legacy value
+                    // even when both are displayed as the same number.
+                    if (raw === initialValues[key] && (!velocityLimitEdited.current || !validInteger || value > max)) {
+                      if (Object.hasOwn(shown, key)) params[key] = shown[key];
+                      continue;
+                    }
+                    replaceVelocityLimit = true;
+                  }
+                  const unchanged = max === undefined && value === persisted[key];
+                  if (raw.trim() === "" || Number.isNaN(value) || (!unchanged && !validInteger))
                     throw new Error(`${label} must be a non-negative whole number.`);
                   if (key === "window_secs" && (value < 1 || value > 600))
                     throw new Error("Window must be 1–600 seconds.");
-                  // A stored legacy value above the limit is inert and may be kept unchanged.
-                  if (max !== undefined && value > max && !unchanged)
+                  if (max !== undefined && value > max)
                     throw new Error(`${label} must be 0–${max}.`);
                   params[key] = value;
                 }
@@ -4810,6 +4811,7 @@ function RuleEditor({ record: r }) {
               scope,
               data: rule,
               clear_guild_override: scope === "global" && state.guildId !== "0",
+              ...(replaceVelocityLimit ? { replace_velocity_limit: true } : {}),
             });
             const savedLocally = applyConfigPatch(saved);
             if (!savedLocally && !(await loadConfig())) return;

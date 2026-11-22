@@ -331,7 +331,7 @@ pub async fn get_rule(db: &Db, guild_id: i64, rule_id: &str) -> Result<Option<Ru
 
 pub async fn upsert_rule(db: &Db, guild_id: i64, rule_id: &str, rule: &RuleDef) -> Result<()> {
     crate::image_spam::validate_rule(rule_id, rule)?;
-    upsert_rule_row(db, guild_id, rule_id, rule, None)
+    upsert_rule_row(db, guild_id, rule_id, rule, None, false)
         .await
         .map(|_| ())
 }
@@ -383,43 +383,38 @@ fn rule_json_for_save_conn(
     Ok(serde_json::to_string(rule)?)
 }
 
-/// Compare a velocity save with the stored rule the operator was shown,
-/// under the writer lock: the row it replaces, a first guild override's
-/// inherited global rule, and `shown_guild`'s row when a server rule is saved
-/// as global.
+/// Compare an unchanged velocity limit with the effective source rule under
+/// the writer lock. A server override takes precedence over the global row,
+/// even when the override omits the limit and uses the built-in fallback.
 fn validate_velocity_limit_conn(
     conn: &impl SqlExecutor,
-    guild_id: i64,
-    shown_guild: Option<i64>,
+    source_guild: i64,
     id: &str,
     rule: &mut RuleDef,
+    replace_velocity_limit: bool,
 ) -> Result<()> {
     if id != "velocity" {
         return Ok(());
     }
-    let stored_limit = |scope: i64| -> Result<Option<Option<serde_json::Value>>> {
-        let data: Option<String> = conn
-            .query_row(
-                "SELECT data FROM rules WHERE guild_id = ?1 AND rule_id = 'velocity'",
-                params![scope],
-                |r| Ok(r.get(0)?),
-            )
-            .optional()?;
-        Ok(data.map(|json| {
-            serde_json::from_str::<serde_json::Value>(&json)
-                .ok()
-                .and_then(|row| row.get("params")?.get("max_messages").cloned())
-        }))
-    };
-    let mut stored = stored_limit(guild_id)?;
-    if stored.is_none() && guild_id != GLOBAL_SCOPE {
-        stored = stored_limit(GLOBAL_SCOPE)?;
+    if replace_velocity_limit {
+        anyhow::ensure!(
+            rule.params.get("max_messages").is_some(),
+            "max_messages is required when replacing the velocity limit"
+        );
+        return crate::image_spam::validate_velocity_limit(rule, None);
     }
-    let mut candidates: Vec<serde_json::Value> = stored.flatten().into_iter().collect();
-    if let Some(shown_guild) = shown_guild {
-        candidates.extend(stored_limit(shown_guild)?.flatten());
-    }
-    crate::image_spam::validate_velocity_limit(rule, &candidates)
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT data FROM rules WHERE rule_id = 'velocity' AND guild_id IN (?1, ?2)
+             ORDER BY guild_id = ?1 DESC LIMIT 1",
+            params![source_guild, GLOBAL_SCOPE],
+            |r| Ok(r.get(0)?),
+        )
+        .optional()?;
+    let stored_limit = stored
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .and_then(|row| row.get("params")?.get("max_messages").cloned());
+    crate::image_spam::validate_velocity_limit(rule, stored_limit)
 }
 
 async fn upsert_rule_row(
@@ -428,6 +423,7 @@ async fn upsert_rule_row(
     id: &str,
     rule: &RuleDef,
     expected: Option<ConfigurationWriteScope>,
+    replace_velocity_limit: bool,
 ) -> Result<RuleDef> {
     let id = id.to_owned();
     let rule = rule.clone();
@@ -435,7 +431,7 @@ async fn upsert_rule_row(
         let tx = conn.transaction_immediate()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
         let mut rule = rule.clone();
-        validate_velocity_limit_conn(&tx, guild_id, None, &id, &mut rule)?;
+        validate_velocity_limit_conn(&tx, guild_id, &id, &mut rule, replace_velocity_limit)?;
         let json = rule_json_for_save_conn(&tx, guild_id, &id, &rule)?;
         let saved = serde_json::from_str(&json)?;
         tx.execute_rows(
@@ -1898,11 +1894,29 @@ pub async fn upsert_enrolled_rule(
     id: &str,
     rule: &RuleDef,
 ) -> Result<RuleDef> {
+    upsert_enrolled_rule_with_velocity_edit(db, scope, id, rule, false).await
+}
+
+pub(super) async fn upsert_enrolled_rule_with_velocity_edit(
+    db: &Db,
+    scope: ConfigurationWriteScope,
+    id: &str,
+    rule: &RuleDef,
+    replace_velocity_limit: bool,
+) -> Result<RuleDef> {
     crate::image_spam::validate_rule(id, rule)?;
     if crate::custom_rules::is_custom_id(id) {
         return upsert_enrolled_custom_rule(db, scope, id, rule).await;
     }
-    upsert_rule_row(db, scope.guild_id(), id, rule, Some(scope)).await
+    upsert_rule_row(
+        db,
+        scope.guild_id(),
+        id,
+        rule,
+        Some(scope),
+        replace_velocity_limit,
+    )
+    .await
 }
 
 /// The global rule editor's save and override clear are one captured mutation.
@@ -1911,6 +1925,16 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
     request: ConfigurationScope,
     id: &str,
     rule: &RuleDef,
+) -> Result<RuleDef> {
+    promote_enrolled_rule(db, request, id, rule, false).await
+}
+
+pub(super) async fn promote_enrolled_rule(
+    db: &Db,
+    request: ConfigurationScope,
+    id: &str,
+    rule: &RuleDef,
+    replace_velocity_limit: bool,
 ) -> Result<RuleDef> {
     anyhow::ensure!(
         request.guild_id() > 0,
@@ -1932,7 +1956,13 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
         guild.verify_conn(&tx)?;
         let mut rule = rule.clone();
         // The editor showed the server's rule that this save clears.
-        validate_velocity_limit_conn(&tx, GLOBAL_SCOPE, Some(guild.guild_id()), &id, &mut rule)?;
+        validate_velocity_limit_conn(
+            &tx,
+            guild.guild_id(),
+            &id,
+            &mut rule,
+            replace_velocity_limit,
+        )?;
         let json = rule_json_for_save_conn(&tx, GLOBAL_SCOPE, &id, &rule)?;
         let saved = serde_json::from_str(&json)?;
         tx.execute_rows(

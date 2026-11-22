@@ -1,6 +1,7 @@
 //! Bot-side application of dashboard writes. The API sends [`ControlOp`]; only
 //! the process that holds the writer lease calls these functions.
 
+use super::configuration::{promote_enrolled_rule, upsert_enrolled_rule_with_velocity_edit};
 use super::*;
 use crate::bot_actions::{Action, Limits};
 use crate::tenant::TenantRuntime;
@@ -56,6 +57,8 @@ pub enum ControlOp {
         rule: RuleDef,
         #[serde(default)]
         clear_guild_override: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        replace_velocity_limit: bool,
     },
     DeleteRule {
         request: ScopeWire,
@@ -733,16 +736,24 @@ async fn apply_control_inner(
             id,
             rule,
             clear_guild_override,
+            replace_velocity_limit,
         } => {
             let saved = if clear_guild_override {
                 anyhow::ensure!(
                     target.global,
                     "override clearing requires a global rule target"
                 );
-                upsert_global_rule_and_clear_enrolled_override(db, scope_of(request)?, &id, &rule)
+                promote_enrolled_rule(db, scope_of(request)?, &id, &rule, replace_velocity_limit)
                     .await?
             } else {
-                upsert_enrolled_rule(db, write_scope(request, target)?, &id, &rule).await?
+                upsert_enrolled_rule_with_velocity_edit(
+                    db,
+                    write_scope(request, target)?,
+                    &id,
+                    &rule,
+                    replace_velocity_limit,
+                )
+                .await?
             };
             Ok(ControlReply::Saved {
                 body: serde_json::to_value(saved)?,

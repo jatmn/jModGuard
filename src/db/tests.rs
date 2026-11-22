@@ -5332,17 +5332,49 @@ fn saving_a_server_velocity_rule_as_global_keeps_its_legacy_limit() {
     tokio_test_block_on(async {
         enroll_guild(&db, 123, 100).await.unwrap().unwrap();
         let mut rule = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
-        // The server stores 1.0, which resolves to 8; a browser sends it as 1.
+        let integer = serde_json::json!(1);
+        let float = serde_json::json!(1.0);
+        // Both source limits reach the writer as the same browser number.
+        let mut promoted = Vec::new();
+        for (destination, source) in [(&integer, &float), (&float, &integer)] {
+            rule.params["max_messages"] = destination.clone();
+            old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+            rule.params["max_messages"] = source.clone();
+            old_writer_rule(&db, 123, "velocity", serde_json::to_value(&rule).unwrap()).await;
+            rule.params["max_messages"] = integer.clone();
+            save_rule_fixture(&db, "global-clear", "velocity", &rule)
+                .await
+                .unwrap();
+            let global = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+            promoted.push((
+                global.params["max_messages"].clone(),
+                crate::types::velocity_max_messages(&global.params),
+            ));
+            assert!(get_rule(&db, 123, "velocity").await.unwrap().is_none());
+        }
+        assert_eq!(promoted, [(float, 8), (integer, 1)]);
+
+        // Without an override, the editor shows the global value.
         rule.params["max_messages"] = serde_json::json!(1.0);
-        old_writer_rule(&db, 123, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
         rule.params["max_messages"] = serde_json::json!(1);
         save_rule_fixture(&db, "global-clear", "velocity", &rule)
             .await
             .unwrap();
         let global = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
-        assert_eq!(global.params["max_messages"], serde_json::json!(1.0));
         assert_eq!(crate::types::velocity_max_messages(&global.params), 8);
-        assert!(get_rule(&db, 123, "velocity").await.unwrap().is_none());
+
+        // A present override can use the built-in fallback by omitting its limit.
+        rule.params["max_messages"] = serde_json::json!(1);
+        old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        rule.params.as_object_mut().unwrap().remove("max_messages");
+        old_writer_rule(&db, 123, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        save_rule_fixture(&db, "global-clear", "velocity", &rule)
+            .await
+            .unwrap();
+        let global = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        assert!(global.params.get("max_messages").is_none());
+        assert_eq!(crate::types::velocity_max_messages(&global.params), 8);
     });
     drop(db);
     cleanup_db(&tmp);
@@ -5745,6 +5777,7 @@ fn invite_description_first_override_inherits_global_on_stale_save() {
                                 id: "invite".into(),
                                 rule,
                                 clear_guild_override: false,
+                                replace_velocity_limit: false,
                             },
                             None,
                         )

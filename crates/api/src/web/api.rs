@@ -269,6 +269,8 @@ pub struct RuleBody {
     data: RuleDef,
     #[serde(default)]
     clear_guild_override: bool,
+    #[serde(default)]
+    replace_velocity_limit: bool,
 }
 
 pub async fn get_rule(
@@ -344,6 +346,7 @@ pub async fn put_rule(
                 id: rule_id.clone(),
                 rule: body.data.clone(),
                 clear_guild_override: body.clear_guild_override,
+                replace_velocity_limit: body.replace_velocity_limit,
             },
         )
         .await?;
