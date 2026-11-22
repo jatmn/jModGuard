@@ -54,6 +54,7 @@ unicode-normalization = "0.1"
 [dev-dependencies]
 hyper = { version = "0.14", default-features = false, features = ["server"] }
 rustls-webpki = { version = "0.103.13", default-features = false, features = ["ring", "std"] }
+tower-sessions = { version = "0.15", default-features = false, features = ["memory-store"] }
 
 [patch.crates-io]
 libsql-sqlite3-parser = { git = "https://github.com/jatmn/jModGuard", rev = "f2391d613c4bb8018873964e779341f50ce05447" }
