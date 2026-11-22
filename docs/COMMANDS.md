@@ -172,8 +172,9 @@ weeks, days, hours, minutes, and seconds (`13m 38s`; intermediate zeros stay, as
 rounded down to whole seconds; a newly started process shows `0s`. Release
 availability is shown in words with an icon: ✅ up to date, ↔️ different source
 (the channel publishes another source; which build is newer is not compared), ⚠️
-source matches but the image digest is unverified or differs, ❓ unknown. A component with no cached
-release row is `❓` and has no SHA or age. Container use is this bot
+source matches but the image digest is unverified or differs, ❓ unknown. The WebUI
+line reports **Storage drift** when readback confirms an installed file mismatch.
+A component with no cached release row is `❓` and has no SHA or age. Container use is this bot
 process's own cgroup. Memory is real program use (`memory.current` minus
 `inactive_file`) shown against `memory.max` (`max` means no limit). A cgroup v1
 `memory.limit_in_bytes` at the unlimited sentinel, or at least the host's total

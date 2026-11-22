@@ -544,7 +544,7 @@ async fn check_one_with(
     app: &Arc<ApiState>,
     component: &str,
     discover: impl AsyncFnOnce(&str, &str) -> anyhow::Result<ComponentRelease>,
-    reconcile: impl AsyncFnOnce(bool) -> anyhow::Result<()>,
+    reconcile: impl AsyncFnOnce(bool) -> anyhow::Result<bool>,
 ) -> anyhow::Result<db::ComponentUpdate> {
     let lease = format!("{:032x}", rand::random::<u128>());
     let now = chrono::Utc::now().timestamp();
@@ -581,20 +581,25 @@ async fn check_one_with(
             }
         };
         if component == "webui" {
-            match reconcile(true).await {
-                Ok(()) => {
-                    if let Some(desired) = checked.desired.clone() {
+            let wrote_webui = match reconcile(true).await {
+                Ok(wrote_observation) => match (checked.state.as_str(), checked.desired.as_ref()) {
+                    ("queued", Some(desired)) => {
                         via_bot!(
                             app,
-                            db::settle_interrupted_webui(&app.db, &desired),
+                            db::settle_interrupted_webui(&app.db, desired),
                             db::ControlOp::SettleInterruptedWebui {
                                 release: desired.clone(),
                             }
                         )?;
+                        true
                     }
+                    _ => wrote_observation,
+                },
+                Err(error) => {
+                    tracing::warn!("WebUI Storage reconciliation failed: {error:#}");
+                    false
                 }
-                Err(error) => tracing::warn!("WebUI Storage reconciliation failed: {error:#}"),
-            }
+            };
             if let Err(error) = retry_pending_purge(
                 app,
                 |name| std::env::var(name).ok(),
@@ -609,6 +614,11 @@ async fn check_one_with(
                 && let Err(error) = cleanup_webui_assets(app, &storage).await
             {
                 tracing::warn!("WebUI managed asset cleanup failed: {error:#}");
+            }
+            if wrote_webui {
+                // The discovery receipt predates reconciliation. Read the
+                // primary while the lease still protects its committed state.
+                return db::component_update(&app.db, component).await;
             }
         }
         Ok(checked)
@@ -668,7 +678,7 @@ where
     result
 }
 
-async fn reconcile_webui(app: &Arc<ApiState>, adopt_desired: bool) -> anyhow::Result<()> {
+async fn reconcile_webui(app: &Arc<ApiState>, adopt_desired: bool) -> anyhow::Result<bool> {
     let storage = &storage()?;
     reconcile_webui_with(
         app,
@@ -688,13 +698,14 @@ async fn reconcile_webui(app: &Arc<ApiState>, adopt_desired: bool) -> anyhow::Re
     .await
 }
 
+/// Returns whether reconciliation successfully wrote the WebUI row.
 async fn reconcile_webui_with<Read, Desired, Installed>(
     app: &ApiState,
     adopt_desired: bool,
     read: impl Fn(&'static str) -> Read,
     verify_desired: impl Fn(ComponentRelease) -> Desired,
     verify_installed: impl Fn(ComponentRelease) -> Installed,
-) -> anyhow::Result<()>
+) -> anyhow::Result<bool>
 where
     Read: Future<Output = anyhow::Result<Option<Vec<u8>>>> + Send,
     Desired: Future<Output = anyhow::Result<ReleaseVerification>> + Send,
@@ -756,7 +767,7 @@ where
                 chrono::Utc::now().timestamp(),
             )
             .await?;
-            return Ok(());
+            return Ok(true);
         }
     }
     let observation_write = if let Some(installed) = state.installed.as_ref()
@@ -779,14 +790,15 @@ where
             .await
             .context("recording WebUI Storage drift")
     } else {
-        Ok(())
+        return Ok(false);
     };
     // Storage reconciliation is complete. Optional observation writes must
     // not prevent the caller from settling an abandoned install.
     if let Err(error) = observation_write {
         tracing::warn!("WebUI observation write failed: {error:#}");
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn cleanup_webui_assets(app: &Arc<ApiState>, storage: &Storage) -> anyhow::Result<()> {
@@ -2376,6 +2388,8 @@ mod tests {
             let recovered = db::component_update(&reader.db, "webui").await.unwrap();
             assert_eq!(recovered.desired.as_ref(), Some(&candidate));
             assert_eq!(recovered.installed.as_ref(), Some(&installed));
+            assert_eq!(checked.state, recovered.state, "{rejected_write:?}");
+            assert_eq!(checked.last_error, recovered.last_error);
             if let Some(expected_op) = rejected_write {
                 assert_eq!(rejected_ops.try_recv(), Ok(expected_op));
                 assert_eq!(recovered.state, "failed", "{expected_op}");

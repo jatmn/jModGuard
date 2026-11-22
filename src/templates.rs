@@ -233,6 +233,7 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
             attention = true;
             continue;
         };
+        let storage_drift = component == "webui" && item.state == "drift";
         let observation_fresh = item
             .observed_at
             .is_some_and(|at| now.saturating_sub(at) <= 7200)
@@ -266,6 +267,11 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
                 short_sha.as_deref()
             };
             let age_for_line = if webui_unmanaged { None } else { age_clause };
+            let reason = if storage_drift && !webui_unmanaged {
+                format!("Storage drift · {reason}")
+            } else {
+                reason
+            };
             lines.push(release_status_line(
                 component,
                 sha_for_line,
@@ -283,7 +289,9 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
         let channel_build =
             candidate.map(|release| format!("{} `{}`", release.channel, &release.source_sha[..7]));
         if !observation_fresh {
-            let reason = if item.observed_at.is_none() {
+            let reason = if storage_drift {
+                "Storage drift".to_string()
+            } else if item.observed_at.is_none() {
                 "unknown".to_string()
             } else {
                 let hours = item
@@ -1438,6 +1446,43 @@ mod presentation_tests {
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
         assert!(api_line.ends_with("⚠️"), "{api_line}");
+    }
+
+    #[test]
+    fn status_reports_confirmed_webui_storage_drift() {
+        let source = "abcdef0123456789abcdef0123456789abcdef01";
+        let mut release = sample_candidate("latest", source, &"b".repeat(64));
+        release.component = "webui".into();
+        let mut row = sample_api_update_row(
+            Some(release.clone()),
+            Some(1_100),
+            None,
+            None,
+            None,
+            "latest",
+        );
+        row.component = "webui".into();
+        row.installed = Some(release);
+        let webui_line = |row: &crate::db::ComponentUpdate| {
+            release_text(std::slice::from_ref(row), 1_200)
+                .lines()
+                .find(|line| line.starts_with("**webui:**"))
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(webui_line(&row), "**webui:** unknown · latest `abcdef0`");
+
+        row.state = "drift".into();
+        assert_eq!(
+            webui_line(&row),
+            "**webui:** Storage drift · latest `abcdef0`"
+        );
+
+        row.check_error = Some("registry returned HTTP 503".into());
+        assert_eq!(
+            webui_line(&row),
+            "**webui:** Storage drift · check failed (HTTP 503)"
+        );
     }
 
     #[test]
