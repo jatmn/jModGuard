@@ -90,17 +90,65 @@ where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
     use tracing_subscriber::Layer as _;
+    use tracing_subscriber::filter::FilterExt as _;
     use tracing_subscriber::layer::SubscriberExt as _;
     let output = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_ansi(false)
         .with_writer(CountedWriter(writer))
-        .with_filter(logging_filter(level));
+        .with_filter(logging_filter(level).and(SuppressStaleSessionWarning));
     let activity = DiscordActivity.with_filter(
         tracing_subscriber::filter::filter_fn(DiscordActivity::wanted)
             .with_max_level_hint(tracing::Level::DEBUG),
     );
     tracing_subscriber::registry().with(output).with(activity)
+}
+
+struct SuppressStaleSessionWarning;
+
+impl<S> tracing_subscriber::layer::Filter<S> for SuppressStaleSessionWarning {
+    fn enabled(
+        &self,
+        _meta: &tracing::Metadata<'_>,
+        _ctx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        true
+    }
+
+    fn callsite_enabled(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::always()
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
+    }
+
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        let meta = event.metadata();
+        if *meta.level() != tracing::Level::WARN || meta.target() != "tower_sessions_core::session"
+        {
+            return true;
+        }
+
+        // An old cookie can outlive an in-memory session across API restarts.
+        let mut stale_session = false;
+        event.record(
+            &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                if field.name() == "message" {
+                    stale_session = format!("{value:?}")
+                        == "possibly suspicious activity: record not found in store";
+                }
+            },
+        );
+        !stale_session
+    }
 }
 
 /// Counts bytes the log output writes as `log_bytes`.
@@ -221,6 +269,42 @@ mod logging_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn stale_session_warning_is_filtered_without_hiding_other_session_events() {
+        let bytes = Capture(Arc::new(Mutex::new(Vec::new())));
+        let writer = bytes.clone();
+        let subscriber = super::log_subscriber("warn", move || writer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "tower_sessions_core::session",
+                "possibly suspicious activity: record not found in store"
+            );
+            tracing::warn!(target: "tower_sessions_core::session", "called load with no session id");
+            tracing::warn!(
+                target: "tower_sessions::service",
+                "possibly suspicious activity: malformed session id"
+            );
+            tracing::warn!("oauth callback: failed to save rotated session: store unavailable");
+            tracing::error!(target: "tower_sessions_core::session", error = "store unavailable");
+        });
+
+        let logs = String::from_utf8(bytes.0.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains("record not found in store"), "{logs}");
+        assert!(
+            logs.contains("WARN called load with no session id"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("WARN possibly suspicious activity: malformed session id"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("WARN oauth callback: failed to save rotated session"),
+            "{logs}"
+        );
+        assert!(logs.contains("ERROR error=\"store unavailable\""), "{logs}");
     }
 
     #[test]
