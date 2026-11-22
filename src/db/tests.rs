@@ -5298,6 +5298,18 @@ fn a_browser_rounded_legacy_velocity_limit_keeps_the_stored_value() {
         let saved = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
         assert_eq!(saved.params["max_messages"], u64::MAX);
 
+        // A stored 1.0 resolves to the default of 8; a browser sends it back
+        // as 1, which must not become a stricter limit.
+        rule.params["max_messages"] = serde_json::json!(1.0);
+        old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        rule.params["max_messages"] = serde_json::json!(1);
+        upsert_enrolled_rule(&db, scope.clone(), "velocity", &rule)
+            .await
+            .unwrap();
+        let saved = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        assert_eq!(saved.params["max_messages"], serde_json::json!(1.0));
+        assert_eq!(crate::types::velocity_max_messages(&saved.params), 8);
+
         // An older writer could store an over-limit value as a JSON float.
         rule.params["max_messages"] = serde_json::json!(1e30);
         old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
