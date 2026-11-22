@@ -43,15 +43,15 @@ merged to verify live automatic dispatch.
 
 ## PR checks and run diagnostics
 
-The workflow pins the Pullfrog v0.1.138 action bootstrap and explicitly enables
-its native `pullfrog` run-status and `pullfrog-approval` verdict checks. The
-bootstrap installs the compatible `pullfrog@^0.1.138` CLI from npm, so the runtime
-can receive later 0.1.x updates. The `status_checks` input is
-deprecated upstream but remains supported on v0; it enables
-reporting even if the console's check toggles are off and emits a deprecation
-warning. The console settings control review dispatch and approvals.
+The workflow pins the Pullfrog v0.1.138 action bootstrap. The bootstrap installs
+the compatible `pullfrog@^0.1.138` CLI from npm. Manual owner commands set the
+legacy `status_checks` input to enable native checks. Automatic reviews use the
+Pullfrog console settings. In **Automations → Review PRs**, enable both the run
+status check and the approval verdict check to publish `pullfrog` and
+`pullfrog-approval`.
 
-The workflow selects `openai/gpt-sol` and uses the existing ChatGPT
+Manual commands select `openai/gpt-sol` in the workflow. Automatic reviews use
+the repository model in Pullfrog, currently `openai/gpt-sol`. Both use the ChatGPT
 subscription stored by Pullfrog. It no longer passes the legacy
 `OPENCODE_API_KEY` or `PULLFROG_MODEL` GitHub Actions secrets.
 
@@ -79,7 +79,9 @@ Existing failed managed-dispatch checks are historical failures. Disabling
 mentions or changing YAML does not rewrite them. A **new** owner PR command
 can post a new native check on the current PR head; verify that check's
 timestamp and linked Actions run.
-Do not use **Re-run jobs**, which the first-attempt guard intentionally skips.
+If GitHub author verification exhausts its retries during an outage, wait for
+GitHub to recover and post a fresh top-level `@pullfrog review this PR` command
+as `jatmn`. GitHub reruns reuse the original workflow revision and event.
 
 Older Pullfrog v0.1.82 runs could log
 `patchWorkflowRunFields failed: Error: PATCH workflow-run: 404` when a standalone
