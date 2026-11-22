@@ -10,6 +10,10 @@ and ship with Admin permission by default. After a fresh check, each status line
 the running source SHA and the source SHA its channel currently publishes, or a short
 reason when a check fails.
 
+On a read-only API deployment, recording hourly Storage drift requires a bot writer
+that can also clear it after a successful readback. If the API is upgraded first,
+the older writer rejects the hourly mismatch write. Upgrade the bot to enable it.
+
 The page shares the workspace's Light, Dark, and System appearance preference. Each
 component has a status badge, release controls, and expandable **Version & technical
 details** with full hashes. **Uptime** uses compact durations such as `13m 38s` or

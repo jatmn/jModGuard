@@ -1020,7 +1020,7 @@ where
                                         &app.db,
                                         "Storage files differ from the installed release"
                                     ),
-                                    db::ControlOp::RecordWebuiDrift {
+                                    db::ControlOp::RecordHourlyWebuiDrift {
                                         error: "Storage files differ from the installed release"
                                             .to_owned(),
                                     }
