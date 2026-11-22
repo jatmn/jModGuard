@@ -1,18 +1,17 @@
-# Pullfrog: owner commands only
+# Pullfrog owner commands and reviews
 
-Pullfrog is an on-demand agent for this repository. The separate CI workflow owns
+Pullfrog handles owner commands and automatic reviews for this repository. The separate CI workflow owns
 checks and image publication. Pullfrog's workflow,
 `.github/workflows/pullfrog.yml`, listens for newly created issue comments and
 top-level PR comments. It does not listen to inline PR review comments, which
-run GitHub workflows from a PR merge commit. It has no push, PR, schedule, or
-`workflow_dispatch` trigger. The Socket Security manifest scan is the separate
+run GitHub workflows from a PR merge commit. The Socket Security manifest scan is the separate
 workflow `.github/workflows/socket.yml`, and it does not listen for comments.
 Set the repository Actions secret `SOCKET_SECURITY_API_KEY` to a Socket API key
 before relying on the scan. A missing secret skips the scan and does not fail the job, and the key is not stored in git.
 The scan uploads discovered Cargo and npm manifests outside ignored paths to Socket, including workspace and member `Cargo.toml` files, `Cargo.lock`, and `tools/eslint/package.json` and its lockfile. It may comment on a pull request with the GitHub Actions token.
 A new blocking alert can fail this check only when Socket compares a pull request change that touches a supported manifest. Push and full-report scans do not fail for alerts. Socket API errors do not fail this check. The CI passed check remains the merge gate.
 After enabling the key, let a scan run on `main` before relying on pull request comparisons; without a main baseline, Socket may treat existing dependencies as newly added.
-The agent step runs only when GitHub identifies
+For manual commands, the agent step runs only when GitHub identifies
 the commenter and event actor as `jatmn` (account ID `12479882`) and the comment
 starts with `@pullfrog` followed by a visible instruction on the same first
 line. A public contributor's comment, a quoted/passive mention, an edited
@@ -29,10 +28,19 @@ For example, create a **new top-level comment** on an issue or PR:
 @pullfrog review this PR and report actionable defects
 ```
 
-The workflow has no `workflow_dispatch`, so Pullfrog's dashboard prompt box and
-its managed webhook automations cannot launch this workflow. Do not replace it
-with the dashboard's generated workflow. The agent action has feature-branch-only
-push permission and a restricted shell; default-branch pushes are not allowed.
+Manual commands have feature-branch push permission and a restricted shell.
+Automatic reviews have push disabled.
+## Automatic reviews
+
+Pullfrog reviews new PRs, drafts, and updated diffs in this public repository
+when GitHub identifies `jatmn` as the PR author. The person pushing an update
+can be a different account. The GitHub App dispatches the workflow on the
+default branch and the author check must pass before the agent starts.
+In Pullfrog settings, enable PR reviews, draft reviews, and re-reviews on new
+commits, and disable managed mentions and external-contributor reviews.
+Use a fresh owner-authored draft and push an update after the workflow is
+merged to verify live automatic dispatch.
+
 ## PR checks and run diagnostics
 
 The workflow pins the Pullfrog v0.1.138 action bootstrap and explicitly enables
@@ -41,8 +49,7 @@ bootstrap installs the compatible `pullfrog@^0.1.138` CLI from npm, so the runti
 can receive later 0.1.x updates. The `status_checks` input is
 deprecated upstream but remains supported on v0; it enables
 reporting even if the console's check toggles are off and emits a deprecation
-warning. It does not enable managed
-mentions, automatic reviews, or dispatch. Keep those automations off.
+warning. The console settings control review dispatch and approvals.
 
 The workflow selects `openai/gpt-sol` and uses the existing ChatGPT
 subscription stored by Pullfrog. It no longer passes the legacy
@@ -79,8 +86,7 @@ Older Pullfrog v0.1.82 runs could log
 run attempts to save metadata without a server-reserved run record. This is an
 upstream persistence limitation, separate from the review and GitHub check
 publication. This repository does not suppress that warning or fix Pullfrog's
-servers. Adding `workflow_dispatch` would change the owner-only execution policy
-and is not part of this workflow.
+servers.
 
 ## Local checks
 
