@@ -98,19 +98,20 @@ pub fn validate_velocity_limit(
         return Ok(());
     }
     let max = crate::types::AUTOMOD_VELOCITY_MAX_MESSAGES;
-    let sent = value.as_u64();
-    // A browser rounds integers above 2^53, so an unchanged legacy limit can
-    // come back slightly different. Equal as JavaScript numbers means
-    // unchanged: keep the exact stored limit.
-    if let (Some(kept), Some(sent)) = (stored.and_then(serde_json::Value::as_u64), sent)
-        && kept > max as u64
-        && kept as f64 == sent as f64
+    // A browser parses numbers as doubles, so an unchanged legacy limit above
+    // 2^53 (or stored in any numeric JSON form) can come back slightly
+    // different, even above u64::MAX. Equal as JavaScript numbers means
+    // unchanged: keep the exact stored value.
+    if let Some(stored) = stored
+        && let (Some(kept), Some(sent)) = (stored.as_f64(), value.as_f64())
+        && kept > max as f64
+        && kept == sent
     {
-        rule.params["max_messages"] = kept.into();
+        rule.params["max_messages"] = stored.clone();
         return Ok(());
     }
     ensure!(
-        sent.is_some_and(|count| count <= max as u64),
+        value.as_u64().is_some_and(|count| count <= max as u64),
         "max_messages must be 0–{max} (a whole number)"
     );
     Ok(())

@@ -5258,10 +5258,31 @@ fn a_browser_rounded_legacy_velocity_limit_keeps_the_stored_value() {
         // A different over-limit value is still a new limit.
         rule.params["max_messages"] = serde_json::json!(9_007_199_254_741_000u64);
         assert!(
-            upsert_enrolled_rule(&db, scope, "velocity", &rule)
+            upsert_enrolled_rule(&db, scope.clone(), "velocity", &rule)
                 .await
                 .is_err()
         );
+
+        // A stored u64::MAX comes back from a browser above u64::MAX.
+        rule.params["max_messages"] = serde_json::json!(u64::MAX);
+        old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        rule.params["max_messages"] = serde_json::from_str("18446744073709552000").unwrap();
+        upsert_enrolled_rule(&db, scope.clone(), "velocity", &rule)
+            .await
+            .unwrap();
+        let saved = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        assert_eq!(saved.params["max_messages"], u64::MAX);
+
+        // An older writer could store an over-limit value as a JSON float.
+        rule.params["max_messages"] = serde_json::json!(1e30);
+        old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        rule.params["max_messages"] =
+            serde_json::from_str("1000000000000000000000000000000").unwrap();
+        upsert_enrolled_rule(&db, scope.clone(), "velocity", &rule)
+            .await
+            .unwrap();
+        let saved = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        assert_eq!(saved.params["max_messages"], serde_json::json!(1e30));
     });
     drop(db);
     cleanup_db(&tmp);
