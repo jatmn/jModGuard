@@ -2157,8 +2157,9 @@ mod tests {
             (serde_json::json!(5000.0), None),
             (serde_json::json!(1e30), None),
             (serde_json::json!(1023.5), None),
+            // In-range non-integers keep their old default of 8, never stricter.
             (serde_json::json!(8.0), Some(9)),
-            // Fractional and invalid legacy values keep their old default of 8.
+            (serde_json::json!(1.0), Some(9)),
             (serde_json::json!(8.5), Some(9)),
             (serde_json::json!(0.5), Some(9)),
             (serde_json::json!("3"), Some(9)),

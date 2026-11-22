@@ -13,10 +13,11 @@ pub const AUTOMOD_WINDOW_MAX_SECS: u64 = 600;
 pub const AUTOMOD_VELOCITY_MAX_MESSAGES: usize = 1_023;
 
 /// Velocity's effective message limit for stored rule params, as the bot
-/// applies it. Older writers could store any JSON value: a number above the
-/// supported limit never triggers, whatever its form; a whole number (integer
-/// or float) is the limit; anything else keeps the default of 8 it always
-/// resolved to.
+/// applies it. Older writers could store any JSON value, and a legacy value
+/// must never enforce more strictly than it did before: an unsigned integer
+/// is the limit; any number above the supported limit never triggers,
+/// whatever its form; anything else (such as `1.0`, `0.5`, or `"3"`) keeps
+/// the default of 8 it always resolved to.
 pub fn velocity_max_messages(params: &serde_json::Value) -> u64 {
     let Some(value) = params.get("max_messages") else {
         return 8;
@@ -26,7 +27,6 @@ pub fn velocity_max_messages(params: &serde_json::Value) -> u64 {
     }
     match value.as_f64() {
         Some(limit) if limit > AUTOMOD_VELOCITY_MAX_MESSAGES as f64 => u64::MAX,
-        Some(limit) if limit >= 0.0 && limit.fract() == 0.0 => limit as u64,
         _ => 8,
     }
 }

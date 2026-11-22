@@ -4612,6 +4612,9 @@ fn velocity_default_rows_start_in_dry_run_once_after_upgrade() {
     omitted_limit.params = serde_json::json!({"window_secs": 10});
     let mut fractional_limit = fresh.clone();
     fractional_limit.params["max_messages"] = serde_json::json!(0.5);
+    // A float limit resolves to the old default of 8, not to its value.
+    let mut float_one = fresh.clone();
+    float_one.params["max_messages"] = serde_json::json!(1.0);
     tokio_test_block_on(async {
         db.with_conn(|conn| {
             conn.execute_bounded(
@@ -4638,7 +4641,11 @@ fn velocity_default_rows_start_in_dry_run_once_after_upgrade() {
             serde_json::to_value(&float_default).unwrap(),
         )
         .await;
-        for (guild, rule) in [(126, &omitted_limit), (127, &fractional_limit)] {
+        for (guild, rule) in [
+            (126, &omitted_limit),
+            (127, &fractional_limit),
+            (128, &float_one),
+        ] {
             old_writer_rule(&db, guild, "velocity", serde_json::to_value(rule).unwrap()).await;
         }
     });
@@ -4646,7 +4653,7 @@ fn velocity_default_rows_start_in_dry_run_once_after_upgrade() {
     drop(db);
 
     let db = Db::open(&tmp, 2).unwrap();
-    for guild in [0, 123, 125, 126, 127] {
+    for guild in [0, 123, 125, 126, 127, 128] {
         let rule = tokio_test_block_on(get_rule(&db, guild, "velocity"))
             .unwrap()
             .unwrap();
