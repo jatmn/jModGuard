@@ -759,23 +759,32 @@ where
             return Ok(());
         }
     }
-    if let Some(installed) = state.installed.as_ref()
+    let observation_write = if let Some(installed) = state.installed.as_ref()
         && let ReleaseVerification::Verified {
             root_hash,
             admin_hash,
         } = verify_installed(installed.clone()).await?
     {
-        return record_verified(
+        record_verified(
             app,
             installed,
             state.observed.as_ref(),
             root_hash,
             admin_hash,
         )
-        .await;
-    }
-    if state.observed.is_some() {
-        record_webui_drift(app).await?;
+        .await
+        .context("recording verified WebUI observation")
+    } else if state.observed.is_some() {
+        record_webui_drift(app)
+            .await
+            .context("recording WebUI Storage drift")
+    } else {
+        Ok(())
+    };
+    // Storage reconciliation is complete. Optional observation writes must
+    // not prevent the caller from settling an abandoned install.
+    if let Err(error) = observation_write {
+        tracing::warn!("WebUI observation write failed: {error:#}");
     }
     Ok(())
 }
@@ -2313,11 +2322,87 @@ mod tests {
         .unwrap();
         assert_eq!(queued, Some(candidate.clone()));
         let row = db::component_update(&reader.db, "webui").await.unwrap();
-        assert_eq!(row.desired, Some(candidate));
+        assert_eq!(row.desired.as_ref(), Some(&candidate));
         assert_eq!(row.state, "queued");
         release_any(Some(&reader), &reader.db, "webui", &lease)
             .await
             .unwrap();
+
+        // A crashed publication left this request queued. One entry page can
+        // have switched without verifying the desired release. A later check
+        // can also verify the old installed files against a legacy row.
+        for (partial_switch, rejected_write) in [
+            (true, None),
+            (true, Some("mismatch")),
+            (false, Some("verified")),
+        ] {
+            let checked = check_one_with(
+                &reader,
+                "webui",
+                async |_, _| Ok(candidate.clone()),
+                async |adopt_desired| {
+                    assert!(adopt_desired);
+                    reconcile_webui_with(
+                        &reader,
+                        adopt_desired,
+                        |path| {
+                            let source = if partial_switch && path == "index.html" {
+                                &candidate.source_sha
+                            } else {
+                                &installed.source_sha
+                            };
+                            std::future::ready(Ok(Some(
+                                format!("/assets/releases/{source}/app.js").into_bytes(),
+                            )))
+                        },
+                        |_| async { unreachable!("both pages must identify the desired release") },
+                        |release| {
+                            assert_eq!(release, installed);
+                            std::future::ready(match rejected_write {
+                                Some("mismatch") => Ok(ReleaseVerification::Mismatch),
+                                Some("verified") => Ok(ReleaseVerification::Verified {
+                                    root_hash: "restored root".into(),
+                                    admin_hash: "restored admin".into(),
+                                }),
+                                _ => Err(anyhow::anyhow!("Storage verification unavailable")),
+                            })
+                        },
+                    )
+                    .await
+                },
+            )
+            .await
+            .unwrap();
+            let recovered = db::component_update(&reader.db, "webui").await.unwrap();
+            assert_eq!(recovered.desired.as_ref(), Some(&candidate));
+            assert_eq!(recovered.installed.as_ref(), Some(&installed));
+            if let Some(expected_op) = rejected_write {
+                assert_eq!(rejected_ops.try_recv(), Ok(expected_op));
+                assert_eq!(recovered.state, "failed", "{expected_op}");
+                assert!(
+                    recovered
+                        .last_error
+                        .unwrap()
+                        .contains("installation was interrupted")
+                );
+                let (retry, lease) = queue_webui_install(
+                    Some(&reader),
+                    &reader.db,
+                    &candidate.digest,
+                    checked.checked_at.unwrap(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(retry, candidate);
+                release_any(Some(&reader), &reader.db, "webui", &lease)
+                    .await
+                    .unwrap();
+            } else {
+                assert!(rejected_ops.try_recv().is_err());
+                assert_eq!(recovered.state, "queued");
+                assert!(recovered.last_error.is_none());
+            }
+        }
         peer.abort();
         assert!(peer.await.unwrap_err().is_cancelled());
         drop(reader);
