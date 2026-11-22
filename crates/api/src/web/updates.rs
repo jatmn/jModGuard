@@ -658,22 +658,12 @@ where
     result
 }
 
-/// A desired WebUI release other than the installed one is a pending install,
-/// and adopting it must pass the new-install checks. An activated install keeps
-/// `desired == installed`; that settled release is re-checked as installed.
-fn pending_webui_release(state: &db::ComponentUpdate) -> Option<&ComponentRelease> {
-    state
-        .desired
-        .as_ref()
-        .filter(|desired| Some(*desired) != state.installed.as_ref())
-}
-
 async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
     let state = db::component_update(&app.db, "webui").await?;
     let storage = storage()?;
     let root = storage.get("index.html").await?;
     let admin = storage.get("administration/index.html").await?;
-    if let Some(release) = pending_webui_release(&state) {
+    if let Some(release) = state.desired.as_ref() {
         let prefix = format!("/assets/releases/{}/", release.source_sha);
         if root.as_ref().is_some_and(|bytes| {
             bytes
@@ -685,10 +675,24 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
                 .any(|part| part == prefix.as_bytes())
         }) {
             let registry = Registry::ghcr()?;
+            // An activated install keeps `desired == installed`. That release
+            // is re-read as installed, so signature expiry does not block it; a
+            // different release must pass the new-install checks.
+            let verification = if state.installed.as_ref() == Some(release) {
+                storage
+                    .verify_installed_release(
+                        &registry,
+                        &db::UpdateControl::from_application(&app.db),
+                        release,
+                    )
+                    .await?
+            } else {
+                storage.verify_release(&registry, release).await?
+            };
             if let ReleaseVerification::Verified {
                 root_hash,
                 admin_hash,
-            } = storage.verify_release(&registry, release).await?
+            } = verification
             {
                 record_running(
                     app,
@@ -2269,8 +2273,6 @@ mod tests {
             .unwrap();
             let settled = db::component_update(&app.db, "webui").await.unwrap();
             assert_eq!(settled.desired.as_ref(), Some(&release));
-            // Manual reconciliation re-checks the settled release as installed.
-            assert!(pending_webui_release(&settled).is_none());
             assert!(hourly(&app, None, None).await.finished);
             let drift = db::component_update(&app.db, "webui").await.unwrap();
             assert_eq!(drift.state, "drift");
@@ -2278,7 +2280,7 @@ mod tests {
                 observation.executable_sha256.clone(),
                 observation.admin_sha256.clone().unwrap(),
             );
-            assert!(hourly(&app, None, Some(hashes)).await.finished);
+            assert!(hourly(&app, None, Some(hashes.clone())).await.finished);
             let restored = db::component_update(&app.db, "webui").await.unwrap();
             assert_eq!(restored.state, "running");
             assert!(restored.last_error.is_none());
@@ -2288,6 +2290,48 @@ mod tests {
                 db::webui_purge_pending(&app.db).await.unwrap().as_deref(),
                 Some(pending.as_str())
             );
+            // A reinstall of the installed release keeps its outcome: verified
+            // bytes do not show that the attempt completed.
+            db::record_update_check(
+                &app.db,
+                "webui",
+                &release.channel,
+                Some(release.clone()),
+                None,
+                106,
+            )
+            .await
+            .unwrap();
+            let (_, lease) = queue_webui_install(None, &app.db, &release.digest, 106)
+                .await
+                .unwrap();
+            db::release_update_lease(&app.db, "webui", &lease)
+                .await
+                .unwrap();
+            // A mismatch clears the observation; a verified readback restores
+            // it without settling the queued request.
+            assert!(hourly(&app, None, None).await.finished);
+            let mismatched = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(mismatched.state, "queued");
+            assert!(mismatched.observed.is_none());
+            assert!(hourly(&app, None, Some(hashes.clone())).await.finished);
+            let reinstall = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(reinstall.state, "queued");
+            assert_eq!(reinstall.desired.as_ref(), Some(&release));
+            assert!(reinstall.observed.is_some());
+            db::record_component_failure(&app.db, "webui", &release, "publish failed")
+                .await
+                .unwrap();
+            assert!(hourly(&app, None, Some(hashes.clone())).await.finished);
+            let failed_reinstall = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(failed_reinstall.state, "failed");
+            assert!(
+                failed_reinstall
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("publish failed"))
+            );
+            assert_eq!(failed_reinstall.desired.as_ref(), Some(&release));
             // A separate failed request keeps its state and error, but a
             // definite mismatch still invalidates the old observation, even
             // when the channel points back at the installed build.
@@ -2300,11 +2344,11 @@ mod tests {
                 &next.channel,
                 Some(next.clone()),
                 None,
-                106,
+                107,
             )
             .await
             .unwrap();
-            let (_, lease) = queue_webui_install(None, &app.db, &next.digest, 106)
+            let (_, lease) = queue_webui_install(None, &app.db, &next.digest, 107)
                 .await
                 .unwrap();
             db::release_update_lease(&app.db, "webui", &lease)
@@ -2314,8 +2358,6 @@ mod tests {
             let failed = db::component_update(&app.db, "webui").await.unwrap();
             assert_eq!(failed.state, "failed");
             assert!(failed.observed.is_some());
-            // A different release must pass the new-install checks to be adopted.
-            assert_eq!(pending_webui_release(&failed), Some(&next));
             assert!(hourly(&app, Some(release.clone()), None).await.finished);
             let invalidated = db::component_update(&app.db, "webui").await.unwrap();
             assert!(invalidated.observed.is_none() && invalidated.observed_at.is_none());

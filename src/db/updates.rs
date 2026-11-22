@@ -769,8 +769,10 @@ pub async fn record_webui_drift(db: &Db, error: &str) -> Result<()> {
 }
 
 /// Restore the installed observation only after all five Storage objects
-/// match its digest-pinned package. Preserve a separate desired request; an
-/// activated install keeps `desired == installed`, which is not separate.
+/// match its digest-pinned package. A queued or failed request keeps its
+/// outcome, even a reinstall of the installed release; verified bytes do not
+/// show that it completed. An activated install keeps `desired == installed`
+/// and settles back to running, which clears confirmed drift.
 pub async fn record_webui_installed_verified(
     db: &Db,
     release: &ComponentRelease,
@@ -781,7 +783,7 @@ pub async fn record_webui_installed_verified(
     let observation = serde_json::to_string(&observation)?;
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let changed = tx.execute_rows("UPDATE component_updates SET observed=?2,observed_at=?3,state=CASE WHEN desired IS NULL OR desired=?1 THEN 'running' ELSE state END,last_error=CASE WHEN desired IS NULL OR desired=?1 THEN NULL ELSE last_error END WHERE component='webui' AND installed=?1",params![installed,observation,now], 1)?;
+        let changed = tx.execute_rows("UPDATE component_updates SET observed=?2,observed_at=?3,state=CASE WHEN desired IS NULL OR (desired=?1 AND state NOT IN ('queued','failed')) THEN 'running' ELSE state END,last_error=CASE WHEN desired IS NULL OR (desired=?1 AND state NOT IN ('queued','failed')) THEN NULL ELSE last_error END WHERE component='webui' AND installed=?1",params![installed,observation,now], 1)?;
         anyhow::ensure!(changed == 1, "installed WebUI release changed during verification");
         tx.commit()?;
         Ok(())

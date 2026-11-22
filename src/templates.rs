@@ -274,9 +274,17 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
             ));
             continue;
         }
+        // The channel check is fresh here, so its build stays visible even
+        // when the running build cannot be compared with it.
+        let candidate = item
+            .candidate
+            .as_ref()
+            .filter(|release| is_ascii_hex_sha40(&release.source_sha));
+        let channel_build =
+            candidate.map(|release| format!("{} `{}`", release.channel, &release.source_sha[..7]));
         if !observation_fresh {
             let reason = if item.observed_at.is_none() {
-                "unknown".into()
+                "unknown".to_string()
             } else {
                 let hours = item
                     .observed_at
@@ -284,8 +292,12 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
                     .unwrap_or(0);
                 format!("observation stale ({hours}h)")
             };
+            let tail = match &channel_build {
+                Some(build) => format!("{reason} · {build}"),
+                None => reason,
+            };
             attention = true;
-            lines.push(release_status_line(component, None, None, reason));
+            lines.push(release_status_line(component, None, None, tail));
             continue;
         }
         let running_source = item
@@ -293,10 +305,6 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
             .as_ref()
             .map(|observed| observed.source_sha.as_str())
             .filter(|sha| is_ascii_hex_sha40(sha));
-        let candidate = item
-            .candidate
-            .as_ref()
-            .filter(|release| is_ascii_hex_sha40(&release.source_sha));
         let availability = if let Some(candidate) = candidate {
             let same_source = running_source == Some(candidate.source_sha.as_str());
             // The installed digest describes the running image only when the
@@ -321,20 +329,15 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
             } else if same_source && installed_digest.is_some() {
                 // The channel was republished at the running source.
                 "source up to date (image digest differs)"
-            } else if same_source
-                && component != "webui"
-                && item
-                    .observed
-                    .as_ref()
-                    .is_some_and(|observed| observed.source_sha == observed.base_image_sha)
-            {
+            } else if same_source {
+                // No installed digest identifies the running image.
                 "source up to date (image digest unverified)"
-            } else if running_source.is_some_and(|sha| sha != candidate.source_sha.as_str()) {
+            } else if running_source.is_some() {
                 // A channel can be republished from older source, so a
                 // different SHA does not say which build is newer.
                 "different source"
             } else {
-                "not checked"
+                "running build unknown"
             }
         } else {
             "not checked"
@@ -342,13 +345,9 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
         attention |= availability != "up to date";
         let icon = release_status_icon(availability);
         // Name the channel build the running build was compared with.
-        let tail = match candidate {
-            Some(release) if availability != "not checked" => format!(
-                "{} `{}` · {availability} {icon}",
-                release.channel,
-                &release.source_sha[..7]
-            ),
-            _ => availability.into(),
+        let tail = match &channel_build {
+            Some(build) => format!("{build} · {availability} {icon}"),
+            None => availability.into(),
         };
         lines.push(release_status_line(
             component,
@@ -1578,6 +1577,38 @@ mod presentation_tests {
                 "{retained}: {api}"
             );
         }
+
+        // A fresh channel result stays visible when the running build cannot
+        // be compared with it, and nothing claims that the builds match.
+        let fresh = |observed: Option<crate::db::ComponentObservation>, observed_at| {
+            let row = sample_api_update_row(
+                Some(sample_candidate("latest", source, &"b".repeat(64))),
+                Some(9_000),
+                None,
+                observed,
+                observed_at,
+                "latest",
+            );
+            release_text(&[row], 9_100)
+                .lines()
+                .find(|line| line.starts_with("**api:**"))
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            fresh(Some(sample_observed(source)), Some(1_000)),
+            "**api:** observation stale (2h) · latest `abcdef0`"
+        );
+        assert_eq!(fresh(None, None), "**api:** unknown · latest `abcdef0`");
+        // A managed build at the candidate source without an installed record.
+        assert!(
+            fresh(Some(sample_observed(source)), Some(9_000))
+                .ends_with("latest `abcdef0` · source up to date (image digest unverified) ⚠️")
+        );
+        assert!(
+            fresh(Some(sample_observed("not-a-source-sha")), Some(9_000))
+                .ends_with("latest `abcdef0` · running build unknown ❓")
+        );
     }
 
     #[test]
