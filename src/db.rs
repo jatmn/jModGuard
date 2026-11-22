@@ -31,7 +31,7 @@ use crate::types::{
 };
 
 mod primary_outage;
-use primary_outage::{Admission, PrimaryBackoff, PrimaryOutageGate};
+use primary_outage::{Admission, PrimaryBackoff, PrimaryOutageGate, PrimaryOutageReported};
 
 mod access_marks;
 pub use access_marks::*;
@@ -228,9 +228,9 @@ where
     Err(last.expect("remote interactive read retry exhausted without an error"))
 }
 
-/// Transient remote failures and deliberate cooldowns reported by the pool.
+/// True when the pool has already warned about this outage or deferred work during it.
 pub fn is_primary_outage(error: &anyhow::Error) -> bool {
-    error.is::<PrimaryBackoff>() || crate::db_compat::remote_unavailable_operation(error).is_some()
+    error.is::<PrimaryBackoff>() || error.is::<PrimaryOutageReported>()
 }
 
 pub fn is_database_commit_indeterminate(err: &anyhow::Error) -> bool {
@@ -1336,11 +1336,9 @@ impl Db {
             }
         };
         let started = Instant::now();
-        let result = self.with_conn_inner(f, Some(generation)).await;
-        if let Err(error) = &result {
-            gate.record_failure(generation, started.elapsed(), error);
-        }
-        result
+        self.with_conn_inner(f, Some(generation))
+            .await
+            .map_err(|error| gate.record_failure(generation, started.elapsed(), error))
     }
 
     async fn with_ungated_conn<T, F>(&self, f: F) -> Result<T>

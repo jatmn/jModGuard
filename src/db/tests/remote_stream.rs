@@ -10,6 +10,12 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadRoute {
+    Primary,
+    ReplicaRoutable,
+}
+
 struct HranaState {
     next_baton: usize,
     latest_baton: Option<String>,
@@ -21,15 +27,16 @@ struct HranaState {
     fail_next_meta_probe: bool,
     reset_next_request: bool,
     fail_next_request: Option<&'static str>,
+    fail_next_status: Option<StatusCode>,
     commit_timeouts: usize,
     rollback_requests: usize,
     in_transaction: bool,
     begin_sql: Vec<String>,
-    timeout_next_cursor: bool,
+    next_cursor_error: Option<(&'static str, &'static str)>,
     hang_next_commit: bool,
     hang_next_statement: bool,
     hang_next_begin: bool,
-    stall_reads: bool,
+    stall_reads: Option<ReadRoute>,
     read_begins: usize,
     begin_released: bool,
     begin_release: Arc<Notify>,
@@ -62,15 +69,16 @@ impl HranaState {
             fail_next_meta_probe: false,
             reset_next_request: false,
             fail_next_request: None,
+            fail_next_status: None,
             commit_timeouts: 0,
             rollback_requests: 0,
             in_transaction: false,
             begin_sql: Vec::new(),
-            timeout_next_cursor: false,
+            next_cursor_error: None,
             hang_next_commit: false,
             hang_next_statement: false,
             hang_next_begin: false,
-            stall_reads: false,
+            stall_reads: None,
             read_begins: 0,
             begin_released: false,
             begin_release: Arc::new(Notify::new()),
@@ -552,7 +560,8 @@ impl HranaFixture {
     }
 
     fn timeout_next_cursor(&self) {
-        self.state.lock().unwrap().timeout_next_cursor = true;
+        self.state.lock().unwrap().next_cursor_error =
+            Some(("TRANSACTION_TIMEOUT", "Transaction timed out"));
     }
 
     fn hang_next_commit(&self) {
@@ -721,18 +730,33 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
         );
     }
     if path == "/v3/pipeline"
-        && input["requests"].as_array().is_some_and(|requests| {
-            requests.iter().any(|request| {
+        && let Some(route) = input["requests"].as_array().and_then(|requests| {
+            requests.iter().find_map(|request| {
                 let sql = statement_sql(request);
-                sql.starts_with("BEGIN") && (sql.contains("DEFERRED") || sql.contains("READONLY"))
+                if !sql.starts_with("BEGIN") {
+                    return None;
+                }
+                if sql.contains("DEFERRED") {
+                    Some(ReadRoute::Primary)
+                } else if sql.contains("READONLY") {
+                    Some(ReadRoute::ReplicaRoutable)
+                } else {
+                    None
+                }
             })
         })
     {
-        let stall = {
+        let (stall, status) = {
             let mut state = state.lock().unwrap();
             state.read_begins += 1;
-            state.stall_reads
+            (
+                state.stall_reads == Some(route),
+                state.fail_next_status.take(),
+            )
         };
+        if let Some(status) = status {
+            return body(status, "fixture HTTP fault");
+        }
         if stall {
             std::future::pending::<()>().await;
         }
@@ -812,11 +836,10 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
             )
         }
         "/v3/cursor" => {
-            if state.timeout_next_cursor {
-                state.timeout_next_cursor = false;
+            if let Some((code, message)) = state.next_cursor_error.take() {
                 let lines = [
                     json!({"baton": baton}).to_string(),
-                    json!({"type": "step_error", "step": 0, "error": {"message": "Transaction timed out", "code": "TRANSACTION_TIMEOUT"}}).to_string(),
+                    json!({"type": "step_error", "step": 0, "error": {"message": message, "code": code}}).to_string(),
                 ];
                 return body(StatusCode::OK, format!("{}\n", lines.join("\n")));
             }
@@ -1312,9 +1335,10 @@ async fn primary_stall_defers_pooled_reads_and_recovers_while_lease_retries() {
         .finish();
     let capture = tracing::subscriber::set_default(subscriber);
 
-    fixture.state.lock().unwrap().stall_reads = true;
+    fixture.state.lock().unwrap().stall_reads = Some(ReadRoute::Primary);
     let started = tokio::time::Instant::now().into_std();
-    let (snapshot, versions) = tokio::join!(get_primary_versions(&db), get_version_state(&other));
+    let (snapshot, versions) =
+        tokio::join!(get_primary_versions(&db), get_primary_versions(&other));
     for error in [snapshot.unwrap_err(), versions.unwrap_err()] {
         assert!(is_database_operation_timeout(&error), "{error:#}");
         assert!(
@@ -1326,7 +1350,7 @@ async fn primary_stall_defers_pooled_reads_and_recovers_while_lease_retries() {
 
     for _ in 0..3 {
         let (snapshot, versions) =
-            tokio::join!(get_primary_versions(&db), get_version_state(&other));
+            tokio::join!(get_primary_versions(&db), get_primary_versions(&other));
         for error in [snapshot.unwrap_err(), versions.unwrap_err()] {
             assert!(
                 error.to_string().contains("primary is backing off"),
@@ -1374,7 +1398,7 @@ async fn primary_stall_defers_pooled_reads_and_recovers_while_lease_retries() {
     assert!(launcher.launcher_fence_deadline().unwrap() > launcher_deadline);
     assert_eq!(fixture.state.lock().unwrap().read_begins, 2);
 
-    fixture.state.lock().unwrap().stall_reads = false;
+    fixture.state.lock().unwrap().stall_reads = None;
     tokio::time::advance(Duration::from_secs(5)).await;
     let (probe_owner, contender) =
         tokio::join!(db.with_conn(|_| Ok(())), other.with_conn(|_| Ok(())));
@@ -1398,16 +1422,116 @@ async fn primary_stall_defers_pooled_reads_and_recovers_while_lease_retries() {
         assert!(log.contains(field), "{log}");
     }
     assert!(log.contains("count=2"), "{log}");
-    assert!(
-        log.contains("begin primary snapshot") && log.contains("begin consistent read"),
-        "{log}"
-    );
+    assert!(log.contains("begin primary snapshot"), "{log}");
     drop(launcher);
     drop(other);
     drop(db);
     drop(fixture);
     drop(local);
     super::cleanup_db(&path);
+}
+
+#[tokio::test(start_paused = true)]
+async fn replica_routable_failures_leave_healthy_primary_reads_available() {
+    let fixture = HranaFixture::start().await;
+    let db = fixture.db_with_operation_timeout(Duration::from_secs(7));
+    fixture.state.lock().unwrap().stall_reads = Some(ReadRoute::ReplicaRoutable);
+
+    let error = get_version_state(&db).await.unwrap_err();
+    assert!(is_database_operation_timeout(&error), "{error:#}");
+    assert!(!is_primary_outage(&error), "{error:#}");
+
+    read_primary_fixture(&db).await.unwrap();
+
+    // Exercise a statement error after a successful READONLY begin as well.
+    fixture.state.lock().unwrap().stall_reads = None;
+    fixture.timeout_next_cursor();
+    let error = get_version_state(&db).await.unwrap_err();
+    assert!(is_remote_interactive_timeout(&error), "{error:#}");
+    assert!(!is_primary_outage(&error), "{error:#}");
+    read_primary_fixture(&db).await.unwrap();
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let before = fixture.state.lock().unwrap().read_begins;
+    read_primary_fixture(&db).await.unwrap();
+    assert_eq!(
+        fixture.state.lock().unwrap().read_begins,
+        before + 1,
+        "primary work must proceed without a recovery probe for a replica fault"
+    );
+}
+
+async fn read_primary_fixture(db: &Db) -> Result<()> {
+    db.with_conn(|conn| {
+        let tx = conn.transaction_primary_snapshot()?;
+        tx.query_row("SELECT 1", (), |_| Ok(()))?;
+        tx.finish_read()
+    })
+    .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn primary_gate_counts_gateway_errors_and_closed_http_connections() {
+    for status in [
+        Some(StatusCode::BAD_GATEWAY),
+        Some(StatusCode::SERVICE_UNAVAILABLE),
+        None,
+    ] {
+        let fixture = HranaFixture::start().await;
+        let db = fixture.db();
+        for reported in [false, true] {
+            {
+                let mut state = fixture.state.lock().unwrap();
+                state.fail_next_status = status;
+                state.reset_next_request = status.is_none();
+            }
+            let error = get_primary_versions(&db).await.unwrap_err();
+            let expected = match status {
+                Some(StatusCode::BAD_GATEWAY) => "status=502",
+                Some(_) => "status=503",
+                None => "connection closed before message completed",
+            };
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(is_primary_outage(&error), reported, "{error:#}");
+        }
+        let error = get_primary_versions(&db).await.unwrap_err();
+        assert!(
+            error.to_string().contains("primary is backing off"),
+            "{error:#}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn isolated_primary_errors_remain_visible_until_the_gate_reports_an_outage() {
+    let fixture = HranaFixture::start().await;
+    let db = fixture.db();
+
+    for _ in 0..3 {
+        fixture.timeout_next_cursor();
+        let error = get_primary_versions(&db).await.unwrap_err();
+        assert!(is_remote_interactive_timeout(&error), "{error:#}");
+        assert!(
+            !is_primary_outage(&error),
+            "caller must still report this error: {error:#}"
+        );
+        tokio::time::advance(Duration::from_secs(15)).await;
+    }
+
+    for _ in 0..2 {
+        fixture.state.lock().unwrap().fail_next_status = Some(StatusCode::FORBIDDEN);
+        let error = get_primary_versions(&db).await.unwrap_err();
+        assert!(format!("{error:#}").contains("status=403"), "{error:#}");
+        assert!(!is_primary_outage(&error), "{error:#}");
+    }
+    for _ in 0..2 {
+        fixture.state.lock().unwrap().next_cursor_error =
+            Some(("SQLITE_ERROR", "no such table: example"));
+        let error = read_primary_fixture(&db).await.unwrap_err();
+        assert!(format!("{error:#}").contains("no such table"), "{error:#}");
+        assert!(!is_primary_outage(&error), "{error:#}");
+    }
+    read_primary_fixture(&db).await.unwrap();
 }
 
 fn install_clock(db: &Db) -> Arc<crate::db_compat::ManualClock> {

@@ -43,6 +43,7 @@ struct QueryReturnedNoRows;
 pub struct DatabaseOperationTimedOut {
     operation: &'static str,
     timeout: Duration,
+    replica_routable: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -56,40 +57,68 @@ pub struct DatabaseCallerAbandoned {
 pub struct DatabaseCommitIndeterminate(#[source] anyhow::Error);
 
 #[derive(Debug, thiserror::Error)]
-#[error("remote database {0} failed")]
-struct RemoteOperationFailed(&'static str);
+#[error("remote database {operation} failed")]
+struct RemoteOperationFailed {
+    operation: &'static str,
+    replica_routable: bool,
+}
 
-/// Identify health failures, excluding application cancellation, pool
-/// saturation and SQL errors such as constraints or invalid credentials.
+/// libSQL 0.10's adapter converts Hyper errors to strings and prefixes HTTP
+/// response failures with the status before putting either in Error::Hrana.
+fn is_remote_availability_error(error: &libsql::Error) -> bool {
+    let message = match error {
+        libsql::Error::Hrana(cause) => cause.to_string().to_ascii_lowercase(),
+        libsql::Error::RemoteSqliteFailure(_, _, message) => message.to_ascii_lowercase(),
+        _ => return false,
+    };
+    if let Some(response) = message.strip_prefix("api error: `status=") {
+        let status = response.split_ascii_whitespace().next();
+        if matches!(status, Some("502" | "503" | "504")) {
+            return true;
+        }
+        if matches!(status, Some("401" | "403")) {
+            return false;
+        }
+    }
+    if let Some(transport) = message.strip_prefix("http error:") {
+        return [
+            "error trying to connect",
+            "network is unreachable",
+            "connection refused",
+            "connection reset",
+            "connection closed",
+            "connection error",
+            "broken pipe",
+            "error reading a body from connection",
+        ]
+        .iter()
+        .any(|failure| transport.contains(failure));
+    }
+    message.contains("transaction_timeout")
+        || message.contains("transaction timed out")
+        || message.contains("transaction timed-out")
+}
+
 pub(crate) fn remote_unavailable_operation(error: &anyhow::Error) -> Option<&'static str> {
     if let Some(timeout) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<DatabaseOperationTimedOut>())
     {
-        return (timeout.operation != "waiting for connection").then_some(timeout.operation);
+        return (!timeout.replica_routable && timeout.operation != "waiting for connection")
+            .then_some(timeout.operation);
     }
-    let is_unavailable = error.chain().any(|cause| {
-        if let Some(error) = cause.downcast_ref::<hyper::Error>() {
-            return error.is_connect();
-        }
-        match cause.downcast_ref::<libsql::Error>() {
-            Some(libsql::Error::Hrana(_) | libsql::Error::RemoteSqliteFailure(..)) => {
-                let message = cause.to_string().to_ascii_lowercase();
-                message.contains("transaction_timeout")
-                    || message.contains("transaction timed out")
-                    || message.contains("transaction timed-out")
-                    || message.contains("network is unreachable")
-                    || message.contains("connection refused")
-                    || message.contains("error trying to connect")
-            }
-            _ => false,
-        }
-    });
-    is_unavailable.then(|| {
-        error
-            .downcast_ref::<RemoteOperationFailed>()
-            .map_or("remote SQL", |failure| failure.0)
-    })
+    let operation = error.downcast_ref::<RemoteOperationFailed>();
+    if operation.is_some_and(|op| op.replica_routable) {
+        return None;
+    }
+    error
+        .chain()
+        .any(|cause| {
+            cause
+                .downcast_ref::<libsql::Error>()
+                .is_some_and(is_remote_availability_error)
+        })
+        .then(|| operation.map_or("remote SQL", |op| op.operation))
 }
 
 pub(crate) fn is_database_operation_timeout(error: &anyhow::Error) -> bool {
@@ -171,7 +200,12 @@ pub(crate) fn database_operation_timed_out(
     operation: &'static str,
     timeout: Duration,
 ) -> anyhow::Error {
-    DatabaseOperationTimedOut { operation, timeout }.into()
+    DatabaseOperationTimedOut {
+        operation,
+        timeout,
+        replica_routable: false,
+    }
+    .into()
 }
 
 pub trait OptionalExtension<T> {
@@ -348,6 +382,7 @@ pub struct DbRuntime {
     handle: tokio::runtime::Handle,
     _thread: Arc<RuntimeThread>,
     operation_timeout: Option<Duration>,
+    replica_routable: bool,
     // Shared by all connections for one physical Db pool. A discovered bound
     // violation pauses growth until that runtime is restarted and repaired.
     growth_guard: Arc<GrowthGuard>,
@@ -373,15 +408,15 @@ impl DbRuntime {
 
     pub fn for_operation_timeout(&self, operation_timeout: Option<Duration>) -> Self {
         Self {
-            handle: self.handle.clone(),
-            _thread: Arc::clone(&self._thread),
             operation_timeout,
-            growth_guard: Arc::clone(&self.growth_guard),
-            startup_probe: self.startup_probe.clone(),
-            #[cfg(test)]
-            manual_clock: Arc::clone(&self.manual_clock),
-            #[cfg(test)]
-            open_releases: Arc::clone(&self.open_releases),
+            ..self.clone()
+        }
+    }
+
+    fn for_replica_read(&self) -> Self {
+        Self {
+            replica_routable: true,
+            ..self.clone()
         }
     }
 
@@ -422,6 +457,7 @@ impl DbRuntime {
                 join: Mutex::new(Some(join)),
             }),
             operation_timeout,
+            replica_routable: false,
             growth_guard: Arc::new(GrowthGuard::default()),
             startup_probe: current_startup_probe(),
             #[cfg(test)]
@@ -535,16 +571,17 @@ impl DbRuntime {
                 result = future => {
                     let result = result.map_err(Into::into);
                     if remote {
-                        result.context(RemoteOperationFailed(operation))
+                        result.context(RemoteOperationFailed { operation, replica_routable: self.replica_routable })
                     } else {
                         result
                     }
                 }
                 _ = abandoned => Err(database_caller_abandoned(operation)),
-                _ = deadline, if remote => Err(database_operation_timed_out(
+                _ = deadline, if remote => Err(DatabaseOperationTimedOut {
                     operation,
-                    timeout.unwrap_or(Duration::ZERO),
-                )),
+                    timeout: timeout.unwrap_or(Duration::ZERO),
+                    replica_routable: self.replica_routable,
+                }.into()),
             }
         })
     }
@@ -615,7 +652,7 @@ impl DbRuntime {
                 result = future.as_mut() => {
                     return result
                         .map_err(anyhow::Error::from)
-                        .context(RemoteOperationFailed(operation));
+                        .context(RemoteOperationFailed { operation, replica_routable: self.replica_routable });
                 }
                 _ = abandoned, if watch.is_some() => Stop::Abandoned,
                 _ = deadline => Stop::Deadline,
@@ -682,7 +719,11 @@ impl DbRuntime {
             }
             match stop {
                 Stop::Abandoned => Err(database_caller_abandoned(operation)),
-                Stop::Deadline => Err(database_operation_timed_out(operation, operation_timeout)),
+                Stop::Deadline => Err(DatabaseOperationTimedOut {
+                    operation,
+                    timeout: operation_timeout,
+                    replica_routable: self.replica_routable,
+                }.into()),
             }
         })
     }
@@ -1530,9 +1571,13 @@ impl Connection {
         Option<PrimaryTally>,
     )> {
         let caller = std::panic::Location::caller();
-        let runtime = self.runtime.clone();
         let immediate = matches!(behavior, libsql::TransactionBehavior::Immediate);
         let primary = !matches!(behavior, libsql::TransactionBehavior::ReadOnly);
+        let runtime = if primary {
+            self.runtime.clone()
+        } else {
+            self.runtime.for_replica_read()
+        };
         let started = tokio::time::Instant::now();
         let open = self.inner.transaction_with_behavior(behavior);
         let opened = match read_budget {
@@ -1659,10 +1704,14 @@ impl Connection {
         primary: Option<PrimaryTally>,
     ) -> Transaction {
         Transaction {
+            runtime: if primary.is_some() {
+                self.runtime.clone()
+            } else {
+                self.runtime.for_replica_read()
+            },
             primary,
             inner: TransactionHandle::Active(inner),
             database: Arc::clone(&self.database),
-            runtime: self.runtime.clone(),
             connection_health: Arc::clone(&self.health),
             connection_config_version: Arc::clone(&self.config_version),
             pending_config_version: std::sync::atomic::AtomicU64::new(0),
@@ -1752,7 +1801,7 @@ impl Connection {
         F: FnOnce(&Row) -> Result<T> + Send,
     {
         require_read_sql(sql)?;
-        self.runtime.block_on_database_within(
+        self.runtime.for_replica_read().block_on_database_within(
             "advisory query",
             self.interactive_read_budget(),
             async {
@@ -1788,6 +1837,7 @@ impl SqlExecutor for Connection {
         require_read_sql(sql)?;
         Ok(self
             .runtime
+            .for_replica_read()
             .block_on_database("execute", self.inner.execute(sql, params))? as usize)
     }
 
@@ -1880,21 +1930,22 @@ impl SqlExecutor for Connection {
         {
             probe.record_catalog();
         }
-        self.runtime.block_on_database("query", async {
-            let mut rows = self.inner.query(sql, params).await?;
-            let row = rows.next().await?.ok_or(QueryReturnedNoRows)?;
-            map(&row)
-        })
+        self.runtime
+            .for_replica_read()
+            .block_on_database("query", async {
+                let mut rows = self.inner.query(sql, params).await?;
+                let row = rows.next().await?.ok_or(QueryReturnedNoRows)?;
+                map(&row)
+            })
     }
 
     fn prepare(&self, sql: &str) -> Result<Statement> {
         require_read_sql(sql)?;
-        let inner = self
-            .runtime
-            .block_on_database("prepare", self.inner.prepare(sql))?;
+        let runtime = self.runtime.for_replica_read();
+        let inner = runtime.block_on_database("prepare", self.inner.prepare(sql))?;
         Ok(Statement {
-            inner: RuntimeOwned::new(inner, &self.runtime),
-            runtime: self.runtime.clone(),
+            inner: RuntimeOwned::new(inner, &runtime),
+            runtime,
             read_deadline: None,
             stream: Arc::new(TransactionStream::new()),
         })

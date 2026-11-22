@@ -15,6 +15,18 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 #[error("remote database primary is backing off after an outage")]
 pub(super) struct PrimaryBackoff;
 
+/// The caller can omit its own warning once the gate has reported the outage.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct PrimaryOutageReported(String);
+
+impl PrimaryOutageReported {
+    fn wrap(error: anyhow::Error) -> anyhow::Error {
+        let message = error.to_string();
+        error.context(Self(message))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct PrimaryOutageGate(Mutex<State>);
 
@@ -57,14 +69,19 @@ impl PrimaryOutageGate {
         Ok(())
     }
 
-    pub(super) fn record_failure(&self, generation: u64, elapsed: Duration, error: &anyhow::Error) {
-        let Some(operation) = remote_unavailable_operation(error) else {
-            return;
+    pub(super) fn record_failure(
+        &self,
+        generation: u64,
+        elapsed: Duration,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let Some(operation) = remote_unavailable_operation(&error) else {
+            return error;
         };
         tracing::debug!(operation, error = ?error, "remote database operation deferred");
         let mut state = self.0.lock();
         if state.generation != generation {
-            return;
+            return PrimaryOutageReported::wrap(error);
         }
         let open = state.retry_at.is_some();
         let failures = state.add_failure(operation, open);
@@ -77,6 +94,11 @@ impl PrimaryOutageGate {
                 "remote database primary unavailable, backing off"
             );
             state.retry_at = Some(Instant::now() + PROBE_INTERVAL);
+        }
+        if state.retry_at.is_some() {
+            PrimaryOutageReported::wrap(error)
+        } else {
+            error
         }
     }
 }
@@ -122,6 +144,7 @@ impl Probe<'_> {
         if let Err(error) = result {
             if let Some(operation) = remote_unavailable_operation(&error) {
                 state.add_failure(operation, true);
+                return Err(PrimaryOutageReported::wrap(error));
             }
             return Err(error);
         }
