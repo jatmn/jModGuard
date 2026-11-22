@@ -659,11 +659,46 @@ where
 }
 
 async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
+    let storage = &storage()?;
+    reconcile_webui_with(
+        app,
+        |path| storage.get(path),
+        |release| async move { storage.verify_release(&Registry::ghcr()?, &release).await },
+        |release| async move {
+            storage
+                .verify_installed_release(
+                    &Registry::ghcr()?,
+                    &db::UpdateControl::from_application(&app.db),
+                    &release,
+                )
+                .await
+        },
+    )
+    .await
+}
+
+async fn reconcile_webui_with<Read, Desired, Installed>(
+    app: &ApiState,
+    read: impl Fn(&'static str) -> Read,
+    verify_desired: impl Fn(ComponentRelease) -> Desired,
+    verify_installed: impl Fn(ComponentRelease) -> Installed,
+) -> anyhow::Result<()>
+where
+    Read: Future<Output = anyhow::Result<Option<Vec<u8>>>> + Send,
+    Desired: Future<Output = anyhow::Result<ReleaseVerification>> + Send,
+    Installed: Future<Output = anyhow::Result<ReleaseVerification>> + Send,
+{
     let state = db::component_update(&app.db, "webui").await?;
-    let storage = storage()?;
-    let root = storage.get("index.html").await?;
-    let admin = storage.get("administration/index.html").await?;
-    if let Some(release) = state.desired.as_ref() {
+    let root = read("index.html").await?;
+    let admin = read("administration/index.html").await?;
+    // Only a switch to a different digest can prove that a desired release
+    // was activated. Channel aliases can name the same installed image.
+    if let Some(release) = state.desired.as_ref().filter(|desired| {
+        state
+            .installed
+            .as_ref()
+            .is_none_or(|installed| desired.digest != installed.digest)
+    }) {
         let prefix = format!("/assets/releases/{}/", release.source_sha);
         if root.as_ref().is_some_and(|bytes| {
             bytes
@@ -673,76 +708,51 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
             bytes
                 .windows(prefix.len())
                 .any(|part| part == prefix.as_bytes())
-        }) {
-            let registry = Registry::ghcr()?;
-            // An activated install keeps `desired == installed`. That release
-            // is re-read as installed, so signature expiry does not block it; a
-            // different release must pass the new-install checks.
-            let verification = if state.installed.as_ref() == Some(release) {
-                storage
-                    .verify_installed_release(
-                        &registry,
-                        &db::UpdateControl::from_application(&app.db),
-                        release,
-                    )
-                    .await?
-            } else {
-                storage.verify_release(&registry, release).await?
-            };
-            if let ReleaseVerification::Verified {
-                root_hash,
-                admin_hash,
-            } = verification
-            {
-                record_running(
-                    app,
-                    "webui",
-                    Some(release.clone()),
-                    ComponentObservation {
-                        guild_schema: None,
-                        update_protocol: 0,
-                        launcher_revision: 0,
-                        baked_launcher_revision: 0,
-                        source_sha: release.source_sha.clone(),
-                        executable_sha256: root_hash,
-                        admin_sha256: Some(admin_hash),
-                        base_image_sha: "Storage Zone".into(),
-                        started_at: chrono::Utc::now().timestamp(),
-                        min_schema: release.min_schema,
-                        max_schema: release.max_schema,
-                        api_capability: 1,
-                        self_update_enabled: true,
-                        base_abi: "static-webui-v1".into(),
-                    },
-                    chrono::Utc::now().timestamp(),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    }
-    if let Some(installed) = state.installed.as_ref() {
-        let registry = Registry::ghcr()?;
-        if let ReleaseVerification::Verified {
+        }) && let ReleaseVerification::Verified {
             root_hash,
             admin_hash,
-        } = storage
-            .verify_installed_release(
-                &registry,
-                &db::UpdateControl::from_application(&app.db),
-                installed,
-            )
-            .await?
+        } = verify_desired(release.clone()).await?
         {
-            return record_verified(
+            record_running(
                 app,
-                installed,
-                state.observed.as_ref(),
-                root_hash,
-                admin_hash,
+                "webui",
+                Some(release.clone()),
+                ComponentObservation {
+                    guild_schema: None,
+                    update_protocol: 0,
+                    launcher_revision: 0,
+                    baked_launcher_revision: 0,
+                    source_sha: release.source_sha.clone(),
+                    executable_sha256: root_hash,
+                    admin_sha256: Some(admin_hash),
+                    base_image_sha: "Storage Zone".into(),
+                    started_at: chrono::Utc::now().timestamp(),
+                    min_schema: release.min_schema,
+                    max_schema: release.max_schema,
+                    api_capability: 1,
+                    self_update_enabled: true,
+                    base_abi: "static-webui-v1".into(),
+                },
+                chrono::Utc::now().timestamp(),
             )
-            .await;
+            .await?;
+            return Ok(());
         }
+    }
+    if let Some(installed) = state.installed.as_ref()
+        && let ReleaseVerification::Verified {
+            root_hash,
+            admin_hash,
+        } = verify_installed(installed.clone()).await?
+    {
+        return record_verified(
+            app,
+            installed,
+            state.observed.as_ref(),
+            root_hash,
+            admin_hash,
+        )
+        .await;
     }
     if state.observed.is_some() {
         via_bot!(
@@ -2048,9 +2058,8 @@ mod tests {
         ))
         .await
     }
-    #[tokio::test]
-    async fn webui_purge_obligation_survives_failed_or_interrupted_purge_through_reconciliation() {
-        let release = ComponentRelease {
+    fn webui_test_release() -> ComponentRelease {
+        ComponentRelease {
             upgrade: None,
             component: "webui".into(),
             channel: "latest".into(),
@@ -2067,7 +2076,148 @@ mod tests {
             launcher_protocol: 1,
             launcher: None,
             base_abi: "static-webui-v1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn webui_reconciliation_preserves_failed_reinstall_and_adopts_distinct_release() {
+        let (app, path) = purge_test_app();
+        let installed = webui_test_release();
+        let now = 100;
+        db::record_update_check(
+            &app.db,
+            "webui",
+            "latest",
+            Some(installed.clone()),
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        db::request_component_install(&app.db, "webui", &installed.digest, now)
+            .await
+            .unwrap();
+        let observation = ComponentObservation {
+            guild_schema: None,
+            update_protocol: 0,
+            launcher_revision: 0,
+            baked_launcher_revision: 0,
+            source_sha: installed.source_sha.clone(),
+            executable_sha256: "old root".into(),
+            admin_sha256: Some("old admin".into()),
+            base_image_sha: "Storage Zone".into(),
+            started_at: now - 10,
+            min_schema: installed.min_schema,
+            max_schema: installed.max_schema,
+            api_capability: 1,
+            self_update_enabled: true,
+            base_abi: "static-webui-v1".into(),
         };
+        record_running(
+            &app,
+            "webui",
+            Some(installed.clone()),
+            observation,
+            now - 10,
+        )
+        .await
+        .unwrap();
+        db::set_webui_purge_pending(&app.db, Some("purge pending".into()))
+            .await
+            .unwrap();
+
+        let mut alias = installed.clone();
+        alias.channel = "stable".into();
+        let mut next = alias.clone();
+        next.source_sha = "c".repeat(40);
+        next.digest = format!("sha256:{}", "d".repeat(64));
+        for (desired, interrupted) in [
+            (installed.clone(), false),
+            (alias, true),
+            (next.clone(), false),
+        ] {
+            let reinstall = desired.digest == installed.digest;
+            db::set_update_policy(&app.db, "webui", &desired.channel, "off", false)
+                .await
+                .unwrap();
+            db::record_update_check(
+                &app.db,
+                "webui",
+                &desired.channel,
+                Some(desired.clone()),
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+            db::request_component_install(&app.db, "webui", &desired.digest, now)
+                .await
+                .unwrap();
+            if !interrupted {
+                db::record_component_failure(&app.db, "webui", &desired, "publish failed")
+                    .await
+                    .unwrap();
+            }
+            let html = format!("/assets/releases/{}/app.js", desired.source_sha).into_bytes();
+            let verified = || ReleaseVerification::Verified {
+                root_hash: "verified root".into(),
+                admin_hash: "verified admin".into(),
+            };
+            reconcile_webui_with(
+                &app,
+                |_| std::future::ready(Ok(Some(html.clone()))),
+                |release| {
+                    assert!(!reinstall);
+                    assert_eq!(release, desired);
+                    std::future::ready(Ok(verified()))
+                },
+                |release| {
+                    assert!(reinstall);
+                    assert_eq!(release, installed);
+                    std::future::ready(Ok(verified()))
+                },
+            )
+            .await
+            .unwrap();
+
+            let row = db::component_update(&app.db, "webui").await.unwrap();
+            let seen = row.observed.unwrap();
+            assert_eq!(seen.executable_sha256, "verified root");
+            assert_eq!(seen.admin_sha256.as_deref(), Some("verified admin"));
+            assert_eq!(row.desired.as_ref(), Some(&desired));
+            if reinstall {
+                assert_eq!(row.installed.as_ref(), Some(&installed));
+                assert_eq!(row.installed_at, Some(now - 10));
+                assert_eq!(seen.started_at, now - 10);
+                if interrupted {
+                    assert_eq!(row.state, "queued");
+                    assert!(row.last_error.is_none());
+                    db::settle_interrupted_webui(&app.db, &desired)
+                        .await
+                        .unwrap();
+                    let settled = db::component_update(&app.db, "webui").await.unwrap();
+                    assert_eq!(settled.state, "failed");
+                    assert!(settled.last_error.unwrap().contains("interrupted"));
+                } else {
+                    assert_eq!(row.state, "failed");
+                    assert_eq!(row.last_error.as_deref(), Some("publish failed"));
+                }
+            } else {
+                assert_eq!(row.state, "running");
+                assert_eq!(row.last_error, None);
+                assert_eq!(row.installed.as_ref(), Some(&next));
+            }
+            assert_eq!(
+                db::webui_purge_pending(&app.db).await.unwrap().as_deref(),
+                Some("purge pending")
+            );
+        }
+        remove_test_db(app, path);
+    }
+
+    #[tokio::test]
+    async fn webui_purge_obligation_survives_failed_or_interrupted_purge_through_reconciliation() {
+        let release = webui_test_release();
         let observation = ComponentObservation {
             guild_schema: None,
             update_protocol: 0,
@@ -2454,24 +2604,7 @@ mod tests {
             rand::random::<u128>()
         ));
         let db = Db::open(&path, 2).unwrap();
-        let release = ComponentRelease {
-            upgrade: None,
-            component: "webui".into(),
-            channel: "latest".into(),
-            release_id: "v1.0.0".into(),
-            source_sha: "a".repeat(40),
-            published_at: "2026-09-23T00:00:00Z".into(),
-            image: "ghcr.io/jatmn/jmodguard-webui".into(),
-            digest: format!("sha256:{}", "b".repeat(64)),
-            min_schema: 15,
-            max_schema: 15,
-            result_schema: 15,
-            min_api: 1,
-            max_api: 1,
-            launcher_protocol: 1,
-            launcher: None,
-            base_abi: "static-webui-v1".into(),
-        };
+        let release = webui_test_release();
         db::record_update_check(
             &db,
             "webui",

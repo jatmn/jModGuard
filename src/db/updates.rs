@@ -779,12 +779,22 @@ pub async fn record_webui_installed_verified(
     observation: ComponentObservation,
     now: i64,
 ) -> Result<()> {
-    let installed = serde_json::to_string(release)?;
+    let release = release.clone();
     let observation = serde_json::to_string(&observation)?;
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let changed = tx.execute_rows("UPDATE component_updates SET observed=?2,observed_at=?3,state=CASE WHEN desired IS NULL OR (desired=?1 AND state NOT IN ('queued','failed')) THEN 'running' ELSE state END,last_error=CASE WHEN desired IS NULL OR (desired=?1 AND state NOT IN ('queued','failed')) THEN NULL ELSE last_error END WHERE component='webui' AND installed=?1",params![installed,observation,now], 1)?;
-        anyhow::ensure!(changed == 1, "installed WebUI release changed during verification");
+        let installed: Option<String> = tx.query_row(
+            "SELECT installed FROM component_updates WHERE component='webui'",
+            (),
+            |row| Ok(row.get(0)?),
+        )?;
+        // Older installs omit optional release fields. Compare the parsed
+        // identity and keep the original text for the desired comparison.
+        anyhow::ensure!(
+            parse_release(installed.clone())?.as_ref() == Some(&release),
+            "installed WebUI release changed during verification"
+        );
+        tx.execute_rows("UPDATE component_updates SET observed=?2,observed_at=?3,state=CASE WHEN desired IS NULL OR (desired=?1 AND state NOT IN ('queued','failed')) THEN 'running' ELSE state END,last_error=CASE WHEN desired IS NULL OR (desired=?1 AND state NOT IN ('queued','failed')) THEN NULL ELSE last_error END WHERE component='webui' AND installed=?1",params![installed,observation,now], 1)?;
         tx.commit()?;
         Ok(())
     }).await
@@ -1660,7 +1670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restored_installed_webui_keeps_interrupted_request_failed() {
+    async fn restored_legacy_webui_keeps_interrupted_request_failed() {
         let path = std::env::temp_dir().join(format!(
             "jmodguard_webui_restore_{:032x}.db",
             rand::random::<u128>()
@@ -1699,6 +1709,18 @@ mod tests {
         record_component_running(&db, "webui", Some(old.clone()), observation.clone(), 101)
             .await
             .unwrap();
+        let mut legacy = serde_json::to_value(&old).unwrap();
+        legacy.as_object_mut().unwrap().remove("upgrade");
+        db.with_conn(move |conn| {
+            conn.execute_rows(
+                "UPDATE component_updates SET installed=?1,desired=?1 WHERE component='webui'",
+                params![legacy.to_string()],
+                1,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
         record_update_check(&db, "webui", "latest", Some(next.clone()), None, 110)
             .await
             .unwrap();
