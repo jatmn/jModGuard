@@ -518,6 +518,21 @@ pub async fn check_one(
     app: &Arc<ApiState>,
     component: &str,
 ) -> anyhow::Result<db::ComponentUpdate> {
+    check_one_with(
+        app,
+        component,
+        async |component, channel| Registry::ghcr()?.discover(component, channel).await,
+        async |adopt_desired| reconcile_webui(app, adopt_desired).await,
+    )
+    .await
+}
+
+async fn check_one_with(
+    app: &Arc<ApiState>,
+    component: &str,
+    discover: impl AsyncFnOnce(&str, &str) -> anyhow::Result<ComponentRelease>,
+    reconcile: impl AsyncFnOnce(bool) -> anyhow::Result<()>,
+) -> anyhow::Result<db::ComponentUpdate> {
     let lease = format!("{:032x}", rand::random::<u128>());
     let now = chrono::Utc::now().timestamp();
     if claim_any(Some(app), &app.db, component, &lease, now, 240).await?
@@ -527,51 +542,33 @@ pub async fn check_one(
     }
     with_update_lease(Some(app), &app.db, component, &lease, 240, async {
         let state = db::component_update(&app.db, component).await?;
-        let registry = Registry::ghcr()?;
-        let checked = match registry.discover(component, &state.channel).await {
-            Ok(candidate) => via_bot!(
-                app,
-                db::record_update_check(
-                    &app.db,
+        let checked = match discover(component, &state.channel).await {
+            Ok(candidate) => {
+                record_release_check(app, component, &state.channel, Some(candidate), None, now)
+                    .await?
+            }
+            Err(error) => {
+                record_release_check(
+                    app,
                     component,
                     &state.channel,
-                    Some(candidate.clone()),
                     None,
+                    Some(format!("{error:#}")),
                     now,
-                ),
-                db::ControlOp::RecordUpdateCheck {
-                    component: component.to_owned(),
-                    channel: state.channel.clone(),
-                    candidate: Some(candidate),
-                    error: None,
-                    now,
+                )
+                .await?;
+                // Channel discovery authorizes new candidates. A failed
+                // lookup still permits a signed readback of the installed digest.
+                if component == "webui"
+                    && let Err(error) = reconcile(false).await
+                {
+                    tracing::warn!("WebUI Storage reconciliation failed: {error:#}");
                 }
-            )?,
-            Err(error) => {
-                let message = format!("{error:#}");
-                via_bot!(
-                    app,
-                    db::record_update_check(
-                        &app.db,
-                        component,
-                        &state.channel,
-                        None,
-                        Some(message.clone()),
-                        now,
-                    ),
-                    db::ControlOp::RecordUpdateCheck {
-                        component: component.to_owned(),
-                        channel: state.channel.clone(),
-                        candidate: None,
-                        error: Some(message),
-                        now,
-                    }
-                )?;
                 return Err(error);
             }
         };
         if component == "webui" {
-            match reconcile_webui(app).await {
+            match reconcile(true).await {
                 Ok(()) => {
                     if let Some(desired) = checked.desired.clone() {
                         via_bot!(
@@ -658,10 +655,11 @@ where
     result
 }
 
-async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
+async fn reconcile_webui(app: &Arc<ApiState>, adopt_desired: bool) -> anyhow::Result<()> {
     let storage = &storage()?;
     reconcile_webui_with(
         app,
+        adopt_desired,
         |path| storage.get(path),
         |release| async move { storage.verify_release(&Registry::ghcr()?, &release).await },
         |release| async move {
@@ -679,6 +677,7 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
 
 async fn reconcile_webui_with<Read, Desired, Installed>(
     app: &ApiState,
+    adopt_desired: bool,
     read: impl Fn(&'static str) -> Read,
     verify_desired: impl Fn(ComponentRelease) -> Desired,
     verify_installed: impl Fn(ComponentRelease) -> Installed,
@@ -689,16 +688,24 @@ where
     Installed: Future<Output = anyhow::Result<ReleaseVerification>> + Send,
 {
     let state = db::component_update(&app.db, "webui").await?;
-    let root = read("index.html").await?;
-    let admin = read("administration/index.html").await?;
+    let html = if adopt_desired {
+        Some((
+            read("index.html").await?,
+            read("administration/index.html").await?,
+        ))
+    } else {
+        None
+    };
     // Only a switch to a different digest can prove that a desired release
     // was activated. Channel aliases can name the same installed image.
-    if let Some(release) = state.desired.as_ref().filter(|desired| {
-        state
-            .installed
-            .as_ref()
-            .is_none_or(|installed| desired.digest != installed.digest)
-    }) {
+    if let Some((root, admin)) = html
+        && let Some(release) = state.desired.as_ref().filter(|desired| {
+            state
+                .installed
+                .as_ref()
+                .is_none_or(|installed| desired.digest != installed.digest)
+        })
+    {
         let prefix = format!("/assets/releases/{}/", release.source_sha);
         if root.as_ref().is_some_and(|bytes| {
             bytes
@@ -831,7 +838,7 @@ async fn record_release_check(
     candidate: Option<ComponentRelease>,
     error: Option<String>,
     now: i64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<db::ComponentUpdate> {
     via_bot!(
         app,
         db::record_update_check(
@@ -849,8 +856,7 @@ async fn record_release_check(
             error,
             now,
         }
-    )?;
-    Ok(())
+    )
 }
 
 /// Record configured-channel digest lookups through the bot writer. Discovery is
@@ -927,65 +933,29 @@ where
                 outcome = timeout(lookup_timeout, discover(component, &channel)) => outcome,
             };
             let now = chrono::Utc::now().timestamp();
-            match outcome {
-                Err(_) => {
-                    record_release_check(
-                        app,
-                        component,
-                        &channel,
-                        None,
-                        Some("release lookup timed out".into()),
-                        now,
-                    )
-                    .await
-                    .inspect_err(|error| warn_record_release_check(component, error))?;
-                }
-                Ok(Err(error)) => {
-                    let message = format!("{error:#}");
-                    record_release_check(app, component, &channel, None, Some(message), now)
-                        .await
-                        .inspect_err(|error| warn_record_release_check(component, error))?;
-                }
+            let record = match outcome {
+                Err(_) => Err("release lookup timed out".into()),
+                Ok(Err(error)) => Err(format!("{error:#}")),
                 Ok(Ok(release)) => {
-                    let record = if let Err(error) = release.validate() {
+                    if let Err(error) = release.validate() {
                         Err(format!("{error:#}"))
                     } else if release.component != component || release.channel != channel {
                         Err("candidate component or channel mismatch".into())
                     } else {
                         Ok(release)
-                    };
-                    match record {
-                        Ok(release) => {
-                            record_release_check(
-                                app,
-                                component,
-                                &channel,
-                                Some(release),
-                                None,
-                                now,
-                            )
-                            .await
-                            .inspect_err(|error| warn_record_release_check(component, error))?;
-                        }
-                        Err(message) => {
-                            record_release_check(
-                                app,
-                                component,
-                                &channel,
-                                None,
-                                Some(message),
-                                now,
-                            )
-                            .await
-                            .inspect_err(|error| warn_record_release_check(component, error))?;
-                        }
                     }
                 }
-            }
+            };
+            let (candidate, error) = match record {
+                Ok(release) => (Some(release), None),
+                Err(message) => (None, Some(message)),
+            };
+            let current = record_release_check(app, component, &channel, candidate, error, now)
+                .await
+                .inspect_err(|error| warn_record_release_check(component, error))?;
             if component == "webui" {
                 // Refresh the installed bytes even if the moving tag lookup
                 // failed. Keep readback under the same lease as publication.
-                let current = db::component_update(&app.db, component).await?;
                 if let Some(installed) = current.installed.as_ref() {
                     let refresh = tokio::select! {
                         biased;
@@ -1641,7 +1611,7 @@ async fn run_webui_install(
                     error: format!("{error:#}"),
                 }
             )?;
-            if let Err(reconcile_error) = reconcile_webui(app).await {
+            if let Err(reconcile_error) = reconcile_webui(app, true).await {
                 tracing::warn!("WebUI failure reconciliation deferred: {reconcile_error:#}");
             }
         }
@@ -2231,6 +2201,23 @@ mod tests {
             assert_eq!(checked.state, "running");
         }
 
+        // Give the API a stale local view while the control writer still
+        // returns the current WebUI row with the installed digest.
+        let (replica, replica_path) = purge_test_app();
+        db::set_update_policy(&replica.db, "webui", "stable", "daily", true)
+            .await
+            .unwrap();
+        let mut cfg = (*reader.cfg).clone();
+        cfg.db.path = replica_path.clone();
+        let db = Db::open_with(cfg.db_open_options()).unwrap();
+        let stale_reader = ApiState::new(cfg, db).unwrap();
+        let batch = hourly(&stale_reader, Some(candidate.clone()), None).await;
+        drop(stale_reader);
+        remove_test_db(replica, replica_path);
+        assert!(batch.finished);
+        assert!(!batch.lease_held.contains("webui"));
+        assert_eq!(rejected_ops.try_recv(), Ok("mismatch"));
+
         // Exercise scheduled admission without publishing to Storage.
         let checked = db::component_update(&reader.db, "webui").await.unwrap();
         let now = checked.checked_at.unwrap();
@@ -2357,6 +2344,7 @@ mod tests {
             };
             reconcile_webui_with(
                 &app,
+                true,
                 |_| std::future::ready(Ok(Some(html.clone()))),
                 |release| {
                     assert!(!reinstall);
@@ -2404,6 +2392,58 @@ mod tests {
                 Some("purge pending")
             );
         }
+        // The channel still points to the installed digest, but discovery
+        // refuses its expired signature. The installed readback can still
+        // verify it and clear drift.
+        db::record_webui_drift(&app.db, "Storage files differ")
+            .await
+            .unwrap();
+        let expired = jmodguard_updater::signature::EXPIRED_IMAGE_SIGNATURE;
+        let result = check_one_with(
+            &app,
+            "webui",
+            async |component, channel| {
+                assert_eq!(component, "webui");
+                assert_eq!(channel, next.channel);
+                anyhow::bail!("{expired}");
+            },
+            async |adopt_desired| {
+                assert!(!adopt_desired);
+                reconcile_webui_with(
+                    &app,
+                    adopt_desired,
+                    |_| async { unreachable!("installed verifier reads Storage") },
+                    |_| async { unreachable!("discovery did not authorize adoption") },
+                    |installed| {
+                        assert_eq!(installed, next);
+                        std::future::ready(Ok(ReleaseVerification::Verified {
+                            root_hash: "restored root".into(),
+                            admin_hash: "restored admin".into(),
+                        }))
+                    },
+                )
+                .await
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), expired);
+        let row = db::component_update(&app.db, "webui").await.unwrap();
+        assert_eq!(row.check_error.as_deref(), Some(expired));
+        assert_eq!(row.state, "running");
+        assert_eq!(row.observed.unwrap().executable_sha256, "restored root");
+        assert_eq!(row.installed.as_ref(), Some(&next));
+        assert_eq!(row.candidate.as_ref(), Some(&next));
+        assert_eq!(
+            db::request_component_install(&app.db, "webui", &next.digest, row.checked_at.unwrap())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "last release check failed; check again",
+        );
+        assert_eq!(
+            db::webui_purge_pending(&app.db).await.unwrap().as_deref(),
+            Some("purge pending")
+        );
         remove_test_db(app, path);
     }
 

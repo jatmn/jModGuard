@@ -18,9 +18,11 @@ The page shares the workspace's Light, Dark, and System appearance preference. E
 component has a status badge, release controls, and expandable **Version & technical
 details** with full hashes. **Uptime** uses compact durations such as `13m 38s` or
 `1d 2h 13m 38s`. **Refresh status** reads the current recorded state;
-**Check now** performs release discovery. Status refreshes every 30 seconds when idle
-and every two seconds while a component or launcher update is pending. Controls stay
-disabled during an action or after a failed status refresh until a fresh read succeeds.
+**Check now** performs release discovery. For WebUI, it can still verify the installed
+files when discovery fails. The failed check remains visible and blocks new installs.
+Status refreshes every 30 seconds when idle and every two seconds while a component
+or launcher update is pending. Controls stay disabled during an action or after a
+failed status refresh until a fresh read succeeds.
 An accepted update request is shown as pending, not as a completed installation.
 If the status read that follows the acknowledgement already shows success or failure,
 the page confirms only that the request was accepted and leaves that result on the card.
