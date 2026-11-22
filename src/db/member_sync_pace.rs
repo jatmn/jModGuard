@@ -238,14 +238,18 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-            extend_member_sync_request_after(&db, 10, 200_000)
-                .await
-                .unwrap();
-            let second =
-                claim_member_sync_request(&db, 10, "worker-a".into(), 200_001, 15_000, 90_000)
+            assert!(
+                claim_member_sync_request(&db, 10, "worker-b".into(), 189_999, 15_000, 90_000)
                     .await
                     .unwrap()
-                    .unwrap();
+                    .is_none(),
+                "the lease still holds after the request interval"
+            );
+            let second =
+                claim_member_sync_request(&db, 10, "worker-a".into(), 190_000, 15_000, 90_000)
+                    .await
+                    .unwrap()
+                    .expect("a new request can claim the slot at lease expiry");
             assert!(second.generation > first.generation);
             assert!(!finish_member_sync_request(&db, first, 210_000).await.unwrap());
             let foreign = MemberSyncRequestClaim {
@@ -271,7 +275,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(held.0, "worker-a");
-            assert_eq!(held.1, 200_001 + 90_000);
+            assert_eq!(held.1, 280_000);
             assert_eq!(held.2, second.generation);
             assert!(
                 finish_member_sync_request(&db, second, 220_000)
