@@ -1013,8 +1013,10 @@ where
                             // queued or failed request keeps its state and error
                             // for the manual check that adopts or settles it.
                             tracing::warn!("WebUI observation refresh found changed Storage files");
-                            if current.observed.is_some() {
-                                via_bot!(
+                            // Discovery is already durable. Rejecting this
+                            // optional write must not skip an eligible install.
+                            if current.observed.is_some()
+                                && let Err(error) = via_bot!(
                                     app,
                                     db::record_webui_drift(
                                         &app.db,
@@ -1025,7 +1027,8 @@ where
                                             .to_owned(),
                                     }
                                 )
-                                .context("recording WebUI Storage drift")?;
+                            {
+                                tracing::warn!("failed to record WebUI Storage drift: {error:#}");
                             }
                         }
                         Ok(Err(error)) => {
@@ -2077,6 +2080,157 @@ mod tests {
             launcher: None,
             base_abi: "static-webui-v1".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_writer_rejection_keeps_webui_eligible_for_scheduled_install() {
+        use jmodguard::control::{NonceWindow, open_frame};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (writer, path) = purge_test_app();
+        let schema = db::CORE_SCHEMA_VERSION;
+        let installed = ComponentRelease {
+            channel: "stable".into(),
+            min_schema: schema,
+            max_schema: schema,
+            result_schema: schema,
+            ..webui_test_release()
+        };
+        let now = 100;
+        let observation = ComponentObservation {
+            guild_schema: None,
+            update_protocol: 0,
+            launcher_revision: 0,
+            baked_launcher_revision: 0,
+            source_sha: installed.source_sha.clone(),
+            executable_sha256: "verified root".into(),
+            admin_sha256: Some("verified admin".into()),
+            base_image_sha: "Storage Zone".into(),
+            started_at: now,
+            min_schema: schema,
+            max_schema: schema,
+            api_capability: 1,
+            self_update_enabled: true,
+            base_abi: "static-webui-v1".into(),
+        };
+        db::set_update_policy(&writer.db, "webui", "stable", "daily", true)
+            .await
+            .unwrap();
+        db::record_update_check(
+            &writer.db,
+            "webui",
+            "stable",
+            Some(installed.clone()),
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        db::request_component_install(&writer.db, "webui", &installed.digest, now)
+            .await
+            .unwrap();
+        record_running(
+            &writer,
+            "webui",
+            Some(installed.clone()),
+            observation.clone(),
+            now,
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = (*writer.cfg).clone();
+        cfg.db.path = path.clone();
+        cfg.bot.control_target = listener.local_addr().unwrap().to_string();
+        let key = "x".repeat(32);
+        cfg.bot.control_secret = jmodguard::config::ControlSecret::new(key.clone());
+        let reader = Db::open_with(cfg.db_open_options()).unwrap();
+        assert!(reader.is_read_only());
+        let reader = ApiState::new(cfg, reader).unwrap();
+        let rejected = Arc::new(AtomicBool::new(false));
+        let peer = tokio::spawn({
+            let writer = Arc::clone(&writer);
+            let rejected = Arc::clone(&rejected);
+            async move {
+                let nonces = Mutex::new(NonceWindow::new());
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let length = stream.read_u32().await.unwrap();
+                    let mut request = vec![0; length as usize];
+                    stream.read_exact(&mut request).await.unwrap();
+                    let (op, actor, _, _) = open_frame(key.as_bytes(), &request, &nonces).unwrap();
+                    assert_eq!(actor, 0);
+                    let reply = if matches!(op, db::ControlOp::RecordHourlyWebuiDrift { .. }) {
+                        rejected.store(true, Ordering::SeqCst);
+                        // The older writer cannot decode this operation.
+                        db::ControlReply::Failed {
+                            message: "write failed".into(),
+                            code: None,
+                        }
+                    } else {
+                        db::apply_control(&writer.db, None, op, None).await.unwrap()
+                    };
+                    let body = serde_json::to_vec(&reply).unwrap();
+                    stream.write_u32(body.len() as u32).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                }
+            }
+        });
+
+        let candidate = ComponentRelease {
+            source_sha: "c".repeat(40),
+            digest: format!("sha256:{}", "d".repeat(64)),
+            ..installed.clone()
+        };
+        let batch = hourly(&reader, Some(candidate.clone()), None).await;
+        assert!(rejected.load(Ordering::SeqCst));
+        assert!(batch.finished);
+        assert!(!batch.lease_held.contains("webui"));
+        let checked = db::component_update(&reader.db, "webui").await.unwrap();
+        assert_eq!(checked.candidate.as_ref(), Some(&candidate));
+        assert!(checked.check_error.is_none());
+        assert_eq!(checked.observed_at, Some(now));
+        assert_eq!(checked.state, "running");
+
+        // Exercise scheduled admission without publishing to Storage.
+        let now = checked.checked_at.unwrap();
+        record_running(&writer, "api", None, observation, now)
+            .await
+            .unwrap();
+        jmodguard_updater::compatible(&reader.db, &candidate, now)
+            .await
+            .unwrap();
+        let lease = "ab".repeat(16);
+        assert_eq!(
+            claim_any(Some(&reader), &reader.db, "webui", &lease, now, 600)
+                .await
+                .unwrap(),
+            db::UpdateLeaseStatus::Held
+        );
+        let queued: Option<ComponentRelease> = commit_typed(
+            &reader,
+            db::ControlOp::RequestDueAutomaticInstall {
+                component: "webui".into(),
+                expected_digest: candidate.digest.clone(),
+                now,
+                unattended_allowed: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(queued, Some(candidate.clone()));
+        let row = db::component_update(&reader.db, "webui").await.unwrap();
+        assert_eq!(row.desired, Some(candidate));
+        assert_eq!(row.state, "queued");
+        release_any(Some(&reader), &reader.db, "webui", &lease)
+            .await
+            .unwrap();
+        peer.abort();
+        assert!(peer.await.unwrap_err().is_cancelled());
+        drop(reader);
+        remove_test_db(writer, path);
     }
 
     #[tokio::test]
