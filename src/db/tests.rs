@@ -5326,6 +5326,29 @@ fn a_browser_rounded_legacy_velocity_limit_keeps_the_stored_value() {
 }
 
 #[test]
+fn saving_a_server_velocity_rule_as_global_keeps_its_legacy_limit() {
+    let tmp = tmp_db_path("legacy_velocity_promote");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        enroll_guild(&db, 123, 100).await.unwrap().unwrap();
+        let mut rule = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        // The server stores 1.0, which resolves to 8; a browser sends it as 1.
+        rule.params["max_messages"] = serde_json::json!(1.0);
+        old_writer_rule(&db, 123, "velocity", serde_json::to_value(&rule).unwrap()).await;
+        rule.params["max_messages"] = serde_json::json!(1);
+        save_rule_fixture(&db, "global-clear", "velocity", &rule)
+            .await
+            .unwrap();
+        let global = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        assert_eq!(global.params["max_messages"], serde_json::json!(1.0));
+        assert_eq!(crate::types::velocity_max_messages(&global.params), 8);
+        assert!(get_rule(&db, 123, "velocity").await.unwrap().is_none());
+    });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn everything_copy_keeps_a_legacy_velocity_limit() {
     let tmp = tmp_db_path("legacy_velocity_copy");
     let db = Db::open(&tmp, 2).unwrap();

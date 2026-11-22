@@ -383,11 +383,14 @@ fn rule_json_for_save_conn(
     Ok(serde_json::to_string(rule)?)
 }
 
-/// Compare a velocity save with the row it replaces, under the writer lock.
-/// A first guild override starts from the inherited global rule.
+/// Compare a velocity save with the stored rule the operator was shown,
+/// under the writer lock: the row it replaces, a first guild override's
+/// inherited global rule, and `shown_guild`'s row when a server rule is saved
+/// as global.
 fn validate_velocity_limit_conn(
     conn: &impl SqlExecutor,
     guild_id: i64,
+    shown_guild: Option<i64>,
     id: &str,
     rule: &mut RuleDef,
 ) -> Result<()> {
@@ -412,7 +415,11 @@ fn validate_velocity_limit_conn(
     if stored.is_none() && guild_id != GLOBAL_SCOPE {
         stored = stored_limit(GLOBAL_SCOPE)?;
     }
-    crate::image_spam::validate_velocity_limit(rule, stored.flatten().as_ref())
+    let mut candidates: Vec<serde_json::Value> = stored.flatten().into_iter().collect();
+    if let Some(shown_guild) = shown_guild {
+        candidates.extend(stored_limit(shown_guild)?.flatten());
+    }
+    crate::image_spam::validate_velocity_limit(rule, &candidates)
 }
 
 async fn upsert_rule_row(
@@ -428,7 +435,7 @@ async fn upsert_rule_row(
         let tx = conn.transaction_immediate()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
         let mut rule = rule.clone();
-        validate_velocity_limit_conn(&tx, guild_id, &id, &mut rule)?;
+        validate_velocity_limit_conn(&tx, guild_id, None, &id, &mut rule)?;
         let json = rule_json_for_save_conn(&tx, guild_id, &id, &rule)?;
         let saved = serde_json::from_str(&json)?;
         tx.execute_rows(
@@ -1924,7 +1931,8 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
         // The global target's check alone does not cover the guild write fence.
         guild.verify_conn(&tx)?;
         let mut rule = rule.clone();
-        validate_velocity_limit_conn(&tx, GLOBAL_SCOPE, &id, &mut rule)?;
+        // The editor showed the server's rule that this save clears.
+        validate_velocity_limit_conn(&tx, GLOBAL_SCOPE, Some(guild.guild_id()), &id, &mut rule)?;
         let json = rule_json_for_save_conn(&tx, GLOBAL_SCOPE, &id, &rule)?;
         let saved = serde_json::from_str(&json)?;
         tx.execute_rows(
