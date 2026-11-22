@@ -3,8 +3,9 @@
 use crate::http_client_builder;
 use crate::oci::{Registry, sha256_hex};
 use anyhow::{Context, Result, ensure};
-use jmodguard::db::ComponentRelease;
+use jmodguard::db::{ComponentRelease, UpdateControl};
 use reqwest::StatusCode;
+use std::collections::HashMap;
 use std::time::Duration;
 
 pub enum ReleaseVerification {
@@ -219,21 +220,37 @@ impl Storage {
         registry: &Registry,
         release: &ComponentRelease,
     ) -> Result<ReleaseVerification> {
-        ensure!(release.component == "webui", "not a WebUI release");
-        let prefix = format!("assets/releases/{}/", release.source_sha);
-        let destinations = [
-            "index.html".to_owned(),
-            "administration/index.html".to_owned(),
-            format!("{prefix}app.js"),
-            format!("{prefix}style.css"),
-            format!("{prefix}administration.js"),
-        ];
-        let package = destinations
-            .iter()
-            .map(|path| format!("webui/{path}"))
-            .collect::<Vec<_>>();
+        let (destinations, package) = release_paths(release)?;
         let request = package.iter().map(String::as_str).collect::<Vec<_>>();
         let expected = registry.files(release, &request).await?;
+        self.compare_release(&destinations, &package, &expected)
+            .await
+    }
+
+    /// Re-check the Storage files of the durably installed release. As with
+    /// launcher boot repair, the signature must still verify, but
+    /// `io.jmodguard.not-after` does not block this re-read.
+    pub async fn verify_installed_release(
+        &self,
+        registry: &Registry,
+        control: &UpdateControl,
+        release: &ComponentRelease,
+    ) -> Result<ReleaseVerification> {
+        let (destinations, package) = release_paths(release)?;
+        let request = package.iter().map(String::as_str).collect::<Vec<_>>();
+        let expected = registry
+            .files_for_installed_restore(control, release, &request)
+            .await?;
+        self.compare_release(&destinations, &package, &expected)
+            .await
+    }
+
+    async fn compare_release(
+        &self,
+        destinations: &[String],
+        package: &[String],
+        expected: &HashMap<String, Vec<u8>>,
+    ) -> Result<ReleaseVerification> {
         for (destination, source) in destinations.iter().zip(package.iter()) {
             let Some(actual) = self.get(destination).await? else {
                 return Ok(ReleaseVerification::Mismatch);
@@ -280,6 +297,25 @@ impl Storage {
         }
         Ok(())
     }
+}
+
+/// The five managed Storage destinations of a WebUI release and their paths
+/// inside the release image.
+fn release_paths(release: &ComponentRelease) -> Result<(Vec<String>, Vec<String>)> {
+    ensure!(release.component == "webui", "not a WebUI release");
+    let prefix = format!("assets/releases/{}/", release.source_sha);
+    let destinations = vec![
+        "index.html".to_owned(),
+        "administration/index.html".to_owned(),
+        format!("{prefix}app.js"),
+        format!("{prefix}style.css"),
+        format!("{prefix}administration.js"),
+    ];
+    let package = destinations
+        .iter()
+        .map(|path| format!("webui/{path}"))
+        .collect();
+    Ok((destinations, package))
 }
 
 fn is_managed(path: &str) -> bool {
@@ -428,5 +464,185 @@ mod tests {
                 .all(|path| path.starts_with(&format!("assets/releases/{sha}/")))
         );
         server.abort();
+    }
+
+    async fn serve(router: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (address, server)
+    }
+
+    async fn object(
+        State(objects): State<Arc<HashMap<String, Vec<u8>>>>,
+        uri: Uri,
+    ) -> (StatusCode, Vec<u8>) {
+        match objects.get(uri.path().rsplit('/').next().unwrap_or("")) {
+            Some(bytes) => (StatusCode::OK, bytes.clone()),
+            None => (StatusCode::NOT_FOUND, vec![]),
+        }
+    }
+
+    async fn stored(
+        State(files): State<Arc<HashMap<String, Vec<u8>>>>,
+        uri: Uri,
+    ) -> (StatusCode, Vec<u8>) {
+        match files.get(uri.path().trim_start_matches("/zone/")) {
+            Some(bytes) => (StatusCode::OK, bytes.clone()),
+            None => (StatusCode::NOT_FOUND, vec![]),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn installed_release_reverification_is_not_blocked_by_signature_expiry() {
+        use crate::signing_fixture::{SigningFixture, SigningKeyChoice};
+        use jmodguard::db::{Db, SqlExecutor, params};
+        let signing = SigningFixture::new();
+        signing.apply_env();
+        let mut release = ComponentRelease {
+            upgrade: None,
+            component: "webui".into(),
+            channel: "latest".into(),
+            release_id: "webui-fixture".into(),
+            source_sha: "c".repeat(40),
+            published_at: "2025-01-01T00:00:00Z".into(),
+            image: "ghcr.io/jatmn/jmodguard-webui".into(),
+            digest: String::new(),
+            min_schema: 15,
+            max_schema: 15,
+            result_schema: 15,
+            min_api: 1,
+            max_api: 1,
+            launcher_protocol: 1,
+            launcher: None,
+            base_abi: "static-webui-v1".into(),
+        };
+        let (destinations, package) = release_paths(&release).unwrap();
+        let mut layer = Vec::new();
+        {
+            let mut tar = tar::Builder::new(&mut layer);
+            for path in &package {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(path.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar.append_data(&mut header, path, path.as_bytes()).unwrap();
+            }
+            tar.finish().unwrap();
+        }
+        let config = serde_json::to_vec(&serde_json::json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {"Labels": {
+                "org.opencontainers.image.revision": release.source_sha,
+                "io.jmodguard.release-id": release.release_id,
+            }},
+        }))
+        .unwrap();
+        let digest = |bytes: &[u8]| format!("sha256:{}", sha256_hex(bytes));
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": digest(&config),
+                "size": config.len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                "digest": digest(&layer),
+                "size": layer.len(),
+            }],
+        }))
+        .unwrap();
+        release.digest = digest(&manifest);
+        let mut objects = HashMap::new();
+        objects.insert(digest(&config), config);
+        objects.insert(digest(&layer), layer);
+        objects.insert(release.digest.clone(), manifest);
+        // The signature's io.jmodguard.not-after has passed.
+        signing.sign(
+            &mut objects,
+            "webui",
+            &release.digest,
+            "2020-01-01T00:00:00Z",
+            SigningKeyChoice::Current,
+        );
+        let (registry_address, registry_server) = serve(
+            Router::new()
+                .fallback(any(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await;
+        let registry = Registry::new(&format!("http://{registry_address}")).unwrap();
+        let files = destinations
+            .iter()
+            .zip(&package)
+            .map(|(destination, source)| (destination.clone(), source.as_bytes().to_vec()))
+            .collect::<HashMap<_, _>>();
+        let (storage_address, storage_server) = serve(
+            Router::new()
+                .fallback(any(stored))
+                .with_state(Arc::new(files)),
+        )
+        .await;
+        let storage = Storage {
+            http: http_client_builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            root: format!("http://{storage_address}/zone"),
+            password: "zone-only-secret".into(),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "installed-webui-{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        let control = UpdateControl::from_application(&db);
+
+        // A new install still refuses the expired signature.
+        let fresh = storage.verify_release(&registry, &release).await;
+        assert_eq!(
+            crate::signature::signature_rejection_phrase(&fresh.err().unwrap()),
+            Some(crate::signature::EXPIRED_IMAGE_SIGNATURE)
+        );
+        // Expiry can be bypassed only for the durably installed release.
+        let uninstalled = storage
+            .verify_installed_release(&registry, &control, &release)
+            .await;
+        assert_eq!(
+            uninstalled.err().unwrap().to_string(),
+            "release is not installed"
+        );
+        let installed = serde_json::to_string(&release).unwrap();
+        db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "UPDATE component_updates SET installed=?1,installed_at=1 WHERE component='webui'",
+                params![installed],
+                128 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        match storage
+            .verify_installed_release(&registry, &control, &release)
+            .await
+            .unwrap()
+        {
+            ReleaseVerification::Verified {
+                root_hash,
+                admin_hash,
+            } => {
+                assert_eq!(root_hash, sha256_hex(package[0].as_bytes()));
+                assert_eq!(admin_hash, sha256_hex(package[1].as_bytes()));
+            }
+            ReleaseVerification::Mismatch => panic!("installed files match"),
+        }
+        registry_server.abort();
+        storage_server.abort();
+        drop(control);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }

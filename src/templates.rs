@@ -40,8 +40,9 @@ pub fn format_compact_duration(seconds: u64) -> String {
 fn release_status_icon(availability: &str) -> &'static str {
     match availability {
         "up to date" => "✅",
-        "update available" => "⬆️",
-        "no source update (image digest unverified)" => "⚠️",
+        "different source" => "↔️",
+        "source up to date (image digest differs)"
+        | "source up to date (image digest unverified)" => "⚠️",
         _ => "❓",
     }
 }
@@ -58,6 +59,36 @@ fn running_short_sha(item: &crate::db::ComponentUpdate) -> Option<String> {
     is_ascii_hex_sha40(sha).then(|| sha[..7].to_string())
 }
 
+fn release_check_failure(error: &str) -> String {
+    // Persisted errors can contain provider details. Render only a known
+    // reason or a status code from the registry and reqwest error formats.
+    // Errors are persisted as `{error:#}` chains joined by ": ", so classify
+    // the root cause, for example the "operation timed out" under reqwest's
+    // "error sending request".
+    let error = error.rsplit(": ").next().unwrap_or(error);
+    let status = error
+        .strip_prefix("registry returned HTTP ")
+        .or_else(|| error.strip_prefix("HTTP status client error ("))
+        .or_else(|| error.strip_prefix("HTTP status server error ("))
+        .and_then(|rest| rest.split([' ', ')']).next())
+        .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|code| code.parse::<u16>().ok())
+        .filter(|code| (100..=599).contains(code));
+    if let Some(status) = status {
+        return format!("check failed (HTTP {status})");
+    }
+    let reason = match error {
+        "release lookup timed out" | "operation timed out" => "timeout",
+        "unsupported base ABI" => "unsupported image ABI",
+        "unsigned image"
+        | "bad image signature"
+        | "expired image signature"
+        | "image signature used an untrusted key" => error,
+        _ => "release source error",
+    };
+    format!("check failed ({reason})")
+}
+
 fn release_status_reason(
     item: &crate::db::ComponentUpdate,
     component: &str,
@@ -66,8 +97,8 @@ fn release_status_reason(
     if component == "webui" && item.installed.is_none() && item.desired.is_none() {
         return Some("webui not managed by updater".into());
     }
-    if item.check_error.is_some() {
-        return Some("check failed".into());
+    if let Some(error) = item.check_error.as_deref() {
+        return Some(release_check_failure(error));
     }
     if item.candidate.is_none()
         || item
@@ -203,6 +234,7 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
             attention = true;
             continue;
         };
+        let storage_drift = component == "webui" && item.state == "drift";
         let observation_fresh = item
             .observed_at
             .is_some_and(|at| now.saturating_sub(at) <= 7200)
@@ -236,6 +268,11 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
                 short_sha.as_deref()
             };
             let age_for_line = if webui_unmanaged { None } else { age_clause };
+            let reason = if storage_drift && !webui_unmanaged {
+                format!("Storage drift · {reason}")
+            } else {
+                reason
+            };
             lines.push(release_status_line(
                 component,
                 sha_for_line,
@@ -244,9 +281,19 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
             ));
             continue;
         }
+        // The channel check is fresh here, so its build stays visible even
+        // when the running build cannot be compared with it.
+        let candidate = item
+            .candidate
+            .as_ref()
+            .filter(|release| is_ascii_hex_sha40(&release.source_sha));
+        let channel_build =
+            candidate.map(|release| format!("{} `{}`", release.channel, &release.source_sha[..7]));
         if !observation_fresh {
-            let reason = if item.observed_at.is_none() {
-                "unknown".into()
+            let reason = if storage_drift {
+                "Storage drift".to_string()
+            } else if item.observed_at.is_none() {
+                "unknown".to_string()
             } else {
                 let hours = item
                     .observed_at
@@ -254,8 +301,12 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
                     .unwrap_or(0);
                 format!("observation stale ({hours}h)")
             };
+            let tail = match &channel_build {
+                Some(build) => format!("{reason} · {build}"),
+                None => reason,
+            };
             attention = true;
-            lines.push(release_status_line(component, None, None, reason));
+            lines.push(release_status_line(component, None, None, tail));
             continue;
         }
         let running_source = item
@@ -263,36 +314,49 @@ fn release_status_lines(updates: &[crate::db::ComponentUpdate], now: i64) -> (St
             .as_ref()
             .map(|observed| observed.source_sha.as_str())
             .filter(|sha| is_ascii_hex_sha40(sha));
-        let availability = if let Some(candidate) = &item.candidate {
-            if item
-                .installed
-                .as_ref()
-                .is_some_and(|installed| installed.digest == candidate.digest)
-                && running_source == Some(candidate.source_sha.as_str())
-            {
-                "up to date"
-            } else if component != "webui"
-                && item.installed.is_none()
-                && item
+        let availability = if let Some(candidate) = candidate {
+            let same_source = running_source == Some(candidate.source_sha.as_str());
+            // The installed digest describes the running image only when the
+            // observation identifies that managed build. A built-in fallback
+            // runs its baked source (`source_sha == base_image_sha`) while the
+            // installed release is retained, and a same-source managed build
+            // looks the same. WebUI observations come from verified readback.
+            let running_managed = component == "webui"
+                || item
                     .observed
                     .as_ref()
-                    .is_some_and(|observed| observed.source_sha == observed.base_image_sha)
-                && running_source == Some(candidate.source_sha.as_str())
-            {
-                "no source update (image digest unverified)"
-            } else if running_source.is_some_and(|sha| sha != candidate.source_sha.as_str()) {
-                "update available"
+                    .is_some_and(|observed| observed.source_sha != observed.base_image_sha);
+            let installed_digest = item
+                .installed
+                .as_ref()
+                .filter(|installed| {
+                    running_managed && running_source == Some(installed.source_sha.as_str())
+                })
+                .map(|installed| installed.digest.as_str());
+            if same_source && installed_digest == Some(candidate.digest.as_str()) {
+                "up to date"
+            } else if same_source && installed_digest.is_some() {
+                // The channel was republished at the running source.
+                "source up to date (image digest differs)"
+            } else if same_source {
+                // No installed digest identifies the running image.
+                "source up to date (image digest unverified)"
+            } else if running_source.is_some() {
+                // A channel can be republished from older source, so a
+                // different SHA does not say which build is newer.
+                "different source"
             } else {
-                "not checked"
+                "running build unknown"
             }
         } else {
             "not checked"
         };
         attention |= availability != "up to date";
-        let tail = if availability == "not checked" {
-            "not checked".to_string()
-        } else {
-            release_status_icon(availability).to_string()
+        let icon = release_status_icon(availability);
+        // Name the channel build the running build was compared with.
+        let tail = match &channel_build {
+            Some(build) => format!("{build} · {availability} {icon}"),
+            None => availability.into(),
         };
         lines.push(release_status_line(
             component,
@@ -1226,9 +1290,9 @@ mod presentation_tests {
         assert_eq!(
             releases,
             [
-                "**bot:** `abcdef0` · `installed 4m 10s` · ✅",
-                "**api:** `abcdef0` · `installed 4m 10s` · ✅",
-                "**webui:** `abcdef0` · `installed 4m 10s` · ✅",
+                "**bot:** `abcdef0` · `installed 4m 10s` · latest `abcdef0` · up to date ✅",
+                "**api:** `abcdef0` · `installed 4m 10s` · latest `abcdef0` · up to date ✅",
+                "**webui:** `abcdef0` · `installed 4m 10s` · latest `abcdef0` · up to date ✅",
             ]
         );
         assert_eq!(
@@ -1391,18 +1455,18 @@ mod presentation_tests {
         };
         let fresh = release_text(&[row.clone()], 1100);
         assert!(fresh.contains("`aaaaaaa`"));
-        assert!(fresh.contains("⬆️"));
-        assert!(!fresh.contains("update available"));
+        assert!(fresh.contains("stable `bbbbbbb` · different source ↔️"));
+        assert!(!fresh.contains("update"));
         row.channel = "nightly".into();
         let wrong_channel = release_text(&[row.clone()], 1100);
-        assert!(!wrong_channel.contains("update available"));
+        assert!(!wrong_channel.contains("different source"));
         let wrong_api = wrong_channel
             .lines()
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
         assert!(wrong_api.contains("not checked"), "{wrong_api}");
         assert!(!wrong_api.contains('❓'), "{wrong_api}");
-        assert!(!wrong_api.contains("⬆️"), "{wrong_api}");
+        assert!(!wrong_api.contains("↔️"), "{wrong_api}");
         assert!(wrong_channel.contains("**bot:** not checked"));
         assert!(wrong_channel.contains("**webui:** not checked"));
         row.channel = "stable".into();
@@ -1414,10 +1478,12 @@ mod presentation_tests {
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
         assert!(api_line.ends_with("⚠️"), "{api_line}");
-        assert!(!baked_current.contains("no source update"));
+        assert!(
+            api_line.contains("stable `aaaaaaa` · source up to date (image digest unverified)")
+        );
         row.channel = "nightly".into();
         let wrong_channel_current = release_text(&[row.clone()], 1100);
-        assert!(!wrong_channel_current.contains("no source update"));
+        assert!(!wrong_channel_current.contains("source up to date"));
         row.channel = "stable".into();
         // Source comparisons still use the full SHA, even when prefixes match.
         let mut same_prefix = row.clone();
@@ -1425,7 +1491,7 @@ mod presentation_tests {
         let out = release_text(&[same_prefix], 1100);
         assert!(
             out.lines()
-                .any(|line| line.starts_with("**api:**") && line.ends_with("⬆️"))
+                .any(|line| line.starts_with("**api:**") && line.ends_with("↔️"))
         );
 
         for component in ["bot", "api", "webui"] {
@@ -1581,8 +1647,8 @@ mod presentation_tests {
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
         assert!(api.contains("not checked"), "{api}");
-        assert!(!api.contains("⬆️"), "{api}");
-        assert!(!api.contains("update available"), "{api}");
+        assert!(!api.contains("↔️"), "{api}");
+        assert!(!api.contains("different source"), "{api}");
 
         let missing = release_text(&[], 1_000);
         for component in ["bot", "api", "webui"] {
@@ -1632,7 +1698,7 @@ mod presentation_tests {
             .lines()
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
-        assert!(api.ends_with("⬆️") || api.ends_with('✅'), "{api}");
+        assert!(api.ends_with("↔️") || api.ends_with('✅'), "{api}");
         assert!(!api.contains("check stale"), "{api}");
 
         let row = sample_api_update_row(
@@ -1689,26 +1755,45 @@ mod presentation_tests {
     }
 
     #[test]
-    fn status_says_check_failed_when_check_error_is_set() {
+    fn status_shows_only_a_safe_reason_when_a_release_check_fails() {
         let source = "abcdef0123456789abcdef0123456789abcdef01";
-        let row = sample_api_update_row(
-            Some(sample_candidate("latest", source, &"b".repeat(64))),
-            Some(1_100),
-            Some("registry returned HTTP 429".into()),
-            Some(sample_observed(source)),
-            Some(1_000),
-            "latest",
-        );
-        let out = release_text(&[row], 1_200);
-        let api = out
-            .lines()
-            .find(|line| line.starts_with("**api:**"))
-            .unwrap();
-        assert!(api.contains("`abcdef0`"), "{api}");
-        assert!(api.contains("check failed"), "{api}");
-        assert!(!api.contains('✅'), "{api}");
-        assert!(!api.contains("⬆️"), "{api}");
-        assert!(!api.contains('❓'), "{api}");
+        for (error, reason) in [
+            ("registry returned HTTP 429 Too Many Requests", "HTTP 429"),
+            (
+                "HTTP status server error (503 Service Unavailable)",
+                "HTTP 503",
+            ),
+            ("release lookup timed out", "timeout"),
+            // reqwest timeouts as persisted through `{error:#}`.
+            ("error sending request: operation timed out", "timeout"),
+            (
+                "request or response body error: operation timed out",
+                "timeout",
+            ),
+            ("unsupported base ABI", "unsupported image ABI"),
+            (
+                "registry returned HTTP 429123 at https://private.example/192.0.2.1",
+                "release source error",
+            ),
+        ] {
+            let row = sample_api_update_row(
+                Some(sample_candidate("latest", source, &"b".repeat(64))),
+                Some(1_100),
+                Some(error.into()),
+                Some(sample_observed(source)),
+                Some(1_000),
+                "latest",
+            );
+            let out = release_text(&[row], 1_200);
+            let api = out
+                .lines()
+                .find(|line| line.starts_with("**api:**"))
+                .unwrap();
+            assert_eq!(
+                api,
+                format!("**api:** `abcdef0` · `first seen 5m` · check failed ({reason})")
+            );
+        }
     }
 
     #[test]
@@ -1791,7 +1876,10 @@ mod presentation_tests {
             .lines()
             .find(|line| line.starts_with("**webui:**"))
             .unwrap();
-        assert!(webui.ends_with("⬆️"), "{webui}");
+        assert!(
+            webui.ends_with("latest `ccccccc` · different source ↔️"),
+            "{webui}"
+        );
         assert!(!webui.contains("webui not managed by updater"), "{webui}");
 
         let mut api = sample_api_update_row(
@@ -1816,6 +1904,43 @@ mod presentation_tests {
     }
 
     #[test]
+    fn status_reports_confirmed_webui_storage_drift() {
+        let source = "abcdef0123456789abcdef0123456789abcdef01";
+        let mut release = sample_candidate("latest", source, &"b".repeat(64));
+        release.component = "webui".into();
+        let mut row = sample_api_update_row(
+            Some(release.clone()),
+            Some(1_100),
+            None,
+            None,
+            None,
+            "latest",
+        );
+        row.component = "webui".into();
+        row.installed = Some(release);
+        let webui_line = |row: &crate::db::ComponentUpdate| {
+            release_text(std::slice::from_ref(row), 1_200)
+                .lines()
+                .find(|line| line.starts_with("**webui:**"))
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(webui_line(&row), "**webui:** unknown · latest `abcdef0`");
+
+        row.state = "drift".into();
+        assert_eq!(
+            webui_line(&row),
+            "**webui:** Storage drift · latest `abcdef0`"
+        );
+
+        row.check_error = Some("registry returned HTTP 503".into());
+        assert_eq!(
+            webui_line(&row),
+            "**webui:** Storage drift · check failed (HTTP 503)"
+        );
+    }
+
+    #[test]
     fn status_wont_claim_up_to_date_from_stale_observation_with_fresh_check() {
         let running = "a".repeat(40);
         let candidate_source = "b".repeat(40);
@@ -1837,11 +1962,11 @@ mod presentation_tests {
             .unwrap();
         assert!(api.contains("observation stale (2h)"), "{api}");
         assert!(!api.ends_with('✅'), "{api}");
-        assert!(!api.contains("⬆️"), "{api}");
+        assert!(!api.contains("↔️"), "{api}");
     }
 
     #[test]
-    fn status_shows_the_running_short_sha_after_a_fresh_check() {
+    fn status_compares_running_and_published_builds_after_a_fresh_check() {
         let source = "abcdef0123456789abcdef0123456789abcdef01";
         let candidate = sample_candidate("latest", source, &"b".repeat(64));
         let mut row = sample_api_update_row(
@@ -1859,13 +1984,13 @@ mod presentation_tests {
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
         assert!(api.contains("`abcdef0`"), "{api}");
-        assert!(api.ends_with('✅'), "{api}");
+        assert!(api.ends_with("latest `abcdef0` · up to date ✅"), "{api}");
         assert!(!api.contains("not checked"), "{api}");
         assert!(!api.contains("check stale"), "{api}");
         assert!(!api.contains("check failed"), "{api}");
         assert!(!api.contains('❓'), "{api}");
 
-        let running = "abcdef0123456789abcdef0123456789abcdef00";
+        let running = "1234567890abcdef1234567890abcdef12345678";
         let row = sample_api_update_row(
             Some(sample_candidate("latest", source, &"b".repeat(64))),
             Some(1_100),
@@ -1879,9 +2004,111 @@ mod presentation_tests {
             .lines()
             .find(|line| line.starts_with("**api:**"))
             .unwrap();
-        assert!(api.contains("`abcdef0`"), "{api}");
-        assert!(!api.contains("`abcdef1`"), "{api}");
-        assert!(api.ends_with("⬆️"), "{api}");
+        assert!(api.starts_with("**api:** `1234567`"), "{api}");
+        assert!(
+            api.ends_with("latest `abcdef0` · different source ↔️"),
+            "{api}"
+        );
+
+        // The channel was republished at the running source with a new digest.
+        let mut row = sample_api_update_row(
+            Some(sample_candidate("latest", source, &"b".repeat(64))),
+            Some(1_100),
+            None,
+            Some(sample_observed(source)),
+            Some(1_000),
+            "latest",
+        );
+        row.installed = Some(sample_candidate("latest", source, &"e".repeat(64)));
+        let out = release_text(&[row], 1_200);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(
+            api.ends_with("latest `abcdef0` · source up to date (image digest differs) ⚠️"),
+            "{api}"
+        );
+        assert!(!api.contains("not checked"), "{api}");
+
+        // A built-in fallback binary runs the candidate source while the
+        // installed release names other source, so its digest is unknown.
+        let mut row = sample_api_update_row(
+            Some(sample_candidate("latest", source, &"b".repeat(64))),
+            Some(1_100),
+            None,
+            Some(sample_observed(source)),
+            Some(1_000),
+            "latest",
+        );
+        row.observed.as_mut().unwrap().base_image_sha = source.into();
+        row.installed = Some(sample_candidate("latest", &"e".repeat(40), &"e".repeat(64)));
+        let out = release_text(&[row], 1_200);
+        let api = out
+            .lines()
+            .find(|line| line.starts_with("**api:**"))
+            .unwrap();
+        assert!(
+            api.ends_with("latest `abcdef0` · source up to date (image digest unverified) ⚠️"),
+            "{api}"
+        );
+
+        // After a same-source rebuild, a baked fallback and the retained
+        // managed install share the source, so the retained digest does not
+        // identify the running image either way.
+        for retained in ["b", "e"] {
+            let mut row = sample_api_update_row(
+                Some(sample_candidate("latest", source, &"b".repeat(64))),
+                Some(1_100),
+                None,
+                Some(sample_observed(source)),
+                Some(1_000),
+                "latest",
+            );
+            row.observed.as_mut().unwrap().base_image_sha = source.into();
+            row.installed = Some(sample_candidate("latest", source, &retained.repeat(64)));
+            let out = release_text(&[row], 1_200);
+            let api = out
+                .lines()
+                .find(|line| line.starts_with("**api:**"))
+                .unwrap();
+            assert!(
+                api.ends_with("latest `abcdef0` · source up to date (image digest unverified) ⚠️"),
+                "{retained}: {api}"
+            );
+        }
+
+        // A fresh channel result stays visible when the running build cannot
+        // be compared with it, and nothing claims that the builds match.
+        let fresh = |observed: Option<crate::db::ComponentObservation>, observed_at| {
+            let row = sample_api_update_row(
+                Some(sample_candidate("latest", source, &"b".repeat(64))),
+                Some(9_000),
+                None,
+                observed,
+                observed_at,
+                "latest",
+            );
+            release_text(&[row], 9_100)
+                .lines()
+                .find(|line| line.starts_with("**api:**"))
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            fresh(Some(sample_observed(source)), Some(1_000)),
+            "**api:** observation stale (2h) · latest `abcdef0`"
+        );
+        assert_eq!(fresh(None, None), "**api:** unknown · latest `abcdef0`");
+        // A managed build at the candidate source without an installed record.
+        assert!(
+            fresh(Some(sample_observed(source)), Some(9_000))
+                .ends_with("latest `abcdef0` · source up to date (image digest unverified) ⚠️")
+        );
+        assert!(
+            fresh(Some(sample_observed("not-a-source-sha")), Some(9_000))
+                .ends_with("latest `abcdef0` · running build unknown ❓")
+        );
     }
 
     #[test]

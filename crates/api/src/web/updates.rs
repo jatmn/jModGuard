@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use jmodguard::db::{self, ComponentObservation, ComponentRelease, Db};
 use jmodguard_updater::http_client_builder;
 use jmodguard_updater::oci::{Registry, sha256_hex};
-use jmodguard_updater::storage::Storage;
+use jmodguard_updater::storage::{ReleaseVerification, Storage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -80,9 +80,27 @@ async fn record_running(
 async fn record_verified(
     app: &ApiState,
     release: &ComponentRelease,
-    observation: ComponentObservation,
-    now: i64,
+    previous: Option<&ComponentObservation>,
+    root_hash: String,
+    admin_hash: String,
 ) -> anyhow::Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    let observation = ComponentObservation {
+        guild_schema: None,
+        update_protocol: 0,
+        launcher_revision: 0,
+        baked_launcher_revision: 0,
+        source_sha: release.source_sha.clone(),
+        executable_sha256: root_hash,
+        admin_sha256: Some(admin_hash),
+        base_image_sha: "Storage Zone".into(),
+        started_at: previous.map_or(now, |seen| seen.started_at),
+        min_schema: release.min_schema,
+        max_schema: release.max_schema,
+        api_capability: 1,
+        self_update_enabled: true,
+        base_abi: "static-webui-v1".into(),
+    };
     if app.db.is_read_only() {
         commit_typed(
             app,
@@ -96,6 +114,19 @@ async fn record_verified(
     } else {
         db::record_webui_installed_verified(&app.db, release, observation, now).await
     }
+}
+
+async fn record_webui_drift(app: &ApiState) -> anyhow::Result<()> {
+    let error = "Storage files differ from the installed release";
+    // Both checks use the guarded wire operation. Older bot writers cannot
+    // clear drift for an activated release that still has a desired selection.
+    via_bot!(
+        app,
+        db::record_webui_drift(&app.db, error),
+        db::ControlOp::RecordHourlyWebuiDrift {
+            error: error.to_owned(),
+        }
+    )
 }
 
 async fn commit_typed<T: serde::de::DeserializeOwned>(
@@ -500,6 +531,21 @@ pub async fn check_one(
     app: &Arc<ApiState>,
     component: &str,
 ) -> anyhow::Result<db::ComponentUpdate> {
+    check_one_with(
+        app,
+        component,
+        async |component, channel| Registry::ghcr()?.discover(component, channel).await,
+        async |adopt_desired| reconcile_webui(app, adopt_desired).await,
+    )
+    .await
+}
+
+async fn check_one_with(
+    app: &Arc<ApiState>,
+    component: &str,
+    discover: impl AsyncFnOnce(&str, &str) -> anyhow::Result<ComponentRelease>,
+    reconcile: impl AsyncFnOnce(bool) -> anyhow::Result<bool>,
+) -> anyhow::Result<db::ComponentUpdate> {
     let lease = format!("{:032x}", rand::random::<u128>());
     let now = chrono::Utc::now().timestamp();
     if claim_any(Some(app), &app.db, component, &lease, now, 240).await?
@@ -509,64 +555,51 @@ pub async fn check_one(
     }
     with_update_lease(Some(app), &app.db, component, &lease, 240, async {
         let state = db::component_update(&app.db, component).await?;
-        let registry = Registry::ghcr()?;
-        let checked = match registry.discover(component, &state.channel).await {
-            Ok(candidate) => via_bot!(
-                app,
-                db::record_update_check(
-                    &app.db,
+        let checked = match discover(component, &state.channel).await {
+            Ok(candidate) => {
+                record_release_check(app, component, &state.channel, Some(candidate), None, now)
+                    .await?
+            }
+            Err(error) => {
+                record_release_check(
+                    app,
                     component,
                     &state.channel,
-                    Some(candidate.clone()),
                     None,
+                    Some(format!("{error:#}")),
                     now,
-                ),
-                db::ControlOp::RecordUpdateCheck {
-                    component: component.to_owned(),
-                    channel: state.channel.clone(),
-                    candidate: Some(candidate),
-                    error: None,
-                    now,
+                )
+                .await?;
+                // Channel discovery authorizes new candidates. A failed
+                // lookup still permits a signed readback of the installed digest.
+                if component == "webui"
+                    && let Err(error) = reconcile(false).await
+                {
+                    tracing::warn!("WebUI Storage reconciliation failed: {error:#}");
                 }
-            )?,
-            Err(error) => {
-                let message = format!("{error:#}");
-                via_bot!(
-                    app,
-                    db::record_update_check(
-                        &app.db,
-                        component,
-                        &state.channel,
-                        None,
-                        Some(message.clone()),
-                        now,
-                    ),
-                    db::ControlOp::RecordUpdateCheck {
-                        component: component.to_owned(),
-                        channel: state.channel.clone(),
-                        candidate: None,
-                        error: Some(message),
-                        now,
-                    }
-                )?;
                 return Err(error);
             }
         };
         if component == "webui" {
-            match reconcile_webui(app).await {
-                Ok(()) => {
-                    if let Some(desired) = checked.desired.clone() {
+            let wrote_webui = match reconcile(true).await {
+                Ok(wrote_observation) => match (checked.state.as_str(), checked.desired.as_ref()) {
+                    ("queued", Some(desired)) => {
                         via_bot!(
                             app,
-                            db::settle_interrupted_webui(&app.db, &desired),
+                            db::settle_interrupted_webui(&app.db, desired),
                             db::ControlOp::SettleInterruptedWebui {
                                 release: desired.clone(),
                             }
                         )?;
+                        true
                     }
+                    _ => wrote_observation,
+                },
+                Err(error) => {
+                    tracing::warn!("WebUI Storage reconciliation failed: {error:#}");
+                    false
                 }
-                Err(error) => tracing::warn!("WebUI Storage reconciliation failed: {error:#}"),
-            }
+            };
             if let Err(error) = retry_pending_purge(
                 app,
                 |name| std::env::var(name).ok(),
@@ -581,6 +614,11 @@ pub async fn check_one(
                 && let Err(error) = cleanup_webui_assets(app, &storage).await
             {
                 tracing::warn!("WebUI managed asset cleanup failed: {error:#}");
+            }
+            if wrote_webui {
+                // The discovery receipt predates reconciliation. Read the
+                // primary while the lease still protects its committed state.
+                return db::component_update(&app.db, component).await;
             }
         }
         Ok(checked)
@@ -640,12 +678,58 @@ where
     result
 }
 
-async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
+async fn reconcile_webui(app: &Arc<ApiState>, adopt_desired: bool) -> anyhow::Result<bool> {
+    let storage = &storage()?;
+    reconcile_webui_with(
+        app,
+        adopt_desired,
+        |path| storage.get(path),
+        |release| async move { storage.verify_release(&Registry::ghcr()?, &release).await },
+        |release| async move {
+            storage
+                .verify_installed_release(
+                    &Registry::ghcr()?,
+                    &db::UpdateControl::from_application(&app.db),
+                    &release,
+                )
+                .await
+        },
+    )
+    .await
+}
+
+/// Returns whether reconciliation successfully wrote the WebUI row.
+async fn reconcile_webui_with<Read, Desired, Installed>(
+    app: &ApiState,
+    adopt_desired: bool,
+    read: impl Fn(&'static str) -> Read,
+    verify_desired: impl Fn(ComponentRelease) -> Desired,
+    verify_installed: impl Fn(ComponentRelease) -> Installed,
+) -> anyhow::Result<bool>
+where
+    Read: Future<Output = anyhow::Result<Option<Vec<u8>>>> + Send,
+    Desired: Future<Output = anyhow::Result<ReleaseVerification>> + Send,
+    Installed: Future<Output = anyhow::Result<ReleaseVerification>> + Send,
+{
     let state = db::component_update(&app.db, "webui").await?;
-    let storage = storage()?;
-    let root = storage.get("index.html").await?;
-    let admin = storage.get("administration/index.html").await?;
-    if let Some(release) = state.desired.as_ref() {
+    let html = if adopt_desired {
+        Some((
+            read("index.html").await?,
+            read("administration/index.html").await?,
+        ))
+    } else {
+        None
+    };
+    // Only a switch to a different digest can prove that a desired release
+    // was activated. Channel aliases can name the same installed image.
+    if let Some((root, admin)) = html
+        && let Some(release) = state.desired.as_ref().filter(|desired| {
+            state
+                .installed
+                .as_ref()
+                .is_none_or(|installed| desired.digest != installed.digest)
+        })
+    {
         let prefix = format!("/assets/releases/{}/", release.source_sha);
         if root.as_ref().is_some_and(|bytes| {
             bytes
@@ -655,83 +739,66 @@ async fn reconcile_webui(app: &Arc<ApiState>) -> anyhow::Result<()> {
             bytes
                 .windows(prefix.len())
                 .any(|part| part == prefix.as_bytes())
-        }) {
-            let registry = Registry::ghcr()?;
-            if let jmodguard_updater::storage::ReleaseVerification::Verified {
-                root_hash,
-                admin_hash,
-            } = storage.verify_release(&registry, release).await?
-            {
-                record_running(
-                    app,
-                    "webui",
-                    Some(release.clone()),
-                    ComponentObservation {
-                        guild_schema: None,
-                        update_protocol: 0,
-                        launcher_revision: 0,
-                        baked_launcher_revision: 0,
-                        source_sha: release.source_sha.clone(),
-                        executable_sha256: root_hash,
-                        admin_sha256: Some(admin_hash),
-                        base_image_sha: "Storage Zone".into(),
-                        started_at: chrono::Utc::now().timestamp(),
-                        min_schema: release.min_schema,
-                        max_schema: release.max_schema,
-                        api_capability: 1,
-                        self_update_enabled: true,
-                        base_abi: "static-webui-v1".into(),
-                    },
-                    chrono::Utc::now().timestamp(),
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-    }
-    if let Some(installed) = state.installed.as_ref() {
-        let registry = Registry::ghcr()?;
-        if let jmodguard_updater::storage::ReleaseVerification::Verified {
+        }) && let ReleaseVerification::Verified {
             root_hash,
             admin_hash,
-        } = storage.verify_release(&registry, installed).await?
+        } = verify_desired(release.clone()).await?
         {
-            let now = chrono::Utc::now().timestamp();
-            record_verified(
+            record_running(
                 app,
-                installed,
+                "webui",
+                Some(release.clone()),
                 ComponentObservation {
                     guild_schema: None,
                     update_protocol: 0,
                     launcher_revision: 0,
                     baked_launcher_revision: 0,
-                    source_sha: installed.source_sha.clone(),
+                    source_sha: release.source_sha.clone(),
                     executable_sha256: root_hash,
                     admin_sha256: Some(admin_hash),
                     base_image_sha: "Storage Zone".into(),
-                    started_at: state.observed.as_ref().map_or(now, |seen| seen.started_at),
-                    min_schema: installed.min_schema,
-                    max_schema: installed.max_schema,
+                    started_at: chrono::Utc::now().timestamp(),
+                    min_schema: release.min_schema,
+                    max_schema: release.max_schema,
                     api_capability: 1,
                     self_update_enabled: true,
                     base_abi: "static-webui-v1".into(),
                 },
-                now,
+                chrono::Utc::now().timestamp(),
             )
             .await?;
-            return Ok(());
+            return Ok(true);
         }
     }
-    if state.observed.is_some() {
-        via_bot!(
+    let observation_write = if let Some(installed) = state.installed.as_ref()
+        && let ReleaseVerification::Verified {
+            root_hash,
+            admin_hash,
+        } = verify_installed(installed.clone()).await?
+    {
+        record_verified(
             app,
-            db::record_webui_drift(&app.db, "Storage files differ from the installed release"),
-            db::ControlOp::RecordWebuiDrift {
-                error: "Storage files differ from the installed release".to_owned(),
-            }
-        )?;
+            installed,
+            state.observed.as_ref(),
+            root_hash,
+            admin_hash,
+        )
+        .await
+        .context("recording verified WebUI observation")
+    } else if state.observed.is_some() {
+        record_webui_drift(app)
+            .await
+            .context("recording WebUI Storage drift")
+    } else {
+        return Ok(false);
+    };
+    // Storage reconciliation is complete. Optional observation writes must
+    // not prevent the caller from settling an abandoned install.
+    if let Err(error) = observation_write {
+        tracing::warn!("WebUI observation write failed: {error:#}");
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn cleanup_webui_assets(app: &Arc<ApiState>, storage: &Storage) -> anyhow::Result<()> {
@@ -799,7 +866,7 @@ async fn record_release_check(
     candidate: Option<ComponentRelease>,
     error: Option<String>,
     now: i64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<db::ComponentUpdate> {
     via_bot!(
         app,
         db::record_update_check(
@@ -817,17 +884,44 @@ async fn record_release_check(
             error,
             now,
         }
-    )?;
-    Ok(())
+    )
 }
 
 /// Record configured-channel digest lookups through the bot writer. Discovery is
 /// injected so tests do not call the registry.
 pub async fn record_release_checks<F>(
     app: &Arc<ApiState>,
+    discover: F,
+    lookup_timeout: Duration,
+    shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+) -> ReleaseCheckBatch
+where
+    F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
+{
+    record_release_checks_with(
+        app,
+        discover,
+        lookup_timeout,
+        shutdown,
+        async |database, installed| {
+            storage()?
+                .verify_installed_release(
+                    &Registry::ghcr()?,
+                    &db::UpdateControl::from_application(database),
+                    installed,
+                )
+                .await
+        },
+    )
+    .await
+}
+
+async fn record_release_checks_with<F>(
+    app: &Arc<ApiState>,
     mut discover: F,
     lookup_timeout: Duration,
     mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+    verify_webui: impl AsyncFn(&Db, &ComponentRelease) -> anyhow::Result<ReleaseVerification>,
 ) -> ReleaseCheckBatch
 where
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
@@ -867,58 +961,72 @@ where
                 outcome = timeout(lookup_timeout, discover(component, &channel)) => outcome,
             };
             let now = chrono::Utc::now().timestamp();
-            match outcome {
-                Err(_) => {
-                    record_release_check(
-                        app,
-                        component,
-                        &channel,
-                        None,
-                        Some("release lookup timed out".into()),
-                        now,
-                    )
-                    .await
-                    .inspect_err(|error| warn_record_release_check(component, error))?;
-                }
-                Ok(Err(error)) => {
-                    let message = format!("{error:#}");
-                    record_release_check(app, component, &channel, None, Some(message), now)
-                        .await
-                        .inspect_err(|error| warn_record_release_check(component, error))?;
-                }
+            let record = match outcome {
+                Err(_) => Err("release lookup timed out".into()),
+                Ok(Err(error)) => Err(format!("{error:#}")),
                 Ok(Ok(release)) => {
-                    let record = if let Err(error) = release.validate() {
+                    if let Err(error) = release.validate() {
                         Err(format!("{error:#}"))
                     } else if release.component != component || release.channel != channel {
                         Err("candidate component or channel mismatch".into())
                     } else {
                         Ok(release)
+                    }
+                }
+            };
+            let (candidate, error) = match record {
+                Ok(release) => (Some(release), None),
+                Err(message) => (None, Some(message)),
+            };
+            let current = record_release_check(app, component, &channel, candidate, error, now)
+                .await
+                .inspect_err(|error| warn_record_release_check(component, error))?;
+            if component == "webui" {
+                // Refresh the installed bytes even if the moving tag lookup
+                // failed. Keep readback under the same lease as publication.
+                if let Some(installed) = current.installed.as_ref() {
+                    let refresh = tokio::select! {
+                        biased;
+                        _ = &mut shutdown => anyhow::bail!("release check shutdown"),
+                        result = timeout(RELEASE_LOOKUP_TIMEOUT, verify_webui(&app.db, installed)) => result,
                     };
-                    match record {
-                        Ok(release) => {
-                            record_release_check(
-                                app,
-                                component,
-                                &channel,
-                                Some(release),
-                                None,
-                                now,
-                            )
-                            .await
-                            .inspect_err(|error| warn_record_release_check(component, error))?;
+                    let observation_result = match refresh {
+                        Ok(Ok(ReleaseVerification::Verified {
+                            root_hash,
+                            admin_hash,
+                        })) => record_verified(
+                            app,
+                            installed,
+                            current.observed.as_ref(),
+                            root_hash,
+                            admin_hash,
+                        )
+                        .await
+                        .context("recording verified WebUI observation"),
+                        Ok(Ok(ReleaseVerification::Mismatch)) => {
+                            // A definite mismatch invalidates the verified
+                            // observation, as manual reconciliation does. A
+                            // queued or failed request keeps its state and error
+                            // for the manual check that adopts or settles it.
+                            tracing::warn!("WebUI observation refresh found changed Storage files");
+                            if current.observed.is_some() {
+                                record_webui_drift(app)
+                                    .await
+                                    .context("recording WebUI Storage drift")
+                            } else {
+                                Ok(())
+                            }
                         }
-                        Err(message) => {
-                            record_release_check(
-                                app,
-                                component,
-                                &channel,
-                                None,
-                                Some(message),
-                                now,
-                            )
-                            .await
-                            .inspect_err(|error| warn_record_release_check(component, error))?;
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => {
+                            tracing::warn!("WebUI observation refresh timed out");
+                            Ok(())
                         }
+                    };
+                    // Discovery is already durable. Observation failures
+                    // cannot disqualify an otherwise eligible install.
+                    if let Err(error) = observation_result {
+                        tracing::warn!("WebUI observation refresh failed: {error:#}");
                     }
                 }
             }
@@ -1522,7 +1630,7 @@ async fn run_webui_install(
                     error: format!("{error:#}"),
                 }
             )?;
-            if let Err(reconcile_error) = reconcile_webui(app).await {
+            if let Err(reconcile_error) = reconcile_webui(app, true).await {
                 tracing::warn!("WebUI failure reconciliation deferred: {reconcile_error:#}");
             }
         }
@@ -1917,9 +2025,36 @@ mod tests {
         remove_test_db(app, path);
     }
 
-    #[tokio::test]
-    async fn webui_purge_obligation_survives_failed_or_interrupted_purge_through_reconciliation() {
-        let release = ComponentRelease {
+    /// One hourly pass: the channel lookup returns `channel` or fails, and the
+    /// installed Storage files verify with `hashes` or mismatch.
+    async fn hourly(
+        app: &Arc<ApiState>,
+        channel: Option<ComponentRelease>,
+        hashes: Option<(String, String)>,
+    ) -> ReleaseCheckBatch {
+        // Boxed so repeated passes do not grow the calling test's future.
+        Box::pin(record_release_checks_with(
+            app,
+            move |_, _| {
+                let channel = channel.clone();
+                Box::pin(async move { channel.context("registry returned HTTP 503") })
+            },
+            RELEASE_LOOKUP_TIMEOUT,
+            Box::pin(std::future::pending()),
+            async |_, _| {
+                Ok(match hashes.clone() {
+                    Some((root_hash, admin_hash)) => ReleaseVerification::Verified {
+                        root_hash,
+                        admin_hash,
+                    },
+                    None => ReleaseVerification::Mismatch,
+                })
+            },
+        ))
+        .await
+    }
+    fn webui_test_release() -> ComponentRelease {
+        ComponentRelease {
             upgrade: None,
             component: "webui".into(),
             channel: "latest".into(),
@@ -1936,7 +2071,550 @@ mod tests {
             launcher_protocol: 1,
             launcher: None,
             base_abi: "static-webui-v1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_writer_preserves_manual_readback_and_scheduled_webui_admission() {
+        use jmodguard::control::{NonceWindow, open_frame};
+        use jmodguard::db::{SqlExecutor, params};
+        use std::sync::Mutex;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (writer, path) = purge_test_app();
+        let schema = db::CORE_SCHEMA_VERSION;
+        let installed = ComponentRelease {
+            channel: "stable".into(),
+            min_schema: schema,
+            max_schema: schema,
+            result_schema: schema,
+            ..webui_test_release()
         };
+        let now = 100;
+        let observation = ComponentObservation {
+            guild_schema: None,
+            update_protocol: 0,
+            launcher_revision: 0,
+            baked_launcher_revision: 0,
+            source_sha: installed.source_sha.clone(),
+            executable_sha256: "verified root".into(),
+            admin_sha256: Some("verified admin".into()),
+            base_image_sha: "Storage Zone".into(),
+            started_at: now,
+            min_schema: schema,
+            max_schema: schema,
+            api_capability: 1,
+            self_update_enabled: true,
+            base_abi: "static-webui-v1".into(),
+        };
+        db::set_update_policy(&writer.db, "webui", "stable", "daily", true)
+            .await
+            .unwrap();
+        db::record_update_check(
+            &writer.db,
+            "webui",
+            "stable",
+            Some(installed.clone()),
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        db::request_component_install(&writer.db, "webui", &installed.digest, now)
+            .await
+            .unwrap();
+        record_running(
+            &writer,
+            "webui",
+            Some(installed.clone()),
+            observation.clone(),
+            now,
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = (*writer.cfg).clone();
+        cfg.db.path = path.clone();
+        cfg.bot.control_target = listener.local_addr().unwrap().to_string();
+        let key = "x".repeat(32);
+        cfg.bot.control_secret = jmodguard::config::ControlSecret::new(key.clone());
+        let reader = Db::open_with(cfg.db_open_options()).unwrap();
+        assert!(reader.is_read_only());
+        let reader = ApiState::new(cfg, reader).unwrap();
+        let (rejected, mut rejected_ops) = tokio::sync::mpsc::unbounded_channel();
+        let peer = tokio::spawn({
+            let writer = Arc::clone(&writer);
+            async move {
+                let nonces = Mutex::new(NonceWindow::new());
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let length = stream.read_u32().await.unwrap();
+                    let mut request = vec![0; length as usize];
+                    stream.read_exact(&mut request).await.unwrap();
+                    let (op, actor, _, _) = open_frame(key.as_bytes(), &request, &nonces).unwrap();
+                    assert_eq!(actor, 0);
+                    let reply = match op {
+                        // The older writer cannot decode this operation.
+                        db::ControlOp::RecordHourlyWebuiDrift { .. } => {
+                            rejected.send("mismatch").unwrap();
+                            db::ControlReply::Failed {
+                                message: "write failed".into(),
+                                code: None,
+                            }
+                        }
+                        db::ControlOp::RecordWebuiInstalledVerified {
+                            release,
+                            observation,
+                            now,
+                        } => {
+                            let installed = serde_json::to_string(&release).unwrap();
+                            let observation = serde_json::to_string(&observation).unwrap();
+                            // The older writer matches serialized JSON and
+                            // keeps drift when an activated row retains desired.
+                            let changed = writer
+                                .db
+                                .with_conn(move |conn| {
+                                    conn.execute_bounded(
+                                        "UPDATE component_updates SET observed=?2,observed_at=?3,
+                                            state=CASE WHEN desired IS NULL THEN 'running' ELSE state END,
+                                            last_error=CASE WHEN desired IS NULL THEN NULL ELSE last_error END
+                                         WHERE component='webui' AND installed=?1",
+                                        params![installed, observation, now],
+                                        64 * 1024,
+                                    )
+                                })
+                                .await
+                                .unwrap();
+                            if changed == 1 {
+                                db::ControlReply::Saved { body: Value::Null }
+                            } else {
+                                rejected.send("verified").unwrap();
+                                db::ControlReply::Failed {
+                                    message: "installed WebUI release changed during verification"
+                                        .into(),
+                                    code: None,
+                                }
+                            }
+                        }
+                        op => db::apply_control(&writer.db, None, op, None).await.unwrap(),
+                    };
+                    let body = serde_json::to_vec(&reply).unwrap();
+                    stream.write_u32(body.len() as u32).await.unwrap();
+                    stream.write_all(&body).await.unwrap();
+                }
+            }
+        });
+
+        // The old bot can verify a normal activated row, but it cannot
+        // clear drift once the legacy mismatch operation has recorded it.
+        let lookup_error = "registry returned HTTP 503";
+        for storage_restored in [false, true] {
+            let result = check_one_with(
+                &reader,
+                "webui",
+                async |_, _| anyhow::bail!("{lookup_error}"),
+                async |adopt_desired| {
+                    assert!(!adopt_desired);
+                    reconcile_webui_with(
+                        &reader,
+                        adopt_desired,
+                        |_| async { unreachable!("installed verifier reads Storage") },
+                        |_| async { unreachable!("discovery did not authorize adoption") },
+                        |release| {
+                            assert_eq!(release, installed);
+                            std::future::ready(Ok(if storage_restored {
+                                ReleaseVerification::Verified {
+                                    root_hash: "restored root".into(),
+                                    admin_hash: "restored admin".into(),
+                                }
+                            } else {
+                                ReleaseVerification::Mismatch
+                            }))
+                        },
+                    )
+                    .await
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap_err().to_string(), lookup_error);
+        }
+        let restored = db::component_update(&reader.db, "webui").await.unwrap();
+        assert_eq!(restored.desired.as_ref(), Some(&installed));
+        assert_eq!(restored.installed.as_ref(), Some(&installed));
+        assert_eq!(
+            restored.observed.unwrap().executable_sha256,
+            "restored root"
+        );
+        assert_eq!(restored.state, "running");
+        assert!(restored.last_error.is_none());
+        assert_eq!(restored.check_error.as_deref(), Some(lookup_error));
+        assert_eq!(rejected_ops.try_recv(), Ok("mismatch"));
+
+        // A legacy row is readable but no longer serializes to its stored JSON.
+        let mut legacy = serde_json::to_value(&installed).unwrap();
+        legacy.as_object_mut().unwrap().remove("upgrade");
+        let legacy = legacy.to_string();
+        writer
+            .db
+            .with_conn(move |conn| {
+                conn.execute_bounded(
+                    "UPDATE component_updates SET installed=?1 WHERE component='webui'",
+                    [legacy],
+                    64 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let candidate = ComponentRelease {
+            source_sha: "c".repeat(40),
+            digest: format!("sha256:{}", "d".repeat(64)),
+            ..installed.clone()
+        };
+        for (expected_op, hashes) in [
+            ("mismatch", None),
+            ("verified", Some(("new root".into(), "new admin".into()))),
+        ] {
+            let batch = hourly(&reader, Some(candidate.clone()), hashes).await;
+            assert_eq!(rejected_ops.try_recv().unwrap(), expected_op);
+            assert!(batch.finished);
+            assert!(!batch.lease_held.contains("webui"), "{expected_op}");
+            let checked = db::component_update(&reader.db, "webui").await.unwrap();
+            assert_eq!(checked.candidate.as_ref(), Some(&candidate));
+            assert_eq!(checked.installed.as_ref(), Some(&installed));
+            assert!(checked.check_error.is_none());
+            assert_eq!(checked.observed_at, restored.observed_at);
+            assert_eq!(checked.state, "running");
+        }
+
+        // Give the API a stale local view while the control writer still
+        // returns the current WebUI row with the installed digest.
+        let (replica, replica_path) = purge_test_app();
+        db::set_update_policy(&replica.db, "webui", "stable", "daily", true)
+            .await
+            .unwrap();
+        let mut cfg = (*reader.cfg).clone();
+        cfg.db.path = replica_path.clone();
+        let db = Db::open_with(cfg.db_open_options()).unwrap();
+        let stale_reader = ApiState::new(cfg, db).unwrap();
+        let batch = hourly(&stale_reader, Some(candidate.clone()), None).await;
+        drop(stale_reader);
+        remove_test_db(replica, replica_path);
+        assert!(batch.finished);
+        assert!(!batch.lease_held.contains("webui"));
+        assert_eq!(rejected_ops.try_recv(), Ok("mismatch"));
+
+        // Exercise scheduled admission without publishing to Storage.
+        let checked = db::component_update(&reader.db, "webui").await.unwrap();
+        let now = checked.checked_at.unwrap();
+        record_running(&writer, "api", None, observation, now)
+            .await
+            .unwrap();
+        jmodguard_updater::compatible(&reader.db, &candidate, now)
+            .await
+            .unwrap();
+        let lease = "ab".repeat(16);
+        assert_eq!(
+            claim_any(Some(&reader), &reader.db, "webui", &lease, now, 600)
+                .await
+                .unwrap(),
+            db::UpdateLeaseStatus::Held
+        );
+        let queued: Option<ComponentRelease> = commit_typed(
+            &reader,
+            db::ControlOp::RequestDueAutomaticInstall {
+                component: "webui".into(),
+                expected_digest: candidate.digest.clone(),
+                now,
+                unattended_allowed: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(queued, Some(candidate.clone()));
+        let row = db::component_update(&reader.db, "webui").await.unwrap();
+        assert_eq!(row.desired.as_ref(), Some(&candidate));
+        assert_eq!(row.state, "queued");
+        release_any(Some(&reader), &reader.db, "webui", &lease)
+            .await
+            .unwrap();
+
+        // A crashed publication left this request queued. One entry page can
+        // have switched without verifying the desired release. A later check
+        // can also verify the old installed files against a legacy row.
+        for (partial_switch, rejected_write) in [
+            (true, None),
+            (true, Some("mismatch")),
+            (false, Some("verified")),
+        ] {
+            let checked = check_one_with(
+                &reader,
+                "webui",
+                async |_, _| Ok(candidate.clone()),
+                async |adopt_desired| {
+                    assert!(adopt_desired);
+                    reconcile_webui_with(
+                        &reader,
+                        adopt_desired,
+                        |path| {
+                            let source = if partial_switch && path == "index.html" {
+                                &candidate.source_sha
+                            } else {
+                                &installed.source_sha
+                            };
+                            std::future::ready(Ok(Some(
+                                format!("/assets/releases/{source}/app.js").into_bytes(),
+                            )))
+                        },
+                        |_| async { unreachable!("both pages must identify the desired release") },
+                        |release| {
+                            assert_eq!(release, installed);
+                            std::future::ready(match rejected_write {
+                                Some("mismatch") => Ok(ReleaseVerification::Mismatch),
+                                Some("verified") => Ok(ReleaseVerification::Verified {
+                                    root_hash: "restored root".into(),
+                                    admin_hash: "restored admin".into(),
+                                }),
+                                _ => Err(anyhow::anyhow!("Storage verification unavailable")),
+                            })
+                        },
+                    )
+                    .await
+                },
+            )
+            .await
+            .unwrap();
+            let recovered = db::component_update(&reader.db, "webui").await.unwrap();
+            assert_eq!(recovered.desired.as_ref(), Some(&candidate));
+            assert_eq!(recovered.installed.as_ref(), Some(&installed));
+            assert_eq!(checked.state, recovered.state, "{rejected_write:?}");
+            assert_eq!(checked.last_error, recovered.last_error);
+            if let Some(expected_op) = rejected_write {
+                assert_eq!(rejected_ops.try_recv(), Ok(expected_op));
+                assert_eq!(recovered.state, "failed", "{expected_op}");
+                assert!(
+                    recovered
+                        .last_error
+                        .unwrap()
+                        .contains("installation was interrupted")
+                );
+                let (retry, lease) = queue_webui_install(
+                    Some(&reader),
+                    &reader.db,
+                    &candidate.digest,
+                    checked.checked_at.unwrap(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(retry, candidate);
+                release_any(Some(&reader), &reader.db, "webui", &lease)
+                    .await
+                    .unwrap();
+            } else {
+                assert!(rejected_ops.try_recv().is_err());
+                assert_eq!(recovered.state, "queued");
+                assert!(recovered.last_error.is_none());
+            }
+        }
+        peer.abort();
+        assert!(peer.await.unwrap_err().is_cancelled());
+        drop(reader);
+        remove_test_db(writer, path);
+    }
+
+    #[tokio::test]
+    async fn webui_reconciliation_preserves_failed_reinstall_and_adopts_distinct_release() {
+        let (app, path) = purge_test_app();
+        let installed = webui_test_release();
+        let now = 100;
+        db::record_update_check(
+            &app.db,
+            "webui",
+            "latest",
+            Some(installed.clone()),
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        db::request_component_install(&app.db, "webui", &installed.digest, now)
+            .await
+            .unwrap();
+        let observation = ComponentObservation {
+            guild_schema: None,
+            update_protocol: 0,
+            launcher_revision: 0,
+            baked_launcher_revision: 0,
+            source_sha: installed.source_sha.clone(),
+            executable_sha256: "old root".into(),
+            admin_sha256: Some("old admin".into()),
+            base_image_sha: "Storage Zone".into(),
+            started_at: now - 10,
+            min_schema: installed.min_schema,
+            max_schema: installed.max_schema,
+            api_capability: 1,
+            self_update_enabled: true,
+            base_abi: "static-webui-v1".into(),
+        };
+        record_running(
+            &app,
+            "webui",
+            Some(installed.clone()),
+            observation,
+            now - 10,
+        )
+        .await
+        .unwrap();
+        db::set_webui_purge_pending(&app.db, Some("purge pending".into()))
+            .await
+            .unwrap();
+
+        let mut alias = installed.clone();
+        alias.channel = "stable".into();
+        let mut next = alias.clone();
+        next.source_sha = "c".repeat(40);
+        next.digest = format!("sha256:{}", "d".repeat(64));
+        for (desired, interrupted) in [
+            (installed.clone(), false),
+            (alias, true),
+            (next.clone(), false),
+        ] {
+            let reinstall = desired.digest == installed.digest;
+            db::set_update_policy(&app.db, "webui", &desired.channel, "off", false)
+                .await
+                .unwrap();
+            db::record_update_check(
+                &app.db,
+                "webui",
+                &desired.channel,
+                Some(desired.clone()),
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+            db::request_component_install(&app.db, "webui", &desired.digest, now)
+                .await
+                .unwrap();
+            if !interrupted {
+                db::record_component_failure(&app.db, "webui", &desired, "publish failed")
+                    .await
+                    .unwrap();
+            }
+            let html = format!("/assets/releases/{}/app.js", desired.source_sha).into_bytes();
+            let verified = || ReleaseVerification::Verified {
+                root_hash: "verified root".into(),
+                admin_hash: "verified admin".into(),
+            };
+            reconcile_webui_with(
+                &app,
+                true,
+                |_| std::future::ready(Ok(Some(html.clone()))),
+                |release| {
+                    assert!(!reinstall);
+                    assert_eq!(release, desired);
+                    std::future::ready(Ok(verified()))
+                },
+                |release| {
+                    assert!(reinstall);
+                    assert_eq!(release, installed);
+                    std::future::ready(Ok(verified()))
+                },
+            )
+            .await
+            .unwrap();
+
+            let row = db::component_update(&app.db, "webui").await.unwrap();
+            let seen = row.observed.unwrap();
+            assert_eq!(seen.executable_sha256, "verified root");
+            assert_eq!(seen.admin_sha256.as_deref(), Some("verified admin"));
+            assert_eq!(row.desired.as_ref(), Some(&desired));
+            if reinstall {
+                assert_eq!(row.installed.as_ref(), Some(&installed));
+                assert_eq!(row.installed_at, Some(now - 10));
+                assert_eq!(seen.started_at, now - 10);
+                if interrupted {
+                    assert_eq!(row.state, "queued");
+                    assert!(row.last_error.is_none());
+                    db::settle_interrupted_webui(&app.db, &desired)
+                        .await
+                        .unwrap();
+                    let settled = db::component_update(&app.db, "webui").await.unwrap();
+                    assert_eq!(settled.state, "failed");
+                    assert!(settled.last_error.unwrap().contains("interrupted"));
+                } else {
+                    assert_eq!(row.state, "failed");
+                    assert_eq!(row.last_error.as_deref(), Some("publish failed"));
+                }
+            } else {
+                assert_eq!(row.state, "running");
+                assert_eq!(row.last_error, None);
+                assert_eq!(row.installed.as_ref(), Some(&next));
+            }
+            assert_eq!(
+                db::webui_purge_pending(&app.db).await.unwrap().as_deref(),
+                Some("purge pending")
+            );
+        }
+        // The channel still points to the installed digest, but discovery
+        // refuses its expired signature. The installed readback can still
+        // verify it and clear drift.
+        db::record_webui_drift(&app.db, "Storage files differ")
+            .await
+            .unwrap();
+        let expired = jmodguard_updater::signature::EXPIRED_IMAGE_SIGNATURE;
+        let result = check_one_with(
+            &app,
+            "webui",
+            async |component, channel| {
+                assert_eq!(component, "webui");
+                assert_eq!(channel, next.channel);
+                anyhow::bail!("{expired}");
+            },
+            async |adopt_desired| {
+                assert!(!adopt_desired);
+                reconcile_webui_with(
+                    &app,
+                    adopt_desired,
+                    |_| async { unreachable!("installed verifier reads Storage") },
+                    |_| async { unreachable!("discovery did not authorize adoption") },
+                    |installed| {
+                        assert_eq!(installed, next);
+                        std::future::ready(Ok(ReleaseVerification::Verified {
+                            root_hash: "restored root".into(),
+                            admin_hash: "restored admin".into(),
+                        }))
+                    },
+                )
+                .await
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().to_string(), expired);
+        let row = db::component_update(&app.db, "webui").await.unwrap();
+        assert_eq!(row.check_error.as_deref(), Some(expired));
+        assert_eq!(row.state, "running");
+        assert_eq!(row.observed.unwrap().executable_sha256, "restored root");
+        assert_eq!(row.installed.as_ref(), Some(&next));
+        assert_eq!(row.candidate.as_ref(), Some(&next));
+        assert_eq!(
+            db::request_component_install(&app.db, "webui", &next.digest, row.checked_at.unwrap())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "last release check failed; check again",
+        );
+        assert_eq!(
+            db::webui_purge_pending(&app.db).await.unwrap().as_deref(),
+            Some("purge pending")
+        );
+        remove_test_db(app, path);
+    }
+
+    #[tokio::test]
+    async fn webui_purge_obligation_survives_failed_or_interrupted_purge_through_reconciliation() {
+        let release = webui_test_release();
         let observation = ComponentObservation {
             guild_schema: None,
             update_protocol: 0,
@@ -2023,10 +2701,58 @@ mod tests {
             )
             .await
             .unwrap();
-            db::record_webui_installed_verified(&app.db, &release, observation.clone(), 103)
+            // The hourly check can verify the installed files through their
+            // pinned digest while discovery of the moving tag is unavailable.
+            let probe_lease = "ab".repeat(16);
+            let batch = Box::pin(record_release_checks_with(
+                &app,
+                |_, _| Box::pin(async { anyhow::bail!("registry returned HTTP 503") }),
+                RELEASE_LOOKUP_TIMEOUT,
+                Box::pin(std::future::pending()),
+                async |_, installed| {
+                    assert_eq!(installed, &release);
+                    let checked_at = db::component_update(&app.db, "webui")
+                        .await
+                        .unwrap()
+                        .checked_at
+                        .unwrap();
+                    assert!(
+                        !db::claim_update_lease(&app.db, "webui", &probe_lease, checked_at, 240)
+                            .await
+                            .unwrap(),
+                        "verification must hold the WebUI update lease"
+                    );
+                    Ok(ReleaseVerification::Verified {
+                        root_hash: observation.executable_sha256.clone(),
+                        admin_hash: observation.admin_sha256.clone().unwrap(),
+                    })
+                },
+            ))
+            .await;
+            assert!(batch.finished);
+            let row = db::component_update(&app.db, "webui").await.unwrap();
+            assert!(
+                db::claim_update_lease(
+                    &app.db,
+                    "webui",
+                    &probe_lease,
+                    row.checked_at.unwrap(),
+                    240,
+                )
+                .await
+                .unwrap(),
+                "the hourly check must release the lease"
+            );
+            db::release_update_lease(&app.db, "webui", &probe_lease)
                 .await
                 .unwrap();
-            let row = db::component_update(&app.db, "webui").await.unwrap();
+            assert!(row.observed_at.is_some_and(|at| at > 102));
+            assert_eq!(row.installed_at, Some(102));
+            assert_eq!(row.observed.unwrap().started_at, observation.started_at);
+            assert_eq!(
+                row.check_error.as_deref(),
+                Some("registry returned HTTP 503")
+            );
             assert_eq!(row.state, "running");
             assert!(row.last_error.is_none());
             let pending = db::webui_purge_pending(&app.db).await.unwrap().unwrap();
@@ -2038,6 +2764,155 @@ mod tests {
             assert!(!pending.contains("purge-only-secret"));
             let status = status_response(&app, None).await.unwrap().0;
             assert_eq!(status["webui_purge_pending"], pending.as_str());
+            // A failed readback proves nothing about Storage and keeps the
+            // verified observation. A definite mismatch invalidates it.
+            let failed = Box::pin(record_release_checks_with(
+                &app,
+                |_, _| Box::pin(async { anyhow::bail!("registry returned HTTP 503") }),
+                RELEASE_LOOKUP_TIMEOUT,
+                Box::pin(std::future::pending()),
+                async |_, _| anyhow::bail!("Storage read failed"),
+            ))
+            .await;
+            assert!(failed.finished);
+            let kept = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(kept.state, "running");
+            assert_eq!(kept.observed_at, row.observed_at);
+            assert!(kept.observed.is_some());
+            let changed = hourly(&app, None, None).await;
+            assert!(changed.finished);
+            assert!(!changed.lease_held.contains("webui"));
+            let drift = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(drift.state, "drift");
+            assert!(drift.observed.is_none() && drift.observed_at.is_none());
+            assert_eq!(drift.installed.as_ref(), Some(&release));
+            assert_eq!(drift.installed_at, Some(102));
+            assert_eq!(
+                db::webui_purge_pending(&app.db).await.unwrap().as_deref(),
+                Some(pending.as_str())
+            );
+            // An activated install keeps `desired == installed`. Confirmed drift
+            // clears once the installed files verify again.
+            db::record_update_check(
+                &app.db,
+                "webui",
+                &release.channel,
+                Some(release.clone()),
+                None,
+                104,
+            )
+            .await
+            .unwrap();
+            let (_, lease) = queue_webui_install(None, &app.db, &release.digest, 104)
+                .await
+                .unwrap();
+            db::release_update_lease(&app.db, "webui", &lease)
+                .await
+                .unwrap();
+            record_running(
+                &app,
+                "webui",
+                Some(release.clone()),
+                observation.clone(),
+                105,
+            )
+            .await
+            .unwrap();
+            let settled = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(settled.desired.as_ref(), Some(&release));
+            assert!(hourly(&app, None, None).await.finished);
+            let drift = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(drift.state, "drift");
+            let hashes = (
+                observation.executable_sha256.clone(),
+                observation.admin_sha256.clone().unwrap(),
+            );
+            assert!(hourly(&app, None, Some(hashes.clone())).await.finished);
+            let restored = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(restored.state, "running");
+            assert!(restored.last_error.is_none());
+            assert!(restored.observed.is_some());
+            assert_eq!(restored.installed_at, Some(102));
+            assert_eq!(
+                db::webui_purge_pending(&app.db).await.unwrap().as_deref(),
+                Some(pending.as_str())
+            );
+            // A reinstall of the installed release keeps its outcome: verified
+            // bytes do not show that the attempt completed.
+            db::record_update_check(
+                &app.db,
+                "webui",
+                &release.channel,
+                Some(release.clone()),
+                None,
+                106,
+            )
+            .await
+            .unwrap();
+            let (_, lease) = queue_webui_install(None, &app.db, &release.digest, 106)
+                .await
+                .unwrap();
+            db::release_update_lease(&app.db, "webui", &lease)
+                .await
+                .unwrap();
+            // A mismatch clears the observation; a verified readback restores
+            // it without settling the queued request.
+            assert!(hourly(&app, None, None).await.finished);
+            let mismatched = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(mismatched.state, "queued");
+            assert!(mismatched.observed.is_none());
+            assert!(hourly(&app, None, Some(hashes.clone())).await.finished);
+            let reinstall = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(reinstall.state, "queued");
+            assert_eq!(reinstall.desired.as_ref(), Some(&release));
+            assert!(reinstall.observed.is_some());
+            db::record_component_failure(&app.db, "webui", &release, "publish failed")
+                .await
+                .unwrap();
+            assert!(hourly(&app, None, Some(hashes.clone())).await.finished);
+            let failed_reinstall = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(failed_reinstall.state, "failed");
+            assert!(
+                failed_reinstall
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("publish failed"))
+            );
+            assert_eq!(failed_reinstall.desired.as_ref(), Some(&release));
+            // A separate failed request keeps its state and error, but a
+            // definite mismatch still invalidates the old observation, even
+            // when the channel points back at the installed build.
+            let mut next = release.clone();
+            next.source_sha = "e".repeat(40);
+            next.digest = format!("sha256:{}", "e".repeat(64));
+            db::record_update_check(
+                &app.db,
+                "webui",
+                &next.channel,
+                Some(next.clone()),
+                None,
+                107,
+            )
+            .await
+            .unwrap();
+            let (_, lease) = queue_webui_install(None, &app.db, &next.digest, 107)
+                .await
+                .unwrap();
+            db::release_update_lease(&app.db, "webui", &lease)
+                .await
+                .unwrap();
+            db::settle_interrupted_webui(&app.db, &next).await.unwrap();
+            let failed = db::component_update(&app.db, "webui").await.unwrap();
+            assert_eq!(failed.state, "failed");
+            assert!(failed.observed.is_some());
+            assert!(hourly(&app, Some(release.clone()), None).await.finished);
+            let invalidated = db::component_update(&app.db, "webui").await.unwrap();
+            assert!(invalidated.observed.is_none() && invalidated.observed_at.is_none());
+            assert_eq!(invalidated.candidate.as_ref(), Some(&release));
+            assert!(invalidated.check_error.is_none());
+            assert_eq!(invalidated.state, "failed");
+            assert_eq!(invalidated.last_error, failed.last_error);
+            assert_eq!(invalidated.desired.as_ref(), Some(&next));
             // A check without purge values cannot resolve it.
             let delay = Duration::from_millis(1);
             retry_pending_purge(&app, purge_values(None, None), &api, delay)
@@ -2126,24 +3001,7 @@ mod tests {
             rand::random::<u128>()
         ));
         let db = Db::open(&path, 2).unwrap();
-        let release = ComponentRelease {
-            upgrade: None,
-            component: "webui".into(),
-            channel: "latest".into(),
-            release_id: "v1.0.0".into(),
-            source_sha: "a".repeat(40),
-            published_at: "2026-09-23T00:00:00Z".into(),
-            image: "ghcr.io/jatmn/jmodguard-webui".into(),
-            digest: format!("sha256:{}", "b".repeat(64)),
-            min_schema: 15,
-            max_schema: 15,
-            result_schema: 15,
-            min_api: 1,
-            max_api: 1,
-            launcher_protocol: 1,
-            launcher: None,
-            base_abi: "static-webui-v1".into(),
-        };
+        let release = webui_test_release();
         db::record_update_check(
             &db,
             "webui",

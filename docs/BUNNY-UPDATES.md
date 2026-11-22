@@ -1,14 +1,29 @@
 # Bunny application and WebUI updates
 
-The owner opens **Administration → Updates** at `/administration/index.html` on the existing WebUI host. The page uses the existing Discord login and the API's owner check. The page shows the observed bot, API, and WebUI source SHAs, release publication times, install ages, failures, and available candidates. `Check now` refreshes one component; the API also checks all three every hour without an open browser. Discord `!stats`, `!status`, and `/stats` use cached observations and ship with Admin permission by default.
+The owner opens **Administration → Updates** at `/administration/index.html` on the existing
+WebUI host. The page uses the existing Discord login and the API's owner check. It shows
+the observed bot, API, and WebUI source SHAs, release publication times, install ages,
+failures, and available candidates. `Check now` refreshes one component. Every hour the
+API also checks the configured channel for each component and verifies the installed
+WebUI files in Storage. Discord `!stats`, `!status`, and `/stats` use cached observations
+and ship with Admin permission by default. After a fresh check, each status line shows
+the running source SHA and the source SHA its channel currently publishes, or a short
+reason when a check fails.
+
+On a read-only API deployment, recording Storage drift from **Check now** or the
+hourly check requires a bot writer that can also clear it after a successful readback.
+If the API is upgraded first, the older writer rejects mismatch writes until the bot
+is upgraded.
 
 The page shares the workspace's Light, Dark, and System appearance preference. Each
 component has a status badge, release controls, and expandable **Version & technical
 details** with full hashes. **Uptime** uses compact durations such as `13m 38s` or
 `1d 2h 13m 38s`. **Refresh status** reads the current recorded state;
-**Check now** performs release discovery. Status refreshes every 30 seconds when idle
-and every two seconds while a component or launcher update is pending. Controls stay
-disabled during an action or after a failed status refresh until a fresh read succeeds.
+**Check now** performs release discovery. For WebUI, it can still verify the installed
+files when discovery fails. The failed check remains visible and blocks new installs.
+Status refreshes every 30 seconds when idle and every two seconds while a component
+or launcher update is pending. Controls stay disabled during an action or after a
+failed status refresh until a fresh read succeeds.
 An accepted update request is shown as pending, not as a completed installation.
 If the status read that follows the acknowledgement already shows success or failure,
 the page confirms only that the request was accepted and leaves that result on the card.
@@ -119,7 +134,7 @@ that publication timestamp for signing, not updater compatibility labels. The ma
 cosign public key is committed at `deploy/update-signing.pub`. The private signing key is not stored in this
 repository; publication fails closed when that Actions secret is missing.
 
-The updater verifies that signature against this pinned key before it downloads image layers or stages an executable. Release discovery also verifies signatures and enforces expiry, regardless of the observed launcher revision. Launcher image staging verifies signatures once a revision-19 or newer launcher is running. A revision-18 launcher has no verifier and is refused that hop. The durable request requires a fresh launcher observation and clears a queued verifier-era selection on refusal. An unsigned image, a wrong signature, or a signature from an untrusted key is refused with that status: `unsigned image`, `bad image signature`, or `image signature used an untrusted key`. An expired signature (`expired image signature`) is refused for a new install. After the [expiry-safe cold-boot rollout](#expiry-safe-cold-boot-rollout), boot repair still checks the signature of an already-installed application release, and it still starts that application after `io.jmodguard.not-after`.
+The updater verifies that signature against this pinned key before it downloads image layers or stages an executable. Release discovery also verifies signatures and enforces expiry, regardless of the observed launcher revision. Launcher image staging verifies signatures once a revision-19 or newer launcher is running. A revision-18 launcher has no verifier and is refused that hop. The durable request requires a fresh launcher observation and clears a queued verifier-era selection on refusal. An unsigned image, a wrong signature, or a signature from an untrusted key is refused with that status: `unsigned image`, `bad image signature`, or `image signature used an untrusted key`. An expired signature (`expired image signature`) is refused for a new install. After the [expiry-safe cold-boot rollout](#expiry-safe-cold-boot-rollout), boot repair still checks the signature of an already-installed application release, and it still starts that application after `io.jmodguard.not-after`. The same applies when the API re-checks the installed WebUI files in Storage: the signature must verify, but `io.jmodguard.not-after` does not block the check. A new WebUI install still refuses an expired signature.
 
 ### Boot-mismatch diagnostics and mixed-fleet rollout
 
@@ -286,7 +301,7 @@ The API needs `BUNNY_STORAGE_ENDPOINT` (regional Storage hostname, default `stor
 
 The publisher uploads and reads back immutable JS/CSS first, then Administration HTML, then root HTML. It records the new SHA only after readback of root HTML. It retains the active managed assets plus one previous managed release, then deletes only the three known files of an older managed release. A manual overwrite of any managed release file is shown as drift on the next successful check. Older manually uploaded `/app.js` and `/style.css` are left in place, and their release SHA remains unknown until an explicit managed install.
 
-The API renews its WebUI check/install lease while Storage work is active so another worker cannot start a competing publish during a slow but healthy request. After an API interruption, the next successful check adopts a fully verified WebUI switch or reports an incomplete queued request as interrupted, including a partially switched pair of HTML files; the owner may then check Storage and request the digest again. An image digest change at the same source SHA does not prove the static file bytes changed, but this updater refuses that repack because the cacheable asset URLs would be reused. It retains source SHA reservations after managed assets are pruned; an older reservation whose digest is no longer known cannot be reused automatically or by an owner request.
+The API renews its WebUI check/install lease while Storage work is active so another worker cannot start a competing publish during a slow but healthy request. After an API interruption, the next successful check adopts a fully verified WebUI switch or reports an incomplete queued request as interrupted, including a partially switched pair of HTML files; the owner may then check Storage and request the digest again. If Storage still verifies as the installed digest, readback refreshes the observation and a failed reinstall keeps its error. An image digest change at the same source SHA does not prove the static file bytes changed, but this updater refuses that repack because the cacheable asset URLs would be reused. It retains source SHA reservations after managed assets are pruned; an older reservation whose digest is no longer known cannot be reused automatically or by an owner request.
 
 After the Storage switch, managed releases should purge the admin Pull Zone with a scoped key when the Bunny account offers one. Bunny's public API docs still describe scoped API keys as upcoming, so check that your dashboard lets you create a key limited to PullZone.Purge. If it does, set `BUNNY_PULL_ZONE_ID` and `BUNNY_PURGE_API_KEY` (that scoped key, never the account API key) on the API container. If it does not, leave both unset and purge the Pull Zone from the dashboard after each WebUI install. The API then calls Bunny's Pull Zone purge after a successful Storage publish, retrying up to six attempts one second apart. Bunny responses 200 and 204 count as success. A purge that still fails fails the install and logs the error. Storage already has the new files and is not rolled back, so the existing failure reconciliation reports the verified Storage release as running. When both purge values are set, the API records the purge as pending in `meta.webui_purge_pending_v1` before it publishes to Storage, so a failed or interrupted purge (for example, an API restart) stays recorded. If that marker cannot be recorded, for example because an older bot rejects the control write, the install fails before publishing. A Storage publication failure restores the marker's previous state. While the marker is set, the WebUI card stays at **Needs attention** with a **CDN purge** line. Storage reconciliation does not clear that marker. Each WebUI **Check now** retries the purge when both purge values are set, and only an accepted purge clears it. Until then, purge the Pull Zone from the dashboard to clear stale CDN HTML. Neither value set skips the purge with a warning, for bootstrap and self-hosted installs without CDN purge. Exactly one set fails the install before anything is published to Storage. The API never logs the key or purge response bodies.
 

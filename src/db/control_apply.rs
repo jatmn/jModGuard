@@ -249,6 +249,11 @@ pub enum ControlOp {
     RecordWebuiDrift {
         error: String,
     },
+    /// Older bot writers must reject hourly drift because they cannot clear it
+    /// for an activated release that still has a desired selection.
+    RecordHourlyWebuiDrift {
+        error: String,
+    },
     SetWebuiPurgePending {
         error: Option<String>,
     },
@@ -450,6 +455,7 @@ pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
         | ControlOp::RecordLauncherFailure { .. }
         | ControlOp::SelectRequiredLauncher { .. }
         | ControlOp::RecordWebuiDrift { .. }
+        | ControlOp::RecordHourlyWebuiDrift { .. }
         | ControlOp::SetWebuiPurgePending { .. }
         | ControlOp::RecordWebuiInstalledVerified { .. }
         | ControlOp::TrackWebuiAssets { .. }
@@ -1058,7 +1064,7 @@ async fn apply_control_inner(
             record_required_launcher(db, &release, operation).await?;
             saved_null()
         }
-        ControlOp::RecordWebuiDrift { error } => {
+        ControlOp::RecordWebuiDrift { error } | ControlOp::RecordHourlyWebuiDrift { error } => {
             record_webui_drift(db, &error).await?;
             saved_null()
         }

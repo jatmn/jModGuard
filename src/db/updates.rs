@@ -758,28 +758,53 @@ pub async fn record_component_rollback(
     }).await
 }
 
+/// Invalidate the WebUI observation after a definite Storage mismatch. A
+/// queued or failed request keeps its state and error for reconciliation.
 pub async fn record_webui_drift(db: &Db, error: &str) -> Result<()> {
     let error = error.chars().take(300).collect::<String>();
     db.with_conn(move |conn| {
-        conn.execute_rows("UPDATE component_updates SET observed=NULL,observed_at=NULL,state=CASE WHEN state IN ('queued','failed') THEN state ELSE 'drift' END,last_error=CASE WHEN state='failed' THEN last_error ELSE ?1 END WHERE component='webui'", params![error], 1)?;
+        conn.execute_rows("UPDATE component_updates SET observed=NULL,observed_at=NULL,state=CASE WHEN state IN ('queued','failed') THEN state ELSE 'drift' END,last_error=CASE WHEN state IN ('queued','failed') THEN last_error ELSE ?1 END WHERE component='webui'", params![error], 1)?;
         Ok(())
     }).await
 }
 
 /// Restore the installed observation only after all five Storage objects
-/// match its digest-pinned package. Preserve a separate failed desired request.
+/// match its digest-pinned package. A queued or failed request keeps its
+/// outcome, even a reinstall of the installed release; verified bytes do not
+/// show that it completed. An activated install retains a selection for the
+/// same release and settles back to running, which clears confirmed drift.
 pub async fn record_webui_installed_verified(
     db: &Db,
     release: &ComponentRelease,
     observation: ComponentObservation,
     now: i64,
 ) -> Result<()> {
-    let installed = serde_json::to_string(release)?;
+    let release = release.clone();
     let observation = serde_json::to_string(&observation)?;
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
-        let changed = tx.execute_rows("UPDATE component_updates SET observed=?2,observed_at=?3,state=CASE WHEN desired IS NULL THEN 'running' ELSE state END,last_error=CASE WHEN desired IS NULL THEN NULL ELSE last_error END WHERE component='webui' AND installed=?1",params![installed,observation,now], 1)?;
-        anyhow::ensure!(changed == 1, "installed WebUI release changed during verification");
+        let (installed, desired): (Option<String>, Option<String>) = tx.query_row(
+            "SELECT installed,desired FROM component_updates WHERE component='webui'",
+            (),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        // Older installs omit optional release fields.
+        anyhow::ensure!(
+            parse_release(installed.clone())?.as_ref() == Some(&release),
+            "installed WebUI release changed during verification"
+        );
+        // Channel aliases and legacy JSON can describe the same package.
+        let settled = parse_release(desired)?.is_none_or(|desired| {
+            desired.digest == release.digest && desired.source_sha == release.source_sha
+        });
+        tx.execute_rows(
+            "UPDATE component_updates SET observed=?2,observed_at=?3,
+                state=CASE WHEN ?4 AND state NOT IN ('queued','failed') THEN 'running' ELSE state END,
+                last_error=CASE WHEN ?4 AND state NOT IN ('queued','failed') THEN NULL ELSE last_error END
+             WHERE component='webui' AND installed=?1",
+            params![installed, observation, now, settled],
+            1,
+        )?;
         tx.commit()?;
         Ok(())
     }).await
@@ -1634,10 +1659,9 @@ mod tests {
         record_webui_drift(&db, "Storage files differ")
             .await
             .unwrap();
-        assert_eq!(
-            component_update(&db, "webui").await.unwrap().state,
-            "queued"
-        );
+        let queued = component_update(&db, "webui").await.unwrap();
+        assert_eq!(queued.state, "queued");
+        assert!(queued.last_error.is_none());
         settle_interrupted_webui(&db, &release).await.unwrap();
         let partial = component_update(&db, "webui").await.unwrap();
         assert_eq!(partial.state, "failed");
@@ -1656,7 +1680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restored_installed_webui_keeps_interrupted_request_failed() {
+    async fn restored_legacy_webui_clears_drift_and_keeps_interrupted_request_failed() {
         let path = std::env::temp_dir().join(format!(
             "jmodguard_webui_restore_{:032x}.db",
             rand::random::<u128>()
@@ -1695,6 +1719,57 @@ mod tests {
         record_component_running(&db, "webui", Some(old.clone()), observation.clone(), 101)
             .await
             .unwrap();
+        let mut legacy = serde_json::to_value(&old).unwrap();
+        legacy.as_object_mut().unwrap().remove("upgrade");
+        let mut alias = old.clone();
+        alias.channel = "stable".into();
+        let desired = serde_json::to_string(&alias).unwrap();
+        db.with_conn(move |conn| {
+            conn.execute_rows(
+                "UPDATE component_updates SET installed=?1,desired=?2 WHERE component='webui'",
+                params![legacy.to_string(), desired],
+                1,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        set_webui_purge_pending(&db, Some("purge pending".into()))
+            .await
+            .unwrap();
+        for (op, expected_state) in [
+            (
+                ControlOp::RecordHourlyWebuiDrift {
+                    error: "Storage files differ".into(),
+                },
+                "drift",
+            ),
+            (
+                ControlOp::RecordWebuiInstalledVerified {
+                    release: old.clone(),
+                    observation: observation.clone(),
+                    now: 102,
+                },
+                "running",
+            ),
+        ] {
+            let op = serde_json::from_value(serde_json::to_value(op).unwrap()).unwrap();
+            apply_control(&db, None, op, None).await.unwrap();
+            assert_eq!(
+                component_update(&db, "webui").await.unwrap().state,
+                expected_state
+            );
+        }
+        let restored = component_update(&db, "webui").await.unwrap();
+        assert_eq!(restored.last_error, None);
+        assert_eq!(restored.observed_at, Some(102));
+        assert_eq!(restored.installed_at, Some(101));
+        assert_eq!(restored.installed, Some(old.clone()));
+        assert_eq!(restored.desired, Some(alias));
+        assert_eq!(
+            webui_purge_pending(&db).await.unwrap().as_deref(),
+            Some("purge pending")
+        );
         record_update_check(&db, "webui", "latest", Some(next.clone()), None, 110)
             .await
             .unwrap();

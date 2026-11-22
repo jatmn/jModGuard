@@ -154,7 +154,7 @@ inline-code values. The title and all six field names carry one Unicode emoji
 from the shared map in `src/emoji.rs`, matching log titles and labels.
 **Server stats** shows Uptime, Cases, Warns and Bans as
 inline fields; **Release status** has one bot, api and webui line with its
-short SHA, age and state; **Container use** shows bot and API CPU and memory.
+running short SHA, age, the short SHA its channel publishes and state; **Container use** shows bot and API CPU and memory.
 The side bar is green when every component is up to date (an unmanaged WebUI
 included) and yellow, the system-notice color, when any release is not current,
 unknown, stale, failed, unverified or the release lookup failed. Embed limits
@@ -170,10 +170,14 @@ Uptime and release ages use compact years, months,
 weeks, days, hours, minutes, and seconds (`13m 38s`; intermediate zeros stay, as in
 `1d 0h 0m 38s`), with fixed 360-day years, 30-day months, and 7-day weeks,
 rounded down to whole seconds; a newly started process shows `0s`. Release
-availability is an icon: ✅ up to date, ⬆️ update available, ⚠️ source matches
-but the image digest is unverified, ❓ unknown. A component with no cached
-release row is `❓` and has no SHA or age. Container use is this bot
-process's own cgroup. Memory is real program use (`memory.current` minus
+availability is shown in words with an icon: ✅ up to date, ↔️ different source
+(the channel publishes another source; which build is newer is not compared), ⚠️
+source matches but the image digest is unverified or differs, ❓ unknown. The WebUI
+line shows **Storage drift** when that state is recorded. A mismatch can clear the
+observation while preserving a queued or failed install state, so the line can also
+show `unknown`.
+A component with no cached release row is `❓` and has no SHA or age. Container use is
+this bot process's own cgroup. Memory is real program use (`memory.current` minus
 `inactive_file`) shown against `memory.max` (`max` means no limit). A cgroup v1
 `memory.limit_in_bytes` at the unlimited sentinel, or at least the host's total
 memory (`MemTotal`), caps nothing and is also shown as `no limit`; the host total
