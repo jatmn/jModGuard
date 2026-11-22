@@ -1449,17 +1449,18 @@ fn velocity_dry_run_upgrade_sql(conn: &impl SqlExecutor) -> Result<String> {
         };
         stored.name.clone_from(&shipped.name);
         stored.description.clone_from(&shipped.description);
-        // An older writer could store a whole number as a JSON float (8.0).
-        if let Some(params) = stored.params.as_object_mut() {
-            for value in params.values_mut() {
-                if let Some(number) = value.as_f64()
-                    && value.is_f64()
-                    && number >= 0.0
-                    && (number as u64) as f64 == number
-                {
-                    *value = (number as u64).into();
-                }
-            }
+        // Compare behavior, not JSON: omitted and legacy values resolve as the
+        // bot reads them. Unknown extra keys still count as customized.
+        let known_keys = stored.params.as_object().is_none_or(|params| {
+            params
+                .keys()
+                .all(|key| key == "window_secs" || key == "max_messages")
+        });
+        if known_keys {
+            stored.params = serde_json::json!({
+                "window_secs": crate::types::velocity_window_secs(&stored.params),
+                "max_messages": crate::types::velocity_max_messages(&stored.params),
+            });
         }
         if serde_json::to_value(&stored)? == shipped_value {
             sql.push_str(&velocity_dry_run_update_sql(guild_id, &data));

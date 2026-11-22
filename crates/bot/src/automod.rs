@@ -72,7 +72,7 @@ impl AuthorState {
     /// window, the rule is over its limit. Legacy thresholds above the
     /// supported limit have no such observation.
     fn velocity_over_limit(&self, rule: &RuleDef, index: usize) -> bool {
-        let max = velocity_max_messages(rule);
+        let max = crate::types::velocity_max_messages(&rule.params);
         let window = velocity_window(rule);
         let arrived = self.velocity_events[index];
         usize::try_from(max)
@@ -83,27 +83,8 @@ impl AuthorState {
     }
 }
 
-/// Older writers could store the limit as any JSON number. A count exceeds a
-/// fractional limit exactly when it exceeds its floor, and values beyond the
-/// retained history stay inert. Other values keep the default.
-fn velocity_max_messages(rule: &RuleDef) -> u64 {
-    rule.params.get("max_messages").map_or(8, |value| {
-        value
-            .as_u64()
-            .or_else(|| {
-                value
-                    .as_f64()
-                    .filter(|limit| *limit >= 0.0)
-                    .map(|limit| limit as u64)
-            })
-            .unwrap_or(8)
-    })
-}
-
 fn velocity_window(rule: &RuleDef) -> Duration {
-    Duration::from_secs(
-        param_u64(rule, "window_secs", 10).clamp(1, crate::types::AUTOMOD_WINDOW_MAX_SECS),
-    )
+    Duration::from_secs(crate::types::velocity_window_secs(&rule.params))
 }
 
 #[derive(Default)]
@@ -2175,8 +2156,12 @@ mod tests {
         for (limit, first_strike) in [
             (serde_json::json!(5000.0), None),
             (serde_json::json!(1e30), None),
+            (serde_json::json!(1023.5), None),
             (serde_json::json!(8.0), Some(9)),
+            // Fractional and invalid legacy values keep their old default of 8.
             (serde_json::json!(8.5), Some(9)),
+            (serde_json::json!(0.5), Some(9)),
+            (serde_json::json!("3"), Some(9)),
         ] {
             let mut cfg = default_automod_config();
             cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = limit.clone();
