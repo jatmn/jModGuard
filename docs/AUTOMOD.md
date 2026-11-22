@@ -71,7 +71,9 @@ escalation accurate without false positives.
   channels in a server, including ordinary messages that match no other rule.
 - Set `window_secs` to 1–600 (default 10) and `max_messages` to 0–1,023
   (default 8). An eligible message adds a strike if the count in the window,
-  including that message, exceeds the limit. Previously saved integer limits
+  including that message, exceeds the limit. Messages are counted by when the
+  bot received them, so a slow configuration read cannot make spaced messages
+  look like a flood. Previously saved integer limits
   above 1,023 do not trigger until the limit is lowered to the supported range.
   Saves that keep such a limit unchanged, such as enabling, dry-run, or a rules
   copy, still succeed; a save cannot set a new limit above 1,023.
@@ -208,7 +210,8 @@ When a dry-run rule and a live rule match the same message, the live rule's
 action runs and the dry-run match is not logged; a more severe dry-run action
 never replaces it. A dry-run match also never stops the member's prefix command
 in that message. Switching a rule between dry-run and live starts a new strike
-ladder, so strikes counted in dry-run never use up live escalation; message
+ladder from the next message the server sends, even if nobody struck in
+between, so strikes counted in dry-run never use up live escalation; message
 history used for detection, such as velocity's window, is kept. An action chosen
 in dry-run stays log-only even if the rule goes live before it runs, and an
 action chosen live only logs if the rule switches to dry-run first.

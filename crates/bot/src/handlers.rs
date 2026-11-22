@@ -1397,6 +1397,7 @@ impl EventHandler for Handler {
             is_moderator,
             can_mention_everyone,
             mention_permission_unknown,
+            received: Some(tokio::time::Instant::from_std(received)),
         };
         let mut stop_commands = false;
         if let Some(pending) = app.automod.evaluate(&cfg, &msg_ctx) {

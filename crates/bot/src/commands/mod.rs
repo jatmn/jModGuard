@@ -3857,6 +3857,7 @@ mod tests {
             is_moderator: false,
             can_mention_everyone: can_mention,
             mention_permission_unknown: unknown,
+            received: None,
         };
         AutomodEngine::new().evaluate(&cfg, &message)
     }
