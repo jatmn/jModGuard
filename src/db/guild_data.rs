@@ -681,6 +681,7 @@ impl GuildDataStore {
             |conn| initialize_store(conn, &expected, create),
             |_| Ok(()),
         )?;
+        db.mark_guild_store();
         Ok(Self {
             db,
             expected,

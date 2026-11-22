@@ -7019,10 +7019,21 @@ async fn access_marks_advance_one_epoch_per_batch() {
 #[tokio::test]
 async fn access_mark_maintenance_preserves_legacy_and_live_marks_until_they_expire() {
     let tmp = tmp_db_path("access_mark_maintenance");
-    let db = Db::open(&tmp, 2).unwrap();
+    let probe = std::sync::Arc::new(StartupProbe::default());
+    let db = {
+        let _probe = enter_startup_probe(Some(probe.clone()));
+        Db::open(&tmp, 2).unwrap()
+    };
     let first = record_access_marks(&db, vec![10], vec![(20, 42)])
         .await
         .unwrap();
+    let transactions = probe.transactions();
+    assert!(!maintain_access_marks(&db).await.unwrap());
+    assert_eq!(
+        probe.transactions(),
+        transactions,
+        "nothing to reclaim takes no writer lock"
+    );
     db.with_conn(|conn| {
         conn.execute_batch_bounded(
             "UPDATE meta SET value='1' WHERE key='access_mark:10';

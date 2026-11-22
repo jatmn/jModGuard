@@ -73,6 +73,16 @@ pub(crate) async fn next_guild_erasure_after(
     after: Option<i64>,
 ) -> Result<Option<GuildErasureJob>> {
     db.with_conn(move |conn| {
+        // Advisory read: with no job queued the idle worker opens no primary
+        // snapshot. Replica lag can only defer a job to a later tick.
+        let queued: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM guild_erasure_jobs)",
+            (),
+            |r| Ok(r.get(0)?),
+        )?;
+        if !queued {
+            return Ok(None);
+        }
         let tx = conn.transaction_primary_snapshot()?;
         let load = |after: i64| {
             tx.query_row(

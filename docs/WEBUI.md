@@ -400,7 +400,16 @@ Below are bot activity (Gateway events per minute and by type, logical Discord R
 guilds, capture queue), API activity (requests per minute, p50/p95 latency, 4xx/5xx,
 active sessions, OAuth and Discord 429s, and the API's Discord requests and 429s by
 OAuth route) and cost drivers per minute (database round
-trips, read and write transactions, Discord requests, log output, API response bytes).
+trips, read and write transactions, primary-routed statements, Discord requests, log
+output, API response bytes).
+Primary-routed statements count every statement a process sends in a transaction the
+provider routes to the primary (all but `BEGIN READONLY`), including that `BEGIN` and its
+`COMMIT` or `ROLLBACK`, plus lease and fence renewals. Core and guild-store databases are
+totalled apart. The cost table ranks them by the code location that opened the transaction
+(for example `db/moderation:<line>`, prefixed `guild ` for a guild store) and shows coarse core
+`BEGIN` latency buckets and `BEGIN` timeouts. No SQL text or identifiers are recorded. A
+prepared query counts once, and a minute keeps at most 24 locations per process; the rest
+count as `other`. Compare the core total with the provider's primary-forwarded queries.
 Each logical Discord request counts once, including direct bot log deliveries. Internal
 rate-limit retries share the original request count.
 Database rows read and Bunny billing are shown as unavailable: the database client does

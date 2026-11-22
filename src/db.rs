@@ -628,6 +628,13 @@ impl Db {
             .owner = owner;
     }
 
+    /// Bot Resources counts this pool's primary work as a guild store's.
+    pub(crate) fn mark_guild_store(&self) {
+        self.connections
+            .guild_store
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn install_commit_lease_probe(&self, probe: crate::db_compat::CommitLeaseProbe) {
         *self
             .connections
@@ -693,6 +700,8 @@ struct ConnectionPool {
     generation_source: Mutex<Option<Arc<Mutex<ActiveLease>>>>,
     launcher_fence: Arc<Mutex<Option<String>>>,
     commit_lease_probe: Arc<Mutex<Option<crate::db_compat::CommitLeaseProbe>>>,
+    /// Guild-store pools count primary work apart from the core database.
+    guild_store: std::sync::atomic::AtomicBool,
 }
 
 enum LeasedConnection {
@@ -767,6 +776,7 @@ impl ConnectionLease {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         connection.set_commit_lease_probe(probe);
+        connection.set_guild_store(pool.guild_store.load(std::sync::atomic::Ordering::Relaxed));
         Ok(Self {
             connection: LeasedConnection::Reusable(connection),
             pool,
@@ -1096,6 +1106,7 @@ impl Db {
                     generation_source: Mutex::new(None),
                     launcher_fence: Arc::clone(&launcher_fence),
                     commit_lease_probe,
+                    guild_store: std::sync::atomic::AtomicBool::new(false),
                 }),
                 lease_connection: Arc::new(Mutex::new(Some(lease_connection))),
                 permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),

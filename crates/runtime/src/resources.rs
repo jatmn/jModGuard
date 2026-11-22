@@ -77,6 +77,16 @@ pub fn peek_counter(name: &str) -> u64 {
     activity().counters.get(name).copied().unwrap_or(0)
 }
 
+/// The current minute's value of one label in a labelled family, without taking it.
+pub fn peek_labelled(family: &str, label: &str) -> u64 {
+    activity()
+        .labelled
+        .get(family)
+        .and_then(|labels| labels.get(label))
+        .copied()
+        .unwrap_or(0)
+}
+
 /// Records one request's latency in the current minute's histogram.
 pub fn observe_latency_ms(ms: u64) {
     let slot = LATENCY_BOUNDS_MS

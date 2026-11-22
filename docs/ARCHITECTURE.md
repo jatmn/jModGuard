@@ -257,7 +257,8 @@ operations now use API admission and bot dispatch.
   `meta` for gateway member and role changes and for guild updates, which can
   include ownership changes. A snapshot older than a matching mark is fetched
   again before use (#653). The bot reclaims expired marks even when there are no
-  new gateway events. The guild-list display cache serves `/api/me` and can keep
+  new gateway events; a check that finds nothing to reclaim is an advisory read and
+  takes no writer lock. The guild-list display cache serves `/api/me` and can keep
   the last good list while Discord is rate-limiting.
 
 ## Source layout

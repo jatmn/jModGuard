@@ -1954,7 +1954,11 @@ async fn arm_expiry(
 
 #[tokio::test]
 async fn timed_ban_dispatches_only_when_due_and_marks_unbanned() {
-    let f = Fixture::new();
+    let probe = std::sync::Arc::new(db::StartupProbe::default());
+    let f = {
+        let _probe = db::enter_startup_probe(Some(probe.clone()));
+        Fixture::new()
+    };
     let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
     db::record_ban(&f.db, 10, 20, None, "temporary")
         .await
@@ -1965,10 +1969,17 @@ async fn timed_ban_dispatches_only_when_due_and_marks_unbanned() {
     arm_expiry(&f.db, enrollment, 20, 100).await.unwrap();
     let discord = MockDiscord::default();
     let limits = WorkerLimits::default();
+    let transactions = probe.transactions();
     expire_bans(&f.db, None, &discord, 99, &limits)
         .await
         .unwrap();
     assert_eq!(discord.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        probe.transactions(),
+        transactions,
+        "a poll with nothing due opens no primary transaction"
+    );
+    // The first poll at the deadline lifts it.
     expire_bans(&f.db, None, &discord, 100, &limits)
         .await
         .unwrap();
@@ -1980,10 +1991,12 @@ async fn timed_ban_dispatches_only_when_due_and_marks_unbanned() {
     let bans = db::list_bans(&f.db, 10, 10).await.unwrap();
     assert!(!bans.iter().find(|b| b.user_id == 20).unwrap().active);
     assert!(bans.iter().find(|b| b.user_id == 21).unwrap().active);
+    let transactions = probe.transactions();
     expire_bans(&f.db, None, &discord, 101, &limits)
         .await
         .unwrap();
     assert_eq!(discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.transactions(), transactions);
 }
 
 #[tokio::test]
