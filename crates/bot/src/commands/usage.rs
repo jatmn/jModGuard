@@ -111,7 +111,7 @@ pub(super) fn reply(
         }
         Invocation::Slash(name) => (
             format!("/{name}"),
-            slash_syntax(&command.behavior),
+            slash_syntax(&command.behavior, error.action),
             format!(
                 "/{} command:{}",
                 super::sanitize_slash_name(help),
@@ -137,20 +137,20 @@ pub(super) fn help_detail(command: &CommandDef, prefix: &str, is_prefix: bool) -
     } else {
         format!("/{}", super::sanitize_slash_name(&command.name))
     };
-    // Effective built-ins retain their shipped name. Preserve explicitly
-    // customized prefix usage on overrides, as well as custom command usage.
-    let generate = jmodguard::defaults::default_commands()
-        .into_iter()
-        .any(|shipped| {
-            shipped.name == command.name
-                && (!is_prefix || command.usage.is_empty() || command.usage == shipped.usage)
-        });
-    let usage = if generate {
-        let (usage, _) = if is_prefix {
-            prefix_syntax(&command.behavior, None)
-        } else {
-            slash_syntax(&command.behavior)
-        };
+    // Saved usage is prefix text. Effective built-ins retain their shipped name
+    // and only use saved text when an operator has customized it.
+    let generated_prefix = is_prefix
+        && jmodguard::defaults::default_commands()
+            .into_iter()
+            .any(|shipped| {
+                shipped.name == command.name
+                    && (command.usage.is_empty() || command.usage == shipped.usage)
+            });
+    let usage = if !is_prefix {
+        let (usage, _) = slash_syntax(&command.behavior, None);
+        command_line(&name, &usage)
+    } else if generated_prefix {
+        let (usage, _) = prefix_syntax(&command.behavior, None);
         command_line(&name, &usage)
     } else {
         command.usage.clone()
@@ -257,17 +257,10 @@ fn prefix_syntax(behavior: &Behavior, action: Option<&str>) -> (String, String) 
             }
             match action {
                 Some(action) => {
-                    let n = match (behavior, action) {
-                        (Behavior::Template { .. } | Behavior::Logchannel { .. }, SET) => 3,
-                        (Behavior::Rule { .. }, DRYRUN) => 3,
-                        _ => 2,
-                    };
-                    args.truncate(n);
-                    for arg in &mut args[1..] {
+                    let (required, optional) = action_arguments(behavior, action);
+                    args.truncate(1 + required.len() + optional.len());
+                    for arg in args.iter_mut().skip(1).take(required.len()) {
                         arg.required = true;
-                    }
-                    if matches!(behavior, Behavior::Rule { .. }) && action == DRYRUN {
-                        args[2].required = false;
                     }
                     let (tail, example) = render(&args[1..]);
                     return (format!("{action} {tail}"), format!("{action} {example}"));
@@ -285,21 +278,62 @@ fn prefix_syntax(behavior: &Behavior, action: Option<&str>) -> (String, String) 
     render(&args)
 }
 
-fn slash_syntax(behavior: &Behavior) -> (String, String) {
+// The registration covers the whole command. After an action has been
+// selected, both kinds of usage can show its actual execution requirements.
+fn action_arguments(
+    behavior: &Behavior,
+    action: &str,
+) -> (&'static [&'static str], &'static [&'static str]) {
+    match (behavior, action) {
+        (Behavior::Template { .. }, SET) => (&["event", "text"], &[]),
+        (Behavior::Template { .. }, GET | RESET) | (Behavior::Logchannel { .. }, UNSET) => {
+            (&["event"], &[])
+        }
+        (Behavior::Logchannel { .. }, SET) => (&["event", "channel"], &[]),
+        (Behavior::Rule { .. }, TOGGLE) => (&["name"], &[]),
+        (Behavior::Rule { .. }, DRYRUN) => (&["name"], &["value"]),
+        _ => (&[], &[]),
+    }
+}
+
+fn slash_syntax(behavior: &Behavior, action: Option<&str>) -> (String, String) {
     let mut usage = Vec::new();
     let mut examples = Vec::new();
+    let (required, optional) = action.map_or((&[][..], &[][..]), |action| {
+        action_arguments(behavior, action)
+    });
+    let plan_requires_user = matches!(
+        behavior,
+        Behavior::Plan { steps } if super::plans::plan_requires_target(steps)
+    );
     for spec in behaviors::slash_spec(behavior) {
+        if let Some(action) = action {
+            if spec.name == "action" {
+                let option = format!("action:{action}");
+                usage.push(option.clone());
+                examples.push(option);
+                continue;
+            }
+            if !required.contains(&spec.name) && !optional.contains(&spec.name) {
+                continue;
+            }
+        }
         let option = format!("{}:<{}>", spec.name, spec.name);
-        usage.push(if spec.required {
-            option
-        } else {
-            format!("[{option}]")
-        });
+        usage.push(
+            if spec.required
+                || required.contains(&spec.name)
+                || (plan_requires_user && spec.name == "user")
+            {
+                option
+            } else {
+                format!("[{option}]")
+            },
+        );
         let example = match (behavior, spec.name) {
             (Behavior::Rule { .. }, "action") => DRYRUN,
             (Behavior::Rule { .. }, "name") => "mention_spam",
             (Behavior::Template { .. }, "action") => GET,
-            (Behavior::Template { .. }, "text") => "",
+            (Behavior::Template { .. }, "text") if action.is_none() => "",
             (Behavior::Logchannel { .. }, "action") => SET,
             (_, name) => argument_example(name),
         };

@@ -3079,6 +3079,98 @@ async fn usage_review_prefix_help_agrees_with_shipped_error_syntax() {
     }
 }
 
+#[tokio::test]
+async fn usage_followup_slash_errors_keep_the_failed_action() {
+    use serenity::model::permissions::Permissions;
+
+    let fx = StatsDispatch::new(false, Vec::new()).await;
+    fx.install(Permissions::MANAGE_GUILD);
+    for (command, options, problem, usage, example) in [
+        (
+            "template",
+            serde_json::json!([
+                {"name": "action", "type": 3, "value": "set"},
+                {"name": "event", "type": 3, "value": "mod_action"}
+            ]),
+            "Missing argument `text`.",
+            "/template action:set event:<event> text:<text>",
+            "/template action:set event:mod_action text:Please read the rules",
+        ),
+        (
+            "logchannel",
+            serde_json::json!([
+                {"name": "action", "type": 3, "value": "set"},
+                {"name": "event", "type": 3, "value": "mod_action"}
+            ]),
+            "Missing argument `channel`.",
+            "/logchannel action:set event:<event> channel:<channel>",
+            "/logchannel action:set event:mod_action channel:<#42>",
+        ),
+        (
+            "rule",
+            serde_json::json!([
+                {"name": "name", "type": 3, "value": "mention_spam"},
+                {"name": "action", "type": 3, "value": "dryrun"},
+                {"name": "value", "type": 3, "value": "maybe"}
+            ]),
+            "Invalid argument `value`.",
+            "/rule name:<name> action:dryrun [value:<value>]",
+            "/rule name:mention_spam action:dryrun value:on",
+        ),
+    ] {
+        fx.slash_with_options(command, options).await;
+        let reply = fx.sent(command);
+        let text = reply["content"].as_str().unwrap();
+        assert!(text.contains(problem), "{text}");
+        assert!(text.contains(&format!("Usage: `{usage}`")), "{text}");
+        assert!(text.contains(&format!("Example: `{example}`")), "{text}");
+    }
+    fx.finish();
+}
+
+#[tokio::test]
+async fn usage_followup_custom_slash_help_matches_required_plan_target() {
+    use serenity::model::permissions::Permissions;
+
+    for saved_usage in ["!cleanup <member-name>", ""] {
+        let mut cleanup = jmodguard::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "kick")
+            .unwrap();
+        cleanup.name = "cleanup".into();
+        cleanup.aliases.clear();
+        cleanup.usage = saved_usage.into();
+        cleanup.behavior = crate::types::Behavior::Plan {
+            steps: vec![crate::types::PlanStep::Kick],
+        };
+        let fx = StatsDispatch::new(false, vec![cleanup]).await;
+        fx.install(Permissions::MANAGE_GUILD);
+        fx.slash("cleanup").await;
+        let error = fx.sent("custom slash usage error");
+        fx.slash_with_options(
+            "help",
+            serde_json::json!([{"name": "command", "type": 3, "value": "cleanup"}]),
+        )
+        .await;
+        let slash_help = fx.sent("custom slash help");
+        fx.prefix("!help cleanup").await;
+        let prefix_help = fx.sent("custom prefix help");
+        fx.finish();
+
+        let help = slash_help["content"].as_str().unwrap();
+        assert!(help.contains("Usage: `/cleanup user:<user>`"), "{help}");
+        let content = error["content"].as_str().unwrap();
+        assert!(content.contains("Missing argument `user`."), "{content}");
+        assert!(
+            content.contains("Usage: `/cleanup user:<user>`"),
+            "{content}"
+        );
+        assert!(content.contains("`/help command:cleanup`"), "{content}");
+        let help = prefix_help["content"].as_str().unwrap();
+        assert!(help.contains(&format!("Usage: `{saved_usage}`")), "{help}");
+    }
+}
+
 /// `!status` (prefix alias) and `/stats` share one dispatch: the permission
 /// denial is unchanged text, and an allowed caller gets one log-style embed.
 #[tokio::test]
