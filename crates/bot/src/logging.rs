@@ -1726,6 +1726,9 @@ pub(crate) fn discord_embed(embed: jmodguard::log_embeds::LogEmbed) -> CreateEmb
     if !embed.description.is_empty() {
         builder = builder.description(embed.description);
     }
+    if let Some(url) = embed.url {
+        builder = builder.url(url);
+    }
     for field in embed.fields {
         builder = builder.field(field.name, field.value, field.inline);
     }

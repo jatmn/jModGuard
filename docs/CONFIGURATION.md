@@ -27,6 +27,8 @@ the bot loads its bot token; the API uses OAuth and queues administrative action
 | `bot.default_prefix` | `!` | seeded into the global settings row on first boot; synced to durable `meta.settings_terminal_defaults` on bot migrate-open (final fallback when global/guild omit the field) (env: `JMODGUARD_DEFAULT_PREFIX`) |
 | `bot.owner_id` | `0` | owner user ID (owner commands + global WebUI config) (env: `JMODGUARD_OWNER_ID`) |
 | `bot.status` | `moderating` | presence text (env: `JMODGUARD_BOT_STATUS`) |
+| `bot.about_webui_url` | — | public Web UI URL that `!about` links to (env: `JMODGUARD_ABOUT_WEBUI_URL`). Only an `https` DNS name is shown, as its origin; IP addresses, `localhost`, hosts containing a Discord ID (17+ digits), and local, internal or reserved names (such as `.local`, `.internal`, `.lan`, `.home.arpa`, `.test`, `.invalid`) are left out. The bot cannot tell whether a name resolves only on a private network (split DNS), so set a name your users can open |
+| `bot.about_instance` | — | optional one-line note about your instance, shown under the upstream project link in `!about` (env: `JMODGUARD_ABOUT_INSTANCE`; up to 200 characters) |
 | `bot.config_poll_secs` | `5` | how often each process polls durable `config_version` (env: `JMODGUARD_CONFIG_POLL_SECS`) |
 | `log.level` | `info` | tracing level (env: `JMODGUARD_LOG_LEVEL`) |
 | `log.directory` | `logs` | rolling log directory (env: `JMODGUARD_LOG_DIRECTORY`; empty = console only). Bot writes `jmodguard-bot.log`; API writes `jmodguard-api.log`. Container images default this env var to empty for platform logging |

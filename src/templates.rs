@@ -188,6 +188,7 @@ pub fn stats_embed(
                 inline: false,
             },
         ],
+        url: None,
     }
     .bounded()
 }
@@ -459,6 +460,227 @@ fn format_bytes(bytes: u64) -> String {
     format!("{whole}.{frac} {suffix}")
 }
 
+/// Public project repository linked from `!about`. Self-hosted copies keep it.
+const PROJECT_REPO_URL: &str = "https://github.com/jatmn/jModGuard";
+/// Brand title of the `!about` embed.
+const ABOUT_TITLE: &str = "🛡️ jModGuard";
+/// `!about` accent color.
+const ABOUT_COLOR: u32 = 0x8ab4f8;
+const ABOUT_TAGLINE: &str =
+    "A data-driven Discord moderation bot you can host for your own servers.";
+const ABOUT_HIGHLIGHTS: &str = "\
+• Automod for spam bots, floods, invites and bad words\n\
+• Moderation commands with cases and escalation\n\
+• Event logs sent to the channels you choose\n\
+• Commands, rules and messages editable without code";
+const ABOUT_GET: &str = "📥 Get jModGuard";
+const ABOUT_VERSION: &str = "🏷️ Version";
+const ABOUT_UPTIME: &str = "⏱️ Uptime";
+const ABOUT_HIGHLIGHTS_LABEL: &str = "✨ Highlights";
+const ABOUT_START: &str = "🧭 Get started";
+const ABOUT_LINKS: &str = "🔗 Links";
+const ABOUT_INSTANCE: &str = "🏠 This instance";
+const ABOUT_INSTANCE_MAX: usize = 200;
+/// Longest guild prefix `!about` shows in its help hint; longer ones show `/help`.
+const ABOUT_PREFIX_MAX: usize = 32;
+
+/// Public facts for `!about`. It holds no Discord application, client, server
+/// or user IDs, hostnames or internal addresses; the only configured values
+/// are the Web UI URL, shown only as a public HTTPS origin, and the operator line.
+/// There is no bot avatar: Discord's custom-avatar URL contains the bot's user ID.
+pub struct About<'a> {
+    pub version: &'a str,
+    pub uptime_seconds: u64,
+    /// Command prefix for this server, shown only through `about_help_hint`.
+    pub prefix: &'a str,
+    /// `bot.about_webui_url` as configured.
+    pub webui_url: &'a str,
+    /// `bot.about_instance` as configured.
+    pub instance: &'a str,
+}
+
+/// Whether `text` holds a Discord ID (application, server, channel or user
+/// snowflake): a run of 17 or more ASCII digits.
+fn has_discord_id(text: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_digit())
+        .any(|run| run.len() >= 17)
+}
+
+/// The origin of a configured Web UI URL when it is a public HTTPS address: a
+/// dotted DNS name with no credentials, IP literal, Discord ID or local,
+/// internal or reserved name. Paths are dropped and an ID-bearing host is
+/// refused so a configured URL cannot carry a server ID.
+/// A name passing this check may still resolve only on a private network.
+fn public_webui_url(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw.trim()).ok()?;
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    let Some(url::Host::Domain(host)) = url.host() else {
+        return None;
+    };
+    // At most one trailing dot (the DNS root); `a.org..` has an empty label.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    // URL parsing accepts characters such as `)` and `*` in a host; a DNS name
+    // has only letters, digits and inner hyphens (IDNs arrive as punycode).
+    let dns_label = |label: &str| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    // Local/internal suffixes plus special-use names that never resolve
+    // publicly (RFC 6761, RFC 7686, RFC 9476).
+    let local = [
+        "localhost",
+        "local",
+        "localdomain",
+        "internal",
+        "intranet",
+        "lan",
+        "home",
+        "corp",
+        "home.arpa",
+        "test",
+        "invalid",
+        "example",
+        "onion",
+        "alt",
+    ];
+    if !host.contains('.')
+        || has_discord_id(host)
+        || !host.split('.').all(dns_label)
+        || local
+            .iter()
+            .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+    {
+        return None;
+    }
+    Some(url.origin().ascii_serialization())
+}
+
+/// Where the `!about` version links: the changelog. The binary only knows its
+/// Cargo version, and main and nightly images report the last stable version
+/// (docs/RELEASES.md), so a release-tag link could point at older code than the
+/// running build.
+fn about_version_url() -> String {
+    format!("{PROJECT_REPO_URL}/blob/main/CHANGELOG.md")
+}
+
+/// The `!about` help pointer, shared by the embed and the plain text. The guild
+/// prefix is free text from settings, so it is shown only when it cannot change
+/// the output: a Discord ID (a mention prefix carries the bot's application ID),
+/// a backtick (it would end the code span and let the rest render as Markdown or
+/// a link), a line break or other control character, or a prefix longer than
+/// [`ABOUT_PREFIX_MAX`] (Discord's length limits would clip the closing backtick)
+/// falls back to `/help`.
+fn about_help_hint(prefix: &str) -> String {
+    let plain = !has_discord_id(prefix)
+        && !prefix.is_empty()
+        && prefix.chars().count() <= ABOUT_PREFIX_MAX
+        && !prefix
+            .chars()
+            .any(|c| c == '`' || c.is_control() || (c.is_whitespace() && c != ' '));
+    let command = if plain {
+        format!("{prefix}help")
+    } else {
+        "/help".into()
+    };
+    format!("{} lists commands.", inline_code(&command))
+}
+
+fn about_instance_line(instance: &str) -> Option<String> {
+    let line = instance.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!line.is_empty()).then(|| crate::log_embeds::clip(&line, ABOUT_INSTANCE_MAX))
+}
+
+/// Branded `!about` embed: project link, version, uptime, highlights and
+/// pointers. Uses only public project URLs and the checked Web UI origin.
+pub fn about_embed(about: &About<'_>) -> crate::log_embeds::LogEmbed {
+    use crate::log_embeds::{Field, LogEmbed};
+    let field = |name: &str, value: String, inline: bool| Field {
+        name: name.into(),
+        value,
+        inline,
+    };
+    let repo_label = PROJECT_REPO_URL.trim_start_matches("https://");
+    let webui = match public_webui_url(about.webui_url) {
+        Some(url) => format!("Manage settings in the [Web UI]({url})."),
+        None => "Server admins manage settings in the Web UI.".into(),
+    };
+    let mut fields = vec![
+        field(
+            ABOUT_GET,
+            format!(
+                "**[{repo_label}]({PROJECT_REPO_URL})**\nFree to download and host for your own server."
+            ),
+            false,
+        ),
+        field(
+            ABOUT_VERSION,
+            format!("[v{}]({})", about.version, about_version_url()),
+            true,
+        ),
+        field(
+            ABOUT_UPTIME,
+            inline_code(&format_duration(about.uptime_seconds)),
+            true,
+        ),
+        field(ABOUT_HIGHLIGHTS_LABEL, ABOUT_HIGHLIGHTS.into(), false),
+        field(
+            ABOUT_START,
+            format!("{}\n{webui}", about_help_hint(about.prefix)),
+            false,
+        ),
+        field(
+            ABOUT_LINKS,
+            format!(
+                "[Docs]({PROJECT_REPO_URL}/tree/main/docs) · [Changelog]({PROJECT_REPO_URL}/blob/main/CHANGELOG.md) · [License]({PROJECT_REPO_URL}/blob/main/LICENSE.md)"
+            ),
+            false,
+        ),
+    ];
+    if let Some(line) = about_instance_line(about.instance) {
+        fields.push(field(ABOUT_INSTANCE, line, false));
+    }
+    LogEmbed {
+        title: ABOUT_TITLE.into(),
+        color: ABOUT_COLOR,
+        description: ABOUT_TAGLINE.into(),
+        fields,
+        url: Some(PROJECT_REPO_URL.into()),
+    }
+    .bounded()
+}
+
+/// Plain-text `!about` for a `{response}` template and for channels where
+/// Discord refuses embeds. Same facts as [`about_embed`].
+pub fn about_text(about: &About<'_>) -> String {
+    let mut lines = vec![
+        format!("**{ABOUT_TITLE}** — {ABOUT_TAGLINE}"),
+        format!("Get it: <{PROJECT_REPO_URL}>"),
+        format!("Version: v{} (<{}>)", about.version, about_version_url()),
+        format!(
+            "Uptime: {}",
+            inline_code(&format_duration(about.uptime_seconds))
+        ),
+        ABOUT_HIGHLIGHTS.into(),
+        about_help_hint(about.prefix),
+    ];
+    if let Some(url) = public_webui_url(about.webui_url) {
+        lines.push(format!("Web UI: <{url}>"));
+    }
+    lines.push(format!(
+        "Docs: <{PROJECT_REPO_URL}/tree/main/docs> · License: <{PROJECT_REPO_URL}/blob/main/LICENSE.md>"
+    ));
+    if let Some(line) = about_instance_line(about.instance) {
+        lines.push(format!("This instance: {line}"));
+    }
+    lines.join("\n")
+}
+
 /// Renders a template, replacing `{variable}` tokens with values from `vars`.
 /// Unknown tokens are left untouched so template mistakes are visible.
 pub fn render(template: &str, vars: &BTreeMap<String, String>) -> String {
@@ -624,6 +846,239 @@ mod presentation_tests {
             assert_eq!(format_duration(seconds), expected, "{seconds}");
             assert_eq!(format_compact_duration(seconds), expected, "{seconds}");
         }
+    }
+
+    /// Discord snowflakes (application, client, server and user IDs) are 17+ digits.
+    fn has_snowflake(text: &str) -> bool {
+        text.split(|c: char| !c.is_ascii_digit())
+            .any(|run| run.len() >= 17)
+    }
+
+    fn about_start(webui_url: &str, instance: &str) -> String {
+        let embed = about_embed(&About {
+            version: "0.2.1",
+            uptime_seconds: 342,
+            prefix: "?",
+            webui_url,
+            instance,
+        });
+        let start = embed.fields.iter().find(|f| f.name == ABOUT_START).unwrap();
+        start.value.clone()
+    }
+
+    #[test]
+    fn about_embed_links_the_repo_and_shows_no_deployment_identifiers() {
+        let id = "1234567890123456789";
+        let about = About {
+            version: "0.2.1",
+            uptime_seconds: 342,
+            prefix: "?",
+            // A configured path or query could carry a server ID; only the origin is shown.
+            webui_url: &format!(" https://Mod.Example.org/guilds/{id}?client_id={id} "),
+            instance: "Hosted by\nExample   Community",
+        };
+        let embed = about_embed(&about);
+        assert_eq!(embed.title, "🛡️ jModGuard");
+        assert_eq!(
+            embed.url.as_deref(),
+            Some("https://github.com/jatmn/jModGuard")
+        );
+        assert_eq!(embed.color, ABOUT_COLOR);
+        assert_eq!(embed.description, ABOUT_TAGLINE);
+        let fields = embed
+            .fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.value.as_str(), f.inline))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fields,
+            [
+                (
+                    ABOUT_GET,
+                    "**[github.com/jatmn/jModGuard](https://github.com/jatmn/jModGuard)**\nFree to download and host for your own server.",
+                    false
+                ),
+                (
+                    ABOUT_VERSION,
+                    "[v0.2.1](https://github.com/jatmn/jModGuard/blob/main/CHANGELOG.md)",
+                    true
+                ),
+                (ABOUT_UPTIME, "`5m 42s`", true),
+                (ABOUT_HIGHLIGHTS_LABEL, ABOUT_HIGHLIGHTS, false),
+                (
+                    ABOUT_START,
+                    "`?help` lists commands.\nManage settings in the [Web UI](https://mod.example.org).",
+                    false
+                ),
+                (
+                    ABOUT_LINKS,
+                    "[Docs](https://github.com/jatmn/jModGuard/tree/main/docs) · [Changelog](https://github.com/jatmn/jModGuard/blob/main/CHANGELOG.md) · [License](https://github.com/jatmn/jModGuard/blob/main/LICENSE.md)",
+                    false
+                ),
+                (ABOUT_INSTANCE, "Hosted by Example Community", false),
+            ]
+        );
+        let text = about_text(&about);
+        assert_eq!(
+            text,
+            format!(
+                "**🛡️ jModGuard** — {ABOUT_TAGLINE}\n\
+                 Get it: <https://github.com/jatmn/jModGuard>\n\
+                 Version: v0.2.1 (<https://github.com/jatmn/jModGuard/blob/main/CHANGELOG.md>)\n\
+                 Uptime: `5m 42s`\n\
+                 {ABOUT_HIGHLIGHTS}\n\
+                 `?help` lists commands.\n\
+                 Web UI: <https://mod.example.org>\n\
+                 Docs: <https://github.com/jatmn/jModGuard/tree/main/docs> · License: <https://github.com/jatmn/jModGuard/blob/main/LICENSE.md>\n\
+                 This instance: Hosted by Example Community"
+            )
+        );
+        // Everything sent is free of IDs and links only to the public project or
+        // the accepted Web UI origin. The whole serialized embed is scanned so
+        // every field it carries, including any image URL, is covered: `"`
+        // starts a JSON URL value, `(` a Markdown link and `<` a plain-text link.
+        let public_only = |value: &str| {
+            assert!(!has_snowflake(value), "{value}");
+            for link in value
+                .split(['(', '<', '"'])
+                .skip(1)
+                .filter(|s| s.starts_with("http"))
+            {
+                assert!(
+                    link.starts_with("https://github.com/jatmn/jModGuard")
+                        || link.starts_with("https://mod.example.org)")
+                        || link.starts_with("https://mod.example.org>"),
+                    "{link}"
+                );
+            }
+        };
+        public_only(&serde_json::to_string(&embed).unwrap());
+        public_only(&text);
+        // The guild prefix is free text from settings. A mention prefix carries
+        // the bot's ID, and a backtick, a line break or a prefix long enough for
+        // Discord's limits to clip the closing backtick would let the rest render
+        // as Markdown, so such prefixes point at `/help` in both formats instead.
+        let long_prefix = format!("[x](https://evil.example.org){}", "a".repeat(2000));
+        for prefix in [
+            "<@123456789012345678>",
+            "<@!123456789012345678>",
+            "1234567890123456789",
+            "a` [x](https://evil.example.org) `",
+            "a\n[x](https://evil.example.org)",
+            "a\u{2028}[x](https://evil.example.org)",
+            long_prefix.as_str(),
+        ] {
+            let about = About { prefix, ..about };
+            let embed = about_embed(&about);
+            let text = about_text(&about);
+            let start = embed.fields.iter().find(|f| f.name == ABOUT_START).unwrap();
+            assert!(
+                start.value.starts_with("`/help` lists commands.\n"),
+                "{prefix:?}: {}",
+                start.value
+            );
+            assert!(
+                text.contains("\n`/help` lists commands.\n"),
+                "{prefix:?}: {text}"
+            );
+            public_only(&serde_json::to_string(&embed).unwrap());
+            public_only(&text);
+        }
+        // Ordinary prefixes, including ones with digits or an inner space, keep
+        // the exact hint.
+        for prefix in ["!", "jm!", "mod 2"] {
+            let hint = format!("`{prefix}help` lists commands.");
+            let about = About { prefix, ..about };
+            assert!(about_text(&about).contains(&hint), "{prefix:?}");
+            let embed = about_embed(&about);
+            let start = embed.fields.iter().find(|f| f.name == ABOUT_START).unwrap();
+            assert!(start.value.starts_with(&hint), "{prefix:?}");
+        }
+        let long = "x".repeat(500);
+        let clipped = about_embed(&About {
+            instance: &long,
+            ..about
+        });
+        let line = &clipped.fields.last().unwrap().value;
+        assert_eq!(line.encode_utf16().count(), ABOUT_INSTANCE_MAX);
+    }
+
+    #[test]
+    fn about_shows_the_web_ui_link_only_for_a_public_https_url() {
+        for internal in [
+            "",
+            "not a url",
+            "http://mod.example.org",
+            "https://localhost:8080",
+            "https://127.0.0.1",
+            "https://10.0.0.5",
+            "https://[::1]:8080",
+            "https://jmodguard-api",
+            "https://api.internal",
+            "https://bot.lan",
+            "https://web.home.arpa",
+            "https://user:secret@mod.example.org",
+            // Reserved special-use names never resolve publicly.
+            "https://dash.test",
+            "https://mod.invalid",
+            "https://mod.example",
+            "https://mod.onion",
+            "https://mod.alt",
+            // Not DNS names: `)` would end the Markdown link at `https://a`.
+            "https://a).evil.example.org",
+            "https://mod*x.example.org",
+            "https://-mod.example.org",
+            "https://mod.example.org..",
+            // Dropping the path is not enough: a per-server host can carry an ID.
+            "https://123456789012345678.dash.example.org",
+            "https://g-123456789012345678.example.org/",
+        ] {
+            let start = about_start(internal, "");
+            assert_eq!(
+                start, "`?help` lists commands.\nServer admins manage settings in the Web UI.",
+                "{internal}"
+            );
+            let text = about_text(&About {
+                version: "0.2.1",
+                uptime_seconds: 342,
+                prefix: "?",
+                webui_url: internal,
+                instance: "",
+            });
+            assert!(!text.contains("Web UI"), "{internal}: {text}");
+        }
+        assert!(
+            about_start("https://mod.example.org:8443/", "")
+                .contains("(https://mod.example.org:8443)")
+        );
+        // A fully qualified name with its root dot stays accepted.
+        assert!(about_start("https://mod.example.org.", "").contains("(https://mod.example.org.)"));
+        // An internationalized name arrives as punycode and stays accepted.
+        assert!(
+            about_start("https://bücher.example.org", "")
+                .contains("(https://xn--bcher-kva.example.org)")
+        );
+    }
+
+    #[test]
+    fn about_links_a_prerelease_version_to_the_changelog() {
+        let embed = about_embed(&About {
+            version: "0.3.0-rc.1",
+            uptime_seconds: 0,
+            prefix: "!",
+            webui_url: "",
+            instance: "",
+        });
+        let version = embed
+            .fields
+            .iter()
+            .find(|f| f.name == ABOUT_VERSION)
+            .unwrap();
+        assert_eq!(
+            version.value,
+            "[v0.3.0-rc.1](https://github.com/jatmn/jModGuard/blob/main/CHANGELOG.md)"
+        );
+        assert!(embed.fields.iter().all(|f| f.name != ABOUT_INSTANCE));
     }
 
     /// Release status field value, with the line layout the stats embed shows.

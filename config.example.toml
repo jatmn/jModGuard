@@ -112,6 +112,13 @@ owner_id = 0
 # The retired chat-history retention field is no longer an operator setting.
 # Presence status text shown under the bot's name.
 status = "moderating"
+# `!about` always links the upstream project. Optionally link your public
+# Web UI (https DNS name only; local, internal and reserved names such as
+# .lan or .test, and hosts containing a Discord ID, are left out, so use a
+# name your users can open) and add one line about your instance.
+# Env: JMODGUARD_ABOUT_WEBUI_URL, JMODGUARD_ABOUT_INSTANCE.
+about_webui_url = ""
+about_instance = ""
 # How often each process polls durable config_version (cross-process cache invalidation).
 # Env: JMODGUARD_CONFIG_POLL_SECS.
 config_poll_secs = 5
