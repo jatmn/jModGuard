@@ -186,7 +186,7 @@ pub async fn record_resource_rollups(
         closed_hours.sort_unstable();
         closed_hours.dedup();
         for (process, hour_start) in closed_hours {
-            rank_closed_hour_labels(&tx, process, hour_start, now_secs)?;
+            rank_closed_hour_labels(&tx, process, hour_start)?;
         }
         if let Some((process, updated_at_ms, text)) = status {
             tx.execute_rows(
@@ -227,18 +227,15 @@ fn write_hour<E: SqlExecutor>(tx: &E, process: ResourceProcess, hour: &Rollup) -
 
 /// While an hour is open its row keeps only its busiest labels so far, so a
 /// label trimmed early loses the counts it had. Once the hour has ended,
-/// rank its labels again on the sum of all its saved minutes. Every minute
-/// in the hour is still retained, and the hour row already holds exactly
-/// those minutes; otherwise the row is left as it is.
+/// rank its labels again on the sum of all its saved minutes. This runs
+/// before the write prunes, so after a long gap the minutes can still be
+/// present. The row is left as it is unless the saved minutes account for
+/// every minute the hour holds.
 fn rank_closed_hour_labels<E: SqlExecutor>(
     tx: &E,
     process: ResourceProcess,
     hour_start: i64,
-    now_secs: i64,
 ) -> Result<()> {
-    if hour_start < now_secs - RESOURCE_MINUTE_RETENTION_SECS {
-        return Ok(());
-    }
     let (hour, minutes): (Option<String>, String) = tx.query_row(
         CLOSED_HOUR_SQL,
         params![

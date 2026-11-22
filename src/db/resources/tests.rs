@@ -146,54 +146,74 @@ async fn an_ended_hour_ranks_labels_on_all_its_minutes() {
     // A steady path is kept by name in every minute. One minute of bursts
     // displaces it from the open hour, and each later minute alone cannot
     // beat the hour-to-date totals it then competes with.
-    let mut minutes = vec![(
-        ResourceProcess::Bot,
-        with_paths(HOUR, quiet(50).chain([("steady".into(), 20)]).collect()),
-    )];
-    minutes.push((
-        ResourceProcess::Bot,
-        with_paths(
-            HOUR + 60,
-            burst(100).chain([("steady".into(), 20)]).collect(),
-        ),
-    ));
-    for m in 2..60 {
+    for process in [ResourceProcess::Bot, ResourceProcess::Api] {
+        let mut minutes = vec![(
+            process,
+            with_paths(HOUR, quiet(50).chain([("steady".into(), 20)]).collect()),
+        )];
         minutes.push((
-            ResourceProcess::Bot,
-            with_paths(HOUR + m * 60, vec![("steady".into(), 20)]),
+            process,
+            with_paths(
+                HOUR + 60,
+                burst(100).chain([("steady".into(), 20)]).collect(),
+            ),
         ));
+        for m in 2..60 {
+            minutes.push((
+                process,
+                with_paths(HOUR + m * 60, vec![("steady".into(), 20)]),
+            ));
+        }
+        record_resource_rollups(&f.db, minutes, None, HOUR + HOUR_SECS - 1)
+            .await
+            .unwrap();
     }
-    record_resource_rollups(&f.db, minutes, None, HOUR + HOUR_SECS - 1)
-        .await
-        .unwrap();
     let open = resource_records(&f.db, HOUR_SECS, HOUR, HOUR + HOUR_SECS)
         .await
         .unwrap();
-    assert!(
-        !open.bot[0].data.labelled["db_primary_paths"].contains_key("steady"),
-        "the open hour trims as it goes"
-    );
+    for hour in [&open.bot[0], &open.api[0]] {
+        assert!(
+            !hour.data.labelled["db_primary_paths"].contains_key("steady"),
+            "the open hour trims as it goes"
+        );
+    }
 
-    // The next hour's first minute ends this one.
-    record_resource_rollups(
-        &f.db,
-        vec![(ResourceProcess::Bot, minute(HOUR + HOUR_SECS, 100, 1))],
-        None,
-        HOUR + HOUR_SECS + 60,
-    )
-    .await
-    .unwrap();
+    // The bot's next hour starts at once; the API's only after a gap longer
+    // than minute retention. That write ranks the hour before it prunes the
+    // hour's minutes.
+    let resumed = HOUR + HOUR_SECS + RESOURCE_MINUTE_RETENTION_SECS + 2 * HOUR_SECS;
+    for (process, start) in [
+        (ResourceProcess::Bot, HOUR + HOUR_SECS),
+        (ResourceProcess::Api, resumed),
+    ] {
+        record_resource_rollups(
+            &f.db,
+            vec![(process, minute(start, 100, 1))],
+            None,
+            start + 60,
+        )
+        .await
+        .unwrap();
+    }
+    let minutes = resource_records(&f.db, MINUTE_SECS, HOUR, HOUR + HOUR_SECS)
+        .await
+        .unwrap();
+    assert!(
+        minutes.api.is_empty(),
+        "the gap write pruned the old minutes"
+    );
     let hours = resource_records(&f.db, HOUR_SECS, HOUR, HOUR + HOUR_SECS)
         .await
         .unwrap();
-    let hour = &hours.bot[0];
-    let paths = &hour.data.labelled["db_primary_paths"];
-    assert_eq!(paths["steady"], 20 * 60);
-    assert_eq!(paths.len(), crate::resources::MAX_LABELS + 1);
-    assert_eq!(paths["other"], 23 * 50, "the quietest paths fall to other");
-    assert_eq!(paths.values().sum::<u64>(), 20 * 60 + 23 * 100 + 23 * 50);
-    assert_eq!(hour.data.minutes, 60);
-    assert_eq!(hour.data.counters["api_requests"], 60);
+    for hour in [&hours.bot[0], &hours.api[0]] {
+        let paths = &hour.data.labelled["db_primary_paths"];
+        assert_eq!(paths["steady"], 20 * 60);
+        assert_eq!(paths.len(), crate::resources::MAX_LABELS + 1);
+        assert_eq!(paths["other"], 23 * 50, "the quietest paths fall to other");
+        assert_eq!(paths.values().sum::<u64>(), 20 * 60 + 23 * 100 + 23 * 50);
+        assert_eq!(hour.data.minutes, 60);
+        assert_eq!(hour.data.counters["api_requests"], 60);
+    }
 }
 
 #[tokio::test]
