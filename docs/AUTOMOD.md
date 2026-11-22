@@ -73,7 +73,9 @@ escalation accurate without false positives.
   (default 8). An eligible message adds a strike if the count in the window,
   including that message, exceeds the limit. Messages are counted by when the
   bot received them, so a slow configuration read cannot make spaced messages
-  look like a flood. Previously saved integer limits
+  look like a flood. Each message is judged on the messages that arrived before
+  it. If the bot finishes an author's messages out of arrival order, a strike
+  can be missed, but none is charged to a message that was under the limit. Previously saved integer limits
   above 1,023 do not trigger until the limit is lowered to the supported range.
   Saves that keep such a limit unchanged, such as enabling, dry-run, or a rules
   copy, still succeed; a save cannot set a new limit above 1,023.

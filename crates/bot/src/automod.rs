@@ -15,6 +15,7 @@ use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::model::prelude::Timestamp;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::Instant as AutomodInstant;
 
@@ -31,6 +32,10 @@ pub struct AutomodEngine {
     /// guild -> each built-in rule's dry-run mode as last seen in its config.
     /// Pruned with the guild's buckets.
     modes: DashMap<u64, GuildModes>,
+    /// Source of mode epochs. Values are never reused, so a mode entry that
+    /// cleanup removed and an evaluation recreated cannot match a surviving
+    /// ladder from another mode.
+    next_mode_epoch: AtomicU64,
 }
 
 /// A rule's mode epoch advances whenever an evaluated message sees the
@@ -69,30 +74,11 @@ impl AuthorState {
         }
         let index = self.velocity_events.partition_point(|at| *at <= arrived);
         self.velocity_events.insert(index, arrived);
-        if self.velocity_over_limit(rule, index) {
-            return true;
-        }
-        // Messages that arrived after this one but were evaluated first each
-        // gain one message in their window. One that reaches exactly the
-        // limit plus one is the strike in-order evaluation would have given
-        // it; windows that were already over the limit have struck already.
-        let window = velocity_window(rule);
-        let later = self
-            .velocity_events
-            .partition_point(|at| at.duration_since(arrived) < window);
-        (index + 1..later).any(|later| self.velocity_just_over_limit(rule, later))
-    }
-
-    /// The window ending at `index` holds exactly the limit plus one.
-    fn velocity_just_over_limit(&self, rule: &RuleDef, index: usize) -> bool {
-        let window = velocity_window(rule);
-        let arrived = self.velocity_events[index];
+        // Each message is judged on the messages that arrived before it, so a
+        // strike always lands on a message that is itself over the limit. If
+        // an earlier arrival is evaluated after a later one, the later
+        // message's strike can be missed, but none is charged to the wrong one.
         self.velocity_over_limit(rule, index)
-            && usize::try_from(param_u64(rule, "max_messages", 8))
-                .ok()
-                .and_then(|max| index.checked_sub(max + 1))
-                .and_then(|before| self.velocity_events.get(before))
-                .is_none_or(|before| arrived.duration_since(*before) >= window)
     }
 
     /// Counts the messages that arrived in the window ending at the message at
@@ -277,6 +263,8 @@ impl AutomodEngine {
             member_joins: DashMap::new(),
             last_prune: Mutex::new(AutomodInstant::now()),
             modes: DashMap::new(),
+            // A new ladder's epoch is 0, which no observed mode ever uses.
+            next_mode_epoch: AtomicU64::new(1),
         }
     }
 
@@ -345,14 +333,15 @@ impl AutomodEngine {
         {
             return seen.epoch;
         }
-        let mut seen = self.modes.entry(guild).or_insert(GuildModes {
+        let fresh = || self.next_mode_epoch.fetch_add(1, Ordering::Relaxed);
+        let mut seen = self.modes.entry(guild).or_insert_with(|| GuildModes {
             dry_run: current,
-            epoch: [0; RULE_IDS.len()],
+            epoch: [fresh(); RULE_IDS.len()],
         });
         for (index, dry_run) in current.into_iter().enumerate() {
             if seen.dry_run[index] != dry_run {
                 seen.dry_run[index] = dry_run;
-                seen.epoch[index] += 1;
+                seen.epoch[index] = fresh();
             }
         }
         seen.epoch
@@ -2059,17 +2048,13 @@ mod tests {
                 );
             }
         }
-        // Arrivals inside the window still count, in either evaluation order.
-        for order in [[0, 500], [500, 0]] {
-            let engine = AutomodEngine::new();
-            assert!(engine.evaluate(&cfg, &message(1, order[0])).is_none());
-            let action = engine.evaluate(&cfg, &message(2, order[1]));
-            assert_eq!(
-                action.map(|action| action.strikes),
-                Some(1),
-                "arrivals 0.5 s apart, evaluated in order {order:?}"
-            );
-        }
+        // Arrivals inside the window still count when evaluated in order.
+        let engine = AutomodEngine::new();
+        assert!(engine.evaluate(&cfg, &message(1, 0)).is_none());
+        let action = engine
+            .evaluate(&cfg, &message(2, 500))
+            .expect("over the limit");
+        assert_eq!(action.strikes, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2099,30 +2084,48 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn out_of_order_velocity_matches_receipt_order_strikes() {
+    async fn out_of_order_velocity_never_strikes_a_message_under_the_limit() {
         use super::AutomodInstant;
         use std::time::Duration;
         let mut cfg = default_automod_config();
         let velocity = cfg.rules.get_mut("velocity").unwrap();
-        velocity.params["max_messages"] = serde_json::json!(3);
+        velocity.params["max_messages"] = serde_json::json!(1);
         velocity.params["window_secs"] = serde_json::json!(1);
         let start = AutomodInstant::now();
         tokio::time::advance(Duration::from_secs(5)).await;
-        // The window ending at 900 ms holds four messages; the windows ending
-        // at 800 ms and 1700 ms hold three each.
-        for order in [[0, 50, 800, 900, 1700], [0, 50, 900, 1700, 800]] {
+        // Message IDs are the arrival times in milliseconds. In receipt order
+        // 750 and 1500 are over the limit; 0 never is.
+        let run = |order: &[u64]| {
             let engine = AutomodEngine::new();
-            let strikes = order
-                .into_iter()
-                .enumerate()
-                .filter(|&(id, after_ms)| {
+            order
+                .iter()
+                .filter_map(|&after_ms| {
                     let mut message = msg(1, "ordinary message", 0, false, false);
-                    message.message_id = id as u64;
+                    message.message_id = after_ms;
                     message.received = Some(start + Duration::from_millis(after_ms));
-                    engine.evaluate(&cfg, &message).is_some()
+                    engine.evaluate(&cfg, &message).map(|action| {
+                        assert_eq!(action.evidence["message_id"], after_ms);
+                        (after_ms, action.action.action)
+                    })
                 })
-                .count();
-            assert_eq!(strikes, 1, "evaluation order {order:?}");
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            run(&[0, 750, 1500]),
+            [(750, "delete".to_owned()), (1500, "timeout".to_owned())]
+        );
+        for order in [
+            [750, 0, 1500],
+            [0, 1500, 750],
+            [1500, 750, 0],
+            [750, 1500, 0],
+        ] {
+            for (struck, _) in run(&order) {
+                assert_ne!(
+                    struck, 0,
+                    "order {order:?} struck a message under the limit"
+                );
+            }
         }
     }
 
@@ -2156,6 +2159,31 @@ mod tests {
         older.role_mentions = 5;
         older.received = Some(start);
         assert!(engine.evaluate(&cfg, &older).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_recreated_mode_entry_cannot_reuse_a_dry_run_ladder() {
+        use std::time::Duration;
+        let mut cfg = default_automod_config();
+        let velocity = cfg.rules.get_mut("velocity").unwrap();
+        velocity.params["max_messages"] = serde_json::json!(1);
+        velocity.dry_run = true;
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "ordinary message", 0, false, false);
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        message.message_id += 1;
+        assert_eq!(engine.evaluate(&cfg, &message).unwrap().strikes, 1);
+        // Cleanup raced the new bucket and removed the guild's mode entry.
+        engine.modes.remove(&message.guild_id);
+
+        cfg.rules.get_mut("velocity").unwrap().dry_run = false;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        message.message_id += 1;
+        assert!(engine.evaluate(&cfg, &message).is_none());
+        message.message_id += 1;
+        let action = engine.evaluate(&cfg, &message).expect("first live strike");
+        assert_eq!(action.strikes, 1);
+        assert_eq!(action.action.action, "delete");
     }
 
     fn default_automod_config() -> CachedGuildConfig {
