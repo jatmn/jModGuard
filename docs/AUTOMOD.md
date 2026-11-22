@@ -84,7 +84,9 @@ escalation accurate without false positives.
   kick, or ban fires, further over-limit messages can be deleted at most once per
   second per bucket, across channels. Dry-run only logs the selected action,
   and the usual exemptions apply. A kick and rejoin keeps the bucket until it
-  expires after 10 minutes without a velocity strike.
+  expires after 10 minutes without a velocity strike. Fallback uses the action
+  type reserved at the final threshold. A replacement action type at the
+  same threshold takes effect on a fresh strike bucket.
 - Upgrading: older versions counted only messages that matched another rule.
   On the first bot start after upgrading, the global velocity rule and any
   server override that still match the shipped default switch to dry-run once,

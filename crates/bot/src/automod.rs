@@ -13,7 +13,7 @@ use serenity::client::Context;
 use serenity::model::guild::Member;
 use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::model::prelude::Timestamp;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::Instant as AutomodInstant;
@@ -98,7 +98,7 @@ struct RuleState {
 
 /// Reservation is independent of whether the selected Discord action runs.
 #[derive(Default)]
-struct ThresholdReservations(HashSet<u32>);
+struct ThresholdReservations(HashMap<u32, String>);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ThresholdState {
@@ -108,15 +108,19 @@ enum ThresholdState {
 
 impl ThresholdReservations {
     fn state(&self, threshold: u32) -> ThresholdState {
-        if self.0.contains(&threshold) {
+        if self.0.contains_key(&threshold) {
             ThresholdState::Reserved
         } else {
             ThresholdState::Available
         }
     }
 
-    fn reserve(&mut self, threshold: u32) {
-        self.0.insert(threshold);
+    fn reserve(&mut self, step: &ActionDef) {
+        self.0.insert(step.at, step.action.clone());
+    }
+
+    fn reserved_for(&self, step: &ActionDef) -> bool {
+        self.0.get(&step.at) == Some(&step.action)
     }
 
     fn release(&mut self, threshold: u32) {
@@ -136,6 +140,13 @@ const STRIKE_RETENTION: Duration = Duration::from_secs(crate::types::AUTOMOD_WIN
 const VELOCITY_FALLBACK_DELETE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl RuleState {
+    fn velocity_fallback_available(&self, step: &ActionDef, now: AutomodInstant) -> bool {
+        self.fired.reserved_for(step)
+            && self
+                .last_velocity_fallback_delete
+                .is_none_or(|last| now.duration_since(last) >= VELOCITY_FALLBACK_DELETE_INTERVAL)
+    }
+
     /// Starts a new ladder when the previous one expired.
     fn record_strike(&mut self, now: AutomodInstant, record_event: bool) -> u32 {
         // Events never postdate the last strike, so it alone decides expiry.
@@ -311,7 +322,7 @@ impl AutomodEngine {
         let has_invite = INVITE_RE.is_match(ctx.content);
 
         let mut best: Option<PendingAction> = None;
-        let mut best_dry = false;
+        let mut velocity_fallback = None;
         for rule_id in RULE_IDS {
             let Some(rule) = cfg.rules.get(rule_id) else {
                 continue;
@@ -385,9 +396,8 @@ impl AutomodEngine {
                 }
                 // A dry-run match is only logged, so it must not stop a live
                 // rule from acting on the same message.
-                if is_more_severe(&pending, true, &best, best_dry) {
+                if is_more_severe(&pending, best.as_ref()) {
                     best = Some(pending);
-                    best_dry = true;
                 }
                 continue;
             }
@@ -402,25 +412,20 @@ impl AutomodEngine {
             let Some(step) = rule.action_for_strike(strikes) else {
                 continue;
             };
+            let mut fallback_step = None;
             let action = if state.fired.state(step.at) == ThresholdState::Available {
-                state.fired.reserve(step.at);
+                state.fired.reserve(step);
                 step.clone()
             } else {
                 // Keep deliberate log/warn-only terminal steps and gaps in the ladder.
                 if rule_id != "velocity"
                     || !matches!(step.action.as_str(), "delete" | "timeout" | "kick" | "ban")
                     || rule.actions.iter().any(|action| action.at > step.at)
+                    || !state.velocity_fallback_available(step, AutomodInstant::now())
                 {
                     continue;
                 }
-                // Reserve the cooldown under the same bucket lock as the ladder.
-                let now = AutomodInstant::now();
-                if state.last_velocity_fallback_delete.is_some_and(|last| {
-                    now.duration_since(last) < VELOCITY_FALLBACK_DELETE_INTERVAL
-                }) {
-                    continue;
-                }
-                state.last_velocity_fallback_delete = Some(now);
+                fallback_step = Some(step);
                 ActionDef {
                     at: step.at,
                     action: "delete".into(),
@@ -447,9 +452,13 @@ impl AutomodEngine {
                 matched_rule: Some(rule.clone()),
                 dry_run: rule.dry_run,
             };
-            if is_more_severe(&pending, rule.dry_run, &best, best_dry) {
-                best = Some(pending);
-                best_dry = rule.dry_run;
+            if is_more_severe(&pending, best.as_ref()) {
+                if let Some(step) = fallback_step {
+                    // Keep the best alternative in case another message takes the cooldown.
+                    velocity_fallback = Some((pending, step));
+                } else {
+                    best = Some(pending);
+                }
             }
         }
 
@@ -520,12 +529,36 @@ impl AutomodEngine {
                 matched_rule: None,
                 dry_run: rule.dry_run,
             };
-            if is_more_severe(&pending, rule.dry_run, &best, best_dry) {
+            if is_more_severe(&pending, best.as_ref()) {
                 best = Some(pending);
-                best_dry = rule.dry_run;
             }
         }
+        // A fallback stored above already beat the earlier rules. It wins ties
+        // with later rules, just as it would in the normal traversal.
+        if let Some((pending, step)) = velocity_fallback
+            && best
+                .as_ref()
+                .is_none_or(|best| !is_more_severe(best, Some(&pending)))
+            && self.reserve_velocity_fallback((ctx.guild_id, ctx.author_id), pending.dry_run, step)
+        {
+            return Some(pending);
+        }
         best
+    }
+
+    fn reserve_velocity_fallback(&self, key: (u64, u64), dry_run: bool, step: &ActionDef) -> bool {
+        let Some(mut bucket) = self.state.get_mut(&key) else {
+            return false;
+        };
+        let Some(state) = bucket.rules.get_mut(&("velocity", dry_run)) else {
+            return false;
+        };
+        let now = AutomodInstant::now();
+        if !state.velocity_fallback_available(step, now) {
+            return false;
+        }
+        state.last_velocity_fallback_delete = Some(now);
+        true
     }
 
     /// Counts this message's mentions plus recent mentions in the window.
@@ -574,12 +607,7 @@ impl AutomodEngine {
 
 /// A live action outranks any dry-run one, so testing a rule in dry-run never
 /// displaces another rule's enforcement on the same message.
-fn is_more_severe(
-    cand: &PendingAction,
-    cand_dry: bool,
-    best: &Option<PendingAction>,
-    best_dry: bool,
-) -> bool {
+fn is_more_severe(cand: &PendingAction, best: Option<&PendingAction>) -> bool {
     fn rank(a: &str) -> u8 {
         match a {
             "ban" => 6,
@@ -590,9 +618,9 @@ fn is_more_severe(
             _ => 1,
         }
     }
-    best.as_ref()
-        .map(|b| (!cand_dry, rank(&cand.action.action)) > (!best_dry, rank(&b.action.action)))
-        .unwrap_or(true)
+    best.is_none_or(|b| {
+        (!cand.dry_run, rank(&cand.action.action)) > (!b.dry_run, rank(&b.action.action))
+    })
 }
 
 fn param_u64(rule: &RuleDef, key: &str, default: u64) -> u64 {
@@ -1677,6 +1705,73 @@ mod tests {
             assert_eq!(step.action.action, terminal);
             assert!(engine.evaluate(&cfg, &message).is_none());
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn velocity_fallback_requires_the_reserved_terminal_action_kind() {
+        for original in ["log", "timeout"] {
+            let mut cfg = default_automod_config();
+            let rule = cfg.rules.get_mut("velocity").unwrap();
+            rule.params["max_messages"] = serde_json::json!(0);
+            rule.actions.truncate(1);
+            rule.actions[0].action = original.into();
+            let engine = AutomodEngine::new();
+            let message = msg(1, "ordinary message", 0, false, false);
+            assert_eq!(
+                engine.evaluate(&cfg, &message).unwrap().action.action,
+                original
+            );
+
+            cfg.rules.get_mut("velocity").unwrap().actions[0].action = "kick".into();
+            assert!(
+                engine.evaluate(&cfg, &message).is_none(),
+                "the old {original} reservation can neither fire the kick nor unlock deletes",
+            );
+            tokio::time::advance(super::STRIKE_RETENTION).await;
+            assert_eq!(
+                engine.evaluate(&cfg, &message).unwrap().action.action,
+                "kick"
+            );
+            assert_eq!(
+                engine.evaluate(&cfg, &message).unwrap().action.action,
+                "delete"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn velocity_fallback_cooldown_is_charged_only_to_the_winner() {
+        let mut cfg = default_automod_config();
+        let rule = cfg.rules.get_mut("velocity").unwrap();
+        rule.params["max_messages"] = serde_json::json!(0);
+        rule.actions.truncate(1);
+        rule.actions[0].action = "kick".into();
+        let custom_id = "custom:0123456789abcdef";
+        let mut custom = custom_rule(
+            serde_json::json!({ "kind": "channel_content", "links": true }),
+            "warn",
+        );
+        custom.dry_run = false;
+        cfg.rules.insert(custom_id.into(), custom);
+        let engine = AutomodEngine::new();
+        let plain = msg(1, "ordinary message", 0, false, false);
+        assert_eq!(engine.evaluate(&cfg, &plain).unwrap().action.action, "kick");
+
+        let link = msg(1, "https://example.com", 0, false, false);
+        let warning = engine.evaluate(&cfg, &link).unwrap();
+        assert_eq!(warning.rule_id, custom_id);
+        assert_eq!(warning.action.action, "warn");
+        let delete = engine
+            .evaluate(&cfg, &plain)
+            .expect("the warning used no cooldown");
+        assert_eq!(delete.rule_id, "velocity");
+        assert_eq!(delete.action.action, "delete");
+        assert!(engine.evaluate(&cfg, &plain).is_none());
+
+        cfg.rules.get_mut(custom_id).unwrap().actions[0].action = "delete".into();
+        assert_eq!(engine.evaluate(&cfg, &link).unwrap().rule_id, custom_id);
+        tokio::time::advance(super::VELOCITY_FALLBACK_DELETE_INTERVAL).await;
+        assert_eq!(engine.evaluate(&cfg, &link).unwrap().rule_id, "velocity");
     }
 
     #[tokio::test]
