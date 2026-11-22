@@ -211,11 +211,11 @@ With dry-run on, generic rules evaluate normally but instead of acting post a
 When a dry-run rule and a live rule match the same message, the live rule's
 action runs and the dry-run match is not logged; a more severe dry-run action
 never replaces it. A dry-run match also never stops the member's prefix command
-in that message. A strike ladder never mixes dry-run and live strikes: once a
-message is evaluated while the rule is in a different mode from its current
-ladder, the rule's next strike starts a new ladder, even if nobody struck in
-between. Message history used for detection, such as velocity's window, is
-kept. An action chosen
+in that message. Dry-run and live keep separate strike ladders, so strikes
+counted in dry-run never use up live escalation, and live strikes from before a
+dry-run trial still count afterwards within the usual 10 minutes. Message
+history used for detection, such as velocity's window and recent mentions, is
+shared by both modes. An action chosen
 in dry-run stays log-only even if the rule goes live before it runs, and an
 action chosen live only logs if the rule switches to dry-run first.
 Exact-image and repeated-text rules report their matched messages there without

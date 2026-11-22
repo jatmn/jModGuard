@@ -15,7 +15,6 @@ use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::model::prelude::Timestamp;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::Instant as AutomodInstant;
 
@@ -29,27 +28,14 @@ pub struct AutomodEngine {
     state: DashMap<(u64, u64), AuthorState>,
     member_joins: DashMap<(u64, u64), Instant>,
     last_prune: Mutex<AutomodInstant>,
-    /// guild -> each built-in rule's dry-run mode as last seen in its config.
-    /// Pruned with the guild's buckets.
-    modes: DashMap<u64, GuildModes>,
-    /// Source of mode epochs. Values are never reused, so a mode entry that
-    /// cleanup removed and an evaluation recreated cannot match a surviving
-    /// ladder from another mode.
-    next_mode_epoch: AtomicU64,
-}
-
-/// A rule's mode epoch advances whenever an evaluated message sees the
-/// guild's configuration switch it between dry-run and live, whether or not
-/// anyone was striking then. A ladder therefore never mixes the two modes.
-#[derive(Clone, Copy)]
-struct GuildModes {
-    dry_run: [bool; RULE_IDS.len()],
-    epoch: [u64; RULE_IDS.len()],
 }
 
 #[derive(Default)]
 struct AuthorState {
-    rules: HashMap<&'static str, RuleState>,
+    /// Strike ladders keyed by (rule, dry-run). Dry-run strikes are simulated,
+    /// so each mode keeps its own ladder: simulated strikes never use up live
+    /// escalation, and live strikes never count toward dry-run.
+    rules: HashMap<(&'static str, bool), RuleState>,
     // Normal traffic keeps the velocity window alive without refreshing strikes.
     velocity_events: VecDeque<AutomodInstant>,
 }
@@ -109,9 +95,6 @@ struct RuleState {
     strikes: u32,
     fired: ThresholdReservations,
     last_event: Option<AutomodInstant>,
-    /// Mode epoch of the current ladder (see `GuildModes`). Dry-run strikes
-    /// are simulated and must not carry into live enforcement.
-    mode_epoch: u64,
 }
 
 /// Reservation is independent of whether the selected Discord action runs.
@@ -153,21 +136,14 @@ enum RuleRetention {
 const STRIKE_RETENTION: Duration = Duration::from_secs(crate::types::AUTOMOD_WINDOW_MAX_SECS);
 
 impl RuleState {
-    /// Starts a new ladder when the previous one expired, or when the rule
-    /// has switched between dry-run and live since the ladder began.
-    /// Observations used by detection are kept on a switch.
-    fn record_strike(&mut self, now: AutomodInstant, mode_epoch: u64, record_event: bool) -> u32 {
+    /// Starts a new ladder when the previous one expired.
+    fn record_strike(&mut self, now: AutomodInstant, record_event: bool) -> u32 {
         // Events never postdate the last strike, so it alone decides expiry.
         if self
             .last_event
             .is_some_and(|last| now.duration_since(last) >= STRIKE_RETENTION)
         {
             *self = RuleState::default();
-        }
-        if self.mode_epoch != mode_epoch {
-            self.strikes = 0;
-            self.fired = ThresholdReservations::default();
-            self.mode_epoch = mode_epoch;
         }
         self.strikes += 1;
         self.last_event = Some(now);
@@ -262,9 +238,6 @@ impl AutomodEngine {
             state: DashMap::new(),
             member_joins: DashMap::new(),
             last_prune: Mutex::new(AutomodInstant::now()),
-            modes: DashMap::new(),
-            // A new ladder's epoch is 0, which no observed mode ever uses.
-            next_mode_epoch: AtomicU64::new(1),
         }
     }
 
@@ -279,11 +252,14 @@ impl AutomodEngine {
     /// `evaluate` marks a strike fired before Discord runs. Release it only
     /// when this process did not attempt the ban, so a later message can try
     /// again. A retention-marker failure still bans and must not release.
-    pub fn release_fired(&self, guild: u64, user: u64, rule_id: &str, at: u32) {
+    pub fn release_fired(&self, guild: u64, user: u64, rule_id: &str, dry_run: bool, at: u32) {
         let Some(mut bucket) = self.state.get_mut(&(guild, user)) else {
             return;
         };
-        if let Some(state) = bucket.rules.get_mut(rule_id) {
+        let Some(rule_id) = RULE_IDS.into_iter().find(|id| *id == rule_id) else {
+            return;
+        };
+        if let Some(state) = bucket.rules.get_mut(&(rule_id, dry_run)) {
             state.fired.release(at);
         }
     }
@@ -308,9 +284,6 @@ impl AutomodEngine {
             }
             !bucket.rules.is_empty() || !bucket.velocity_events.is_empty()
         });
-        // A guild without buckets has no ladders left to compare epochs with.
-        let guilds: HashSet<u64> = self.state.iter().map(|entry| entry.key().0).collect();
-        self.modes.retain(|guild, _| guilds.contains(guild));
         let joined_now = Instant::now();
         self.member_joins
             .retain(|_, t| joined_now.duration_since(*t) < Duration::from_secs(24 * 3600));
@@ -324,36 +297,12 @@ impl AutomodEngine {
         }
     }
 
-    /// Observes each built-in rule's mode in this guild's configuration and
-    /// returns its mode epochs. Usually a read; it writes only on a switch.
-    fn observe_modes(&self, guild: u64, cfg: &CachedGuildConfig) -> [u64; RULE_IDS.len()] {
-        let current = RULE_IDS.map(|id| cfg.rules.get(id).is_some_and(|rule| rule.dry_run));
-        if let Some(seen) = self.modes.get(&guild)
-            && seen.dry_run == current
-        {
-            return seen.epoch;
-        }
-        let fresh = || self.next_mode_epoch.fetch_add(1, Ordering::Relaxed);
-        let mut seen = self.modes.entry(guild).or_insert_with(|| GuildModes {
-            dry_run: current,
-            epoch: [fresh(); RULE_IDS.len()],
-        });
-        for (index, dry_run) in current.into_iter().enumerate() {
-            if seen.dry_run[index] != dry_run {
-                seen.dry_run[index] = dry_run;
-                seen.epoch[index] = fresh();
-            }
-        }
-        seen.epoch
-    }
-
     /// Evaluates all enabled rules for a message. Returns the pending action
     pub fn evaluate(&self, cfg: &CachedGuildConfig, ctx: &MsgCtx<'_>) -> Option<PendingAction> {
         let now = AutomodInstant::now();
         // Only velocity counts by arrival; other windows and strikes keep the
         // evaluation clock, which never runs backwards for one author.
         let arrived = ctx.received.unwrap_or(now);
-        let mode_epochs = self.observe_modes(ctx.guild_id, cfg);
         let normalized = normalize::normalize_lenient(ctx.content);
         let compact = normalize::normalize_compact(ctx.content);
         let has_url = URL_RE.is_match(ctx.content);
@@ -361,7 +310,7 @@ impl AutomodEngine {
 
         let mut best: Option<PendingAction> = None;
         let mut best_dry = false;
-        for (rule_index, rule_id) in RULE_IDS.into_iter().enumerate() {
+        for rule_id in RULE_IDS {
             let Some(rule) = cfg.rules.get(rule_id) else {
                 continue;
             };
@@ -445,10 +394,9 @@ impl AutomodEngine {
             if rule_id == "velocity" && !bucket.record_velocity(rule, arrived) {
                 continue;
             }
-            let state = bucket.rules.entry(rule_id).or_default();
+            let state = bucket.rules.entry((rule_id, rule.dry_run)).or_default();
             // Only mention spam reads past strike timestamps.
-            let strikes =
-                state.record_strike(now, mode_epochs[rule_index], rule_id == "mention_spam");
+            let strikes = state.record_strike(now, rule_id == "mention_spam");
             let fire = rule
                 .action_for_strike(strikes)
                 .filter(|a| state.fired.state(a.at) == ThresholdState::Available);
@@ -561,7 +509,8 @@ impl AutomodEngine {
 
         let mut total = ctx.everyone_mentions + ctx.here_mentions + ctx.role_mentions;
         if let Some(bucket) = self.state.get(&(ctx.guild_id, ctx.author_id)) {
-            for (rid, s) in bucket.rules.iter() {
+            // Mention counts are detection history, shared by both modes.
+            for ((rid, _), s) in bucket.rules.iter() {
                 if *rid == "mention_spam" {
                     total += s
                         .events
@@ -1926,7 +1875,7 @@ mod tests {
             .state
             .get(&(message.guild_id, message.author_id))
             .unwrap();
-        let badword = &bucket.rules["badword"];
+        let badword = &bucket.rules[&("badword", false)];
         assert_eq!(badword.strikes, 3);
         assert!(badword.events.is_empty());
     }
@@ -2058,7 +2007,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_mode_switch_without_strikes_still_resets_the_ladder() {
+    async fn a_dry_run_trial_neither_adds_to_nor_erases_live_strikes() {
         use std::time::Duration;
         let mut cfg = default_automod_config();
         cfg.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(1);
@@ -2068,19 +2017,21 @@ mod tests {
         message.message_id += 1;
         assert_eq!(engine.evaluate(&cfg, &message).unwrap().strikes, 1);
 
-        // Dry-run sees only below-limit traffic, then the rule goes live again.
+        // Dry-run strikes go to their own ladder.
         cfg.rules.get_mut("velocity").unwrap().dry_run = true;
         tokio::time::advance(Duration::from_secs(20)).await;
-        message.message_id += 1;
-        assert!(engine.evaluate(&cfg, &message).is_none());
+        for strikes in [None, Some(1), Some(2)] {
+            message.message_id += 1;
+            assert_eq!(engine.evaluate(&cfg, &message).map(|a| a.strikes), strikes);
+        }
         cfg.rules.get_mut("velocity").unwrap().dry_run = false;
         tokio::time::advance(Duration::from_secs(20)).await;
         message.message_id += 1;
         assert!(engine.evaluate(&cfg, &message).is_none());
         message.message_id += 1;
-        let action = engine.evaluate(&cfg, &message).expect("new live burst");
-        assert_eq!(action.strikes, 1);
-        assert_eq!(action.action.action, "delete");
+        let action = engine.evaluate(&cfg, &message).expect("live escalation");
+        assert_eq!(action.strikes, 2);
+        assert_eq!(action.action.action, "timeout");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2162,28 +2113,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_recreated_mode_entry_cannot_reuse_a_dry_run_ladder() {
-        use std::time::Duration;
-        let mut cfg = default_automod_config();
-        let velocity = cfg.rules.get_mut("velocity").unwrap();
+    async fn a_late_dry_run_evaluation_cannot_reset_the_live_ladder() {
+        let mut live = default_automod_config();
+        live.rules.get_mut("velocity").unwrap().params["max_messages"] = serde_json::json!(1);
+        let mut stale = default_automod_config();
+        let velocity = stale.rules.get_mut("velocity").unwrap();
         velocity.params["max_messages"] = serde_json::json!(1);
         velocity.dry_run = true;
         let engine = AutomodEngine::new();
         let mut message = msg(1, "ordinary message", 0, false, false);
-        assert!(engine.evaluate(&cfg, &message).is_none());
+        assert!(engine.evaluate(&live, &message).is_none());
         message.message_id += 1;
-        assert_eq!(engine.evaluate(&cfg, &message).unwrap().strikes, 1);
-        // Cleanup raced the new bucket and removed the guild's mode entry.
-        engine.modes.remove(&message.guild_id);
-
-        cfg.rules.get_mut("velocity").unwrap().dry_run = false;
-        tokio::time::advance(Duration::from_secs(20)).await;
+        assert_eq!(engine.evaluate(&live, &message).unwrap().strikes, 1);
+        // A late evaluation still holding the older dry-run snapshot only adds
+        // a log-only strike to the dry-run ladder.
         message.message_id += 1;
-        assert!(engine.evaluate(&cfg, &message).is_none());
+        assert!(engine.evaluate(&stale, &message).unwrap().dry_run);
         message.message_id += 1;
-        let action = engine.evaluate(&cfg, &message).expect("first live strike");
-        assert_eq!(action.strikes, 1);
-        assert_eq!(action.action.action, "delete");
+        let action = engine.evaluate(&live, &message).expect("escalation");
+        assert_eq!(action.strikes, 2);
+        assert_eq!(action.action.action, "timeout");
     }
 
     fn default_automod_config() -> CachedGuildConfig {
@@ -2227,7 +2176,7 @@ mod tests {
                     bucket.velocity_events.extend([at, now]);
                 } else {
                     bucket.rules.insert(
-                        id,
+                        (id, false),
                         RuleState {
                             events: std::collections::VecDeque::from([WindowEvent { at }]),
                             last_event: Some(at),
@@ -2341,7 +2290,7 @@ mod tests {
         let first = engine.evaluate(&cfg, &message).expect("first ban");
         assert_eq!(first.action.action, "ban");
         assert!(engine.evaluate(&cfg, &message).is_none());
-        engine.release_fired(1, 2, &first.rule_id, first.action.at);
+        engine.release_fired(1, 2, &first.rule_id, first.dry_run, first.action.at);
         let retry = engine.evaluate(&cfg, &message).expect("retried ban");
         assert_eq!(retry.action.action, "ban");
         assert_eq!(retry.action.at, 1);
