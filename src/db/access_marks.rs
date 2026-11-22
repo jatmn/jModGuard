@@ -91,18 +91,28 @@ pub async fn record_access_marks(
 /// Returns true when a full batch was processed so the bot can check again soon.
 pub async fn maintain_access_marks(db: &Db) -> Result<bool> {
     db.with_conn(|conn| {
-        let mut tx = conn.transaction_primary_write()?;
         let expired = "key >= ?1 AND key < ?2 AND instr(value, ':') > 0 \
                        AND CAST(substr(value, instr(value, ':') + 1) AS INTEGER) <= unixepoch()";
         let legacy = "key >= ?1 AND key < ?2 AND instr(value, ':') = 0";
-        let (has_expired, has_legacy): (bool, bool) = tx.query_row(
-            &format!(
-                "SELECT EXISTS(SELECT 1 FROM meta WHERE {expired}), \
-                             EXISTS(SELECT 1 FROM meta WHERE {legacy})"
-            ),
-            params![MARK_PREFIX, MARK_END],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        let pending = format!(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE {expired}), \
+                         EXISTS(SELECT 1 FROM meta WHERE {legacy})"
+        );
+        // Advisory read first: with nothing to reclaim the idle pass takes no
+        // writer lock. Replica lag only keeps a mark until a later pass, which
+        // invalidates more, never less.
+        let (has_expired, has_legacy): (bool, bool) =
+            conn.query_row_advisory(&pending, params![MARK_PREFIX, MARK_END], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        if !has_expired && !has_legacy {
+            return Ok(false);
+        }
+        let mut tx = conn.transaction_primary_write()?;
+        let (has_expired, has_legacy): (bool, bool) =
+            tx.query_row(&pending, params![MARK_PREFIX, MARK_END], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
         if !has_expired && !has_legacy {
             tx.finish_read()?;
             return Ok(false);

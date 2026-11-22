@@ -2635,6 +2635,21 @@ impl From<bool> for ExpiryDeadlineMatch {
 /// in that order, so one read passes over listed guilds without one. Both
 /// queries share one read transaction; the second runs only when the list is
 /// not empty and the first found nothing.
+/// Advisory read: whether any active ban's deadline has passed at `now`. It
+/// is a superset of every expiry selection and opens no primary transaction,
+/// so an idle poll leaves the primary alone. Replica lag can defer a poll but
+/// never authorizes dispatch: selection and claim below stay on the primary.
+pub async fn expired_ban_may_be_due(db: &Db, now: i64) -> Result<bool> {
+    db.with_conn(move |conn| {
+        conn.query_row_advisory(
+            "SELECT EXISTS(SELECT 1 FROM bans WHERE active=1 AND expires_at<=?1)",
+            params![now],
+            |row| Ok(row.get::<bool>(0)?),
+        )
+    })
+    .await
+}
+
 pub async fn next_expired_ban(
     db: &Db,
     now: i64,

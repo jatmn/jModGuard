@@ -186,6 +186,9 @@ pub struct StartupProbe {
     transactions: AtomicU64,
     queries: AtomicU64,
     catalog: AtomicU64,
+    /// Primary statements by Bot Resources path label, as counted for the
+    /// process-wide `db_primary_paths` family.
+    primary_paths: Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
 impl StartupProbe {
@@ -203,6 +206,35 @@ impl StartupProbe {
 
     pub fn catalog(&self) -> u64 {
         self.catalog.load(Ordering::Relaxed)
+    }
+
+    /// Primary statements this probe's databases counted under `label`.
+    pub fn primary_statements(&self, label: &str) -> u64 {
+        self.primary_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Every path label with primary statements counted by this probe.
+    pub fn primary_labels(&self) -> Vec<String> {
+        self.primary_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn record_primary(&self, label: &str, statements: u64) {
+        let mut paths = self
+            .primary_paths
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = paths.entry(label.to_owned()).or_default();
+        *count = count.saturating_add(statements);
     }
 
     pub(crate) fn record_immediate(&self) {
@@ -859,6 +891,80 @@ pub struct Connection {
     /// Guild pools probe the core lease at commit. `None` leaves commits unchanged.
     commit_lease_probe: Option<CommitLeaseProbe>,
     schema_verification: Arc<Mutex<Option<SchemaVerification>>>,
+    /// Copied from the pool at checkout. Guild-store primary work is counted
+    /// apart from the core database's.
+    guild_store: bool,
+}
+
+/// Bot Resources families for primary-routed work. Labels are code locations
+/// and latency buckets only, never SQL text or identifiers.
+const PRIMARY_STATEMENTS: &str = "db_primary_statements";
+const GUILD_PRIMARY_STATEMENTS: &str = "db_guild_primary_statements";
+const PRIMARY_PATHS: &str = "db_primary_paths";
+const PRIMARY_BEGIN_MS: &str = "db_primary_begin_ms";
+const PRIMARY_BEGIN_TIMEOUTS: &str = "db_primary_begin_timeouts";
+const PRIMARY_BEGIN_BUCKETS: [(u128, &str); 5] = [
+    (10, "<=10ms"),
+    (50, "<=50ms"),
+    (250, "<=250ms"),
+    (1000, "<=1s"),
+    (5000, "<=5s"),
+];
+
+/// Counts statements a primary-routed transaction sends, under the code
+/// location that opened it. `BEGIN` and the closing `COMMIT`/`ROLLBACK` are
+/// counted when it opens; every statement it drives counts once.
+#[derive(Clone)]
+struct PrimaryTally {
+    label: Arc<str>,
+    total: &'static str,
+    probe: Option<Arc<StartupProbe>>,
+}
+
+impl PrimaryTally {
+    fn new(location: &std::panic::Location<'_>, guild_store: bool, runtime: &DbRuntime) -> Self {
+        Self {
+            label: primary_path_label(location, guild_store).into(),
+            total: if guild_store {
+                GUILD_PRIMARY_STATEMENTS
+            } else {
+                PRIMARY_STATEMENTS
+            },
+            probe: runtime.startup_probe.clone(),
+        }
+    }
+
+    fn count(&self, statements: u64) {
+        jmodguard_runtime::resources::count(self.total, statements);
+        jmodguard_runtime::resources::count_labelled(PRIMARY_PATHS, &self.label, statements);
+        if let Some(probe) = &self.probe {
+            probe.record_primary(&self.label, statements);
+        }
+    }
+}
+
+/// `src/db/moderation.rs` line 12 becomes `db/moderation:12`; a workspace
+/// member's `crates/bot/src/x.rs` becomes `bot/x`. Guild stores add `guild `.
+fn primary_path_label(location: &std::panic::Location<'_>, guild_store: bool) -> String {
+    let file = location.file();
+    let file = file.strip_suffix(".rs").unwrap_or(file);
+    let path = match file.rsplit_once("crates/") {
+        Some((_, member)) => member.replacen("/src/", "/", 1),
+        None => file
+            .rsplit_once("src/")
+            .map_or(file, |(_, path)| path)
+            .to_owned(),
+    };
+    let scope = if guild_store { "guild " } else { "" };
+    format!("{scope}{path}:{}", location.line())
+}
+
+fn primary_begin_bucket(elapsed: Duration) -> &'static str {
+    let ms = elapsed.as_millis();
+    PRIMARY_BEGIN_BUCKETS
+        .iter()
+        .find(|(bound, _)| ms <= *bound)
+        .map_or(">5s", |(_, label)| label)
 }
 
 /// The active-bot lease row is not this instance, or it has expired.
@@ -1255,6 +1361,7 @@ impl Connection {
             expected_launcher: None,
             commit_lease_probe: None,
             schema_verification: Arc::new(Mutex::new(None)),
+            guild_store: false,
         })
     }
 
@@ -1272,6 +1379,7 @@ impl Connection {
             expected_launcher: None,
             commit_lease_probe: None,
             schema_verification: Arc::new(Mutex::new(None)),
+            guild_store: false,
         })
     }
 
@@ -1293,6 +1401,10 @@ impl Connection {
 
     pub(crate) fn set_commit_lease_probe(&mut self, probe: Option<CommitLeaseProbe>) {
         self.commit_lease_probe = probe;
+    }
+
+    pub(crate) fn set_guild_store(&mut self, guild_store: bool) {
+        self.guild_store = guild_store;
     }
 
     pub(crate) fn set_read_only(&mut self, read_only: bool) {
@@ -1338,6 +1450,7 @@ impl Connection {
     /// Checked schema/bootstrap batch. Startup verifies identity and retries
     /// ambiguous remote results separately because the receipt table may not
     /// exist until this batch has completed.
+    #[track_caller]
     pub fn execute_batch_bounded(&self, sql: &str, max_growth_bytes: u64) -> Result<()> {
         anyhow::ensure!(
             self.inner.is_autocommit(),
@@ -1348,6 +1461,7 @@ impl Connection {
         tx.commit()
     }
 
+    #[track_caller]
     pub fn transaction(&self) -> Result<Transaction> {
         self.transaction_immediate()
     }
@@ -1363,22 +1477,49 @@ impl Connection {
     /// Starts a write transaction at the primary immediately. Remote libSQL
     /// can reject a deferred transaction when it must upgrade from a replica
     /// read to a primary write while another writer is active.
+    ///
+    /// Every behavior except `READONLY` is routed to the primary; those count
+    /// their statements under the caller's code location, and core opens also
+    /// record a coarse `BEGIN` latency bucket or a timeout.
+    #[track_caller]
     fn open_remote_transaction(
         &self,
         operation: &'static str,
         behavior: libsql::TransactionBehavior,
         read_budget: Option<Duration>,
-    ) -> Result<(libsql::Transaction, Option<tokio::time::Instant>)> {
+    ) -> Result<(
+        libsql::Transaction,
+        Option<tokio::time::Instant>,
+        Option<PrimaryTally>,
+    )> {
+        let caller = std::panic::Location::caller();
         let runtime = self.runtime.clone();
         let immediate = matches!(behavior, libsql::TransactionBehavior::Immediate);
+        let primary = !matches!(behavior, libsql::TransactionBehavior::ReadOnly);
         let started = tokio::time::Instant::now();
         let open = self.inner.transaction_with_behavior(behavior);
-        let inner = match read_budget {
-            Some(budget) => {
-                runtime.complete_or_release_open_within(operation, Some(budget), open)?
-            }
-            None => runtime.complete_or_release_open(operation, open)?,
+        let opened = match read_budget {
+            Some(budget) => runtime.complete_or_release_open_within(operation, Some(budget), open),
+            None => runtime.complete_or_release_open(operation, open),
         };
+        if primary && !self.guild_store {
+            match &opened {
+                Ok(_) => jmodguard_runtime::resources::count_labelled(
+                    PRIMARY_BEGIN_MS,
+                    primary_begin_bucket(started.elapsed()),
+                    1,
+                ),
+                Err(error) if is_database_operation_timeout(error) => {
+                    jmodguard_runtime::resources::count(PRIMARY_BEGIN_TIMEOUTS, 1);
+                }
+                Err(_) => {}
+            }
+        }
+        let inner = opened?;
+        let tally = primary.then(|| PrimaryTally::new(caller, self.guild_store, &self.runtime));
+        if let Some(tally) = &tally {
+            tally.count(2);
+        }
         if let Some(probe) = &self.runtime.startup_probe {
             probe.transactions.fetch_add(1, Ordering::Relaxed);
             if immediate {
@@ -1386,17 +1527,18 @@ impl Connection {
             }
         }
         jmodguard_runtime::resources::count(if immediate { "db_writes" } else { "db_reads" }, 1);
-        Ok((inner, read_budget.map(|budget| started + budget)))
+        Ok((inner, read_budget.map(|budget| started + budget), tally))
     }
 
+    #[track_caller]
     pub fn transaction_immediate(&self) -> Result<Transaction> {
         self.refuse_writer_lock()?;
-        let (inner, _) = self.open_remote_transaction(
+        let (inner, _, tally) = self.open_remote_transaction(
             "begin immediate transaction",
             libsql::TransactionBehavior::Immediate,
             None,
         )?;
-        let mut transaction = self.wrap_transaction(inner, WriteState::Unprepared, None);
+        let mut transaction = self.wrap_transaction(inner, WriteState::Unprepared, None, tally);
         transaction.ensure_mutation_receipt()?;
         Ok(transaction)
     }
@@ -1410,42 +1552,45 @@ impl Connection {
     /// snapshot is open, and a held writer does not make the snapshot wait.
     /// `BEGIN READONLY` is not used here: remote libSQL may serve it from a
     /// replica. The snapshot cannot be upgraded into a write.
+    #[track_caller]
     pub fn transaction_primary_snapshot(&self) -> Result<Transaction> {
-        let (inner, deadline) = self.open_remote_transaction(
+        let (inner, deadline, tally) = self.open_remote_transaction(
             "begin primary snapshot",
             libsql::TransactionBehavior::Deferred,
             self.interactive_read_budget(),
         )?;
-        Ok(self.wrap_transaction(inner, WriteState::Snapshot, deadline))
+        Ok(self.wrap_transaction(inner, WriteState::Snapshot, deadline, tally))
     }
 
     /// Snapshot capture reads before acquiring the writer lock. A concurrent
     /// writer can invalidate promotion; the capture owner must restart the
     /// entire operation on a proven busy error, never reuse the read results.
+    #[track_caller]
     pub(crate) fn transaction_capture(&self) -> Result<Transaction> {
         self.refuse_writer_lock()?;
-        let (inner, deadline) = self.open_remote_transaction(
+        let (inner, deadline, tally) = self.open_remote_transaction(
             "begin capture transaction",
             libsql::TransactionBehavior::Deferred,
             self.interactive_read_budget(),
         )?;
-        Ok(self.wrap_transaction(inner, WriteState::Unprepared, deadline))
+        Ok(self.wrap_transaction(inner, WriteState::Unprepared, deadline, tally))
     }
 
     /// Replica-scalable read. `BEGIN READONLY` does not take the writer lock.
     /// Remote libSQL may serve it from a replica, so callers that need a fresh
     /// primary snapshot use [`Self::transaction_primary_snapshot`].
     pub fn transaction_consistent_read(&self) -> Result<Transaction> {
-        let (inner, deadline) = self.open_remote_transaction(
+        let (inner, deadline, tally) = self.open_remote_transaction(
             "begin consistent read",
             libsql::TransactionBehavior::ReadOnly,
             self.interactive_read_budget(),
         )?;
-        Ok(self.wrap_transaction(inner, WriteState::Snapshot, deadline))
+        Ok(self.wrap_transaction(inner, WriteState::Snapshot, deadline, tally))
     }
 
     /// Maintenance-only DELETE transaction. It preserves a 16 MB hard-limit
     /// reserve and may commit above 900 MB only when allocation did not grow.
+    #[track_caller]
     pub fn transaction_reclaim(&self) -> Result<Transaction> {
         let mut transaction = self.transaction_primary_write()?;
         transaction.prepare_reclaim()?;
@@ -1458,14 +1603,15 @@ impl Connection {
     /// open use [`Self::transaction_primary_snapshot`]. Before non-migration
     /// writes, enable a mutation receipt on the returned transaction so lost
     /// COMMIT responses remain recoverable.
+    #[track_caller]
     pub fn transaction_primary_write(&self) -> Result<Transaction> {
         self.refuse_writer_lock()?;
-        let (inner, _) = self.open_remote_transaction(
+        let (inner, _, tally) = self.open_remote_transaction(
             "begin primary write transaction",
             libsql::TransactionBehavior::Immediate,
             None,
         )?;
-        Ok(self.wrap_transaction(inner, WriteState::Unprepared, None))
+        Ok(self.wrap_transaction(inner, WriteState::Unprepared, None, tally))
     }
 
     fn wrap_transaction(
@@ -1473,8 +1619,10 @@ impl Connection {
         inner: libsql::Transaction,
         write_state: WriteState,
         read_deadline: Option<tokio::time::Instant>,
+        primary: Option<PrimaryTally>,
     ) -> Transaction {
         Transaction {
+            primary,
             inner: TransactionHandle::Active(inner),
             database: Arc::clone(&self.database),
             runtime: self.runtime.clone(),
@@ -1516,6 +1664,7 @@ impl Connection {
     }
 
     /// Only fixed-format, existing lease rows may bypass mutation admission.
+    #[track_caller]
     pub(crate) fn execute_lease_cas(
         &self,
         sql: &str,
@@ -1537,6 +1686,12 @@ impl Connection {
             crate::db::ACTIVE_BOT_LEASE_TTL_MS.max(crate::db::LAUNCHER_FENCE_TTL_MS) as u64,
         ));
         self.inner.busy_timeout(timeout)?;
+        PrimaryTally::new(
+            std::panic::Location::caller(),
+            self.guild_store,
+            &self.runtime,
+        )
+        .count(1);
         // In-place replacement of an existing fixed-length meta lease cannot
         // allocate pages, so it needs no capacity reservation or receipt. The
         // CAS is idempotent: a lost response is resolved by retry/re-read. Its
@@ -1547,6 +1702,29 @@ impl Connection {
             self.inner.execute(sql, params),
             true,
         )? as usize)
+    }
+
+    /// Autocommit read for an idle worker's advisory check. Remote libSQL can
+    /// serve it from a replica. It keeps the interactive read budget of the
+    /// primary snapshot it replaces, not the pool's longer operation deadline,
+    /// so a stalled read cannot hold a sequential worker for long.
+    pub fn query_row_advisory<T, P, F>(&self, sql: &str, params: P, map: F) -> Result<T>
+    where
+        T: Send,
+        P: IntoParams + Send,
+        F: FnOnce(&Row) -> Result<T> + Send,
+    {
+        require_read_sql(sql)?;
+        self.runtime.block_on_database_within(
+            "advisory query",
+            self.interactive_read_budget(),
+            async {
+                let mut rows = self.inner.query(sql, params).await?;
+                let row = rows.next().await?.ok_or(QueryReturnedNoRows)?;
+                map(&row)
+            },
+            true,
+        )
     }
 
     pub fn is_autocommit(&self) -> bool {
@@ -1576,6 +1754,7 @@ impl SqlExecutor for Connection {
             .block_on_database("execute", self.inner.execute(sql, params))? as usize)
     }
 
+    #[track_caller]
     fn execute_bounded(
         &self,
         sql: &str,
@@ -1593,6 +1772,7 @@ impl SqlExecutor for Connection {
         Ok(changed)
     }
 
+    #[track_caller]
     fn execute_reclaim_bounded(
         &self,
         sql: &str,
@@ -1610,6 +1790,7 @@ impl SqlExecutor for Connection {
         Ok(changed)
     }
 
+    #[track_caller]
     fn query_row_bounded<T, P, F>(
         &self,
         sql: &str,
@@ -1873,6 +2054,8 @@ pub struct Transaction {
     expected_launcher: Option<String>,
     commit_lease_probe: Option<CommitLeaseProbe>,
     schema_verification: Arc<Mutex<Option<SchemaVerification>>>,
+    /// Set on primary-routed transactions; see [`PrimaryTally`].
+    primary: Option<PrimaryTally>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2152,6 +2335,9 @@ impl Transaction {
         T: Send,
         E: Into<anyhow::Error> + Send,
     {
+        if let Some(primary) = &self.primary {
+            primary.count(1);
+        }
         if let Some(timeout) = self.statement_wait() {
             self.runtime
                 .block_on_database_within(operation, Some(timeout), future, true)
@@ -3012,6 +3198,108 @@ mod tests {
             error.contains("read-only connection cannot start a write transaction"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn primary_statements_are_counted_under_the_opening_code_location() {
+        use jmodguard_runtime::resources::{peek_counter, peek_labelled};
+        // The probe isolates this connection's counts from other tests that
+        // share the process-wide families.
+        let probe = Arc::new(StartupProbe::default());
+        let mut connection = {
+            let _probe = enter_startup_probe(Some(probe.clone()));
+            Connection::open(":memory:").unwrap()
+        };
+        let begins = || {
+            PRIMARY_BEGIN_BUCKETS
+                .iter()
+                .map(|(_, label)| *label)
+                .chain([">5s"])
+                .map(|label| peek_labelled(PRIMARY_BEGIN_MS, label))
+                .sum::<u64>()
+        };
+        let begins_before = begins();
+        let core_before = peek_counter(PRIMARY_STATEMENTS);
+
+        let (tx, line) = (connection.transaction_primary_snapshot().unwrap(), line!());
+        let label = format!("db_compat:{line}");
+        assert_eq!(probe.primary_statements(&label), 2, "BEGIN and its end");
+        let _: i64 = tx.query_row("SELECT 1", (), |r| Ok(r.get(0)?)).unwrap();
+        let _: i64 = tx.query_row("SELECT 2", (), |r| Ok(r.get(0)?)).unwrap();
+        tx.finish_read().unwrap();
+        assert_eq!(probe.primary_statements(&label), 4);
+        assert!(peek_counter(PRIMARY_STATEMENTS) >= core_before + 4);
+        assert!(begins() > begins_before, "a primary BEGIN latency bucket");
+
+        // A replica-routed read is not primary work.
+        let (tx, line) = (connection.transaction_consistent_read().unwrap(), line!());
+        tx.finish_read().unwrap();
+        assert_eq!(probe.primary_statements(&format!("db_compat:{line}")), 0);
+
+        // Guild-store pools are labelled and totalled separately.
+        connection.set_guild_store(true);
+        let guild_before = peek_counter(GUILD_PRIMARY_STATEMENTS);
+        let (tx, line) = (connection.transaction_primary_write().unwrap(), line!());
+        tx.finish_read().unwrap();
+        assert_eq!(
+            probe.primary_statements(&format!("guild db_compat:{line}")),
+            2
+        );
+        assert_eq!(probe.primary_statements(&format!("db_compat:{line}")), 0);
+        assert!(peek_counter(GUILD_PRIMARY_STATEMENTS) >= guild_before + 2);
+        assert_eq!(probe.primary_labels().len(), 2);
+    }
+
+    #[test]
+    fn advisory_read_keeps_the_interactive_budget_not_the_pool_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let clock = ManualClock::new();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let server = {
+            let clock = Arc::clone(&clock);
+            std::thread::spawn(move || {
+                // The read has started once its request connects. Only the
+                // interactive budget then elapses; a read bound to the pool
+                // deadline is still waiting when this fixture gives up and
+                // closes the socket.
+                let (_socket, _) = listener.accept().unwrap();
+                clock.advance(INTERACTIVE_READ_BUDGET);
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            })
+        };
+        // The bot pool's long operation deadline.
+        let runtime = DbRuntime::with_operation_timeout(Some(Duration::from_secs(75))).unwrap();
+        runtime.install_manual_clock(Some(clock));
+        let connector = crate::remote_https::https_connector();
+        let database = runtime
+            .block_on(
+                libsql::Builder::new_remote(format!("http://{address}"), "test-token".into())
+                    .connector(connector)
+                    .build(),
+            )
+            .unwrap();
+        let connection = Connection::from_database(Arc::new(database), runtime).unwrap();
+        let error = connection
+            .query_row_advisory("SELECT 1", (), |row| Ok(row.get::<i64>(0)?))
+            .expect_err("a stalled advisory read must time out");
+        let _ = release_tx.send(());
+        server.join().unwrap();
+        assert!(is_database_operation_timeout(&error), "{error:#}");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{INTERACTIVE_READ_BUDGET:?}")),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn primary_begin_latency_uses_coarse_buckets() {
+        assert_eq!(primary_begin_bucket(Duration::from_millis(3)), "<=10ms");
+        assert_eq!(primary_begin_bucket(Duration::from_millis(50)), "<=50ms");
+        assert_eq!(primary_begin_bucket(Duration::from_millis(900)), "<=1s");
+        assert_eq!(primary_begin_bucket(Duration::from_secs(6)), ">5s");
     }
 
     #[test]

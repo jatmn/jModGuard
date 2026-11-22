@@ -479,6 +479,7 @@ impl HranaFixture {
                 generation_source: Mutex::new(None),
                 launcher_fence: Arc::clone(&launcher_fence),
                 commit_lease_probe: Arc::new(Mutex::new(None)),
+                guild_store: false,
             }),
             lease_connection: Arc::new(Mutex::new(Some(
                 Connection::from_database(Arc::clone(&database), lease_runtime).unwrap(),

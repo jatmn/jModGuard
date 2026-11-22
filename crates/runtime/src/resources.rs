@@ -18,8 +18,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const MINUTE_SECS: i64 = 60;
 /// Seconds in one persisted hour rollup.
 pub const HOUR_SECS: i64 = 3600;
-/// Distinct labels kept per labelled family in one rollup; the rest count as `other`.
+/// Distinct labels kept per labelled family in one stored rollup: the busiest
+/// ones by count. The rest are added to `other`.
 pub const MAX_LABELS: usize = 24;
+/// Distinct labels one family tracks during the live minute, before the
+/// minute keeps its busiest [`MAX_LABELS`]. Labels past this count as `other`.
+const WORKING_LABELS: usize = 256;
 const MAX_LABEL_BYTES: usize = 80;
 /// Process starts kept in one rollup.
 const MAX_STARTS: usize = 32;
@@ -64,17 +68,29 @@ pub fn count(name: &'static str, n: u64) {
 }
 
 /// Adds `n` under `label` in a bounded family (for example gateway events by
-/// type). Labels past [`MAX_LABELS`] in one minute count as `other`.
+/// type). The completed minute keeps its busiest [`MAX_LABELS`] labels, so a
+/// label that first appears late in the minute is ranked by its count, not by
+/// when it arrived.
 pub fn count_labelled(family: &'static str, label: &str, n: u64) {
     let label = bounded_label(label);
     let mut activity = activity();
     let labels = activity.labelled.entry(family).or_default();
-    add_label(labels, label, n);
+    add_label(labels, label, n, WORKING_LABELS);
 }
 
 /// The current minute's value of a counter, without taking it.
 pub fn peek_counter(name: &str) -> u64 {
     activity().counters.get(name).copied().unwrap_or(0)
+}
+
+/// The current minute's value of one label in a labelled family, without taking it.
+pub fn peek_labelled(family: &str, label: &str) -> u64 {
+    activity()
+        .labelled
+        .get(family)
+        .and_then(|labels| labels.get(label))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Records one request's latency in the current minute's histogram.
@@ -126,14 +142,38 @@ fn bounded_label(label: &str) -> String {
     label[..end].to_owned()
 }
 
-fn add_label(labels: &mut BTreeMap<String, u64>, label: String, n: u64) {
-    let key = if labels.contains_key(&label) || labels.len() < MAX_LABELS {
+fn add_label(labels: &mut BTreeMap<String, u64>, label: String, n: u64, limit: usize) {
+    let key = if labels.contains_key(&label) || labels.len() < limit {
         label
     } else {
         LABEL_OTHER.to_owned()
     };
     let value = labels.entry(key).or_default();
     *value = value.saturating_add(n);
+}
+
+/// Keeps the `max` busiest labels (equal counts by name) and adds the rest to
+/// `other`, so the family's total is unchanged.
+fn keep_busiest(labels: &mut BTreeMap<String, u64>, max: usize) {
+    let mut ranked: Vec<(&String, u64)> = labels
+        .iter()
+        .filter(|(label, _)| label.as_str() != LABEL_OTHER)
+        .map(|(label, count)| (label, *count))
+        .collect();
+    if ranked.len() <= max {
+        return;
+    }
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let dropped: Vec<String> = ranked[max..]
+        .iter()
+        .map(|(label, _)| (*label).clone())
+        .collect();
+    let mut rest = 0u64;
+    for label in dropped {
+        rest = rest.saturating_add(labels.remove(&label).unwrap_or(0));
+    }
+    let other = labels.entry(LABEL_OTHER.to_owned()).or_default();
+    *other = other.saturating_add(rest);
 }
 
 /// Counters and histograms one rollup carries. Missing names were not
@@ -179,6 +219,8 @@ pub struct Rollup {
 
 impl Rollup {
     /// Adds `other` (a shorter rollup inside this one's span) to this rollup.
+    /// Label families are merged in full; call [`Self::keep_busiest_labels`]
+    /// before storing the result.
     pub fn absorb(&mut self, other: &Rollup) {
         let (cpu_sum, cpu_n) = weighted(self.cpu_avg_tenths.map(u64::from), self.data.cpu_samples);
         let (other_cpu, other_cpu_n) =
@@ -208,7 +250,8 @@ impl Rollup {
         for (family, labels) in &other.data.labelled {
             let into = self.data.labelled.entry(family.clone()).or_default();
             for (label, value) in labels {
-                add_label(into, label.clone(), *value);
+                let total = into.entry(label.clone()).or_default();
+                *total = total.saturating_add(*value);
             }
         }
         if !other.data.latency.is_empty() {
@@ -225,6 +268,13 @@ impl Rollup {
                 .entry(name.clone())
                 .and_modify(|current| *current = (*current).max(*value))
                 .or_insert(*value);
+        }
+    }
+
+    /// Bounds every label family to its busiest [`MAX_LABELS`] labels.
+    pub fn keep_busiest_labels(&mut self) {
+        for labels in self.data.labelled.values_mut() {
+            keep_busiest(labels, MAX_LABELS);
         }
     }
 
@@ -360,6 +410,7 @@ impl RollupBuilder {
             .into_iter()
             .map(|(family, labels)| (family.to_owned(), labels))
             .collect();
+        rollup.keep_busiest_labels();
         if taken.latency.iter().any(|count| *count > 0) {
             rollup.data.latency = taken.latency.to_vec();
         }
@@ -711,6 +762,7 @@ mod tests {
         );
         hour.absorb(&a);
         hour.absorb(&b);
+        hour.keep_busiest_labels();
         assert_eq!(hour.cpu_avg_tenths, Some(175));
         assert_eq!(hour.cpu_max_tenths, Some(500));
         assert_eq!(hour.memory_avg_bytes, None);
@@ -722,6 +774,44 @@ mod tests {
         let gateway = &hour.data.labelled["gateway"];
         assert_eq!(gateway.len(), MAX_LABELS + 1);
         assert_eq!(gateway["other"], 5);
+    }
+
+    #[test]
+    fn a_busy_label_that_arrives_late_keeps_its_name() {
+        // Within one minute: many low-volume labels report before the busiest one.
+        let mut minute = BTreeMap::new();
+        for i in 0..MAX_LABELS + 6 {
+            add_label(&mut minute, format!("quiet{i:02}"), 1, WORKING_LABELS);
+        }
+        for _ in 0..50 {
+            add_label(&mut minute, "busy".into(), 2, WORKING_LABELS);
+        }
+        keep_busiest(&mut minute, MAX_LABELS);
+        assert_eq!(minute["busy"], 100);
+        assert_eq!(minute.len(), MAX_LABELS + 1);
+        assert_eq!(minute.values().sum::<u64>(), 100 + MAX_LABELS as u64 + 6);
+
+        // Across minutes: a full earlier minute does not reserve the hour's slots.
+        let mut hour = Rollup::empty(3600, HOUR_SECS);
+        let mut early = Rollup::empty(3600, MINUTE_SECS);
+        early.data.labelled.insert(
+            "paths".into(),
+            (0..MAX_LABELS)
+                .map(|i| (format!("quiet{i:02}"), 3))
+                .collect(),
+        );
+        let mut late = Rollup::empty(3660, MINUTE_SECS);
+        late.data
+            .labelled
+            .insert("paths".into(), [("busy".to_owned(), 500)].into());
+        hour.absorb(&early);
+        hour.keep_busiest_labels();
+        hour.absorb(&late);
+        hour.keep_busiest_labels();
+        let paths = &hour.data.labelled["paths"];
+        assert_eq!(paths["busy"], 500);
+        assert_eq!(paths["other"], 3, "one quiet label made room");
+        assert_eq!(paths.values().sum::<u64>(), 500 + 3 * MAX_LABELS as u64);
     }
 
     #[test]

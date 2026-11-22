@@ -1116,6 +1116,17 @@ async fn expire_bans(
     // therefore cannot starve guilds that have not failed, or a retry that has
     // waited longer. Each read, found or not, counts against the batch, and
     // one read passes over every earlier retry guild that has no due ban.
+    // An idle poll stops at one advisory read. With no ban due anywhere, no
+    // retry guild has one either, as after an exhausted pass.
+    if app.is_some_and(|app| !app.activation.may_record()) {
+        return Ok(());
+    }
+    if !db::expired_ban_may_be_due(db, now).await? {
+        if let Some(app) = app {
+            app.expiry_check_retries.forget_idle(now);
+        }
+        return Ok(());
+    }
     let started = tokio::time::Instant::now();
     let mut deferred = Vec::new();
     let mut deferred_guilds = app

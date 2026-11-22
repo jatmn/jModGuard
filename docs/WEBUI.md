@@ -400,7 +400,23 @@ Below are bot activity (Gateway events per minute and by type, logical Discord R
 guilds, capture queue), API activity (requests per minute, p50/p95 latency, 4xx/5xx,
 active sessions, OAuth and Discord 429s, and the API's Discord requests and 429s by
 OAuth route) and cost drivers per minute (database round
-trips, read and write transactions, Discord requests, log output, API response bytes).
+trips, read and write transactions, primary-routed statements, Discord requests, log
+output, API response bytes).
+Primary-routed statements count every statement a process sends in a transaction the
+provider routes to the primary (all but `BEGIN READONLY`), including that `BEGIN` and its
+`COMMIT` or `ROLLBACK`, plus the bot's writer-lease renewals. Core and guild-store databases are
+totalled apart. The cost table ranks them by the code location that opened the transaction
+(for example `db/moderation:<line>`, prefixed `guild ` for a guild store) and shows coarse core
+`BEGIN` latency buckets and `BEGIN` timeouts. No SQL text or identifiers are recorded. A
+prepared query counts once. Each stored minute and hour keeps its 24 busiest labels per
+family and process, ranked by count rather than arrival; the rest count as `other`. The
+1-hour and 24-hour ranges rank across every saved minute. The 7-day and 30-day ranges read
+hour rows. Once an hour ends, its labels are ranked again on the sum of all its saved
+minutes; only the current hour ranks by its running totals. These totals cover only the
+bot and API processes. Each launcher
+(`jmodguard-updater`) also sends primary work that is not shown: its launcher fence renewal
+every 5 seconds (one statement, about 720 an hour) and its update-control reads. Add that
+separately before comparing the core total with the provider's primary-forwarded queries.
 Each logical Discord request counts once, including direct bot log deliveries. Internal
 rate-limit retries share the original request count.
 Database rows read and Bunny billing are shown as unavailable: the database client does

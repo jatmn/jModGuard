@@ -188,8 +188,19 @@ async fn stale_membership_does_not_read_or_write() {
 
 #[tokio::test]
 async fn erasure_clears_owned_rows_without_backup_jobs() {
-    let f = Fixture::new();
+    let probe = Arc::new(db::StartupProbe::default());
+    let f = {
+        let _probe = db::enter_startup_probe(Some(probe.clone()));
+        Fixture::new()
+    };
     let enrollment = enroll(&f, 10, 100).await;
+    let transactions = probe.transactions();
+    assert!(!f.tenant.drive_erasure().await.unwrap());
+    assert_eq!(
+        probe.transactions(),
+        transactions,
+        "an idle erasure tick opens no primary snapshot"
+    );
     f.tenant
         .record_selected_case(enrollment.clone(), case_data(9))
         .await
