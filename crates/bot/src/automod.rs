@@ -33,8 +33,9 @@ pub struct AutomodEngine {
     modes: DashMap<u64, GuildModes>,
 }
 
-/// A rule's mode epoch advances whenever the guild's configuration switches
-/// it between dry-run and live, whether or not anyone was striking then.
+/// A rule's mode epoch advances whenever an evaluated message sees the
+/// guild's configuration switch it between dry-run and live, whether or not
+/// anyone was striking then. A ladder therefore never mixes the two modes.
 #[derive(Clone, Copy)]
 struct GuildModes {
     dry_run: [bool; RULE_IDS.len()],
@@ -68,14 +69,30 @@ impl AuthorState {
         }
         let index = self.velocity_events.partition_point(|at| *at <= arrived);
         self.velocity_events.insert(index, arrived);
-        // A message that arrived after this one but was evaluated first now
-        // has one more message in its window; count it as in-order would.
+        if self.velocity_over_limit(rule, index) {
+            return true;
+        }
+        // Messages that arrived after this one but were evaluated first each
+        // gain one message in their window. One that reaches exactly the
+        // limit plus one is the strike in-order evaluation would have given
+        // it; windows that were already over the limit have struck already.
         let window = velocity_window(rule);
-        let latest_affected = self
+        let later = self
             .velocity_events
-            .partition_point(|at| at.duration_since(arrived) < window)
-            - 1;
-        self.velocity_over_limit(rule, index) || self.velocity_over_limit(rule, latest_affected)
+            .partition_point(|at| at.duration_since(arrived) < window);
+        (index + 1..later).any(|later| self.velocity_just_over_limit(rule, later))
+    }
+
+    /// The window ending at `index` holds exactly the limit plus one.
+    fn velocity_just_over_limit(&self, rule: &RuleDef, index: usize) -> bool {
+        let window = velocity_window(rule);
+        let arrived = self.velocity_events[index];
+        self.velocity_over_limit(rule, index)
+            && usize::try_from(param_u64(rule, "max_messages", 8))
+                .ok()
+                .and_then(|max| index.checked_sub(max + 1))
+                .and_then(|before| self.velocity_events.get(before))
+                .is_none_or(|before| arrived.duration_since(*before) >= window)
     }
 
     /// Counts the messages that arrived in the window ending at the message at
@@ -167,7 +184,7 @@ impl RuleState {
             self.mode_epoch = mode_epoch;
         }
         self.strikes += 1;
-        self.last_event = Some(self.last_event.map_or(now, |last| last.max(now)));
+        self.last_event = Some(now);
         if record_event {
             self.events.push_back(WindowEvent { at: now });
         }
@@ -213,7 +230,7 @@ pub struct MsgCtx<'a> {
     /// The everyone-attempt rule still matches. Kick and ban are withheld.
     pub mention_permission_unknown: bool,
     /// When the bot received the message, before any configuration read.
-    /// Rate windows use it; callers without one use the evaluation time.
+    /// Velocity counts by it; callers without one use the evaluation time.
     pub received: Option<AutomodInstant>,
 }
 
@@ -343,7 +360,10 @@ impl AutomodEngine {
 
     /// Evaluates all enabled rules for a message. Returns the pending action
     pub fn evaluate(&self, cfg: &CachedGuildConfig, ctx: &MsgCtx<'_>) -> Option<PendingAction> {
-        let now = ctx.received.unwrap_or_else(AutomodInstant::now);
+        let now = AutomodInstant::now();
+        // Only velocity counts by arrival; other windows and strikes keep the
+        // evaluation clock, which never runs backwards for one author.
+        let arrived = ctx.received.unwrap_or(now);
         let mode_epochs = self.observe_modes(ctx.guild_id, cfg);
         let normalized = normalize::normalize_lenient(ctx.content);
         let compact = normalize::normalize_compact(ctx.content);
@@ -433,7 +453,7 @@ impl AutomodEngine {
             }
 
             let mut bucket = self.state.entry((ctx.guild_id, ctx.author_id)).or_default();
-            if rule_id == "velocity" && !bucket.record_velocity(rule, now) {
+            if rule_id == "velocity" && !bucket.record_velocity(rule, arrived) {
                 continue;
             }
             let state = bucket.rules.entry(rule_id).or_default();
@@ -2076,6 +2096,66 @@ mod tests {
         let action = engine.evaluate(&cfg, &message).expect("new live burst");
         assert_eq!(action.strikes, 1);
         assert_eq!(action.action.action, "delete");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn out_of_order_velocity_matches_receipt_order_strikes() {
+        use super::AutomodInstant;
+        use std::time::Duration;
+        let mut cfg = default_automod_config();
+        let velocity = cfg.rules.get_mut("velocity").unwrap();
+        velocity.params["max_messages"] = serde_json::json!(3);
+        velocity.params["window_secs"] = serde_json::json!(1);
+        let start = AutomodInstant::now();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        // The window ending at 900 ms holds four messages; the windows ending
+        // at 800 ms and 1700 ms hold three each.
+        for order in [[0, 50, 800, 900, 1700], [0, 50, 900, 1700, 800]] {
+            let engine = AutomodEngine::new();
+            let strikes = order
+                .into_iter()
+                .enumerate()
+                .filter(|&(id, after_ms)| {
+                    let mut message = msg(1, "ordinary message", 0, false, false);
+                    message.message_id = id as u64;
+                    message.received = Some(start + Duration::from_millis(after_ms));
+                    engine.evaluate(&cfg, &message).is_some()
+                })
+                .count();
+            assert_eq!(strikes, 1, "evaluation order {order:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delayed_message_does_not_count_later_mention_strikes() {
+        use super::AutomodInstant;
+        use std::time::Duration;
+        let mut cfg = default_automod_config();
+        // An escalating ladder makes an extra strike visible.
+        let ladder = cfg.rules["velocity"].actions.clone();
+        let mention = cfg.rules.get_mut("mention_spam").unwrap();
+        mention.actions = ladder;
+        mention.params["window_secs"] = serde_json::json!(1);
+        mention.params["max_mentions_in_window"] = serde_json::json!(5);
+        let engine = AutomodEngine::new();
+        let start = AutomodInstant::now();
+        // The later message is evaluated first and strikes.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let mut later = msg(1, "ping", 0, false, false);
+        later.message_id = 2;
+        later.role_mentions = 6;
+        later.received = Some(start + Duration::from_secs(2));
+        assert_eq!(
+            engine.evaluate(&cfg, &later).unwrap().rule_id,
+            "mention_spam"
+        );
+        // The older message, at the limit, is evaluated two seconds later.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let mut older = msg(1, "ping", 0, false, false);
+        older.message_id = 1;
+        older.role_mentions = 5;
+        older.received = Some(start);
+        assert!(engine.evaluate(&cfg, &older).is_none());
     }
 
     fn default_automod_config() -> CachedGuildConfig {
