@@ -4632,6 +4632,7 @@ function RuleEditor({ record: r }) {
     if (r.rule_id === "invite") draft.allowlist_codes = inviteCodes(rule.params?.allowlist_codes).join(", ");
     return draft;
   });
+  const [initialValues] = useState(() => ({ ...values }));
   const [spamBan] = useState(() => ({ ...spamRuleBan(rule) }));
   // Inactive legacy image rows should convert to the safe dry-run mode by default.
   const [dryRun, setDryRun] = useState(() => (spam ? !spamConfigured(r.rule_id, rule) || rule.dry_run : rule.dry_run));
@@ -4765,8 +4766,15 @@ function RuleEditor({ record: r }) {
                 const persisted =
                   (scopeSelRef.current?.value === "global" && state.guildId !== "0" ? r.global : r.effective)
                     ?.params ?? {};
+                const shown = r.effective?.params ?? {};
                 for (const { key, label, max } of fields) {
                   const raw = String(values[key] ?? "");
+                  // An untouched limit sends back the stored value exactly,
+                  // whatever its JSON form, so a legacy value keeps its meaning.
+                  if (max !== undefined && raw === initialValues[key] && Object.hasOwn(shown, key)) {
+                    params[key] = shown[key];
+                    continue;
+                  }
                   const value = Number(raw);
                   // An untouched legacy value (fractional, or beyond the safe
                   // integer range) is kept; the server keeps its exact value.

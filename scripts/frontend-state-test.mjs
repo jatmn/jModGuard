@@ -3840,7 +3840,7 @@ test('velocity editor keeps an unchanged legacy limit but refuses a new one abov
   assert.deepEqual(calls[1].body.data.params, {window_secs: 15, max_messages: 5000});
 });
 
-for (const legacy of [2 ** 53, 5000.5]) test(`velocity editor keeps an untouched legacy limit ${legacy}`, async () => {
+for (const legacy of [2 ** 53, 5000.5, '1', 1]) test(`velocity editor keeps an untouched legacy limit ${JSON.stringify(legacy)}`, async () => {
   const calls = [];
   const h = harness(async (url, options) => {
     if (options.method === 'PUT') calls.push({url, body: JSON.parse(options.body)});
