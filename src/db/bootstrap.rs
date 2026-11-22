@@ -701,7 +701,7 @@ pub async fn claim_active_bot(
     let instance = instance.to_owned();
     let armed = instance.clone();
     let generation = db
-        .with_conn(move |conn| {
+        .with_ungated_conn(move |conn| {
             // This transaction writes the lease row. It must commit even when a
             // previous owner is still armed on the pool.
             conn.set_expected_lease_owner(None);
@@ -826,7 +826,7 @@ pub async fn renew_active_bot(
 pub async fn release_active_bot(db: &Db, instance: &str) -> Result<()> {
     anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
     let instance = instance.to_owned();
-    db.with_conn(move |conn| {
+    db.with_ungated_conn(move |conn| {
         // The delete removes the row this commit would re-read. Ownership is
         // checked below; the pool stays armed so later commits fail.
         conn.set_expected_lease_owner(None);

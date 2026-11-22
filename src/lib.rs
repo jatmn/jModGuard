@@ -26,6 +26,7 @@ pub use jmodguard_runtime::resources;
 pub use jmodguard_runtime::set_process_ready;
 pub use jmodguard_runtime::set_shutdown_context;
 pub mod emoji;
+pub mod idle_poll;
 pub mod ids;
 pub mod image_spam;
 pub mod known_spam;

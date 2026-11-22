@@ -55,6 +55,43 @@ pub struct DatabaseCallerAbandoned {
 #[error("remote database commit outcome is indeterminate: {0}")]
 pub struct DatabaseCommitIndeterminate(#[source] anyhow::Error);
 
+#[derive(Debug, thiserror::Error)]
+#[error("remote database {0} failed")]
+struct RemoteOperationFailed(&'static str);
+
+/// Identify health failures, excluding application cancellation, pool
+/// saturation and SQL errors such as constraints or invalid credentials.
+pub(crate) fn remote_unavailable_operation(error: &anyhow::Error) -> Option<&'static str> {
+    if let Some(timeout) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<DatabaseOperationTimedOut>())
+    {
+        return (timeout.operation != "waiting for connection").then_some(timeout.operation);
+    }
+    let is_unavailable = error.chain().any(|cause| {
+        if let Some(error) = cause.downcast_ref::<hyper::Error>() {
+            return error.is_connect();
+        }
+        match cause.downcast_ref::<libsql::Error>() {
+            Some(libsql::Error::Hrana(_) | libsql::Error::RemoteSqliteFailure(..)) => {
+                let message = cause.to_string().to_ascii_lowercase();
+                message.contains("transaction_timeout")
+                    || message.contains("transaction timed out")
+                    || message.contains("transaction timed-out")
+                    || message.contains("network is unreachable")
+                    || message.contains("connection refused")
+                    || message.contains("error trying to connect")
+            }
+            _ => false,
+        }
+    });
+    is_unavailable.then(|| {
+        error
+            .downcast_ref::<RemoteOperationFailed>()
+            .map_or("remote SQL", |failure| failure.0)
+    })
+}
+
 pub(crate) fn is_database_operation_timeout(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<DatabaseOperationTimedOut>().is_some()
@@ -498,7 +535,7 @@ impl DbRuntime {
                 result = future => {
                     let result = result.map_err(Into::into);
                     if remote {
-                        result.with_context(|| format!("remote database {operation} failed"))
+                        result.context(RemoteOperationFailed(operation))
                     } else {
                         result
                     }
@@ -578,7 +615,7 @@ impl DbRuntime {
                 result = future.as_mut() => {
                     return result
                         .map_err(anyhow::Error::from)
-                        .with_context(|| format!("remote database {operation} failed"));
+                        .context(RemoteOperationFailed(operation));
                 }
                 _ = abandoned, if watch.is_some() => Stop::Abandoned,
                 _ = deadline => Stop::Deadline,

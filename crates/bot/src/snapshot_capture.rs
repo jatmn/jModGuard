@@ -628,7 +628,9 @@ impl SnapshotIngress {
         let stores = match app.tenant.usage_stores().await {
             Ok(stores) => stores,
             Err(error) => {
-                tracing::warn!("snapshot maintenance catalog unavailable: {error:#}");
+                if !crate::db::is_primary_outage(&error) {
+                    tracing::warn!("snapshot maintenance catalog unavailable: {error:#}");
+                }
                 self.gap();
                 return std::time::Duration::from_secs(30);
             }
@@ -675,7 +677,9 @@ impl SnapshotIngress {
                 let expired = match store.expire_snapshots(100, now).await {
                     Ok(count) => count,
                     Err(error) => {
-                        tracing::warn!(store_id, "snapshot cleanup unavailable: {error:#}");
+                        if !crate::db::is_primary_outage(&error) {
+                            tracing::warn!(store_id, "snapshot cleanup unavailable: {error:#}");
+                        }
                         self.cleanup_paused.lock().insert(store_id.to_owned());
                         idle = false;
                         active[index] = false;
@@ -688,10 +692,12 @@ impl SnapshotIngress {
                 let usage = match store.measure_usage(false).await {
                     Ok(usage) => usage,
                     Err(error) => {
-                        tracing::warn!(
-                            store_id,
-                            "snapshot usage measurement unavailable: {error:#}"
-                        );
+                        if !crate::db::is_primary_outage(&error) {
+                            tracing::warn!(
+                                store_id,
+                                "snapshot usage measurement unavailable: {error:#}"
+                            );
+                        }
                         self.cleanup_paused.lock().insert(store_id.to_owned());
                         idle = false;
                         active[index] = false;
@@ -705,10 +711,12 @@ impl SnapshotIngress {
                     match store.evict_snapshots(100, now).await {
                         Ok(count) => count,
                         Err(error) => {
-                            tracing::warn!(
-                                store_id,
-                                "snapshot pressure cleanup unavailable: {error:#}"
-                            );
+                            if !crate::db::is_primary_outage(&error) {
+                                tracing::warn!(
+                                    store_id,
+                                    "snapshot pressure cleanup unavailable: {error:#}"
+                                );
+                            }
                             self.cleanup_paused.lock().insert(store_id.to_owned());
                             idle = false;
                             active[index] = false;

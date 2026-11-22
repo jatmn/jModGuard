@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use db::{UpdateControl, UpgradeAcknowledgement as Ack, UpgradePhase as Phase};
 use jmodguard::config::{ApiProcessConfig, BotProcessConfig};
 use jmodguard::db::{self, ComponentObservation, ComponentRelease};
+use jmodguard::idle_poll::IdlePoll;
 #[cfg(test)]
 use jmodguard_updater::compatible;
 use jmodguard_updater::compatible_control;
@@ -3649,24 +3650,33 @@ async fn main() -> Result<()> {
         core_migration_wait: None,
     };
     supervisor.load_boot_mismatch_handoff().await?;
+    let mut next_poll = IdlePoll::Updater.first_tick(tokio::time::Instant::now());
     loop {
+        tokio::select! {
+            _ = jmodguard::shutdown_signal() => break,
+            _ = tokio::time::sleep_until(next_poll) => {}
+        }
         tokio::select! {
             _ = jmodguard::shutdown_signal() => break,
             result = supervisor.tick() => match result {
                 Ok(true) => std::process::exit(77),
                 Ok(false) => {},
                 Err(error) => {
-                    tracing::warn!("update controller: {error:#}");
+                    if !db::is_primary_outage(&error) {
+                        tracing::warn!("update controller: {error:#}");
+                    }
                     match supervisor.idle().await {
                         Err(error) if supervisor.role == "bot" => {
-                            tracing::warn!("launcher idle: {error:#}");
+                            if !db::is_primary_outage(&error) {
+                                tracing::warn!("launcher idle: {error:#}");
+                            }
                         }
                         result => result?,
                     }
                 },
             },
         }
-        tokio::select! { _ = jmodguard::shutdown_signal() => break, _ = tokio::time::sleep(POLL) => {} }
+        next_poll = tokio::time::Instant::now() + POLL;
     }
     if let Some(task) = fence_renewal {
         task.abort();

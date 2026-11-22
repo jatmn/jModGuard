@@ -30,6 +30,9 @@ use crate::types::{
     CommandDef, GLOBAL_SCOPE, GuildSettings, GuildSettingsOverride, RuleDef, resolve_settings,
 };
 
+mod primary_outage;
+use primary_outage::{Admission, PrimaryBackoff, PrimaryOutageGate};
+
 mod access_marks;
 pub use access_marks::*;
 mod bot_actions;
@@ -212,7 +215,7 @@ where
                 if is_remote_interactive_timeout(&error)
                     && attempt < REMOTE_INTERACTIVE_READ_ATTEMPTS =>
             {
-                tracing::warn!(
+                tracing::debug!(
                     attempt,
                     error = %error,
                     "retrying read after remote interactive transaction timeout"
@@ -223,6 +226,11 @@ where
         }
     }
     Err(last.expect("remote interactive read retry exhausted without an error"))
+}
+
+/// Transient remote failures and deliberate cooldowns reported by the pool.
+pub fn is_primary_outage(error: &anyhow::Error) -> bool {
+    error.is::<PrimaryBackoff>() || crate::db_compat::remote_unavailable_operation(error).is_some()
 }
 
 pub fn is_database_commit_indeterminate(err: &anyhow::Error) -> bool {
@@ -360,7 +368,7 @@ pub fn startup_retry_kind(err: &anyhow::Error, remote: bool) -> Option<StartupRe
     if is_remote_interactive_timeout(err) {
         return Some(StartupRetryKind::InteractiveTransaction);
     }
-    if is_transient_remote_open(err) {
+    if err.is::<PrimaryBackoff>() || is_transient_remote_open(err) {
         return Some(StartupRetryKind::Transport);
     }
     None
@@ -695,6 +703,7 @@ struct ConnectionPool {
     commit_lease_probe: Arc<Mutex<Option<crate::db_compat::CommitLeaseProbe>>>,
     /// Guild-store pools count primary work apart from the core database.
     guild_store: bool,
+    outage: PrimaryOutageGate,
 }
 
 /// Which database family a pool serves, for Bot Resources accounting.
@@ -1114,6 +1123,7 @@ impl Db {
                     launcher_fence: Arc::clone(&launcher_fence),
                     commit_lease_probe,
                     guild_store,
+                    outage: PrimaryOutageGate::default(),
                 }),
                 lease_connection: Arc::new(Mutex::new(Some(lease_connection))),
                 permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
@@ -1308,6 +1318,44 @@ impl Db {
         F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        if !self.remote {
+            return self.with_ungated_conn(f).await;
+        }
+        let gate = &self.connections.outage;
+        let generation = match gate.admit()? {
+            Admission::Work(generation) => generation,
+            Admission::Probe(probe) => {
+                let result = self
+                    .with_ungated_conn(|conn| {
+                        let tx = conn.transaction_primary_snapshot()?;
+                        tx.query_row("SELECT 1", (), |_| Ok(()))?;
+                        tx.finish_read()
+                    })
+                    .await;
+                probe.finish(result)?
+            }
+        };
+        let started = Instant::now();
+        let result = self.with_conn_inner(f, Some(generation)).await;
+        if let Err(error) = &result {
+            gate.record_failure(generation, started.elapsed(), error);
+        }
+        result
+    }
+
+    async fn with_ungated_conn<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.with_conn_inner(f, None).await
+    }
+
+    async fn with_conn_inner<T, F>(&self, f: F, generation: Option<u64>) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
         let acquire = Arc::clone(&self.permits).acquire_owned();
         let permit = match self.permit_timeout {
             Some(timeout) => tokio::time::timeout(timeout, acquire)
@@ -1328,6 +1376,9 @@ impl Db {
             // back and return the permit instead of keeping both until the
             // operation deadline.
             let _permit = permit;
+            if let Some(generation) = generation {
+                connections.outage.check(generation)?;
+            }
             let mut connection = ConnectionLease::checkout(connections)?;
             let result = f(&mut connection);
             if result.is_ok()

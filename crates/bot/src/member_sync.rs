@@ -1034,7 +1034,9 @@ async fn run_loop(
         let fenced = match db::guild_stores::write_fenced_guilds(&app.db, cached_guilds).await {
             Ok(fenced) => fenced,
             Err(error) => {
-                tracing::warn!("member sync fence snapshot unavailable: {error:#}");
+                if !db::is_primary_outage(&error) {
+                    tracing::warn!("member sync fence snapshot unavailable: {error:#}");
+                }
                 defer_until = ScanWait::Until(tokio::time::Instant::now() + idle_recheck);
                 continue;
             }
@@ -1105,10 +1107,12 @@ async fn run_loop(
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    tracing::warn!(
-                        guild_id = gid,
-                        "member sync fence re-check failed: {error:#}"
-                    );
+                    if !db::is_primary_outage(&error) {
+                        tracing::warn!(
+                            guild_id = gid,
+                            "member sync fence re-check failed: {error:#}"
+                        );
+                    }
                     continue;
                 }
             }
@@ -1119,10 +1123,12 @@ async fn run_loop(
                 {
                     Ok(status) => status,
                     Err(error) => {
-                        tracing::warn!(
-                            guild_id = gid,
-                            "member directory initialization deferred: {error:#}"
-                        );
+                        if !db::is_primary_outage(&error) {
+                            tracing::warn!(
+                                guild_id = gid,
+                                "member directory initialization deferred: {error:#}"
+                            );
+                        }
                         continue;
                     }
                 }
@@ -1134,10 +1140,12 @@ async fn run_loop(
                     Ok(status) => status,
                     Err(error) if error.is::<db::guild_stores::GuildWriteFenced>() => continue,
                     Err(error) => {
-                        tracing::warn!(
-                            guild_id = gid,
-                            "member directory status unavailable: {error:#}"
-                        );
+                        if !db::is_primary_outage(&error) {
+                            tracing::warn!(
+                                guild_id = gid,
+                                "member directory status unavailable: {error:#}"
+                            );
+                        }
                         continue;
                     }
                 }
@@ -1279,10 +1287,12 @@ async fn run_loop(
                 let targeted = match store.next_member_target_check(scope.clone(), now_ms).await {
                     Ok(check) => check,
                     Err(error) => {
-                        tracing::warn!(
-                            guild_id = guild_id.get(),
-                            "member target check lookup failed: {error:#}"
-                        );
+                        if !db::is_primary_outage(&error) {
+                            tracing::warn!(
+                                guild_id = guild_id.get(),
+                                "member target check lookup failed: {error:#}"
+                            );
+                        }
                         None
                     }
                 };

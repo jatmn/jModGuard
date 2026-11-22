@@ -29,6 +29,8 @@ struct HranaState {
     hang_next_commit: bool,
     hang_next_statement: bool,
     hang_next_begin: bool,
+    stall_reads: bool,
+    read_begins: usize,
     begin_released: bool,
     begin_release: Arc<Notify>,
     skip_immediate_lock: bool,
@@ -68,6 +70,8 @@ impl HranaState {
             hang_next_commit: false,
             hang_next_statement: false,
             hang_next_begin: false,
+            stall_reads: false,
+            read_begins: 0,
             begin_released: false,
             begin_release: Arc::new(Notify::new()),
             skip_immediate_lock: false,
@@ -480,6 +484,7 @@ impl HranaFixture {
                 launcher_fence: Arc::clone(&launcher_fence),
                 commit_lease_probe: Arc::new(Mutex::new(None)),
                 guild_store: false,
+                outage: PrimaryOutageGate::default(),
             }),
             lease_connection: Arc::new(Mutex::new(Some(
                 Connection::from_database(Arc::clone(&database), lease_runtime).unwrap(),
@@ -714,6 +719,23 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
             StatusCode::TOO_MANY_REQUESTS,
             json!({"message":"rate limited","code":"HTTP_429"}).to_string(),
         );
+    }
+    if path == "/v3/pipeline"
+        && input["requests"].as_array().is_some_and(|requests| {
+            requests.iter().any(|request| {
+                let sql = statement_sql(request);
+                sql.starts_with("BEGIN") && (sql.contains("DEFERRED") || sql.contains("READONLY"))
+            })
+        })
+    {
+        let stall = {
+            let mut state = state.lock().unwrap();
+            state.read_begins += 1;
+            state.stall_reads
+        };
+        if stall {
+            std::future::pending::<()>().await;
+        }
     }
     let provider = state.lock().unwrap().provider.clone();
     if let Some(provider) = provider {
@@ -1240,6 +1262,152 @@ async fn primary_snapshot_skips_rollback_when_the_cursor_stream_is_closed() {
     );
     assert_eq!(db.connections.idle.lock().unwrap().len(), 1);
     assert_eq!(db.permits.available_permits(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn primary_stall_defers_pooled_reads_and_recovers_while_lease_retries() {
+    #[derive(Clone)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let path = super::tmp_db_path("primary_outage");
+    let local = Db::open(&path, 2).unwrap();
+    let instance = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let refuse = Arc::new(AtomicBool::new(false));
+    let now = crate::control::now_ms();
+    assert!(
+        claim_active_bot(&local, instance, now, Arc::clone(&refuse))
+            .await
+            .unwrap()
+    );
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    fixture.state.lock().unwrap().backing = Some((runtime, backing));
+    let db = fixture.db_with_operation_timeout(Duration::from_secs(7));
+    let other = db.clone();
+    let launcher = UpdateControl::from_application(&db);
+    launcher.arm_launcher_fence("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    assert!(launcher.renew_launcher_fence().await.unwrap());
+    let launcher_deadline = launcher.launcher_fence_deadline().unwrap();
+    db.arm_writer_term(instance, local.leased_generation().unwrap());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer = Log(Arc::clone(&bytes));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let capture = tracing::subscriber::set_default(subscriber);
+
+    fixture.state.lock().unwrap().stall_reads = true;
+    let started = tokio::time::Instant::now().into_std();
+    let (snapshot, versions) = tokio::join!(get_primary_versions(&db), get_version_state(&other));
+    for error in [snapshot.unwrap_err(), versions.unwrap_err()] {
+        assert!(is_database_operation_timeout(&error), "{error:#}");
+        assert!(
+            error.to_string().ends_with("timed out after 4s"),
+            "{error:#}"
+        );
+    }
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 2);
+
+    for _ in 0..3 {
+        let (snapshot, versions) =
+            tokio::join!(get_primary_versions(&db), get_version_state(&other));
+        for error in [snapshot.unwrap_err(), versions.unwrap_err()] {
+            assert!(
+                error.to_string().contains("primary is backing off"),
+                "{error:#}"
+            );
+        }
+    }
+    assert_eq!(
+        fixture.state.lock().unwrap().read_begins,
+        2,
+        "deferred callers must not send database requests"
+    );
+
+    let deadline = started + Duration::from_secs(12);
+    fixture.state.lock().unwrap().fail_next_cas = true;
+    assert!(
+        renew_active_bot(
+            &db,
+            instance,
+            crate::control::now_ms(),
+            deadline,
+            Arc::clone(&refuse)
+        )
+        .await
+        .is_err(),
+        "first renewal attempt must reach the injected CAS error"
+    );
+    assert!(
+        renew_active_bot(&db, instance, crate::control::now_ms(), deadline, refuse)
+            .await
+            .unwrap(),
+        "lease retry must reach the database during the cooldown"
+    );
+    local
+        .with_conn(|conn| {
+            conn.execute_rows("DELETE FROM meta WHERE key='launcher_lease'", (), 1)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(
+        launcher.renew_launcher_fence_cas().await.unwrap(),
+        "a missing fence must still be reacquired while ordinary work backs off"
+    );
+    assert!(launcher.launcher_fence_deadline().unwrap() > launcher_deadline);
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 2);
+
+    fixture.state.lock().unwrap().stall_reads = false;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let (probe_owner, contender) =
+        tokio::join!(db.with_conn(|_| Ok(())), other.with_conn(|_| Ok(())));
+    assert_ne!(probe_owner.is_ok(), contender.is_ok());
+    assert_eq!(
+        fixture.state.lock().unwrap().read_begins,
+        3,
+        "one caller may probe the primary after the cooldown"
+    );
+    assert_eq!(
+        get_primary_versions(&db).await.unwrap(),
+        get_primary_versions(&local).await.unwrap(),
+        "regular reads must resume using the same remote pool"
+    );
+
+    drop(capture);
+    let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+    assert_eq!(log.matches("WARN ").count(), 1, "{log}");
+    assert_eq!(log.matches("primary recovered").count(), 1, "{log}");
+    for field in ["count=", "first_failure=", "last_failure=", "operations="] {
+        assert!(log.contains(field), "{log}");
+    }
+    assert!(log.contains("count=2"), "{log}");
+    assert!(
+        log.contains("begin primary snapshot") && log.contains("begin consistent read"),
+        "{log}"
+    );
+    drop(launcher);
+    drop(other);
+    drop(db);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
 }
 
 fn install_clock(db: &Db) -> Arc<crate::db_compat::ManualClock> {

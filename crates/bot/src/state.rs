@@ -1815,7 +1815,9 @@ impl BotState {
                             };
                             retry = AuditPass::Retrying { _owner: owner };
                         }
-                        tracing::warn!("gateway manual ban audit will retry: {error:#}");
+                        if !db::is_primary_outage(&error) {
+                            tracing::warn!("gateway manual ban audit will retry: {error:#}");
+                        }
                     }
                 }
             }
@@ -2013,63 +2015,42 @@ impl BotState {
     /// last observation (primed at startup), invalidates the guild config cache.
     /// Returns `true` when a change triggered invalidation.
     pub async fn poll_config_version(&self) -> Result<bool> {
-        let _version_reconcile = self.version_reconcile_lock.lock().await;
-        let remote = db::get_version_state(&self.db).await?;
-        let prev = self.last_config_version.load(Ordering::SeqCst);
-        let revision_changed = remote.config_revision != *self.last_config_revision.lock();
-        if revision_changed
-            || remote.config != prev
-            || remote.config < self.db.required_config_version()
-        {
-            let suspected_floor = prev.max(self.db.required_config_version());
-            let write_generation = self.db.config_write_generation();
-            let primary = db::get_primary_versions(&self.db).await?;
-            return Ok(self
-                .reconcile_primary_versions(primary, suspected_floor, write_generation)
-                .0);
-        }
-        Ok(false)
+        Ok(self.poll_versions(false).await?.0)
     }
 
-    /// Loads durable `slash_registry_version`. Returns the remote version when
-    /// it differs from the last **committed** observation (does not advance).
-    ///
-    /// Callers must [`commit_slash_registry_version`] only after Discord slash
-    /// re-sync succeeds. Advancing before sync left failed guilds stale until
-    /// the next command-registry write.
+    /// Loads the pending slash version without acknowledging Discord sync.
     pub async fn pending_slash_registry_version(&self) -> Result<Option<u64>> {
         if self.slash_unauthorized.load(Ordering::SeqCst) {
             return Ok(None);
         }
+        Ok(self.poll_versions(true).await?.1)
+    }
+
+    /// One observation for both periodic pollers. An observed slash change
+    /// stays pending until the separate Discord reconciliation succeeds.
+    pub async fn poll_versions(&self, check_slash: bool) -> Result<(bool, Option<u64>)> {
         let _version_reconcile = self.version_reconcile_lock.lock().await;
         let remote = db::get_version_state(&self.db).await?;
-        let prev = self.last_slash_registry_version.load(Ordering::SeqCst);
-        let config_revision_changed = remote.config_revision != *self.last_config_revision.lock();
-        let slash_revision_changed =
-            remote.slash_revision != *self.last_slash_registry_revision.lock();
-        if config_revision_changed
-            || slash_revision_changed
-            || remote.config < self.db.required_config_version()
-            || remote.slash != prev
-        {
-            let suspected_floor = self
-                .last_config_version
-                .load(Ordering::SeqCst)
-                .max(self.db.required_config_version());
+        let previous_config = self.last_config_version.load(Ordering::SeqCst);
+        let floor = self.db.required_config_version();
+        let check_slash = check_slash && !self.slash_unauthorized.load(Ordering::SeqCst);
+        let config_changed = remote.config_revision != *self.last_config_revision.lock()
+            || remote.config != previous_config
+            || remote.config < floor;
+        let slash_changed = check_slash
+            && (remote.slash != self.last_slash_registry_version.load(Ordering::SeqCst)
+                || remote.slash_revision != *self.last_slash_registry_revision.lock());
+        let mut invalidated = false;
+        if config_changed || slash_changed {
             let write_generation = self.db.config_write_generation();
             let primary = db::get_primary_versions(&self.db).await?;
-            let (_, slash_changed) =
-                self.reconcile_primary_versions(primary, suspected_floor, write_generation);
-            let current = self.last_slash_registry_version.load(Ordering::SeqCst);
-            Ok(
-                (slash_changed || self.force_slash_registry_retry.load(Ordering::SeqCst))
-                    .then_some(current),
-            )
-        } else if self.force_slash_registry_retry.load(Ordering::SeqCst) {
-            Ok(Some(prev))
-        } else {
-            Ok(None)
+            invalidated = self
+                .reconcile_primary_versions(primary, previous_config.max(floor), write_generation)
+                .0;
         }
+        let slash = (check_slash && self.force_slash_registry_retry.load(Ordering::SeqCst))
+            .then(|| self.last_slash_registry_version.load(Ordering::SeqCst));
+        Ok((invalidated, slash))
     }
 
     fn reconcile_primary_versions(
@@ -4016,10 +3997,10 @@ mod tests {
         );
         let cmd = crate::defaults::custom_command_fixture("slashpending");
         tokio_test_block_on(db::upsert_command(&app.db, 1, "slashpending", &cmd)).unwrap();
-        let pending = tokio_test_block_on(app.pending_slash_registry_version())
-            .unwrap()
-            .expect("command write must surface pending slash version");
-        assert_eq!(pending, initial_slash + 1);
+        let (invalidated, pending) = tokio_test_block_on(app.poll_versions(true)).unwrap();
+        assert!(invalidated, "the shared read must observe the config bump");
+        assert_eq!(pending, Some(initial_slash + 1));
+        let pending = pending.unwrap();
         // Peek again — must still be pending (no auto-advance).
         assert_eq!(
             tokio_test_block_on(app.pending_slash_registry_version()).unwrap(),

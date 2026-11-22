@@ -106,14 +106,19 @@ fn log_dir(app: &BotState) -> Option<std::path::PathBuf> {
 }
 
 /// Runs until shutdown.
-pub async fn run(app: Arc<BotState>, shards: Arc<ShardManager>, cache: Arc<Cache>) {
+pub async fn run(
+    app: Arc<BotState>,
+    shards: Arc<ShardManager>,
+    cache: Arc<Cache>,
+    poll_start: tokio::time::Instant,
+) {
     let mut builder = RollupBuilder::default();
     let mut backlog: Vec<Rollup> = Vec::new();
     let mut failing = false;
     // The API keeps its recent minutes; send only those not saved yet.
     let mut api_saved_through = i64::MIN;
-    let mut tick = tokio::time::interval(jmodguard::cgroup::SAMPLE_INTERVAL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tick = jmodguard::idle_poll::IdlePoll::BotResources
+        .interval(poll_start, jmodguard::cgroup::SAMPLE_INTERVAL);
     loop {
         tokio::select! {
             _ = crate::shutdown_signal() => break,
@@ -170,7 +175,7 @@ pub async fn run(app: Arc<BotState>, shards: Arc<ShardManager>, cache: Arc<Cache
                 }
                 failing = false;
             }
-            Ok(Err(error)) if !failing => {
+            Ok(Err(error)) if !failing && !db::is_primary_outage(&error) => {
                 failing = true;
                 tracing::warn!("resource rollup save failed; retrying each minute: {error:#}");
             }
