@@ -3171,6 +3171,87 @@ async fn usage_followup_custom_slash_help_matches_required_plan_target() {
     }
 }
 
+#[tokio::test]
+async fn usage_followup_self_service_plans_only_advertise_usable_targets() {
+    use serenity::model::permissions::Permissions;
+
+    let mut self_service = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "kick")
+        .unwrap();
+    self_service.name = "join-role".into();
+    self_service.aliases.clear();
+    self_service.permission = "everyone".into();
+    self_service.response.clear();
+    self_service.log_event.clear();
+    self_service.behavior = crate::types::Behavior::Plan {
+        steps: vec![crate::types::PlanStep::AddRole { role_id: 51 }],
+    };
+    let mut targeted = self_service.clone();
+    targeted.name = "grant-role".into();
+    targeted.permission = "mod".into();
+    let fx = StatsDispatch::new(false, vec![self_service, targeted]).await;
+    fx.install(Permissions::MANAGE_GUILD);
+
+    let mut help = Vec::new();
+    for name in ["join-role", "grant-role"] {
+        fx.slash_with_options(
+            "help",
+            serde_json::json!([{"name": "command", "type": 3, "value": name}]),
+        )
+        .await;
+        help.push(fx.sent(name));
+    }
+    fx.slash_with_options(
+        "join-role",
+        serde_json::json!([{"name": "user", "type": 6, "value": "42"}]),
+    )
+    .await;
+    assert!(
+        !fx.captured
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|raw| raw.starts_with("PUT ")),
+        "an explicit target reached role assignment"
+    );
+    let denied = fx.sent("explicit target on self-service command");
+    assert!(
+        denied["content"]
+            .as_str()
+            .unwrap()
+            .contains("targeted action plans require the command permission to be mod or higher")
+    );
+
+    fx.slash("join-role").await;
+    let writes: Vec<_> = fx
+        .captured
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|raw| {
+            raw.lines()
+                .next()
+                .filter(|route| route.starts_with("PUT "))
+                .map(str::to_owned)
+        })
+        .collect();
+    fx.finish();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert!(
+        writes[0].contains("/guilds/10/members/7/roles/51"),
+        "{writes:?}"
+    );
+
+    let self_help = help[0]["content"].as_str().unwrap();
+    assert!(self_help.contains("Usage: `/join-role`"), "{self_help}");
+    let mod_help = help[1]["content"].as_str().unwrap();
+    assert!(
+        mod_help.contains("Usage: `/grant-role [user:<user>]`"),
+        "{mod_help}"
+    );
+}
+
 /// `!status` (prefix alias) and `/stats` share one dispatch: the permission
 /// denial is unchanged text, and an allowed caller gets one log-style embed.
 #[tokio::test]

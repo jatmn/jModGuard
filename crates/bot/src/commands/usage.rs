@@ -105,13 +105,13 @@ pub(super) fn reply(
             let prefix = &cfg.settings.prefix;
             (
                 format!("{prefix}{name}"),
-                prefix_syntax(&command.behavior, error.action),
+                prefix_syntax(command, error.action),
                 format!("{prefix}{help} {}", command.name),
             )
         }
         Invocation::Slash(name) => (
             format!("/{name}"),
-            slash_syntax(&command.behavior, error.action),
+            slash_syntax(command, error.action),
             format!(
                 "/{} command:{}",
                 super::sanitize_slash_name(help),
@@ -147,10 +147,10 @@ pub(super) fn help_detail(command: &CommandDef, prefix: &str, is_prefix: bool) -
                     && (command.usage.is_empty() || command.usage == shipped.usage)
             });
     let usage = if !is_prefix {
-        let (usage, _) = slash_syntax(&command.behavior, None);
+        let (usage, _) = slash_syntax(command, None);
         command_line(&name, &usage)
     } else if generated_prefix {
-        let (usage, _) = prefix_syntax(&command.behavior, None);
+        let (usage, _) = prefix_syntax(command, None);
         command_line(&name, &usage)
     } else {
         command.usage.clone()
@@ -208,10 +208,24 @@ impl PrefixArg {
     }
 }
 
-// Start with the ordered option definitions used for slash registration and
-// argument adaptation. Describe prefix-only positions, flags and defaults here.
-fn prefix_syntax(behavior: &Behavior, action: Option<&str>) -> (String, String) {
-    let mut args: Vec<_> = behaviors::slash_spec(behavior)
+fn usage_options(command: &CommandDef) -> Vec<behaviors::OptionSpec> {
+    let mut specs = behaviors::slash_spec(&command.behavior);
+    if let Behavior::Plan { steps } = &command.behavior
+        && !super::plans::plan_requires_target(steps)
+        && !super::plans::plan_permission_allows_target(&command.permission)
+    {
+        // The registered option describes what the steps can do. A
+        // self-service plan's permission limits those steps to the caller.
+        specs.retain(|spec| spec.name != "user");
+    }
+    specs
+}
+
+// Start with the shared option definitions and account for prefix-only
+// positions, flags and defaults.
+fn prefix_syntax(command: &CommandDef, action: Option<&str>) -> (String, String) {
+    let behavior = &command.behavior;
+    let mut args: Vec<_> = usage_options(command)
         .into_iter()
         .map(|spec| PrefixArg::new(spec.name, spec.required, argument_example(spec.name)))
         .collect();
@@ -296,7 +310,8 @@ fn action_arguments(
     }
 }
 
-fn slash_syntax(behavior: &Behavior, action: Option<&str>) -> (String, String) {
+fn slash_syntax(command: &CommandDef, action: Option<&str>) -> (String, String) {
+    let behavior = &command.behavior;
     let mut usage = Vec::new();
     let mut examples = Vec::new();
     let (required, optional) = action.map_or((&[][..], &[][..]), |action| {
@@ -306,7 +321,7 @@ fn slash_syntax(behavior: &Behavior, action: Option<&str>) -> (String, String) {
         behavior,
         Behavior::Plan { steps } if super::plans::plan_requires_target(steps)
     );
-    for spec in behaviors::slash_spec(behavior) {
+    for spec in usage_options(command) {
         if let Some(action) = action {
             if spec.name == "action" {
                 let option = format!("action:{action}");

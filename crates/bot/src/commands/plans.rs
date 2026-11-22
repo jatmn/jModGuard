@@ -75,7 +75,7 @@ pub async fn run(env: &CmdEnv<'_>, steps: &[PlanStep]) -> Result<BehaviorOutcome
     // Public plans are self-service by design. Supplying a target turns a
     // state-changing plan into a moderation operation, so never let an
     // `everyone` command grant roles, DM, or moderate another member.
-    if target.is_some() && PermLevel::parse(&env.cmd.permission) < PermLevel::Mod {
+    if target.is_some() && !plan_permission_allows_target(&env.cmd.permission) {
         return Err(anyhow!(
             "targeted action plans require the command permission to be mod or higher"
         ));
@@ -190,6 +190,10 @@ pub(super) fn plan_requires_target(steps: &[PlanStep]) -> bool {
             PlanStep::Timeout { .. } | PlanStep::Kick | PlanStep::Ban { .. }
         )
     })
+}
+
+pub(super) fn plan_permission_allows_target(permission: &str) -> bool {
+    PermLevel::parse(permission) >= PermLevel::Mod
 }
 
 pub(crate) fn plan_accepts_target(steps: &[PlanStep]) -> bool {
