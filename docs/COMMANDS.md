@@ -38,12 +38,12 @@ an example, and the help command. Public usage replies expire after 30 seconds.
 | `!softban <user> [reason]` | Moderation | mod | Ban, delete the last 24 hours of messages, then unban so the user can rejoin |
 | `!unban <user> [reason]` | Moderation | mod | Unban a user (`!ub`) |
 | `!kick <user> [--dm] [reason]` | Moderation | mod | Kick a user; optional `--dm` DMs the reason (`!k`) |
-| `!timeout <user> [minutes] [reason]` | Moderation | mod | Timeout a user for the configured default when minutes are omitted. Use `0` to remove it (`!mute`, `!t`) |
+| `!timeout <user> [minutes [reason]]` | Moderation | mod | Omit both trailing arguments to use the configured default. Supply minutes before a reason. Use `0` to remove a timeout (`!mute`, `!t`) |
 | `!warn <user> [reason]` | Moderation | mod | Warn a user (`!w`) |
 | `!warns <user>` | Moderation | mod | List a user's warnings |
 | `!warnclear <user>` | Moderation | mod | Clear a user's warnings |
 | `!userinfo [user]` | Moderation | mod | Cached profile, warnings, and recent cases (defaults to you). A cached voice channel is named only when the caller can view it; otherwise the voice field is `unavailable` and omits the name and id. Channel mentions in case reasons use that rule. A private thread, including an archived one, also needs Manage Threads on the parent or known thread membership; uncached membership is `unavailable` and omits the id. An archived public thread stays with parent visibility. A user, role, or channel mention whose id is zero or does not fit is `unavailable` |
-| `!purge [count]` | Moderation | mod | Delete recent messages (max 100; `!clear`, `!p`) |
+| `!purge [count]` | Moderation | mod | Delete recent messages. Supply a positive count (capped at 100), or omit it to use the configured default (`!clear`, `!p`) |
 | `!say [#channel] <text>` | Moderation | mod | Post a message as the bot (`!echo`) |
 | `!slowmode [seconds]` | Moderation | mod | Set slowmode on this channel. Omit seconds to use the configured default |
 | `!banlist [limit]` | Moderation | mod | Recent bans tracked by the bot (`!bans`) |

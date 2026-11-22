@@ -5,6 +5,7 @@ use crate::types::{Behavior, CommandDef};
 
 const REPLY_TEMPLATE: &str =
     "{flavor} {problem}\nUsage: {usage}\nExample: {example}\nSee {help} for details.";
+const HELP_DETAIL_TEMPLATE: &str = "**{command}** {description} `{category}`\nAliases: {aliases}\nUsage: {usage}\nRequires: {permission}";
 
 pub(super) const BAN_MINUTES_FLAG: &str = "--minutes";
 pub(super) const LIST: &str = "list";
@@ -71,14 +72,17 @@ impl fmt::Display for ArgumentError {
 
 impl std::error::Error for ArgumentError {}
 
+pub(super) enum Invocation<'a> {
+    Prefix(&'a str),
+    Slash(&'a str),
+}
+
 pub(super) fn reply(
     error: &ArgumentError,
     cfg: &CachedGuildConfig,
     command: &CommandDef,
-    invocation: &str,
+    invocation: Invocation<'_>,
 ) -> String {
-    let prefix = &cfg.settings.prefix;
-    let (usage, example) = syntax(&command.behavior, error.action);
     let flavor = match (&command.behavior, &error.problem, error.name) {
         (Behavior::Ban { .. }, ArgumentProblem::Missing, "user") => {
             "Who's getting the hammer? I need a user."
@@ -96,25 +100,85 @@ pub(super) fn reply(
                 .min_by_key(|cmd| &cmd.name)
         })
         .map_or("help", |cmd| cmd.name.as_str());
+    let (name, (usage, example), help) = match invocation {
+        Invocation::Prefix(name) => {
+            let prefix = &cfg.settings.prefix;
+            (
+                format!("{prefix}{name}"),
+                prefix_syntax(&command.behavior, error.action),
+                format!("{prefix}{help} {}", command.name),
+            )
+        }
+        Invocation::Slash(name) => (
+            format!("/{name}"),
+            slash_syntax(&command.behavior),
+            format!(
+                "/{} command:{}",
+                super::sanitize_slash_name(help),
+                command.name
+            ),
+        ),
+    };
     crate::templates::render(
         REPLY_TEMPLATE,
         &BTreeMap::from([
             ("flavor".into(), flavor.into()),
             ("problem".into(), error.to_string()),
-            (
-                "usage".into(),
-                code_span(&format!("{prefix}{invocation} {usage}")),
-            ),
-            (
-                "example".into(),
-                code_span(&format!("{prefix}{invocation} {example}")),
-            ),
-            (
-                "help".into(),
-                code_span(&format!("{prefix}{help} {}", command.name)),
-            ),
+            ("usage".into(), code_span(&command_line(&name, &usage))),
+            ("example".into(), code_span(&command_line(&name, &example))),
+            ("help".into(), code_span(&help)),
         ]),
     )
+}
+
+pub(super) fn help_detail(command: &CommandDef, prefix: &str, is_prefix: bool) -> String {
+    let name = if is_prefix {
+        format!("{prefix}{}", command.name)
+    } else {
+        format!("/{}", super::sanitize_slash_name(&command.name))
+    };
+    // Effective built-ins retain their shipped name. Preserve explicitly
+    // customized prefix usage on overrides, as well as custom command usage.
+    let generate = jmodguard::defaults::default_commands()
+        .into_iter()
+        .any(|shipped| {
+            shipped.name == command.name
+                && (!is_prefix || command.usage.is_empty() || command.usage == shipped.usage)
+        });
+    let usage = if generate {
+        let (usage, _) = if is_prefix {
+            prefix_syntax(&command.behavior, None)
+        } else {
+            slash_syntax(&command.behavior)
+        };
+        command_line(&name, &usage)
+    } else {
+        command.usage.clone()
+    };
+    let aliases = if command.aliases.is_empty() {
+        "-".to_string()
+    } else {
+        command.aliases.join(", ")
+    };
+    crate::templates::render(
+        HELP_DETAIL_TEMPLATE,
+        &BTreeMap::from([
+            ("command".into(), name),
+            ("description".into(), command.description.clone()),
+            ("category".into(), command.category.clone()),
+            ("aliases".into(), aliases),
+            ("usage".into(), code_span(&usage)),
+            ("permission".into(), command.permission.clone()),
+        ]),
+    )
+}
+
+fn command_line(name: &str, args: &str) -> String {
+    if args.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{name} {args}")
+    }
 }
 
 fn code_span(command: &str) -> String {
@@ -146,29 +210,10 @@ impl PrefixArg {
 
 // Start with the ordered option definitions used for slash registration and
 // argument adaptation. Describe prefix-only positions, flags and defaults here.
-fn syntax(behavior: &Behavior, action: Option<&str>) -> (String, String) {
+fn prefix_syntax(behavior: &Behavior, action: Option<&str>) -> (String, String) {
     let mut args: Vec<_> = behaviors::slash_spec(behavior)
         .into_iter()
-        .map(|spec| {
-            let example = match spec.name {
-                "user" => "42",
-                "reason" => "repeated spam",
-                "minutes" => "60",
-                "count" => "10",
-                "seconds" => "15",
-                "prefix" => "?",
-                "pattern" => "spam",
-                "sample" => "example spam",
-                "text" => "Please read the rules",
-                "event" => "mod_action",
-                "channel" => "<#42>",
-                "command" => "ban",
-                "name" => "ModGuard",
-                "value" => "on",
-                _ => "",
-            };
-            PrefixArg::new(spec.name, spec.required, example)
-        })
+        .map(|spec| PrefixArg::new(spec.name, spec.required, argument_example(spec.name)))
         .collect();
     match behavior {
         Behavior::Ban { .. } | Behavior::Kick { .. } => {
@@ -180,6 +225,14 @@ fn syntax(behavior: &Behavior, action: Option<&str>) -> (String, String) {
             }
         }
         Behavior::Banlist => args.push(PrefixArg::new("limit", false, "10")),
+        Behavior::Timeout { .. } => {
+            // The prefix parser reaches the reason only after consuming minutes.
+            let reason = args.pop().expect("timeout has a reason option");
+            let minutes = &mut args[1];
+            minutes.syntax = format!("{} [{}]", minutes.syntax, reason.syntax);
+            let (usage, example) = render(&args);
+            return (usage, format!("{example} {}", reason.example));
+        }
         Behavior::Warn { .. } | Behavior::Slowmode { .. } | Behavior::Testregex => {
             // The prefix forms have defaults, even though slash requires these options.
             args.last_mut().unwrap().required = false;
@@ -230,6 +283,51 @@ fn syntax(behavior: &Behavior, action: Option<&str>) -> (String, String) {
         _ => {}
     }
     render(&args)
+}
+
+fn slash_syntax(behavior: &Behavior) -> (String, String) {
+    let mut usage = Vec::new();
+    let mut examples = Vec::new();
+    for spec in behaviors::slash_spec(behavior) {
+        let option = format!("{}:<{}>", spec.name, spec.name);
+        usage.push(if spec.required {
+            option
+        } else {
+            format!("[{option}]")
+        });
+        let example = match (behavior, spec.name) {
+            (Behavior::Rule { .. }, "action") => DRYRUN,
+            (Behavior::Rule { .. }, "name") => "mention_spam",
+            (Behavior::Template { .. }, "action") => GET,
+            (Behavior::Template { .. }, "text") => "",
+            (Behavior::Logchannel { .. }, "action") => SET,
+            (_, name) => argument_example(name),
+        };
+        if !example.is_empty() {
+            examples.push(format!("{}:{example}", spec.name));
+        }
+    }
+    (usage.join(" "), examples.join(" "))
+}
+
+fn argument_example(name: &str) -> &'static str {
+    match name {
+        "user" => "42",
+        "reason" => "repeated spam",
+        "minutes" => "60",
+        "count" => "10",
+        "seconds" => "15",
+        "prefix" => "?",
+        "pattern" => "spam",
+        "sample" => "example spam",
+        "text" => "Please read the rules",
+        "event" => "mod_action",
+        "channel" => "<#42>",
+        "command" => "ban",
+        "name" => "ModGuard",
+        "value" => "on",
+        _ => "",
+    }
 }
 
 fn render(args: &[PrefixArg]) -> (String, String) {

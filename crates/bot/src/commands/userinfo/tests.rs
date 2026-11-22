@@ -2805,6 +2805,10 @@ impl StatsDispatch {
     }
 
     async fn slash(&self, name: &str) {
+        self.slash_with_options(name, serde_json::json!([])).await;
+    }
+
+    async fn slash_with_options(&self, name: &str, options: serde_json::Value) {
         let mut member = Member::default();
         member.user = Self::author();
         member.guild_id = GuildId::new(Self::GUILD);
@@ -2825,7 +2829,7 @@ impl StatsDispatch {
                 "attachment_size_limit": 10000000,
                 "user": Self::author(),
                 "member": member,
-                "data": {"id": "3", "name": name, "type": 1, "options": []}
+                "data": {"id": "3", "name": name, "type": 1, "options": options}
             }))
             .unwrap();
         crate::commands::handle_interaction(&self.app, &self.ctx, interaction).await;
@@ -2892,7 +2896,7 @@ async fn malformed_moderation_commands_send_usage_in_the_invocation_channel() {
         (
             "!mute 42 later",
             "`minutes`",
-            "`!mute <user> [minutes] [reason]`",
+            "`!mute <user> [minutes [reason]]`",
             "`!mute 42 60 repeated spam`",
             "`!help timeout`",
         ),
@@ -2941,7 +2945,12 @@ async fn public_usage_replies_expire_in_prefix_and_deferred_slash_dispatch() {
             fx.prefix("!ban").await;
         }
         let reply = fx.sent("missing ban user");
-        assert!(reply["content"].as_str().unwrap().contains("`!help ban`"));
+        let help = if slash {
+            "`/help command:ban`"
+        } else {
+            "`!help ban`"
+        };
+        assert!(reply["content"].as_str().unwrap().contains(help));
         assert!(
             fx.deleted.try_recv().is_err(),
             "the reply was removed immediately"
@@ -2961,6 +2970,112 @@ async fn public_usage_replies_expire_in_prefix_and_deferred_slash_dispatch() {
         };
         assert!(route.contains(path), "{route}");
         fx.finish();
+    }
+}
+
+#[tokio::test]
+async fn usage_review_rejects_zero_purge_without_fetching_messages() {
+    use serenity::model::permissions::Permissions;
+
+    for slash in [false, true] {
+        let fx = StatsDispatch::new(false, Vec::new()).await;
+        fx.install(Permissions::MANAGE_MESSAGES);
+        if slash {
+            fx.slash_with_options(
+                "purge",
+                serde_json::json!([{"name": "count", "type": 4, "value": 0}]),
+            )
+            .await;
+        } else {
+            fx.prefix("!purge 0").await;
+        }
+
+        let valid_requests_only = fx.captured.lock().unwrap().iter().all(|raw| {
+            let route = raw.lines().next().unwrap_or_default();
+            !route.starts_with("GET ") && !route.starts_with("DELETE ")
+        });
+        assert!(
+            valid_requests_only,
+            "zero count reached Discord message retrieval"
+        );
+        let reply = fx.sent("zero purge count");
+        fx.finish();
+        let content = reply["content"].as_str().unwrap();
+        assert!(content.contains("Invalid argument `count`."), "{content}");
+    }
+}
+
+#[tokio::test]
+async fn usage_review_slash_errors_and_help_show_registered_options() {
+    use serenity::model::permissions::Permissions;
+
+    let fx = StatsDispatch::new(false, Vec::new()).await;
+    fx.install(Permissions::MANAGE_GUILD);
+    fx.slash_with_options(
+        "testregex",
+        serde_json::json!([
+            {"name": "pattern", "type": 3, "value": "["},
+            {"name": "sample", "type": 3, "value": "example spam"}
+        ]),
+    )
+    .await;
+    let error = fx.sent("invalid regex");
+    fx.slash_with_options(
+        "help",
+        serde_json::json!([{"name": "command", "type": 3, "value": "testregex"}]),
+    )
+    .await;
+    let help = fx.sent("slash help");
+    fx.finish();
+
+    let content = error["content"].as_str().unwrap();
+    assert!(content.contains("Invalid argument `pattern`."), "{content}");
+    assert!(
+        content.contains("Example: `/testregex pattern:spam sample:example spam`"),
+        "{content}"
+    );
+    assert!(content.contains("`/help command:testregex`"), "{content}");
+    for payload in [&error, &help] {
+        let text = payload["content"].as_str().unwrap();
+        assert!(
+            text.contains("Usage: `/testregex pattern:<pattern> sample:<sample>`"),
+            "{text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn usage_review_prefix_timeout_requires_minutes_before_reason() {
+    use serenity::model::permissions::Permissions;
+
+    let fx = StatsDispatch::new(false, Vec::new()).await;
+    fx.install(Permissions::MODERATE_MEMBERS);
+    fx.prefix("!mute 42 repeated spam").await;
+    let reply = fx.sent("timeout reason without minutes");
+    fx.finish();
+    let content = reply["content"].as_str().unwrap();
+    assert!(content.contains("Invalid argument `minutes`."), "{content}");
+    assert!(
+        content.contains("Usage: `!mute <user> [minutes [reason]]`"),
+        "{content}"
+    );
+}
+
+#[tokio::test]
+async fn usage_review_prefix_help_agrees_with_shipped_error_syntax() {
+    use serenity::model::permissions::Permissions;
+
+    let fx = StatsDispatch::new(false, Vec::new()).await;
+    fx.install(Permissions::MANAGE_GUILD);
+    fx.prefix("!warn").await;
+    let error = fx.sent("missing warn user");
+    fx.prefix("!help warn").await;
+    let help = fx.sent("prefix help");
+    fx.finish();
+
+    for payload in [&error, &help] {
+        let text = payload["content"].as_str().unwrap();
+        assert!(text.contains("Usage: `!warn <user> [reason]`"), "{text}");
     }
 }
 

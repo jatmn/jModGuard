@@ -1013,10 +1013,14 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             })
         }
         Behavior::Purge { default_count } => {
-            let count: u64 = env
+            let count = env
                 .args
                 .clone()
-                .number("count", "Enter a whole number of messages to delete.")?
+                .number::<std::num::NonZeroU64>(
+                    "count",
+                    "Enter a positive whole number of messages to delete.",
+                )?
+                .map(std::num::NonZeroU64::get)
                 .unwrap_or(u64::from(*default_count))
                 .clamp(1, 100);
             let msgs = env
@@ -1242,18 +1246,10 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
             let mut args = env.args.clone();
             let response = if let Some(name) = args.next_arg() {
                 match cfg.find_command(&name) {
-                    Some(c) => format!(
-                        "**!{}** {} `{}`\nAliases: {}\nUsage: `{}`\nRequires: {}",
-                        c.name,
-                        c.description,
-                        c.category,
-                        if c.aliases.is_empty() {
-                            "-".to_string()
-                        } else {
-                            c.aliases.join(", ")
-                        },
-                        c.usage,
-                        c.permission
+                    Some(c) => super::usage::help_detail(
+                        c,
+                        &cfg.settings.prefix,
+                        env.source_message.is_some(),
                     ),
                     None => {
                         return Err(ArgumentError::invalid(

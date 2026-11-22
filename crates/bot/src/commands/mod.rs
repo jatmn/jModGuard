@@ -818,7 +818,7 @@ pub async fn handle_prefix(
             tracing::warn!("command `{}` failed: {e:#}", cmd.name);
             let argument = e.downcast_ref::<usage::ArgumentError>();
             let reply = match argument {
-                Some(error) => usage::reply(error, &cfg, &cmd, name),
+                Some(error) => usage::reply(error, &cfg, &cmd, usage::Invocation::Prefix(name)),
                 None => format!("error: {e:#}"),
             };
             let message = text_message(
@@ -1296,7 +1296,9 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         Err(e) => {
             let argument = e.downcast_ref::<usage::ArgumentError>();
             let text = match argument {
-                Some(error) => usage::reply(error, &cfg, &cmd, &cmd.name),
+                Some(error) => {
+                    usage::reply(error, &cfg, &cmd, usage::Invocation::Slash(&slash.name))
+                }
                 None => format!("error: {e:#}"),
             };
             let delivery = respond(
