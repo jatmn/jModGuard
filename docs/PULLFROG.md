@@ -36,11 +36,12 @@ Pullfrog reviews new PRs, drafts, and updated diffs in this public repository
 when GitHub identifies `jatmn` as the PR author. The person pushing an update
 can be a different account. The GitHub App dispatches the workflow on the
 default branch and the author check must pass before the agent starts.
-In Pullfrog settings, enable PR reviews, draft reviews, and re-reviews on new
-commits, and disable managed mentions and external-contributor reviews.
-After merging the workflow, open a fresh owner-authored draft and push an
-update to verify live automatic dispatch. On the latest PR commit, confirm
-the completed automatic run published a review and both native checks. If a
+Merge the workflow to the default branch and verify it declares
+`workflow_dispatch` there before enabling automatic reviews in Pullfrog.
+Then enable PR reviews, drafts, and re-reviews on new commits, and disable
+managed mentions and external-contributor reviews. Open a fresh owner-authored
+draft and push an update. On the latest PR commit, confirm the completed
+automatic run published a review and both native checks. If a
 non-owner collaborator is available, check a PR they authored. Confirm that
 the workflow skips the review action, no review is posted, and any
 Pullfrog-created run-status check reaches a terminal state.
