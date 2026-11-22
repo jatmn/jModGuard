@@ -57,10 +57,18 @@ dylint_full=0
 dependency_scan=0
 
 add() {
-  case " ${selected} " in
-    *" $1 "*) ;;
-    *) selected="${selected} $1" ;;
-  esac
+  local group
+  for group in "${groups[@]}"; do
+    if [ "$group" = "$1" ]; then
+      case " ${selected} " in
+        *" $1 "*) ;;
+        *) selected="${selected} $1" ;;
+      esac
+      return
+    fi
+  done
+  printf 'select-checks: unknown check group: %s\n' "$1" >&2
+  exit 2
 }
 
 all_groups() {
@@ -108,6 +116,13 @@ updater_consumers() {
   add boundaries
 }
 
+# API, updater and remote database tests exercise the bot.
+bot_consumers() {
+  add api
+  add updater
+  add remote-database
+}
+
 classify() {
   local path="$1"
   local top="${path%%/*}"
@@ -117,12 +132,23 @@ classify() {
     */Cargo.toml|*/Cargo.lock|*/package.json|*/package-lock.json|*/npm-shrinkwrap.json|*/yarn.lock|*/pnpm-lock.yaml|*/bun.lock|*/bun.lockb|*/.npmrc|*/.gitignore|/.github/workflows/socket.yml)
       dependency_scan=1 ;;
   esac
+  # Frontend tests replay template previews and check command and audit types.
+  case "$path" in
+    crates/api/src/web/template_preview_cases.json|src/log_embeds.rs|src/types.rs)
+      add frontend ;;
+  esac
   case "$path" in
     .github/workflows/ci.yml|.github/workflows/publish.yml|scripts/select-checks.sh|scripts/select-checks-test.sh|scripts/ci-workflow-test.mjs|scripts/ci-preflight.sh|scripts/ci-setup.sh)
       all_groups "CI control changed: $path"
       return
       ;;
-    scripts/publish-image.sh|scripts/publish-image-test.sh|scripts/prepare-publication.sh|scripts/prepare-publication-test.sh)
+    scripts/publish-image.sh)
+      # Launcher tests source the publisher to check Docker build arguments.
+      add publish-tests
+      add updater
+      return
+      ;;
+    scripts/publish-image-test.sh|scripts/prepare-publication.sh|scripts/prepare-publication-test.sh)
       add publish-tests
       return
       ;;
@@ -167,12 +193,18 @@ classify() {
       add runner-tests
       return
       ;;
+    AGENTS.md|docs/CI.md)
+      # The runner's audit-expiry self-check verifies both documents.
+      add runner-tests
+      return
+      ;;
     crates/api/Cargo.toml)
       add fmt; add dylint; add api; add boundaries; add integration; add supply-chain
       return
       ;;
     crates/bot/Cargo.toml)
       add fmt; add dylint; add bot; add boundaries; add integration; add supply-chain
+      bot_consumers
       return
       ;;
     crates/runtime/Cargo.toml)
@@ -199,11 +231,11 @@ classify() {
       return
       ;;
     Dockerfile.bot)
-      add fmt; add bot; add updater; add bootstrap; add publish-tests
+      add fmt; add bot; add updater; add core; add bootstrap; add publish-tests
       return
       ;;
     Dockerfile.api)
-      add api; add fmt; add updater; add boundaries; add integration; add bootstrap; add publish-tests
+      add api; add fmt; add updater; add core; add boundaries; add integration; add bootstrap; add publish-tests
       return
       ;;
     scripts/bootstrap-container.sh|scripts/bootstrap-container-test.sh)
@@ -262,7 +294,7 @@ classify() {
       crate="${crate%%/*}"
       case "$crate" in
         api) add fmt; add dylint; add api; add boundaries; add integration ;;
-        bot) add fmt; add dylint; add bot; add boundaries; add integration ;;
+        bot) add fmt; add dylint; add bot; add boundaries; add integration; bot_consumers ;;
         runtime) add fmt; add dylint; add runtime; add boundaries; runtime_consumers ;;
         updater) add fmt; add dylint; add updater; updater_consumers ;;
         integration-tests) add fmt; add dylint; add integration ;;
