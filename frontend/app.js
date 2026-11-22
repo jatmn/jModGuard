@@ -4768,12 +4768,20 @@ function RuleEditor({ record: r }) {
                 for (const { key, label, max } of fields) {
                   const raw = String(values[key] ?? "");
                   const value = Number(raw);
-                  if (raw.trim() === "" || !Number.isSafeInteger(value) || value < 0)
+                  // An untouched legacy limit may exceed the safe integer range;
+                  // the server keeps its exact stored value.
+                  const unchanged = value === persisted[key];
+                  if (
+                    raw.trim() === "" ||
+                    !Number.isInteger(value) ||
+                    value < 0 ||
+                    (!Number.isSafeInteger(value) && !unchanged)
+                  )
                     throw new Error(`${label} must be a non-negative whole number.`);
                   if (key === "window_secs" && (value < 1 || value > 600))
                     throw new Error("Window must be 1–600 seconds.");
                   // A stored legacy value above the limit is inert and may be kept unchanged.
-                  if (max !== undefined && value > max && value !== persisted[key])
+                  if (max !== undefined && value > max && !unchanged)
                     throw new Error(`${label} must be 0–${max}.`);
                   params[key] = value;
                 }

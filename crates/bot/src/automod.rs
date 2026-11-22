@@ -146,7 +146,9 @@ impl RuleState {
             *self = RuleState::default();
         }
         self.strikes += 1;
-        self.last_event = Some(now);
+        // Concurrent evaluations can record strikes out of clock order; the
+        // retention deadline never moves backwards.
+        self.last_event = Some(self.last_event.map_or(now, |last| last.max(now)));
         if record_event {
             self.events.push_back(WindowEvent { at: now });
         }
@@ -2133,6 +2135,22 @@ mod tests {
         let action = engine.evaluate(&live, &message).expect("escalation");
         assert_eq!(action.strikes, 2);
         assert_eq!(action.action.action, "timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_older_strike_timestamp_cannot_shorten_retention() {
+        use super::{AutomodInstant, RuleRetention, RuleState, STRIKE_RETENTION};
+        use std::time::Duration;
+        let older = AutomodInstant::now();
+        let newer = older + Duration::from_secs(10);
+        let mut state = RuleState::default();
+        // Concurrent evaluations record the newer strike first.
+        assert_eq!(state.record_strike(newer, false), 1);
+        assert_eq!(state.record_strike(older, false), 2);
+        // The older strike has expired, the newer one has not.
+        let check = older + STRIKE_RETENTION + Duration::from_secs(5);
+        assert!(state.prune(check, STRIKE_RETENTION) == RuleRetention::Retained);
+        assert_eq!(state.record_strike(check, false), 3);
     }
 
     fn default_automod_config() -> CachedGuildConfig {

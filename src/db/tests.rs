@@ -5234,6 +5234,40 @@ fn legacy_velocity_limit_survives_saves_that_keep_it() {
 }
 
 #[test]
+fn a_browser_rounded_legacy_velocity_limit_keeps_the_stored_value() {
+    let tmp = tmp_db_path("legacy_velocity_rounded");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(async {
+        let scope =
+            ConfigurationWriteScope::new(ConfigurationScope::Global, ConfigurationScope::Global)
+                .unwrap();
+        let mut rule = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        // 2^53 + 1 cannot round-trip through a JavaScript number.
+        rule.params["max_messages"] = serde_json::json!(9_007_199_254_740_993u64);
+        old_writer_rule(&db, 0, "velocity", serde_json::to_value(&rule).unwrap()).await;
+
+        rule.enabled = false;
+        rule.params["max_messages"] = serde_json::json!(9_007_199_254_740_992u64);
+        upsert_enrolled_rule(&db, scope.clone(), "velocity", &rule)
+            .await
+            .unwrap();
+        let saved = get_rule(&db, 0, "velocity").await.unwrap().unwrap();
+        assert!(!saved.enabled);
+        assert_eq!(saved.params["max_messages"], 9_007_199_254_740_993u64);
+
+        // A different over-limit value is still a new limit.
+        rule.params["max_messages"] = serde_json::json!(9_007_199_254_741_000u64);
+        assert!(
+            upsert_enrolled_rule(&db, scope, "velocity", &rule)
+                .await
+                .is_err()
+        );
+    });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn everything_copy_keeps_a_legacy_velocity_limit() {
     let tmp = tmp_db_path("legacy_velocity_copy");
     let db = Db::open(&tmp, 2).unwrap();

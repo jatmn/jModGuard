@@ -389,7 +389,7 @@ fn validate_velocity_limit_conn(
     conn: &impl SqlExecutor,
     guild_id: i64,
     id: &str,
-    rule: &RuleDef,
+    rule: &mut RuleDef,
 ) -> Result<()> {
     if id != "velocity" {
         return Ok(());
@@ -427,7 +427,8 @@ async fn upsert_rule_row(
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         verify_configuration_write(&tx, expected.as_ref(), guild_id)?;
-        validate_velocity_limit_conn(&tx, guild_id, &id, &rule)?;
+        let mut rule = rule.clone();
+        validate_velocity_limit_conn(&tx, guild_id, &id, &mut rule)?;
         let json = rule_json_for_save_conn(&tx, guild_id, &id, &rule)?;
         let saved = serde_json::from_str(&json)?;
         tx.execute_rows(
@@ -1922,7 +1923,8 @@ pub async fn upsert_global_rule_and_clear_enrolled_override(
         global.verify_conn(&tx)?;
         // The global target's check alone does not cover the guild write fence.
         guild.verify_conn(&tx)?;
-        validate_velocity_limit_conn(&tx, GLOBAL_SCOPE, &id, &rule)?;
+        let mut rule = rule.clone();
+        validate_velocity_limit_conn(&tx, GLOBAL_SCOPE, &id, &mut rule)?;
         let json = rule_json_for_save_conn(&tx, GLOBAL_SCOPE, &id, &rule)?;
         let saved = serde_json::from_str(&json)?;
         tx.execute_rows(
