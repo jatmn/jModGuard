@@ -1407,6 +1407,8 @@ pub struct WebConfigSnapshot {
     pub global_templates: std::collections::HashMap<String, String>,
     pub guild_log_channels: std::collections::HashMap<String, i64>,
     pub guild_log_filters: std::collections::HashMap<String, LogFilter>,
+    /// Missing global velocity rows resolve to dry-run after the upgrade.
+    pub velocity_default_dry_run: bool,
 }
 
 /// One Hrana statement for every configuration collection in a snapshot.
@@ -1451,6 +1453,7 @@ SELECT
      FROM (SELECT id,guild_id,kind,value,note FROM known_spam
            WHERE guild_id = ?1 OR guild_id = ?2 ORDER BY id LIMIT 2048))
   ,EXISTS(SELECT 1 FROM meta WHERE key = 'invite_description_v1')
+  ,EXISTS(SELECT 1 FROM meta WHERE key = 'velocity_default_dry_run')
 "#;
 
 struct ConfigurationSnapshotRows {
@@ -1470,6 +1473,7 @@ struct ConfigurationSnapshotRows {
     known_bad_images: Vec<KnownBadImage>,
     known_spam: Vec<crate::known_spam::Entry>,
     nickname_reconcile: Option<NicknameReconcileStatus>,
+    velocity_default_dry_run: bool,
 }
 
 fn parse_meta_version(raw: Option<String>) -> u64 {
@@ -1602,6 +1606,7 @@ fn load_configuration_snapshot_conn(
                 )?),
                 known_spam: parse_json_vec(row.get(23)?, "known_spam")?,
                 nickname_reconcile,
+                velocity_default_dry_run: row.get::<bool>(25)?,
             })
         },
     )
@@ -1645,6 +1650,7 @@ impl ConfigurationSnapshotRows {
             global_templates: self.global_templates,
             guild_log_channels: self.guild_log_channels,
             guild_log_filters: self.guild_log_filters,
+            velocity_default_dry_run: self.velocity_default_dry_run,
         }
     }
 
@@ -1657,7 +1663,7 @@ impl ConfigurationSnapshotRows {
         let gl_settings =
             settings_override_from_raw(GLOBAL_SCOPE, self.global_settings_raw.clone());
         let settings = resolve_settings(&g_settings, &gl_settings, &self.defaults);
-        let default_rules = crate::defaults::default_rules();
+        let default_rules = crate::defaults::install_default_rules(self.velocity_default_dry_run);
         let mut rules = std::collections::HashMap::new();
         for (i, id) in crate::types::RULE_IDS.iter().enumerate() {
             let def = default_rules[i].clone();
@@ -2221,6 +2227,33 @@ pub async fn get_enrolled_rule(
                 .next()
                 .map(|(_, row)| row))
         })
+    })
+    .await
+}
+
+/// A built-in rule's layers plus the default a missing global row resolves to
+/// on this install, read in one snapshot.
+pub async fn get_enrolled_builtin_rule(
+    db: &Db,
+    scope: ConfigurationScope,
+    id: &str,
+) -> Result<(ConfigurationLayers<Option<RuleDef>>, RuleDef)> {
+    let id = id.to_owned();
+    configuration_read(db, scope, move |tx, guild| {
+        let layers = read_layers(guild, |g| {
+            Ok(load_rule_rows_conn(tx, g, Some(&id))?
+                .into_iter()
+                .next()
+                .map(|(_, row)| row))
+        })?;
+        let velocity_dry_run =
+            meta_string_conn(tx, super::bootstrap::META_VELOCITY_DEFAULT_DRY_RUN)?.is_some();
+        let index = crate::types::RULE_IDS
+            .iter()
+            .position(|rule| *rule == id)
+            .context("unknown built-in rule")?;
+        let default = crate::defaults::install_default_rules(velocity_dry_run).swap_remove(index);
+        Ok((layers, default))
     })
     .await
 }

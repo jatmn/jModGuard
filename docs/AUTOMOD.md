@@ -86,7 +86,9 @@ escalation accurate without false positives.
   including a default the servers only inherited, so they log before they act.
   Turn off dry-run to enforce. Edited rules and new installs keep their
   settings. A server whose configuration is frozen by an interrupted guild move
-  keeps its rule unchanged.
+  keeps its rule unchanged. On an upgraded install, a global velocity rule that
+  is later removed (for example by copying rules into global from a server that
+  only inherits velocity) also falls back to dry-run, not to live enforcement.
 
 ### 8. `account_age` — brand-new accounts
 - Params: `min_age_days` (3).

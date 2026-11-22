@@ -4719,6 +4719,82 @@ fn velocity_upgrade_covers_an_inherited_default_without_a_global_row() {
 }
 
 #[test]
+fn global_copy_after_the_upgrade_keeps_velocity_in_dry_run() {
+    let effective = |db: &Db, guild: i64| {
+        tokio_test_block_on(load_config_parts(db, guild))
+            .unwrap()
+            .rules
+            .remove("velocity")
+            .unwrap()
+    };
+    // A new install never upgraded, so a missing global row stays live.
+    let tmp = tmp_db_path("velocity_copy_fresh");
+    let db = Db::open(&tmp, 2).unwrap();
+    tokio_test_block_on(crate::db::copy_guild_config(
+        &db,
+        10,
+        0,
+        vec!["rules".into()],
+    ))
+    .unwrap();
+    assert!(!effective(&db, 123).dry_run);
+    drop(db);
+    cleanup_db(&tmp);
+
+    let tmp = tmp_db_path("velocity_copy_upgraded");
+    let db = Db::open(&tmp, 2).unwrap();
+    clear_velocity_upgrade_marker(&db);
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert!(effective(&db, 123).dry_run);
+    // Server 10 only inherits velocity, so the copy removes the global row.
+    tokio_test_block_on(crate::db::copy_guild_config(
+        &db,
+        10,
+        0,
+        vec!["rules".into()],
+    ))
+    .unwrap();
+    assert!(
+        tokio_test_block_on(get_rule(&db, 0, "velocity"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(effective(&db, 123).dry_run, "immediately after the copy");
+    assert!(
+        tokio_test_block_on(load_web_config_snapshot(&db, 123))
+            .unwrap()
+            .velocity_default_dry_run
+    );
+    let (layers, default) = tokio_test_block_on(get_enrolled_builtin_rule(
+        &db,
+        ConfigurationScope::Global,
+        "velocity",
+    ))
+    .unwrap();
+    assert!(layers.global.is_none() && default.dry_run);
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert!(effective(&db, 123).dry_run, "after reopen");
+    assert!(
+        tokio_test_block_on(get_rule(&db, 0, "velocity"))
+            .unwrap()
+            .unwrap()
+            .dry_run
+    );
+
+    // An explicit live setting is still honored.
+    let mut live = effective(&db, 0);
+    live.dry_run = false;
+    tokio_test_block_on(upsert_rule(&db, 0, "velocity", &live)).unwrap();
+    drop(db);
+    let db = Db::open(&tmp, 2).unwrap();
+    assert!(!effective(&db, 123).dry_run);
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn velocity_upgrade_leaves_a_fenced_guild_unchanged() {
     use crate::db::guild_stores::{StoreId, StorePolicy, register_store};
     let tmp = tmp_db_path("velocity_upgrade_fenced_guild");

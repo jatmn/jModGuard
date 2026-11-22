@@ -86,7 +86,7 @@ pub async fn guild_config(
     .await?;
 
     // rules: effective + scope info
-    let default_rules = crate::defaults::default_rules();
+    let default_rules = crate::defaults::install_default_rules(snapshot.velocity_default_dry_run);
     let mut rules = Vec::new();
     for (i, rid) in crate::types::RULE_IDS.iter().enumerate() {
         let def = default_rules[i].clone();
@@ -294,12 +294,9 @@ pub async fn get_rule(
             "global": null,
         })));
     }
-    let idx = crate::types::RULE_IDS
-        .iter()
-        .position(|r| *r == rule_id.as_str())
-        .unwrap();
-    let def = crate::defaults::default_rules()[idx].clone();
-    let layers = db::get_enrolled_rule(&app.db, scope, &rule_id).await?;
+    // Validated above as a built-in; a missing global row resolves to this
+    // install's default.
+    let (layers, def) = db::get_enrolled_builtin_rule(&app.db, scope, &rule_id).await?;
     let (guild_override, global) = (layers.guild, layers.global);
     let effective = db::resolve(&guild_override, &global, &def);
     Ok(Json(serde_json::json!({

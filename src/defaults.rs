@@ -12,6 +12,21 @@ pub(crate) const OLD_INVITE_DESCRIPTION: &str =
 pub(crate) const INVITE_DESCRIPTION: &str =
     "Discord invite links, except invite codes configured in allowlist_codes.";
 
+/// Shipped rules as this install resolves them where no global row is stored.
+/// After the velocity upgrade on an existing install, the velocity default is
+/// dry-run, so removing the global row never turns on live enforcement.
+pub fn install_default_rules(velocity_dry_run: bool) -> Vec<RuleDef> {
+    let mut rules = default_rules();
+    if velocity_dry_run
+        && let Some(index) = crate::types::RULE_IDS
+            .iter()
+            .position(|id| *id == "velocity")
+    {
+        rules[index].dry_run = true;
+    }
+    rules
+}
+
 pub fn default_rules() -> Vec<RuleDef> {
     let mut out = Vec::with_capacity(RULE_IDS.len());
     for id in RULE_IDS {
