@@ -40,7 +40,10 @@ In Pullfrog settings, enable PR reviews, draft reviews, and re-reviews on new
 commits, and disable managed mentions and external-contributor reviews.
 After merging the workflow, open a fresh owner-authored draft and push an
 update to verify live automatic dispatch. On the latest PR commit, confirm
-the completed automatic run published both native checks.
+the completed automatic run published a review and both native checks. If a
+non-owner collaborator is available, check a PR they authored. Confirm that
+the workflow skips the review action, no review is posted, and any
+Pullfrog-created run-status check reaches a terminal state.
 
 ## PR checks and run diagnostics
 
