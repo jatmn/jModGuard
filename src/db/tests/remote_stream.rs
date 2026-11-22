@@ -36,7 +36,7 @@ struct HranaState {
     hang_next_commit: bool,
     hang_next_statement: bool,
     hang_next_begin: bool,
-    stall_reads: Option<ReadRoute>,
+    stall_reads: &'static [ReadRoute],
     read_begins: usize,
     begin_released: bool,
     begin_release: Arc<Notify>,
@@ -78,7 +78,7 @@ impl HranaState {
             hang_next_commit: false,
             hang_next_statement: false,
             hang_next_begin: false,
-            stall_reads: None,
+            stall_reads: &[],
             read_begins: 0,
             begin_released: false,
             begin_release: Arc::new(Notify::new()),
@@ -750,7 +750,7 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
             let mut state = state.lock().unwrap();
             state.read_begins += 1;
             (
-                state.stall_reads == Some(route),
+                state.stall_reads.contains(&route),
                 state.fail_next_status.take(),
             )
         };
@@ -837,6 +837,14 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
         }
         "/v3/cursor" => {
             if let Some((code, message)) = state.next_cursor_error.take() {
+                if code == "TRANSACTION_TIMEOUT"
+                    && let Some((runtime, conn)) = &state.backing
+                    && !conn.is_autocommit()
+                {
+                    runtime.block_on(conn.execute("ROLLBACK", ())).unwrap();
+                    state.in_transaction = false;
+                    state.write_locked = false;
+                }
                 let lines = [
                     json!({"baton": baton}).to_string(),
                     json!({"type": "step_error", "step": 0, "error": {"message": message, "code": code}}).to_string(),
@@ -1335,7 +1343,7 @@ async fn primary_stall_defers_pooled_reads_and_recovers_while_lease_retries() {
         .finish();
     let capture = tracing::subscriber::set_default(subscriber);
 
-    fixture.state.lock().unwrap().stall_reads = Some(ReadRoute::Primary);
+    fixture.state.lock().unwrap().stall_reads = &[ReadRoute::Primary];
     let started = tokio::time::Instant::now().into_std();
     let (snapshot, versions) =
         tokio::join!(get_primary_versions(&db), get_primary_versions(&other));
@@ -1398,7 +1406,7 @@ async fn primary_stall_defers_pooled_reads_and_recovers_while_lease_retries() {
     assert!(launcher.launcher_fence_deadline().unwrap() > launcher_deadline);
     assert_eq!(fixture.state.lock().unwrap().read_begins, 2);
 
-    fixture.state.lock().unwrap().stall_reads = None;
+    fixture.state.lock().unwrap().stall_reads = &[];
     tokio::time::advance(Duration::from_secs(5)).await;
     let (probe_owner, contender) =
         tokio::join!(db.with_conn(|_| Ok(())), other.with_conn(|_| Ok(())));
@@ -1432,33 +1440,58 @@ async fn primary_stall_defers_pooled_reads_and_recovers_while_lease_retries() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn replica_routable_failures_leave_healthy_primary_reads_available() {
+async fn version_poll_confirms_primary_health_after_ambiguous_read_failure() {
+    let path = super::tmp_db_path("remote_version_routes");
+    let local = Db::open(&path, 2).unwrap();
+    let expected = get_primary_versions(&local).await.unwrap();
     let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    fixture.state.lock().unwrap().backing = Some((runtime, backing));
     let db = fixture.db_with_operation_timeout(Duration::from_secs(7));
-    fixture.state.lock().unwrap().stall_reads = Some(ReadRoute::ReplicaRoutable);
 
-    let error = get_version_state(&db).await.unwrap_err();
-    assert!(is_database_operation_timeout(&error), "{error:#}");
-    assert!(!is_primary_outage(&error), "{error:#}");
+    fixture.state.lock().unwrap().stall_reads = &[ReadRoute::ReplicaRoutable];
+    assert_eq!(get_version_state(&db).await.unwrap(), expected);
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 2);
+    assert_eq!(get_primary_versions(&db).await.unwrap(), expected);
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 3);
 
-    read_primary_fixture(&db).await.unwrap();
-
-    // Exercise a statement error after a successful READONLY begin as well.
-    fixture.state.lock().unwrap().stall_reads = None;
+    // The same fallback applies when a READONLY statement fails after BEGIN.
+    fixture.state.lock().unwrap().stall_reads = &[];
     fixture.timeout_next_cursor();
-    let error = get_version_state(&db).await.unwrap_err();
-    assert!(is_remote_interactive_timeout(&error), "{error:#}");
-    assert!(!is_primary_outage(&error), "{error:#}");
-    read_primary_fixture(&db).await.unwrap();
+    assert_eq!(get_version_state(&db).await.unwrap(), expected);
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 5);
 
-    tokio::time::advance(Duration::from_secs(5)).await;
-    let before = fixture.state.lock().unwrap().read_begins;
-    read_primary_fixture(&db).await.unwrap();
-    assert_eq!(
-        fixture.state.lock().unwrap().read_begins,
-        before + 1,
-        "primary work must proceed without a recovery probe for a replica fault"
+    // Only the version poll sees this shared-endpoint outage. Its fallback
+    // reaches the stalled primary and opens the gate for the next poll.
+    fixture.state.lock().unwrap().stall_reads = &[ReadRoute::ReplicaRoutable, ReadRoute::Primary];
+    let error = get_version_state(&db).await.unwrap_err();
+    assert!(is_primary_outage(&error), "{error:#}");
+    assert!(
+        error.to_string().contains("begin primary snapshot"),
+        "{error:#}"
     );
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 7);
+    let error = get_version_state(&db).await.unwrap_err();
+    assert!(
+        error.to_string().contains("primary is backing off"),
+        "{error:#}"
+    );
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 7);
+
+    fixture.state.lock().unwrap().stall_reads = &[];
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(get_version_state(&db).await.unwrap(), expected);
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 9);
+
+    drop(db);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
 }
 
 async fn read_primary_fixture(db: &Db) -> Result<()> {

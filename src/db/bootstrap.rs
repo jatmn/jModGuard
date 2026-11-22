@@ -459,13 +459,22 @@ pub async fn get_slash_registry_version(db: &Db) -> Result<u64> {
 }
 
 pub async fn get_version_state(db: &Db) -> Result<VersionState> {
-    db.with_conn(|conn| {
-        let tx = conn.transaction_consistent_read()?;
-        let state = get_version_state_conn(&tx)?;
-        tx.finish_read()?;
-        Ok(state)
-    })
-    .await
+    let result = db
+        .with_conn(|conn| {
+            let tx = conn.transaction_consistent_read()?;
+            let state = get_version_state_conn(&tx)?;
+            tx.finish_read()?;
+            Ok(state)
+        })
+        .await;
+    match result {
+        // READONLY can reach the primary when the endpoint has no replica.
+        // Confirm on the primary route before the pool can attribute an outage.
+        Err(error) if crate::db_compat::replica_read_unavailable(&error) => {
+            get_primary_versions(db).await
+        }
+        result => result,
+    }
 }
 
 /// Reads both invalidation counters from a deferred primary snapshot. The

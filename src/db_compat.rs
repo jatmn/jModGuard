@@ -56,7 +56,7 @@ pub struct DatabaseCallerAbandoned {
 #[error("remote database commit outcome is indeterminate: {0}")]
 pub struct DatabaseCommitIndeterminate(#[source] anyhow::Error);
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("remote database {operation} failed")]
 struct RemoteOperationFailed {
     operation: &'static str,
@@ -99,17 +99,15 @@ fn is_remote_availability_error(error: &libsql::Error) -> bool {
         || message.contains("transaction timed-out")
 }
 
-pub(crate) fn remote_unavailable_operation(error: &anyhow::Error) -> Option<&'static str> {
+fn unavailable_operation(error: &anyhow::Error) -> Option<RemoteOperationFailed> {
     if let Some(timeout) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<DatabaseOperationTimedOut>())
     {
-        return (!timeout.replica_routable && timeout.operation != "waiting for connection")
-            .then_some(timeout.operation);
-    }
-    let operation = error.downcast_ref::<RemoteOperationFailed>();
-    if operation.is_some_and(|op| op.replica_routable) {
-        return None;
+        return (timeout.operation != "waiting for connection").then_some(RemoteOperationFailed {
+            operation: timeout.operation,
+            replica_routable: timeout.replica_routable,
+        });
     }
     error
         .chain()
@@ -118,7 +116,24 @@ pub(crate) fn remote_unavailable_operation(error: &anyhow::Error) -> Option<&'st
                 .downcast_ref::<libsql::Error>()
                 .is_some_and(is_remote_availability_error)
         })
-        .then(|| operation.map_or("remote SQL", |op| op.operation))
+        .then(|| {
+            error
+                .downcast_ref::<RemoteOperationFailed>()
+                .copied()
+                .unwrap_or(RemoteOperationFailed {
+                    operation: "remote SQL",
+                    replica_routable: false,
+                })
+        })
+}
+
+pub(crate) fn remote_unavailable_operation(error: &anyhow::Error) -> Option<&'static str> {
+    let failure = unavailable_operation(error)?;
+    (!failure.replica_routable).then_some(failure.operation)
+}
+
+pub(crate) fn replica_read_unavailable(error: &anyhow::Error) -> bool {
+    unavailable_operation(error).is_some_and(|failure| failure.replica_routable)
 }
 
 pub(crate) fn is_database_operation_timeout(error: &anyhow::Error) -> bool {
