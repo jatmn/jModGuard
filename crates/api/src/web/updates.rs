@@ -116,6 +116,19 @@ async fn record_verified(
     }
 }
 
+async fn record_webui_drift(app: &ApiState) -> anyhow::Result<()> {
+    let error = "Storage files differ from the installed release";
+    // Both checks use the guarded wire operation. Older bot writers cannot
+    // clear drift for an activated release that still has a desired selection.
+    via_bot!(
+        app,
+        db::record_webui_drift(&app.db, error),
+        db::ControlOp::RecordHourlyWebuiDrift {
+            error: error.to_owned(),
+        }
+    )
+}
+
 async fn commit_typed<T: serde::de::DeserializeOwned>(
     app: &ApiState,
     op: db::ControlOp,
@@ -762,13 +775,7 @@ where
         .await;
     }
     if state.observed.is_some() {
-        via_bot!(
-            app,
-            db::record_webui_drift(&app.db, "Storage files differ from the installed release"),
-            db::ControlOp::RecordWebuiDrift {
-                error: "Storage files differ from the installed release".to_owned(),
-            }
-        )?;
+        record_webui_drift(app).await?;
     }
     Ok(())
 }
@@ -982,18 +989,9 @@ where
                             // for the manual check that adopts or settles it.
                             tracing::warn!("WebUI observation refresh found changed Storage files");
                             if current.observed.is_some() {
-                                via_bot!(
-                                    app,
-                                    db::record_webui_drift(
-                                        &app.db,
-                                        "Storage files differ from the installed release"
-                                    ),
-                                    db::ControlOp::RecordHourlyWebuiDrift {
-                                        error: "Storage files differ from the installed release"
-                                            .to_owned(),
-                                    }
-                                )
-                                .context("recording WebUI Storage drift")
+                                record_webui_drift(app)
+                                    .await
+                                    .context("recording WebUI Storage drift")
                             } else {
                                 Ok(())
                             }
@@ -2056,9 +2054,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_writer_rejection_keeps_webui_eligible_for_scheduled_install() {
+    async fn legacy_writer_preserves_manual_readback_and_scheduled_webui_admission() {
         use jmodguard::control::{NonceWindow, open_frame};
-        use jmodguard::db::SqlExecutor;
+        use jmodguard::db::{SqlExecutor, params};
         use std::sync::Mutex;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2113,24 +2111,6 @@ mod tests {
         )
         .await
         .unwrap();
-        // A legacy row is readable but no longer serializes to its stored JSON.
-        let mut legacy = serde_json::to_value(&installed).unwrap();
-        legacy.as_object_mut().unwrap().remove("upgrade");
-        let legacy = legacy.to_string();
-        let raw_installed = legacy.clone();
-        writer
-            .db
-            .with_conn(move |conn| {
-                conn.execute_bounded(
-                    "UPDATE component_updates SET installed=?1 WHERE component='webui'",
-                    [raw_installed],
-                    64 * 1024,
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut cfg = (*writer.cfg).clone();
         cfg.db.path = path.clone();
@@ -2161,14 +2141,38 @@ mod tests {
                                 code: None,
                             }
                         }
-                        db::ControlOp::RecordWebuiInstalledVerified { release, .. } => {
-                            // The older writer uses serialized JSON equality.
-                            assert_ne!(serde_json::to_string(&release).unwrap(), legacy);
-                            rejected.send("verified").unwrap();
-                            db::ControlReply::Failed {
-                                message: "installed WebUI release changed during verification"
-                                    .into(),
-                                code: None,
+                        db::ControlOp::RecordWebuiInstalledVerified {
+                            release,
+                            observation,
+                            now,
+                        } => {
+                            let installed = serde_json::to_string(&release).unwrap();
+                            let observation = serde_json::to_string(&observation).unwrap();
+                            // The older writer matches serialized JSON and
+                            // keeps drift when an activated row retains desired.
+                            let changed = writer
+                                .db
+                                .with_conn(move |conn| {
+                                    conn.execute_bounded(
+                                        "UPDATE component_updates SET observed=?2,observed_at=?3,
+                                            state=CASE WHEN desired IS NULL THEN 'running' ELSE state END,
+                                            last_error=CASE WHEN desired IS NULL THEN NULL ELSE last_error END
+                                         WHERE component='webui' AND installed=?1",
+                                        params![installed, observation, now],
+                                        64 * 1024,
+                                    )
+                                })
+                                .await
+                                .unwrap();
+                            if changed == 1 {
+                                db::ControlReply::Saved { body: Value::Null }
+                            } else {
+                                rejected.send("verified").unwrap();
+                                db::ControlReply::Failed {
+                                    message: "installed WebUI release changed during verification"
+                                        .into(),
+                                    code: None,
+                                }
                             }
                         }
                         op => db::apply_control(&writer.db, None, op, None).await.unwrap(),
@@ -2179,6 +2183,68 @@ mod tests {
                 }
             }
         });
+
+        // The old bot can verify a normal activated row, but it cannot
+        // clear drift once the legacy mismatch operation has recorded it.
+        let lookup_error = "registry returned HTTP 503";
+        for storage_restored in [false, true] {
+            let result = check_one_with(
+                &reader,
+                "webui",
+                async |_, _| anyhow::bail!("{lookup_error}"),
+                async |adopt_desired| {
+                    assert!(!adopt_desired);
+                    reconcile_webui_with(
+                        &reader,
+                        adopt_desired,
+                        |_| async { unreachable!("installed verifier reads Storage") },
+                        |_| async { unreachable!("discovery did not authorize adoption") },
+                        |release| {
+                            assert_eq!(release, installed);
+                            std::future::ready(Ok(if storage_restored {
+                                ReleaseVerification::Verified {
+                                    root_hash: "restored root".into(),
+                                    admin_hash: "restored admin".into(),
+                                }
+                            } else {
+                                ReleaseVerification::Mismatch
+                            }))
+                        },
+                    )
+                    .await
+                },
+            )
+            .await;
+            assert_eq!(result.unwrap_err().to_string(), lookup_error);
+        }
+        let restored = db::component_update(&reader.db, "webui").await.unwrap();
+        assert_eq!(restored.desired.as_ref(), Some(&installed));
+        assert_eq!(restored.installed.as_ref(), Some(&installed));
+        assert_eq!(
+            restored.observed.unwrap().executable_sha256,
+            "restored root"
+        );
+        assert_eq!(restored.state, "running");
+        assert!(restored.last_error.is_none());
+        assert_eq!(restored.check_error.as_deref(), Some(lookup_error));
+        assert_eq!(rejected_ops.try_recv(), Ok("mismatch"));
+
+        // A legacy row is readable but no longer serializes to its stored JSON.
+        let mut legacy = serde_json::to_value(&installed).unwrap();
+        legacy.as_object_mut().unwrap().remove("upgrade");
+        let legacy = legacy.to_string();
+        writer
+            .db
+            .with_conn(move |conn| {
+                conn.execute_bounded(
+                    "UPDATE component_updates SET installed=?1 WHERE component='webui'",
+                    [legacy],
+                    64 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
 
         let candidate = ComponentRelease {
             source_sha: "c".repeat(40),
@@ -2197,7 +2263,7 @@ mod tests {
             assert_eq!(checked.candidate.as_ref(), Some(&candidate));
             assert_eq!(checked.installed.as_ref(), Some(&installed));
             assert!(checked.check_error.is_none());
-            assert_eq!(checked.observed_at, Some(now));
+            assert_eq!(checked.observed_at, restored.observed_at);
             assert_eq!(checked.state, "running");
         }
 
