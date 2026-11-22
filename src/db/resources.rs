@@ -1,8 +1,9 @@
 //! Owner Bot Resources storage: bounded per-process rollups and the bot's
 //! latest status. Only the bot writes. Each new minute is merged into its
 //! hour row in the same transaction, so 7- and 30-day ranges read hour rows
-//! and never scan a month of minutes. Every write prunes expired rows through
-//! the primary-key range, without scanning the table.
+//! and never scan a month of minutes. Once an hour ends, its label
+//! breakdowns are ranked again from its saved minutes. Every write prunes
+//! expired rows through the primary-key range, without scanning the table.
 
 use super::write_budget::BoundedWrites;
 use super::{Db, OptionalExtension, SqlExecutor, params};
@@ -32,6 +33,17 @@ pub const RESOURCE_HISTORY_ROW_LIMIT: i64 = 1500;
 /// Expired rows of one span, through the primary-key range.
 const PRUNE_SQL: &str = "DELETE FROM resource_rollups \
      WHERE process IN ('bot', 'api') AND span_secs=?1 AND start_secs<?2";
+
+/// The process's latest hour before ?3, through the primary-key range.
+const PREVIOUS_HOUR_SQL: &str = "SELECT start_secs FROM resource_rollups \
+     WHERE process=?1 AND span_secs=?2 AND start_secs<?3 \
+     ORDER BY start_secs DESC LIMIT 1";
+
+/// One hour row and all its saved minutes, through the primary-key range.
+const CLOSED_HOUR_SQL: &str = "SELECT (SELECT data FROM resource_rollups \
+             WHERE process=?1 AND span_secs=?2 AND start_secs=?4), \
+            (SELECT json_group_array(json(data)) FROM resource_rollups \
+             WHERE process=?1 AND span_secs=?3 AND start_secs>=?4 AND start_secs<?5)";
 
 /// One process's newest rows in a window, through the primary-key range.
 fn history_sql(process: ResourceProcess) -> String {
@@ -122,6 +134,7 @@ pub async fn record_resource_rollups(
         let mut tx = conn.transaction_primary_write()?;
         tx.ensure_mutation_receipt()?;
         let mut write = ResourceRollupWrite::default();
+        let mut closed_hours = Vec::new();
         for (process, rollup, text) in accepted {
             let inserted = tx.execute_rows(
                 "INSERT INTO resource_rollups (process, span_secs, start_secs, data) \
@@ -146,19 +159,34 @@ pub async fn record_resource_rollups(
                     |row| Ok(row.get(0)?),
                 )
                 .optional()?;
+            if existing.is_none() {
+                // This process has started a new hour, so its previous hour
+                // (the latest one, even after a gap) has ended.
+                let previous: Option<i64> = tx
+                    .query_row(
+                        PREVIOUS_HOUR_SQL,
+                        params![process.as_str(), HOUR_SECS, hour_start],
+                        |row| Ok(row.get(0)?),
+                    )
+                    .optional()?;
+                closed_hours.extend(previous.map(|start| (process, start)));
+            }
             let mut hour = existing
                 .and_then(|text| serde_json::from_str::<Rollup>(&text).ok())
                 .filter(|hour| hour.start_secs == hour_start && hour.span_secs == HOUR_SECS)
                 .unwrap_or_else(|| Rollup::empty(hour_start, HOUR_SECS));
             hour.absorb(&rollup);
             hour.keep_busiest_labels();
-            tx.execute_rows(
-                "INSERT INTO resource_rollups (process, span_secs, start_secs, data) \
-                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(process, span_secs, start_secs) \
-                 DO UPDATE SET data=excluded.data",
-                params![process.as_str(), HOUR_SECS, hour_start, rollup_json(&hour)?],
-                1,
-            )?;
+            write_hour(&tx, process, &hour)?;
+            if hour_start + HOUR_SECS <= now_secs {
+                // A late minute for an hour that has already ended.
+                closed_hours.push((process, hour_start));
+            }
+        }
+        closed_hours.sort_unstable();
+        closed_hours.dedup();
+        for (process, hour_start) in closed_hours {
+            rank_closed_hour_labels(&tx, process, hour_start, now_secs)?;
         }
         if let Some((process, updated_at_ms, text)) = status {
             tx.execute_rows(
@@ -179,6 +207,73 @@ pub async fn record_resource_rollups(
         Ok(write)
     })
     .await
+}
+
+fn write_hour<E: SqlExecutor>(tx: &E, process: ResourceProcess, hour: &Rollup) -> Result<()> {
+    tx.execute_rows(
+        "INSERT INTO resource_rollups (process, span_secs, start_secs, data) \
+         VALUES (?1, ?2, ?3, ?4) ON CONFLICT(process, span_secs, start_secs) \
+         DO UPDATE SET data=excluded.data",
+        params![
+            process.as_str(),
+            HOUR_SECS,
+            hour.start_secs,
+            rollup_json(hour)?
+        ],
+        1,
+    )?;
+    Ok(())
+}
+
+/// While an hour is open its row keeps only its busiest labels so far, so a
+/// label trimmed early loses the counts it had. Once the hour has ended,
+/// rank its labels again on the sum of all its saved minutes. Every minute
+/// in the hour is still retained, and the hour row already holds exactly
+/// those minutes; otherwise the row is left as it is.
+fn rank_closed_hour_labels<E: SqlExecutor>(
+    tx: &E,
+    process: ResourceProcess,
+    hour_start: i64,
+    now_secs: i64,
+) -> Result<()> {
+    if hour_start < now_secs - RESOURCE_MINUTE_RETENTION_SECS {
+        return Ok(());
+    }
+    let (hour, minutes): (Option<String>, String) = tx.query_row(
+        CLOSED_HOUR_SQL,
+        params![
+            process.as_str(),
+            HOUR_SECS,
+            MINUTE_SECS,
+            hour_start,
+            hour_start + HOUR_SECS
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let Some(mut hour) = hour
+        .and_then(|text| serde_json::from_str::<Rollup>(&text).ok())
+        .filter(|hour| hour.start_secs == hour_start && hour.span_secs == HOUR_SECS)
+    else {
+        return Ok(());
+    };
+    let mut ranked = Rollup::empty(hour_start, HOUR_SECS);
+    // An unreadable minute leaves the counts short, so the row is kept.
+    for minute in serde_json::from_str::<Vec<serde_json::Value>>(&minutes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<Rollup>(value).ok())
+    {
+        ranked.absorb(&minute);
+    }
+    if ranked.data.minutes != hour.data.minutes {
+        return Ok(());
+    }
+    ranked.keep_busiest_labels();
+    if ranked.data.labelled == hour.data.labelled {
+        return Ok(());
+    }
+    hour.data.labelled = ranked.data.labelled;
+    write_hour(tx, process, &hour)
 }
 
 /// Rollups of `span_secs` starting in `[from_secs, to_secs)` for both

@@ -411,8 +411,9 @@ totalled apart. The cost table ranks them by the code location that opened the t
 prepared query counts once. Each stored minute and hour keeps its 24 busiest labels per
 family and process, ranked by count rather than arrival; the rest count as `other`. The
 1-hour and 24-hour ranges rank across every saved minute. The 7-day and 30-day ranges read
-hour rows, where a label that only becomes busy late in an hour competes with the hour's
-running totals. These totals cover only the bot and API processes. Each launcher
+hour rows. Once an hour ends, its labels are ranked again on the sum of all its saved
+minutes; only the current hour ranks by its running totals. These totals cover only the
+bot and API processes. Each launcher
 (`jmodguard-updater`) also sends primary work that is not shown: its launcher fence renewal
 every 5 seconds (one statement, about 720 an hour) and its update-control reads. Add that
 separately before comparing the core total with the provider's primary-forwarded queries.
