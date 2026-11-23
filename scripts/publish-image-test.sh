@@ -287,6 +287,25 @@ contains_arg "ghcr.io/jatmn/jmodguard-bot:v1.2.3" "${stable_args[@]}" \
 contains_arg "ghcr.io/jatmn/jmodguard-bot:stable" "${stable_args[@]}" \
   && fail 'Stable pointer must move only after verification'
 
+# Tag promotion happens after the build. Check the full set for each source.
+for mode in main tag manual nightly; do
+  case "$mode" in
+    main|manual)
+      label=""
+      expected_tags="$(printf '%s\n' "$HEAD_SHA" latest)" ;;
+    tag)
+      label=v1.2.3
+      expected_tags="$(printf '%s\n' "$HEAD_SHA" "$label" latest stable)" ;;
+    nightly)
+      label="nightly-20260915-${HEAD_SHA:0:12}"
+      expected_tags="$(printf '%s\n' "$HEAD_SHA" "$label" nightly)" ;;
+  esac
+  channel="$(channel_for "$mode" "$label" || true)"
+  actual_tags="$(promotion_tag_list "$HEAD_SHA" "$label" "$channel")"
+  [[ "$actual_tags" == "$expected_tags" ]] \
+    || fail "$mode promotion tags: expected [$expected_tags], got [$actual_tags]"
+done
+
 # Every component must describe the core schema in the selected build source.
 # Migration 0016 is already active; advertising 15 admitted a bot-only migration
 # and then stranded the old API behind the same compatibility check.
@@ -1606,75 +1625,6 @@ rm -rf "$legacy_webui_dir"
 unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR
 
 reload_publisher
-PROD_PROMOTE_CREATE=0
-ROLLBACK_PROMOTE_IMAGE=ghcr.io/jatmn/jmodguard-api
-ROLLBACK_PROMOTE_DIGEST="sha256:$(printf 'c%.0s' {1..64})"
-ROLLBACK_PROMOTE_PREV="sha256:$(printf 'b%.0s' {1..64})"
-declare -A ROLLBACK_PROMOTE_TAG_DIGEST=()
-docker() {
-  local prev="" arg ref digest
-  if [[ "$1 $2 $3" == 'buildx imagetools create' ]]; then
-    for arg in "$@"; do
-      if [[ "$prev" == --tag ]]; then
-        ref="$arg"
-      fi
-      if [[ "$arg" == *@sha256:* ]]; then
-        digest="${arg#*@}"
-      fi
-      prev="$arg"
-    done
-    [[ -n "$ref" && -n "$digest" ]] && ROLLBACK_PROMOTE_TAG_DIGEST["$ref"]="$digest"
-    PROD_PROMOTE_CREATE=$((PROD_PROMOTE_CREATE + 1))
-    # Only the second promotion fails. A later restore must be able to succeed.
-    if [[ "$PROD_PROMOTE_CREATE" -eq 2 ]]; then
-      return 1
-    fi
-    return 0
-  fi
-  return 0
-}
-run_docker() {
-  local prev="" arg ref digest
-  if [[ "$1 $2 $3" == 'buildx imagetools create' ]]; then
-    for arg in "$@"; do
-      if [[ "$prev" == --tag ]]; then
-        ref="$arg"
-      fi
-      if [[ "$arg" == *@sha256:* ]]; then
-        digest="${arg#*@}"
-      fi
-      prev="$arg"
-    done
-    [[ -n "$ref" && -n "$digest" ]] && ROLLBACK_PROMOTE_TAG_DIGEST["$ref"]="$digest"
-    return 0
-  fi
-  if [[ "$1 $2" == 'buildx imagetools' && "$3" == inspect && "$*" == *'{{json .Manifest}}'* ]]; then
-    ref="$4"
-    digest="${ROLLBACK_PROMOTE_TAG_DIGEST[$ref]:-$ROLLBACK_PROMOTE_DIGEST}"
-    printf '{"digest":"%s","size":10}\n' "$digest"
-    return 0
-  fi
-  if [[ "$1 $2" == 'buildx imagetools' && "$*" == *'{{json .Image}}'* ]]; then
-    printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z","org.opencontainers.image.revision":"abc"},"Entrypoint":["/bin/sh","/usr/local/bin/jmodguard-bootstrap"]}}'
-    return 0
-  fi
-  return 0
-}
-ROLLBACK_PROMOTE_TAG_DIGEST["${ROLLBACK_PROMOTE_IMAGE}:${HEAD_SHA}"]="$ROLLBACK_PROMOTE_PREV"
-PROMOTION_ROLLBACK=()
-promote_image_tag "$ROLLBACK_PROMOTE_IMAGE" "${HEAD_SHA}" "$ROLLBACK_PROMOTE_DIGEST" \
-  || fail 'first promotion must succeed before create failure'
-ROLLBACK_PROMOTE_TAG_DIGEST["${ROLLBACK_PROMOTE_IMAGE}:${HEAD_SHA}"]="$ROLLBACK_PROMOTE_DIGEST"
-[[ "${#PROMOTION_ROLLBACK[@]}" -eq 1 ]] || fail 'first promotion must record rollback state'
-if promote_image_tag "$ROLLBACK_PROMOTE_IMAGE" latest "$ROLLBACK_PROMOTE_DIGEST"; then
-  fail 'production registry_promote_tag must fail when imagetools create fails'
-fi
-rollback_promoted_tags
-[[ "${ROLLBACK_PROMOTE_TAG_DIGEST[${ROLLBACK_PROMOTE_IMAGE}:${HEAD_SHA}]:-}" == "$ROLLBACK_PROMOTE_PREV" ]] \
-  || fail 'rollback must restore the first promoted tag after production create failure'
-unset -f docker
-
-reload_publisher
 JMODGUARD_UPDATE_SIGNING_KEY="$SIGNING_KEY_VALUE"
 JMODGUARD_UPDATE_SIGNING_PASSWORD="$SIGNING_PASSWORD_VALUE"
 capture_signing_secrets
@@ -1839,72 +1789,107 @@ printf '%s\n' "${PUBLISH_LAST_ERROR:-}" | grep -q 'staged on disk' \
 rm -rf "$EARLY_SIGNING_DIR"
 unset JMODGUARD_SIGNING_SECRETS_DIR
 
-reload_publisher
-ROLLBACK_IMAGE=ghcr.io/jatmn/jmodguard-bot
-ROLLBACK_DIGEST="sha256:$(printf 'b%.0s' {1..64})"
-ROLLBACK_PREV="sha256:$(printf 'a%.0s' {1..64})"
-declare -A ROLLBACK_TAG_DIGEST=()
-ROLLBACK_PROMOTES=0
-ROLLBACK_ROLLBACKS=0
-run_docker() {
-  local prev="" arg ref digest
-  if [[ "$1 $2 $3" == 'buildx imagetools create' ]]; then
-    for arg in "$@"; do
-      if [[ "$prev" == --tag ]]; then
-        ref="$arg"
-      fi
-      if [[ "$arg" == *@sha256:* ]]; then
-        digest="${arg#*@}"
-      fi
-      prev="$arg"
-    done
-    ROLLBACK_TAG_DIGEST["$ref"]="$digest"
-    if [[ "$ref" == "${ROLLBACK_IMAGE}:latest" ]]; then
-      ROLLBACK_PROMOTES=$((ROLLBACK_PROMOTES + 1))
-      ROLLBACK_TAG_DIGEST["$ref"]="$ROLLBACK_PREV"
-      return 0
-    fi
-    ROLLBACK_PROMOTES=$((ROLLBACK_PROMOTES + 1))
-    return 0
+# Exercise the production queue with a file-backed Docker fixture so the
+# parent can observe registry writes after the promotion shell exits.
+promotion_image=ghcr.io/jatmn/jmodguard-bot
+candidate_digest="sha256:$(printf 'b%.0s' {1..64})"
+previous_digest="sha256:$(printf 'a%.0s' {1..64})"
+concurrent_digest="sha256:$(printf 'c%.0s' {1..64})"
+for promotion_case in create-failure digest-mismatch inspect-failure interrupted concurrent-change; do
+  registry_dir="$PUBLISH_TEST_TRACE_DIR/promotion-$promotion_case"
+  mkdir "$registry_dir"
+  printf '%s\n' "$previous_digest" >"$registry_dir/$HEAD_SHA"
+  printf '%s\n' "$previous_digest" >"$registry_dir/latest"
+  : >"$registry_dir/writes"
+
+  set +e
+  promotion_output="$(
+    exec 2>&1
+    reload_publisher
+    docker() {
+      local ref tag digest
+      case "$*" in
+        "buildx imagetools inspect $promotion_image:"*" --format {{json .Manifest}}")
+          tag="${4##*:}"
+          if [[ "$promotion_case" == inspect-failure && "$tag" == latest ]]; then
+            echo 'registry: connection refused' >&2
+            return 1
+          fi
+          printf '{"digest":"%s","size":10}\n' "$(<"$registry_dir/$tag")"
+          ;;
+        "buildx imagetools create --prefer-index=false --tag $promotion_image:"*" $promotion_image@"*)
+          ref="$6"
+          tag="${ref##*:}"
+          digest="${7#*@}"
+          printf '%s %s\n' "$tag" "$digest" >>"$registry_dir/writes"
+          if [[ "$tag" == latest && "$digest" == "$candidate_digest" ]]; then
+            case "$promotion_case" in
+              create-failure)
+                # An error response can follow a registry write.
+                printf '%s\n' "$digest" >"$registry_dir/$tag"
+                return 1 ;;
+              digest-mismatch) return 0 ;; # Accepted, but the tag still points at the old digest.
+              concurrent-change)
+                printf '%s\n' "$concurrent_digest" >"$registry_dir/$HEAD_SHA"
+                return 1 ;;
+            esac
+          fi
+          printf '%s\n' "$digest" >"$registry_dir/$tag"
+          if [[ "$promotion_case" == interrupted && "$tag" == latest && "$digest" == "$candidate_digest" ]]; then
+            kill -TERM "$BASHPID"
+          fi
+          ;;
+        *) fail "unexpected docker command during promotion: $*" ;;
+      esac
+    }
+    gh() { fail "unexpected GitHub request during promotion: $*"; }
+
+    resolve_promotion_target "$promotion_image" "$HEAD_SHA" "$candidate_digest"
+    resolve_promotion_target "$promotion_image" latest "$candidate_digest"
+    commit_queued_promotions
+  )"
+  promotion_status=$?
+  set -e
+
+  expected_status=1
+  expected_error="failed to promote $promotion_image:latest"
+  expected_sha_digest="$previous_digest"
+  expected_writes="$(printf '%s %s\n' "$HEAD_SHA" "$candidate_digest" latest "$candidate_digest")"
+  restore_sha="$HEAD_SHA $previous_digest"
+  if [[ "$promotion_case" == interrupted ]]; then
+    expected_status=143
+    expected_error=""
   fi
-  if [[ "$1 $2" == 'buildx imagetools' ]]; then
-    if [[ "$3" == inspect && "$*" == *'{{json .Manifest}}'* ]]; then
-      ref="$4"
-      digest="${ROLLBACK_TAG_DIGEST[$ref]:-$ROLLBACK_DIGEST}"
-      printf '{"digest":"%s","size":10}\n' "$digest"
-      return 0
-    fi
-    if [[ "$*" == *'{{json .Image}}'* ]]; then
-      printf '%s' '{"config":{"Labels":{"io.jmodguard.published-at":"2026-10-27T12:00:00Z","org.opencontainers.image.revision":"abc"},"Entrypoint":["/bin/sh","/usr/local/bin/jmodguard-bootstrap"]}}'
-      return 0
-    fi
-  fi
-  return 0
-}
-registry_promote_tag() {
-  run_docker buildx imagetools create "$@" || return 1
-}
-ROLLBACK_TAG_DIGEST["${ROLLBACK_IMAGE}:${HEAD_SHA}"]="$ROLLBACK_PREV"
-PROMOTION_ROLLBACK=()
-promote_image_tag "$ROLLBACK_IMAGE" "${HEAD_SHA}" "$ROLLBACK_DIGEST" \
-  || fail 'first promotion must succeed'
-ROLLBACK_TAG_DIGEST["${ROLLBACK_IMAGE}:${HEAD_SHA}"]="$ROLLBACK_DIGEST"
-[[ "${#PROMOTION_ROLLBACK[@]}" -eq 1 ]] || fail 'first promotion must record rollback state'
-ROLLBACK_TAG_DIGEST["${ROLLBACK_IMAGE}:latest"]="$ROLLBACK_PREV"
-if promote_image_tag "$ROLLBACK_IMAGE" latest "$ROLLBACK_DIGEST"; then
-  fail 'second promotion must fail when digest verification mismatches'
-fi
-rollback_promoted_tags
-[[ "${ROLLBACK_TAG_DIGEST[${ROLLBACK_IMAGE}:${HEAD_SHA}]:-}" == "$ROLLBACK_PREV" ]] \
-  || fail 'rollback must restore the first promoted tag to its previous digest'
-[[ "$ROLLBACK_PROMOTES" -ge 2 ]] || fail 'rollback test must exercise two promotions'
+  case "$promotion_case" in
+    create-failure|interrupted)
+      expected_writes+=$'\n'"latest $previous_digest"$'\n'"$restore_sha" ;;
+    digest-mismatch)
+      expected_writes+=$'\n'"$restore_sha" ;;
+    inspect-failure)
+      expected_error="cannot inspect $promotion_image:latest before promotion"
+      expected_writes="" ;;
+    concurrent-change)
+      expected_error="rollback skipped $promotion_image:$HEAD_SHA: changed since promotion"
+      expected_sha_digest="$concurrent_digest" ;;
+  esac
+  [[ "$promotion_status" == "$expected_status" ]] \
+    || fail "$promotion_case: expected exit $expected_status, got $promotion_status: $promotion_output"
+  [[ "$(<"$registry_dir/$HEAD_SHA")" == "$expected_sha_digest" ]] \
+    || fail "$promotion_case: source SHA tag did not retain the expected digest"
+  [[ "$(<"$registry_dir/latest")" == "$previous_digest" ]] \
+    || fail "$promotion_case: latest did not retain its previous digest"
+  [[ "$(<"$registry_dir/writes")" == "$expected_writes" ]] \
+    || fail "$promotion_case: expected writes [$expected_writes], got [$(<"$registry_dir/writes")]"
+  [[ "$promotion_output" == *"$expected_error"* ]] \
+    || fail "$promotion_case: expected '$expected_error', got: $promotion_output"
+done
 
 # Early registry-delete failures must explain which prerequisite failed.
 reload_publisher
 for delete_case in invalid-ref missing-token list-failure malformed-list invalid-id; do
   if delete_output="$(
     GHCR_TOKEN=fixture
-    delete_ref="${ROLLBACK_IMAGE}:latest"
+    delete_ref="ghcr.io/jatmn/jmodguard-bot:latest"
     case "$delete_case" in
       invalid-ref) delete_ref=invalid ;;
       missing-token) unset GHCR_TOKEN GITHUB_TOKEN ;;
