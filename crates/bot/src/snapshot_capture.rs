@@ -3444,9 +3444,15 @@ mod tests {
     }
 
     fn temp_app(prefix: &str) -> (Arc<BotState>, std::path::PathBuf) {
+        temp_app_with_config(prefix, crate::config::BotProcessConfig::default())
+    }
+
+    fn temp_app_with_config(
+        prefix: &str,
+        mut cfg: crate::config::BotProcessConfig,
+    ) -> (Arc<BotState>, std::path::PathBuf) {
         let path =
             std::env::temp_dir().join(format!("{prefix}_{:032x}.db", rand::random::<u128>()));
-        let mut cfg = crate::config::BotProcessConfig::default();
         cfg.db.path = path.clone();
         cfg.db.pool_size = 1;
         cfg.log.discord_concurrency = 4;
@@ -3471,6 +3477,104 @@ mod tests {
             "mentions": [], "mention_roles": [], "attachments": [], "embeds": [],
             "pinned": false, "type": 0
         })
+    }
+
+    async fn assert_gateway_capture_eligibility(enabled: bool) {
+        use serenity::model::event::{MessageCreateEvent, ReadyEvent};
+
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.bot.message_capture_enabled = enabled;
+        let (app, path) = temp_app_with_config("snapshot_gateway_eligibility", cfg);
+        let scope = cache_scope(&app, 100).await;
+        let store = app.tenant.store(&scope).await.unwrap();
+        crate::db::upsert_log_channel(&app.db, 789, "message_delete", 901)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+
+        let ctx = test_delete_context().await;
+        let mut ready: ReadyEvent = serde_json::from_value(serde_json::json!({
+            "v": 10,
+            "user": {"id": "4242", "username": "our-bot", "bot": true},
+            "guilds": [],
+            "session_id": "fixture",
+            "resume_gateway_url": "wss://gateway.example.test",
+            "application": {"id": "4242", "flags": 0}
+        }))
+        .unwrap();
+        ctx.cache.update(&mut ready);
+
+        // Drain the real worker to completion after the collector has seen every event.
+        let mut receiver = app.snapshots.receiver.lock().start().unwrap();
+        // Leave the edit eligible even if the disabled create was correctly rejected.
+        app.snapshots.content_access.lock().insert(789);
+        let created_at_ms = app.snapshots.started_at_ms;
+        let snowflake = ((created_at_ms as u64) - 1_420_070_400_000) << 22;
+        let mut expected = Vec::new();
+        for (offset, (content, author, bot, webhook, eligible)) in [
+            ("human", "42", false, None, true),
+            ("other bot", "43", true, None, false),
+            ("webhook", "44", false, Some("45"), false),
+            ("own bot", "4242", true, None, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = MessageId::new(snowflake + offset as u64);
+            let mut message = message_json(id, content);
+            message["author"]["id"] = serde_json::json!(author);
+            message["author"]["bot"] = serde_json::json!(bot);
+            message["webhook_id"] = serde_json::json!(webhook);
+            let event: MessageCreateEvent = serde_json::from_value(message).unwrap();
+            app.snapshots
+                .on_gateway_event(&app, ctx.clone(), &Event::MessageCreate(event));
+            expected.push((id.get(), (enabled && eligible).then(|| content.to_owned())));
+        }
+
+        let edited = MessageId::new(snowflake + 4);
+        let mut edit = message_json(edited, "human edit");
+        let edited_at = chrono::DateTime::from_timestamp_millis(created_at_ms).unwrap();
+        edit["edited_timestamp"] = serde_json::json!(edited_at.to_rfc3339());
+        edit["webhook_id"] = serde_json::Value::Null;
+        let event: MessageUpdateEvent = serde_json::from_value(edit).unwrap();
+        app.snapshots
+            .on_gateway_event(&app, ctx, &Event::MessageUpdate(event));
+        expected.push((edited.get(), enabled.then(|| "human edit".to_owned())));
+
+        receiver.close();
+        run(Arc::clone(&app), receiver).await;
+
+        let mut durable = Vec::new();
+        let mut cached = Vec::new();
+        for &(id, _) in &expected {
+            let row = store
+                .retained_snapshot(scope.clone(), 456, id as i64)
+                .await
+                .unwrap();
+            durable.push((id, row.map(|row| row.fields.content.unwrap())));
+            let row = app
+                .snapshots
+                .recent
+                .lock()
+                .get((789, 456, id), &scope, created_at_ms);
+            cached.push((id, row.map(|row| row.fields.content.unwrap())));
+        }
+        assert_eq!(durable, expected, "guild-store snapshots");
+        assert_eq!(cached, expected, "memory snapshots");
+
+        drop(store);
+        drop(app);
+        remove_db_and_store(&path);
+    }
+
+    #[tokio::test]
+    async fn gateway_capture_retains_only_eligible_human_messages() {
+        assert_gateway_capture_eligibility(true).await;
+    }
+
+    #[tokio::test]
+    async fn gateway_capture_off_switch_blocks_creates_and_edits() {
+        assert_gateway_capture_eligibility(false).await;
     }
 
     async fn wait_for_body(
@@ -3916,7 +4020,7 @@ mod tests {
     async fn memory_cache_respects_count_byte_and_age_caps() {
         let (app, path) = temp_app("snapshot_memory_cache_caps");
         let scope = cache_scope(&app, 100).await;
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = 1_800_000_000_000;
         let observation = cache_observation;
         let mut recent = RecentMessages::default();
         for id in 1..=(MAX_RECENT as i64 + 10) {
@@ -3951,10 +4055,24 @@ mod tests {
         assert!(recent.get((789, 456, 1000), &scope, now).is_some());
 
         let mut recent = RecentMessages::default();
-        let old = now - RECENT_LIFETIME_MS + 1000;
-        recent.observe(&scope, &observation(1, old, "old"), true, now);
+        let old = now - (23 * 60 + 59) * 60_000;
+        let mut late = observation(1, old, "late arrival");
+        late.observed_at_ms = now;
+        recent.observe(&scope, &late, true, now);
         assert!(recent.get((789, 456, 1), &scope, now).is_some());
-        let later = now + 1000;
+
+        let edit_time = now + 30_000;
+        late.observed_at_ms = edit_time;
+        late.edit_at_ms = Some(edit_time);
+        late.fields.content = Some("late edit".into());
+        recent.observe(&scope, &late, true, edit_time);
+        let later = now + 60_000;
+        let before_expiry = recent.get((789, 456, 1), &scope, later - 1).unwrap();
+        assert_eq!(before_expiry.fields.content.as_deref(), Some("late edit"));
+        assert!(
+            recent.get((789, 456, 1), &scope, later).is_none(),
+            "expired row still readable before trimming"
+        );
         recent.observe(&scope, &observation(2, later, "new"), true, later);
         assert!(
             recent.take((789, 456, 1), &scope, later).is_none(),
