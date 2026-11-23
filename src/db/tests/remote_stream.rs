@@ -23,6 +23,7 @@ struct HranaState {
     expire_next_cursor: bool,
     expired_requests: usize,
     fail_next_commit: bool,
+    drop_next_commit_response: bool,
     fail_next_cas: bool,
     fail_next_meta_probe: bool,
     reset_next_request: bool,
@@ -65,6 +66,7 @@ impl HranaState {
             expire_next_cursor: false,
             expired_requests: 0,
             fail_next_commit: false,
+            drop_next_commit_response: false,
             fail_next_cas: false,
             fail_next_meta_probe: false,
             reset_next_request: false,
@@ -798,6 +800,10 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
     match path.as_str() {
         "/v3/pipeline" => {
             let requests = input["requests"].as_array().expect("pipeline requests");
+            let drop_commit_response = state.drop_next_commit_response
+                && requests
+                    .iter()
+                    .any(|request| statement_sql(request).starts_with("COMMIT"));
             let mut closed = false;
             let results: Vec<Json> = requests
                 .iter()
@@ -829,6 +835,13 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
                     json!({"type": "ok", "response": response})
                 })
                 .collect();
+            if drop_commit_response {
+                state.drop_next_commit_response = false;
+                state.expired.insert(baton);
+                let (sender, response) = Body::channel();
+                sender.abort();
+                return body(StatusCode::OK, response);
+            }
             body(
                 StatusCode::OK,
                 json!({"baton": if closed { None } else { Some(baton) }, "results": results})
@@ -910,6 +923,9 @@ fn pipeline_batch_response(request: &Json, state: &mut HranaState) -> Json {
     } else if sql.starts_with("COMMIT") && state.fail_next_commit {
         state.fail_next_commit = false;
         state.commit_timeouts += 1;
+        if let Some((runtime, conn)) = &state.backing {
+            runtime.block_on(conn.execute("ROLLBACK", ())).unwrap();
+        }
         state.in_transaction = false;
         state.write_locked = false;
         return json!({
@@ -1257,6 +1273,51 @@ async fn remote_commit_timeout_does_not_roll_back_the_closed_stream() {
         0,
         "COMMIT already closed the stream"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_commit_error_is_reconciled_against_durable_rows() {
+    let path = super::tmp_db_path("remote_commit_receipt");
+    let local = Db::open(&path, 2).unwrap();
+    let request = ConfigurationScope::Guild(enroll_guild(&local, 10, 100).await.unwrap().unwrap());
+    let scope = ConfigurationWriteScope::new(request.clone(), request).unwrap();
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    fixture.state.lock().unwrap().backing = Some((runtime, backing));
+    let remote = fixture.db();
+
+    fixture.fail_next_commit();
+    let error = add_enrolled_badwords(&remote, scope.clone(), "sample", None)
+        .await
+        .expect_err("a rejected commit with no receipt must fail");
+    assert_eq!(fixture.commit_timeouts(), 1);
+    assert!(is_remote_interactive_timeout(&error), "{error:#}");
+    assert!(!is_database_commit_indeterminate(&error), "{error:#}");
+    assert!(list_badwords(&local, 10).await.unwrap().is_empty());
+
+    fixture.state.lock().unwrap().drop_next_commit_response = true;
+    let saved = add_enrolled_badwords(&remote, scope, "sample", None)
+        .await
+        .expect("a lost response after an applied COMMIT must reconcile as success");
+    assert!(!fixture.state.lock().unwrap().drop_next_commit_response);
+    let stored = list_badwords(&local, 10).await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(
+        stored[0].pattern,
+        crate::normalize::badword_patterns("sample").unwrap()[0]
+    );
+    assert_eq!(stored[0].id, saved[0].id);
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
 }
 
 #[tokio::test(flavor = "multi_thread")]
