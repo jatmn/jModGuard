@@ -1663,6 +1663,7 @@ run_docker() {
 }
 got="$(image_published_at "ghcr.io/jatmn/jmodguard-bot@sha256:$(printf 'a%.0s' {1..64})")"
 assert_eq "$got" "2026-10-27T17:00:00Z"
+assert_eq "$(not_after_from_published_at "$got")" "2027-10-28T17:00:00Z"
 
 reload_publisher
 # shellcheck disable=SC2034 # read through grep_array's nameref
@@ -1679,11 +1680,11 @@ assert_eq "$PROD_SIGNING_FINGERPRINT" "d36f7ae0529b99c64f662c319855648309c7e0d6f
   || fail 'deploy/update-signing.pub fingerprint changed unexpectedly'
 
 reload_publisher
-COSIGN_TRACE="$PUBLISH_TEST_TRACE_DIR/cosign-commands.log"
+COSIGN_TRACE="$PUBLISH_TEST_TRACE_DIR/cosign-commands.args"
 : >"$COSIGN_TRACE"
 run_cosign() {
-  printf 'cosign %s\n' "$*" >>"$COSIGN_TRACE"
-  return 0
+  # Prefix each call with its argument count to retain command boundaries too.
+  printf '%s\0' "$#" "$@" >>"$COSIGN_TRACE"
 }
 run_docker() {
   if [[ "$1 $2" == 'buildx imagetools' ]]; then
@@ -1706,27 +1707,16 @@ persist_signing_secrets_to_files "$PROD_SIGN_SCRATCH"
 assert_signing_secrets_not_in_environ
 PROD_SIGN_KEY_FILE="${PROD_SIGN_SCRATCH}/signing.key"
 sign_published_digest bot "$PROD_SIGN_IMAGE" "$PROD_SIGN_DIGEST"
-grep -Fq 'cosign sign --yes' "$COSIGN_TRACE" || fail 'production signing must pass --yes to cosign sign'
-grep -Fq "${PROD_SIGN_IMAGE}@${PROD_SIGN_DIGEST}" "$COSIGN_TRACE" || fail 'production signing must target the verified digest reference'
-grep -Fq "cosign sign --yes --key ${PROD_SIGN_KEY_FILE}" "$COSIGN_TRACE" \
-  || fail 'production signing must use a key file'
 rm -rf "$PROD_SIGN_SCRATCH"
-grep -Fq 'env://JMODGUARD_UPDATE_SIGNING_KEY' "$COSIGN_TRACE" \
-  && fail 'production signing must not pass the private key through the environment'
-grep -Fq 'io.jmodguard.not-after=' "$COSIGN_TRACE" || fail 'production signing must attach the expiry annotation'
-grep -Fq -- '--annotation' "$COSIGN_TRACE" && fail 'cosign sign must use -a/--annotations, not --annotation'
-grep -Fq ' -a io.jmodguard.not-after=' "$COSIGN_TRACE" \
-  || grep -Fq -- '-a io.jmodguard.not-after=' "$COSIGN_TRACE" \
-  || fail 'cosign sign must pass -a for the expiry annotation'
-grep -Fq 'cosign verify' "$COSIGN_TRACE" || fail 'production signing must invoke cosign verify'
-grep -Fq -- '--tlog-upload=false' "$COSIGN_TRACE" \
-  && fail 'production signing must upload signatures to the Rekor transparency log'
-grep -Fq -- '--insecure-ignore-tlog' "$COSIGN_TRACE" \
-  && fail 'production verification must check the Rekor transparency log entry'
-grep -Fq -- "--key ${SIGNING_PUBLIC_KEY}" "$COSIGN_TRACE" \
-  || grep -Fq -- "--key $root/deploy/update-signing.pub" "$COSIGN_TRACE" \
-  || fail 'production verification must use the committed cosign public key'
-grep -Fq "${PROD_SIGN_IMAGE}@${PROD_SIGN_DIGEST}" "$COSIGN_TRACE" || fail 'production verification must target the verified digest reference'
+PROD_SIGN_REF="${PROD_SIGN_IMAGE}@${PROD_SIGN_DIGEST}"
+expected_sign_argv=(sign --yes --key "$PROD_SIGN_KEY_FILE"
+  -a 'io.jmodguard.not-after=2027-10-28T17:00:00Z' "$PROD_SIGN_REF")
+expected_verify_argv=(verify --key "$TEST_SIGNING_PUBLIC_KEY" "$PROD_SIGN_REF")
+expected_cosign_trace="$PUBLISH_TEST_TRACE_DIR/expected-cosign-commands.args"
+printf '%s\0' "${#expected_sign_argv[@]}" "${expected_sign_argv[@]}" \
+  "${#expected_verify_argv[@]}" "${expected_verify_argv[@]}" >"$expected_cosign_trace"
+cmp -s "$COSIGN_TRACE" "$expected_cosign_trace" \
+  || fail 'production signing must pass the expected separate arguments to cosign sign and verify'
 _JMG_SIGNING_KEY=""
 _JMG_SIGNING_PASSWORD=""
 
@@ -1772,6 +1762,69 @@ run_docker() {
 if verify_image_runtime_configuration bot 'ghcr.io/jatmn/jmodguard-bot@sha256:deadbeef' current 2>/dev/null; then
   fail 'mismatched entrypoint must fail runtime configuration'
 fi
+
+(
+  reload_publisher
+  verify_fixture="$(mktemp -d "${TMPDIR:-/tmp}/publish-verify-XXXXXX")"
+  trap 'rm -rf "$verify_fixture"' EXIT
+  image_fixture="$verify_fixture/image"
+  context="$verify_fixture/context"
+  mkdir -p "$image_fixture/bin" "$image_fixture/share/jmodguard" \
+    "$image_fixture/webui" "$context/dist/webui"
+  printf 'service executable\n' >"$image_fixture/bin/jmodguard-bot"
+  printf 'launcher executable\n' >"$image_fixture/bin/jmodguard-launcher"
+  printf '<p>Packaged WebUI</p>\n' >"$context/dist/webui/index.html"
+  cp "$context/dist/webui/index.html" "$image_fixture/webui/index.html"
+
+  write_image_inventory() {
+    (cd "$image_fixture" && sha256sum bin/jmodguard-bot bin/jmodguard-launcher) \
+      >"$image_fixture/share/jmodguard/files.sha256"
+  }
+  run_docker() {
+    case "$1" in
+      pull|rm) return 0 ;;
+      create) printf '%s\n' current-image ;;
+      cp)
+        case "$2" in
+          current-image:/webui/.) cp -R "$image_fixture/webui/." "$3" ;;
+          current-image:/usr/local/*) cp "$image_fixture/${2#current-image:/usr/local/}" "$3" ;;
+          *) fail "unexpected image copy: $2" ;;
+        esac
+        ;;
+      buildx)
+        case "$4" in
+          bot@*) runtime_image_json bot ;;
+          webui@*) runtime_image_json webui ;;
+          *) fail "unexpected runtime configuration reference: $4" ;;
+        esac
+        ;;
+      *) fail "unexpected current-layout verifier command: $*" ;;
+    esac
+  }
+  assert_image_verification_fails() {
+    local component="$1" reason="$2" output
+    if output="$(TMPDIR="$verify_fixture" verify_published_image \
+      "$component" "$component" "$MOCK_BUILD_DIGEST" "$context" current 2>&1)"; then
+      fail "image verification accepted $component despite $reason"
+    fi
+    grep -Fxq "Image publication failed: $reason" <<<"$output" \
+      || fail "unexpected image verification output: $output"
+  }
+
+  write_image_inventory
+  TMPDIR="$verify_fixture" verify_published_image bot bot "$MOCK_BUILD_DIGEST" "$context" current
+  TMPDIR="$verify_fixture" verify_published_image webui webui "$MOCK_BUILD_DIGEST" "$context" current
+
+  printf 'different service executable\n' >"$image_fixture/bin/jmodguard-bot"
+  assert_image_verification_fails bot 'effective service binaries do not match image inventory'
+
+  : >"$image_fixture/bin/jmodguard-bot"
+  write_image_inventory
+  assert_image_verification_fails bot 'published service executable is empty'
+
+  printf '<p>Changed WebUI</p>\n' >"$image_fixture/webui/index.html"
+  assert_image_verification_fails webui 'published WebUI files differ from the packaged assets'
+)
 
 reload_publisher
 EARLY_SIGNING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/early-signing-XXXXXX")"
@@ -2049,8 +2102,9 @@ inspect_digest() {
   printf '%s\n' "$1" >>"$signature_digest_trace"
   [[ "$1" == "${signature_skip_image}:latest" ]] && printf '%s\t' "$MOCK_BUILD_DIGEST"
 }
-image_published_at() { printf '%s' '2026-10-01T00:00:00Z'; }
-not_after_from_published_at() { printf '%s' '9999-12-31T00:00:00Z'; }
+# Keep both fixtures far from the current clock while using the real expiry calculation.
+signature_published_at='9000-01-01T00:00:00Z'
+image_published_at() { printf '%s' "$signature_published_at"; }
 verify_args="$PUBLISH_TEST_TRACE_DIR/signature-verify.args"
 expected_verify_args="$PUBLISH_TEST_TRACE_DIR/expected-signature-verify.args"
 printf '%s\0' verify --key "$TEST_SIGNING_PUBLIC_KEY" "${signature_skip_image}@${MOCK_BUILD_DIGEST}" >"$expected_verify_args"
@@ -2070,6 +2124,13 @@ published_signature_still_valid "$signature_skip_image" \
   || fail 'a verified unexpired signature must allow the unchanged-image skip'
 cmp -s "$verify_args" "$expected_verify_args" \
   || fail 'successful verification must receive verify, --key, the key path, and the image digest as separate arguments'
+signature_published_at='2000-01-01T00:00:00Z'
+: >"$verify_args"
+if published_signature_still_valid "$signature_skip_image"; then
+  fail 'a verified but expired signature must prevent the unchanged-image skip'
+fi
+cmp -s "$verify_args" "$expected_verify_args" \
+  || fail 'expired signature must reach verification for the expected image digest'
 unset -f cosign
 missing_cosign_path="$(mktemp -d "${TMPDIR:-/tmp}/publish-no-cosign-XXXXXX")"
 ln -s "$(type -P cut)" "$missing_cosign_path/cut"
