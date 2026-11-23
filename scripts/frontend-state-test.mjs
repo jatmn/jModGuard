@@ -3428,13 +3428,18 @@ test('an async action cannot restore drafts into a replacement membership', asyn
   assert.equal(h.app.isDirty(), false);
 });
 
-test('copy captures source membership on selection and sends both page scopes', async () => {
+test('copy confirms the selected source and section before sending both page scopes', async () => {
   const calls = [];
+  const prompts = [];
+  let allowCopy = false;
   const cfg = { enrollment_id: 'destination', settings: { prefix: '!', bot_name: '' }, settings_override: {}, global_settings: { prefix: '!' } };
   const { app, elements } = harness(async (url, opts) => {
     calls.push({ url, opts });
     if (url.endsWith('/copy') && opts.method === 'POST') return response({ copied: ['settings'] });
     return response(url.includes('987654321098765433') ? { enrollment_id: 'selected-source' } : cfg);
+  }, new Map(), new Map(), message => {
+    prompts.push(message);
+    return allowCopy;
   });
   app.state.config = cfg;
   app.state.tab = 'settings';
@@ -3456,6 +3461,12 @@ test('copy captures source membership on selection and sends both page scopes', 
   assert.equal(restoredSource.value, app.state.guilds[1].id);
   assert.equal(restoredSection.value, 'settings', 'unrelated save must not broaden the selected copy scope');
   copy = elements.find(n => n.localName === 'button' && n.textContent === 'Copy');
+  await fire(copy, 'click', {});
+  assert.equal(calls.some(c => c.opts.method === 'POST' && c.url.endsWith('/copy')), false,
+    'declining the confirmation must send no copy request');
+  assert.deepEqual(prompts, ['Copy settings from Second?']);
+
+  allowCopy = true;
   await fire(copy, 'click', {});
   const sent = calls.find(c => c.opts.method === 'POST' && c.url.endsWith('/copy'));
   assert.equal(JSON.parse(sent.opts.body).from_enrollment_id, 'selected-source');
@@ -10871,6 +10882,49 @@ test('a background Bans refresh keeps an open reason draft reachable', async () 
   await runReadRefresh(h, 180000);
   assert.equal(editor().value, 'Unsaved reason');
   assert.equal(h.app.isDirty(), true);
+});
+
+test('a dirty template guards tab close and survives declined sign-out', async () => {
+  const prompts = [];
+  const requests = [];
+  let allowSignOut = false;
+  const h = harness(async (url, { method }) => {
+    requests.push(`${method} ${url}`);
+    return { json: async () => ({ return_to: '/signed-out' }) };
+  }, new Map(), new Map(), message => {
+    prompts.push(message);
+    return allowSignOut;
+  });
+  h.app.state.config = { enrollment_id: 'membership', templates: [{ event: 'member_join', effective: 'Welcome' }] };
+  h.app.navigate('templates');
+  await settle();
+
+  const cleanUnload = new h.window.Event('beforeunload', { cancelable: true });
+  h.window.dispatchEvent(cleanUnload);
+  assert.equal(cleanUnload.defaultPrevented, false);
+  const template = () => h.document.querySelector('.template-card textarea');
+  template().value = 'Unsaved welcome';
+  await fire(template(), 'input');
+  const dirtyUnload = new h.window.Event('beforeunload', { cancelable: true });
+  h.window.dispatchEvent(dirtyUnload);
+  assert.equal(dirtyUnload.defaultPrevented, true, 'an unsaved template must guard tab close');
+
+  const guildId = h.app.state.guildId;
+  const signOut = () => h.document.querySelector('#logout-btn');
+  await fire(signOut(), 'click');
+  assert.deepEqual(requests, [], 'declining the confirmation must send no sign-out request');
+  assert.deepEqual(prompts, ['Discard unsaved changes?']);
+  assert.equal(h.app.state.guildId, guildId);
+  assert.equal(h.app.isDirty(), true);
+  assert.equal(template().value, 'Unsaved welcome');
+
+  allowSignOut = true;
+  await fire(signOut(), 'click');
+  assert.deepEqual(requests, ['POST /logout']);
+  assert.equal(h.location.href, '/signed-out');
+  const redirectUnload = new h.window.Event('beforeunload', { cancelable: true });
+  h.window.dispatchEvent(redirectUnload);
+  assert.equal(redirectUnload.defaultPrevented, false, 'confirmed sign-out must allow navigation without another prompt');
 });
 
 test('a due owner refresh cannot repopulate the cache while sign-out is pending', async () => {
