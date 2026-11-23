@@ -88,6 +88,7 @@ test("waitForApiMe does not retry application JSON 503", async () => {
 test("waitForApiMe paces retries and restarts the proxy failure budget after warmup", async () => {
   const clock = { ms: 0 };
   const delays = [];
+  const attemptStarts = [];
   const replies = [
     { status: 502, body: "Bad Gateway" },
     { status: 503, body: '{"error":"not ready"}' },
@@ -97,6 +98,7 @@ test("waitForApiMe paces retries and restarts the proxy failure budget after war
     { status: 200, body: '{"user":{"username":"ok"},"guilds":[]}' },
   ];
   const fetchImpl = async () => {
+    attemptStarts.push(clock.ms);
     const { status, body, headers, latency = 0 } = replies.shift() ?? { status: 500 };
     clock.ms += latency;
     return new Response(body, { status, headers });
@@ -106,8 +108,10 @@ test("waitForApiMe paces retries and restarts the proxy failure budget after war
       // Every fixture response arrives before its 90 s request deadline.
       if (ms === 90_000) return;
       delays.push(ms);
-      clock.ms += ms;
-      queueMicrotask(fn);
+      queueMicrotask(() => {
+        clock.ms += ms;
+        fn();
+      });
     },
     clearTimeout() {},
   };
@@ -116,6 +120,7 @@ test("waitForApiMe paces retries and restarts the proxy failure budget after war
   const me = await waitForApiMe();
   assert.equal(me.user.username, "ok");
   assert.deepEqual(delays, [500, 750, 1125, 3000, 2000]);
+  assert.deepEqual(attemptStarts, [0, 500, 1_250, 91_375, 94_375, 96_375]);
 });
 
 test("waitForApiMe keeps retrying warmup until axum answers", async () => {
