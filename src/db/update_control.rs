@@ -1927,6 +1927,14 @@ mod tests {
                 )
                 .await
         }
+        async fn assert_pair_not_queued(&self) {
+            assert!(self.control.upgrade().await.unwrap().is_none());
+            for role in ["bot", "api"] {
+                let row = self.control.component(role).await.unwrap();
+                assert!(row.desired.is_none(), "{role} has a desired update");
+                assert_ne!(row.state, "queued", "{role} has a queued update");
+            }
+        }
         async fn ack(
             &self,
             id: &str,
@@ -2279,24 +2287,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_mismatch_and_downgrades_are_rejected_without_queuing() {
-        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION + 1).await;
-        let mut api = f.control.component("api").await.unwrap().candidate.unwrap();
-        api.source_sha = "f".repeat(40);
+    async fn paired_queue_requires_matching_source_builds() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let bot = f.control.component("bot").await.unwrap().candidate.unwrap();
+        let api = f.control.component("api").await.unwrap().candidate.unwrap();
+        let mut mismatched = api.clone();
+        mismatched.source_sha = "f".repeat(40);
+        f.control
+            .checked("api", "latest", Some(mismatched), None, 100)
+            .await
+            .unwrap();
+        let error = f.queue(false, 100).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "bot and API must come from the same compatible source build"
+        );
+        f.assert_pair_not_queued().await;
+
         f.control
             .checked("api", "latest", Some(api.clone()), None, 100)
             .await
             .unwrap();
-        assert!(f.queue(false, 100).await.is_err());
-        assert!(f.control.upgrade().await.unwrap().is_none());
-        assert!(f.control.component("bot").await.unwrap().desired.is_none());
-        api.source_sha = "c".repeat(40);
-        api.upgrade.as_mut().unwrap().guild_schema = guild_data::SCHEMA_VERSION - 1;
-        f.control
-            .checked("api", "latest", Some(api), None, 100)
-            .await
-            .unwrap();
-        assert!(f.queue(false, 100).await.is_err());
+        let queued = f.queue(false, 100).await.unwrap();
+        assert_eq!(queued.phase, UpgradePhase::Preparing);
+        let stored = f.control.upgrade().await.unwrap().unwrap();
+        assert_eq!(stored.id, queued.id);
+        for (role, candidate) in [("bot", bot), ("api", api)] {
+            assert_eq!(queued.service(role).unwrap().release, candidate);
+            assert_eq!(stored.service(role).unwrap().release, candidate);
+            let row = f.control.component(role).await.unwrap();
+            assert_eq!(row.state, "queued", "{role}");
+            assert_eq!(row.desired.as_ref(), Some(&candidate), "{role}");
+        }
+    }
+
+    #[tokio::test]
+    async fn paired_queue_refuses_a_lower_guild_schema() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION - 1).await;
+        let error = f.queue(false, 100).await.unwrap_err();
+        assert_eq!(error.to_string(), APP_ONLY_SCHEMA_CHANGE_REFUSED);
+        f.assert_pair_not_queued().await;
     }
 
     #[tokio::test]
