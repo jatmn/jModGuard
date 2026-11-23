@@ -2066,20 +2066,25 @@ inspect_digest() {
 }
 image_published_at() { printf '%s' '2026-10-01T00:00:00Z'; }
 not_after_from_published_at() { printf '%s' '9999-12-31T00:00:00Z'; }
+verify_args="$PUBLISH_TEST_TRACE_DIR/signature-verify.args"
+expected_verify_args="$PUBLISH_TEST_TRACE_DIR/expected-signature-verify.args"
+printf '%s\0' verify --key "$TEST_SIGNING_PUBLIC_KEY" "${signature_skip_image}@${MOCK_BUILD_DIGEST}" >"$expected_verify_args"
 cosign_verify_status=1
 cosign() {
-  printf 'cosign %s\n' "$*" >"$COSIGN_TRACE"
+  printf '%s\0' "$@" >>"$verify_args"
   return "$cosign_verify_status"
 }
+: >"$verify_args"
 published_signature_still_valid "$signature_skip_image" \
   && fail 'rejected signature must prevent the unchanged-image skip'
-expected_verify="cosign verify --key $TEST_SIGNING_PUBLIC_KEY ${signature_skip_image}@${MOCK_BUILD_DIGEST}"
-assert_eq "$(<"$COSIGN_TRACE")" "$expected_verify"
+cmp -s "$verify_args" "$expected_verify_args" \
+  || fail 'rejected verification must receive verify, --key, the key path, and the image digest as separate arguments'
 cosign_verify_status=0
-: >"$COSIGN_TRACE"
+: >"$verify_args"
 published_signature_still_valid "$signature_skip_image" \
   || fail 'a verified unexpired signature must allow the unchanged-image skip'
-assert_eq "$(<"$COSIGN_TRACE")" "$expected_verify"
+cmp -s "$verify_args" "$expected_verify_args" \
+  || fail 'successful verification must receive verify, --key, the key path, and the image digest as separate arguments'
 unset -f cosign
 missing_cosign_path="$(mktemp -d "${TMPDIR:-/tmp}/publish-no-cosign-XXXXXX")"
 ln -s "$(type -P cut)" "$missing_cosign_path/cut"
