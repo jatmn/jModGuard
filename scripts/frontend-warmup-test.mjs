@@ -85,37 +85,37 @@ test("waitForApiMe does not retry application JSON 503", async () => {
   });
 });
 
-test("waitForApiMe keeps retrying origin-start failures until axum answers", async () => {
-  let calls = 0;
+test("waitForApiMe paces retries and restarts the proxy failure budget after warmup", async () => {
+  const clock = { ms: 0 };
+  const delays = [];
+  const replies = [
+    { status: 502, body: "Bad Gateway" },
+    { status: 503, body: '{"error":"not ready"}' },
+    { status: 502, body: "Bad Gateway", latency: 89_000 },
+    { status: 503, body: '{"error":"not ready"}', headers: { "retry-after": "3" } },
+    { status: 503, body: '{"error":"not ready"}' },
+    { status: 200, body: '{"user":{"username":"ok"},"guilds":[]}' },
+  ];
   const fetchImpl = async () => {
-    calls += 1;
-    if (calls === 1) {
-      return {
-        ok: false,
-        status: 502,
-        headers: { get: () => null },
-        text: async () => "Bad Gateway",
-      };
-    }
-    if (calls === 2) {
-      return {
-        ok: false,
-        status: 503,
-        headers: { get: (name) => (name === "retry-after" ? "0" : null) },
-        text: async () => JSON.stringify({ error: "not ready" }),
-      };
-    }
-    return {
-      ok: true,
-      status: 200,
-      headers: { get: () => null },
-      text: async () => JSON.stringify({ user: { username: "ok" }, guilds: [] }),
-    };
+    const { status, body, headers, latency = 0 } = replies.shift() ?? { status: 500 };
+    clock.ms += latency;
+    return new Response(body, { status, headers });
   };
-  const { waitForApiMe } = loadFrontend(fetchImpl);
+  const timers = {
+    setTimeout(fn, ms) {
+      // Every fixture response arrives before its 90 s request deadline.
+      if (ms === 90_000) return;
+      delays.push(ms);
+      clock.ms += ms;
+      queueMicrotask(fn);
+    },
+    clearTimeout() {},
+  };
+  const { waitForApiMe } = loadFrontend(fetchImpl, clock, timers);
+  // The second 502 arrives after 90 s total, but its own streak is only 89 s old.
   const me = await waitForApiMe();
-  assert.equal(calls, 3);
   assert.equal(me.user.username, "ok");
+  assert.deepEqual(delays, [500, 750, 1125, 3000, 2000]);
 });
 
 test("waitForApiMe keeps retrying warmup until axum answers", async () => {
