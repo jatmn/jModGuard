@@ -773,16 +773,6 @@ mod tests {
             "failed projection rolls back its ban insert"
         );
         sql(&app, "DROP TRIGGER fail_ban_projection").await;
-        // Commit the core row, but leave its tenant case unavailable.
-        let result = db::apply_gateway_ban_delivery(&app.db, delivery.id.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            db::apply_gateway_ban_delivery(&app.db, delivery.id.clone())
-                .await
-                .unwrap(),
-            result
-        );
         drop(app);
         let app = BotState::new(
             Default::default(),
@@ -802,6 +792,14 @@ mod tests {
         assert_eq!(pending[0].delivery.id, delivery.id);
         assert_eq!(pending[0].projection, db::GatewayProjection::Applied);
         assert_eq!(pending[0].case, db::GatewayCaseProgress::Pending);
+        assert_eq!(count(&app, "events").await, 1);
+        assert_eq!(count(&app, "bans").await, 1);
+
+        // Retrieve the committed result for comparison after the later unban.
+        let result = db::apply_gateway_ban_delivery(&app.db, delivery.id.clone())
+            .await
+            .unwrap()
+            .expect("the drained delivery has a core write result");
 
         app.tenant.activate(scope.clone()).await.unwrap();
         cursor = 0;
@@ -842,7 +840,7 @@ mod tests {
             db::apply_gateway_ban_delivery(&app.db, delivery.id.clone())
                 .await
                 .unwrap(),
-            result,
+            Some(result),
             "uncertain original write returns its original row after unban"
         );
         assert_eq!(

@@ -753,6 +753,21 @@ async fn durable_pending_rejoin_note_survives_stale_member_add_without_refresh()
 }
 
 #[tokio::test]
+async fn rejoin_enrichment_retries_without_guild_enrollment() {
+    let f = Fixture::new();
+    assert_eq!(
+        enrich_member_rejoin_vars(
+            &f.app,
+            GuildId::new(999_999),
+            &user(42),
+            &mut BTreeMap::new()
+        )
+        .await,
+        MemberRejoinEnrich::Retry
+    );
+}
+
+#[tokio::test]
 async fn gateway_rejoin_retries_failed_log_before_clearing_receipt() {
     use hyper::service::{make_service_fn, service_fn};
     use hyper::{Body, Method, Request, Response, Server};
