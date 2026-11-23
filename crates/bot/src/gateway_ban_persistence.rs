@@ -789,16 +789,45 @@ mod tests {
             db::Db::open(&dir.join("core.db"), 2).unwrap(),
         )
         .unwrap();
-        app.tenant.activate(scope.clone()).await.unwrap();
         let mut cursor = 0;
         drain(&app, &mut cursor).await.unwrap();
+        let pending = db::pending_gateway_ban_deliveries(&app.db, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "an inactive tenant must leave its case pending"
+        );
+        assert_eq!(pending[0].delivery.id, delivery.id);
+        assert_eq!(pending[0].projection, db::GatewayProjection::Applied);
+        assert_eq!(pending[0].case, db::GatewayCaseProgress::Pending);
+
+        app.tenant.activate(scope.clone()).await.unwrap();
+        cursor = 0;
+        drain(&app, &mut cursor).await.unwrap();
+        assert!(
+            db::pending_gateway_ban_deliveries(&app.db, 0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "activation must let the inbox acknowledge the persisted case"
+        );
+        let (store, tenant) = app.tenant.live(scope.clone()).await.unwrap();
+        assert_eq!(
+            store
+                .case_count(tenant.clone(), crate::tenant::case_limits())
+                .await
+                .unwrap(),
+            1,
+            "the acknowledged case must already exist in the activated store"
+        );
         // Recreate the gap after a tenant commit but before its core acknowledgment.
         sql(&app, "UPDATE gateway_ban_deliveries SET case_saved=0").await;
         cursor = 0;
         drain(&app, &mut cursor).await.unwrap();
         assert_eq!(count(&app, "events").await, 1);
         assert_eq!(count(&app, "bans").await, 1);
-        let (store, tenant) = app.tenant.live(scope.clone()).await.unwrap();
         assert_eq!(
             store
                 .case_count(tenant, crate::tenant::case_limits())
