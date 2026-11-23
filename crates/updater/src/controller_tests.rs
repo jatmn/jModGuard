@@ -3355,6 +3355,114 @@ async fn api_waits_only_for_a_migration_the_bot_would_run() {
     tokio::fs::remove_dir_all(root).await.unwrap();
 }
 
+#[tokio::test]
+async fn uninstalled_baked_bot_refuses_migration_when_another_release_owns_it() {
+    #[derive(Debug)]
+    enum Blocker {
+        ManagedPrevious,
+        NonQueuedDesired,
+        NewerObservation,
+        PendingUpgrade,
+    }
+
+    let root =
+        std::env::temp_dir().join(format!("baked-migration-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "baked-bot").await;
+    let (db, control) = open_launcher_db(&root).await;
+    let (registry, _reserved) = refused_registry().await;
+    let mut bot = controller(
+        "bot",
+        baked,
+        Registry::new(&registry).unwrap(),
+        control.clone(),
+        &root,
+    );
+    let schema = bot.baked_compatibility.core - 1;
+    assert!(schema >= bot.baked_compatibility.migration_min_core);
+    set_core_schema(&db, schema).await;
+
+    let stamp = 1_700_000_000;
+    let target = release_at("bot", 'a', schema);
+    let release = serde_json::to_string(&target).unwrap();
+    for case in [
+        Blocker::ManagedPrevious,
+        Blocker::NonQueuedDesired,
+        Blocker::NewerObservation,
+        Blocker::PendingUpgrade,
+    ] {
+        let pending_upgrade = matches!(case, Blocker::PendingUpgrade);
+        let mut observed = fresh_observation(stamp);
+        let (previous, desired, update_state) = match case {
+            Blocker::ManagedPrevious => (Some(release.clone()), None, "idle"),
+            Blocker::NonQueuedDesired => (None, Some(release.clone()), "failed"),
+            Blocker::NewerObservation => {
+                observed.max_schema = bot.baked_compatibility.core + 1;
+                (None, None, "idle")
+            }
+            Blocker::PendingUpgrade => (None, None, "idle"),
+        };
+        let observed = serde_json::to_string(&observed).unwrap();
+        db.with_conn(move |conn| {
+            conn.execute_bounded(
+                "UPDATE component_updates SET previous=?1,desired=?2,state=?3,observed=?4,observed_at=?5 WHERE component='bot'",
+                params![previous, desired, update_state, observed, stamp],
+                64 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        if pending_upgrade {
+            let api = release_at("api", 'b', schema);
+            control
+                .running("api", None, fresh_observation(stamp), stamp)
+                .await
+                .unwrap();
+            for candidate in [&target, &api] {
+                control
+                    .checked(
+                        &candidate.component,
+                        "latest",
+                        Some(candidate.clone()),
+                        None,
+                        stamp,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let upgrade = control
+                .request_upgrade(&target.digest, &api.digest, false, stamp)
+                .await
+                .unwrap();
+            assert_eq!(upgrade.phase, Phase::Preparing);
+        }
+        let state = control.component("bot").await.unwrap();
+        assert!(state.installed.is_none(), "{case:?}");
+        if pending_upgrade {
+            assert_eq!(state.state, "queued");
+        }
+        let result = bot.restore(&state).await;
+        let started = bot.running.is_some();
+        if started {
+            bot.stop_application().await.unwrap();
+        }
+        assert!(
+            !started,
+            "{case:?} must prevent the built-in bot from starting"
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "baked application cannot open database; use owner recovery",
+            "{case:?}"
+        );
+        assert_eq!(control.schema_version().await.unwrap(), schema, "{case:?}");
+    }
+
+    drop((bot, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
 /// Historical desired rows omit `upgrade`. Migration keeps them queued; the
 /// next updater pass must refuse each one and later passes must leave it.
 #[tokio::test]

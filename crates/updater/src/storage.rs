@@ -336,6 +336,9 @@ fn is_managed(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signing_fixture::{
+        SigningFixture, SigningKeyChoice, signature_not_after_far_future,
+    };
     use axum::{
         Router,
         body::Bytes,
@@ -343,7 +346,10 @@ mod tests {
         http::{HeaderMap, Method, StatusCode, Uri},
         routing::any,
     };
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, OnceLock},
+    };
     use tokio::sync::Mutex;
     #[tokio::test]
     async fn storage_status_errors_omit_urls() {
@@ -483,22 +489,23 @@ mod tests {
         }
     }
 
-    async fn stored(
-        State(files): State<Arc<HashMap<String, Vec<u8>>>>,
-        uri: Uri,
-    ) -> (StatusCode, Vec<u8>) {
-        match files.get(uri.path().trim_start_matches("/zone/")) {
-            Some(bytes) => (StatusCode::OK, bytes.clone()),
-            None => (StatusCode::NOT_FOUND, vec![]),
-        }
-    }
+    const ROOT_HTML: &str = "index.html";
+    const ADMIN_HTML: &str = "administration/index.html";
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn installed_release_reverification_is_not_blocked_by_signature_expiry() {
-        use crate::signing_fixture::{SigningFixture, SigningKeyChoice};
-        use jmodguard::db::{Db, SqlExecutor, params};
-        let signing = SigningFixture::new();
-        signing.apply_env();
+    async fn webui_registry(
+        not_after: &str,
+    ) -> (
+        Registry,
+        ComponentRelease,
+        HashMap<String, Vec<u8>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        static SIGNING: OnceLock<SigningFixture> = OnceLock::new();
+        let signing = SIGNING.get_or_init(|| {
+            let signing = SigningFixture::new();
+            signing.apply_env();
+            signing
+        });
         let mut release = ComponentRelease {
             upgrade: None,
             component: "webui".into(),
@@ -517,16 +524,35 @@ mod tests {
             launcher: None,
             base_abi: "static-webui-v1".into(),
         };
-        let (destinations, package) = release_paths(&release).unwrap();
+        let assets = format!("assets/releases/{}", release.source_sha);
+        let files = HashMap::from([
+            (
+                ROOT_HTML.to_owned(),
+                format!(r#"<script src="/{assets}/app.js"></script><link href="/{assets}/style.css">"#)
+                    .into_bytes(),
+            ),
+            (
+                ADMIN_HTML.to_owned(),
+                format!(r#"<script src="/{assets}/administration.js"></script><link href="/{assets}/style.css">"#)
+                    .into_bytes(),
+            ),
+            (format!("{assets}/app.js"), b"dashboard JavaScript".to_vec()),
+            (format!("{assets}/style.css"), b"shared stylesheet".to_vec()),
+            (
+                format!("{assets}/administration.js"),
+                b"administration JavaScript".to_vec(),
+            ),
+        ]);
         let mut layer = Vec::new();
         {
             let mut tar = tar::Builder::new(&mut layer);
-            for path in &package {
+            for (path, bytes) in &files {
                 let mut header = tar::Header::new_gnu();
-                header.set_size(path.len() as u64);
+                header.set_size(bytes.len() as u64);
                 header.set_mode(0o644);
                 header.set_cksum();
-                tar.append_data(&mut header, path, path.as_bytes()).unwrap();
+                tar.append_data(&mut header, format!("webui/{path}"), bytes.as_slice())
+                    .unwrap();
             }
             tar.finish().unwrap();
         }
@@ -559,12 +585,11 @@ mod tests {
         objects.insert(digest(&config), config);
         objects.insert(digest(&layer), layer);
         objects.insert(release.digest.clone(), manifest);
-        // The signature's io.jmodguard.not-after has passed.
         signing.sign(
             &mut objects,
             "webui",
             &release.digest,
-            "2020-01-01T00:00:00Z",
+            not_after,
             SigningKeyChoice::Current,
         );
         let (registry_address, registry_server) = serve(
@@ -574,15 +599,58 @@ mod tests {
         )
         .await;
         let registry = Registry::new(&format!("http://{registry_address}")).unwrap();
-        let files = destinations
-            .iter()
-            .zip(&package)
-            .map(|(destination, source)| (destination.clone(), source.as_bytes().to_vec()))
-            .collect::<HashMap<_, _>>();
+        (registry, release, files, registry_server)
+    }
+
+    #[derive(Default)]
+    struct StorageFixture {
+        files: HashMap<String, Vec<u8>>,
+        uploads: Vec<String>,
+        fail_root_upload: bool,
+    }
+
+    async fn stored(
+        State(state): State<Arc<Mutex<StorageFixture>>>,
+        method: Method,
+        uri: Uri,
+        body: Bytes,
+    ) -> (StatusCode, Vec<u8>) {
+        let path = uri.path().trim_start_matches("/zone/");
+        let mut state = state.lock().await;
+        match method {
+            Method::GET => match state.files.get(path) {
+                Some(bytes) => (StatusCode::OK, bytes.clone()),
+                None => (StatusCode::NOT_FOUND, vec![]),
+            },
+            Method::PUT => {
+                state.uploads.push(path.to_owned());
+                state.files.insert(path.to_owned(), body.to_vec());
+                // The server may have stored the new HTML before reporting failure.
+                if path == ROOT_HTML && std::mem::take(&mut state.fail_root_upload) {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, vec![]);
+                }
+                (StatusCode::CREATED, vec![])
+            }
+            Method::DELETE => {
+                state.files.remove(path);
+                (StatusCode::OK, vec![])
+            }
+            _ => (StatusCode::METHOD_NOT_ALLOWED, vec![]),
+        }
+    }
+
+    async fn webui_storage(
+        fixture: StorageFixture,
+    ) -> (
+        Storage,
+        Arc<Mutex<StorageFixture>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let state = Arc::new(Mutex::new(fixture));
         let (storage_address, storage_server) = serve(
             Router::new()
                 .fallback(any(stored))
-                .with_state(Arc::new(files)),
+                .with_state(Arc::clone(&state)),
         )
         .await;
         let storage = Storage {
@@ -593,6 +661,125 @@ mod tests {
             root: format!("http://{storage_address}/zone"),
             password: "zone-only-secret".into(),
         };
+        (storage, state, storage_server)
+    }
+
+    #[tokio::test]
+    async fn fresh_release_verification_rejects_changed_or_missing_assets() {
+        let (registry, release, files, registry_server) =
+            webui_registry(&signature_not_after_far_future()).await;
+        let (storage, state, storage_server) = webui_storage(StorageFixture {
+            files: files.clone(),
+            ..StorageFixture::default()
+        })
+        .await;
+        assert_verified(
+            storage.verify_release(&registry, &release).await.unwrap(),
+            &files,
+        );
+        let asset = format!("assets/releases/{}/administration.js", release.source_sha);
+        state
+            .lock()
+            .await
+            .files
+            .insert(asset.clone(), b"changed JavaScript".to_vec());
+        assert!(
+            matches!(
+                storage.verify_release(&registry, &release).await.unwrap(),
+                ReleaseVerification::Mismatch
+            ),
+            "a changed asset must prevent adoption"
+        );
+        state.lock().await.files.remove(&asset).unwrap();
+        assert!(
+            matches!(
+                storage.verify_release(&registry, &release).await.unwrap(),
+                ReleaseVerification::Mismatch
+            ),
+            "a missing asset must prevent adoption"
+        );
+        registry_server.abort();
+        storage_server.abort();
+    }
+
+    #[tokio::test]
+    async fn publish_restores_html_when_root_upload_fails() {
+        let (registry, release, files, registry_server) =
+            webui_registry(&signature_not_after_far_future()).await;
+        let old_asset = format!("assets/releases/{}/app.js", "b".repeat(40));
+        let assets = format!("assets/releases/{}", release.source_sha);
+        for old_admin in [Some(b"previous administration HTML".as_slice()), None] {
+            let mut previous = HashMap::from([
+                (ROOT_HTML.to_owned(), b"previous root HTML".to_vec()),
+                (old_asset.clone(), b"previous JavaScript".to_vec()),
+            ]);
+            if let Some(admin) = old_admin {
+                previous.insert(ADMIN_HTML.to_owned(), admin.to_vec());
+            }
+            let (storage, state, storage_server) = webui_storage(StorageFixture {
+                files: previous.clone(),
+                fail_root_upload: true,
+                ..StorageFixture::default()
+            })
+            .await;
+
+            let error = storage.publish(&registry, &release).await.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<reqwest::Error>().unwrap().status(),
+                Some(StatusCode::INTERNAL_SERVER_ERROR)
+            );
+            assert!(!format!("{error:#}").contains("HTML restoration also failed"));
+
+            let state = state.lock().await;
+            let mut asset_uploads = state.uploads[..3].to_vec();
+            asset_uploads.sort_unstable();
+            assert_eq!(
+                asset_uploads,
+                [
+                    format!("{assets}/administration.js"),
+                    format!("{assets}/app.js"),
+                    format!("{assets}/style.css"),
+                ]
+            );
+            assert_eq!(&state.uploads[3..5], [ADMIN_HTML, ROOT_HTML]);
+            previous.extend(
+                files
+                    .iter()
+                    .filter(|(path, _)| path.starts_with(&assets))
+                    .map(|(path, bytes)| (path.clone(), bytes.clone())),
+            );
+            assert_eq!(
+                state.files, previous,
+                "failed publication must restore the prior HTML"
+            );
+            storage_server.abort();
+        }
+        registry_server.abort();
+    }
+
+    fn assert_verified(result: ReleaseVerification, files: &HashMap<String, Vec<u8>>) {
+        match result {
+            ReleaseVerification::Verified {
+                root_hash,
+                admin_hash,
+            } => {
+                assert_eq!(root_hash, sha256_hex(&files[ROOT_HTML]));
+                assert_eq!(admin_hash, sha256_hex(&files[ADMIN_HTML]));
+            }
+            ReleaseVerification::Mismatch => panic!("matching files must verify"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn installed_release_reverification_is_not_blocked_by_signature_expiry() {
+        use jmodguard::db::{Db, SqlExecutor, params};
+        let (registry, release, files, registry_server) =
+            webui_registry("2020-01-01T00:00:00Z").await;
+        let (storage, _, storage_server) = webui_storage(StorageFixture {
+            files: files.clone(),
+            ..StorageFixture::default()
+        })
+        .await;
         let path = std::env::temp_dir().join(format!(
             "installed-webui-{:032x}.db",
             rand::random::<u128>()
@@ -625,20 +812,13 @@ mod tests {
         })
         .await
         .unwrap();
-        match storage
-            .verify_installed_release(&registry, &control, &release)
-            .await
-            .unwrap()
-        {
-            ReleaseVerification::Verified {
-                root_hash,
-                admin_hash,
-            } => {
-                assert_eq!(root_hash, sha256_hex(package[0].as_bytes()));
-                assert_eq!(admin_hash, sha256_hex(package[1].as_bytes()));
-            }
-            ReleaseVerification::Mismatch => panic!("installed files match"),
-        }
+        assert_verified(
+            storage
+                .verify_installed_release(&registry, &control, &release)
+                .await
+                .unwrap(),
+            &files,
+        );
         registry_server.abort();
         storage_server.abort();
         drop(control);
