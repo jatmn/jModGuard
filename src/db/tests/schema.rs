@@ -115,6 +115,71 @@ fn old_or_foreign_databases_are_rejected_without_changing_their_rows() {
 }
 
 #[test]
+fn supported_versions_require_the_core_family_before_bootstrap_writes() {
+    for (version, family) in [
+        (CORE_SCHEMA_VERSION, None),
+        (CORE_BASELINE_VERSION, Some("another-app")),
+    ] {
+        let path = tmp_db_path("schema_family_refusal");
+        if version == CORE_SCHEMA_VERSION {
+            drop(Db::open_with(options(&path, true)).unwrap());
+        }
+        let conn = Connection::open(&path).unwrap();
+        let ready = version.to_string();
+        if version == CORE_BASELINE_VERSION {
+            apply_core_steps(&conn, &MIGRATIONS[..1]);
+            write_meta_string_conn(&conn, META_BOOTSTRAP_COMPLETE, &ready).unwrap();
+        }
+        conn.execute_rows(
+            "INSERT INTO guild_settings (guild_id, settings) VALUES (42, ?1)",
+            params![r#"{"prefix":"?"}"#],
+            1,
+        )
+        .unwrap();
+        if let Some(family) = family {
+            write_meta_string_conn(&conn, "schema_family", family).unwrap();
+        } else {
+            conn.execute_rows("DELETE FROM meta WHERE key='schema_family'", (), 1)
+                .unwrap();
+        }
+        let schema = schema_dump(&conn);
+
+        for migrate in [true, false] {
+            let error = Db::open_with(DbOpenOptions {
+                read_only: !migrate,
+                ..options(&path, migrate)
+            })
+            .err()
+            .expect("supported version must not bypass the schema family check");
+            assert!(error.is::<UnsupportedSchema>(), "{error:#}");
+            assert!(format!("{error:#}").contains("schema family"), "{error:#}");
+            assert_eq!(user_version(&conn), version);
+            assert_eq!(schema_dump(&conn), schema);
+            assert_eq!(
+                meta_string_conn(&conn, "schema_family").unwrap().as_deref(),
+                family
+            );
+            assert_eq!(
+                meta_string_conn(&conn, META_BOOTSTRAP_COMPLETE)
+                    .unwrap()
+                    .as_deref(),
+                Some(ready.as_str())
+            );
+            let settings: String = conn
+                .query_row(
+                    "SELECT settings FROM guild_settings WHERE guild_id=42",
+                    (),
+                    |row| Ok(row.get(0)?),
+                )
+                .unwrap();
+            assert_eq!(settings, r#"{"prefix":"?"}"#);
+        }
+        drop(conn);
+        cleanup_db(&path);
+    }
+}
+
+#[test]
 fn newer_or_invalid_versions_refuse_before_bootstrap_changes() {
     for version in [0, -1, CORE_SCHEMA_VERSION + 1] {
         let path = tmp_db_path("schema_version_refusal");
