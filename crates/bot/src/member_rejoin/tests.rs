@@ -753,67 +753,61 @@ async fn durable_pending_rejoin_note_survives_stale_member_add_without_refresh()
 }
 
 #[tokio::test]
-async fn failed_rejoin_retries_after_stale_member_add_without_refresh() {
+async fn rejoin_enrichment_retries_without_guild_enrollment() {
     let f = Fixture::new();
-    f.app.activation.mark_lock_held(true);
-    const GUILD: u64 = 789;
-    const USER: u64 = 42;
-    const STAY: &str = "stay-retry";
-    let note = RejoinNote::IndexNotReady;
-    let vars = member_rejoin_vars(&user(USER), &note);
-    db::upsert_log_channel(&f.app.db, GUILD as i64, "member_rejoin", 200)
-        .await
-        .unwrap();
-    f.app.invalidate_configs();
-    let sink = Sink::default();
-    let refresh_attempt = f
-        .app
-        .rejoin_note_deliveries
-        .begin_in_flight(GUILD, USER, STAY)
-        .expect("fresh stay reserves delivery");
-    refresh_attempt.complete(false);
-    assert!(
-        f.app
-            .rejoin_note_deliveries
-            .pending_redelivery(GUILD, USER, STAY),
-        "failed delivery must remain retryable"
-    );
-    let membership_refresh = false;
-    let retry_undelivered = f
-        .app
-        .rejoin_note_deliveries
-        .pending_redelivery(GUILD, USER, STAY);
-    assert!(retry_undelivered);
-    assert!(!membership_refresh);
-    let stale_retry = f
-        .app
-        .rejoin_note_deliveries
-        .begin_in_flight(GUILD, USER, STAY)
-        .expect("stale add must retry the undelivered stay");
-    let sent =
-        emit_to(&f.app, &sink, GuildId::new(GUILD), "member_rejoin", vars).await == Delivery::Sent;
-    stale_retry.complete(sent);
-    assert!(sent);
-    assert_eq!(sink.messages.lock().unwrap().len(), 1);
-    assert!(
-        !f.app
-            .rejoin_note_deliveries
-            .begin_attempt(GUILD, USER, STAY),
-        "successful delivery must not post again"
+    assert_eq!(
+        enrich_member_rejoin_vars(
+            &f.app,
+            GuildId::new(999_999),
+            &user(42),
+            &mut BTreeMap::new()
+        )
+        .await,
+        MemberRejoinEnrich::Retry
     );
 }
 
 #[tokio::test]
-async fn member_rejoin_emit_retries_without_clearing_durable_pending() {
+async fn gateway_rejoin_retries_failed_log_before_clearing_receipt() {
+    use hyper::service::{make_service_fn, service_fn};
+    use hyper::{Body, Method, Request, Response, Server};
+    use serenity::client::EventHandler;
+    use std::convert::Infallible;
+    use std::sync::atomic::AtomicBool;
+
     const GUILD: i64 = 10;
     const USER: i64 = 42;
     let f = Fixture::new();
+    assert!(
+        db::claim_active_bot(
+            &f.app.db,
+            f.app.activation.instance(),
+            jmodguard::control::now_ms(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap()
+    );
+    f.app.activation.mark_lock_held(true);
+    f.app.activation.note_discord_connected();
     let enrollment = db::enroll_guild(&f.app.db, GUILD, 100)
         .await
         .unwrap()
         .unwrap();
     f.app.tenant.activate(enrollment.clone()).await.unwrap();
     let (store, scope) = ready_directory(&f.app, &enrollment).await;
+    record_application(
+        &f.app,
+        Some(enrollment),
+        CaseAction::Kick,
+        CaseOutcome::Succeeded,
+        USER as u64,
+        Some(1),
+        Some("prior case for rejoin".into()),
+        CaseEvidence::Unavailable,
+    )
+    .await
+    .unwrap();
     store
         .observe_member(
             scope.clone(),
@@ -833,39 +827,98 @@ async fn member_rejoin_emit_retries_without_clearing_durable_pending() {
         .depart_member(scope.clone(), USER, 2_000)
         .await
         .unwrap();
-    store
-        .observe_member(
-            scope.clone(),
-            MemberObservation {
-                user_id: USER,
-                username: Some(Some("member".into())),
-                global_name: None,
-                nickname: None,
-                joined_at_ms: Some(3_000),
-                observed_at_ms: 3_000,
-                is_join: true,
-            },
-        )
+    db::upsert_log_channel(&f.app.db, GUILD, "member_rejoin", 999)
         .await
         .unwrap();
-    assert!(
-        store
-            .has_pending_rejoin_note(scope.clone(), USER)
-            .await
-            .unwrap()
+    f.app.invalidate_configs();
+    let member: serenity::model::guild::Member = serde_json::from_value(serde_json::json!({
+        "guild_id": GUILD.to_string(),
+        "user": user(USER as u64),
+        "roles": [],
+        "joined_at": "1970-01-01T00:00:03Z",
+        "deaf": false,
+        "mute": false,
+        "flags": 0
+    }))
+    .unwrap();
+    let handler = crate::handlers::Handler {
+        app: Arc::clone(&f.app),
+    };
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&requests);
+    let server = Server::bind(&([127, 0, 0, 1], 0).into());
+    let http = Arc::new(
+        serenity::http::HttpBuilder::new("fixture")
+            .proxy(format!("http://{}", server.local_addr()))
+            .ratelimiter_disabled(true)
+            .build(),
     );
-    let mut vars = BTreeMap::new();
+    let ctx = crate::commands::mod_reason_dm::fixture_context_for_dm_order_test(
+        http,
+        Arc::new(serenity::cache::Cache::new()),
+    )
+    .await;
+    let server = tokio::spawn(server.serve(make_service_fn(move |_| {
+        let captured = Arc::clone(&captured);
+        async move {
+            Ok::<_, Infallible>(service_fn(move |request: Request<Body>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let body = hyper::body::to_bytes(body).await.unwrap();
+                    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let mut calls = captured.lock().unwrap();
+                    calls.push((parts.method, parts.uri.path().to_owned(), payload));
+                    let (status, body) = if calls.len() == 1 {
+                        (400, r#"{"code":50035,"message":"Fixture rejected the log"}"#)
+                    } else {
+                        (200, r#"{"id":"1000","channel_id":"999","author":{"id":"1","username":"fixture","discriminator":"0","avatar":null},"content":"fixture","timestamp":"2026-01-01T00:00:00Z","tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#)
+                    };
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                }
+            }))
+        }
+    })));
+
+    handler
+        .guild_member_addition(ctx.clone(), member.clone())
+        .await;
+    let pending_after_failure = store.has_pending_rejoin_note(scope.clone(), USER).await;
+    handler
+        .guild_member_addition(ctx.clone(), member.clone())
+        .await;
+    let pending_after_success = store.has_pending_rejoin_note(scope.clone(), USER).await;
+    handler.guild_member_addition(ctx, member).await;
+    let pending_after_duplicate = store.has_pending_rejoin_note(scope, USER).await;
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+
+    assert!(
+        pending_after_failure.unwrap(),
+        "failed log delivery must keep the current stay's receipt"
+    );
+    assert!(
+        !pending_after_success.unwrap(),
+        "successful log delivery must clear the current stay's receipt"
+    );
+    assert!(!pending_after_duplicate.unwrap());
+    let requests = requests.lock().unwrap();
     assert_eq!(
-        enrich_member_rejoin_vars(&f.app, GuildId::new(999_999), &user(USER as u64), &mut vars)
-            .await,
-        MemberRejoinEnrich::Retry
+        requests.len(),
+        2,
+        "one failed post and one successful retry"
     );
-    assert!(
-        store
-            .has_pending_rejoin_note(scope.clone(), USER)
-            .await
-            .unwrap()
-    );
+    for (method, path, payload) in requests.iter() {
+        assert_eq!(method, Method::POST);
+        assert_eq!(path, "/api/v10/channels/999/messages");
+        assert!(crate::logging::tests::log_text(payload).contains("prior case for rejoin"));
+    }
 }
 
 #[test]
