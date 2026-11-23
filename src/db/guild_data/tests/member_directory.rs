@@ -26,6 +26,183 @@ async fn ready() -> (Fixture, GuildDataStore, GuildDataScope) {
 }
 
 #[tokio::test]
+async fn shared_store_member_cleanup_and_erasure_preserve_the_other_guild() {
+    let (f, store, scope) = ready().await;
+    let placement = f.placement(&store.expected, 20).await;
+    store
+        .bind_initial_placement(placement.clone())
+        .await
+        .unwrap();
+    let other = GuildDataScope::new(
+        placement,
+        crate::db::GuildEnrollment {
+            guild_id: 20,
+            id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            joined_at_ns: 200,
+        },
+    )
+    .unwrap();
+    store.bind_initial_membership(other.clone()).await.unwrap();
+    complete_for_checks(&store, &scope).await;
+    assert!(
+        store
+            .backfill_member_case_index(scope.clone(), 42, 100)
+            .await
+            .unwrap()
+    );
+    store
+        .initialize_member_directory(other.clone(), 42, 1_000)
+        .await
+        .unwrap();
+
+    let shared_user = 77;
+    store
+        .observe_member(scope.clone(), observed(shared_user, Some(500), 1_000))
+        .await
+        .unwrap();
+    store
+        .depart_member(scope.clone(), shared_user, 2_500)
+        .await
+        .unwrap();
+    // A second member keeps data in the first guild for the erasure step.
+    store
+        .observe_member(scope.clone(), observed(78, Some(800), 1_000))
+        .await
+        .unwrap();
+    store
+        .observe_member(other.clone(), observed(shared_user, Some(900), 1_000))
+        .await
+        .unwrap();
+    store
+        .observe_ban(other.clone(), shared_user, 3_000)
+        .await
+        .unwrap();
+    let ban = CaseId::new();
+    store
+        .record_case(
+            other.clone(),
+            ban.clone(),
+            CaseData {
+                ban_attempt_tag: None,
+                source: CaseSource::DiscordAudit { entry_id: 123 },
+                action: CaseAction::Ban,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: shared_user,
+                actor_id: Some(42),
+                occurred_at_ms: 3_000,
+                reason: None,
+                evidence: CaseEvidence::Unavailable,
+            },
+            CaseLimits::default(),
+        )
+        .await
+        .unwrap();
+
+    let assert_neighbor = async |after: &str| {
+        let retained = store
+            .get_member(other.clone(), shared_user)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("neighbor's member missing {after}"));
+        assert!(
+            retained.ever_banned && retained.is_banned,
+            "neighbor's ban changed {after}"
+        );
+        assert_eq!(
+            retained.joined_at_ms,
+            Some(900),
+            "neighbor's join changed {after}"
+        );
+        let history = store
+            .member_history(other.clone(), shared_user, None, 10)
+            .await
+            .unwrap();
+        assert!(
+            history
+                .entries
+                .iter()
+                .any(|e| e.kind == "join" && e.joined_at_ms == Some(900)),
+            "neighbor's stay missing {after}",
+        );
+        assert!(
+            history
+                .entries
+                .iter()
+                .any(|e| e.kind == "ban" && e.case_id.as_deref() == Some(ban.as_str())),
+            "neighbor's ban history missing {after}",
+        );
+        let page = store
+            .list_members(
+                other.clone(),
+                MemberQuery {
+                    q: None,
+                    status: MemberStatusFilter::All,
+                    joined_from_ms: None,
+                    joined_to_ms: None,
+                    sort: MemberSort::UserId,
+                    descending: false,
+                    after: None,
+                    limit: 10,
+                    include_total: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total, Some(1), "neighbor's count {after}");
+        assert_eq!(page.members.len(), 1, "neighbor's page {after}");
+        assert_eq!(page.members[0].user_id, "77", "neighbor's member {after}");
+    };
+    let departed = store
+        .get_member(scope.clone(), shared_user)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!departed.is_current && !departed.ever_banned);
+    assert_eq!(departed.joined_at_ms, Some(500));
+    assert_neighbor("before cleanup").await;
+
+    let candidate = store
+        .next_member_cleanup_candidate(scope.clone(), 400_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.user_id, shared_user);
+    store
+        .settle_member_cleanup(scope.clone(), candidate, false, 400_001)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_member(scope.clone(), shared_user)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get_member(scope.clone(), 78).await.unwrap().is_some());
+    assert_neighbor("after cleanup").await;
+
+    store.close_membership(scope.clone()).await.unwrap();
+    assert!(store.erase_closed_scope(scope).await.unwrap());
+    // A public lookup refuses the erased scope, so inspect the target rows directly.
+    let remaining: i64 = store
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM guild_member_directory WHERE guild_id=10",
+                (),
+                |r| Ok(r.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "erasure must remove the closed guild's member"
+    );
+    assert_neighbor("after erasure").await;
+}
+
+#[tokio::test]
 async fn member_orders_seek_the_scoped_indexes_after_schema_21_upgrade() {
     use crate::db_compat::Connection;
 

@@ -882,6 +882,172 @@ fn consider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn gateway_text_admission_filters_messages_and_preserves_contentless_updates() {
+        use serenity::all::{CurrentUser, Timestamp, UserId, UserUpdateEvent};
+        use std::sync::atomic::AtomicBool;
+
+        let directory =
+            std::env::temp_dir().join(format!("text_gateway_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            crate::db::Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        app.activation.note_discord_connected();
+        crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut rule = crate::defaults::default_rules().remove(2);
+        rule.whitelist_users = vec![43];
+        rule.whitelist_channels = vec![14];
+        rule.whitelist_roles = vec![7];
+        crate::db::upsert_rule(&app.db, 10, "repeat_text", &rule)
+            .await
+            .unwrap();
+        crate::db::upsert_log_channel(&app.db, 10, "automod", 999)
+            .await
+            .unwrap();
+        app.poll_config_version().await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .proxy(format!("http://{}", listener.local_addr().unwrap()))
+            .ratelimiter_disabled(true)
+            .build();
+        let cache = Arc::new(serenity::cache::Cache::new());
+        let mut bot = CurrentUser::default();
+        bot.id = UserId::new(44);
+        let mut ready_user: UserUpdateEvent =
+            serde_json::from_value(serde_json::to_value(bot).unwrap()).unwrap();
+        cache.update(&mut ready_user);
+        let ctx = crate::commands::mod_reason_dm::fixture_context_for_dm_order_test(
+            Arc::new(http),
+            cache,
+        )
+        .await;
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let received = cfg.loaded_at;
+        let received_at = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let revision = app.text_spam.revision();
+        let observe_create = |msg: &Message| {
+            observe(&app, &ctx, &cfg, msg, received, received_at, revision);
+        };
+        let valid = "é".repeat(20);
+        let short = "é".repeat(19);
+        let oversized = "a".repeat(4001);
+        let message = |id, channel, author, content: &str, age_ms, roles: &[&str]| {
+            let mut msg = Message::default();
+            msg.id = serenity::all::MessageId::new(id);
+            msg.guild_id = Some(serenity::all::GuildId::new(10));
+            msg.channel_id = serenity::all::ChannelId::new(channel);
+            msg.author.id = UserId::new(author);
+            msg.author.name = "fixture".into();
+            msg.content = content.into();
+            msg.timestamp =
+                Timestamp::from_millis(received_at.timestamp_millis() - age_ms).unwrap();
+            msg.member = Some(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "roles": roles, "deaf": false, "mute": false, "flags": 0,
+                }))
+                .unwrap(),
+            ));
+            msg
+        };
+        let mut webhook = message(108, 11, 42, &valid, 0, &[]);
+        webhook.webhook_id = Some(serenity::all::WebhookId::new(9));
+        let mut own = message(107, 11, 44, &valid, 0, &[]);
+        own.author.bot = true;
+        for (label, msg) in [
+            ("short text", message(100, 11, 42, &short, 0, &[])),
+            ("blank text", message(101, 11, 42, "   ", 0, &[])),
+            ("oversized text", message(102, 11, 42, &oversized, 0, &[])),
+            ("expired text", message(103, 11, 42, &valid, 60_000, &[])),
+            ("exempt user", message(104, 11, 43, &valid, 0, &[])),
+            ("exempt channel", message(105, 14, 42, &valid, 0, &[])),
+            ("exempt role", message(106, 11, 42, &valid, 0, &["7"])),
+            ("own bot", own),
+            ("webhook", webhook),
+        ] {
+            let (channel, id) = (msg.channel_id.get(), msg.id.get());
+            observe_create(&msg);
+            assert_eq!(app.text_spam.author_of(10, channel, id), None, "{label}");
+        }
+
+        observe_create(&message(109, 11, 42, &valid, 0, &[]));
+        let author = app.text_spam.author_of(10, 11, 109);
+        assert_eq!(author, Some(42));
+        let update = serde_json::from_value(serde_json::json!({
+            "id": "109", "channel_id": "11", "guild_id": "10", "embeds": [],
+        }))
+        .unwrap();
+        observe_update(
+            &app,
+            &ctx,
+            &cfg,
+            &update,
+            &crate::handlers::UpdateObservation {
+                author,
+                received,
+                received_at,
+            },
+            revision,
+        );
+        assert_eq!(
+            app.text_spam.author_of(10, 11, 109),
+            Some(42),
+            "omitting content must preserve an admitted message",
+        );
+        observe_create(&message(110, 12, 42, &valid, 0, &[]));
+        observe_create(&message(111, 13, 42, &valid, 0, &[]));
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (stream, _) = listener.accept().await.unwrap();
+            hyper::server::conn::Http::new()
+                .serve_connection(
+                    stream,
+                    hyper::service::service_fn(|req: hyper::Request<hyper::Body>| async {
+                        assert_eq!(req.method(), hyper::Method::POST);
+                        assert_eq!(req.uri().path(), "/api/v10/channels/999/messages");
+                        let body = hyper::body::to_bytes(req.into_body()).await.unwrap();
+                        let report = serde_json::from_slice(&body).unwrap();
+                        let text = crate::logging::tests::log_text(&report);
+                        assert!(text.contains("Repeated text test") && text.contains("log only"), "{text}");
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .header("connection", "close")
+                                .body(hyper::Body::from(r#"{"id":"1","channel_id":"999","author":{"id":"44","username":"fixture"},"content":"","timestamp":"2026-01-01T00:00:00Z","tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#))
+                                .unwrap(),
+                        )
+                    }),
+                )
+                .await
+                .unwrap();
+        })
+        .await
+        .expect("eligible text from three channels must produce a dry-run log");
+        drop(app);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     fn policy() -> Policy {
         Policy {
             mode: "exact_text".into(),
