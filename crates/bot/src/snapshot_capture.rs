@@ -4069,6 +4069,10 @@ mod tests {
         let later = now + 60_000;
         let before_expiry = recent.get((789, 456, 1), &scope, later - 1).unwrap();
         assert_eq!(before_expiry.fields.content.as_deref(), Some("late edit"));
+        assert!(
+            recent.get((789, 456, 1), &scope, later).is_none(),
+            "expired row still readable before trimming"
+        );
         recent.observe(&scope, &observation(2, later, "new"), true, later);
         assert!(
             recent.take((789, 456, 1), &scope, later).is_none(),
