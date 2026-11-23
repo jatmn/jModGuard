@@ -2011,11 +2011,10 @@ impl BotState {
         self.configs.invalidate();
     }
 
-    /// Loads durable `config_version` from the DB. When it differs from the
-    /// last observation (primed at startup), invalidates the guild config cache.
-    /// Returns `true` when a change triggered invalidation.
+    /// Loads durable `config_version` and invalidates the config cache on change.
+    /// On-demand moderation checks defer immediately if the version peek fails.
     pub async fn poll_config_version(&self) -> Result<bool> {
-        Ok(self.poll_versions(false).await?.0)
+        Ok(self.check_versions(false).await?.0)
     }
 
     /// Loads the pending slash version without acknowledging Discord sync.
@@ -2023,14 +2022,31 @@ impl BotState {
         if self.slash_unauthorized.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        Ok(self.poll_versions(true).await?.1)
+        Ok(self.check_versions(true).await?.1)
     }
 
-    /// One observation for both periodic pollers. An observed slash change
-    /// stays pending until the separate Discord reconciliation succeeds.
-    pub async fn poll_versions(&self, check_slash: bool) -> Result<(bool, Option<u64>)> {
+    async fn check_versions(&self, check_slash: bool) -> Result<(bool, Option<u64>)> {
         let _version_reconcile = self.version_reconcile_lock.lock().await;
         let remote = db::get_version_state(&self.db).await?;
+        self.reconcile_version_observation(check_slash, remote)
+            .await
+    }
+
+    /// Scheduled observation for config and slash reconciliation.
+    pub async fn poll_versions(&self, check_slash: bool) -> Result<(bool, Option<u64>)> {
+        // The initial read can spend a second deadline on the primary. Keep
+        // that outage check off the lock used by on-demand moderation.
+        let remote = db::poll_version_state(&self.db).await?;
+        let _version_reconcile = self.version_reconcile_lock.lock().await;
+        self.reconcile_version_observation(check_slash, remote)
+            .await
+    }
+
+    async fn reconcile_version_observation(
+        &self,
+        check_slash: bool,
+        remote: db::VersionState,
+    ) -> Result<(bool, Option<u64>)> {
         let previous_config = self.last_config_version.load(Ordering::SeqCst);
         let floor = self.db.required_config_version();
         let check_slash = check_slash && !self.slash_unauthorized.load(Ordering::SeqCst);

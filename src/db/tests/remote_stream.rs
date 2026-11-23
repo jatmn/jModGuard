@@ -1454,39 +1454,52 @@ async fn version_poll_confirms_primary_health_after_ambiguous_read_failure() {
     fixture.state.lock().unwrap().backing = Some((runtime, backing));
     let db = fixture.db_with_operation_timeout(Duration::from_secs(7));
 
+    fixture.state.lock().unwrap().stall_reads = &[ReadRoute::ReplicaRoutable, ReadRoute::Primary];
+    let error = get_version_state(&db).await.unwrap_err();
+    assert!(
+        error.to_string().contains("begin consistent read"),
+        "{error:#}"
+    );
+    assert!(!is_primary_outage(&error), "{error:#}");
+    assert_eq!(
+        fixture.state.lock().unwrap().read_begins,
+        1,
+        "an on-demand check must return after its first failed read"
+    );
+
     fixture.state.lock().unwrap().stall_reads = &[ReadRoute::ReplicaRoutable];
-    assert_eq!(get_version_state(&db).await.unwrap(), expected);
-    assert_eq!(fixture.state.lock().unwrap().read_begins, 2);
-    assert_eq!(get_primary_versions(&db).await.unwrap(), expected);
+    assert_eq!(poll_version_state(&db).await.unwrap(), expected);
     assert_eq!(fixture.state.lock().unwrap().read_begins, 3);
+    assert_eq!(get_primary_versions(&db).await.unwrap(), expected);
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 4);
 
     // The same fallback applies when a READONLY statement fails after BEGIN.
     fixture.state.lock().unwrap().stall_reads = &[];
     fixture.timeout_next_cursor();
-    assert_eq!(get_version_state(&db).await.unwrap(), expected);
-    assert_eq!(fixture.state.lock().unwrap().read_begins, 5);
+    assert_eq!(poll_version_state(&db).await.unwrap(), expected);
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 6);
 
     // Only the version poll sees this shared-endpoint outage. Its fallback
     // reaches the stalled primary and opens the gate for the next poll.
     fixture.state.lock().unwrap().stall_reads = &[ReadRoute::ReplicaRoutable, ReadRoute::Primary];
-    let error = get_version_state(&db).await.unwrap_err();
+    let error = poll_version_state(&db).await.unwrap_err();
     assert!(is_primary_outage(&error), "{error:#}");
     assert!(
         error.to_string().contains("begin primary snapshot"),
         "{error:#}"
     );
-    assert_eq!(fixture.state.lock().unwrap().read_begins, 7);
-    let error = get_version_state(&db).await.unwrap_err();
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 8);
+    let error = poll_version_state(&db).await.unwrap_err();
     assert!(
         error.to_string().contains("primary is backing off"),
         "{error:#}"
     );
-    assert_eq!(fixture.state.lock().unwrap().read_begins, 7);
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 8);
 
     fixture.state.lock().unwrap().stall_reads = &[];
     tokio::time::advance(Duration::from_secs(5)).await;
-    assert_eq!(get_version_state(&db).await.unwrap(), expected);
-    assert_eq!(fixture.state.lock().unwrap().read_begins, 9);
+    assert_eq!(poll_version_state(&db).await.unwrap(), expected);
+    assert_eq!(fixture.state.lock().unwrap().read_begins, 10);
 
     drop(db);
     drop(fixture);

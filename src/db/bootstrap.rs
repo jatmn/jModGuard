@@ -458,18 +458,21 @@ pub async fn get_slash_registry_version(db: &Db) -> Result<u64> {
         .await
 }
 
+/// A version peek for callers that defer promptly on connection failure.
 pub async fn get_version_state(db: &Db) -> Result<VersionState> {
-    let result = db
-        .with_conn(|conn| {
-            let tx = conn.transaction_consistent_read()?;
-            let state = get_version_state_conn(&tx)?;
-            tx.finish_read()?;
-            Ok(state)
-        })
-        .await;
-    match result {
-        // READONLY can reach the primary when the endpoint has no replica.
-        // Confirm on the primary route before the pool can attribute an outage.
+    db.with_conn(|conn| {
+        let tx = conn.transaction_consistent_read()?;
+        let state = get_version_state_conn(&tx)?;
+        tx.finish_read()?;
+        Ok(state)
+    })
+    .await
+}
+
+/// Scheduled polls confirm ambiguous read failures on the primary so a lone
+/// poll can detect an outage even when the endpoint has no read replica.
+pub async fn poll_version_state(db: &Db) -> Result<VersionState> {
+    match get_version_state(db).await {
         Err(error) if crate::db_compat::replica_read_unavailable(&error) => {
             get_primary_versions(db).await
         }

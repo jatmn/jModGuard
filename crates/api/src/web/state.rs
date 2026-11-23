@@ -278,7 +278,7 @@ impl ApiState {
     /// needed. Preserve the read floor and primary-confirmed rollback behavior.
     pub async fn poll_config_version(&self) -> Result<bool> {
         let mut previous = self.config_observation.lock().await;
-        let remote = db::get_version_state(&self.db).await?;
+        let remote = db::poll_version_state(&self.db).await?;
         if remote.config == previous.version
             && remote.config_revision == previous.revision
             && remote.config >= self.db.required_config_version()
