@@ -10,6 +10,7 @@ import { timeoutBudgets } from "./check-test-flakes.mjs";
 const script = fileURLToPath(new URL("./check-test-flakes.mjs", import.meta.url));
 const allowlist = "tools/test-flake-allowlist.tsv";
 const entry = "clock\tsrc/test.rs\ttests::legacy\t2\t#666\n";
+const compilerSource = "fn first() {}\nfn legacy() {}\nfn unpaused() {}\nfn retrying() {}\n";
 const sample = (duration) => `
 pub async fn production() {
     timeout(Duration::from_secs(90), x()).await;
@@ -51,7 +52,8 @@ function fixture(t) {
     git("init", "-q");
     write(allowlist, entry);
     write("src/service.rs", sample("1_000"));
-    write("src/test.rs", "fn first() {}\nfn legacy() {}\nfn unpaused() {}\n");
+    write("src/test.rs", compilerSource);
+    write("scripts/frontend-budget-test.mjs", 'test("frontend", { timeout: 1_000 }, run);\n');
     git("add", ".");
     git("-c", "user.name=Fixture", "-c", "user.email=fixture", "commit", "-qm", "base");
     git("update-ref", "refs/remotes/origin/main", "HEAD");
@@ -77,6 +79,26 @@ test("a shorter test budget and allowlist and ordinary production budget changes
     write(allowlist, entry.replace("\t2\t", "\t1\t"));
     const result = run("contracts");
     assert.equal(result.status, 0, result.stderr);
+});
+
+test("the contracts gate rejects a frontend budget increase", (t) => {
+    const { write, run } = fixture(t);
+    write("scripts/frontend-budget-test.mjs", 'test("frontend", { timeout: 1_001 }, run);\n');
+    const result = run("contracts");
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /^scripts\/frontend-budget-test\.mjs:1: timeout increased;/m);
+});
+
+test("the contracts gate rejects nonzero nextest retries in a workflow", (t) => {
+    const { write, run } = fixture(t);
+    const path = ".github/workflows/test.yml";
+    write(path, "jobs:\n  check:\n    steps:\n      - run: cargo nextest run --retries 0\n");
+    const disabled = run("contracts");
+    assert.equal(disabled.status, 0, disabled.stderr);
+    write(path, "jobs:\n  check:\n    steps:\n      - run: cargo nextest run --retries 2\n");
+    const enabled = run("contracts");
+    assert.equal(enabled.status, 1, enabled.stderr);
+    assert.match(enabled.stderr, /^\.github\/workflows\/test\.yml:4: nextest retries mask test failures$/m);
 });
 
 test("a verified GitHub merge checkout uses its main parent even with a stale event base", (t) => {
@@ -144,32 +166,39 @@ test("the contracts gate finishes on a long malformed Rust attribute run", (t) =
     assert.match(result.stderr, /timeout increased/);
 });
 
-test("the compiler gate requires a matching base diagnostic for unchanged findings", (t) => {
+test("the compiler gate requires a matching base diagnostic and always rejects unlisted retries", (t) => {
     const { cwd, write, run } = fixture(t);
-    write("src/test.rs", "\nfn first() {}\nfn legacy() {}\nfn unpaused() {}\nfn added() {}\n");
-    const record = (line, name) => JSON.stringify({
+    write("src/test.rs", "\n" + compilerSource + "fn added() {}\n");
+    const clock = (name) => `clock in test ${name}: use an injected or paused clock (tokio::time::Instant::now)`;
+    const retry = "retry in test retrying: do not mask assertion failures";
+    const record = (line, message) => JSON.stringify({
         reason: "compiler-message",
         message: {
             code: { code: "test_flake" },
-            message: `clock in test ${name}: use an injected or paused clock (tokio::time::Instant::now)`,
+            message,
             spans: [{ file_name: "src/test.rs", is_primary: true, column_start: 1, line_start: line, line_end: line }],
         },
     });
     write("bin/cargo", `#!/usr/bin/env node
 const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
-assert.equal(readFileSync("src/test.rs", "utf8"), ${JSON.stringify("fn first() {}\nfn legacy() {}\nfn unpaused() {}\n")});
+assert.equal(readFileSync("src/test.rs", "utf8"), ${JSON.stringify(compilerSource)});
 assert.deepEqual(process.argv.slice(-2), ["-p", "fixture"]);
-console.log(${JSON.stringify(record(1, "first"))});
+console.log(${JSON.stringify(record(1, clock("first")))});
+console.log(${JSON.stringify(record(4, retry))});
 `);
     chmodSync(join(cwd, "bin/cargo"), 0o755);
     const result = run("rust", {
-        input: [record(2, "first"), record(3, "tests::legacy"), record(4, "unpaused"), record(5, "added")].join("\n"),
+        input: [
+            record(2, clock("first")), record(3, clock("tests::legacy")), record(4, clock("unpaused")),
+            record(5, retry), record(6, clock("added")),
+        ].join("\n"),
         env: { PATH: `${join(cwd, "bin")}:${process.env.PATH}` },
     }, "test-flake-fixture.so", "-p", "fixture");
     assert.equal(result.status, 1, result.stderr);
     assert.match(result.stderr, /Inherited test flake: .*src\/test.rs:2:1: clock in test first/);
     assert.match(result.stderr, /^src\/test.rs:4:1: clock in test unpaused/m);
-    assert.match(result.stderr, /^src\/test.rs:5:1: clock in test added/m);
+    assert.match(result.stderr, /^src\/test.rs:5:1: retry in test retrying/m);
+    assert.match(result.stderr, /^src\/test.rs:6:1: clock in test added/m);
     assert.doesNotMatch(result.stderr, /tests::legacy/);
 });

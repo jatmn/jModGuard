@@ -1558,6 +1558,10 @@ unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR JMODGUARD_DEFER_PROMOT
 # Historical WebUI sources without an independent package must skip signing cleanly.
 reload_publisher
 mock_publish_helpers
+registry_inspect() {
+  printf 'registry inspect %s\n' "$*" >>"$TRACE_FILE"
+  return 1
+}
 legacy_webui_dir="$(mktemp -d "${TMPDIR:-/tmp}/publish-webui-legacy-XXXXXX")"
 JMODGUARD_PUBLISH_STATE_DIR="$legacy_webui_dir"
 export JMODGUARD_PUBLISH_STATE_DIR
@@ -1587,6 +1591,8 @@ export GHCR_USERNAME GHCR_TOKEN GITHUB_TOKEN PLAN_JSON
 output="$(publish_component webui 2>&1)" || fail 'legacy WebUI build must skip cleanly'
 [[ "$output" == *'predates the independent WebUI package'* ]] \
   || fail "unexpected legacy WebUI build message: $output"
+grep -Fxq 'registry inspect ghcr.io/jatmn/jmodguard-webui:latest --format {{json .Image}}' "$TRACE_FILE" \
+  || fail 'legacy WebUI build must handle a missing latest image'
 [[ -f "$legacy_webui_dir/handoff.json" ]] || fail 'legacy WebUI skip must write handoff metadata'
 HANDOFF_JSON="$(cat "$legacy_webui_dir/handoff.json")"
 HANDOFF_JSON="$HANDOFF_JSON" node --input-type=commonjs -e \
@@ -2053,29 +2059,43 @@ reload_publisher
 SIGNING_PUBLIC_KEY="$TEST_SIGNING_PUBLIC_KEY"
 export SIGNING_PUBLIC_KEY
 signature_skip_image='ghcr.io/jatmn/jmodguard-api'
+signature_digest_trace="$PUBLISH_TEST_TRACE_DIR/signature-digest.log"
 inspect_digest() {
+  printf '%s\n' "$1" >>"$signature_digest_trace"
   [[ "$1" == "${signature_skip_image}:latest" ]] && printf '%s\t' "$MOCK_BUILD_DIGEST"
 }
 image_published_at() { printf '%s' '2026-10-01T00:00:00Z'; }
-not_after_from_published_at() { printf '%s' '2027-12-31T00:00:00Z'; }
+not_after_from_published_at() { printf '%s' '9999-12-31T00:00:00Z'; }
+verify_args="$PUBLISH_TEST_TRACE_DIR/signature-verify.args"
+expected_verify_args="$PUBLISH_TEST_TRACE_DIR/expected-signature-verify.args"
+printf '%s\0' verify --key "$TEST_SIGNING_PUBLIC_KEY" "${signature_skip_image}@${MOCK_BUILD_DIGEST}" >"$expected_verify_args"
+cosign_verify_status=1
+cosign() {
+  printf '%s\0' "$@" >>"$verify_args"
+  return "$cosign_verify_status"
+}
+: >"$verify_args"
 published_signature_still_valid "$signature_skip_image" \
-  && fail 'unsigned registry image must fail signature revalidation with cosign available'
-cosign() { printf 'cosign %s\n' "$*" >"$COSIGN_TRACE"; }
+  && fail 'rejected signature must prevent the unchanged-image skip'
+cmp -s "$verify_args" "$expected_verify_args" \
+  || fail 'rejected verification must receive verify, --key, the key path, and the image digest as separate arguments'
+cosign_verify_status=0
+: >"$verify_args"
 published_signature_still_valid "$signature_skip_image" \
   || fail 'a verified unexpired signature must allow the unchanged-image skip'
-grep -Fq 'cosign verify' "$COSIGN_TRACE" || fail 'signature revalidation must invoke cosign verify'
-grep -Fq -- '--insecure-ignore-tlog' "$COSIGN_TRACE" \
-  && fail 'signature revalidation must check the Rekor transparency log entry'
+cmp -s "$verify_args" "$expected_verify_args" \
+  || fail 'successful verification must receive verify, --key, the key path, and the image digest as separate arguments'
 unset -f cosign
 missing_cosign_path="$(mktemp -d "${TMPDIR:-/tmp}/publish-no-cosign-XXXXXX")"
+ln -s "$(type -P cut)" "$missing_cosign_path/cut"
+: >"$signature_digest_trace"
 if (
-  export SIGNING_PUBLIC_KEY="$TEST_SIGNING_PUBLIC_KEY"
   PATH="$missing_cosign_path"
-  JMODGUARD_PUBLISH_IMAGE_LIB=1 source "$root/scripts/publish-image.sh"
   published_signature_still_valid "$signature_skip_image"
 ); then
   fail 'missing cosign must fail closed instead of skipping signature revalidation'
 fi
+[[ ! -s "$signature_digest_trace" ]] || fail 'missing cosign must refuse before inspecting the image'
 rm -rf "$missing_cosign_path"
 
 cleanup_test_signing
