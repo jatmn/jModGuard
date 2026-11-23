@@ -2458,6 +2458,52 @@ mod tests {
     }
 
     #[test]
+    fn default_badword_ladder_escalates_on_distinct_matches() {
+        let mut cfg = default_automod_config();
+        cfg.regexes = vec![jmodguard::normalize::compile_user_regex("scam").unwrap()];
+        let engine = AutomodEngine::new();
+        let mut message = msg(1, "scam", 0, false, false);
+        for (strike, expected) in [
+            (1, Some(("badword", "delete", 0, 1))),
+            (2, Some(("badword", "warn", 0, 2))),
+            (3, None),
+            (4, Some(("badword", "timeout", 60, 4))),
+        ] {
+            message.message_id = strike;
+            let action = engine.evaluate(&cfg, &message);
+            let actual = action.as_ref().map(|action| {
+                (
+                    action.rule_id.as_str(),
+                    action.action.action.as_str(),
+                    action.action.duration_minutes,
+                    action.strikes,
+                )
+            });
+            assert_eq!(actual, expected, "badword match {strike}");
+        }
+    }
+
+    #[test]
+    fn stronger_live_action_wins_in_either_rule_order() {
+        let mut cfg = default_automod_config();
+        cfg.regexes = vec![jmodguard::normalize::compile_user_regex("scam").unwrap()];
+        let message = msg(1, "scam https://discord.gg/test", 0, false, false);
+
+        // Badword is visited first. Keep both rules live and move the ban
+        // between them so choosing the first or last match cannot pass.
+        for (stronger, weaker) in [("invite", "badword"), ("badword", "invite")] {
+            cfg.rules.get_mut(weaker).unwrap().actions[0].action = "delete".into();
+            cfg.rules.get_mut(stronger).unwrap().actions[0].action = "ban".into();
+            let action = AutomodEngine::new()
+                .evaluate(&cfg, &message)
+                .expect("both live rules match");
+            assert_eq!(action.rule_id, stronger);
+            assert_eq!(action.action.action, "ban");
+            assert!(!action.dry_run);
+        }
+    }
+
+    #[test]
     fn builtin_legacy_windows_clamp_to_retained_history() {
         assert_legacy_windows(&[(0, 500, true), (0, 2000, false)]);
     }

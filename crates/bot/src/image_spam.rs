@@ -2745,6 +2745,49 @@ mod tests {
         assert!(admit(d, 11, 101, at).is_none());
         admit(d, 12, 102, at).unwrap()
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn metadata_claim_enforces_both_windows_after_admission() {
+        let start = tokio::time::Instant::now().into_std();
+        for (window_secs, elapsed_secs, expected) in
+            [(5, 4, true), (5, 5, false), (60, 9, true), (60, 10, false)]
+        {
+            let policy = Policy {
+                window_secs,
+                ..policy()
+            };
+            let detector = Detector::new(Limits::default()).unwrap();
+            let admitted_at = start + Duration::from_secs(2);
+            for (id, channel, at) in [(10, 100, start), (11, 101, admitted_at)] {
+                let mut message = post(id, channel, at, &[1, 2]);
+                message.hashes = None;
+                message.metadata.push(ImageMetadata {
+                    size: 3,
+                    filename: "image.png".into(),
+                    media_type: "image/png".into(),
+                });
+                assert!(matches!(
+                    detector.admit(1, 2, message, (0, 0), &policy, admitted_at, false),
+                    AdmitOutcome::Admitted
+                ));
+            }
+            // Both observations were within the rule window at admission.
+            let claimed = detector.claim_metadata_match(
+                1,
+                2,
+                (101, 11),
+                (0, 0),
+                &policy,
+                start + Duration::from_secs(elapsed_secs),
+            );
+            assert_eq!(
+                claimed.is_some(),
+                expected,
+                "rule window {window_secs}s, first post age {elapsed_secs}s"
+            );
+        }
+    }
+
     fn evidence(messages: &[(u64, u64)], author: u64, values: &[u8]) -> Vec<TextEvidence> {
         let hashes: BTreeSet<Hash> = values.iter().map(|value| [*value; 32]).collect();
         let text = format_hashes(&hashes.into_iter().collect::<Vec<_>>());
