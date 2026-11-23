@@ -1680,11 +1680,11 @@ assert_eq "$PROD_SIGNING_FINGERPRINT" "d36f7ae0529b99c64f662c319855648309c7e0d6f
   || fail 'deploy/update-signing.pub fingerprint changed unexpectedly'
 
 reload_publisher
-COSIGN_TRACE="$PUBLISH_TEST_TRACE_DIR/cosign-commands.log"
+COSIGN_TRACE="$PUBLISH_TEST_TRACE_DIR/cosign-commands.args"
 : >"$COSIGN_TRACE"
 run_cosign() {
-  printf 'cosign %s\n' "$*" >>"$COSIGN_TRACE"
-  return 0
+  # Prefix each call with its argument count to retain command boundaries too.
+  printf '%s\0' "$#" "$@" >>"$COSIGN_TRACE"
 }
 run_docker() {
   if [[ "$1 $2" == 'buildx imagetools' ]]; then
@@ -1707,25 +1707,16 @@ persist_signing_secrets_to_files "$PROD_SIGN_SCRATCH"
 assert_signing_secrets_not_in_environ
 PROD_SIGN_KEY_FILE="${PROD_SIGN_SCRATCH}/signing.key"
 sign_published_digest bot "$PROD_SIGN_IMAGE" "$PROD_SIGN_DIGEST"
-grep -Fq 'cosign sign --yes' "$COSIGN_TRACE" || fail 'production signing must pass --yes to cosign sign'
-grep -Fq "${PROD_SIGN_IMAGE}@${PROD_SIGN_DIGEST}" "$COSIGN_TRACE" || fail 'production signing must target the verified digest reference'
-grep -Fq "cosign sign --yes --key ${PROD_SIGN_KEY_FILE}" "$COSIGN_TRACE" \
-  || fail 'production signing must use a key file'
 rm -rf "$PROD_SIGN_SCRATCH"
-grep -Fq 'env://JMODGUARD_UPDATE_SIGNING_KEY' "$COSIGN_TRACE" \
-  && fail 'production signing must not pass the private key through the environment'
-grep -Fq -- '--annotation' "$COSIGN_TRACE" && fail 'cosign sign must use -a/--annotations, not --annotation'
-grep -Fq -- ' -a io.jmodguard.not-after=2027-10-28T17:00:00Z ' "$COSIGN_TRACE" \
-  || fail 'cosign sign must set the expiry annotation to 366 days after publication'
-grep -Fq 'cosign verify' "$COSIGN_TRACE" || fail 'production signing must invoke cosign verify'
-grep -Fq -- '--tlog-upload=false' "$COSIGN_TRACE" \
-  && fail 'production signing must upload signatures to the Rekor transparency log'
-grep -Fq -- '--insecure-ignore-tlog' "$COSIGN_TRACE" \
-  && fail 'production verification must check the Rekor transparency log entry'
-grep -Fq -- "--key ${SIGNING_PUBLIC_KEY}" "$COSIGN_TRACE" \
-  || grep -Fq -- "--key $root/deploy/update-signing.pub" "$COSIGN_TRACE" \
-  || fail 'production verification must use the committed cosign public key'
-grep -Fq "${PROD_SIGN_IMAGE}@${PROD_SIGN_DIGEST}" "$COSIGN_TRACE" || fail 'production verification must target the verified digest reference'
+PROD_SIGN_REF="${PROD_SIGN_IMAGE}@${PROD_SIGN_DIGEST}"
+expected_sign_argv=(sign --yes --key "$PROD_SIGN_KEY_FILE"
+  -a 'io.jmodguard.not-after=2027-10-28T17:00:00Z' "$PROD_SIGN_REF")
+expected_verify_argv=(verify --key "$TEST_SIGNING_PUBLIC_KEY" "$PROD_SIGN_REF")
+expected_cosign_trace="$PUBLISH_TEST_TRACE_DIR/expected-cosign-commands.args"
+printf '%s\0' "${#expected_sign_argv[@]}" "${expected_sign_argv[@]}" \
+  "${#expected_verify_argv[@]}" "${expected_verify_argv[@]}" >"$expected_cosign_trace"
+cmp -s "$COSIGN_TRACE" "$expected_cosign_trace" \
+  || fail 'production signing must pass the expected separate arguments to cosign sign and verify'
 _JMG_SIGNING_KEY=""
 _JMG_SIGNING_PASSWORD=""
 
