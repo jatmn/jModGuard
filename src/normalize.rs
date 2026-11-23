@@ -289,6 +289,22 @@ mod tests {
             "unexpected: {err}"
         );
     }
+
+    #[test]
+    fn compile_user_regex_enforces_project_size_limit() {
+        let pattern = r"\w{4}";
+        regex::Regex::new(pattern).expect("pattern fits the default size limit");
+        let err = compile_user_regex(pattern).unwrap_err();
+        assert!(err.contains("size limit"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn compile_user_regex_enforces_project_nesting_limit() {
+        let pattern = format!("{}a{}", "(".repeat(60), ")".repeat(60));
+        regex::Regex::new(&pattern).expect("pattern fits the default nesting limit");
+        let err = compile_user_regex(&pattern).unwrap_err();
+        assert!(err.contains("nested"), "unexpected: {err}");
+    }
 }
 
 #[cfg(test)]

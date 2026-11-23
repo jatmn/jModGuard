@@ -1694,7 +1694,7 @@ mod tests {
     }
 
     #[test]
-    fn public_bind_rejects_localhost_oauth_origin() {
+    fn public_bind_requires_non_loopback_https_origin() {
         let mut cfg = Config::default();
         cfg.web.bind = "0.0.0.0:8080".into();
         cfg.web.base_url = "http://localhost:8080".into();
@@ -1707,6 +1707,13 @@ mod tests {
         cfg.web.base_url = "https://jmodguard.example.b-cdn.net".into();
         cfg.validate_public_base_url().unwrap();
 
+        cfg.web.base_url = "http://dashboard.example.com".into();
+        let err = cfg.validate_public_base_url().unwrap_err();
+        assert!(
+            err.to_string().contains("web.base_url must be https"),
+            "unexpected: {err:#}"
+        );
+
         for origin in ["https://127.0.0.2", "https://[::]", "https://localhost."] {
             cfg.web.base_url = origin.into();
             assert!(
@@ -1718,6 +1725,61 @@ mod tests {
         cfg.web.bind = "127.0.0.1:8080".into();
         cfg.web.base_url = "http://localhost:8080".into();
         cfg.validate_public_base_url().unwrap();
+    }
+
+    #[test]
+    fn api_loader_requires_https_for_public_bind() {
+        const CHILD: &str = "JMODGUARD_TEST_PUBLIC_BIND_CHILD";
+        const TEST_NAME: &str = "config::tests::api_loader_requires_https_for_public_bind";
+        const CHECKED_LOADERS: &str = "checked API and bot config loaders";
+        if std::env::var_os(CHILD).is_some() {
+            let Err(err) = super::ApiProcessConfig::load() else {
+                panic!("API accepted a public HTTP origin");
+            };
+            assert!(
+                err.to_string().contains("web.base_url must be https"),
+                "unexpected: {err:#}"
+            );
+            assert_eq!(
+                super::BotProcessConfig::load().unwrap().bot.default_prefix,
+                "?"
+            );
+            println!("{CHECKED_LOADERS}");
+            return;
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard-config-{:032x}.toml",
+            rand::random::<u128>()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+            [web]
+            bind = "0.0.0.0:8080"
+            base_url = "http://dashboard.example.com"
+
+            [bot]
+            default_prefix = "?"
+            "#,
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env_clear()
+            .env(CHILD, "1")
+            .env("JMODGUARD_CONFIG", &path)
+            .output();
+        std::fs::remove_file(&path).unwrap();
+
+        let output = output.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(CHECKED_LOADERS),
+            "{}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[test]
