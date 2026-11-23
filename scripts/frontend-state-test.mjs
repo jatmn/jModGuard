@@ -3398,6 +3398,23 @@ test('drafts survive retries only within the captured bot membership', async () 
   }
 });
 
+test('configuration reload discards live template drafts for a replacement membership', async () => {
+  const h = templateDraftHarness();
+  const draft = h.document.querySelectorAll('textarea')[1];
+  draft.value = 'Old draft';
+  await fire(draft, 'input');
+  assert.equal(h.app.isDirty(), true);
+
+  h.recover('replacement');
+  assert.equal(await h.app.loadConfig(), true);
+  await settle();
+
+  assert.equal(h.app.state.config.enrollment_id, 'replacement');
+  assert.equal(h.app.isDirty(), false);
+  assert.equal(h.document.querySelectorAll('textarea')[1].value, 'Saved leave');
+  assert.match(h.nodes.get('#toast').textContent, /Bot membership changed/);
+});
+
 test('an async action cannot restore drafts into a replacement membership', async () => {
   const h = templateDraftHarness();
   const input = h.document.querySelectorAll('textarea')[1];
@@ -5319,6 +5336,25 @@ test('loadConfig reads guild config with POST', async () => {
   });
   await app.loadConfig();
   assert.deepEqual(calls[0], { url: `/api/guilds/${app.state.guildId}/config`, method: 'POST' });
+});
+
+test('cross-origin dashboard config loads and saves use credentialed fetches', async () => {
+  const calls = [];
+  const h = harness(async (url, { method, credentials }) => {
+    calls.push({ url, method, credentials });
+    return response({ enrollment_id: 'membership', settings: { prefix: '!' } });
+  });
+  h.window.JMODGUARD_API_BASE = 'https://api.example.test';
+  const path = `/api/guilds/${h.app.state.guildId}`;
+
+  assert.equal(await h.app.loadConfig(), true);
+  await h.app.api(`${path}/settings`, 'PUT', { prefix: '?' });
+
+  assert.deepEqual(calls.map(({ url, method }) => `${method} ${url}`), [
+    `POST https://api.example.test${path}/config`,
+    `PUT https://api.example.test${path}/settings`,
+  ]);
+  assert.deepEqual(calls.map(({ credentials }) => credentials), ['include', 'include']);
 });
 
 test('signed-out landing footer links to public policies on the page origin', async () => {
