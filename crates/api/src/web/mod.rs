@@ -2601,14 +2601,39 @@ mod tests {
     }
 
     fn test_app_with_config(cfg: crate::config::ApiProcessConfig) -> Arc<ApiState> {
+        test_app_with_oauth_calls(cfg).0
+    }
+
+    /// Router tests never reach discord.com: every OAuth endpoint points at a
+    /// loopback listener that counts each connection and closes it.
+    fn test_app_with_oauth_calls(
+        cfg: crate::config::ApiProcessConfig,
+    ) -> (Arc<ApiState>, Arc<std::sync::atomic::AtomicUsize>) {
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let tmp =
             std::env::temp_dir().join(format!("jmodguard_web_{}_{}.db", std::process::id(), n));
         let db = crate::db::Db::open(&tmp, 2).unwrap();
-        let app = crate::web::state::ApiState::new(cfg, db).unwrap();
+        let mut app = crate::web::state::ApiState::new(cfg, db).unwrap();
         std::fs::remove_file(&tmp).ok();
         crate::tenant::remove_sidecars(&tmp);
-        app
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        tokio::spawn(async move {
+            while let Ok((connection, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(connection);
+            }
+        });
+        let oauth = Arc::get_mut(&mut Arc::get_mut(&mut app).unwrap().oauth).unwrap();
+        oauth.token_endpoint = Some(format!("{base}/token"));
+        oauth.me_endpoint = Some(format!("{base}/me"));
+        oauth.guilds_endpoint = Some(format!("{base}/guilds"));
+        oauth.member_endpoint = Some(format!("{base}/members"));
+        (app, calls)
     }
 
     #[tokio::test]
@@ -3535,11 +3560,17 @@ mod tests {
             if let Some(cookie) = &cookie {
                 request = request.header(COOKIE, cookie);
             }
-            let res = test_app()
+            let (app, oauth_calls) = test_app_with_oauth_calls(Default::default());
+            let res = router(app)
                 .oneshot(request.body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{uri} {cookie:?}");
+            assert_eq!(
+                oauth_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{uri} {cookie:?}: a rejected callback must not attempt a token exchange"
+            );
             let cookies: Vec<String> = res
                 .headers()
                 .get_all(SET_COOKIE)
@@ -3565,8 +3596,8 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_callback_matching_cookie_passes_csrf() {
-        let app = test_app();
-        let res = app
+        let (app, oauth_calls) = test_app_with_oauth_calls(Default::default());
+        let res = router(app)
             .oneshot(
                 Request::builder()
                     .uri("/oauth/callback?code=fake&state=deadbeef")
@@ -3595,6 +3626,7 @@ mod tests {
             text.contains("token exchange failed"),
             "must reach Discord exchange after CSRF: {text}"
         );
+        assert_eq!(oauth_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(
             cookies.iter().any(|cookie| {
                 cookie.contains(COOKIE_OAUTH_STATE) && cookie.contains("Max-Age=0")
