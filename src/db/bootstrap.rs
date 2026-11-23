@@ -458,6 +458,7 @@ pub async fn get_slash_registry_version(db: &Db) -> Result<u64> {
         .await
 }
 
+/// A version peek for callers that defer promptly on connection failure.
 pub async fn get_version_state(db: &Db) -> Result<VersionState> {
     db.with_conn(|conn| {
         let tx = conn.transaction_consistent_read()?;
@@ -466,6 +467,17 @@ pub async fn get_version_state(db: &Db) -> Result<VersionState> {
         Ok(state)
     })
     .await
+}
+
+/// Scheduled polls confirm ambiguous read failures on the primary so a lone
+/// poll can detect an outage even when the endpoint has no read replica.
+pub async fn poll_version_state(db: &Db) -> Result<VersionState> {
+    match get_version_state(db).await {
+        Err(error) if crate::db_compat::replica_read_unavailable(&error) => {
+            get_primary_versions(db).await
+        }
+        result => result,
+    }
 }
 
 /// Reads both invalidation counters from a deferred primary snapshot. The
@@ -701,7 +713,7 @@ pub async fn claim_active_bot(
     let instance = instance.to_owned();
     let armed = instance.clone();
     let generation = db
-        .with_conn(move |conn| {
+        .with_ungated_conn(move |conn| {
             // This transaction writes the lease row. It must commit even when a
             // previous owner is still armed on the pool.
             conn.set_expected_lease_owner(None);
@@ -826,7 +838,7 @@ pub async fn renew_active_bot(
 pub async fn release_active_bot(db: &Db, instance: &str) -> Result<()> {
     anyhow::ensure!(valid_bot_instance(instance), "invalid active-bot instance");
     let instance = instance.to_owned();
-    db.with_conn(move |conn| {
+    db.with_ungated_conn(move |conn| {
         // The delete removes the row this commit would re-read. Ownership is
         // checked below; the pool stays armed so later commits fail.
         conn.set_expected_lease_owner(None);

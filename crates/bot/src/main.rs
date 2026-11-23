@@ -1,6 +1,7 @@
 //! jModGuard Discord bot process (gateway only — health listener optional).
 
 use anyhow::{Context as _, Result};
+use jmodguard::idle_poll::IdlePoll;
 use jmodguard_bot::config::BotProcessConfig;
 use jmodguard_bot::handlers::Handler;
 use jmodguard_bot::logging;
@@ -86,8 +87,55 @@ async fn drain_nickname_reconciles(
                 }
             }
         }
-        Err(error) => {
+        Err(error) if !db::is_primary_outage(&error) => {
             tracing::warn!("failed to load pending nickname reconciliations: {error:#}")
+        }
+        Err(_) => {}
+    }
+}
+
+/// Reconcile only the guilds still pending for this registry version.
+async fn reconcile_slash_registry(
+    app: Arc<BotState>,
+    cache: Arc<serenity::cache::Cache>,
+    http: Arc<serenity::http::Http>,
+    remote: u64,
+) {
+    let cached: Vec<u64> = cache.guilds().into_iter().map(|g| g.get()).collect();
+    match app.plan_slash_resync(remote, &cached) {
+        jmodguard_bot::state::SlashResyncPlan::Defer => {
+            tracing::debug!("slash re-sync deferred: guild cache empty (will retry)");
+        }
+        jmodguard_bot::state::SlashResyncPlan::Sync { guilds, invalidate } => {
+            tracing::debug!(
+                "slash registry reconciliation pending ({} guild(s))",
+                guilds.len()
+            );
+            if invalidate {
+                app.invalidate_configs();
+            }
+            let mut failed = std::collections::HashSet::new();
+            for gid in guilds {
+                if !jmodguard_bot::commands::sync_slash_commands_versioned_http(
+                    &app,
+                    (&cache, http.as_ref()),
+                    serenity::model::id::GuildId::new(gid),
+                    remote,
+                )
+                .await
+                {
+                    failed.insert(gid);
+                }
+            }
+            let failed_n = failed.len();
+            if app.finish_slash_resync(remote, failed) {
+                tracing::info!(remote, "slash registry reconciliation committed");
+            } else {
+                tracing::debug!(
+                    "slash re-sync pending ({failed_n} guild(s)); \
+                     waiting for retry deadlines or registry/membership changes"
+                );
+            }
         }
     }
 }
@@ -295,11 +343,13 @@ async fn main() -> Result<()> {
     app.install_discord_cache(Arc::clone(&cache));
     app.install_http_member_lookup(Arc::clone(&http));
 
+    let poll_start = tokio::time::Instant::now();
     tokio::spawn(jmodguard_bot::access_marks::run(Arc::clone(&app)));
     tokio::spawn(jmodguard_bot::resources::run(
         Arc::clone(&app),
         client.shard_manager.clone(),
         Arc::clone(&cache),
+        poll_start,
     ));
 
     // One process-wide importer shares its Discord request budget across all
@@ -320,9 +370,10 @@ async fn main() -> Result<()> {
             std::time::Instant::now(),
         )?;
         tokio::spawn(async move {
-            let mut tick =
-                tokio::time::interval(Duration::from_secs(u64::from(app.cfg.enrollment.poll_secs)));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut tick = IdlePoll::Enrollment.interval(
+                poll_start,
+                Duration::from_secs(u64::from(app.cfg.enrollment.poll_secs)),
+            );
             loop {
                 tokio::select! { _ = shutdown_signal() => break, _ = tick.tick() => {} }
                 if !app.activation.may_record() {
@@ -343,7 +394,9 @@ async fn main() -> Result<()> {
                         checked = report.checked,
                         "membership repair incomplete; failed guilds will be revisited next sweep"
                     ),
-                    Err(error) => tracing::warn!("membership discovery deferred: {error:#}"),
+                    Err(error) if !db::is_primary_outage(&error) => {
+                        tracing::warn!("membership discovery deferred: {error:#}")
+                    }
                     _ => {}
                 }
             }
@@ -356,13 +409,13 @@ async fn main() -> Result<()> {
         let http = Arc::clone(&http);
         let cache = Arc::clone(&cache);
         tokio::spawn(async move {
-            let mut poll = tokio::time::interval(Duration::from_secs(u64::from(
-                app.cfg.action_worker.poll_secs,
-            )));
+            let mut poll = IdlePoll::Actions.interval(
+                poll_start,
+                Duration::from_secs(u64::from(app.cfg.action_worker.poll_secs)),
+            );
             let mut cleanup = tokio::time::interval(Duration::from_secs(u64::from(
                 app.cfg.action_worker.cleanup_interval_secs,
             )));
-            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
@@ -384,7 +437,11 @@ async fn main() -> Result<()> {
                         tokio::select! {
                             _ = shutdown_signal() => break,
                             result = jmodguard_bot::action_worker::drain_with_state(&app, &discord, &app.cfg.action_worker.limits) => {
-                                if let Err(error) = result { tracing::warn!("bot action queue unavailable: {error:#}"); }
+                                if let Err(error) = result
+                                    && !db::is_primary_outage(&error)
+                                {
+                                    tracing::warn!("bot action queue unavailable: {error:#}");
+                                }
                             }
                         }
                     }
@@ -392,7 +449,9 @@ async fn main() -> Result<()> {
                         if !app.activation.may_record() {
                             continue;
                         }
-                        if let Err(error) = db::prune_bot_action_history(&app.db, chrono::Utc::now().timestamp(), app.cfg.actions.clone()).await {
+                        if let Err(error) = db::prune_bot_action_history(&app.db, chrono::Utc::now().timestamp(), app.cfg.actions.clone()).await
+                            && !db::is_primary_outage(&error)
+                        {
                             tracing::warn!("bot action history cleanup failed: {error:#}");
                         }
                     }
@@ -423,8 +482,7 @@ async fn main() -> Result<()> {
     {
         let app = Arc::clone(&app);
         tokio::spawn(async move {
-            let mut poll = tokio::time::interval(Duration::from_secs(5));
-            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut poll = IdlePoll::Erasure.interval(poll_start, Duration::from_secs(5));
             loop {
                 tokio::select! {
                     _ = shutdown_signal() => break,
@@ -437,7 +495,9 @@ async fn main() -> Result<()> {
                                 Ok(true) => {}
                                 Ok(false) => break,
                                 Err(error) => {
-                                    tracing::warn!("guild erasure deferred: {error:#}");
+                                    if !db::is_primary_outage(&error) {
+                                        tracing::warn!("guild erasure deferred: {error:#}");
+                                    }
                                     break;
                                 }
                             }
@@ -453,18 +513,21 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let mut cursor = 0;
             let mut history_cursor = 0;
-            let mut poll = tokio::time::interval(Duration::from_secs(5));
-            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut poll = IdlePoll::BanRecovery.interval(poll_start, Duration::from_secs(5));
             loop {
                 tokio::select! {
                     _ = shutdown_signal() => break,
                     _ = poll.tick() => {
                         if app.activation.may_record()
-                            && let Err(error) = jmodguard_bot::gateway_ban_persistence::drain(&app, &mut cursor).await {
+                            && let Err(error) = jmodguard_bot::gateway_ban_persistence::drain(&app, &mut cursor).await
+                            && !db::is_primary_outage(&error)
+                        {
                             tracing::warn!("gateway ban inbox recovery will retry: {error:#}");
                         }
                         if let Some(_hold) = app.activation.hold_control()
-                            && let Err(error) = db::recover_pending_ban_reason_history(&app.db, &app.tenant, &mut history_cursor).await {
+                            && let Err(error) = db::recover_pending_ban_reason_history(&app.db, &app.tenant, &mut history_cursor).await
+                            && !db::is_primary_outage(&error)
+                        {
                             tracing::warn!("ban reason history scan will retry: {error:#}");
                         }
                     }
@@ -481,8 +544,8 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let identity = tokio::sync::OnceCell::new();
             let mut identity_retry = jmodguard_bot::discord::RestRetry::default();
-            let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut interval =
+                IdlePoll::Nicknames.interval(poll_start, Duration::from_secs(poll_secs));
             loop {
                 interval.tick().await;
                 if !app.activation.may_record() {
@@ -496,87 +559,40 @@ async fn main() -> Result<()> {
     }
     {
         let app = Arc::clone(&app);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                match app.poll_config_version().await {
-                    Ok(true) => {
-                        tracing::info!("config_version changed; guild config cache invalidated")
-                    }
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!("config_version poll failed: {e:#}"),
-                }
-            }
-        });
-    }
-    {
-        let app = Arc::clone(&app);
         let http = Arc::clone(&http);
         let cache = Arc::clone(&cache);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut interval =
+                IdlePoll::BotVersions.interval(poll_start, Duration::from_secs(poll_secs));
+            let mut slash_sync = tokio::task::JoinSet::new();
             loop {
                 interval.tick().await;
-                if !app.activation.may_record() {
-                    continue;
+                if let Some(Err(error)) = slash_sync.try_join_next() {
+                    tracing::error!("slash reconciliation task failed: {error}");
                 }
-                // Peek slash registry every tick (not gated on config_version) so a
-                // future slash-only bump cannot be missed. Do not commit the observed
-                // version until Discord re-sync has nothing left to retry — otherwise
-                // a transient set_commands failure left that guild stale until the
-                // next registry write. Retries are per-failed-guild only (not a full
-                // cache sweep) so one bad guild cannot amplify Discord rate limits.
-                match app.pending_slash_registry_version().await {
-                    Ok(Some(remote)) => {
-                        let cached: Vec<u64> =
-                            cache.guilds().into_iter().map(|g| g.get()).collect();
-                        match app.plan_slash_resync(remote, &cached) {
-                            jmodguard_bot::state::SlashResyncPlan::Defer => {
-                                tracing::debug!(
-                                    "slash re-sync deferred: guild cache empty (will retry)"
-                                );
-                            }
-                            jmodguard_bot::state::SlashResyncPlan::Sync { guilds, invalidate } => {
-                                tracing::debug!(
-                                    "slash registry reconciliation pending ({} guild(s))",
-                                    guilds.len()
-                                );
-                                if invalidate {
-                                    app.invalidate_configs();
-                                }
-                                let mut failed = std::collections::HashSet::new();
-                                for gid in guilds {
-                                    if !jmodguard_bot::commands::sync_slash_commands_versioned_http(
-                                        &app,
-                                        (&cache, http.as_ref()),
-                                        serenity::model::id::GuildId::new(gid),
-                                        remote,
-                                    )
-                                    .await
-                                    {
-                                        failed.insert(gid);
-                                    }
-                                }
-                                let failed_n = failed.len();
-                                if app.finish_slash_resync(remote, failed) {
-                                    tracing::info!(
-                                        remote,
-                                        "slash registry reconciliation committed"
-                                    );
-                                } else {
-                                    tracing::debug!(
-                                        "slash re-sync pending ({failed_n} guild(s)); \
-                                         waiting for retry deadlines or registry/membership changes"
-                                    );
-                                }
-                            }
+                let check_slash = slash_sync.is_empty() && app.activation.may_record();
+                match app.poll_versions(check_slash).await {
+                    Ok((config_changed, slash_version)) => {
+                        if config_changed {
+                            tracing::info!(
+                                "config_version changed; guild config cache invalidated"
+                            );
+                        }
+                        if let Some(version) = slash_version
+                            && app.activation.may_record()
+                        {
+                            slash_sync.spawn(reconcile_slash_registry(
+                                Arc::clone(&app),
+                                Arc::clone(&cache),
+                                Arc::clone(&http),
+                                version,
+                            ));
                         }
                     }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!("slash_registry_version poll failed: {e:#}"),
+                    Err(error) if !db::is_primary_outage(&error) => {
+                        tracing::warn!("config and slash version poll failed: {error:#}");
+                    }
+                    Err(_) => {}
                 }
             }
         });

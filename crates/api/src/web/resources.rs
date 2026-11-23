@@ -447,10 +447,10 @@ impl SessionStore for CountedStore {
 }
 
 /// Folds this API's samples into minutes kept for the bot to collect.
-pub async fn run_rollups(log_dir: Option<std::path::PathBuf>) {
+pub async fn run_rollups(log_dir: Option<std::path::PathBuf>, poll_start: tokio::time::Instant) {
     let mut builder = RollupBuilder::default();
-    let mut tick = tokio::time::interval(jmodguard::cgroup::SAMPLE_INTERVAL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tick = jmodguard::idle_poll::IdlePoll::ApiResources
+        .interval(poll_start, jmodguard::cgroup::SAMPLE_INTERVAL);
     loop {
         tokio::select! {
             _ = jmodguard::shutdown_signal() => break,

@@ -1,6 +1,7 @@
 //! jModGuard API / WebUI process (axum only — no Discord gateway).
 
 use anyhow::{Context as _, Result};
+use jmodguard::idle_poll::IdlePoll;
 use jmodguard_api::config::ApiProcessConfig;
 use jmodguard_api::{health, init_tracing, shutdown_signal, web};
 use jmodguard_updater::oci::Registry;
@@ -106,7 +107,8 @@ async fn main() -> Result<()> {
                 // a background task on a process that then failed to listen.
                 let log_dir = (!app.cfg.log.directory.as_os_str().is_empty())
                     .then(|| app.cfg.log.directory.clone());
-                tokio::spawn(web::resources::run_rollups(log_dir));
+                let poll_start = tokio::time::Instant::now();
+                tokio::spawn(web::resources::run_rollups(log_dir, poll_start));
                 let poll_secs = app.cfg.bot.config_poll_secs.max(1);
                 let update_app = Arc::clone(&app);
                 let release_check = tokio::spawn(async move {
@@ -129,8 +131,8 @@ async fn main() -> Result<()> {
                     .await;
                 });
                 tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut interval =
+                        IdlePoll::ApiVersions.interval(poll_start, Duration::from_secs(poll_secs));
                     loop {
                         interval.tick().await;
                         match app.poll_config_version().await {
@@ -140,7 +142,10 @@ async fn main() -> Result<()> {
                                 )
                             }
                             Ok(false) => {}
-                            Err(e) => tracing::warn!("config_version poll failed: {e:#}"),
+                            Err(error) if !jmodguard::db::is_primary_outage(&error) => {
+                                tracing::warn!("config_version poll failed: {error:#}");
+                            }
+                            Err(_) => {}
                         }
                     }
                 });

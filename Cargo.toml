@@ -54,6 +54,7 @@ unicode-normalization = "0.1"
 [dev-dependencies]
 hyper = { version = "0.14", default-features = false, features = ["server"] }
 rustls-webpki = { version = "0.103.13", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["test-util"] }
 tower-sessions = { version = "0.15", default-features = false, features = ["memory-store"] }
 
 [patch.crates-io]
