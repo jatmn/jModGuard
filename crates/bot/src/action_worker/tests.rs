@@ -4363,3 +4363,132 @@ fn ban_refusal_follows_the_ban_command_and_discord_role_hierarchy() {
         Outcome::uncertain("discord_outcome_unknown")
     );
 }
+
+#[tokio::test]
+async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
+    use hyper::service::{make_service_fn, service_fn};
+    use hyper::{Body, Method, Request, Response, Server};
+    use serde_json::{json, to_value};
+    use serenity::model::guild::{Guild, Member, Role};
+    use serenity::model::id::RoleId;
+    use std::convert::Infallible;
+    use std::sync::{Arc, Mutex};
+
+    let f = Fixture::new();
+    let joined_at = serenity::model::Timestamp::parse("2026-01-01T00:00:00Z").unwrap();
+    db::enroll_guild(&f.db, 10, joined_at.timestamp_nanos_opt().unwrap())
+        .await
+        .unwrap();
+
+    let mut bot = Member::default();
+    bot.user.id = UserId::new(7);
+    bot.roles = vec![RoleId::new(30)];
+    bot.joined_at = Some(joined_at);
+    let mut owner = Member::default();
+    owner.user.id = UserId::new(42);
+    let mut role = Role::default();
+    role.id = bot.roles[0];
+    role.permissions = Permissions::BAN_MEMBERS;
+    role.position = 30;
+    let mut guild = Guild::default();
+    guild.id = GuildId::new(10);
+    guild.owner_id = owner.user.id;
+    guild.roles.insert(role.id, role);
+
+    let replies = Arc::new([
+        to_value(guild).unwrap(),
+        to_value(bot).unwrap(),
+        to_value(owner).unwrap(),
+    ]);
+    let ban_requests = Arc::new(Mutex::new(Vec::new()));
+    let captured_bans = Arc::clone(&ban_requests);
+    let server = Server::bind(&([127, 0, 0, 1], 0).into());
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{}", server.local_addr()))
+        .ratelimiter_disabled(true)
+        .build();
+    let server = tokio::spawn(server.serve(make_service_fn(move |_| {
+        let replies = Arc::clone(&replies);
+        let captured_bans = Arc::clone(&captured_bans);
+        async move {
+            Ok::<_, Infallible>(service_fn(move |request: Request<Body>| {
+                let path = request.uri().path();
+                let (status, body) = match (request.method(), path) {
+                    (&Method::GET, "/api/v10/guilds/10") => (200, replies[0].clone()),
+                    (&Method::GET, "/api/v10/guilds/10/members/7") => (200, replies[1].clone()),
+                    (&Method::GET, "/api/v10/guilds/10/members/42") => (200, replies[2].clone()),
+                    (&Method::GET, "/api/v10/guilds/10/members/99") => {
+                        (404, json!({"code": 10007, "message": "Unknown Member"}))
+                    }
+                    (&Method::GET, "/api/v10/guilds/10/members/100") => {
+                        (404, json!({"code": 10013, "message": "Unknown User"}))
+                    }
+                    (&Method::GET, "/api/v10/guilds/10/members/101") => {
+                        (429, json!({"code": 0, "message": "Rate limited"}))
+                    }
+                    (&Method::GET, "/api/v10/guilds/10/members/102") => {
+                        (503, json!({"code": 0, "message": "Service unavailable"}))
+                    }
+                    (&Method::PUT, _) => {
+                        captured_bans.lock().unwrap().push(path.to_owned());
+                        (408, json!({"code": 0, "message": "Request Timeout"}))
+                    }
+                    _ => panic!("unexpected Discord request: {} {path}", request.method()),
+                };
+                std::future::ready(Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                ))
+            }))
+        }
+    })));
+    let activation = crate::activation::Activation::new();
+    activation.mark_lock_held(true);
+    let discord = LiveDiscord {
+        http: &http,
+        bot_user_id: UserId::new(7),
+        activation: &activation,
+    };
+
+    for (target, expected) in [
+        (99, Outcome::uncertain("discord_outcome_unknown")),
+        (100, Outcome::failed("unknown_user")),
+        (101, Outcome::failed("ban_check_unavailable")),
+        (102, Outcome::failed("ban_check_unavailable")),
+    ] {
+        let job = db::enqueue_bot_action(
+            &f.db,
+            10,
+            42,
+            &f.request_key(&format!("ban-{target}")),
+            Action::Ban {
+                user_id: target,
+                reason: "fixture".into(),
+                delete_message_days: 0,
+                duration_minutes: None,
+            },
+            now(),
+            Limits::default(),
+        )
+        .await
+        .unwrap();
+        drain(&f.db, &discord, &WorkerLimits::default())
+            .await
+            .unwrap();
+        let (state, outcome) = f.persisted_status(&job).await;
+        assert_eq!(
+            (state.as_str(), outcome.as_deref()),
+            (expected.state, Some(expected.code)),
+            "target {target}"
+        );
+    }
+    assert_eq!(
+        *ban_requests.lock().unwrap(),
+        ["/api/v10/guilds/10/bans/99"]
+    );
+    assert!(db::list_bans(&f.db, 10, 10).await.unwrap().is_empty());
+    server.abort();
+}
