@@ -10922,6 +10922,9 @@ test('a dirty template guards tab close and survives declined sign-out', async (
   await fire(signOut(), 'click');
   assert.deepEqual(requests, ['POST /logout']);
   assert.equal(h.location.href, '/signed-out');
+  const redirectUnload = new h.window.Event('beforeunload', { cancelable: true });
+  h.window.dispatchEvent(redirectUnload);
+  assert.equal(redirectUnload.defaultPrevented, false, 'confirmed sign-out must allow navigation without another prompt');
 });
 
 test('a due owner refresh cannot repopulate the cache while sign-out is pending', async () => {
