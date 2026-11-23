@@ -1694,7 +1694,7 @@ mod tests {
     }
 
     #[test]
-    fn public_bind_rejects_localhost_oauth_origin() {
+    fn public_bind_requires_non_loopback_https_origin() {
         let mut cfg = Config::default();
         cfg.web.bind = "0.0.0.0:8080".into();
         cfg.web.base_url = "http://localhost:8080".into();
@@ -1707,6 +1707,13 @@ mod tests {
         cfg.web.base_url = "https://jmodguard.example.b-cdn.net".into();
         cfg.validate_public_base_url().unwrap();
 
+        cfg.web.base_url = "http://dashboard.example.com".into();
+        let err = cfg.validate_public_base_url().unwrap_err();
+        assert!(
+            err.to_string().contains("web.base_url must be https"),
+            "unexpected: {err:#}"
+        );
+
         for origin in ["https://127.0.0.2", "https://[::]", "https://localhost."] {
             cfg.web.base_url = origin.into();
             assert!(
@@ -1718,6 +1725,52 @@ mod tests {
         cfg.web.bind = "127.0.0.1:8080".into();
         cfg.web.base_url = "http://localhost:8080".into();
         cfg.validate_public_base_url().unwrap();
+    }
+
+    #[test]
+    fn api_loader_requires_https_for_public_bind() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let names = [
+            "JMODGUARD_CONFIG",
+            "JMODGUARD_WEB_BIND",
+            "JMODGUARD_WEB_BASE_URL",
+            "JMODGUARD_CORS_ORIGINS",
+            "JMODGUARD_DEFAULT_PREFIX",
+        ];
+        let _saved = SavedEnv::capture(&names);
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard-config-{:032x}.toml",
+            rand::random::<u128>()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+            [web]
+            bind = "0.0.0.0:8080"
+            base_url = "http://dashboard.example.com"
+
+            [bot]
+            default_prefix = "?"
+            "#,
+        )
+        .unwrap();
+        for name in names {
+            unsafe { std::env::remove_var(name) };
+        }
+        unsafe { std::env::set_var("JMODGUARD_CONFIG", &path) };
+
+        let api = super::ApiProcessConfig::load();
+        let bot = super::BotProcessConfig::load();
+        std::fs::remove_file(&path).unwrap();
+
+        let Err(err) = api else {
+            panic!("API accepted a public HTTP origin");
+        };
+        assert!(
+            err.to_string().contains("web.base_url must be https"),
+            "unexpected: {err:#}"
+        );
+        assert_eq!(bot.unwrap().bot.default_prefix, "?");
     }
 
     #[test]
