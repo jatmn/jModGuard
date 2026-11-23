@@ -3310,6 +3310,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cors_allows_only_listed_origins_and_never_a_wildcard() {
+        let mut cfg = crate::config::ApiProcessConfig::default();
+        cfg.web.cors_origins = vec!["*".into(), "https://admin.example.com".into()];
+        let app = router(test_app_with_config(cfg));
+        let send = |method: &str, origin: &str| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri("/api/me")
+                .header("origin", origin);
+            if method == "OPTIONS" {
+                request = request.header("access-control-request-method", "POST");
+            }
+            app.clone().oneshot(request.body(Body::empty()).unwrap())
+        };
+        for method in ["GET", "OPTIONS"] {
+            let res = send(method, "https://attacker.example.com").await.unwrap();
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                None,
+                "{method} from an unlisted Origin"
+            );
+            let res = send(method, "https://admin.example.com").await.unwrap();
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .and_then(|v| v.to_str().ok()),
+                Some("https://admin.example.com"),
+                "{method} from the listed Origin"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn startup_listener_handoff_to_axum_keeps_liveness() {
         // Same composition as jmodguard-api: raw /health on the public bind
         // until open finishes, then axum takes that socket. Application
@@ -3487,38 +3521,46 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_callback_rejects_missing_csrf_cookie() {
-        // No prior /login cookie → CSRF reject (must not skip check).
-        let app = test_app();
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .uri("/oauth/callback?code=fake&state=attacker")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-        let cookies: Vec<String> = res
-            .headers()
-            .get_all(SET_COOKIE)
-            .iter()
-            .filter_map(|value| value.to_str().ok().map(str::to_owned))
-            .collect();
-        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let text = String::from_utf8_lossy(&body);
-        assert!(
-            text.contains("OAuth state mismatch"),
-            "expected CSRF reject page, got: {text}"
-        );
-        assert!(
-            cookies.iter().any(|cookie| {
-                cookie.contains(COOKIE_OAUTH_STATE) && cookie.contains("Max-Age=0")
-            }),
-            "CSRF reject must expire the handshake cookies: {cookies:?}"
-        );
+        // No prior /login cookie → CSRF reject (must not skip check). An empty
+        // state must not match a missing or empty cookie.
+        for (uri, cookie) in [
+            ("/oauth/callback?code=fake&state=attacker", None),
+            ("/oauth/callback?code=fake&state=", None),
+            (
+                "/oauth/callback?code=fake&state=",
+                Some(format!("{COOKIE_OAUTH_STATE}=")),
+            ),
+        ] {
+            let mut request = Request::builder().uri(uri);
+            if let Some(cookie) = &cookie {
+                request = request.header(COOKIE, cookie);
+            }
+            let res = test_app()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{uri} {cookie:?}");
+            let cookies: Vec<String> = res
+                .headers()
+                .get_all(SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok().map(str::to_owned))
+                .collect();
+            let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains("OAuth state mismatch"),
+                "{uri} {cookie:?}: expected CSRF reject page, got: {text}"
+            );
+            assert!(
+                cookies.iter().any(|cookie| {
+                    cookie.contains(COOKIE_OAUTH_STATE) && cookie.contains("Max-Age=0")
+                }),
+                "CSRF reject must expire the handshake cookies: {cookies:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3572,6 +3614,10 @@ mod tests {
         assert!(!oauth_csrf_ok(&headers, Some("attacker")));
         assert!(!oauth_csrf_ok(&HeaderMap::new(), Some("deadbeef")));
         assert!(!oauth_csrf_ok(&headers, None));
+        assert!(!oauth_csrf_ok(&HeaderMap::new(), Some("")));
+        let mut empty = HeaderMap::new();
+        empty.insert(COOKIE, HeaderValue::from_static("jmodguard_oauth_state="));
+        assert!(!oauth_csrf_ok(&empty, Some("")));
     }
 
     fn auth_user(discord_id: u64) -> AuthCtx {
