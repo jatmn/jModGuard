@@ -4940,6 +4940,25 @@ async fn owner_preview_cannot_write_and_does_not_inherit_owner_authority() {
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(denied["code"], "preview_read_only");
+    let badword = db::add_badword(&f.app.db, 10, "preview", None)
+        .await
+        .unwrap();
+    let (status, denied) = f
+        .request_preview(
+            "DELETE",
+            &format!("/api/guilds/10/badwords/{badword}"),
+            "",
+            token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    assert_eq!(denied["code"], "preview_read_only");
+    assert!(
+        db::get_badword_primary(&f.app.db, badword)
+            .await
+            .unwrap()
+            .is_some()
+    );
     let (status, me) = f.request_preview("POST", "/api/me", "", token).await;
     assert_eq!(status, StatusCode::OK, "{me}");
     for path in ["/api/guilds/10/cases", "/api/guilds/10/analytics"] {
