@@ -2868,6 +2868,79 @@ impl StatsDispatch {
 }
 
 #[tokio::test]
+async fn prefix_enforces_command_enabled_role_and_channel_settings() {
+    use crate::types::{Behavior, CommandDef, PlanStep};
+    use serenity::model::permissions::Permissions;
+
+    const PLAN_REPLY: &str = "custom plan ran";
+    let cases: [(_, _, &[_], &[_], _); 5] = [
+        (
+            "disabled",
+            false,
+            &[],
+            &[],
+            Some("that command is disabled"),
+        ),
+        (
+            "wrong-role",
+            true,
+            &[60],
+            &[],
+            Some("this command is restricted to specific roles"),
+        ),
+        ("matching-role", true, &[60, StatsDispatch::ROLE], &[], None),
+        (
+            "wrong-channel",
+            true,
+            &[],
+            &[3],
+            Some("this command is restricted to specific channels"),
+        ),
+        ("matching-channel", true, &[], &[2], None),
+    ];
+    let commands = cases
+        .iter()
+        .map(|&(name, enabled, roles, channels, _)| CommandDef {
+            name: name.into(),
+            aliases: Vec::new(),
+            category: "Moderation".into(),
+            description: String::new(),
+            usage: String::new(),
+            enabled,
+            permission: "mod".into(),
+            roles: roles.to_vec(),
+            channels: channels.to_vec(),
+            cooldown_secs: 0,
+            behavior: Behavior::Plan {
+                steps: vec![PlanStep::Reply {
+                    template: PLAN_REPLY.into(),
+                }],
+            },
+            response: String::new(),
+            log_event: String::new(),
+            builtin_override: false,
+        })
+        .collect();
+    let fx = StatsDispatch::new(false, commands).await;
+    fx.install(Permissions::BAN_MEMBERS);
+
+    for (name, _, _, _, expected_denial) in cases {
+        fx.prefix(&format!("!{name}")).await;
+        let reply = fx.sent(name);
+        let content = reply["content"].as_str().unwrap();
+        if let Some(reason) = expected_denial {
+            assert!(
+                content.ends_with(&format!(" — {reason}")),
+                "{name}: {reply}"
+            );
+        } else {
+            assert_eq!(content, PLAN_REPLY, "{name}: {reply}");
+        }
+    }
+    fx.finish();
+}
+
+#[tokio::test]
 async fn malformed_moderation_commands_send_usage_in_the_invocation_channel() {
     use serenity::model::permissions::Permissions;
 
