@@ -883,11 +883,7 @@ fn consider(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn gateway_text_admission_filters_messages_and_preserves_contentless_updates() {
-        use serenity::all::{CurrentUser, Timestamp, UserId, UserUpdateEvent};
-        use std::sync::atomic::AtomicBool;
-
+    async fn gateway_text_app(rule: crate::types::RuleDef) -> (std::path::PathBuf, Arc<BotState>) {
         let directory =
             std::env::temp_dir().join(format!("text_gateway_{:032x}", rand::random::<u128>()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -901,36 +897,48 @@ mod tests {
                 &app.db,
                 app.activation.instance(),
                 jmodguard::control::now_ms(),
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
             .await
             .unwrap()
         );
         app.activation.mark_lock_held(true);
         app.activation.note_discord_connected();
-        crate::db::enroll_guild(&app.db, 10, 100)
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
             .await
             .unwrap()
             .unwrap();
-        let mut rule = crate::defaults::default_rules().remove(2);
-        rule.whitelist_users = vec![43];
-        rule.whitelist_channels = vec![14];
-        rule.whitelist_roles = vec![7];
-        crate::db::upsert_rule(&app.db, 10, "repeat_text", &rule)
-            .await
-            .unwrap();
+        app.tenant.activate(enrollment).await.unwrap();
+        for (id, mut selected) in jmodguard::types::RULE_IDS
+            .iter()
+            .copied()
+            .zip(crate::defaults::default_rules())
+        {
+            if id == "repeat_text" {
+                selected = rule.clone();
+            } else {
+                selected.enabled = false;
+            }
+            crate::db::upsert_rule(&app.db, 10, id, &selected)
+                .await
+                .unwrap();
+        }
         crate::db::upsert_log_channel(&app.db, 10, "automod", 999)
             .await
             .unwrap();
         app.poll_config_version().await.unwrap();
+        (directory, app)
+    }
 
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let http = serenity::http::HttpBuilder::new("fixture")
-            .proxy(format!("http://{}", listener.local_addr().unwrap()))
-            .ratelimiter_disabled(true)
-            .build();
+    #[tokio::test]
+    async fn gateway_text_admission_filters_messages_and_preserves_contentless_updates() {
+        use serenity::all::{CurrentUser, Timestamp, UserId, UserUpdateEvent};
+
+        let mut rule = crate::defaults::default_rules().remove(2);
+        rule.whitelist_users = vec![43];
+        rule.whitelist_channels = vec![14];
+        rule.whitelist_roles = vec![7];
+        let (directory, app) = gateway_text_app(rule).await;
         let cache = Arc::new(serenity::cache::Cache::new());
         let mut bot = CurrentUser::default();
         bot.id = UserId::new(44);
@@ -938,7 +946,12 @@ mod tests {
             serde_json::from_value(serde_json::to_value(bot).unwrap()).unwrap();
         cache.update(&mut ready_user);
         let ctx = crate::commands::mod_reason_dm::fixture_context_for_dm_order_test(
-            Arc::new(http),
+            Arc::new(
+                serenity::http::HttpBuilder::new("fixture")
+                    .proxy("http://127.0.0.1:0")
+                    .ratelimiter_disabled(true)
+                    .build(),
+            ),
             cache,
         )
         .await;
@@ -1014,38 +1027,125 @@ mod tests {
             Some(42),
             "omitting content must preserve an admitted message",
         );
-        observe_create(&message(110, 12, 42, &valid, 0, &[]));
-        observe_create(&message(111, 13, 42, &valid, 0, &[]));
-
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let (stream, _) = listener.accept().await.unwrap();
-            hyper::server::conn::Http::new()
-                .serve_connection(
-                    stream,
-                    hyper::service::service_fn(|req: hyper::Request<hyper::Body>| async {
-                        assert_eq!(req.method(), hyper::Method::POST);
-                        assert_eq!(req.uri().path(), "/api/v10/channels/999/messages");
-                        let body = hyper::body::to_bytes(req.into_body()).await.unwrap();
-                        let report = serde_json::from_slice(&body).unwrap();
-                        let text = crate::logging::tests::log_text(&report);
-                        assert!(text.contains("Repeated text test") && text.contains("log only"), "{text}");
-                        Ok::<_, std::convert::Infallible>(
-                            hyper::Response::builder()
-                                .status(200)
-                                .header("content-type", "application/json")
-                                .header("connection", "close")
-                                .body(hyper::Body::from(r#"{"id":"1","channel_id":"999","author":{"id":"44","username":"fixture"},"content":"","timestamp":"2026-01-01T00:00:00Z","tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0}"#))
-                                .unwrap(),
-                        )
-                    }),
-                )
-                .await
-                .unwrap();
-        })
-        .await
-        .expect("eligible text from three channels must produce a dry-run log");
         drop(app);
-        let _ = std::fs::remove_dir_all(directory);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_text_match_logs_in_dry_run_and_deletes_and_bans_in_live_mode() {
+        use crate::spam_actions::tests::{assert_ban_request, serve_discord_stub};
+        use serenity::all::{ChannelId, EventHandler, GuildId, MessageId, Timestamp, UserId};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const LOG_REQUEST: &str = "POST /api/v10/channels/999/messages";
+
+        for dry_run in [true, false] {
+            let mut rule = crate::defaults::default_rules().remove(2);
+            rule.dry_run = dry_run;
+            if !dry_run {
+                rule.actions = serde_json::from_value(serde_json::json!([
+                    {"action": "delete"}, {"action": "ban"}
+                ]))
+                .unwrap();
+            }
+            let (directory, app) = gateway_text_app(rule).await;
+            let handler = crate::handlers::Handler { app };
+            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let http = serenity::http::HttpBuilder::new("fixture")
+                .proxy(format!("http://{}", listener.local_addr().unwrap()))
+                .ratelimiter_disabled(true)
+                .build();
+            let ctx = crate::commands::mod_reason_dm::fixture_context_for_dm_order_test(
+                Arc::new(http),
+                Arc::new(serenity::cache::Cache::new()),
+            )
+            .await;
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let reports = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_requests = Arc::clone(&requests);
+            let server_reports = Arc::clone(&reports);
+            let server_stop = Arc::clone(&stop);
+            let server = std::thread::spawn(move || {
+                serve_discord_stub(
+                    listener,
+                    server_requests,
+                    server_stop,
+                    move |method, path, body| {
+                        if method == "POST" && path == "/api/v10/channels/999/messages" {
+                            server_reports.lock().push(body.to_owned());
+                        }
+                        None
+                    },
+                );
+            });
+
+            let completed = tokio::time::timeout(Duration::from_secs(15), async {
+                for (channel, id) in [(11, 101), (12, 102), (13, 103)] {
+                    let mut msg = Message::default();
+                    msg.id = MessageId::new(id);
+                    msg.guild_id = Some(GuildId::new(10));
+                    msg.channel_id = ChannelId::new(channel);
+                    msg.author.id = UserId::new(99);
+                    msg.author.name = "member".into();
+                    msg.content = "same repeated message in each channel".into();
+                    msg.timestamp = Timestamp::now();
+                    msg.member = Some(Box::new(
+                        serde_json::from_value(serde_json::json!({
+                            "roles": [], "deaf": false, "mute": false, "flags": 0,
+                        }))
+                        .unwrap(),
+                    ));
+                    handler.message(ctx.clone(), msg).await;
+                }
+                // The spawned text report owns a cloned app until its HTTP
+                // work is done. The handler is the fixture's only other owner.
+                while Arc::strong_count(&handler.app) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            stop.store(true, Ordering::Relaxed);
+            server.join().unwrap();
+            completed.expect("Gateway text handling must complete");
+            drop(handler);
+            std::fs::remove_dir_all(directory).unwrap();
+
+            let mut seen = requests.lock();
+            seen.sort_unstable();
+            if dry_run {
+                assert_eq!(*seen, [LOG_REQUEST], "dry run must only send the log");
+            } else {
+                assert_eq!(seen.len(), 7, "unexpected live requests: {seen:?}");
+                assert_eq!(
+                    seen[..6],
+                    [
+                        "DELETE /api/v10/channels/11/messages/101",
+                        "DELETE /api/v10/channels/12/messages/102",
+                        "DELETE /api/v10/channels/13/messages/103",
+                        "GET /api/v10/guilds/10/bans/99",
+                        "GET /api/v10/guilds/10/members/99",
+                        LOG_REQUEST,
+                    ],
+                );
+                assert_ban_request(&seen[6], 10, 99, 0);
+            }
+            let reports = reports.lock();
+            assert_eq!(reports.len(), 1);
+            let report = serde_json::from_str(&reports[0]).unwrap();
+            let text = crate::logging::tests::log_text(&report);
+            if dry_run {
+                assert!(
+                    text.contains("Repeated text test") && text.contains("log only"),
+                    "{text}"
+                );
+            } else {
+                assert!(
+                    text.contains("ban Succeeded") && text.contains("deleted 3 messages"),
+                    "{text}"
+                );
+            }
+        }
     }
 
     fn policy() -> Policy {
