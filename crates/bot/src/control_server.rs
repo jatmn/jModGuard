@@ -621,13 +621,22 @@ mod tests {
     }
 
     fn remember_guild(cache: &Cache, guild_id: u64, member: Option<Member>) {
+        remember_guild_with_permissions(cache, guild_id, member, Permissions::MANAGE_GUILD);
+    }
+
+    fn remember_guild_with_permissions(
+        cache: &Cache,
+        guild_id: u64,
+        member: Option<Member>,
+        permissions: Permissions,
+    ) {
         let mut guild = Guild::default();
         guild.id = GuildId::new(guild_id);
         guild.owner_id = UserId::new(1);
         let mut role = Role::default();
         role.id = RoleId::new(20);
         role.guild_id = guild.id;
-        role.permissions = Permissions::MANAGE_GUILD;
+        role.permissions = permissions;
         guild.roles.insert(role.id, role);
         if let Some(member) = member {
             guild.members.insert(member.user.id, member);
@@ -667,6 +676,96 @@ mod tests {
         assert_eq!(
             db::get_settings(&bot.db, 10).await.unwrap().prefix,
             "!saved"
+        );
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ban_members_can_edit_ban_reason_but_cannot_edit_guild_settings() {
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        let cache = Arc::new(Cache::new());
+        remember_guild_with_permissions(
+            &cache,
+            10,
+            Some(actor_member(10, true)),
+            Permissions::BAN_MEMBERS,
+        );
+        bot.install_discord_cache(cache);
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+
+        let original_prefix = db::get_settings(&bot.db, 10).await.unwrap().prefix;
+        let reply = submit(bound, seal(&patch(&enrollment, "!denied"), 7));
+        assert_eq!(failure_message(&reply), "actor is not allowed");
+        assert_eq!(
+            db::get_settings(&bot.db, 10).await.unwrap().prefix,
+            original_prefix
+        );
+
+        db::record_ban(&bot.db, 10, 91, Some(7), "original reason")
+            .await
+            .unwrap();
+        let bans = db::list_enrolled_bans(&bot.db, enrollment.clone(), 10)
+            .await
+            .unwrap();
+        let op = db::ControlOp::EditBanReason {
+            scope: scope(&enrollment),
+            ban_id: bans[0].id,
+            actor_id: 7,
+            reason: "corrected reason".into(),
+        };
+        let reply = submit(bound, seal(&op, 7));
+        assert!(matches!(reply, ControlReply::Saved { .. }), "{reply:?}");
+        let bans = db::list_enrolled_bans(&bot.db, enrollment, 10)
+            .await
+            .unwrap();
+        assert_eq!(bans[0].edited_reason.as_deref(), Some("corrected reason"));
+        assert_eq!(bans[0].reason_edited_by, Some(7));
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn administrator_can_edit_guild_settings_and_case_delete_roles() {
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        bot.tenant
+            .activate(enrollment.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let cache = Arc::new(Cache::new());
+        remember_guild_with_permissions(
+            &cache,
+            10,
+            Some(actor_member(10, true)),
+            Permissions::ADMINISTRATOR,
+        );
+        bot.install_discord_cache(cache);
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+
+        let reply = submit(bound, seal(&patch(&enrollment, "!admin"), 7));
+        assert!(matches!(reply, ControlReply::Saved { .. }), "{reply:?}");
+        assert_eq!(
+            db::get_settings(&bot.db, 10).await.unwrap().prefix,
+            "!admin"
+        );
+
+        // Serenity expands Administrator to include Manage Guild. Only the
+        // Administrator bit grants this operation to a non-owner.
+        let (store, live) = bot.tenant.live(enrollment.clone()).await.unwrap();
+        let revision = store.tenant_settings(live.clone()).await.unwrap().revision;
+        let op = db::ControlOp::SetCaseDeleteRoles {
+            scope: scope(&enrollment),
+            revision,
+            roles: vec![30],
+        };
+        let reply = submit(bound, seal(&op, 7));
+        assert!(matches!(reply, ControlReply::Saved { .. }), "{reply:?}");
+        assert_eq!(
+            store.tenant_settings(live).await.unwrap().case_delete_roles,
+            vec![30]
         );
         drop(bot);
         cleanup(&path);
