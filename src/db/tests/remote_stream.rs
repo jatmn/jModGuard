@@ -1300,6 +1300,27 @@ async fn remote_commit_error_is_reconciled_against_durable_rows() {
     assert!(!is_database_commit_indeterminate(&error), "{error:#}");
     assert!(list_badwords(&local, 10).await.unwrap().is_empty());
 
+    // Use a fresh primary-outage gate for the two lost-response cases.
+    drop(remote);
+    let remote = fixture.db();
+    fixture.fail_next_commit();
+    fixture.state.lock().unwrap().drop_next_commit_response = true;
+    let error = add_enrolled_badwords(&remote, scope.clone(), "sample", None)
+        .await
+        .expect_err("a lost response after a rolled-back COMMIT must fail");
+    assert_eq!(fixture.commit_timeouts(), 2);
+    assert!(!fixture.state.lock().unwrap().drop_next_commit_response);
+    assert!(
+        matches!(
+            error.downcast_ref::<libsql::Error>(),
+            Some(libsql::Error::Hrana(_))
+        ),
+        "{error:#}"
+    );
+    assert!(!is_remote_interactive_timeout(&error), "{error:#}");
+    assert!(!is_database_commit_indeterminate(&error), "{error:#}");
+    assert!(list_badwords(&local, 10).await.unwrap().is_empty());
+
     fixture.state.lock().unwrap().drop_next_commit_response = true;
     let saved = add_enrolled_badwords(&remote, scope, "sample", None)
         .await
