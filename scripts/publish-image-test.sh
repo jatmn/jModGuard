@@ -109,6 +109,14 @@ with_main
 assert_request $'main\t'
 JMODGUARD_RELEASE_TAG=v1.2.3 JMODGUARD_RELEASE_SHA="$BASE_SHA" assert_request $'release\trefs/tags/v1.2.3'
 GITHUB_REF=refs/tags/v1 assert_request $'tag\trefs/tags/v1'
+for identity in GITHUB_ACTOR=outsider GITHUB_TRIGGERING_ACTOR=outsider GITHUB_ACTOR_ID=123; do
+  field="${identity%%=*}"
+  if rejection="$(export "$field=${identity#*=}"; GITHUB_REF=refs/tags/v1 publish_request 2>&1)"; then
+    fail "tag push with $field set to a non-owner must fail"
+  fi
+  [[ "$rejection" == *'Tag publication requires the repository owner' ]] \
+    || fail "tag push with $field set to a non-owner failed for the wrong reason: $rejection"
+done
 for event in pull_request pull_request_target merge_group release issue_comment; do
   GITHUB_EVENT_NAME="$event" assert_request skip
 done

@@ -140,6 +140,21 @@ function condition(job, context) {
   assert.ok(match, "job must have an explicit guard");
   return Boolean(expression((match[1] || match[2]).trim(), context));
 }
+const tagPush = {
+  github: {
+    repository: "jatmn/jModGuard", event_name: "push", ref: "refs/tags/v1", ref_type: "tag",
+    actor: "jatmn", triggering_actor: "jatmn", actor_id: "12479882",
+  },
+  needs: { ci: { result: "success" }, release: { result: "skipped" } },
+  inputs: { source: "" },
+};
+const preparePublication = jobs.get("prepare-publication");
+assert.equal(condition(preparePublication, tagPush), true, "owner tag push must allow publication");
+for (const [field, value] of [["actor", "outsider"], ["triggering_actor", "outsider"], ["actor_id", "123"]]) {
+  const outsider = { ...tagPush, github: { ...tagPush.github, [field]: value } };
+  assert.equal(condition(preparePublication, outsider), false, `tag push with a non-owner ${field} must be blocked`);
+}
+
 function binding(job, key, context) {
   const match = job.match(new RegExp(`^ +${key}: \\$\\{\\{ (.+) \\}\\}$`, "m"));
   assert.ok(match, "missing workflow binding: " + key);
