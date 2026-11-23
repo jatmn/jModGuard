@@ -88,43 +88,18 @@ fn health_addr(log: &str) -> String {
 }
 
 fn get(addr: &str, path: &str) -> String {
-    use std::io::{ErrorKind, Write};
-    // Under parallel test load the health listener can reset or close a
-    // just-accepted connection (BrokenPipe on write, ConnectionReset), as in
-    // CI runs 697/715. Retry only those two errors, at most 3 attempts.
-    // Anything else (connection refused, other I/O errors) panics at once and
-    // any response, even an empty one, is returned unchanged, so a child that
-    // really died still fails the test.
-    let mut attempt = 1;
-    loop {
-        let result = (|| -> std::io::Result<String> {
-            let mut stream = std::net::TcpStream::connect(addr)?;
-            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-            write!(
-                stream,
-                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-            )?;
-            let mut body = String::new();
-            stream.read_to_string(&mut body)?;
-            Ok(body)
-        })();
-        match result {
-            Ok(body) => return body,
-            Err(error)
-                if attempt < 3
-                    && matches!(
-                        error.kind(),
-                        ErrorKind::ConnectionReset | ErrorKind::BrokenPipe
-                    ) =>
-            {
-                attempt += 1;
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Err(error) => {
-                panic!("health request to {addr}{path} failed on attempt {attempt}: {error}")
-            }
-        }
-    }
+    use std::io::Write;
+    let result = (|| -> std::io::Result<String> {
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes())?;
+        let mut body = String::new();
+        stream.read_to_string(&mut body)?;
+        Ok(body)
+    })();
+    result.unwrap_or_else(|error| panic!("health request to {addr}{path} failed: {error}"))
 }
 
 /// Wait for the child to exit after SIGTERM. A child still running after

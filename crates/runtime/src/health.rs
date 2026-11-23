@@ -152,12 +152,26 @@ async fn answer_connection_with_reason(
     not_ready_reason: &str,
 ) -> Result<()> {
     let mut buf = [0u8; 2048];
-    let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(0);
-    let probe = parse_probe(&buf[..n]);
+    // Keep one deadline for the whole request line, even across TCP reads.
+    let line_end = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut used = 0;
+        while used < buf.len() {
+            let n = stream.read(&mut buf[used..]).await?;
+            if n == 0 {
+                break;
+            }
+            if let Some(newline) = buf[used..used + n].iter().position(|&byte| byte == b'\n') {
+                return Ok(used + newline);
+            }
+            used += n;
+        }
+        Ok::<_, std::io::Error>(0)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or(0);
+    let probe = parse_probe(&buf[..line_end]);
     let response = probe_response(probe, crate::process_ready(), not_ready_reason);
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
@@ -390,6 +404,37 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK"), "unexpected: {text}");
         assert!(text.contains("\r\n\r\nok"), "unexpected: {text}");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn health_request_line_can_span_multiple_reads() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client.write_all(b"GET ").await.unwrap();
+        server.readable().await.unwrap();
+        server.writable().await.unwrap();
+
+        let response = super::answer_connection(server);
+        tokio::pin!(response);
+        // Poll the handler with only the first fragment available.
+        tokio::select! {
+            biased;
+            result = &mut response => panic!("answered before the request line was complete: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+
+        client
+            .write_all(b"/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        response.await.unwrap();
+        let mut text = String::new();
+        client.read_to_string(&mut text).await.unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "unexpected: {text}");
+        assert!(text.ends_with("\r\n\r\nok"), "unexpected: {text}");
     }
 
     // Paused time fires the sleep below only after every ready accept and
