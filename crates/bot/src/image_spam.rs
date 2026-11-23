@@ -2747,13 +2747,15 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn metadata_claim_rechecks_the_short_rule_window_after_admission() {
+    async fn metadata_claim_enforces_both_windows_after_admission() {
         let start = tokio::time::Instant::now().into_std();
-        let policy = Policy {
-            window_secs: 5,
-            ..policy()
-        };
-        for (elapsed_secs, expected) in [(4, true), (5, false)] {
+        for (window_secs, elapsed_secs, expected) in
+            [(5, 4, true), (5, 5, false), (60, 9, true), (60, 10, false)]
+        {
+            let policy = Policy {
+                window_secs,
+                ..policy()
+            };
             let detector = Detector::new(Limits::default()).unwrap();
             let admitted_at = start + Duration::from_secs(2);
             for (id, channel, at) in [(10, 100, start), (11, 101, admitted_at)] {
@@ -2781,7 +2783,7 @@ mod tests {
             assert_eq!(
                 claimed.is_some(),
                 expected,
-                "first post age {elapsed_secs}s"
+                "rule window {window_secs}s, first post age {elapsed_secs}s"
             );
         }
     }
