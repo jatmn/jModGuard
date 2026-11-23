@@ -26,6 +26,8 @@ import { join } from "node:path";
         test("uncontrolled", async () => {
             await wait(10);
             await new Promise(resolve => globalThis["setTimeout"](resolve, 10));
+            window.setTimeout(() => {}, 10);
+            global.setTimeout(() => {}, 10);
             Date.now();
             new globalThis.Date();
             for (let i = 0; i < 2; i++) {
@@ -34,7 +36,7 @@ import { join } from "node:path";
             }
         });
     `);
-    assert.deepEqual(messages, ["sleep", "sleep", "clock", "clock", "retry"].map((id) => ["jmodguard/test-flake", id]));
+    assert.deepEqual(messages, ["sleep", "sleep", "sleep", "sleep", "clock", "clock", "retry"].map((id) => ["jmodguard/test-flake", id]));
 });
 
 test("accepts fixed dates, fixture timers, and a scoped fake clock", async () => {
