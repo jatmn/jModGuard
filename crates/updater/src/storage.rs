@@ -677,27 +677,31 @@ mod tests {
             storage.verify_release(&registry, &release).await.unwrap(),
             &files,
         );
-        let asset = format!("assets/releases/{}/administration.js", release.source_sha);
-        state
-            .lock()
-            .await
-            .files
-            .insert(asset.clone(), b"changed JavaScript".to_vec());
-        assert!(
-            matches!(
-                storage.verify_release(&registry, &release).await.unwrap(),
-                ReleaseVerification::Mismatch
-            ),
-            "a changed asset must prevent adoption"
-        );
-        state.lock().await.files.remove(&asset).unwrap();
-        assert!(
-            matches!(
-                storage.verify_release(&registry, &release).await.unwrap(),
-                ReleaseVerification::Mismatch
-            ),
-            "a missing asset must prevent adoption"
-        );
+        for name in ["app.js", "style.css", "administration.js"] {
+            let asset = format!("assets/releases/{}/{name}", release.source_sha);
+            state
+                .lock()
+                .await
+                .files
+                .insert(asset.clone(), b"changed asset".to_vec());
+            assert!(
+                matches!(
+                    storage.verify_release(&registry, &release).await.unwrap(),
+                    ReleaseVerification::Mismatch
+                ),
+                "changed {name} must prevent adoption"
+            );
+            state.lock().await.files.remove(&asset).unwrap();
+            assert!(
+                matches!(
+                    storage.verify_release(&registry, &release).await.unwrap(),
+                    ReleaseVerification::Mismatch
+                ),
+                "missing {name} must prevent adoption"
+            );
+            let original = files[&asset].clone();
+            state.lock().await.files.insert(asset, original);
+        }
         registry_server.abort();
         storage_server.abort();
     }
