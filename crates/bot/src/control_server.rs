@@ -727,7 +727,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn administrator_can_edit_guild_settings_and_case_delete_roles() {
+    async fn case_delete_roles_require_administrator_for_a_non_owner() {
         let (bot, path) = writer_bot().await;
         let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
         bot.tenant
@@ -736,14 +736,29 @@ mod tests {
             .unwrap()
             .unwrap();
         let cache = Arc::new(Cache::new());
+        remember_guild(&cache, 10, Some(actor_member(10, true)));
+        bot.install_discord_cache(Arc::clone(&cache));
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+
+        let (store, live) = bot.tenant.live(enrollment.clone()).await.unwrap();
+        let before = store.tenant_settings(live.clone()).await.unwrap();
+        let op = db::ControlOp::SetCaseDeleteRoles {
+            scope: scope(&enrollment),
+            revision: before.revision.clone(),
+            roles: vec![30],
+        };
+        let reply = submit(bound, seal(&op, 7));
+        assert_eq!(failure_message(&reply), "actor is not allowed");
+        assert_eq!(store.tenant_settings(live.clone()).await.unwrap(), before);
+
+        // Serenity expands Administrator to include Manage Guild. Try the
+        // same change again with Administrator to distinguish the two gates.
         remember_guild_with_permissions(
             &cache,
             10,
             Some(actor_member(10, true)),
             Permissions::ADMINISTRATOR,
         );
-        bot.install_discord_cache(cache);
-        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
 
         let reply = submit(bound, seal(&patch(&enrollment, "!admin"), 7));
         assert!(matches!(reply, ControlReply::Saved { .. }), "{reply:?}");
@@ -752,15 +767,6 @@ mod tests {
             "!admin"
         );
 
-        // Serenity expands Administrator to include Manage Guild. Only the
-        // Administrator bit grants this operation to a non-owner.
-        let (store, live) = bot.tenant.live(enrollment.clone()).await.unwrap();
-        let revision = store.tenant_settings(live.clone()).await.unwrap().revision;
-        let op = db::ControlOp::SetCaseDeleteRoles {
-            scope: scope(&enrollment),
-            revision,
-            roles: vec![30],
-        };
         let reply = submit(bound, seal(&op, 7));
         assert!(matches!(reply, ControlReply::Saved { .. }), "{reply:?}");
         assert_eq!(
