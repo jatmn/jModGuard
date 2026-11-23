@@ -1729,15 +1729,25 @@ mod tests {
 
     #[test]
     fn api_loader_requires_https_for_public_bind() {
-        let _env_lock = ENV_LOCK.lock().unwrap();
-        let names = [
-            "JMODGUARD_CONFIG",
-            "JMODGUARD_WEB_BIND",
-            "JMODGUARD_WEB_BASE_URL",
-            "JMODGUARD_CORS_ORIGINS",
-            "JMODGUARD_DEFAULT_PREFIX",
-        ];
-        let _saved = SavedEnv::capture(&names);
+        const CHILD: &str = "JMODGUARD_TEST_PUBLIC_BIND_CHILD";
+        const TEST_NAME: &str = "config::tests::api_loader_requires_https_for_public_bind";
+        const CHECKED_LOADERS: &str = "checked API and bot config loaders";
+        if std::env::var_os(CHILD).is_some() {
+            let Err(err) = super::ApiProcessConfig::load() else {
+                panic!("API accepted a public HTTP origin");
+            };
+            assert!(
+                err.to_string().contains("web.base_url must be https"),
+                "unexpected: {err:#}"
+            );
+            assert_eq!(
+                super::BotProcessConfig::load().unwrap().bot.default_prefix,
+                "?"
+            );
+            println!("{CHECKED_LOADERS}");
+            return;
+        }
+
         let path = std::env::temp_dir().join(format!(
             "jmodguard-config-{:032x}.toml",
             rand::random::<u128>()
@@ -1754,23 +1764,22 @@ mod tests {
             "#,
         )
         .unwrap();
-        for name in names {
-            unsafe { std::env::remove_var(name) };
-        }
-        unsafe { std::env::set_var("JMODGUARD_CONFIG", &path) };
-
-        let api = super::ApiProcessConfig::load();
-        let bot = super::BotProcessConfig::load();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env_clear()
+            .env(CHILD, "1")
+            .env("JMODGUARD_CONFIG", &path)
+            .output();
         std::fs::remove_file(&path).unwrap();
 
-        let Err(err) = api else {
-            panic!("API accepted a public HTTP origin");
-        };
+        let output = output.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            err.to_string().contains("web.base_url must be https"),
-            "unexpected: {err:#}"
+            output.status.success() && stdout.contains(CHECKED_LOADERS),
+            "{}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
         );
-        assert_eq!(bot.unwrap().bot.default_prefix, "?");
     }
 
     #[test]
