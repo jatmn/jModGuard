@@ -2745,6 +2745,47 @@ mod tests {
         assert!(admit(d, 11, 101, at).is_none());
         admit(d, 12, 102, at).unwrap()
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn metadata_claim_rechecks_the_short_rule_window_after_admission() {
+        let start = tokio::time::Instant::now().into_std();
+        let policy = Policy {
+            window_secs: 5,
+            ..policy()
+        };
+        for (elapsed_secs, expected) in [(4, true), (5, false)] {
+            let detector = Detector::new(Limits::default()).unwrap();
+            let admitted_at = start + Duration::from_secs(2);
+            for (id, channel, at) in [(10, 100, start), (11, 101, admitted_at)] {
+                let mut message = post(id, channel, at, &[1, 2]);
+                message.hashes = None;
+                message.metadata.push(ImageMetadata {
+                    size: 3,
+                    filename: "image.png".into(),
+                    media_type: "image/png".into(),
+                });
+                assert!(matches!(
+                    detector.admit(1, 2, message, (0, 0), &policy, admitted_at, false),
+                    AdmitOutcome::Admitted
+                ));
+            }
+            // Both observations were within the rule window at admission.
+            let claimed = detector.claim_metadata_match(
+                1,
+                2,
+                (101, 11),
+                (0, 0),
+                &policy,
+                start + Duration::from_secs(elapsed_secs),
+            );
+            assert_eq!(
+                claimed.is_some(),
+                expected,
+                "first post age {elapsed_secs}s"
+            );
+        }
+    }
+
     fn evidence(messages: &[(u64, u64)], author: u64, values: &[u8]) -> Vec<TextEvidence> {
         let hashes: BTreeSet<Hash> = values.iter().map(|value| [*value; 32]).collect();
         let text = format_hashes(&hashes.into_iter().collect::<Vec<_>>());

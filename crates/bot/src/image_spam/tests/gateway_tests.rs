@@ -128,7 +128,7 @@ impl Fixture {
         }
     }
 
-    async fn post(&self, author: u64, channel: u64, message: u64, age_secs: i64, image: bool) {
+    async fn post(&self, author: u64, channel: u64, message: u64, age_secs: i64, image_count: u64) {
         let mut msg = Message::default();
         msg.id = MessageId::new(message);
         msg.channel_id = ChannelId::new(channel);
@@ -144,12 +144,14 @@ impl Fixture {
             }))
             .unwrap(),
         ));
-        if image {
+        for image in 0..image_count {
+            let attachment = message + 1000 + 10000 * image;
+            let filename = format!("image-{image}.jpg");
             msg.attachments.push(serde_json::from_value(serde_json::json!({
-                "id": (message + 1000).to_string(),
-                "filename": "image.jpg",
+                "id": attachment.to_string(),
+                "filename": filename,
                 "size": 90536,
-                "url": format!("https://cdn.discordapp.com/attachments/{channel}/{}/image.jpg", message + 1000),
+                "url": format!("https://cdn.discordapp.com/attachments/{channel}/{attachment}/{filename}"),
                 "proxy_url": "",
                 "width": 100,
                 "height": 100,
@@ -170,8 +172,8 @@ impl Fixture {
     }
 
     async fn burst(&self) {
-        self.post(99, 101, 1010, 1, true).await;
-        self.post(99, 102, 1011, 0, true).await;
+        self.post(99, 101, 1010, 1, 1).await;
+        self.post(99, 102, 1011, 0, 1).await;
         self.drain().await;
     }
 }
@@ -201,10 +203,10 @@ async fn gateway_two_channel_image_burst_bans_and_sweeps_previous_hour() {
 
 async fn assert_ban_and_sweep(cfg: jmodguard::config::BotProcessConfig) {
     let fixture = Fixture::new(cfg, live_rule()).await;
-    fixture.post(99, 103, 1001, 3500, false).await;
-    fixture.post(99, 104, 1002, 600, false).await;
-    fixture.post(99, 103, 1003, 3660, false).await;
-    fixture.post(98, 104, 1004, 600, false).await;
+    fixture.post(99, 103, 1001, 3500, 0).await;
+    fixture.post(99, 104, 1002, 600, 0).await;
+    fixture.post(99, 103, 1003, 3660, 0).await;
+    fixture.post(98, 104, 1004, 600, 0).await;
     fixture.burst().await;
     let seen = fixture.discord.requests.lock().clone();
     assert!(
@@ -288,7 +290,7 @@ async fn gateway_fast_image_dry_run_logs_without_mutations_or_components() {
     ]))
     .unwrap();
     let fixture = Fixture::new(Default::default(), rule).await;
-    fixture.post(99, 103, 1001, 600, false).await;
+    fixture.post(99, 103, 1001, 600, 0).await;
     fixture.burst().await;
     assert_eq!(
         *fixture.discord.requests.lock(),
@@ -353,13 +355,46 @@ async fn gateway_fast_image_respects_enabled_exceptions_and_channel_scope() {
 #[tokio::test]
 async fn gateway_fast_match_requires_one_author_two_channels_and_a_recent_pair() {
     let fixture = Fixture::new(Default::default(), live_rule()).await;
-    fixture.post(99, 101, 1001, 12, true).await;
-    fixture.post(99, 102, 1002, 0, true).await; // The only recent post by author 99.
-    fixture.post(99, 102, 1003, 0, true).await; // Repetition in the same channel.
-    fixture.post(98, 103, 1004, 0, true).await; // Another author.
+    fixture.post(99, 101, 1001, 12, 1).await;
+    fixture.post(99, 102, 1002, 0, 1).await; // The only recent post by author 99.
+    fixture.post(99, 102, 1003, 0, 1).await; // Repetition in the same channel.
+    fixture.post(98, 103, 1004, 0, 1).await; // Another author.
     fixture.drain().await;
     let seen = fixture.discord.requests.lock();
     assert!(seen.is_empty(), "{seen:?}");
+}
+
+#[tokio::test]
+async fn gateway_fast_match_respects_both_windows_for_two_image_posts() {
+    for (window_secs, expired_age_secs) in [(60, 30), (5, 7)] {
+        let mut rule = live_rule();
+        rule.params["window_secs"] = window_secs.into();
+        let fixture = Fixture::new(Default::default(), rule).await;
+
+        // Two attachments bypass the single-image prefilter. Two channels
+        // leave the byte matcher below its three-channel minimum.
+        fixture.post(99, 101, 1001, expired_age_secs, 2).await;
+        fixture.post(99, 102, 1002, 0, 2).await;
+        fixture.drain().await;
+        {
+            let requests = fixture.discord.requests.lock();
+            assert!(
+                requests.is_empty(),
+                "window {window_secs}s, first post {expired_age_secs}s old: {requests:?}",
+            );
+        }
+
+        fixture.post(98, 101, 1003, 1, 2).await;
+        fixture.post(98, 102, 1004, 0, 2).await;
+        fixture.drain().await;
+        let requests = fixture.discord.requests.lock();
+        let bans: Vec<_> = requests
+            .iter()
+            .filter(|line| line.starts_with("PUT "))
+            .collect();
+        assert_eq!(bans.len(), 1, "window {window_secs}s: {requests:?}");
+        crate::spam_actions::tests::assert_ban_request(bans[0], 1, 98, 3600);
+    }
 }
 
 #[tokio::test]
