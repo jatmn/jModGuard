@@ -2605,7 +2605,8 @@ mod tests {
     }
 
     /// Router tests never reach discord.com: every OAuth endpoint points at a
-    /// loopback listener that counts each connection and closes it.
+    /// loopback listener that counts each connection and closes it. The client
+    /// ignores proxy variables so an `HTTP_PROXY` cannot divert those requests.
     fn test_app_with_oauth_calls(
         cfg: crate::config::ApiProcessConfig,
     ) -> (Arc<ApiState>, Arc<std::sync::atomic::AtomicUsize>) {
@@ -2633,6 +2634,12 @@ mod tests {
         oauth.me_endpoint = Some(format!("{base}/me"));
         oauth.guilds_endpoint = Some(format!("{base}/guilds"));
         oauth.member_endpoint = Some(format!("{base}/members"));
+        oauth.set_http_client_for_test(
+            jmodguard_updater::http_client_builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+        );
         (app, calls)
     }
 
