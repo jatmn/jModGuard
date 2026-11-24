@@ -21,7 +21,7 @@ import {
 import {
   clearListLocation, ListControls, ListEmptyRow, ListLoadProgress, ListSortHeading, readListLocation,
   flushPendingListSearch, listLoadProgress, openFilteredList, readListPage, rememberListLocation, restoreListLocation,
-  useListControls,
+  setCaseListLocation, useListControls,
 } from "./list-controls.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import { noAutofill } from "./no-autofill.js";
@@ -2308,7 +2308,7 @@ function restoreWorkspace() {
   const linkedGuild = linkedList && state.guilds.find((g) => g.id === guild);
   state.guildId = linkedGuild?.id || state.guilds.find((g) => g.id === saved.guildId)?.id || state.guilds[0]?.id || null;
   state.tab = workspaceTab(linkedList ? linkedGuild ? list : null : saved.tab);
-  if (linkedGuild && list === "cases" && state.tab === "cases" && /^[a-f0-9]{32}$/.test(caseId ?? "")) {
+  if (linkedGuild && state.tab === "cases" && caseId) {
     pendingCase = { guildId: guild, caseId };
   }
   syncListLocation();
@@ -2376,6 +2376,9 @@ function navigate(tab) {
   ui.set({ view: "main-view", pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
   state.tab = workspaceTab(tab);
   syncListLocation();
+  if (state.tab === "cases" && pendingCase?.guildId === state.guildId) {
+    setCaseListLocation(state.guildId, pendingCase.caseId);
+  }
   persistWorkspace();
   renderTab();
   return true;
@@ -6539,6 +6542,7 @@ const TEMPLATE_VARIABLE_GROUPS = [
   ["common", "Who, where and when"],
   ["message", "Messages"],
   ["moderation", "Moderation"],
+  ["cleanup", "Automod cleanup"],
   ["role", "Roles"],
   ["thread", "Threads"],
   ["member", "Member details"],
@@ -6577,6 +6581,15 @@ const TEMPLATE_VARIABLES = [
   ["rule_id", "moderation", "That rule's ID", "mention_spam"],
   ["duration", "moderation", "How long: a timeout's length, or time spent in the server", "1d"],
   ["command", "moderation", "The custom command that ran", "example"],
+  ["cleanup_action", "cleanup", "The enforcement outcome and case link, when available", "Banned · Open case"],
+  ["cleanup_total", "cleanup", "The number of messages deleted. Include this variable to use grouped cleanup notices.", "6"],
+  ["cleanup_channels", "cleanup", "How many messages were deleted from each channel", "#general 4, #media 2"],
+  ["cleanup_first", "cleanup", "The earliest delete observation or failure, in UTC", "2026-11-09 22:35:49 UTC"],
+  ["cleanup_last", "cleanup", "The latest delete observation or failure, in UTC", "2026-11-09 22:35:54 UTC"],
+  ["cleanup_sample", "cleanup", "One short message sample, when available", "Repeated image caption"],
+  ["cleanup_evidence", "cleanup", "The matched evidence hash, when available", "SHA-256 abcd…"],
+  ["cleanup_failures", "cleanup", "The failure count and reasons by channel", "2 · missing permission (#media 2)"],
+  ["cleanup_source_channels", "cleanup", "Comma-separated IDs of the source channels", "42,84"],
   ["added", "role", "Roles that were added", "@Member"],
   ["removed", "role", "Roles that were removed", "none"],
   ["role", "role", "The role, as a mention", "@Member"],
@@ -6598,6 +6611,7 @@ const TEMPLATE_VARIABLES = [
   ["before_global", "member", "Their display name before the change", "Alice"],
   ["after_global", "member", "Their display name after the change", "Alice Example"],
 ].map(([name, group, meaning, example]) => ({ name, group, meaning, example }));
+const CLEANUP_VARIABLE_NAMES = TEMPLATE_VARIABLES.filter(v => v.group === "cleanup").map(v => v.name);
 
 // Variables each event supplies besides {guild}, {time} and {emoji}. Every variable
 // in a shipped template is listed here.
@@ -6626,7 +6640,7 @@ const TEMPLATE_EVENT_VARIABLES = {
   thread_create: "mention channel thread thread_id thread_name notice",
   thread_update: "channel before thread thread_id thread_name archived locked auto_archive invitable",
   thread_delete: "channel thread thread_id thread_name",
-  automod_delete: "mention channel message_id message_url content attachments coverage reason rule rule_id",
+  automod_delete: `mention user_id channel message_id message_url content attachments coverage reason rule rule_id ${CLEANUP_VARIABLE_NAMES.join(" ")}`,
   member_rejoin: "user mention user_id notice cases",
 };
 
@@ -6905,13 +6919,21 @@ function TemplateCard({ record: t }) {
     defaultValue: t.effective,
   });
   const template = ui.getSnapshot().drafts[`template:${t.event}:text`]?.value ?? t.effective;
+  const groupedCleanup = t.event === "automod_delete" && template.includes("{cleanup_total}");
   // {emoji} stays with the preview's own emoji rule.
-  const samples = Object.fromEntries(TEMPLATE_VARIABLES.filter((v) => v.name !== "emoji").map((v) => [v.name, v.example]));
-  const preview = templateEmbedPreview(t, template, {
-    ...samples,
-    action: t.event === "role_change" ? "updated" : "ban",
-    notice: t.event === "thread_create" ? "created" : "Prior moderation",
-  });
+  const samples = Object.fromEntries(TEMPLATE_VARIABLES
+    .filter(v => v.name !== "emoji" && (groupedCleanup || v.group !== "cleanup"))
+    .map(v => [v.name, v.example]));
+  samples.action = t.event === "role_change" ? "updated" : "ban";
+  samples.notice = t.event === "thread_create" ? "created" : "Prior moderation";
+  if (groupedCleanup) {
+    const supplied = new Set(["mention", "user_id", "rule", "rule_id", "guild", "time", "event", "emoji", ...CLEANUP_VARIABLE_NAMES]);
+    samples.event = t.event;
+    for (const [, name] of template.matchAll(/\{([^{}]+)\}/g)) {
+      if (!supplied.has(name)) samples[name] = "unavailable for grouped cleanup";
+    }
+  }
+  const preview = templateEmbedPreview(t, template, samples);
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef, "This server", "Global", true, `template:${t.event}:scope`);
   return h(

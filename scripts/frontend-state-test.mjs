@@ -1385,7 +1385,7 @@ test('template variable help lists each variable with its meaning and an example
   app.state.config = { templates: [] };
   const reference = app.tabTemplates().querySelector('.reference-panel');
   const groups = [...reference.querySelectorAll('.template-variable-group h3')].map(el => el.textContent);
-  assert.deepEqual(groups, ['Who, where and when', 'Messages', 'Moderation', 'Roles', 'Threads', 'Member details']);
+  assert.deepEqual(groups, ['Who, where and when', 'Messages', 'Moderation', 'Automod cleanup', 'Roles', 'Threads', 'Member details']);
   const rows = new Map([...reference.querySelectorAll('.template-variable-group tbody tr')]
     .map(tr => [...tr.querySelectorAll('td')].map(td => td.textContent))
     .map(([name, meaning, example]) => [name, { meaning, example }]));
@@ -1454,6 +1454,43 @@ test('each template editor offers only its event variables, matching the shipped
   assert.doesNotMatch(chipFor('thread_update', '{before}').title.split('Not always filled in: ')[1], /message/);
   assert.match(chipFor('message_edit', '{after}').title, /“not supplied in this update”/);
   assert.match(chipFor('member_rejoin', '{cases}').title, /Empty when/);
+});
+
+test('Automod Delete template chips and preview match the documented cleanup summary variables', async () => {
+  const docs = fs.readFileSync(new URL('../docs/LOGGING-DATA.md', import.meta.url), 'utf8');
+  const bot = fs.readFileSync(new URL('../crates/bot/src/logging/cleanup_incident.rs', import.meta.url), 'utf8');
+  const summary = bot.slice(bot.indexOf('fn summary_vars('), bot.indexOf('pub(crate) async fn flush('));
+  const keys = [...new Set([...summary.matchAll(/"(cleanup_[a-z_]+)"/g)].map(([, name]) => name))].sort();
+  const documented = [...new Set([...docs.matchAll(/\{(cleanup_[a-z_]+)\}/g)].map(([, name]) => name))].sort();
+  assert.ok(keys.length > 0, 'the bot summary exposes grouped variables');
+  assert.deepEqual(documented, keys, 'documentation matches the bot summary');
+
+  const template = [...keys.map(name => `{${name}}`), '{message_url}'].join(' · ');
+  const h = harness();
+  h.app.state.config = { templates: [
+    { event: 'automod_delete', effective: template },
+    { event: 'message_delete', effective: '{message_url}' },
+  ] };
+  const panel = h.app.tabTemplates();
+  const [automod, ordinary] = panel.querySelectorAll('.template-card');
+  const groupedChips = (card) => [...card.querySelectorAll('.template-var-chip')]
+    .map(chip => chip.textContent.match(/^\{(cleanup_[a-z_]+)\}/)?.[1]).filter(Boolean).sort();
+  assert.deepEqual(groupedChips(automod), keys);
+  assert.deepEqual(groupedChips(ordinary), []);
+  const preview = automod.querySelector('.log-embed-description').textContent;
+  for (const name of keys) {
+    const row = [...panel.querySelectorAll('.template-variable-group tbody tr')]
+      .find(candidate => candidate.firstChild.textContent === `{${name}}`);
+    assert.ok(row?.children[1].textContent && row.children[2].textContent, `${name} has help and a sample`);
+    assert.ok(preview.includes(row.children[2].textContent), `${name} renders that sample`);
+  }
+  assert.doesNotMatch(preview, /\{cleanup_/);
+  assert.match(preview, /unavailable for grouped cleanup/);
+  const total = [...automod.querySelectorAll('.template-var-chip')].find(chip => chip.textContent === '{cleanup_total}');
+  const input = automod.querySelector('textarea');
+  input.setSelectionRange(0, 0);
+  await fire(total, 'click');
+  assert.equal(input.value, '{cleanup_total}' + template);
 });
 
 test('a variable chip inserts at the cursor as an unsaved edit that previews and saves', async () => {
@@ -1603,7 +1640,7 @@ for (const route of ['same guild', 'late callback', 'cancelled navigation']) tes
     calls.push(url);
     if (url.endsWith('/member-sync')) return response({ status: 'complete' });
     if (url.includes('/members?')) return response({ members: [{ user_id: '7' }] });
-    if (url.includes('/members/7/history')) return response({ entries: [{ kind: 'ban', case_id: 'case-one' }] });
+    if (url.includes('/members/7/history')) return response({ entries: [{ kind: 'ban', case_id: CASE_ID }] });
     return response({ cases: [], history: [] });
   }, new Map(), new Map(), () => false);
   const panel = memberView(h);
@@ -1611,20 +1648,29 @@ for (const route of ['same guild', 'late callback', 'cancelled navigation']) tes
   await flushMembers();
   await fire(findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'View history'), 'click', {});
   await flushMembers();
-  const jump = findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Open case case-one');
+  const jump = findNode(panel, n => n.localName === 'button' && n.getAttribute('aria-label') === `Open case ${CASE_ID}`);
   if (route === 'late callback') h.app.state.guildId = h.app.state.guilds[1].id;
   if (route === 'cancelled navigation') h.app.markDirty();
   await fire(jump, 'click', {});
   await flushMembers();
   if (route === 'same guild') {
-    assert.ok(calls.includes(`/api/guilds/${originalGuild}/cases/case-one`));
+    assert.ok(calls.includes(`/api/guilds/${originalGuild}/cases/${CASE_ID}`));
     assert.equal(h.app.state.tab, 'cases');
     assert.ok(h.document.querySelector('.case-view'), 'the handoff opens the case file dialog');
+    await fire(iconAction(caseDialog(h), 'Close case'), 'click');
+    await fire(h.document.querySelector('#content thead button'), 'click');
+    const linked = new URLSearchParams(h.location.search);
+    assert.equal(linked.get('list'), 'cases');
+    assert.equal(linked.get('guild'), originalGuild);
+    assert.equal(linked.get('sort'), 'case');
+    assert.equal(linked.get('case'), CASE_ID, 'the handoff survives the first Cases sort write');
+    h.app.navigate('members');
+    assert.equal(new URLSearchParams(h.location.search).has('case'), false, 'the case link stays in Cases');
   } else {
     h.app.state.guildId = h.app.state.guilds[1].id;
     h.app.tabCases();
     await flushMembers();
-    assert.equal(calls.filter(url => url.includes('/cases/case-one')).length, 0, 'old case intent must not follow a changed/cancelled view');
+    assert.equal(calls.filter(url => url.includes(`/cases/${CASE_ID}`)).length, 0, 'old case intent must not follow a changed/cancelled view');
   }
 });
 
@@ -10873,9 +10919,11 @@ for (const [list, view] of moderationListViews) {
     assert.equal(new URLSearchParams(restored.location.search).get('page_size'), '100');
     const bookmarked = harness(fetchPage, storage);
     bookmarked.location.search = `?list=${list}&guild=${bookmarked.app.state.guildId}&page_size=250`;
+    if (list !== 'cases') bookmarked.location.search += `&case=${CASE_ID}`;
     await view(bookmarked);
     await settle();
     assert.equal(requests.at(-1).get('limit'), '250', 'URL overrides saved preference');
+    assert.equal(new URLSearchParams(bookmarked.location.search).has('case'), false, 'non-Cases lists discard a stray case parameter');
     const otherList = list === 'bans' ? casesView : bansView;
     const other = await otherList(restored);
     assert.equal(memberLabelled(other, 'Rows per page').value, '50');
@@ -11053,7 +11101,7 @@ test('Cases maps sortable headers and a bookmarked filtered view to the API', as
 
 test('Cases opens the case linked from an automod cleanup after sign-in', async () => {
   const { calls, fetchImpl } = caseFixture();
-  const h = harness(fetchImpl);
+  const h = harness(fetchImpl, new Map([['jmodguard.list-page-size.cases', '100']]));
   const { me, guilds, guildId } = h.app.state;
   h.location.search = `?list=cases&guild=${guildId}&case=${CASE_ID}`;
   h.app.handleAuthLoss({ status: 401 });
@@ -11064,16 +11112,34 @@ test('Cases opens the case linked from an automod cleanup after sign-in', async 
   h.location.search = '';
   Object.assign(h.app.state, { me, guilds });
   h.app.restoreWorkspace();
-  await casesView(h);
+  const root = await casesView(h);
   await settle();
   assert.ok(caseDialog(h), 'the case dialog opens');
   assert.equal(calls.filter(c => c.url.endsWith(`/guilds/${guildId}/cases/${CASE_ID}`)).length, 1);
+  const query = () => new URLSearchParams(h.location.search);
+  assert.equal(query().get('page_size'), '100', 'the mount canonicalized the URL');
+  assert.equal(query().get('case'), CASE_ID);
+  await fire(iconAction(caseDialog(h), 'Close case'), 'click');
+  await fire(root.querySelector('thead button'), 'click');
+  const date = root.querySelector('input[type="date"]');
+  date.value = '2026-01-02';
+  await fire(date, 'change');
+  await fire(findNode(root, n => n.localName === 'button' && n.textContent === 'Clear filters'), 'click');
+  assert.equal(query().get('sort'), 'case');
+  assert.equal(query().has('from'), false);
+  assert.equal(query().get('case'), CASE_ID, 'filter and sort writes keep the deep link');
+  assert.ok(calls.filter(c => c.url.includes('/cases?')).every(c => !new URLSearchParams(c.url.split('?')[1]).has('case')));
+  const reopened = harness(fetchImpl);
+  reopened.location.search = h.location.search;
+  reopened.app.restoreWorkspace();
+  await casesView(reopened);
+  assert.ok(caseDialog(reopened), 'the updated link reopens the case');
 });
 
 test('Cases resets its filters, sort and pending search on a server switch', async () => {
   const { h, calls, trigger, options } = await switcherHarness(switcherGuilds);
   const [first, second] = switcherGuilds;
-  h.location.search = `?list=cases&guild=${first.id}&sort=action&dir=asc&q=first&outcome=failed`;
+  h.location.search = `?list=cases&guild=${first.id}&sort=action&dir=asc&q=first&outcome=failed&case=${CASE_ID}`;
   const root = await casesView(h);
   const search = root.querySelector('input[type="search"]');
   assert.equal(search.value, 'first');
@@ -11092,6 +11158,7 @@ test('Cases resets its filters, sort and pending search on a server switch', asy
   assert.equal(query.has('outcome'), false);
   assert.equal(h.document.querySelector('#content input[type="search"]').value, '');
   assert.equal(new URLSearchParams(h.location.search).has('list'), false);
+  assert.equal(new URLSearchParams(h.location.search).has('case'), false);
   assert.equal([...h.timers.values()].some(timer => timer.delay === 300), false);
 });
 

@@ -26,9 +26,15 @@ function emptyFilters(config) {
   return Object.fromEntries(filterKeys(config).map((key) => [key, ""]));
 }
 
-export function readListLocation() {
-  const query = new URLSearchParams(location.search);
-  return { list: query.get("list"), guild: query.get("guild"), caseId: query.get("case") };
+function validCaseId(id) {
+  return /^[a-f0-9]{32}$/.test(id ?? "");
+}
+
+export function readListLocation(query = new URLSearchParams(location.search)) {
+  const list = query.get("list");
+  const guild = query.get("guild");
+  const caseId = query.get("case");
+  return { list, guild, caseId: list === "cases" && guild && validCaseId(caseId) ? caseId : null };
 }
 
 export function flushPendingListSearch(list, guildId) {
@@ -46,6 +52,15 @@ function replaceListLocation(query) {
   history.replaceState(history.state, "", listLocation(query));
 }
 
+export function setCaseListLocation(guildId, caseId) {
+  if (!guildId || !validCaseId(caseId)) return;
+  const query = new URLSearchParams(location.search);
+  query.set("list", "cases");
+  query.set("guild", guildId);
+  query.set("case", caseId);
+  replaceListLocation(query);
+}
+
 // OAuth returns to the workspace root. Preserve a list link in this browser tab.
 export function rememberListLocation(configs) {
   if (!configs.has(readListLocation().list)) return;
@@ -59,16 +74,15 @@ export function restoreListLocation(configs, guilds) {
   try {
     const remembered = new URLSearchParams(window.sessionStorage.getItem(savedListLocation));
     window.sessionStorage.removeItem(savedListLocation);
-    const list = remembered.get("list");
-    const guild = remembered.get("guild");
+    const { list, guild, caseId } = readListLocation(remembered);
     const config = configs.get(list);
     if (!current.list && config && guilds.some(({ id }) => id === guild)) {
       const restored = new URLSearchParams(location.search);
       for (const key of ["list", "guild", "sort", "dir", "page_size", ...filterKeys(config), ...legacyFilterKeys(config)]) {
         if (remembered.has(key)) restored.set(key, remembered.get(key));
       }
-      const caseId = list === "cases" ? remembered.get("case") : null;
       if (caseId) restored.set("case", caseId);
+      else restored.delete("case");
       replaceListLocation(restored);
       return { list, guild, caseId };
     }
@@ -79,10 +93,9 @@ export function restoreListLocation(configs, guilds) {
 export function clearListLocation(config) {
   const query = new URLSearchParams(location.search);
   if (query.get("list") !== config.list) return;
-  for (const key of ["list", "guild", "sort", "dir", "page_size", ...filterKeys(config), ...legacyFilterKeys(config)]) {
+  for (const key of ["list", "guild", "case", "sort", "dir", "page_size", ...filterKeys(config), ...legacyFilterKeys(config)]) {
     query.delete(key);
   }
-  if (config.list === "cases") query.delete("case");
   replaceListLocation(query);
 }
 
@@ -145,6 +158,9 @@ function readView(config, guildId) {
 
 function viewQuery(config, guildId, view) {
   const query = new URLSearchParams(location.search);
+  const link = readListLocation(query);
+  // A case link belongs to the Cases list for its original server.
+  if (link.list !== config.list || link.guild !== guildId || !link.caseId) query.delete("case");
   query.set("list", config.list);
   query.set("guild", guildId);
   query.set("sort", view.sort);
