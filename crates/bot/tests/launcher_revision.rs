@@ -158,6 +158,40 @@ fn lease_present(path: &Path) -> bool {
 }
 
 #[test]
+fn bot_startup_warns_once_when_legacy_retention_is_configured() {
+    let root = temp_root("retention-warning");
+    let config = root.join("config.toml");
+    let warning = "bot.retention_days and JMODGUARD_RETENTION_DAYS are deprecated";
+    for (toml, env, expected) in [
+        ("", None, 0),
+        ("", Some("  "), 0),
+        ("retention_days = 7", None, 1),
+        ("", Some("0"), 1),
+        ("retention_days = 0", Some("100000"), 1),
+    ] {
+        std::fs::write(&config, format!("[bot]\n{toml}\n")).unwrap();
+        let mut envs = vec![
+            ("JMODGUARD_CONFIG", config.to_str().unwrap()),
+            ("JMODGUARD_DISCORD_TOKEN", "dummy-token"),
+            ("JMODGUARD_HEALTH_BIND", ""),
+            ("JMODGUARD_LAUNCHER_REVISION", "0"),
+        ];
+        if let Some(value) = env {
+            envs.push(("JMODGUARD_RETENTION_DAYS", value));
+        }
+        let mut remove = vec!["JMODGUARD_PROCESS_PROBE"];
+        if env.is_none() {
+            remove.push("JMODGUARD_RETENTION_DAYS");
+        }
+        let running = spawn(&envs, &remove);
+        // Stop at the launcher refusal so startup runs without a database or Discord.
+        let log = wait_log(&running, "this release requires launcher revision");
+        assert_eq!(log.matches(warning).count(), expected, "{toml} {env:?}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn old_or_unknown_launcher_child_is_refused_without_readiness_and_exits_cleanly() {
     for revision in [
         None,

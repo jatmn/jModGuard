@@ -652,7 +652,6 @@ page or action it counts, so a tile matches its sidebar item:
 | Prefix | sliders (as Settings) | gray |
 | Bot name | robot | blue |
 | Badword patterns | speech bubble with x (as Badwords) | amber |
-| Routine chat collection | database | gray |
 
 The **Getting started** links show the sidebar icon of the page they open, where a text arrow
 used to be: **Tune automod** a green shield, **Configure commands** a blue terminal prompt and

@@ -404,7 +404,7 @@ for (const [theme, selector] of [["light", ":root"], ["dark", ':root[data-theme=
     // daisyUI 5 .btn:hover darkens --btn-color with 7% black in OKLab.
     const surfaces = { "Overview tile": tile, "Getting started card": colors["--panel"], "setup link": link, "setup link hover": mixOklab("#000000", link, 0.07) };
     const tiles = Object.entries(iconMaps.DASHBOARD_ICONS);
-    assert.equal(tiles.length, 12, "one icon per Overview tile");
+    assert.equal(tiles.length, 11, "one icon per Overview tile");
     const checks = [
       ...tiles.map(([key, entry]) => [`tile ${key}`, entry, ["Overview tile", "Getting started card"]]),
       ...SETUP_LINK_TABS.map((tab) => [`setup link ${tab}`, iconMaps.NAV_ICONS[tab], ["setup link", "setup link hover"]]),
