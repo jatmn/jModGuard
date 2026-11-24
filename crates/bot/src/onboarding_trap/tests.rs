@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const GUILD: u64 = 10;
 const TRAP_ROLE: u64 = 20;
+const NEW_TRAP_ROLE: u64 = 23;
 const MEMBER: u64 = 30;
 const REASON: &str = "[Automod] Kicked for suspected bot (onboarding)";
 
@@ -41,6 +42,7 @@ fn guild(everyone: Permissions) -> Guild {
         (TRAP_ROLE, Permissions::empty()),
         (21, Permissions::MANAGE_MESSAGES),
         (22, Permissions::ADMINISTRATOR),
+        (NEW_TRAP_ROLE, Permissions::empty()),
     ] {
         let mut role = Role::default();
         role.id = RoleId::new(id);
@@ -84,17 +86,23 @@ fn saturated_replay_history_keeps_new_live_stays_eligible() {
     let role = RoleId::new(TRAP_ROLE);
     let joined_at = Timestamp::now();
     let pending = (guild, UserId::new(MEMBER));
-    let _in_flight = recent.claim(pending, joined_at, role, false).unwrap();
+    let _in_flight = recent
+        .claim(pending, joined_at, role, false, (0, 0))
+        .unwrap();
     for dry in [true, false] {
         for index in 0..=MATCH_LIMIT {
             let subject = (guild, UserId::new(100 + index as u64));
-            let claim = recent.claim(subject, joined_at, role, dry).unwrap();
+            let claim = recent.claim(subject, joined_at, role, dry, (0, 0)).unwrap();
             assert!(claim.complete(dry, |_| true));
         }
     }
-    assert!(recent.claim(pending, joined_at, role, false).is_none());
+    assert!(
+        recent
+            .claim(pending, joined_at, role, false, (0, 0))
+            .is_none()
+    );
     let fresh = (GuildId::new(GUILD + 1), UserId::new(MEMBER));
-    let claim = recent.claim(fresh, joined_at, role, false).unwrap();
+    let claim = recent.claim(fresh, joined_at, role, false, (0, 0)).unwrap();
     assert!(claim.complete(false, |_| true));
     assert!(!claim.complete(false, |_| true));
 }
@@ -105,17 +113,124 @@ fn invalidated_claim_cannot_complete_or_release_its_successor() {
     let subject = (GuildId::new(GUILD), UserId::new(MEMBER));
     let role = RoleId::new(TRAP_ROLE);
     let joined_at = Timestamp::now();
-    let first = recent.claim(subject, joined_at, role, false).unwrap();
-    assert!(recent.claim(subject, joined_at, role, false).is_none());
+    let first = recent
+        .claim(subject, joined_at, role, false, (0, 0))
+        .unwrap();
+    assert!(
+        recent
+            .claim(subject, joined_at, role, false, (0, 0))
+            .is_none()
+    );
     recent.observe(subject.0, subject.1, Some((joined_at, &[])));
-    let successor = recent.claim(subject, joined_at, role, false).unwrap();
+    let successor = recent
+        .claim(subject, joined_at, role, false, (0, 0))
+        .unwrap();
 
     assert!(!first.complete(false, |_| true));
     drop(first);
-    assert!(recent.claim(subject, joined_at, role, false).is_none());
+    assert!(
+        recent
+            .claim(subject, joined_at, role, false, (0, 0))
+            .is_none()
+    );
     assert!(successor.complete(false, |_| true));
     drop(successor);
-    assert!(recent.claim(subject, joined_at, role, false).is_none());
+    assert!(
+        recent
+            .claim(subject, joined_at, role, false, (0, 0))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn repeated_replacements_cancel_stalled_preflights_and_only_latest_dispatches() {
+    use std::cell::Cell;
+    use std::future::poll_fn;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+        poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
+    }
+
+    // Use one of the per-mode permits so each handoff hits the production cap.
+    let recent = &RecentMatches {
+        claims: Mutex::default(),
+        preflights: std::array::from_fn(|_| Semaphore::new(1)),
+    };
+    let ready = &Semaphore::new(0);
+    let lookup_count = &Cell::new(0);
+    let subject = (GuildId::new(GUILD), UserId::new(MEMBER));
+    let joined_at = Timestamp::now();
+    let role = RoleId::new(TRAP_ROLE);
+    let grant = |revision| async move {
+        let claim = recent
+            .claim(subject, joined_at, role, false, (0, revision))
+            .unwrap();
+        claim
+            .preflight(async {
+                lookup_count.set(lookup_count.get() + 1);
+                let _response = ready.acquire().await.ok()?;
+                claim.complete(false, |_| true).then_some(revision)
+            })
+            .await
+    };
+    let mut pending = Box::pin(grant(1));
+    assert!(poll_once(pending.as_mut()).await.is_pending());
+    assert_eq!(lookup_count.get(), 1);
+    for revision in 2..=8 {
+        let mut successor = Box::pin(grant(revision));
+        assert!(poll_once(successor.as_mut()).await.is_pending());
+        assert_eq!(
+            lookup_count.get(),
+            revision - 1,
+            "obsolete lookup still owns the permit"
+        );
+        assert!(
+            recent
+                .claim(subject, joined_at, role, false, (0, revision - 1))
+                .is_none()
+        );
+        assert_eq!(poll_once(pending.as_mut()).await, Poll::Ready(None));
+        assert!(poll_once(successor.as_mut()).await.is_pending());
+        assert_eq!(
+            lookup_count.get(),
+            revision,
+            "latest lookup used the released permit"
+        );
+        pending = successor;
+    }
+    ready.add_permits(1);
+    assert_eq!(pending.await, Some(8));
+    assert!(
+        recent
+            .claim(subject, joined_at, role, false, (0, 9))
+            .is_none()
+    );
+}
+
+#[test]
+fn committed_kick_keeps_same_stay_reserved_even_if_replay_history_is_evicted() {
+    let recent = RecentMatches::default();
+    let subject = (GuildId::new(GUILD), UserId::new(MEMBER));
+    let joined_at = Timestamp::now();
+    let claim = recent
+        .claim(subject, joined_at, RoleId::new(TRAP_ROLE), false, (0, 1))
+        .unwrap();
+    assert!(claim.complete(false, |_| true));
+    recent.claims.lock().history[0].evict_oldest();
+    recent.observe(subject.0, subject.1, Some((joined_at, &[])));
+    assert!(
+        recent
+            .claim(
+                subject,
+                joined_at,
+                RoleId::new(NEW_TRAP_ROLE),
+                false,
+                (0, 2)
+            )
+            .is_none()
+    );
 }
 
 struct Call {
@@ -217,6 +332,11 @@ async fn gateway_case(
     .await;
     let guild_json = serde_json::to_string(&guild).unwrap();
     let member_json = serde_json::to_string(&discord_member).unwrap();
+    let mut member_with_new_role = discord_member.clone();
+    member_with_new_role.roles.push(RoleId::new(NEW_TRAP_ROLE));
+    let member_with_new_role_json = serde_json::to_string(&member_with_new_role).unwrap();
+    let new_role_granted = Arc::new(AtomicBool::new(false));
+    let server_new_role_granted = Arc::clone(&new_role_granted);
     let pause = event_kind.starts_with("during dispatch").then(|| {
         Arc::new((
             tokio::sync::Notify::new(),
@@ -230,6 +350,8 @@ async fn gateway_case(
         let (guild_json, member_json) = (guild_json.clone(), member_json.clone());
         let staff_json = staff_json.clone();
         let staff_veto = server_staff_veto.clone();
+        let new_role_granted = Arc::clone(&server_new_role_granted);
+        let member_with_new_role_json = member_with_new_role_json.clone();
         let pause = server_pause.clone();
         async move {
             Ok::<_, Infallible>(service_fn(move |request| {
@@ -237,6 +359,8 @@ async fn gateway_case(
                 let (guild_json, member_json) = (guild_json.clone(), member_json.clone());
                 let staff_json = staff_json.clone();
                 let staff_veto = staff_veto.clone();
+                let new_role_granted = Arc::clone(&new_role_granted);
+                let member_with_new_role_json = member_with_new_role_json.clone();
                 let pause = pause.clone();
                 async move {
                     let (parts, body) = request.into_parts();
@@ -257,7 +381,13 @@ async fn gateway_case(
                     }
                     let (status, body) = match call.method {
                         Method::GET if call.path.contains("/members/") => {
-                            let body = if staff_veto.load(Ordering::Relaxed) { staff_json } else { member_json };
+                            let body = if staff_veto.load(Ordering::Relaxed) {
+                                staff_json
+                            } else if new_role_granted.load(Ordering::Relaxed) {
+                                member_with_new_role_json
+                            } else {
+                                member_json
+                            };
                             (200, body)
                         }
                         Method::GET => (200, guild_json),
@@ -317,7 +447,13 @@ async fn gateway_case(
     }
     let mut changed_rule = rule.clone();
     if let Some(pause) = pause {
-        let trigger = handler.guild_member_update(ctx.clone(), None, None, update(&member));
+        let trigger_finished = Notify::new();
+        let trigger = async {
+            handler
+                .guild_member_update(ctx.clone(), None, None, update(&member))
+                .await;
+            trigger_finished.notify_one();
+        };
         let contradict = async {
             tokio::time::timeout(Duration::from_secs(5), pause.0.notified())
                 .await
@@ -344,11 +480,15 @@ async fn gateway_case(
                 }
                 "during dispatch: disabled"
                 | "during dispatch: dry run"
-                | "during dispatch: new trap role" => {
+                | "during dispatch: new trap role"
+                | "during dispatch: new trap role grant" => {
                     match event_kind {
                         "during dispatch: disabled" => changed_rule.enabled = false,
                         "during dispatch: dry run" => changed_rule.dry_run = true,
-                        _ => changed_rule.params["role_id"] = serde_json::json!("23"),
+                        _ => {
+                            changed_rule.params["role_id"] =
+                                serde_json::json!(NEW_TRAP_ROLE.to_string());
+                        }
                     }
                     changed_rule = db::compare_and_set_onboarding_trap(
                         &app.db,
@@ -360,6 +500,10 @@ async fn gateway_case(
                     .await
                     .unwrap();
                     app.invalidate_configs();
+                    if event_kind == "during dispatch: new trap role grant" {
+                        new_role_granted.store(true, Ordering::Relaxed);
+                        latest.roles.push(RoleId::new(NEW_TRAP_ROLE));
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -372,6 +516,11 @@ async fn gateway_case(
                 handler
                     .guild_member_update(ctx.clone(), Some(latest), None, update(&member))
                     .await;
+            }
+            if matches!(
+                event_kind,
+                "during dispatch: regrant" | "during dispatch: new trap role grant"
+            ) {
                 assert_eq!(
                     calls
                         .lock()
@@ -379,8 +528,11 @@ async fn gateway_case(
                         .filter(|call| call.method == Method::DELETE)
                         .count(),
                     1,
-                    "the re-grant must dispatch while the original match is still parked"
+                    "the qualifying grant must dispatch while the original lookup is still parked"
                 );
+                tokio::time::timeout(Duration::from_secs(5), trigger_finished.notified())
+                    .await
+                    .expect("the superseded handler must finish before the lookup is released");
             }
             pause.1.notify_one();
         };
@@ -441,9 +593,14 @@ async fn gateway_case(
     if expected_kick || dry {
         // Both events can replay an uncached old state. The server deliberately
         // still reports the same member so we exercise the process replay guard.
+        let replay = if new_role_granted.load(Ordering::Relaxed) {
+            &member_with_new_role
+        } else {
+            &member
+        };
         tokio::join!(
-            handler.guild_member_update(ctx.clone(), None, None, update(&member)),
-            handler.guild_member_update(ctx, None, None, update(&member)),
+            handler.guild_member_update(ctx.clone(), None, None, update(replay)),
+            handler.guild_member_update(ctx, None, None, update(replay)),
         );
     }
     server.abort();
@@ -586,6 +743,21 @@ async fn a_disable_or_role_change_saved_during_member_lookup_prevents_the_kick()
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn a_grant_for_the_new_trap_role_supersedes_the_parked_old_role_match() {
+    let member = member(MEMBER, &[TRAP_ROLE], Timestamp::now());
+    gateway_case(
+        member.clone(),
+        member,
+        guild(Permissions::empty()),
+        "during dispatch: new trap role grant",
+        30,
+        false,
+        true,
+    )
+    .await;
 }
 
 #[tokio::test]
