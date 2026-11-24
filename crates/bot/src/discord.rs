@@ -148,35 +148,35 @@ impl LogDispatch {
 
 /// The journal fence follows the actual transport attempt, including retries
 /// after 429. A replacement bot may recover only work definitely not dispatched.
-#[derive(Clone, Copy)]
-pub(crate) struct CleanupJournalKey<'a> {
-    pub batch: &'a str,
-    pub message: Option<i64>,
-}
-
 pub(crate) struct LogAttempt<'a> {
     pub status: &'a mut LogDispatch,
-    pub journal: Option<(&'a crate::db::Db, CleanupJournalKey<'a>)>,
+    pub journal: Option<(&'a crate::db::Db, crate::db::CleanupJournalKey<'a>)>,
+    pub previous_part_sent: bool,
 }
 
 impl LogAttempt<'_> {
-    async fn journal(&self, dispatching: bool) -> Result<()> {
+    pub async fn ensure_current_enrollment(&self) -> Result<()> {
         if let Some((db, key)) = self.journal {
-            let messages = key.message.map(|message| vec![message]);
-            crate::db::set_cleanup_dispatching(db, key.batch.into(), messages, dispatching).await?;
+            crate::db::ensure_cleanup_enrollment(db, key.guild_id, key.enrollment_id.to_owned())
+                .await?;
         }
         Ok(())
     }
 
     pub async fn before_send(&mut self) -> Result<()> {
-        self.journal(true).await?;
+        if let Some((db, key)) = self.journal {
+            crate::db::set_cleanup_dispatching(db, key, self.previous_part_sent, true).await?;
+        }
         *self.status = LogDispatch::MayHaveSent;
         Ok(())
     }
 
     pub async fn reset_journal_if_unsent(&self) -> Result<()> {
-        if *self.status != LogDispatch::MayHaveSent {
-            self.journal(false).await?;
+        if !self.previous_part_sent
+            && *self.status != LogDispatch::MayHaveSent
+            && let Some((db, key)) = self.journal
+        {
+            crate::db::set_cleanup_dispatching(db, key, true, false).await?;
         }
         Ok(())
     }
@@ -190,12 +190,13 @@ pub(crate) async fn send_discord_log_after_rate_limit(
     http: &serenity::http::Http,
     channel: ChannelId,
     message: serenity::builder::CreateMessage,
+    attachment: Option<serenity::builder::CreateAttachment>,
     still_current: &(dyn Fn() -> bool + Sync),
     on_global_rate_limit: &OnGlobalRateLimitCallback,
     mut attempt: Option<&mut LogAttempt<'_>>,
 ) -> Result<bool> {
     let ratelimiter = http.ratelimiter.as_ref();
-    if ratelimiter.is_none() && attempt.is_none() {
+    if ratelimiter.is_none() && attempt.is_none() && attachment.is_none() {
         if !still_current() {
             return Ok(false);
         }
@@ -203,8 +204,12 @@ pub(crate) async fn send_discord_log_after_rate_limit(
         return Ok(true);
     }
 
+    let message = match &attachment {
+        Some(file) => message.add_file(file.clone()),
+        None => message,
+    };
     let payload =
-        serde_json::to_vec(&message).map_err(|_| anyhow!("discord log delivery failed"))?;
+        serde_json::to_string(&message).map_err(|_| anyhow!("discord log delivery failed"))?;
     let message_route = serenity::http::Route::ChannelMessages {
         channel_id: channel,
     };
@@ -240,9 +245,22 @@ pub(crate) async fn send_discord_log_after_rate_limit(
         let post = client
             .post(&path)
             .header(reqwest::header::USER_AGENT, serenity::constants::USER_AGENT)
-            .header(reqwest::header::AUTHORIZATION, &token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(payload.clone())
+            .header(reqwest::header::AUTHORIZATION, &token);
+        let post = match &attachment {
+            Some(file) => post.multipart(
+                reqwest::multipart::Form::new()
+                    .text("payload_json", payload.clone())
+                    .part(
+                        "files[0]",
+                        reqwest::multipart::Part::bytes(file.data.clone())
+                            .file_name(file.filename.clone()),
+                    ),
+            ),
+            None => post
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(payload.clone()),
+        };
+        let post = post
             .build()
             .map_err(|_| anyhow!("discord log delivery failed"))?;
         if let Some(attempt) = attempt.as_deref_mut() {

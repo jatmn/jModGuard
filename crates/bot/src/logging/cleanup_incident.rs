@@ -5,7 +5,7 @@ use super::*;
 use crate::automod_delete_marks::{CleanupDeleteClaim, GatewayDeleteOrigin, PreparedAutomodDelete};
 use crate::db::CleanupDeleteRecord;
 use crate::db::guild_data::{CaseId, CaseOutcome};
-use crate::discord::{CleanupJournalKey, LogDispatch};
+use crate::discord::{LogAttempt, LogDispatch};
 use std::collections::BTreeSet;
 use tokio::time::Instant as Clock;
 
@@ -717,7 +717,7 @@ fn summary_vars(
     incident: &Incident,
     filter: Option<&db::LogFilter>,
     failures_only: bool,
-) -> Option<BTreeMap<String, String>> {
+) -> Option<(BTreeMap<String, String>, Vec<i64>)> {
     let (_, user) = subject;
     let mut vars = BTreeMap::from([
         ("mention".into(), format!("<@{user}>")),
@@ -735,7 +735,7 @@ fn summary_vars(
     let mut last = None;
     let mut sample = None;
     let mut evidence_visible = false;
-    let mut total = 0;
+    let mut confirmed = Vec::new();
     for (&(channel, message), item) in &incident.messages {
         if (incident.outcome == Some(CaseOutcome::Failed) && item.purge_origin.is_some())
             || (failures_only && item.result.is_ok())
@@ -748,7 +748,7 @@ fn summary_vars(
         last = Some(last.map_or(item.at, |last| item.at.max(last)));
         match &item.result {
             Ok(row) => {
-                total += 1;
+                confirmed.push(message as i64);
                 *channels.entry(channel).or_default() += 1;
                 if let Some((source, id, text)) = &incident.sample
                     && (*source, *id) == (channel, message)
@@ -798,7 +798,7 @@ fn summary_vars(
     };
     vars.extend([
         ("cleanup_action".to_owned(), action),
-        ("cleanup_total".to_owned(), total.to_string()),
+        ("cleanup_total".to_owned(), confirmed.len().to_string()),
         ("cleanup_channels".to_owned(), channel_counts(channels)),
         ("cleanup_first".to_owned(), format_time(first?)),
         ("cleanup_last".to_owned(), format_time(last?)),
@@ -832,7 +832,7 @@ fn summary_vars(
                 .join(","),
         ),
     ]);
-    Some(vars)
+    Some((vars, confirmed))
 }
 
 pub(crate) async fn persist_cleanup_observations(app: &BotState) {
@@ -989,7 +989,9 @@ impl PendingIncident {
         }
 
         if !shutdown && !self.fallback {
-            if let Some(mut vars) = summary_vars(self.subject, &self.incident, filter, false) {
+            if let Some((mut vars, confirmed)) =
+                summary_vars(self.subject, &self.incident, filter, false)
+            {
                 if let Some(case) = &self.incident.case {
                     let id = case.as_str();
                     let case_display =
@@ -1008,14 +1010,16 @@ impl PendingIncident {
                     format!("cleanup-s{:016x}", self.incident.nonce),
                 );
                 let batch = batch_key(self.incident.nonce);
-                let journal = self
-                    .incident
-                    .enrollment
-                    .as_ref()
-                    .map(|_| CleanupJournalKey {
-                        batch: &batch,
-                        message: None,
-                    });
+                let journal =
+                    self.incident
+                        .enrollment
+                        .as_ref()
+                        .map(|enrollment| db::CleanupJournalKey {
+                            guild_id: enrollment.guild_id,
+                            enrollment_id: &enrollment.id,
+                            batch: &batch,
+                            messages: &confirmed,
+                        });
                 let delivery = emit_cleanup_summary(
                     app,
                     sink,
@@ -1051,14 +1055,21 @@ impl PendingIncident {
             }
         }
 
-        if let Some(mut vars) = summary_vars(self.subject, &self.incident, filter, true) {
+        if let Some((mut vars, _)) = summary_vars(self.subject, &self.incident, filter, true) {
             vars.insert("cleanup_failure_notice".into(), String::new());
             vars.insert(
                 "cleanup_nonce".into(),
                 format!("cleanup-f{:016x}", self.incident.nonce),
             );
+            let scope = self.individual((0, 0));
+            let mut dispatch = LogDispatch::Pending;
+            let attempt = scope.journal(&[]).map(|key| LogAttempt {
+                status: &mut dispatch,
+                journal: Some((&app.db, key)),
+                previous_part_sent: false,
+            });
             if channel_for(&cfg, "automod_delete").is_none()
-                || emit_to_observed(
+                || emit_to_observed_with_audit(
                     app,
                     sink,
                     GuildId::new(guild),
@@ -1066,9 +1077,13 @@ impl PendingIncident {
                     vars,
                     None,
                     Admission::WaitForShutdown,
+                    || true,
+                    false,
+                    None,
+                    attempt,
                 )
                 .await
-                    == Delivery::Sent
+                .0 == Delivery::Sent
             {
                 self.incident.messages.retain(|_, item| item.result.is_ok());
             }
@@ -1125,11 +1140,8 @@ impl PendingIncident {
             rule: &self.incident.rule,
             reason: &self.incident.reason,
             observed_at: None,
-            batch: self
-                .incident
-                .enrollment
-                .as_ref()
-                .map(|_| batch_key(self.incident.nonce)),
+            batch: batch_key(self.incident.nonce),
+            enrollment_id: self.incident.enrollment.as_ref().map(|e| e.id.as_str()),
         }
     }
 }
@@ -1141,10 +1153,21 @@ struct IndividualCleanup<'a> {
     rule: &'a str,
     reason: &'a str,
     observed_at: Option<chrono::DateTime<chrono::Utc>>,
-    batch: Option<String>,
+    batch: String,
+    enrollment_id: Option<&'a str>,
 }
 
 impl IndividualCleanup<'_> {
+    fn journal<'a>(&'a self, messages: &'a [i64]) -> Option<db::CleanupJournalKey<'a>> {
+        self.enrollment_id
+            .map(|enrollment_id| db::CleanupJournalKey {
+                guild_id: self.subject.0 as i64,
+                enrollment_id,
+                batch: &self.batch,
+                messages,
+            })
+    }
+
     /// A true result is a delivered report or an explicit routing/filter decision.
     async fn emit(
         &self,
@@ -1198,15 +1221,11 @@ impl IndividualCleanup<'_> {
             report.vars.insert("time".into(), observed_at.to_rfc3339());
         }
         let mut dispatch = LogDispatch::Pending;
-        let attempt = self.batch.as_ref().map(|batch| crate::discord::LogAttempt {
+        let messages = [message as i64];
+        let attempt = self.journal(&messages).map(|key| LogAttempt {
             status: &mut dispatch,
-            journal: Some((
-                &app.db,
-                CleanupJournalKey {
-                    batch,
-                    message: Some(message as i64),
-                },
-            )),
+            journal: Some((&app.db, key)),
+            previous_part_sent: false,
         });
         let (delivery, _) = emit_to_observed_with_audit(
             app,
@@ -1264,32 +1283,31 @@ impl IndividualCleanup<'_> {
                 transcript.push_unknown(id);
             }
         }
-        if let Some(batch) = &self.batch
-            && let Err(error) =
-                db::set_cleanup_dispatching(&app.db, batch.clone(), Some(messages.clone()), true)
-                    .await
-        {
-            tracing::warn!(%error, "could not fence cleanup bulk fallback");
-            return false;
-        }
-        // Like ordinary bulk placement, ambiguous transport is terminal to
-        // avoid sending another copy of a transcript Discord may have accepted.
-        let outcome = emit_retained_bulk_to(
+        emit_retained_bulk_with_journal(
             app,
             sink,
             GuildId::new(guild),
             ChannelId::new(source),
             transcript,
+            self.journal(&messages),
         )
-        .await;
-        if outcome == BulkDeliveryOutcome::Failed
-            && let Some(batch) = &self.batch
-            && let Err(error) =
-                db::set_cleanup_dispatching(&app.db, batch.clone(), Some(messages), false).await
-        {
-            tracing::warn!(%error, "could not reopen cleanup bulk fallback");
+        .await
+            != BulkDeliveryOutcome::Failed
+    }
+}
+
+impl<'a> From<&'a CleanupDeleteRecord> for IndividualCleanup<'a> {
+    fn from(record: &'a CleanupDeleteRecord) -> Self {
+        Self {
+            subject: (record.guild_id as u64, record.user_id as u64),
+            target: (record.channel_id as u64, record.message_id as u64),
+            rule_id: &record.rule_id,
+            rule: &record.rule_name,
+            reason: "Automod cleanup interrupted by restart",
+            observed_at: chrono::DateTime::from_timestamp_millis(record.observed_at_ms),
+            batch: record.batch.clone(),
+            enrollment_id: Some(&record.enrollment_id),
         }
-        outcome != BulkDeliveryOutcome::Failed
     }
 }
 
@@ -1319,15 +1337,7 @@ async fn recover_cleanup_page(
             retry = true;
             continue;
         }
-        let notice = IndividualCleanup {
-            subject: (guild, record.user_id as u64),
-            target: (record.channel_id as u64, record.message_id as u64),
-            rule_id: &record.rule_id,
-            rule: &record.rule_name,
-            reason: "Automod cleanup interrupted by restart",
-            observed_at: chrono::DateTime::from_timestamp_millis(record.observed_at_ms),
-            batch: Some(record.batch.clone()),
-        };
+        let notice = IndividualCleanup::from(&record);
         // Without the outcome of the interrupted enforcement, a purge echo
         // has known author identity but might have been an unrelated delete.
         let event = if record.purge {

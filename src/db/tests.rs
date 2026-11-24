@@ -1,5 +1,86 @@
 use super::*;
 
+#[tokio::test]
+async fn cleanup_dispatch_requires_every_row_and_an_active_unfenced_enrollment() {
+    use super::guild_stores::{StoreId, StorePolicy, register_store};
+
+    let tmp = tmp_db_path("cleanup_dispatch");
+    let db = Db::open(&tmp, 2).unwrap();
+    let enrollment = enroll_guild(&db, 8, 100).await.unwrap().unwrap();
+    save_cleanup_deletes(
+        &db,
+        "previous".into(),
+        vec![CleanupDeleteRecord {
+            batch: "cleanup".into(),
+            guild_id: enrollment.guild_id,
+            enrollment_id: enrollment.id.clone(),
+            channel_id: 9,
+            message_id: 10,
+            user_id: 11,
+            rule_id: "spam".into(),
+            rule_name: "Spam".into(),
+            observed_at_ms: 100,
+            purge: false,
+        }],
+    )
+    .await
+    .unwrap();
+    let key = CleanupJournalKey {
+        guild_id: enrollment.guild_id,
+        enrollment_id: &enrollment.id,
+        batch: "cleanup",
+        messages: &[10, 12],
+    };
+    assert!(
+        set_cleanup_dispatching(&db, key, false, true)
+            .await
+            .is_err()
+    );
+    let key = CleanupJournalKey {
+        messages: &[10],
+        ..key
+    };
+    // The partial claim must roll back so the exact row is still available.
+    set_cleanup_dispatching(&db, key, false, true)
+        .await
+        .unwrap();
+    set_cleanup_dispatching(&db, key, true, false)
+        .await
+        .unwrap();
+    let destination = format!("{:032x}", 9u128);
+    register_store(
+        &db,
+        StoreId::parse(&destination).unwrap(),
+        StorePolicy::Shared,
+    )
+    .await
+    .unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO guild_write_fences
+               (guild_id,generation,phase,destination_store_id,destination_revision,created_at)
+             VALUES (8,?1,'freeze',?1,?1,100)",
+            params![destination],
+            1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(
+        set_cleanup_dispatching(&db, key, false, true)
+            .await
+            .is_err()
+    );
+    assert!(
+        ensure_cleanup_enrollment(&db, enrollment.guild_id, enrollment.id.clone())
+            .await
+            .is_err()
+    );
+    drop(db);
+    let _ = std::fs::remove_file(tmp);
+}
+
 #[test]
 fn remote_pool_admission_has_a_deadline() {
     let tmp = tmp_db_path("pool_admission_timeout");

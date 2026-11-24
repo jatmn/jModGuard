@@ -80,26 +80,69 @@ pub async fn recovered_cleanup_deletes(
     .await
 }
 
-/// A summary fences its whole batch. An individual or bulk fallback fences
-/// just the messages included in that attempt.
+#[derive(Clone, Copy)]
+pub struct CleanupJournalKey<'a> {
+    pub guild_id: i64,
+    pub enrollment_id: &'a str,
+    pub batch: &'a str,
+    pub messages: &'a [i64],
+}
+
+pub async fn ensure_cleanup_enrollment(db: &Db, guild: i64, enrollment_id: String) -> Result<()> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_snapshot()?;
+        let current = active_enrollment_conn(&tx, guild)?;
+        anyhow::ensure!(
+            current.is_some_and(|enrollment| enrollment.id == enrollment_id),
+            "cleanup enrollment is no longer active"
+        );
+        super::guild_stores::refuse_fenced_write(&tx, guild)?;
+        tx.finish_read()
+    })
+    .await
+}
+
+/// Claim or reopen the exact rows covered by a Discord attempt. If any row
+/// is missing, belongs to another enrollment, or changed state, roll back.
 pub async fn set_cleanup_dispatching(
     db: &Db,
-    batch: String,
-    messages: Option<Vec<i64>>,
+    key: CleanupJournalKey<'_>,
+    expected_dispatching: bool,
     dispatching: bool,
 ) -> Result<()> {
-    let messages = messages
-        .map(|messages| serde_json::to_string(&messages))
-        .transpose()?;
+    let guild = key.guild_id;
+    let enrollment = key.enrollment_id.to_owned();
+    let count = key.messages.len();
+    if count == 0 {
+        // Failure-only summaries have no confirmed deletes to journal.
+        return ensure_cleanup_enrollment(db, guild, enrollment).await;
+    }
+    let batch = key.batch.to_owned();
+    let messages = serde_json::to_string(key.messages)?;
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
         tx.ensure_mutation_receipt()?;
-        tx.execute_bounded(
-            "UPDATE cleanup_delete_journal SET dispatching=?3
-               WHERE batch=?1 AND (?2 IS NULL OR message_id IN (SELECT value FROM json_each(?2)))",
-            params![batch, messages, dispatching],
+        let changed = tx.execute_bounded(
+            "UPDATE cleanup_delete_journal SET dispatching=?6
+              WHERE batch=?1 AND message_id IN (SELECT value FROM json_each(?2))
+                AND guild_id=?3 AND enrollment_id=?4 AND dispatching=?5
+                AND EXISTS (SELECT 1 FROM guild_enrollments e
+                            WHERE e.guild_id=?3 AND e.id=?4 AND e.active=1)
+                AND NOT EXISTS (SELECT 1 FROM guild_write_fences f WHERE f.guild_id=?3)",
+            params![
+                batch,
+                messages,
+                guild,
+                enrollment,
+                expected_dispatching,
+                dispatching
+            ],
             0,
         )?;
+        anyhow::ensure!(
+            changed == count,
+            "cleanup dispatch rows are no longer current"
+        );
         tx.commit()
     })
     .await

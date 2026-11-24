@@ -1,7 +1,7 @@
 use super::*;
 use crate::logging::tests::{
-    ScriptedHttpReply, log_text, read_proxied_request, replay_snapshot, request_log_payload,
-    scripted_discord_proxy,
+    ReplayAttachmentProxy, ScriptedHttpReply, log_text, read_proxied_request,
+    replay_attachment_proxy, replay_snapshot, request_log_payload, scripted_discord_proxy,
 };
 
 const GUILD: u64 = 8;
@@ -424,6 +424,122 @@ async fn a_summary_dispatched_before_an_abrupt_restart_is_not_replayed() {
 }
 
 #[tokio::test]
+async fn recovered_delete_cannot_use_rejoined_membership_after_admission() {
+    use std::future::Future;
+
+    for event in ["message_delete", "message_bulk_delete"] {
+        let f = Fixture::new(true).await;
+        let old = f.enroll().await;
+        let cleanup = f.begin().await.unwrap();
+        db::delete_log_channel(&f.app.db, GUILD as i64, "message_delete")
+            .await
+            .unwrap();
+        db::upsert_log_channel(&f.app.db, GUILD as i64, event, DESTINATION as i64)
+            .await
+            .unwrap();
+        f.rest(Some(&cleanup), 1, 101).await;
+        drop(cleanup);
+        let restarted =
+            BotState::new(Default::default(), db::Db::open(&f.path.0, 2).unwrap()).unwrap();
+        restarted.activation.mark_lock_held(true);
+        let records =
+            db::recovered_cleanup_deletes(&restarted.db, restarted.activation.instance().into(), 0)
+                .await
+                .unwrap();
+        let [(_, record)] = records.as_slice() else {
+            panic!("expected one recovered delete");
+        };
+        assert_eq!(record.enrollment_id, old.id);
+        let notice = IndividualCleanup::from(record);
+        let cfg = restarted.configs.get(&restarted.db, GUILD).await.unwrap();
+        let slots = &restarted.log_delivery_slots;
+        let held = slots
+            .acquire_many(slots.available_permits().try_into().unwrap())
+            .await
+            .unwrap();
+        let send = notice.emit(&restarted, &f.sink, &cfg, None, "automod_delete");
+        tokio::pin!(send);
+        let queued =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(send.as_mut().poll(cx))).await;
+        assert!(queued.is_pending(), "{event}");
+
+        db::retire_guild_enrollment(&restarted.db, old.guild_id, old.joined_at_ns)
+            .await
+            .unwrap();
+        let new = db::enroll_guild(&restarted.db, old.guild_id, old.joined_at_ns + 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(new.id, old.id);
+        db::upsert_log_channel(&restarted.db, new.guild_id, event, 30)
+            .await
+            .unwrap();
+        restarted.configs.invalidate();
+        drop(held);
+
+        assert!(!send.await, "{event}");
+        assert!(f.notices().is_empty(), "{event}");
+    }
+}
+
+#[tokio::test]
+async fn stopping_before_bulk_admission_leaves_the_delete_recoverable() {
+    let f = Fixture::new(true).await;
+    f.enroll().await;
+    let cleanup = f.begin().await.unwrap();
+    // Remove the single route after incident admission to exercise its bulk fallback.
+    db::delete_log_channel(&f.app.db, GUILD as i64, "message_delete")
+        .await
+        .unwrap();
+    db::upsert_log_channel(&f.app.db, GUILD as i64, "message_bulk_delete", 30)
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    f.rest(Some(&cleanup), 1, 101).await;
+    drop(cleanup);
+    let slots = &f.app.log_delivery_slots;
+    let held = slots
+        .acquire_many(slots.available_permits().try_into().unwrap())
+        .await
+        .unwrap();
+    let waiters = f.app.log_delivery_waiters.available_permits();
+    let sink = Arc::new(Sink::default());
+    let worker = tokio::spawn({
+        let app = Arc::clone(&f.app);
+        let sink = Arc::clone(&sink);
+        async move { flush(&app, sink.as_ref(), true).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while f.app.log_delivery_waiters.available_permits() == waiters {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("bulk fallback must be waiting for a delivery slot");
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    assert!(sink.0.lock().is_empty());
+    drop(held);
+    let path = Arc::clone(&f.path);
+    drop(f);
+
+    let restarted = BotState::new(Default::default(), db::Db::open(&path.0, 2).unwrap()).unwrap();
+    restarted.activation.mark_lock_held(true);
+    let (http, requests, server) = replay_attachment_proxy(ReplayAttachmentProxy::Forbidden).await;
+    let (last, retry) = recover_cleanup_page(&restarted, &http, 0).await.unwrap();
+    assert!(last.is_some() && !retry);
+    server.abort();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let attachment = String::from_utf8_lossy(&requests[0]);
+    assert!(attachment.contains("POST /api/v10/channels/30/messages"));
+    assert!(attachment.contains("filename=\"deleted-messages.txt\""));
+    assert!(attachment.contains("Message 101"));
+    let fallback = String::from_utf8_lossy(&requests[1]);
+    assert!(log_text(&request_log_payload(&fallback)).contains("Message 101"));
+}
+
+#[tokio::test]
 async fn disabling_grouping_preserves_individual_automod_and_purge_logs() {
     let f = Fixture::new(false).await;
     assert!(f.begin().await.is_none());
@@ -471,6 +587,74 @@ async fn rejected_ban_replays_pending_purge_as_plain_delete() {
     assert!(notices[0].contains("Message deleted"));
     assert!(notices[1].contains("**Deleted:** 1"));
     assert!(notices[1].contains("Ban failed"));
+}
+
+#[tokio::test]
+async fn rejected_ban_summary_leaves_unsent_purge_echoes_recoverable() {
+    struct RejectPurge {
+        purge: FailsOrBlocks,
+        summary: FailsOrBlocks,
+    }
+
+    #[serenity::async_trait]
+    impl LogDelivery for RejectPurge {
+        async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
+            if channel.get() == DESTINATION {
+                self.purge.send(channel, message).await
+            } else {
+                self.summary.send(channel, message).await
+            }
+        }
+    }
+
+    let f = Fixture::new(true).await;
+    f.enroll().await;
+    db::upsert_log_channel(&f.app.db, GUILD as i64, "automod_delete", 30)
+        .await
+        .unwrap();
+    let cleanup = f.begin().await.unwrap();
+    f.rest(Some(&cleanup), 1, 101).await;
+    f.remember(SUBJECT, 2, 102);
+    cleanup.begin_purge(PURGE_WINDOW_SECS, BAN_REQUESTED_AT_MS);
+    assert!(f.single(2, 102).is_none());
+    cleanup.outcome(CaseOutcome::Failed, None);
+    drop(cleanup);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::resume();
+    let sink = Arc::new(RejectPurge {
+        purge: FailsOrBlocks::reject(400, r#"{"code":50035,"message":"Invalid form body"}"#).await,
+        summary: FailsOrBlocks {
+            response: SummaryResponse::Blocked,
+            ..Default::default()
+        },
+    });
+    let worker = tokio::spawn({
+        let app = Arc::clone(&f.app);
+        let sink = Arc::clone(&sink);
+        async move { flush(&app, sink.as_ref(), false).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), sink.summary.entered.notified())
+        .await
+        .unwrap();
+    assert!(sink.purge.rejected.lock()[0].contains("<#2>"));
+    assert!(sink.summary.rejected.lock()[0].contains("**Channels:** <#1> 1"));
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    let path = Arc::clone(&f.path);
+    drop(f);
+
+    let restarted = BotState::new(Default::default(), db::Db::open(&path.0, 2).unwrap()).unwrap();
+    restarted.activation.mark_lock_held(true);
+    let recovery = Sink::default();
+    let (last, retry) = recover_cleanup_page(&restarted, &recovery, 0)
+        .await
+        .unwrap();
+    assert!(last.is_some() && !retry);
+    let notices = recovery.0.lock();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].0.get(), DESTINATION);
+    assert!(log_text(&notices[0].1).contains("<#2>"));
 }
 
 #[derive(Default)]

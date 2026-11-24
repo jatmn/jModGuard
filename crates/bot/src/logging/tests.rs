@@ -3045,6 +3045,7 @@ async fn bulk_text_fallback_delivers_every_part_after_attachment_forbidden() {
         Duration::from_secs(30),
         started,
         recovery,
+        None,
     )
     .await;
     assert!(
@@ -3066,7 +3067,7 @@ async fn bulk_text_fallback_delivers_every_part_after_attachment_forbidden() {
 }
 
 #[derive(Clone, Copy)]
-enum ReplayAttachmentProxy {
+pub(super) enum ReplayAttachmentProxy {
     /// 403 when the body names the transcript file; 200 for plain text.
     Forbidden,
     /// Read each request, then leave the connection open.
@@ -3150,7 +3151,7 @@ fn request_names_transcript(request: &[u8]) -> bool {
         .any(|window| window == b"deleted-messages.txt")
 }
 
-async fn replay_attachment_proxy(
+pub(super) async fn replay_attachment_proxy(
     mode: ReplayAttachmentProxy,
 ) -> (
     serenity::http::Http,
@@ -4002,6 +4003,7 @@ async fn discord_rest_counts_logical_requests_across_delivery_paths() {
             &http,
             channel,
             CreateMessage::new().content("fixture"),
+            None,
             current,
             &crate::discord::ignore_global_rate_limit,
             None,
@@ -4062,6 +4064,7 @@ async fn stale_incomplete_notice_is_dropped_after_preemptive_rate_limit_wait() {
             &http,
             ChannelId::new(456),
             CreateMessage::new().content("seed"),
+            None,
             &|| true,
             &ignore_rl,
             None,
@@ -4082,6 +4085,7 @@ async fn stale_incomplete_notice_is_dropped_after_preemptive_rate_limit_wait() {
             &http,
             ChannelId::new(456),
             CreateMessage::new().content("stale"),
+            None,
             &move || !commit_flag.load(Ordering::SeqCst),
             &ignore_rl,
             None,
@@ -4144,6 +4148,7 @@ async fn stale_incomplete_notice_is_not_retried_after_a_429_wait() {
             &http,
             ChannelId::new(456),
             CreateMessage::new().content("stale"),
+            None,
             &move || !commit_flag.load(Ordering::SeqCst),
             &ignore_rl,
             None,
@@ -4710,6 +4715,7 @@ async fn global_429_virtual_wait_blocks_an_earlier_member_sync_claim() {
             &http,
             ChannelId::new(456),
             CreateMessage::new().content("notice"),
+            None,
             &|| true,
             &member_sync_hook,
             None,
