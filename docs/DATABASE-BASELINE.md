@@ -134,8 +134,9 @@ Gateway snapshot. Version 21 adds virtual keys and scoped indexes for case list 
 Version 22 adds virtual keys and scoped indexes for member directory sorting.
 Version 23 corrects the virtual member name sort key for empty names.
 Version 24 stores onboarding setup observations and private case visibility in
-separate columns, preserving legacy JSON payloads. Deploy matching bot and API
-images through the [paired upgrade](BUNNY-UPDATES.md#schema-upgrades-and-recovery).
+separate columns, preserving legacy JSON payloads. For stores on schema 23, use
+matching bot and API images with the [paired upgrade](BUNNY-UPDATES.md#schema-upgrades-and-recovery).
+The new bot migrates the stores before the matching API starts.
 Earlier binaries must not open stores that use a newer guild schema. This separate
 database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer

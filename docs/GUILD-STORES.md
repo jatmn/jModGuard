@@ -96,8 +96,9 @@ Version 23 replaces the virtual Member name key and rebuilds its four indexes to
 Version 24 adds separate columns for onboarding setup observations and private
 case visibility. Existing case and server-name JSON keeps its original shape,
 and the dashboard shows setup checks as unavailable until the bot records an
-observation. Deploy matching bot and API images through the
-[paired upgrade](BUNNY-UPDATES.md#schema-upgrades-and-recovery).
+observation. For stores on schema 23, use matching bot and API images with the
+[paired upgrade](BUNNY-UPDATES.md#schema-upgrades-and-recovery). Apply starts the
+bot to migrate the stores before it starts the API.
 Guild-store migrations run separately from core bootstrap.
 
 | Operation | Contract |

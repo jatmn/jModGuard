@@ -13,6 +13,7 @@ pub struct RecoveryState {
     pub oauth: Arc<oauth::OAuthClient>,
     pub control: UpdateControl,
     pub apply_enabled: bool,
+    pub(super) now: fn() -> i64,
     /// Normal router sends owner actions through `api`. Maintenance `serve`
     /// stays read-only and uses `writer` when the control target is set.
     pub api: Option<Arc<super::state::ApiState>>,
@@ -20,6 +21,10 @@ pub struct RecoveryState {
     /// Bot launcher link for owner upgrade actions. The bot launcher keeps
     /// running while a failed paired upgrade has stopped the bot process.
     pub launcher: Option<jmodguard::control::WriterLink>,
+}
+
+pub(super) fn current_timestamp() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 /// Empty or unusable `JMODGUARD_LAUNCHER_CONTROL_TARGET` leaves no link.
@@ -161,11 +166,12 @@ pub fn routes<S: Clone + Send + Sync + 'static>(state: Arc<RecoveryState>) -> Ro
 async fn status(State(state): State<Arc<RecoveryState>>, session: Session) -> Reply {
     owner(&state, &session).await?;
     let control = &state.control;
+    let now = (state.now)();
     let result = async {
         Ok::<_, anyhow::Error>(json!({
             "operation":control.upgrade().await?,
             "boot_mismatches":control.boot_mismatches().await?,
-            "launchers":control.components().await?.into_iter().filter(|row| row.component != "webui").map(|row| (row.component.clone(), jmodguard_updater::launcher_status(&row, chrono::Utc::now().timestamp()))).collect::<serde_json::Map<String, Value>>(),
+            "launchers":control.components().await?.into_iter().filter(|row| row.component != "webui").map(|row| (row.component.clone(), jmodguard_updater::launcher_status(&row, now))).collect::<serde_json::Map<String, Value>>(),
             "components":control.components().await?.into_iter().filter(|row| row.component != "webui").collect::<Vec<_>>(),
             "core_schema":control.schema_version().await?,
             "apply_enabled":state.apply_enabled,
@@ -188,7 +194,7 @@ async fn check(
     if !matches!(input.channel.as_str(), "latest" | "stable" | "nightly") {
         return Err(problem(StatusCode::BAD_REQUEST, "invalid channel"));
     }
-    let now = chrono::Utc::now().timestamp();
+    let now = (state.now)();
     // Same lease as Administration Check now, held for both services so an
     // hourly poll cannot interleave. Registry work happens before any row write.
     let owner = upgrade_value(
@@ -270,7 +276,7 @@ async fn apply(
             "explicit confirmation and enabled on-demand updates are required",
         ));
     }
-    let now = chrono::Utc::now().timestamp();
+    let now = (state.now)();
     let operation = upgrade_value(
         &state,
         state
@@ -376,6 +382,7 @@ pub async fn serve(cfg: ApiProcessConfig) -> anyhow::Result<()> {
         oauth,
         control,
         apply_enabled: std::env::var("JMODGUARD_UPDATE_APPLY_ENABLED").as_deref() == Ok("1"),
+        now: current_timestamp,
         api: None,
         writer,
         launcher,
@@ -526,6 +533,7 @@ mod tests {
                 oauth: app.oauth.clone(),
                 control: UpdateControl::from_application(&db),
                 apply_enabled: false,
+                now: current_timestamp,
                 api: (!maintenance).then(|| app.clone()),
                 writer: None,
                 launcher: None,
@@ -770,6 +778,249 @@ mod tests {
         }
     }
 
+    fn paired_release(role: &str, digit: char, core: i64, guild: i64) -> ComponentRelease {
+        ComponentRelease {
+            component: role.into(),
+            channel: "latest".into(),
+            release_id: "test".into(),
+            source_sha: "c".repeat(40),
+            published_at: "2026-10-01T00:00:00Z".into(),
+            image: format!("ghcr.io/jatmn/jmodguard-{role}"),
+            digest: format!("sha256:{}", digit.to_string().repeat(64)),
+            min_schema: core,
+            max_schema: core,
+            result_schema: core,
+            min_api: 1,
+            max_api: 1,
+            launcher_protocol: 1,
+            launcher: Some(db::LauncherCompatibility {
+                revision: db::LAUNCHER_REVISION,
+                min_revision: db::REQUIRED_LAUNCHER_REVISION,
+            }),
+            base_abi: "debian-bookworm-amd64".into(),
+            upgrade: Some(UpgradeCompatibility {
+                control_protocol: db::UPDATE_CONTROL_PROTOCOL,
+                min_core: 15,
+                min_guild: 1,
+                guild_schema: guild,
+            }),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paired_apply_upgrades_managed_guild_store_from_23_to_24() {
+        use db::guild_data::{GuildDataStore, GuildStoreOptions};
+        use db::guild_stores::{StoreId, StorePolicy, StoreRegistration};
+        use db::{UpgradeAcknowledgement as Ack, UpgradePhase as Phase};
+
+        const NOW: i64 = 200;
+        let root =
+            std::env::temp_dir().join(format!("paired-guild-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir(&root).unwrap();
+        let mut cfg = ApiProcessConfig::default();
+        cfg.db.path = root.join("core.db");
+        cfg.db.pool_size = 2;
+        cfg.bot.owner_id = 123;
+        cfg.web.base_url = "https://api.example.test".into();
+        let db = Db::open(&cfg.db.path, 2).unwrap();
+        let guild = GuildStoreOptions {
+            path: root.join("core.db.guild.db"),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            read_only: false,
+        };
+        let registration = StoreRegistration::for_test(StoreId::new(), StorePolicy::Shared);
+        let target_guild = db::guild_data::SCHEMA_VERSION;
+        let from_guild = target_guild - 1;
+        GuildDataStore::create_historical_store(guild.clone(), registration.clone(), from_guild)
+            .unwrap();
+        let control = UpdateControl::from_application(&db);
+        let now = NOW;
+        let core = db::CORE_SCHEMA_VERSION;
+        let bot = paired_release("bot", 'a', core, target_guild);
+        let api = paired_release("api", 'b', core, target_guild);
+        let observation = |release: &ComponentRelease, guild| ComponentObservation {
+            source_sha: release.source_sha.clone(),
+            executable_sha256: "e".repeat(64),
+            admin_sha256: None,
+            base_image_sha: "d".repeat(40),
+            started_at: now,
+            min_schema: core,
+            max_schema: core,
+            api_capability: 1,
+            self_update_enabled: true,
+            base_abi: release.base_abi.clone(),
+            guild_schema: Some(guild),
+            update_protocol: db::UPDATE_CONTROL_PROTOCOL,
+            launcher_revision: db::LAUNCHER_REVISION,
+            baked_launcher_revision: db::LAUNCHER_REVISION,
+        };
+        for (target, digit) in [(&bot, 'f'), (&api, 'e')] {
+            let mut installed = paired_release(&target.component, digit, core, from_guild);
+            installed.source_sha = "d".repeat(40);
+            control
+                .checked(
+                    &target.component,
+                    "latest",
+                    Some(installed.clone()),
+                    None,
+                    now,
+                )
+                .await
+                .unwrap();
+            db::request_component_install(&db, &target.component, &installed.digest, now)
+                .await
+                .unwrap();
+            control
+                .running(
+                    &target.component,
+                    Some(installed.clone()),
+                    observation(&installed, from_guild),
+                    now,
+                )
+                .await
+                .unwrap();
+            control
+                .checked(&target.component, "latest", Some(target.clone()), None, now)
+                .await
+                .unwrap();
+        }
+        for target in [&bot, &api] {
+            let refused = jmodguard_updater::compatible(&db, target, now)
+                .await
+                .unwrap_err();
+            assert_eq!(refused.to_string(), db::APP_ONLY_SCHEMA_CHANGE_REFUSED);
+        }
+
+        control.arm_launcher_fence(&"cc".repeat(16));
+        assert!(control.renew_launcher_fence().await.unwrap());
+        let secret = "k".repeat(32);
+        let bind = std::net::SocketAddr::from(([127, 0, 0, 1], 0)).to_string();
+        let bound = jmodguard::launcher_link::spawn(control.clone(), &bind, &secret).unwrap();
+        cfg.bot.launcher_target = bound.to_string();
+        cfg.bot.control_secret = crate::config::ControlSecret::new(secret);
+        let state = Arc::new(RecoveryState {
+            oauth: Arc::new(oauth::OAuthClient::from_config(&cfg).unwrap()),
+            launcher: launcher_link(&cfg),
+            control: UpdateControl::open(&cfg.db_open_options())
+                .unwrap()
+                .unwrap(),
+            cfg: Arc::new(cfg.clone()),
+            apply_enabled: true,
+            now: || NOW,
+            api: None,
+            writer: None,
+        });
+        let store = MemoryStore::default();
+        let owner = cookie(&store, cfg.bot.owner_id).await;
+        let router = maintenance_router(state, store);
+        let (status, body) = request(
+            &router,
+            "POST",
+            "/api/service-upgrade",
+            &owner,
+            &json!({
+                "bot_digest": bot.digest,
+                "api_digest": api.digest,
+                "confirmed": true,
+                "recover": true,
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let op = control.upgrade().await.unwrap().unwrap();
+        assert_eq!(op.phase, Phase::Preparing);
+        assert_eq!(op.from_guild, from_guild);
+        assert_eq!(op.bot.release, bot);
+        assert_eq!(op.api.release, api);
+        let error = GuildDataStore::open(guild.clone(), registration.clone())
+            .err()
+            .unwrap();
+        assert!(db::is_schema_not_ready(&error), "{error:#}");
+
+        // Stand in for process preparation and exit with real durable launcher steps.
+        for role in ["bot", "api"] {
+            control.join_upgrade(&op.id, role, role).await.unwrap();
+        }
+        for (role, ack) in [
+            ("bot", Ack::Prepared),
+            ("api", Ack::Prepared),
+            ("api", Ack::Stopped),
+            ("bot", Ack::Stopped),
+        ] {
+            control.acknowledge(&op.id, role, role, ack).await.unwrap();
+        }
+        assert!(
+            control
+                .acknowledge(&op.id, "api", "api", Ack::Starting)
+                .await
+                .is_err()
+        );
+        let fenced = control
+            .acknowledge(&op.id, "bot", "bot", Ack::Starting)
+            .await
+            .unwrap();
+        assert!(fenced.irreversible);
+        let bot_cfg = crate::config::BotProcessConfig {
+            db: cfg.db.clone(),
+            ..Default::default()
+        };
+        let bot_db = jmodguard_bot::startup::open_database(&bot_cfg)
+            .await
+            .unwrap();
+        let bot_state = jmodguard_bot::startup::build_state(bot_cfg, bot_db)
+            .await
+            .unwrap();
+        GuildDataStore::open(guild, registration).unwrap();
+
+        control
+            .running(
+                "bot",
+                Some(bot.clone()),
+                observation(&bot, target_guild),
+                now,
+            )
+            .await
+            .unwrap();
+        let ready = control
+            .acknowledge(&op.id, "bot", "bot", Ack::Ready)
+            .await
+            .unwrap();
+        assert_eq!(ready.phase, Phase::StartingApi);
+        control
+            .acknowledge(&op.id, "api", "api", Ack::Starting)
+            .await
+            .unwrap();
+        let api_db = Db::open_with(cfg.db_open_options()).unwrap();
+        let api_state = crate::startup::build_state(cfg, api_db).await.unwrap();
+        control
+            .running(
+                "api",
+                Some(api.clone()),
+                observation(&api, target_guild),
+                now,
+            )
+            .await
+            .unwrap();
+        let complete = control
+            .acknowledge(&op.id, "api", "api", Ack::Ready)
+            .await
+            .unwrap();
+        assert_eq!(complete.phase, Phase::Complete);
+        for target in [bot, api] {
+            let installed = control
+                .component(&target.component)
+                .await
+                .unwrap()
+                .installed;
+            assert_eq!(installed, Some(target));
+        }
+        drop((api_state, bot_state, router, control, db));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn future_schema_recovery_requires_owner_origin_and_explicit_pair_confirmation() {
         let path =
@@ -795,32 +1046,7 @@ mod tests {
         let store_schema = db::CORE_SCHEMA_VERSION + 1;
         let store_guild = db::guild_data::SCHEMA_VERSION;
         for (role, digit) in [("bot", 'a'), ("api", 'b')] {
-            let release = ComponentRelease {
-                component: role.into(),
-                channel: "latest".into(),
-                release_id: "test".into(),
-                source_sha: "c".repeat(40),
-                published_at: "2026-10-01T00:00:00Z".into(),
-                image: format!("ghcr.io/jatmn/jmodguard-{role}"),
-                digest: format!("sha256:{}", digit.to_string().repeat(64)),
-                min_schema: store_schema,
-                max_schema: store_schema,
-                result_schema: store_schema,
-                min_api: 1,
-                max_api: 1,
-                launcher_protocol: 1,
-                launcher: Some(db::LauncherCompatibility {
-                    revision: db::LAUNCHER_REVISION,
-                    min_revision: db::REQUIRED_LAUNCHER_REVISION,
-                }),
-                base_abi: "debian-bookworm-amd64".into(),
-                upgrade: Some(UpgradeCompatibility {
-                    control_protocol: db::UPDATE_CONTROL_PROTOCOL,
-                    min_core: 15,
-                    min_guild: 1,
-                    guild_schema: store_guild,
-                }),
-            };
+            let release = paired_release(role, digit, store_schema, store_guild);
             control
                 .checked(role, "latest", Some(release), None, now)
                 .await
@@ -869,6 +1095,7 @@ mod tests {
             cfg: Arc::new(cfg),
             control: reader,
             apply_enabled: true,
+            now: current_timestamp,
             api: None,
             writer: None,
         });
