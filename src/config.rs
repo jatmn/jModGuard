@@ -120,7 +120,8 @@ impl DbConfig {
 pub struct BotConfig {
     pub default_prefix: String,
     pub owner_id: u64,
-    pub retention_days: u32,
+    /// Deprecated. Only used for the legacy database settings fallback.
+    pub retention_days: Option<u32>,
     pub status: String,
     /// Public Web UI URL linked from `!about`. Empty or non-public URLs are not shown.
     pub about_webui_url: String,
@@ -372,7 +373,7 @@ impl Default for BotConfig {
         Self {
             default_prefix: "!".into(),
             owner_id: 0,
-            retention_days: 7,
+            retention_days: None,
             status: "moderating".into(),
             about_webui_url: String::new(),
             about_instance: String::new(),
@@ -608,7 +609,7 @@ impl DbConfig {
             migrate,
             read_only: !migrate,
             default_prefix: bot.default_prefix.clone(),
-            retention_days: bot.retention_days,
+            retention_days: bot.retention_days.unwrap_or(7),
         }
     }
 }
@@ -969,8 +970,10 @@ impl Config {
                 let parsed: u32 = v.parse().with_context(|| {
                     format!("JMODGUARD_RETENTION_DAYS must be an integer, got `{v}`")
                 })?;
-                self.bot.retention_days =
-                    Self::retention_days_in_range(parsed, "JMODGUARD_RETENTION_DAYS")?;
+                self.bot.retention_days = Some(Self::retention_days_in_range(
+                    parsed,
+                    "JMODGUARD_RETENTION_DAYS",
+                )?);
             }
         }
         if let Ok(v) = env::var("JMODGUARD_BOT_STATUS") {
@@ -1023,9 +1026,10 @@ impl Config {
         if let Ok(v) = env::var("JMODGUARD_LOG_DIRECTORY") {
             self.log.directory = PathBuf::from(v.trim());
         }
-        // File and env both feed bot migrate-open terminal defaults; WebUI
-        // writes already reject above MAX_RETENTION_DAYS or purge skips.
-        Self::retention_days_in_range(self.bot.retention_days, "bot.retention_days")?;
+        // File and env both feed the legacy terminal default on bot migrate-open.
+        if let Some(days) = self.bot.retention_days {
+            Self::retention_days_in_range(days, "bot.retention_days")?;
+        }
         Ok(())
     }
 }
@@ -1819,11 +1823,11 @@ mod tests {
             std::env::set_var("JMODGUARD_ABOUT_WEBUI_URL", " https://mod.example.org ");
             std::env::set_var("JMODGUARD_ABOUT_INSTANCE", "Hosted by Example");
         }
-        let mut cfg = Config::default();
+        let mut cfg = Config::parse_file("[bot]\nretention_days=0", false).unwrap();
         cfg.apply_env().unwrap();
         assert_eq!(cfg.db.pool_size, 4);
         assert_eq!(cfg.bot.default_prefix, "?");
-        assert_eq!(cfg.bot.retention_days, 14);
+        assert_eq!(cfg.db.open_options(&cfg.bot, true).retention_days, 14);
         assert_eq!(cfg.bot.status, "watching");
         assert_eq!(cfg.bot.about_webui_url, "https://mod.example.org");
         assert_eq!(cfg.bot.about_instance, "Hosted by Example");
@@ -1855,7 +1859,27 @@ mod tests {
     }
 
     #[test]
-    fn retention_days_env_rejects_above_purge_maximum() {
+    fn retention_days_keeps_legacy_terminal_default_and_accepts_file_bounds() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _saved = SavedEnv::capture(&["JMODGUARD_RETENTION_DAYS"]);
+        unsafe { std::env::set_var("JMODGUARD_RETENTION_DAYS", "  ") };
+        let omitted = Config::parse_file("[bot]", false).unwrap();
+        assert_eq!(omitted.bot.retention_days, None);
+        assert_eq!(
+            omitted.db.open_options(&omitted.bot, true).retention_days,
+            7
+        );
+        for days in [0, 7, crate::db::MAX_RETENTION_DAYS] {
+            let mut cfg =
+                Config::parse_file(&format!("[bot]\nretention_days={days}"), false).unwrap();
+            cfg.apply_env().unwrap();
+            assert_eq!(cfg.bot.retention_days, Some(days));
+            assert_eq!(cfg.db.open_options(&cfg.bot, true).retention_days, days);
+        }
+    }
+
+    #[test]
+    fn retention_days_env_rejects_above_maximum() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         const NAMES: &[&str] = &["JMODGUARD_RETENTION_DAYS"];
         let _saved = SavedEnv::capture(NAMES);
@@ -1873,13 +1897,13 @@ mod tests {
     }
 
     #[test]
-    fn retention_days_file_value_rejects_above_purge_maximum() {
+    fn retention_days_file_value_rejects_above_maximum() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         const NAMES: &[&str] = &["JMODGUARD_RETENTION_DAYS"];
         let _saved = SavedEnv::capture(NAMES);
         unsafe { std::env::remove_var("JMODGUARD_RETENTION_DAYS") };
         let mut cfg = Config::default();
-        cfg.bot.retention_days = crate::db::MAX_RETENTION_DAYS + 1;
+        cfg.bot.retention_days = Some(crate::db::MAX_RETENTION_DAYS + 1);
         let err = cfg.apply_env().unwrap_err();
         assert!(
             err.to_string().contains("bot.retention_days"),

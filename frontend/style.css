@@ -293,10 +293,8 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .setup-number { color: var(--accent); font-size: .8125rem; font-weight: 750; }
 .setup-note { border-top: 1px solid var(--shell-border); padding-top: 8px; color: var(--muted); font-size: .8125rem; }
 .dashboard-section { display: flex; flex-direction: column; gap: 8px; }
-.dashboard-section .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); overflow: visible; background: var(--panel); border: 1px solid var(--shell-border); }
-/* daisyUI stats flow into columns; the merged dashboard grid wraps its twelve tiles into rows. */
-.dashboard-section .stats.dashboard-stats { grid-auto-flow: row; }
-.dashboard-section .stat { min-width: 0; }
+.dashboard-section .stats { display: flex; flex-wrap: wrap; overflow: visible; background: var(--panel); border: 1px solid var(--shell-border); }
+.dashboard-section .stat { flex: 1 0 25%; min-width: 0; }
 .dashboard-section .stat-value { overflow-wrap: anywhere; white-space: normal; }
 .dashboard-section .stat-title { display: flex; align-items: center; gap: 2px; white-space: normal; }
 .dashboard-note { display: flex; align-items: baseline; gap: 12px; padding: 8px 12px; border: 1px solid var(--hero-border); border-left: 3px solid var(--accent); border-radius: 8px; background: var(--hero); font-size: .8125rem; }
@@ -447,7 +445,7 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 
 @media (max-width: 1100px) {
   .setup-links { grid-template-columns: 1fr; }
-  .dashboard-section .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dashboard-section .stat { flex-basis: 50%; }
   .routing-fields { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
   .routing-actions { grid-column: 1 / -1; }
 }

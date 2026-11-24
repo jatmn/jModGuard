@@ -830,7 +830,7 @@ test('dashboard setup state comes from configuration, not the stats read or its 
   assert.equal(Boolean(h.document.querySelector('#content .getting-started')), false, 'no setup guide while loading');
 });
 
-test('dashboard merges every previous stat into one compact grid under a one-line header', async () => {
+test('dashboard shows the configured and measured stats in one compact grid', async () => {
   const { app } = harness(async () => response({ events: 7, warns: 2, bans: 1, cases: 4 }));
   app.state.config = configuredDashboard();
   const dashboard = app.tabDashboard();
@@ -844,8 +844,9 @@ test('dashboard merges every previous stat into one compact grid under a one-lin
   const expected = [
     ['Rules enabled', '1 / 2'], ['Rules in dry-run', '1'], ['Commands enabled', '1 / 2'], ['Log channels', '1'],
     ['Moderation records', '7'], ['Warns', '2'], ['Bans', '1'], ['Cases', '4'],
-    ['Prefix', '!'], ['Bot name', 'Guard'], ['Badword patterns', '3'], ['Routine chat collection', 'Off'],
+    ['Prefix', '!'], ['Bot name', 'Guard'], ['Badword patterns', '3'],
   ];
+  assert.equal(value('Routine chat collection'), undefined);
   assert.equal(grids[0].children.length, expected.length, 'no stat dropped or duplicated');
   for (const [label, shown] of expected) assert.equal(value(label), shown, label);
   // The hero, its eyebrow and the separate explainer band are gone.
@@ -4293,11 +4294,14 @@ const densityProbe = `(async () => {
   for (let i = 0; i < 200 && /Loading/.test(document.querySelector('.dashboard-stats').textContent); i++) await wait();
   await frame();
   const rect = element => { const { top, bottom, width, height } = element.getBoundingClientRect(); return { top, bottom, width, height }; };
+  const statBoxes = [...document.querySelectorAll('.dashboard-stats .stat')].map(rect);
+  const lastStatTop = Math.max(...statBoxes.map(stat => stat.top));
   const result = { theme: document.documentElement.dataset.theme, viewport: innerHeight, scrollY,
     bodyFont: parseFloat(getComputedStyle(document.body).fontSize),
     statFont: parseFloat(getComputedStyle(document.querySelector('.stat-value')).fontSize),
     stats: rect(document.querySelector('.dashboard-stats')), header: rect(document.querySelector('.page-header')),
-    statRows: new Set([...document.querySelectorAll('.dashboard-stats .stat')].map(stat => Math.round(stat.getBoundingClientRect().top))).size,
+    statRows: new Set(statBoxes.map(stat => Math.round(stat.top))).size,
+    lastStatWidths: statBoxes.filter(stat => stat.top === lastStatTop).map(stat => stat.width),
     gettingStarted: Boolean(document.querySelector('.getting-started')),
     tabs: Math.min(...[...document.querySelectorAll('#tabs button')].map(button => rect(button).height)) };
   const probes = document.createElement('div');
@@ -4359,6 +4363,11 @@ test('dashboard density fits 1280x800 and keeps 24px targets in both themes', { 
       assert.ok(m.tabs >= 24, `${name}: navigation targets ${m.tabs}px`);
       assert.equal(m.outline, 'solid 2px', `${name}: focus ring`);
       assert.ok(m.tipShown && m.tip.width > 0, `${name}: focus shows the tooltip`);
+      const lastRowTiles = width > 1100 ? 3 : 1;
+      assert.equal(m.lastStatWidths.length, lastRowTiles, `${name}: final row tile count`);
+      const lastTileWidth = (m.stats.width - 2) / lastRowTiles; // Exclude the two 1px borders.
+      for (const tileWidth of m.lastStatWidths)
+        assert.ok(Math.abs(tileWidth - lastTileWidth) < 1, `${name}: final row shares the available width evenly`);
       if (width <= 720) {
         // Narrow screens scale fields back up to the touch size.
         for (const control of ['btn', 'input', 'select']) assert.equal(Math.round(m.controls[control].height), 40, `${name}: ${control}`);
@@ -4367,7 +4376,7 @@ test('dashboard density fits 1280x800 and keeps 24px targets in both themes', { 
       for (const control of ['btn', 'input', 'select'])
         assert.ok(m.controls[control].height >= 28 && m.controls[control].height <= 32, `${name}: ${control} ${m.controls[control].height}px`);
       assert.ok(m.header.height <= 40, `${name}: one-line page header ${m.header.height}px`);
-      // Twelve stats wrap into rows (protection, activity, configuration) instead of one squeezed row.
+      // Protection, activity and configuration each occupy one desktop row.
       assert.equal(m.statRows, 3, `${name}: stat grid rows`);
       // Acceptance: every stat is visible without scrolling.
       assert.equal(m.scrollY, 0, name);
@@ -11180,7 +11189,6 @@ const DASHBOARD_TILES = [
   ['Prefix', 'prefix', 'sliders', 'neutral', 'settings'],
   ['Bot name', 'bot-name', 'bot', 'info', 'actions'],
   ['Badword patterns', 'badword-patterns', 'message-x', 'warning', 'badwords'],
-  ['Routine chat collection', 'routine-chat-collection', 'database', 'neutral', 'usage'],
 ];
 const SETUP_LINKS = [
   ['01', 'Tune automod', 'Review rules and test them in dry-run.', 'rules', 'shield', 'success'],

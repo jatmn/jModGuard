@@ -3391,7 +3391,6 @@ function tabDashboard() {
         stat("Prefix", cfg.settings?.prefix, "prefix"),
         stat("Bot name", cfg.settings?.bot_name || "default", "bot-name"),
         stat("Badword patterns", (cfg.badwords ?? []).length, "badword-patterns"),
-        stat("Routine chat collection", "Off", "routine-chat-collection"),
       ),
     ),
   );

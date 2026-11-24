@@ -20,19 +20,15 @@ impl Drop for Running {
     }
 }
 
-fn spawn(envs: &[(&str, &str)], remove: &[&str]) -> Running {
+fn spawn(envs: &[(&str, &str)]) -> Running {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_jmodguard-api"));
-    cmd.env("JMODGUARD_CONFIG", "/no/such/jmodguard-config.toml")
+    cmd.env_clear()
+        .env("JMODGUARD_CONFIG", "/no/such/jmodguard-config.toml")
         .env("JMODGUARD_LOG_LEVEL", "info")
         .env("JMODGUARD_LOG_DIRECTORY", "")
+        .envs(envs.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (key, value) in envs {
-        cmd.env(key, value);
-    }
-    for key in remove {
-        cmd.env_remove(key);
-    }
     let mut child = cmd.spawn().unwrap();
     let log = Arc::new(Mutex::new(String::new()));
     let (open, pipes_closed) = mpsc::channel();
@@ -137,18 +133,11 @@ fn root(label: &str) -> PathBuf {
 #[test]
 fn revision_two_api_child_answers_health_and_does_not_exit() {
     let dir = root("rev2");
-    let mut running = spawn(
-        &[
-            ("JMODGUARD_WEB_BIND", "127.0.0.1:0"),
-            ("JMODGUARD_READY_FILE", dir.join("ready").to_str().unwrap()),
-            ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
-        ],
-        &[
-            "JMODGUARD_LAUNCHER_REVISION",
-            "JMODGUARD_OAUTH_CLIENT_ID",
-            "JMODGUARD_OAUTH_CLIENT_SECRET",
-        ],
-    );
+    let mut running = spawn(&[
+        ("JMODGUARD_WEB_BIND", "127.0.0.1:0"),
+        ("JMODGUARD_READY_FILE", dir.join("ready").to_str().unwrap()),
+        ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
+    ]);
     wait_log(
         &running,
         "this release requires launcher revision 7; the running launcher is revision 2",
@@ -167,15 +156,12 @@ fn revision_two_api_child_answers_health_and_does_not_exit() {
 #[test]
 fn revision_seven_api_child_passes_the_launcher_gate() {
     let dir = root("rev7");
-    let mut running = spawn(
-        &[
-            ("JMODGUARD_WEB_BIND", "127.0.0.1:0"),
-            ("JMODGUARD_READY_FILE", dir.join("ready").to_str().unwrap()),
-            ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
-            ("JMODGUARD_LAUNCHER_REVISION", "7"),
-        ],
-        &["JMODGUARD_OAUTH_CLIENT_ID", "JMODGUARD_OAUTH_CLIENT_SECRET"],
-    );
+    let mut running = spawn(&[
+        ("JMODGUARD_WEB_BIND", "127.0.0.1:0"),
+        ("JMODGUARD_READY_FILE", dir.join("ready").to_str().unwrap()),
+        ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
+        ("JMODGUARD_LAUNCHER_REVISION", "7"),
+    ]);
     let log = wait_log(&running, "Discord OAuth credentials required");
     assert!(!log.contains("requires launcher revision"));
     wait_exit(
@@ -188,16 +174,7 @@ fn revision_seven_api_child_passes_the_launcher_gate() {
 
 #[test]
 fn standalone_api_without_launcher_markers_is_not_gated() {
-    let mut running = spawn(
-        &[("JMODGUARD_WEB_BIND", "127.0.0.1:0")],
-        &[
-            "JMODGUARD_LAUNCHER_REVISION",
-            "JMODGUARD_READY_FILE",
-            "JMODGUARD_UPDATE_MAINTENANCE",
-            "JMODGUARD_OAUTH_CLIENT_ID",
-            "JMODGUARD_OAUTH_CLIENT_SECRET",
-        ],
-    );
+    let mut running = spawn(&[("JMODGUARD_WEB_BIND", "127.0.0.1:0")]);
     let log = wait_log(&running, "Discord OAuth credentials required");
     assert!(!log.contains("requires launcher revision"));
     wait_exit(

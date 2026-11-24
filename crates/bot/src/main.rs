@@ -215,6 +215,11 @@ async fn main() -> Result<()> {
     }
 
     init_tracing(&cfg.log, "bot");
+    if cfg.bot.retention_days.is_some() {
+        tracing::warn!(
+            "bot.retention_days and JMODGUARD_RETENTION_DAYS are deprecated and have no effect on collection or retention"
+        );
+    }
     jmodguard::set_shutdown_context("bot");
     jmodguard::resources::process_started_at_ms();
 

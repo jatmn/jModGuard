@@ -146,7 +146,6 @@ export const DASHBOARD_ICONS = {
   prefix: NAV_ICONS.settings,
   "bot-name": NAV_ICONS.actions,
   "badword-patterns": NAV_ICONS.badwords,
-  "routine-chat-collection": NAV_ICONS.usage,
 };
 
 // Decorative: the accessible name always comes from the surrounding control or text.
