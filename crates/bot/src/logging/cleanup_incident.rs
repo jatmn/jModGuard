@@ -4,12 +4,15 @@
 use super::*;
 use crate::automod_delete_marks::{CleanupDeleteClaim, GatewayDeleteOrigin, PreparedAutomodDelete};
 use crate::db::guild_data::{CaseId, CaseOutcome};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use tokio::time::Instant as Clock;
 
 const MAX_INCIDENTS: usize = 64;
+const MAX_RETRIES_PER_GUILD: usize = 8;
 const MAX_MESSAGES: usize = 256;
 const MAX_LIFETIME: Duration = Duration::from_secs(30);
 const DELIVERY_RETRY: Duration = Duration::from_secs(10);
+const MAX_DELIVERY_RETRY: Duration = Duration::from_secs(60);
 
 const SUMMARY_TEMPLATE: &str = "Automod cleanup\n\n**User:** {mention} (`{user_id}`)\n**Rule:** {rule} (`{rule_id}`)\n**Action:** {cleanup_action}\n**Deleted:** {cleanup_total}\n**Channels:** {cleanup_channels}\n**Time range:** {cleanup_first} – {cleanup_last}\n**Sample:** {cleanup_sample}\n**Evidence:** {cleanup_evidence}\n**Delete failures:** {cleanup_failures}";
 
@@ -495,28 +498,65 @@ struct PendingIncident {
     incident: Incident,
     fallback: bool,
     retry_at: Clock,
-    failure_nonce: u64,
+    retry_delay: Duration,
+    summary_started: AtomicBool,
+    nonce: u64,
 }
 
 /// Return partially delivered work to the queue if shutdown cancels this send.
 /// Leave the slot reserved while sending so admission still counts it.
 struct DeliveryLease<'a> {
-    queue: &'a CleanupIncidents,
+    app: &'a BotState,
     id: u64,
     pending: Option<PendingIncident>,
 }
 
 impl Drop for DeliveryLease<'_> {
     fn drop(&mut self) {
-        let mut state = self.queue.inner.lock();
-        if let Some(pending) = self.pending.take()
+        let queue = &self.app.cleanup_incidents;
+        let mut state = queue.inner.lock();
+        let evicted = if let Some(pending) = self.pending.take()
             && !pending.incident.messages.is_empty()
         {
+            let guild = pending.subject.0;
+            let retrying = !pending.retry_delay.is_zero();
             state.pending.insert(self.id, Some(pending));
+            if retrying {
+                state.evict_excess_retry(guild)
+            } else {
+                None
+            }
         } else {
             state.pending.remove(&self.id);
+            None
+        };
+        drop(state);
+        if let Some(mut evicted) = evicted {
+            let discarded = evicted.incident.messages.len();
+            evicted.finish_matching(self.app, |_| true);
+            record_delivery_failure(self.app);
+            tracing::debug!(
+                discarded,
+                "evicted oldest cleanup delivery from a full guild queue"
+            );
         }
-        self.queue.wake.notify_one();
+        queue.wake.notify_one();
+    }
+}
+
+impl Incidents {
+    fn evict_excess_retry(&mut self, guild: u64) -> Option<PendingIncident> {
+        let mut retries = self.pending.iter().filter_map(|(&id, entry)| {
+            entry
+                .as_ref()
+                .filter(|pending| pending.subject.0 == guild && !pending.retry_delay.is_zero())
+                .map(|_| id)
+        });
+        let oldest = retries.next()?;
+        if retries.count() >= MAX_RETRIES_PER_GUILD {
+            return self.pending.remove(&oldest).flatten();
+        }
+        None
     }
 }
 
@@ -574,7 +614,9 @@ impl CleanupIncidents {
                             incident,
                             fallback,
                             retry_at: now,
-                            failure_nonce: rand::random(),
+                            retry_delay: Duration::ZERO,
+                            summary_started: AtomicBool::new(false),
+                            nonce: rand::random(),
                         }),
                     )
                 }),
@@ -589,10 +631,16 @@ impl CleanupIncidents {
             .collect()
     }
 
-    fn lease(&self, id: u64) -> Option<DeliveryLease<'_>> {
-        let pending = self.inner.lock().pending.get_mut(&id)?.take()?;
+    fn lease(app: &BotState, id: u64) -> Option<DeliveryLease<'_>> {
+        let pending = app
+            .cleanup_incidents
+            .inner
+            .lock()
+            .pending
+            .get_mut(&id)?
+            .take()?;
         Some(DeliveryLease {
-            queue: self,
+            app,
             id,
             pending: Some(pending),
         })
@@ -736,12 +784,13 @@ fn summary_vars(
 
 pub(crate) async fn flush(app: &Arc<BotState>, sink: &impl LogDelivery, shutdown: bool) {
     for id in app.cleanup_incidents.queue_due(Clock::now(), shutdown) {
-        let Some(mut lease) = app.cleanup_incidents.lease(id) else {
+        let Some(mut lease) = CleanupIncidents::lease(app, id) else {
             continue;
         };
         let pending = lease.pending.as_mut().expect("leased incident");
         pending.deliver(app, sink, shutdown).await;
-        pending.retry_at = Clock::now() + DELIVERY_RETRY;
+        pending.retry_delay = (pending.retry_delay * 2).clamp(DELIVERY_RETRY, MAX_DELIVERY_RETRY);
+        pending.retry_at = Clock::now() + pending.retry_delay;
     }
 }
 
@@ -755,7 +804,36 @@ impl PendingIncident {
         }
     }
 
+    fn finish_matching(&mut self, app: &BotState, dispose: impl Fn(&Delete) -> bool) {
+        let targets = self
+            .incident
+            .messages
+            .iter()
+            .filter(|(_, item)| dispose(item))
+            .map(|(&target, _)| target)
+            .collect::<Vec<_>>();
+        for target in targets {
+            self.finish(app, target);
+        }
+    }
+
+    fn finish_summary(&mut self, app: &BotState, uncertain: bool) {
+        let rejected = self.incident.outcome == Some(CaseOutcome::Failed);
+        // Rejected-ban purge echoes have an independent ordinary-log route.
+        self.finish_matching(app, |item| !rejected || item.purge_origin.is_none());
+        self.summary_started.store(false, Relaxed);
+        self.fallback = true;
+        if uncertain {
+            record_delivery_failure(app);
+        }
+    }
+
     async fn deliver(&mut self, app: &Arc<BotState>, sink: &impl LogDelivery, shutdown: bool) {
+        // Shutdown can interrupt the worker after handing the summary to the
+        // transport. Its acknowledgement may be lost even though Discord posted it.
+        if self.summary_started.load(Relaxed) {
+            self.finish_summary(app, true);
+        }
         if self.incident.messages.is_empty() {
             return;
         }
@@ -798,19 +876,20 @@ impl PendingIncident {
                         action.push_str(&case_display);
                     });
                 }
-                if emit_to(app, sink, GuildId::new(guild), "automod_delete", vars).await
-                    == Delivery::Sent
-                {
-                    let sent = self
-                        .incident
-                        .messages
-                        .iter()
-                        .filter(|(_, item)| !(rejected && item.purge_origin.is_some()))
-                        .map(|(&target, _)| target)
-                        .collect::<Vec<_>>();
-                    for target in sent {
-                        self.finish(app, target);
-                    }
+                vars.insert(
+                    "cleanup_nonce".into(),
+                    format!("cleanup-s{:016x}", self.nonce),
+                );
+                let delivery = emit_cleanup_summary(
+                    app,
+                    sink,
+                    GuildId::new(guild),
+                    vars,
+                    &self.summary_started,
+                )
+                .await;
+                if delivery != SummaryDelivery::NotSent {
+                    self.finish_summary(app, delivery == SummaryDelivery::Ambiguous);
                     return;
                 }
             }
@@ -841,7 +920,7 @@ impl PendingIncident {
             vars.insert("cleanup_failure_notice".into(), String::new());
             vars.insert(
                 "cleanup_nonce".into(),
-                format!("cleanup-f{:016x}", self.failure_nonce),
+                format!("cleanup-f{:016x}", self.nonce),
             );
             if channel_for(&cfg, "automod_delete").is_none()
                 || emit_to_observed(

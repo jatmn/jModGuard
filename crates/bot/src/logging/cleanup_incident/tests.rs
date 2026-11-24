@@ -49,9 +49,13 @@ impl Fixture {
     }
 
     async fn begin_for(&self, user: u64) -> Option<Cleanup<'_>> {
+        self.begin_in(GUILD, user).await
+    }
+
+    async fn begin_in(&self, guild: u64, user: u64) -> Option<Cleanup<'_>> {
         begin_cleanup(
             &self.app,
-            GUILD,
+            guild,
             user,
             CleanupRule {
                 id: "image_spam",
@@ -357,10 +361,37 @@ async fn rejected_ban_replays_pending_purge_as_plain_delete() {
 }
 
 #[derive(Default)]
+enum SummaryResponse {
+    #[default]
+    Lost,
+    Blocked,
+    Rejected(serenity::http::ErrorResponse),
+}
+
+#[derive(Default)]
 struct FailsOrBlocks {
     rejected: Mutex<Vec<String>>,
-    block: bool,
+    response: SummaryResponse,
     entered: tokio::sync::Notify,
+}
+
+impl FailsOrBlocks {
+    async fn reject(status: u16, body: &'static str) -> Self {
+        let stub = StubDiscord::start(move |_, _| (status, body));
+        let err = stub
+            .http
+            .get_channel(ChannelId::new(DESTINATION))
+            .await
+            .unwrap_err();
+        let serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response)) = err
+        else {
+            panic!("expected a definite fixture rejection: {err}")
+        };
+        Self {
+            response: SummaryResponse::Rejected(response),
+            ..Default::default()
+        }
+    }
 }
 
 #[serenity::async_trait]
@@ -370,10 +401,15 @@ impl LogDelivery for FailsOrBlocks {
             .lock()
             .push(log_text(&serde_json::to_value(message)?));
         self.entered.notify_one();
-        if self.block {
-            std::future::pending().await
-        } else {
-            anyhow::bail!("fixture rejected delivery")
+        match &self.response {
+            SummaryResponse::Lost => {
+                anyhow::bail!("fixture lost the response after accepting the message")
+            }
+            SummaryResponse::Blocked => std::future::pending().await,
+            SummaryResponse::Rejected(error) => Err(serenity::Error::Http(
+                serenity::http::HttpError::UnsuccessfulRequest(error.clone()),
+            )
+            .into()),
         }
     }
 }
@@ -384,7 +420,8 @@ async fn failures_only_survive_rejected_summary_and_fallback() {
     let cleanup = f.begin().await.unwrap();
     cleanup.failed(2, 102, "missing permission");
     drop(cleanup);
-    let reject = FailsOrBlocks::default();
+    let reject =
+        FailsOrBlocks::reject(400, r#"{"code":50035,"message":"Invalid form body"}"#).await;
 
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(10)).await;
@@ -411,7 +448,8 @@ async fn retry_keeps_absorbed_delete_after_both_sends_fail() {
     let cleanup = f.begin().await.unwrap();
     f.rest(Some(&cleanup), 1, 101).await;
     drop(cleanup);
-    let reject = FailsOrBlocks::default();
+    let reject =
+        FailsOrBlocks::reject(400, r#"{"code":50035,"message":"Invalid form body"}"#).await;
 
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(10)).await;
@@ -464,7 +502,7 @@ async fn excluded_user_is_intentionally_settled_without_leaking_into_bulk() {
 }
 
 #[tokio::test]
-async fn shutdown_replays_both_due_incidents_after_the_first_send_blocks() {
+async fn shutdown_replays_only_the_due_incident_that_has_not_started_sending() {
     let f = Fixture::new(true).await;
     for (user, channel, message) in [(SUBJECT, 1, 101), (SUBJECT + 1, 2, 102)] {
         let cleanup = f.begin_for(user).await.unwrap();
@@ -473,7 +511,7 @@ async fn shutdown_replays_both_due_incidents_after_the_first_send_blocks() {
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(10)).await;
     let sink = Arc::new(FailsOrBlocks {
-        block: true,
+        response: SummaryResponse::Blocked,
         ..Default::default()
     });
     let worker = tokio::spawn({
@@ -489,14 +527,13 @@ async fn shutdown_replays_both_due_incidents_after_the_first_send_blocks() {
 
     flush(&f.app, &f.sink, true).await;
     let notices = f.notices();
-    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("Automod message deleted"));
+    assert!(notices[0].contains("<#2>"));
     assert!(
-        notices
-            .iter()
-            .all(|notice| notice.contains("Automod message deleted"))
+        f.single(1, 101).is_none(),
+        "the possible summary retains echo ownership"
     );
-    assert!(notices[0].contains("<#1>"));
-    assert!(notices[1].contains("<#2>"));
 }
 
 #[tokio::test]
@@ -891,4 +928,125 @@ async fn live_ban_cleanup_records_blocked_and_cancelled_outcomes() {
             1
         );
     }
+}
+
+#[tokio::test]
+async fn ambiguous_summary_never_retries_or_expands_to_individual_logs() {
+    for response in [SummaryResponse::Lost, SummaryResponse::Blocked] {
+        let f = Fixture::new(true).await;
+        let cleanup = f.begin().await.unwrap();
+        for (channel, message) in [(1, 101), (2, 102), (3, 103)] {
+            f.rest(Some(&cleanup), channel, message).await;
+        }
+        cleanup.failed(4, 104, "missing permission");
+        drop(cleanup);
+
+        let sink = FailsOrBlocks {
+            response,
+            ..Default::default()
+        };
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        flush(&f.app, &sink, false).await;
+        {
+            let captured = sink.rejected.lock();
+            assert_eq!(captured.len(), 1, "{captured:?}");
+            assert!(captured[0].contains("**Deleted:** 3"));
+            assert!(captured[0].contains("**Delete failures:** 1"));
+        }
+        f.settle().await;
+        f.app.activation.begin_shutdown();
+        flush(&f.app, &f.sink, true).await;
+        assert!(f.notices().is_empty());
+        assert!(f.app.cleanup_incidents.inner.lock().pending.is_empty());
+        assert!(f.single(1, 101).is_none());
+        tokio::time::resume();
+    }
+}
+
+struct GuildRoutingSink {
+    bad: FailsOrBlocks,
+    good: Sink,
+}
+
+#[serenity::async_trait]
+impl LogDelivery for GuildRoutingSink {
+    async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
+        if channel.get() == DESTINATION {
+            self.bad.send(channel, message).await
+        } else {
+            self.good.send(channel, message).await
+        }
+    }
+}
+
+#[tokio::test]
+async fn persistently_rejected_guild_cannot_fill_other_guilds_cleanup_capacity() {
+    const HEALTHY_GUILD: u64 = 18;
+    const HEALTHY_DESTINATION: u64 = 21;
+    let f = Fixture::new(true).await;
+    db::upsert_log_channel(
+        &f.app.db,
+        HEALTHY_GUILD as i64,
+        "message_delete",
+        HEALTHY_DESTINATION as i64,
+    )
+    .await
+    .unwrap();
+    let sink = GuildRoutingSink {
+        bad: FailsOrBlocks::reject(403, r#"{"code":50013,"message":"Missing Permissions"}"#).await,
+        good: Sink::default(),
+    };
+    tokio::time::pause();
+    for i in 0..=MAX_INCIDENTS as u64 {
+        let cleanup = f.begin_for(SUBJECT + i).await.unwrap();
+        f.rest(Some(&cleanup), 1, 101 + i).await;
+        drop(cleanup);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        flush(&f.app, &sink, false).await;
+    }
+
+    {
+        let state = f.app.cleanup_incidents.inner.lock();
+        assert_eq!(state.pending.len(), MAX_RETRIES_PER_GUILD);
+        assert_eq!(
+            state.pending.first_key_value().unwrap().0,
+            &((MAX_INCIDENTS + 1 - MAX_RETRIES_PER_GUILD) as u64)
+        );
+        assert!(
+            state
+                .pending
+                .values()
+                .flatten()
+                .any(|pending| pending.retry_delay > DELIVERY_RETRY)
+        );
+        assert!(
+            state
+                .pending
+                .values()
+                .flatten()
+                .all(|pending| pending.subject.0 == GUILD)
+        );
+    }
+    assert!(!sink.bad.rejected.lock().is_empty());
+    assert!(
+        f.single(1, 101).is_none(),
+        "eviction settles the original echo receipt"
+    );
+
+    let cleanup = f
+        .begin_in(HEALTHY_GUILD, SUBJECT)
+        .await
+        .expect("healthy guild can still group");
+    for (channel, message) in [(2, 201), (3, 202)] {
+        let prepared = cleanup.prepare(&f.app, channel, message);
+        assert!(cleanup.deleted(&f.app, channel, message, prepared, false));
+    }
+    drop(cleanup);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    flush(&f.app, &sink, false).await;
+    let sent = sink.good.0.lock();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0.get(), HEALTHY_DESTINATION);
+    assert!(log_text(&sent[0].1).contains("**Deleted:** 2"));
 }

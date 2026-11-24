@@ -1340,9 +1340,47 @@ pub(crate) async fn emit_to_if(
         commit,
         false,
         None,
+        None,
     )
     .await
     .0
+}
+
+#[derive(PartialEq, Eq)]
+enum SummaryDelivery {
+    Sent,
+    NotSent,
+    Ambiguous,
+}
+
+async fn emit_cleanup_summary(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild: GuildId,
+    vars: BTreeMap<String, String>,
+    started: &std::sync::atomic::AtomicBool,
+) -> SummaryDelivery {
+    let (delivery, _) = emit_to_observed_with_audit(
+        app,
+        sink,
+        guild,
+        "automod_delete",
+        vars,
+        None,
+        Admission::Immediate,
+        || true,
+        false,
+        None,
+        Some(started),
+    )
+    .await;
+    if delivery == Delivery::Sent {
+        SummaryDelivery::Sent
+    } else if started.load(std::sync::atomic::Ordering::Relaxed) {
+        SummaryDelivery::Ambiguous
+    } else {
+        SummaryDelivery::NotSent
+    }
 }
 
 /// Incomplete-notice delivery. The predicate is checked again after a rate-limit wait.
@@ -1364,6 +1402,7 @@ pub(crate) async fn emit_to_if_after_rate_limit(
         Admission::Immediate,
         commit,
         true,
+        None,
         None,
     )
     .await
@@ -1390,6 +1429,7 @@ async fn emit_to_observed(
         || true,
         false,
         None,
+        None,
     )
     .await
     .0
@@ -1407,6 +1447,7 @@ async fn emit_to_observed_with_audit(
     commit: impl Fn() -> bool + Sync,
     after_rate_limit: bool,
     rejoin_enrich_user: Option<&serenity::model::user::User>,
+    summary_started: Option<&std::sync::atomic::AtomicBool>,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
     // here, before admission/config/filter exits can discard the observation.
@@ -1448,6 +1489,7 @@ async fn emit_to_observed_with_audit(
         }
         Admission::Held(_) => None,
     };
+    use std::sync::atomic::Ordering::Relaxed;
     let mut matched_audit = None;
     let result = tokio::time::timeout(deadline.saturating_sub(started.elapsed()), async {
         let cfg = app.configs.get(&app.db, guild_id.get()).await?;
@@ -1613,6 +1655,9 @@ async fn emit_to_observed_with_audit(
             message = message.nonce(nonce).enforce_nonce(true);
         }
         let call = crate::discord::race_discord_call(&app.activation, async {
+            if let Some(started) = summary_started {
+                started.store(true, Relaxed);
+            }
             if after_rate_limit {
                 sink.send_after_rate_limit(channel_id, message, &commit, &on_global_rate_limit)
                     .await
@@ -1634,6 +1679,11 @@ async fn emit_to_observed_with_audit(
                     rest_target,
                     Instant::now(),
                 );
+                if let Some(started) = summary_started
+                    && summary_send_definitely_rejected(&error)
+                {
+                    started.store(false, Relaxed);
+                }
                 return Err(error);
             }
         }
@@ -1643,11 +1693,21 @@ async fn emit_to_observed_with_audit(
     let delivery = match result {
         Ok(Ok(delivery)) => delivery,
         Ok(Err(_)) | Err(_) => {
-            record_delivery_failure(app);
+            // The incident accounts for an uncertain send when it settles.
+            if !summary_started.is_some_and(|started| started.load(Relaxed)) {
+                record_delivery_failure(app);
+            }
             Delivery::Failed
         }
     };
     (delivery, matched_audit)
+}
+
+fn summary_send_definitely_rejected(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<serenity::Error>()
+        .and_then(crate::discord::http_error_response)
+        .is_some_and(|(status, _)| (400..500).contains(&status) && status != 408)
 }
 
 fn member_audit_action(event: &str) -> Option<Action> {
@@ -3747,6 +3807,7 @@ pub(crate) async fn emit_member_event(
         } else {
             None
         },
+        None,
     )
     .await
 }
@@ -3774,6 +3835,7 @@ pub(crate) async fn emit_verified_member_departure(
         Admission::Immediate,
         || true,
         false,
+        None,
         None,
     )
     .await;

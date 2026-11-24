@@ -1311,6 +1311,7 @@ async fn member_rejoin_delivers_when_indexed_case_exceeds_read_budget() {
         || true,
         false,
         Some(&user),
+        None,
     )
     .await;
     assert_eq!(delivery, Delivery::Sent);
@@ -1923,6 +1924,7 @@ async fn ban_report_returns_late_audit_for_its_stored_row() {
         Admission::Immediate,
         || true,
         false,
+        None,
         None,
     )
     .await;

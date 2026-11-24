@@ -127,11 +127,15 @@ and persistence contracts below are unchanged.
   public `bot.about_webui_url`. Otherwise the notice includes the case ID.
 - A cleanup still in progress at the 30-second cap or whose summary cannot
   be sent falls back to individual delete notices and a separate failure count.
-  Pending cleanup deliveries share the bounded incident buffer. Reports stay
-  pending until delivered or ruled out by the destination and filters. Failed
-  individual cleanup deliveries retry with the same Discord nonce. Bulk replay
-  follows the ordinary bulk rule for ambiguous sends. On a planned restart
-  the bot uses the existing shutdown window to attempt unfinished deliveries.
+  A summary whose send may have reached Discord settles as possibly delivered.
+  The bot keeps the echo receipts and sends neither a second summary nor
+  individual notices for the covered deletes. Pending cleanup deliveries
+  share the bounded incident buffer. Definitive failures can retry with
+  exponential delays of 10 to 60 seconds. Each server can retain up to eight
+  retrying incidents. A ninth evicts that server's oldest retry and counts a
+  delivery failure. Individual cleanup retries reuse the same Discord nonce.
+  Bulk replay follows the ordinary bulk rule for ambiguous sends. On a planned
+  restart the bot uses the existing shutdown window to attempt unfinished deliveries.
   Incident buffers and echo receipts are process-local. An abrupt stop can
   lose buffered reports. The grouped summary has no transcript attachment.
 - Delivery slot pressure queues at most 128 waiting reports across the bot.
