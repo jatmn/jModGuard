@@ -1822,17 +1822,7 @@ function App() {
               h(
                 "span",
                 { id: "workspace-status" },
-                isPreview()
-                  ? "Preview — changes disabled"
-                  : guildAccess() === "none"
-                    ? ""
-                    : guildAccess() === "dashboard"
-                      ? "Read-only access"
-                      : (display.activity === "busy")
-                        ? "Working…"
-                        : (display.edits === "dirty")
-                          ? "Unsaved changes"
-                          : "Changes saved with each action",
+                workspaceStatus(display),
               ),
             ),
             h(
@@ -2253,6 +2243,15 @@ function canManageServer() {
 
 function canBanMembers() {
   return !isPreview() && guildAccess() !== "none" && selectedGuild()?.can_ban_members === true;
+}
+
+function workspaceStatus({ activity, edits }) {
+  if (isPreview()) return "Preview — changes disabled";
+  if (guildAccess() === "none") return "";
+  if (!canEditSettings()) return canBanMembers() ? "Dashboard access" : "Read-only access";
+  if (activity === "busy") return "Working…";
+  if (edits === "dirty") return "Unsaved changes";
+  return "Changes saved with each action";
 }
 
 function tabAllowed(tab) {
@@ -9100,7 +9099,7 @@ function tabSettings() {
 }
 
 const ACCESS_LEVELS = [
-  ["dashboard", "Dashboard (read-only)"],
+  ["dashboard", "Dashboard"],
   ["settings", "Dashboard and settings"],
 ];
 
@@ -9153,7 +9152,7 @@ function AccessRolesCard({ revision, generation }) {
       h("p", { className: "muted" }, "Members with a listed role can sign in and open this server only."),
       h(GoodToKnow, {
         items: [
-          "Dashboard access is view-only.",
+          "Discord’s Ban Members permission allows ban actions at either access level.",
           "Settings access can also edit rules, badwords, known spam and images, templates, log channels and bot settings.",
           "Commands, copying configuration, member import controls, case notes, case removal and this list need Manage Server.",
           `A removed role stops working as soon as the bot sees the change, and within ${ttl >= 120 ? `${Math.round(ttl / 60)} minutes` : `${ttl} seconds`} at most.`,

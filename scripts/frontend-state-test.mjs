@@ -4204,6 +4204,7 @@ test('a fragment-only preview stays read-only on the round trip through Administ
   await open(back);
   assert.equal(await tabs(), dashboardTabs, 'return opens the same Dashboard-level navigation');
   assert.ok(await read('#preview-banner', 'element.textContent'));
+  assert.equal(await read('#workspace-status', 'element.textContent'), 'Preview — changes disabled');
   assert.deepEqual(calls, [['/api/me', preview], ['/api/updates', preview], ['/api/me', preview]]);
 });
 
@@ -8914,6 +8915,7 @@ test('Bot servers removal releases a request identity the server refuses for goo
 test('dashboard role access hides settings tabs and keeps reads in place', async () => {
   const h = harness(async () => response({}));
   h.app.state.guilds[0].access = 'dashboard';
+  h.app.state.guilds[0].can_ban_members = false;
   h.app.state.config = null;
   h.app.navigate('rules');
   assert.equal(h.app.state.tab, 'dashboard');
@@ -8933,25 +8935,26 @@ test('workspace access and preview profiles match navigation and available contr
   const settings = [...dashboard, 'rules', 'badwords', 'known-spam', 'known-bad-images', 'settings', 'logchannels', 'commands', 'templates'];
   const banControls = ['ban', 'edit reason', 'unban', 'cancel ban', 'cancel unban'];
   const settingsEdits = ['custom rule', 'add words', 'add spam', 'add image', 'template save', 'log routing'];
+  const previewStatus = 'Preview — changes disabled';
   const cfg = {
     enrollment_id: 'membership', settings: { prefix: '!', bot_name: 'Guard' }, global_settings: { prefix: '!' },
     rules: [], commands: [], badwords: [],
     log_channels: [{ event: 'member_join', effective: '0' }],
     templates: [{ event: 'member_join', effective: 'Welcome {user}' }],
   };
-  for (const [label, access, profile, expectedNav, expectedControls] of [
-    ['no servers', null, null, [], []],
-    ['missing access', undefined, null, [], []],
-    ['unknown access', 'unrecognized', null, [], []],
-    ['dashboard', 'dashboard', null, dashboard, []],
-    ['dashboard with Ban Members', 'dashboard', null, dashboard, banControls],
-    ['settings', 'settings', null, settings, ['protection', 'settings save', ...settingsEdits]],
-    ['Discord admin', 'manage', null, settings, ['protection', ...banControls, 'settings save', 'access roles', 'case removal', 'copy', 'custom command', ...settingsEdits]],
-    ['manage only', 'manage', null, settings, ['protection', 'settings save', 'access roles', 'copy', 'custom command', ...settingsEdits]],
-    ['member preview', null, 'member', [], []],
-    ['moderator preview', 'dashboard', 'moderator', dashboard, []],
-    ['settings preview', 'settings', 'settings', settings, ['protection']],
-    ['administrator preview', 'manage', 'administrator', settings, ['protection', 'access roles']],
+  for (const [label, access, profile, expectedStatus, expectedNav, expectedControls] of [
+    ['no servers', null, null, '', [], []],
+    ['missing access', undefined, null, '', [], []],
+    ['unknown access', 'unrecognized', null, '', [], []],
+    ['dashboard', 'dashboard', null, 'Read-only access', dashboard, []],
+    ['dashboard with Ban Members', 'dashboard', null, 'Dashboard access', dashboard, banControls],
+    ['settings', 'settings', null, 'Changes saved with each action', settings, ['protection', 'settings save', ...settingsEdits]],
+    ['Discord admin', 'manage', null, 'Changes saved with each action', settings, ['protection', ...banControls, 'settings save', 'access roles', 'case removal', 'copy', 'custom command', ...settingsEdits]],
+    ['manage only', 'manage', null, 'Changes saved with each action', settings, ['protection', 'settings save', 'access roles', 'copy', 'custom command', ...settingsEdits]],
+    ['member preview', null, 'member', previewStatus, [], []],
+    ['moderator preview', 'dashboard', 'moderator', previewStatus, dashboard, []],
+    ['settings preview', 'settings', 'settings', previewStatus, settings, ['protection']],
+    ['administrator preview', 'manage', 'administrator', previewStatus, settings, ['protection', 'access roles']],
   ]) {
     const guilds = access === null ? [] : [{
       id: '10', name: 'First', access, manage: access === 'manage',
@@ -8982,6 +8985,7 @@ test('workspace access and preview profiles match navigation and available contr
     }
     await h.app.init();
     await settle();
+    assert.equal(h.nodes.get('#workspace-status').textContent, expectedStatus, label);
     assert.deepEqual([...h.document.querySelectorAll('#tabs [data-tab]')].map(n => n.dataset.tab), expectedNav, label);
     assert.equal(Boolean(h.document.querySelector('[aria-label="Workspace navigation"]')), !!expectedNav.length, label);
     assert.equal(Boolean(h.nodes.get('#guild-select')), !!guilds.length, label);
@@ -9107,7 +9111,10 @@ test('access-role saves send string role IDs, levels and the loaded revision', a
   h.app.state.tab = 'settings';
   h.app.tabSettings();
   await settle();
-  assert.match(h.document.querySelector('.test-panel').textContent, /stops working as soon as the bot sees the change, and within 4 minutes at most/);
+  const panel = h.document.querySelector('.test-panel');
+  assert.equal(panel.querySelector('.access-role-row option[value="dashboard"]').textContent, 'Dashboard');
+  assert.match(panel.textContent, /Discord’s Ban Members permission allows ban actions at either access level/);
+  assert.match(panel.textContent, /stops working as soon as the bot sees the change, and within 4 minutes at most/);
   const add = h.elements.find((n) => n.localName === 'button' && n.textContent === 'Add role');
   await fire(add, 'click', {});
   const inputs = h.elements.filter((n) => n.localName === 'input' && /Discord role/.test(n.getAttribute('placeholder') || ''));
