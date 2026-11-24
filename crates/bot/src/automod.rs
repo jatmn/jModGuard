@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::Instant as AutomodInstant;
 
+use crate::db::guild_data::CaseOutcome;
 use crate::normalize;
 use crate::state::{BotState, CachedGuildConfig};
 use crate::types::{ActionDef, RULE_IDS, RuleDef};
@@ -710,13 +711,13 @@ async fn automod_try_delete_message(
     rule_id: &str,
     rule_name: &str,
     reason: &str,
-) {
+) -> Option<CaseOutcome> {
     let target = automod_delete_target(guild_id, channel);
     if app
         .remembered_discord_targets
         .blocked(target, Instant::now())
     {
-        return;
+        return None;
     }
     let prepared = app
         .automod_delete_marks
@@ -760,6 +761,7 @@ async fn automod_try_delete_message(
                 app, http, guild_id, channel, message, &prepared, rule_id, rule_name, reason,
             )
             .await;
+            Some(CaseOutcome::Succeeded)
         }
         Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
             let removal = app.automod_delete_marks.remove_unconfirmed(
@@ -802,6 +804,7 @@ async fn automod_try_delete_message(
                 target,
                 Instant::now(),
             );
+            Some(crate::cases::classify_discord(Some(&error)))
         }
         Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
             let skip_uncertain = {
@@ -870,6 +873,7 @@ async fn automod_try_delete_message(
                     .await;
                 }
             }
+            Some(CaseOutcome::Uncertain)
         }
     }
 }
@@ -1036,19 +1040,30 @@ pub(crate) async fn execute_pending_with(
         return false;
     }
 
-    let explicit_log = actions.iter().any(|action| action.action == "log");
+    let explicit_log = custom && actions.iter().any(|action| action.action == "log");
+    let mut earlier_actions = Vec::new();
+    let mut earlier_reasons = Vec::new();
     for action in actions {
         let mut vars = vars.clone();
         vars.insert("action".into(), action.action.clone());
         let rendered_reason = crate::templates::render(&action.reason, &vars);
         let reason = jmodguard::ban_reason::without_tag(&rendered_reason).to_owned();
         vars.insert("reason".into(), reason.clone());
-        let log_automod = if custom && explicit_log {
+        let log_automod = if explicit_log {
             action.action == "log"
         } else {
             settings.log_automod
         };
-        execute_live(
+        if explicit_log && action.action == "log" && !earlier_actions.is_empty() {
+            vars.insert("action".into(), earlier_actions.join(", "));
+            if !earlier_reasons.is_empty() {
+                if !reason.is_empty() {
+                    earlier_reasons.push(format!("log: {reason}"));
+                }
+                vars.insert("reason".into(), earlier_reasons.join("; "));
+            }
+        }
+        let outcome = execute_live(
             app,
             http,
             cache,
@@ -1062,7 +1077,7 @@ pub(crate) async fn execute_pending_with(
             pending.matched_rule.as_ref().unwrap_or(settings),
             enrollment.clone(),
             vars,
-            reason,
+            &reason,
             config_unknown,
             log_automod,
             settings.open_case,
@@ -1070,13 +1085,26 @@ pub(crate) async fn execute_pending_with(
             &settings.whitelist_roles,
         )
         .await;
+        if explicit_log && action.action != "log" {
+            let (name, status) = match outcome {
+                Some((name, CaseOutcome::Succeeded)) => (name, "succeeded"),
+                Some((name, CaseOutcome::Failed)) => (name, "failed"),
+                Some((name, CaseOutcome::Uncertain)) => (name, "unconfirmed"),
+                Some((name, CaseOutcome::Attempted)) => (name, "attempted"),
+                None => (action.action.as_str(), "skipped"),
+            };
+            earlier_actions.push(format!("{name} ({status})"));
+            if !reason.is_empty() {
+                earlier_reasons.push(format!("{name}: {reason}"));
+            }
+        }
     }
     true
 }
 
 /// The enforcement path of [`execute_pending_with`], after the dry-run decision.
 #[allow(clippy::too_many_arguments)]
-async fn execute_live(
+async fn execute_live<'a>(
     app: &Arc<BotState>,
     http: &Arc<serenity::http::Http>,
     cache: &serenity::cache::Cache,
@@ -1086,17 +1114,17 @@ async fn execute_live(
     msg_id: Option<u64>,
     msg_channel: Option<u64>,
     pending: &PendingAction,
-    rule: &ActionDef,
+    rule: &'a ActionDef,
     matched_settings: &RuleDef,
     enrollment: Option<db::GuildEnrollment>,
     mut vars: std::collections::BTreeMap<String, String>,
-    reason: String,
+    reason: &str,
     config_unknown: bool,
     log_automod: bool,
     open_case: bool,
     skip_moderators: bool,
     skipped_roles: &[u64],
-) {
+) -> Option<(&'a str, CaseOutcome)> {
     // A missing member is not a known member with no roles. Gateway members
     // may have no user field, but their supplied role list is still useful.
     let role_ids: Option<Vec<u64>> = provided_member
@@ -1127,7 +1155,7 @@ async fn execute_live(
     if known_skipped_role
         || skip_moderators && moderator_status == crate::commands::ModeratorStatus::Moderator
     {
-        return;
+        return None;
     }
     let moderator_unknown = moderator_status == crate::commands::ModeratorStatus::Unknown;
     let warning = if config_unknown {
@@ -1154,7 +1182,7 @@ async fn execute_live(
             action = rule.action,
             "automod Discord mutation skipped because the guild is write-fenced"
         );
-        return;
+        return None;
     }
 
     if let Some(warning) = warning
@@ -1166,9 +1194,9 @@ async fn execute_live(
             rule_id = pending.rule_id.as_str(),
             "{warning}"
         );
-        if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
+        let outcome = if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
             if !app.activation.may_record() {
-                return;
+                return None;
             }
             automod_try_delete_message(
                 app,
@@ -1178,10 +1206,12 @@ async fn execute_live(
                 id,
                 pending.rule_id.as_str(),
                 pending.rule_name.as_str(),
-                reason.as_str(),
+                reason,
             )
-            .await;
-        }
+            .await
+        } else {
+            None
+        };
         // This return precedes the ban handoff and operation identity creation.
         if log_automod {
             let mut v = vars;
@@ -1195,16 +1225,16 @@ async fn execute_live(
             );
             logging::emit_to(app, http, guild_id, "automod", v).await;
         }
-        return;
+        return outcome.map(|outcome| ("delete", outcome));
     }
 
     let mut publish_report = true;
-    match rule.action.as_str() {
-        "log" => {}
+    let outcome = match rule.action.as_str() {
+        "log" => None,
         "delete" => {
             if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
                 if !app.activation.may_record() {
-                    return;
+                    return None;
                 }
                 automod_try_delete_message(
                     app,
@@ -1214,18 +1244,19 @@ async fn execute_live(
                     id,
                     pending.rule_id.as_str(),
                     pending.rule_name.as_str(),
-                    reason.as_str(),
+                    reason,
                 )
-                .await;
+                .await
+            } else {
+                None
             }
         }
         "channel_reply" => {
-            if let Some(channel) = msg_channel
+            let outcome = if let Some(channel) = msg_channel
                 && let Ok((template, delete_after)) =
                     jmodguard::custom_rules::channel_reply(matched_settings)
             {
-                publish_report = app
-                    .automod
+                app.automod
                     .replies
                     .send(
                         &app.activation,
@@ -1236,14 +1267,16 @@ async fn execute_live(
                         template,
                         delete_after,
                     )
-                    .await;
+                    .await
             } else {
-                publish_report = false;
-            }
+                None
+            };
+            publish_report = outcome == Some(CaseOutcome::Succeeded);
+            outcome
         }
         "warn" => {
             if !app.activation.may_record() {
-                return;
+                return None;
             }
             let warn_result = db::add_enrolled_warn(
                 &app.db,
@@ -1254,7 +1287,7 @@ async fn execute_live(
             )
             .await;
             if !app.activation.may_record() {
-                return;
+                return None;
             }
             let outcome = crate::cases::classify_db_commit(&warn_result);
             if open_case {
@@ -1262,10 +1295,10 @@ async fn execute_live(
                     app,
                     enrollment.clone(),
                     crate::db::guild_data::CaseAction::Warning,
-                    outcome,
+                    outcome.clone(),
                     target.id.get(),
                     None,
-                    Some(reason.clone()),
+                    Some(reason.to_owned()),
                     crate::cases::text_excerpt(
                         msg_channel.unwrap_or(0),
                         msg_id.unwrap_or(0),
@@ -1276,6 +1309,7 @@ async fn execute_live(
                 )
                 .await;
             }
+            Some(outcome)
         }
         "timeout" => {
             let minutes = rule.duration_minutes.max(1) as i64;
@@ -1293,7 +1327,7 @@ async fn execute_live(
                     Timestamp::from_unix_timestamp(chrono::Utc::now().timestamp() + minutes * 60)
                 {
                     if !app.activation.may_record() {
-                        return;
+                        return None;
                     }
                     if automod_member_blocked(app, guild_id.get(), target.id.get(), "timeout") {
                         called = false;
@@ -1337,20 +1371,18 @@ async fn execute_live(
                 tracing::warn!("automod timeout: no guild member for {}", target.id);
             }
             if !app.activation.may_record() {
-                return;
+                return None;
             }
-            if open_case
-                && let Some(outcome) =
-                    crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
-            {
+            let outcome = crate::cases::discord_attempt_outcome(called, discord_err.as_ref());
+            if open_case && let Some(outcome) = &outcome {
                 crate::cases::record(
                     app,
                     enrollment.clone(),
                     crate::db::guild_data::CaseAction::Timeout,
-                    outcome,
+                    outcome.clone(),
                     target.id.get(),
                     None,
-                    Some(reason.clone()),
+                    Some(reason.to_owned()),
                     crate::cases::text_excerpt(
                         msg_channel.unwrap_or(0),
                         msg_id.unwrap_or(0),
@@ -1361,6 +1393,7 @@ async fn execute_live(
                 )
                 .await;
             }
+            outcome
         }
         "kick" => {
             let member = member_for_selected_action(
@@ -1372,7 +1405,7 @@ async fn execute_live(
             );
             let (called, discord_err) = if let Some(member) = member {
                 if !app.activation.may_record() {
-                    return;
+                    return None;
                 }
                 if automod_member_blocked(app, guild_id.get(), target.id.get(), "kick") {
                     (false, None)
@@ -1384,7 +1417,7 @@ async fn execute_live(
                         });
                     let discord_err = match crate::discord::race_discord_call(
                         &app.activation,
-                        member.kick_with_reason(http, &reason),
+                        member.kick_with_reason(http, reason),
                     )
                     .await
                     {
@@ -1412,20 +1445,18 @@ async fn execute_live(
                 (false, None)
             };
             if !app.activation.may_record() {
-                return;
+                return None;
             }
-            if open_case
-                && let Some(outcome) =
-                    crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
-            {
+            let outcome = crate::cases::discord_attempt_outcome(called, discord_err.as_ref());
+            if open_case && let Some(outcome) = &outcome {
                 crate::cases::record_application(
                     app,
                     enrollment.clone(),
                     crate::db::guild_data::CaseAction::Kick,
-                    outcome,
+                    outcome.clone(),
                     target.id.get(),
                     None,
-                    Some(reason.clone()),
+                    Some(reason.to_owned()),
                     crate::cases::text_excerpt(
                         msg_channel.unwrap_or(0),
                         msg_id.unwrap_or(0),
@@ -1435,8 +1466,10 @@ async fn execute_live(
                 )
                 .await;
             }
+            outcome
         }
         "ban" => {
+            let mut ban_outcome = None;
             let decision = crate::member_directory::observe_ban_handoff(
                 app,
                 http,
@@ -1516,7 +1549,7 @@ async fn execute_live(
                                             crate::db::guild_data::CaseAction::Ban,
                                             target.id.get(),
                                             None,
-                                            Some(reason.clone()),
+                                            Some(reason.to_owned()),
                                             crate::cases::text_excerpt(
                                                 msg_channel.unwrap_or(0),
                                                 msg_id.unwrap_or(0),
@@ -1533,7 +1566,7 @@ async fn execute_live(
                                 None
                             };
                             let discord_reason =
-                                crate::cases::ban_dispatch_reason(&reason, attempted.as_ref());
+                                crate::cases::ban_dispatch_reason(reason, attempted.as_ref());
                             let operation_id = pending_ban.operation_id().to_owned();
                             let suppression = app.suppress_next_gateway_case(
                                 crate::state::GatewayCaseAction::Ban,
@@ -1589,6 +1622,7 @@ async fn execute_live(
                                     publish_report = false;
                                 }
                                 Some((_, crate::discord::DiscordCall::Cancelled)) => {
+                                    ban_outcome = Some(CaseOutcome::Uncertain);
                                     pending_ban
                                         .finish(app, crate::db::guild_data::CaseOutcome::Uncertain)
                                         .await;
@@ -1610,8 +1644,8 @@ async fn execute_live(
                                     }
                                     let outcome =
                                         crate::cases::classify_discord(discord.err().as_deref());
-                                    if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed)
-                                    {
+                                    ban_outcome = Some(outcome.clone());
+                                    if matches!(outcome, CaseOutcome::Failed) {
                                         app.release_gateway_case_suppression(suppression);
                                     }
                                     if app.activation.may_record() {
@@ -1666,20 +1700,23 @@ async fn execute_live(
                     }
                 }
             }
+            ban_outcome
         }
         other => {
             tracing::warn!("unknown automod action `{other}`");
+            None
         }
-    }
+    };
+    let report = outcome.map(|outcome| (rule.action.as_str(), outcome));
 
     if !publish_report {
-        return;
+        return report;
     }
     // Log-only/delete-only observations are routine Discord reports. Retain
     // selected moderation records until the typed case model replaces this table.
     if open_case && matches!(rule.action.as_str(), "warn" | "timeout" | "kick" | "ban") {
         if !app.activation.may_record() {
-            return;
+            return report;
         }
         let evidence = serde_json::json!({
             "rule": pending.rule_id, "action": rule.action,
@@ -1700,7 +1737,7 @@ async fn execute_live(
     }
 
     if !log_automod {
-        return;
+        return report;
     }
     let mut v = vars;
     v.insert(
@@ -1711,6 +1748,7 @@ async fn execute_live(
             .to_string(),
     );
     logging::emit_to(app, http, guild_id, "automod", v).await;
+    report
 }
 
 fn member_for_selected_action(
@@ -2994,6 +3032,83 @@ mod tests {
         rule.skip_moderators = true;
         rule.whitelist_roles = vec![7];
         rule
+    }
+
+    #[tokio::test]
+    async fn media_preset_save_accepts_only_direct_chat_channels() {
+        use serenity::all::{ChannelId, ChannelType, GuildChannel};
+
+        let path =
+            std::env::temp_dir().join(format!("media_channels_{:032x}.db", rand::random::<u128>()));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let wire = crate::db::ConfigurationScope::Guild(enrollment.clone()).to_wire();
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        let channels = [
+            (70, ChannelType::Text, true),
+            (71, ChannelType::News, true),
+            (72, ChannelType::Voice, true),
+            (73, ChannelType::Stage, true),
+            (74, ChannelType::Forum, false),
+            (75, ChannelType::Unknown(16), false),
+            (76, ChannelType::Category, false),
+            (77, ChannelType::PublicThread, false),
+        ];
+        let discord_channels = channels.map(|(id, kind, _)| {
+            let mut channel = GuildChannel::default();
+            channel.id = ChannelId::new(id);
+            channel.kind = kind;
+            channel
+        });
+        let names = crate::server_names::snapshot([], &discord_channels);
+        store.replace_server_names(scope, names, 1).await.unwrap();
+
+        let mut last_saved = vec![];
+        for (id, _, allowed) in channels {
+            let mut rule = media_rule();
+            rule.include_channels = vec![id];
+            let result = crate::db::apply_control(
+                &app.db,
+                Some(&app.tenant),
+                crate::db::ControlOp::UpsertRule {
+                    request: wire.clone(),
+                    target: wire.clone(),
+                    id: MEDIA_RULE_ID.into(),
+                    rule,
+                    clear_guild_override: false,
+                    replace_velocity_limit: false,
+                },
+                None,
+            )
+            .await;
+            if allowed {
+                assert!(matches!(
+                    result.unwrap(),
+                    crate::db::ControlReply::Saved { .. }
+                ));
+                last_saved = vec![id];
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains(&format!("Channel {id}"))
+                );
+            }
+            let saved = crate::db::get_rule(&app.db, 10, MEDIA_RULE_ID)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.include_channels, last_saved);
+        }
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
     }
 
     #[test]
@@ -4290,6 +4405,7 @@ mod tests {
     #[derive(Default)]
     struct ReplyRequests {
         posts: std::sync::Mutex<Vec<serde_json::Value>>,
+        logs: std::sync::Mutex<Vec<serde_json::Value>>,
         sent_at: std::sync::OnceLock<Instant>,
         deleted_at: std::sync::OnceLock<Instant>,
         deleted: tokio::sync::Notify,
@@ -4327,9 +4443,11 @@ mod tests {
             .unwrap();
         let mut rule = media_rule();
         rule.log_automod = false;
-        for action in ["log", "channel_reply"] {
+        rule.actions[0].reason = "Links or media are blocked here".into();
+        for (action, reason) in [("log", ""), ("channel_reply", "Explain the channel rule")] {
             let mut extra = rule.actions[0].clone();
             extra.action = action.into();
+            extra.reason = reason.into();
             rule.actions.push(extra);
         }
         rule.params["channel_reply"] = serde_json::json!({
@@ -4400,6 +4518,7 @@ mod tests {
 
         // An expiry of zero posts for another member and schedules no delete.
         rule.params["channel_reply"]["delete_after_seconds"] = serde_json::json!(0);
+        rule.actions.swap(1, 2);
         crate::db::upsert_rule(&app.db, 10, MEDIA_RULE_ID, &rule)
             .await
             .unwrap();
@@ -4426,6 +4545,23 @@ mod tests {
             )
             .await
         );
+        message.message_id = 14;
+        let pending = app.automod.evaluate(&cfg, &message).unwrap();
+        assert!(
+            execute_pending_with(
+                &app,
+                &stub.http,
+                &stub.cache,
+                GuildId::new(10),
+                &user,
+                None,
+                "member",
+                Some(14),
+                Some(70),
+                &pending,
+            )
+            .await
+        );
 
         // A pending match must stop if its channel selection is cleared before dispatch.
         rule.include_channels.clear();
@@ -4443,7 +4579,7 @@ mod tests {
                 &user,
                 None,
                 "member",
-                Some(14),
+                Some(15),
                 Some(70),
                 &pending,
             )
@@ -4477,9 +4613,38 @@ mod tests {
                 "DELETE /api/v10/channels/70/messages/12",
                 "POST /api/v10/channels/90/messages",
                 "DELETE /api/v10/channels/70/messages/13",
-                "POST /api/v10/channels/90/messages",
                 "POST /api/v10/channels/70/messages",
+                "POST /api/v10/channels/90/messages",
+                "DELETE /api/v10/channels/70/messages/14",
+                "POST /api/v10/channels/90/messages",
             ]
+        );
+        let logs = replies.logs.lock().unwrap();
+        assert_eq!(logs.len(), 4);
+        let field = |index: usize, name: &str| {
+            logs[index]["embeds"][0]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|field| field["name"].as_str().unwrap().ends_with(name))
+                .unwrap()["value"]
+                .as_str()
+                .unwrap()
+        };
+        assert_eq!(field(0, "Action"), "delete (succeeded)");
+        assert_eq!(
+            field(0, "Reason"),
+            "delete: Links or media are blocked here"
+        );
+        assert_eq!(field(1, "Action"), "delete (succeeded)");
+        assert_eq!(
+            field(2, "Action"),
+            "delete (succeeded), channel_reply (succeeded)"
+        );
+        assert!(field(2, "Reason").contains("channel_reply: Explain the channel rule"));
+        assert_eq!(
+            field(3, "Action"),
+            "delete (failed), channel_reply (skipped)"
         );
         assert_eq!(
             lines
@@ -4552,6 +4717,16 @@ mod tests {
                                 let _ = replies.deleted_at.set(Instant::now());
                                 replies.deleted.notify_one();
                             }
+                            if let Some(replies) = &replies
+                                && request.method == "POST"
+                                && request.path == "/api/v10/channels/90/messages"
+                            {
+                                replies
+                                    .logs
+                                    .lock()
+                                    .unwrap()
+                                    .push(serde_json::from_str(&request.body).unwrap());
+                            }
                             let response = if let Some(replies) = &replies
                                 && request.method == "POST"
                                 && request.path == "/api/v10/channels/70/messages"
@@ -4570,6 +4745,15 @@ mod tests {
                                 }).to_string();
                                 format!(
                                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            } else if replies.is_some()
+                                && request.method == "DELETE"
+                                && request.path == "/api/v10/channels/70/messages/14"
+                            {
+                                let body = r#"{"message":"Missing Permissions","code":50013}"#;
+                                format!(
+                                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                                     body.len()
                                 )
                             } else if request.method == "GET" {

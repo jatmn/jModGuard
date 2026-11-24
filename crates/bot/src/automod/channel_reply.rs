@@ -11,6 +11,7 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 use crate::activation::Activation;
+use crate::db::guild_data::CaseOutcome;
 use crate::discord::{DiscordCall, race_discord_call};
 
 const WINDOW: Duration = Duration::from_secs(30);
@@ -66,15 +67,15 @@ impl Replies {
         user: UserId,
         template: &str,
         delete_after_seconds: u64,
-    ) -> bool {
+    ) -> Option<CaseOutcome> {
         if !activation.may_record() {
-            return false;
+            return None;
         }
         let delete_permit = if delete_after_seconds == 0 {
             None
         } else {
             let Ok(permit) = Arc::clone(&self.deletes).try_acquire_owned() else {
-                return false;
+                return None;
             };
             Some(permit)
         };
@@ -89,15 +90,19 @@ impl Replies {
                 .replied_user(false),
         );
         if !self.reserve((guild, channel, user), Instant::now()) {
-            return false;
+            return None;
         }
-        let Ok(DiscordCall::Finished(Ok(sent))) = tokio::time::timeout(
+        let sent = match tokio::time::timeout(
             HTTP_TIMEOUT,
             race_discord_call(activation, channel.send_message(http.as_ref(), message)),
         )
         .await
-        else {
-            return false;
+        {
+            Ok(DiscordCall::Finished(Ok(sent))) => sent,
+            Ok(DiscordCall::Finished(Err(error))) => {
+                return Some(crate::cases::classify_discord(Some(&error)));
+            }
+            Ok(DiscordCall::Cancelled) | Err(_) => return Some(CaseOutcome::Uncertain),
         };
 
         if let Some(permit) = delete_permit {
@@ -118,7 +123,7 @@ impl Replies {
                 .await;
             });
         }
-        true
+        Some(CaseOutcome::Succeeded)
     }
 }
 
@@ -126,8 +131,8 @@ impl Replies {
 mod tests {
     use super::*;
 
-    #[test]
-    fn reply_cooldown_is_per_user_channel_and_guild_at_window_boundary() {
+    #[tokio::test(start_paused = true)]
+    async fn reply_cooldown_is_per_user_channel_and_guild_at_window_boundary() {
         let replies = Replies::default();
         let now = Instant::now();
         let key = (GuildId::new(1), ChannelId::new(2), UserId::new(3));

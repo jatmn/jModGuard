@@ -752,9 +752,24 @@ async fn apply_control_inner(
                 promote_enrolled_rule(db, scope_of(request)?, &id, &rule, replace_velocity_limit)
                     .await?
             } else {
+                let target = scope_of(target)?;
+                let scope = ConfigurationWriteScope::new(scope_of(request)?, target.clone())?;
+                if crate::custom_rules::is_custom_id(&id)
+                    && crate::custom_rules::requires_include_channels(&rule)
+                    && !rule.include_channels.is_empty()
+                    && let ConfigurationScope::Guild(enrollment) = target
+                {
+                    let tenant = tenant.context("server channel list is unavailable")?;
+                    let (store, data_scope) = tenant.live(enrollment).await?;
+                    let names = store.server_names(data_scope).await?;
+                    crate::custom_rules::validate_media_preset_channels(
+                        &rule.include_channels,
+                        &names.channels,
+                    )?;
+                }
                 upsert_enrolled_rule_with_velocity_edit(
                     db,
-                    write_scope(request, target)?,
+                    scope,
                     &id,
                     &rule,
                     replace_velocity_limit,

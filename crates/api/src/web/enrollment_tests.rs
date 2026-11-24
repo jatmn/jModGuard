@@ -9540,7 +9540,14 @@ async fn server_names_serve_the_bot_snapshot_with_string_ids_and_no_discord_call
         .unwrap();
     let (status, body) = f.request("POST", "/api/guilds/10/server-names", "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, serde_json::json!({"roles": [], "channels": []}));
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "roles": [],
+            "channels": [],
+            "media_preset_channel_kinds": ["text", "announcement", "voice", "stage"],
+        })
+    );
 
     let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
     let names = db::guild_data::ServerNames {
@@ -9578,6 +9585,7 @@ async fn server_names_serve_the_bot_snapshot_with_string_ids_and_no_discord_call
                 "roles": [{"id": "9007199254740993", "name": "Moderators", "color": 3447003, "position": 3, "managed": false}],
                 "channels": [{"id": "9007199254740995", "name": "general", "kind": "text", "parent_id": null, "position": 0}],
                 "observed_at_ms": 1700,
+                "media_preset_channel_kinds": ["text", "announcement", "voice", "stage"],
             })
         );
     }

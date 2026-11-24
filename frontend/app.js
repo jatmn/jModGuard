@@ -4125,6 +4125,7 @@ function useServerNames(userIds) {
     status: live ? "loading" : "unavailable",
     roles: [],
     channels: [],
+    mediaPresetChannelKinds: [],
     users: new Map(),
   }));
   useEffect(() => {
@@ -4137,6 +4138,7 @@ function useServerNames(userIds) {
           status: "loaded",
           roles: Array.isArray(data?.roles) ? data.roles : [],
           channels: Array.isArray(data?.channels) ? data.channels : [],
+          mediaPresetChannelKinds: Array.isArray(data?.media_preset_channel_kinds) ? data.media_preset_channel_kinds : [],
         })),
       () => {
         if (!controller.signal.aborted) setNames((current) => ({ ...current, status: "failed" }));
@@ -4183,14 +4185,15 @@ function PickerChip({ kind, id, names, onRemove }) {
 
 // Chips for the chosen roles, channels or users, plus controls to add more: a
 // native select of names when the bot has shared them, a member search for
-// users, and an ID box (Enter adds IDs, mentions or links). The ID box stays
-// next to the select for IDs the snapshot lacks, such as threads. Save commits
+// users, and an ID box (Enter adds IDs, mentions or links). A channel picker
+// restricted by type requires a choice from the snapshot. Other pickers also
+// accept IDs the snapshot lacks, such as threads. Save commits
 // or refuses text still in the box through `pending`, as the old ID fields did.
 // The box text is picker state, so it survives the box being replaced when
 // names arrive, and member results are kept with the query they answer.
 // `draft: false` is for filters: choosing a value changes the view, not unsaved settings.
 // `memberStatus` widens member search, e.g. to banned or departed case subjects.
-function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pending, single = false, idLabel, draft = true, memberStatus = "current" }) {
+function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pending, single = false, idLabel, draft = true, memberStatus = "current", channelKinds = null }) {
   const [, bump] = useState(0);
   const [text, setText] = useState("");
   const [found, setFound] = useState(null);
@@ -4241,9 +4244,9 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
     kind === "role"
       ? names.roles.filter((r) => r.id !== state.guildId)
       : kind === "channel"
-        ? names.channels.filter((c) => c.kind !== "category")
+        ? names.channels.filter((c) => channelKinds ? channelKinds.includes(c.kind) : c.kind !== "category")
         : [];
-  const useSelect = kind !== "user" && names.status === "loaded" && options.length > 0;
+  const useSelect = channelKinds !== null || (kind !== "user" && names.status === "loaded" && options.length > 0);
   const noun = kind === "role" ? "role" : kind === "channel" ? "channel" : "member";
   const search = async (value) => {
     searchAbort.current?.abort();
@@ -4329,6 +4332,7 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
             {
               className: "select select-sm",
               defaultValue: "",
+              disabled: channelKinds !== null && options.length === 0,
               onChange: (e) => {
                 add(e.target.value);
                 e.target.value = "";
@@ -4345,7 +4349,7 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
           )
         : textBox(true),
     ),
-    useSelect ? textBox(false) : null,
+    useSelect && channelKinds === null ? textBox(false) : null,
     results
       ? h(
           "ul",
@@ -4725,9 +4729,10 @@ function CustomRuleEditor({ record: r, creating }) {
       preset ? h(IdPicker, {
         kind: "channel",
         label: "Only check these channels",
-        hint: "Pick at least one channel to enable this rule.",
+        hint: "Pick a channel with direct text chat. Choices appear after the bot shares the channel list.",
         ids: rule.include_channels,
         names,
+        channelKinds: names.mediaPresetChannelKinds,
         pending,
         onChange: () => {
           if (!rule.include_channels.length) rule.enabled = false;

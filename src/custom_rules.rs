@@ -9,6 +9,8 @@ use crate::types::{ActionDef, GLOBAL_SCOPE, RuleDef};
 pub const CUSTOM_ID_PREFIX: &str = "custom:";
 pub const MAX_CUSTOM_RULES_PER_GUILD: usize = 32;
 pub const NO_LINKS_OR_MEDIA_PRESET: &str = "no_links_or_media";
+/// Server channel kinds whose own ID carries chat messages.
+pub const MEDIA_PRESET_CHANNEL_KINDS: &[&str] = &["text", "announcement", "voice", "stage"];
 pub const DEFAULT_REPLY_DELETE_SECONDS: u64 = 10;
 pub const MAX_REPLY_DELETE_SECONDS: u64 = 300;
 
@@ -216,6 +218,22 @@ pub fn content_toggle(rule: &RuleDef, key: &str) -> bool {
 
 pub fn requires_include_channels(rule: &RuleDef) -> bool {
     rule.params.get("preset").and_then(Value::as_str) == Some(NO_LINKS_OR_MEDIA_PRESET)
+}
+
+pub(crate) fn validate_media_preset_channels(
+    ids: &[u64],
+    channels: &[crate::db::guild_data::ServerChannelName],
+) -> Result<()> {
+    for id in ids {
+        let id = id.to_string();
+        ensure!(
+            channels.iter().any(|channel| {
+                channel.id == id && MEDIA_PRESET_CHANNEL_KINDS.contains(&channel.kind.as_str())
+            }),
+            "Channel {id} is unavailable for the no links or media preset. Pick a supported channel from the server list."
+        );
+    }
+    Ok(())
 }
 
 fn validate_channel_content(rule: &RuleDef) -> Result<()> {

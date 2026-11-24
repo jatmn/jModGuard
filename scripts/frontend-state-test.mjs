@@ -6803,6 +6803,12 @@ test('custom pattern draft save uses dry_run and custom id', () => {
 
 test('No links or media preset requires channels and saves ordered actions and reply settings', async () => {
   const writes = [];
+  const channels = [
+    ['70', 'general', 'text'], ['71', 'news', 'announcement'],
+    ['72', 'voice', 'voice'], ['73', 'events', 'stage'],
+    ['74', 'topics', 'forum'], ['75', 'gallery', 'media'],
+    ['76', 'rooms', 'category'], ['77', 'unknown', 'other'],
+  ].map(([id, name, kind]) => ({ id, name, kind }));
   const h = harness(async (url, options) => {
     if (options.method === 'PUT') {
       const { data } = JSON.parse(options.body);
@@ -6811,7 +6817,11 @@ test('No links or media preset requires channels and saves ordered actions and r
       writes.push(data);
       return response({ ok: true, config_patch: { kind: 'rule', id, scope: 'guild', value: data } });
     }
-    return response({ roles: [], channels: [], users: {} });
+    return response({
+      roles: [],
+      channels,
+      media_preset_channel_kinds: ['text', 'announcement', 'voice', 'stage'],
+    });
   });
   h.app.state.config = { enrollment_id: 'membership', rules: [] };
   h.app.navigate('rules');
@@ -6832,14 +6842,21 @@ test('No links or media preset requires channels and saves ordered actions and r
     await fire(input, 'input');
     await fire(input, 'keydown', { key: 'Enter' });
   };
-  await addId('Only check these channels', '70');
+  const channelPicker = control('Only check these channels');
+  assert.deepEqual([...channelPicker.options].map(option => option.value), ['', '70', '71', '72', '73']);
+  assert.equal(channelPicker.closest('.id-picker').querySelector('input'), null);
+  const pickChannel = async (id) => {
+    channelPicker.value = id;
+    await fire(channelPicker, 'change');
+  };
+  await pickChannel('70');
   assert.equal(enabled.disabled, false);
   await fire(enabled, 'click');
   assert.equal(enabled.checked, true);
-  await fire(modal.querySelector('button[aria-label="Remove Channel 70"]'), 'click');
+  await fire(modal.querySelector('button[aria-label="Remove #general"]'), 'click');
   assert.equal(enabled.checked, false);
   assert.equal(enabled.disabled, true);
-  await addId('Only check these channels', '71');
+  await pickChannel('71');
   await fire(enabled, 'click');
   await addId('Skip roles', '7');
 

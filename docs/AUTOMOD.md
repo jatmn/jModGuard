@@ -144,9 +144,12 @@ effect while the rule is in dry-run. Rules live in stored configuration, not
 ## No links or media
 
 1. Open **Automod → No links or media** in your server's dashboard. Pick
-   the channels under **Only check these channels**. The preset stays off
-   until you select a channel and turn on **Enabled**. Clearing the channel
-   list turns it off. Copies to other servers start off with no channels.
+   text or announcement channels, or the text chat in voice or stage channels,
+   under **Only check these channels**. The picker uses the bot's channel list.
+   Forum and media posts live in threads, outside this preset's channel scope.
+   The preset stays off until you select a channel and turn on **Enabled**.
+   Clearing the channel list turns it off. Copies to other servers start off
+   with no channels.
 2. Choose what to block. **Links** includes Tenor and Giphy links from Discord's
    GIF picker. To block those GIFs while allowing ordinary links, turn off
    **Links** and leave **GIF picker links** on. **Attachments and images**
@@ -155,7 +158,8 @@ effect while the rule is in dry-run. Rules live in stored configuration, not
    domains**. Each subdomain needs its own entry.
 3. Leave **Skip moderators** on and add trusted or media roles under **Skip
    roles** as needed. The default actions delete the message and post to your
-   configured automod log.
+   configured automod log. The log reports the outcomes of actions listed
+   before it. Move the log after the reply to include the reply outcome.
 4. To tell members why their post was removed, select **Add action → Reply in
    channel**. Write the **Reply text**, for example `{user} No links or GIFs
    are allowed in {channel}.` The placeholders mention the author and channel.

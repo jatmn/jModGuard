@@ -1,5 +1,5 @@
 //! Captured-enrollment read of the bot's role and channel names for the rule
-//! editor pickers (#621). Display data only; the API never asks Discord.
+//! editor pickers (#621). The API never asks Discord.
 use super::state::ApiState;
 use super::{ApiResult, GuildAccess, authorize_guild};
 use axum::Json;
@@ -18,7 +18,8 @@ pub async fn server_names(
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
     let (store, scope) = app.tenant.live(enrollment).await?;
-    Ok(Json(serde_json::to_value(
-        store.server_names(scope).await?,
-    )?))
+    let mut names = serde_json::to_value(store.server_names(scope).await?)?;
+    names["media_preset_channel_kinds"] =
+        serde_json::json!(jmodguard::custom_rules::MEDIA_PRESET_CHANNEL_KINDS);
+    Ok(Json(names))
 }
