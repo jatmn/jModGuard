@@ -17,6 +17,31 @@ pub(crate) enum UnconfirmedMarkRemoval {
     ReplayPlainDelete,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatewayDeleteOrigin {
+    Single,
+    Bulk,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CleanupDeleteClaim {
+    Rest(PreparedAutomodDelete),
+    Gateway(GatewayDeleteOrigin),
+    Observed(PreparedAutomodDelete),
+    AlreadyGone(PreparedAutomodDelete),
+}
+
+impl CleanupDeleteClaim {
+    pub(crate) fn prepared(self) -> Option<PreparedAutomodDelete> {
+        match self {
+            Self::Rest(prepared) | Self::Observed(prepared) | Self::AlreadyGone(prepared) => {
+                Some(prepared)
+            }
+            Self::Gateway(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GatewayDeleteObservation {
     Automod {
@@ -188,6 +213,7 @@ struct MessageGatewayState {
     report: ReportProgress,
     /// First bulk-placement decision for this message. Not replaced by a reload.
     report_owner: Option<ReportOwner>,
+    bulk_observed: bool,
 }
 
 /// Delivery and REST settlement are independent: ambiguous delivery keeps
@@ -314,7 +340,7 @@ pub(crate) struct AutomodDeleteMarks {
     entries: HashMap<MarkKey, AutomodDeleteMark>,
     by_message: HashMap<MessageTarget, Vec<MarkKey>>,
     gateway: HashMap<MessageTarget, MessageGatewayState>,
-    // Like a settled individual report, an incident owns later gateway echoes.
+    // Incidents own later echoes while pending and for a bounded time after delivery.
     cleanup_receipts: HashSet<MessageTarget>,
     cleanup_expiry: VecDeque<(Instant, MessageTarget)>,
     /// Pending ids kept in a bulk transcript, keyed until delivery settles.
@@ -1701,10 +1727,9 @@ impl AutomodDeleteMarkAccess {
     pub(crate) fn claim_cleanup_delete(
         &self,
         target: MessageTarget,
-        prepared: Option<PreparedAutomodDelete>,
+        claim: CleanupDeleteClaim,
         retained: Option<&MessageSnapshot>,
-        gateway_required: bool,
-    ) -> Option<Option<MessageSnapshot>> {
+    ) -> Option<(Option<MessageSnapshot>, Option<GatewayDeleteOrigin>)> {
         let mut marks = self.inner.lock();
         let now = Instant::now();
         marks.prune(now);
@@ -1716,39 +1741,80 @@ impl AutomodDeleteMarkAccess {
             return None;
         }
         let gateway = marks.gateway.get(&target);
-        if gateway.is_some_and(|state| state.report.is_settled())
-            || (gateway_required && !gateway.is_some_and(|state| state.receipt.is_observed()))
-        {
+        if gateway.is_some_and(|state| state.report.is_settled()) {
             return None;
         }
         let (guild, channel, message) = target;
-        let snapshot = if let Some(prepared) = prepared {
-            let key = AutomodDeleteMarks::mark_key(guild, channel, message, prepared.attempt);
-            let entry = marks.entries.get(&key)?;
-            if entry.confirmation.is_confirmed()
-                || !marks
-                    .by_message
-                    .get(&target)
-                    .is_some_and(|keys| keys.len() == 1)
-            {
-                return None;
+        let (snapshot, origin) = match claim {
+            CleanupDeleteClaim::Gateway(origin) => {
+                if marks.live_marks(target) {
+                    // The raw Gateway handler can run before snapshot placement.
+                    // Keep the echo's identity for the pending REST attempt to settle.
+                    let keys = marks.mark_keys_for_message(guild, channel, message);
+                    if keys.iter().all(|key| {
+                        marks
+                            .entries
+                            .get(key)
+                            .is_some_and(|entry| !entry.confirmation.is_confirmed())
+                    }) {
+                        let gateway = marks.gateway.entry(target).or_default();
+                        gateway.receipt = GatewayReceipt::Observed;
+                        gateway.bulk_observed |= origin == GatewayDeleteOrigin::Bulk;
+                        if let Some(row) = retained.cloned() {
+                            marks.store_gateway_retained(target, row, now_ms());
+                        }
+                    }
+                    return None;
+                }
+                (retained.cloned(), Some(origin))
             }
-            let snapshot = gateway
-                .and_then(|state| state.retained.clone())
-                .or_else(|| entry.retained.clone());
-            marks.remove_key(key, now);
-            snapshot
-        } else {
-            if marks.live_marks(target) {
-                return None;
+            claim => {
+                let prepared = claim.prepared()?;
+                let key = AutomodDeleteMarks::mark_key(guild, channel, message, prepared.attempt);
+                let entry = marks.entries.get(&key)?;
+                if entry.confirmation.is_confirmed()
+                    || !marks
+                        .by_message
+                        .get(&target)
+                        .is_some_and(|keys| keys.len() == 1)
+                {
+                    return None;
+                }
+                let origin = match claim {
+                    CleanupDeleteClaim::Rest(_) => None,
+                    _ => {
+                        let Some(gateway) = gateway.filter(|state| state.receipt.is_observed())
+                        else {
+                            if matches!(claim, CleanupDeleteClaim::AlreadyGone(_)) {
+                                // Release under the same lock that checks for a receipt.
+                                // A later echo can now claim directly using the saved identity.
+                                marks.remove_key(key, now);
+                            }
+                            return None;
+                        };
+                        Some(if gateway.bulk_observed {
+                            GatewayDeleteOrigin::Bulk
+                        } else {
+                            GatewayDeleteOrigin::Single
+                        })
+                    }
+                };
+                let snapshot = gateway
+                    .and_then(|state| state.retained.clone())
+                    .or_else(|| entry.retained.clone());
+                marks.remove_key(key, now);
+                (snapshot, origin)
             }
-            retained.cloned()
         };
         marks.cleanup_receipts.insert(target);
-        marks
+        Some((settlement_retained(snapshot), origin))
+    }
+
+    pub(crate) fn finish_cleanup_delete(&self, target: MessageTarget) {
+        self.inner
+            .lock()
             .cleanup_expiry
-            .push_back((now + AUTOMOD_DELETE_MARK_TTL, target));
-        Some(settlement_retained(snapshot))
+            .push_back((Instant::now() + AUTOMOD_DELETE_MARK_TTL, target));
     }
 
     /// A pending id stayed in a bulk transcript.
@@ -1773,6 +1839,9 @@ impl AutomodDeleteMarkAccess {
         let mut marks = self.inner.lock();
         let now = Instant::now();
         let observation = marks.observe_gateway_delete(guild, channel, message, retained, now);
+        if let Some(state) = marks.gateway.get_mut(&(guild, channel, message)) {
+            state.bulk_observed = true;
+        }
         let mut reserved = false;
         if reserve && matches!(observation, GatewayDeleteObservation::PendingAutomod) {
             // The regression test injects a REST failure here. It must run

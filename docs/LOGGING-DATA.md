@@ -104,29 +104,42 @@ and persistence contracts below are unchanged.
   purge events for the same server, user, and active rule. A purge event must
   match a previously observed author and fall within the ban's requested
   message-age window. Unattributed deletes use their usual single or bulk log.
-  Nearby strikes for the same rule join the open incident. After 10 seconds
+  Nearby strikes for the same rule join the open incident, including the
+  velocity rule's existing delete fallback after a terminal kick. After 10 seconds
   of quiet the bot sends one summary to the Automod Delete log, or to its
   Message Delete fallback. It includes the observed deletion time range,
   channel counts, a bounded sample and available evidence, and a separate
-  failure count. Source and user exclusions still apply.
+  failure count. Source and user exclusions still apply. A definitively
+  rejected ban returns its tentative purge observations to ordinary single
+  or bulk delete logging and that route's exclusions.
+- A saved custom Automod Delete template keeps its per-message presentation
+  unless it uses `{cleanup_total}` to opt into grouped notices. A grouped
+  template can use `{mention}`, `{user_id}`, `{rule}`, `{rule_id}`,
+  `{cleanup_action}` (outcome and case), `{cleanup_total}`, `{cleanup_channels}`,
+  `{cleanup_first}`, `{cleanup_last}`, `{cleanup_sample}`, `{cleanup_evidence}`,
+  `{cleanup_failures}`, and `{cleanup_source_channels}` (comma-separated
+  source IDs). Content and evidence appear only when the template requests them.
 - To change the settle delay, set `[log].automod_cleanup_settle_secs` or
   `JMODGUARD_LOG_AUTOMOD_CLEANUP_SETTLE_SECS` to 5–10 seconds. To restore the
   original per-message behavior, set `[log].group_automod_cleanup_deletes`
   or `JMODGUARD_LOG_GROUP_AUTOMOD_CLEANUP_DELETES` to `false`. These settings
   apply to the bot process. A case link opens the Web UI when the bot has a
   public `bot.about_webui_url`. Otherwise the notice includes the case ID.
-- A cleanup still in progress at the 30-second cap falls back to individual
-  notices. On a planned restart the bot uses the existing shutdown window to
-  attempt individual notices for unfinished cleanups. Incident buffers and
-  echo receipts are process-local. After an abrupt stop, later Gateway
-  observations use ordinary delete logging, and already buffered reports can
-  be lost. The notice has no transcript attachment.
+- A cleanup still in progress at the 30-second cap or whose summary cannot
+  be sent falls back to individual delete notices and a separate failure count.
+  Pending cleanup deliveries share the bounded incident buffer. Reports stay
+  pending until delivered or ruled out by the destination and filters. Failed
+  individual cleanup deliveries retry with the same Discord nonce. Bulk replay
+  follows the ordinary bulk rule for ambiguous sends. On a planned restart
+  the bot uses the existing shutdown window to attempt unfinished deliveries.
+  Incident buffers and echo receipts are process-local. An abrupt stop can
+  lose buffered reports. The grouped summary has no transcript attachment.
 - Delivery slot pressure queues at most 128 waiting reports across the bot.
   Each waits up to the configured Discord timeout for a slot, then uses the
   existing delivery deadline and filters. Routine reports include admission in
   their total deadline. Full queues and expired waits drop the report and count
-  a delivery failure. This retries admission only: a failed or ambiguous Discord
-  request is never resent. Waiting reports are in memory and are lost on restart.
+  a delivery failure. This queue retries admission only. Waiting reports are
+  in memory and are lost on restart.
 - Join reports use the delivered user and the join timestamp in the Gateway member
   payload; they do not look up a saved directory join date. Leave reports use the
   saved directory stay when an authoritative departure decision is available,

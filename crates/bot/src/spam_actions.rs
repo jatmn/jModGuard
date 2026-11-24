@@ -533,6 +533,7 @@ async fn punish_proven_match(
             name,
             reason: &found.reason,
             action: "ban",
+            join_only: false,
             sample: found
                 .excerpts
                 .iter()
@@ -907,6 +908,7 @@ async fn punish_proven_match(
                                         &enrollment,
                                         found.author,
                                         ban_action.ban_delete_message_seconds(),
+                                        chrono::Utc::now().timestamp_millis(),
                                         cleanup.as_ref(),
                                         || true,
                                     )
@@ -1110,6 +1112,9 @@ where
     if matches!(discord, Ok(crate::discord::DiscordCall::Cancelled)) {
         app.spam_gate
             .finish_ban(found.guild, found.author, now, false);
+        if let Some(cleanup) = cleanup {
+            cleanup.outcome(CaseOutcome::Uncertain, None);
+        }
         pending_ban.finish(app, CaseOutcome::Uncertain).await;
         return None;
     }
@@ -1120,6 +1125,9 @@ where
         }
         Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => CaseOutcome::Uncertain,
     };
+    if let Some(cleanup) = cleanup {
+        cleanup.outcome(outcome.clone(), None);
+    }
     app.spam_gate.finish_ban(
         found.guild,
         found.author,
@@ -1138,7 +1146,7 @@ where
         None
     };
     if let Some(cleanup) = cleanup {
-        cleanup.outcome(outcome.clone(), case_id.clone());
+        cleanup.case(&outcome, case_id.clone());
     }
     pending_ban.finish(app, outcome.clone()).await;
     if matches!(outcome, CaseOutcome::Succeeded) {

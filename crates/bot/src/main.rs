@@ -348,7 +348,7 @@ async fn main() -> Result<()> {
     app.install_discord_cache(Arc::clone(&cache));
     app.install_http_member_lookup(Arc::clone(&http));
 
-    tokio::spawn(logging::run_cleanup_reports(
+    let cleanup_reports = tokio::spawn(logging::run_cleanup_reports(
         Arc::clone(&app),
         Arc::clone(&http),
     ));
@@ -664,6 +664,8 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         shutdown_signal().await;
         shutdown_activation.begin_shutdown();
+        cleanup_reports.abort();
+        let _ = cleanup_reports.await;
         jmodguard::set_process_ready(false);
         // Date the planned stop now, before the notice drain cuts off recording, and
         // only when every shard that reached Ready still has a connected session.

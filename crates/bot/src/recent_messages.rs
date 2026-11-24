@@ -5,6 +5,7 @@ use parking_lot::Mutex;
 use serenity::http::Http;
 use std::collections::BTreeMap;
 use std::time::Duration;
+use tokio::time::Instant;
 
 const MAX_TRACKED_MESSAGES: usize = 32_768;
 const MAX_DELETE_WINDOW_SECS: i64 = 7 * 86_400;
@@ -21,6 +22,7 @@ struct MessageIdentity {
     author: u64,
     channel: u64,
     created_ms: i64,
+    purge_echo_until: Option<Instant>,
 }
 
 impl RecentMessages {
@@ -37,6 +39,7 @@ impl RecentMessages {
             author,
             channel,
             created_ms,
+            purge_echo_until: None,
         });
         if entries.len() > MAX_TRACKED_MESSAGES {
             entries.pop_first();
@@ -45,10 +48,23 @@ impl RecentMessages {
 
     pub(crate) fn identity(&self, guild: u64, channel: u64, message: u64) -> Option<(u64, i64)> {
         let entries = self.entries.lock();
-        let entry = entries
-            .get(&(message, guild))
-            .filter(|entry| entry.channel == channel)?;
+        let entry = entries.get(&(message, guild)).filter(|entry| {
+            entry.channel == channel
+                && entry
+                    .purge_echo_until
+                    .is_none_or(|until| Instant::now() < until)
+        })?;
         Some((entry.author, entry.created_ms))
+    }
+
+    /// Discord says the message is gone. Keep its identity for a late echo,
+    /// and keep it out of future REST sweeps.
+    pub(crate) fn defer_purge_echo(&self, guild: u64, channel: u64, message: u64, until: Instant) {
+        if let Some(entry) = self.entries.lock().get_mut(&(message, guild))
+            && entry.channel == channel
+        {
+            entry.purge_echo_until = Some(until);
+        }
     }
 
     pub(crate) fn forget(&self, guild: u64, channel: u64, message: u64) {
@@ -68,27 +84,34 @@ impl RecentMessages {
 
     pub(crate) fn prune(&self) {
         let cutoff = chrono::Utc::now().timestamp_millis() - MAX_DELETE_WINDOW_SECS * 1000;
-        self.entries
-            .lock()
-            .retain(|_, item| item.created_ms >= cutoff);
+        let now = Instant::now();
+        self.entries.lock().retain(|_, item| {
+            item.created_ms >= cutoff && item.purge_echo_until.is_none_or(|until| now < until)
+        });
     }
 
     fn still_tracked(&self, guild: u64, author: u64, channel: u64, message: u64) -> bool {
         self.entries
             .lock()
             .get(&(message, guild))
-            .is_some_and(|entry| entry.author == author && entry.channel == channel)
+            .is_some_and(|entry| {
+                entry.author == author
+                    && entry.channel == channel
+                    && entry.purge_echo_until.is_none()
+            })
     }
 
-    fn for_ban(&self, guild: u64, author: u64, seconds: u32) -> Vec<(u64, u64)> {
-        let now = chrono::Utc::now().timestamp_millis();
-        let cutoff = now - i64::from(seconds) * 1000;
+    fn for_ban(&self, guild: u64, author: u64, seconds: u32, now_ms: i64) -> Vec<(u64, u64)> {
+        let cutoff = now_ms - i64::from(seconds) * 1000;
         self.entries
             .lock()
             .iter()
             .rev()
             .filter(|((_, id), item)| {
-                *id == guild && item.author == author && (cutoff..=now).contains(&item.created_ms)
+                *id == guild
+                    && item.author == author
+                    && item.purge_echo_until.is_none()
+                    && (cutoff..=now_ms).contains(&item.created_ms)
             })
             .map(|((message, _), item)| (item.channel, *message))
             .collect()
@@ -103,6 +126,7 @@ pub(crate) async fn sweep_after_ban(
     enrollment: &GuildEnrollment,
     author: u64,
     seconds: u32,
+    sweep_at_ms: i64,
     cleanup: Option<&crate::logging::Cleanup<'_>>,
     still_admitted: impl Fn() -> bool,
 ) -> usize {
@@ -116,9 +140,11 @@ pub(crate) async fn sweep_after_ban(
     {
         return 0;
     }
-    let messages = app.recent_messages.for_ban(guild, author, seconds);
+    let messages = app
+        .recent_messages
+        .for_ban(guild, author, seconds, sweep_at_ms);
     let mut deleted = 0;
-    let deadline = tokio::time::Instant::now() + MAX_SWEEP_TIME;
+    let deadline = Instant::now() + MAX_SWEEP_TIME;
     for (channel, message) in messages {
         if !still_admitted() {
             break;
@@ -153,12 +179,10 @@ pub(crate) async fn sweep_after_ban(
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
                 let gone = crate::discord::http_error_response(&error)
                     .is_some_and(|(_, code)| code == 10008);
-                if let Some((cleanup, prepared)) = cleanup.zip(prepared)
-                    && !(gone && cleanup.deleted(app, channel, message, prepared, true))
-                {
-                    cleanup
-                        .release_ungrouped(app, http, channel, message, prepared)
-                        .await;
+                if let Some((cleanup, prepared)) = cleanup.zip(prepared) {
+                    if gone && cleanup.purge_sweep_gone(app, channel, message, prepared) {
+                        continue;
+                    }
                     if !gone {
                         cleanup.failed(
                             channel,
@@ -166,11 +190,13 @@ pub(crate) async fn sweep_after_ban(
                             crate::logging::cleanup_delete_failure(&error),
                         );
                     }
-                }
-                if gone {
-                    // Discord's ban may already have removed it.
+                    cleanup
+                        .release_ungrouped(app, http, channel, message, prepared)
+                        .await;
+                } else if gone {
                     app.recent_messages.forget(guild, channel, message);
-                } else {
+                }
+                if !gone {
                     tracing::debug!(guild, channel, message, %error, "automod ban purge could not delete tracked message");
                 }
             }
@@ -183,7 +209,10 @@ pub(crate) async fn sweep_after_ban(
                         "automod ban purge reached its deadline"
                     );
                 }
-                if let Some((cleanup, prepared)) = cleanup.zip(prepared) {
+                if let Some((cleanup, prepared)) = cleanup.zip(prepared)
+                    && !cleanup.deleted(app, channel, message, prepared, true)
+                {
+                    cleanup.failed(channel, message, "delete outcome unknown");
                     cleanup
                         .release_ungrouped(app, http, channel, message, prepared)
                         .await;

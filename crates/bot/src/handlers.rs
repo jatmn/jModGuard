@@ -1560,7 +1560,14 @@ impl EventHandler for Handler {
         self.app
             .image_spam
             .deleted(guild_id.get(), channel_id.get(), deleted_message_id.get());
-        logging::claim_cleanup_gateway(&self.app, guild_id, channel_id, deleted_message_id, None);
+        logging::claim_cleanup_gateway(
+            &self.app,
+            guild_id,
+            channel_id,
+            deleted_message_id,
+            None,
+            crate::automod_delete_marks::GatewayDeleteOrigin::Single,
+        );
         self.app
             .recent_messages
             .forget(guild_id.get(), channel_id.get(), deleted_message_id.get());
@@ -1602,7 +1609,14 @@ impl EventHandler for Handler {
             );
         }
         for id in &multiple_deleted_messages_ids {
-            logging::claim_cleanup_gateway(&self.app, guild_id, channel_id, *id, None);
+            logging::claim_cleanup_gateway(
+                &self.app,
+                guild_id,
+                channel_id,
+                *id,
+                None,
+                crate::automod_delete_marks::GatewayDeleteOrigin::Bulk,
+            );
             self.app
                 .recent_messages
                 .forget(guild_id.get(), channel_id.get(), id.get());

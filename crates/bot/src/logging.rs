@@ -1556,7 +1556,14 @@ async fn emit_to_observed_with_audit(
             return Ok(Delivery::Sent);
         }
         let template = if event == "automod_delete" && vars.contains_key("cleanup_total") {
-            cleanup_incident::SUMMARY_TEMPLATE
+            if vars.contains_key("cleanup_failure_notice") {
+                cleanup_incident::FAILURE_TEMPLATE
+            } else {
+                let Some(template) = cleanup_incident::summary_template(&cfg) else {
+                    return Ok(Delivery::Unconfigured);
+                };
+                template
+            }
         } else {
             cfg.templates
                 .get(event)
@@ -1564,6 +1571,15 @@ async fn emit_to_observed_with_audit(
                 .unwrap_or_else(|| default_template(event))
         };
         templates::format_log_timestamps(&mut vars);
+        if event == "automod_delete"
+            && vars.contains_key("cleanup_total")
+            && templates::render_bounded(template, &vars, 4097)
+                .encode_utf16()
+                .count()
+                > 4096
+        {
+            return Ok(Delivery::Dropped);
+        }
         let _ = render_log_template(event, template, &mut vars);
         if !app.activation.may_record() {
             return Ok(Delivery::Dropped);
@@ -1590,18 +1606,18 @@ async fn emit_to_observed_with_audit(
                 crate::handlers::observe_member_sync_rate_limit_wait(&app, wait);
             }
         };
+        let nonce = vars.remove("cleanup_nonce");
+        let mut message = log_message(event, template, &vars);
+        if let Some(nonce) = nonce {
+            let nonce = serenity::model::channel::Nonce::String(nonce);
+            message = message.nonce(nonce).enforce_nonce(true);
+        }
         let call = crate::discord::race_discord_call(&app.activation, async {
             if after_rate_limit {
-                sink.send_after_rate_limit(
-                    channel_id,
-                    log_message(event, template, &vars),
-                    &commit,
-                    &on_global_rate_limit,
-                )
-                .await
+                sink.send_after_rate_limit(channel_id, message, &commit, &on_global_rate_limit)
+                    .await
             } else {
-                sink.send(channel_id, log_message(event, template, &vars))
-                    .await?;
+                sink.send(channel_id, message).await?;
                 Ok(true)
             }
         });
@@ -3302,7 +3318,14 @@ pub(crate) fn place_bulk_delete(
     reserve_pending: bool,
 ) -> BulkDeletePlacement {
     use crate::automod_delete_marks::GatewayDeleteObservation;
-    claim_cleanup_gateway(app, guild_id, channel, id, retained);
+    claim_cleanup_gateway(
+        app,
+        guild_id,
+        channel,
+        id,
+        retained,
+        crate::automod_delete_marks::GatewayDeleteOrigin::Bulk,
+    );
     let (observation, reserved_pending) = app.automod_delete_marks.observe_and_reserve_bulk_delete(
         guild_id.get(),
         channel.get(),
@@ -3349,7 +3372,14 @@ fn classify_observed_delete(
     retained: Option<&MessageSnapshot>,
 ) -> Option<MessageReport> {
     use crate::automod_delete_marks::GatewayDeleteObservation;
-    claim_cleanup_gateway(app, guild_id, channel, id, retained);
+    claim_cleanup_gateway(
+        app,
+        guild_id,
+        channel,
+        id,
+        retained,
+        crate::automod_delete_marks::GatewayDeleteOrigin::Single,
+    );
     let retained_for_mark = retained.cloned();
     let observation = app.automod_delete_marks.observe_gateway_delete(
         guild_id.get(),
