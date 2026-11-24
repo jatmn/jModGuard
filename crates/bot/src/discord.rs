@@ -125,6 +125,27 @@ fn log_delivery_client() -> &'static reqwest::Client {
     })
 }
 
+/// What is known about the most recent HTTP attempt. This lives with the
+/// pending incident so cancellation can inspect it after dropping the send.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogDispatch {
+    #[default]
+    Pending,
+    RateLimited(tokio::time::Instant),
+    MayHaveSent,
+    Rejected,
+}
+
+impl LogDispatch {
+    pub(crate) fn observe_status(&mut self, status: u16) {
+        match status {
+            429 if !matches!(self, Self::RateLimited(_)) => *self = Self::Pending,
+            400..=499 if status != 408 && status != 429 => *self = Self::Rejected,
+            _ => {}
+        }
+    }
+}
+
 /// Send one log message after the shared route rate-limit wait.
 ///
 /// `still_current` runs again after every wait and before the HTTP request.
@@ -135,33 +156,32 @@ pub(crate) async fn send_discord_log_after_rate_limit(
     message: serenity::builder::CreateMessage,
     still_current: &(dyn Fn() -> bool + Sync),
     on_global_rate_limit: &OnGlobalRateLimitCallback,
+    mut dispatch: Option<&mut LogDispatch>,
 ) -> Result<bool> {
-    let Some(ratelimiter) = http.ratelimiter.as_ref() else {
+    let ratelimiter = http.ratelimiter.as_ref();
+    if ratelimiter.is_none() && dispatch.is_none() {
         if !still_current() {
             return Ok(false);
         }
         channel.send_message(http, message).await?;
         return Ok(true);
-    };
+    }
 
     let payload =
         serde_json::to_vec(&message).map_err(|_| anyhow!("discord log delivery failed"))?;
-    let mut path = serenity::http::Route::ChannelMessages {
-        channel_id: channel,
-    }
-    .path()
-    .into_owned();
-    if let Some(proxy) = http.proxy.as_deref() {
-        path = path.replace("https://discord.com", proxy.trim_end_matches('/'));
-    }
     let message_route = serenity::http::Route::ChannelMessages {
         channel_id: channel,
     };
     let request = serenity::http::Request::new(message_route, serenity::http::LightMethod::Post);
+    let mut path = message_route.path().into_owned();
+    if let Some(proxy) = http.proxy.as_deref() {
+        path = path.replace("https://discord.com", proxy.trim_end_matches('/'));
+    }
     let bucket_key = request.route_ref().ratelimiting_bucket();
     let on_wait = |_: serenity::http::RatelimitInfo| note_rate_limit_wait_for_test();
     let token = reqwest::header::HeaderValue::from_str(http.token())
         .map_err(|_| anyhow!("discord log delivery failed"))?;
+    let client = log_delivery_client();
 
     if !still_current() {
         return Ok(false);
@@ -169,33 +189,65 @@ pub(crate) async fn send_discord_log_after_rate_limit(
     // This path bypasses Serenity's request span. Count the logical send once.
     jmodguard::resources::count("discord_rest", 1);
     loop {
-        let routes = ratelimiter.routes();
-        let bucket = {
-            let mut routes = routes.write().await;
-            std::sync::Arc::clone(routes.entry(bucket_key).or_default())
+        let bucket = if let Some(ratelimiter) = ratelimiter {
+            let routes = ratelimiter.routes();
+            let bucket = std::sync::Arc::clone(routes.write().await.entry(bucket_key).or_default());
+            bucket.lock().await.pre_hook(&request, &on_wait).await;
+            Some(bucket)
+        } else {
+            None
         };
-        bucket.lock().await.pre_hook(&request, &on_wait).await;
-        // The pre-hook sleep is the rate-limit wait. Recheck before any bytes leave.
+        // Recheck after admission, before building and handing off the POST.
         if !still_current() {
             return Ok(false);
         }
-        let response = log_delivery_client()
+        let post = client
             .post(&path)
             .header(reqwest::header::USER_AGENT, serenity::constants::USER_AGENT)
             .header(reqwest::header::AUTHORIZATION, &token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(payload.clone())
-            .send()
-            .await
+            .build()
             .map_err(|_| anyhow!("discord log delivery failed"))?;
-        if response.headers().get("x-ratelimit-global").is_some() {
-            let Some(retry_after) = response
-                .headers()
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<f64>().ok())
-                .and_then(|retry_after| std::time::Duration::try_from_secs_f64(retry_after).ok())
-            else {
+        if let Some(dispatch) = dispatch.as_deref_mut() {
+            *dispatch = LogDispatch::MayHaveSent;
+        }
+        let response = match client.execute(post).await {
+            Ok(response) => response,
+            Err(error) => {
+                if error.is_connect()
+                    && let Some(dispatch) = dispatch.as_deref_mut()
+                {
+                    *dispatch = LogDispatch::Pending;
+                }
+                return Err(anyhow!("discord log delivery failed"));
+            }
+        };
+        // A rejected 429 is settled before post_hook can wait for another attempt.
+        let rate_limited = response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let retry_after = rate_limited
+            .then(|| {
+                response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .and_then(|delay| Duration::try_from_secs_f64(delay).ok())
+            })
+            .flatten();
+        if let Some(dispatch) = dispatch.as_deref_mut() {
+            dispatch.observe_status(response.status().as_u16());
+            if let Some(until) =
+                retry_after.and_then(|delay| tokio::time::Instant::now().checked_add(delay))
+            {
+                *dispatch = LogDispatch::RateLimited(until);
+            }
+        }
+        if ratelimiter.is_some()
+            && rate_limited
+            && response.headers().contains_key("x-ratelimit-global")
+        {
+            let Some(retry_after) = retry_after else {
                 return Err(anyhow!(
                     "discord log delivery failed ({})",
                     response.status().as_u16()
@@ -215,13 +267,14 @@ pub(crate) async fn send_discord_log_after_rate_limit(
             }
             continue;
         }
-        let retry = bucket
-            .lock()
-            .await
-            .post_hook(&response, &request, &on_wait, false)
-            .await
-            .map_err(|_| anyhow!("discord log delivery failed"))?;
-        if retry {
+        if let Some(bucket) = bucket
+            && bucket
+                .lock()
+                .await
+                .post_hook(&response, &request, &on_wait, false)
+                .await
+                .map_err(|_| anyhow!("discord log delivery failed"))?
+        {
             if !still_current() {
                 return Ok(false);
             }

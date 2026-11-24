@@ -3075,7 +3075,7 @@ enum ReplayAttachmentProxy {
     ServerError,
 }
 
-async fn read_proxied_request(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+pub(super) async fn read_proxied_request(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     let mut request = Vec::new();
     let header_end = loop {
@@ -3128,7 +3128,7 @@ async fn write_proxy_reply(
     let _ = stream.write_all(response.as_bytes()).await;
 }
 
-fn request_log_payload(request: &str) -> serde_json::Value {
+pub(super) fn request_log_payload(request: &str) -> serde_json::Value {
     let body = request.split_once("\r\n\r\n").unwrap().1;
     if let Some((_, json_part)) = body.split_once("name=\"payload_json\"") {
         let json = json_part
@@ -3222,7 +3222,7 @@ async fn replay_attachment_proxy_signalling(
     (http, requests, server, received)
 }
 
-fn replay_snapshot(content: &str) -> MessageSnapshot {
+pub(super) fn replay_snapshot(content: &str) -> MessageSnapshot {
     MessageSnapshot {
         guild_id: 789,
         channel_id: 456,
@@ -3870,13 +3870,13 @@ async fn truncated_success_body_stays_ambiguous_for_attachment_fallback_and_coun
     server.abort();
 }
 
-struct ScriptedHttpReply {
-    status: u16,
-    headers: &'static str,
-    body: &'static str,
+pub(super) struct ScriptedHttpReply {
+    pub(super) status: u16,
+    pub(super) headers: &'static str,
+    pub(super) body: &'static str,
 }
 
-async fn scripted_discord_proxy(
+pub(super) async fn scripted_discord_proxy(
     replies: Vec<ScriptedHttpReply>,
 ) -> (
     serenity::http::Http,
@@ -4004,6 +4004,7 @@ async fn discord_rest_counts_logical_requests_across_delivery_paths() {
             CreateMessage::new().content("fixture"),
             current,
             &crate::discord::ignore_global_rate_limit,
+            None,
         )
     };
     let counter = || jmodguard::resources::peek_counter("discord_rest");
@@ -4063,6 +4064,7 @@ async fn stale_incomplete_notice_is_dropped_after_preemptive_rate_limit_wait() {
             CreateMessage::new().content("seed"),
             &|| true,
             &ignore_rl,
+            None,
         )
         .await
         .unwrap()
@@ -4082,6 +4084,7 @@ async fn stale_incomplete_notice_is_dropped_after_preemptive_rate_limit_wait() {
             CreateMessage::new().content("stale"),
             &move || !commit_flag.load(Ordering::SeqCst),
             &ignore_rl,
+            None,
         )
         .await
     })
@@ -4143,6 +4146,7 @@ async fn stale_incomplete_notice_is_not_retried_after_a_429_wait() {
             CreateMessage::new().content("stale"),
             &move || !commit_flag.load(Ordering::SeqCst),
             &ignore_rl,
+            None,
         )
         .await
     })
@@ -4708,6 +4712,7 @@ async fn global_429_virtual_wait_blocks_an_earlier_member_sync_claim() {
             CreateMessage::new().content("notice"),
             &|| true,
             &member_sync_hook,
+            None,
         )
         .await
         .unwrap()

@@ -1161,9 +1161,13 @@ pub(crate) trait LogDelivery: Sync {
         message: CreateMessage,
         still_current: &(dyn Fn() -> bool + Sync),
         _on_global_rate_limit: &crate::discord::OnGlobalRateLimitCallback,
+        dispatch: Option<&mut crate::discord::LogDispatch>,
     ) -> anyhow::Result<bool> {
         if !still_current() {
             return Ok(false);
+        }
+        if let Some(dispatch) = dispatch {
+            *dispatch = crate::discord::LogDispatch::MayHaveSent;
         }
         self.send(channel, message).await?;
         Ok(true)
@@ -1202,6 +1206,7 @@ impl LogDelivery for serenity::http::Http {
         message: CreateMessage,
         still_current: &(dyn Fn() -> bool + Sync),
         on_global_rate_limit: &crate::discord::OnGlobalRateLimitCallback,
+        dispatch: Option<&mut crate::discord::LogDispatch>,
     ) -> anyhow::Result<bool> {
         crate::discord::send_discord_log_after_rate_limit(
             self,
@@ -1209,6 +1214,7 @@ impl LogDelivery for serenity::http::Http {
             message,
             still_current,
             on_global_rate_limit,
+            dispatch,
         )
         .await
     }
@@ -1230,9 +1236,16 @@ impl LogDelivery for std::sync::Arc<serenity::http::Http> {
         message: CreateMessage,
         still_current: &(dyn Fn() -> bool + Sync),
         on_global_rate_limit: &crate::discord::OnGlobalRateLimitCallback,
+        dispatch: Option<&mut crate::discord::LogDispatch>,
     ) -> anyhow::Result<bool> {
         self.as_ref()
-            .send_after_rate_limit(channel, message, still_current, on_global_rate_limit)
+            .send_after_rate_limit(
+                channel,
+                message,
+                still_current,
+                on_global_rate_limit,
+                dispatch,
+            )
             .await
     }
 }
@@ -1245,7 +1258,7 @@ pub(crate) enum Delivery {
     Failed,
     /// Skipped because this guild/channel was recently rejected with a permanent error.
     Blocked,
-    /// Admitted rejoin enrichment found nothing to report; do not retry delivery.
+    /// This delivery path found no report to send.
     NothingToSend,
 }
 
@@ -1349,7 +1362,8 @@ pub(crate) async fn emit_to_if(
 #[derive(PartialEq, Eq)]
 enum SummaryDelivery {
     Sent,
-    NotSent,
+    Retry,
+    Fallback,
     Ambiguous,
 }
 
@@ -1358,7 +1372,7 @@ async fn emit_cleanup_summary(
     sink: &impl LogDelivery,
     guild: GuildId,
     vars: BTreeMap<String, String>,
-    started: &std::sync::atomic::AtomicBool,
+    dispatch: &mut crate::discord::LogDispatch,
 ) -> SummaryDelivery {
     let (delivery, _) = emit_to_observed_with_audit(
         app,
@@ -1371,15 +1385,15 @@ async fn emit_cleanup_summary(
         || true,
         false,
         None,
-        Some(started),
+        Some(dispatch),
     )
     .await;
-    if delivery == Delivery::Sent {
-        SummaryDelivery::Sent
-    } else if started.load(std::sync::atomic::Ordering::Relaxed) {
-        SummaryDelivery::Ambiguous
-    } else {
-        SummaryDelivery::NotSent
+    match (delivery, *dispatch) {
+        (Delivery::Sent, _) => SummaryDelivery::Sent,
+        (_, crate::discord::LogDispatch::MayHaveSent) => SummaryDelivery::Ambiguous,
+        (_, crate::discord::LogDispatch::Rejected) => SummaryDelivery::Fallback,
+        (Delivery::Failed | Delivery::Dropped, _) => SummaryDelivery::Retry,
+        _ => SummaryDelivery::Fallback,
     }
 }
 
@@ -1447,7 +1461,7 @@ async fn emit_to_observed_with_audit(
     commit: impl Fn() -> bool + Sync,
     after_rate_limit: bool,
     rejoin_enrich_user: Option<&serenity::model::user::User>,
-    summary_started: Option<&std::sync::atomic::AtomicBool>,
+    mut summary_dispatch: Option<&mut crate::discord::LogDispatch>,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
     // here, before admission/config/filter exits can discard the observation.
@@ -1489,7 +1503,6 @@ async fn emit_to_observed_with_audit(
         }
         Admission::Held(_) => None,
     };
-    use std::sync::atomic::Ordering::Relaxed;
     let mut matched_audit = None;
     let result = tokio::time::timeout(deadline.saturating_sub(started.elapsed()), async {
         let cfg = app.configs.get(&app.db, guild_id.get()).await?;
@@ -1597,7 +1610,9 @@ async fn emit_to_observed_with_audit(
         {
             return Ok(Delivery::Sent);
         }
-        let template = if event == "automod_delete" && vars.contains_key("cleanup_total") {
+        let nonce = vars.remove("cleanup_nonce");
+        let grouped_cleanup = event == "automod_delete" && vars.contains_key("cleanup_total");
+        let template = if grouped_cleanup {
             if vars.contains_key("cleanup_failure_notice") {
                 cleanup_incident::FAILURE_TEMPLATE
             } else {
@@ -1607,20 +1622,34 @@ async fn emit_to_observed_with_audit(
                 template
             }
         } else {
-            cfg.templates
-                .get(event)
-                .map(String::as_str)
-                .unwrap_or_else(|| default_template(event))
+            let saved = cfg.templates.get(event).map(String::as_str);
+            match saved {
+                Some(saved)
+                    if event == "automod_delete"
+                        && template_keys(saved).any(|key| key.starts_with("cleanup_")) =>
+                {
+                    cleanup_incident::SINGLE_DELETE_TEMPLATE
+                }
+                Some(saved) => saved,
+                None => default_template(event),
+            }
         };
         templates::format_log_timestamps(&mut vars);
-        if event == "automod_delete"
-            && vars.contains_key("cleanup_total")
+        if grouped_cleanup {
+            // A mixed custom template may request values tied to one message.
+            // The summary has no single message or unbounded retained content.
+            for key in template_keys(template) {
+                vars.entry(key.to_owned())
+                    .or_insert_with(|| "unavailable for grouped cleanup".into());
+            }
+        }
+        if grouped_cleanup
             && templates::render_bounded(template, &vars, 4097)
                 .encode_utf16()
                 .count()
                 > 4096
         {
-            return Ok(Delivery::Dropped);
+            return Ok(Delivery::NothingToSend);
         }
         let _ = render_log_template(event, template, &mut vars);
         if !app.activation.may_record() {
@@ -1648,19 +1677,21 @@ async fn emit_to_observed_with_audit(
                 crate::handlers::observe_member_sync_rate_limit_wait(&app, wait);
             }
         };
-        let nonce = vars.remove("cleanup_nonce");
         let mut message = log_message(event, template, &vars);
         if let Some(nonce) = nonce {
             let nonce = serenity::model::channel::Nonce::String(nonce);
             message = message.nonce(nonce).enforce_nonce(true);
         }
         let call = crate::discord::race_discord_call(&app.activation, async {
-            if let Some(started) = summary_started {
-                started.store(true, Relaxed);
-            }
-            if after_rate_limit {
-                sink.send_after_rate_limit(channel_id, message, &commit, &on_global_rate_limit)
-                    .await
+            if after_rate_limit || summary_dispatch.is_some() {
+                sink.send_after_rate_limit(
+                    channel_id,
+                    message,
+                    &commit,
+                    &on_global_rate_limit,
+                    summary_dispatch.as_deref_mut(),
+                )
+                .await
             } else {
                 sink.send(channel_id, message).await?;
                 Ok(true)
@@ -1679,10 +1710,12 @@ async fn emit_to_observed_with_audit(
                     rest_target,
                     Instant::now(),
                 );
-                if let Some(started) = summary_started
-                    && summary_send_definitely_rejected(&error)
+                if let Some(dispatch) = summary_dispatch.as_deref_mut()
+                    && let Some((status, _)) = error
+                        .downcast_ref::<serenity::Error>()
+                        .and_then(crate::discord::http_error_response)
                 {
-                    started.store(false, Relaxed);
+                    dispatch.observe_status(status);
                 }
                 return Err(error);
             }
@@ -1694,20 +1727,15 @@ async fn emit_to_observed_with_audit(
         Ok(Ok(delivery)) => delivery,
         Ok(Err(_)) | Err(_) => {
             // The incident accounts for an uncertain send when it settles.
-            if !summary_started.is_some_and(|started| started.load(Relaxed)) {
+            if summary_dispatch
+                .is_none_or(|dispatch| *dispatch != crate::discord::LogDispatch::MayHaveSent)
+            {
                 record_delivery_failure(app);
             }
             Delivery::Failed
         }
     };
     (delivery, matched_audit)
-}
-
-fn summary_send_definitely_rejected(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<serenity::Error>()
-        .and_then(crate::discord::http_error_response)
-        .is_some_and(|(status, _)| (400..500).contains(&status) && status != 408)
 }
 
 fn member_audit_action(event: &str) -> Option<Action> {
@@ -2059,15 +2087,16 @@ pub(crate) fn render_log_template(
     templates::render_bounded(template, vars, 2000)
 }
 
+fn template_keys(template: &str) -> impl Iterator<Item = &str> {
+    template.split_inclusive('}').filter_map(|chunk| {
+        let (_, key) = chunk.strip_suffix('}')?.rsplit_once('{')?;
+        Some(key)
+    })
+}
+
 fn substituted_key_count(template: &str, key: &str) -> usize {
-    template
-        .split_inclusive('}')
-        .filter(|chunk| {
-            chunk.ends_with('}')
-                && chunk
-                    .rfind('{')
-                    .is_some_and(|start| &chunk[start + 1..chunk.len() - 1] == key)
-        })
+    template_keys(template)
+        .filter(|candidate| *candidate == key)
         .count()
 }
 

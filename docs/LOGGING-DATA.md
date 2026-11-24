@@ -118,7 +118,9 @@ and persistence contracts below are unchanged.
   `{cleanup_action}` (outcome and case), `{cleanup_total}`, `{cleanup_channels}`,
   `{cleanup_first}`, `{cleanup_last}`, `{cleanup_sample}`, `{cleanup_evidence}`,
   `{cleanup_failures}`, and `{cleanup_source_channels}` (comma-separated
-  source IDs). Content and evidence appear only when the template requests them.
+  source IDs). Grouped notices mark values tied to a single message unavailable.
+  Individual notices use the built-in single-message presentation without
+  retained text or attachments when a saved template contains grouped variables.
 - To change the settle delay, set `[log].automod_cleanup_settle_secs` or
   `JMODGUARD_LOG_AUTOMOD_CLEANUP_SETTLE_SECS` to 5–10 seconds. To restore the
   original per-message behavior, set `[log].group_automod_cleanup_deletes`
@@ -127,11 +129,14 @@ and persistence contracts below are unchanged.
   public `bot.about_webui_url`. Otherwise the notice includes the case ID.
 - A cleanup still in progress at the 30-second cap or whose summary cannot
   be sent falls back to individual delete notices and a separate failure count.
-  A summary whose send may have reached Discord settles as possibly delivered.
+  A summary interrupted before its POST, including while waiting for a rate
+  limit or backing off after a 429, remains pending for grouped retry. A
+  summary whose POST may have been accepted settles as possibly delivered.
   The bot keeps the echo receipts and sends neither a second summary nor
   individual notices for the covered deletes. Pending cleanup deliveries
-  share the bounded incident buffer. Definitive failures can retry with
-  exponential delays of 10 to 60 seconds. Each server can retain up to eight
+  share the bounded incident buffer and use exponential retry delays of
+  10 to 60 seconds, extended by Discord's Retry-After when present. Each server
+  can retain up to eight
   retrying incidents. A ninth evicts that server's oldest retry and counts a
   delivery failure. Individual cleanup retries reuse the same Discord nonce.
   Bulk replay follows the ordinary bulk rule for ambiguous sends. On a planned

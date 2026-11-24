@@ -1,5 +1,8 @@
 use super::*;
-use crate::logging::tests::log_text;
+use crate::logging::tests::{
+    ScriptedHttpReply, log_text, read_proxied_request, replay_snapshot, request_log_payload,
+    scripted_discord_proxy,
+};
 
 const GUILD: u64 = 8;
 const SUBJECT: u64 = 9;
@@ -636,6 +639,10 @@ async fn saved_legacy_and_grouped_templates_control_sample_visibility() {
             "My delete notice for Exact image spam",
         ),
         ("My cleanup counted {cleanup_total}", "My cleanup counted 1"),
+        (
+            "My cleanup counted {cleanup_total} · Link {message_url} · Text {content}",
+            "My cleanup counted 1 · Link unavailable for grouped cleanup · Text unavailable for grouped cleanup",
+        ),
     ] {
         let f = Fixture::new(true).await;
         db::upsert_template(&f.app.db, GUILD as i64, "automod_delete", template)
@@ -1049,4 +1056,225 @@ async fn persistently_rejected_guild_cannot_fill_other_guilds_cleanup_capacity()
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0].0.get(), HEALTHY_DESTINATION);
     assert!(log_text(&sent[0].1).contains("**Deleted:** 2"));
+}
+
+async fn queue_summary(f: &Fixture) {
+    let cleanup = f.begin().await.unwrap();
+    f.rest(Some(&cleanup), 1, 101).await;
+    f.rest(Some(&cleanup), 2, 102).await;
+    drop(cleanup);
+}
+
+fn assert_waiting_summary(f: &Fixture) {
+    let state = f.app.cleanup_incidents.inner.lock();
+    assert_eq!(state.pending.len(), 1);
+    let pending = state.pending.values().next().unwrap().as_ref().unwrap();
+    assert!(!pending.fallback);
+    assert!(matches!(
+        pending.summary_dispatch,
+        LogDispatch::Pending | LogDispatch::RateLimited(_)
+    ));
+    assert_eq!(pending.retry_delay, DELIVERY_RETRY);
+    assert_eq!(pending.incident.messages.len(), 2);
+}
+
+fn successful_summary_reply() -> ScriptedHttpReply {
+    ScriptedHttpReply {
+        status: 200,
+        headers: "",
+        body: "{}",
+    }
+}
+
+#[tokio::test]
+async fn summary_timeout_waiting_for_serenity_bucket_keeps_the_grouped_retry() {
+    use std::sync::atomic::Ordering;
+    let f = Fixture::new(true).await;
+    let (http, calls, server) = scripted_discord_proxy(vec![successful_summary_reply()]).await;
+    let route = serenity::http::Route::ChannelMessages {
+        channel_id: DESTINATION.into(),
+    };
+    let routes = http.ratelimiter.as_ref().unwrap().routes();
+    let bucket = Arc::clone(
+        routes
+            .write()
+            .await
+            .entry(route.ratelimiting_bucket())
+            .or_default(),
+    );
+    let held = bucket.lock().await;
+    queue_summary(&f).await;
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    flush(&f.app, &http, false).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no POST before the bucket releases"
+    );
+    assert_waiting_summary(&f);
+    assert!(f.single(1, 101).is_none());
+    drop(held);
+
+    flush(&f.app, &http, false).await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the summary waits for its backoff"
+    );
+    tokio::time::advance(DELIVERY_RETRY).await;
+    tokio::time::resume();
+    flush(&f.app, &http, false).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one grouped POST on retry");
+    assert!(f.app.cleanup_incidents.inner.lock().pending.is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+async fn summary_timeout_during_429_backoff_keeps_the_grouped_retry() {
+    use std::sync::atomic::Ordering;
+    for headers in [
+        "retry-after: 60\r\n",
+        "x-ratelimit-global: true\r\nretry-after: 60\r\n",
+    ] {
+        let f = Fixture::new(true).await;
+        let (http, calls, server) = scripted_discord_proxy(vec![
+            ScriptedHttpReply {
+                status: 429,
+                headers,
+                body: "{}",
+            },
+            successful_summary_reply(),
+        ])
+        .await;
+        let http = Arc::new(http);
+        let waiting = Arc::new(tokio::sync::Notify::new());
+        queue_summary(&f).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::time::resume();
+
+        let mut worker = tokio::spawn({
+            let app = Arc::clone(&f.app);
+            let http = Arc::clone(&http);
+            let waiting = Arc::clone(&waiting);
+            async move {
+                crate::discord::with_rate_limit_wait_hook(
+                    Arc::new(move || waiting.notify_one()),
+                    flush(&app, http.as_ref(), false),
+                )
+                .await;
+            }
+        });
+        tokio::select! {
+            _ = waiting.notified() => {}
+            result = &mut worker => panic!("summary completed before rate-limit wait: {result:?}"),
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(f.app.cfg.log.discord_timeout_secs)).await;
+        worker.await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the rejected POST was sent"
+        );
+        assert_waiting_summary(&f);
+
+        tokio::time::advance(DELIVERY_RETRY).await;
+        flush(&f.app, http.as_ref(), false).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the provider backoff still applies"
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
+        flush(&f.app, http.as_ref(), false).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the retry sends one summary"
+        );
+        assert!(f.app.cleanup_incidents.inner.lock().pending.is_empty());
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn lost_summary_ack_from_http_keeps_receipts_without_replaying() {
+    let f = Fixture::new(true).await;
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_proxied_request(&mut stream).await.unwrap();
+        // The complete POST is received. Drop the connection without an acknowledgement.
+        String::from_utf8(request).unwrap()
+    });
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{addr}"))
+        .build();
+    queue_summary(&f).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::resume();
+    flush(&f.app, &http, false).await;
+    let request = server.await.unwrap();
+    assert!(request.starts_with("POST /api/v10/channels/"));
+    assert!(log_text(&request_log_payload(&request)).contains("**Deleted:** 2"));
+    assert!(f.app.cleanup_incidents.inner.lock().pending.is_empty());
+    assert!(f.single(1, 101).is_none());
+    tokio::time::pause();
+    f.settle().await;
+    flush(&f.app, &f.sink, true).await;
+    assert!(f.notices().is_empty());
+}
+
+#[tokio::test]
+async fn grouped_template_uses_a_private_single_message_notice_on_fallback_and_when_disabled() {
+    for enabled in [true, false] {
+        let f = Fixture::new(enabled).await;
+        db::upsert_template(
+            &f.app.db,
+            GUILD as i64,
+            "automod_delete",
+            "My cleanup counted {cleanup_total}, channels {cleanup_channels}",
+        )
+        .await
+        .unwrap();
+        let cleanup = f.begin().await;
+        let guild = GuildId::new(GUILD);
+        let channel = ChannelId::new(1);
+        let id = MessageId::new(101);
+        let row = MessageSnapshot {
+            guild_id: GUILD as i64,
+            channel_id: channel.get() as i64,
+            message_id: id.get() as i64,
+            ..replay_snapshot("private retained message")
+        };
+        let observe = || observed_delete_report(&f.app, guild, channel, id, Some(&row));
+        if let Some(cleanup) = cleanup {
+            let prepared = cleanup.prepare(&f.app, channel.get(), id.get());
+            assert!(observe().is_none());
+            assert!(cleanup.deleted(&f.app, channel.get(), id.get(), prepared, false));
+            drop(cleanup);
+            f.app.activation.begin_shutdown();
+            flush(&f.app, &f.sink, true).await;
+        } else {
+            f.rest(None, channel.get(), id.get()).await;
+            let report = observe().unwrap();
+            assert_eq!(report.event, "automod_delete");
+            emit_to(&f.app, &f.sink, guild, report.event, report.vars).await;
+        }
+        let notices = f.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let notice = &notices[0];
+        assert!(notice.contains("Automod message deleted"));
+        assert!(notice.contains("/channels/8/1/101"), "{notice}");
+        assert!(!notice.contains("{cleanup_"));
+        assert!(!notice.contains("private retained message"));
+    }
 }

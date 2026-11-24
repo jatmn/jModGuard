@@ -4,7 +4,7 @@
 use super::*;
 use crate::automod_delete_marks::{CleanupDeleteClaim, GatewayDeleteOrigin, PreparedAutomodDelete};
 use crate::db::guild_data::{CaseId, CaseOutcome};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use crate::discord::LogDispatch;
 use tokio::time::Instant as Clock;
 
 const MAX_INCIDENTS: usize = 64;
@@ -18,11 +18,14 @@ const SUMMARY_TEMPLATE: &str = "Automod cleanup\n\n**User:** {mention} (`{user_i
 
 pub(super) const FAILURE_TEMPLATE: &str = "Automod cleanup delete failures\n\n**User:** {mention} (`{user_id}`)\n**Rule:** {rule} (`{rule_id}`)\n**Delete failures:** {cleanup_failures}";
 
+/// A grouped template may deliberately omit retained text or attachments.
+pub(super) const SINGLE_DELETE_TEMPLATE: &str = "Automod message deleted\n\n**Channel:** {channel}\n**Rule:** {rule} (`{rule_id}`)\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`";
+
 pub(super) fn summary_template(cfg: &crate::state::CachedGuildConfig) -> Option<&str> {
     match cfg.templates.get("automod_delete").map(String::as_str) {
         None => Some(SUMMARY_TEMPLATE),
         Some(saved) if saved == default_template("automod_delete") => Some(SUMMARY_TEMPLATE),
-        Some(saved) if saved.contains("{cleanup_total}") => Some(saved),
+        Some(saved) if template_keys(saved).any(|key| key == "cleanup_total") => Some(saved),
         Some(_) => None,
     }
 }
@@ -499,7 +502,7 @@ struct PendingIncident {
     fallback: bool,
     retry_at: Clock,
     retry_delay: Duration,
-    summary_started: AtomicBool,
+    summary_dispatch: LogDispatch,
     nonce: u64,
 }
 
@@ -615,7 +618,7 @@ impl CleanupIncidents {
                             fallback,
                             retry_at: now,
                             retry_delay: Duration::ZERO,
-                            summary_started: AtomicBool::new(false),
+                            summary_dispatch: LogDispatch::Pending,
                             nonce: rand::random(),
                         }),
                     )
@@ -791,6 +794,9 @@ pub(crate) async fn flush(app: &Arc<BotState>, sink: &impl LogDelivery, shutdown
         pending.deliver(app, sink, shutdown).await;
         pending.retry_delay = (pending.retry_delay * 2).clamp(DELIVERY_RETRY, MAX_DELIVERY_RETRY);
         pending.retry_at = Clock::now() + pending.retry_delay;
+        if let LogDispatch::RateLimited(until) = pending.summary_dispatch {
+            pending.retry_at = pending.retry_at.max(until);
+        }
     }
 }
 
@@ -821,7 +827,7 @@ impl PendingIncident {
         let rejected = self.incident.outcome == Some(CaseOutcome::Failed);
         // Rejected-ban purge echoes have an independent ordinary-log route.
         self.finish_matching(app, |item| !rejected || item.purge_origin.is_none());
-        self.summary_started.store(false, Relaxed);
+        self.summary_dispatch = LogDispatch::Pending;
         self.fallback = true;
         if uncertain {
             record_delivery_failure(app);
@@ -831,7 +837,7 @@ impl PendingIncident {
     async fn deliver(&mut self, app: &Arc<BotState>, sink: &impl LogDelivery, shutdown: bool) {
         // Shutdown can interrupt the worker after handing the summary to the
         // transport. Its acknowledgement may be lost even though Discord posted it.
-        if self.summary_started.load(Relaxed) {
+        if self.summary_dispatch == LogDispatch::MayHaveSent {
             self.finish_summary(app, true);
         }
         if self.incident.messages.is_empty() {
@@ -885,12 +891,16 @@ impl PendingIncident {
                     sink,
                     GuildId::new(guild),
                     vars,
-                    &self.summary_started,
+                    &mut self.summary_dispatch,
                 )
                 .await;
-                if delivery != SummaryDelivery::NotSent {
-                    self.finish_summary(app, delivery == SummaryDelivery::Ambiguous);
-                    return;
+                match delivery {
+                    SummaryDelivery::Sent | SummaryDelivery::Ambiguous => {
+                        self.finish_summary(app, delivery == SummaryDelivery::Ambiguous);
+                        return;
+                    }
+                    SummaryDelivery::Retry => return,
+                    SummaryDelivery::Fallback => {}
                 }
             }
             self.fallback = true;
