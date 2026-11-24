@@ -848,6 +848,7 @@ async fn punish_proven_match(
                                         &enrollment,
                                         found.author,
                                         ban_action.ban_delete_message_seconds(),
+                                        || true,
                                     )
                                     .await;
                                 }

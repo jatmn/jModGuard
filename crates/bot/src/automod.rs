@@ -994,16 +994,12 @@ pub(crate) async fn execute_pending_with(
         );
         return false;
     };
-    // A preset must still be enabled and include this channel when a queued
-    // match reaches execution, including after a channel is removed.
-    if (jmodguard::custom_rules::requires_include_channels(settings)
+    let media_preset = jmodguard::custom_rules::requires_include_channels(settings)
         || pending
             .matched_rule
             .as_ref()
-            .is_some_and(jmodguard::custom_rules::requires_include_channels))
-        && (!settings.enabled
-            || msg_channel.is_none_or(|channel| !settings.include_channels.contains(&channel)))
-    {
+            .is_some_and(jmodguard::custom_rules::requires_include_channels);
+    if media_preset && !preset_scope_allows(settings, target.id, msg_channel, &[], false) {
         return false;
     }
     let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
@@ -1042,7 +1038,7 @@ pub(crate) async fn execute_pending_with(
 
     let explicit_log = custom && actions.iter().any(|action| action.action == "log");
     let enforces = actions.iter().any(|action| action.action != "log");
-    let provided_member = match resolve_rule_member(
+    let resolved_member = resolve_rule_member(
         app,
         http,
         cache,
@@ -1052,8 +1048,26 @@ pub(crate) async fn execute_pending_with(
         settings,
         enforces,
     )
-    .await
-    {
+    .await;
+    let mut preset_dispatch = None;
+    if media_preset {
+        let Some(dispatch) = recheck_preset(
+            app,
+            cache,
+            guild_id,
+            target.id,
+            msg_channel,
+            pending,
+            settings,
+            resolved_member.as_ref().ok().and_then(Option::as_ref),
+        )
+        .await
+        else {
+            return false;
+        };
+        preset_dispatch = Some(dispatch);
+    }
+    let provided_member = match resolved_member {
         Ok(member) => member,
         Err(RuleExemption::Exempt) => return true,
         Err(RuleExemption::Unknown(reason)) => {
@@ -1084,7 +1098,25 @@ pub(crate) async fn execute_pending_with(
     };
     let mut earlier_actions = Vec::new();
     let mut earlier_reasons = Vec::new();
-    for action in actions {
+    for (index, action) in actions.iter().enumerate() {
+        // The previous action may have awaited Discord, logging or persistence.
+        if media_preset && index != 0 {
+            let Some(dispatch) = recheck_preset(
+                app,
+                cache,
+                guild_id,
+                target.id,
+                msg_channel,
+                pending,
+                settings,
+                provided_member.as_ref(),
+            )
+            .await
+            else {
+                break;
+            };
+            preset_dispatch = Some(dispatch);
+        }
         let mut vars = vars.clone();
         vars.insert("action".into(), action.action.clone());
         let rendered_reason = crate::templates::render(&action.reason, &vars);
@@ -1119,6 +1151,7 @@ pub(crate) async fn execute_pending_with(
             enrollment.clone(),
             vars,
             &reason,
+            preset_dispatch.as_ref(),
             config_unknown,
             log_automod,
             settings.open_case,
@@ -1139,6 +1172,102 @@ pub(crate) async fn execute_pending_with(
         }
     }
     true
+}
+
+fn preset_scope_allows(
+    rule: &RuleDef,
+    user_id: UserId,
+    channel: Option<u64>,
+    roles: &[u64],
+    moderator: bool,
+) -> bool {
+    rule.enabled
+        && channel.is_some_and(|channel| {
+            rule.include_channels.contains(&channel)
+                && !jmodguard::custom_rules::rule_scope_skips(
+                    rule,
+                    user_id.get(),
+                    channel,
+                    roles,
+                    moderator,
+                    true,
+                )
+        })
+}
+
+/// A scope seen after asynchronous admission. The version checks are
+/// synchronous so a later I/O wait cannot authorize a stale dispatch.
+struct PresetDispatch {
+    guild_id: u64,
+    cache_version: u64,
+    durable_version: u64,
+    write_generation: u64,
+}
+
+impl PresetDispatch {
+    fn is_current(&self, app: &BotState) -> bool {
+        self.write_generation & 1 == 0
+            && self.write_generation == app.db.config_write_generation()
+            && self.durable_version >= app.db.required_config_version()
+            && app.configs.last_known(self.guild_id).is_some_and(|cfg| {
+                cfg.version == self.cache_version && cfg.durable_version == self.durable_version
+            })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recheck_preset(
+    app: &BotState,
+    cache: &serenity::cache::Cache,
+    guild_id: GuildId,
+    user: UserId,
+    channel: Option<u64>,
+    pending: &PendingAction,
+    checked_rule: &RuleDef,
+    member: Option<&Member>,
+) -> Option<PresetDispatch> {
+    let write_generation = app.db.config_write_generation();
+    // The cache honors the bot writer's committed-version floor and falls
+    // back to the primary when a replica is behind an acknowledged save.
+    let cfg = app.configs.get(&app.db, guild_id.get()).await.ok()?;
+    let current = cfg.rules.get(&pending.rule_id)?;
+    // A change to the rule invalidates both the ordered plan and the exemption
+    // decision made from it. A later message can be judged under the edit.
+    if current != checked_rule || current.dry_run {
+        return None;
+    }
+
+    let roles: Vec<_> = member
+        .map(|member| member.roles.iter().map(|role| role.get()).collect())
+        .unwrap_or_default();
+    let mut moderator = false;
+    if let Some(guild) = cache.guild(guild_id) {
+        if (current.skip_moderators || !current.whitelist_roles.is_empty())
+            && let Some(cached) = guild.members.get(&user)
+            && member.is_some_and(|member| member.roles != cached.roles)
+        {
+            // The membership changed since the exemption lookup.
+            return None;
+        }
+        moderator = current.skip_moderators
+            && (guild.owner_id == user
+                || crate::commands::permission_level(
+                    app.cfg.bot.owner_id,
+                    &guild.roles,
+                    user.get(),
+                    roles.iter().copied().chain([guild_id.get()]),
+                ) >= crate::commands::PermLevel::Mod);
+    }
+    if !preset_scope_allows(current, user, channel, &roles, moderator) {
+        return None;
+    }
+    let dispatch = PresetDispatch {
+        guild_id: guild_id.get(),
+        cache_version: cfg.version,
+        durable_version: cfg.durable_version,
+        write_generation,
+    };
+    dispatch.is_current(app).then_some(dispatch)
 }
 
 enum RuleExemption {
@@ -1290,6 +1419,7 @@ async fn execute_live<'a>(
     enrollment: Option<db::GuildEnrollment>,
     mut vars: std::collections::BTreeMap<String, String>,
     reason: &str,
+    preset_dispatch: Option<&PresetDispatch>,
     config_unknown: bool,
     log_automod: bool,
     open_case: bool,
@@ -1314,6 +1444,11 @@ async fn execute_live<'a>(
             action = rule.action,
             "automod Discord mutation skipped because the guild is write-fenced"
         );
+        return None;
+    }
+
+    let dispatch_is_current = || preset_dispatch.is_none_or(|dispatch| dispatch.is_current(app));
+    if !dispatch_is_current() {
         return None;
     }
 
@@ -1658,7 +1793,7 @@ async fn execute_live<'a>(
                         .is_some();
                 }
                 crate::member_directory::BanContinuation::BanThenRecord => {
-                    if !app.activation.may_record() {
+                    if !app.activation.may_record() || !dispatch_is_current() {
                         publish_report = false;
                     } else {
                         let pending_ban = crate::member_directory::begin_ban_attempt(
@@ -1668,6 +1803,9 @@ async fn execute_live<'a>(
                         )
                         .await;
                         if !app.activation.may_record() {
+                            publish_report = false;
+                        } else if !dispatch_is_current() {
+                            pending_ban.finish(app, CaseOutcome::Failed).await;
                             publish_report = false;
                         } else {
                             let attempted = if open_case {
@@ -1706,12 +1844,13 @@ async fn execute_live<'a>(
                                 target.id.get(),
                                 Some(&operation_id),
                             );
-                            let raced = if automod_member_blocked(
-                                app,
-                                guild_id.get(),
-                                target.id.get(),
-                                "ban",
-                            ) {
+                            let raced = if !dispatch_is_current()
+                                || automod_member_blocked(
+                                    app,
+                                    guild_id.get(),
+                                    target.id.get(),
+                                    "ban",
+                                ) {
                                 None
                             } else {
                                 let recovery =
@@ -1811,6 +1950,7 @@ async fn execute_live<'a>(
                                         .is_some();
                                         if let Some(enrollment) = &enrollment
                                             && rule.ban_delete_message_seconds() > 0
+                                            && dispatch_is_current()
                                         {
                                             let deleted = crate::recent_messages::sweep_after_ban(
                                                 app,
@@ -1818,6 +1958,7 @@ async fn execute_live<'a>(
                                                 enrollment,
                                                 target.id.get(),
                                                 rule.ban_delete_message_seconds(),
+                                                dispatch_is_current,
                                             )
                                             .await;
                                             vars.insert(
@@ -3179,7 +3320,12 @@ mod tests {
             .unwrap()
             .unwrap();
         app.tenant.activate(enrollment.clone()).await.unwrap();
-        let wire = crate::db::ConfigurationScope::Guild(enrollment.clone()).to_wire();
+        let wire = crate::db::ScopeWire {
+            global: false,
+            guild_id: enrollment.guild_id,
+            enrollment_id: enrollment.id.clone(),
+            joined_at_ns: enrollment.joined_at_ns,
+        };
         let (store, scope) = app.tenant.live(enrollment).await.unwrap();
         let channels = [
             (70, ChannelType::Text, true),
@@ -4542,14 +4688,258 @@ mod tests {
         }
     }
 
+    struct DiscordRequestGate {
+        method: &'static str,
+        path: &'static str,
+        entered: tokio::sync::Notify,
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl DiscordRequestGate {
+        fn wait_if_selected(&self, method: &str, path: &str) {
+            if method == self.method && path == self.path {
+                let release = self.release.lock().unwrap().take();
+                if let Some(release) = release {
+                    self.entered.notify_one();
+                    let _ = release.blocking_recv();
+                }
+            }
+        }
+    }
+
     #[derive(Default)]
     struct ReplyRequests {
+        gate: Option<DiscordRequestGate>,
         member: Option<serenity::model::guild::Member>,
         posts: std::sync::Mutex<Vec<serde_json::Value>>,
         logs: std::sync::Mutex<Vec<serde_json::Value>>,
         sent_at: std::sync::OnceLock<Instant>,
         deleted_at: std::sync::OnceLock<Instant>,
         deleted: tokio::sync::Notify,
+    }
+
+    enum PresetEdit {
+        Disable,
+        RemoveChannel,
+        DryRun,
+        SkipRole,
+    }
+
+    #[derive(Clone, Copy)]
+    enum DiscordWait {
+        Member,
+        Delete,
+        BanLookup,
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_stops_after_disable_during_member_lookup() {
+        edit_preset_during_discord_wait(PresetEdit::Disable, DiscordWait::Member).await;
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_stops_after_channel_removal_during_member_lookup() {
+        edit_preset_during_discord_wait(PresetEdit::RemoveChannel, DiscordWait::Member).await;
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_rechecks_mode_and_exemptions_after_member_lookup() {
+        for edit in [PresetEdit::DryRun, PresetEdit::SkipRole] {
+            edit_preset_during_discord_wait(edit, DiscordWait::Member).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_rechecks_scope_between_delete_and_reply() {
+        edit_preset_during_discord_wait(PresetEdit::Disable, DiscordWait::Delete).await;
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_stops_after_disable_during_ban_lookup() {
+        edit_preset_during_discord_wait(PresetEdit::Disable, DiscordWait::BanLookup).await;
+    }
+
+    async fn edit_preset_during_discord_wait(edit: PresetEdit, wait: DiscordWait) {
+        use serenity::all::{Guild, GuildCreateEvent, GuildId, Member, Role, RoleId, User, UserId};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let path = std::env::temp_dir().join(format!(
+            "preset_dispatch_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let wire = crate::db::ScopeWire {
+            global: false,
+            guild_id: enrollment.guild_id,
+            enrollment_id: enrollment.id.clone(),
+            joined_at_ns: enrollment.joined_at_ns,
+        };
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        store
+            .replace_server_names(
+                scope,
+                crate::db::guild_data::ServerNames {
+                    channels: [70, 71]
+                        .into_iter()
+                        .map(|id| crate::db::guild_data::ServerChannelName {
+                            id: id.to_string(),
+                            name: format!("channel-{id}"),
+                            kind: "text".into(),
+                            parent_id: None,
+                            position: 0,
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let mut rule = media_rule();
+        rule.include_channels.push(71);
+        if matches!(wait, DiscordWait::BanLookup) {
+            rule.actions[0].action = "ban".into();
+        }
+        let mut reply = rule.actions[0].clone();
+        reply.action = "channel_reply".into();
+        rule.actions.push(reply);
+        rule.params["channel_reply"] =
+            serde_json::json!({ "template": "{user} No links", "delete_after_seconds": 0 });
+        let save = |rule: RuleDef| {
+            crate::db::apply_control(
+                &app.db,
+                Some(&app.tenant),
+                crate::db::ControlOp::UpsertRule {
+                    request: wire.clone(),
+                    target: wire.clone(),
+                    id: MEDIA_RULE_ID.into(),
+                    rule,
+                    clear_guild_override: false,
+                    replace_velocity_limit: false,
+                },
+                None,
+            )
+        };
+        assert!(matches!(
+            save(rule.clone()).await.unwrap(),
+            crate::db::ControlReply::Saved { .. }
+        ));
+        rule.dry_run = false;
+        assert!(matches!(
+            save(rule.clone()).await.unwrap(),
+            crate::db::ControlReply::Saved { .. }
+        ));
+
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        user.name = "member".into();
+        let mut member = Member::default();
+        member.guild_id = GuildId::new(10);
+        member.user = user.clone();
+        member.roles = vec![RoleId::new(77)];
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let gate = match wait {
+            DiscordWait::Member => ("GET", "/api/v10/guilds/10/members/99"),
+            DiscordWait::Delete => ("DELETE", "/api/v10/channels/70/messages/42"),
+            DiscordWait::BanLookup => ("GET", "/api/v10/guilds/10/bans/99"),
+        };
+        let requests = Arc::new(ReplyRequests {
+            member: Some(member),
+            gate: Some(DiscordRequestGate {
+                method: gate.0,
+                path: gate.1,
+                entered: tokio::sync::Notify::new(),
+                release: std::sync::Mutex::new(Some(release_rx)),
+            }),
+            ..Default::default()
+        });
+        let stub = DiscordStub::bind(Some(Arc::clone(&requests)));
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(10);
+        guild.owner_id = UserId::new(1);
+        for id in [10, 77] {
+            let mut role = Role::default();
+            role.id = RoleId::new(id);
+            guild.roles.insert(role.id, role);
+        }
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        stub.cache.update(&mut event);
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let mut message = msg(70, "https://other.test", 0, false, false);
+        message.guild_id = 10;
+        message.author_id = 99;
+        message.message_id = 42;
+        let pending = app.automod.evaluate(&cfg, &message).unwrap();
+        assert_eq!(pending.rule_id, MEDIA_RULE_ID);
+        let execution = execute_pending_with(
+            &app,
+            &stub.http,
+            &stub.cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        );
+        let edit_while_waiting = async {
+            let gate = requests.gate.as_ref().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+                .await
+                .unwrap();
+            match edit {
+                PresetEdit::Disable => rule.enabled = false,
+                PresetEdit::RemoveChannel => {
+                    rule.include_channels.remove(0);
+                }
+                PresetEdit::DryRun => rule.dry_run = true,
+                PresetEdit::SkipRole => rule.whitelist_roles.push(77),
+            }
+            let result = save(rule).await;
+            release.send(()).unwrap();
+            assert!(matches!(
+                result.unwrap(),
+                crate::db::ControlReply::Saved { .. }
+            ));
+        };
+        let (started, ()) = tokio::join!(execution, edit_while_waiting);
+        let seen = stub.finish();
+        let mut expected = vec!["GET /api/v10/guilds/10/members/99"];
+        if !matches!(wait, DiscordWait::Member) {
+            assert!(started);
+            match wait {
+                DiscordWait::Delete => expected.push("DELETE /api/v10/channels/70/messages/42"),
+                DiscordWait::BanLookup => expected.push("GET /api/v10/guilds/10/bans/99"),
+                DiscordWait::Member => unreachable!(),
+            }
+        } else {
+            assert!(!started);
+        }
+        assert_eq!(seen, expected);
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
     }
 
     #[tokio::test]
@@ -4863,6 +5253,11 @@ mod tests {
                                 continue;
                             };
                             server_lines.lock().unwrap().push(request.summary());
+                            if let Some(gate) =
+                                replies.as_ref().and_then(|fixture| fixture.gate.as_ref())
+                            {
+                                gate.wait_if_selected(&request.method, &request.path);
+                            }
                             if request.method == "PUT" && request.path.contains("/bans/") {
                                 server_reasons.lock().unwrap().push(request.reason);
                             }
