@@ -88,15 +88,34 @@ fn saturated_replay_history_keeps_new_live_stays_eligible() {
     for dry in [true, false] {
         for index in 0..=MATCH_LIMIT {
             let subject = (guild, UserId::new(100 + index as u64));
-            let _claim = recent.claim(subject, joined_at, role, dry).unwrap();
-            assert!(recent.complete_if_current(subject, joined_at, dry, |_| true));
+            let claim = recent.claim(subject, joined_at, role, dry).unwrap();
+            assert!(claim.complete(dry, |_| true));
         }
     }
     assert!(recent.claim(pending, joined_at, role, false).is_none());
     let fresh = (GuildId::new(GUILD + 1), UserId::new(MEMBER));
-    let _claim = recent.claim(fresh, joined_at, role, false).unwrap();
-    assert!(recent.complete_if_current(fresh, joined_at, false, |_| true));
-    assert!(!recent.complete_if_current(fresh, joined_at, false, |_| true));
+    let claim = recent.claim(fresh, joined_at, role, false).unwrap();
+    assert!(claim.complete(false, |_| true));
+    assert!(!claim.complete(false, |_| true));
+}
+
+#[test]
+fn invalidated_claim_cannot_complete_or_release_its_successor() {
+    let recent = RecentMatches::default();
+    let subject = (GuildId::new(GUILD), UserId::new(MEMBER));
+    let role = RoleId::new(TRAP_ROLE);
+    let joined_at = Timestamp::now();
+    let first = recent.claim(subject, joined_at, role, false).unwrap();
+    assert!(recent.claim(subject, joined_at, role, false).is_none());
+    recent.observe(subject.0, subject.1, Some((joined_at, &[])));
+    let successor = recent.claim(subject, joined_at, role, false).unwrap();
+
+    assert!(!first.complete(false, |_| true));
+    drop(first);
+    assert!(recent.claim(subject, joined_at, role, false).is_none());
+    assert!(successor.complete(false, |_| true));
+    drop(successor);
+    assert!(recent.claim(subject, joined_at, role, false).is_none());
 }
 
 struct Call {
@@ -198,9 +217,13 @@ async fn gateway_case(
     .await;
     let guild_json = serde_json::to_string(&guild).unwrap();
     let member_json = serde_json::to_string(&discord_member).unwrap();
-    let pause = event_kind
-        .starts_with("during dispatch")
-        .then(|| Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new())));
+    let pause = event_kind.starts_with("during dispatch").then(|| {
+        Arc::new((
+            tokio::sync::Notify::new(),
+            tokio::sync::Notify::new(),
+            AtomicBool::new(true),
+        ))
+    });
     let server_pause = pause.clone();
     let server = tokio::spawn(server.serve(make_service_fn(move |_| {
         let captured = Arc::clone(&captured);
@@ -227,6 +250,7 @@ async fn gateway_case(
                     };
                     if let Some(pause) = pause
                         && call.method == Method::GET && call.path.contains("/members/")
+                        && pause.2.swap(false, Ordering::Relaxed)
                     {
                         pause.0.notify_one();
                         pause.1.notified().await;
@@ -291,6 +315,7 @@ async fn gateway_case(
             .guild_member_update(ctx.clone(), None, None, update(&member))
             .await;
     }
+    let mut changed_rule = rule.clone();
     if let Some(pause) = pause {
         let trigger = handler.guild_member_update(ctx.clone(), None, None, update(&member));
         let contradict = async {
@@ -299,7 +324,9 @@ async fn gateway_case(
                 .unwrap();
             let mut latest = member.clone();
             match event_kind {
-                "during dispatch: role removed" => latest.roles.clear(),
+                "during dispatch: role removed" | "during dispatch: regrant" => {
+                    latest.roles.clear()
+                }
                 "during dispatch: rejoined" => {
                     latest.joined_at = Some(Timestamp::now());
                     latest.roles.clear();
@@ -315,14 +342,46 @@ async fn gateway_case(
                         )
                         .await;
                 }
+                "during dispatch: disabled"
+                | "during dispatch: dry run"
+                | "during dispatch: new trap role" => {
+                    match event_kind {
+                        "during dispatch: disabled" => changed_rule.enabled = false,
+                        "during dispatch: dry run" => changed_rule.dry_run = true,
+                        _ => changed_rule.params["role_id"] = serde_json::json!("23"),
+                    }
+                    changed_rule = db::compare_and_set_onboarding_trap(
+                        &app.db,
+                        GUILD as i64,
+                        None,
+                        &rule,
+                        &changed_rule,
+                    )
+                    .await
+                    .unwrap();
+                    app.invalidate_configs();
+                }
                 _ => unreachable!(),
             }
-            if event_kind != "during dispatch: left" {
+            if latest.roles != member.roles {
                 handler
                     .guild_member_update(ctx.clone(), Some(member.clone()), None, update(&latest))
                     .await;
             }
-            // The REST response is intentionally stale. The Gateway answer wins.
+            if event_kind == "during dispatch: regrant" {
+                handler
+                    .guild_member_update(ctx.clone(), Some(latest), None, update(&member))
+                    .await;
+                assert_eq!(
+                    calls
+                        .lock()
+                        .iter()
+                        .filter(|call| call.method == Method::DELETE)
+                        .count(),
+                    1,
+                    "the re-grant must dispatch while the original match is still parked"
+                );
+            }
             pause.1.notify_one();
         };
         tokio::join!(trigger, contradict);
@@ -349,6 +408,35 @@ async fn gateway_case(
                     .await
             }
         }
+    }
+    let downgraded = event_kind == "during dispatch: dry run";
+    if downgraded {
+        // The downgraded match already logged in the dry-run mode.
+        handler
+            .guild_member_update(ctx.clone(), None, None, update(&member))
+            .await;
+        {
+            let calls = calls.lock();
+            let effects: Vec<_> = calls
+                .iter()
+                .filter(|call| call.method != Method::GET)
+                .collect();
+            assert_eq!(effects.len(), 1);
+            assert_eq!(effects[0].method, Method::POST);
+            assert!(effects[0].path.ends_with("/channels/71/messages"));
+            assert!(effects[0].body.contains("[DRY RUN]"));
+        }
+        assert!(
+            store
+                .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        db::compare_and_set_onboarding_trap(&app.db, GUILD as i64, None, &changed_rule, &rule)
+            .await
+            .unwrap();
+        app.invalidate_configs();
     }
     if expected_kick || dry {
         // Both events can replay an uncached old state. The server deliberately
@@ -378,6 +466,11 @@ async fn gateway_case(
             )
         })
         .collect::<Vec<_>>();
+    let effects = if downgraded {
+        &effects[1..]
+    } else {
+        &effects[..]
+    };
     if expected_kick {
         assert_eq!(effects.len(), 3, "{event_kind}: {effects:?}");
         assert_eq!(effects[0].0, Method::DELETE);
@@ -473,6 +566,56 @@ async fn newer_gateway_membership_vetoes_a_stale_dispatch_response() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn a_disable_or_role_change_saved_during_member_lookup_prevents_the_kick() {
+    for event in [
+        "during dispatch: disabled",
+        "during dispatch: new trap role",
+    ] {
+        let member = member(MEMBER, &[TRAP_ROLE], Timestamp::now());
+        gateway_case(
+            member.clone(),
+            member,
+            guild(Permissions::empty()),
+            event,
+            30,
+            false,
+            false,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_downgrade_during_member_lookup_logs_dry_and_preserves_the_live_claim() {
+    let member = member(MEMBER, &[TRAP_ROLE], Timestamp::now());
+    gateway_case(
+        member.clone(),
+        member,
+        guild(Permissions::empty()),
+        "during dispatch: dry run",
+        30,
+        false,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_regrant_during_member_lookup_can_dispatch_once_for_the_same_stay() {
+    let member = member(MEMBER, &[TRAP_ROLE], Timestamp::now());
+    gateway_case(
+        member.clone(),
+        member,
+        guild(Permissions::empty()),
+        "during dispatch: regrant",
+        30,
+        false,
+        true,
+    )
+    .await;
 }
 
 #[tokio::test]

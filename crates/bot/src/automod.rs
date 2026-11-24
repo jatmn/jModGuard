@@ -22,7 +22,6 @@ use crate::normalize;
 use crate::state::{BotState, CachedGuildConfig};
 use crate::types::{ActionDef, RULE_IDS, RuleDef};
 use crate::{db, logging};
-use jmodguard::onboarding_trap::RULE_ID as ONBOARDING_TRAP;
 
 pub struct AutomodEngine {
     /// (guild, user) -> window history and per-rule strike buckets
@@ -848,7 +847,7 @@ async fn automod_try_delete_message(
     }
 }
 
-fn automod_member_blocked(app: &BotState, guild: u64, user: u64, action: &str) -> bool {
+pub(crate) fn automod_member_blocked(app: &BotState, guild: u64, user: u64, action: &str) -> bool {
     automod_member_target(guild, user, action).is_some_and(|target| {
         app.remembered_discord_targets
             .blocked(target, Instant::now())
@@ -871,6 +870,48 @@ fn automod_remember_member_failure(
             Instant::now(),
         );
     }
+}
+
+pub(crate) async fn kick_with_recovery(
+    app: &BotState,
+    http: &serenity::http::Http,
+    guild_id: GuildId,
+    member: &Member,
+    reason: &str,
+) -> Option<serenity::Error> {
+    let guild = guild_id.get();
+    let user = member.user.id.get();
+    let recovery = automod_member_target(guild, user, "kick").map(|target| {
+        app.remembered_discord_targets
+            .capture_recovery_epoch(target)
+    });
+    let result = member.kick_with_reason(http, reason).await;
+    if let (Some(recovery), Err(error)) = (recovery, &result) {
+        automod_remember_member_failure(app, recovery, guild, user, "kick", error);
+    }
+    result.err()
+}
+
+pub(crate) fn action_vars(
+    target: &serenity::model::user::User,
+    display_name: &str,
+    rule_name: &str,
+    rule: &ActionDef,
+    strikes: u32,
+    msg_channel: Option<u64>,
+) -> (std::collections::BTreeMap<String, String>, String) {
+    let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
+    if let Some(channel) = msg_channel {
+        vars.insert("source_channel_id".into(), channel.to_string());
+    }
+    vars.insert("rule".into(), rule_name.to_owned());
+    vars.insert("action".into(), rule.action.clone());
+    vars.insert("strikes".into(), strikes.to_string());
+    vars.insert("time".into(), chrono::Utc::now().to_rfc3339());
+    let rendered_reason = crate::templates::render(&rule.reason, &vars);
+    let reason = jmodguard::ban_reason::without_tag(&rendered_reason).to_owned();
+    vars.insert("reason".into(), reason.clone());
+    (vars, reason)
 }
 
 /// Executes a decided automod action. Returns true if the action entered the
@@ -918,17 +959,14 @@ pub(crate) async fn execute_pending_with(
 ) -> bool {
     let enrollment = crate::cases::capture(app, guild_id.get()).await;
     let rule = &pending.action;
-    let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
-    if let Some(channel) = msg_channel {
-        vars.insert("source_channel_id".into(), channel.to_string());
-    }
-    vars.insert("rule".into(), pending.rule_name.clone());
-    vars.insert("action".into(), rule.action.clone());
-    vars.insert("strikes".into(), pending.strikes.to_string());
-    vars.insert("time".into(), chrono::Utc::now().to_rfc3339());
-    let rendered_reason = crate::templates::render(&rule.reason, &vars);
-    let reason = jmodguard::ban_reason::without_tag(&rendered_reason).to_owned();
-    vars.insert("reason".into(), reason.clone());
+    let (vars, reason) = action_vars(
+        target,
+        display_name,
+        &pending.rule_name,
+        rule,
+        pending.strikes,
+        msg_channel,
+    );
 
     let loaded = app.configs.get(&app.db, guild_id.get()).await;
     if pending.rule_id == "known_spam" {
@@ -959,8 +997,7 @@ pub(crate) async fn execute_pending_with(
         .and_then(|cfg| cfg.rules.get(&pending.rule_id));
     let config_unknown = current.is_none();
     let custom = jmodguard::custom_rules::is_custom_id(&pending.rule_id);
-    let onboarding_trap = pending.rule_id == ONBOARDING_TRAP;
-    let settings = if custom || onboarding_trap {
+    let settings = if custom {
         current
     } else {
         current.or(pending.matched_rule.as_ref())
@@ -987,38 +1024,7 @@ pub(crate) async fn execute_pending_with(
         settings.whitelist_roles.as_slice(),
     );
 
-    if onboarding_trap
-        && (enrollment.is_none()
-            || provided_member.is_none()
-            || !settings.enabled
-            || !skip_moderators
-            || !open_case
-            || !log_automod
-            || pending
-                .matched_rule
-                .as_ref()
-                .is_none_or(|matched| matched.params != settings.params)
-            || !matches!(settings.actions.as_slice(), [action] if action.action == "kick" && action.reason == rule.reason))
-    {
-        return false;
-    }
-
     if dry {
-        if onboarding_trap
-            && let Some(member) = provided_member.as_ref()
-            && crate::onboarding_trap::member_at_dispatch(
-                app,
-                http,
-                cache,
-                member,
-                settings,
-                pending.dry_run,
-            )
-            .await
-            .is_none()
-        {
-            return false;
-        }
         let mut v = vars.clone();
         v.insert(
             "action".into(),
@@ -1053,7 +1059,6 @@ pub(crate) async fn execute_pending_with(
         open_case,
         skip_moderators,
         skipped_roles,
-        onboarding_trap.then_some(settings),
     )
     .await;
     true
@@ -1079,7 +1084,6 @@ async fn execute_live(
     open_case: bool,
     skip_moderators: bool,
     skipped_roles: &[u64],
-    trap_settings: Option<&RuleDef>,
 ) {
     let rule = &pending.action;
     // A missing member is not a known member with no roles. Gateway members
@@ -1115,9 +1119,7 @@ async fn execute_live(
     {
         return;
     }
-    // The trap fetches the member, owner and roles at dispatch.
-    let moderator_unknown = pending.rule_id != ONBOARDING_TRAP
-        && moderator_status == crate::commands::ModeratorStatus::Unknown;
+    let moderator_unknown = moderator_status == crate::commands::ModeratorStatus::Unknown;
     let warning = if config_unknown {
         Some("rule configuration unavailable; deleting the message and skipping kick or ban")
     } else if role_ids.is_none() && (skip_moderators || !skipped_roles.is_empty()) {
@@ -1341,56 +1343,17 @@ async fn execute_live(
                 if automod_member_blocked(app, guild_id.get(), target.id.get(), "kick") {
                     (false, None)
                 } else {
-                    let recovery = automod_member_target(guild_id.get(), target.id.get(), "kick")
-                        .map(|member_target| {
-                            app.remembered_discord_targets
-                                .capture_recovery_epoch(member_target)
-                        });
-                    let mut started = false;
-                    let dispatch = async {
-                        let member = if let Some(settings) = trap_settings {
-                            crate::onboarding_trap::member_at_dispatch(
-                                app,
-                                http,
-                                cache,
-                                &member,
-                                settings,
-                                pending.dry_run,
-                            )
-                            .await?
-                        } else {
-                            member
-                        };
-                        // The outer cutoff race has polled this future. No other
-                        // awaited gate separates the trap claim from the kick.
-                        started = true;
-                        Some(member.kick_with_reason(http, &reason).await)
+                    let discord_err = match crate::discord::race_discord_call(
+                        &app.activation,
+                        kick_with_recovery(app, http, guild_id, &member, &reason),
+                    )
+                    .await
+                    {
+                        crate::discord::DiscordCall::Cancelled => {
+                            Some(crate::discord::cutoff_discord_error())
+                        }
+                        crate::discord::DiscordCall::Finished(error) => error,
                     };
-                    let discord_err =
-                        match crate::discord::race_discord_call(&app.activation, dispatch).await {
-                            crate::discord::DiscordCall::Cancelled
-                                if trap_settings.is_some() && !started =>
-                            {
-                                return;
-                            }
-                            crate::discord::DiscordCall::Cancelled => {
-                                Some(crate::discord::cutoff_discord_error())
-                            }
-                            crate::discord::DiscordCall::Finished(None) => return,
-                            crate::discord::DiscordCall::Finished(Some(result)) => {
-                                if let (Some(recovery), Err(error)) = (recovery, &result) {
-                                    automod_remember_member_failure(
-                                        app,
-                                        recovery,
-                                        guild_id.get(),
-                                        target.id.get(),
-                                        "kick",
-                                        error,
-                                    );
-                                }
-                                result.err()
-                            }
-                        };
                     (true, discord_err)
                 }
             } else {
@@ -1404,52 +1367,22 @@ async fn execute_live(
                 && let Some(outcome) =
                     crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
             {
-                if pending.rule_id == ONBOARDING_TRAP {
-                    let case_id = crate::cases::record_onboarding_kick(
-                        app,
-                        enrollment.clone(),
-                        outcome.clone(),
+                crate::cases::record_application(
+                    app,
+                    enrollment.clone(),
+                    crate::db::guild_data::CaseAction::Kick,
+                    outcome,
+                    target.id.get(),
+                    None,
+                    Some(reason.clone()),
+                    crate::cases::text_excerpt(
+                        msg_channel.unwrap_or(0),
+                        msg_id.unwrap_or(0),
                         target.id.get(),
-                        reason.clone(),
-                    )
-                    .await;
-                    match outcome {
-                        crate::db::guild_data::CaseOutcome::Succeeded => {
-                            if let Some(case_id) = case_id {
-                                let mut case_vars = vars.clone();
-                                case_vars.insert(
-                                    "actor".into(),
-                                    format!("Automod · case `{}`", case_id.as_str()),
-                                );
-                                logging::emit_to(app, http, guild_id, "member_kick", case_vars)
-                                    .await;
-                            }
-                        }
-                        crate::db::guild_data::CaseOutcome::Failed => {
-                            vars.insert("action".into(), "kick failed".into());
-                        }
-                        _ => {
-                            vars.insert("action".into(), "kick outcome uncertain".into());
-                        }
-                    }
-                } else {
-                    crate::cases::record_application(
-                        app,
-                        enrollment.clone(),
-                        crate::db::guild_data::CaseAction::Kick,
-                        outcome,
-                        target.id.get(),
-                        None,
-                        Some(reason.clone()),
-                        crate::cases::text_excerpt(
-                            msg_channel.unwrap_or(0),
-                            msg_id.unwrap_or(0),
-                            target.id.get(),
-                            pending.evidence["content"].as_str().unwrap_or(""),
-                        ),
-                    )
-                    .await;
-                }
+                        pending.evidence["content"].as_str().unwrap_or(""),
+                    ),
+                )
+                .await;
             }
         }
         "ban" => {

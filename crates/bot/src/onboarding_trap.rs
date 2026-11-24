@@ -2,9 +2,11 @@
 #[cfg(test)]
 mod tests;
 
-use crate::automod::{PendingAction, execute_pending_with};
+use crate::automod::{action_vars, automod_member_blocked, kick_with_recovery};
 use crate::commands::{PermLevel, permission_level};
+use crate::discord::{DiscordCall, race_discord_call};
 use crate::state::BotState;
+use crate::{cases, db, logging};
 use jmodguard::onboarding_trap::{RULE_ID, join_window_minutes, role_id};
 use jmodguard::types::RuleDef;
 use parking_lot::Mutex;
@@ -22,7 +24,7 @@ type Subject = (GuildId, UserId);
 type MatchKey = (Subject, Timestamp);
 
 #[derive(Default)]
-pub(crate) struct RecentMatches([Mutex<ModeClaims>; 2]);
+pub(crate) struct RecentMatches(Mutex<[ModeClaims; 2]>);
 
 #[derive(Default)]
 struct ModeClaims {
@@ -32,6 +34,7 @@ struct ModeClaims {
 }
 
 struct ActiveMatch {
+    token: Arc<()>,
     joined_at: Timestamp,
     role: RoleId,
     invalidated: bool,
@@ -57,18 +60,53 @@ impl ModeClaims {
 }
 
 struct MatchClaim<'a> {
-    mode: &'a Mutex<ModeClaims>,
+    recent: &'a RecentMatches,
+    dry_run: bool,
+    token: Arc<()>,
     key: MatchKey,
+}
+
+impl MatchClaim<'_> {
+    fn complete(&self, dry_run: bool, roles_admit: impl FnOnce(&[RoleId]) -> bool) -> bool {
+        let mut modes = self.recent.0.lock();
+        let subject = self.key.0;
+        if modes[usize::from(self.dry_run)]
+            .active
+            .get(&subject)
+            .is_none_or(|active| {
+                !Arc::ptr_eq(&active.token, &self.token)
+                    || active.invalidated
+                    || !active.latest_roles.as_deref().is_none_or(roles_admit)
+            })
+        {
+            return false;
+        }
+        // Record the dispatched mode, which can differ from the mode selected
+        // by the Gateway matcher if an admin enabled dry-run in the meantime.
+        let mode = &mut modes[usize::from(dry_run)];
+        let now = Instant::now();
+        mode.prune(now);
+        if mode.completed.contains(&self.key) {
+            return false;
+        }
+        if mode.completed.len() >= MATCH_LIMIT {
+            mode.evict_oldest();
+        }
+        mode.completed.insert(self.key);
+        mode.order.push_back((now, self.key));
+        true
+    }
 }
 
 impl Drop for MatchClaim<'_> {
     fn drop(&mut self) {
-        let (subject, joined_at) = self.key;
-        let mut mode = self.mode.lock();
+        let subject = self.key.0;
+        let mut modes = self.recent.0.lock();
+        let mode = &mut modes[usize::from(self.dry_run)];
         if mode
             .active
             .get(&subject)
-            .is_some_and(|active| active.joined_at == joined_at)
+            .is_some_and(|active| Arc::ptr_eq(&active.token, &self.token))
         {
             mode.active.remove(&subject);
         }
@@ -83,30 +121,38 @@ impl RecentMatches {
         role: RoleId,
         dry_run: bool,
     ) -> Option<MatchClaim<'_>> {
-        let mode = &self.0[usize::from(dry_run)];
-        let mut claims = mode.lock();
+        let mut modes = self.0.lock();
+        let claims = &mut modes[usize::from(dry_run)];
         let key = (subject, joined_at);
         claims.prune(Instant::now());
         if claims.completed.contains(&key) {
             return None;
         }
         if let Some(active) = claims.active.get(&subject) {
-            if active.joined_at >= joined_at {
+            if active.joined_at > joined_at || active.joined_at == joined_at && !active.invalidated
+            {
                 return None;
             }
         } else if claims.active.len() >= MATCH_LIMIT {
             return None;
         }
+        let token = Arc::new(());
         claims.active.insert(
             subject,
             ActiveMatch {
+                token: token.clone(),
                 joined_at,
                 role,
                 invalidated: false,
                 latest_roles: None,
             },
         );
-        Some(MatchClaim { mode, key })
+        Some(MatchClaim {
+            recent: self,
+            dry_run,
+            token,
+            key,
+        })
     }
 
     pub(crate) fn observe(
@@ -115,8 +161,7 @@ impl RecentMatches {
         user: UserId,
         membership: Option<(Timestamp, &[RoleId])>,
     ) {
-        for mode in &self.0 {
-            let mut mode = mode.lock();
+        for mode in self.0.lock().iter_mut() {
             if let Some(active) = mode.active.get_mut(&(guild, user)) {
                 if let Some((joined_at, roles)) = membership
                     && joined_at == active.joined_at
@@ -130,36 +175,10 @@ impl RecentMatches {
         }
     }
 
-    fn complete_if_current(
-        &self,
-        subject: Subject,
-        joined_at: Timestamp,
-        dry_run: bool,
-        roles_admit: impl FnOnce(&[RoleId]) -> bool,
-    ) -> bool {
-        let mut mode = self.0[usize::from(dry_run)].lock();
-        let key = (subject, joined_at);
-        if mode.completed.contains(&key)
-            || mode.active.get(&subject).is_none_or(|active| {
-                active.joined_at != joined_at
-                    || active.invalidated
-                    || !active.latest_roles.as_deref().is_none_or(roles_admit)
-            })
-        {
-            return false;
-        }
-        if mode.completed.len() >= MATCH_LIMIT {
-            mode.evict_oldest();
-        }
-        mode.completed.insert(key);
-        mode.order.push_back((Instant::now(), key));
-        true
-    }
-
     pub(crate) fn prune(&self) {
         let now = Instant::now();
-        for mode in &self.0 {
-            mode.lock().prune(now);
+        for mode in self.0.lock().iter_mut() {
+            mode.prune(now);
         }
     }
 }
@@ -251,7 +270,7 @@ async fn check_event(app: &Arc<BotState>, http: &Http, cache: &Cache, event: Rol
     if action.action != "kick" || !matches_role(&event, role, minutes, now) {
         return;
     }
-    let Some(_claim) = app.automod.onboarding_matches.claim(
+    let Some(claim) = app.automod.onboarding_matches.claim(
         (event.guild, event.user.id),
         event.joined_at,
         role,
@@ -259,64 +278,146 @@ async fn check_event(app: &Arc<BotState>, http: &Http, cache: &Cache, event: Rol
     ) else {
         return;
     };
-    let mut member = Member::default();
-    member.guild_id = event.guild;
-    member.user = event.user.clone();
-    member.joined_at = Some(event.joined_at);
-    member.roles = event.roles.to_vec();
-
-    let pending = PendingAction {
-        rule_id: RULE_ID.into(),
-        rule_name: rule.name.clone(),
-        action: action.clone(),
-        strikes: 1,
-        evidence: serde_json::json!({}),
-        mention_permission_unknown: false,
-        matched_rule: Some(rule.clone()),
-        dry_run: rule.dry_run,
+    let Some(enrollment) = cases::capture(app, event.guild.get()).await else {
+        return;
     };
-    execute_pending_with(
-        app,
-        http,
-        cache,
-        event.guild,
-        event.user,
-        Some(member),
-        event.display_name,
-        None,
-        None,
-        &pending,
-    )
-    .await;
+    let (mut vars, reason) =
+        action_vars(event.user, event.display_name, &rule.name, action, 1, None);
+
+    // Keep rule refresh, claim settlement and kick in the same cutoff race.
+    let dispatch = async {
+        let (member, dry_run) =
+            member_at_dispatch(app, http, cache, &event, &enrollment, rule, &claim).await?;
+        if dry_run {
+            Some(Dispatch::DryRun)
+        } else {
+            Some(Dispatch::Kick(
+                kick_with_recovery(app, http, event.guild, &member, &reason).await,
+            ))
+        }
+    };
+    let DiscordCall::Finished(Some(dispatched)) =
+        race_discord_call(&app.activation, dispatch).await
+    else {
+        return;
+    };
+    drop(claim);
+    if !app.activation.may_record() {
+        return;
+    }
+    match dispatched {
+        Dispatch::DryRun => {
+            vars.insert(
+                "action".into(),
+                format!("[DRY RUN] would kick: {}", action.reason),
+            );
+        }
+        Dispatch::Kick(error) => {
+            let outcome = cases::classify_discord(error.as_ref());
+            let case_id = cases::record_onboarding_kick(
+                app,
+                Some(enrollment.clone()),
+                outcome.clone(),
+                event.user.id.get(),
+                reason.clone(),
+            )
+            .await;
+            match outcome {
+                db::guild_data::CaseOutcome::Succeeded => {
+                    if let Some(case_id) = case_id {
+                        let mut case_vars = vars.clone();
+                        case_vars.insert(
+                            "actor".into(),
+                            format!("Automod · case `{}`", case_id.as_str()),
+                        );
+                        logging::emit_to(app, http, event.guild, "member_kick", case_vars).await;
+                    }
+                }
+                db::guild_data::CaseOutcome::Failed => {
+                    vars.insert("action".into(), "kick failed".into());
+                }
+                _ => {
+                    vars.insert("action".into(), "kick outcome uncertain".into());
+                }
+            }
+            if !app.activation.may_record() {
+                return;
+            }
+            logging::log_persistence_result(
+                "automod event",
+                db::insert_enrolled_event(
+                    &app.db,
+                    Some(enrollment),
+                    "automod",
+                    Some(event.user.id.get() as i64),
+                    None,
+                    &serde_json::json!({
+                        "rule": RULE_ID, "action": "kick", "reason": reason, "evidence": {},
+                    }),
+                )
+                .await,
+            );
+        }
+    }
+    vars.insert("content".into(), String::new());
+    logging::emit_to(app, http, event.guild, "automod", vars).await;
 }
 
-// Called after configuration and fence reads. Refresh the member last and
-// check any Gateway evidence that arrived while the HTTP calls were pending.
-pub(crate) async fn member_at_dispatch(
+enum Dispatch {
+    DryRun,
+    Kick(Option<serenity::Error>),
+}
+
+/// Refresh after each potentially slow pre-dispatch operation. Once a match
+/// becomes dry-run it stays log-only, even if the rule changes again.
+async fn refresh_rule(
+    app: &BotState,
+    enrollment: &db::GuildEnrollment,
+    matched: &RuleDef,
+    dry_run: &mut bool,
+) -> Option<RuleDef> {
+    let (current, fenced) = db::get_onboarding_trap_for_dispatch(&app.db, enrollment.clone())
+        .await
+        .ok()?;
+    *dry_run |= current.dry_run;
+    (current.enabled
+        && (*dry_run || !fenced)
+        && current.skip_moderators
+        && current.open_case
+        && current.log_automod
+        && role_id(&current) == role_id(matched)
+        && join_window_minutes(&current) == join_window_minutes(matched)
+        && matches!(current.actions.as_slice(), [action]
+            if action.action == "kick" && action.at == 1 && action.reason == matched.actions[0].reason))
+    .then_some(current)
+}
+
+async fn member_at_dispatch(
     app: &BotState,
     http: &Http,
     cache: &Cache,
-    matched: &Member,
-    rule: &RuleDef,
-    claimed_dry_run: bool,
-) -> Option<Member> {
-    use crate::discord::{DiscordCall, race_discord_call};
-    let (guild_id, user_id) = (matched.guild_id, matched.user.id);
-    let joined_at = matched.joined_at?;
-    let role = RoleId::new(role_id(rule)?);
-    let DiscordCall::Finished(Ok(guild)) =
-        race_discord_call(&app.activation, http.get_guild(guild_id)).await
-    else {
-        return None;
-    };
+    event: &RoleEvent<'_>,
+    enrollment: &db::GuildEnrollment,
+    matched: &RuleDef,
+    claim: &MatchClaim<'_>,
+) -> Option<(Member, bool)> {
+    let (guild_id, user_id) = (event.guild, event.user.id);
+    let joined_at = event.joined_at;
+    let role = RoleId::new(role_id(matched)?);
+    let mut dry_run = matched.dry_run;
+
+    // Enrollment capture and both REST lookups are awaited. Check the
+    // primary rule after each one, with the final read as the last await
+    // before validating recent membership evidence and dispatching the kick.
+    refresh_rule(app, enrollment, matched, &mut dry_run).await?;
+    let guild = http.get_guild(guild_id).await.ok()?;
     if guild.owner_id == user_id {
         return None;
     }
-    let DiscordCall::Finished(Ok(member)) =
-        race_discord_call(&app.activation, http.get_member(guild_id, user_id)).await
-    else {
-        return None;
-    };
+    refresh_rule(app, enrollment, matched, &mut dry_run).await?;
+    let member = http.get_member(guild_id, user_id).await.ok()?;
+    let rule = refresh_rule(app, enrollment, matched, &mut dry_run).await?;
+
     let roles_admit = |assigned: &[RoleId]| {
         let roles: Vec<_> = assigned.iter().map(|role| role.get()).collect();
         let effective = roles.iter().copied().chain([guild_id.get()]);
@@ -327,7 +428,7 @@ pub(crate) async fn member_at_dispatch(
             && permission_level(app.cfg.bot.owner_id, &guild.roles, user_id.get(), effective)
                 < PermLevel::Mod
             && !jmodguard::custom_rules::rule_scope_skips(
-                rule,
+                &rule,
                 user_id.get(),
                 0,
                 &roles,
@@ -345,6 +446,7 @@ pub(crate) async fn member_at_dispatch(
                 >= PermLevel::Mod
         };
         cached.owner_id == user_id
+            || staff(event.roles)
             || staff(&member.roles)
             || cached.members.get(&user_id).is_some_and(|cached_member| {
                 cached_member.joined_at != Some(joined_at)
@@ -354,17 +456,14 @@ pub(crate) async fn member_at_dispatch(
     });
     if member.user.id != user_id
         || member.joined_at != Some(joined_at)
+        || !roles_admit(event.roles)
         || !roles_admit(&member.roles)
         || cached_contradicts
         || !app.activation.may_record()
-        || !app.automod.onboarding_matches.complete_if_current(
-            (guild_id, user_id),
-            joined_at,
-            claimed_dry_run,
-            roles_admit,
-        )
+        || (!dry_run && automod_member_blocked(app, guild_id.get(), user_id.get(), "kick"))
+        || !claim.complete(dry_run, roles_admit)
     {
         return None;
     }
-    Some(member)
+    Some((member, dry_run))
 }

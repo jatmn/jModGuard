@@ -460,6 +460,24 @@ fn store_rule_conn(tx: &impl SqlExecutor, guild_id: i64, id: &str, json: &str) -
     Ok(())
 }
 
+fn effective_onboarding_trap_conn(tx: &impl SqlExecutor, guild_id: i64) -> Result<RuleDef> {
+    use crate::onboarding_trap::RULE_ID;
+    let stored: Option<String> = tx
+        .query_row(
+            "SELECT data FROM rules WHERE rule_id=?1 AND guild_id IN (?2, 0)
+             ORDER BY guild_id DESC LIMIT 1",
+            params![RULE_ID, guild_id],
+            |row| Ok(row.get(0)?),
+        )
+        .optional()?;
+    let mut rule = match stored {
+        Some(json) => serde_json::from_str(&json)?,
+        None => crate::defaults::rule(RULE_ID),
+    };
+    crate::onboarding_trap::normalize_role_id(&mut rule);
+    Ok(rule)
+}
+
 /// Save the draft only if its effective rule still matches inside the writer
 /// transaction. Dashboard and slash/prefix commands share this guard.
 pub async fn compare_and_set_onboarding_trap(
@@ -477,19 +495,7 @@ pub async fn compare_and_set_onboarding_trap(
     db.with_conn(move |conn| {
         let tx = conn.transaction_immediate()?;
         verify_configuration_write(&tx, scope.as_ref(), guild_id)?;
-        let stored: Option<String> = tx
-            .query_row(
-                "SELECT data FROM rules WHERE rule_id=?1 AND guild_id IN (?2, 0)
-             ORDER BY guild_id DESC LIMIT 1",
-                params![RULE_ID, guild_id],
-                |row| Ok(row.get(0)?),
-            )
-            .optional()?;
-        let mut current: RuleDef = match stored {
-            Some(json) => serde_json::from_str(&json)?,
-            None => crate::defaults::rule(RULE_ID),
-        };
-        crate::onboarding_trap::normalize_role_id(&mut current);
+        let current = effective_onboarding_trap_conn(&tx, guild_id)?;
         anyhow::ensure!(
             serde_json::to_value(current)? == serde_json::to_value(expected)?,
             "The onboarding trap changed. Reload the rule and try again."
@@ -2302,6 +2308,21 @@ async fn configuration_read<T: Send + 'static>(
         "primary configuration read is below the process's committed-version floor"
     );
     Ok(result)
+}
+
+/// Read the current trap and write fence in the same enrollment-verified
+/// primary snapshot before authorizing a kick.
+pub async fn get_onboarding_trap_for_dispatch(
+    db: &Db,
+    enrollment: GuildEnrollment,
+) -> Result<(RuleDef, bool)> {
+    configuration_read(db, ConfigurationScope::Guild(enrollment), |tx, guild| {
+        Ok((
+            effective_onboarding_trap_conn(tx, guild)?,
+            super::guild_stores::guild_write_fenced(tx, guild)?,
+        ))
+    })
+    .await
 }
 
 fn read_layers<T: Clone>(
