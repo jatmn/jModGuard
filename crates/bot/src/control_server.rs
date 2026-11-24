@@ -1174,7 +1174,18 @@ mod tests {
             bound,
             seal_request(&db::ControlOp::LookupResult, 7, &request_id),
         );
-        assert!(matches!(saved, ControlReply::Saved { .. }), "{saved:?}");
+        let rows = db::list_badwords(&bot.db, enrollment.guild_id)
+            .await
+            .unwrap();
+        let [row] = rows.as_slice() else {
+            panic!("the original request must insert one badwords row");
+        };
+        assert_eq!(
+            saved,
+            ControlReply::Saved {
+                body: serde_json::json!(row.id),
+            }
+        );
         let replay = submit(bound, seal_request(&op, 7, &request_id));
         assert_eq!(replay, saved);
         assert_eq!(
