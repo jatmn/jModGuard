@@ -26,19 +26,15 @@ fn temp_root(label: &str) -> PathBuf {
     root
 }
 
-fn spawn(envs: &[(&str, &str)], remove: &[&str]) -> Running {
+fn spawn(envs: &[(&str, &str)]) -> Running {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_jmodguard-bot"));
-    cmd.env("JMODGUARD_CONFIG", "/no/such/jmodguard-config.toml")
+    cmd.env_clear()
+        .env("JMODGUARD_CONFIG", "/no/such/jmodguard-config.toml")
         .env("JMODGUARD_LOG_LEVEL", "info")
         .env("JMODGUARD_LOG_DIRECTORY", "")
+        .envs(envs.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (key, value) in envs {
-        cmd.env(key, value);
-    }
-    for key in remove {
-        cmd.env_remove(key);
-    }
     let mut child = cmd.spawn().unwrap();
     let log = Arc::new(Mutex::new(String::new()));
     if let Some(pipe) = child.stdout.take() {
@@ -158,6 +154,36 @@ fn lease_present(path: &Path) -> bool {
 }
 
 #[test]
+fn bot_startup_warns_once_when_legacy_retention_is_configured() {
+    let root = temp_root("retention-warning");
+    let config = root.join("config.toml");
+    let warning = "bot.retention_days and JMODGUARD_RETENTION_DAYS are deprecated";
+    for (toml, env, expected) in [
+        ("", None, 0),
+        ("", Some("  "), 0),
+        ("retention_days = 7", None, 1),
+        ("", Some("0"), 1),
+        ("retention_days = 0", Some("100000"), 1),
+    ] {
+        std::fs::write(&config, format!("[bot]\n{toml}\n")).unwrap();
+        let mut envs = vec![
+            ("JMODGUARD_CONFIG", config.to_str().unwrap()),
+            ("JMODGUARD_DISCORD_TOKEN", "dummy-token"),
+            ("JMODGUARD_HEALTH_BIND", ""),
+            ("JMODGUARD_LAUNCHER_REVISION", "0"),
+        ];
+        if let Some(value) = env {
+            envs.push(("JMODGUARD_RETENTION_DAYS", value));
+        }
+        let running = spawn(&envs);
+        // Stop at the launcher refusal so startup runs without a database or Discord.
+        let log = wait_log(&running, "this release requires launcher revision");
+        assert_eq!(log.matches(warning).count(), expected, "{toml} {env:?}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn old_or_unknown_launcher_child_is_refused_without_readiness_and_exits_cleanly() {
     for revision in [
         None,
@@ -182,12 +208,7 @@ fn old_or_unknown_launcher_child_is_refused_without_readiness_and_exits_cleanly(
         if let Some(revision) = revision {
             envs.push(("JMODGUARD_LAUNCHER_REVISION", revision));
         }
-        let remove = if revision.is_none() {
-            vec!["JMODGUARD_LAUNCHER_REVISION"]
-        } else {
-            vec![]
-        };
-        let mut running = spawn(&envs, &remove);
+        let mut running = spawn(&envs);
         wait_log(&running, "this release requires launcher revision 7");
         let log = wait_log(&running, "health listener");
         let addr = health_addr(&log);
@@ -230,17 +251,14 @@ fn old_or_unknown_launcher_child_is_refused_without_readiness_and_exits_cleanly(
 fn revision_seven_launcher_child_starts_and_claims_the_lease() {
     let root = temp_root("rev7");
     let db_path = root.join("core.db");
-    let running = spawn(
-        &[
-            ("JMODGUARD_DISCORD_TOKEN", "dummy-token"),
-            ("JMODGUARD_DB_PATH", db_path.to_str().unwrap()),
-            ("JMODGUARD_HEALTH_BIND", "127.0.0.1:0"),
-            ("JMODGUARD_READY_FILE", root.join("ready").to_str().unwrap()),
-            ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
-            ("JMODGUARD_LAUNCHER_REVISION", "7"),
-        ],
-        &[],
-    );
+    let running = spawn(&[
+        ("JMODGUARD_DISCORD_TOKEN", "dummy-token"),
+        ("JMODGUARD_DB_PATH", db_path.to_str().unwrap()),
+        ("JMODGUARD_HEALTH_BIND", "127.0.0.1:0"),
+        ("JMODGUARD_READY_FILE", root.join("ready").to_str().unwrap()),
+        ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
+        ("JMODGUARD_LAUNCHER_REVISION", "7"),
+    ]);
     let log = wait_log(&running, "database ready");
     assert!(!log.contains("requires launcher revision"));
     let started = Instant::now();
@@ -258,18 +276,11 @@ fn revision_seven_launcher_child_starts_and_claims_the_lease() {
 fn standalone_bot_without_launcher_markers_is_not_gated() {
     let root = temp_root("standalone");
     let db_path = root.join("core.db");
-    let running = spawn(
-        &[
-            ("JMODGUARD_DISCORD_TOKEN", "dummy-token"),
-            ("JMODGUARD_DB_PATH", db_path.to_str().unwrap()),
-            ("JMODGUARD_HEALTH_BIND", "127.0.0.1:0"),
-        ],
-        &[
-            "JMODGUARD_LAUNCHER_REVISION",
-            "JMODGUARD_READY_FILE",
-            "JMODGUARD_UPDATE_MAINTENANCE",
-        ],
-    );
+    let running = spawn(&[
+        ("JMODGUARD_DISCORD_TOKEN", "dummy-token"),
+        ("JMODGUARD_DB_PATH", db_path.to_str().unwrap()),
+        ("JMODGUARD_HEALTH_BIND", "127.0.0.1:0"),
+    ]);
     let log = wait_log(&running, "database ready");
     assert!(!log.contains("requires launcher revision"));
     let started = Instant::now();
@@ -325,17 +336,14 @@ fn guild_store_ahead_of_the_build_is_held_once_not_exited_for_a_launcher_restart
     });
     let ready_file = root.join("ready");
     let bind = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)).to_string();
-    let mut running = spawn(
-        &[
-            ("JMODGUARD_DISCORD_TOKEN", "dummy-token"),
-            ("JMODGUARD_DB_PATH", db_path.to_str().unwrap()),
-            ("JMODGUARD_HEALTH_BIND", bind.as_str()),
-            ("JMODGUARD_READY_FILE", ready_file.to_str().unwrap()),
-            ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
-            ("JMODGUARD_LAUNCHER_REVISION", "7"),
-        ],
-        &[],
-    );
+    let mut running = spawn(&[
+        ("JMODGUARD_DISCORD_TOKEN", "dummy-token"),
+        ("JMODGUARD_DB_PATH", db_path.to_str().unwrap()),
+        ("JMODGUARD_HEALTH_BIND", bind.as_str()),
+        ("JMODGUARD_READY_FILE", ready_file.to_str().unwrap()),
+        ("JMODGUARD_UPDATE_MAINTENANCE", "0"),
+        ("JMODGUARD_LAUNCHER_REVISION", "7"),
+    ]);
     let log = wait_log(&running, "bot held without the writer lease");
     assert!(
         log.contains("unsupported guild-store schema")

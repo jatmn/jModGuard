@@ -33,6 +33,8 @@ const iconsSource = fs.readFileSync(new URL('../frontend/icons.js', import.meta.
   .replace(/^import .*;$/gm, '').replaceAll('export const', 'const').replaceAll('export function', 'function');
 const listControlsSource = fs.readFileSync(new URL('../frontend/list-controls.js', import.meta.url), 'utf8')
   .replace(/^import .*;$/gm, '').replace(/^const h = React\.createElement;$/m, '').replace(/^export /gm, '');
+const noAutofillSource = fs.readFileSync(new URL('../frontend/no-autofill.js', import.meta.url), 'utf8')
+  .replace('export function', 'function');
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
   .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, '\n');
 const pages = [];
@@ -143,7 +145,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     setInterval: timerApi.setInterval, clearInterval: timerApi.clearInterval,
     confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${listControlsSource}\n${source}\n({ListControls, ListSortHeading, ListEmptyRow, useListControls, state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId, COMMAND_BEHAVIORS, PLAN_STEP_LABELS, planStepFor})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${noAutofillSource}\n${listControlsSource}\n${source}\n({ListControls, ListSortHeading, ListEmptyRow, useListControls, state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId, COMMAND_BEHAVIORS, PLAN_STEP_LABELS, planStepFor})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   for (const guild of app.state.guilds) Object.assign(guild, { access: 'manage', can_ban_members: true, can_delete_cases: true });
@@ -183,6 +185,70 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
 }
 
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
+
+function assertPasswordManagerHints(root, ...requiredFields) {
+  for (const selector of requiredFields) {
+    assert.ok(root.querySelector(selector), `expected a rendered ${selector}`);
+  }
+  for (const field of root.querySelectorAll('input, textarea')) {
+    const label = field.getAttribute('aria-label') || field.labels?.[0]?.textContent || field.placeholder || field.localName;
+    assert.equal(field.getAttribute('autocomplete'), 'off', label);
+    assert.ok(field.hasAttribute('data-1p-ignore'), label);
+    assert.equal(field.getAttribute('data-lpignore'), 'true', label);
+    assert.ok(field.hasAttribute('data-bwignore'), label);
+    assert.equal(field.getAttribute('data-form-type'), 'other', label);
+  }
+}
+
+test('Cases fields tell password managers to ignore them', async () => {
+  const h = harness(async () => response({ cases: [] }));
+  assertPasswordManagerHints(await casesView(h), 'input[type="search"]', 'input[type="date"]');
+});
+
+test('Members fields tell password managers to ignore them', async () => {
+  const h = harness(async () => response({ members: [] }));
+  const panel = memberView(h);
+  await settle();
+  assertPasswordManagerHints(panel, 'input[type="search"]');
+});
+
+test('Commands fields tell password managers to ignore them', async () => {
+  const command = commandFixture('help', { kind: 'help' });
+  const { h } = commandEditorHarness({ commands: [builtinRecord(command)] });
+  h.app.navigate('commands');
+  const panel = h.document.querySelector('#content');
+  assertPasswordManagerHints(panel, 'input[type="checkbox"]');
+  await fire(findNode(panel, n => n.localName === 'button' && n.textContent === '+ New custom command'), 'click');
+  assertPasswordManagerHints(h.document.querySelector('.modal-overlay'), 'input[placeholder="command name"]', 'textarea');
+});
+
+test('Settings fields tell password managers to ignore them', async () => {
+  const h = settingsHarness();
+  await settle();
+  assertPasswordManagerHints(h.document, 'input');
+});
+
+test('Bot servers fields tell password managers to ignore them', async () => {
+  const h = ownerHarness(async () => response({ servers: [directoryServer] }));
+  const panel = h.app.TabOwnerServers();
+  await settle();
+  assert.match(panel.querySelector('tbody').textContent, /Alpha/);
+  assertPasswordManagerHints(panel);
+});
+
+test('Platform analytics fields tell password managers to ignore them', async () => {
+  const h = ownerHarness(async () => response(platformSnapshot()));
+  h.app.navigate('platform-analytics');
+  await settle();
+  assertPasswordManagerHints(platformPage(h), 'input[aria-label="Filter servers"]');
+});
+
+test('Bans fields and the inline reason editor tell password managers to ignore them', async () => {
+  const h = harness(async () => response(banRows()));
+  const panel = await bansView(h);
+  await fire(panel.querySelector('button[aria-label="Edit reason"]'), 'click');
+  assertPasswordManagerHints(panel, 'textarea[aria-label="jModGuard reason"]');
+});
 
 function findNode(root, predicate) {
   if (!root) return null;
@@ -830,7 +896,7 @@ test('dashboard setup state comes from configuration, not the stats read or its 
   assert.equal(Boolean(h.document.querySelector('#content .getting-started')), false, 'no setup guide while loading');
 });
 
-test('dashboard merges every previous stat into one compact grid under a one-line header', async () => {
+test('dashboard shows the configured and measured stats in one compact grid', async () => {
   const { app } = harness(async () => response({ events: 7, warns: 2, bans: 1, cases: 4 }));
   app.state.config = configuredDashboard();
   const dashboard = app.tabDashboard();
@@ -844,8 +910,9 @@ test('dashboard merges every previous stat into one compact grid under a one-lin
   const expected = [
     ['Rules enabled', '1 / 2'], ['Rules in dry-run', '1'], ['Commands enabled', '1 / 2'], ['Log channels', '1'],
     ['Moderation records', '7'], ['Warns', '2'], ['Bans', '1'], ['Cases', '4'],
-    ['Prefix', '!'], ['Bot name', 'Guard'], ['Badword patterns', '3'], ['Routine chat collection', 'Off'],
+    ['Prefix', '!'], ['Bot name', 'Guard'], ['Badword patterns', '3'],
   ];
+  assert.equal(value('Routine chat collection'), undefined);
   assert.equal(grids[0].children.length, expected.length, 'no stat dropped or duplicated');
   for (const [label, shown] of expected) assert.equal(value(label), shown, label);
   // The hero, its eyebrow and the separate explainer band are gone.
@@ -4293,11 +4360,14 @@ const densityProbe = `(async () => {
   for (let i = 0; i < 200 && /Loading/.test(document.querySelector('.dashboard-stats').textContent); i++) await wait();
   await frame();
   const rect = element => { const { top, bottom, width, height } = element.getBoundingClientRect(); return { top, bottom, width, height }; };
+  const statBoxes = [...document.querySelectorAll('.dashboard-stats .stat')].map(rect);
+  const lastStatTop = Math.max(...statBoxes.map(stat => stat.top));
   const result = { theme: document.documentElement.dataset.theme, viewport: innerHeight, scrollY,
     bodyFont: parseFloat(getComputedStyle(document.body).fontSize),
     statFont: parseFloat(getComputedStyle(document.querySelector('.stat-value')).fontSize),
     stats: rect(document.querySelector('.dashboard-stats')), header: rect(document.querySelector('.page-header')),
-    statRows: new Set([...document.querySelectorAll('.dashboard-stats .stat')].map(stat => Math.round(stat.getBoundingClientRect().top))).size,
+    statRows: new Set(statBoxes.map(stat => Math.round(stat.top))).size,
+    lastStatWidths: statBoxes.filter(stat => stat.top === lastStatTop).map(stat => stat.width),
     gettingStarted: Boolean(document.querySelector('.getting-started')),
     tabs: Math.min(...[...document.querySelectorAll('#tabs button')].map(button => rect(button).height)) };
   const probes = document.createElement('div');
@@ -4359,6 +4429,11 @@ test('dashboard density fits 1280x800 and keeps 24px targets in both themes', { 
       assert.ok(m.tabs >= 24, `${name}: navigation targets ${m.tabs}px`);
       assert.equal(m.outline, 'solid 2px', `${name}: focus ring`);
       assert.ok(m.tipShown && m.tip.width > 0, `${name}: focus shows the tooltip`);
+      const lastRowTiles = width > 1100 ? 3 : 1;
+      assert.equal(m.lastStatWidths.length, lastRowTiles, `${name}: final row tile count`);
+      const lastTileWidth = (m.stats.width - 2) / lastRowTiles; // Exclude the two 1px borders.
+      for (const tileWidth of m.lastStatWidths)
+        assert.ok(Math.abs(tileWidth - lastTileWidth) < 1, `${name}: final row shares the available width evenly`);
       if (width <= 720) {
         // Narrow screens scale fields back up to the touch size.
         for (const control of ['btn', 'input', 'select']) assert.equal(Math.round(m.controls[control].height), 40, `${name}: ${control}`);
@@ -4367,7 +4442,7 @@ test('dashboard density fits 1280x800 and keeps 24px targets in both themes', { 
       for (const control of ['btn', 'input', 'select'])
         assert.ok(m.controls[control].height >= 28 && m.controls[control].height <= 32, `${name}: ${control} ${m.controls[control].height}px`);
       assert.ok(m.header.height <= 40, `${name}: one-line page header ${m.header.height}px`);
-      // Twelve stats wrap into rows (protection, activity, configuration) instead of one squeezed row.
+      // Protection, activity and configuration each occupy one desktop row.
       assert.equal(m.statRows, 3, `${name}: stat grid rows`);
       // Acceptance: every stat is visible without scrolling.
       assert.equal(m.scrollY, 0, name);
@@ -5620,8 +5695,8 @@ test('rule editor summary describes every built-in rule and custom rule and upda
     const modal = await h.app.editRule({ name: rule_id, rule_id, effective });
     assert.equal(summary(modal), expected, rule_id);
     // Every rule uses the same sections; only Trigger differs.
-    assert.deepEqual([...modal.querySelectorAll('.editor-section-title')].map(textOf).filter((t) => t !== 'Action'),
-      ['Trigger', 'Actions', 'Exceptions', 'Scope'].filter((t) => !(rule_id.startsWith('custom:') && t === 'Actions')), rule_id);
+    assert.deepEqual([...modal.querySelectorAll('.editor-section-title')].map(textOf),
+      ['Trigger', 'Actions', 'Exceptions', 'Scope'], rule_id);
     assert.ok(modal.querySelector('details.editor-advanced'), `${rule_id} keeps advanced options collapsed`);
     await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Cancel'), 'click');
   }
@@ -6939,6 +7014,122 @@ test('custom pattern draft save uses dry_run and custom id', () => {
   assert.equal(draft.params.kind, 'pattern');
   const record = h.app.newCustomRuleDraft();
   assert.match(record.rule_id, /^custom:[0-9a-f]{16}$/);
+});
+
+test('No links or media preset requires channels and saves ordered actions and reply settings', async () => {
+  const writes = [];
+  const channels = [
+    ['70', 'general', 'text'], ['71', 'news', 'announcement'],
+    ['72', 'voice', 'voice'], ['73', 'events', 'stage'],
+    ['74', 'topics', 'forum'], ['75', 'gallery', 'media'],
+    ['76', 'rooms', 'category'], ['77', 'unknown', 'other'],
+  ].map(([id, name, kind]) => ({ id, name, kind }));
+  const h = harness(async (url, options) => {
+    if (options.method === 'PUT') {
+      const { data } = JSON.parse(options.body);
+      const id = url.split('/').pop();
+      assert.match(id, /^custom:[0-9a-f]{16}$/);
+      writes.push(data);
+      return response({ ok: true, config_patch: { kind: 'rule', id, scope: 'guild', value: data } });
+    }
+    return response({
+      roles: [],
+      channels,
+      media_preset_channel_kinds: ['text', 'announcement', 'voice', 'stage'],
+    });
+  });
+  h.app.state.config = { enrollment_id: 'membership', rules: [] };
+  h.app.navigate('rules');
+  const button = (root, text) => findNode(root, n => n.localName === 'button' && textOf(n) === text);
+  await fire(button(h.nodes.get('#content'), 'No links or media'), 'click');
+  const modal = h.nodes.get('.modal-overlay');
+  const control = (text) => findNode(modal, n => n.localName === 'label' && textOf(n) === text).control;
+  const enabled = control('Enabled');
+  assert.equal(enabled.checked, false);
+  assert.equal(enabled.disabled, true);
+  assert.equal(control('Skip moderators').checked, true);
+  for (const label of ['Links', 'Attachments and images', 'GIF picker links', 'Stickers']) {
+    assert.equal(control(label).checked, true);
+  }
+  const addId = async (label, id) => {
+    const input = control(label);
+    input.value = id;
+    await fire(input, 'input');
+    await fire(input, 'keydown', { key: 'Enter' });
+  };
+  const channelPicker = control('Only check these channels');
+  assert.deepEqual([...channelPicker.options].map(option => option.value), ['', '70', '71', '72', '73']);
+  assert.equal(channelPicker.closest('.id-picker').querySelector('input'), null);
+  const pickChannel = async (id) => {
+    channelPicker.value = id;
+    await fire(channelPicker, 'change');
+  };
+  await pickChannel('70');
+  assert.equal(enabled.disabled, false);
+  await fire(enabled, 'click');
+  assert.equal(enabled.checked, true);
+  await fire(modal.querySelector('button[aria-label="Remove #general"]'), 'click');
+  assert.equal(enabled.checked, false);
+  assert.equal(enabled.disabled, true);
+  await pickChannel('71');
+  await fire(enabled, 'click');
+  await addId('Skip roles', '7');
+
+  await fire(button(modal, 'Add action'), 'click');
+  assert.equal(control('Delete reply after (seconds)').value, '10');
+  control('Delete reply after (seconds)').value = '0';
+  await fire(control('Delete reply after (seconds)'), 'input');
+  control('Reply text').value = '{user} Try another channel. <:wave:12>';
+  await fire(control('Reply text'), 'input');
+  control('Allowed domains').value = 'example.test';
+  await fire(control('Allowed domains'), 'input');
+  await fire(modal.querySelector('button[aria-label="Move action 3 up"]'), 'click');
+  await fire(button(modal, 'Save'), 'click');
+
+  assert.equal(writes.length, 1);
+  const [saved] = writes;
+  assert.equal(saved.name, 'No links or media');
+  assert.equal(saved.params.preset, 'no_links_or_media');
+  assert.equal(saved.enabled, true);
+  assert.equal(saved.dry_run, true);
+  assert.deepEqual(saved.include_channels, ['71']);
+  assert.deepEqual(saved.whitelist_roles, ['7']);
+  assert.deepEqual(saved.params.allowed_domains, ['example.test']);
+  assert.deepEqual(saved.params.channel_reply, {
+    template: '{user} Try another channel. <:wave:12>',
+    delete_after_seconds: 0,
+  });
+  assert.deepEqual(saved.actions.map(action => action.action), ['delete', 'channel_reply', 'log']);
+});
+
+test('No links or media reports removed channels and uses the saved disabled state', async () => {
+  const id = 'custom:01234567';
+  const rule = {
+    name: 'No links or media', enabled: true, dry_run: false,
+    params: { kind: 'channel_content', preset: 'no_links_or_media', links: true },
+    actions: [{ at: 1, action: 'delete' }],
+    include_channels: ['70'],
+  };
+  const h = harness(async (_url, options) => {
+    if (options.method === 'PUT') {
+      const { data } = JSON.parse(options.body);
+      assert.equal(data.enabled, true);
+      assert.deepEqual(data.include_channels, ['70']);
+      return response({
+        ok: true,
+        config_patch: { kind: 'rule', id, scope: 'guild', value: { ...data, enabled: false, include_channels: [] } },
+      });
+    }
+    return response({ roles: [], channels: [], media_preset_channel_kinds: ['text'] });
+  });
+  const record = { rule_id: id, name: rule.name, effective: rule, guild_override: rule };
+  h.app.state.config = { enrollment_id: 'membership', rules: [record] };
+  const modal = await h.app.editRule(record);
+  await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+  assert.equal(h.nodes.get('.modal-overlay'), null);
+  assert.equal(h.app.state.config.rules[0].effective.enabled, false);
+  assert.deepEqual(Array.from(h.app.state.config.rules[0].effective.include_channels), []);
+  assert.equal(h.nodes.get('#toast').textContent, 'Rule saved. Removed 1 unavailable channel. The rule is now off.');
 });
 
 for (const failure of [
@@ -11258,7 +11449,6 @@ const DASHBOARD_TILES = [
   ['Prefix', 'prefix', 'sliders', 'neutral', 'settings'],
   ['Bot name', 'bot-name', 'bot', 'info', 'actions'],
   ['Badword patterns', 'badword-patterns', 'message-x', 'warning', 'badwords'],
-  ['Routine chat collection', 'routine-chat-collection', 'database', 'neutral', 'usage'],
 ];
 const SETUP_LINKS = [
   ['01', 'Tune automod', 'Review rules and test them in dry-run.', 'rules', 'shield', 'success'],

@@ -130,8 +130,6 @@ clock	crates/bot/src/commands/mod.rs	commands::tests::slash_http_saves_registrat
 clock	crates/bot/src/control_server.rs	control_server::tests::control_job_during_the_first_recovery_read_is_recovery_in_progress	1	#666
 sleep	crates/bot/src/control_server.rs	control_server::tests::control_job_during_the_first_recovery_read_is_recovery_in_progress	1	#666
 sleep	crates/bot/src/control_server.rs	control_server::tests::copy_does_not_apply_when_the_source_permission_is_revoked	1	#666
-clock	crates/bot/src/control_server.rs	control_server::tests::late_control_result_is_retrievable_and_replay_does_not_apply_twice	2	#666
-sleep	crates/bot/src/control_server.rs	control_server::tests::late_control_result_is_retrievable_and_replay_does_not_apply_twice	1	#666
 clock	crates/bot/src/control_server.rs	control_server::tests::lookup_never_applies_and_returns_only_the_same_actors_result	1	#666
 clock	crates/bot/src/control_server.rs	control_server::tests::old_ready_result_is_evicted_and_a_pending_entry_is_kept	2	#666
 sleep	crates/bot/src/control_server.rs	control_server::tests::queued_control_expires_before_apply	1	#666

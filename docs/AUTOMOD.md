@@ -106,10 +106,11 @@ escalation accurate without false positives.
 
 ## Actions
 
-`log` · `delete` · `warn` · `timeout` (minutes) · `kick` · `ban`. When several generic rules fire on one message, the **most severe** action
-wins (ban > kick > timeout > warn > delete > log). Exact-image and repeated-text
-matches never use that generic executor; they log or delete-and-ban through their
-own path.
+When several generic rules fire on one message, the rule with the **most
+severe** action wins (ban > kick > timeout > warn > delete > log or channel
+reply). A built-in rule runs its selected strike action. A custom rule runs
+its ordered actions. Exact-image and repeated-text matches use their own
+executor for logging or delete-and-ban.
 
 Every ban action offers **Ban** (no history deletion) or **Ban and purge
 (previous hour)** in the WebUI. Purge asks Discord's Ban Member API to delete
@@ -142,6 +143,37 @@ ban preference so switching back to enforcement preserves the choice; it has no
 effect while the rule is in dry-run. Rules live in stored configuration, not
 `config.toml`.
 
+## No links or media
+
+1. Open **Automod → No links or media** in your server's dashboard. Pick
+   text or announcement channels, or the text chat in voice or stage channels,
+   under **Only check these channels**. The picker uses the bot's channel list.
+   Forum and media posts live in threads, outside this preset's channel scope.
+   The preset stays off until you select a channel and turn on **Enabled**.
+   On save, the bot removes unavailable channels and the dashboard reports the
+   change. If no channels remain, the rule turns off. You can still disable a
+   saved rule while the channel list is unavailable. Copies to other servers
+   start off with no channels.
+2. Choose what to block. **Links** includes Tenor and Giphy links from Discord's
+   GIF picker. To block those GIFs while allowing ordinary links, turn off
+   **Links** and leave **GIF picker links** on. **Attachments and images**
+   includes uploaded GIFs. **Stickers** checks Discord sticker items. To exempt
+   links to specific sites, enter comma-separated bare domains under **Allowed
+   domains**. Each subdomain needs its own entry.
+3. Leave **Skip moderators** on and add trusted or media roles under **Skip
+   roles** as needed. The default actions delete the message and post to your
+   configured automod log. The log reports the outcomes of actions listed
+   before it. Move the log after the reply to include the reply outcome.
+4. To tell members why their post was removed, select **Add action → Reply in
+   channel**. Write the **Reply text**, for example `{user} No links or GIFs
+   are allowed in {channel}.` The placeholders mention the author and channel.
+   You can paste Discord custom emoji markup. Only the message author can be
+   pinged. The bot sends at most one reply per member per channel every 30
+   seconds. Replies expire after 10 seconds by default. Set **Delete reply
+   after (seconds)** to 0 to keep them, or choose a delay up to 300 seconds.
+5. Save and check the automod log in dry-run. Edit the rule and turn off
+   **Dry-run** when you're ready to enforce it. The preset checks new messages.
+
 ## Custom rules (per server)
 
 Operators can add up to **32** guild-scoped rules with ids `custom:` plus 8–32
@@ -151,16 +183,22 @@ custom rule arrives in dry-run, the 32-rule cap applies, and custom rules are
 refused for the global scope. Saves go through the bot `UpsertRule` control
 operation (the API does not write the row directly).
 
-Each custom rule has exactly **one** action (`delete`, `warn`, `timeout`, `kick`,
-or `ban` with the Ban / Ban and purge choice above). Types:
+The winning custom rule runs its actions in the saved order on each match.
+Its strongest action determines which rule wins. Each action type can appear
+once. Available actions are `delete`, `log`, `warn`, `timeout`, `kick`, `ban`
+(with the Ban / Ban and purge choice above), and `channel_reply` for message
+rules. An explicit `log` posts one entry at its position in the action list.
+Without it, **Post to automod log** controls action reports. Types:
 
 - **pattern** — `params.pattern` compiled with the same linear-time regex engine
   as badwords (length cap 512; look-around and backreferences rejected).
 - **word** — 1–32 whole words matched case-insensitively on literal and
   normalized text. `scam!`, `scam.`, and `(scam)` match `scam`; `scamper` does
   not. A configured word containing punctuation retains its normalized matching.
-- **channel_content** — `params.links` and/or `params.attachments` (at least one
-  true): URL/invite detection or `attachment_count > 0`.
+- **channel_content** — enable at least one of `params.links`,
+  `params.attachments`, `params.gifs`, or `params.stickers`. Optionally supply
+  up to 32 bare domain strings in `params.allowed_domains` to exempt individual
+  link hosts.
 - **everyone_attempt** — one `@everyone` or `@here` token (or everyone mention
   flag) when the member lacks Mention Everyone in that channel, including role
   and member overwrites and the parent channel of a thread. Active threads are
@@ -176,7 +214,8 @@ or `ban` with the Ban / Ban and purge choice above). Types:
 Built-in and custom rules share skip lists plus **skip moderators** and optional
 **include channels** (empty = all channels except skipped). Custom rules also
 expose **post to automod log** and **open a case** switches (built-in rules keep
-today’s log/case behavior).
+today’s log/case behavior). The **No links or media** preset requires at least
+one included channel before it can run.
 
 ## Whitelists
 
@@ -184,21 +223,15 @@ Per rule: `whitelist_roles` (role IDs), `whitelist_channels` (channel IDs),
 `whitelist_users` (user IDs). Matches skip the rule entirely. Optional
 `include_channels` limits a rule to listed channels (empty means all non-skipped
 channels). `skip_moderators` skips members at mod permission level or higher.
-Pending actions recheck moderator and skipped-role exemptions using supplied
-member roles or, when those are absent, the author's cached guild roles. A known
-exempt author is skipped before deletion, warning records, timeout, kick, or ban.
-Exact-image and repeated-text rules honor both settings on admission and again
-before enforcement. The message carries its channel, so the channel list cannot
-fail open or closed. For a pending kick or ban, unknown moderator status with
-`skip_moderators` on replaces the penalty with message deletion and a warning.
-Missing membership is distinct from a known empty role list: pending kicks or
-bans from rules that skip moderators or roles use that same fallback when member
-roles are unavailable. Rules without those role dependencies enforce normally.
-An everyone-attempt whose channel permission cannot be resolved uses the same
-fallback for kick and ban, including when skip moderators is off. Missing role
-definitions also make that permission unknown. Delete, timeout, warn, and log
-keep their normal paths without an extra message delete. A delete action runs
-once; timeout and warn do not gain a deletion, and log never deletes.
+Pending generic actions recheck moderator and skipped-role exemptions using
+Gateway member roles and the guild cache. When possible, a bounded Discord
+lookup fills in missing member or role data. If the bot still cannot confirm
+eligibility, it skips enforcement and records the skipped actions and reason
+in the configured automod log. A known exempt author is skipped entirely.
+Exact-image and repeated-text use their own enforcement path and check exemptions
+there. An everyone-attempt with resolved exemptions but unknown channel
+permission still falls back to message deletion for kick or ban. The fallback
+does not apply when the moderator or skipped-role check is unresolved.
 If a custom rule is deleted, or its configuration cannot be read, before a
 pending action runs, the bot logs a warning and takes no Discord action, including
 delete, timeout, or warn. A pending action carries the dry-run setting from

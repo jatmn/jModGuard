@@ -8,6 +8,15 @@ use crate::types::{ActionDef, GLOBAL_SCOPE, RuleDef};
 
 pub const CUSTOM_ID_PREFIX: &str = "custom:";
 pub const MAX_CUSTOM_RULES_PER_GUILD: usize = 32;
+pub const NO_LINKS_OR_MEDIA_PRESET: &str = "no_links_or_media";
+/// Server channel kinds whose own ID carries chat messages.
+pub const MEDIA_PRESET_CHANNEL_KINDS: &[&str] = &["text", "announcement", "voice", "stage"];
+pub const DEFAULT_REPLY_DELETE_SECONDS: u64 = 10;
+pub const MAX_REPLY_DELETE_SECONDS: u64 = 300;
+
+const MAX_CUSTOM_ACTIONS: usize = 7;
+const MAX_ALLOWED_DOMAINS: usize = 32;
+const MAX_REPLY_LENGTH: usize = 2000;
 
 const MAX_NAME_LEN: usize = 80;
 const MAX_DESCRIPTION_LEN: usize = 400;
@@ -95,17 +104,39 @@ fn validate_custom_body(_id: &str, rule: &RuleDef, compile_pattern: bool) -> Res
     );
 
     ensure!(
-        rule.actions.len() == 1,
-        "custom rules must have exactly one action"
+        (1..=MAX_CUSTOM_ACTIONS).contains(&rule.actions.len()),
+        "custom rules must have 1–{MAX_CUSTOM_ACTIONS} actions"
     );
-    let action = &rule.actions[0];
-    validate_action(action)?;
-
     let kind = rule
         .params
         .get("kind")
         .and_then(|v| v.as_str())
         .context("custom rule params.kind is required")?;
+    if requires_include_channels(rule) {
+        ensure!(
+            kind == "channel_content",
+            "the no links or media preset requires channel content"
+        );
+        ensure!(
+            !rule.enabled || rule.include_channels.iter().any(|channel| *channel != 0),
+            "pick at least one channel before enabling the no links or media preset"
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    for action in &rule.actions {
+        ensure!(
+            seen.insert(action.action.as_str()),
+            "custom actions cannot be repeated"
+        );
+        validate_action(action)?;
+        if action.action == "channel_reply" {
+            ensure!(
+                kind != "honeypot_role",
+                "channel replies require a message trigger"
+            );
+            channel_reply(rule)?;
+        }
+    }
     match kind {
         "pattern" => {
             let pattern = rule
@@ -139,7 +170,7 @@ fn validate_action(action: &ActionDef) -> Result<()> {
         "purge_last_hour is only valid for ban"
     );
     match action.action.as_str() {
-        "delete" | "warn" | "kick" => {
+        "log" | "delete" | "warn" | "kick" | "channel_reply" => {
             ensure!(
                 action.delete_days == 0,
                 "delete_days must be 0 for this action"
@@ -181,14 +212,147 @@ fn validate_words(rule: &RuleDef) -> Result<()> {
     Ok(())
 }
 
-fn validate_channel_content(rule: &RuleDef) -> Result<()> {
-    let links = rule.params.get("links").and_then(|v| v.as_bool());
-    let attachments = rule.params.get("attachments").and_then(|v| v.as_bool());
-    ensure!(
-        links == Some(true) || attachments == Some(true),
-        "channel_content needs links or attachments enabled"
-    );
+pub fn content_toggle(rule: &RuleDef, key: &str) -> bool {
+    rule.params.get(key).and_then(Value::as_bool) == Some(true)
+}
+
+pub fn requires_include_channels(rule: &RuleDef) -> bool {
+    rule.params.get("preset").and_then(Value::as_str) == Some(NO_LINKS_OR_MEDIA_PRESET)
+}
+
+pub(crate) fn reconcile_media_preset_channels(
+    rule: &mut RuleDef,
+    channels: &[crate::db::guild_data::ServerChannelName],
+) -> Result<()> {
+    let kinds: std::collections::HashMap<_, _> = channels
+        .iter()
+        .filter_map(|channel| Some((channel.id.parse::<u64>().ok()?, channel.kind.as_str())))
+        .collect();
+    for id in &rule.include_channels {
+        if let Some(kind) = kinds.get(id) {
+            ensure!(
+                MEDIA_PRESET_CHANNEL_KINDS.contains(kind),
+                "Channel {id} is unsupported for the no links or media preset. Pick a channel with direct text chat."
+            );
+        }
+    }
+    rule.include_channels.retain(|id| kinds.contains_key(id));
+    if rule.include_channels.is_empty() {
+        rule.enabled = false;
+    }
     Ok(())
+}
+
+fn validate_channel_content(rule: &RuleDef) -> Result<()> {
+    ensure!(
+        ["links", "attachments", "gifs", "stickers"]
+            .iter()
+            .any(|key| content_toggle(rule, key)),
+        "channel_content needs links, attachments, GIFs, or stickers enabled"
+    );
+    if let Some(domains) = rule.params.get("allowed_domains") {
+        let domains = domains
+            .as_array()
+            .context("allowed_domains must be an array")?;
+        ensure!(
+            domains.len() <= MAX_ALLOWED_DOMAINS,
+            "at most {MAX_ALLOWED_DOMAINS} domains are allowed"
+        );
+        for domain in domains {
+            let domain = domain.as_str().context("allowed domains must be strings")?;
+            ensure!(
+                valid_allowed_domain(domain),
+                "use a bare domain in allowed_domains"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn valid_allowed_domain(domain: &str) -> bool {
+    let domain = domain.strip_suffix('.').unwrap_or(domain);
+    domain.len() <= 253
+        && domain.contains('.')
+        && domain.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        && matches!(url::Host::parse(domain), Ok(url::Host::Domain(_)))
+}
+
+/// Tests URL tokens already recognized by the message detector. Entries allow
+/// exact hosts, including GIF hosts, without exempting other URLs in a message.
+pub fn channel_link_blocked(rule: &RuleDef, token: &str) -> bool {
+    let links = content_toggle(rule, "links");
+    let gifs = content_toggle(rule, "gifs");
+    let allowed_domains = rule.params["allowed_domains"]
+        .as_array()
+        .filter(|domains| !domains.is_empty());
+    if !links && !gifs {
+        return false;
+    }
+    if links && allowed_domains.is_none() {
+        return true;
+    }
+    // The detector also recognizes www. links and Discord invites without a scheme.
+    let token = token.trim_end_matches([')', ']', '}', ',', '!', '?']);
+    let parsed = if token.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    }) {
+        url::Url::parse(token)
+    } else {
+        url::Url::parse(&format!("https://{token}"))
+    };
+    let Ok(url) = parsed else { return links };
+    let Some(domain) = url.domain() else {
+        return links;
+    };
+    let domain = domain.trim_end_matches('.');
+    let gif_host = ["tenor.com", "giphy.com", "gph.is"].iter().any(|host| {
+        domain == *host
+            || domain
+                .strip_suffix(host)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    });
+    let allowed = url.username().is_empty()
+        && url.password().is_none()
+        && allowed_domains.is_some_and(|domains| {
+            domains
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|allowed| allowed.trim_end_matches('.').eq_ignore_ascii_case(domain))
+        });
+    (links || gifs && gif_host) && !allowed
+}
+
+pub fn channel_reply(rule: &RuleDef) -> Result<(&str, u64)> {
+    let config = &rule.params["channel_reply"];
+    let template = config["template"]
+        .as_str()
+        .context("channel replies require a message template")?;
+    ensure!(
+        !template.trim().is_empty(),
+        "channel reply text cannot be empty"
+    );
+    ensure!(
+        template.encode_utf16().count() <= MAX_REPLY_LENGTH,
+        "channel reply text must be at most {MAX_REPLY_LENGTH} characters"
+    );
+    let seconds = match config.get("delete_after_seconds") {
+        Some(value) => value
+            .as_u64()
+            .context("reply auto-delete must be a whole number of seconds")?,
+        None => DEFAULT_REPLY_DELETE_SECONDS,
+    };
+    ensure!(
+        seconds <= MAX_REPLY_DELETE_SECONDS,
+        "reply auto-delete must be 0–{MAX_REPLY_DELETE_SECONDS} seconds"
+    );
+    Ok((template, seconds))
 }
 
 pub fn parse_role_id(rule: &RuleDef) -> Result<u64> {
@@ -276,8 +440,8 @@ pub fn rule_scope_skips(
         return true;
     }
     if check_include_channels
-        && !rule.include_channels.is_empty()
-        && !rule.include_channels.contains(&channel_id)
+        && (requires_include_channels(rule) || !rule.include_channels.is_empty())
+        && (channel_id == 0 || !rule.include_channels.contains(&channel_id))
     {
         return true;
     }
@@ -297,10 +461,6 @@ pub const UNKNOWN_MENTION_PERMISSION_WARNING: &str =
 /// Logged when a pending `custom:` rule is gone or its config cannot be read.
 /// No Discord action runs. Built-in rules do not use this stop.
 pub const CUSTOM_RULE_UNAVAILABLE_WARNING: &str = "custom rule unavailable; skipping the action";
-
-/// Missing membership cannot rule out a moderator or a skipped role.
-pub const UNKNOWN_MEMBERSHIP_WARNING: &str =
-    "member roles unknown; deleting the message and skipping kick or ban";
 
 /// A channel id travels with the message, so only the moderator lookup can fail.
 /// Unknown status must not be treated as permission to kick or ban.
@@ -334,20 +494,36 @@ pub fn spam_scope_admits(
     )
 }
 
-pub fn custom_rule_action(rule: &RuleDef) -> Option<ActionDef> {
-    rule.actions.first().cloned()
+/// The strongest action decides which rule wins. The executor uses the
+/// original action list, so this selection never changes their running order.
+pub fn primary_custom_action(rule: &RuleDef) -> Option<&ActionDef> {
+    rule.actions
+        .iter()
+        .rev()
+        .max_by_key(|action| action_rank(&action.action))
 }
 
-/// Returns the most severe honeypot action when `role_id` was newly added.
+pub fn action_rank(action: &str) -> u8 {
+    match action {
+        "ban" => 6,
+        "kick" => 5,
+        "timeout" => 4,
+        "warn" => 3,
+        "delete" => 2,
+        _ => 1,
+    }
+}
+
+/// Returns the matching role rule with the strongest action.
 /// Dry-run rules are included so the executor can log them without acting.
-pub fn honeypot_role_added(
-    rules: &std::collections::HashMap<String, RuleDef>,
+pub fn honeypot_role_added<'a>(
+    rules: &'a std::collections::HashMap<String, RuleDef>,
     added_role_ids: &[u64],
     author_id: u64,
     member_roles: &[u64],
     is_moderator: bool,
-) -> Option<(String, ActionDef)> {
-    let mut best: Option<(String, ActionDef)> = None;
+) -> Option<(&'a str, &'a RuleDef, &'a ActionDef)> {
+    let mut best: Option<(&str, &RuleDef, &ActionDef)> = None;
     for (rule_id, rule) in rules {
         if !is_custom_id(rule_id) || !rule.enabled {
             continue;
@@ -358,35 +534,21 @@ pub fn honeypot_role_added(
         let Ok(role_id) = parse_role_id(rule) else {
             continue;
         };
-        if !added_role_ids.contains(&role_id) {
+        if !added_role_ids.contains(&role_id)
+            || rule_scope_skips(rule, author_id, 0, member_roles, is_moderator, false)
+        {
             continue;
         }
-        if rule_scope_skips(rule, author_id, 0, member_roles, is_moderator, false) {
-            continue;
-        }
-        let Some(action) = custom_rule_action(rule) else {
+        let Some(action) = primary_custom_action(rule) else {
             continue;
         };
-        if is_more_severe_action(&action, best.as_ref().map(|(_, a)| a)) {
-            best = Some((rule_id.clone(), action));
+        if best.is_none_or(|(_, _, current)| {
+            action_rank(&action.action) > action_rank(&current.action)
+        }) {
+            best = Some((rule_id, rule, action));
         }
     }
     best
-}
-
-fn is_more_severe_action(cand: &ActionDef, best: Option<&ActionDef>) -> bool {
-    fn rank(a: &str) -> u8 {
-        match a {
-            "ban" => 6,
-            "kick" => 5,
-            "timeout" => 4,
-            "warn" => 3,
-            "delete" => 2,
-            _ => 1,
-        }
-    }
-    best.map(|b| rank(&cand.action) > rank(&b.action))
-        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -498,6 +660,75 @@ mod tests {
         assert!(withhold_member_penalty(true, true));
         assert!(!withhold_member_penalty(false, true));
         assert!(!withhold_member_penalty(true, false));
+    }
+
+    #[test]
+    fn channel_reply_validation_and_expiry_defaults() {
+        let id = "custom:01234567";
+        let mut rule = sample_rule(
+            "channel_content",
+            json!({
+                "preset": NO_LINKS_OR_MEDIA_PRESET,
+                "stickers": true,
+                "channel_reply": { "template": "{user} please check {channel}" }
+            }),
+        );
+        rule.actions[0].action = "channel_reply".into();
+        assert_eq!(channel_reply(&rule).unwrap().1, 10);
+        assert!(validate_custom_rule_shape(1, id, &rule).is_err());
+        rule.enabled = false;
+        assert!(validate_custom_rule_shape(1, id, &rule).is_ok());
+        rule.enabled = true;
+        rule.include_channels = vec![0];
+        assert!(validate_custom_rule_shape(1, id, &rule).is_err());
+        rule.include_channels = vec![5];
+        for (seconds, valid) in [
+            (json!(0), true),
+            (json!(300), true),
+            (json!(301), false),
+            (json!(-1), false),
+            (json!(0.5), false),
+            (json!(null), false),
+        ] {
+            rule.params["channel_reply"]["delete_after_seconds"] = seconds;
+            assert_eq!(validate_custom_rule_shape(1, id, &rule).is_ok(), valid);
+        }
+        rule.params["channel_reply"]["delete_after_seconds"] = json!(0);
+        assert_eq!(channel_reply(&rule).unwrap().1, 0);
+        rule.actions.push(rule.actions[0].clone());
+        assert!(validate_custom_rule_shape(1, id, &rule).is_err());
+        rule.actions.pop();
+        rule.params["channel_reply"]["template"] = json!(" ");
+        assert!(validate_custom_rule_shape(1, id, &rule).is_err());
+        rule.params["channel_reply"]["template"] = json!("😀".repeat(1001));
+        assert!(validate_custom_rule_shape(1, id, &rule).is_err());
+        rule.params = json!({ "kind": "honeypot_role", "role_id": 3, "channel_reply": { "template": "hello" } });
+        assert!(validate_custom_rule_shape(1, id, &rule).is_err());
+    }
+
+    #[test]
+    fn allowed_domains_are_bare_and_bounded() {
+        let id = "custom:01234567";
+        let mut rule = sample_rule("channel_content", json!({ "links": true }));
+        for (domain, valid) in [
+            ("EXAMPLE.test.", true),
+            ("sub.example.test", true),
+            ("*.example.test", false),
+            ("https://example.test", false),
+            ("example.test/path", false),
+            ("example.test:80", false),
+            ("example.test@other.test", false),
+            ("example..test", false),
+        ] {
+            rule.params["allowed_domains"] = json!([domain]);
+            assert_eq!(
+                validate_custom_rule_shape(1, id, &rule).is_ok(),
+                valid,
+                "{domain}"
+            );
+        }
+        rule.params["allowed_domains"] = json!(vec!["example.test"; MAX_ALLOWED_DOMAINS + 1]);
+        assert!(validate_custom_rule_shape(1, id, &rule).is_err());
     }
 
     #[test]

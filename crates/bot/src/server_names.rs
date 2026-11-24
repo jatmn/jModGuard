@@ -1,6 +1,6 @@
 //! Keeps the guild store's role and channel names current for the Web UI
-//! pickers (#621). Display data only: a failed write is logged and never
-//! affects moderation. Each refresh stores the whole snapshot again, so a missed
+//! pickers (#621) and preset channel selection. A failed write is logged and
+//! never affects live moderation. Each refresh stores the whole snapshot again, so a missed
 //! event heals on the next role or channel change or Gateway reconnect.
 
 use crate::db::guild_data::{OnboardingTrapSetup, ServerChannelName, ServerNames, ServerRoleName};

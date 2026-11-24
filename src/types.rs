@@ -222,7 +222,7 @@ where
     deserializer.deserialize_option(PatchVisitor(PhantomData))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuleDef {
     pub name: String,
     pub description: String,
@@ -275,7 +275,7 @@ impl RuleDef {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionDef {
     /// Strike count at which this action fires. Higher `at` = more severe.
     #[serde(default)]

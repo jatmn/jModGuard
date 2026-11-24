@@ -200,11 +200,14 @@ without raw report content.
 Operator UI controls and per-guild fairness remain pending. These defaults are tunable,
 not measured throughput budgets. See [logging/data status](LOGGING-DATA.md).
 
-The internal settings/schema still contain the retired `retention_days` field during
-this staged refactor. It has no live message-retention effect and is absent from API
-responses; settings requests containing it are rejected. The archive tables and helpers
-are removed from this fresh baseline. Unsupported existing databases are refused, not
-migrated or cleaned. The full tenant/case model remains future work.
+`bot.retention_days` and its environment override `JMODGUARD_RETENTION_DAYS` are
+deprecated. The bot warns at startup when either is explicitly set. Existing
+values still load as the legacy database settings fallback and have no effect on
+message or member history retention. The internal `retention_days` field is absent
+from API responses, and settings requests containing it are rejected. The archive
+tables and helpers are removed from this fresh baseline. Unsupported existing
+databases are refused, not migrated or cleaned. The full tenant/case model remains
+future work.
 
 ## Bot membership repair
 

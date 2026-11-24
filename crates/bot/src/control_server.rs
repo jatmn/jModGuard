@@ -156,6 +156,17 @@ fn forget(results: &Results, request_id: &str) {
 }
 
 pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>> {
+    spawn_listener(
+        app,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn spawn_listener(
+    app: Arc<BotState>,
+    #[cfg(test)] mut completion: Option<tokio::sync::oneshot::Sender<String>>,
+) -> anyhow::Result<Option<std::net::SocketAddr>> {
     let key = match control::load_writer_key(app.cfg.bot.control_secret.as_str()) {
         Ok(key) => key,
         Err(error) => {
@@ -230,6 +241,10 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
             };
             remember(&worker_results, &job.request_id, &reply);
             let _ = job.reply.send(reply);
+            #[cfg(test)]
+            if let Some(completion) = completion.take() {
+                let _ = completion.send(job.request_id);
+            }
         }
     });
     let nonces = Arc::new(Mutex::new(NonceWindow::new()));
@@ -529,7 +544,7 @@ mod tests {
     use crate::state::{BotState, ControlMemberFetch};
     use serenity::all::{Cache, Guild, GuildCreateEvent, Member, Permissions, Role};
     use serenity::model::id::{GuildId, RoleId, UserId};
-    use std::io::Write;
+    use std::io::{ErrorKind, Write};
     use std::net::TcpStream;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1114,7 +1129,10 @@ mod tests {
         let (bot, path) = writer_bot().await;
         let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
         allow_actor(&bot);
-        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        let bound = spawn_listener(Arc::clone(&bot), Some(completion))
+            .unwrap()
+            .unwrap();
         let hold = bot.activation.hold_rule();
         let scope = scope(&enrollment);
         let op = db::ControlOp::AddBadword {
@@ -1125,7 +1143,7 @@ mod tests {
         };
         let request_id = control::random_request_id().unwrap();
         let frame = seal_request(&op, 7, &request_id);
-        let timed_out = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut stream = TcpStream::connect(bound).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_millis(200)))
@@ -1134,27 +1152,42 @@ mod tests {
                 .set_write_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
             stream.write_all(&frame).unwrap();
-            control::read_frame(&mut stream).is_err()
-        });
-        assert!(timed_out.await.unwrap(), "the first wait must time out");
-        drop(hold);
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let count = db::list_badwords(&bot.db, enrollment.guild_id)
-                .await
-                .unwrap()
-                .len();
-            if count == 1 {
-                break;
-            }
+            let error = stream
+                .peek(&mut [0])
+                .expect_err("the first wait must time out");
             assert!(
-                std::time::Instant::now() < deadline,
-                "the accepted control operation did not finish"
+                matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+                "{error}"
             );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .unwrap();
+        drop(hold);
+        // SQLite can expose the committed row before the writer caches its reply.
+        let completed_request = tokio::time::timeout(Duration::from_secs(2), completed)
+            .await
+            .expect("the writer did not publish the control result")
+            .expect("the writer stopped before publishing the control result");
+        assert_eq!(completed_request, request_id);
+
+        let saved = submit(
+            bound,
+            seal_request(&db::ControlOp::LookupResult, 7, &request_id),
+        );
+        let rows = db::list_badwords(&bot.db, enrollment.guild_id)
+            .await
+            .unwrap();
+        let [row] = rows.as_slice() else {
+            panic!("the original request must insert one badwords row");
+        };
+        assert_eq!(
+            saved,
+            ControlReply::Saved {
+                body: serde_json::json!(row.id),
+            }
+        );
         let replay = submit(bound, seal_request(&op, 7, &request_id));
-        assert!(matches!(replay, ControlReply::Saved { .. }), "{replay:?}");
+        assert_eq!(replay, saved);
         assert_eq!(
             db::list_badwords(&bot.db, enrollment.guild_id)
                 .await

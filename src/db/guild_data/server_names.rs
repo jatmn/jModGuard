@@ -1,6 +1,7 @@
 //! The bot's latest view of a membership's role and channel names (#621), so
-//! Web UI pickers can show names instead of raw IDs. Display data only: never
-//! used for permissions or moderation decisions. One bounded JSON row per
+//! Web UI pickers can show names instead of raw IDs. The no-links preset also
+//! checks selected channel types against this snapshot on save. Permissions
+//! and live moderation decisions do not use it. One bounded JSON row per
 //! membership keeps a whole snapshot to a single write.
 use super::tenant_logs::verify_scope;
 use super::*;
