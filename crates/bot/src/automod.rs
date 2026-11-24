@@ -999,7 +999,10 @@ pub(crate) async fn execute_pending_with(
             .matched_rule
             .as_ref()
             .is_some_and(jmodguard::custom_rules::requires_include_channels);
-    if media_preset && !preset_scope_allows(settings, target.id, msg_channel, &[], false) {
+    if media_preset
+        && (pending.matched_rule.as_ref() != Some(settings)
+            || !preset_scope_allows(settings, target.id, msg_channel, &[], false))
+    {
         return false;
     }
     let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
@@ -1058,7 +1061,6 @@ pub(crate) async fn execute_pending_with(
             target.id,
             msg_channel,
             pending,
-            settings,
             resolved_member.as_ref().ok().and_then(Option::as_ref),
         )
         .await
@@ -1098,6 +1100,7 @@ pub(crate) async fn execute_pending_with(
     };
     let mut earlier_actions = Vec::new();
     let mut earlier_reasons = Vec::new();
+    let mut has_unreported_outcome = false;
     for (index, action) in actions.iter().enumerate() {
         // The previous action may have awaited Discord, logging or persistence.
         if media_preset && index != 0 {
@@ -1108,11 +1111,14 @@ pub(crate) async fn execute_pending_with(
                 target.id,
                 msg_channel,
                 pending,
-                settings,
                 provided_member.as_ref(),
             )
             .await
             else {
+                if has_unreported_outcome {
+                    apply_action_outcomes(&mut vars, &earlier_actions, &earlier_reasons, "");
+                    emit_action_report(app, http, guild_id, pending, vars).await;
+                }
                 break;
             };
             preset_dispatch = Some(dispatch);
@@ -1122,19 +1128,13 @@ pub(crate) async fn execute_pending_with(
         let rendered_reason = crate::templates::render(&action.reason, &vars);
         let reason = jmodguard::ban_reason::without_tag(&rendered_reason).to_owned();
         vars.insert("reason".into(), reason.clone());
-        let log_automod = if explicit_log {
-            action.action == "log"
-        } else {
-            settings.log_automod
-        };
-        if explicit_log && action.action == "log" && !earlier_actions.is_empty() {
-            vars.insert("action".into(), earlier_actions.join(", "));
-            if !earlier_reasons.is_empty() {
-                if !reason.is_empty() {
-                    earlier_reasons.push(format!("log: {reason}"));
-                }
-                vars.insert("reason".into(), earlier_reasons.join("; "));
-            }
+        if explicit_log && action.action == "log" {
+            apply_action_outcomes(&mut vars, &earlier_actions, &earlier_reasons, &reason);
+            emit_action_report(app, http, guild_id, pending, vars).await;
+            earlier_actions.clear();
+            earlier_reasons.clear();
+            has_unreported_outcome = false;
+            continue;
         }
         let outcome = execute_live(
             app,
@@ -1153,11 +1153,12 @@ pub(crate) async fn execute_pending_with(
             &reason,
             preset_dispatch.as_ref(),
             config_unknown,
-            log_automod,
+            !explicit_log && settings.log_automod,
             settings.open_case,
         )
         .await;
-        if explicit_log && action.action != "log" {
+        if explicit_log {
+            has_unreported_outcome |= outcome.is_some();
             let (name, status) = match outcome {
                 Some((name, CaseOutcome::Succeeded)) => (name, "succeeded"),
                 Some((name, CaseOutcome::Failed)) => (name, "failed"),
@@ -1172,6 +1173,42 @@ pub(crate) async fn execute_pending_with(
         }
     }
     true
+}
+
+fn apply_action_outcomes(
+    vars: &mut std::collections::BTreeMap<String, String>,
+    earlier_actions: &[String],
+    earlier_reasons: &[String],
+    log_reason: &str,
+) {
+    if !earlier_actions.is_empty() {
+        vars.insert("action".into(), earlier_actions.join(", "));
+    }
+    if !earlier_reasons.is_empty() {
+        let mut reason = earlier_reasons.join("; ");
+        if !log_reason.is_empty() {
+            reason.push_str("; log: ");
+            reason.push_str(log_reason);
+        }
+        vars.insert("reason".into(), reason);
+    }
+}
+
+async fn emit_action_report(
+    app: &Arc<BotState>,
+    http: &serenity::http::Http,
+    guild_id: GuildId,
+    pending: &PendingAction,
+    mut vars: std::collections::BTreeMap<String, String>,
+) {
+    vars.insert(
+        "content".into(),
+        pending.evidence["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned(),
+    );
+    logging::emit_to(app, http, guild_id, "automod", vars).await;
 }
 
 fn preset_scope_allows(
@@ -1223,7 +1260,6 @@ async fn recheck_preset(
     user: UserId,
     channel: Option<u64>,
     pending: &PendingAction,
-    checked_rule: &RuleDef,
     member: Option<&Member>,
 ) -> Option<PresetDispatch> {
     let write_generation = app.db.config_write_generation();
@@ -1233,7 +1269,7 @@ async fn recheck_preset(
     let current = cfg.rules.get(&pending.rule_id)?;
     // A change to the rule invalidates both the ordered plan and the exemption
     // decision made from it. A later message can be judged under the edit.
-    if current != checked_rule || current.dry_run {
+    if current != pending.matched_rule.as_ref()? || current.dry_run {
         return None;
     }
 
@@ -2012,15 +2048,7 @@ async fn execute_live<'a>(
     if !log_automod {
         return report;
     }
-    let mut v = vars;
-    v.insert(
-        "content".into(),
-        pending.evidence["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
-    );
-    logging::emit_to(app, http, guild_id, "automod", v).await;
+    emit_action_report(app, http, guild_id, pending, vars).await;
     report
 }
 
@@ -4723,10 +4751,13 @@ mod tests {
         RemoveChannel,
         DryRun,
         SkipRole,
+        LogOnly,
+        ReplyText,
     }
 
     #[derive(Clone, Copy)]
     enum DiscordWait {
+        BeforeDispatch,
         Member,
         Delete,
         BanLookup,
@@ -4750,13 +4781,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_media_preset_rechecks_scope_between_delete_and_reply() {
+    async fn pending_media_preset_reports_completed_delete_after_disable_without_reply() {
         edit_preset_during_discord_wait(PresetEdit::Disable, DiscordWait::Delete).await;
     }
 
     #[tokio::test]
     async fn pending_media_preset_stops_after_disable_during_ban_lookup() {
         edit_preset_during_discord_wait(PresetEdit::Disable, DiscordWait::BanLookup).await;
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_discards_changed_action_plan_before_dispatch() {
+        for edit in [PresetEdit::LogOnly, PresetEdit::ReplyText] {
+            edit_preset_during_discord_wait(edit, DiscordWait::BeforeDispatch).await;
+        }
     }
 
     async fn edit_preset_during_discord_wait(edit: PresetEdit, wait: DiscordWait) {
@@ -4814,14 +4852,22 @@ mod tests {
             )
             .await
             .unwrap();
+        crate::db::upsert_log_channel(&app.db, 10, "automod", 90)
+            .await
+            .unwrap();
         let mut rule = media_rule();
         rule.include_channels.push(71);
+        rule.log_automod = false;
+        rule.actions[0].reason = "Links or media are blocked here".into();
         if matches!(wait, DiscordWait::BanLookup) {
             rule.actions[0].action = "ban".into();
         }
-        let mut reply = rule.actions[0].clone();
-        reply.action = "channel_reply".into();
-        rule.actions.push(reply);
+        for (action, reason) in [("log", ""), ("channel_reply", "Explain the channel rule")] {
+            let mut extra = rule.actions[0].clone();
+            extra.action = action.into();
+            extra.reason = reason.into();
+            rule.actions.push(extra);
+        }
         rule.params["channel_reply"] =
             serde_json::json!({ "template": "{user} No links", "delete_after_seconds": 0 });
         let save = |rule: RuleDef| {
@@ -4858,15 +4904,16 @@ mod tests {
         member.roles = vec![RoleId::new(77)];
         let (release, release_rx) = tokio::sync::oneshot::channel();
         let gate = match wait {
-            DiscordWait::Member => ("GET", "/api/v10/guilds/10/members/99"),
-            DiscordWait::Delete => ("DELETE", "/api/v10/channels/70/messages/42"),
-            DiscordWait::BanLookup => ("GET", "/api/v10/guilds/10/bans/99"),
+            DiscordWait::BeforeDispatch => None,
+            DiscordWait::Member => Some(("GET", "/api/v10/guilds/10/members/99")),
+            DiscordWait::Delete => Some(("DELETE", "/api/v10/channels/70/messages/42")),
+            DiscordWait::BanLookup => Some(("GET", "/api/v10/guilds/10/bans/99")),
         };
         let requests = Arc::new(ReplyRequests {
             member: Some(member),
-            gate: Some(DiscordRequestGate {
-                method: gate.0,
-                path: gate.1,
+            gate: gate.map(|(method, path)| DiscordRequestGate {
+                method,
+                path,
                 entered: tokio::sync::Notify::new(),
                 release: std::sync::Mutex::new(Some(release_rx)),
             }),
@@ -4903,11 +4950,12 @@ mod tests {
             Some(70),
             &pending,
         );
-        let edit_while_waiting = async {
-            let gate = requests.gate.as_ref().unwrap();
-            tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
-                .await
-                .unwrap();
+        let edit_and_save = async {
+            if let Some(gate) = &requests.gate {
+                tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+                    .await
+                    .unwrap();
+            }
             match edit {
                 PresetEdit::Disable => rule.enabled = false,
                 PresetEdit::RemoveChannel => {
@@ -4915,28 +4963,63 @@ mod tests {
                 }
                 PresetEdit::DryRun => rule.dry_run = true,
                 PresetEdit::SkipRole => rule.whitelist_roles.push(77),
+                PresetEdit::LogOnly => rule.actions.retain(|action| action.action == "log"),
+                PresetEdit::ReplyText => {
+                    rule.params["channel_reply"]["template"] = "Updated text".into()
+                }
             }
             let result = save(rule).await;
-            release.send(()).unwrap();
+            if requests.gate.is_some() {
+                release.send(()).unwrap();
+            }
             assert!(matches!(
                 result.unwrap(),
                 crate::db::ControlReply::Saved { .. }
             ));
         };
-        let (started, ()) = tokio::join!(execution, edit_while_waiting);
-        let seen = stub.finish();
-        let mut expected = vec!["GET /api/v10/guilds/10/members/99"];
-        if !matches!(wait, DiscordWait::Member) {
-            assert!(started);
-            match wait {
-                DiscordWait::Delete => expected.push("DELETE /api/v10/channels/70/messages/42"),
-                DiscordWait::BanLookup => expected.push("GET /api/v10/guilds/10/bans/99"),
-                DiscordWait::Member => unreachable!(),
-            }
+        let started = if matches!(wait, DiscordWait::BeforeDispatch) {
+            edit_and_save.await;
+            execution.await
         } else {
-            assert!(!started);
-        }
+            tokio::join!(execution, edit_and_save).0
+        };
+        let seen = stub.finish();
+        let member = "GET /api/v10/guilds/10/members/99";
+        assert_eq!(
+            started,
+            matches!(wait, DiscordWait::Delete | DiscordWait::BanLookup),
+            "{seen:?}"
+        );
+        let expected: &[&str] = match wait {
+            DiscordWait::BeforeDispatch => &[],
+            DiscordWait::Member => &[member],
+            DiscordWait::Delete => &[
+                member,
+                "DELETE /api/v10/channels/70/messages/42",
+                "POST /api/v10/channels/90/messages",
+            ],
+            DiscordWait::BanLookup => &[member, "GET /api/v10/guilds/10/bans/99"],
+        };
         assert_eq!(seen, expected);
+        {
+            let logs = requests.logs.lock().unwrap();
+            if matches!(wait, DiscordWait::Delete) {
+                assert_eq!(logs.len(), 1);
+                let fields = logs[0]["embeds"][0]["fields"].as_array().unwrap();
+                let field = |name| {
+                    fields
+                        .iter()
+                        .find(|field| field["name"].as_str().unwrap().ends_with(name))
+                        .unwrap()["value"]
+                        .as_str()
+                        .unwrap()
+                };
+                assert_eq!(field("Action"), "delete (succeeded)");
+                assert_eq!(field("Reason"), "delete: Links or media are blocked here");
+            } else {
+                assert!(logs.is_empty());
+            }
+        }
         drop(app);
         let _ = std::fs::remove_file(&path);
         crate::tenant::remove_sidecars(&path);
