@@ -33,6 +33,8 @@ const iconsSource = fs.readFileSync(new URL('../frontend/icons.js', import.meta.
   .replace(/^import .*;$/gm, '').replaceAll('export const', 'const').replaceAll('export function', 'function');
 const listControlsSource = fs.readFileSync(new URL('../frontend/list-controls.js', import.meta.url), 'utf8')
   .replace(/^import .*;$/gm, '').replace(/^const h = React\.createElement;$/m, '').replace(/^export /gm, '');
+const noAutofillSource = fs.readFileSync(new URL('../frontend/no-autofill.js', import.meta.url), 'utf8')
+  .replace('export function', 'function');
 const source = fs.readFileSync(new URL('../frontend/app.js', import.meta.url), 'utf8')
   .replace(/^import[\s\S]*?;$/gm, '').replace(/\ncapturePreviewToken\(\);\nroot.render\(h\(App\)\);\ninit\(\);\n/, '\n');
 const pages = [];
@@ -143,7 +145,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     setInterval: timerApi.setInterval, clearInterval: timerApi.clearInterval,
     confirm, crypto: {randomUUID}, navigator: win.navigator,
   });
-  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${listControlsSource}\n${source}\n({ListControls, ListSortHeading, ListEmptyRow, useListControls, state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId, COMMAND_BEHAVIORS, PLAN_STEP_LABELS, planStepFor})`, context);
+  const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${noAutofillSource}\n${listControlsSource}\n${source}\n({ListControls, ListSortHeading, ListEmptyRow, useListControls, state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId, COMMAND_BEHAVIORS, PLAN_STEP_LABELS, planStepFor})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
   for (const guild of app.state.guilds) Object.assign(guild, { access: 'manage', can_ban_members: true, can_delete_cases: true });
@@ -183,6 +185,70 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
 }
 
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
+
+function assertPasswordManagerHints(root, ...requiredFields) {
+  for (const selector of requiredFields) {
+    assert.ok(root.querySelector(selector), `expected a rendered ${selector}`);
+  }
+  for (const field of root.querySelectorAll('input, textarea')) {
+    const label = field.getAttribute('aria-label') || field.labels?.[0]?.textContent || field.placeholder || field.localName;
+    assert.equal(field.getAttribute('autocomplete'), 'off', label);
+    assert.ok(field.hasAttribute('data-1p-ignore'), label);
+    assert.equal(field.getAttribute('data-lpignore'), 'true', label);
+    assert.ok(field.hasAttribute('data-bwignore'), label);
+    assert.equal(field.getAttribute('data-form-type'), 'other', label);
+  }
+}
+
+test('Cases fields tell password managers to ignore them', async () => {
+  const h = harness(async () => response({ cases: [] }));
+  assertPasswordManagerHints(await casesView(h), 'input[type="search"]', 'input[type="date"]');
+});
+
+test('Members fields tell password managers to ignore them', async () => {
+  const h = harness(async () => response({ members: [] }));
+  const panel = memberView(h);
+  await settle();
+  assertPasswordManagerHints(panel, 'input[type="search"]');
+});
+
+test('Commands fields tell password managers to ignore them', async () => {
+  const command = commandFixture('help', { kind: 'help' });
+  const { h } = commandEditorHarness({ commands: [builtinRecord(command)] });
+  h.app.navigate('commands');
+  const panel = h.document.querySelector('#content');
+  assertPasswordManagerHints(panel, 'input[type="checkbox"]');
+  await fire(findNode(panel, n => n.localName === 'button' && n.textContent === '+ New custom command'), 'click');
+  assertPasswordManagerHints(h.document.querySelector('.modal-overlay'), 'input[placeholder="command name"]', 'textarea');
+});
+
+test('Settings fields tell password managers to ignore them', async () => {
+  const h = settingsHarness();
+  await settle();
+  assertPasswordManagerHints(h.document, 'input');
+});
+
+test('Bot servers fields tell password managers to ignore them', async () => {
+  const h = ownerHarness(async () => response({ servers: [directoryServer] }));
+  const panel = h.app.TabOwnerServers();
+  await settle();
+  assert.match(panel.querySelector('tbody').textContent, /Alpha/);
+  assertPasswordManagerHints(panel);
+});
+
+test('Platform analytics fields tell password managers to ignore them', async () => {
+  const h = ownerHarness(async () => response(platformSnapshot()));
+  h.app.navigate('platform-analytics');
+  await settle();
+  assertPasswordManagerHints(platformPage(h), 'input[aria-label="Filter servers"]');
+});
+
+test('Bans fields and the inline reason editor tell password managers to ignore them', async () => {
+  const h = harness(async () => response(banRows()));
+  const panel = await bansView(h);
+  await fire(panel.querySelector('button[aria-label="Edit reason"]'), 'click');
+  assertPasswordManagerHints(panel, 'textarea[aria-label="jModGuard reason"]');
+});
 
 function findNode(root, predicate) {
   if (!root) return null;
