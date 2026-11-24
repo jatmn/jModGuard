@@ -1100,7 +1100,8 @@ pub(crate) async fn execute_pending_with(
     };
     let mut earlier_actions = Vec::new();
     let mut earlier_reasons = Vec::new();
-    let mut has_unreported_outcome = false;
+    let mut explicit_log_pending = explicit_log;
+    let mut has_action_outcome = false;
     for (index, action) in actions.iter().enumerate() {
         // The previous action may have awaited Discord, logging or persistence.
         if media_preset && index != 0 {
@@ -1115,7 +1116,7 @@ pub(crate) async fn execute_pending_with(
             )
             .await
             else {
-                if has_unreported_outcome {
+                if explicit_log_pending && has_action_outcome {
                     apply_action_outcomes(&mut vars, &earlier_actions, &earlier_reasons, "");
                     emit_action_report(app, http, guild_id, pending, vars).await;
                 }
@@ -1128,12 +1129,10 @@ pub(crate) async fn execute_pending_with(
         let rendered_reason = crate::templates::render(&action.reason, &vars);
         let reason = jmodguard::ban_reason::without_tag(&rendered_reason).to_owned();
         vars.insert("reason".into(), reason.clone());
-        if explicit_log && action.action == "log" {
+        if explicit_log_pending && action.action == "log" {
             apply_action_outcomes(&mut vars, &earlier_actions, &earlier_reasons, &reason);
             emit_action_report(app, http, guild_id, pending, vars).await;
-            earlier_actions.clear();
-            earlier_reasons.clear();
-            has_unreported_outcome = false;
+            explicit_log_pending = false;
             continue;
         }
         let outcome = execute_live(
@@ -1157,8 +1156,8 @@ pub(crate) async fn execute_pending_with(
             settings.open_case,
         )
         .await;
-        if explicit_log {
-            has_unreported_outcome |= outcome.is_some();
+        if explicit_log_pending {
+            has_action_outcome |= outcome.is_some();
             let (name, status) = match outcome {
                 Some((name, CaseOutcome::Succeeded)) => (name, "succeeded"),
                 Some((name, CaseOutcome::Failed)) => (name, "failed"),
@@ -4760,6 +4759,7 @@ mod tests {
         BeforeDispatch,
         Member,
         Delete,
+        DeleteAfterLog,
         BanLookup,
     }
 
@@ -4783,6 +4783,11 @@ mod tests {
     #[tokio::test]
     async fn pending_media_preset_reports_completed_delete_after_disable_without_reply() {
         edit_preset_during_discord_wait(PresetEdit::Disable, DiscordWait::Delete).await;
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_logs_once_when_disabled_during_delete_after_log() {
+        edit_preset_during_discord_wait(PresetEdit::Disable, DiscordWait::DeleteAfterLog).await;
     }
 
     #[tokio::test]
@@ -4868,6 +4873,9 @@ mod tests {
             extra.reason = reason.into();
             rule.actions.push(extra);
         }
+        if matches!(wait, DiscordWait::DeleteAfterLog) {
+            rule.actions.swap(0, 1);
+        }
         rule.params["channel_reply"] =
             serde_json::json!({ "template": "{user} No links", "delete_after_seconds": 0 });
         let save = |rule: RuleDef| {
@@ -4906,7 +4914,9 @@ mod tests {
         let gate = match wait {
             DiscordWait::BeforeDispatch => None,
             DiscordWait::Member => Some(("GET", "/api/v10/guilds/10/members/99")),
-            DiscordWait::Delete => Some(("DELETE", "/api/v10/channels/70/messages/42")),
+            DiscordWait::Delete | DiscordWait::DeleteAfterLog => {
+                Some(("DELETE", "/api/v10/channels/70/messages/42"))
+            }
             DiscordWait::BanLookup => Some(("GET", "/api/v10/guilds/10/bans/99")),
         };
         let requests = Arc::new(ReplyRequests {
@@ -4987,7 +4997,10 @@ mod tests {
         let member = "GET /api/v10/guilds/10/members/99";
         assert_eq!(
             started,
-            matches!(wait, DiscordWait::Delete | DiscordWait::BanLookup),
+            matches!(
+                wait,
+                DiscordWait::Delete | DiscordWait::DeleteAfterLog | DiscordWait::BanLookup
+            ),
             "{seen:?}"
         );
         let expected: &[&str] = match wait {
@@ -4998,12 +5011,17 @@ mod tests {
                 "DELETE /api/v10/channels/70/messages/42",
                 "POST /api/v10/channels/90/messages",
             ],
+            DiscordWait::DeleteAfterLog => &[
+                member,
+                "POST /api/v10/channels/90/messages",
+                "DELETE /api/v10/channels/70/messages/42",
+            ],
             DiscordWait::BanLookup => &[member, "GET /api/v10/guilds/10/bans/99"],
         };
         assert_eq!(seen, expected);
         {
             let logs = requests.logs.lock().unwrap();
-            if matches!(wait, DiscordWait::Delete) {
+            if matches!(wait, DiscordWait::Delete | DiscordWait::DeleteAfterLog) {
                 assert_eq!(logs.len(), 1);
                 let fields = logs[0]["embeds"][0]["fields"].as_array().unwrap();
                 let field = |name| {
@@ -5014,8 +5032,12 @@ mod tests {
                         .as_str()
                         .unwrap()
                 };
-                assert_eq!(field("Action"), "delete (succeeded)");
-                assert_eq!(field("Reason"), "delete: Links or media are blocked here");
+                if matches!(wait, DiscordWait::Delete) {
+                    assert_eq!(field("Action"), "delete (succeeded)");
+                    assert_eq!(field("Reason"), "delete: Links or media are blocked here");
+                } else {
+                    assert_eq!(field("Action"), "log");
+                }
             } else {
                 assert!(logs.is_empty());
             }
