@@ -1041,6 +1041,47 @@ pub(crate) async fn execute_pending_with(
     }
 
     let explicit_log = custom && actions.iter().any(|action| action.action == "log");
+    let enforces = actions.iter().any(|action| action.action != "log");
+    let provided_member = match resolve_rule_member(
+        app,
+        http,
+        cache,
+        guild_id,
+        target.id,
+        provided_member,
+        settings,
+        enforces,
+    )
+    .await
+    {
+        Ok(member) => member,
+        Err(RuleExemption::Exempt) => return true,
+        Err(RuleExemption::Unknown(reason)) => {
+            tracing::warn!(
+                guild_id = guild_id.get(),
+                user_id = target.id.get(),
+                rule_id = pending.rule_id.as_str(),
+                reason,
+                "automod enforcement skipped"
+            );
+            if explicit_log || settings.log_automod {
+                let skipped = actions
+                    .iter()
+                    .filter(|action| action.action != "log")
+                    .map(|action| format!("{} (skipped)", action.action))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                vars.insert("action".into(), skipped);
+                vars.insert("reason".into(), reason.into());
+                vars.insert(
+                    "content".into(),
+                    pending.evidence["content"].as_str().unwrap_or("").into(),
+                );
+                logging::emit_to(app, http, guild_id, "automod", vars).await;
+            }
+            return true;
+        }
+    };
     let mut earlier_actions = Vec::new();
     let mut earlier_reasons = Vec::new();
     for action in actions {
@@ -1081,8 +1122,6 @@ pub(crate) async fn execute_pending_with(
             config_unknown,
             log_automod,
             settings.open_case,
-            settings.skip_moderators,
-            &settings.whitelist_roles,
         )
         .await;
         if explicit_log && action.action != "log" {
@@ -1100,6 +1139,138 @@ pub(crate) async fn execute_pending_with(
         }
     }
     true
+}
+
+enum RuleExemption {
+    Exempt,
+    Unknown(&'static str),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_rule_member(
+    app: &BotState,
+    http: &serenity::http::Http,
+    cache: &serenity::cache::Cache,
+    guild_id: GuildId,
+    user_id: UserId,
+    provided: Option<Member>,
+    settings: &RuleDef,
+    enforces: bool,
+) -> Result<Option<Member>, RuleExemption> {
+    use crate::commands::{ModeratorStatus, PermLevel, permission_level};
+
+    if !settings.skip_moderators && settings.whitelist_roles.is_empty() {
+        return Ok(provided);
+    }
+    let (cached_owner, cached_member) = cache
+        .guild(guild_id)
+        .map(|guild| (Some(guild.owner_id), guild.members.get(&user_id).cloned()))
+        .unwrap_or_default();
+    if settings.skip_moderators
+        && (cached_owner == Some(user_id) || app.cfg.bot.owner_id == user_id.get())
+    {
+        return Err(RuleExemption::Exempt);
+    }
+    let fetched_guild = if settings.skip_moderators && cached_owner.is_none() && enforces {
+        if let Ok(crate::discord::DiscordCall::Finished(Ok(guild))) = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::discord::race_discord_call(&app.activation, http.get_guild(guild_id)),
+        )
+        .await
+        {
+            if guild.owner_id == user_id {
+                return Err(RuleExemption::Exempt);
+            }
+            Some(guild)
+        } else {
+            return Err(RuleExemption::Unknown(
+                "moderator status could not be confirmed",
+            ));
+        }
+    } else {
+        None
+    };
+
+    // Gateway PartialMember roles are useful even when the user field was
+    // omitted. The author ID comes from the event, not the partial member.
+    let mut member = provided.or(cached_member);
+    if member.is_none()
+        && enforces
+        && let Ok(crate::discord::DiscordCall::Finished(Ok(fetched))) = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::discord::race_discord_call(&app.activation, http.get_member(guild_id, user_id)),
+        )
+        .await
+        && fetched.user.id == user_id
+    {
+        member = Some(fetched);
+    }
+    let Some(roles) = member.as_ref().map(|member| &member.roles) else {
+        return if enforces {
+            Err(RuleExemption::Unknown(
+                "member roles could not be confirmed",
+            ))
+        } else {
+            Ok(member)
+        };
+    };
+    if roles
+        .iter()
+        .any(|role| settings.whitelist_roles.contains(&role.get()))
+    {
+        return Err(RuleExemption::Exempt);
+    }
+    if !settings.skip_moderators {
+        return Ok(member);
+    }
+
+    // Include the implicit @everyone role. A missing definition is unknown.
+    let role_ids: Vec<_> = roles
+        .iter()
+        .map(|role| role.get())
+        .chain([guild_id.get()])
+        .collect();
+    let check_roles = |roles: &HashMap<_, _>| {
+        if permission_level(
+            app.cfg.bot.owner_id,
+            roles,
+            user_id.get(),
+            role_ids.iter().copied(),
+        ) >= PermLevel::Mod
+        {
+            ModeratorStatus::Moderator
+        } else if role_ids.iter().all(|id| roles.contains_key(&(*id).into())) {
+            ModeratorStatus::Member
+        } else {
+            ModeratorStatus::Unknown
+        }
+    };
+    let mut status = fetched_guild.as_ref().map_or_else(
+        || {
+            cache
+                .guild(guild_id)
+                .map_or(ModeratorStatus::Unknown, |guild| check_roles(&guild.roles))
+        },
+        |guild| check_roles(&guild.roles),
+    );
+    if status == ModeratorStatus::Unknown
+        && cached_owner.is_some()
+        && enforces
+        && let Ok(crate::discord::DiscordCall::Finished(Ok(roles))) = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::discord::race_discord_call(&app.activation, http.get_guild_roles(guild_id)),
+        )
+        .await
+    {
+        status = check_roles(&roles.into_iter().map(|role| (role.id, role)).collect());
+    }
+    match status {
+        ModeratorStatus::Moderator => Err(RuleExemption::Exempt),
+        ModeratorStatus::Unknown if enforces => Err(RuleExemption::Unknown(
+            "moderator status could not be confirmed",
+        )),
+        _ => Ok(member),
+    }
 }
 
 /// The enforcement path of [`execute_pending_with`], after the dry-run decision.
@@ -1122,48 +1293,9 @@ async fn execute_live<'a>(
     config_unknown: bool,
     log_automod: bool,
     open_case: bool,
-    skip_moderators: bool,
-    skipped_roles: &[u64],
 ) -> Option<(&'a str, CaseOutcome)> {
-    // A missing member is not a known member with no roles. Gateway members
-    // may have no user field, but their supplied role list is still useful.
-    let role_ids: Option<Vec<u64>> = provided_member
-        .map(|member| member.roles.iter().map(|role| role.get()).collect())
-        .or_else(|| {
-            cache.guild(guild_id).and_then(|guild| {
-                guild
-                    .members
-                    .get(&target.id)
-                    .map(|member| member.roles.iter().map(|role| role.get()).collect())
-            })
-        });
-    let moderator_status =
-        role_ids
-            .as_deref()
-            .map_or(crate::commands::ModeratorStatus::Unknown, |roles| {
-                crate::commands::cached_moderator_status(
-                    app,
-                    cache,
-                    guild_id,
-                    target.id.get(),
-                    roles,
-                )
-            });
-    let known_skipped_role = role_ids
-        .as_deref()
-        .is_some_and(|roles| skipped_roles.iter().any(|role| roles.contains(role)));
-    if known_skipped_role
-        || skip_moderators && moderator_status == crate::commands::ModeratorStatus::Moderator
-    {
-        return None;
-    }
-    let moderator_unknown = moderator_status == crate::commands::ModeratorStatus::Unknown;
     let warning = if config_unknown {
         Some("rule configuration unavailable; deleting the message and skipping kick or ban")
-    } else if role_ids.is_none() && (skip_moderators || !skipped_roles.is_empty()) {
-        Some(jmodguard::custom_rules::UNKNOWN_MEMBERSHIP_WARNING)
-    } else if jmodguard::custom_rules::withhold_member_penalty(skip_moderators, moderator_unknown) {
-        Some(jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING)
     } else if pending.mention_permission_unknown {
         Some(jmodguard::custom_rules::UNKNOWN_MENTION_PERMISSION_WARNING)
     } else {
@@ -3069,7 +3201,7 @@ mod tests {
         store.replace_server_names(scope, names, 1).await.unwrap();
 
         let mut last_saved = vec![];
-        for (id, _, allowed) in channels {
+        for (id, kind, allowed) in channels {
             let mut rule = media_rule();
             rule.include_channels = vec![id];
             let result = crate::db::apply_control(
@@ -3092,6 +3224,14 @@ mod tests {
                     crate::db::ControlReply::Saved { .. }
                 ));
                 last_saved = vec![id];
+            } else if kind == ChannelType::PublicThread {
+                // Threads aren't in the snapshot. Pruning the unavailable ID
+                // still prevents the rule from targeting a thread.
+                let crate::db::ControlReply::Saved { body } = result.unwrap() else {
+                    panic!("expected a saved rule");
+                };
+                assert_eq!(body["enabled"], false);
+                last_saved.clear();
             } else {
                 assert!(
                     result
@@ -4404,6 +4544,7 @@ mod tests {
 
     #[derive(Default)]
     struct ReplyRequests {
+        member: Option<serenity::model::guild::Member>,
         posts: std::sync::Mutex<Vec<serde_json::Value>>,
         logs: std::sync::Mutex<Vec<serde_json::Value>>,
         sent_at: std::sync::OnceLock<Instant>,
@@ -4413,7 +4554,7 @@ mod tests {
 
     #[tokio::test]
     async fn media_rule_dispatches_delete_log_reply_in_order_and_expires_only_the_reply() {
-        use serenity::all::{GuildId, User, UserId};
+        use serenity::all::{Guild, GuildCreateEvent, GuildId, Member, Role, RoleId, User, UserId};
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use std::time::Duration;
@@ -4465,6 +4606,21 @@ mod tests {
         let cfg = app.configs.get(&app.db, 10).await.unwrap();
         let replies = Arc::new(ReplyRequests::default());
         let stub = DiscordStub::bind(Some(Arc::clone(&replies)));
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(10);
+        guild.owner_id = UserId::new(1);
+        let mut everyone = Role::default();
+        everyone.id = RoleId::new(10);
+        guild.roles.insert(everyone.id, everyone);
+        for id in [42, 43] {
+            let mut member = Member::default();
+            member.guild_id = guild.id;
+            member.user.id = UserId::new(id);
+            guild.members.insert(member.user.id, member);
+        }
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        stub.cache.update(&mut event);
         let mut user = User::default();
         user.id = UserId::new(42);
         user.name = "member".into();
@@ -4727,7 +4883,17 @@ mod tests {
                                     .unwrap()
                                     .push(serde_json::from_str(&request.body).unwrap());
                             }
-                            let response = if let Some(replies) = &replies
+                            let response = if request.method == "GET"
+                                && request.path == "/api/v10/guilds/10/members/99"
+                                && let Some(member) =
+                                    replies.as_ref().and_then(|fixture| fixture.member.as_ref())
+                            {
+                                let body = serde_json::to_string(member).unwrap();
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            } else if let Some(replies) = &replies
                                 && request.method == "POST"
                                 && request.path == "/api/v10/channels/70/messages"
                             {
@@ -4838,6 +5004,9 @@ mod tests {
         let mut guild = Guild::default();
         guild.id = GuildId::new(10);
         guild.owner_id = UserId::new(1);
+        let mut everyone = Role::default();
+        everyone.id = RoleId::new(10);
+        guild.roles.insert(everyone.id, everyone);
         let mut role = Role::default();
         role.id = RoleId::new(55);
         role.permissions = if moderator {
@@ -5001,6 +5170,9 @@ mod tests {
                 Ok(())
             }
         }
+        let exemption_unconfirmed =
+            expect_withheld && !matches!(config_lookup, ConfigLookup::UnreadableBuiltin);
+        let explicit_log = exemption_unconfirmed && action == "ban";
         let id = if matches!(config_lookup, ConfigLookup::UnreadableBuiltin) || action == "log" {
             "velocity"
         } else {
@@ -5034,6 +5206,20 @@ mod tests {
         rule.actions[0].duration_minutes = 5;
         rule.skip_moderators = skip_moderators;
         rule.whitelist_roles = skipped_roles;
+        if explicit_log {
+            let mut log = rule.actions[0].clone();
+            log.action = "log".into();
+            rule.actions.push(log);
+            rule.log_automod = false;
+        }
+        if action == "channel_reply" {
+            rule.params["channel_reply"] = serde_json::json!({ "template": "Explanation" });
+        }
+        if exemption_unconfirmed {
+            crate::db::upsert_log_channel(&app.db, 10, "automod", 90)
+                .await
+                .unwrap();
+        }
         if id == "velocity" {
             rule.params = serde_json::json!({ "max_messages": 0, "window_secs": 10 });
         }
@@ -5071,6 +5257,7 @@ mod tests {
         let mut everyone = Role::default();
         everyone.id = RoleId::new(10);
         guild.roles.insert(everyone.id, everyone);
+        let member_roles_missing = member_roles.is_none();
         let member = member_roles.map(|roles| {
             let mut member = Member::default();
             member.guild_id = guild.id;
@@ -5085,7 +5272,20 @@ mod tests {
             }
             member
         });
-        let stub = DiscordStub::start();
+        let fetched_member =
+            (skip_moderators && !expect_withheld && member_roles_missing && action == "delete")
+                .then(|| {
+                    let mut member = Member::default();
+                    member.guild_id = guild.id;
+                    member.user = user.clone();
+                    member
+                });
+        let stub_with_payloads = exemption_unconfirmed || fetched_member.is_some();
+        let requests = Arc::new(ReplyRequests {
+            member: fetched_member,
+            ..Default::default()
+        });
+        let stub = DiscordStub::bind(stub_with_payloads.then(|| Arc::clone(&requests)));
         let mut event: GuildCreateEvent =
             serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
         stub.cache.update(&mut event);
@@ -5113,6 +5313,12 @@ mod tests {
         .with_subscriber(subscriber)
         .await;
         let seen = stub.finish();
+        if requests.member.is_some() {
+            assert_eq!(
+                seen.first().map(String::as_str),
+                Some("GET /api/v10/guilds/10/members/99")
+            );
+        }
         let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
         let deletes = seen
             .iter()
@@ -5134,6 +5340,45 @@ mod tests {
                     && output.contains(jmodguard::custom_rules::CUSTOM_RULE_UNAVAILABLE_WARNING),
                 "{output}"
             );
+        } else if exemption_unconfirmed {
+            assert_eq!(
+                deletes, 0,
+                "an unresolved exemption prevents deletion: {seen:?}"
+            );
+            assert!(
+                seen.iter()
+                    .all(|line| line.starts_with("GET ")
+                        || line == "POST /api/v10/channels/90/messages"),
+                "only read-only lookups and the configured log may run: {seen:?}",
+            );
+            assert!(
+                crate::db::list_warns(&app.db, 10, 99)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let reports = requests.logs.lock().unwrap();
+            assert_eq!(reports.len(), 1);
+            let fields = reports[0]["embeds"][0]["fields"].as_array().unwrap();
+            let field = |name| {
+                fields
+                    .iter()
+                    .find(|field| field["name"].as_str().unwrap().ends_with(name))
+                    .unwrap()["value"]
+                    .as_str()
+                    .unwrap()
+            };
+            assert_eq!(field("Action"), format!("{action} (skipped)"));
+            let reason = if missing_role {
+                "moderator status could not be confirmed"
+            } else {
+                "member roles could not be confirmed"
+            };
+            assert_eq!(field("Reason"), reason);
+            assert!(
+                output.contains("automod enforcement skipped") && output.contains(reason),
+                "{output}"
+            );
         } else if expect_withheld || action == "delete" {
             assert_eq!(deletes, 1, "delete must run exactly once: {seen:?}");
         } else {
@@ -5148,10 +5393,12 @@ mod tests {
                     || line.starts_with("DELETE ") && line.contains("/members/"))),
                 "no ban handoff, ban, or kick: {seen:?}"
             );
-            assert!(
-                output.contains("WARN") && output.contains("skipping kick or ban"),
-                "{output}"
-            );
+            if !exemption_unconfirmed {
+                assert!(
+                    output.contains("WARN") && output.contains("skipping kick or ban"),
+                    "{output}"
+                );
+            }
             assert!(app.gateway_ban_echo_operation(10, 99).is_none());
             let scope = app.tenant.scope(enrollment).await.unwrap();
             let store = app.tenant.store(&scope).await.unwrap();
@@ -5189,8 +5436,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_roles_withhold_only_dependent_kick_and_ban() {
-        for action in ["ban", "kick"] {
+    async fn unknown_membership_skips_all_enforcement_including_ban_then_log() {
+        for action in ["ban", "kick", "delete", "timeout", "warn", "channel_reply"] {
             lookup_fallback_case(
                 action,
                 true,
@@ -5212,6 +5459,20 @@ mod tests {
             )
             .await;
         }
+    }
+
+    #[tokio::test]
+    async fn missing_gateway_member_can_be_recovered_before_enforcement() {
+        lookup_fallback_case(
+            "delete",
+            true,
+            vec![],
+            None,
+            false,
+            false,
+            ConfigLookup::Available,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -5253,15 +5514,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_role_definitions_preserve_timeout_and_warn() {
-        for action in ["delete", "timeout", "warn", "log"] {
+    async fn unknown_role_definitions_skip_every_enforcement_action() {
+        for action in ["delete", "timeout", "warn", "channel_reply"] {
             lookup_fallback_case(
                 action,
                 true,
                 vec![],
                 Some(vec![55]),
                 true,
-                false,
+                true,
                 ConfigLookup::Available,
             )
             .await;

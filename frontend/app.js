@@ -4763,7 +4763,15 @@ function CustomRuleEditor({ record: r, creating }) {
             const data = buildCustomRuleSaveBody(rule, creating);
             const saved = await api(`/api/guilds/${state.guildId}/rules/${r.rule_id}`, "PUT", { scope: "guild", data });
             if (!applyConfigPatch(saved) && !(await loadConfig())) return;
-            toast("Rule saved", "success");
+            const persisted = state.config.rules.find((record) => record.rule_id === r.rule_id)?.effective;
+            const removed = preset && persisted ? data.include_channels.length - persisted.include_channels.length : 0;
+            if (removed > 0) {
+              const channels = removed === 1 ? "1 unavailable channel" : `${removed} unavailable channels`;
+              const disabled = data.enabled && !persisted.enabled ? " The rule is now off." : "";
+              toast(`Rule saved. Removed ${channels}.${disabled}`);
+            } else {
+              toast("Rule saved", "success");
+            }
             closeOverlay();
             renderTab();
           },

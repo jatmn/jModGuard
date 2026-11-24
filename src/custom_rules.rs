@@ -220,18 +220,25 @@ pub fn requires_include_channels(rule: &RuleDef) -> bool {
     rule.params.get("preset").and_then(Value::as_str) == Some(NO_LINKS_OR_MEDIA_PRESET)
 }
 
-pub(crate) fn validate_media_preset_channels(
-    ids: &[u64],
+pub(crate) fn reconcile_media_preset_channels(
+    rule: &mut RuleDef,
     channels: &[crate::db::guild_data::ServerChannelName],
 ) -> Result<()> {
-    for id in ids {
-        let id = id.to_string();
-        ensure!(
-            channels.iter().any(|channel| {
-                channel.id == id && MEDIA_PRESET_CHANNEL_KINDS.contains(&channel.kind.as_str())
-            }),
-            "Channel {id} is unavailable for the no links or media preset. Pick a supported channel from the server list."
-        );
+    let kinds: std::collections::HashMap<_, _> = channels
+        .iter()
+        .filter_map(|channel| Some((channel.id.parse::<u64>().ok()?, channel.kind.as_str())))
+        .collect();
+    for id in &rule.include_channels {
+        if let Some(kind) = kinds.get(id) {
+            ensure!(
+                MEDIA_PRESET_CHANNEL_KINDS.contains(kind),
+                "Channel {id} is unsupported for the no links or media preset. Pick a channel with direct text chat."
+            );
+        }
+    }
+    rule.include_channels.retain(|id| kinds.contains_key(id));
+    if rule.include_channels.is_empty() {
+        rule.enabled = false;
     }
     Ok(())
 }
@@ -454,10 +461,6 @@ pub const UNKNOWN_MENTION_PERMISSION_WARNING: &str =
 /// Logged when a pending `custom:` rule is gone or its config cannot be read.
 /// No Discord action runs. Built-in rules do not use this stop.
 pub const CUSTOM_RULE_UNAVAILABLE_WARNING: &str = "custom rule unavailable; skipping the action";
-
-/// Missing membership cannot rule out a moderator or a skipped role.
-pub const UNKNOWN_MEMBERSHIP_WARNING: &str =
-    "member roles unknown; deleting the message and skipping kick or ban";
 
 /// A channel id travels with the message, so only the moderator lookup can fail.
 /// Unknown status must not be treated as permission to kick or ban.

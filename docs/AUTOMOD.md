@@ -148,8 +148,10 @@ effect while the rule is in dry-run. Rules live in stored configuration, not
    under **Only check these channels**. The picker uses the bot's channel list.
    Forum and media posts live in threads, outside this preset's channel scope.
    The preset stays off until you select a channel and turn on **Enabled**.
-   Clearing the channel list turns it off. Copies to other servers start off
-   with no channels.
+   On save, the bot removes unavailable channels and the dashboard reports the
+   change. If no channels remain, the rule turns off. You can still disable a
+   saved rule while the channel list is unavailable. Copies to other servers
+   start off with no channels.
 2. Choose what to block. **Links** includes Tenor and Giphy links from Discord's
    GIF picker. To block those GIFs while allowing ordinary links, turn off
    **Links** and leave **GIF picker links** on. **Attachments and images**
@@ -219,21 +221,15 @@ Per rule: `whitelist_roles` (role IDs), `whitelist_channels` (channel IDs),
 `whitelist_users` (user IDs). Matches skip the rule entirely. Optional
 `include_channels` limits a rule to listed channels (empty means all non-skipped
 channels). `skip_moderators` skips members at mod permission level or higher.
-Pending actions recheck moderator and skipped-role exemptions using supplied
-member roles or, when those are absent, the author's cached guild roles. A known
-exempt author is skipped before deletion, warning records, timeout, kick, or ban.
-Exact-image and repeated-text rules honor both settings on admission and again
-before enforcement. The message carries its channel, so the channel list cannot
-fail open or closed. For a pending kick or ban, unknown moderator status with
-`skip_moderators` on replaces the penalty with message deletion and a warning.
-Missing membership is distinct from a known empty role list: pending kicks or
-bans from rules that skip moderators or roles use that same fallback when member
-roles are unavailable. Rules without those role dependencies enforce normally.
-An everyone-attempt whose channel permission cannot be resolved uses the same
-fallback for kick and ban, including when skip moderators is off. Missing role
-definitions also make that permission unknown. Delete, timeout, warn, and log
-keep their normal paths without an extra message delete. A delete action runs
-once; timeout and warn do not gain a deletion, and log never deletes.
+Pending generic actions recheck moderator and skipped-role exemptions using
+Gateway member roles and the guild cache. When possible, a bounded Discord
+lookup fills in missing member or role data. If the bot still cannot confirm
+eligibility, it skips enforcement and records the skipped actions and reason
+in the configured automod log. A known exempt author is skipped entirely.
+Exact-image and repeated-text use their own enforcement path and check exemptions
+there. An everyone-attempt with resolved exemptions but unknown channel
+permission still falls back to message deletion for kick or ban. The fallback
+does not apply when the moderator or skipped-role check is unresolved.
 If a custom rule is deleted, or its configuration cannot be read, before a
 pending action runs, the bot logs a warning and takes no Discord action, including
 delete, timeout, or warn. A pending action carries the dry-run setting from

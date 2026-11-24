@@ -6887,6 +6887,36 @@ test('No links or media preset requires channels and saves ordered actions and r
   assert.deepEqual(saved.actions.map(action => action.action), ['delete', 'channel_reply', 'log']);
 });
 
+test('No links or media reports removed channels and uses the saved disabled state', async () => {
+  const id = 'custom:01234567';
+  const rule = {
+    name: 'No links or media', enabled: true, dry_run: false,
+    params: { kind: 'channel_content', preset: 'no_links_or_media', links: true },
+    actions: [{ at: 1, action: 'delete' }],
+    include_channels: ['70'],
+  };
+  const h = harness(async (_url, options) => {
+    if (options.method === 'PUT') {
+      const { data } = JSON.parse(options.body);
+      assert.equal(data.enabled, true);
+      assert.deepEqual(data.include_channels, ['70']);
+      return response({
+        ok: true,
+        config_patch: { kind: 'rule', id, scope: 'guild', value: { ...data, enabled: false, include_channels: [] } },
+      });
+    }
+    return response({ roles: [], channels: [], media_preset_channel_kinds: ['text'] });
+  });
+  const record = { rule_id: id, name: rule.name, effective: rule, guild_override: rule };
+  h.app.state.config = { enrollment_id: 'membership', rules: [record] };
+  const modal = await h.app.editRule(record);
+  await fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+  assert.equal(h.nodes.get('.modal-overlay'), null);
+  assert.equal(h.app.state.config.rules[0].effective.enabled, false);
+  assert.deepEqual(Array.from(h.app.state.config.rules[0].effective.include_channels), []);
+  assert.equal(h.nodes.get('#toast').textContent, 'Rule saved. Removed 1 unavailable channel. The rule is now off.');
+});
+
 for (const failure of [
   { status: 401, error: 'authorization expired' },
   { status: 400, error: 'authorization expired', code: 'auth_lost' },
