@@ -138,12 +138,11 @@ function OwnerTools() {
     "div",
     { id: "owner-tools", className: "owner-tools" },
     h("a", { className: "btn btn-sm", href: "/administration/index.html" }, h(Icon, { name: NAV_ICONS["administration"].icon, intent: NAV_ICONS["administration"].intent, className: "nav-icon" }), "Administration"),
-    h(
+    canManageServer() && h(
       ActionButton,
       {
         className: "btn btn-sm",
         onClick: async () => {
-          if (!state.guildId) return toast("Select a server first", "error");
           const launched = await api("/api/preview", "POST", {
             guild_id: String(state.guildId),
             profile: profile.current.value,
@@ -158,12 +157,13 @@ function OwnerTools() {
       h(Icon, { name: NAV_ICONS["view-as"].icon, intent: NAV_ICONS["view-as"].intent, className: "nav-icon" }),
       "View as…",
     ),
-    h(
+    canManageServer() && h(
       Select,
       { ref: profile, className: "select", "aria-label": "Preview profile" },
-      ...["administrator", "moderator", "member"].map((value) =>
-        h("option", { key: value, value }, value[0].toUpperCase() + value.slice(1)),
-      ),
+      h("option", { value: "administrator" }, "Administrator"),
+      h("option", { value: "moderator" }, "Moderator (read-only)"),
+      h("option", { value: "settings" }, "Settings"),
+      h("option", { value: "member" }, "Member"),
     ),
   );
 }
@@ -194,7 +194,7 @@ function ServerIcon({ guild }) {
 // small listbox: focus moves to the open list, which tracks the active option
 // with aria-activedescendant. It makes no requests; choosing a different server
 // runs the same guarded switch as before.
-function ServerPicker({ guilds, selectedId, onSelect, children }) {
+function ServerPicker({ guilds, selectedId, onSelect }) {
   const working = useContext(BusyContext);
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
@@ -275,7 +275,7 @@ function ServerPicker({ guilds, selectedId, onSelect, children }) {
       h(
         "span",
         { id: "guild-select-value", className: "server-picker-name", title: selected?.name },
-        selected ? selected.name : guilds.length ? "Select a server" : "No manageable servers",
+        selected ? selected.name : "Select a server",
       ),
     ),
     h(
@@ -312,16 +312,15 @@ function ServerPicker({ guilds, selectedId, onSelect, children }) {
           ),
         ),
     ),
-    children,
   );
 }
 
 async function switchGuild(guildId) {
   if (!canLeave()) return;
-  ui.set({ pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
+  ui.set({ pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null, editor: null });
   pendingCase = null;
   state.guildId = guildId;
-  if (!tabAllowed(state.tab)) state.tab = "dashboard";
+  state.tab = workspaceTab(state.tab);
   syncListLocation();
   state.config = null;
   ui.set({ edits: "clean" });
@@ -1723,18 +1722,9 @@ function App() {
     window.addEventListener("beforeunload", beforeUnload);
     return () => window.removeEventListener("beforeunload", beforeUnload);
   }, []);
-  // Each item's icon and its fixed meaning color come from NAV_ICONS (frontend/icons.js).
-  const navigationBase = [
-    ["Overview", [["dashboard", "Dashboard"], ["analytics", "Analytics"]]],
-    ["Moderation", [["cases", "Cases"], ["bans", "Bans"], ["members", "Members"], ["actions", "Bot actions"], ["events", "Audit Log"]]],
-    ["Automod", [["rules", "Automod Rules"], ["badwords", "Badwords"], ["known-spam", "Known spam"], ["known-bad-images", "Known-bad images"]]],
-    ["Configuration", [["settings", "Settings"], ["logchannels", "Log Channels"], ["commands", "Commands"], ["templates", "Templates"]]],
-  ];
-  // Owner sections live in the main interface, not on the separate
-  // /administration page (Updates only). They appear only for the bot owner.
-  const navigation = isBotOwner()
-    ? [...navigationBase, ["Owner", [["servers", "Bot servers"], ["resources", "Bot Resources"], ["usage", "Database Usage"], ["platform-analytics", "Platform analytics"]]]]
-    : navigationBase;
+  const navigation = workspaceNavigation
+    .map(([group, items]) => [group, items.filter(([tab]) => tabAllowed(tab))])
+    .filter(([, items]) => items.length);
   return h(
     BusyContext.Provider,
     { value: (display.activity === "busy") },
@@ -1757,46 +1747,42 @@ function App() {
               h("span", { className: "brand-mark", "aria-hidden": true }, "jG"),
               h("span", null, "jModGuard", h("small", null, "MODERATION WORKSPACE")),
             ),
-            h(
+            state.guilds.length > 0 && h(
               ServerPicker,
               { guilds: state.guilds, selectedId: state.guildId, onSelect: switchGuild },
-              state.me?.role_discovery_incomplete && h("p", { className: "muted", role: "status" },
-                "Some server access checks could not finish. ",
-                h(ActionButton, { className: "btn btn-xs", onClick: async () => {
-                  if (canLeave()) await init();
-                } }, "Retry server discovery"),
-              ),
             ),
-            h(
+            state.me?.role_discovery_incomplete && h("p", { className: "muted", role: "status" },
+              "Some server access checks could not finish. ",
+              h(ActionButton, { className: "btn btn-xs", onClick: async () => {
+                if (canLeave()) await init();
+              } }, "Retry server discovery"),
+            ),
+            navigation.length > 0 && h(
               "nav",
               { "aria-label": "Workspace navigation" },
               h(
                 "ul",
                 { id: "tabs", className: "menu w-full" },
-                ...navigation.flatMap(([group, items]) => {
-                  // Read-only access hides every Automod and Configuration page; drop the empty heading too.
-                  const allowed = items.filter(([tab]) => tabAllowed(tab));
-                  return allowed.length === 0 ? [] : [
-                    h("li", { key: `group-${group}`, className: "nav-label menu-title" }, group),
-                    ...allowed.map(([tab, label]) =>
+                ...navigation.flatMap(([group, items]) => [
+                  h("li", { key: `group-${group}`, className: "nav-label menu-title" }, group),
+                  ...items.map(([tab, label]) =>
+                    h(
+                      "li",
+                      { key: tab },
                       h(
-                        "li",
-                        { key: tab },
-                        h(
-                          ActionButton,
-                          {
-                            "data-tab": tab,
-                            className: state.tab === tab ? "active menu-active btn-active" : "",
-                            "aria-current": state.tab === tab ? "page" : undefined,
-                            onClick: () => navigate(tab),
-                          },
-                          h(Icon, { name: NAV_ICONS[tab].icon, intent: NAV_ICONS[tab].intent, className: "nav-icon" }),
-                          label,
-                        ),
+                        ActionButton,
+                        {
+                          "data-tab": tab,
+                          className: state.tab === tab ? "active menu-active btn-active" : "",
+                          "aria-current": state.tab === tab ? "page" : undefined,
+                          onClick: () => navigate(tab),
+                        },
+                        h(Icon, { name: NAV_ICONS[tab].icon, intent: NAV_ICONS[tab].intent, className: "nav-icon" }),
+                        label,
                       ),
                     ),
-                  ];
-                }),
+                  ),
+                ]),
               ),
             ),
             h(OwnerTools),
@@ -1836,15 +1822,7 @@ function App() {
               h(
                 "span",
                 { id: "workspace-status" },
-                isPreview()
-                  ? "Preview — changes disabled"
-                  : guildAccess() === "dashboard"
-                    ? "Read-only access"
-                  : (display.activity === "busy")
-                    ? "Working…"
-                    : (display.edits === "dirty")
-                      ? "Unsaved changes"
-                      : "Changes saved with each action",
+                workspaceStatus(display),
               ),
             ),
             h(
@@ -1985,15 +1963,16 @@ function Content() {
   // Owner sections cover every server the bot serves; they need no selected
   // guild or loaded configuration.
   const ownerSections = { servers: TabOwnerServers, usage: TabDatabaseUsage, "platform-analytics": TabPlatformAnalytics, resources: TabBotResources };
-  if (Object.hasOwn(ownerSections, state.tab)) return h(ownerSections[state.tab]);
-  if (!state.guildId)
+  const tab = workspaceTab(state.tab);
+  if (Object.hasOwn(ownerSections, tab)) return h(ownerSections[tab]);
+  if (!tab)
     return emptyPanel(
-      state.me?.role_discovery_incomplete ? "Server discovery incomplete" : "No servers to manage yet",
+      state.me?.role_discovery_incomplete ? "Server discovery incomplete" : "You don't have access to any servers using jModGuard",
       state.me?.role_discovery_incomplete
         ? "Some server access checks could not finish. Retry to check your servers again."
         : state.me?.role_scope_missing
-        ? "Sign out and sign in again so jModGuard can check your server roles."
-        : "Sign in with an account that has Manage Server permission, or a role a server admin granted Web UI access, in a server using jModGuard.",
+          ? "Sign out and sign in again so jModGuard can check your server roles."
+          : "",
     );
   if (!state.config)
     return emptyPanel(
@@ -2012,7 +1991,7 @@ function Content() {
         ),
       { role: "status" },
     );
-  return h((tabAllowed(state.tab) && components[state.tab]) || tabDashboard);
+  return h(components[tab]);
 }
 function renderTab() {
   const pending = ui.getSnapshot().pendingDrafts;
@@ -2066,8 +2045,14 @@ async function init() {
   try {
     state.me = await waitForApiMe();
     readSessionEnding = false;
+    const previousGuild = state.guildId;
+    const previousAccess = guildAccess();
     state.guilds = state.me.guilds;
     restoreWorkspace();
+    if (state.guildId !== previousGuild || guildAccess() !== previousAccess) {
+      state.config = null;
+      ui.set({ editor: null });
+    }
     showView("main-view");
     if (await loadConfig()) renderTab();
   } catch (error) {
@@ -2123,27 +2108,30 @@ const authLossCleanups = new Set();
 
 const actionReconcileDelays = [1000, 1500, 2500, 5000, 10000, 20000, 40000, 80000, 120000, 150000];
 
-const tabs = [
-  "dashboard",
-  "analytics",
-  "rules",
-  "badwords",
-  "known-spam",
-  "known-bad-images",
-  "commands",
-  "templates",
-  "logchannels",
-  "events",
-  "members",
-  "bans",
-  "actions",
-  "cases",
-  "settings",
-  "servers",
-  "usage",
-  "platform-analytics",
-  "resources",
+// Each sidebar entry declares the minimum access it needs.
+const workspaceNavigation = [
+  ["Overview", [
+    ["dashboard", "Dashboard", "dashboard"], ["analytics", "Analytics", "dashboard"],
+  ]],
+  ["Moderation", [
+    ["cases", "Cases", "dashboard"], ["bans", "Bans", "dashboard"], ["members", "Members", "dashboard"],
+    ["actions", "Bot actions", "dashboard"], ["events", "Audit Log", "dashboard"],
+  ]],
+  ["Automod", [
+    ["rules", "Automod Rules", "settings"], ["badwords", "Badwords", "settings"],
+    ["known-spam", "Known spam", "settings"], ["known-bad-images", "Known-bad images", "settings"],
+  ]],
+  ["Configuration", [
+    ["settings", "Settings", "settings"], ["logchannels", "Log Channels", "settings"],
+    ["commands", "Commands", "settings"], ["templates", "Templates", "settings"],
+  ]],
+  ["Owner", [
+    ["servers", "Bot servers", "owner"], ["resources", "Bot Resources", "owner"],
+    ["usage", "Database Usage", "owner"], ["platform-analytics", "Platform analytics", "owner"],
+  ]],
 ];
+const tabAccess = new Map(workspaceNavigation.flatMap(([, items]) => items.map(([tab, , access]) => [tab, access])));
+const guildAccessRank = { none: 0, dashboard: 1, settings: 2, manage: 3 };
 
 let pendingCase = null;
 
@@ -2159,10 +2147,11 @@ function restoreWorkspace() {
     /* Storage may be unavailable. */
   }
   const { list, guild } = restoreListLocation(WORKSPACE_LISTS, state.guilds);
-  const linkedGuild = WORKSPACE_LISTS.has(list) && state.guilds.find((g) => g.id === guild);
+  const linkedList = WORKSPACE_LISTS.has(list);
+  const linkedGuild = linkedList && state.guilds.find((g) => g.id === guild);
   state.guildId = linkedGuild?.id || state.guilds.find((g) => g.id === saved.guildId)?.id || state.guilds[0]?.id || null;
-  const destination = linkedGuild ? list : saved.tab;
-  state.tab = tabs.includes(destination) && tabAllowed(destination) ? destination : "dashboard";
+  state.tab = workspaceTab(linkedList ? linkedGuild ? list : null : saved.tab);
+  syncListLocation();
 }
 
 function syncListLocation() {
@@ -2225,7 +2214,7 @@ async function handleEvent(handler, event, savedFields, group) {
 function navigate(tab) {
   if (!canLeave()) return false;
   ui.set({ view: "main-view", pendingDrafts: null, drafts: {}, draftBaselines: {}, copySource: null });
-  state.tab = tabs.includes(tab) && tabAllowed(tab) ? tab : "dashboard";
+  state.tab = workspaceTab(tab);
   syncListLocation();
   persistWorkspace();
   renderTab();
@@ -2233,28 +2222,46 @@ function navigate(tab) {
 }
 
 function isBotOwner() {
-  return !!(state.me && state.me.is_bot_owner);
+  return state.me?.is_bot_owner === true && !isPreview();
 }
 
 // Web UI access in the selected server: "manage" (owner or Manage Server),
 // or a level a server admin mapped to one of the user's Discord roles. The API
 // enforces every level; hiding controls here is only presentation.
 function guildAccess() {
-  return selectedGuild()?.access || "manage";
+  const access = selectedGuild()?.access;
+  return typeof access === "string" && Object.hasOwn(guildAccessRank, access) ? access : "none";
 }
 
 function canEditSettings() {
-  return guildAccess() !== "dashboard";
+  return !isPreview() && guildAccessRank[guildAccess()] >= guildAccessRank.settings;
 }
 
 function canManageServer() {
   return guildAccess() === "manage";
 }
 
-const settingsTabs = ["rules", "badwords", "known-spam", "known-bad-images", "commands", "templates", "logchannels", "settings"];
+function canBanMembers() {
+  return !isPreview() && guildAccess() !== "none" && selectedGuild()?.can_ban_members === true;
+}
+
+function workspaceStatus({ activity, edits }) {
+  if (isPreview()) return "Preview — changes disabled";
+  if (guildAccess() === "none") return "";
+  if (!canEditSettings()) return canBanMembers() ? "Dashboard access" : "Read-only access";
+  if (activity === "busy") return "Working…";
+  if (edits === "dirty") return "Unsaved changes";
+  return "Changes saved with each action";
+}
 
 function tabAllowed(tab) {
-  return canEditSettings() || !settingsTabs.includes(tab);
+  const access = tabAccess.get(tab);
+  return access === "owner" ? isBotOwner() : guildAccessRank[guildAccess()] >= guildAccessRank[access];
+}
+
+function workspaceTab(tab) {
+  if (tabAllowed(tab)) return tab;
+  return tabAllowed("dashboard") ? "dashboard" : null;
 }
 
 let previewCapability = { kind: "absent" };
@@ -3037,7 +3044,7 @@ async function waitForApiMe() {
 async function loadConfig() {
   const guildId = state.guildId;
   const request = ++configRequest;
-  if (!guildId) {
+  if (guildAccess() === "none") {
     renderTab();
     return;
   }
@@ -3311,16 +3318,21 @@ function tabDashboard() {
   const result = useCachedApiRead(`/api/guilds/${guildId}/stats`, "stats");
   const count = (key) =>
     result.loading ? "Loading…" : result.data?.[key] == null ? "Unavailable" : String(result.data[key]);
+  const setupLinks = [
+    ["01", "Tune automod", "Review rules and test them in dry-run.", "rules"],
+    ["02", "Configure commands", "Choose commands and moderator permissions.", "commands"],
+    ["03", "Route your logs", "Connect event reports to Discord channels.", "logchannels"],
+  ].filter(([, , , tab]) => tabAllowed(tab));
   return h(
     "div",
     { className: "contents" },
     pageHeader(
       "Dashboard",
       g?.name,
-      h(ActionButton, { className: "btn btn-sm btn-primary", onClick: () => navigate("rules") }, "Review protection"),
+      tabAllowed("rules") && h(ActionButton, { className: "btn btn-sm btn-primary", onClick: () => navigate("rules") }, "Review protection"),
       h(ActionButton, { className: "btn btn-sm btn-outline", onClick: () => navigate("events") }, "View audit log"),
     ),
-    !setupComplete(cfg) &&
+    setupLinks.length > 0 && !setupComplete(cfg) &&
       h(
         "section",
         { className: "card bg-base-100 card-border getting-started" },
@@ -3331,11 +3343,7 @@ function tabDashboard() {
           h(
             "div",
             { className: "setup-links" },
-            ...[
-              ["01", "Tune automod", "Review rules and test them in dry-run.", "rules"],
-              ["02", "Configure commands", "Choose commands and moderator permissions.", "commands"],
-              ["03", "Route your logs", "Connect event reports to Discord channels.", "logchannels"],
-            ].map(([number, title, description, tab]) =>
+            ...setupLinks.map(([number, title, description, tab]) =>
               h(
                 ActionButton,
                 { className: "btn setup-link", onClick: () => navigate(tab) },
@@ -3346,7 +3354,7 @@ function tabDashboard() {
               ),
             ),
           ),
-          h(
+          canEditSettings() && h(
             "p",
             { className: "setup-note" },
             "Save in each editor. The bot picks up changes within a few seconds." +
@@ -3684,7 +3692,7 @@ function tabRules() {
     "div",
     {},
     h("h2", {}, "Automod rules"),
-    h(
+    canEditSettings() && h(
       "div",
       { className: "row", style: { marginBottom: "12px" } },
       h(
@@ -3755,7 +3763,7 @@ function ruleCard(r) {
         h(
           "div",
           { className: "card-actions" },
-          h(IconButton, { action: "edit", label: "Edit", onClick: () => editRule(r) }),
+          canEditSettings() && h(IconButton, { action: "edit", label: "Edit", onClick: () => editRule(r) }),
         ),
       ),
       h("p", {}, r.description),
@@ -4951,15 +4959,17 @@ function RuleStatusCard({ record, trigger }) {
     h(
       "div",
       { className: "card-body" },
-      h(RuleEditorHeader, {
-        key: attempt,
-        title: record.name,
-        enabled: rule.enabled,
-        dryRun: rule.dry_run,
-        disabled: inactive,
-        onEnabled: toggle("enabled"),
-        onDryRun: toggle("dry_run"),
-      }),
+      canEditSettings()
+        ? h(RuleEditorHeader, {
+            key: attempt,
+            title: record.name,
+            enabled: rule.enabled,
+            dryRun: rule.dry_run,
+            disabled: inactive,
+            onEnabled: toggle("enabled"),
+            onDryRun: toggle("dry_run"),
+          })
+        : h("h3", { className: "card-title" }, record.name),
       h(RuleSummary, {
         text: inactive
           ? `${record.name} is inactive. Open it to convert it.`
@@ -4973,7 +4983,7 @@ function RuleStatusCard({ record, trigger }) {
           : record.global
             ? h("span", { className: "badge badge-soft badge-sm badge-primary scope-tag" }, "global")
             : null,
-        h(ActionButton, { className: "btn", onClick: () => editRule(record) }, "Edit actions & exemptions"),
+        canEditSettings() && h(ActionButton, { className: "btn", onClick: () => editRule(record) }, "Edit actions & exemptions"),
       ),
     ),
   );
@@ -5108,7 +5118,7 @@ function tabBadwords() {
       ],
     }),
     h(RuleStatusCard, { record: badwordsRule(), trigger: RULE_TRIGGERS.badword.phrase() }),
-    h(
+    canEditSettings() && h(
       DraftCard,
       { group: "badwords", className: "card bg-base-100 card-border list-card list-add" },
       h(
@@ -5222,7 +5232,7 @@ function tabBadwords() {
           h(
             "td",
             {},
-            canDelete
+            canEditSettings() && (canDelete
               ? h(IconButton, {
                   action: "remove",
                   label: "Remove",
@@ -5233,12 +5243,12 @@ function tabBadwords() {
                     );
                   },
                 })
-              : h("span", { className: "muted" }, "Owner only"),
+              : h("span", { className: "muted" }, "Owner only")),
           ),
         );
       },
     }),
-    h(
+    canEditSettings() && h(
       DraftCard,
       { group: "badwords-test" },
       h(
@@ -5374,7 +5384,7 @@ function CommandEnabledCell({ record, canManage }) {
 
 function tabCommands() {
   const cmds = state.config.commands;
-  const canManage = canManageServer();
+  const canManage = canManageServer() && !isPreview();
   return h(
     "div",
     {},
@@ -6457,7 +6467,7 @@ function TemplateCard({ record: t }) {
       h(
         "div",
         { className: "template-workspace" },
-        h(
+        canEditSettings() && h(
           "div",
           { className: "template-editor" },
           field("Message template", text),
@@ -6476,7 +6486,7 @@ function TemplateCard({ record: t }) {
           h(LogEmbedPreview, { embed: preview }),
         ),
       ),
-      h(
+      canEditSettings() && h(
         "div",
         { className: "editor-footer" },
         field("Save to", scopeSel),
@@ -6598,6 +6608,14 @@ function LogChannelCard({ lc }) {
   });
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef, "This server", "Global", false);
+  if (!canEditSettings()) return h("div", { className: "card bg-base-100 card-border log-channel-card" },
+    h("div", { className: "card-body" },
+      eventHeading(lc.event),
+      h("p", null, `Destination channel: ${input.props.defaultValue || "Not set"}`),
+      h("p", null, `Ignored users or bots: ${(lc.ignore?.users || []).join(", ") || "None"}`),
+      h("p", null, `Ignored source channels: ${(lc.ignore?.channels || []).join(", ") || "None"}`),
+    ),
+  );
   return h(
     DraftCard,
     { group: `log:${lc.event}`, className: "card bg-base-100 card-border log-channel-card" },
@@ -6732,9 +6750,20 @@ function actionIsLogChannel(job) {
 }
 
 function actionCanCancel(job) {
-  if (!job || (actionIsLogChannel(job) && !canEditSettings())) return false;
-  if (job.state === "pending" || job.state === "claimed") return true;
-  return actionIsLogChannel(job) && (job.state === "running" || job.state === "uncertain");
+  if (!job || isPreview()) return false;
+  const kind = job.action?.kind;
+  const unstarted = job.state === "pending" || job.state === "claimed";
+  switch (kind) {
+    case "set_log_channel":
+      return canEditSettings() && (unstarted || job.state === "running" || job.state === "uncertain");
+    case "member_sync":
+      return canManageServer() && unstarted;
+    case "ban":
+    case "unban":
+      return canBanMembers() && unstarted;
+    default:
+      return false;
+  }
 }
 
 function actionCancelLabel(job) {
@@ -8165,7 +8194,7 @@ function CaseView({ guildId, caseId, onRemoved, onFilter }) {
       loadCaseHistory(base, controller.signal),
       apiRead(`${base}/evidence`, controller.signal),
       // Channel names are a settings-level read; read-only access keeps channel IDs.
-      canEditSettings() ? apiRead(`/api/guilds/${guildId}/server-names`, controller.signal).catch(() => null) : null,
+      tabAllowed("settings") ? apiRead(`/api/guilds/${guildId}/server-names`, controller.signal).catch(() => null) : null,
     ]).then(
       ([payload, history, evidence, serverNames]) => {
         if (controller.signal.aborted) return;
@@ -8302,7 +8331,7 @@ function CaseView({ guildId, caseId, onRemoved, onFilter }) {
       h("h3", {}, "Evidence"),
       h(CaseEvidence, { guildId, caseId, texts, files: view.files, names, channels: view.channels }),
     ),
-    canManageServer() || view.canDelete
+    !isPreview() && (canManageServer() || view.canDelete)
       ? h(
           "div",
           { className: "case-actions" },
@@ -8513,7 +8542,7 @@ function tabCases() {
                 h(
                   "td",
                   { colSpan: 5 },
-                  h(
+                  !isPreview() && h(
                     IconButton,
                     {
                       action: "retry",
@@ -8716,15 +8745,15 @@ function tabSettings() {
     },
     h("option", { value: "" }, "Select a source server"),
     ...state.guilds
-      .filter((g) => g.id !== state.guildId && (g.access || "manage") === "manage")
-      .map((g) => h("option", { value: g.id }, g.name)),
+      .filter((g) => g.id !== state.guildId && g.access === "manage")
+      .map((g) => h("option", { key: g.id, value: g.id }, g.name)),
   );
   const sectionSelRef = useRef(null);
   const sectionSel = h(
     Select,
     { ref: sectionSelRef, className: "select", draftKey: "copy:section", defaultValue: "all" },
     ["all", "rules", "badwords", "commands", "templates", "settings"].map((s) =>
-      h("option", { value: s }, s === "all" ? "everything" : s),
+      h("option", { key: s, value: s }, s === "all" ? "everything" : s),
     ),
   );
   const globalPrefixRef = useRef(null);
@@ -8766,7 +8795,14 @@ function tabSettings() {
     );
   }
 
-  const cards = [
+  const cards = [];
+  if (isPreview()) cards.push(
+    h(ListCard, { title: "This server" },
+      h("p", null, `Prefix: ${cfg.settings.prefix}`),
+      h("p", null, `Bot nickname: ${cfg.settings.bot_name || "Default"}`),
+    ),
+  );
+  else cards.push(
     h(
       DraftCard,
       { group: "settings", className: "card bg-base-100 card-border" },
@@ -8869,7 +8905,7 @@ function tabSettings() {
         ),
       ),
     ),
-  ];
+  );
 
   const [roleBaseline, setRoleBaseline] = useState("");
   const roleInputRef = useRef(null);
@@ -8883,8 +8919,9 @@ function tabSettings() {
   });
   const roleRevision = useRef("");
   const roleWriteGeneration = useRef(0);
+  const canEditCaseRemoval = canManageServer() && !isPreview() && selectedGuild()?.can_delete_cases === true;
   useEffect(() => {
-    if (!canManageServer()) return undefined;
+    if (!canEditCaseRemoval) return undefined;
     let active = true;
     const initialRoleGeneration = roleWriteGeneration.current;
     apiRead(`/api/guilds/${state.guildId}/case-delete-roles`)
@@ -8903,6 +8940,8 @@ function tabSettings() {
   }, []);
   if (canManageServer()) cards.push(
     h(AccessRolesCard, { key: "access-roles", revision: roleRevision, generation: roleWriteGeneration }),
+  );
+  if (canEditCaseRemoval) cards.push(
     h(
       DraftCard,
       { group: "roles", className: "card bg-base-100 card-border" },
@@ -8996,7 +9035,7 @@ function tabSettings() {
     );
   }
 
-  if (canManageServer()) cards.push(
+  if (canManageServer() && !isPreview()) cards.push(
     h(
       DraftCard,
       { group: "copy", className: "card bg-base-100 card-border" },
@@ -9060,7 +9099,7 @@ function tabSettings() {
 }
 
 const ACCESS_LEVELS = [
-  ["dashboard", "Dashboard (read-only)"],
+  ["dashboard", "Dashboard"],
   ["settings", "Dashboard and settings"],
 ];
 
@@ -9113,7 +9152,7 @@ function AccessRolesCard({ revision, generation }) {
       h("p", { className: "muted" }, "Members with a listed role can sign in and open this server only."),
       h(GoodToKnow, {
         items: [
-          "Dashboard access is view-only.",
+          "Discord’s Ban Members permission allows ban actions at either access level.",
           "Settings access can also edit rules, badwords, known spam and images, templates, log channels and bot settings.",
           "Commands, copying configuration, member import controls, case notes, case removal and this list need Manage Server.",
           `A removed role stops working as soon as the bot sees the change, and within ${ttl >= 120 ? `${Math.round(ttl / 60)} minutes` : `${ttl} seconds`} at most.`,
@@ -9121,7 +9160,11 @@ function AccessRolesCard({ revision, generation }) {
       }),
       rows === null
         ? h("p", { className: "muted", role: "status" }, "Loading roles…")
-        : h(
+        : isPreview()
+          ? rows.length
+            ? h("ul", null, ...rows.map((row) => h("li", { key: row.key }, `${row.role_id} — ${ACCESS_LEVELS.find(([level]) => level === row.level)?.[1] || row.level}`)))
+            : h("p", { className: "muted" }, "No roles have Web UI access.")
+          : h(
             React.Fragment,
             null,
             rows.length === 0 && h("p", { className: "muted" }, "No roles have Web UI access."),
@@ -10141,7 +10184,7 @@ function tabKnownSpam() {
       ],
     }),
     h(RuleStatusCard, { record: rule, trigger: RULE_TRIGGERS.known_spam.phrase() }),
-    h(DraftCard, { group: "known-spam", className: "card bg-base-100 card-border list-card list-add" },
+    canEditSettings() && h(DraftCard, { group: "known-spam", className: "card bg-base-100 card-border list-card list-add" },
       h("div", { className: "card-body" },
         h("h3", { className: "card-title" }, "Add spam"),
         h("div", { className: "list-form-row" },
@@ -10197,13 +10240,13 @@ function tabKnownSpam() {
         h("td", null, row.kind === "url" ? "URL pattern" : "Sample"),
         h("td", null, scopeName(row)),
         h("td", { className: "muted" }, row.note || "—"),
-        h("td", null, row.guild_id !== "0" || isBotOwner() ? h(IconButton, { action: "remove", label: "Remove",
+        h("td", null, canEditSettings() && (String(row.guild_id) !== "0" || isBotOwner() ? h(IconButton, { action: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm("Remove this known spam entry?")) return;
             await api(`/api/guilds/${guildId}/known-spam/${row.id}`, "DELETE");
             if (state.guildId === guildId && await loadConfig()) renderTab();
           },
-        }) : h("span", { className: "muted" }, "Owner only")),
+        }) : h("span", { className: "muted" }, "Owner only"))),
       ),
     }),
     h("details", { className: "card bg-base-100 card-border list-card list-extra" },
@@ -10244,7 +10287,7 @@ function tabKnownBadImages() {
       ],
     }),
     h(RuleStatusCard, { record: rule, trigger: rule ? knownBadTrigger(rule.effective) : "" }),
-    h(
+    canEditSettings() && h(
       DraftCard,
       { group: "known-bad-images", className: "card bg-base-100 card-border list-card list-add" },
       h(
@@ -10288,7 +10331,7 @@ function tabKnownBadImages() {
         h("td", { className: "list-entry-cell mono" }, row.hash),
         h("td", null, row.added_at), h("td", null, row.added_via),
         h("td", null, row.actor), h("td", { className: "muted" }, row.note || "—"),
-        h("td", null, h(IconButton, { action: "remove", label: "Remove",
+        h("td", null, canEditSettings() && h(IconButton, { action: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm(`Remove SHA-256 ${row.hash}?`)) return;
             await api(`/api/guilds/${guildId}/known-bad-images/${row.hash}`, "DELETE");
@@ -10476,14 +10519,14 @@ function BanReasonCell({ record, names, guildId, editor: reasonEditor, onEdit, o
           `Original: ${parts.text || (parts.placeholder || "No reason given").toLowerCase()}`,
         )
       : null,
-    isPreview()
-      ? null
-      : h(IconButton, {
+    canBanMembers()
+      ? h(IconButton, {
           action: "edit",
           label: "Edit reason",
           className: "btn btn-xs btn-square btn-ghost",
           onClick: () => onEdit(current || ""),
-        }),
+        })
+      : null,
   );
 }
 
@@ -10746,7 +10789,7 @@ function tabBans() {
       h(
         "td",
         null,
-        record.active &&
+        record.active && canBanMembers() &&
           h(IconButton, {
             action: "unban",
             label: `Unban ${banPersonText(user)}`,
@@ -10783,14 +10826,12 @@ function tabBans() {
     h(
       "div",
       { className: "row", style: { marginBottom: "12px" } },
-      isPreview()
-        ? null
-        : h(
-            ActionButton,
-            { type: "button", className: "btn btn-error", onClick: () => leaveReasonEditor() && openBanDialog(guildId, result.refresh) },
-            h(Icon, { name: "hammer" }),
-            "Ban user",
-          ),
+      canBanMembers() && h(
+        ActionButton,
+        { type: "button", className: "btn btn-error", onClick: () => leaveReasonEditor() && openBanDialog(guildId, result.refresh) },
+        h(Icon, { name: "hammer" }),
+        "Ban user",
+      ),
       h(ActionButton, { type: "button", className: "btn", onClick: result.refresh }, "Refresh"),
       h(LastUpdated, { result }),
     ),

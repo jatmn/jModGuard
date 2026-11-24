@@ -64,11 +64,26 @@ function apiBase() {
   return (window.JMODGUARD_API_BASE || "").replace(/\/$/, "");
 }
 
+function readPreviewToken() {
+  const fragmentToken = new window.URLSearchParams(window.location.hash.slice(1)).get("preview");
+  if (fragmentToken) return fragmentToken;
+  try {
+    return window.sessionStorage.getItem("jmodguard_preview");
+  } catch (_) {
+    return null;
+  }
+}
+
+const previewToken = readPreviewToken();
+const workspaceHref = previewToken ? `/#preview=${encodeURIComponent(previewToken)}` : "/";
+
 async function request(path, body) {
+  const headers = body === undefined ? {} : { "Content-Type": "application/json" };
+  if (previewToken) headers["x-jmodguard-preview"] = previewToken;
   const response = await fetch(apiBase() + path, {
     method: body === undefined ? "GET" : "POST",
     credentials: "include", cache: "no-store",
-    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const value = await response.json().catch(() => ({}));
@@ -85,7 +100,7 @@ async function request(path, body) {
     throw new Error("Sign in again to manage updates.");
   }
   if (response.status === 403) {
-    ui.set({ access: "denied", freshness: "stale" });
+    ui.set({ access: "denied", freshness: "stale", signIn: "optional", snapshot: null });
     clearTimeout(refreshTimer);
   }
   if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
@@ -349,11 +364,18 @@ function Administration() {
   const display = useStore(ui);
   useEffect(() => {
     const visible = () => {
-      if (document.visibilityState !== "hidden") refresh();
+      if (document.visibilityState !== "hidden" && ui.getSnapshot().access !== "denied") refresh();
     };
     document.addEventListener("visibilitychange", visible);
     return () => { document.removeEventListener("visibilitychange", visible); clearTimeout(refreshTimer); };
   }, []);
+  if (display.access === "denied" && display.signIn !== "required") return h("section", { className: "card bg-base-100 card-border" },
+    h("div", { className: "card-body" },
+      h("h1", { className: "card-title" }, "Owner access required"),
+      h("p", null, "Administration is available only to the configured bot owner."),
+      h("a", { href: workspaceHref }, "Back to workspace"),
+    ),
+  );
   const loaded = window.JMODGUARD_WEBUI_SHA || "unknown (local or legacy asset)";
   const installedWeb = display.snapshot?.components.find(item => item.component === "webui")?.observed?.source_sha || "unknown or changed outside this updater";
   const differentWeb = /^[a-f0-9]{40}$/.test(loaded) && /^[a-f0-9]{40}$/.test(installedWeb) && loaded !== installedWeb;
@@ -365,7 +387,7 @@ function Administration() {
     h("header", { className: "administration-header" },
       h("div", null, h("span", { className: "eyebrow" }, "OWNER ADMINISTRATION"), h("h1", { id: "admin-title" }, "Updates")),
       h("div", { className: "administration-tools" }, h("button", { id: "refresh-status", type: "button", className: "btn btn-sm", disabled: (display.activity === "busy"),
-        onClick: () => { if (ui.getSnapshot().activity !== "busy") { ui.set({ actionMessage: "" }); return refresh(); } } }, h(Icon, { name: ACTION_ICONS.retry.icon, intent: ACTION_ICONS.retry.intent }), "Refresh status"), h(Appearance, appearance), h("a", { className: "btn btn-sm", href: "/" }, h(Icon, { name: ACTION_ICONS.back.icon, intent: ACTION_ICONS.back.intent }), "Back to workspace"))),
+        onClick: () => { if (ui.getSnapshot().activity !== "busy") { ui.set({ actionMessage: "" }); return refresh(); } } }, h(Icon, { name: ACTION_ICONS.retry.icon, intent: ACTION_ICONS.retry.intent }), "Refresh status"), h(Appearance, appearance), h("a", { className: "btn btn-sm", href: workspaceHref }, h(Icon, { name: ACTION_ICONS.back.icon, intent: ACTION_ICONS.back.intent }), "Back to workspace"))),
     h("p", { id: "update-status", className: `alert alert-soft administration-notice ${{ good: "alert-success", warn: "alert-warning", bad: "alert-error", neutral: "" }[display.status.tone]}`, role: "status", "aria-live": "polite" }, display.status.message),
     h("div", { id: "sign-in", className: (display.signIn === "required") ? "" : "hidden" }, h("a", { id: "sign-in-link", className: "btn btn-primary", href: login }, "Sign in with Discord")),
     h("div", { id: "updates", className: display.access === "allowed" ? "" : "hidden" },

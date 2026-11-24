@@ -146,6 +146,7 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   const app = vm.runInContext(`${stateSource}\n${appearanceSource}\n${chartsSource}\n${iconsSource}\n${listControlsSource}\n${source}\n({ListControls, ListSortHeading, ListEmptyRow, useListControls, state, api, init, logout, downloadPrivate, submitBotAction, applyQueuedLogChannel, reconcileQueuedLogChannel, scheduleLogChannelReconcile, actionReconcileDelays, tabActions, tabBans, tabKnownBadImages, tabKnownSpam, tabMembers, tabCases, tabTemplates, tabLogChannels, tabAnalytics, restoreWorkspace, persistWorkspace, workspaceKey, loadConfig, applyConfigPatch, handleEvent, tabDashboard, tabSettings, renderTab, ruleCard, spamConfigured, editRule, editCommand, currentDrafts, navigate, capturePreviewToken, currentPreviewToken, returnFromPreview, parseSnowflake, splitIds, handleAuthLoss, markDirty, isDirty: () => (ui.getSnapshot().edits === "dirty"), resetDirty: () => { ui.set({ edits: "clean" }); }, isBusy: () => (ui.getSnapshot().activity === "busy"), OwnerTools, TabOwnerServers, buildCustomRuleSaveBody, newCustomRuleDraft, isCustomRuleId, COMMAND_BEHAVIORS, PLAN_STEP_LABELS, planStepFor})`, context);
   app.state.me = { user: { id: '123456789012345678' } };
   app.state.guilds = [{ id: '987654321098765432', name: 'First' }, { id: '987654321098765433', name: 'Second' }];
+  for (const guild of app.state.guilds) Object.assign(guild, { access: 'manage', can_ban_members: true, can_delete_cases: true });
   app.state.guildId = app.state.guilds[0].id;
   const fixtureContent = document.querySelector('#content');
   function mount(Component, props) {
@@ -4065,15 +4066,16 @@ async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', 
   const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
-    const json = body => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (routes(url, json, res, req)) return;
     if (url.pathname === '/api/me') return json({
       user: { id: '100000000000000001', username: 'moderator', global_name: 'Moderator' },
-      guilds, is_bot_owner: !previewMode(), preview: previewMode(),
+      guilds: guilds.map(guild => ({ access: 'manage', ...guild })),
+      is_bot_owner: !previewMode(), preview: previewMode(),
     });
     if (url.pathname.endsWith('/config')) return json({ enrollment_id: 'e1', settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
     if (url.pathname.endsWith('/analytics')) return json(browserAnalytics(Number(url.searchParams.get('days')) || 30));
     if (url.pathname.endsWith('/member-sync')) return json(memberSync);
-    if (routes(url, json, res)) return;
     if (url.pathname.startsWith('/api/')) return json({});
     const file = new URL(url.pathname === '/' ? 'index.html' : url.pathname.slice(1), dist);
     if (!file.href.startsWith(dist.href) || !fs.existsSync(file)) { res.writeHead(404); return res.end(); }
@@ -4140,6 +4142,71 @@ async function launchFirefox() {
     throw error;
   }
 }
+
+test('a fragment-only preview stays read-only on the round trip through Administration', { timeout: 60000 }, async t => {
+  if (!firefoxBinary || !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url))) {
+    assert.ok(!process.env.CI, 'CI requires Firefox and the built WebUI');
+    return t.skip('Firefox or the built WebUI is unavailable');
+  }
+  const domEvent = globalThis.Event;
+  globalThis.Event = NodeEvent;
+  let server, browser;
+  t.after(async () => {
+    await browser?.close();
+    if (server) await new Promise(resolve => server.close(resolve));
+    globalThis.Event = domEvent;
+  });
+  const preview = 'fixture-preview';
+  const calls = [];
+  server = await serveBuiltApp(() => false, undefined, {}, (url, json, _res, req) => {
+    if (url.pathname !== '/api/me' && url.pathname !== '/api/updates') return false;
+    const token = req.headers['x-jmodguard-preview'];
+    const previewActive = token === preview;
+    calls.push([url.pathname, token]);
+    if (url.pathname === '/api/updates') {
+      if (previewActive) json({ error: 'preview is read-only' }, 403);
+      else json({ components: [] });
+    } else {
+      json({
+        user: { id: '42' }, guilds: [{ id: '10', name: 'Guild', access: previewActive ? 'dashboard' : 'manage' }],
+        is_bot_owner: !previewActive, preview: previewActive ? { profile: 'moderator', guild_id: '10' } : null,
+      });
+    }
+    return true;
+  });
+  browser = await launchFirefox();
+  await browser.send('script.addPreloadScript', {
+    functionDeclaration: '() => Object.defineProperty(window, "sessionStorage", { get() { throw new Error("storage disabled"); } })',
+  });
+  const address = server.address();
+  const origin = `http://${address.address}:${address.port}`;
+  const open = url => browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
+  const read = async (selector, resultExpression) => {
+    const { result } = await browser.send('script.evaluate', {
+      target: { context: browser.context }, awaitPromise: true, expression: `(async () => {
+        for (let i = 0; i < 100; i++) {
+          const element = document.querySelector(${JSON.stringify(selector)});
+          if (element) return ${resultExpression};
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        return null;
+      })()`,
+    });
+    return result.value;
+  };
+  const dashboardTabs = 'dashboard,analytics,cases,bans,members,actions,events';
+  const tabs = () => read('#tabs', '[...element.querySelectorAll("[data-tab]")].map(tab => tab.dataset.tab).join(",")');
+  await open(`${origin}/#preview=${preview}`);
+  assert.equal(await tabs(), dashboardTabs);
+  await open(`${origin}/administration/index.html#preview=${preview}`);
+  const back = await read('#content section a', 'element.href');
+  assert.ok(back, 'the denied Administration page offers a workspace link');
+  await open(back);
+  assert.equal(await tabs(), dashboardTabs, 'return opens the same Dashboard-level navigation');
+  assert.ok(await read('#preview-banner', 'element.textContent'));
+  assert.equal(await read('#workspace-status', 'element.textContent'), 'Preview — changes disabled');
+  assert.deepEqual(calls, [['/api/me', preview], ['/api/updates', preview], ['/api/me', preview]]);
+});
 
 // Scrolls a tall workspace page, then records where the sidebar parts render.
 const sidebarLayoutProbe = `(async () => {
@@ -6022,13 +6089,8 @@ test('server switcher with one server or none', async () => {
   assert.equal(one.options()[0].getAttribute('aria-selected'), 'true');
 
   const none = await switcherHarness([]);
-  assert.equal(none.trigger().disabled, true);
-  assert.equal(none.trigger().textContent, 'No manageable servers');
-  assert.equal(none.trigger().querySelector('.server-icon'), null);
-  await fire(none.trigger(), 'click');
-  await none.key(none.trigger(), 'ArrowDown');
-  assert.equal(none.trigger().getAttribute('aria-expanded'), 'false');
-  assert.equal(none.list().hidden, true);
+  assert.equal(none.trigger(), null);
+  assert.equal(none.h.nodes.get('#guild-select-list'), null);
   assert.equal(none.options().length, 0);
 });
 
@@ -8713,8 +8775,7 @@ test('Bot servers is an owner-only navigation sub-section', () => {
   nonOwner.app.navigate('dashboard');
   assert.ok(!navLabels(nonOwner).some(label => label.includes('Bot servers')), 'non-owner never sees the section');
   nonOwner.app.navigate('servers');
-  assert.equal(nonOwner.app.state.tab, 'servers');
-  assert.match(textOf(nonOwner.document.querySelector('#content')), /Owner access required/);
+  assert.equal(nonOwner.app.state.tab, 'dashboard');
 });
 
 test('Bot servers directory renders server facts without guild-scoped reads', async () => {
@@ -8854,6 +8915,7 @@ test('Bot servers removal releases a request identity the server refuses for goo
 test('dashboard role access hides settings tabs and keeps reads in place', async () => {
   const h = harness(async () => response({}));
   h.app.state.guilds[0].access = 'dashboard';
+  h.app.state.guilds[0].can_ban_members = false;
   h.app.state.config = null;
   h.app.navigate('rules');
   assert.equal(h.app.state.tab, 'dashboard');
@@ -8866,6 +8928,150 @@ test('dashboard role access hides settings tabs and keeps reads in place', async
   h.storage.set(h.app.workspaceKey(), JSON.stringify({ guildId: h.app.state.guilds[0].id, tab: 'settings' }));
   h.app.restoreWorkspace();
   assert.equal(h.app.state.tab, 'dashboard');
+});
+
+test('workspace access and preview profiles match navigation and available controls', async () => {
+  const dashboard = ['dashboard', 'analytics', 'cases', 'bans', 'members', 'actions', 'events'];
+  const settings = [...dashboard, 'rules', 'badwords', 'known-spam', 'known-bad-images', 'settings', 'logchannels', 'commands', 'templates'];
+  const banControls = ['ban', 'edit reason', 'unban', 'cancel ban', 'cancel unban'];
+  const settingsEdits = ['custom rule', 'add words', 'add spam', 'add image', 'template save', 'log routing'];
+  const previewStatus = 'Preview — changes disabled';
+  const cfg = {
+    enrollment_id: 'membership', settings: { prefix: '!', bot_name: 'Guard' }, global_settings: { prefix: '!' },
+    rules: [], commands: [], badwords: [],
+    log_channels: [{ event: 'member_join', effective: '0' }],
+    templates: [{ event: 'member_join', effective: 'Welcome {user}' }],
+  };
+  for (const [label, access, profile, expectedStatus, expectedNav, expectedControls] of [
+    ['no servers', null, null, '', [], []],
+    ['missing access', undefined, null, '', [], []],
+    ['unknown access', 'unrecognized', null, '', [], []],
+    ['dashboard', 'dashboard', null, 'Read-only access', dashboard, []],
+    ['dashboard with Ban Members', 'dashboard', null, 'Dashboard access', dashboard, banControls],
+    ['settings', 'settings', null, 'Changes saved with each action', settings, ['protection', 'settings save', ...settingsEdits]],
+    ['Discord admin', 'manage', null, 'Changes saved with each action', settings, ['protection', ...banControls, 'settings save', 'access roles', 'case removal', 'copy', 'custom command', ...settingsEdits]],
+    ['manage only', 'manage', null, 'Changes saved with each action', settings, ['protection', 'settings save', 'access roles', 'copy', 'custom command', ...settingsEdits]],
+    ['member preview', null, 'member', previewStatus, [], []],
+    ['moderator preview', 'dashboard', 'moderator', previewStatus, dashboard, []],
+    ['settings preview', 'settings', 'settings', previewStatus, settings, ['protection']],
+    ['administrator preview', 'manage', 'administrator', previewStatus, settings, ['protection', 'access roles']],
+  ]) {
+    const guilds = access === null ? [] : [{
+      id: '10', name: 'First', access, manage: access === 'manage',
+      can_ban_members: ['Discord admin', 'dashboard with Ban Members', 'missing access'].includes(label) || profile === 'administrator',
+      can_delete_cases: label === 'Discord admin' || profile === 'administrator',
+    }];
+    const calls = [];
+    const h = harness(async (url, options) => {
+      calls.push(url);
+      if (profile) assert.equal(options.headers['x-jmodguard-preview'], 'fixture-preview', label);
+      if (url.endsWith('/api/me')) return response({
+        user: { id: '42' }, guilds, is_bot_owner: false, preview: profile ? { profile, guild_id: '10' } : null,
+      });
+      if (url.endsWith('/config')) return response(cfg);
+      if (url.includes('/bans?')) return response(banRows());
+      if (url.endsWith('/actions')) return response([
+        { ...queuedAction(), id: 'ban-job', action: { kind: 'ban', user_id: '42' } },
+        { ...queuedAction(), id: 'unban-job' },
+        { ...queuedAction('running'), id: 'log-job', action: { kind: 'set_log_channel', event: 'member_join' } },
+      ]);
+      if (/\/(access-roles|case-delete-roles)$/.test(url)) return response({ roles: [], revision: 'r1' });
+      return response({});
+    });
+    h.location.search = expectedNav.length ? '' : '?list=bans&guild=10&status=active';
+    if (profile) {
+      h.location.hash = '#preview=fixture-preview';
+      h.app.capturePreviewToken();
+    }
+    await h.app.init();
+    await settle();
+    assert.equal(h.nodes.get('#workspace-status').textContent, expectedStatus, label);
+    assert.deepEqual([...h.document.querySelectorAll('#tabs [data-tab]')].map(n => n.dataset.tab), expectedNav, label);
+    assert.equal(Boolean(h.document.querySelector('[aria-label="Workspace navigation"]')), !!expectedNav.length, label);
+    assert.equal(Boolean(h.nodes.get('#guild-select')), !!guilds.length, label);
+    assert.ok(h.nodes.get('#logout-btn'), label);
+    assert.equal(h.nodes.get('#owner-tools a'), null, label);
+    assert.doesNotMatch(h.document.body.textContent, /View as…|OWNER ADMINISTRATION/, label);
+    if (!expectedNav.length) {
+      assert.match(h.nodes.get('#content').textContent, /You don't have access to any servers using jModGuard/, label);
+      assert.equal(h.location.search, '', label);
+      assert.deepEqual(calls, ['/api/me'], label);
+    }
+    const controls = [];
+    const has = (selector) => h.nodes.get(selector);
+    const button = (name) => [...h.document.querySelectorAll('#content button')].some(n => n.textContent === name);
+    if (button('Review protection')) controls.push('protection');
+    h.app.navigate('bans');
+    await settle();
+    if (button('Ban user')) controls.push('ban');
+    if (has('#content [aria-label="Edit reason"]')) controls.push('edit reason');
+    if (has('#content [aria-label^="Unban "]')) controls.push('unban');
+    h.app.navigate('actions');
+    await settle();
+    const cancels = [...h.document.querySelectorAll('#content [aria-label="Cancel"]')];
+    for (const [kind, text] of [['ban', 'Ban 42'], ['unban', 'Unban 99']]) {
+      if (cancels.some(cancel => cancel.closest('tr').textContent.includes(text))) controls.push(`cancel ${kind}`);
+    }
+    if (access === 'dashboard') assert.equal(has('#content [aria-label="Force cancel"]'), null, label);
+    h.app.navigate('settings');
+    await settle();
+    if (button('Save')) controls.push('settings save');
+    if (h.nodes.get('#content').textContent.includes('Web UI access by role')) controls.push('access roles');
+    if (button('Save case-removal roles')) controls.push('case removal');
+    if (button('Copy')) controls.push('copy');
+    h.app.navigate('commands');
+    if (button('+ New custom command')) controls.push('custom command');
+    for (const [tab, name, control] of [
+      ['rules', 'Add custom rule', 'custom rule'],
+      ['badwords', 'Add words', 'add words'],
+      ['known-spam', 'Add sample', 'add spam'],
+      ['known-bad-images', 'Add hash', 'add image'],
+      ['templates', 'Save', 'template save'],
+      ['logchannels', 'Set', 'log routing'],
+    ]) {
+      h.app.navigate(tab);
+      if (tab === 'badwords' ? has('#content .list-add') : button(name)) controls.push(control);
+    }
+    assert.deepEqual(controls, expectedControls, label);
+    if (label === 'Discord admin' || profile === 'administrator') {
+      for (const tab of ['servers', 'resources', 'usage', 'platform-analytics']) {
+        h.app.navigate(tab);
+        assert.equal(h.app.state.tab, 'dashboard', label);
+      }
+      assert.ok(!calls.some(url => /\/api\/(owner|database-usage|platform|preview|updates)/.test(url)), label);
+    }
+  }
+});
+
+test('configured bot owner can open the fleet workspace without a server selection', async () => {
+  const calls = [];
+  const h = harness(async (url) => {
+    calls.push(url);
+    return response(url.endsWith('/api/me')
+      ? { user: { id: '42' }, is_bot_owner: true, guilds: [] }
+      : { servers: [] });
+  });
+  await h.app.init();
+  await settle();
+  assert.deepEqual([...h.document.querySelectorAll('#tabs [data-tab]')].map(n => n.dataset.tab),
+    ['servers', 'resources', 'usage', 'platform-analytics']);
+  assert.equal(h.nodes.get('#guild-select'), null);
+  assert.ok(h.nodes.get('#owner-tools a'));
+  assert.deepEqual(calls, ['/api/me']);
+  h.app.navigate('servers');
+  await settle();
+  assert.deepEqual(calls, ['/api/me', '/api/owner-servers']);
+});
+
+test('a list link for an inaccessible server falls back to Dashboard on an accessible server', async () => {
+  const h = harness(async (url) => response(url.endsWith('/api/me')
+    ? { user: { id: '42' }, guilds: [{ id: '20', name: 'Second', access: 'dashboard' }] }
+    : { enrollment_id: 'membership', rules: [], commands: [] }));
+  h.location.search = '?list=cases&guild=10&sort=date';
+  await h.app.init();
+  assert.equal(h.app.state.guildId, '20');
+  assert.equal(h.app.state.tab, 'dashboard');
+  assert.equal(h.location.search, '');
 });
 
 test('settings role access omits Manage Server cards from Settings', async () => {
@@ -8905,7 +9111,10 @@ test('access-role saves send string role IDs, levels and the loaded revision', a
   h.app.state.tab = 'settings';
   h.app.tabSettings();
   await settle();
-  assert.match(h.document.querySelector('.test-panel').textContent, /stops working as soon as the bot sees the change, and within 4 minutes at most/);
+  const panel = h.document.querySelector('.test-panel');
+  assert.equal(panel.querySelector('.access-role-row option[value="dashboard"]').textContent, 'Dashboard');
+  assert.match(panel.textContent, /Discord’s Ban Members permission allows ban actions at either access level/);
+  assert.match(panel.textContent, /stops working as soon as the bot sees the change, and within 4 minutes at most/);
   const add = h.elements.find((n) => n.localName === 'button' && n.textContent === 'Add role');
   await fire(add, 'click', {});
   const inputs = h.elements.filter((n) => n.localName === 'input' && /Discord role/.test(n.getAttribute('placeholder') || ''));
@@ -11066,7 +11275,7 @@ test('every Dashboard tile and setup link shows a colored SVG icon from the shar
   }
 });
 
-test('owner and non-owner Dashboards show the same tile and setup link icons', async () => {
+test('Dashboard tiles stay visible while setup links follow workspace access', async () => {
   const views = {
     owner: ownerHarness(async () => response({ events: 1, warns: 0, bans: 0, cases: 0 })),
     'non-owner': harness(async () => response({ events: 1, warns: 0, bans: 0, cases: 0 })),
@@ -11080,11 +11289,13 @@ test('owner and non-owner Dashboards show the same tile and setup link icons', a
     h.app.renderTab();
     await settle();
     const content = h.nodes.get('#content');
-    assert.equal(assertDashboardIcons(content, name), SETUP_LINKS.length, `${name} sees every setup link`);
-    icons[name] = [...content.querySelectorAll('.dashboard-stats svg, .setup-link svg')].map(svg => `${svg.getAttribute('data-icon')}:${svg.getAttribute('class')}`);
-    const note = textOf(content.querySelector('.setup-note'));
-    if (name === 'owner') assert.match(note, /As bot owner, you can also edit Global defaults/, name);
-    else assert.doesNotMatch(note, /Global defaults/, name);
+    const readOnly = name === 'read-only role';
+    assert.equal(assertDashboardIcons(content, name), readOnly ? 0 : SETUP_LINKS.length, name);
+    icons[name] = [...content.querySelectorAll('.dashboard-stats svg')].map(svg => `${svg.getAttribute('data-icon')}:${svg.getAttribute('class')}`);
+    const note = content.querySelector('.setup-note');
+    if (name === 'owner') assert.match(textOf(note), /As bot owner, you can also edit Global defaults/, name);
+    else if (readOnly) assert.equal(note, null);
+    else assert.doesNotMatch(textOf(note), /Global defaults/, name);
   }
   assert.deepEqual(icons['non-owner'], icons.owner, 'no owner-only icon');
   assert.deepEqual(icons['read-only role'], icons.owner);
@@ -11161,7 +11372,7 @@ test('owner sections list Database Usage, Platform analytics and Bot Resources; 
   for (const tab of ['usage', 'platform-analytics', 'resources']) {
     nonOwner.app.navigate(tab);
     await settle();
-    assert.match(textOf(nonOwner.document.querySelector('#content')), /Owner access required/, tab);
+    assert.equal(nonOwner.app.state.tab, 'dashboard', tab);
   }
   assert.ok(!calls.some(url => /database-usage|platform|resources/.test(url)), 'a non-owner never requests owner data');
 });
