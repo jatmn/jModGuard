@@ -5,7 +5,10 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Response, Server};
 use serenity::all::{EventHandler, Guild, HttpBuilder, Permissions, Role};
 use std::convert::Infallible;
+use std::future::poll_fn;
+use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
 
 const GUILD: u64 = 10;
 const TRAP_ROLE: u64 = 20;
@@ -142,16 +145,13 @@ fn invalidated_claim_cannot_complete_or_release_its_successor() {
     );
 }
 
+async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+    poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
+}
+
 #[tokio::test]
 async fn repeated_replacements_cancel_stalled_preflights_and_only_latest_dispatches() {
     use std::cell::Cell;
-    use std::future::poll_fn;
-    use std::pin::Pin;
-    use std::task::Poll;
-
-    async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
-        poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
-    }
 
     // Use one of the per-mode permits so each handoff hits the production cap.
     let recent = &RecentMatches {
@@ -447,6 +447,8 @@ async fn gateway_case(
     }
     let mut changed_rule = rule.clone();
     if let Some(pause) = pause {
+        let removed_before_claim =
+            event_kind == "during dispatch: new trap role removed before claim";
         let trigger_finished = Notify::new();
         let trigger = async {
             handler
@@ -481,7 +483,8 @@ async fn gateway_case(
                 "during dispatch: disabled"
                 | "during dispatch: dry run"
                 | "during dispatch: new trap role"
-                | "during dispatch: new trap role grant" => {
+                | "during dispatch: new trap role grant"
+                | "during dispatch: new trap role removed before claim" => {
                     match event_kind {
                         "during dispatch: disabled" => changed_rule.enabled = false,
                         "during dispatch: dry run" => changed_rule.dry_run = true,
@@ -500,14 +503,62 @@ async fn gateway_case(
                     .await
                     .unwrap();
                     app.invalidate_configs();
-                    if event_kind == "during dispatch: new trap role grant" {
+                    if event_kind == "during dispatch: new trap role grant" || removed_before_claim
+                    {
                         new_role_granted.store(true, Ordering::Relaxed);
                         latest.roles.push(RoleId::new(NEW_TRAP_ROLE));
                     }
                 }
                 _ => unreachable!(),
             }
-            if latest.roles != member.roles {
+            if removed_before_claim {
+                // Occupy both core connections so the grant and removal record
+                // Gateway roles before either can enter trap matching.
+                let mut holders = Vec::new();
+                for _ in 0..2 {
+                    let db = app.db.clone();
+                    let (held, acquired) = tokio::sync::oneshot::channel();
+                    let (release, resume) = tokio::sync::oneshot::channel::<()>();
+                    let holder = tokio::spawn(async move {
+                        db.with_conn(move |_| {
+                            held.send(()).unwrap();
+                            let _ = resume.blocking_recv();
+                            Ok(())
+                        })
+                        .await
+                        .unwrap();
+                    });
+                    acquired.await.unwrap();
+                    holders.push((release, holder));
+                }
+                assert!(ctx.cache.guild(member.guild_id).is_none());
+                let mut grant = pin!(handler.guild_member_update(
+                    ctx.clone(),
+                    Some(member.clone()),
+                    None,
+                    update(&latest)
+                ));
+                assert!(poll_once(grant.as_mut()).await.is_pending());
+                let mut removal = pin!(handler.guild_member_update(
+                    ctx.clone(),
+                    Some(latest.clone()),
+                    None,
+                    update(&member)
+                ));
+                assert!(poll_once(removal.as_mut()).await.is_pending());
+                for (release, holder) in holders {
+                    release.send(()).unwrap();
+                    holder.await.unwrap();
+                }
+                tokio::join!(grant, removal);
+                assert!(
+                    calls
+                        .lock()
+                        .iter()
+                        .any(|call| call.method == Method::GET && call.path.contains("/members/")),
+                    "the delayed grant must reach the stale REST lookup"
+                );
+            } else if latest.roles != member.roles {
                 handler
                     .guild_member_update(ctx.clone(), Some(member.clone()), None, update(&latest))
                     .await;
@@ -756,6 +807,22 @@ async fn a_grant_for_the_new_trap_role_supersedes_the_parked_old_role_match() {
         30,
         false,
         true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn gateway_role_removal_while_the_replacement_waits_for_the_directory_vetoes_the_kick() {
+    let joined_at = Timestamp::from_millis(1).unwrap();
+    let member = member(MEMBER, &[TRAP_ROLE], joined_at);
+    gateway_case(
+        member.clone(),
+        member,
+        guild(Permissions::empty()),
+        "during dispatch: new trap role removed before claim",
+        0,
+        false,
+        false,
     )
     .await;
 }

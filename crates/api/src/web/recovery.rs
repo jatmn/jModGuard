@@ -963,15 +963,8 @@ mod tests {
             .await
             .unwrap();
         assert!(fenced.irreversible);
-        let bot_cfg = crate::config::BotProcessConfig {
-            db: cfg.db.clone(),
-            ..Default::default()
-        };
-        let bot_db = jmodguard_bot::startup::open_database(&bot_cfg)
-            .await
-            .unwrap();
-        let bot_state = jmodguard_bot::startup::build_state(bot_cfg, bot_db)
-            .await
+        // The writable tenant open is the guild migration step in bot startup.
+        jmodguard::tenant::TenantRuntime::open(&db, &cfg.db, &cfg.guild_stores, &cfg.evidence)
             .unwrap();
         GuildDataStore::open(guild, registration).unwrap();
 
@@ -1017,7 +1010,7 @@ mod tests {
                 .installed;
             assert_eq!(installed, Some(target));
         }
-        drop((api_state, bot_state, router, control, db));
+        drop((api_state, router, control, db));
         std::fs::remove_dir_all(root).unwrap();
     }
 

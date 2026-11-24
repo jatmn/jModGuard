@@ -51,6 +51,8 @@ struct ActiveMatch {
     role: RoleId,
     revision: ConfigRevision,
     phase: ClaimPhase,
+    // Gateway evidence belongs to the stay, even when the claim is replaced.
+    // An empty observation also vetoes dispatch after a leave or rejoin.
     latest_roles: Option<Vec<RoleId>>,
 }
 
@@ -188,7 +190,7 @@ impl RecentMatches {
             return None;
         }
         let active = &mut claims.active[mode];
-        if let Some(previous) = active.get_mut(&subject) {
+        let latest_roles = if let Some(previous) = active.get_mut(&subject) {
             if previous.joined_at > joined_at
                 || previous.joined_at == joined_at
                     && !previous.can_replace_same_stay(role, revision)
@@ -196,9 +198,16 @@ impl RecentMatches {
                 return None;
             }
             previous.invalidate();
+            if previous.joined_at == joined_at {
+                previous.latest_roles.take()
+            } else {
+                None
+            }
         } else if active.len() >= MATCH_LIMIT {
             return None;
-        }
+        } else {
+            None
+        };
         let token = Arc::new(Notify::new());
         active.insert(
             subject,
@@ -208,7 +217,7 @@ impl RecentMatches {
                 role,
                 revision,
                 phase: ClaimPhase::Preflight,
-                latest_roles: None,
+                latest_roles,
             },
         );
         Some(MatchClaim {
@@ -227,14 +236,13 @@ impl RecentMatches {
     ) {
         for mode in &mut self.claims.lock().active {
             if let Some(active) = mode.get_mut(&(guild, user))
-                && active.phase == ClaimPhase::Preflight
+                && active.phase != ClaimPhase::Dispatched
             {
-                if let Some((joined_at, roles)) = membership
-                    && joined_at == active.joined_at
-                    && roles.contains(&active.role)
-                {
-                    active.latest_roles = Some(roles.to_vec());
-                } else {
+                let roles = membership
+                    .filter(|(joined_at, _)| *joined_at == active.joined_at)
+                    .map_or(&[][..], |(_, roles)| roles);
+                active.latest_roles = Some(roles.to_vec());
+                if !roles.contains(&active.role) {
                     active.invalidate();
                 }
             }

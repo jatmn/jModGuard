@@ -271,8 +271,10 @@ To apply a matched pair on the current core schema, use **Update bot and API tog
 
 Paired Apply supports the observed guild schema or the next guild schema when
 both images advertise support for the observed version as a migration origin.
-Both images must match the current core schema. Core schema changes require
-a coordinated base-image rollout with the bot started first.
+Both images must match the current core schema. For a core migration, start
+the new base image's baked bot before the API. On a managed installation, a
+same-ABI base-image swap restores the pinned bot and leaves the core schema
+unchanged.
 
 For the guild schema 23 → 24 upgrade, use a revision-49 or newer bot launcher.
 If the running bot launcher is older, check the matching release in
