@@ -11051,6 +11051,25 @@ test('Cases maps sortable headers and a bookmarked filtered view to the API', as
   })) assert.equal(lists().at(-1).get(key), value, key);
 });
 
+test('Cases opens the case linked from an automod cleanup after sign-in', async () => {
+  const { calls, fetchImpl } = caseFixture();
+  const h = harness(fetchImpl);
+  const { me, guilds, guildId } = h.app.state;
+  h.location.search = `?list=cases&guild=${guildId}&case=${CASE_ID}`;
+  h.app.handleAuthLoss({ status: 401 });
+  await settle();
+  const login = h.document.getElementById('login-link');
+  login.addEventListener('click', event => event.preventDefault());
+  await fire(login, 'click', { button: 0 });
+  h.location.search = '';
+  Object.assign(h.app.state, { me, guilds });
+  h.app.restoreWorkspace();
+  await casesView(h);
+  await settle();
+  assert.ok(caseDialog(h), 'the case dialog opens');
+  assert.equal(calls.filter(c => c.url.endsWith(`/guilds/${guildId}/cases/${CASE_ID}`)).length, 1);
+});
+
 test('Cases resets its filters, sort and pending search on a server switch', async () => {
   const { h, calls, trigger, options } = await switcherHarness(switcherGuilds);
   const [first, second] = switcherGuilds;

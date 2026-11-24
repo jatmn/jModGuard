@@ -2303,11 +2303,14 @@ function restoreWorkspace() {
   } catch (_) {
     /* Storage may be unavailable. */
   }
-  const { list, guild } = restoreListLocation(WORKSPACE_LISTS, state.guilds);
+  const { list, guild, caseId } = restoreListLocation(WORKSPACE_LISTS, state.guilds);
   const linkedList = WORKSPACE_LISTS.has(list);
   const linkedGuild = linkedList && state.guilds.find((g) => g.id === guild);
   state.guildId = linkedGuild?.id || state.guilds.find((g) => g.id === saved.guildId)?.id || state.guilds[0]?.id || null;
   state.tab = workspaceTab(linkedList ? linkedGuild ? list : null : saved.tab);
+  if (linkedGuild && list === "cases" && state.tab === "cases" && /^[a-f0-9]{32}$/.test(caseId ?? "")) {
+    pendingCase = { guildId: guild, caseId };
+  }
   syncListLocation();
 }
 

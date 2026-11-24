@@ -4172,10 +4172,18 @@ mod tests {
         crate::db::upsert_log_channel(&app.db, 1, "automod", 999)
             .await
             .unwrap();
-        if !log_post_delay.is_zero() {
+        let purge = matches!(change, DispatchChange::PurgeLastHour);
+        if !log_post_delay.is_zero() || purge {
             crate::db::upsert_log_channel(&app.db, 1, "automod_delete", 998)
                 .await
                 .unwrap();
+        }
+        if purge {
+            for event in ["message_delete", "message_bulk_delete"] {
+                crate::db::upsert_log_channel(&app.db, 1, event, 998)
+                    .await
+                    .unwrap();
+            }
         }
         app.poll_config_version().await.unwrap();
         let cfg = app.configs.get(&app.db, 1).await.unwrap();
@@ -4227,7 +4235,7 @@ mod tests {
                 .build(),
         );
         let ctx = delete_context(Arc::clone(&http)).await;
-        if matches!(change, DispatchChange::PurgeLastHour) {
+        if purge {
             use serenity::client::EventHandler;
             let mut message = Message::default();
             message.id = 990.into();
@@ -4239,6 +4247,12 @@ mod tests {
                 chrono::Utc::now().timestamp_millis() - 120_000,
             )
             .unwrap();
+            crate::handlers::Handler {
+                app: Arc::clone(&app),
+            }
+            .message(ctx.clone(), message.clone())
+            .await;
+            message.id = 991.into();
             crate::handlers::Handler {
                 app: Arc::clone(&app),
             }
@@ -4259,11 +4273,13 @@ mod tests {
         let server_lines = Arc::clone(&lines);
         let reports = Arc::new(Mutex::new(Vec::new()));
         let server_reports = Arc::clone(&reports);
+        let cleanup_reports = Arc::new(Mutex::new(Vec::new()));
+        let server_cleanup_reports = Arc::clone(&cleanup_reports);
         let server_stop = Arc::clone(&stop);
         let trigger = (trigger_method.to_owned(), trigger_path.to_owned());
         let runtime = tokio::runtime::Handle::current();
         let scope = scope.clone();
-        let ctx = ctx.clone();
+        let server_ctx = ctx.clone();
         let server = Server(
             stop,
             Some(std::thread::spawn(move || {
@@ -4276,6 +4292,11 @@ mod tests {
                             if path.ends_with("/channels/998/messages") && !log_post_delay.is_zero()
                             {
                                 std::thread::sleep(log_post_delay);
+                            }
+                            if purge && path.ends_with("/channels/998/messages") {
+                                server_cleanup_reports
+                                    .lock()
+                                    .push(serde_json::from_str::<serde_json::Value>(body).unwrap());
                             }
                             if path.ends_with("/channels/999/messages") {
                                 server_reports
@@ -4307,7 +4328,7 @@ mod tests {
                             let message = parts.last().unwrap().parse::<u64>().unwrap();
                             let channel = parts[parts.len() - 3].parse::<u64>().unwrap();
                             runtime.block_on(handler.message_delete(
-                                ctx.clone(),
+                                server_ctx.clone(),
                                 ChannelId::new(channel),
                                 MessageId::new(message),
                                 Some(GuildId::new(1)),
@@ -4317,6 +4338,14 @@ mod tests {
                                 None,
                                 "own echoes must remove the live observation"
                             );
+                        }
+                        if purge && method == "PUT" && path.ends_with("/bans/99") {
+                            runtime.block_on(handler.message_delete_bulk(
+                                server_ctx.clone(),
+                                ChannelId::new(199),
+                                vec![MessageId::new(991)],
+                                Some(GuildId::new(1)),
+                            ));
                         }
                         if method != trigger.0
                             || !path.ends_with(&trigger.1)
@@ -4338,7 +4367,7 @@ mod tests {
                                     "joined_at": "2026-01-01T00:00:00Z"
                                 })).unwrap();
                                 runtime.block_on(handler.guild_member_update(
-                                    ctx.clone(),
+                                    server_ctx.clone(),
                                     None,
                                     None,
                                     event,
@@ -4349,7 +4378,7 @@ mod tests {
                                     "id": "99", "username": "fixture", "discriminator": "0001", "avatar": null
                                 })).unwrap();
                                 runtime.block_on(handler.guild_member_removal(
-                                    ctx.clone(),
+                                    server_ctx.clone(),
                                     GuildId::new(1),
                                     user,
                                     None,
@@ -4357,7 +4386,7 @@ mod tests {
                             }
                             DispatchChange::OwnEchoAndExternalDelete => {
                                 runtime.block_on(handler.message_delete(
-                                    ctx.clone(),
+                                    server_ctx.clone(),
                                     ChannelId::new(102),
                                     MessageId::new(12),
                                     Some(GuildId::new(1)),
@@ -4365,7 +4394,7 @@ mod tests {
                             }
                             DispatchChange::OwnEchoAndExternalBulkDelete => {
                                 runtime.block_on(handler.message_delete_bulk(
-                                    ctx.clone(),
+                                    server_ctx.clone(),
                                     ChannelId::new(102),
                                     vec![MessageId::new(12)],
                                     Some(GuildId::new(1)),
@@ -4374,7 +4403,7 @@ mod tests {
                             DispatchChange::LateOwnDeleteEcho => {
                                 for i in 0..if known_bad { 1 } else { 3 } {
                                     runtime.block_on(handler.message_delete(
-                                        ctx.clone(),
+                                        server_ctx.clone(),
                                         ChannelId::new(100 + i),
                                         MessageId::new(10 + i),
                                         Some(GuildId::new(1)),
@@ -4434,6 +4463,28 @@ mod tests {
             "Exact image spam",
         )
         .await;
+        if purge {
+            use serenity::client::EventHandler;
+            let handler = crate::handlers::Handler {
+                app: Arc::clone(&app),
+            };
+            handler
+                .message_delete(ctx, 100.into(), 10.into(), Some(GuildId::new(1)))
+                .await;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(11)).await;
+            tokio::time::resume();
+            crate::logging::flush_cleanup_reports(&app, http.as_ref(), false).await;
+            let reports = cleanup_reports.lock();
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            let report = crate::logging::tests::log_text(&reports[0]);
+            assert!(report.contains("**Deleted:** 5"), "{report}");
+            assert!(
+                report.contains("<#100> 1, <#101> 1, <#102> 1, <#199> 2"),
+                "{report}"
+            );
+            assert!(report.contains("Banned"), "{report}");
+        }
         drop(server);
         assert_eq!(disposition, ReportDisposition::Consumed);
         assert_eq!(
@@ -4463,7 +4514,6 @@ mod tests {
             assert!(seen.is_empty(), "{seen:?}");
         }
 
-        let purge = matches!(change, DispatchChange::PurgeLastHour);
         if purge {
             assert!(
                 seen.iter()

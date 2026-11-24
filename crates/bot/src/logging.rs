@@ -15,6 +15,15 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+mod cleanup_incident;
+#[cfg(test)]
+pub(crate) use cleanup_incident::flush as flush_cleanup_reports;
+pub(crate) use cleanup_incident::{
+    Cleanup, CleanupIncidents, CleanupRule, begin_cleanup, claim_cleanup_gateway,
+    cleanup_delete_failure,
+};
+pub use cleanup_incident::{flush_cleanup_on_shutdown, run_cleanup_reports};
+
 const SNIPPET_KEEP: Duration = Duration::from_secs(600);
 const SNIPPETS_PER_GUILD: usize = 64;
 pub(crate) const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
@@ -1546,11 +1555,14 @@ async fn emit_to_observed_with_audit(
         {
             return Ok(Delivery::Sent);
         }
-        let template = cfg
-            .templates
-            .get(event)
-            .map(String::as_str)
-            .unwrap_or_else(|| default_template(event));
+        let template = if event == "automod_delete" && vars.contains_key("cleanup_total") {
+            cleanup_incident::SUMMARY_TEMPLATE
+        } else {
+            cfg.templates
+                .get(event)
+                .map(String::as_str)
+                .unwrap_or_else(|| default_template(event))
+        };
         templates::format_log_timestamps(&mut vars);
         let _ = render_log_template(event, template, &mut vars);
         if !app.activation.may_record() {
@@ -1698,6 +1710,11 @@ fn excluded(filter: &db::LogFilter, vars: &BTreeMap<String, String>) -> bool {
     user_match
         || channel_id_excluded(filter, source)
         || channel_id_excluded(filter, vars.get("before_channel_id").map(String::as_str))
+        || vars.get("cleanup_source_channels").is_some_and(|channels| {
+            channels
+                .split(',')
+                .any(|channel| channel_id_excluded(filter, Some(channel)))
+        })
 }
 
 fn channel_id_excluded(filter: &db::LogFilter, raw: Option<&str>) -> bool {
@@ -3285,6 +3302,7 @@ pub(crate) fn place_bulk_delete(
     reserve_pending: bool,
 ) -> BulkDeletePlacement {
     use crate::automod_delete_marks::GatewayDeleteObservation;
+    claim_cleanup_gateway(app, guild_id, channel, id, retained);
     let (observation, reserved_pending) = app.automod_delete_marks.observe_and_reserve_bulk_delete(
         guild_id.get(),
         channel.get(),
@@ -3331,6 +3349,7 @@ fn classify_observed_delete(
     retained: Option<&MessageSnapshot>,
 ) -> Option<MessageReport> {
     use crate::automod_delete_marks::GatewayDeleteObservation;
+    claim_cleanup_gateway(app, guild_id, channel, id, retained);
     let retained_for_mark = retained.cloned();
     let observation = app.automod_delete_marks.observe_gateway_delete(
         guild_id.get(),

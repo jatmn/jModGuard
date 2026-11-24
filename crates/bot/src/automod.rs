@@ -1907,6 +1907,35 @@ async fn execute_live<'a>(
                                 target.id.get(),
                                 Some(&operation_id),
                             );
+                            let purge_seconds = rule.ban_delete_message_seconds();
+                            let cleanup = if purge_seconds > 0 {
+                                logging::begin_cleanup(
+                                    app,
+                                    guild_id.get(),
+                                    target.id.get(),
+                                    logging::CleanupRule {
+                                        id: &pending.rule_id,
+                                        name: &pending.rule_name,
+                                        reason,
+                                        action: "ban",
+                                        sample: msg_channel.zip(msg_id).map(
+                                            |(channel, message)| {
+                                                (
+                                                    channel,
+                                                    message,
+                                                    pending.evidence["content"]
+                                                        .as_str()
+                                                        .unwrap_or(""),
+                                                )
+                                            },
+                                        ),
+                                        hash: None,
+                                    },
+                                )
+                                .await
+                            } else {
+                                None
+                            };
                             let raced = if !dispatch_is_current()
                                 || automod_member_blocked(
                                     app,
@@ -1922,6 +1951,9 @@ async fn execute_live<'a>(
                                             app.remembered_discord_targets
                                                 .capture_recovery_epoch(member_target)
                                         });
+                                if let Some(cleanup) = &cleanup {
+                                    cleanup.begin_purge(purge_seconds);
+                                }
                                 Some((
                                     recovery,
                                     crate::discord::race_discord_call(
@@ -1983,8 +2015,13 @@ async fn execute_live<'a>(
                                         app.release_gateway_case_suppression(suppression);
                                     }
                                     if app.activation.may_record() {
-                                        if let Some(attempt) = attempted {
-                                            attempt.finish(app, outcome.clone()).await;
+                                        let case = if let Some(attempt) = attempted {
+                                            attempt.finish(app, outcome.clone()).await
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(cleanup) = &cleanup {
+                                            cleanup.outcome(outcome.clone(), case);
                                         }
                                         pending_ban.finish(app, outcome.clone()).await;
                                     }
@@ -2020,7 +2057,8 @@ async fn execute_live<'a>(
                                                 http,
                                                 enrollment,
                                                 target.id.get(),
-                                                rule.ban_delete_message_seconds(),
+                                                purge_seconds,
+                                                cleanup.as_ref(),
                                                 dispatch_is_current,
                                             )
                                             .await;

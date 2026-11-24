@@ -524,6 +524,30 @@ async fn punish_proven_match(
         .await;
         return ReportDisposition::Consumed;
     }
+    let cleanup = crate::logging::begin_cleanup(
+        app,
+        found.guild,
+        found.author,
+        crate::logging::CleanupRule {
+            id: rule,
+            name,
+            reason: &found.reason,
+            action: "ban",
+            sample: found
+                .excerpts
+                .iter()
+                .find(|item| !item.text.is_empty())
+                .map(|item| {
+                    (
+                        item.channel_id as u64,
+                        item.message_id as u64,
+                        item.text.as_str(),
+                    )
+                }),
+            hash: found.proving_hashes.first(),
+        },
+    )
+    .await;
     let now = Instant::now();
     let mut deleted_count = 0;
     let mut delete_notes = Vec::new();
@@ -603,21 +627,38 @@ async fn punish_proven_match(
             Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
                 deleted_count += 1;
                 app.recent_messages.forget(found.guild, *channel, *message);
-                crate::logging::spawn_prepared_automod_delete(
-                    std::sync::Arc::clone(app),
-                    Arc::clone(&http),
-                    found.guild,
-                    *channel,
-                    *message,
-                    prepared,
-                    rule.to_owned(),
-                    name.to_owned(),
-                    found.reason.clone(),
-                )
-                .await;
+                if !cleanup.as_ref().is_some_and(|cleanup| {
+                    cleanup.deleted(app, *channel, *message, prepared, false)
+                }) {
+                    crate::logging::spawn_prepared_automod_delete(
+                        std::sync::Arc::clone(app),
+                        Arc::clone(&http),
+                        found.guild,
+                        *channel,
+                        *message,
+                        prepared,
+                        rule.to_owned(),
+                        name.to_owned(),
+                        found.reason.clone(),
+                    )
+                    .await;
+                }
                 CaseOutcome::Succeeded
             }
             Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
+                if let Some(cleanup) = &cleanup {
+                    if crate::discord::http_error_response(&error)
+                        .is_some_and(|(_, code)| code == 10008)
+                    {
+                        cleanup.deleted(app, *channel, *message, prepared, true);
+                    } else {
+                        cleanup.failed(
+                            *channel,
+                            *message,
+                            crate::logging::cleanup_delete_failure(&error),
+                        );
+                    }
+                }
                 let removal = app.automod_delete_marks.remove_unconfirmed(
                     found.guild,
                     *channel,
@@ -654,6 +695,14 @@ async fn punish_proven_match(
                 delete_outcome(&error)
             }
             Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
+                if let Some(cleanup) = &cleanup {
+                    if cleanup.deleted(app, *channel, *message, prepared, true) {
+                        delete_notes
+                            .push(format!("{channel}/{message} delete observed during purge"));
+                    } else {
+                        cleanup.failed(*channel, *message, "delete outcome unknown");
+                    }
+                }
                 if let Some(settlement) =
                     app.automod_delete_marks.take_uncertain_gateway_settlement(
                         found.guild,
@@ -784,6 +833,9 @@ async fn punish_proven_match(
                 .await
                 {
                     ban_outcome = Some(CaseOutcome::Succeeded);
+                    if let Some(cleanup) = &cleanup {
+                        cleanup.outcome(CaseOutcome::Succeeded, None);
+                    }
                 }
             }
             crate::member_directory::BanContinuation::BanThenRecord => {
@@ -823,6 +875,9 @@ async fn punish_proven_match(
                                 &found.reason,
                                 attempted.as_ref(),
                             );
+                            if let Some(cleanup) = &cleanup {
+                                cleanup.begin_purge(ban_action.ban_delete_message_seconds());
+                            }
                             if let Some(outcome) = dispatch_spam_ban(
                                 app,
                                 enrollment.clone(),
@@ -831,6 +886,7 @@ async fn punish_proven_match(
                                 now,
                                 pending_ban,
                                 attempted,
+                                cleanup.as_ref(),
                                 crate::discord::automod_ban(
                                     http.as_ref(),
                                     GuildId::new(found.guild),
@@ -848,6 +904,7 @@ async fn punish_proven_match(
                                         &enrollment,
                                         found.author,
                                         ban_action.ban_delete_message_seconds(),
+                                        cleanup.as_ref(),
                                         || true,
                                     )
                                     .await;
@@ -860,6 +917,7 @@ async fn punish_proven_match(
             }
         }
     }
+    drop(cleanup);
     let action = if proof_stale {
         "remaining actions skipped; image proof or configuration is no longer current".into()
     } else if withhold_ban {
@@ -1028,6 +1086,7 @@ async fn dispatch_spam_ban<B>(
     now: Instant,
     pending_ban: crate::member_directory::PendingBan,
     attempted: Option<crate::cases::ApplicationAttempt>,
+    cleanup: Option<&crate::logging::Cleanup<'_>>,
     ban: B,
 ) -> Option<CaseOutcome>
 where
@@ -1075,6 +1134,9 @@ where
     } else {
         None
     };
+    if let Some(cleanup) = cleanup {
+        cleanup.outcome(outcome.clone(), case_id.clone());
+    }
     pending_ban.finish(app, outcome.clone()).await;
     if matches!(outcome, CaseOutcome::Succeeded) {
         let _ = crate::db::record_enrolled_ban_if_absent(
@@ -1400,6 +1462,7 @@ pub(crate) mod tests {
                 Instant::now(),
                 pending,
                 attempted,
+                None,
                 async {
                     SPAM_PHASES.lock().push("ban-enter");
                     SPAM_PHASES.lock().push("ban-complete");

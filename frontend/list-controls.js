@@ -28,7 +28,7 @@ function emptyFilters(config) {
 
 export function readListLocation() {
   const query = new URLSearchParams(location.search);
-  return { list: query.get("list"), guild: query.get("guild") };
+  return { list: query.get("list"), guild: query.get("guild"), caseId: query.get("case") };
 }
 
 export function flushPendingListSearch(list, guildId) {
@@ -67,8 +67,10 @@ export function restoreListLocation(configs, guilds) {
       for (const key of ["list", "guild", "sort", "dir", "page_size", ...filterKeys(config), ...legacyFilterKeys(config)]) {
         if (remembered.has(key)) restored.set(key, remembered.get(key));
       }
+      const caseId = list === "cases" ? remembered.get("case") : null;
+      if (caseId) restored.set("case", caseId);
       replaceListLocation(restored);
-      return { list, guild };
+      return { list, guild, caseId };
     }
   } catch (_) {}
   return current;
@@ -80,6 +82,7 @@ export function clearListLocation(config) {
   for (const key of ["list", "guild", "sort", "dir", "page_size", ...filterKeys(config), ...legacyFilterKeys(config)]) {
     query.delete(key);
   }
+  if (config.list === "cases") query.delete("case");
   replaceListLocation(query);
 }
 

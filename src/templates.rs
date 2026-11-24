@@ -575,7 +575,7 @@ fn has_discord_id(text: &str) -> bool {
 /// internal or reserved name. Paths are dropped and an ID-bearing host is
 /// refused so a configured URL cannot carry a server ID.
 /// A name passing this check may still resolve only on a private network.
-fn public_webui_url(raw: &str) -> Option<String> {
+pub fn public_webui_url(raw: &str) -> Option<String> {
     let url = url::Url::parse(raw.trim()).ok()?;
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         return None;

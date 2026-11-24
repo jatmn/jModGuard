@@ -99,6 +99,28 @@ and persistence contracts below are unchanged.
   If both maps are full, deletion still runs and only the gateway reports it,
   without automod attribution. Restart loses these marks; durable replay is
   outside this contract.
+- **Group automod cleanup deletes** is on by default. The bot groups explicit
+  spam deletes, successful tracked ban-sweep deletes, and attributable Discord
+  purge events for the same server, user, and active rule. A purge event must
+  match a previously observed author and fall within the ban's requested
+  message-age window. Unattributed deletes use their usual single or bulk log.
+  Nearby strikes for the same rule join the open incident. After 10 seconds
+  of quiet the bot sends one summary to the Automod Delete log, or to its
+  Message Delete fallback. It includes the observed deletion time range,
+  channel counts, a bounded sample and available evidence, and a separate
+  failure count. Source and user exclusions still apply.
+- To change the settle delay, set `[log].automod_cleanup_settle_secs` or
+  `JMODGUARD_LOG_AUTOMOD_CLEANUP_SETTLE_SECS` to 5–10 seconds. To restore the
+  original per-message behavior, set `[log].group_automod_cleanup_deletes`
+  or `JMODGUARD_LOG_GROUP_AUTOMOD_CLEANUP_DELETES` to `false`. These settings
+  apply to the bot process. A case link opens the Web UI when the bot has a
+  public `bot.about_webui_url`. Otherwise the notice includes the case ID.
+- A cleanup still in progress at the 30-second cap falls back to individual
+  notices. On a planned restart the bot uses the existing shutdown window to
+  attempt individual notices for unfinished cleanups. Incident buffers and
+  echo receipts are process-local. After an abrupt stop, later Gateway
+  observations use ordinary delete logging, and already buffered reports can
+  be lost. The notice has no transcript attachment.
 - Delivery slot pressure queues at most 128 waiting reports across the bot.
   Each waits up to the configured Discord timeout for a slot, then uses the
   existing delivery deadline and filters. Routine reports include admission in

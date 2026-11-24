@@ -3,7 +3,7 @@
 use crate::db::guild_data::MessageSnapshot;
 use parking_lot::Mutex;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 const AUTOMOD_DELETE_MARK_TTL: Duration = Duration::from_secs(10 * 60);
@@ -314,6 +314,9 @@ pub(crate) struct AutomodDeleteMarks {
     entries: HashMap<MarkKey, AutomodDeleteMark>,
     by_message: HashMap<MessageTarget, Vec<MarkKey>>,
     gateway: HashMap<MessageTarget, MessageGatewayState>,
+    // Like a settled individual report, an incident owns later gateway echoes.
+    cleanup_receipts: HashSet<MessageTarget>,
+    cleanup_expiry: VecDeque<(Instant, MessageTarget)>,
     /// Pending ids kept in a bulk transcript, keyed until delivery settles.
     bulk_logs: HashMap<MessageTarget, BulkLogState>,
     /// Deadlines for delivered rows and for ambiguous rows whose REST attempts
@@ -966,6 +969,15 @@ impl AutomodDeleteMarks {
     }
 
     fn prune(&mut self, now: Instant) {
+        while self
+            .cleanup_expiry
+            .front()
+            .is_some_and(|(expires, _)| *expires <= now)
+        {
+            if let Some((_, target)) = self.cleanup_expiry.pop_front() {
+                self.cleanup_receipts.remove(&target);
+            }
+        }
         self.expire_bulk_logs(now);
         self.expire_unmarked(now);
         let wall = now_ms();
@@ -1090,6 +1102,9 @@ impl AutomodDeleteMarks {
     ) -> GatewayDeleteObservation {
         self.prune(now);
         let target = Self::message_target(guild, channel, message);
+        if self.cleanup_receipts.contains(&target) {
+            return GatewayDeleteObservation::Suppressed;
+        }
         let keys = self.mark_keys_for_message(guild, channel, message);
         if keys.is_empty() {
             if let Some(observation) = self.observe_unmarked(target, retained) {
@@ -1679,6 +1694,61 @@ impl AutomodDeleteMarkAccess {
             marks.note_report_owner(guild, channel, message, ReportOwner::Individual);
         }
         observation
+    }
+
+    /// Transfer one confirmed REST delete or author-attributed purge echo to an
+    /// incident. Any older reconciliation or bulk owner keeps its existing path.
+    pub(crate) fn claim_cleanup_delete(
+        &self,
+        target: MessageTarget,
+        prepared: Option<PreparedAutomodDelete>,
+        retained: Option<&MessageSnapshot>,
+        gateway_required: bool,
+    ) -> Option<Option<MessageSnapshot>> {
+        let mut marks = self.inner.lock();
+        let now = Instant::now();
+        marks.prune(now);
+        if marks.cleanup_receipts.len() >= MAX_AUTOMOD_DELETE_MARKS
+            || marks.cleanup_receipts.contains(&target)
+            || marks.bulk_row_owns(target)
+            || marks.unmarked.contains_key(&target)
+        {
+            return None;
+        }
+        let gateway = marks.gateway.get(&target);
+        if gateway.is_some_and(|state| state.report.is_settled())
+            || (gateway_required && !gateway.is_some_and(|state| state.receipt.is_observed()))
+        {
+            return None;
+        }
+        let (guild, channel, message) = target;
+        let snapshot = if let Some(prepared) = prepared {
+            let key = AutomodDeleteMarks::mark_key(guild, channel, message, prepared.attempt);
+            let entry = marks.entries.get(&key)?;
+            if entry.confirmation.is_confirmed()
+                || !marks
+                    .by_message
+                    .get(&target)
+                    .is_some_and(|keys| keys.len() == 1)
+            {
+                return None;
+            }
+            let snapshot = gateway
+                .and_then(|state| state.retained.clone())
+                .or_else(|| entry.retained.clone());
+            marks.remove_key(key, now);
+            snapshot
+        } else {
+            if marks.live_marks(target) {
+                return None;
+            }
+            retained.cloned()
+        };
+        marks.cleanup_receipts.insert(target);
+        marks
+            .cleanup_expiry
+            .push_back((now + AUTOMOD_DELETE_MARK_TTL, target));
+        Some(settlement_retained(snapshot))
     }
 
     /// A pending id stayed in a bulk transcript.

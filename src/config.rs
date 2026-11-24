@@ -219,6 +219,8 @@ pub struct LogConfig {
     pub directory: PathBuf,
     pub discord_concurrency: usize,
     pub discord_timeout_secs: u64,
+    pub group_automod_cleanup_deletes: bool,
+    pub automod_cleanup_settle_secs: u64,
 }
 
 impl Default for DbConfig {
@@ -442,6 +444,8 @@ impl Default for LogConfig {
             directory: PathBuf::from("logs"),
             discord_concurrency: 8,
             discord_timeout_secs: 10,
+            group_automod_cleanup_deletes: true,
+            automod_cleanup_settle_secs: 10,
         }
     }
 }
@@ -682,6 +686,10 @@ impl Config {
         if !api {
             cfg.enrollment.validate()?;
             cfg.image_spam.validate()?;
+            anyhow::ensure!(
+                (5..=10).contains(&cfg.log.automod_cleanup_settle_secs),
+                "log.automod_cleanup_settle_secs must be between 5 and 10"
+            );
             cfg.action_worker.validate()?;
             cfg.member_sync.validate()?;
         }
@@ -822,6 +830,17 @@ impl Config {
                 self.image_spam = serde_json::from_str(&raw)
                     .context("invalid JMODGUARD_IMAGE_SPAM_LIMITS JSON")?;
                 self.image_spam.validate()?;
+            }
+            if let Ok(raw) = env::var("JMODGUARD_LOG_GROUP_AUTOMOD_CLEANUP_DELETES") {
+                self.log.group_automod_cleanup_deletes = raw
+                    .trim()
+                    .parse()
+                    .context("JMODGUARD_LOG_GROUP_AUTOMOD_CLEANUP_DELETES must be true or false")?;
+            }
+            if let Ok(raw) = env::var("JMODGUARD_LOG_AUTOMOD_CLEANUP_SETTLE_SECS") {
+                self.log.automod_cleanup_settle_secs = raw.trim().parse().context(
+                    "JMODGUARD_LOG_AUTOMOD_CLEANUP_SETTLE_SECS must be between 5 and 10",
+                )?;
             }
             self.enrollment.apply_env()?;
             self.action_worker.apply_env()?;
