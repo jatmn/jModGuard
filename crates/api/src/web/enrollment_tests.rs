@@ -9825,6 +9825,7 @@ async fn server_names_serve_the_bot_snapshot_with_string_ids_and_no_discord_call
             bot_can_kick: Some(false),
             roles_at_or_above_bot: vec!["9007199254740993".into()],
             roles_with_grants: vec!["9007199254740993".into()],
+            roles_with_member_grants: vec!["9007199254740993".into()],
         }),
     };
     assert!(
@@ -9849,6 +9850,7 @@ async fn server_names_serve_the_bot_snapshot_with_string_ids_and_no_discord_call
                     "bot_can_kick": false,
                     "roles_at_or_above_bot": ["9007199254740993"],
                     "roles_with_grants": ["9007199254740993"],
+                    "roles_with_member_grants": ["9007199254740993"],
                 },
             })
         );

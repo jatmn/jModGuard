@@ -5,6 +5,7 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Response, Server};
 use serenity::all::{EventHandler, Guild, HttpBuilder, Permissions, Role};
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const GUILD: u64 = 10;
 const TRAP_ROLE: u64 = 20;
@@ -157,6 +158,30 @@ async fn gateway_case(
     }
     app.invalidate_configs();
 
+    let fenced = event_kind == "retry after fence";
+    if fenced {
+        use crate::db::SqlExecutor as _;
+        let destination = scope.placement().store_id().as_str().to_owned();
+        app.db
+            .with_conn(move |conn| {
+                conn.execute_bounded(
+                    "INSERT INTO guild_write_fences(
+                    guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                 ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                    crate::db::params![GUILD as i64, format!("{:032x}", 9_u128), destination],
+                    64 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    let staff_veto = Arc::new(AtomicBool::new(event_kind == "retry after staff veto"));
+    let server_staff_veto = staff_veto.clone();
+    let mut staff_member = discord_member.clone();
+    staff_member.roles.push(RoleId::new(21));
+    let staff_json = serde_json::to_string(&staff_member).unwrap();
+
     let calls = Arc::new(Mutex::new(Vec::<Call>::new()));
     let captured = Arc::clone(&calls);
     let server = Server::bind(&([127, 0, 0, 1], 0).into());
@@ -180,11 +205,15 @@ async fn gateway_case(
     let server = tokio::spawn(server.serve(make_service_fn(move |_| {
         let captured = Arc::clone(&captured);
         let (guild_json, member_json) = (guild_json.clone(), member_json.clone());
+        let staff_json = staff_json.clone();
+        let staff_veto = server_staff_veto.clone();
         let pause = server_pause.clone();
         async move {
             Ok::<_, Infallible>(service_fn(move |request| {
                 let captured = Arc::clone(&captured);
                 let (guild_json, member_json) = (guild_json.clone(), member_json.clone());
+                let staff_json = staff_json.clone();
+                let staff_veto = staff_veto.clone();
                 let pause = pause.clone();
                 async move {
                     let (parts, body) = request.into_parts();
@@ -203,7 +232,10 @@ async fn gateway_case(
                         pause.1.notified().await;
                     }
                     let (status, body) = match call.method {
-                        Method::GET if call.path.contains("/members/") => (200, member_json),
+                        Method::GET if call.path.contains("/members/") => {
+                            let body = if staff_veto.load(Ordering::Relaxed) { staff_json } else { member_json };
+                            (200, body)
+                        }
                         Method::GET => (200, guild_json),
                         Method::DELETE => (204, String::new()),
                         Method::POST => (200, serde_json::json!({
@@ -230,6 +262,34 @@ async fn gateway_case(
     let mut old = member.clone();
     if event_kind != "unchanged" {
         old.roles.clear();
+    }
+    if event_kind.starts_with("retry after ") {
+        assert!(calls.lock().iter().all(|call| call.method == Method::GET));
+        assert!(
+            store
+                .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        staff_veto.store(false, Ordering::Relaxed);
+        if fenced {
+            use crate::db::SqlExecutor as _;
+            app.db
+                .with_conn(|conn| {
+                    conn.execute_bounded(
+                        "DELETE FROM guild_write_fences WHERE guild_id=?1",
+                        crate::db::params![GUILD as i64],
+                        64 * 1024,
+                    )?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        handler
+            .guild_member_update(ctx.clone(), None, None, update(&member))
+            .await;
     }
     if let Some(pause) = pause {
         let trigger = handler.guild_member_update(ctx.clone(), None, None, update(&member));
@@ -410,6 +470,23 @@ async fn newer_gateway_membership_vetoes_a_stale_dispatch_response() {
             30,
             false,
             false,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn onboarding_trap_retries_the_same_stay_after_fence_or_staff_veto() {
+    for event in ["retry after fence", "retry after staff veto"] {
+        let member = member(MEMBER, &[TRAP_ROLE], Timestamp::now());
+        gateway_case(
+            member.clone(),
+            member,
+            guild(Permissions::empty()),
+            event,
+            30,
+            false,
+            true,
         )
         .await;
     }

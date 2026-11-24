@@ -6866,7 +6866,7 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
     if (url.endsWith('/server-names')) return response({
       roles: [{ id: roleId, name: 'Anti-bot', managed: false }],
       channels: [],
-      onboarding_trap: { bot_can_kick: false, roles_at_or_above_bot: [roleId], roles_with_grants: [roleId] },
+      onboarding_trap: { bot_can_kick: false, roles_at_or_above_bot: [roleId], roles_with_grants: [roleId], roles_with_member_grants: [roleId] },
     });
     assert.equal(options.method, 'PUT');
     assert.match(url, new RegExp(`/rules/${id}$`));
@@ -6899,6 +6899,8 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   assert.match(textOf(modal), /lacks Kick Members/);
   assert.match(textOf(modal), /below jModGuard’s highest role/);
   assert.match(textOf(modal), /grants permissions or channel access/);
+  assert.match(textOf(modal), /individual channel permission grant/);
+  assert.match(textOf(modal), /Kick is the available moderation action/);
   await typeValue(pickerLabelled(modal, 'Join window (minutes)'), '0');
   await save(modal);
   assert.equal(calls.length, 1);
@@ -6911,6 +6913,7 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   assert.deepEqual(calls[0].data.actions, [{ at: 1, action: 'kick', reason }]);
   await settle();
   assert.match(textOf(card), /lacks Kick Members/);
+  assert.match(textOf(card), /individual channel permission grant/);
 
   modal = await edit();
   await fire(pickerByName(modal, 'Remove @Anti-bot'), 'click');

@@ -5,11 +5,16 @@ starts disabled. When enabled, it checks whether the configured role arrived
 with a join or was added in a member update. Moderators, administrators and the
 server owner are always exempt.
 
+Kick is the available moderation action. Recent-message cleanup and role removal
+are follow-up work in #786.
+
 ## Create the Anti-bot role
 
 1. In Discord, open **Server Settings → Roles** and create **Anti-bot**.
 2. Give the role zero server permissions. Check category and channel permission
-   overrides, and leave the role without access grants.
+   overrides, and leave the role without access grants. The setup check also
+   reports individual channel grants for members with the role that the bot
+   has seen. Review any member-specific grants in Discord.
 3. Move **Anti-bot** below jModGuard's highest role. Give jModGuard **Kick
    Members**. jModGuard must also outrank the members it kicks.
 

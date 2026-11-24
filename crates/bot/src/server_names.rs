@@ -91,15 +91,25 @@ fn onboarding_setup(guild: &Guild, bot_id: UserId) -> OnboardingTrapSetup {
         .filter(|role| !role.permissions.is_empty())
         .map(|role| role.id)
         .collect();
+    let mut member_grants = std::collections::HashSet::new();
     for overwrite in guild
         .channels
         .values()
         .flat_map(|channel| &channel.permission_overwrites)
     {
-        if let PermissionOverwriteType::Role(role) = overwrite.kind
-            && !overwrite.allow.is_empty()
-        {
-            grants.insert(role);
+        if overwrite.allow.is_empty() {
+            continue;
+        }
+        match overwrite.kind {
+            PermissionOverwriteType::Role(role) => {
+                grants.insert(role);
+            }
+            PermissionOverwriteType::Member(user) => {
+                if let Some(member) = guild.members.get(&user) {
+                    member_grants.extend(member.roles.iter().copied());
+                }
+            }
+            _ => {}
         }
     }
     OnboardingTrapSetup {
@@ -109,6 +119,29 @@ fn onboarding_setup(guild: &Guild, bot_id: UserId) -> OnboardingTrapSetup {
         }),
         roles_at_or_above_bot,
         roles_with_grants: grants.into_iter().map(|role| role.to_string()).collect(),
+        roles_with_member_grants: member_grants
+            .into_iter()
+            .map(|role| role.to_string())
+            .collect(),
+    }
+}
+
+pub(crate) fn refresh_for_member_grants(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    guild_id: u64,
+    user_id: UserId,
+) {
+    let affects_setup = ctx.cache.guild(guild_id).is_some_and(|guild| {
+        guild.channels.values().any(|channel| {
+            channel.permission_overwrites.iter().any(|overwrite| {
+                overwrite.kind == PermissionOverwriteType::Member(user_id)
+                    && !overwrite.allow.is_empty()
+            })
+        })
+    });
+    if affects_setup {
+        refresh_from_cache(app, ctx, guild_id);
     }
 }
 
@@ -258,6 +291,36 @@ mod tests {
         assert_eq!(onboarding_setup(&guild, bot_id).bot_can_kick, Some(true));
         guild.roles.remove(&bot_role);
         assert_eq!(onboarding_setup(&guild, bot_id).bot_can_kick, None);
+    }
+
+    #[test]
+    fn onboarding_trap_separates_member_channel_allows_from_role_grants() {
+        use serenity::all::{Member, PermissionOverwrite};
+
+        let mut guild = Guild::default();
+        let trap = RoleId::new(22);
+        let user = UserId::new(8);
+        let mut member = Member::default();
+        member.roles.push(trap);
+        guild.members.insert(user, member);
+        let mut channel = GuildChannel::default();
+        channel.permission_overwrites.push(PermissionOverwrite {
+            kind: PermissionOverwriteType::Member(user),
+            allow: Permissions::VIEW_CHANNEL,
+            deny: Permissions::empty(),
+        });
+        guild.channels.insert(channel.id, channel);
+
+        let setup = onboarding_setup(&guild, UserId::new(3));
+        assert!(setup.roles_with_grants.is_empty());
+        assert_eq!(setup.roles_with_member_grants, [trap.to_string()]);
+
+        guild.members.get_mut(&user).unwrap().roles.clear();
+        assert!(
+            onboarding_setup(&guild, UserId::new(3))
+                .roles_with_member_grants
+                .is_empty()
+        );
     }
 
     #[test]

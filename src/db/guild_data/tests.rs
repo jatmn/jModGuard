@@ -1591,7 +1591,7 @@ async fn released_guild_stores_upgrade_with_data_and_reopen() {
     )
     .unwrap();
 
-    for released in [GUILD_BASELINE_VERSION, V0_2_1_GUILD_VERSION, 23] {
+    for released in [GUILD_BASELINE_VERSION, V0_2_1_GUILD_VERSION] {
         let historical = path("released_guild_upgrade");
         let opts = options(&historical);
         GuildDataStore::create_historical_store(opts.clone(), registration.clone(), released)
@@ -1633,14 +1633,6 @@ async fn released_guild_stores_upgrade_with_data_and_reopen() {
             let conn = Connection::open(&historical).unwrap();
             assert_eq!(user_version(&conn), VERSION);
             assert_eq!(schema_dump(&conn), expected);
-            if released == 23 {
-                let old_reader =
-                    verify_identity_version(&conn, &registration, released).unwrap_err();
-                assert!(
-                    StoreCheckError::is_schema_refusal(&old_reader),
-                    "{old_reader:#}"
-                );
-            }
         }
         clean(&historical);
     }

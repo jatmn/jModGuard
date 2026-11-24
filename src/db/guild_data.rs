@@ -2,6 +2,7 @@
 use super::guild_stores::{GuildPlacement, StoreId, StorePolicy, StoreRegistration};
 use super::write_budget::BoundedWrites;
 use super::*;
+use crate::db_compat::Transaction;
 
 const FAMILY: &str = "jmodguard-guild-1";
 pub const SCHEMA_VERSION: i64 = match i64::from_str_radix(
@@ -21,8 +22,6 @@ const CASE_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0020_case_li
 const MEMBER_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0021_member_list_orders.sql");
 const MEMBER_NAME_SCHEMA: &str =
     include_str!("../../migrations/guild/0022_member_name_sort_key.sql");
-const ONBOARDING_TRAP_SCHEMA: &str =
-    include_str!("../../migrations/guild/0023_onboarding_trap.sql");
 mod bunny_transfer;
 #[cfg(any(test, feature = "test-support"))]
 mod historical_schema;
@@ -50,6 +49,23 @@ mod server_names;
 pub use server_names::{OnboardingTrapSetup, ServerChannelName, ServerNames, ServerRoleName};
 mod tenant_settings;
 pub use tenant_settings::{AccessLevel, AccessRole, TenantSettings, access_level_for_roles};
+
+fn has_onboarding_trap_storage(conn: &impl SqlExecutor) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+         WHERE type='trigger' AND name='guild_server_names_clear_onboarding_observation')",
+        (),
+        |row| Ok(row.get(0)?),
+    )
+}
+
+fn install_onboarding_trap_storage(tx: &mut Transaction) -> Result<()> {
+    tx.ensure_mutation_receipt()?;
+    tx.execute_batch_bounded(
+        include_str!("../../migrations/guild/onboarding_trap_extension.sql"),
+        1024 * 1024,
+    )
+}
 
 /// Trusted installation connection settings. Never accept these from a guild request.
 /// Deliberately has no Debug/Serialize implementation: token and URL may be sensitive.
@@ -360,7 +376,6 @@ fn verify_identity_version(
                 "trigger",
                 "guild_server_names_insert guild_server_names_update",
             ),
-            (24, "trigger", "guild_case_member_visibility_immutable"),
         ];
         let missing = |kind: &str, name: &str| {
             StoreCheckError::Schema(format!(
@@ -536,9 +551,6 @@ fn initialize_store(
                 .saturating_add(1024 * 1024);
             tx.execute_batch_bounded(MEMBER_NAME_SCHEMA, name_index_bound)?;
         }
-        if version < 24 {
-            tx.execute_batch_bounded(ONBOARDING_TRAP_SCHEMA, 1024 * 1024)?;
-        }
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -554,7 +566,6 @@ fn initialize_store(
     tx.execute_batch_bounded(CASE_LIST_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_LIST_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_NAME_SCHEMA, 1024 * 1024)?;
-    tx.execute_batch_bounded(ONBOARDING_TRAP_SCHEMA, 1024 * 1024)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",

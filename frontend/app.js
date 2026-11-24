@@ -4644,6 +4644,7 @@ function OnboardingTrapWarnings({ names, roleId }) {
   if (setup?.bot_can_kick === false) warnings.push("jModGuard lacks Kick Members.");
   if (setup?.roles_at_or_above_bot?.includes(roleId)) warnings.push("Move the trap role below jModGuard’s highest role.");
   if (setup?.roles_with_grants?.includes(roleId)) warnings.push("The trap role grants permissions or channel access. Remove those grants in Discord.");
+  if (setup?.roles_with_member_grants?.includes(roleId)) warnings.push("A member with the trap role has an individual channel permission grant. Review their channel overrides in Discord.");
   if (setup && !names.roles.some((role) => role.id === roleId)) warnings.push("The selected trap role is missing from the bot’s server snapshot.");
   return warnings.length ? h("ul", { className: "field-help", role: "status" }, ...warnings.map((warning) =>
     h("li", { key: warning }, warning))) : null;
@@ -4705,7 +4706,7 @@ function OnboardingTrapEditor({ record }) {
     h(
       EditorSection,
       { title: "Action" },
-      h("p", {}, "Kick, open a private case, and post to the Member kicked and Automod logs."),
+      h("p", {}, "Kick is the available moderation action. It opens a private case and posts to the Member kick and Automod logs."),
       h(Field, {},
         h(Label, {}, "Kick reason"),
         h(Input, { className: "input", value: rule.actions[0].reason, onChange: (event) => {

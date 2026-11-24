@@ -167,7 +167,6 @@ pub enum CaseEvidence {
     Text(Vec<TextEvidence>),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CaseData {
     /// Persisted only by record_case; never serialized into API responses.
     #[serde(default, skip_serializing)]
@@ -353,12 +352,6 @@ fn validate_data(data: &CaseData, limits: CaseLimits) -> Result<()> {
     Ok(())
 }
 
-fn decode_case_data(payload: &str) -> Result<CaseData> {
-    let mut fields: serde_json::Map<String, serde_json::Value> = serde_json::from_str(payload)?;
-    fields.remove("hide_from_member_history");
-    Ok(serde_json::from_value(serde_json::Value::Object(fields))?)
-}
-
 impl GuildDataStore {
     /// Record observed facts under a stable source key. Retry with the same key and
     /// payload; conflicting facts fail. Removed keys never recreate their payload.
@@ -413,8 +406,12 @@ impl GuildDataStore {
             let mut tx = conn.transaction_primary_write()?;
             verify_scope(&tx, &expected, &scope, true)?;
             let matched = super::case_sources::source_match(&tx, &scope, &source)?;
+            let has_visibility = (hide_from_member_history || matched.is_some())
+                && has_onboarding_trap_storage(&tx)?;
+            let visibility = if has_visibility { "hide_from_member_history" } else { "0" };
             // Fetch only matching identities and a SQL equality bit, never another payload.
-            let mut stmt = tx.prepare("SELECT case_id,source_key,deleted,payload=?4 AND hide_from_member_history=?6 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND (case_id=?3 OR case_id=?5)")?;
+            let mut stmt = tx.prepare(&format!("SELECT case_id,source_key,deleted,payload=?4 AND {visibility}=?6
+                FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND (case_id=?3 OR case_id=?5)"))?;
             let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),payload.as_str(),matched.as_ref().map_or("", |m| m.id.as_str()),hide_from_member_history], |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<bool>(2)?,r.get::<Option<bool>>(3)?)))?;
             let mut existing = None;
             for row in rows {
@@ -432,16 +429,23 @@ impl GuildDataStore {
             drop(stmt);
             if let Some(existing) = existing { tx.finish_read()?; return Ok(existing); }
             tx.ensure_mutation_receipt()?;
-            tx.execute_rows("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted,hide_from_member_history) VALUES(?1,?2,?3,?4,?5,0,?6)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),source.as_str(),payload.as_str(),hide_from_member_history], 1)?;
             if hide_from_member_history {
-                // The existing insert trigger creates an index entry. Remove it
-                // before commit so member histories never see the hidden case.
+                if !has_visibility {
+                    install_onboarding_trap_storage(&mut tx)?;
+                }
                 tx.execute_rows(
-                    "DELETE FROM guild_member_case_index WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3",
-                    params![scope.guild_id(), scope.enrollment.id.as_str(), id.as_str()],
+                    "INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted,hide_from_member_history)
+                     VALUES(?1,?2,?3,?4,?5,0,1)",
+                    params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),source.as_str(),payload.as_str()],
                     1,
                 )?;
             } else {
+                tx.execute_rows(
+                    "INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted)
+                     VALUES(?1,?2,?3,?4,?5,0)",
+                    params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),source.as_str(),payload.as_str()],
+                    1,
+                )?;
                 tx.execute_rows(
                     "INSERT OR IGNORE INTO guild_member_case_index(guild_id,enrollment_id,user_id,case_id,action_kind,occurred_at_ms) SELECT ?1,?2,CAST(json_extract(?5,'$.subject_id') AS INTEGER),?3,json_extract(?5,'$.action'),CAST(json_extract(?5,'$.occurred_at_ms') AS INTEGER) WHERE json_valid(?5) AND json_extract(?5,'$.subject_id') IS NOT NULL AND json_extract(?5,'$.action') IS NOT NULL",
                     params![
@@ -534,7 +538,7 @@ impl GuildDataStore {
             let result = match row {
                 None => None,
                 Some(None) => return Err(CaseError::Limit.into()),
-                Some(Some(payload)) => { let data = decode_case_data(&payload)?; validate_data(&data, limits)?; Some(data) }
+                Some(Some(payload)) => { let data = serde_json::from_str(&payload)?; validate_data(&data, limits)?; Some(data) }
             };
             tx.finish_read()?;
             Ok(result)
@@ -776,7 +780,7 @@ impl GuildDataStore {
                 tx.finish_read()?;
                 return Ok(None);
             };
-            let current = decode_case_data(&payload)?;
+            let current: CaseData = serde_json::from_str(&payload)?;
             match current.outcome {
                 CaseOutcome::Attempted => {},
                 CaseOutcome::Succeeded | CaseOutcome::Failed | CaseOutcome::Uncertain => {
@@ -802,7 +806,7 @@ impl GuildDataStore {
                 tx.finish_read()?;
                 return Err(CaseError::Limit.into());
             };
-            let data = decode_case_data(&updated)?;
+            let data: CaseData = serde_json::from_str(&updated)?;
             validate_data(&data, limits)?;
             anyhow::ensure!(data.outcome == outcome, CaseError::Conflict);
             tx.commit()?;

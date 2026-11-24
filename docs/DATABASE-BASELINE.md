@@ -119,7 +119,7 @@ across guilds ([MEMBERS.md](MEMBERS.md)).
 
 ## Separate guild-store family
 
-The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version 24,
+The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version 23,
 using `migrations/guild/0016_baseline.sql` through `0022_member_name_sort_key.sql`.
 The v0.2.0 baseline includes the version 16 payload format with optional immutable
 ban attempt tags, and the version 17 `guild_member_pending_rejoin_notes` table for
@@ -137,7 +137,7 @@ database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings, bounded latest-message snapshots and the bounded
 [member directory](MEMBERS.md). Initialize verifies and upgrades a matching earlier
-store atomically. Opening an initialized store requires version 24. See
+store atomically. Opening an initialized store requires version 23. See
 [tenant runtime](TENANT-RUNTIME.md). Core is at migration 0028. Each opener refuses
 the other family. No records are moved by startup.
 Guild migration 0009 adds bounded latest-message snapshots with fixed 24-hour expiry

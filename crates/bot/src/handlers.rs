@@ -837,6 +837,12 @@ impl EventHandler for Handler {
         let app = Arc::clone(self.app());
         let guild_id = new_member.guild_id;
         let uid = new_member.user.id.get();
+        crate::server_names::refresh_for_member_grants(
+            &app,
+            &ctx,
+            guild_id.get(),
+            new_member.user.id,
+        );
         app.member_joins.take(guild_id.get(), uid);
         app.automod.member_joined(guild_id.get(), uid);
         let observed_at_ms = chrono::Utc::now().timestamp_millis();
@@ -933,6 +939,7 @@ impl EventHandler for Handler {
             .text_spam
             .invalidate_author(guild_id.get(), user.id.get());
         let app = Arc::clone(self.app());
+        crate::server_names::refresh_for_member_grants(&app, &ctx, guild_id.get(), user.id);
         let observed_join = app.member_joins.take(guild_id.get(), user.id.get());
         let departed_at = chrono::Utc::now();
         let enrollment = crate::cases::capture(&app, guild_id.get()).await;
@@ -1682,8 +1689,17 @@ impl EventHandler for Handler {
             return;
         }
         let _rule_hold = self.app.activation.hold_rule();
-        if roles_changed && event.user.id == ctx.cache.current_user().id {
-            crate::server_names::refresh_from_cache(&self.app, &ctx, event.guild_id.get());
+        if roles_changed {
+            if event.user.id == ctx.cache.current_user().id {
+                crate::server_names::refresh_from_cache(&self.app, &ctx, event.guild_id.get());
+            } else {
+                crate::server_names::refresh_for_member_grants(
+                    &self.app,
+                    &ctx,
+                    event.guild_id.get(),
+                    event.user.id,
+                );
+            }
         }
         self.app
             .image_spam

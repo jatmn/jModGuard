@@ -1341,51 +1341,56 @@ async fn execute_live(
                 if automod_member_blocked(app, guild_id.get(), target.id.get(), "kick") {
                     (false, None)
                 } else {
-                    let member = if let Some(settings) = trap_settings {
-                        let Some(fresh) = crate::onboarding_trap::member_at_dispatch(
-                            app,
-                            http,
-                            cache,
-                            &member,
-                            settings,
-                            pending.dry_run,
-                        )
-                        .await
-                        else {
-                            return;
-                        };
-                        fresh
-                    } else {
-                        member
-                    };
                     let recovery = automod_member_target(guild_id.get(), target.id.get(), "kick")
                         .map(|member_target| {
                             app.remembered_discord_targets
                                 .capture_recovery_epoch(member_target)
                         });
-                    let discord_err = match crate::discord::race_discord_call(
-                        &app.activation,
-                        member.kick_with_reason(http, &reason),
-                    )
-                    .await
-                    {
-                        crate::discord::DiscordCall::Cancelled => {
-                            Some(crate::discord::cutoff_discord_error())
-                        }
-                        crate::discord::DiscordCall::Finished(result) => {
-                            if let (Some(recovery), Err(error)) = (recovery, &result) {
-                                automod_remember_member_failure(
-                                    app,
-                                    recovery,
-                                    guild_id.get(),
-                                    target.id.get(),
-                                    "kick",
-                                    error,
-                                );
-                            }
-                            result.err()
-                        }
+                    let mut started = false;
+                    let dispatch = async {
+                        let member = if let Some(settings) = trap_settings {
+                            crate::onboarding_trap::member_at_dispatch(
+                                app,
+                                http,
+                                cache,
+                                &member,
+                                settings,
+                                pending.dry_run,
+                            )
+                            .await?
+                        } else {
+                            member
+                        };
+                        // The outer cutoff race has polled this future. No other
+                        // awaited gate separates the trap claim from the kick.
+                        started = true;
+                        Some(member.kick_with_reason(http, &reason).await)
                     };
+                    let discord_err =
+                        match crate::discord::race_discord_call(&app.activation, dispatch).await {
+                            crate::discord::DiscordCall::Cancelled
+                                if trap_settings.is_some() && !started =>
+                            {
+                                return;
+                            }
+                            crate::discord::DiscordCall::Cancelled => {
+                                Some(crate::discord::cutoff_discord_error())
+                            }
+                            crate::discord::DiscordCall::Finished(None) => return,
+                            crate::discord::DiscordCall::Finished(Some(result)) => {
+                                if let (Some(recovery), Err(error)) = (recovery, &result) {
+                                    automod_remember_member_failure(
+                                        app,
+                                        recovery,
+                                        guild_id.get(),
+                                        target.id.get(),
+                                        "kick",
+                                        error,
+                                    );
+                                }
+                                result.err()
+                            }
+                        };
                     (true, discord_err)
                 }
             } else {

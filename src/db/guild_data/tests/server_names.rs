@@ -156,14 +156,35 @@ async fn server_names_store_a_sorted_bounded_snapshot_and_skip_unchanged_writes(
 #[tokio::test]
 async fn onboarding_observations_keep_legacy_names_and_reject_older_updates() {
     let (_f, store, scope) = ready().await;
-    let names = ServerNames {
+    assert!(
+        !store
+            .db
+            .with_conn(|conn| has_onboarding_trap_storage(conn))
+            .await
+            .unwrap()
+    );
+    let legacy_names = ServerNames {
         roles: vec![role("11", "Trap", 1)],
+        ..ServerNames::default()
+    };
+    assert!(
+        store
+            .replace_server_names(scope.clone(), legacy_names.clone(), 1_000)
+            .await
+            .unwrap()
+    );
+    let before = store.server_names(scope.clone()).await.unwrap();
+    assert_eq!(before.roles, legacy_names.roles);
+    assert!(before.onboarding_trap.is_none());
+
+    let names = ServerNames {
         onboarding_trap: Some(OnboardingTrapSetup {
             bot_can_kick: Some(true),
             roles_at_or_above_bot: vec![],
             roles_with_grants: vec!["11".into()],
+            roles_with_member_grants: vec![],
         }),
-        ..ServerNames::default()
+        ..legacy_names
     };
     assert!(
         store
@@ -181,7 +202,7 @@ async fn onboarding_observations_keep_legacy_names_and_reject_older_updates() {
     );
     assert_eq!(
         store
-            .server_names(scope)
+            .server_names(scope.clone())
             .await
             .unwrap()
             .onboarding_trap
@@ -210,6 +231,41 @@ async fn onboarding_observations_keep_legacy_names_and_reject_older_updates() {
     let old: LegacyNames = serde_json::from_str(&encoded).unwrap();
     assert_eq!(old.roles[0].name, "Trap");
     assert!(old.channels.is_empty());
+
+    let current: i64 = store
+        .db
+        .with_conn(|conn| conn.query_row("PRAGMA user_version", (), |row| Ok(row.get(0)?)))
+        .await
+        .unwrap();
+    assert_eq!(
+        current, 23,
+        "previous binaries still see their original schema version"
+    );
+    store
+        .db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "UPDATE guild_server_names SET names=?1,observed_at_ms=3000 WHERE guild_id=10",
+                params![encoded],
+                64 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let after = store.server_names(scope).await.unwrap();
+    assert_eq!(after.roles[0].name, "Trap");
+    assert_eq!(after.observed_at_ms, Some(3_000));
+    assert!(
+        after.onboarding_trap.is_none(),
+        "the old writer refreshed names without permission observations"
+    );
+    drop(
+        serde_json::from_value::<ServerNames>(serde_json::json!({
+            "roles": [], "channels": [], "future_observation": true
+        }))
+        .unwrap(),
+    );
 }
 
 #[tokio::test]
