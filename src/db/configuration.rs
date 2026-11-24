@@ -308,6 +308,9 @@ fn load_rule_rows_conn(
         let (id, json, upgraded) = row?;
         let mut rule = read_json(&json, "rules")?;
         normalize_invite_description_for_read(&id, &mut rule, upgraded);
+        if id == crate::onboarding_trap::RULE_ID {
+            crate::onboarding_trap::normalize_role_id(&mut rule);
+        }
         out.push((id, rule));
     }
     Ok(out)
@@ -345,6 +348,9 @@ fn rule_json_for_save_conn(
 ) -> Result<String> {
     if id == crate::onboarding_trap::RULE_ID {
         crate::onboarding_trap::validate(guild_id, rule)?;
+        let mut rule = rule.clone();
+        crate::onboarding_trap::normalize_role_id(&mut rule);
+        return Ok(serde_json::to_string(&rule)?);
     }
     if id == "invite"
         && rule.description == crate::defaults::OLD_INVITE_DESCRIPTION
@@ -436,13 +442,61 @@ async fn upsert_rule_row(
         validate_velocity_limit_conn(&tx, guild_id, &id, &mut rule, replace_velocity_limit)?;
         let json = rule_json_for_save_conn(&tx, guild_id, &id, &rule)?;
         let saved = serde_json::from_str(&json)?;
-        tx.execute_rows(
-            "INSERT INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)
-             ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",
-            params![guild_id, id, json],
-            1,
-        )?;
-        bump_config_version_conn(&tx)?;
+        store_rule_conn(&tx, guild_id, &id, &json)?;
+        tx.commit()?;
+        Ok(saved)
+    })
+    .await
+}
+
+fn store_rule_conn(tx: &impl SqlExecutor, guild_id: i64, id: &str, json: &str) -> Result<()> {
+    tx.execute_rows(
+        "INSERT INTO rules (guild_id, rule_id, data) VALUES (?1, ?2, ?3)
+         ON CONFLICT(guild_id, rule_id) DO UPDATE SET data = excluded.data",
+        params![guild_id, id, json],
+        1,
+    )?;
+    bump_config_version_conn(tx)?;
+    Ok(())
+}
+
+/// Save the draft only if its effective rule still matches inside the writer
+/// transaction. Dashboard and slash/prefix commands share this guard.
+pub async fn compare_and_set_onboarding_trap(
+    db: &Db,
+    guild_id: i64,
+    scope: Option<ConfigurationWriteScope>,
+    expected: &RuleDef,
+    replacement: &RuleDef,
+) -> Result<RuleDef> {
+    use crate::onboarding_trap::RULE_ID;
+    anyhow::ensure!(guild_id > 0, "The onboarding trap is server-specific");
+    let mut expected = expected.clone();
+    crate::onboarding_trap::normalize_role_id(&mut expected);
+    let replacement = replacement.clone();
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_immediate()?;
+        verify_configuration_write(&tx, scope.as_ref(), guild_id)?;
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT data FROM rules WHERE rule_id=?1 AND guild_id IN (?2, 0)
+             ORDER BY guild_id DESC LIMIT 1",
+                params![RULE_ID, guild_id],
+                |row| Ok(row.get(0)?),
+            )
+            .optional()?;
+        let mut current: RuleDef = match stored {
+            Some(json) => serde_json::from_str(&json)?,
+            None => crate::defaults::rule(RULE_ID),
+        };
+        crate::onboarding_trap::normalize_role_id(&mut current);
+        anyhow::ensure!(
+            serde_json::to_value(current)? == serde_json::to_value(expected)?,
+            "The onboarding trap changed. Reload the rule and try again."
+        );
+        let json = rule_json_for_save_conn(&tx, guild_id, RULE_ID, &replacement)?;
+        let saved = serde_json::from_str(&json)?;
+        store_rule_conn(&tx, guild_id, RULE_ID, &json)?;
         tx.commit()?;
         Ok(saved)
     })
@@ -1585,6 +1639,9 @@ fn load_configuration_snapshot_conn(
             for rules in [&mut guild_rules, &mut global_rules] {
                 if let Some(invite) = rules.get_mut("invite") {
                     normalize_invite_description_for_read("invite", invite, upgraded);
+                }
+                if let Some(trap) = rules.get_mut(crate::onboarding_trap::RULE_ID) {
+                    crate::onboarding_trap::normalize_role_id(trap);
                 }
             }
             Ok(ConfigurationSnapshotRows {

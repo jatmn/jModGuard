@@ -136,7 +136,13 @@ impl GuildDataStore {
     ) -> Result<bool> {
         self.check_target(&scope.placement)?;
         anyhow::ensure!(observed_at_ms > 0, TenantDataError::Setting);
-        let encoded = serde_json::to_string(&names.normalized()?)?;
+        let mut names = names.normalized()?;
+        let setup = names
+            .onboarding_trap
+            .take()
+            .map(|setup| serde_json::to_string(&setup))
+            .transpose()?;
+        let encoded = serde_json::to_string(&names)?;
         anyhow::ensure!(encoded.len() <= NAMES_MAX_BYTES, TenantDataError::Setting);
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
@@ -146,24 +152,32 @@ impl GuildDataStore {
                 verify_scope(&tx, &expected, &scope, true)?;
                 let existing = tx
                     .query_row(
-                        "SELECT names FROM guild_server_names WHERE guild_id=?1 AND enrollment_id=?2",
+                        "SELECT names, onboarding_trap, observed_at_ms FROM guild_server_names
+                         WHERE guild_id=?1 AND enrollment_id=?2",
                         params![scope.guild_id(), scope.enrollment.id.as_str()],
-                        |r| Ok(r.get::<String>(0)?),
+                        |r| Ok((r.get::<String>(0)?, r.get::<Option<String>>(1)?, r.get::<i64>(2)?)),
                     )
                     .optional()?;
-                if existing.as_deref() == Some(encoded.as_str()) {
+                if existing.as_ref().is_some_and(|(stored, stored_setup, observed)| {
+                    *observed > observed_at_ms || (stored == &encoded && stored_setup == &setup)
+                }) {
                     tx.finish_read()?;
                     return Ok(false);
                 }
                 tx.ensure_mutation_receipt()?;
                 tx.execute_rows(
-                    "INSERT INTO guild_server_names(guild_id,enrollment_id,names,observed_at_ms) VALUES(?1,?2,?3,?4)
-                     ON CONFLICT(guild_id) DO UPDATE SET names=excluded.names,observed_at_ms=excluded.observed_at_ms",
+                    "INSERT INTO guild_server_names(guild_id,enrollment_id,names,observed_at_ms,onboarding_trap)
+                     VALUES(?1,?2,?3,?4,?5)
+                     ON CONFLICT(guild_id) DO UPDATE SET names=excluded.names,
+                       observed_at_ms=excluded.observed_at_ms,onboarding_trap=excluded.onboarding_trap
+                     WHERE guild_server_names.enrollment_id=excluded.enrollment_id
+                       AND guild_server_names.observed_at_ms<=excluded.observed_at_ms",
                     params![
                         scope.guild_id(),
                         scope.enrollment.id.as_str(),
                         encoded,
-                        observed_at_ms
+                        observed_at_ms,
+                        setup,
                     ],
                     1,
                 )?;
@@ -184,17 +198,28 @@ impl GuildDataStore {
                 verify_scope(&tx, &expected, &scope, true)?;
                 let row = tx
                     .query_row(
-                        "SELECT names,observed_at_ms FROM guild_server_names WHERE guild_id=?1 AND enrollment_id=?2",
+                        "SELECT names,observed_at_ms,onboarding_trap FROM guild_server_names
+                         WHERE guild_id=?1 AND enrollment_id=?2",
                         params![scope.guild_id(), scope.enrollment.id.as_str()],
-                        |r| Ok((r.get::<String>(0)?, r.get::<i64>(1)?)),
+                        |r| {
+                            Ok((
+                                r.get::<String>(0)?,
+                                r.get::<i64>(1)?,
+                                r.get::<Option<String>>(2)?,
+                            ))
+                        },
                     )
                     .optional()?;
                 tx.finish_read()?;
                 Ok(match row {
-                    Some((names, observed_at_ms)) => ServerNames {
-                        observed_at_ms: Some(observed_at_ms),
-                        ..serde_json::from_str(&names)?
-                    },
+                    Some((names, observed_at_ms, setup)) => {
+                        let mut names: ServerNames = serde_json::from_str(&names)?;
+                        names.observed_at_ms = Some(observed_at_ms);
+                        if let Some(setup) = setup {
+                            names.onboarding_trap = Some(serde_json::from_str(&setup)?);
+                        }
+                        names
+                    }
                     None => ServerNames::default(),
                 })
             })

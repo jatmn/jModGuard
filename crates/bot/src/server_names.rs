@@ -129,13 +129,14 @@ pub fn refresh_from_cache(app: &Arc<BotState>, ctx: &Context, guild_id: u64) {
     tokio::spawn(async move {
         loop {
             // Owned data is copied before any await.
+            let observed_at_ms = jmodguard::control::now_ms();
             let names = ctx.cache.guild(guild_id).map(|guild| {
                 let mut names = snapshot(guild.roles.values(), guild.channels.values());
                 names.onboarding_trap = Some(onboarding_setup(&guild, ctx.cache.current_user().id));
                 names
             });
             if let Some(names) = names {
-                record(&app, guild_id, names).await;
+                record(&app, guild_id, names, observed_at_ms).await;
             }
             if !finish(guild_id) {
                 break;
@@ -178,7 +179,7 @@ fn finish(guild_id: u64) -> bool {
     }
 }
 
-async fn record(app: &BotState, guild_id: u64, names: ServerNames) {
+async fn record(app: &BotState, guild_id: u64, names: ServerNames, observed_at_ms: i64) {
     let Some(enrollment) = crate::cases::capture(app, guild_id).await else {
         return;
     };
@@ -190,7 +191,7 @@ async fn record(app: &BotState, guild_id: u64, names: ServerNames) {
         }
     };
     if let Err(error) = store
-        .replace_server_names(scope, names, jmodguard::control::now_ms())
+        .replace_server_names(scope, names, observed_at_ms)
         .await
     {
         tracing::warn!(guild_id, "server names not saved: {error:#}");

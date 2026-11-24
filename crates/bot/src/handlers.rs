@@ -823,6 +823,13 @@ impl EventHandler for Handler {
 
     async fn guild_member_addition(&self, ctx: Context, new_member: Member) {
         crate::resources::gateway_event("guild_member_addition");
+        self.app.automod.onboarding_matches.observe(
+            new_member.guild_id,
+            new_member.user.id,
+            new_member
+                .joined_at
+                .map(|joined_at| (joined_at, new_member.roles.as_slice())),
+        );
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -910,6 +917,10 @@ impl EventHandler for Handler {
         member_data: Option<Member>,
     ) {
         crate::resources::gateway_event("guild_member_removal");
+        self.app
+            .automod
+            .onboarding_matches
+            .observe(guild_id, user.id, None);
         self.app.access_marks.member(guild_id.get(), user.id.get());
         if !self.app.activation.allows_rule_trigger() {
             return;
@@ -1656,6 +1667,11 @@ impl EventHandler for Handler {
         event: GuildMemberUpdateEvent,
     ) {
         crate::resources::gateway_event("guild_member_update");
+        self.app.automod.onboarding_matches.observe(
+            event.guild_id,
+            event.user.id,
+            Some((event.joined_at, &event.roles)),
+        );
         let roles_changed = member_roles_may_have_changed(old_if_available.as_ref(), &event.roles);
         if roles_changed {
             self.app

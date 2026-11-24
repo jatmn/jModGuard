@@ -58,6 +58,7 @@ fn join_window_includes_its_boundary_and_zero_checks_older_members() {
     let event = RoleEvent {
         guild: member.guild_id,
         user: &member.user,
+        display_name: member.display_name(),
         roles: &member.roles,
         old_roles: Some(&[]),
         joined_at,
@@ -73,6 +74,28 @@ fn join_window_includes_its_boundary_and_zero_checks_older_members() {
         0,
         Timestamp::from_millis(1).unwrap()
     ));
+}
+
+#[test]
+fn saturated_replay_history_keeps_new_live_stays_eligible() {
+    let recent = RecentMatches::default();
+    let guild = GuildId::new(GUILD);
+    let role = RoleId::new(TRAP_ROLE);
+    let joined_at = Timestamp::now();
+    let pending = (guild, UserId::new(MEMBER));
+    let _in_flight = recent.claim(pending, joined_at, role, false).unwrap();
+    for dry in [true, false] {
+        for index in 0..=MATCH_LIMIT {
+            let subject = (guild, UserId::new(100 + index as u64));
+            let _claim = recent.claim(subject, joined_at, role, dry).unwrap();
+            assert!(recent.complete_if_current(subject, joined_at, dry, |_| true));
+        }
+    }
+    assert!(recent.claim(pending, joined_at, role, false).is_none());
+    let fresh = (GuildId::new(GUILD + 1), UserId::new(MEMBER));
+    let _claim = recent.claim(fresh, joined_at, role, false).unwrap();
+    assert!(recent.complete_if_current(fresh, joined_at, false, |_| true));
+    assert!(!recent.complete_if_current(fresh, joined_at, false, |_| true));
 }
 
 struct Call {
@@ -150,13 +173,19 @@ async fn gateway_case(
     .await;
     let guild_json = serde_json::to_string(&guild).unwrap();
     let member_json = serde_json::to_string(&discord_member).unwrap();
+    let pause = event_kind
+        .starts_with("during dispatch")
+        .then(|| Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new())));
+    let server_pause = pause.clone();
     let server = tokio::spawn(server.serve(make_service_fn(move |_| {
         let captured = Arc::clone(&captured);
         let (guild_json, member_json) = (guild_json.clone(), member_json.clone());
+        let pause = server_pause.clone();
         async move {
             Ok::<_, Infallible>(service_fn(move |request| {
                 let captured = Arc::clone(&captured);
                 let (guild_json, member_json) = (guild_json.clone(), member_json.clone());
+                let pause = pause.clone();
                 async move {
                     let (parts, body) = request.into_parts();
                     let body = hyper::body::to_bytes(body).await.unwrap();
@@ -167,6 +196,12 @@ async fn gateway_case(
                         audit_reason: parts.headers.get("x-audit-log-reason")
                             .map(|value| value.to_str().unwrap().to_owned()).unwrap_or_default(),
                     };
+                    if let Some(pause) = pause
+                        && call.method == Method::GET && call.path.contains("/members/")
+                    {
+                        pause.0.notify_one();
+                        pause.1.notified().await;
+                    }
                     let (status, body) = match call.method {
                         Method::GET if call.path.contains("/members/") => (200, member_json),
                         Method::GET => (200, guild_json),
@@ -196,26 +231,63 @@ async fn gateway_case(
     if event_kind != "unchanged" {
         old.roles.clear();
     }
-    match event_kind {
-        "join" => {
-            handler
-                .guild_member_addition(ctx.clone(), member.clone())
+    if let Some(pause) = pause {
+        let trigger = handler.guild_member_update(ctx.clone(), None, None, update(&member));
+        let contradict = async {
+            tokio::time::timeout(Duration::from_secs(5), pause.0.notified())
                 .await
-        }
-        "uncached" => {
-            handler
-                .guild_member_update(ctx.clone(), None, None, update(&member))
-                .await
-        }
-        _ => {
-            handler
-                .guild_member_update(
-                    ctx.clone(),
-                    Some(old),
-                    Some(member.clone()),
-                    update(&member),
-                )
-                .await
+                .unwrap();
+            let mut latest = member.clone();
+            match event_kind {
+                "during dispatch: role removed" => latest.roles.clear(),
+                "during dispatch: rejoined" => {
+                    latest.joined_at = Some(Timestamp::now());
+                    latest.roles.clear();
+                }
+                "during dispatch: promoted" => latest.roles.push(RoleId::new(21)),
+                "during dispatch: left" => {
+                    handler
+                        .guild_member_removal(
+                            ctx.clone(),
+                            member.guild_id,
+                            member.user.clone(),
+                            Some(member.clone()),
+                        )
+                        .await;
+                }
+                _ => unreachable!(),
+            }
+            if event_kind != "during dispatch: left" {
+                handler
+                    .guild_member_update(ctx.clone(), Some(member.clone()), None, update(&latest))
+                    .await;
+            }
+            // The REST response is intentionally stale. The Gateway answer wins.
+            pause.1.notify_one();
+        };
+        tokio::join!(trigger, contradict);
+    } else {
+        match event_kind {
+            "join" => {
+                handler
+                    .guild_member_addition(ctx.clone(), member.clone())
+                    .await
+            }
+            "uncached" => {
+                handler
+                    .guild_member_update(ctx.clone(), None, None, update(&member))
+                    .await
+            }
+            _ => {
+                handler
+                    .guild_member_update(
+                        ctx.clone(),
+                        Some(old),
+                        Some(member.clone()),
+                        update(&member),
+                    )
+                    .await
+            }
         }
     }
     if expected_kick || dry {
@@ -317,6 +389,30 @@ async fn gateway_case(
     drop(app);
     crate::tenant::remove_sidecars(&path);
     std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn newer_gateway_membership_vetoes_a_stale_dispatch_response() {
+    for event in [
+        "during dispatch: role removed",
+        "during dispatch: rejoined",
+        "during dispatch: promoted",
+        "during dispatch: left",
+    ] {
+        let joined_at =
+            Timestamp::from_millis(Timestamp::now().timestamp_millis() - 60_000).unwrap();
+        let member = member(MEMBER, &[TRAP_ROLE], joined_at);
+        gateway_case(
+            member.clone(),
+            member,
+            guild(Permissions::empty()),
+            event,
+            30,
+            false,
+            false,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]

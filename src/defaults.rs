@@ -35,7 +35,7 @@ pub fn default_rules() -> Vec<RuleDef> {
     out
 }
 
-fn rule(id: &str) -> RuleDef {
+pub(crate) fn rule(id: &str) -> RuleDef {
     let (name, description, params, actions) = match id {
         "mention_spam" => (
             "Mention spam",

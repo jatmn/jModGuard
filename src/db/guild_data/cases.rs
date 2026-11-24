@@ -395,13 +395,10 @@ impl GuildDataStore {
             data: &'a CaseData,
             #[serde(skip_serializing_if = "Option::is_none")]
             ban_attempt_tag: Option<&'a crate::ban_reason::BanAttemptTag>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            hide_from_member_history: Option<bool>,
         }
         let payload = serde_json::to_string(&StoredCase {
             data: &data,
             ban_attempt_tag: data.ban_attempt_tag.as_ref(),
-            hide_from_member_history: hide_from_member_history.then_some(true),
         })?;
         anyhow::ensure!(
             payload.len() <= limits.max_record_bytes as usize,
@@ -417,8 +414,8 @@ impl GuildDataStore {
             verify_scope(&tx, &expected, &scope, true)?;
             let matched = super::case_sources::source_match(&tx, &scope, &source)?;
             // Fetch only matching identities and a SQL equality bit, never another payload.
-            let mut stmt = tx.prepare("SELECT case_id,source_key,deleted,payload=?4 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND (case_id=?3 OR case_id=?5)")?;
-            let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),payload.as_str(),matched.as_ref().map_or("", |m| m.id.as_str())], |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<bool>(2)?,r.get::<Option<bool>>(3)?)))?;
+            let mut stmt = tx.prepare("SELECT case_id,source_key,deleted,payload=?4 AND hide_from_member_history=?6 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND (case_id=?3 OR case_id=?5)")?;
+            let rows = stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),payload.as_str(),matched.as_ref().map_or("", |m| m.id.as_str()),hide_from_member_history], |r| Ok((r.get::<String>(0)?,r.get::<String>(1)?,r.get::<bool>(2)?,r.get::<Option<bool>>(3)?)))?;
             let mut existing = None;
             for row in rows {
                 let (found, key, deleted, equal) = row?;
@@ -435,7 +432,7 @@ impl GuildDataStore {
             drop(stmt);
             if let Some(existing) = existing { tx.finish_read()?; return Ok(existing); }
             tx.ensure_mutation_receipt()?;
-            tx.execute_rows("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?1,?2,?3,?4,?5,0)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),source.as_str(),payload.as_str()], 1)?;
+            tx.execute_rows("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted,hide_from_member_history) VALUES(?1,?2,?3,?4,?5,0,?6)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),source.as_str(),payload.as_str(),hide_from_member_history], 1)?;
             if hide_from_member_history {
                 // The existing insert trigger creates an index entry. Remove it
                 // before commit so member histories never see the hidden case.

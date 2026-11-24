@@ -14,6 +14,13 @@ pub fn role_id(rule: &RuleDef) -> Option<u64> {
         .filter(|id| *id != 0)
 }
 
+/// Keep legacy numeric snowflakes exact before JavaScript sees them.
+pub(crate) fn normalize_role_id(rule: &mut RuleDef) {
+    if let Some(id) = role_id(rule) {
+        rule.params["role_id"] = id.to_string().into();
+    }
+}
+
 pub fn join_window_minutes(rule: &RuleDef) -> Option<u32> {
     let minutes = match rule.params.get("join_window_minutes") {
         Some(value) => value.as_u64()?,

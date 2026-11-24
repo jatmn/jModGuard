@@ -154,6 +154,65 @@ async fn server_names_store_a_sorted_bounded_snapshot_and_skip_unchanged_writes(
 }
 
 #[tokio::test]
+async fn onboarding_observations_keep_legacy_names_and_reject_older_updates() {
+    let (_f, store, scope) = ready().await;
+    let names = ServerNames {
+        roles: vec![role("11", "Trap", 1)],
+        onboarding_trap: Some(OnboardingTrapSetup {
+            bot_can_kick: Some(true),
+            roles_at_or_above_bot: vec![],
+            roles_with_grants: vec!["11".into()],
+        }),
+        ..ServerNames::default()
+    };
+    assert!(
+        store
+            .replace_server_names(scope.clone(), names.clone(), 2_000)
+            .await
+            .unwrap()
+    );
+    let mut older = names;
+    older.onboarding_trap.as_mut().unwrap().bot_can_kick = Some(false);
+    assert!(
+        !store
+            .replace_server_names(scope.clone(), older, 1_000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .server_names(scope)
+            .await
+            .unwrap()
+            .onboarding_trap
+            .unwrap()
+            .bot_can_kick,
+        Some(true)
+    );
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyNames {
+        roles: Vec<ServerRoleName>,
+        channels: Vec<ServerChannelName>,
+    }
+    let encoded: String = store
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT names FROM guild_server_names WHERE guild_id=10",
+                (),
+                |row| Ok(row.get(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    let old: LegacyNames = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(old.roles[0].name, "Trap");
+    assert!(old.channels.is_empty());
+}
+
+#[tokio::test]
 async fn server_names_keep_a_worst_case_snapshot_within_the_row_limit() {
     let (_f, store, scope) = ready().await;
     // Control characters need six-byte JSON escapes, the most a name can grow.

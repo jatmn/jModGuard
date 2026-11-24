@@ -28,7 +28,7 @@ pub struct AutomodEngine {
     /// (guild, user) -> window history and per-rule strike buckets
     state: DashMap<(u64, u64), AuthorState>,
     member_joins: DashMap<(u64, u64), Instant>,
-    onboarding_matches: crate::onboarding_trap::RecentMatches,
+    pub(crate) onboarding_matches: crate::onboarding_trap::RecentMatches,
     last_prune: Mutex<AutomodInstant>,
 }
 
@@ -987,12 +987,9 @@ pub(crate) async fn execute_pending_with(
         settings.whitelist_roles.as_slice(),
     );
 
-    if onboarding_trap {
-        let Some(member) = provided_member.as_ref() else {
-            return false;
-        };
-        let roles: Vec<_> = member.roles.iter().map(|role| role.get()).collect();
-        if enrollment.is_none()
+    if onboarding_trap
+        && (enrollment.is_none()
+            || provided_member.is_none()
             || !settings.enabled
             || !skip_moderators
             || !open_case
@@ -1001,22 +998,27 @@ pub(crate) async fn execute_pending_with(
                 .matched_rule
                 .as_ref()
                 .is_none_or(|matched| matched.params != settings.params)
-            || !matches!(settings.actions.as_slice(), [action] if action.action == "kick" && action.reason == rule.reason)
-            || jmodguard::custom_rules::rule_scope_skips(
-                settings,
-                target.id.get(),
-                0,
-                &roles,
-                false,
-                false,
-            )
-            || !app.automod.onboarding_matches.claim(member, dry)
-        {
-            return false;
-        }
+            || !matches!(settings.actions.as_slice(), [action] if action.action == "kick" && action.reason == rule.reason))
+    {
+        return false;
     }
 
     if dry {
+        if onboarding_trap
+            && let Some(member) = provided_member.as_ref()
+            && crate::onboarding_trap::member_at_dispatch(
+                app,
+                http,
+                cache,
+                member,
+                settings,
+                pending.dry_run,
+            )
+            .await
+            .is_none()
+        {
+            return false;
+        }
         let mut v = vars.clone();
         v.insert(
             "action".into(),
@@ -1051,6 +1053,7 @@ pub(crate) async fn execute_pending_with(
         open_case,
         skip_moderators,
         skipped_roles,
+        onboarding_trap.then_some(settings),
     )
     .await;
     true
@@ -1076,6 +1079,7 @@ async fn execute_live(
     open_case: bool,
     skip_moderators: bool,
     skipped_roles: &[u64],
+    trap_settings: Option<&RuleDef>,
 ) {
     let rule = &pending.action;
     // A missing member is not a known member with no roles. Gateway members
@@ -1111,8 +1115,7 @@ async fn execute_live(
     {
         return;
     }
-    // The trap already fetched the current member, owner and complete roles
-    // from Discord before handing the kick to this executor.
+    // The trap fetches the member, owner and roles at dispatch.
     let moderator_unknown = pending.rule_id != ONBOARDING_TRAP
         && moderator_status == crate::commands::ModeratorStatus::Unknown;
     let warning = if config_unknown {
@@ -1332,15 +1335,29 @@ async fn execute_live(
                 target.id,
             );
             let (called, discord_err) = if let Some(member) = member {
-                if !app.activation.may_record()
-                    || pending.rule_id == ONBOARDING_TRAP
-                        && crate::onboarding_trap::cached_staff(app, cache, guild_id, target.id)
-                {
+                if !app.activation.may_record() {
                     return;
                 }
                 if automod_member_blocked(app, guild_id.get(), target.id.get(), "kick") {
                     (false, None)
                 } else {
+                    let member = if let Some(settings) = trap_settings {
+                        let Some(fresh) = crate::onboarding_trap::member_at_dispatch(
+                            app,
+                            http,
+                            cache,
+                            &member,
+                            settings,
+                            pending.dry_run,
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+                        fresh
+                    } else {
+                        member
+                    };
                     let recovery = automod_member_target(guild_id.get(), target.id.get(), "kick")
                         .map(|member_target| {
                             app.remembered_discord_targets

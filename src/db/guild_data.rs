@@ -21,6 +21,8 @@ const CASE_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0020_case_li
 const MEMBER_LIST_SCHEMA: &str = include_str!("../../migrations/guild/0021_member_list_orders.sql");
 const MEMBER_NAME_SCHEMA: &str =
     include_str!("../../migrations/guild/0022_member_name_sort_key.sql");
+const ONBOARDING_TRAP_SCHEMA: &str =
+    include_str!("../../migrations/guild/0023_onboarding_trap.sql");
 mod bunny_transfer;
 #[cfg(any(test, feature = "test-support"))]
 mod historical_schema;
@@ -358,6 +360,7 @@ fn verify_identity_version(
                 "trigger",
                 "guild_server_names_insert guild_server_names_update",
             ),
+            (24, "trigger", "guild_case_member_visibility_immutable"),
         ];
         let missing = |kind: &str, name: &str| {
             StoreCheckError::Schema(format!(
@@ -533,6 +536,9 @@ fn initialize_store(
                 .saturating_add(1024 * 1024);
             tx.execute_batch_bounded(MEMBER_NAME_SCHEMA, name_index_bound)?;
         }
+        if version < 24 {
+            tx.execute_batch_bounded(ONBOARDING_TRAP_SCHEMA, 1024 * 1024)?;
+        }
         tx.pragma_update(None, "user_version", VERSION)?;
         return tx.commit();
     }
@@ -548,6 +554,7 @@ fn initialize_store(
     tx.execute_batch_bounded(CASE_LIST_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_LIST_SCHEMA, 32_000_000)?;
     tx.execute_batch_bounded(MEMBER_NAME_SCHEMA, 1024 * 1024)?;
+    tx.execute_batch_bounded(ONBOARDING_TRAP_SCHEMA, 1024 * 1024)?;
     tx.ensure_mutation_receipt()?;
     tx.execute_rows(
         "INSERT INTO store_identity(singleton,schema_family,store_id,dedicated_guild_id) VALUES(1,?1,?2,?3)",

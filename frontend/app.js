@@ -4655,6 +4655,7 @@ function SavedOnboardingTrapWarnings({ roleId }) {
 }
 
 function OnboardingTrapEditor({ record }) {
+  const [expected] = useState(() => record.effective);
   const [rule] = useState(() => JSON.parse(JSON.stringify(record.effective)));
   const [roleIds] = useState(() => rule.params?.role_id ? [String(rule.params.role_id)] : []);
   const [windowMinutes, setWindowMinutes] = useState(() => String(rule.params?.join_window_minutes ?? 30));
@@ -4729,7 +4730,7 @@ function OnboardingTrapEditor({ record }) {
             enabled: rule.enabled && roleId !== null,
             params: { ...rule.params, role_id: roleId, join_window_minutes: Number(windowMinutes) },
           };
-          await reloadAfter(() => api(`/api/guilds/${state.guildId}/rules/${record.rule_id}`, "PUT", { scope: "guild", data }), () => {
+          await reloadAfter(() => api(`/api/guilds/${state.guildId}/rules/${record.rule_id}`, "PUT", { scope: "guild", data, expected }), () => {
             toast("Rule saved", "success");
             closeOverlay();
           });

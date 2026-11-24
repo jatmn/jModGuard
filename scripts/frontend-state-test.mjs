@@ -6861,6 +6861,7 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
       actions: [{ at: 1, action: 'kick', reason }],
     },
   };
+  const original = record.effective;
   const h = harness(async (url, options) => {
     if (url.endsWith('/server-names')) return response({
       roles: [{ id: roleId, name: 'Anti-bot', managed: false }],
@@ -6902,6 +6903,7 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   await save(modal);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].scope, 'guild');
+  assert.deepEqual(calls[0].expected, original);
   assert.equal(calls[0].data.enabled, true);
   assert.equal(calls[0].data.dry_run, true);
   assert.equal(calls[0].data.skip_moderators, true);
@@ -6916,6 +6918,7 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   await save(modal);
   assert.equal(calls[1].data.enabled, false);
   assert.equal(calls[1].data.params.role_id, null);
+  assert.deepEqual(calls[1].expected, calls[0].data);
 });
 
 test('custom pattern draft save uses dry_run and custom id', () => {

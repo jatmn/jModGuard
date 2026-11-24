@@ -1753,12 +1753,13 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                 return Err(ArgumentError::missing("rule").for_action(TOGGLE).into());
             }
             let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
-            let mut rule = cfg.rules.get(&rule_id).cloned().ok_or_else(|| {
+            let previous = cfg.rules.get(&rule_id).ok_or_else(|| {
                 ArgumentError::invalid("rule", "Choose a configured automod rule.")
                     .for_action(TOGGLE)
             })?;
+            let mut rule = previous.clone();
             rule.enabled = !rule.enabled;
-            db::upsert_rule(&env.app.db, guild, &rule_id, &rule).await?;
+            save_command_rule(&env.app.db, guild, &rule_id, previous, &rule).await?;
             env.app.invalidate_configs();
             Ok(BehaviorOutcome {
                 response: Some(format!(
@@ -1785,12 +1786,13 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
                 }
             };
             let cfg = env.app.configs.get(&env.app.db, env.guild_id.get()).await?;
-            let mut rule = cfg.rules.get(&rule_id).cloned().ok_or_else(|| {
+            let previous = cfg.rules.get(&rule_id).ok_or_else(|| {
                 ArgumentError::invalid("rule", "Choose a configured automod rule.")
                     .for_action(DRYRUN)
             })?;
+            let mut rule = previous.clone();
             set_rule_dry_run(&rule_id, &mut rule, on)?;
-            db::upsert_rule(&env.app.db, guild, &rule_id, &rule).await?;
+            save_command_rule(&env.app.db, guild, &rule_id, previous, &rule).await?;
             env.app.invalidate_configs();
             Ok(BehaviorOutcome {
                 response: Some(format!("Rule `{rule_id}` dry-run is now {on}.")),
@@ -1802,6 +1804,21 @@ async fn run_rule(env: &CmdEnv<'_>, default_action: &str) -> Result<BehaviorOutc
         }
         _ => Err(ArgumentError::invalid("action", "Choose a rule action shown below.").into()),
     }
+}
+
+async fn save_command_rule(
+    db: &db::Db,
+    guild: i64,
+    id: &str,
+    previous: &crate::types::RuleDef,
+    rule: &crate::types::RuleDef,
+) -> Result<()> {
+    if id == jmodguard::onboarding_trap::RULE_ID {
+        db::compare_and_set_onboarding_trap(db, guild, None, previous, rule).await?;
+    } else {
+        db::upsert_rule(db, guild, id, rule).await?;
+    }
+    Ok(())
 }
 
 fn rule_action_and_id(args: &mut Args, default_action: &str) -> (String, String) {
