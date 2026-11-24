@@ -32,12 +32,16 @@ afterEach(() => {
   }
 });
 
-function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test", visibility = "visible", now = () => NOW_SECONDS * 1000, preview } = {}) {
+function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test", visibility = "visible", now = () => NOW_SECONDS * 1000, preview, previewFragment } = {}) {
   const dom = new JSDOM('<!doctype html><html><head><meta name="theme-color"></head><body><main id="content"></main></body></html>', { url: origin });
   const { window } = dom, { document } = window;
   Object.defineProperty(document, "visibilityState", { value: visibility, writable: true });
   Object.defineProperty(window, "localStorage", { get() { throw new Error("storage disabled"); } });
   if (preview) window.sessionStorage.setItem("jmodguard_preview", preview);
+  if (previewFragment) {
+    window.location.hash = new URLSearchParams({ preview: previewFragment });
+    Object.defineProperty(window, "sessionStorage", { get() { throw new Error("storage disabled"); } });
+  }
   window.JMODGUARD_WEBUI_SHA = "a".repeat(40);
   window.JMODGUARD_API_BASE = apiBase;
   window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
@@ -758,6 +762,7 @@ test("a signed-in Discord administrator sees only an access denial", async () =>
   const content = view.elements.get("content");
   assert.match(content.textContent, /access required/i);
   assert.equal(content.querySelector("button, input, select, #updates"), null);
+  assert.equal(content.querySelector("a").getAttribute("href"), "/");
   assert.equal(view.timers.size, 0);
 });
 
@@ -772,6 +777,24 @@ test("an Administrator preview stays denied on the Administration page", async (
   assert.deepEqual(calls, [["/api/updates", "fixture-preview"]]);
   assert.match(view.elements.get("content").textContent, /Owner access required/);
   assert.equal(view.elements.get("updates"), null);
+});
+
+test("the workspace link keeps a fragment-only preview during and after the access check", async () => {
+  const token = "fixture+preview";
+  let respond;
+  const calls = [];
+  const view = page((url, options) => {
+    calls.push([url, options.headers["x-jmodguard-preview"]]);
+    return new Promise(resolve => { respond = resolve; });
+  }, { previewFragment: token });
+  const workspaceHref = () => view.elements.get("content").querySelector('a[href^="/"]').getAttribute("href");
+  const checkingHref = workspaceHref();
+  respond(response({ error: "preview is read-only" }, 403));
+  await run("refresh()", view.context);
+  assert.deepEqual(calls, [["/api/updates", token]]);
+  assert.match(view.elements.get("content").textContent, /Owner access required/);
+  assert.equal(checkingHref, "/#preview=fixture%2Bpreview");
+  assert.equal(workspaceHref(), checkingHref);
 });
 
 test("transient initial access checks retry automatically but confirmed denials do not", async () => {

@@ -4066,7 +4066,8 @@ async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', 
   const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
-    const json = body => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    const json = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (routes(url, json, res, req)) return;
     if (url.pathname === '/api/me') return json({
       user: { id: '100000000000000001', username: 'moderator', global_name: 'Moderator' },
       guilds: guilds.map(guild => ({ access: 'manage', ...guild })),
@@ -4075,7 +4076,6 @@ async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', 
     if (url.pathname.endsWith('/config')) return json({ enrollment_id: 'e1', settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
     if (url.pathname.endsWith('/analytics')) return json(browserAnalytics(Number(url.searchParams.get('days')) || 30));
     if (url.pathname.endsWith('/member-sync')) return json(memberSync);
-    if (routes(url, json, res)) return;
     if (url.pathname.startsWith('/api/')) return json({});
     const file = new URL(url.pathname === '/' ? 'index.html' : url.pathname.slice(1), dist);
     if (!file.href.startsWith(dist.href) || !fs.existsSync(file)) { res.writeHead(404); return res.end(); }
@@ -4142,6 +4142,70 @@ async function launchFirefox() {
     throw error;
   }
 }
+
+test('a fragment-only preview stays read-only on the round trip through Administration', { timeout: 60000 }, async t => {
+  if (!firefoxBinary || !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url))) {
+    assert.ok(!process.env.CI, 'CI requires Firefox and the built WebUI');
+    return t.skip('Firefox or the built WebUI is unavailable');
+  }
+  const domEvent = globalThis.Event;
+  globalThis.Event = NodeEvent;
+  let server, browser;
+  t.after(async () => {
+    await browser?.close();
+    if (server) await new Promise(resolve => server.close(resolve));
+    globalThis.Event = domEvent;
+  });
+  const preview = 'fixture-preview';
+  const calls = [];
+  server = await serveBuiltApp(() => false, undefined, {}, (url, json, _res, req) => {
+    if (url.pathname !== '/api/me' && url.pathname !== '/api/updates') return false;
+    const token = req.headers['x-jmodguard-preview'];
+    const previewActive = token === preview;
+    calls.push([url.pathname, token]);
+    if (url.pathname === '/api/updates') {
+      if (previewActive) json({ error: 'preview is read-only' }, 403);
+      else json({ components: [] });
+    } else {
+      json({
+        user: { id: '42' }, guilds: [{ id: '10', name: 'Guild', access: previewActive ? 'dashboard' : 'manage' }],
+        is_bot_owner: !previewActive, preview: previewActive ? { profile: 'moderator', guild_id: '10' } : null,
+      });
+    }
+    return true;
+  });
+  browser = await launchFirefox();
+  await browser.send('script.addPreloadScript', {
+    functionDeclaration: '() => Object.defineProperty(window, "sessionStorage", { get() { throw new Error("storage disabled"); } })',
+  });
+  const address = server.address();
+  const origin = `http://${address.address}:${address.port}`;
+  const open = url => browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
+  const read = async (selector, resultExpression) => {
+    const { result } = await browser.send('script.evaluate', {
+      target: { context: browser.context }, awaitPromise: true, expression: `(async () => {
+        for (let i = 0; i < 100; i++) {
+          const element = document.querySelector(${JSON.stringify(selector)});
+          if (element) return ${resultExpression};
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        return null;
+      })()`,
+    });
+    return result.value;
+  };
+  const dashboardTabs = 'dashboard,analytics,cases,bans,members,actions,events';
+  const tabs = () => read('#tabs', '[...element.querySelectorAll("[data-tab]")].map(tab => tab.dataset.tab).join(",")');
+  await open(`${origin}/#preview=${preview}`);
+  assert.equal(await tabs(), dashboardTabs);
+  await open(`${origin}/administration/index.html#preview=${preview}`);
+  const back = await read('#content section a', 'element.href');
+  assert.ok(back, 'the denied Administration page offers a workspace link');
+  await open(back);
+  assert.equal(await tabs(), dashboardTabs, 'return opens the same Dashboard-level navigation');
+  assert.ok(await read('#preview-banner', 'element.textContent'));
+  assert.deepEqual(calls, [['/api/me', preview], ['/api/updates', preview], ['/api/me', preview]]);
+});
 
 // Scrolls a tall workspace page, then records where the sidebar parts render.
 const sidebarLayoutProbe = `(async () => {
@@ -8867,6 +8931,7 @@ test('dashboard role access hides settings tabs and keeps reads in place', async
 test('workspace access and preview profiles match navigation and available controls', async () => {
   const dashboard = ['dashboard', 'analytics', 'cases', 'bans', 'members', 'actions', 'events'];
   const settings = [...dashboard, 'rules', 'badwords', 'known-spam', 'known-bad-images', 'settings', 'logchannels', 'commands', 'templates'];
+  const banControls = ['ban', 'edit reason', 'unban', 'cancel ban', 'cancel unban'];
   const settingsEdits = ['custom rule', 'add words', 'add spam', 'add image', 'template save', 'log routing'];
   const cfg = {
     enrollment_id: 'membership', settings: { prefix: '!', bot_name: 'Guard' }, global_settings: { prefix: '!' },
@@ -8879,8 +8944,9 @@ test('workspace access and preview profiles match navigation and available contr
     ['missing access', undefined, null, [], []],
     ['unknown access', 'unrecognized', null, [], []],
     ['dashboard', 'dashboard', null, dashboard, []],
+    ['dashboard with Ban Members', 'dashboard', null, dashboard, banControls],
     ['settings', 'settings', null, settings, ['protection', 'settings save', ...settingsEdits]],
-    ['Discord admin', 'manage', null, settings, ['protection', 'ban', 'edit reason', 'unban', 'settings save', 'access roles', 'case removal', 'copy', 'custom command', ...settingsEdits]],
+    ['Discord admin', 'manage', null, settings, ['protection', ...banControls, 'settings save', 'access roles', 'case removal', 'copy', 'custom command', ...settingsEdits]],
     ['manage only', 'manage', null, settings, ['protection', 'settings save', 'access roles', 'copy', 'custom command', ...settingsEdits]],
     ['member preview', null, 'member', [], []],
     ['moderator preview', 'dashboard', 'moderator', dashboard, []],
@@ -8889,7 +8955,7 @@ test('workspace access and preview profiles match navigation and available contr
   ]) {
     const guilds = access === null ? [] : [{
       id: '10', name: 'First', access, manage: access === 'manage',
-      can_ban_members: label === 'Discord admin' || profile === 'administrator',
+      can_ban_members: ['Discord admin', 'dashboard with Ban Members', 'missing access'].includes(label) || profile === 'administrator',
       can_delete_cases: label === 'Discord admin' || profile === 'administrator',
     }];
     const calls = [];
@@ -8901,6 +8967,11 @@ test('workspace access and preview profiles match navigation and available contr
       });
       if (url.endsWith('/config')) return response(cfg);
       if (url.includes('/bans?')) return response(banRows());
+      if (url.endsWith('/actions')) return response([
+        { ...queuedAction(), id: 'ban-job', action: { kind: 'ban', user_id: '42' } },
+        { ...queuedAction(), id: 'unban-job' },
+        { ...queuedAction('running'), id: 'log-job', action: { kind: 'set_log_channel', event: 'member_join' } },
+      ]);
       if (/\/(access-roles|case-delete-roles)$/.test(url)) return response({ roles: [], revision: 'r1' });
       return response({});
     });
@@ -8931,6 +9002,13 @@ test('workspace access and preview profiles match navigation and available contr
     if (button('Ban user')) controls.push('ban');
     if (has('#content [aria-label="Edit reason"]')) controls.push('edit reason');
     if (has('#content [aria-label^="Unban "]')) controls.push('unban');
+    h.app.navigate('actions');
+    await settle();
+    const cancels = [...h.document.querySelectorAll('#content [aria-label="Cancel"]')];
+    for (const [kind, text] of [['ban', 'Ban 42'], ['unban', 'Unban 99']]) {
+      if (cancels.some(cancel => cancel.closest('tr').textContent.includes(text))) controls.push(`cancel ${kind}`);
+    }
+    if (access === 'dashboard') assert.equal(has('#content [aria-label="Force cancel"]'), null, label);
     h.app.navigate('settings');
     await settle();
     if (button('Save')) controls.push('settings save');

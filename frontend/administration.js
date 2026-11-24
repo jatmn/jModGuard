@@ -64,13 +64,22 @@ function apiBase() {
   return (window.JMODGUARD_API_BASE || "").replace(/\/$/, "");
 }
 
+function readPreviewToken() {
+  const fragmentToken = new window.URLSearchParams(window.location.hash.slice(1)).get("preview");
+  if (fragmentToken) return fragmentToken;
+  try {
+    return window.sessionStorage.getItem("jmodguard_preview");
+  } catch (_) {
+    return null;
+  }
+}
+
+const previewToken = readPreviewToken();
+const workspaceHref = previewToken ? `/#preview=${encodeURIComponent(previewToken)}` : "/";
+
 async function request(path, body) {
   const headers = body === undefined ? {} : { "Content-Type": "application/json" };
-  let preview = new window.URLSearchParams(window.location.hash.slice(1)).get("preview");
-  try {
-    preview ||= window.sessionStorage.getItem("jmodguard_preview");
-  } catch (_) {}
-  if (preview) headers["x-jmodguard-preview"] = preview;
+  if (previewToken) headers["x-jmodguard-preview"] = previewToken;
   const response = await fetch(apiBase() + path, {
     method: body === undefined ? "GET" : "POST",
     credentials: "include", cache: "no-store",
@@ -364,7 +373,7 @@ function Administration() {
     h("div", { className: "card-body" },
       h("h1", { className: "card-title" }, "Owner access required"),
       h("p", null, "Administration is available only to the configured bot owner."),
-      h("a", { href: "/" }, "Back to workspace"),
+      h("a", { href: workspaceHref }, "Back to workspace"),
     ),
   );
   const loaded = window.JMODGUARD_WEBUI_SHA || "unknown (local or legacy asset)";
@@ -378,7 +387,7 @@ function Administration() {
     h("header", { className: "administration-header" },
       h("div", null, h("span", { className: "eyebrow" }, "OWNER ADMINISTRATION"), h("h1", { id: "admin-title" }, "Updates")),
       h("div", { className: "administration-tools" }, h("button", { id: "refresh-status", type: "button", className: "btn btn-sm", disabled: (display.activity === "busy"),
-        onClick: () => { if (ui.getSnapshot().activity !== "busy") { ui.set({ actionMessage: "" }); return refresh(); } } }, h(Icon, { name: ACTION_ICONS.retry.icon, intent: ACTION_ICONS.retry.intent }), "Refresh status"), h(Appearance, appearance), h("a", { className: "btn btn-sm", href: "/" }, h(Icon, { name: ACTION_ICONS.back.icon, intent: ACTION_ICONS.back.intent }), "Back to workspace"))),
+        onClick: () => { if (ui.getSnapshot().activity !== "busy") { ui.set({ actionMessage: "" }); return refresh(); } } }, h(Icon, { name: ACTION_ICONS.retry.icon, intent: ACTION_ICONS.retry.intent }), "Refresh status"), h(Appearance, appearance), h("a", { className: "btn btn-sm", href: workspaceHref }, h(Icon, { name: ACTION_ICONS.back.icon, intent: ACTION_ICONS.back.intent }), "Back to workspace"))),
     h("p", { id: "update-status", className: `alert alert-soft administration-notice ${{ good: "alert-success", warn: "alert-warning", bad: "alert-error", neutral: "" }[display.status.tone]}`, role: "status", "aria-live": "polite" }, display.status.message),
     h("div", { id: "sign-in", className: (display.signIn === "required") ? "" : "hidden" }, h("a", { id: "sign-in-link", className: "btn btn-primary", href: login }, "Sign in with Discord")),
     h("div", { id: "updates", className: display.access === "allowed" ? "" : "hidden" },

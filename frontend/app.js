@@ -2252,7 +2252,7 @@ function canManageServer() {
 }
 
 function canBanMembers() {
-  return canEditSettings() && selectedGuild()?.can_ban_members === true;
+  return !isPreview() && guildAccess() !== "none" && selectedGuild()?.can_ban_members === true;
 }
 
 function tabAllowed(tab) {
