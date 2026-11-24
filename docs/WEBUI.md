@@ -46,6 +46,19 @@ moderation cases and their history. Confirm what was removed and what was
 retained to the requester privately. The policy gives the initial response
 target and explains that later Discord events can recreate entries.
 
+### Privacy disclosure sources
+
+- Session contents, sign-out, inactivity and restart are defined in
+  `crates/api/src/web/mod.rs` by `store_login_session`, `logout`, `router`
+  and `router_with_store`.
+- Permission checks and token renewal use the session in
+  `crates/api/src/web/mod.rs`. The Discord guild and member-role calls are in
+  `crates/api/src/web/oauth.rs`.
+- The in-memory store, `tower-sessions-memory-store`, is pinned in
+  `Cargo.lock`. Its `MemoryStore::load` stops returning expired records. The
+  API also expires its in-memory authentication state through
+  `sweep_auth_sessions` in `crates/api/src/web/state.rs`.
+
 ## Getting and hosting the files
 
 Build the five website files from source before hosting or compiling the API's

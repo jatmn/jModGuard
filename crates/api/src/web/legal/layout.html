@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title} · jModGuard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="legal-site">
+  <header class="legal-header">
+    <div class="legal-header-inner">
+      <a class="brand" href="/"><span class="brand-mark" aria-hidden="true">jG</span>jModGuard</a>
+      <div class="legal-dashboard"><a href="/">Back to dashboard</a></div>
+      <nav aria-label="Policies">
+        <a href="/privacy"{privacy_current}>Privacy Policy</a>
+        <a href="/terms"{terms_current}>Terms of Service</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="legal-page">
+    <div class="legal-summary">
+      <h1>{title}</h1>
+      <p>{scope}</p>
+      <dl class="legal-meta">
+        <div><dt>Operator</dt><dd>{operator}</dd></div>
+        <div><dt>Effective date</dt><dd>{effective_date}</dd></div>
+      </dl>
+    </div>
+
+    <div class="legal-layout">
+      <nav class="legal-toc" aria-label="On this page">
+        <div class="legal-toc-desktop">
+          <p>On this page</p>
+          <ul>{contents}</ul>
+        </div>
+        <details class="legal-toc-mobile">
+          <summary>On this page</summary>
+          <ul>{contents}</ul>
+        </details>
+      </nav>
+
+      <article class="legal-content">
+{body}
+      </article>
+    </div>
+  </main>
+
+  <footer class="legal-footer">
+    <p>Effective date · {effective_date}</p>
+    <nav aria-label="Footer">
+      <a href="/">Back to dashboard</a>
+      <a href="/privacy">Privacy Policy</a>
+      <a href="/terms">Terms of Service</a>
+    </nav>
+  </footer>
+</body>
+</html>

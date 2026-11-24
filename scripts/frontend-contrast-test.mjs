@@ -5,9 +5,9 @@ import vm from "node:vm";
 
 const css = readFileSync(new URL("../frontend/style.css", import.meta.url), "utf8");
 
-function tokens(selector) {
+function tokens(selector, source = css) {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const block = css.match(new RegExp(`${escaped}\\s*\\{([^}]+)\\}`));
+  const block = source.match(new RegExp(`${escaped}\\s*\\{([^}]+)\\}`));
   assert.ok(block, `missing ${selector} theme tokens`);
   return Object.fromEntries([...block[1].matchAll(/(--[\w-]+):\s*(#[\da-fA-F]{6})/g)]
     .map(([, name, color]) => [name, color]));
@@ -152,6 +152,23 @@ function mediaBlock(query) {
   }
   throw new Error(`unterminated @media ${query}`);
 }
+test("public policies use readable dashboard colors in both system themes", () => {
+  const dark = tokens(".legal-site", mediaBlock("screen and (prefers-color-scheme: dark)"));
+  const dashboardDark = tokens(':root[data-theme="dark"]');
+  for (const [token, color] of Object.entries(dark)) assert.equal(color, dashboardDark[token], token);
+
+  for (const palette of [tokens(":root"), dark]) {
+    for (const [foreground, surface] of [
+      ["--text", "--bg"], ["--text", "--panel"], ["--text", "--panel2"],
+      ["--text", "--hero"], ["--hero-text", "--hero"], ["--muted", "--bg"],
+      ["--selected-text", "--selected"], ["--accent", "--bg"], ["--accent", "--panel"],
+      ["--accent-hover", "--bg"], ["--accent-hover", "--panel"], ["--accent-hover", "--panel2"],
+    ]) {
+      assert.ok(contrast(palette[foreground], palette[surface]) >= 4.5, `${foreground} on ${surface}`);
+    }
+  }
+});
+
 // daisyUI 5.7: btn/input/select height = --size-field x10 (sm x8, xs x6); checkbox/badge = --size-selector x6.
 const FIELD = { md: 10, sm: 8, xs: 6 };
 
