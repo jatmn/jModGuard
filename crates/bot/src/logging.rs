@@ -1406,11 +1406,10 @@ async fn emit_cleanup_summary(
         || true,
         false,
         None,
-        Some(crate::discord::LogAttempt {
-            status: dispatch,
-            journal: journal.map(|key| (&app.db, key)),
-            previous_part_sent: false,
-        }),
+        Some(crate::discord::LogAttempt::new(
+            dispatch,
+            journal.map(|key| (&app.db, key)),
+        )),
     )
     .await;
     match (delivery, *dispatch) {
@@ -2943,11 +2942,8 @@ async fn emit_retained_bulk_with_journal(
     let deadline = Duration::from_secs(app.cfg.log.discord_timeout_secs);
     let started = Instant::now();
     let mut status = crate::discord::LogDispatch::Pending;
-    let mut attempt = journal.map(|key| crate::discord::LogAttempt {
-        status: &mut status,
-        journal: Some((&app.db, key)),
-        previous_part_sent: false,
-    });
+    let mut attempt =
+        journal.map(|key| crate::discord::LogAttempt::new(&mut status, Some((&app.db, key))));
     let routing = tokio::time::timeout(deadline.saturating_sub(started.elapsed()), async {
         if let Some(attempt) = &attempt {
             attempt.ensure_current_enrollment().await?;

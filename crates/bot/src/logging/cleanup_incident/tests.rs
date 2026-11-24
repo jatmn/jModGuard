@@ -424,6 +424,163 @@ async fn a_summary_dispatched_before_an_abrupt_restart_is_not_replayed() {
 }
 
 #[tokio::test]
+async fn interrupted_claim_reply_is_retried_or_recovered_with_one_post() {
+    use db::TEST_CLEANUP_CLAIM_COMMITTED;
+    use std::sync::atomic::Ordering;
+
+    for restart in [false, true] {
+        let f = Fixture::new(true).await;
+        f.enroll().await;
+        let cleanup = f.begin().await.unwrap();
+        f.rest(Some(&cleanup), 1, 101).await;
+        drop(cleanup);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::time::resume();
+
+        let (http, posts, server) = scripted_discord_proxy(vec![ScriptedHttpReply {
+            status: 200,
+            headers: "",
+            body: "{}",
+        }])
+        .await;
+        let http = Arc::new(http);
+        let committed = Arc::new(tokio::sync::Notify::new());
+        let worker = tokio::spawn(TEST_CLEANUP_CLAIM_COMMITTED.scope(Arc::clone(&committed), {
+            let app = Arc::clone(&f.app);
+            let http = Arc::clone(&http);
+            async move { flush(&app, http.as_ref(), false).await }
+        }));
+        tokio::time::timeout(Duration::from_secs(5), committed.notified())
+            .await
+            .unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+
+        if restart {
+            let path = Arc::clone(&f.path);
+            drop(f);
+            let restarted =
+                BotState::new(Default::default(), db::Db::open(&path.0, 2).unwrap()).unwrap();
+            restarted.activation.mark_lock_held(true);
+            let recovered = recover_cleanup_page(&restarted, http.as_ref(), 0)
+                .await
+                .unwrap();
+            assert!(recovered.0.is_some() && !recovered.1);
+            assert_eq!(
+                recover_cleanup_page(&restarted, http.as_ref(), 0)
+                    .await
+                    .unwrap(),
+                (None, false)
+            );
+        } else {
+            flush(&f.app, http.as_ref(), false).await;
+            flush(&f.app, http.as_ref(), false).await;
+        }
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "restart={restart}");
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn write_fenced_observation_falls_back_after_unfencing_without_blocking_other_guilds() {
+    use db::{
+        SqlExecutor as _,
+        guild_stores::{StoreId, StorePolicy, register_store},
+        params,
+    };
+
+    const OTHER: u64 = 11;
+    const OTHER_DESTINATION: u64 = 30;
+    let f = Fixture::new(true).await;
+    let enrollment = f.enroll().await;
+    db::enroll_guild(&f.app.db, OTHER as i64, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    db::upsert_log_channel(
+        &f.app.db,
+        OTHER as i64,
+        "message_delete",
+        OTHER_DESTINATION as i64,
+    )
+    .await
+    .unwrap();
+    let destination = StoreId::new();
+    register_store(&f.app.db, destination.clone(), StorePolicy::Shared)
+        .await
+        .unwrap();
+    f.app
+        .db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO guild_write_fences
+                (guild_id,generation,phase,destination_store_id,destination_revision,created_at)
+             VALUES(?1,?2,'freeze',?2,?2,100)",
+                params![GUILD, destination.as_str()],
+                1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let cleanup = f.begin().await.unwrap();
+    f.rest(Some(&cleanup), 1, 101).await;
+    let other = f.begin_in(OTHER, SUBJECT).await.unwrap();
+    assert!(
+        other
+            .deleted(&f.app, 2, 102, other.prepare(&f.app, 2, 102), false)
+            .await
+    );
+    drop((cleanup, other));
+    let journaled = f
+        .app
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT group_concat(message_id) FROM cleanup_delete_journal",
+                (),
+                |row| Ok(row.get::<String>(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(journaled, "102");
+
+    tokio::time::pause();
+    f.settle().await;
+    assert_eq!(f.notices().len(), 1);
+    assert_eq!(f.sink.0.lock()[0].0.get(), OTHER_DESTINATION);
+    assert!(f.notices()[0].contains("**Deleted:** 1"));
+
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_bounded(
+                "DELETE FROM guild_write_fences WHERE guild_id=?1",
+                params![GUILD],
+                0,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        db::guild_enrollment(&f.app.db, GUILD as i64).await.unwrap(),
+        Some(enrollment)
+    );
+    f.settle().await;
+    f.settle().await;
+    let notices = f.notices();
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert_eq!(f.sink.0.lock()[1].0.get(), DESTINATION);
+    assert!(notices[1].contains("Automod message deleted"));
+    assert!(notices[1].contains("<#1>"));
+}
+
+#[tokio::test]
 async fn recovered_delete_cannot_use_rejoined_membership_after_admission() {
     use std::future::Future;
 

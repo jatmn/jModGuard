@@ -129,9 +129,12 @@ and persistence contracts below are unchanged.
   public `bot.about_webui_url`. Otherwise the notice includes the case ID.
 - A cleanup still in progress at the 30-second cap or whose summary cannot
   be sent falls back to individual delete notices and a separate failure count.
-  A summary interrupted before its POST, including while waiting for a rate
-  limit or backing off after a 429, remains pending for grouped retry. A
-  summary whose POST may have been accepted settles as possibly delivered.
+  A summary waiting for a delivery slot, rate limit, or journal claim remains
+  pending for grouped retry. A committed claim is also eligible for startup
+  recovery until the bot arms it at the transport boundary. The running bot
+  reopens an armed claim if it detects cancellation before handing off the
+  request. An abrupt process loss at the final handoff is treated as possibly
+  delivered, as is a summary whose POST may have been accepted.
   The bot keeps the echo receipts and sends neither a second summary nor
   individual notices for the covered deletes. Pending cleanup deliveries
   share the bounded incident buffer and use exponential retry delays of
@@ -146,10 +149,12 @@ and persistence contracts below are unchanged.
   Confirmed REST deletes use Automod Delete. Purge observations with an
   interrupted enforcement use the ordinary delete route. The journal stores
   message and rule identifiers and timestamps. It stores no retained message
-  content or attachments. Recovery skips requests that may already have
-  reached Discord and work from retired guild memberships. Delete failures
-  and gateway echo receipts stay in memory. The grouped summary has no
-  transcript attachment.
+  content or attachments. When a guild write fence defers an observation, the
+  bot keeps it within the bounded incident buffer and delivers it individually
+  after the same enrollment becomes writable. Recovery skips requests that may
+  already have reached Discord and work from retired guild memberships.
+  Delete failures and gateway echo receipts stay in memory. The grouped
+  summary has no transcript attachment.
 - Delivery slot pressure queues at most 128 waiting reports across the bot.
   Each waits up to the configured Discord timeout for a slot, then uses the
   existing delivery deadline and filters. Routine reports include admission in

@@ -16,16 +16,45 @@ pub struct CleanupDeleteRecord {
     pub purge: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupDeleteSave {
+    Saved,
+    WriteFenced,
+    Retired,
+}
+
+/// Results follow the order of the input observations.
 pub async fn save_cleanup_deletes(
     db: &Db,
     owner: String,
     rows: Vec<CleanupDeleteRecord>,
-) -> Result<()> {
+) -> Result<Vec<CleanupDeleteSave>> {
     let rows = serde_json::to_string(&rows)?;
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
+        let outcomes = tx.prepare(
+            "SELECT e.id IS NOT NULL, f.guild_id IS NOT NULL
+               FROM json_each(?1) j
+               LEFT JOIN guild_enrollments e
+                 ON e.guild_id=j.value->>'guild_id' AND e.id=j.value->>'enrollment_id' AND e.active=1
+               LEFT JOIN guild_write_fences f ON f.guild_id=e.guild_id
+              ORDER BY j.key",
+        )?.query_map(params![rows.clone()], |row| {
+            Ok(if !row.get::<bool>(0)? {
+                CleanupDeleteSave::Retired
+            } else if row.get::<bool>(1)? {
+                CleanupDeleteSave::WriteFenced
+            } else {
+                CleanupDeleteSave::Saved
+            })
+        })?.collect::<Result<Vec<_>>>()?;
+        let expected = outcomes.iter().filter(|&&status| status == CleanupDeleteSave::Saved).count();
+        if expected == 0 {
+            tx.finish_read()?;
+            return Ok(outcomes);
+        }
         tx.ensure_mutation_receipt()?;
-        tx.execute_bounded(
+        let changed = tx.execute_bounded(
             "INSERT INTO cleanup_delete_journal
                 (batch,message_id,owner,guild_id,enrollment_id,channel_id,user_id,
                  rule_id,rule_name,observed_at_ms,purge)
@@ -36,11 +65,19 @@ pub async fn save_cleanup_deletes(
                JOIN guild_enrollments e
                  ON e.guild_id=j.value->>'guild_id' AND e.id=j.value->>'enrollment_id' AND e.active=1
               WHERE NOT EXISTS (SELECT 1 FROM guild_write_fences f WHERE f.guild_id=e.guild_id)
-             ON CONFLICT(batch,message_id) DO UPDATE SET purge=excluded.purge",
+             ON CONFLICT(batch,message_id) DO UPDATE SET purge=excluded.purge
+              WHERE cleanup_delete_journal.guild_id=excluded.guild_id
+                AND cleanup_delete_journal.enrollment_id=excluded.enrollment_id
+                AND cleanup_delete_journal.owner=excluded.owner",
             params![owner, rows],
             1024 * 1024,
         )?;
-        tx.commit()
+        anyhow::ensure!(
+            changed == expected,
+            "cleanup delete journal row belongs to different work"
+        );
+        tx.commit()?;
+        Ok(outcomes)
     })
     .await
 }
@@ -57,7 +94,7 @@ pub async fn recovered_cleanup_deletes(
                     d.user_id,d.rule_id,d.rule_name,d.observed_at_ms,d.purge
                FROM cleanup_delete_journal d
                JOIN guild_enrollments e ON e.guild_id=d.guild_id AND e.id=d.enrollment_id AND e.active=1
-              WHERE d.rowid>?1 AND d.owner<>?2 AND d.dispatching=0
+              WHERE d.rowid>?1 AND d.owner<>?2 AND d.dispatching<=0
                 AND NOT EXISTS (SELECT 1 FROM guild_write_fences f WHERE f.guild_id=d.guild_id)
               ORDER BY d.rowid LIMIT 32",
         )?.query_map(params![after, owner], |row| {
@@ -102,50 +139,145 @@ pub async fn ensure_cleanup_enrollment(db: &Db, guild: i64, enrollment_id: Strin
     .await
 }
 
-/// Claim or reopen the exact rows covered by a Discord attempt. If any row
-/// is missing, belongs to another enrollment, or changed state, roll back.
-pub async fn set_cleanup_dispatching(
-    db: &Db,
-    key: CleanupJournalKey<'_>,
-    expected_dispatching: bool,
-    dispatching: bool,
-) -> Result<()> {
-    let guild = key.guild_id;
-    let enrollment = key.enrollment_id.to_owned();
-    let count = key.messages.len();
-    if count == 0 {
-        // Failure-only summaries have no confirmed deletes to journal.
-        return ensure_cleanup_enrollment(db, guild, enrollment).await;
+/// The existing journal column holds zero for a ready row, a negative token
+/// for a recoverable claim, and a positive token for an armed send. Legacy 1
+/// remains possibly sent. Tokens prevent a delayed cancellation or rejection
+/// from clearing another attempt's dispatch protection.
+#[derive(Clone)]
+pub struct CleanupDispatchClaim {
+    db: Db,
+    guild: i64,
+    enrollment: String,
+    batch: String,
+    messages: String,
+    count: usize,
+    token: i64,
+}
+
+impl CleanupDispatchClaim {
+    pub async fn reserve(db: &Db, key: CleanupJournalKey<'_>) -> Result<Self> {
+        anyhow::ensure!(!key.messages.is_empty(), "cleanup claim has no messages");
+        let claim = Self {
+            db: db.clone(),
+            guild: key.guild_id,
+            enrollment: key.enrollment_id.to_owned(),
+            batch: key.batch.to_owned(),
+            messages: serde_json::to_string(key.messages)?,
+            count: key.messages.len(),
+            token: rand::random_range(2..=i64::MAX),
+        };
+        claim.transition(None, -claim.token).await?;
+        #[cfg(feature = "test-support")]
+        if let Ok(committed) = TEST_CLEANUP_CLAIM_COMMITTED.try_with(Arc::clone) {
+            committed.notify_one();
+            std::future::pending::<()>().await;
+        }
+        Ok(claim)
     }
-    let batch = key.batch.to_owned();
-    let messages = serde_json::to_string(key.messages)?;
-    db.with_conn(move |conn| {
-        let mut tx = conn.transaction_primary_write()?;
-        tx.ensure_mutation_receipt()?;
-        let changed = tx.execute_bounded(
-            "UPDATE cleanup_delete_journal SET dispatching=?6
-              WHERE batch=?1 AND message_id IN (SELECT value FROM json_each(?2))
-                AND guild_id=?3 AND enrollment_id=?4 AND dispatching=?5
-                AND EXISTS (SELECT 1 FROM guild_enrollments e
-                            WHERE e.guild_id=?3 AND e.id=?4 AND e.active=1)
-                AND NOT EXISTS (SELECT 1 FROM guild_write_fences f WHERE f.guild_id=?3)",
-            params![
-                batch,
-                messages,
-                guild,
-                enrollment,
-                expected_dispatching,
-                dispatching
-            ],
-            0,
-        )?;
-        anyhow::ensure!(
-            changed == count,
-            "cleanup dispatch rows are no longer current"
-        );
-        tx.commit()
-    })
-    .await
+
+    /// Keep the final journal write owned until the caller accepts the send
+    /// boundary. Cancellation or a failed commit acknowledgement must release
+    /// this token if the database did arm it.
+    pub async fn arm_for_send(&self) -> Result<()> {
+        let (ready, armed) = tokio::sync::oneshot::channel();
+        let (start, started) = tokio::sync::oneshot::channel();
+        let claim = self.clone();
+        tokio::spawn(async move {
+            if ready.is_closed() {
+                return;
+            }
+            let result = claim.transition(Some(-claim.token), claim.token).await;
+            let armed = result.is_ok();
+            if ready.send(result).is_ok() && armed && started.await.is_ok() {
+                return;
+            }
+            // Keep the proof that no request started through a primary outage.
+            // Releases are token-scoped, so even a lost release reply is safe to retry.
+            loop {
+                match claim.release().await {
+                    Ok(()) => break,
+                    Err(error)
+                        if is_primary_outage(&error)
+                            || is_database_operation_timeout(&error)
+                            || is_database_commit_indeterminate(&error)
+                            || is_remote_interactive_timeout(&error)
+                            || crate::db_compat::remote_unavailable_operation(&error).is_some() =>
+                    {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not reopen an unstarted cleanup dispatch");
+                        break;
+                    }
+                }
+            }
+        });
+        armed.await??;
+        start
+            .send(())
+            .map_err(|()| anyhow::anyhow!("cleanup dispatch handoff was lost"))
+    }
+
+    /// Recheck an already armed bulk report before sending another part.
+    pub async fn verify_armed(&self) -> Result<()> {
+        self.transition(Some(self.token), self.token).await
+    }
+
+    /// Reopen only this attempt after cancellation before handoff or a
+    /// definitive rejection. A failed arm can leave the recoverable claim as-is.
+    pub async fn release(&self) -> Result<()> {
+        self.transition(Some(self.token), 0).await
+    }
+
+    async fn transition(&self, expected: Option<i64>, next: i64) -> Result<()> {
+        let Self {
+            db,
+            guild,
+            enrollment,
+            batch,
+            messages,
+            count,
+            token: _,
+        } = self.clone();
+        db.with_conn(move |conn| {
+            let mut tx = conn.transaction_primary_write()?;
+            tx.ensure_mutation_receipt()?;
+            // Claim tokens can grow a row compared with the zero default.
+            let growth = if expected.is_none() {
+                (count as u64)
+                    .saturating_mul(tx.capacity_page_size()?)
+                    .saturating_mul(4)
+            } else {
+                0
+            };
+            // Releasing this token cannot authorize another send across a fence.
+            let changed = tx.execute_bounded(
+                "UPDATE cleanup_delete_journal SET dispatching=?6
+                  WHERE batch=?1 AND message_id IN (SELECT value FROM json_each(?2))
+                    AND guild_id=?3 AND enrollment_id=?4
+                    AND ((?5 IS NULL AND dispatching<=0) OR dispatching=?5)
+                    AND EXISTS (SELECT 1 FROM guild_enrollments e
+                                WHERE e.guild_id=?3 AND e.id=?4 AND e.active=1)
+                    AND (?6=0 OR NOT EXISTS (SELECT 1 FROM guild_write_fences f WHERE f.guild_id=?3))",
+                params![batch, messages, guild, enrollment, expected, next],
+                growth,
+            )?;
+            if next != 0 {
+                anyhow::ensure!(
+                    changed == count,
+                    "cleanup dispatch rows are no longer current"
+                );
+            }
+            tx.commit()
+        })
+        .await
+    }
+}
+
+#[cfg(feature = "test-support")]
+tokio::task_local! {
+    // Hold the result after the real transaction commits to simulate a lost reply.
+    pub static TEST_CLEANUP_CLAIM_COMMITTED: Arc<tokio::sync::Notify>;
 }
 
 pub async fn settle_cleanup_deletes(db: &Db, keys: Vec<(String, i64)>) -> Result<()> {
@@ -170,7 +302,7 @@ pub async fn prune_cleanup_journal(db: &Db, owner: String) -> Result<usize> {
         let removed = tx.execute_reclaim(
             "DELETE FROM cleanup_delete_journal WHERE rowid IN (
                  SELECT d.rowid FROM cleanup_delete_journal d
-                  WHERE (d.owner<>?1 AND d.dispatching=1)
+                  WHERE (d.owner<>?1 AND d.dispatching>0)
                      OR NOT EXISTS (SELECT 1 FROM guild_enrollments e
                          WHERE e.guild_id=d.guild_id AND e.id=d.enrollment_id AND e.active=1)
                   ORDER BY d.rowid LIMIT 256)",

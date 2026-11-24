@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::automod_delete_marks::{CleanupDeleteClaim, GatewayDeleteOrigin, PreparedAutomodDelete};
-use crate::db::CleanupDeleteRecord;
 use crate::db::guild_data::{CaseId, CaseOutcome};
+use crate::db::{CleanupDeleteRecord, CleanupDeleteSave};
 use crate::discord::{LogAttempt, LogDispatch};
 use std::collections::BTreeSet;
 use tokio::time::Instant as Clock;
@@ -46,6 +46,7 @@ pub(crate) struct CleanupIncidents {
 #[derive(Default)]
 struct JournalWrites {
     observed: BTreeMap<(u64, Message), CleanupDeleteRecord>,
+    skipped: BTreeMap<(u64, Message), CleanupDeleteSave>,
     settled: BTreeSet<(u64, i64)>,
 }
 
@@ -854,14 +855,22 @@ pub(crate) async fn persist_cleanup_observations(app: &BotState) {
     for records in observed.chunks(64) {
         let owner = app.activation.instance().to_owned();
         let rows = records.iter().map(|(_, row)| row.clone()).collect();
-        if let Err(error) = db::save_cleanup_deletes(&app.db, owner, rows).await {
-            tracing::warn!(%error, "could not journal confirmed cleanup deletes");
-            break;
-        }
+        let outcomes = match db::save_cleanup_deletes(&app.db, owner, rows).await {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                tracing::warn!(%error, "could not journal confirmed cleanup deletes");
+                break;
+            }
+        };
         let mut journal = queue.journal.lock();
-        for (key, row) in records {
+        for ((key, row), outcome) in records.iter().zip(outcomes) {
             if journal.observed.get(key) == Some(row) {
-                journal.observed.remove(key);
+                if outcome != CleanupDeleteSave::Saved {
+                    journal.skipped.insert(*key, outcome);
+                }
+                if outcome != CleanupDeleteSave::WriteFenced {
+                    journal.observed.remove(key);
+                }
             }
         }
     }
@@ -910,6 +919,7 @@ impl PendingIncident {
                 let mut journal = app.cleanup_incidents.journal.lock();
                 let batch = self.incident.nonce;
                 journal.observed.remove(&(batch, target));
+                journal.skipped.remove(&(batch, target));
                 journal.settled.insert((batch, target.1 as i64));
             }
             app.automod_delete_marks
@@ -950,23 +960,33 @@ impl PendingIncident {
         if self.incident.messages.is_empty() {
             return;
         }
+        // If the primary could not save the observations, keep the batch in
+        // memory for retry. A dispatched summary must cover durable records.
+        let (awaiting_journal, fenced, retired) = {
+            let batch = self.incident.nonce;
+            let targets = (batch, (0, 0))..=(batch, (u64::MAX, u64::MAX));
+            let journal = app.cleanup_incidents.journal.lock();
+            let awaiting = journal.observed.range(targets.clone()).next().is_some();
+            let mut fenced = false;
+            let mut retired = false;
+            for (_, outcome) in journal.skipped.range(targets) {
+                fenced |= *outcome == CleanupDeleteSave::WriteFenced;
+                retired |= *outcome == CleanupDeleteSave::Retired;
+            }
+            (awaiting, fenced, retired)
+        };
+        if retired {
+            self.finish_matching(app, |_| true);
+            return;
+        }
+        self.fallback |= fenced;
+        if awaiting_journal && (!shutdown || fenced) {
+            return;
+        }
         let (guild, _) = self.subject;
         let Ok(cfg) = app.configs.get(&app.db, guild).await else {
             return;
         };
-        // If the primary could not save the observations, keep the batch in
-        // memory for retry. A dispatched summary must cover durable records.
-        let awaiting_journal = app
-            .cleanup_incidents
-            .journal
-            .lock()
-            .observed
-            .range((self.incident.nonce, (0, 0))..=(self.incident.nonce, (u64::MAX, u64::MAX)))
-            .next()
-            .is_some();
-        if awaiting_journal && !shutdown {
-            return;
-        }
 
         let rejected = self.incident.outcome == Some(CaseOutcome::Failed);
         if rejected {
@@ -1063,11 +1083,9 @@ impl PendingIncident {
             );
             let scope = self.individual((0, 0));
             let mut dispatch = LogDispatch::Pending;
-            let attempt = scope.journal(&[]).map(|key| LogAttempt {
-                status: &mut dispatch,
-                journal: Some((&app.db, key)),
-                previous_part_sent: false,
-            });
+            let attempt = scope
+                .journal(&[])
+                .map(|key| LogAttempt::new(&mut dispatch, Some((&app.db, key))));
             if channel_for(&cfg, "automod_delete").is_none()
                 || emit_to_observed_with_audit(
                     app,
@@ -1222,11 +1240,9 @@ impl IndividualCleanup<'_> {
         }
         let mut dispatch = LogDispatch::Pending;
         let messages = [message as i64];
-        let attempt = self.journal(&messages).map(|key| LogAttempt {
-            status: &mut dispatch,
-            journal: Some((&app.db, key)),
-            previous_part_sent: false,
-        });
+        let attempt = self
+            .journal(&messages)
+            .map(|key| LogAttempt::new(&mut dispatch, Some((&app.db, key))));
         let (delivery, _) = emit_to_observed_with_audit(
             app,
             sink,

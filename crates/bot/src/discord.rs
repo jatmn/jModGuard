@@ -1,6 +1,6 @@
 //! Shared Discord REST helpers.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use parking_lot::Mutex;
 use serenity::model::channel::Channel;
 use serenity::model::id::ChannelId;
@@ -150,11 +150,24 @@ impl LogDispatch {
 /// after 429. A replacement bot may recover only work definitely not dispatched.
 pub(crate) struct LogAttempt<'a> {
     pub status: &'a mut LogDispatch,
-    pub journal: Option<(&'a crate::db::Db, crate::db::CleanupJournalKey<'a>)>,
+    journal: Option<(&'a crate::db::Db, crate::db::CleanupJournalKey<'a>)>,
+    claim: Option<crate::db::CleanupDispatchClaim>,
     pub previous_part_sent: bool,
 }
 
-impl LogAttempt<'_> {
+impl<'a> LogAttempt<'a> {
+    pub fn new(
+        status: &'a mut LogDispatch,
+        journal: Option<(&'a crate::db::Db, crate::db::CleanupJournalKey<'a>)>,
+    ) -> Self {
+        Self {
+            status,
+            journal,
+            claim: None,
+            previous_part_sent: false,
+        }
+    }
+
     pub async fn ensure_current_enrollment(&self) -> Result<()> {
         if let Some((db, key)) = self.journal {
             crate::db::ensure_cleanup_enrollment(db, key.guild_id, key.enrollment_id.to_owned())
@@ -165,18 +178,31 @@ impl LogAttempt<'_> {
 
     pub async fn before_send(&mut self) -> Result<()> {
         if let Some((db, key)) = self.journal {
-            crate::db::set_cleanup_dispatching(db, key, self.previous_part_sent, true).await?;
+            if key.messages.is_empty() {
+                self.ensure_current_enrollment().await?;
+            } else if self.previous_part_sent {
+                self.claim
+                    .as_ref()
+                    .context("cleanup bulk send has no dispatch claim")?
+                    .verify_armed()
+                    .await?;
+            } else {
+                let claim = crate::db::CleanupDispatchClaim::reserve(db, key).await?;
+                claim.arm_for_send().await?;
+                self.claim = Some(claim);
+            }
         }
         *self.status = LogDispatch::MayHaveSent;
         Ok(())
     }
 
-    pub async fn reset_journal_if_unsent(&self) -> Result<()> {
+    pub async fn reset_journal_if_unsent(&mut self) -> Result<()> {
         if !self.previous_part_sent
             && *self.status != LogDispatch::MayHaveSent
-            && let Some((db, key)) = self.journal
+            && let Some(claim) = self.claim.as_ref()
         {
-            crate::db::set_cleanup_dispatching(db, key, true, false).await?;
+            claim.release().await?;
+            self.claim = None;
         }
         Ok(())
     }

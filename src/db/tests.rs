@@ -3,11 +3,12 @@ use super::*;
 #[tokio::test]
 async fn cleanup_dispatch_requires_every_row_and_an_active_unfenced_enrollment() {
     use super::guild_stores::{StoreId, StorePolicy, register_store};
+    use std::future::Future as _;
 
     let tmp = tmp_db_path("cleanup_dispatch");
     let db = Db::open(&tmp, 2).unwrap();
     let enrollment = enroll_guild(&db, 8, 100).await.unwrap().unwrap();
-    save_cleanup_deletes(
+    let outcomes = save_cleanup_deletes(
         &db,
         "previous".into(),
         vec![CleanupDeleteRecord {
@@ -25,28 +26,66 @@ async fn cleanup_dispatch_requires_every_row_and_an_active_unfenced_enrollment()
     )
     .await
     .unwrap();
+    assert_eq!(outcomes, [CleanupDeleteSave::Saved]);
     let key = CleanupJournalKey {
         guild_id: enrollment.guild_id,
         enrollment_id: &enrollment.id,
         batch: "cleanup",
         messages: &[10, 12],
     };
-    assert!(
-        set_cleanup_dispatching(&db, key, false, true)
-            .await
-            .is_err()
-    );
+    assert!(CleanupDispatchClaim::reserve(&db, key).await.is_err());
     let key = CleanupJournalKey {
         messages: &[10],
         ..key
     };
-    // The partial claim must roll back so the exact row is still available.
-    set_cleanup_dispatching(&db, key, false, true)
+    // The partial claim must roll back without changing the remaining row.
+    let retryable = recovered_cleanup_deletes(&db, "replacement".into(), 0)
         .await
         .unwrap();
-    set_cleanup_dispatching(&db, key, true, false)
-        .await
-        .unwrap();
+    assert_eq!(retryable.len(), 1);
+    let first = CleanupDispatchClaim::reserve(&db, key).await.unwrap();
+    let next = CleanupDispatchClaim::reserve(&db, key).await.unwrap();
+    assert!(first.arm_for_send().await.is_err());
+    next.arm_for_send().await.unwrap();
+    first.release().await.unwrap();
+    assert!(
+        recovered_cleanup_deletes(&db, "replacement".into(), 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    next.release().await.unwrap();
+    let unstarted = CleanupDispatchClaim::reserve(&db, key).await.unwrap();
+    let mut arm = Box::pin(unstarted.arm_for_send());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(arm.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    // Let the database commit the arm while its consumer is suspended.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !recovered_cleanup_deletes(&db, "replacement".into(), 0)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(arm);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while recovered_cleanup_deletes(&db, "replacement".into(), 0)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let destination = format!("{:032x}", 9u128);
     register_store(
         &db,
@@ -67,11 +106,7 @@ async fn cleanup_dispatch_requires_every_row_and_an_active_unfenced_enrollment()
     })
     .await
     .unwrap();
-    assert!(
-        set_cleanup_dispatching(&db, key, false, true)
-            .await
-            .is_err()
-    );
+    assert!(CleanupDispatchClaim::reserve(&db, key).await.is_err());
     assert!(
         ensure_cleanup_enrollment(&db, enrollment.guild_id, enrollment.id.clone())
             .await
