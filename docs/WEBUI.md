@@ -22,18 +22,24 @@ Start `jmodguard-bot` once first so the database is migrated, then start
 
 [Privacy Policy](../crates/api/src/web/legal/privacy.html) is served at
 `/privacy` and [Terms of Service](../crates/api/src/web/legal/terms.html) at
-`/terms`. The API serves both in either build. They return HTML without
-sign-in or JavaScript. Both pages and the dashboard use the same public origin
-for navigation and styling. The API fills in the operator details at request
-time. It also exposes them in the public `GET /api/legal` response.
+`/terms`. The API serves both pages and `/api/legal/style.css` in either build.
+The pages return HTML without sign-in or JavaScript. Both pages and the dashboard
+use the same public origin for navigation and styling. The API fills in the
+operator details at request time. It also exposes them in the public
+`GET /api/legal` response.
 
-When the dashboard is hosted separately, forward `/privacy` and `/terms`
-from the public dashboard origin to the API, including when
-`JMODGUARD_API_BASE` is set. Keep serving the home page and stylesheet on
-the dashboard origin. See the [edge rule example](DEPLOY-BUNNY.md#5-point-api-paths-on-the-pull-zone-at-the-api-container).
+When the dashboard is hosted separately, forward `/privacy`, `/terms`, and
+`/api/legal/style.css` from the public dashboard origin to the API. The policy
+pages request the stylesheet on that origin even when
+`window.JMODGUARD_API_BASE` is set. An existing `/api*` rule covers the
+stylesheet. With narrower forwarding rules, add the exact stylesheet path.
+See the [edge rule example](DEPLOY-BUNNY.md#5-point-api-paths-on-the-pull-zone-at-the-api-container).
+
 Before registering the URLs with Discord, deploy the API and WebUI, then
-verify that the public `/privacy` and `/terms` URLs each return their own HTML
-with HTTP 200 in a signed-out window. Follow each page’s link to the other.
+request `/privacy`, `/terms`, and `/api/legal/style.css` on the public
+dashboard origin without cookies. Check that both policy pages return their
+own HTML with HTTP 200 and that the stylesheet returns HTTP 200 with a
+`text/css` content type. Follow each page’s link to the other.
 
 Fill in the API’s [`[legal]` configuration](CONFIGURATION.md#public-legal-details)
 before publishing the policy URLs. Before acting on a deletion request, verify
@@ -45,6 +51,19 @@ guild-store writes so queued work and member sync are accounted for. Preserve
 moderation cases and their history. Confirm what was removed and what was
 retained to the requester privately. The policy gives the initial response
 target and explains that later Discord events can recreate entries.
+
+### Privacy disclosure sources
+
+- Session contents, sign-out, inactivity and restart are defined in
+  `crates/api/src/web/mod.rs` by `store_login_session`, `logout`, `router`
+  and `router_with_store`.
+- Permission checks and token renewal use the session in
+  `crates/api/src/web/mod.rs`. The Discord guild and member-role calls are in
+  `crates/api/src/web/oauth.rs`.
+- The in-memory store, `tower-sessions-memory-store`, is pinned in
+  `Cargo.lock`. Its `MemoryStore::load` stops returning expired records. The
+  API also expires its in-memory authentication state through
+  `sweep_auth_sessions` in `crates/api/src/web/state.rs`.
 
 ## Getting and hosting the files
 
@@ -189,7 +208,7 @@ serves them at `http://localhost:8080`.
    admin site is either the Pull Zone `*.b-cdn.net` hostname or an owned domain/subdomain
    you add on that zone. Use that same host for `JMODGUARD_WEB_BASE_URL` and
    the Discord OAuth redirect.
-4. Point `/api`, `/login`, `/logout`, `/oauth`, and `/health` on that Pull
+4. Point `/api*`, `/login*`, `/logout*`, `/oauth*`, and `/health*` on that Pull
    Zone at the API container with **Override Origin URL** (`OriginUrl`) to
    the API endpoint Pull Zone host (you must create a CDN endpoint on the
    API container's port in the app first; sticky sessions are set on that
@@ -197,8 +216,9 @@ serves them at `http://localhost:8080`.
    DEPLOY-BUNNY.md). Do not
    use Override Origin: Magic Containers on a Storage Pull Zone. Leave
    `window.JMODGUARD_API_BASE` unset. Strip Response Cookies must be off
-   (Caching → General; `DisableCookies=false`). Add the separate public policy
-   rule for `/privacy` and `/terms` described in [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md#5-point-api-paths-on-the-pull-zone-at-the-api-container).
+   (Caching → General; `DisableCookies=false`). The `/api*` rule covers
+   `/api/legal/style.css`. Add the separate policy rule for `/privacy` and
+   `/terms` from the [Bunny edge rule example](DEPLOY-BUNNY.md#5-point-api-paths-on-the-pull-zone-at-the-api-container).
 
 For the initial bootstrap only, upload all five files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. After that, GitHub Actions **Publish** builds an independent WebUI package to GHCR on trusted publication builds; it does not upload it to Bunny directly. The owner installs it from **Administration → Updates**, and the API writes it to Storage with `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, and `BUNNY_STORAGE_ENDPOINT`, then purges the Pull Zone when both `BUNNY_PULL_ZONE_ID` and a scoped `BUNNY_PURGE_API_KEY` (where the Bunny account offers scoped keys; otherwise purge from the dashboard) are set on the API container (never git); see
 [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) and [BUNNY-UPDATES.md](BUNNY-UPDATES.md#storage-zone-publication). A private ops repo is **not required** to install.
@@ -217,6 +237,11 @@ and register that API origin's `/oauth/callback` with Discord. `/login`
 and `/oauth/callback` must share that hostname so the CSRF cookies Discord
 cannot set are sent back on the redirect. Bunny’s designed shape does not
 need that split: the Pull Zone is one hostname for both the files and `/api`.
+
+Proxy `/privacy`, `/terms`, and `/api/legal/style.css` from the public
+dashboard origin to the API. Use an exact match for the stylesheet when the
+dashboard origin has no API forwarding rule that covers it. Run the
+[signed-out policy checks](#public-policy-pages) on the dashboard origin.
 
 Never put a database URL or token in these files.
 

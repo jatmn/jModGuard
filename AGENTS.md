@@ -430,9 +430,10 @@ authorize live provider calls or require a Codex skill to contribute.
   `Number`. Bunny API-path edge rules must also **Override Cache Time = 0**
   (plus Bypass Perma-Cache); Bypass Perma-Cache alone is not enough.
 - Cross-origin CDN SPA is not the Bunny topology. Bunny serves `frontend/`
-  from Storage and proxies `/api` `/login` `/oauth` to a private API
-  container (same origin; no CORS). `web.cors_origins` /
-  `JMODGUARD_CORS_ORIGINS` exist only for a split-origin experiment.
+  from Storage and proxies `/api`, `/login`, `/oauth`, `/privacy`, `/terms`,
+  and `/api/legal/style.css` to a private API container (same origin; no CORS).
+  `web.cors_origins` / `JMODGUARD_CORS_ORIGINS` exist only for a split-origin
+  experiment.
   `https` `web.base_url` is the public CDN hostname. CORS validation
   runs through `ApiProcessConfig::load` only. A public bind (`0.0.0.0`) must also pass
   `validate_public_base_url` (`JMODGUARD_WEB_BASE_URL` https, not localhost).

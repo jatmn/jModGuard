@@ -5,9 +5,9 @@ import vm from "node:vm";
 
 const css = readFileSync(new URL("../frontend/style.css", import.meta.url), "utf8");
 
-function tokens(selector) {
+function tokens(selector, source = css) {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const block = css.match(new RegExp(`${escaped}\\s*\\{([^}]+)\\}`));
+  const block = source.match(new RegExp(`${escaped}\\s*\\{([^}]+)\\}`));
   assert.ok(block, `missing ${selector} theme tokens`);
   return Object.fromEntries([...block[1].matchAll(/(--[\w-]+):\s*(#[\da-fA-F]{6})/g)]
     .map(([, name, color]) => [name, color]));
@@ -142,16 +142,34 @@ function px(value) {
   assert.ok(match, `expected a rem/px length, got ${value}`);
   return Number(match[1]) * (match[2] === "rem" ? 16 : 1);
 }
-function mediaBlock(query) {
-  const start = css.indexOf(`@media ${query} {`);
+function mediaBlock(query, source = css) {
+  const start = source.indexOf(`@media ${query} {`);
   assert.ok(start >= 0, `missing @media ${query}`);
   let depth = 0;
-  for (let index = css.indexOf("{", start); index < css.length; index++) {
-    if (css[index] === "{") depth++;
-    if (css[index] === "}" && --depth === 0) return css.slice(css.indexOf("{", start) + 1, index);
+  for (let index = source.indexOf("{", start); index < source.length; index++) {
+    if (source[index] === "{") depth++;
+    if (source[index] === "}" && --depth === 0) return source.slice(source.indexOf("{", start) + 1, index);
   }
   throw new Error(`unterminated @media ${query}`);
 }
+test("public policies use readable dashboard colors in both system themes", () => {
+  const legalCss = readFileSync(new URL("../crates/api/src/web/legal/style.css", import.meta.url), "utf8");
+  const light = tokens(".legal-site", legalCss);
+  const dark = tokens(".legal-site", mediaBlock("screen and (prefers-color-scheme: dark)", legalCss));
+
+  for (const [palette, dashboard] of [[light, tokens(":root")], [dark, tokens(':root[data-theme="dark"]')]]) {
+    for (const [token, color] of Object.entries(palette)) assert.equal(color, dashboard[token], token);
+    for (const [foreground, surface] of [
+      ["--text", "--bg"], ["--text", "--panel"], ["--text", "--panel2"],
+      ["--text", "--hero"], ["--hero-text", "--hero"], ["--muted", "--bg"],
+      ["--selected-text", "--selected"], ["--accent", "--bg"], ["--accent", "--panel"],
+      ["--accent-hover", "--bg"], ["--accent-hover", "--panel"], ["--accent-hover", "--panel2"],
+    ]) {
+      assert.ok(contrast(palette[foreground], palette[surface]) >= 4.5, `${foreground} on ${surface}`);
+    }
+  }
+});
+
 // daisyUI 5.7: btn/input/select height = --size-field x10 (sm x8, xs x6); checkbox/badge = --size-selector x6.
 const FIELD = { md: 10, sm: 8, xs: 6 };
 

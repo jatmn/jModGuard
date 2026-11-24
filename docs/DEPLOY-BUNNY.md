@@ -25,11 +25,11 @@ WebUI GHCR package; the owner update path is described in
 Browser  →  Bunny CDN (Pull Zone)
               │
               ├─ /  /administration/  /assets/releases/   ← Storage Zone
-              └─ /api  /login  /oauth/*   ← API Magic Container (origin only)
-                                              │
-Discord  ←  bot Magic Container               │
-              │                               │
-              └──────── Bunny Database ───────┘
+              └─ /api*  /login*  /logout*  /oauth*  /health*   ← API Magic Container (origin only)
+                 /privacy  /terms  /api/legal/style.css          │
+Discord  ←  bot Magic Container                                  │
+              │                                                  │
+              └──────── Bunny Database ──────────────────────────┘
                        (remote libSQL)
 ```
 
@@ -154,10 +154,10 @@ Set both purge values or neither. Neither skips the purge with a warning;
 exactly one fails the install. Without a scoped purge key, leave both unset
 and purge the Pull Zone from the dashboard after each WebUI install.
 
-Leave `window.JMODGUARD_API_BASE` unset. The Pull Zone also sends `/api`,
-`/login`, `/logout`, and `/oauth/callback` to the API container (step 5),
-so the UI and API are same-origin. Do not put a database URL or token in
-these files.
+Leave `window.JMODGUARD_API_BASE` unset. The Pull Zone sends the API routes
+and the public policy paths `/privacy`, `/terms`, and `/api/legal/style.css`
+to the API container (step 5) so they share the UI origin. Do not put a
+database URL or token in these files.
 
 ## 3. Build and publish both images
 
@@ -483,17 +483,21 @@ On the Pull Zone from step 2 (Storage origin for the files):
    stripped. If you update the zone via the Bunny API, send only the
    fields you are changing — posting the full GET body back fails
    (`model.invalid` on `id`).
-5. Add a separate edge rule for the exact paths `/privacy` and `/terms` on
-   the public origin. Use the same **Override Origin URL**, **Bypass
-   Perma-Cache**, and **Override Cache Time = 0** actions. The API serves
-   both pages in the Bunny build. The separate rule keeps the existing
-   path patterns within Bunny’s per-trigger limit.
+5. Forward `/privacy`, `/terms`, and `/api/legal/style.css` from the public
+   origin to the API. The `/api*` pattern in step 3 covers the stylesheet.
+   Add a separate edge rule that matches `/privacy` and `/terms` exactly.
+   If your API rule uses narrower matches, include the exact
+   `/api/legal/style.css` path in the separate policy rule. Use the same
+   **Override Origin URL**, **Bypass Perma-Cache**, and
+   **Override Cache Time = 0** actions. The separate rule keeps the path
+   patterns within Bunny’s per-trigger limit.
 6. Everything else stays on Storage (`/`, `/app.js`, `/style.css`). daisyUI and
    Headless UI are included in those built CSS/JS files.
 
-After rollout, request both policy paths on the public origin without cookies.
-Each should return HTTP 200 and its policy HTML before you register the URLs
-with Discord.
+After rollout, request `/privacy`, `/terms`, and `/api/legal/style.css` on
+the public origin without cookies. Check that both policy pages return HTTP 200
+with their own HTML and that the stylesheet returns HTTP 200 with a `text/css`
+content type before you register the URLs with Discord.
 
 After this, a browser on the **public admin host** (`JMODGUARD_WEB_BASE_URL`:
 the Pull Zone `*.b-cdn.net` hostname, or the owned domain/subdomain if you

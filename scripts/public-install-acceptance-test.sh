@@ -124,6 +124,13 @@ require_contains docs/DEPLOY-BUNNY.md "is the **public admin host**"
 require_absent docs/DEPLOY-BUNNY.md "Open the **CDN** hostname"
 require_absent docs/DEPLOY-BUNNY.md "is the **CDN** origin"
 
+# test_separate_host_setup_lists_public_policy_routes
+separate_host_setup=$(sed -n '/^\*\*Another host or CDN\.\*\*/,/^## /p' "$root/docs/WEBUI.md")
+for policy_route in /api/legal/style.css /privacy /terms; do
+  [[ "$separate_host_setup" == *"\`$policy_route\`"* ]] ||
+    fail "missing route in the separate-host setup in docs/WEBUI.md: $policy_route"
+done
+
 # test_discord_invite_permissions_follow_url_generator_order
 node --input-type=module - "$root" <<'JS' || fail "discord invite permission order"
 import fs from "node:fs";

@@ -193,20 +193,10 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .login-card h1 { font-size: clamp(34px, 5vw, 56px); line-height: 1.13; letter-spacing: -2px; margin: 20px 0 24px; }
 .login-card p { color: var(--muted); line-height: 1.8; }
 .login-card small { display: block; color: var(--muted); }
-.legal-links, .legal-page nav { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; }
+.legal-links { display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem; }
 .login-card .legal-links { justify-content: center; margin-top: 0.75rem; }
-.legal-links a, .legal-page a { color: var(--accent); text-decoration: underline; }
-.legal-links a, .legal-page nav a { display: inline-block; min-height: var(--target-min); }
+.legal-links a { color: var(--accent); text-decoration: underline; display: inline-block; min-height: var(--target-min); }
 .workspace-footer .legal-links a { display: inline-flex; align-items: center; }
-.legal-page { max-width: 48rem; margin: 0 auto; padding: clamp(1.5rem, 6vw, 4rem) 1.25rem; font-size: 1rem; line-height: 1.65; }
-.legal-page h1 { margin: 1.5rem 0 1rem; font-size: clamp(2rem, 6vw, 3rem); font-weight: 750; line-height: 1.15; }
-.legal-page h2 { margin: 1.5rem 0 0.5rem; font-size: 1.25rem; font-weight: 700; }
-.legal-page p, .legal-page li { margin-bottom: 0.75rem; }
-.legal-page dt { font-weight: 700; }
-.legal-page dd { margin-bottom: 0.75rem; white-space: pre-line; }
-.legal-page ul { list-style: disc outside; }
-.legal-page ol { list-style: decimal outside; }
-.legal-page ul, .legal-page ol { padding-inline-start: 1.5rem; }
 .theme-picker { display: flex; align-items: center; gap: 10px; color: var(--side-muted); font-size: 12px; padding: 0 10px 10px; }
 .sidebar-footer .theme-picker { width: 100%; padding: 0; }
 .theme-picker .select { flex: 1; min-width: 0; }

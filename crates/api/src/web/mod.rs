@@ -2069,6 +2069,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             .route("/privacy", get(legal::privacy))
             .route("/terms", get(legal::terms))
             .route("/api/legal", get(legal::details))
+            .route("/api/legal/style.css", get(legal::stylesheet))
             .merge(sessioned),
     )
     .layer(axum::middleware::from_fn(resources::count_request))
@@ -2943,6 +2944,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legal_pages_privacy_keeps_source_paths_out_of_the_policy() {
+        let html = public_legal_html(test_app(), "/privacy").await;
+        assert!(!html.contains(".rs"));
+        assert!(html.contains(
+            r##"Follow <a href="#operator-details">the operator’s deletion instructions</a>."##
+        ));
+        assert_eq!(
+            html.matches(r#"<li class="legal-retention-card">"#).count(),
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn legal_pages_render_the_shared_layout_and_resolvable_section_links() {
+        let app = test_app();
+        for (path, other, count) in [("/privacy", "/terms", 6), ("/terms", "/privacy", 4)] {
+            let html = public_legal_html(app.clone(), path).await;
+            let (_, header) = html.split_once(r#"<header class="legal-header">"#).unwrap();
+            let (header, _) = header.split_once("</header>").unwrap();
+            assert!(header.contains(r#"class="brand-mark""#), "{path}");
+            assert!(header.contains(&format!(r#"href="{path}" aria-current="page""#)));
+            assert!(header.contains(&format!(r#"href="{other}""#)));
+            assert!(header.contains(r#"<a href="/">Back to dashboard</a>"#));
+            assert!(html.contains(r#"class="legal-summary""#), "{path}");
+
+            let (_, toc) = html.split_once(r#"<nav class="legal-toc""#).unwrap();
+            let (toc, _) = toc.split_once("</nav>").unwrap();
+            assert!(toc.contains(r#"<details class="legal-toc-mobile">"#));
+            let mut headings: Vec<_> = html
+                .split(r#"<h2 id=""#)
+                .skip(1)
+                .map(|heading| heading.split_once('"').unwrap().0)
+                .collect();
+            headings.sort_unstable();
+            assert_eq!(headings.len(), count, "{path}");
+            assert!(headings.windows(2).all(|pair| pair[0] != pair[1]), "{path}");
+            let mut links: Vec<_> = toc
+                .split("href=\"#")
+                .skip(1)
+                .map(|link| link.split_once('"').unwrap().0)
+                .collect();
+            links.sort_unstable();
+            let expected: Vec<_> = headings.iter().flat_map(|&id| [id, id]).collect();
+            assert_eq!(links, expected, "{path}");
+            assert!(html.contains(
+                r#"<section class="legal-operator" aria-labelledby="operator-details">"#
+            ));
+
+            let (_, footer) = html.split_once(r#"<footer class="legal-footer">"#).unwrap();
+            for link in [r#"href="/privacy""#, r#"href="/terms""#, r#"href="/""#] {
+                assert!(footer.contains(link), "{path}: {link}");
+            }
+            assert!(footer.contains("Effective date"));
+        }
+    }
+
+    #[tokio::test]
     async fn legal_pages_privacy_is_public_without_a_session() {
         let app = test_app();
         assert_public_legal_page(
@@ -2973,16 +3031,39 @@ mod tests {
         let app = test_app();
         for (path, other) in [("/privacy", "/terms"), ("/terms", "/privacy")] {
             let html = public_legal_html(app.clone(), path).await;
+            let (_, stylesheet) = html.split_once(r#"<link rel="stylesheet" href=""#).unwrap();
+            let (stylesheet, _) = stylesheet.split_once('"').unwrap();
+            let response = public_legal_response(app.clone(), stylesheet, None).await;
+            assert!(stylesheet.starts_with("/api/"), "{path}: {stylesheet}");
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/css; charset=utf-8"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let css = std::str::from_utf8(&bytes).unwrap();
+            for rule in [
+                ".legal-summary",
+                ".legal-toc-desktop",
+                ".legal-toc-mobile",
+                "@media print",
+            ] {
+                assert!(css.contains(rule), "{stylesheet}: missing {rule}");
+            }
             assert!(
-                html.contains(r#"<link rel="stylesheet" href="/style.css">"#),
+                !css.contains("@import"),
+                "{stylesheet}: must be self-contained"
+            );
+            assert!(html.contains(r#"<a class="brand" href="/">"#), "{path}");
+            assert!(
+                html.contains(r#"<a href="/">Back to dashboard</a>"#),
                 "{path}"
             );
-            assert!(html.contains(r#"<a href="/">jModGuard</a>"#), "{path}");
             assert!(html.contains(&format!(r#"href="{other}""#)), "{path}");
         }
 
-        // In split deployments the dashboard origin serves these two assets
-        // and forwards the policy paths to this router.
+        // The dashboard serves its own assets in split deployments.
         for path in ["/", "/style.css"] {
             let request = Request::builder().uri(path).body(Body::empty()).unwrap();
             let response = app.clone().oneshot(request).await.unwrap();
@@ -3065,8 +3146,58 @@ mod tests {
             );
             assert!(!html.contains("<data removal>"), "{path}");
             assert!(!html.contains("nonpublic-"), "{path}");
+            assert_eq!(html.matches("Specimen &amp; Sample").count(), 2, "{path}");
+            assert_eq!(html.matches("2030-02-03").count(), 3, "{path}");
         }
         assert_unauthenticated(app, "GET", "/api/me", "").await;
+    }
+
+    #[tokio::test]
+    async fn legal_pages_link_only_valid_privacy_contacts() {
+        for (contact, expected) in [
+            (
+                " privacy+requests@example.test ",
+                r#"<a href="mailto:privacy+requests@example.test">privacy+requests@example.test</a>"#,
+            ),
+            (
+                "privacy?bcc=other@example.test",
+                r#"<a href="mailto:privacy%3Fbcc%3Dother@example.test">privacy?bcc=other@example.test</a>"#,
+            ),
+            (
+                "HTTPS://example.test/help?request=data&lang=en#privacy",
+                r#"<a href="https://example.test/help?request=data&amp;lang=en#privacy">HTTPS://example.test/help?request=data&amp;lang=en#privacy</a>"#,
+            ),
+            ("Sample Privacy Desk", "Sample Privacy Desk"),
+            ("a..b@example.test", "a..b@example.test"),
+            ("contact@-example.test", "contact@-example.test"),
+            ("contact@", "contact@"),
+            ("left@right@example.test", "left@right@example.test"),
+            ("https://", "https://"),
+            ("https:///example.test", "https:///example.test"),
+            ("https://example.test/a b", "https://example.test/a b"),
+            ("https://user@example.test", "https://user@example.test"),
+            ("http://example.test", "http://example.test"),
+            ("javascript:alert(1)", "javascript:alert(1)"),
+            (
+                "<b>Privacy & contact</b>",
+                "&lt;b&gt;Privacy &amp; contact&lt;/b&gt;",
+            ),
+        ] {
+            let app = router(test_app_with_config(crate::config::ApiProcessConfig {
+                legal: crate::config::LegalConfig {
+                    privacy_contact: contact.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+            for path in ["/privacy", "/terms"] {
+                let html = public_legal_html(app.clone(), path).await;
+                assert!(
+                    html.contains(&format!("<dt>Privacy contact</dt><dd>{expected}</dd>")),
+                    "{path}: {contact:?}",
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3103,7 +3234,11 @@ mod tests {
                     html.contains("This instance’s operator has not configured contact details."),
                     "{path}"
                 );
-                assert_eq!(html.matches("<dd>Not configured</dd>").count(), 6, "{path}");
+                let (_, card) = html
+                    .split_once(r#"<section class="legal-operator""#)
+                    .unwrap();
+                let (card, _) = card.split_once("</section>").unwrap();
+                assert_eq!(card.matches("<dd>Not configured</dd>").count(), 6, "{path}");
             }
         }
     }
