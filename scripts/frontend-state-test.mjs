@@ -6846,6 +6846,78 @@ test('honeypot switch shows the kick action that save submits', async () => {
   assert.equal(action.value, 'kick');
 });
 
+test('built-in onboarding trap starts off, warns on unsafe setup, and saves a guild role', async () => {
+  const calls = [];
+  const id = 'onboarding_bot_trap';
+  const roleId = '22';
+  const reason = '[Automod] Kicked for suspected bot (onboarding)';
+  const record = {
+    rule_id: id,
+    name: 'Onboarding bot trap',
+    description: 'Kick members who select the trap role in Discord Onboarding.',
+    effective: {
+      enabled: false, dry_run: true, skip_moderators: true, log_automod: true, open_case: true,
+      params: { role_id: null, join_window_minutes: 30 },
+      actions: [{ at: 1, action: 'kick', reason }],
+    },
+  };
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/server-names')) return response({
+      roles: [{ id: roleId, name: 'Anti-bot', managed: false }],
+      channels: [],
+      onboarding_trap: { bot_can_kick: false, roles_at_or_above_bot: [roleId], roles_with_grants: [roleId] },
+    });
+    assert.equal(options.method, 'PUT');
+    assert.match(url, new RegExp(`/rules/${id}$`));
+    const body = JSON.parse(options.body);
+    calls.push(body);
+    return response({ config_patch: { kind: 'rule', id, scope: 'guild', value: body.data } });
+  });
+  h.app.state.config = { enrollment_id: 'membership', rules: [record] };
+  h.app.navigate('rules');
+  const card = h.nodes.get('#content');
+  assert.match(textOf(card), /Onboarding bot trap.*disabled/s);
+  const guide = findNode(card, n => n.localName === 'a' && textOf(n) === 'Onboarding bot trap setup guide');
+  assert.match(guide.getAttribute('href'), /docs\/ONBOARDING-BOT-TRAP\.md$/);
+  const edit = async () => {
+    await fire(findNode(card, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Edit'), 'click');
+    await settle();
+    return h.document.querySelector('.modal-overlay');
+  };
+  const save = (modal) => fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+  let modal = await edit();
+  assert.equal(pickerLabelled(modal, 'Enabled').disabled, true);
+  assert.equal(pickerLabelled(modal, 'Join window (minutes)').value, '30');
+  assert.equal(pickerLabelled(modal, 'Kick reason').value, reason);
+  await chooseOption(pickerLabelled(modal, 'Trap role'), '@Anti-bot');
+  const enabled = pickerLabelled(modal, 'Enabled');
+  assert.equal(enabled.checked, false);
+  assert.equal(enabled.disabled, false);
+  enabled.checked = true;
+  await fire(enabled, 'change');
+  assert.match(textOf(modal), /lacks Kick Members/);
+  assert.match(textOf(modal), /below jModGuard’s highest role/);
+  assert.match(textOf(modal), /grants permissions or channel access/);
+  await typeValue(pickerLabelled(modal, 'Join window (minutes)'), '0');
+  await save(modal);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].scope, 'guild');
+  assert.equal(calls[0].data.enabled, true);
+  assert.equal(calls[0].data.dry_run, true);
+  assert.equal(calls[0].data.skip_moderators, true);
+  assert.deepEqual(calls[0].data.params, { role_id: roleId, join_window_minutes: 0 });
+  assert.deepEqual(calls[0].data.actions, [{ at: 1, action: 'kick', reason }]);
+  await settle();
+  assert.match(textOf(card), /lacks Kick Members/);
+
+  modal = await edit();
+  await fire(pickerByName(modal, 'Remove @Anti-bot'), 'click');
+  assert.equal(pickerLabelled(modal, 'Enabled').disabled, true);
+  await save(modal);
+  assert.equal(calls[1].data.enabled, false);
+  assert.equal(calls[1].data.params.role_id, null);
+});
+
 test('custom pattern draft save uses dry_run and custom id', () => {
   const h = harness();
   const draft = h.app.buildCustomRuleSaveBody(

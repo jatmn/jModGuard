@@ -336,14 +336,16 @@ pub async fn upsert_rule(db: &Db, guild_id: i64, rule_id: &str, rule: &RuleDef) 
         .map(|_| ())
 }
 
-/// Normalize only the obsolete shipped text, while holding the same writer
-/// transaction as bootstrap/save. Custom descriptions remain operator-owned.
+/// Check special built-in constraints and normalize obsolete shipped text.
 fn rule_json_for_save_conn(
     conn: &impl SqlExecutor,
     guild_id: i64,
     id: &str,
     rule: &RuleDef,
 ) -> Result<String> {
+    if id == crate::onboarding_trap::RULE_ID {
+        crate::onboarding_trap::validate(guild_id, rule)?;
+    }
     if id == "invite"
         && rule.description == crate::defaults::OLD_INVITE_DESCRIPTION
         && (meta_string_conn(conn, "invite_description_v1")?.is_some()
@@ -1066,8 +1068,16 @@ fn prepare_badword_replacement(
 fn prepare_copied_rules(dst: i64, rows: Vec<(String, RuleDef)>) -> Result<Vec<(String, RuleDef)>> {
     let mut replacement = Vec::with_capacity(rows.len());
     let mut custom = 0usize;
-    for (id, rule) in rows {
+    for (id, mut rule) in rows {
         crate::image_spam::validate_rule(&id, &rule)?;
+        if id == crate::onboarding_trap::RULE_ID {
+            // The role belongs to the source server and must be picked again.
+            rule.enabled = false;
+            if let Some(role) = rule.params.get_mut("role_id") {
+                *role = serde_json::Value::Null;
+            }
+            crate::onboarding_trap::validate(dst, &rule)?;
+        }
         if crate::custom_rules::is_custom_id(&id) {
             custom += 1;
             replacement.push((

@@ -552,6 +552,18 @@ impl TenantRuntime {
         enrollment: GuildEnrollment,
         data: crate::db::guild_data::CaseData,
     ) -> Result<Option<crate::db::guild_data::RecordCase>> {
+        self.record_selected_case_with_visibility(enrollment, data, false)
+            .await
+    }
+
+    /// Keep the case in the private case dashboard, with optional exclusion
+    /// from member histories and Discord member summaries.
+    pub async fn record_selected_case_with_visibility(
+        &self,
+        enrollment: GuildEnrollment,
+        data: crate::db::guild_data::CaseData,
+        hide_from_member_history: bool,
+    ) -> Result<Option<crate::db::guild_data::RecordCase>> {
         let guild_id = enrollment.guild_id;
         let (store, scope) = match self.live(enrollment).await {
             Ok(live) => live,
@@ -562,7 +574,10 @@ impl TenantRuntime {
             Err(error) => return Err(error),
         };
         let id = CaseId::new();
-        match store.record_case(scope, id, data, case_limits()).await {
+        match store
+            .record_case_with_visibility(scope, id, data, case_limits(), hide_from_member_history)
+            .await
+        {
             Ok(result) => Ok(Some(result)),
             Err(error) if skippable_live(&error) => {
                 tracing::warn!("selected case not recorded: {error:#}");

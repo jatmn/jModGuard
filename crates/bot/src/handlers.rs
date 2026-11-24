@@ -899,6 +899,7 @@ impl EventHandler for Handler {
                 .await;
             }
         }
+        crate::onboarding_trap::on_join(&app, &ctx.http, &ctx.cache, &new_member).await;
     }
 
     async fn guild_member_removal(
@@ -1655,7 +1656,8 @@ impl EventHandler for Handler {
         event: GuildMemberUpdateEvent,
     ) {
         crate::resources::gateway_event("guild_member_update");
-        if member_roles_may_have_changed(old_if_available.as_ref(), &event.roles) {
+        let roles_changed = member_roles_may_have_changed(old_if_available.as_ref(), &event.roles);
+        if roles_changed {
             self.app
                 .access_marks
                 .member(event.guild_id.get(), event.user.id.get());
@@ -1664,6 +1666,9 @@ impl EventHandler for Handler {
             return;
         }
         let _rule_hold = self.app.activation.hold_rule();
+        if roles_changed && event.user.id == ctx.cache.current_user().id {
+            crate::server_names::refresh_from_cache(&self.app, &ctx, event.guild_id.get());
+        }
         self.app
             .image_spam
             .invalidate_author(event.guild_id.get(), event.user.id.get());
@@ -1677,27 +1682,42 @@ impl EventHandler for Handler {
             chrono::Utc::now().timestamp_millis(),
         )
         .await;
+        if let Some(new) = &new_if_available {
+            let old_roles = old_if_available
+                .as_ref()
+                .map(|member| member.roles.as_slice());
+            clear_remembered_if_bot_roles_changed(
+                &self.app,
+                new.guild_id.get(),
+                ctx.cache.current_user().id,
+                new.user.id,
+                old_roles,
+                &new.roles,
+            );
+            clear_remembered_if_subject_roles_changed(
+                &self.app,
+                new.guild_id.get(),
+                new.user.id.get(),
+                old_roles,
+                &new.roles,
+            );
+        }
+        if roles_changed
+            || old_if_available
+                .as_ref()
+                .is_some_and(|old| old.joined_at != Some(event.joined_at))
+        {
+            crate::onboarding_trap::on_update(
+                &app,
+                &ctx.http,
+                &ctx.cache,
+                old_if_available.as_ref(),
+                &event,
+            )
+            .await;
+        }
         let Some(new) = new_if_available else { return };
         let guild_id = new.guild_id;
-        clear_remembered_if_bot_roles_changed(
-            &self.app,
-            guild_id.get(),
-            ctx.cache.current_user().id,
-            new.user.id,
-            old_if_available
-                .as_ref()
-                .map(|member| member.roles.as_slice()),
-            &new.roles,
-        );
-        clear_remembered_if_subject_roles_changed(
-            &self.app,
-            guild_id.get(),
-            new.user.id.get(),
-            old_if_available
-                .as_ref()
-                .map(|member| member.roles.as_slice()),
-            &new.roles,
-        );
         let old_to = old_if_available
             .as_ref()
             .and_then(|member| member.communication_disabled_until);

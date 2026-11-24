@@ -9723,6 +9723,11 @@ async fn server_names_serve_the_bot_snapshot_with_string_ids_and_no_discord_call
             position: 0,
         }],
         observed_at_ms: None,
+        onboarding_trap: Some(db::guild_data::OnboardingTrapSetup {
+            bot_can_kick: Some(false),
+            roles_at_or_above_bot: vec!["9007199254740993".into()],
+            roles_with_grants: vec!["9007199254740993".into()],
+        }),
     };
     assert!(
         store
@@ -9742,6 +9747,11 @@ async fn server_names_serve_the_bot_snapshot_with_string_ids_and_no_discord_call
                 "roles": [{"id": "9007199254740993", "name": "Moderators", "color": 3447003, "position": 3, "managed": false}],
                 "channels": [{"id": "9007199254740995", "name": "general", "kind": "text", "parent_id": null, "position": 0}],
                 "observed_at_ms": 1700,
+                "onboarding_trap": {
+                    "bot_can_kick": false,
+                    "roles_at_or_above_bot": ["9007199254740993"],
+                    "roles_with_grants": ["9007199254740993"],
+                },
             })
         );
     }

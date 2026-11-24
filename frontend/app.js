@@ -2032,6 +2032,10 @@ function closeOverlay() {
   ui.set({ editor: null, edits: "clean" });
 }
 function editRule(record) {
+  if (record.rule_id === ONBOARDING_TRAP_RULE) {
+    ui.set({ editor: h(OnboardingTrapEditor, { record }) });
+    return;
+  }
   if (isCustomRuleId(record.rule_id)) {
     ui.set({ editor: h(CustomRuleEditor, { record, creating: false }) });
     return;
@@ -3686,8 +3690,12 @@ function newCustomRuleDraft() {
   };
 }
 
+const ONBOARDING_TRAP_RULE = "onboarding_bot_trap";
+const ONBOARDING_TRAP_GUIDE = "https://github.com/jatmn/jModGuard/blob/main/docs/ONBOARDING-BOT-TRAP.md";
+
 function tabRules() {
-  const rules = state.config.rules.filter((r) => r.rule_id !== "known_spam");
+  const rules = state.config.rules.filter((r) => r.rule_id !== "known_spam" &&
+    (state.guildId !== "0" || r.rule_id !== ONBOARDING_TRAP_RULE));
   return h(
     "div",
     {},
@@ -3719,6 +3727,7 @@ function tabRules() {
 
 function ruleCard(r) {
   const rule = r.effective;
+  const trap = r.rule_id === ONBOARDING_TRAP_RULE;
   const spam = !isCustomRuleId(r.rule_id) && spamRule(r.rule_id);
   const supported = !spam || spamConfigured(r.rule_id, rule);
   const badge = !rule.enabled || !supported ? "off" : rule.dry_run ? "dry" : "on";
@@ -3757,7 +3766,7 @@ function ruleCard(r) {
             r.guild_override
               ? h("span", { className: "badge badge-soft badge-sm badge-neutral override-tag" }, "server override")
               : null,
-            r.global ? h("span", { className: "badge badge-soft badge-sm badge-primary scope-tag" }, "global") : null,
+            r.global && !trap ? h("span", { className: "badge badge-soft badge-sm badge-primary scope-tag" }, "global") : null,
           ),
         ),
         h(
@@ -3767,6 +3776,10 @@ function ruleCard(r) {
         ),
       ),
       h("p", {}, r.description),
+      trap ? h("p", {}, h("a", { href: ONBOARDING_TRAP_GUIDE, className: "link" }, "Onboarding bot trap setup guide")) : null,
+      trap && rule.enabled && canEditSettings()
+        ? h(SavedOnboardingTrapWarnings, { roleId: String(rule.params?.role_id ?? "") })
+        : null,
     ),
   );
 }
@@ -4088,6 +4101,7 @@ function useServerNames(userIds) {
           status: "loaded",
           roles: Array.isArray(data?.roles) ? data.roles : [],
           channels: Array.isArray(data?.channels) ? data.channels : [],
+          onboardingTrap: data?.onboarding_trap,
         })),
       () => {
         if (!controller.signal.aborted) setNames((current) => ({ ...current, status: "failed" }));
@@ -4617,6 +4631,110 @@ function CustomRuleEditor({ record: r, creating }) {
             "Delete",
           )
         : null,
+      h(ActionButton, { className: "btn btn-outline", onClick: () => canLeave() && closeOverlay() }, "Cancel"),
+    ),
+  );
+}
+
+function OnboardingTrapWarnings({ names, roleId }) {
+  if (names.status === "loading") return null;
+  const setup = names.onboardingTrap;
+  const warnings = [];
+  if (!setup || setup.bot_can_kick == null) warnings.push("Bot setup checks are unavailable. Check jModGuard’s role and permissions in Discord.");
+  if (setup?.bot_can_kick === false) warnings.push("jModGuard lacks Kick Members.");
+  if (setup?.roles_at_or_above_bot?.includes(roleId)) warnings.push("Move the trap role below jModGuard’s highest role.");
+  if (setup?.roles_with_grants?.includes(roleId)) warnings.push("The trap role grants permissions or channel access. Remove those grants in Discord.");
+  if (setup && !names.roles.some((role) => role.id === roleId)) warnings.push("The selected trap role is missing from the bot’s server snapshot.");
+  return warnings.length ? h("ul", { className: "field-help", role: "status" }, ...warnings.map((warning) =>
+    h("li", { key: warning }, warning))) : null;
+}
+
+function SavedOnboardingTrapWarnings({ roleId }) {
+  const [names] = useServerNames([]);
+  return h(OnboardingTrapWarnings, { names, roleId });
+}
+
+function OnboardingTrapEditor({ record }) {
+  const [rule] = useState(() => JSON.parse(JSON.stringify(record.effective)));
+  const [roleIds] = useState(() => rule.params?.role_id ? [String(rule.params.role_id)] : []);
+  const [windowMinutes, setWindowMinutes] = useState(() => String(rule.params?.join_window_minutes ?? 30));
+  const [names] = useServerNames([]);
+  const [, setRevision] = useState(0);
+  const refresh = () => setRevision((value) => value + 1);
+  const pending = useRef(new Set()).current;
+  const hasRole = roleIds.length > 0 && roleIds[0] !== state.guildId;
+  return h(
+    DialogPanel,
+    { className: "modal-box rule-editor", onInput: trackDraft },
+    h(RuleEditorHeader, {
+      key: hasRole,
+      title: record.name,
+      enabled: rule.enabled && hasRole,
+      dryRun: rule.dry_run,
+      disabled: !hasRole,
+      onEnabled: (on) => { rule.enabled = on; refresh(); },
+      onDryRun: (on) => { rule.dry_run = on; refresh(); },
+    }),
+    h(
+      EditorSection,
+      { title: "Trigger" },
+      h(IdPicker, {
+        kind: "role",
+        label: "Trap role",
+        hint: "Pick the role granted by the optional Discord Onboarding answer.",
+        ids: roleIds,
+        names: { ...names, roles: names.roles.filter((role) => role.id !== state.guildId && !role.managed) },
+        pending,
+        single: true,
+        onChange: () => {
+          if (!roleIds.length || roleIds[0] === state.guildId) rule.enabled = false;
+          refresh();
+        },
+      }),
+      rule.enabled && hasRole ? h(OnboardingTrapWarnings, { names, roleId: roleIds[0] }) : null,
+      h(Field, {},
+        h(Label, {}, "Join window (minutes)"),
+        h(Input, {
+          type: "number", className: "input", min: 0, max: 1440, step: 1, required: true,
+          value: windowMinutes, onChange: (event) => setWindowMinutes(event.target.value),
+        }),
+      ),
+      h("p", { className: "field-help" }, "Use 0 to check role additions at any time. Moderators, administrators and the server owner are always skipped."),
+    ),
+    h(
+      EditorSection,
+      { title: "Action" },
+      h("p", {}, "Kick, open a private case, and post to the Member kicked and Automod logs."),
+      h(Field, {},
+        h(Label, {}, "Kick reason"),
+        h(Input, { className: "input", value: rule.actions[0].reason, onChange: (event) => {
+          rule.actions[0].reason = event.target.value;
+          refresh();
+        } }),
+      ),
+    ),
+    h("p", {}, h("a", { href: ONBOARDING_TRAP_GUIDE, className: "link" }, "Onboarding bot trap setup guide")),
+    h(
+      "div",
+      { className: "modal-action" },
+      h(ActionButton, {
+        className: "btn btn-primary",
+        onClick: async () => {
+          if (!flushPendingIds(pending)) return;
+          const roleId = roleIds[0] || null;
+          if (roleId === state.guildId) throw new Error("Choose a role other than @everyone");
+          if (!/^\d+$/.test(windowMinutes) || Number(windowMinutes) > 1440) throw new Error("Enter a join window from 0 to 1440 minutes");
+          const data = {
+            ...rule,
+            enabled: rule.enabled && roleId !== null,
+            params: { ...rule.params, role_id: roleId, join_window_minutes: Number(windowMinutes) },
+          };
+          await reloadAfter(() => api(`/api/guilds/${state.guildId}/rules/${record.rule_id}`, "PUT", { scope: "guild", data }), () => {
+            toast("Rule saved", "success");
+            closeOverlay();
+          });
+        },
+      }, "Save"),
       h(ActionButton, { className: "btn btn-outline", onClick: () => canLeave() && closeOverlay() }, "Cancel"),
     ),
   );

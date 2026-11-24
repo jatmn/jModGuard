@@ -495,8 +495,45 @@ pub(crate) async fn record_data(
     enrollment: db::GuildEnrollment,
     data: CaseData,
 ) -> Option<db::guild_data::CaseId> {
+    record_data_with_visibility(tenant, enrollment, data, false).await
+}
+
+pub(crate) async fn record_onboarding_kick(
+    app: &BotState,
+    enrollment: Option<db::GuildEnrollment>,
+    outcome: CaseOutcome,
+    subject: u64,
+    reason: String,
+) -> Option<CaseId> {
+    let enrollment = enrollment?;
+    let data = CaseData {
+        ban_attempt_tag: None,
+        source: application_source(),
+        action: CaseAction::Kick,
+        outcome,
+        subject_id: subject as i64,
+        actor_id: None,
+        occurred_at_ms: chrono::Utc::now().timestamp_millis(),
+        reason: Some(reason),
+        evidence: CaseEvidence::Unavailable,
+    };
+    let case_id =
+        record_data_with_visibility(&app.tenant, enrollment.clone(), data.clone(), true).await?;
+    remember_recorded_application(app, enrollment, &data, case_id.clone(), true).await;
+    Some(case_id)
+}
+
+async fn record_data_with_visibility(
+    tenant: &crate::tenant::TenantRuntime,
+    enrollment: db::GuildEnrollment,
+    data: CaseData,
+    hide_from_member_history: bool,
+) -> Option<CaseId> {
     let guild_id = enrollment.guild_id;
-    match tenant.record_selected_case(enrollment, data).await {
+    match tenant
+        .record_selected_case_with_visibility(enrollment, data, hide_from_member_history)
+        .await
+    {
         Ok(Some(result)) => match result {
             db::guild_data::RecordCase::Created(id) | db::guild_data::RecordCase::Existing(id) => {
                 Some(id)

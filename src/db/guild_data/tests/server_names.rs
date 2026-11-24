@@ -78,6 +78,7 @@ async fn server_names_store_a_sorted_bounded_snapshot_and_skip_unchanged_writes(
             channel("40", "threads", "public_thread", 3),
         ],
         observed_at_ms: Some(99),
+        onboarding_trap: None,
     };
     assert!(
         store
@@ -165,6 +166,7 @@ async fn server_names_keep_a_worst_case_snapshot_within_the_row_limit() {
             .map(|id| channel(&(10_000 + id).to_string(), &name, "text", id))
             .collect(),
         observed_at_ms: None,
+        onboarding_trap: None,
     };
     assert!(
         store

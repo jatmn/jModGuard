@@ -45,7 +45,7 @@ pub use member_directory::*;
 mod tenant_logs;
 pub use tenant_logs::{GuildDataScope, LogChannelSnapshot, TenantDataError};
 mod server_names;
-pub use server_names::{ServerChannelName, ServerNames, ServerRoleName};
+pub use server_names::{OnboardingTrapSetup, ServerChannelName, ServerNames, ServerRoleName};
 mod tenant_settings;
 pub use tenant_settings::{AccessLevel, AccessRole, TenantSettings, access_level_for_roles};
 

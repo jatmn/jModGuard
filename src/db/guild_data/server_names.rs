@@ -38,11 +38,23 @@ pub struct ServerChannelName {
     pub position: i64,
 }
 
+/// Gateway observations for onboarding setup. They are display-only and may
+/// lag Discord. Unknown bot permissions are distinct from a known denial.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OnboardingTrapSetup {
+    pub bot_can_kick: Option<bool>,
+    pub roles_at_or_above_bot: Vec<String>,
+    pub roles_with_grants: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerNames {
     pub roles: Vec<ServerRoleName>,
     pub channels: Vec<ServerChannelName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboarding_trap: Option<OnboardingTrapSetup>,
     /// When the bot last changed this snapshot; None before its first one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at_ms: Option<i64>,
@@ -89,6 +101,18 @@ impl ServerNames {
         });
         self.roles.dedup_by(|a, b| a.id == b.id);
         self.roles.truncate(SERVER_NAME_ROLE_LIMIT);
+        if let Some(setup) = self.onboarding_trap.as_mut() {
+            let retained: std::collections::HashSet<_> =
+                self.roles.iter().map(|role| role.id.as_str()).collect();
+            for ids in [
+                &mut setup.roles_at_or_above_bot,
+                &mut setup.roles_with_grants,
+            ] {
+                ids.retain(|id| retained.contains(id.as_str()));
+                ids.sort_unstable();
+                ids.dedup();
+            }
+        }
         self.channels.sort_by(|a, b| {
             a.position
                 .cmp(&b.position)

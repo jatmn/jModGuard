@@ -1,8 +1,9 @@
 # Automod
 
-jModGuard ships 8 rule entries. Exact-image and repeated-text spam use dedicated
-matchers. Their dry-run setting is the log-only test mode; turning it off selects
-delete-and-ban mode. The other rules support:
+jModGuard ships built-in automod rules. Exact-image and repeated-text spam use
+dedicated matchers. Their dry-run setting is the log-only test mode; turning it
+off selects delete-and-ban mode. The [Onboarding bot trap](ONBOARDING-BOT-TRAP.md)
+checks member events and uses a single kick. Message rules with escalation support:
 
 - **parameters** (rule-specific, JSON),
 - an **action escalation table** — `at` = strike count at which an action

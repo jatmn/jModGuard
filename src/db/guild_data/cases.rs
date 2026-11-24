@@ -353,6 +353,12 @@ fn validate_data(data: &CaseData, limits: CaseLimits) -> Result<()> {
     Ok(())
 }
 
+fn decode_case_data(payload: &str) -> Result<CaseData> {
+    let mut fields: serde_json::Map<String, serde_json::Value> = serde_json::from_str(payload)?;
+    fields.remove("hide_from_member_history");
+    Ok(serde_json::from_value(serde_json::Value::Object(fields))?)
+}
+
 impl GuildDataStore {
     /// Record observed facts under a stable source key. Retry with the same key and
     /// payload; conflicting facts fail. Removed keys never recreate their payload.
@@ -360,8 +366,20 @@ impl GuildDataStore {
         &self,
         scope: GuildDataScope,
         id: CaseId,
+        data: CaseData,
+        limits: CaseLimits,
+    ) -> Result<RecordCase> {
+        self.record_case_with_visibility(scope, id, data, limits, false)
+            .await
+    }
+
+    pub(crate) async fn record_case_with_visibility(
+        &self,
+        scope: GuildDataScope,
+        id: CaseId,
         mut data: CaseData,
         limits: CaseLimits,
+        hide_from_member_history: bool,
     ) -> Result<RecordCase> {
         self.check_target(&scope.placement)?;
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
@@ -377,10 +395,13 @@ impl GuildDataStore {
             data: &'a CaseData,
             #[serde(skip_serializing_if = "Option::is_none")]
             ban_attempt_tag: Option<&'a crate::ban_reason::BanAttemptTag>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            hide_from_member_history: Option<bool>,
         }
         let payload = serde_json::to_string(&StoredCase {
             data: &data,
             ban_attempt_tag: data.ban_attempt_tag.as_ref(),
+            hide_from_member_history: hide_from_member_history.then_some(true),
         })?;
         anyhow::ensure!(
             payload.len() <= limits.max_record_bytes as usize,
@@ -415,17 +436,27 @@ impl GuildDataStore {
             if let Some(existing) = existing { tx.finish_read()?; return Ok(existing); }
             tx.ensure_mutation_receipt()?;
             tx.execute_rows("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(?1,?2,?3,?4,?5,0)", params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str(),source.as_str(),payload.as_str()], 1)?;
-            tx.execute_rows(
-                "INSERT OR IGNORE INTO guild_member_case_index(guild_id,enrollment_id,user_id,case_id,action_kind,occurred_at_ms) SELECT ?1,?2,CAST(json_extract(?5,'$.subject_id') AS INTEGER),?3,json_extract(?5,'$.action'),CAST(json_extract(?5,'$.occurred_at_ms') AS INTEGER) WHERE json_valid(?5) AND json_extract(?5,'$.subject_id') IS NOT NULL AND json_extract(?5,'$.action') IS NOT NULL",
-                params![
-                    scope.guild_id(),
-                    scope.enrollment.id.as_str(),
-                    id.as_str(),
-                    source.as_str(),
-                    payload.as_str()
-                ],
-                1,
-            )?;
+            if hide_from_member_history {
+                // The existing insert trigger creates an index entry. Remove it
+                // before commit so member histories never see the hidden case.
+                tx.execute_rows(
+                    "DELETE FROM guild_member_case_index WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3",
+                    params![scope.guild_id(), scope.enrollment.id.as_str(), id.as_str()],
+                    1,
+                )?;
+            } else {
+                tx.execute_rows(
+                    "INSERT OR IGNORE INTO guild_member_case_index(guild_id,enrollment_id,user_id,case_id,action_kind,occurred_at_ms) SELECT ?1,?2,CAST(json_extract(?5,'$.subject_id') AS INTEGER),?3,json_extract(?5,'$.action'),CAST(json_extract(?5,'$.occurred_at_ms') AS INTEGER) WHERE json_valid(?5) AND json_extract(?5,'$.subject_id') IS NOT NULL AND json_extract(?5,'$.action') IS NOT NULL",
+                    params![
+                        scope.guild_id(),
+                        scope.enrollment.id.as_str(),
+                        id.as_str(),
+                        source.as_str(),
+                        payload.as_str()
+                    ],
+                    1,
+                )?;
+            }
             tx.commit()?;
             Ok(RecordCase::Created(id))
         }).await
@@ -506,7 +537,7 @@ impl GuildDataStore {
             let result = match row {
                 None => None,
                 Some(None) => return Err(CaseError::Limit.into()),
-                Some(Some(payload)) => { let data: CaseData = serde_json::from_str(&payload)?; validate_data(&data, limits)?; Some(data) }
+                Some(Some(payload)) => { let data = decode_case_data(&payload)?; validate_data(&data, limits)?; Some(data) }
             };
             tx.finish_read()?;
             Ok(result)
@@ -748,7 +779,7 @@ impl GuildDataStore {
                 tx.finish_read()?;
                 return Ok(None);
             };
-            let current: CaseData = serde_json::from_str(&payload)?;
+            let current = decode_case_data(&payload)?;
             match current.outcome {
                 CaseOutcome::Attempted => {},
                 CaseOutcome::Succeeded | CaseOutcome::Failed | CaseOutcome::Uncertain => {
@@ -774,7 +805,7 @@ impl GuildDataStore {
                 tx.finish_read()?;
                 return Err(CaseError::Limit.into());
             };
-            let data: CaseData = serde_json::from_str(&updated)?;
+            let data = decode_case_data(&updated)?;
             validate_data(&data, limits)?;
             anyhow::ensure!(data.outcome == outcome, CaseError::Conflict);
             tx.commit()?;

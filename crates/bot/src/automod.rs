@@ -22,11 +22,13 @@ use crate::normalize;
 use crate::state::{BotState, CachedGuildConfig};
 use crate::types::{ActionDef, RULE_IDS, RuleDef};
 use crate::{db, logging};
+use jmodguard::onboarding_trap::RULE_ID as ONBOARDING_TRAP;
 
 pub struct AutomodEngine {
     /// (guild, user) -> window history and per-rule strike buckets
     state: DashMap<(u64, u64), AuthorState>,
     member_joins: DashMap<(u64, u64), Instant>,
+    onboarding_matches: crate::onboarding_trap::RecentMatches,
     last_prune: Mutex<AutomodInstant>,
 }
 
@@ -250,6 +252,7 @@ impl AutomodEngine {
         Self {
             state: DashMap::new(),
             member_joins: DashMap::new(),
+            onboarding_matches: Default::default(),
             last_prune: Mutex::new(AutomodInstant::now()),
         }
     }
@@ -300,6 +303,7 @@ impl AutomodEngine {
         let joined_now = Instant::now();
         self.member_joins
             .retain(|_, t| joined_now.duration_since(*t) < Duration::from_secs(24 * 3600));
+        self.onboarding_matches.prune();
         *self.last_prune.lock() = now;
     }
 
@@ -955,7 +959,8 @@ pub(crate) async fn execute_pending_with(
         .and_then(|cfg| cfg.rules.get(&pending.rule_id));
     let config_unknown = current.is_none();
     let custom = jmodguard::custom_rules::is_custom_id(&pending.rule_id);
-    let settings = if custom {
+    let onboarding_trap = pending.rule_id == ONBOARDING_TRAP;
+    let settings = if custom || onboarding_trap {
         current
     } else {
         current.or(pending.matched_rule.as_ref())
@@ -981,6 +986,35 @@ pub(crate) async fn execute_pending_with(
         settings.skip_moderators,
         settings.whitelist_roles.as_slice(),
     );
+
+    if onboarding_trap {
+        let Some(member) = provided_member.as_ref() else {
+            return false;
+        };
+        let roles: Vec<_> = member.roles.iter().map(|role| role.get()).collect();
+        if enrollment.is_none()
+            || !settings.enabled
+            || !skip_moderators
+            || !open_case
+            || !log_automod
+            || pending
+                .matched_rule
+                .as_ref()
+                .is_none_or(|matched| matched.params != settings.params)
+            || !matches!(settings.actions.as_slice(), [action] if action.action == "kick" && action.reason == rule.reason)
+            || jmodguard::custom_rules::rule_scope_skips(
+                settings,
+                target.id.get(),
+                0,
+                &roles,
+                false,
+                false,
+            )
+            || !app.automod.onboarding_matches.claim(member, dry)
+        {
+            return false;
+        }
+    }
 
     if dry {
         let mut v = vars.clone();
@@ -1077,7 +1111,10 @@ async fn execute_live(
     {
         return;
     }
-    let moderator_unknown = moderator_status == crate::commands::ModeratorStatus::Unknown;
+    // The trap already fetched the current member, owner and complete roles
+    // from Discord before handing the kick to this executor.
+    let moderator_unknown = pending.rule_id != ONBOARDING_TRAP
+        && moderator_status == crate::commands::ModeratorStatus::Unknown;
     let warning = if config_unknown {
         Some("rule configuration unavailable; deleting the message and skipping kick or ban")
     } else if role_ids.is_none() && (skip_moderators || !skipped_roles.is_empty()) {
@@ -1295,7 +1332,10 @@ async fn execute_live(
                 target.id,
             );
             let (called, discord_err) = if let Some(member) = member {
-                if !app.activation.may_record() {
+                if !app.activation.may_record()
+                    || pending.rule_id == ONBOARDING_TRAP
+                        && crate::onboarding_trap::cached_staff(app, cache, guild_id, target.id)
+                {
                     return;
                 }
                 if automod_member_blocked(app, guild_id.get(), target.id.get(), "kick") {
@@ -1342,22 +1382,52 @@ async fn execute_live(
                 && let Some(outcome) =
                     crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
             {
-                crate::cases::record_application(
-                    app,
-                    enrollment.clone(),
-                    crate::db::guild_data::CaseAction::Kick,
-                    outcome,
-                    target.id.get(),
-                    None,
-                    Some(reason.clone()),
-                    crate::cases::text_excerpt(
-                        msg_channel.unwrap_or(0),
-                        msg_id.unwrap_or(0),
+                if pending.rule_id == ONBOARDING_TRAP {
+                    let case_id = crate::cases::record_onboarding_kick(
+                        app,
+                        enrollment.clone(),
+                        outcome.clone(),
                         target.id.get(),
-                        pending.evidence["content"].as_str().unwrap_or(""),
-                    ),
-                )
-                .await;
+                        reason.clone(),
+                    )
+                    .await;
+                    match outcome {
+                        crate::db::guild_data::CaseOutcome::Succeeded => {
+                            if let Some(case_id) = case_id {
+                                let mut case_vars = vars.clone();
+                                case_vars.insert(
+                                    "actor".into(),
+                                    format!("Automod · case `{}`", case_id.as_str()),
+                                );
+                                logging::emit_to(app, http, guild_id, "member_kick", case_vars)
+                                    .await;
+                            }
+                        }
+                        crate::db::guild_data::CaseOutcome::Failed => {
+                            vars.insert("action".into(), "kick failed".into());
+                        }
+                        _ => {
+                            vars.insert("action".into(), "kick outcome uncertain".into());
+                        }
+                    }
+                } else {
+                    crate::cases::record_application(
+                        app,
+                        enrollment.clone(),
+                        crate::db::guild_data::CaseAction::Kick,
+                        outcome,
+                        target.id.get(),
+                        None,
+                        Some(reason.clone()),
+                        crate::cases::text_excerpt(
+                            msg_channel.unwrap_or(0),
+                            msg_id.unwrap_or(0),
+                            target.id.get(),
+                            pending.evidence["content"].as_str().unwrap_or(""),
+                        ),
+                    )
+                    .await;
+                }
             }
         }
         "ban" => {
