@@ -876,7 +876,10 @@ async fn punish_proven_match(
                                 attempted.as_ref(),
                             );
                             if let Some(cleanup) = &cleanup {
-                                cleanup.begin_purge(ban_action.ban_delete_message_seconds());
+                                cleanup.begin_purge(
+                                    ban_action.ban_delete_message_seconds(),
+                                    chrono::Utc::now().timestamp_millis(),
+                                );
                             }
                             if let Some(outcome) = dispatch_spam_ban(
                                 app,

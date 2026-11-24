@@ -1952,7 +1952,10 @@ async fn execute_live<'a>(
                                                 .capture_recovery_epoch(member_target)
                                         });
                                 if let Some(cleanup) = &cleanup {
-                                    cleanup.begin_purge(purge_seconds);
+                                    cleanup.begin_purge(
+                                        purge_seconds,
+                                        chrono::Utc::now().timestamp_millis(),
+                                    );
                                 }
                                 Some((
                                     recovery,

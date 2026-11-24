@@ -166,13 +166,12 @@ impl Cleanup<'_> {
         .await;
     }
 
-    pub(crate) fn begin_purge(&self, seconds: u32) {
+    pub(crate) fn begin_purge(&self, seconds: u32, requested_at_ms: i64) {
         if seconds > 0 {
             self.update(|incident| {
-                let now = chrono::Utc::now().timestamp_millis();
-                let from = now - i64::from(seconds) * 1000;
+                let from = requested_at_ms - i64::from(seconds) * 1000;
                 incident.purge_from = Some(incident.purge_from.map_or(from, |old| old.min(from)));
-                incident.purge_until = Some(now);
+                incident.purge_until = Some(requested_at_ms);
                 incident.purge_receipt_until = Some(incident.deadline);
                 incident.touch(Clock::now());
             });

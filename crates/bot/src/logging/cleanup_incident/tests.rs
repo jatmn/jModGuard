@@ -4,6 +4,8 @@ use crate::logging::tests::log_text;
 const GUILD: u64 = 8;
 const SUBJECT: u64 = 9;
 const DESTINATION: u64 = 20;
+const BAN_REQUESTED_AT_MS: i64 = 3 * 60 * 60 * 1_000;
+const PURGE_WINDOW_SECS: u32 = 60 * 60;
 
 #[derive(Default)]
 struct Sink(Mutex<Vec<serde_json::Value>>);
@@ -91,7 +93,7 @@ impl Fixture {
             author,
             channel,
             message,
-            chrono::Utc::now().timestamp_millis() - 1000,
+            BAN_REQUESTED_AT_MS - 1_000,
         );
     }
 
@@ -150,7 +152,7 @@ async fn one_notice_for_rest_and_single_and_bulk_purge_echoes_across_three_chann
 
     f.remember(SUBJECT, 2, 103);
     f.remember(SUBJECT, 3, 104);
-    cleanup.begin_purge(3600);
+    cleanup.begin_purge(PURGE_WINDOW_SECS, BAN_REQUESTED_AT_MS);
     assert!(f.single(2, 103).is_none());
     let purge = f.bulk(3, 104);
     assert!(purge.report.is_none() && !purge.reserved_pending);
@@ -204,7 +206,7 @@ async fn partial_failures_are_separate_and_a_purge_can_clear_one() {
     cleanup.failed(2, 102, "missing permission");
     cleanup.failed(2, 103, "missing permission");
     f.remember(SUBJECT, 2, 102);
-    cleanup.begin_purge(3600);
+    cleanup.begin_purge(PURGE_WINDOW_SECS, BAN_REQUESTED_AT_MS);
     assert!(f.single(2, 102).is_none());
     cleanup.outcome(CaseOutcome::Succeeded, None);
     drop(cleanup);
@@ -228,9 +230,9 @@ async fn purge_preserves_other_users_and_unknown_or_out_of_window_messages() {
         SUBJECT,
         3,
         104,
-        chrono::Utc::now().timestamp_millis() - 7_200_000,
+        BAN_REQUESTED_AT_MS - i64::from(PURGE_WINDOW_SECS) * 2 * 1_000,
     );
-    cleanup.begin_purge(3600);
+    cleanup.begin_purge(PURGE_WINDOW_SECS, BAN_REQUESTED_AT_MS);
     for report in [
         f.single(1, 101),
         f.bulk(2, 102).report,
@@ -247,7 +249,7 @@ async fn planned_restart_flushes_individual_notices_and_replacement_has_no_claim
     let cleanup = f.begin().await.unwrap();
     f.rest(Some(&cleanup), 1, 101).await;
     f.remember(SUBJECT, 2, 102);
-    cleanup.begin_purge(3600);
+    cleanup.begin_purge(PURGE_WINDOW_SECS, BAN_REQUESTED_AT_MS);
     assert!(f.single(2, 102).is_none());
     drop(cleanup);
 
@@ -300,7 +302,7 @@ async fn rejected_ban_replays_pending_purge_as_plain_delete() {
     let cleanup = f.begin().await.unwrap();
     f.rest(Some(&cleanup), 1, 101).await;
     f.remember(SUBJECT, 2, 102);
-    cleanup.begin_purge(3600);
+    cleanup.begin_purge(PURGE_WINDOW_SECS, BAN_REQUESTED_AT_MS);
     assert!(f.single(2, 102).is_none());
     cleanup.outcome(CaseOutcome::Failed, None);
     f.remember(SUBJECT, 3, 103);
