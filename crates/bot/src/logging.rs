@@ -20,7 +20,7 @@ mod cleanup_incident;
 pub(crate) use cleanup_incident::flush as flush_cleanup_reports;
 pub(crate) use cleanup_incident::{
     Cleanup, CleanupIncidents, CleanupRule, begin_cleanup, claim_cleanup_gateway,
-    cleanup_delete_failure,
+    cleanup_delete_failure, persist_cleanup_observations,
 };
 pub use cleanup_incident::{flush_cleanup_on_shutdown, run_cleanup_reports};
 
@@ -1161,15 +1161,26 @@ pub(crate) trait LogDelivery: Sync {
         message: CreateMessage,
         still_current: &(dyn Fn() -> bool + Sync),
         _on_global_rate_limit: &crate::discord::OnGlobalRateLimitCallback,
-        dispatch: Option<&mut crate::discord::LogDispatch>,
+        attempt: Option<&mut crate::discord::LogAttempt<'_>>,
     ) -> anyhow::Result<bool> {
         if !still_current() {
             return Ok(false);
         }
-        if let Some(dispatch) = dispatch {
-            *dispatch = crate::discord::LogDispatch::MayHaveSent;
+        if let Some(attempt) = attempt {
+            attempt.before_send().await?;
+            let result = self.send(channel, message).await;
+            if let Err(error) = &result
+                && let Some((status, _)) = error
+                    .downcast_ref::<serenity::Error>()
+                    .and_then(crate::discord::http_error_response)
+            {
+                attempt.status.observe_status(status);
+                attempt.reset_journal_if_unsent().await?;
+            }
+            result?;
+        } else {
+            self.send(channel, message).await?;
         }
-        self.send(channel, message).await?;
         Ok(true)
     }
     async fn member_audit(&self, _guild: GuildId, _action: Action) -> anyhow::Result<AuditLogs> {
@@ -1206,7 +1217,7 @@ impl LogDelivery for serenity::http::Http {
         message: CreateMessage,
         still_current: &(dyn Fn() -> bool + Sync),
         on_global_rate_limit: &crate::discord::OnGlobalRateLimitCallback,
-        dispatch: Option<&mut crate::discord::LogDispatch>,
+        attempt: Option<&mut crate::discord::LogAttempt<'_>>,
     ) -> anyhow::Result<bool> {
         crate::discord::send_discord_log_after_rate_limit(
             self,
@@ -1214,7 +1225,7 @@ impl LogDelivery for serenity::http::Http {
             message,
             still_current,
             on_global_rate_limit,
-            dispatch,
+            attempt,
         )
         .await
     }
@@ -1236,7 +1247,7 @@ impl LogDelivery for std::sync::Arc<serenity::http::Http> {
         message: CreateMessage,
         still_current: &(dyn Fn() -> bool + Sync),
         on_global_rate_limit: &crate::discord::OnGlobalRateLimitCallback,
-        dispatch: Option<&mut crate::discord::LogDispatch>,
+        attempt: Option<&mut crate::discord::LogAttempt<'_>>,
     ) -> anyhow::Result<bool> {
         self.as_ref()
             .send_after_rate_limit(
@@ -1244,7 +1255,7 @@ impl LogDelivery for std::sync::Arc<serenity::http::Http> {
                 message,
                 still_current,
                 on_global_rate_limit,
-                dispatch,
+                attempt,
             )
             .await
     }
@@ -1373,6 +1384,7 @@ async fn emit_cleanup_summary(
     guild: GuildId,
     vars: BTreeMap<String, String>,
     dispatch: &mut crate::discord::LogDispatch,
+    journal: Option<crate::discord::CleanupJournalKey<'_>>,
 ) -> SummaryDelivery {
     let (delivery, _) = emit_to_observed_with_audit(
         app,
@@ -1385,7 +1397,10 @@ async fn emit_cleanup_summary(
         || true,
         false,
         None,
-        Some(dispatch),
+        Some(crate::discord::LogAttempt {
+            status: dispatch,
+            journal: journal.map(|key| (&app.db, key)),
+        }),
     )
     .await;
     match (delivery, *dispatch) {
@@ -1461,7 +1476,7 @@ async fn emit_to_observed_with_audit(
     commit: impl Fn() -> bool + Sync,
     after_rate_limit: bool,
     rejoin_enrich_user: Option<&serenity::model::user::User>,
-    mut summary_dispatch: Option<&mut crate::discord::LogDispatch>,
+    mut log_attempt: Option<crate::discord::LogAttempt<'_>>,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
     // here, before admission/config/filter exits can discard the observation.
@@ -1625,8 +1640,7 @@ async fn emit_to_observed_with_audit(
             let saved = cfg.templates.get(event).map(String::as_str);
             match saved {
                 Some(saved)
-                    if event == "automod_delete"
-                        && template_keys(saved).any(|key| key.starts_with("cleanup_")) =>
+                    if event == "automod_delete" && templates::uses_automod_cleanup(saved) =>
                 {
                     cleanup_incident::SINGLE_DELETE_TEMPLATE
                 }
@@ -1638,7 +1652,7 @@ async fn emit_to_observed_with_audit(
         if grouped_cleanup {
             // A mixed custom template may request values tied to one message.
             // The summary has no single message or unbounded retained content.
-            for key in template_keys(template) {
+            for key in templates::template_keys(template) {
                 vars.entry(key.to_owned())
                     .or_insert_with(|| "unavailable for grouped cleanup".into());
             }
@@ -1683,13 +1697,13 @@ async fn emit_to_observed_with_audit(
             message = message.nonce(nonce).enforce_nonce(true);
         }
         let call = crate::discord::race_discord_call(&app.activation, async {
-            if after_rate_limit || summary_dispatch.is_some() {
+            if after_rate_limit || log_attempt.is_some() {
                 sink.send_after_rate_limit(
                     channel_id,
                     message,
                     &commit,
                     &on_global_rate_limit,
-                    summary_dispatch.as_deref_mut(),
+                    log_attempt.as_mut(),
                 )
                 .await
             } else {
@@ -1710,13 +1724,6 @@ async fn emit_to_observed_with_audit(
                     rest_target,
                     Instant::now(),
                 );
-                if let Some(dispatch) = summary_dispatch.as_deref_mut()
-                    && let Some((status, _)) = error
-                        .downcast_ref::<serenity::Error>()
-                        .and_then(crate::discord::http_error_response)
-                {
-                    dispatch.observe_status(status);
-                }
                 return Err(error);
             }
         }
@@ -1727,8 +1734,8 @@ async fn emit_to_observed_with_audit(
         Ok(Ok(delivery)) => delivery,
         Ok(Err(_)) | Err(_) => {
             // The incident accounts for an uncertain send when it settles.
-            if summary_dispatch
-                .is_none_or(|dispatch| *dispatch != crate::discord::LogDispatch::MayHaveSent)
+            if log_attempt
+                .is_none_or(|attempt| *attempt.status != crate::discord::LogDispatch::MayHaveSent)
             {
                 record_delivery_failure(app);
             }
@@ -2087,15 +2094,8 @@ pub(crate) fn render_log_template(
     templates::render_bounded(template, vars, 2000)
 }
 
-fn template_keys(template: &str) -> impl Iterator<Item = &str> {
-    template.split_inclusive('}').filter_map(|chunk| {
-        let (_, key) = chunk.strip_suffix('}')?.rsplit_once('{')?;
-        Some(key)
-    })
-}
-
 fn substituted_key_count(template: &str, key: &str) -> usize {
-    template_keys(template)
+    templates::template_keys(template)
         .filter(|candidate| *candidate == key)
         .count()
 }

@@ -628,9 +628,15 @@ async fn punish_proven_match(
             Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
                 deleted_count += 1;
                 app.recent_messages.forget(found.guild, *channel, *message);
-                if !cleanup.as_ref().is_some_and(|cleanup| {
-                    cleanup.deleted(app, *channel, *message, prepared, false)
-                }) {
+                let grouped = match &cleanup {
+                    Some(cleanup) => {
+                        cleanup
+                            .deleted(app, *channel, *message, prepared, false)
+                            .await
+                    }
+                    None => false,
+                };
+                if !grouped {
                     crate::logging::spawn_prepared_automod_delete(
                         std::sync::Arc::clone(app),
                         Arc::clone(&http),
@@ -651,7 +657,9 @@ async fn punish_proven_match(
                     if crate::discord::http_error_response(&error)
                         .is_some_and(|(_, code)| code == 10008)
                     {
-                        cleanup.deleted(app, *channel, *message, prepared, true);
+                        cleanup
+                            .deleted(app, *channel, *message, prepared, true)
+                            .await;
                     } else {
                         cleanup.failed(
                             *channel,
@@ -697,7 +705,10 @@ async fn punish_proven_match(
             }
             Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
                 if let Some(cleanup) = &cleanup {
-                    if cleanup.deleted(app, *channel, *message, prepared, true) {
+                    if cleanup
+                        .deleted(app, *channel, *message, prepared, true)
+                        .await
+                    {
                         delete_notes
                             .push(format!("{channel}/{message} delete observed during purge"));
                     } else {

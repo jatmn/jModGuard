@@ -146,6 +146,42 @@ impl LogDispatch {
     }
 }
 
+/// The journal fence follows the actual transport attempt, including retries
+/// after 429. A replacement bot may recover only work definitely not dispatched.
+#[derive(Clone, Copy)]
+pub(crate) struct CleanupJournalKey<'a> {
+    pub batch: &'a str,
+    pub message: Option<i64>,
+}
+
+pub(crate) struct LogAttempt<'a> {
+    pub status: &'a mut LogDispatch,
+    pub journal: Option<(&'a crate::db::Db, CleanupJournalKey<'a>)>,
+}
+
+impl LogAttempt<'_> {
+    async fn journal(&self, dispatching: bool) -> Result<()> {
+        if let Some((db, key)) = self.journal {
+            let messages = key.message.map(|message| vec![message]);
+            crate::db::set_cleanup_dispatching(db, key.batch.into(), messages, dispatching).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn before_send(&mut self) -> Result<()> {
+        self.journal(true).await?;
+        *self.status = LogDispatch::MayHaveSent;
+        Ok(())
+    }
+
+    pub async fn reset_journal_if_unsent(&self) -> Result<()> {
+        if *self.status != LogDispatch::MayHaveSent {
+            self.journal(false).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Send one log message after the shared route rate-limit wait.
 ///
 /// `still_current` runs again after every wait and before the HTTP request.
@@ -156,10 +192,10 @@ pub(crate) async fn send_discord_log_after_rate_limit(
     message: serenity::builder::CreateMessage,
     still_current: &(dyn Fn() -> bool + Sync),
     on_global_rate_limit: &OnGlobalRateLimitCallback,
-    mut dispatch: Option<&mut LogDispatch>,
+    mut attempt: Option<&mut LogAttempt<'_>>,
 ) -> Result<bool> {
     let ratelimiter = http.ratelimiter.as_ref();
-    if ratelimiter.is_none() && dispatch.is_none() {
+    if ratelimiter.is_none() && attempt.is_none() {
         if !still_current() {
             return Ok(false);
         }
@@ -209,16 +245,17 @@ pub(crate) async fn send_discord_log_after_rate_limit(
             .body(payload.clone())
             .build()
             .map_err(|_| anyhow!("discord log delivery failed"))?;
-        if let Some(dispatch) = dispatch.as_deref_mut() {
-            *dispatch = LogDispatch::MayHaveSent;
+        if let Some(attempt) = attempt.as_deref_mut() {
+            attempt.before_send().await?;
         }
         let response = match client.execute(post).await {
             Ok(response) => response,
             Err(error) => {
                 if error.is_connect()
-                    && let Some(dispatch) = dispatch.as_deref_mut()
+                    && let Some(attempt) = attempt.as_deref_mut()
                 {
-                    *dispatch = LogDispatch::Pending;
+                    *attempt.status = LogDispatch::Pending;
+                    attempt.reset_journal_if_unsent().await?;
                 }
                 return Err(anyhow!("discord log delivery failed"));
             }
@@ -235,12 +272,15 @@ pub(crate) async fn send_discord_log_after_rate_limit(
                     .and_then(|delay| Duration::try_from_secs_f64(delay).ok())
             })
             .flatten();
-        if let Some(dispatch) = dispatch.as_deref_mut() {
-            dispatch.observe_status(response.status().as_u16());
+        if let Some(attempt) = attempt.as_deref_mut() {
+            attempt.status.observe_status(response.status().as_u16());
             if let Some(until) =
                 retry_after.and_then(|delay| tokio::time::Instant::now().checked_add(delay))
             {
-                *dispatch = LogDispatch::RateLimited(until);
+                *attempt.status = LogDispatch::RateLimited(until);
+            }
+            if rate_limited || *attempt.status == LogDispatch::Rejected {
+                attempt.reset_journal_if_unsent().await?;
             }
         }
         if ratelimiter.is_some()

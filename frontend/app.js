@@ -6582,7 +6582,7 @@ const TEMPLATE_VARIABLES = [
   ["duration", "moderation", "How long: a timeout's length, or time spent in the server", "1d"],
   ["command", "moderation", "The custom command that ran", "example"],
   ["cleanup_action", "cleanup", "The enforcement outcome and case link, when available", "Banned · Open case"],
-  ["cleanup_total", "cleanup", "The number of messages deleted. Include this variable to use grouped cleanup notices.", "6"],
+  ["cleanup_total", "cleanup", "The number of messages deleted", "6"],
   ["cleanup_channels", "cleanup", "How many messages were deleted from each channel", "#general 4, #media 2"],
   ["cleanup_first", "cleanup", "The earliest delete observation or failure, in UTC", "2026-11-09 22:35:49 UTC"],
   ["cleanup_last", "cleanup", "The latest delete observation or failure, in UTC", "2026-11-09 22:35:54 UTC"],
@@ -6919,7 +6919,12 @@ function TemplateCard({ record: t }) {
     defaultValue: t.effective,
   });
   const template = ui.getSnapshot().drafts[`template:${t.event}:text`]?.value ?? t.effective;
-  const groupedCleanup = t.event === "automod_delete" && template.includes("{cleanup_total}");
+  const keys = [...template.matchAll(/[^}]*}/g)].flatMap(([chunk]) => {
+    const start = chunk.lastIndexOf("{");
+    return start === -1 ? [] : [chunk.slice(start + 1, -1)];
+  });
+  const cleanupVariables = t.cleanup_variables ?? [];
+  const groupedCleanup = keys.some(key => cleanupVariables.includes(key));
   // {emoji} stays with the preview's own emoji rule.
   const samples = Object.fromEntries(TEMPLATE_VARIABLES
     .filter(v => v.name !== "emoji" && (groupedCleanup || v.group !== "cleanup"))
@@ -6927,9 +6932,9 @@ function TemplateCard({ record: t }) {
   samples.action = t.event === "role_change" ? "updated" : "ban";
   samples.notice = t.event === "thread_create" ? "created" : "Prior moderation";
   if (groupedCleanup) {
-    const supplied = new Set(["mention", "user_id", "rule", "rule_id", "guild", "time", "event", "emoji", ...CLEANUP_VARIABLE_NAMES]);
+    const supplied = new Set(["mention", "user_id", "rule", "rule_id", "guild", "time", "event", "emoji", ...cleanupVariables]);
     samples.event = t.event;
-    for (const [, name] of template.matchAll(/\{([^{}]+)\}/g)) {
+    for (const name of keys) {
       if (!supplied.has(name)) samples[name] = "unavailable for grouped cleanup";
     }
   }
@@ -6961,7 +6966,8 @@ function TemplateCard({ record: t }) {
         h(
           "div",
           { className: "template-preview" },
-          h("strong", {}, "Preview"),
+          h("strong", {}, groupedCleanup ? "Grouped cleanup preview" : "Preview"),
+          groupedCleanup && h("p", { className: "muted" }, "Individual notices use the built-in layout."),
           h(LogEmbedPreview, { embed: preview }),
         ),
       ),

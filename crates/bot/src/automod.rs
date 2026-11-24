@@ -764,9 +764,15 @@ async fn automod_try_delete_message(
     match raced {
         Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {
             app.recent_messages.forget(guild_id, channel, message);
-            if !cleanup
-                .is_some_and(|cleanup| cleanup.deleted(app, channel, message, prepared, false))
-            {
+            let grouped = match cleanup {
+                Some(cleanup) => {
+                    cleanup
+                        .deleted(app, channel, message, prepared, false)
+                        .await
+                }
+                None => false,
+            };
+            if !grouped {
                 logging::complete_prepared_automod_delete(
                     app, http, guild_id, channel, message, &prepared, rule_id, rule_name, reason,
                 )

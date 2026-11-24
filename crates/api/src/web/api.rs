@@ -70,6 +70,11 @@ fn template_wire(
         "guild_override": guild_row,
         "global": global_row.unwrap_or_else(|| def.to_string()),
         "preview_emoji": jmodguard::emoji::preview(event, def),
+        "cleanup_variables": if event == "automod_delete" {
+            jmodguard::templates::AUTOMOD_CLEANUP_VARIABLES
+        } else {
+            &[]
+        },
     })
 }
 
@@ -906,6 +911,8 @@ pub async fn put_template(
     if !crate::types::is_log_event(&event) {
         return Err(ApiError(anyhow::anyhow!("unknown event type `{event}`")));
     }
+    // A supported cleanup variable is enough to opt in, so the same save
+    // accepts custom Automod Delete templates with or without cleanup_total.
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
     app.commit_json_actor(

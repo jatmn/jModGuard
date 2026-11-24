@@ -1574,6 +1574,7 @@ impl EventHandler for Handler {
         self.app
             .text_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
+        logging::persist_cleanup_observations(&self.app).await;
         if !hooked
             && let Some(report) = logging::observed_delete_report(
                 &self.app,
@@ -1627,6 +1628,7 @@ impl EventHandler for Handler {
                 .text_spam
                 .invalidate(guild_id.get(), channel_id.get(), id.get());
         }
+        logging::persist_cleanup_observations(&self.app).await;
         if !hooked {
             let ids = crate::snapshot_capture::unique_ids(&multiple_deleted_messages_ids);
             let cfg = self

@@ -1464,11 +1464,15 @@ test('Automod Delete template chips and preview match the documented cleanup sum
   const documented = [...new Set([...docs.matchAll(/\{(cleanup_[a-z_]+)\}/g)].map(([, name]) => name))].sort();
   assert.ok(keys.length > 0, 'the bot summary exposes grouped variables');
   assert.deepEqual(documented, keys, 'documentation matches the bot summary');
+  const shared = fs.readFileSync(new URL('../src/templates.rs', import.meta.url), 'utf8');
+  const definition = shared.split('pub const AUTOMOD_CLEANUP_VARIABLES')[1].split('];')[0];
+  const optIn = [...definition.matchAll(/"(cleanup_[a-z_]+)"/g)].map(([, name]) => name);
+  assert.deepEqual([...optIn].sort(), keys, 'the shared opt-in list matches the bot summary');
 
   const template = [...keys.map(name => `{${name}}`), '{message_url}'].join(' · ');
   const h = harness();
   h.app.state.config = { templates: [
-    { event: 'automod_delete', effective: template },
+    { event: 'automod_delete', effective: template, cleanup_variables: optIn },
     { event: 'message_delete', effective: '{message_url}' },
   ] };
   const panel = h.app.tabTemplates();
@@ -1491,6 +1495,38 @@ test('Automod Delete template chips and preview match the documented cleanup sum
   input.setSelectionRange(0, 0);
   await fire(total, 'click');
   assert.equal(input.value, '{cleanup_total}' + template);
+});
+
+test('a cleanup sample chip preserves custom wording in preview and saves without a total chip', async () => {
+  const event = 'automod_delete';
+  const original = 'I removed {message_url}. Sample: ';
+  let saved;
+  const config = () => ({ enrollment_id: 'e', templates: [
+    { event, effective: saved ?? original, cleanup_variables: ['cleanup_sample'] },
+  ] });
+  const h = harness(async (url, options) => {
+    if (options.method === 'PUT' && url.endsWith('/templates/automod_delete')) {
+      saved = JSON.parse(options.body).template;
+    }
+    return response(url.endsWith('/config') ? config() : {});
+  });
+  h.app.state.config = config();
+  h.app.navigate('templates');
+  const input = () => h.document.querySelector('.template-card textarea');
+  const preview = () => h.document.querySelector('.log-embed-description').textContent;
+  assert.doesNotMatch(preview(), /unavailable for grouped cleanup/);
+  const sample = [...h.document.querySelectorAll('.template-var-chip')]
+    .find(chip => chip.textContent === '{cleanup_sample}');
+  input().setSelectionRange(original.length, original.length);
+  await fire(sample, 'click');
+  assert.equal(input().value, original + '{cleanup_sample}');
+  assert.match(h.document.querySelector('.template-preview').textContent, /Grouped cleanup preview/);
+  assert.equal(preview(), 'I removed unavailable for grouped cleanup. Sample: Repeated image caption');
+  const save = [...h.document.querySelectorAll('.template-card button')]
+    .find(button => button.textContent === 'Save');
+  await fire(save, 'click');
+  assert.equal(saved, original + '{cleanup_sample}');
+  assert.match(preview(), /I removed unavailable for grouped cleanup/);
 });
 
 test('a variable chip inserts at the cursor as an unsaved edit that previews and saves', async () => {

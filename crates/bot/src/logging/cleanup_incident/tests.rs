@@ -25,7 +25,7 @@ impl LogDelivery for Sink {
 
 struct Fixture {
     app: Arc<BotState>,
-    path: std::path::PathBuf,
+    path: Arc<FixturePath>,
     sink: Sink,
 }
 
@@ -42,7 +42,7 @@ impl Fixture {
         app.activation.mark_lock_held(true);
         Self {
             app,
-            path,
+            path: Arc::new(FixturePath(path)),
             sink: Sink::default(),
         }
     }
@@ -82,9 +82,15 @@ impl Fixture {
             "Exact image spam",
             "same image",
         );
-        if !cleanup
-            .is_some_and(|cleanup| cleanup.deleted(&self.app, channel, message, prepared, false))
-        {
+        let grouped = match cleanup {
+            Some(cleanup) => {
+                cleanup
+                    .deleted(&self.app, channel, message, prepared, false)
+                    .await
+            }
+            None => false,
+        };
+        if !grouped {
             complete_prepared_automod_delete(
                 &self.app,
                 &self.sink,
@@ -174,11 +180,13 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
+struct FixturePath(std::path::PathBuf);
+
+impl Drop for FixturePath {
     fn drop(&mut self) {
-        crate::tenant::remove_sidecars(&self.path);
+        crate::tenant::remove_sidecars(&self.0);
         for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
+            let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
         }
     }
 }
@@ -192,7 +200,7 @@ async fn one_notice_for_rest_and_single_and_bulk_purge_echoes_across_three_chann
     // Gateway-first REST echo and a repeated bulk echo for the same message.
     let prepared = cleanup.prepare(&f.app, 1, 102);
     assert!(f.single(1, 102).is_none());
-    assert!(cleanup.deleted(&f.app, 1, 102, prepared, false));
+    assert!(cleanup.deleted(&f.app, 1, 102, prepared, false).await);
     assert!(f.bulk(1, 102).report.is_none());
     assert!(f.single(1, 101).is_none());
 
@@ -311,6 +319,108 @@ async fn planned_restart_flushes_individual_notices_and_replacement_has_no_claim
     );
     let restarted = Fixture::new(true).await;
     assert_eq!(restarted.single(2, 102).unwrap().event, "message_delete");
+}
+
+#[tokio::test]
+async fn abrupt_restart_recovers_confirmed_deletes_once_as_individual_notices() {
+    let f = Fixture::new(true).await;
+    f.enroll().await;
+    let cleanup = f.begin().await.unwrap();
+    f.rest(Some(&cleanup), 1, 101).await;
+    f.remember(SUBJECT, 2, 102);
+    cleanup.begin_purge(PURGE_WINDOW_SECS, BAN_REQUESTED_AT_MS);
+    claim_cleanup_gateway(
+        &f.app,
+        GuildId::new(GUILD),
+        ChannelId::new(2),
+        MessageId::new(102),
+        None,
+        GatewayDeleteOrigin::Bulk,
+    );
+    persist_cleanup_observations(&f.app).await;
+    cleanup.failed(3, 103, "missing permission");
+    let path = Arc::clone(&f.path);
+    drop(cleanup);
+    assert!(f.notices().is_empty());
+    drop(f); // close the original state and database without a shutdown flush
+
+    // Recovery is still needed if an admin disables grouping before restarting.
+    let mut cfg = crate::config::BotProcessConfig::default();
+    cfg.log.group_automod_cleanup_deletes = false;
+    let restarted = BotState::new(cfg, db::Db::open(&path.0, 2).unwrap()).unwrap();
+    restarted.activation.mark_lock_held(true);
+    let sink = Sink::default();
+    let (last, retry) = recover_cleanup_page(&restarted, &sink, 0).await.unwrap();
+    assert!(last.is_some() && !retry);
+    assert_eq!(
+        recover_cleanup_page(&restarted, &sink, 0).await.unwrap(),
+        (None, false)
+    );
+    let notices: Vec<_> = sink
+        .0
+        .lock()
+        .iter()
+        .map(|(_, payload)| log_text(payload))
+        .collect();
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert!(
+        notices
+            .iter()
+            .any(|text| text.contains("Automod message deleted") && text.contains("<#1>")),
+        "{notices:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .any(|text| text.contains("Message deleted") && text.contains("<#2>")),
+        "{notices:?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .all(|text| !text.contains("**Deleted:**") && !text.contains("<#3>")),
+        "{notices:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_summary_dispatched_before_an_abrupt_restart_is_not_replayed() {
+    let f = Fixture::new(true).await;
+    f.enroll().await;
+    let cleanup = f.begin().await.unwrap();
+    f.rest(Some(&cleanup), 1, 101).await;
+    let path = Arc::clone(&f.path);
+    drop(cleanup);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::resume();
+    let sink = Arc::new(FailsOrBlocks {
+        response: SummaryResponse::Blocked,
+        ..Default::default()
+    });
+    let worker = tokio::spawn({
+        let app = Arc::clone(&f.app);
+        let sink = Arc::clone(&sink);
+        async move { flush(&app, sink.as_ref(), false).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), sink.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(sink.rejected.lock().len(), 1);
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    drop(f);
+
+    let restarted = BotState::new(Default::default(), db::Db::open(&path.0, 2).unwrap()).unwrap();
+    restarted.activation.mark_lock_held(true);
+    let recovery = Sink::default();
+    assert_eq!(
+        recover_cleanup_page(&restarted, &recovery, 0)
+            .await
+            .unwrap(),
+        (None, false)
+    );
+    assert!(recovery.0.lock().is_empty());
 }
 
 #[tokio::test]
@@ -614,7 +724,7 @@ async fn rejected_purge_replays_bulk_to_its_destination_with_bulk_exclusions() {
         GatewayDeleteOrigin::Bulk,
     );
     // The raw event can arrive before the snapshot handler classifies the bulk member.
-    assert!(cleanup.deleted(&f.app, 2, 104, prepared, true));
+    assert!(cleanup.deleted(&f.app, 2, 104, prepared, true).await);
     assert!(f.bulk(2, 104).report.is_none());
     cleanup.outcome(CaseOutcome::Failed, None);
     drop(cleanup);
@@ -659,6 +769,30 @@ async fn saved_legacy_and_grouped_templates_control_sample_visibility() {
         assert!(!notices[0].contains("sample from the first channel"));
         tokio::time::resume();
     }
+}
+
+#[tokio::test]
+async fn a_cleanup_sample_alone_opts_into_a_custom_grouped_notice() {
+    let f = Fixture::new(true).await;
+    db::upsert_template(
+        &f.app.db,
+        GUILD as i64,
+        "automod_delete",
+        "My cleanup sampled {cleanup_sample}",
+    )
+    .await
+    .unwrap();
+    let cleanup = f.begin().await.unwrap();
+    f.rest(Some(&cleanup), 1, 101).await;
+    drop(cleanup);
+    tokio::time::pause();
+    f.settle().await;
+    let notices = f.notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].contains("My cleanup sampled sample from the first channel"),
+        "{notices:?}"
+    );
 }
 
 #[tokio::test]
@@ -1047,7 +1181,11 @@ async fn persistently_rejected_guild_cannot_fill_other_guilds_cleanup_capacity()
         .expect("healthy guild can still group");
     for (channel, message) in [(2, 201), (3, 202)] {
         let prepared = cleanup.prepare(&f.app, channel, message);
-        assert!(cleanup.deleted(&f.app, channel, message, prepared, false));
+        assert!(
+            cleanup
+                .deleted(&f.app, channel, message, prepared, false)
+                .await
+        );
     }
     drop(cleanup);
     tokio::time::advance(Duration::from_secs(10)).await;
@@ -1259,7 +1397,11 @@ async fn grouped_template_uses_a_private_single_message_notice_on_fallback_and_w
         if let Some(cleanup) = cleanup {
             let prepared = cleanup.prepare(&f.app, channel.get(), id.get());
             assert!(observe().is_none());
-            assert!(cleanup.deleted(&f.app, channel.get(), id.get(), prepared, false));
+            assert!(
+                cleanup
+                    .deleted(&f.app, channel.get(), id.get(), prepared, false)
+                    .await
+            );
             drop(cleanup);
             f.app.activation.begin_shutdown();
             flush(&f.app, &f.sink, true).await;

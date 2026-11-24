@@ -113,8 +113,8 @@ and persistence contracts below are unchanged.
   rejected ban returns its tentative purge observations to ordinary single
   or bulk delete logging and that route's exclusions.
 - A saved custom Automod Delete template keeps its per-message presentation
-  unless it uses `{cleanup_total}` to opt into grouped notices. A grouped
-  template can use `{mention}`, `{user_id}`, `{rule}`, `{rule_id}`,
+  unless it uses a supported cleanup variable to opt into grouped notices.
+  A grouped template can use `{mention}`, `{user_id}`, `{rule}`, `{rule_id}`,
   `{cleanup_action}` (outcome and case), `{cleanup_total}`, `{cleanup_channels}`,
   `{cleanup_first}`, `{cleanup_last}`, `{cleanup_sample}`, `{cleanup_evidence}`,
   `{cleanup_failures}`, and `{cleanup_source_channels}` (comma-separated
@@ -140,9 +140,16 @@ and persistence contracts below are unchanged.
   retrying incidents. A ninth evicts that server's oldest retry and counts a
   delivery failure. Individual cleanup retries reuse the same Discord nonce.
   Bulk replay follows the ordinary bulk rule for ambiguous sends. On a planned
-  restart the bot uses the existing shutdown window to attempt unfinished deliveries.
-  Incident buffers and echo receipts are process-local. An abrupt stop can
-  lose buffered reports. The grouped summary has no transcript attachment.
+  restart the bot uses the existing shutdown window to attempt unfinished
+  deliveries. The replacement bot replays journaled deletes individually
+  from the primary database, even if grouping has since been disabled.
+  Confirmed REST deletes use Automod Delete. Purge observations with an
+  interrupted enforcement use the ordinary delete route. The journal stores
+  message and rule identifiers and timestamps. It stores no retained message
+  content or attachments. Recovery skips requests that may already have
+  reached Discord and work from retired guild memberships. Delete failures
+  and gateway echo receipts stay in memory. The grouped summary has no
+  transcript attachment.
 - Delivery slot pressure queues at most 128 waiting reports across the bot.
   Each waits up to the configured Discord timeout for a slot, then uses the
   existing delivery deadline and filters. Routine reports include admission in

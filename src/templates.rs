@@ -2,6 +2,30 @@
 
 use std::collections::BTreeMap;
 
+/// The Automod Delete editor receives this same opt-in list from the API.
+pub const AUTOMOD_CLEANUP_VARIABLES: &[&str] = &[
+    "cleanup_action",
+    "cleanup_total",
+    "cleanup_channels",
+    "cleanup_first",
+    "cleanup_last",
+    "cleanup_sample",
+    "cleanup_evidence",
+    "cleanup_failures",
+    "cleanup_source_channels",
+];
+
+pub fn template_keys(template: &str) -> impl Iterator<Item = &str> {
+    template.split_inclusive('}').filter_map(|chunk| {
+        let (_, key) = chunk.strip_suffix('}')?.rsplit_once('{')?;
+        Some(key)
+    })
+}
+
+pub fn uses_automod_cleanup(template: &str) -> bool {
+    template_keys(template).any(|key| AUTOMOD_CLEANUP_VARIABLES.contains(&key))
+}
+
 /// Compact Discord elapsed time, using fixed 360-day years (twelve 30-day
 /// months), 30-day months, and 7-day weeks, not calendar years or months.
 /// Leading/trailing zero units are omitted; intermediate zeros stay, so one

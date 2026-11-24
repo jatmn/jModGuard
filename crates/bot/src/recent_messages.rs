@@ -169,7 +169,9 @@ pub(crate) async fn sweep_after_ban(
                 deleted += 1;
                 app.recent_messages.forget(guild, channel, message);
                 if let Some((cleanup, prepared)) = cleanup.zip(prepared)
-                    && !cleanup.deleted(app, channel, message, prepared, false)
+                    && !cleanup
+                        .deleted(app, channel, message, prepared, false)
+                        .await
                 {
                     cleanup
                         .complete_ungrouped(app, http, channel, message, prepared)
@@ -180,7 +182,11 @@ pub(crate) async fn sweep_after_ban(
                 let gone = crate::discord::http_error_response(&error)
                     .is_some_and(|(_, code)| code == 10008);
                 if let Some((cleanup, prepared)) = cleanup.zip(prepared) {
-                    if gone && cleanup.purge_sweep_gone(app, channel, message, prepared) {
+                    if gone
+                        && cleanup
+                            .purge_sweep_gone(app, channel, message, prepared)
+                            .await
+                    {
                         continue;
                     }
                     if !gone {
@@ -210,7 +216,7 @@ pub(crate) async fn sweep_after_ban(
                     );
                 }
                 if let Some((cleanup, prepared)) = cleanup.zip(prepared)
-                    && !cleanup.deleted(app, channel, message, prepared, true)
+                    && !cleanup.deleted(app, channel, message, prepared, true).await
                 {
                     cleanup.failed(channel, message, "delete outcome unknown");
                     cleanup
