@@ -4997,10 +4997,11 @@ async fn owner_preview_cannot_write_and_does_not_inherit_owner_authority() {
 
 #[tokio::test]
 async fn preview_profiles_apply_distinct_permission_views() {
-    for (profile, can_delete) in [
-        ("administrator", true),
-        ("moderator", false),
-        ("member", false),
+    for (profile, access) in [
+        ("administrator", Some("manage")),
+        ("settings", Some("settings")),
+        ("moderator", Some("dashboard")),
+        ("member", None),
     ] {
         let f = Fixture::new(true).await;
         f.enroll(10).await;
@@ -5024,25 +5025,67 @@ async fn preview_profiles_apply_distinct_permission_views() {
         let (status, me) = f.request_preview("GET", "/api/me", "", token).await;
         assert_eq!(status, StatusCode::OK, "{profile}: {me}");
         assert_eq!(me["preview"]["profile"], profile);
+        assert_eq!(me["is_bot_owner"], false, "{profile}: {me}");
+        if let Some(access) = access {
+            assert_eq!(me["guilds"][0]["access"], access, "{profile}: {me}");
+            assert_eq!(
+                me["guilds"][0]["manage"],
+                access == "manage",
+                "{profile}: {me}"
+            );
+        } else {
+            assert_eq!(me["guilds"], serde_json::json!([]), "{profile}: {me}");
+        }
 
         let (status, cases) = f
             .request_preview("GET", "/api/guilds/10/cases", "", token)
             .await;
-        if profile == "member" {
-            assert!(me["guilds"].as_array().unwrap().is_empty(), "{me}");
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{cases}");
-            assert!(
-                cases["error"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("MANAGE_GUILD"),
-                "{cases}"
+        if access.is_some() {
+            assert_eq!(status, StatusCode::OK, "{profile}: {cases}");
+            assert_eq!(
+                cases["can_delete"],
+                profile == "administrator",
+                "{profile}: {cases}"
             );
         } else {
-            assert_eq!(me["guilds"][0]["manage"], true, "{profile}: {me}");
-            assert_eq!(status, StatusCode::OK, "{profile}: {cases}");
-            assert_eq!(cases["can_delete"], can_delete, "{profile}: {cases}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{profile}: {cases}");
+            assert_eq!(cases["code"], "guild_access_denied", "{cases}");
         }
+        for (route, expected) in [
+            ("config", access.is_some()),
+            ("stats", access.is_some()),
+            ("analytics", access.is_some()),
+            ("bans", access.is_some()),
+            ("members", access.is_some()),
+            ("actions", access.is_some()),
+            ("events", access.is_some()),
+            (
+                "server-names",
+                matches!(access, Some("manage" | "settings")),
+            ),
+            ("access-roles", access == Some("manage")),
+        ] {
+            let path = format!("/api/guilds/10/{route}");
+            let (status, body) = f.request_preview("POST", &path, "", token).await;
+            assert_eq!(
+                status.is_success(),
+                expected,
+                "{profile} {path}: {status} {body}"
+            );
+            if !expected {
+                if route == "actions" {
+                    assert_eq!(body["error"], "actions not available", "{profile}: {body}");
+                } else {
+                    assert_eq!(
+                        body["code"], "guild_access_denied",
+                        "{profile} {path}: {body}"
+                    );
+                }
+            }
+        }
+        let (status, body) = f.request_preview("POST", "/api/updates", "", token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{profile}: {body}");
+        assert_eq!(f.discord.member_calls.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -5508,6 +5551,126 @@ async fn recovery_routes_require_an_authenticated_owner() {
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 0);
     assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
     assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn owner_routes_reject_a_discord_administrator() {
+    let f = Fixture::new(false).await;
+    let admin = oauth::DiscordGuild {
+        permissions: Some(oauth::PermissionsField::Number((1 << 3) | (1 << 5))),
+        ..managed_guild(10)
+    };
+    *f.discord.guilds.lock().unwrap() = vec![admin.clone()];
+    tests::seed_auth_caches(&f.app, 42, vec![admin]);
+    f.enroll(10).await;
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["guilds"][0]["access"], "manage", "{me}");
+    assert_eq!(me["guilds"][0]["can_ban_members"], true, "{me}");
+    assert_eq!(me["guilds"][0]["can_delete_cases"], true, "{me}");
+    assert_eq!(me["is_bot_owner"], false, "{me}");
+
+    let routes = [
+        ("POST", "/api/owner-servers", ""),
+        (
+            "POST",
+            "/api/owner-servers/{guild_id}/leave",
+            r#"{"request_id":"fixture"}"#,
+        ),
+        (
+            "POST",
+            "/api/owner-servers/{guild_id}/actions/{action_id}",
+            "",
+        ),
+        ("GET", "/api/owner/resources", ""),
+        ("POST", "/api/owner/resources", ""),
+        ("POST", "/api/database-usage", ""),
+        ("POST", "/api/database-usage/{id}", ""),
+        ("POST", "/api/platform/analytics", ""),
+        ("GET", "/api/updates", ""),
+        ("POST", "/api/updates", ""),
+        ("POST", "/api/updates/check", r#"{"component":"api"}"#),
+        (
+            "POST",
+            "/api/updates/install",
+            r#"{"component":"api","digest":"fixture"}"#,
+        ),
+        (
+            "POST",
+            "/api/updates/policy",
+            r#"{"component":"api","channel":"stable","cadence":"off"}"#,
+        ),
+        ("POST", "/api/updates/alert-channel", r#"{"channel_id":""}"#),
+        ("GET", "/api/service-upgrade", ""),
+        (
+            "POST",
+            "/api/service-upgrade",
+            r#"{"bot_digest":"","api_digest":"","confirmed":true}"#,
+        ),
+        (
+            "POST",
+            "/api/service-upgrade/check",
+            r#"{"channel":"stable"}"#,
+        ),
+        ("POST", "/api/service-upgrade/cancel", r#"{"id":"fixture"}"#),
+        (
+            "POST",
+            "/api/preview",
+            r#"{"guild_id":"10","profile":"administrator"}"#,
+        ),
+        ("POST", "/api/guilds/0/config", ""),
+        ("PUT", "/api/guilds/0/settings", r#"{"prefix":"!"}"#),
+    ];
+    for (method, route, input) in routes {
+        let (expected, message) = match route {
+            "/api/preview" => (
+                StatusCode::BAD_REQUEST,
+                "preview requires the configured bot owner",
+            ),
+            route if route.starts_with("/api/guilds/0/") => (
+                StatusCode::BAD_REQUEST,
+                "global config requires the configured bot owner (bot.owner_id)",
+            ),
+            route if route.starts_with("/api/service-upgrade") => (
+                StatusCode::FORBIDDEN,
+                "only the configured owner can manage upgrades",
+            ),
+            _ => (StatusCode::FORBIDDEN, "bot owner required"),
+        };
+        let path = route
+            .replace("{guild_id}", "10")
+            .replace("{action_id}", "fixture")
+            .replace("{id}", "fixture");
+        let (status, body) = f.request(method, &path, input).await;
+        assert_eq!(status, expected, "{method} {path}: {body}");
+        assert_eq!(body["error"], message, "{method} {path}: {body}");
+    }
+
+    // Keep the denial inventory in sync with the registered owner endpoint families.
+    let owner_prefixes = [
+        "/api/owner",
+        "/api/database-usage",
+        "/api/platform/",
+        "/api/updates",
+        "/api/service-upgrade",
+        "/api/preview",
+    ];
+    let registered: std::collections::BTreeSet<_> =
+        [include_str!("mod.rs"), include_str!("recovery.rs")]
+            .into_iter()
+            .flat_map(|source| source.split(".route(").skip(1))
+            .filter_map(|route| route.split('"').nth(1))
+            .filter(|path| {
+                owner_prefixes.iter().any(|prefix| path.starts_with(prefix))
+                    && *path != "/api/service-upgrade/recovery"
+            })
+            .collect();
+    let tested: std::collections::BTreeSet<_> = routes
+        .into_iter()
+        .map(|(_, route, _)| route)
+        .filter(|route| !route.starts_with("/api/guilds/0/"))
+        .collect();
+    assert_eq!(registered, tested);
 }
 
 #[tokio::test]
@@ -9020,7 +9183,8 @@ async fn role_mapped_moderator_reaches_only_that_guild_at_its_level() {
     assert_eq!(
         me["guilds"],
         serde_json::json!([{
-            "id": "10", "name": "fixture", "icon": null, "manage": false, "access": "dashboard"
+            "id": "10", "name": "fixture", "icon": null, "manage": false, "access": "dashboard",
+            "can_ban_members": false, "can_delete_cases": false
         }])
     );
     assert_eq!(me["role_scope_missing"], false);

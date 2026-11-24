@@ -1607,6 +1607,8 @@ async fn api_me(
                 "icon": g.icon,
                 "manage": g.manage_permission(),
                 "access": access.as_str(),
+                "can_ban_members": g.ban_members_permission(),
+                "can_delete_cases": g.administrator_permission(),
             }))
         })
         .collect();
@@ -1821,6 +1823,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
     let sessioned = sessioned
         .route("/", get(index))
         .route("/app.js", get(app_js))
+        .route("/administration", get(administration_index))
         .route("/administration/index.html", get(administration_index))
         .route("/administration.js", get(administration_js))
         .route("/style.css", get(style_css));
@@ -2276,9 +2279,12 @@ pub(super) async fn authorize_actions(
     Ok(auth)
 }
 
-/// Role-based admission needs a live (non-preview) member of that guild.
+/// Live role admission needs membership. A preview can use only its synthetic role.
 fn role_access_possible(auth: &AuthCtx, guild_id: u64) -> bool {
-    preview::current().is_none() && auth.guilds.iter().any(|g| g.id == guild_id.to_string())
+    if preview::current().is_some() {
+        return auth.role_access.is_some_and(|(guild, _)| guild == guild_id);
+    }
+    auth.guilds.iter().any(|g| g.id == guild_id.to_string())
 }
 
 fn admit_role_level(
@@ -2350,6 +2356,13 @@ async fn guild_role_level(
     auth: &AuthCtx,
     enrollment: &crate::db::GuildEnrollment,
 ) -> ApiResult<Option<AccessLevel>> {
+    let guild_id = u64::try_from(enrollment.guild_id).unwrap_or(0);
+    if preview::current().is_some() {
+        return Ok(auth
+            .role_access
+            .filter(|(guild, _)| *guild == guild_id)
+            .map(|(_, level)| level));
+    }
     let mappings = match app.tenant.live(enrollment.clone()).await {
         Ok((store, scope)) => store.tenant_settings(scope).await.map(|s| s.access_roles),
         Err(error) => Err(error),
@@ -2367,7 +2380,6 @@ async fn guild_role_level(
     if mappings.is_empty() {
         return Ok(None);
     }
-    let guild_id = u64::try_from(enrollment.guild_id).unwrap_or(0);
     let roles = member_roles(app, session, auth.discord_user_id(), guild_id).await?;
     let roles = roles
         .iter()
@@ -2444,6 +2456,10 @@ async fn role_access_guilds(
     let mut incomplete = false;
     let mut granted = Vec::new();
     if preview::current().is_some() {
+        granted.extend(
+            auth.role_access
+                .map(|(guild, level)| (guild.to_string(), level)),
+        );
         return (granted, scope_missing, incomplete);
     }
     // One budget covers catalog reads, tenant reads and all Discord lookups.
@@ -3491,6 +3507,7 @@ mod tests {
             "/",
             "/app.js",
             "/style.css",
+            "/administration",
             "/administration/index.html",
             "/administration.js",
         ] {

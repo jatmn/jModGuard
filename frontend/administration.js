@@ -65,10 +65,16 @@ function apiBase() {
 }
 
 async function request(path, body) {
+  const headers = body === undefined ? {} : { "Content-Type": "application/json" };
+  let preview = new window.URLSearchParams(window.location.hash.slice(1)).get("preview");
+  try {
+    preview ||= window.sessionStorage.getItem("jmodguard_preview");
+  } catch (_) {}
+  if (preview) headers["x-jmodguard-preview"] = preview;
   const response = await fetch(apiBase() + path, {
     method: body === undefined ? "GET" : "POST",
     credentials: "include", cache: "no-store",
-    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const value = await response.json().catch(() => ({}));
@@ -85,7 +91,7 @@ async function request(path, body) {
     throw new Error("Sign in again to manage updates.");
   }
   if (response.status === 403) {
-    ui.set({ access: "denied", freshness: "stale" });
+    ui.set({ access: "denied", freshness: "stale", signIn: "optional", snapshot: null });
     clearTimeout(refreshTimer);
   }
   if (!response.ok) throw new Error(value.error || `Request failed (${response.status})`);
@@ -349,11 +355,18 @@ function Administration() {
   const display = useStore(ui);
   useEffect(() => {
     const visible = () => {
-      if (document.visibilityState !== "hidden") refresh();
+      if (document.visibilityState !== "hidden" && ui.getSnapshot().access !== "denied") refresh();
     };
     document.addEventListener("visibilitychange", visible);
     return () => { document.removeEventListener("visibilitychange", visible); clearTimeout(refreshTimer); };
   }, []);
+  if (display.access === "denied" && display.signIn !== "required") return h("section", { className: "card bg-base-100 card-border" },
+    h("div", { className: "card-body" },
+      h("h1", { className: "card-title" }, "Owner access required"),
+      h("p", null, "Administration is available only to the configured bot owner."),
+      h("a", { href: "/" }, "Back to workspace"),
+    ),
+  );
   const loaded = window.JMODGUARD_WEBUI_SHA || "unknown (local or legacy asset)";
   const installedWeb = display.snapshot?.components.find(item => item.component === "webui")?.observed?.source_sha || "unknown or changed outside this updater";
   const differentWeb = /^[a-f0-9]{40}$/.test(loaded) && /^[a-f0-9]{40}$/.test(installedWeb) && loaded !== installedWeb;

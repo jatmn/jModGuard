@@ -32,11 +32,12 @@ afterEach(() => {
   }
 });
 
-function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test", visibility = "visible", now = () => NOW_SECONDS * 1000 } = {}) {
+function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = "https://ui.example.test", visibility = "visible", now = () => NOW_SECONDS * 1000, preview } = {}) {
   const dom = new JSDOM('<!doctype html><html><head><meta name="theme-color"></head><body><main id="content"></main></body></html>', { url: origin });
   const { window } = dom, { document } = window;
   Object.defineProperty(document, "visibilityState", { value: visibility, writable: true });
   Object.defineProperty(window, "localStorage", { get() { throw new Error("storage disabled"); } });
+  if (preview) window.sessionStorage.setItem("jmodguard_preview", preview);
   window.JMODGUARD_WEBUI_SHA = "a".repeat(40);
   window.JMODGUARD_API_BASE = apiBase;
   window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
@@ -504,7 +505,8 @@ test("authorization loss hides the controls and stops automatic polling", async 
   });
   lost = true;
   await run("refresh()", view.context);
-  assert.equal(view.elements.get("updates").classList.contains("hidden"), true);
+  assert.equal(view.elements.get("updates"), null);
+  assert.equal(view.elements.get("refresh-status"), null);
   assert.equal(view.timers.size, 0);
 });
 
@@ -746,6 +748,32 @@ test("Browser version remains expanded or collapsed across status refreshes", as
   assert.equal(details().open, false);
 });
 
+test("a signed-in Discord administrator sees only an access denial", async () => {
+  const calls = [];
+  const view = await ready(async (url, options) => {
+    calls.push([url, options.method]);
+    return response({ error: "only the configured owner can manage upgrades" }, 403);
+  });
+  assert.deepEqual(calls, [["/api/updates", "POST"]]);
+  const content = view.elements.get("content");
+  assert.match(content.textContent, /access required/i);
+  assert.equal(content.querySelector("button, input, select, #updates"), null);
+  assert.equal(view.timers.size, 0);
+});
+
+test("an Administrator preview stays denied on the Administration page", async () => {
+  const calls = [];
+  const view = await ready(async (url, options) => {
+    calls.push([url, options.headers["x-jmodguard-preview"]]);
+    return options.headers["x-jmodguard-preview"]
+      ? response({ error: "preview is read-only" }, 403)
+      : response(state([record()]));
+  }, { preview: "fixture-preview" });
+  assert.deepEqual(calls, [["/api/updates", "fixture-preview"]]);
+  assert.match(view.elements.get("content").textContent, /Owner access required/);
+  assert.equal(view.elements.get("updates"), null);
+});
+
 test("transient initial access checks retry automatically but confirmed denials do not", async () => {
   for (const failure of ["network", "server"]) {
     let calls = 0;
@@ -761,16 +789,14 @@ test("transient initial access checks retry automatically but confirmed denials 
     assert.equal(view.elements.get("updates").classList.contains("hidden"), false);
     assert.equal(updateButton(view, "api").disabled, false);
   }
-  for (const denial of [response({}, 401), response({}, 403), response({ error: "bot owner required" }, 403)]) {
-    let denied = true;
-    const view = await ready(async (url) => denied ? denial : response(url === "/api/me" ? { is_bot_owner: true } : state([record()])));
-    assert.equal(view.timers.size, 0);
-    assert.equal(view.elements.get("updates").classList.contains("hidden"), true);
-    denied = false;
-    await fire(view.elements.get("refresh-status"), "click");
-    assert.equal(view.elements.get("updates").classList.contains("hidden"), false);
-    assert.equal(view.timers.size, 1);
-  }
+  let denied = true;
+  const view = await ready(async () => denied ? response({}, 401) : response(state([record()])));
+  assert.equal(view.timers.size, 0);
+  assert.ok(view.elements.get("updates").classList.contains("hidden"));
+  denied = false;
+  await fire(view.elements.get("refresh-status"), "click");
+  assert.ok(!view.elements.get("updates").classList.contains("hidden"));
+  assert.equal(view.timers.size, 1);
 });
 
 test("Discord rate limits delay the next administration refresh", async () => {

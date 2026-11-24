@@ -26,6 +26,7 @@ tokio::task_local! {
 pub enum PreviewProfile {
     Administrator,
     Moderator,
+    Settings,
     Member,
 }
 
@@ -34,6 +35,7 @@ impl PreviewProfile {
         match value {
             "administrator" => Some(Self::Administrator),
             "moderator" => Some(Self::Moderator),
+            "settings" => Some(Self::Settings),
             "member" => Some(Self::Member),
             _ => None,
         }
@@ -45,8 +47,16 @@ impl PreviewProfile {
         const MANAGE_GUILD: u64 = 1 << 5;
         match self {
             Self::Administrator => ADMINISTRATOR | BAN_MEMBERS | MANAGE_GUILD,
-            Self::Moderator => BAN_MEMBERS | MANAGE_GUILD,
-            Self::Member => 0,
+            Self::Moderator | Self::Settings | Self::Member => 0,
+        }
+    }
+
+    fn role_level(self) -> Option<crate::db::guild_data::AccessLevel> {
+        use crate::db::guild_data::AccessLevel;
+        match self {
+            Self::Moderator => Some(AccessLevel::Dashboard),
+            Self::Settings => Some(AccessLevel::Settings),
+            Self::Administrator | Self::Member => None,
         }
     }
 }
@@ -310,6 +320,10 @@ pub fn apply_overlay(auth: &mut AuthCtx) -> Result<(), ApiError> {
     guild.owner = false;
     guild.permissions = Some(PermissionsField::Number(preview.profile.permissions()));
     auth.guilds = vec![guild];
+    auth.role_access = preview
+        .profile
+        .role_level()
+        .map(|level| (preview.guild_id, level));
     Ok(())
 }
 
