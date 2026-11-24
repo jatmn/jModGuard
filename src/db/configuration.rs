@@ -1066,10 +1066,14 @@ fn prepare_badword_replacement(
 fn prepare_copied_rules(dst: i64, rows: Vec<(String, RuleDef)>) -> Result<Vec<(String, RuleDef)>> {
     let mut replacement = Vec::with_capacity(rows.len());
     let mut custom = 0usize;
-    for (id, rule) in rows {
+    for (id, mut rule) in rows {
         crate::image_spam::validate_rule(&id, &rule)?;
         if crate::custom_rules::is_custom_id(&id) {
             custom += 1;
+            if crate::custom_rules::requires_include_channels(&rule) {
+                rule.enabled = false;
+                rule.include_channels.clear();
+            }
             replacement.push((
                 id.clone(),
                 crate::custom_rules::custom_rule_for_create(dst, &id, rule)?,

@@ -259,6 +259,42 @@ async fn copy_custom_rules_start_dry_run_respect_cap_and_reject_global() {
     assert!(!get_rule(&f.db, 20, id).await.unwrap().unwrap().dry_run);
 }
 
+#[tokio::test]
+async fn media_preset_copy_requires_destination_channels() {
+    let f = Fixture::new();
+    let source = f.scope(10).await;
+    let destination = f.scope(20).await;
+    let id = "custom:0123456789abcdef";
+    let mut rule = custom_rule(true, "unused");
+    rule.params = json!({
+        "kind": "channel_content",
+        "preset": crate::custom_rules::NO_LINKS_OR_MEDIA_PRESET,
+        "links": true
+    });
+    rule.include_channels = vec![70];
+    let mut log = rule.actions[0].clone();
+    log.action = "log".into();
+    rule.actions.push(log);
+    upsert_enrolled_rule(&f.db, write_scope(&source), id, &rule)
+        .await
+        .unwrap();
+    copy_enrolled_guild_config(&f.db, source, destination, vec!["rules".into()])
+        .await
+        .unwrap();
+    let copied = get_rule(&f.db, 20, id).await.unwrap().unwrap();
+    assert!(copied.dry_run);
+    assert!(!copied.enabled);
+    assert!(copied.include_channels.is_empty());
+    assert_eq!(
+        copied
+            .actions
+            .iter()
+            .map(|action| action.action.as_str())
+            .collect::<Vec<_>>(),
+        ["delete", "log"]
+    );
+}
+
 // Run the admitted maximum through captured copy and the same SQL insertion path.
 #[tokio::test]
 async fn full_custom_rule_copy_batches_inserts_and_preserves_replacement() {

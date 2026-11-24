@@ -18,16 +18,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::Instant as AutomodInstant;
 
+use crate::db::guild_data::CaseOutcome;
 use crate::normalize;
 use crate::state::{BotState, CachedGuildConfig};
 use crate::types::{ActionDef, RULE_IDS, RuleDef};
 use crate::{db, logging};
+
+mod channel_reply;
 
 pub struct AutomodEngine {
     /// (guild, user) -> window history and per-rule strike buckets
     state: DashMap<(u64, u64), AuthorState>,
     member_joins: DashMap<(u64, u64), Instant>,
     last_prune: Mutex<AutomodInstant>,
+    replies: channel_reply::Replies,
 }
 
 #[derive(Default)]
@@ -193,6 +197,7 @@ pub struct MsgCtx<'a> {
     pub author_id: u64,
     pub content: &'a str,
     pub attachment_count: usize,
+    pub sticker_count: usize,
     pub everyone_mentions: usize,
     pub here_mentions: usize,
     pub role_mentions: usize,
@@ -219,13 +224,45 @@ pub struct PendingAction {
     /// The winning action is an everyone-attempt whose channel permission
     /// could not be resolved. Kick and ban delete the message and stop.
     pub mention_permission_unknown: bool,
-    /// The built-in rule as it was when the message matched. If its
+    /// The rule as it was when the message matched. For a built-in rule, if its
     /// configuration cannot be re-read before acting, these settings still
-    /// decide dry-run and exemptions. Custom rules leave this empty.
+    /// decide dry-run and exemptions. Custom rules snapshot the ordered actions
+    /// here, but still require current configuration before acting.
     pub matched_rule: Option<RuleDef>,
     /// Whether the rule was in dry-run when this action was selected. Its
     /// strike ladder belongs to that mode, so execution never runs it live.
     pub dry_run: bool,
+}
+
+impl PendingAction {
+    pub fn from_custom(
+        rule_id: &str,
+        rule: &RuleDef,
+        primary: &ActionDef,
+        evidence: serde_json::Value,
+        mention_permission_unknown: bool,
+    ) -> Self {
+        Self {
+            rule_id: rule_id.to_owned(),
+            rule_name: rule.name.clone(),
+            action: primary.clone(),
+            strikes: 1,
+            evidence,
+            mention_permission_unknown,
+            matched_rule: Some(rule.clone()),
+            dry_run: rule.dry_run,
+        }
+    }
+
+    fn actions(&self) -> &[ActionDef] {
+        if jmodguard::custom_rules::is_custom_id(&self.rule_id)
+            && let Some(rule) = &self.matched_rule
+        {
+            &rule.actions
+        } else {
+            std::slice::from_ref(&self.action)
+        }
+    }
 }
 
 static URL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
@@ -251,6 +288,7 @@ impl AutomodEngine {
             state: DashMap::new(),
             member_joins: DashMap::new(),
             last_prune: Mutex::new(AutomodInstant::now()),
+            replies: channel_reply::Replies::default(),
         }
     }
 
@@ -300,6 +338,7 @@ impl AutomodEngine {
         let joined_now = Instant::now();
         self.member_joins
             .retain(|_, t| joined_now.duration_since(*t) < Duration::from_secs(24 * 3600));
+        self.replies.prune(now);
         *self.last_prune.lock() = now;
     }
 
@@ -492,10 +531,13 @@ impl AutomodEngine {
                     jmodguard::custom_rules::word_rule_matches(ctx.content, &words)
                 }
                 "channel_content" => {
-                    let links = rule.params.get("links").and_then(|v| v.as_bool()) == Some(true);
-                    let attachments =
-                        rule.params.get("attachments").and_then(|v| v.as_bool()) == Some(true);
-                    (links && has_url) || (attachments && ctx.attachment_count > 0)
+                    use jmodguard::custom_rules::{channel_link_blocked, content_toggle};
+                    (content_toggle(rule, "attachments") && ctx.attachment_count > 0)
+                        || (content_toggle(rule, "stickers") && ctx.sticker_count > 0)
+                        || (has_url
+                            && URL_RE
+                                .find_iter(ctx.content)
+                                .any(|m| channel_link_blocked(rule, m.as_str())))
                 }
                 "everyone_attempt" => {
                     !ctx.can_mention_everyone
@@ -510,25 +552,22 @@ impl AutomodEngine {
             if !triggered {
                 continue;
             }
-            let Some(action) = jmodguard::custom_rules::custom_rule_action(rule) else {
+            let Some(action) = jmodguard::custom_rules::primary_custom_action(rule) else {
                 continue;
             };
-            let pending = PendingAction {
-                rule_id: rule_id.clone(),
-                rule_name: rule.name.clone(),
+            let pending = PendingAction::from_custom(
+                rule_id,
+                rule,
                 action,
-                strikes: 1,
-                mention_permission_unknown: kind == "everyone_attempt"
-                    && ctx.mention_permission_unknown,
-                evidence: serde_json::json!({
+                serde_json::json!({
                     "content": truncate(ctx.content, 2000),
                     "channel_id": ctx.channel_id,
                     "message_id": ctx.message_id,
                     "attachments": ctx.attachment_count,
+                    "stickers": ctx.sticker_count,
                 }),
-                matched_rule: None,
-                dry_run: rule.dry_run,
-            };
+                kind == "everyone_attempt" && ctx.mention_permission_unknown,
+            );
             if is_more_severe(&pending, best.as_ref()) {
                 best = Some(pending);
             }
@@ -608,18 +647,10 @@ impl AutomodEngine {
 /// A live action outranks any dry-run one, so testing a rule in dry-run never
 /// displaces another rule's enforcement on the same message.
 fn is_more_severe(cand: &PendingAction, best: Option<&PendingAction>) -> bool {
-    fn rank(a: &str) -> u8 {
-        match a {
-            "ban" => 6,
-            "kick" => 5,
-            "timeout" => 4,
-            "warn" => 3,
-            "delete" => 2,
-            _ => 1,
-        }
-    }
+    use jmodguard::custom_rules::action_rank;
     best.is_none_or(|b| {
-        (!cand.dry_run, rank(&cand.action.action)) > (!b.dry_run, rank(&b.action.action))
+        (!cand.dry_run, action_rank(&cand.action.action))
+            > (!b.dry_run, action_rank(&b.action.action))
     })
 }
 
@@ -680,13 +711,13 @@ async fn automod_try_delete_message(
     rule_id: &str,
     rule_name: &str,
     reason: &str,
-) {
+) -> Option<CaseOutcome> {
     let target = automod_delete_target(guild_id, channel);
     if app
         .remembered_discord_targets
         .blocked(target, Instant::now())
     {
-        return;
+        return None;
     }
     let prepared = app
         .automod_delete_marks
@@ -730,6 +761,7 @@ async fn automod_try_delete_message(
                 app, http, guild_id, channel, message, &prepared, rule_id, rule_name, reason,
             )
             .await;
+            Some(CaseOutcome::Succeeded)
         }
         Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
             let removal = app.automod_delete_marks.remove_unconfirmed(
@@ -772,6 +804,7 @@ async fn automod_try_delete_message(
                 target,
                 Instant::now(),
             );
+            Some(crate::cases::classify_discord(Some(&error)))
         }
         Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
             let skip_uncertain = {
@@ -840,6 +873,7 @@ async fn automod_try_delete_message(
                     .await;
                 }
             }
+            Some(CaseOutcome::Uncertain)
         }
     }
 }
@@ -885,7 +919,7 @@ pub async fn execute_pending(
 ) -> bool {
     execute_pending_with(
         app,
-        ctx.http.as_ref(),
+        &ctx.http,
         ctx.cache.as_ref(),
         guild_id,
         target,
@@ -902,7 +936,7 @@ pub async fn execute_pending(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_pending_with(
     app: &Arc<BotState>,
-    http: &serenity::http::Http,
+    http: &Arc<serenity::http::Http>,
     cache: &serenity::cache::Cache,
     guild_id: GuildId,
     target: &serenity::model::user::User,
@@ -913,19 +947,6 @@ pub(crate) async fn execute_pending_with(
     pending: &PendingAction,
 ) -> bool {
     let enrollment = crate::cases::capture(app, guild_id.get()).await;
-    let rule = &pending.action;
-    let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
-    if let Some(channel) = msg_channel {
-        vars.insert("source_channel_id".into(), channel.to_string());
-    }
-    vars.insert("rule".into(), pending.rule_name.clone());
-    vars.insert("action".into(), rule.action.clone());
-    vars.insert("strikes".into(), pending.strikes.to_string());
-    vars.insert("time".into(), chrono::Utc::now().to_rfc3339());
-    let rendered_reason = crate::templates::render(&rule.reason, &vars);
-    let reason = jmodguard::ban_reason::without_tag(&rendered_reason).to_owned();
-    vars.insert("reason".into(), reason.clone());
-
     let loaded = app.configs.get(&app.db, guild_id.get()).await;
     if pending.rule_id == "known_spam" {
         let Ok(cfg) = loaded.as_ref() else {
@@ -973,134 +994,497 @@ pub(crate) async fn execute_pending_with(
         );
         return false;
     };
-    // Either the selection or this configuration check can keep an action log-only.
-    let (dry, log_automod, open_case, skip_moderators, skipped_roles) = (
-        pending.dry_run || settings.dry_run,
-        settings.log_automod,
-        settings.open_case,
-        settings.skip_moderators,
-        settings.whitelist_roles.as_slice(),
-    );
+    let media_preset = jmodguard::custom_rules::requires_include_channels(settings)
+        || pending
+            .matched_rule
+            .as_ref()
+            .is_some_and(jmodguard::custom_rules::requires_include_channels);
+    if media_preset
+        && (pending.matched_rule.as_ref() != Some(settings)
+            || !preset_scope_allows(settings, target.id, msg_channel, &[], false))
+    {
+        return false;
+    }
+    let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
+    if let Some(channel) = msg_channel {
+        vars.insert("source_channel_id".into(), channel.to_string());
+    }
+    vars.insert("rule".into(), pending.rule_name.clone());
+    vars.insert("strikes".into(), pending.strikes.to_string());
+    vars.insert("time".into(), chrono::Utc::now().to_rfc3339());
+    let actions = pending.actions();
 
-    if dry {
-        let mut v = vars.clone();
-        v.insert(
-            "action".into(),
-            format!("[DRY RUN] would {}: {}", rule.action, rule.reason),
+    // Either the selection or this configuration check can keep a rule log-only.
+    if pending.dry_run || settings.dry_run {
+        let summary = actions
+            .iter()
+            .map(|action| format!("{}: {}", action.action, action.reason))
+            .collect::<Vec<_>>()
+            .join(", ");
+        vars.insert("action".into(), pending.action.action.clone());
+        let rendered_reason = crate::templates::render(&pending.action.reason, &vars);
+        vars.insert(
+            "reason".into(),
+            jmodguard::ban_reason::without_tag(&rendered_reason).to_owned(),
         );
-        v.insert(
+        vars.insert("action".into(), format!("[DRY RUN] would {summary}"));
+        vars.insert(
             "content".into(),
             pending.evidence["content"]
                 .as_str()
                 .unwrap_or("")
-                .to_string(),
+                .to_owned(),
         );
-        logging::emit_to(app, http, guild_id, "automod", v).await;
+        logging::emit_to(app, http, guild_id, "automod", vars).await;
         return false;
     }
 
-    execute_live(
+    let explicit_log = custom && actions.iter().any(|action| action.action == "log");
+    let enforces = actions.iter().any(|action| action.action != "log");
+    let resolved_member = resolve_rule_member(
         app,
         http,
         cache,
         guild_id,
-        target,
+        target.id,
         provided_member,
-        msg_id,
-        msg_channel,
-        pending,
-        enrollment,
-        vars,
-        reason,
-        config_unknown,
-        log_automod,
-        open_case,
-        skip_moderators,
-        skipped_roles,
+        settings,
+        enforces,
     )
     .await;
+    let mut preset_dispatch = None;
+    if media_preset {
+        let Some(dispatch) = recheck_preset(
+            app,
+            cache,
+            guild_id,
+            target.id,
+            msg_channel,
+            pending,
+            resolved_member.as_ref().ok().and_then(Option::as_ref),
+        )
+        .await
+        else {
+            return false;
+        };
+        preset_dispatch = Some(dispatch);
+    }
+    let provided_member = match resolved_member {
+        Ok(member) => member,
+        Err(RuleExemption::Exempt) => return true,
+        Err(RuleExemption::Unknown(reason)) => {
+            tracing::warn!(
+                guild_id = guild_id.get(),
+                user_id = target.id.get(),
+                rule_id = pending.rule_id.as_str(),
+                reason,
+                "automod enforcement skipped"
+            );
+            if explicit_log || settings.log_automod {
+                let skipped = actions
+                    .iter()
+                    .filter(|action| action.action != "log")
+                    .map(|action| format!("{} (skipped)", action.action))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                vars.insert("action".into(), skipped);
+                vars.insert("reason".into(), reason.into());
+                vars.insert(
+                    "content".into(),
+                    pending.evidence["content"].as_str().unwrap_or("").into(),
+                );
+                logging::emit_to(app, http, guild_id, "automod", vars).await;
+            }
+            return true;
+        }
+    };
+    let mut earlier_actions = Vec::new();
+    let mut earlier_reasons = Vec::new();
+    let mut explicit_log_pending = explicit_log;
+    let mut has_action_outcome = false;
+    for (index, action) in actions.iter().enumerate() {
+        // The previous action may have awaited Discord, logging or persistence.
+        if media_preset && index != 0 {
+            let Some(dispatch) = recheck_preset(
+                app,
+                cache,
+                guild_id,
+                target.id,
+                msg_channel,
+                pending,
+                provided_member.as_ref(),
+            )
+            .await
+            else {
+                if explicit_log_pending && has_action_outcome {
+                    apply_action_outcomes(&mut vars, &earlier_actions, &earlier_reasons, "");
+                    emit_action_report(app, http, guild_id, pending, vars).await;
+                }
+                break;
+            };
+            preset_dispatch = Some(dispatch);
+        }
+        let mut vars = vars.clone();
+        vars.insert("action".into(), action.action.clone());
+        let rendered_reason = crate::templates::render(&action.reason, &vars);
+        let reason = jmodguard::ban_reason::without_tag(&rendered_reason).to_owned();
+        vars.insert("reason".into(), reason.clone());
+        if explicit_log_pending && action.action == "log" {
+            apply_action_outcomes(&mut vars, &earlier_actions, &earlier_reasons, &reason);
+            emit_action_report(app, http, guild_id, pending, vars).await;
+            explicit_log_pending = false;
+            continue;
+        }
+        let outcome = execute_live(
+            app,
+            http,
+            cache,
+            guild_id,
+            target,
+            provided_member.as_ref(),
+            msg_id,
+            msg_channel,
+            pending,
+            action,
+            pending.matched_rule.as_ref().unwrap_or(settings),
+            enrollment.clone(),
+            vars,
+            &reason,
+            preset_dispatch.as_ref(),
+            config_unknown,
+            !explicit_log && settings.log_automod,
+            settings.open_case,
+        )
+        .await;
+        if explicit_log_pending {
+            has_action_outcome |= outcome.is_some();
+            let (name, status) = match outcome {
+                Some((name, CaseOutcome::Succeeded)) => (name, "succeeded"),
+                Some((name, CaseOutcome::Failed)) => (name, "failed"),
+                Some((name, CaseOutcome::Uncertain)) => (name, "unconfirmed"),
+                Some((name, CaseOutcome::Attempted)) => (name, "attempted"),
+                None => (action.action.as_str(), "skipped"),
+            };
+            earlier_actions.push(format!("{name} ({status})"));
+            if !reason.is_empty() {
+                earlier_reasons.push(format!("{name}: {reason}"));
+            }
+        }
+    }
     true
+}
+
+fn apply_action_outcomes(
+    vars: &mut std::collections::BTreeMap<String, String>,
+    earlier_actions: &[String],
+    earlier_reasons: &[String],
+    log_reason: &str,
+) {
+    if !earlier_actions.is_empty() {
+        vars.insert("action".into(), earlier_actions.join(", "));
+    }
+    if !earlier_reasons.is_empty() {
+        let mut reason = earlier_reasons.join("; ");
+        if !log_reason.is_empty() {
+            reason.push_str("; log: ");
+            reason.push_str(log_reason);
+        }
+        vars.insert("reason".into(), reason);
+    }
+}
+
+async fn emit_action_report(
+    app: &Arc<BotState>,
+    http: &serenity::http::Http,
+    guild_id: GuildId,
+    pending: &PendingAction,
+    mut vars: std::collections::BTreeMap<String, String>,
+) {
+    vars.insert(
+        "content".into(),
+        pending.evidence["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned(),
+    );
+    logging::emit_to(app, http, guild_id, "automod", vars).await;
+}
+
+fn preset_scope_allows(
+    rule: &RuleDef,
+    user_id: UserId,
+    channel: Option<u64>,
+    roles: &[u64],
+    moderator: bool,
+) -> bool {
+    rule.enabled
+        && channel.is_some_and(|channel| {
+            rule.include_channels.contains(&channel)
+                && !jmodguard::custom_rules::rule_scope_skips(
+                    rule,
+                    user_id.get(),
+                    channel,
+                    roles,
+                    moderator,
+                    true,
+                )
+        })
+}
+
+/// A scope seen after asynchronous admission. The version checks are
+/// synchronous so a later I/O wait cannot authorize a stale dispatch.
+struct PresetDispatch {
+    guild_id: u64,
+    cache_version: u64,
+    durable_version: u64,
+    write_generation: u64,
+}
+
+impl PresetDispatch {
+    fn is_current(&self, app: &BotState) -> bool {
+        self.write_generation & 1 == 0
+            && self.write_generation == app.db.config_write_generation()
+            && self.durable_version >= app.db.required_config_version()
+            && app.configs.last_known(self.guild_id).is_some_and(|cfg| {
+                cfg.version == self.cache_version && cfg.durable_version == self.durable_version
+            })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recheck_preset(
+    app: &BotState,
+    cache: &serenity::cache::Cache,
+    guild_id: GuildId,
+    user: UserId,
+    channel: Option<u64>,
+    pending: &PendingAction,
+    member: Option<&Member>,
+) -> Option<PresetDispatch> {
+    let write_generation = app.db.config_write_generation();
+    // The cache honors the bot writer's committed-version floor and falls
+    // back to the primary when a replica is behind an acknowledged save.
+    let cfg = app.configs.get(&app.db, guild_id.get()).await.ok()?;
+    let current = cfg.rules.get(&pending.rule_id)?;
+    // A change to the rule invalidates both the ordered plan and the exemption
+    // decision made from it. A later message can be judged under the edit.
+    if current != pending.matched_rule.as_ref()? || current.dry_run {
+        return None;
+    }
+
+    let roles: Vec<_> = member
+        .map(|member| member.roles.iter().map(|role| role.get()).collect())
+        .unwrap_or_default();
+    let mut moderator = false;
+    if let Some(guild) = cache.guild(guild_id) {
+        if (current.skip_moderators || !current.whitelist_roles.is_empty())
+            && let Some(cached) = guild.members.get(&user)
+            && member.is_some_and(|member| member.roles != cached.roles)
+        {
+            // The membership changed since the exemption lookup.
+            return None;
+        }
+        moderator = current.skip_moderators
+            && (guild.owner_id == user
+                || crate::commands::permission_level(
+                    app.cfg.bot.owner_id,
+                    &guild.roles,
+                    user.get(),
+                    roles.iter().copied().chain([guild_id.get()]),
+                ) >= crate::commands::PermLevel::Mod);
+    }
+    if !preset_scope_allows(current, user, channel, &roles, moderator) {
+        return None;
+    }
+    let dispatch = PresetDispatch {
+        guild_id: guild_id.get(),
+        cache_version: cfg.version,
+        durable_version: cfg.durable_version,
+        write_generation,
+    };
+    dispatch.is_current(app).then_some(dispatch)
+}
+
+enum RuleExemption {
+    Exempt,
+    Unknown(&'static str),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_rule_member(
+    app: &BotState,
+    http: &serenity::http::Http,
+    cache: &serenity::cache::Cache,
+    guild_id: GuildId,
+    user_id: UserId,
+    provided: Option<Member>,
+    settings: &RuleDef,
+    enforces: bool,
+) -> Result<Option<Member>, RuleExemption> {
+    use crate::commands::{ModeratorStatus, PermLevel, permission_level};
+
+    if !settings.skip_moderators && settings.whitelist_roles.is_empty() {
+        return Ok(provided);
+    }
+    let (cached_owner, cached_member) = cache
+        .guild(guild_id)
+        .map(|guild| (Some(guild.owner_id), guild.members.get(&user_id).cloned()))
+        .unwrap_or_default();
+    if settings.skip_moderators
+        && (cached_owner == Some(user_id) || app.cfg.bot.owner_id == user_id.get())
+    {
+        return Err(RuleExemption::Exempt);
+    }
+    let fetched_guild = if settings.skip_moderators && cached_owner.is_none() && enforces {
+        if let Ok(crate::discord::DiscordCall::Finished(Ok(guild))) = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::discord::race_discord_call(&app.activation, http.get_guild(guild_id)),
+        )
+        .await
+        {
+            if guild.owner_id == user_id {
+                return Err(RuleExemption::Exempt);
+            }
+            Some(guild)
+        } else {
+            return Err(RuleExemption::Unknown(
+                "moderator status could not be confirmed",
+            ));
+        }
+    } else {
+        None
+    };
+
+    // Gateway PartialMember roles are useful even when the user field was
+    // omitted. The author ID comes from the event, not the partial member.
+    let mut member = provided.or(cached_member);
+    if member.is_none()
+        && enforces
+        && let Ok(crate::discord::DiscordCall::Finished(Ok(fetched))) = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::discord::race_discord_call(&app.activation, http.get_member(guild_id, user_id)),
+        )
+        .await
+        && fetched.user.id == user_id
+    {
+        member = Some(fetched);
+    }
+    let Some(roles) = member.as_ref().map(|member| &member.roles) else {
+        return if enforces {
+            Err(RuleExemption::Unknown(
+                "member roles could not be confirmed",
+            ))
+        } else {
+            Ok(member)
+        };
+    };
+    if roles
+        .iter()
+        .any(|role| settings.whitelist_roles.contains(&role.get()))
+    {
+        return Err(RuleExemption::Exempt);
+    }
+    if !settings.skip_moderators {
+        return Ok(member);
+    }
+
+    // Include the implicit @everyone role. A missing definition is unknown.
+    let role_ids: Vec<_> = roles
+        .iter()
+        .map(|role| role.get())
+        .chain([guild_id.get()])
+        .collect();
+    let check_roles = |roles: &HashMap<_, _>| {
+        if permission_level(
+            app.cfg.bot.owner_id,
+            roles,
+            user_id.get(),
+            role_ids.iter().copied(),
+        ) >= PermLevel::Mod
+        {
+            ModeratorStatus::Moderator
+        } else if role_ids.iter().all(|id| roles.contains_key(&(*id).into())) {
+            ModeratorStatus::Member
+        } else {
+            ModeratorStatus::Unknown
+        }
+    };
+    let mut status = fetched_guild.as_ref().map_or_else(
+        || {
+            cache
+                .guild(guild_id)
+                .map_or(ModeratorStatus::Unknown, |guild| check_roles(&guild.roles))
+        },
+        |guild| check_roles(&guild.roles),
+    );
+    if status == ModeratorStatus::Unknown
+        && cached_owner.is_some()
+        && enforces
+        && let Ok(crate::discord::DiscordCall::Finished(Ok(roles))) = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::discord::race_discord_call(&app.activation, http.get_guild_roles(guild_id)),
+        )
+        .await
+    {
+        status = check_roles(&roles.into_iter().map(|role| (role.id, role)).collect());
+    }
+    match status {
+        ModeratorStatus::Moderator => Err(RuleExemption::Exempt),
+        ModeratorStatus::Unknown if enforces => Err(RuleExemption::Unknown(
+            "moderator status could not be confirmed",
+        )),
+        _ => Ok(member),
+    }
 }
 
 /// The enforcement path of [`execute_pending_with`], after the dry-run decision.
 #[allow(clippy::too_many_arguments)]
-async fn execute_live(
+async fn execute_live<'a>(
     app: &Arc<BotState>,
-    http: &serenity::http::Http,
+    http: &Arc<serenity::http::Http>,
     cache: &serenity::cache::Cache,
     guild_id: GuildId,
     target: &serenity::model::user::User,
-    provided_member: Option<Member>,
+    provided_member: Option<&Member>,
     msg_id: Option<u64>,
     msg_channel: Option<u64>,
     pending: &PendingAction,
+    rule: &'a ActionDef,
+    matched_settings: &RuleDef,
     enrollment: Option<db::GuildEnrollment>,
     mut vars: std::collections::BTreeMap<String, String>,
-    reason: String,
+    reason: &str,
+    preset_dispatch: Option<&PresetDispatch>,
     config_unknown: bool,
     log_automod: bool,
     open_case: bool,
-    skip_moderators: bool,
-    skipped_roles: &[u64],
-) {
-    let rule = &pending.action;
-    // A missing member is not a known member with no roles. Gateway members
-    // may have no user field, but their supplied role list is still useful.
-    let role_ids: Option<Vec<u64>> = provided_member
-        .as_ref()
-        .map(|member| member.roles.iter().map(|role| role.get()).collect())
-        .or_else(|| {
-            cache.guild(guild_id).and_then(|guild| {
-                guild
-                    .members
-                    .get(&target.id)
-                    .map(|member| member.roles.iter().map(|role| role.get()).collect())
-            })
-        });
-    let moderator_status =
-        role_ids
-            .as_deref()
-            .map_or(crate::commands::ModeratorStatus::Unknown, |roles| {
-                crate::commands::cached_moderator_status(
-                    app,
-                    cache,
-                    guild_id,
-                    target.id.get(),
-                    roles,
-                )
-            });
-    let known_skipped_role = role_ids
-        .as_deref()
-        .is_some_and(|roles| skipped_roles.iter().any(|role| roles.contains(role)));
-    if known_skipped_role
-        || skip_moderators && moderator_status == crate::commands::ModeratorStatus::Moderator
-    {
-        return;
-    }
-    let moderator_unknown = moderator_status == crate::commands::ModeratorStatus::Unknown;
+) -> Option<(&'a str, CaseOutcome)> {
     let warning = if config_unknown {
         Some("rule configuration unavailable; deleting the message and skipping kick or ban")
-    } else if role_ids.is_none() && (skip_moderators || !skipped_roles.is_empty()) {
-        Some(jmodguard::custom_rules::UNKNOWN_MEMBERSHIP_WARNING)
-    } else if jmodguard::custom_rules::withhold_member_penalty(skip_moderators, moderator_unknown) {
-        Some(jmodguard::custom_rules::UNKNOWN_MODERATOR_WARNING)
     } else if pending.mention_permission_unknown {
         Some(jmodguard::custom_rules::UNKNOWN_MENTION_PERMISSION_WARNING)
     } else {
         None
     };
 
-    if matches!(rule.action.as_str(), "delete" | "timeout" | "kick" | "ban")
-        && db::guild_stores::guild_is_write_fenced(&app.db, guild_id.get() as i64)
-            .await
-            .unwrap_or(true)
+    if matches!(
+        rule.action.as_str(),
+        "delete" | "timeout" | "kick" | "ban" | "channel_reply"
+    ) && db::guild_stores::guild_is_write_fenced(&app.db, guild_id.get() as i64)
+        .await
+        .unwrap_or(true)
     {
         tracing::warn!(
             guild_id = guild_id.get(),
             action = rule.action,
             "automod Discord mutation skipped because the guild is write-fenced"
         );
-        return;
+        return None;
+    }
+
+    let dispatch_is_current = || preset_dispatch.is_none_or(|dispatch| dispatch.is_current(app));
+    if !dispatch_is_current() {
+        return None;
     }
 
     if let Some(warning) = warning
@@ -1112,9 +1496,9 @@ async fn execute_live(
             rule_id = pending.rule_id.as_str(),
             "{warning}"
         );
-        if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
+        let outcome = if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
             if !app.activation.may_record() {
-                return;
+                return None;
             }
             automod_try_delete_message(
                 app,
@@ -1124,10 +1508,12 @@ async fn execute_live(
                 id,
                 pending.rule_id.as_str(),
                 pending.rule_name.as_str(),
-                reason.as_str(),
+                reason,
             )
-            .await;
-        }
+            .await
+        } else {
+            None
+        };
         // This return precedes the ban handoff and operation identity creation.
         if log_automod {
             let mut v = vars;
@@ -1141,16 +1527,16 @@ async fn execute_live(
             );
             logging::emit_to(app, http, guild_id, "automod", v).await;
         }
-        return;
+        return outcome.map(|outcome| ("delete", outcome));
     }
 
     let mut publish_report = true;
-    match rule.action.as_str() {
-        "log" => {}
+    let outcome = match rule.action.as_str() {
+        "log" => None,
         "delete" => {
             if let (Some(ch), Some(id)) = (msg_channel, msg_id) {
                 if !app.activation.may_record() {
-                    return;
+                    return None;
                 }
                 automod_try_delete_message(
                     app,
@@ -1160,14 +1546,39 @@ async fn execute_live(
                     id,
                     pending.rule_id.as_str(),
                     pending.rule_name.as_str(),
-                    reason.as_str(),
+                    reason,
                 )
-                .await;
+                .await
+            } else {
+                None
             }
+        }
+        "channel_reply" => {
+            let outcome = if let Some(channel) = msg_channel
+                && let Ok((template, delete_after)) =
+                    jmodguard::custom_rules::channel_reply(matched_settings)
+            {
+                app.automod
+                    .replies
+                    .send(
+                        &app.activation,
+                        http,
+                        guild_id,
+                        ChannelId::new(channel),
+                        target.id,
+                        template,
+                        delete_after,
+                    )
+                    .await
+            } else {
+                None
+            };
+            publish_report = outcome == Some(CaseOutcome::Succeeded);
+            outcome
         }
         "warn" => {
             if !app.activation.may_record() {
-                return;
+                return None;
             }
             let warn_result = db::add_enrolled_warn(
                 &app.db,
@@ -1178,7 +1589,7 @@ async fn execute_live(
             )
             .await;
             if !app.activation.may_record() {
-                return;
+                return None;
             }
             let outcome = crate::cases::classify_db_commit(&warn_result);
             if open_case {
@@ -1186,10 +1597,10 @@ async fn execute_live(
                     app,
                     enrollment.clone(),
                     crate::db::guild_data::CaseAction::Warning,
-                    outcome,
+                    outcome.clone(),
                     target.id.get(),
                     None,
-                    Some(reason.clone()),
+                    Some(reason.to_owned()),
                     crate::cases::text_excerpt(
                         msg_channel.unwrap_or(0),
                         msg_id.unwrap_or(0),
@@ -1200,11 +1611,12 @@ async fn execute_live(
                 )
                 .await;
             }
+            Some(outcome)
         }
         "timeout" => {
             let minutes = rule.duration_minutes.max(1) as i64;
             let member = member_for_selected_action(
-                provided_member.clone(),
+                provided_member.cloned(),
                 cache
                     .guild(guild_id)
                     .and_then(|g| g.members.get(&target.id).cloned()),
@@ -1217,7 +1629,7 @@ async fn execute_live(
                     Timestamp::from_unix_timestamp(chrono::Utc::now().timestamp() + minutes * 60)
                 {
                     if !app.activation.may_record() {
-                        return;
+                        return None;
                     }
                     if automod_member_blocked(app, guild_id.get(), target.id.get(), "timeout") {
                         called = false;
@@ -1261,20 +1673,18 @@ async fn execute_live(
                 tracing::warn!("automod timeout: no guild member for {}", target.id);
             }
             if !app.activation.may_record() {
-                return;
+                return None;
             }
-            if open_case
-                && let Some(outcome) =
-                    crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
-            {
+            let outcome = crate::cases::discord_attempt_outcome(called, discord_err.as_ref());
+            if open_case && let Some(outcome) = &outcome {
                 crate::cases::record(
                     app,
                     enrollment.clone(),
                     crate::db::guild_data::CaseAction::Timeout,
-                    outcome,
+                    outcome.clone(),
                     target.id.get(),
                     None,
-                    Some(reason.clone()),
+                    Some(reason.to_owned()),
                     crate::cases::text_excerpt(
                         msg_channel.unwrap_or(0),
                         msg_id.unwrap_or(0),
@@ -1285,10 +1695,11 @@ async fn execute_live(
                 )
                 .await;
             }
+            outcome
         }
         "kick" => {
             let member = member_for_selected_action(
-                provided_member.clone(),
+                provided_member.cloned(),
                 cache
                     .guild(guild_id)
                     .and_then(|g| g.members.get(&target.id).cloned()),
@@ -1296,7 +1707,7 @@ async fn execute_live(
             );
             let (called, discord_err) = if let Some(member) = member {
                 if !app.activation.may_record() {
-                    return;
+                    return None;
                 }
                 if automod_member_blocked(app, guild_id.get(), target.id.get(), "kick") {
                     (false, None)
@@ -1308,7 +1719,7 @@ async fn execute_live(
                         });
                     let discord_err = match crate::discord::race_discord_call(
                         &app.activation,
-                        member.kick_with_reason(http, &reason),
+                        member.kick_with_reason(http, reason),
                     )
                     .await
                     {
@@ -1336,20 +1747,18 @@ async fn execute_live(
                 (false, None)
             };
             if !app.activation.may_record() {
-                return;
+                return None;
             }
-            if open_case
-                && let Some(outcome) =
-                    crate::cases::discord_attempt_outcome(called, discord_err.as_ref())
-            {
+            let outcome = crate::cases::discord_attempt_outcome(called, discord_err.as_ref());
+            if open_case && let Some(outcome) = &outcome {
                 crate::cases::record_application(
                     app,
                     enrollment.clone(),
                     crate::db::guild_data::CaseAction::Kick,
-                    outcome,
+                    outcome.clone(),
                     target.id.get(),
                     None,
-                    Some(reason.clone()),
+                    Some(reason.to_owned()),
                     crate::cases::text_excerpt(
                         msg_channel.unwrap_or(0),
                         msg_id.unwrap_or(0),
@@ -1359,8 +1768,10 @@ async fn execute_live(
                 )
                 .await;
             }
+            outcome
         }
         "ban" => {
+            let mut ban_outcome = None;
             let decision = crate::member_directory::observe_ban_handoff(
                 app,
                 http,
@@ -1417,7 +1828,7 @@ async fn execute_live(
                         .is_some();
                 }
                 crate::member_directory::BanContinuation::BanThenRecord => {
-                    if !app.activation.may_record() {
+                    if !app.activation.may_record() || !dispatch_is_current() {
                         publish_report = false;
                     } else {
                         let pending_ban = crate::member_directory::begin_ban_attempt(
@@ -1427,6 +1838,9 @@ async fn execute_live(
                         )
                         .await;
                         if !app.activation.may_record() {
+                            publish_report = false;
+                        } else if !dispatch_is_current() {
+                            pending_ban.finish(app, CaseOutcome::Failed).await;
                             publish_report = false;
                         } else {
                             let attempted = if open_case {
@@ -1440,7 +1854,7 @@ async fn execute_live(
                                             crate::db::guild_data::CaseAction::Ban,
                                             target.id.get(),
                                             None,
-                                            Some(reason.clone()),
+                                            Some(reason.to_owned()),
                                             crate::cases::text_excerpt(
                                                 msg_channel.unwrap_or(0),
                                                 msg_id.unwrap_or(0),
@@ -1457,7 +1871,7 @@ async fn execute_live(
                                 None
                             };
                             let discord_reason =
-                                crate::cases::ban_dispatch_reason(&reason, attempted.as_ref());
+                                crate::cases::ban_dispatch_reason(reason, attempted.as_ref());
                             let operation_id = pending_ban.operation_id().to_owned();
                             let suppression = app.suppress_next_gateway_case(
                                 crate::state::GatewayCaseAction::Ban,
@@ -1465,12 +1879,13 @@ async fn execute_live(
                                 target.id.get(),
                                 Some(&operation_id),
                             );
-                            let raced = if automod_member_blocked(
-                                app,
-                                guild_id.get(),
-                                target.id.get(),
-                                "ban",
-                            ) {
+                            let raced = if !dispatch_is_current()
+                                || automod_member_blocked(
+                                    app,
+                                    guild_id.get(),
+                                    target.id.get(),
+                                    "ban",
+                                ) {
                                 None
                             } else {
                                 let recovery =
@@ -1513,6 +1928,7 @@ async fn execute_live(
                                     publish_report = false;
                                 }
                                 Some((_, crate::discord::DiscordCall::Cancelled)) => {
+                                    ban_outcome = Some(CaseOutcome::Uncertain);
                                     pending_ban
                                         .finish(app, crate::db::guild_data::CaseOutcome::Uncertain)
                                         .await;
@@ -1534,8 +1950,8 @@ async fn execute_live(
                                     }
                                     let outcome =
                                         crate::cases::classify_discord(discord.err().as_deref());
-                                    if matches!(outcome, crate::db::guild_data::CaseOutcome::Failed)
-                                    {
+                                    ban_outcome = Some(outcome.clone());
+                                    if matches!(outcome, CaseOutcome::Failed) {
                                         app.release_gateway_case_suppression(suppression);
                                     }
                                     if app.activation.may_record() {
@@ -1569,6 +1985,7 @@ async fn execute_live(
                                         .is_some();
                                         if let Some(enrollment) = &enrollment
                                             && rule.ban_delete_message_seconds() > 0
+                                            && dispatch_is_current()
                                         {
                                             let deleted = crate::recent_messages::sweep_after_ban(
                                                 app,
@@ -1576,6 +1993,7 @@ async fn execute_live(
                                                 enrollment,
                                                 target.id.get(),
                                                 rule.ban_delete_message_seconds(),
+                                                dispatch_is_current,
                                             )
                                             .await;
                                             vars.insert(
@@ -1590,20 +2008,23 @@ async fn execute_live(
                     }
                 }
             }
+            ban_outcome
         }
         other => {
             tracing::warn!("unknown automod action `{other}`");
+            None
         }
-    }
+    };
+    let report = outcome.map(|outcome| (rule.action.as_str(), outcome));
 
     if !publish_report {
-        return;
+        return report;
     }
     // Log-only/delete-only observations are routine Discord reports. Retain
     // selected moderation records until the typed case model replaces this table.
     if open_case && matches!(rule.action.as_str(), "warn" | "timeout" | "kick" | "ban") {
         if !app.activation.may_record() {
-            return;
+            return report;
         }
         let evidence = serde_json::json!({
             "rule": pending.rule_id, "action": rule.action,
@@ -1624,17 +2045,10 @@ async fn execute_live(
     }
 
     if !log_automod {
-        return;
+        return report;
     }
-    let mut v = vars;
-    v.insert(
-        "content".into(),
-        pending.evidence["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
-    );
-    logging::emit_to(app, http, guild_id, "automod", v).await;
+    emit_action_report(app, http, guild_id, pending, vars).await;
+    report
 }
 
 fn member_for_selected_action(
@@ -2635,6 +3049,7 @@ mod tests {
             author_id: 2,
             content: "discord.gg/spam",
             attachment_count: 0,
+            sticker_count: 0,
             everyone_mentions: 0,
             here_mentions: 0,
             role_mentions: 0,
@@ -2715,6 +3130,7 @@ mod tests {
             author_id: 42,
             content,
             attachment_count: attachments,
+            sticker_count: 0,
             everyone_mentions: 0,
             here_mentions: 0,
             role_mentions: 0,
@@ -2897,6 +3313,205 @@ mod tests {
         );
     }
 
+    const MEDIA_RULE_ID: &str = "custom:0123456789abcdef";
+
+    fn media_rule() -> RuleDef {
+        let mut rule = custom_rule(
+            serde_json::json!({
+                "kind": "channel_content",
+                "preset": jmodguard::custom_rules::NO_LINKS_OR_MEDIA_PRESET,
+                "links": true,
+                "attachments": true,
+                "stickers": true,
+                "gifs": true,
+                "allowed_domains": ["example.test"],
+            }),
+            "delete",
+        );
+        rule.include_channels = vec![70];
+        rule.skip_moderators = true;
+        rule.whitelist_roles = vec![7];
+        rule
+    }
+
+    #[tokio::test]
+    async fn media_preset_save_accepts_only_direct_chat_channels() {
+        use serenity::all::{ChannelId, ChannelType, GuildChannel};
+
+        let path =
+            std::env::temp_dir().join(format!("media_channels_{:032x}.db", rand::random::<u128>()));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let wire = crate::db::ScopeWire {
+            global: false,
+            guild_id: enrollment.guild_id,
+            enrollment_id: enrollment.id.clone(),
+            joined_at_ns: enrollment.joined_at_ns,
+        };
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        let channels = [
+            (70, ChannelType::Text, true),
+            (71, ChannelType::News, true),
+            (72, ChannelType::Voice, true),
+            (73, ChannelType::Stage, true),
+            (74, ChannelType::Forum, false),
+            (75, ChannelType::Unknown(16), false),
+            (76, ChannelType::Category, false),
+            (77, ChannelType::PublicThread, false),
+        ];
+        let discord_channels = channels.map(|(id, kind, _)| {
+            let mut channel = GuildChannel::default();
+            channel.id = ChannelId::new(id);
+            channel.kind = kind;
+            channel
+        });
+        let names = crate::server_names::snapshot([], &discord_channels);
+        store.replace_server_names(scope, names, 1).await.unwrap();
+
+        let mut last_saved = vec![];
+        for (id, kind, allowed) in channels {
+            let mut rule = media_rule();
+            rule.include_channels = vec![id];
+            let result = crate::db::apply_control(
+                &app.db,
+                Some(&app.tenant),
+                crate::db::ControlOp::UpsertRule {
+                    request: wire.clone(),
+                    target: wire.clone(),
+                    id: MEDIA_RULE_ID.into(),
+                    rule,
+                    clear_guild_override: false,
+                    replace_velocity_limit: false,
+                },
+                None,
+            )
+            .await;
+            if allowed {
+                assert!(matches!(
+                    result.unwrap(),
+                    crate::db::ControlReply::Saved { .. }
+                ));
+                last_saved = vec![id];
+            } else if kind == ChannelType::PublicThread {
+                // Threads aren't in the snapshot. Pruning the unavailable ID
+                // still prevents the rule from targeting a thread.
+                let crate::db::ControlReply::Saved { body } = result.unwrap() else {
+                    panic!("expected a saved rule");
+                };
+                assert_eq!(body["enabled"], false);
+                last_saved.clear();
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains(&format!("Channel {id}"))
+                );
+            }
+            let saved = crate::db::get_rule(&app.db, 10, MEDIA_RULE_ID)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.include_channels, last_saved);
+        }
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[test]
+    fn media_preset_scopes_links_attachments_stickers_and_gifs() {
+        let engine = AutomodEngine::new();
+        let mut rule = media_rule();
+        let cfg = |rule: &RuleDef| {
+            test_cfg(
+                &HashMap::from([(MEDIA_RULE_ID.to_owned(), rule.clone())]),
+                &HashMap::new(),
+            )
+        };
+        let check = |rule: &RuleDef, message: &MsgCtx<'_>| {
+            engine
+                .evaluate(&cfg(rule), message)
+                .is_some_and(|hit| hit.rule_id == MEDIA_RULE_ID && hit.action.action == "delete")
+        };
+        for (content, blocked) in [
+            ("plain text", false),
+            ("see <https://EXAMPLE.test/path>", false),
+            ("https://example.test https://other.test", true),
+            ("https://example.test.other.test", true),
+            ("https://sub.example.test", true),
+            ("https://example.test_/path", true),
+            ("https://example.test_", true),
+            ("https://other.test@example.test", true),
+        ] {
+            assert_eq!(
+                check(&rule, &msg(70, content, 0, false, false)),
+                blocked,
+                "{content}"
+            );
+        }
+        let mut message = msg(70, "https://other.test", 0, false, false);
+        assert!(check(&rule, &message));
+        message.channel_id = 71;
+        assert!(!check(&rule, &message));
+        message.channel_id = 70;
+        rule.include_channels.clear();
+        assert!(!check(&rule, &message));
+        rule.include_channels = vec![70];
+        rule.enabled = false;
+        assert!(!check(&rule, &message));
+        rule.enabled = true;
+        message.is_moderator = true;
+        assert!(!check(&rule, &message));
+        message.is_moderator = false;
+        message.member_roles = &[7];
+        assert!(!check(&rule, &message));
+        message.member_roles = &[];
+
+        message.content = "";
+        message.attachment_count = 1;
+        assert!(check(&rule, &message));
+        rule.params["attachments"] = false.into();
+        assert!(!check(&rule, &message));
+        message.attachment_count = 0;
+        message.sticker_count = 1;
+        assert!(check(&rule, &message));
+        rule.params["stickers"] = false.into();
+        assert!(!check(&rule, &message));
+        message.sticker_count = 0;
+
+        for content in [
+            "https://tenor.com/view/dancing",
+            "https://media.giphy.com/media/clip/giphy.gif",
+        ] {
+            message.content = content;
+            for (links, gifs, blocked) in [
+                (true, false, true),
+                (false, true, true),
+                (false, false, false),
+            ] {
+                rule.params["links"] = links.into();
+                rule.params["gifs"] = gifs.into();
+                assert_eq!(
+                    check(&rule, &message),
+                    blocked,
+                    "{content}, links={links}, gifs={gifs}"
+                );
+            }
+        }
+        rule.params["gifs"] = true.into();
+        message.content = "https://tenor.com.other.test/gif";
+        assert!(!check(&rule, &message));
+        message.content = "https://tenor.com/view/dancing";
+        rule.params["allowed_domains"] = serde_json::json!(["tenor.com"]);
+        assert!(!check(&rule, &message));
+    }
+
     #[test]
     fn custom_channel_content_and_everyone() {
         let id = "custom:0123456789abcdef".to_string();
@@ -3039,12 +3654,23 @@ mod tests {
             "kick",
         );
         honeypot.dry_run = false;
+        let mut log = honeypot.actions[0].clone();
+        log.action = "log".into();
+        honeypot.actions.insert(0, log);
         rules.insert(id.clone(), honeypot);
-        let hit = jmodguard::custom_rules::honeypot_role_added(&rules, &[99], 42, &[], false);
+        let (matched_id, rule, primary) =
+            jmodguard::custom_rules::honeypot_role_added(&rules, &[99], 42, &[], false).unwrap();
+        assert_eq!(matched_id, id);
+        assert_eq!(primary.action, "kick");
+        let pending =
+            PendingAction::from_custom(matched_id, rule, primary, serde_json::json!({}), false);
         assert_eq!(
-            hit.as_ref()
-                .map(|(rid, a)| (rid.as_str(), a.action.as_str())),
-            Some((id.as_str(), "kick"))
+            pending
+                .actions()
+                .iter()
+                .map(|action| action.action.as_str())
+                .collect::<Vec<_>>(),
+            ["log", "kick"],
         );
         assert!(
             jmodguard::custom_rules::honeypot_role_added(&rules, &[], 42, &[], false).is_none()
@@ -3249,6 +3875,7 @@ mod tests {
             author_id: AUTHOR,
             content: "@everyone",
             attachment_count: 0,
+            sticker_count: 0,
             everyone_mentions: 1,
             here_mentions: 0,
             role_mentions: 0,
@@ -3296,10 +3923,12 @@ mod tests {
         .unwrap();
         app.poll_config_version().await.unwrap();
         app.configs.invalidate();
-        let http = serenity::http::HttpBuilder::new("token")
-            .proxy(format!("http://{addr}"))
-            .ratelimiter_disabled(true)
-            .build();
+        let http = std::sync::Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(format!("http://{addr}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
         let cache = serenity::cache::Cache::new();
         let mut user = User::default();
         user.id = UserId::new(AUTHOR);
@@ -3516,6 +4145,7 @@ mod tests {
             author_id: 99,
             content: "@everyone",
             attachment_count: 0,
+            sticker_count: 0,
             everyone_mentions: 1,
             here_mentions: 0,
             role_mentions: 0,
@@ -3556,10 +4186,12 @@ mod tests {
             .unwrap();
         app.poll_config_version().await.unwrap();
         app.configs.invalidate();
-        let http = serenity::http::HttpBuilder::new("token")
-            .proxy(format!("http://{addr}"))
-            .ratelimiter_disabled(true)
-            .build();
+        let http = std::sync::Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(format!("http://{addr}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
         let cache = serenity::cache::Cache::new();
         let mut user = User::default();
         user.id = UserId::new(99);
@@ -3698,6 +4330,7 @@ mod tests {
             author_id: 99,
             content: "spamword",
             attachment_count: 0,
+            sticker_count: 0,
             everyone_mentions: 0,
             here_mentions: 0,
             role_mentions: 0,
@@ -4082,8 +4715,603 @@ mod tests {
         }
     }
 
+    struct DiscordRequestGate {
+        method: &'static str,
+        path: &'static str,
+        entered: tokio::sync::Notify,
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl DiscordRequestGate {
+        fn wait_if_selected(&self, method: &str, path: &str) {
+            if method == self.method && path == self.path {
+                let release = self.release.lock().unwrap().take();
+                if let Some(release) = release {
+                    self.entered.notify_one();
+                    let _ = release.blocking_recv();
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct ReplyRequests {
+        gate: Option<DiscordRequestGate>,
+        member: Option<serenity::model::guild::Member>,
+        posts: std::sync::Mutex<Vec<serde_json::Value>>,
+        logs: std::sync::Mutex<Vec<serde_json::Value>>,
+        sent_at: std::sync::OnceLock<Instant>,
+        deleted_at: std::sync::OnceLock<Instant>,
+        deleted: tokio::sync::Notify,
+    }
+
+    enum PresetEdit {
+        Disable,
+        RemoveChannel,
+        DryRun,
+        SkipRole,
+        LogOnly,
+        ReplyText,
+    }
+
+    #[derive(Clone, Copy)]
+    enum DiscordWait {
+        BeforeDispatch,
+        Member,
+        Delete,
+        DeleteAfterLog,
+        BanLookup,
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_stops_after_disable_during_member_lookup() {
+        edit_preset_during_discord_wait(PresetEdit::Disable, DiscordWait::Member).await;
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_stops_after_channel_removal_during_member_lookup() {
+        edit_preset_during_discord_wait(PresetEdit::RemoveChannel, DiscordWait::Member).await;
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_rechecks_mode_and_exemptions_after_member_lookup() {
+        for edit in [PresetEdit::DryRun, PresetEdit::SkipRole] {
+            edit_preset_during_discord_wait(edit, DiscordWait::Member).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_reports_completed_delete_after_disable_without_reply() {
+        edit_preset_during_discord_wait(PresetEdit::Disable, DiscordWait::Delete).await;
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_logs_once_when_disabled_during_delete_after_log() {
+        edit_preset_during_discord_wait(PresetEdit::Disable, DiscordWait::DeleteAfterLog).await;
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_stops_after_disable_during_ban_lookup() {
+        edit_preset_during_discord_wait(PresetEdit::Disable, DiscordWait::BanLookup).await;
+    }
+
+    #[tokio::test]
+    async fn pending_media_preset_discards_changed_action_plan_before_dispatch() {
+        for edit in [PresetEdit::LogOnly, PresetEdit::ReplyText] {
+            edit_preset_during_discord_wait(edit, DiscordWait::BeforeDispatch).await;
+        }
+    }
+
+    async fn edit_preset_during_discord_wait(edit: PresetEdit, wait: DiscordWait) {
+        use serenity::all::{Guild, GuildCreateEvent, GuildId, Member, Role, RoleId, User, UserId};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let path = std::env::temp_dir().join(format!(
+            "preset_dispatch_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let wire = crate::db::ScopeWire {
+            global: false,
+            guild_id: enrollment.guild_id,
+            enrollment_id: enrollment.id.clone(),
+            joined_at_ns: enrollment.joined_at_ns,
+        };
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+        store
+            .replace_server_names(
+                scope,
+                crate::db::guild_data::ServerNames {
+                    channels: [70, 71]
+                        .into_iter()
+                        .map(|id| crate::db::guild_data::ServerChannelName {
+                            id: id.to_string(),
+                            name: format!("channel-{id}"),
+                            kind: "text".into(),
+                            parent_id: None,
+                            position: 0,
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        crate::db::upsert_log_channel(&app.db, 10, "automod", 90)
+            .await
+            .unwrap();
+        let mut rule = media_rule();
+        rule.include_channels.push(71);
+        rule.log_automod = false;
+        rule.actions[0].reason = "Links or media are blocked here".into();
+        if matches!(wait, DiscordWait::BanLookup) {
+            rule.actions[0].action = "ban".into();
+        }
+        for (action, reason) in [("log", ""), ("channel_reply", "Explain the channel rule")] {
+            let mut extra = rule.actions[0].clone();
+            extra.action = action.into();
+            extra.reason = reason.into();
+            rule.actions.push(extra);
+        }
+        if matches!(wait, DiscordWait::DeleteAfterLog) {
+            rule.actions.swap(0, 1);
+        }
+        rule.params["channel_reply"] =
+            serde_json::json!({ "template": "{user} No links", "delete_after_seconds": 0 });
+        let save = |rule: RuleDef| {
+            crate::db::apply_control(
+                &app.db,
+                Some(&app.tenant),
+                crate::db::ControlOp::UpsertRule {
+                    request: wire.clone(),
+                    target: wire.clone(),
+                    id: MEDIA_RULE_ID.into(),
+                    rule,
+                    clear_guild_override: false,
+                    replace_velocity_limit: false,
+                },
+                None,
+            )
+        };
+        assert!(matches!(
+            save(rule.clone()).await.unwrap(),
+            crate::db::ControlReply::Saved { .. }
+        ));
+        rule.dry_run = false;
+        assert!(matches!(
+            save(rule.clone()).await.unwrap(),
+            crate::db::ControlReply::Saved { .. }
+        ));
+
+        let mut user = User::default();
+        user.id = UserId::new(99);
+        user.name = "member".into();
+        let mut member = Member::default();
+        member.guild_id = GuildId::new(10);
+        member.user = user.clone();
+        member.roles = vec![RoleId::new(77)];
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let gate = match wait {
+            DiscordWait::BeforeDispatch => None,
+            DiscordWait::Member => Some(("GET", "/api/v10/guilds/10/members/99")),
+            DiscordWait::Delete | DiscordWait::DeleteAfterLog => {
+                Some(("DELETE", "/api/v10/channels/70/messages/42"))
+            }
+            DiscordWait::BanLookup => Some(("GET", "/api/v10/guilds/10/bans/99")),
+        };
+        let requests = Arc::new(ReplyRequests {
+            member: Some(member),
+            gate: gate.map(|(method, path)| DiscordRequestGate {
+                method,
+                path,
+                entered: tokio::sync::Notify::new(),
+                release: std::sync::Mutex::new(Some(release_rx)),
+            }),
+            ..Default::default()
+        });
+        let stub = DiscordStub::bind(Some(Arc::clone(&requests)));
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(10);
+        guild.owner_id = UserId::new(1);
+        for id in [10, 77] {
+            let mut role = Role::default();
+            role.id = RoleId::new(id);
+            guild.roles.insert(role.id, role);
+        }
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        stub.cache.update(&mut event);
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let mut message = msg(70, "https://other.test", 0, false, false);
+        message.guild_id = 10;
+        message.author_id = 99;
+        message.message_id = 42;
+        let pending = app.automod.evaluate(&cfg, &message).unwrap();
+        assert_eq!(pending.rule_id, MEDIA_RULE_ID);
+        let execution = execute_pending_with(
+            &app,
+            &stub.http,
+            &stub.cache,
+            GuildId::new(10),
+            &user,
+            None,
+            "member",
+            Some(42),
+            Some(70),
+            &pending,
+        );
+        let edit_and_save = async {
+            if let Some(gate) = &requests.gate {
+                tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+                    .await
+                    .unwrap();
+            }
+            match edit {
+                PresetEdit::Disable => rule.enabled = false,
+                PresetEdit::RemoveChannel => {
+                    rule.include_channels.remove(0);
+                }
+                PresetEdit::DryRun => rule.dry_run = true,
+                PresetEdit::SkipRole => rule.whitelist_roles.push(77),
+                PresetEdit::LogOnly => rule.actions.retain(|action| action.action == "log"),
+                PresetEdit::ReplyText => {
+                    rule.params["channel_reply"]["template"] = "Updated text".into()
+                }
+            }
+            let result = save(rule).await;
+            if requests.gate.is_some() {
+                release.send(()).unwrap();
+            }
+            assert!(matches!(
+                result.unwrap(),
+                crate::db::ControlReply::Saved { .. }
+            ));
+        };
+        let started = if matches!(wait, DiscordWait::BeforeDispatch) {
+            edit_and_save.await;
+            execution.await
+        } else {
+            tokio::join!(execution, edit_and_save).0
+        };
+        let seen = stub.finish();
+        let member = "GET /api/v10/guilds/10/members/99";
+        assert_eq!(
+            started,
+            matches!(
+                wait,
+                DiscordWait::Delete | DiscordWait::DeleteAfterLog | DiscordWait::BanLookup
+            ),
+            "{seen:?}"
+        );
+        let expected: &[&str] = match wait {
+            DiscordWait::BeforeDispatch => &[],
+            DiscordWait::Member => &[member],
+            DiscordWait::Delete => &[
+                member,
+                "DELETE /api/v10/channels/70/messages/42",
+                "POST /api/v10/channels/90/messages",
+            ],
+            DiscordWait::DeleteAfterLog => &[
+                member,
+                "POST /api/v10/channels/90/messages",
+                "DELETE /api/v10/channels/70/messages/42",
+            ],
+            DiscordWait::BanLookup => &[member, "GET /api/v10/guilds/10/bans/99"],
+        };
+        assert_eq!(seen, expected);
+        {
+            let logs = requests.logs.lock().unwrap();
+            if matches!(wait, DiscordWait::Delete | DiscordWait::DeleteAfterLog) {
+                assert_eq!(logs.len(), 1);
+                let fields = logs[0]["embeds"][0]["fields"].as_array().unwrap();
+                let field = |name| {
+                    fields
+                        .iter()
+                        .find(|field| field["name"].as_str().unwrap().ends_with(name))
+                        .unwrap()["value"]
+                        .as_str()
+                        .unwrap()
+                };
+                if matches!(wait, DiscordWait::Delete) {
+                    assert_eq!(field("Action"), "delete (succeeded)");
+                    assert_eq!(field("Reason"), "delete: Links or media are blocked here");
+                } else {
+                    assert_eq!(field("Action"), "log");
+                }
+            } else {
+                assert!(logs.is_empty());
+            }
+        }
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
+    #[tokio::test]
+    async fn media_rule_dispatches_delete_log_reply_in_order_and_expires_only_the_reply() {
+        use serenity::all::{Guild, GuildCreateEvent, GuildId, Member, Role, RoleId, User, UserId};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let path =
+            std::env::temp_dir().join(format!("media_rule_{:032x}.db", rand::random::<u128>()));
+        let app =
+            BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+        assert!(
+            crate::db::claim_active_bot(
+                &app.db,
+                app.activation.instance(),
+                jmodguard::control::now_ms(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap()
+        );
+        app.activation.mark_lock_held(true);
+        let enrollment = crate::db::enroll_guild(&app.db, 10, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment).await.unwrap();
+        crate::db::upsert_log_channel(&app.db, 10, "automod", 90)
+            .await
+            .unwrap();
+        let mut rule = media_rule();
+        rule.log_automod = false;
+        rule.actions[0].reason = "Links or media are blocked here".into();
+        for (action, reason) in [("log", ""), ("channel_reply", "Explain the channel rule")] {
+            let mut extra = rule.actions[0].clone();
+            extra.action = action.into();
+            extra.reason = reason.into();
+            rule.actions.push(extra);
+        }
+        rule.params["channel_reply"] = serde_json::json!({
+            "template": "{user} Use a different channel than {channel}. <:wave:12> @everyone @here <@55> <@&56>",
+            "delete_after_seconds": 1,
+        });
+        crate::db::upsert_rule(&app.db, 10, MEDIA_RULE_ID, &rule)
+            .await
+            .unwrap();
+        rule.dry_run = false;
+        crate::db::upsert_rule(&app.db, 10, MEDIA_RULE_ID, &rule)
+            .await
+            .unwrap();
+        app.configs.invalidate();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        let replies = Arc::new(ReplyRequests::default());
+        let stub = DiscordStub::bind(Some(Arc::clone(&replies)));
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(10);
+        guild.owner_id = UserId::new(1);
+        let mut everyone = Role::default();
+        everyone.id = RoleId::new(10);
+        guild.roles.insert(everyone.id, everyone);
+        for id in [42, 43] {
+            let mut member = Member::default();
+            member.guild_id = guild.id;
+            member.user.id = UserId::new(id);
+            guild.members.insert(member.user.id, member);
+        }
+        let mut event: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        stub.cache.update(&mut event);
+        let mut user = User::default();
+        user.id = UserId::new(42);
+        user.name = "member".into();
+
+        let evaluate = |message: &MsgCtx<'_>| {
+            let pending = app.automod.evaluate(&cfg, message);
+            assert!(
+                pending
+                    .as_ref()
+                    .is_none_or(|hit| hit.rule_id == MEDIA_RULE_ID)
+            );
+            pending
+        };
+        let mut message = msg(71, "https://other.test", 0, false, false);
+        message.guild_id = 10;
+        assert!(evaluate(&message).is_none());
+        message.channel_id = 70;
+        for (id, content, attachments) in [(11, "https://other.test", 0), (12, "", 1)] {
+            message.message_id = id;
+            message.content = content;
+            message.attachment_count = attachments;
+            let pending = evaluate(&message).unwrap();
+            assert!(
+                execute_pending_with(
+                    &app,
+                    &stub.http,
+                    &stub.cache,
+                    GuildId::new(10),
+                    &user,
+                    None,
+                    "member",
+                    Some(id),
+                    Some(70),
+                    &pending,
+                )
+                .await
+            );
+        }
+        {
+            let posts = replies.posts.lock().unwrap();
+            assert_eq!(posts.len(), 1);
+            assert_eq!(
+                posts[0]["content"],
+                "<@42> Use a different channel than <#70>. <:wave:12> @everyone @here <@55> <@&56>",
+            );
+            assert_eq!(
+                posts[0]["allowed_mentions"],
+                serde_json::json!({ "parse": [], "users": ["42"], "roles": [], "replied_user": false }),
+            );
+        }
+
+        // An expiry of zero posts for another member and schedules no delete.
+        rule.params["channel_reply"]["delete_after_seconds"] = serde_json::json!(0);
+        rule.actions.swap(1, 2);
+        crate::db::upsert_rule(&app.db, 10, MEDIA_RULE_ID, &rule)
+            .await
+            .unwrap();
+        app.configs.invalidate();
+        let cfg = app.configs.get(&app.db, 10).await.unwrap();
+        user.id = UserId::new(43);
+        message.author_id = 43;
+        message.message_id = 13;
+        message.attachment_count = 0;
+        message.sticker_count = 1;
+        let pending = app.automod.evaluate(&cfg, &message).unwrap();
+        assert!(
+            execute_pending_with(
+                &app,
+                &stub.http,
+                &stub.cache,
+                GuildId::new(10),
+                &user,
+                None,
+                "member",
+                Some(13),
+                Some(70),
+                &pending,
+            )
+            .await
+        );
+        message.message_id = 14;
+        let pending = app.automod.evaluate(&cfg, &message).unwrap();
+        assert!(
+            execute_pending_with(
+                &app,
+                &stub.http,
+                &stub.cache,
+                GuildId::new(10),
+                &user,
+                None,
+                "member",
+                Some(14),
+                Some(70),
+                &pending,
+            )
+            .await
+        );
+
+        // A pending match must stop if its channel selection is cleared before dispatch.
+        rule.include_channels.clear();
+        rule.enabled = false;
+        crate::db::upsert_rule(&app.db, 10, MEDIA_RULE_ID, &rule)
+            .await
+            .unwrap();
+        app.configs.invalidate();
+        assert!(
+            !execute_pending_with(
+                &app,
+                &stub.http,
+                &stub.cache,
+                GuildId::new(10),
+                &user,
+                None,
+                "member",
+                Some(15),
+                Some(70),
+                &pending,
+            )
+            .await
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), replies.deleted.notified())
+            .await
+            .unwrap();
+        assert!(
+            replies
+                .deleted_at
+                .get()
+                .unwrap()
+                .duration_since(*replies.sent_at.get().unwrap())
+                >= Duration::from_secs(1),
+            "the reply must survive for at least its configured lifetime",
+        );
+        let lines = stub.finish();
+        let ordered: Vec<_> = lines
+            .iter()
+            .filter(|line| !line.ends_with("/messages/81"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            ordered,
+            [
+                "DELETE /api/v10/channels/70/messages/11",
+                "POST /api/v10/channels/90/messages",
+                "POST /api/v10/channels/70/messages",
+                "DELETE /api/v10/channels/70/messages/12",
+                "POST /api/v10/channels/90/messages",
+                "DELETE /api/v10/channels/70/messages/13",
+                "POST /api/v10/channels/70/messages",
+                "POST /api/v10/channels/90/messages",
+                "DELETE /api/v10/channels/70/messages/14",
+                "POST /api/v10/channels/90/messages",
+            ]
+        );
+        let logs = replies.logs.lock().unwrap();
+        assert_eq!(logs.len(), 4);
+        let field = |index: usize, name: &str| {
+            logs[index]["embeds"][0]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|field| field["name"].as_str().unwrap().ends_with(name))
+                .unwrap()["value"]
+                .as_str()
+                .unwrap()
+        };
+        assert_eq!(field(0, "Action"), "delete (succeeded)");
+        assert_eq!(
+            field(0, "Reason"),
+            "delete: Links or media are blocked here"
+        );
+        assert_eq!(field(1, "Action"), "delete (succeeded)");
+        assert_eq!(
+            field(2, "Action"),
+            "delete (succeeded), channel_reply (succeeded)"
+        );
+        assert!(field(2, "Reason").contains("channel_reply: Explain the channel rule"));
+        assert_eq!(
+            field(3, "Action"),
+            "delete (failed), channel_reply (skipped)"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.ends_with("/messages/81"))
+                .count(),
+            1
+        );
+        assert_eq!(replies.posts.lock().unwrap().len(), 2);
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        crate::tenant::remove_sidecars(&path);
+    }
+
     struct DiscordStub {
-        http: serenity::http::Http,
+        http: std::sync::Arc<serenity::http::Http>,
         cache: serenity::cache::Cache,
         lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         ban_reasons: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -4093,7 +5321,7 @@ mod tests {
 
     impl DiscordStub {
         fn start() -> Self {
-            Self::bind()
+            Self::bind(None)
         }
 
         fn finish(mut self) -> Vec<String> {
@@ -4106,7 +5334,7 @@ mod tests {
     }
 
     impl DiscordStub {
-        fn bind() -> Self {
+        fn bind(replies: Option<std::sync::Arc<ReplyRequests>>) -> Self {
             use crate::spam_actions::tests::read_http_request;
             use std::io::Write;
             use std::sync::Arc;
@@ -4130,13 +5358,74 @@ mod tests {
                                 continue;
                             };
                             server_lines.lock().unwrap().push(request.summary());
+                            if let Some(gate) =
+                                replies.as_ref().and_then(|fixture| fixture.gate.as_ref())
+                            {
+                                gate.wait_if_selected(&request.method, &request.path);
+                            }
                             if request.method == "PUT" && request.path.contains("/bans/") {
                                 server_reasons.lock().unwrap().push(request.reason);
                             }
-                            let response = if request.method == "GET" {
-                                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            if let Some(replies) = &replies
+                                && request.method == "DELETE"
+                                && request.path == "/api/v10/channels/70/messages/81"
+                            {
+                                let _ = replies.deleted_at.set(Instant::now());
+                                replies.deleted.notify_one();
+                            }
+                            if let Some(replies) = &replies
+                                && request.method == "POST"
+                                && request.path == "/api/v10/channels/90/messages"
+                            {
+                                replies
+                                    .logs
+                                    .lock()
+                                    .unwrap()
+                                    .push(serde_json::from_str(&request.body).unwrap());
+                            }
+                            let response = if request.method == "GET"
+                                && request.path == "/api/v10/guilds/10/members/99"
+                                && let Some(member) =
+                                    replies.as_ref().and_then(|fixture| fixture.member.as_ref())
+                            {
+                                let body = serde_json::to_string(member).unwrap();
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            } else if let Some(replies) = &replies
+                                && request.method == "POST"
+                                && request.path == "/api/v10/channels/70/messages"
+                            {
+                                let _ = replies.sent_at.set(Instant::now());
+                                let mut posts = replies.posts.lock().unwrap();
+                                posts.push(serde_json::from_str(&request.body).unwrap());
+                                let id = 80 + posts.len();
+                                let body = serde_json::json!({
+                                    "id": id.to_string(), "channel_id": "70",
+                                    "author": { "id": "7", "username": "bot", "discriminator": "0" },
+                                    "content": "", "timestamp": "2020-01-01T00:00:00Z",
+                                    "tts": false, "mention_everyone": false, "mentions": [],
+                                    "mention_roles": [], "attachments": [], "embeds": [],
+                                    "pinned": false, "type": 0,
+                                }).to_string();
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            } else if replies.is_some()
+                                && request.method == "DELETE"
+                                && request.path == "/api/v10/channels/70/messages/14"
+                            {
+                                let body = r#"{"message":"Missing Permissions","code":50013}"#;
+                                format!(
+                                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            } else if request.method == "GET" {
+                                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
                             } else {
-                                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
                             };
                             let _ = stream.write_all(response.as_bytes());
                             let _ = stream.flush();
@@ -4149,10 +5438,12 @@ mod tests {
                     }
                 }
             });
-            let http = serenity::http::HttpBuilder::new("token")
-                .proxy(format!("http://{addr}"))
-                .ratelimiter_disabled(true)
-                .build();
+            let http = std::sync::Arc::new(
+                serenity::http::HttpBuilder::new("token")
+                    .proxy(format!("http://{addr}"))
+                    .ratelimiter_disabled(true)
+                    .build(),
+            );
             let cache = serenity::cache::Cache::new();
             Self {
                 http,
@@ -4213,6 +5504,9 @@ mod tests {
         let mut guild = Guild::default();
         guild.id = GuildId::new(10);
         guild.owner_id = UserId::new(1);
+        let mut everyone = Role::default();
+        everyone.id = RoleId::new(10);
+        guild.roles.insert(everyone.id, everyone);
         let mut role = Role::default();
         role.id = RoleId::new(55);
         role.permissions = if moderator {
@@ -4376,6 +5670,9 @@ mod tests {
                 Ok(())
             }
         }
+        let exemption_unconfirmed =
+            expect_withheld && !matches!(config_lookup, ConfigLookup::UnreadableBuiltin);
+        let explicit_log = exemption_unconfirmed && action == "ban";
         let id = if matches!(config_lookup, ConfigLookup::UnreadableBuiltin) || action == "log" {
             "velocity"
         } else {
@@ -4409,6 +5706,20 @@ mod tests {
         rule.actions[0].duration_minutes = 5;
         rule.skip_moderators = skip_moderators;
         rule.whitelist_roles = skipped_roles;
+        if explicit_log {
+            let mut log = rule.actions[0].clone();
+            log.action = "log".into();
+            rule.actions.push(log);
+            rule.log_automod = false;
+        }
+        if action == "channel_reply" {
+            rule.params["channel_reply"] = serde_json::json!({ "template": "Explanation" });
+        }
+        if exemption_unconfirmed {
+            crate::db::upsert_log_channel(&app.db, 10, "automod", 90)
+                .await
+                .unwrap();
+        }
         if id == "velocity" {
             rule.params = serde_json::json!({ "max_messages": 0, "window_secs": 10 });
         }
@@ -4446,6 +5757,7 @@ mod tests {
         let mut everyone = Role::default();
         everyone.id = RoleId::new(10);
         guild.roles.insert(everyone.id, everyone);
+        let member_roles_missing = member_roles.is_none();
         let member = member_roles.map(|roles| {
             let mut member = Member::default();
             member.guild_id = guild.id;
@@ -4460,7 +5772,20 @@ mod tests {
             }
             member
         });
-        let stub = DiscordStub::start();
+        let fetched_member =
+            (skip_moderators && !expect_withheld && member_roles_missing && action == "delete")
+                .then(|| {
+                    let mut member = Member::default();
+                    member.guild_id = guild.id;
+                    member.user = user.clone();
+                    member
+                });
+        let stub_with_payloads = exemption_unconfirmed || fetched_member.is_some();
+        let requests = Arc::new(ReplyRequests {
+            member: fetched_member,
+            ..Default::default()
+        });
+        let stub = DiscordStub::bind(stub_with_payloads.then(|| Arc::clone(&requests)));
         let mut event: GuildCreateEvent =
             serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
         stub.cache.update(&mut event);
@@ -4488,6 +5813,12 @@ mod tests {
         .with_subscriber(subscriber)
         .await;
         let seen = stub.finish();
+        if requests.member.is_some() {
+            assert_eq!(
+                seen.first().map(String::as_str),
+                Some("GET /api/v10/guilds/10/members/99")
+            );
+        }
         let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
         let deletes = seen
             .iter()
@@ -4509,6 +5840,45 @@ mod tests {
                     && output.contains(jmodguard::custom_rules::CUSTOM_RULE_UNAVAILABLE_WARNING),
                 "{output}"
             );
+        } else if exemption_unconfirmed {
+            assert_eq!(
+                deletes, 0,
+                "an unresolved exemption prevents deletion: {seen:?}"
+            );
+            assert!(
+                seen.iter()
+                    .all(|line| line.starts_with("GET ")
+                        || line == "POST /api/v10/channels/90/messages"),
+                "only read-only lookups and the configured log may run: {seen:?}",
+            );
+            assert!(
+                crate::db::list_warns(&app.db, 10, 99)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let reports = requests.logs.lock().unwrap();
+            assert_eq!(reports.len(), 1);
+            let fields = reports[0]["embeds"][0]["fields"].as_array().unwrap();
+            let field = |name| {
+                fields
+                    .iter()
+                    .find(|field| field["name"].as_str().unwrap().ends_with(name))
+                    .unwrap()["value"]
+                    .as_str()
+                    .unwrap()
+            };
+            assert_eq!(field("Action"), format!("{action} (skipped)"));
+            let reason = if missing_role {
+                "moderator status could not be confirmed"
+            } else {
+                "member roles could not be confirmed"
+            };
+            assert_eq!(field("Reason"), reason);
+            assert!(
+                output.contains("automod enforcement skipped") && output.contains(reason),
+                "{output}"
+            );
         } else if expect_withheld || action == "delete" {
             assert_eq!(deletes, 1, "delete must run exactly once: {seen:?}");
         } else {
@@ -4523,10 +5893,12 @@ mod tests {
                     || line.starts_with("DELETE ") && line.contains("/members/"))),
                 "no ban handoff, ban, or kick: {seen:?}"
             );
-            assert!(
-                output.contains("WARN") && output.contains("skipping kick or ban"),
-                "{output}"
-            );
+            if !exemption_unconfirmed {
+                assert!(
+                    output.contains("WARN") && output.contains("skipping kick or ban"),
+                    "{output}"
+                );
+            }
             assert!(app.gateway_ban_echo_operation(10, 99).is_none());
             let scope = app.tenant.scope(enrollment).await.unwrap();
             let store = app.tenant.store(&scope).await.unwrap();
@@ -4564,8 +5936,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_roles_withhold_only_dependent_kick_and_ban() {
-        for action in ["ban", "kick"] {
+    async fn unknown_membership_skips_all_enforcement_including_ban_then_log() {
+        for action in ["ban", "kick", "delete", "timeout", "warn", "channel_reply"] {
             lookup_fallback_case(
                 action,
                 true,
@@ -4587,6 +5959,20 @@ mod tests {
             )
             .await;
         }
+    }
+
+    #[tokio::test]
+    async fn missing_gateway_member_can_be_recovered_before_enforcement() {
+        lookup_fallback_case(
+            "delete",
+            true,
+            vec![],
+            None,
+            false,
+            false,
+            ConfigLookup::Available,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -4628,15 +6014,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_role_definitions_preserve_timeout_and_warn() {
-        for action in ["delete", "timeout", "warn", "log"] {
+    async fn unknown_role_definitions_skip_every_enforcement_action() {
+        for action in ["delete", "timeout", "warn", "channel_reply"] {
             lookup_fallback_case(
                 action,
                 true,
                 vec![],
                 Some(vec![55]),
                 true,
-                false,
+                true,
                 ConfigLookup::Available,
             )
             .await;
@@ -5355,10 +6741,12 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        let http = serenity::http::HttpBuilder::new("token")
-            .proxy(format!("http://{addr}"))
-            .ratelimiter_disabled(true)
-            .build();
+        let http = std::sync::Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(format!("http://{addr}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
         let cache = serenity::cache::Cache::new();
         let mut user = User::default();
         user.id = UserId::new(99);
@@ -5462,10 +6850,12 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        let http = serenity::http::HttpBuilder::new("token")
-            .proxy(format!("http://{addr}"))
-            .ratelimiter_disabled(true)
-            .build();
+        let http = std::sync::Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(format!("http://{addr}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
         let cache = serenity::cache::Cache::new();
         let mut user = User::default();
         user.id = UserId::new(99);
@@ -5678,10 +7068,12 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        let http = serenity::http::HttpBuilder::new("token")
-            .proxy(format!("http://{addr}"))
-            .ratelimiter_disabled(true)
-            .build();
+        let http = std::sync::Arc::new(
+            serenity::http::HttpBuilder::new("token")
+                .proxy(format!("http://{addr}"))
+                .ratelimiter_disabled(true)
+                .build(),
+        );
         let probe = Arc::new(AutomodDeleteCancelProbe {
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),

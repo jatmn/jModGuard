@@ -3933,6 +3933,7 @@ mod tests {
             author_id: 42,
             content: "@everyone",
             attachment_count: 0,
+            sticker_count: 0,
             everyone_mentions: 1,
             here_mentions: 0,
             role_mentions: 0,

@@ -9704,7 +9704,14 @@ async fn server_names_serve_the_bot_snapshot_with_string_ids_and_no_discord_call
         .unwrap();
     let (status, body) = f.request("POST", "/api/guilds/10/server-names", "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, serde_json::json!({"roles": [], "channels": []}));
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "roles": [],
+            "channels": [],
+            "media_preset_channel_kinds": ["text", "announcement", "voice", "stage"],
+        })
+    );
 
     let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
     let names = db::guild_data::ServerNames {
@@ -9742,6 +9749,7 @@ async fn server_names_serve_the_bot_snapshot_with_string_ids_and_no_discord_call
                 "roles": [{"id": "9007199254740993", "name": "Moderators", "color": 3447003, "position": 3, "managed": false}],
                 "channels": [{"id": "9007199254740995", "name": "general", "kind": "text", "parent_id": null, "position": 0}],
                 "observed_at_ms": 1700,
+                "media_preset_channel_kinds": ["text", "announcement", "voice", "stage"],
             })
         );
     }
@@ -9751,6 +9759,116 @@ async fn server_names_serve_the_bot_snapshot_with_string_ids_and_no_discord_call
             + f.discord.token_calls.load(Ordering::SeqCst),
         discord_calls
     );
+}
+
+#[tokio::test]
+async fn media_preset_saves_with_deleted_channels_and_validates_remaining_types() {
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let bot = f.attach_save_writer().await;
+    let enrollment = db::guild_enrollment(&bot.db, 10).await.unwrap().unwrap();
+    bot.tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = bot.tenant.live(enrollment).await.unwrap();
+    let id = "custom:01234567";
+    let path = format!("/api/guilds/10/rules/{id}");
+    let mut rule: crate::types::RuleDef = serde_json::from_value(serde_json::json!({
+        "name": "No links or media",
+        "description": "Block links in selected channels.",
+        "enabled": true,
+        "dry_run": false,
+        "params": { "kind": "channel_content", "preset": "no_links_or_media", "links": true },
+        "actions": [{ "at": 1, "action": "delete" }],
+        "include_channels": ["70", "71"],
+        "whitelist_channels": ["72"],
+        "whitelist_roles": ["7"]
+    }))
+    .unwrap();
+    db::upsert_rule(&bot.db, 10, id, &rule).await.unwrap();
+    let save = |rule: &crate::types::RuleDef| {
+        serde_json::json!({ "scope": "guild", "data": rule }).to_string()
+    };
+
+    // No snapshot has arrived yet. Disabling an existing selection still works.
+    rule.enabled = false;
+    let (status, body) = f.request("PUT", &path, &save(&rule)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["config_patch"]["value"]["include_channels"],
+        serde_json::json!(["70", "71"])
+    );
+    assert_eq!(body["config_patch"]["value"]["enabled"], false);
+    rule.enabled = true;
+    let (status, body) = f.request("PUT", &path, &save(&rule)).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "cannot enable while the channel list is unavailable: {body}"
+    );
+    rule.enabled = false;
+    rule.include_channels.push(74);
+    let (status, body) = f.request("PUT", &path, &save(&rule)).await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "cannot add a selection while the list is unavailable: {body}"
+    );
+    rule.include_channels.pop();
+
+    let channels =
+        [(71, "text"), (74, "forum")].map(|(id, kind)| db::guild_data::ServerChannelName {
+            id: id.to_string(),
+            name: kind.into(),
+            kind: kind.into(),
+            parent_id: None,
+            position: 0,
+        });
+    store
+        .replace_server_names(
+            scope,
+            db::guild_data::ServerNames {
+                channels: channels.into(),
+                ..Default::default()
+            },
+            1_700,
+        )
+        .await
+        .unwrap();
+    for enabled in [true, false] {
+        // Recreate the saved state with both channels selected, then edit it
+        // using the stale selections the dashboard initially loaded.
+        rule.enabled = true;
+        db::upsert_rule(&bot.db, 10, id, &rule).await.unwrap();
+        rule.enabled = enabled;
+        let (status, body) = f.request("PUT", &path, &save(&rule)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let saved = db::get_rule(&bot.db, 10, id).await.unwrap().unwrap();
+        assert_eq!(saved.enabled, enabled);
+        assert_eq!(saved.include_channels, [71]);
+        assert_eq!(
+            saved.whitelist_channels,
+            [72],
+            "thread exceptions survive the server-channel snapshot"
+        );
+        assert_eq!(saved.whitelist_roles, [7]);
+        assert_eq!(body["config_patch"]["value"], serde_json::json!(saved));
+    }
+    rule.enabled = true;
+    rule.include_channels = vec![70, 74];
+    let (status, body) = f.request("PUT", &path, &save(&rule)).await;
+    assert_ne!(status, StatusCode::OK);
+    assert!(body.to_string().contains("unsupported"), "{body}");
+    rule.include_channels = vec![70];
+    let (status, body) = f.request("PUT", &path, &save(&rule)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["config_patch"]["value"]["include_channels"],
+        serde_json::json!([])
+    );
+    assert_eq!(body["config_patch"]["value"]["enabled"], false);
 }
 
 #[tokio::test]

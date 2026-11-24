@@ -95,6 +95,7 @@ pub(crate) async fn sweep_after_ban(
     enrollment: &GuildEnrollment,
     author: u64,
     seconds: u32,
+    still_admitted: impl Fn() -> bool,
 ) -> usize {
     let guild = enrollment.guild_id as u64;
     if seconds == 0
@@ -110,6 +111,9 @@ pub(crate) async fn sweep_after_ban(
     let mut deleted = 0;
     let sweep = async {
         for (channel, message) in messages {
+            if !still_admitted() {
+                break;
+            }
             if !app
                 .recent_messages
                 .still_tracked(guild, author, channel, message)

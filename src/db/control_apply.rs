@@ -707,6 +707,48 @@ fn lease_rejected(error: &anyhow::Error) -> bool {
     })
 }
 
+async fn reconcile_media_preset_scope(
+    db: &Db,
+    tenant: Option<&TenantRuntime>,
+    enrollment: GuildEnrollment,
+    id: &str,
+    rule: &mut RuleDef,
+) -> Result<()> {
+    let snapshot = async {
+        let tenant = tenant.context("server channel list is unavailable")?;
+        let (store, scope) = tenant.live(enrollment.clone()).await?;
+        let names = store.server_names(scope).await?;
+        anyhow::ensure!(
+            names.observed_at_ms.is_some(),
+            "server channel list is unavailable"
+        );
+        Ok::<_, anyhow::Error>(names)
+    }
+    .await;
+    match snapshot {
+        Ok(names) => crate::custom_rules::reconcile_media_preset_channels(rule, &names.channels),
+        Err(error) if !rule.enabled => {
+            // An outage must not prevent disabling. Only an existing selection
+            // can be retained until the bot can validate new channels again.
+            let existing = get_enrolled_rule(db, ConfigurationScope::Guild(enrollment), id)
+                .await?
+                .guild;
+            anyhow::ensure!(
+                existing.is_some_and(|saved| {
+                    crate::custom_rules::requires_include_channels(&saved)
+                        && rule
+                            .include_channels
+                            .iter()
+                            .all(|id| saved.include_channels.contains(id))
+                }),
+                "{error:#}. Wait for the bot to share channels before adding new selections."
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn apply_control_inner(
     db: &Db,
     tenant: Option<&TenantRuntime>,
@@ -740,7 +782,7 @@ async fn apply_control_inner(
             request,
             target,
             id,
-            rule,
+            mut rule,
             clear_guild_override,
             replace_velocity_limit,
         } => {
@@ -752,9 +794,18 @@ async fn apply_control_inner(
                 promote_enrolled_rule(db, scope_of(request)?, &id, &rule, replace_velocity_limit)
                     .await?
             } else {
+                let target = scope_of(target)?;
+                let scope = ConfigurationWriteScope::new(scope_of(request)?, target.clone())?;
+                if crate::custom_rules::is_custom_id(&id)
+                    && crate::custom_rules::requires_include_channels(&rule)
+                    && !rule.include_channels.is_empty()
+                    && let ConfigurationScope::Guild(enrollment) = target
+                {
+                    reconcile_media_preset_scope(db, tenant, enrollment, &id, &mut rule).await?;
+                }
                 upsert_enrolled_rule_with_velocity_edit(
                     db,
-                    write_scope(request, target)?,
+                    scope,
                     &id,
                     &rule,
                     replace_velocity_limit,
