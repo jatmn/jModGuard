@@ -1387,6 +1387,7 @@ impl EventHandler for Handler {
             author_id: msg.author.id.get(),
             content: &msg.content,
             attachment_count: msg.attachments.len(),
+            sticker_count: msg.sticker_items.len(),
             everyone_mentions: usize::from(msg.mention_everyone),
             here_mentions: usize::from(msg.mention_everyone),
             role_mentions: msg.mention_roles.len(),
@@ -1766,29 +1767,20 @@ impl EventHandler for Handler {
                     let level = crate::commands::perm_level(&app, &g.roles, &new);
                     (level >= crate::commands::PermLevel::Mod, false)
                 });
-                if let Some((rule_id, action)) = jmodguard::custom_rules::honeypot_role_added(
+                if let Some((rule_id, rule, action)) = jmodguard::custom_rules::honeypot_role_added(
                     &cfg.rules,
                     &added,
                     new.user.id.get(),
                     &member_roles,
                     is_moderator,
                 ) {
-                    let rule_name = cfg
-                        .rules
-                        .get(&rule_id)
-                        .map(|r| r.name.clone())
-                        .unwrap_or_else(|| rule_id.clone());
-                    let dry_run = cfg.rules.get(&rule_id).is_some_and(|rule| rule.dry_run);
-                    let pending = crate::automod::PendingAction {
+                    let pending = crate::automod::PendingAction::from_custom(
                         rule_id,
-                        rule_name,
+                        rule,
                         action,
-                        strikes: 1,
-                        evidence: serde_json::json!({}),
-                        mention_permission_unknown: false,
-                        matched_rule: None,
-                        dry_run,
-                    };
+                        serde_json::json!({}),
+                        false,
+                    );
                     execute_pending(
                         &app,
                         &ctx,

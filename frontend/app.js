@@ -3678,6 +3678,43 @@ function newCustomRuleDraft() {
   };
 }
 
+const MEDIA_RULE_PRESET = "no_links_or_media";
+const CHANNEL_REPLY_DEFAULT = {
+  template: "{user} No links or media are allowed in {channel}.",
+  delete_after_seconds: 10,
+};
+const CUSTOM_RULE_ACTIONS = ["delete", "log", "channel_reply", "warn", "timeout", "kick", "ban"];
+
+function newMediaRuleDraft() {
+  const draft = newCustomRuleDraft();
+  const name = "No links or media";
+  const description = "Delete links and media in selected channels.";
+  return {
+    ...draft,
+    name,
+    description,
+    effective: {
+      ...draft.effective,
+      name,
+      description,
+      enabled: false,
+      skip_moderators: true,
+      log_automod: false,
+      open_case: false,
+      params: {
+        kind: "channel_content",
+        preset: MEDIA_RULE_PRESET,
+        links: true,
+        attachments: true,
+        gifs: true,
+        stickers: true,
+        channel_reply: { ...CHANNEL_REPLY_DEFAULT },
+      },
+      actions: [{ at: 1, action: "delete" }, { at: 1, action: "log" }],
+    },
+  };
+}
+
 function tabRules() {
   const rules = state.config.rules.filter((r) => r.rule_id !== "known_spam");
   return h(
@@ -3695,6 +3732,16 @@ function tabRules() {
         },
         "Add custom rule",
       ),
+      state.guildId && state.guildId !== "0"
+        ? h(
+            ActionButton,
+            {
+              className: "btn btn-outline btn-sm",
+              onClick: () => ui.set({ editor: h(CustomRuleEditor, { record: newMediaRuleDraft(), creating: true }) }),
+            },
+            "No links or media",
+          )
+        : null,
     ),
     h("p", { className: "muted" }, "Each rule catches one kind of abuse. Use dry-run while you tune it."),
     h(GoodToKnow, {
@@ -3822,6 +3869,10 @@ function spamThresholds(p, id) {
 function buildCustomRuleSaveBody(rule, creating) {
   const body = JSON.parse(JSON.stringify(rule));
   if (creating) body.dry_run = true;
+  if (body.params?.preset === MEDIA_RULE_PRESET && !body.include_channels.length) body.enabled = false;
+  if (body.actions.some((action) => action.action === "channel_reply")) {
+    body.params.channel_reply ||= { ...CHANNEL_REPLY_DEFAULT };
+  }
   return body;
 }
 
@@ -3903,6 +3954,7 @@ const RULE_TRIGGERS = {
 
 const RULE_ACTION_LABELS = {
   log: "Log only",
+  channel_reply: "Reply in channel",
   delete: "Delete message",
   warn: "Warn",
   timeout: "Timeout",
@@ -3997,7 +4049,7 @@ function EditorSection({ title, hint, className = "", children }) {
 
 // Enabled and Dry-run sit in the header as toggles; their labels stay the
 // exact control names.
-function RuleEditorHeader({ title, enabled, dryRun, dryRunDisabled, disabled, onEnabled, onDryRun, dryRunRef }) {
+function RuleEditorHeader({ title, enabled, dryRun, dryRunDisabled, disabled, requireChannels, hasChannels, onEnabled, onDryRun, dryRunRef }) {
   return h(
     "div",
     { className: "editor-heading rule-editor-header" },
@@ -4008,7 +4060,12 @@ function RuleEditorHeader({ title, enabled, dryRun, dryRunDisabled, disabled, on
       h(
         "label",
         { className: "toggle-label" },
-        h(Input, { type: "checkbox", className: "toggle toggle-sm", defaultChecked: enabled, disabled, onChange: (e) => onEnabled(e.target.checked) }),
+        h(Input, {
+          type: "checkbox",
+          className: "toggle toggle-sm",
+          ...(requireChannels ? { checked: enabled, disabled: !hasChannels } : { defaultChecked: enabled, disabled }),
+          onChange: (e) => onEnabled(e.target.checked),
+        }),
         "Enabled",
       ),
       h(
@@ -4368,12 +4425,12 @@ function RuleExceptions({ rule, names, rememberUser, onChange, pending }) {
   );
 }
 
-function RuleAdvanced({ rule, names, onChange, pending, children }) {
+function RuleAdvanced({ rule, names, onChange, pending, includePicker = true, children }) {
   return h(
     "details",
     { className: "editor-advanced" },
     h("summary", null, "Advanced"),
-    h(IdPicker, {
+    includePicker ? h(IdPicker, {
       kind: "channel",
       label: "Only check these channels",
       hint: "Leave empty to check every channel.",
@@ -4381,7 +4438,7 @@ function RuleAdvanced({ rule, names, onChange, pending, children }) {
       names,
       onChange,
       pending,
-    }),
+    }) : null,
     children,
   );
 }
@@ -4400,8 +4457,13 @@ function customRulePhrase(rule, names) {
     return count ? `When a message contains ${count === 1 ? "the listed word" : `any of ${count} listed words`}` : "When a message contains a listed word (none yet)";
   }
   if (p.kind === "channel_content") {
-    const parts = [p.links && "a link", p.attachments && "an attachment"].filter(Boolean);
-    return parts.length ? `When someone posts ${parts.join(" or ")}` : "Never (choose links or attachments)";
+    const parts = [
+      p.links && "a link",
+      p.attachments && "an attachment",
+      p.gifs && !p.links && "a GIF link",
+      p.stickers && "a sticker",
+    ].filter(Boolean);
+    return parts.length ? `When someone posts ${parts.join(" or ")}` : "Choose at least one content type";
   }
   if (p.kind === "everyone_attempt") return "When someone without permission tries to mention @everyone or @here";
   if (p.kind === "honeypot_role") {
@@ -4419,14 +4481,29 @@ function CustomRuleEditor({ record: r, creating }) {
   const [honeypotRoles] = useState(() => (rule.params?.role_id ? [String(rule.params.role_id)] : []));
   const pending = useRef(new Set()).current;
   const kind = rule.params?.kind || "pattern";
-  const action = rule.actions?.[0];
-  const summary = ruleSummaryText(customRulePhrase(rule, names), action ? ruleStepPhrase(action) : "no action", rule.enabled, rule.dry_run);
+  const preset = rule.params?.preset === MEDIA_RULE_PRESET;
+  const actions = rule.actions;
+  const actionChoices = CUSTOM_RULE_ACTIONS.filter((action) => kind !== "honeypot_role" || action !== "channel_reply");
+  const unusedActions = actionChoices.filter((choice) => !actions.some((action) => action.action === choice));
+  const reply = rule.params.channel_reply || CHANNEL_REPLY_DEFAULT;
+  const setReply = (key, value) => {
+    rule.params.channel_reply = { ...reply, [key]: value };
+    refresh();
+  };
+  const summary = ruleSummaryText(
+    customRulePhrase(rule, names),
+    actions.map((action) => action.action === "log" ? "Log to automod" : ruleStepPhrase(action)).join(", then "),
+    rule.enabled,
+    rule.dry_run,
+  );
   return h(
     DialogPanel,
     { className: "modal-box rule-editor", onInput: trackDraft },
     h(RuleEditorHeader, {
-      title: creating ? "Add custom rule" : `Edit custom rule: ${r.name || r.rule_id}`,
+      title: creating ? (preset ? r.name : "Add custom rule") : `Edit custom rule: ${r.name || r.rule_id}`,
       enabled: rule.enabled,
+      requireChannels: preset,
+      hasChannels: rule.include_channels.length > 0,
       dryRun: rule.dry_run,
       dryRunDisabled: creating,
       onEnabled: (on) => {
@@ -4446,7 +4523,7 @@ function CustomRuleEditor({ record: r, creating }) {
         "div",
         { className: "editor-columns" },
         field("Name", h(Input, { type: "text", defaultValue: rule.name, className: "input input-sm", onInput: (e) => (rule.name = e.target.value) })),
-        field(
+        !preset ? field(
           "Type",
           h(
             Select,
@@ -4457,6 +4534,7 @@ function CustomRuleEditor({ record: r, creating }) {
                 const next = e.target.value;
                 const prev = rule.params || {};
                 rule.params = { kind: next };
+                if (prev.channel_reply) rule.params.channel_reply = prev.channel_reply;
                 if (next === "pattern") rule.params.pattern = prev.pattern || "";
                 if (next === "word") rule.params.words = Array.isArray(prev.words) ? prev.words : [];
                 if (next === "channel_content") {
@@ -4465,15 +4543,9 @@ function CustomRuleEditor({ record: r, creating }) {
                 }
                 if (next === "honeypot_role") {
                   rule.params.role_id = prev.role_id || honeypotRoles[0] || "";
-                  const current = rule.actions?.[0]?.action;
-                  if (!current || current === "delete") {
-                    rule.actions = [{
-                      at: 1,
-                      action: "kick",
-                      duration_minutes: 0,
-                      delete_days: 0,
-                      reason: rule.actions?.[0]?.reason || "",
-                    }];
+                  rule.actions = actions.filter((action) => action.action !== "channel_reply");
+                  if (!rule.actions.length || (rule.actions.length === 1 && rule.actions[0].action === "delete")) {
+                    rule.actions = [{ at: 1, action: "kick", reason: rule.actions[0]?.reason || "" }];
                   }
                 }
                 markDirty();
@@ -4486,7 +4558,7 @@ function CustomRuleEditor({ record: r, creating }) {
             h("option", { value: "everyone_attempt" }, "@everyone / @here attempt"),
             h("option", { value: "honeypot_role" }, "Honeypot role"),
           ),
-        ),
+        ) : null,
       ),
       kind === "pattern"
         ? field(
@@ -4518,14 +4590,43 @@ function CustomRuleEditor({ record: r, creating }) {
             h("p", { className: "field-help" }, "Separate words with commas."),
           )
         : null,
-      kind === "channel_content"
-        ? h(
-            "div",
-            { className: "row checkbox-group" },
-            h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.params.links, onChange: (e) => { rule.params.links = e.target.checked; refresh(); } }), "Links"),
-            h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.params.attachments, onChange: (e) => { rule.params.attachments = e.target.checked; refresh(); } }), "Attachments"),
-          )
-        : null,
+      kind === "channel_content" ? h(
+        React.Fragment,
+        null,
+        h(
+          "div",
+          { className: "row checkbox-group" },
+          ...[
+            ["links", "Links"],
+            ["attachments", "Attachments and images"],
+            ["gifs", "GIF picker links"],
+            ["stickers", "Stickers"],
+          ].map(([key, label]) => h(
+            "label",
+            { key, className: "checkbox-label" },
+            h(Input, {
+              type: "checkbox",
+              className: "checkbox",
+              checked: rule.params[key] === true,
+              onChange: (e) => { rule.params[key] = e.target.checked; refresh(); },
+            }),
+            label,
+          )),
+        ),
+        h("p", { className: "field-help" }, "Links includes GIF picker links. To block just GIF picker links, turn Links off."),
+        field(
+          "Allowed domains",
+          h(Input, {
+            type: "text",
+            className: "input input-sm",
+            defaultValue: (rule.params.allowed_domains || []).join(", "),
+            onInput: (e) => {
+              rule.params.allowed_domains = e.target.value.split(",").map((domain) => domain.trim()).filter(Boolean);
+            },
+          }),
+          h("p", { className: "field-help" }, "Separate exact domains with commas. Each subdomain needs its own entry."),
+        ),
+      ) : null,
       kind === "everyone_attempt" ? h("p", { className: "field-help" }, "Members allowed to mention everyone are never caught.") : null,
       kind === "honeypot_role"
         ? h(IdPicker, {
@@ -4545,31 +4646,101 @@ function CustomRuleEditor({ record: r, creating }) {
     ),
     h(
       EditorSection,
-      { title: "Action", hint: "Runs on every match." },
-      action
-        ? h(RuleAction, {
-            key: itemKey(action),
-            action,
-            index: 0,
-            strike: false,
-            clearBan: true,
-            choices: ["delete", "warn", "timeout", "kick", "ban"],
-            onChange: refresh,
-          })
-        : null,
+      { title: "Actions", hint: "Run in the order shown when this rule wins a match." },
+      ...actions.map((action, index) => h(
+        React.Fragment,
+        { key: itemKey(action) },
+        h(RuleAction, {
+          action,
+          index,
+          strike: false,
+          clearBan: true,
+          choices: actionChoices.filter((choice) => choice === action.action || unusedActions.includes(choice)),
+          remove: actions.length > 1 ? () => {
+            actions.splice(index, 1);
+            markDirty();
+            refresh();
+          } : null,
+          onChange: refresh,
+        }),
+        actions.length > 1
+          ? h("div", { className: "row" }, ...[-1, 1].map((offset) => {
+              const next = index + offset;
+              const direction = offset < 0 ? "up" : "down";
+              return h(ActionButton, {
+                key: direction,
+                className: "btn btn-sm",
+                disabled: next < 0 || next >= actions.length,
+                "aria-label": `Move action ${index + 1} ${direction}`,
+                onClick: () => {
+                  [actions[index], actions[next]] = [actions[next], actions[index]];
+                  markDirty();
+                  refresh();
+                },
+              }, `Move ${direction}`);
+            }))
+          : null,
+        action.action === "channel_reply" ? h(
+          React.Fragment,
+          null,
+          field(
+            "Reply text",
+            h(Input, {
+              type: "text",
+              className: "input input-sm",
+              maxLength: 2000,
+              defaultValue: reply.template,
+              onInput: (e) => setReply("template", e.target.value),
+            }),
+            h("p", { className: "field-help" }, "Use {user} and {channel} for mentions. You can paste Discord custom emoji markup."),
+          ),
+          field(
+            "Delete reply after (seconds)",
+            h(Input, {
+              type: "number",
+              className: "input input-sm",
+              min: 0,
+              max: 300,
+              defaultValue: reply.delete_after_seconds ?? 10,
+              onInput: (e) => setReply("delete_after_seconds", e.target.value === "" ? 10 : e.target.valueAsNumber),
+            }),
+            h("p", { className: "field-help" }, "Use 0 to keep replies. Each member can receive one reply per channel every 30 seconds."),
+          ),
+        ) : null,
+      )),
+      unusedActions.length ? h(ActionButton, {
+        className: "btn btn-sm btn-outline",
+        onClick: () => {
+          const kind = unusedActions[0];
+          actions.push({ at: 1, action: kind, ...(kind === "timeout" ? { duration_minutes: 60 } : {}) });
+          markDirty();
+          refresh();
+        },
+      }, "Add action") : null,
     ),
     h(RuleExceptions, { rule, names, rememberUser, onChange: refresh, pending }),
     h(
       EditorSection,
       { title: "Scope" },
-      h("p", { className: "field-help" }, "Custom rules apply to this server only."),
+      preset ? h(IdPicker, {
+        kind: "channel",
+        label: "Only check these channels",
+        hint: "Pick at least one channel to enable this rule.",
+        ids: rule.include_channels,
+        names,
+        pending,
+        onChange: () => {
+          if (!rule.include_channels.length) rule.enabled = false;
+          refresh();
+        },
+      }) : h("p", { className: "field-help" }, "Custom rules apply to this server only."),
       h(
         RuleAdvanced,
-        { rule, names, onChange: refresh, pending },
+        { rule, names, onChange: refresh, pending, includePicker: !preset },
         h(
           "div",
           { className: "row checkbox-group" },
-          h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.log_automod, onChange: (e) => (rule.log_automod = e.target.checked) }), "Post to automod log"),
+          !actions.some((action) => action.action === "log") ? h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.log_automod, onChange: (e) => (rule.log_automod = e.target.checked) }), "Post to automod log") : null,
           h("label", { className: "checkbox-label" }, h(Input, { type: "checkbox", className: "checkbox", defaultChecked: rule.open_case, onChange: (e) => (rule.open_case = e.target.checked) }), "Open a case"),
         ),
         kind === "honeypot_role" ? h("p", { className: "field-help" }, "For a hidden case, turn on Open a case and turn off Post to automod log.") : null,
@@ -9305,7 +9476,7 @@ function RuleAction({ action, index, remove, onChange, strike = true, clearBan =
               onChange?.();
             },
           },
-          ...choices.map((value) => h("option", { key: value, value }, RULE_ACTION_LABELS[value])),
+          ...choices.map((value) => h("option", { key: value, value }, !strike && value === "log" ? "Log to automod" : RULE_ACTION_LABELS[value])),
         ),
       ),
       kind === "timeout"

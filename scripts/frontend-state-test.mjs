@@ -5553,8 +5553,8 @@ test('rule editor summary describes every built-in rule and custom rule and upda
     const modal = await h.app.editRule({ name: rule_id, rule_id, effective });
     assert.equal(summary(modal), expected, rule_id);
     // Every rule uses the same sections; only Trigger differs.
-    assert.deepEqual([...modal.querySelectorAll('.editor-section-title')].map(textOf).filter((t) => t !== 'Action'),
-      ['Trigger', 'Actions', 'Exceptions', 'Scope'].filter((t) => !(rule_id.startsWith('custom:') && t === 'Actions')), rule_id);
+    assert.deepEqual([...modal.querySelectorAll('.editor-section-title')].map(textOf),
+      ['Trigger', 'Actions', 'Exceptions', 'Scope'], rule_id);
     assert.ok(modal.querySelector('details.editor-advanced'), `${rule_id} keeps advanced options collapsed`);
     await fire(findNode(modal, n => n.localName === 'button' && n.textContent === 'Cancel'), 'click');
   }
@@ -6799,6 +6799,75 @@ test('custom pattern draft save uses dry_run and custom id', () => {
   assert.equal(draft.params.kind, 'pattern');
   const record = h.app.newCustomRuleDraft();
   assert.match(record.rule_id, /^custom:[0-9a-f]{16}$/);
+});
+
+test('No links or media preset requires channels and saves ordered actions and reply settings', async () => {
+  const writes = [];
+  const h = harness(async (url, options) => {
+    if (options.method === 'PUT') {
+      const { data } = JSON.parse(options.body);
+      const id = url.split('/').pop();
+      assert.match(id, /^custom:[0-9a-f]{16}$/);
+      writes.push(data);
+      return response({ ok: true, config_patch: { kind: 'rule', id, scope: 'guild', value: data } });
+    }
+    return response({ roles: [], channels: [], users: {} });
+  });
+  h.app.state.config = { enrollment_id: 'membership', rules: [] };
+  h.app.navigate('rules');
+  const button = (root, text) => findNode(root, n => n.localName === 'button' && textOf(n) === text);
+  await fire(button(h.nodes.get('#content'), 'No links or media'), 'click');
+  const modal = h.nodes.get('.modal-overlay');
+  const control = (text) => findNode(modal, n => n.localName === 'label' && textOf(n) === text).control;
+  const enabled = control('Enabled');
+  assert.equal(enabled.checked, false);
+  assert.equal(enabled.disabled, true);
+  assert.equal(control('Skip moderators').checked, true);
+  for (const label of ['Links', 'Attachments and images', 'GIF picker links', 'Stickers']) {
+    assert.equal(control(label).checked, true);
+  }
+  const addId = async (label, id) => {
+    const input = control(label);
+    input.value = id;
+    await fire(input, 'input');
+    await fire(input, 'keydown', { key: 'Enter' });
+  };
+  await addId('Only check these channels', '70');
+  assert.equal(enabled.disabled, false);
+  await fire(enabled, 'click');
+  assert.equal(enabled.checked, true);
+  await fire(modal.querySelector('button[aria-label="Remove Channel 70"]'), 'click');
+  assert.equal(enabled.checked, false);
+  assert.equal(enabled.disabled, true);
+  await addId('Only check these channels', '71');
+  await fire(enabled, 'click');
+  await addId('Skip roles', '7');
+
+  await fire(button(modal, 'Add action'), 'click');
+  assert.equal(control('Delete reply after (seconds)').value, '10');
+  control('Delete reply after (seconds)').value = '0';
+  await fire(control('Delete reply after (seconds)'), 'input');
+  control('Reply text').value = '{user} Try another channel. <:wave:12>';
+  await fire(control('Reply text'), 'input');
+  control('Allowed domains').value = 'example.test';
+  await fire(control('Allowed domains'), 'input');
+  await fire(modal.querySelector('button[aria-label="Move action 3 up"]'), 'click');
+  await fire(button(modal, 'Save'), 'click');
+
+  assert.equal(writes.length, 1);
+  const [saved] = writes;
+  assert.equal(saved.name, 'No links or media');
+  assert.equal(saved.params.preset, 'no_links_or_media');
+  assert.equal(saved.enabled, true);
+  assert.equal(saved.dry_run, true);
+  assert.deepEqual(saved.include_channels, ['71']);
+  assert.deepEqual(saved.whitelist_roles, ['7']);
+  assert.deepEqual(saved.params.allowed_domains, ['example.test']);
+  assert.deepEqual(saved.params.channel_reply, {
+    template: '{user} Try another channel. <:wave:12>',
+    delete_after_seconds: 0,
+  });
+  assert.deepEqual(saved.actions.map(action => action.action), ['delete', 'channel_reply', 'log']);
 });
 
 for (const failure of [
