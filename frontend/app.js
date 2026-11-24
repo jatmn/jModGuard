@@ -964,11 +964,41 @@ const PLATFORM_METRICS = [
 const PLATFORM_HELP =
   "Counts come from records the bot stored, bucketed by UTC day; days before recording started show zero. Changes compare with the previous period of the same length; joins and leaves have no 90-day comparison. Actions count automod enforcement and moderator commands once each. Share is a server's part of the fleet total.";
 
-const PLATFORM_COVERAGE = {
-  importing: { label: "importing", tone: "warn", title: "The initial member import is still running." },
-  uncertain: { label: "unverified", tone: "warn", title: "A coverage gap awaits Reconcile on the Members page." },
+const MEMBER_DIRECTORY_COVERAGE = {
+  not_started: { label: "not imported", tone: "warn", title: "Open Members to check initial import availability." },
+  importing: { label: "importing", tone: "warn", title: "The initial member import has yet to finish." },
+  stalled: { label: "stalled", tone: "warn", title: "The initial member import has stopped progressing." },
+  reconciling: { label: "reconciling", tone: "warn", title: "The bot is scheduled to recover member coverage." },
+  uncertain: { label: "unverified", tone: "warn", title: "The member list may be out of date. Open Members for recovery options." },
   unavailable: { label: "unavailable", tone: "warn", title: "This server's member directory could not be read." },
 };
+
+function memberDirectoryBadge(directory, guildId, importingLabel = "importing") {
+  const coverage = directory?.coverage;
+  if (!Object.hasOwn(MEMBER_DIRECTORY_COVERAGE, coverage)) return null;
+  const badge = MEMBER_DIRECTORY_COVERAGE[coverage];
+  const details = [badge.title];
+  if (directory.reconciliation_reason || directory.gap_at) {
+    details.push(memberGapCause(directory.reconciliation_reason, memberGapWhen(directory.gap_at)) + ".");
+  }
+  if (directory.status_reason) details.push(directory.status_reason);
+  if (directory.next_attempt_at) details.push(`Next attempt: ${memberTime(directory.next_attempt_at)}`);
+  else if (coverage === "stalled") details.push("Next attempt: not scheduled");
+  const canOpenImport = coverage === "not_started" && !isPreview() &&
+    state.guilds.some((guild) => guild.id === guildId && guildAccessRank[guild.access] >= guildAccessRank.dashboard);
+  return {
+    ...badge,
+    label: coverage === "importing" ? importingLabel : badge.label,
+    title: details.join(" "),
+    importLink: canOpenImport
+      ? `?list=members&guild=${encodeURIComponent(guildId)}`
+      : null,
+  };
+}
+
+function memberImportLink(badge) {
+  return badge?.importLink && h("a", { className: "link", href: badge.importLink, title: badge.title }, "Import");
+}
 
 const PLATFORM_SERVER_FILTERS = [
   ["all", "All servers"],
@@ -984,7 +1014,7 @@ function platformMemberStatus(members) {
     ? ` Member totals cover ${members.guilds_counted ?? 0} of ${members.servers ?? 0} servers; the rest were unavailable.`
     : "";
   const incomplete = members.guilds_incomplete
-    ? ` ${members.guilds_incomplete} counted ${members.guilds_incomplete === 1 ? "server has" : "servers have"} a member directory still importing or awaiting Reconcile.`
+    ? ` ${members.guilds_incomplete} counted ${members.guilds_incomplete === 1 ? "server has" : "servers have"} incomplete member-directory coverage.`
     : "";
   return `Member totals are ${members.status || "complete"}.${unavailable}${incomplete}`;
 }
@@ -1010,6 +1040,7 @@ function platformRows(snapshot) {
       actions: platformActions(guild),
       previousActions: platformActions(guild.previous),
       members: directory ? directory.current : null,
+      directory,
       coverage: !guild.active ? null : !directory ? "unavailable" : directory.coverage === "complete" ? null : directory.coverage,
     };
   });
@@ -1150,7 +1181,7 @@ function PlatformServerTable({ rows, totals, rangeLabel }) {
           shown.length
             ? shown.map((row) => {
                 const delta = formatDelta(row.actions, row.previousActions);
-                const coverage = PLATFORM_COVERAGE[row.coverage];
+                const coverage = memberDirectoryBadge(row.directory || { coverage: row.coverage }, row.guild_id);
                 return h(
                   "tr",
                   { key: row.guild_id },
@@ -1175,6 +1206,7 @@ function PlatformServerTable({ rows, totals, rangeLabel }) {
                     { className: "pa-metric" },
                     h("span", { className: "pa-num", title: row.members == null ? undefined : formatExact(row.members) }, row.active ? (row.members == null ? "—" : formatCount(row.members)) : "—"),
                     coverage && h("span", { className: `an-badge an-badge-${coverage.tone}`, title: coverage.title }, coverage.label),
+                    memberImportLink(coverage),
                   ),
                   h(
                     "td",
@@ -3429,7 +3461,7 @@ const ANALYTICS_HELP = [
   "Some numbers overlap (a warn is also a mod action), so they're never added up.",
   "The heat map counts each automod action, moderator command and spam ban once.",
   "Members is partial while the first import runs.",
-  "If Members shows unverified, the Members page says whether to Reconcile or wait for it to clear.",
+  "Open Members to see recovery progress, retry timing, and available controls.",
 ];
 
 // Loaded analytics summaries per guild, page membership and range. Switching
@@ -3537,10 +3569,7 @@ function tabAnalytics() {
   const total = (key) => sumSeries(points, key);
   const prev = (key) => (previous ? previous[key] : null);
   const daily = (key) => points.map((point) => point[key] ?? 0);
-  const coverage = {
-    importing: { label: "partial", tone: "warn", title: "The initial member import is still running." },
-    uncertain: { label: "unverified", tone: "warn", title: "A coverage gap awaits Reconcile on the Members page." },
-  }[members?.coverage];
+  const coverage = memberDirectoryBadge(members, guildId, "partial");
   const tile = (label, key, color) =>
     h(KpiTile, {
       key: label,
@@ -3586,6 +3615,7 @@ function tabAnalytics() {
         loading,
         unavailable: failed || (data && !members),
         badge: coverage,
+        action: memberImportLink(coverage),
         rangeLabel,
       }),
       h(KpiTile, {
@@ -6787,7 +6817,13 @@ function memberGapCause(reason, when) {
   const label = Object.hasOwn(MEMBER_CONNECTION_GAPS, reason || "") ? MEMBER_CONNECTION_GAPS[reason] : null;
   return label
     ? `The bot was offline or reconnected${when} (${label})`
-    : `The bot could not save a member or ban change${when}`;
+    : reason
+      ? `The bot could not save a member or ban change${when} (${reason})`
+      : `The bot recorded a coverage gap${when}`;
+}
+
+function memberGapWhen(gapAt) {
+  return gapAt ? ` at ${memberTime(gapAt)}` : "";
 }
 
 function memberInstant(value) {
@@ -6919,7 +6955,8 @@ function tabMembers() {
         controlPending() ||
         (latestStatus &&
           (["queued", "running", "waiting"].includes(latestStatus.status) ||
-            ["queued", "running", "waiting"].includes(latestStatus.audit_recovery_status)));
+            ["queued", "running", "waiting"].includes(latestStatus.audit_recovery_status) ||
+            latestStatus.automatic_reconcile_at));
       if (!active) {
         pollDueAt = 0;
         return;
@@ -6933,6 +6970,8 @@ function tabMembers() {
           attempts.push(Number(latestStatus.next_attempt_at) || 0);
         if (["queued", "running", "waiting"].includes(latestStatus?.audit_recovery_status))
           attempts.push(Number(latestStatus.audit_recovery_next_attempt_at) || 0);
+        if (latestStatus?.automatic_reconcile_at)
+          attempts.push(Number(latestStatus.automatic_reconcile_at));
         // A queued control can change the schedule before the worker's next page.
         if (attempts.length && !controlPending())
           delay = Math.max(delay, Math.min(...attempts) - statusNow - elapsed);
@@ -6969,8 +7008,9 @@ function tabMembers() {
         sync.phase === "complete" && sync.status !== "complete" && sync.local_history_complete === false
           ? phases.indexOf("local_history")
           : phases.indexOf(String(sync.phase || ""));
-      const statusLabel = memberSyncStatusLabels[sync.status || "needs_attention"] || String(sync.status);
-      const statusTone =
+      const stalled = sync.coverage === "stalled";
+      const statusLabel = stalled ? "Stalled" : memberSyncStatusLabels[sync.status || "needs_attention"] || String(sync.status);
+      const statusTone = stalled ? "badge-warning" :
         { complete: "badge-success", needs_attention: "badge-error", paused: "badge-warning", waiting: "badge-warning" }[
           sync.status
         ] || "badge-info";
@@ -7085,7 +7125,7 @@ function tabMembers() {
           (sync.started_at ? Math.max(0, (statusNow - Number(sync.started_at)) / 1000) : null);
         const workerUnconfirmed = ["worker_unconfirmed", "worker_offline"].includes(sync.estimate_reason);
         const forecastUnknown =
-          workerUnconfirmed ||
+          stalled || workerUnconfirmed ||
           ["paused", "needs_attention"].includes(sync.status) ||
           (sync.status === "waiting" && sync.estimate_reason !== "rate_limited") ||
           sync.estimate_reason === "discord_unavailable";
@@ -7165,6 +7205,8 @@ function tabMembers() {
           }
         }
         notes.push(h("p", { className: "muted" }, retryText));
+      } else if (stalled) {
+        notes.push(h("p", { className: "muted" }, "Next attempt: not scheduled"));
       }
       function syncControlButton(operation, label) {
         // Mirror the API's validate_member_sync_operation: omit controls this state can never accept.
@@ -7222,16 +7264,35 @@ function tabMembers() {
           label,
         );
       }
-      // Live coverage is its own status line or banner, separate from the import summary.
-      // A short planned restart clears itself when audit recovery finishes, unless
-      // that recovery stopped for attention. Anything else needs Reconcile.
-      const autoClearing = sync.gap_auto_clear && sync.audit_recovery_status !== "needs_attention";
-      const reconcileInNotice = sync.reconciliation_needed && !autoClearing && !isPreview() && canManageServer();
+      const reconciling = sync.coverage === "reconciling";
+      const auditRecovery = sync.gap_auto_clear && sync.status === "complete" &&
+        (reconciling || sync.coverage == null) &&
+        ["queued", "running", undefined].includes(sync.audit_recovery_status);
+      const reconcileInNotice = sync.reconciliation_needed && !reconciling && !auditRecovery && !isPreview() && canManageServer();
       const reconcileButton = reconcileInNotice && syncControlButton("reconcile", "Reconcile from Discord");
       let coverage;
       if (sync.reconciliation_needed) {
-        const when = sync.gap_at ? ` at ${asDate(sync.gap_at)}` : "";
-        coverage = autoClearing
+        const when = memberGapWhen(sync.gap_at);
+        const cause = memberGapCause(sync.reconciliation_reason, when);
+        let recovery = "Select Reconcile from Discord to re-check the full member and ban lists. This can take a while on large servers.";
+        if (sync.automatic_reconcile_at && !reconciling) {
+          recovery = `Next automatic Reconcile: ${asDate(sync.automatic_reconcile_at)}. You can select Reconcile from Discord to start sooner.`;
+        } else if (reconciling) {
+          recovery = "The bot will re-check the member and ban lists using its normal request pace.";
+        } else if (sync.coverage && !sync.initial_completed_at) {
+          recovery = "The bot can reconcile this gap after the initial import finishes.";
+        } else if (sync.coverage && !sync.run_id) {
+          recovery = "The saved import job needs repair before Reconcile can run.";
+        } else if (sync.run_kind === "reconcile" && sync.status === "needs_attention") {
+          recovery = "Resolve the reported error and select Retry to resume Reconcile.";
+        } else if (sync.run_kind === "reconcile" && sync.status === "paused") {
+          recovery = "Select Resume to continue Reconcile.";
+        } else if (sync.phase === "complete" && sync.local_history_complete === false) {
+          recovery = "The bot is finishing local case history.";
+        } else if (sync.status === "waiting" || sync.audit_recovery_status === "waiting") {
+          recovery = "The bot will retry at the next attempt shown below.";
+        }
+        coverage = auditRecovery
           ? h(
               "p",
               { id: "member-coverage-notice", className: "muted", role: "status" },
@@ -7239,16 +7300,12 @@ function tabMembers() {
             )
           : h(
               "div",
-              { id: "member-coverage-notice", className: "alert alert-soft alert-warning alert-wrap", role: "status" },
+              { id: "member-coverage-notice", className: reconciling ? "muted" : "alert alert-soft alert-warning alert-wrap", role: "status" },
               h(
                 "div",
                 {},
-                h("strong", {}, "Member list may be out of date"),
-                h(
-                  "p",
-                  {},
-                  `${memberGapCause(sync.reconciliation_reason, when)}, so it may have missed some joins, leaves, or bans. Select Reconcile from Discord to re-check the full member and ban lists. This can take a while on large servers.`,
-                ),
+                h("strong", {}, reconciling ? "Member list reconciling" : "Member list may be out of date"),
+                h("p", {}, `${cause}, so it may have missed some joins, leaves, or bans. ${recovery}`),
               ),
               reconcileButton && h("div", { className: "row" }, reconcileButton),
             );
@@ -7258,7 +7315,9 @@ function tabMembers() {
           { id: "member-coverage-notice", className: "muted", role: "status" },
           complete
             ? "Member list: up to date"
-            : [
+            : sync.coverage === "not_started"
+              ? "Member list: not imported"
+              : [
                 "Member list: ",
                 h("span", { key: "partial", className: "badge badge-soft badge-sm badge-warning" }, "partial"),
                 " ",

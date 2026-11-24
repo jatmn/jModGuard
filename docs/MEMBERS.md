@@ -26,6 +26,10 @@ PDT beside PST). Before the bot admits a genuinely new enrollment, the page says
 the first bot initialization and disables run controls. Once a saved run exists,
 its controls become available. Missing metadata for an already admitted
 enrollment instead needs attention; it never authorizes a new initial seed.
+Analytics reports **not imported** until the bot creates that first job. A
+queued or running import shows **stalled** after more than one hour without
+progress, or after twice the expected page interval when that is longer. Its
+status shows the saved reason and next attempt.
 While the page is visible, the status keeps following an acknowledged sync
 control and separate audit recovery even if the initial import is complete.
 The member-stage finish time is a preliminary forecast from a recent bot
@@ -64,15 +68,17 @@ except it resumes audit recovery that stopped because a Discord page did not
 advance. Controls recheck the saved import state at execution; a queued control
 that is no longer allowed does not overwrite needs attention or a pause.
 A queued Pause or Resume delivered after the import reaches `complete` instead
-succeeds as a no-op with a `member_sync_already_completed` receipt. After
-completion, a full current-member and current-ban scan runs only when a guild
-administrator explicitly selects **Reconcile from Discord**. An outage,
-restore, bot restart or redeploy, or a replaced Gateway session on an already
-progressed import can leave coverage uncertain; a separate banner above the
-import summary reports that gap, with
-its time and reason, until a requested reconciliation finishes or, after a
-short planned restart, audit recovery completes. Live events and
-bounded checks for affected users continue while coverage is uncertain.
+succeeds as a no-op with a `member_sync_already_completed` receipt. Once the
+initial import is complete, the bot schedules a full **Reconcile from Discord**
+for a recorded gap that audit-only recovery cannot clear. It uses the existing
+request pace and backoff. Automatic runs start at least six hours after the
+last full Reconcile started. An administrator can select **Reconcile from
+Discord** sooner once the previous run finishes.
+The Members status and Analytics badge show the gap's reason and time.
+Coverage shows **reconciling** when recovery is queued or running and
+**unverified** during cooldown, backoff, or when the job needs attention. A
+blocked run reports why and which control can resume it. Live events and
+bounded checks for affected users continue throughout recovery.
 A bot process's first Gateway Ready is a restart gap. When a shutdown signal
 stops the previous process while every Ready shard is still connected, it
 records that time as a planned stop; the stop counts only if that process then
@@ -84,8 +90,9 @@ checks membership since the gap. A crash, a stop without a connected Gateway
 or a confirmed release, a restart during the initial import, a longer or
 unknown downtime (including a stop time ahead of the new host's clock), a replaced Gateway session inside one process, an
 unavailable guild, or a failed per-user save still needs Reconcile, and any
-such gap keeps a later short restart from clearing itself. Audit recovery that
-stops for attention also leaves the warning until Retry or Reconcile. The bot separately catches up
+such gap keeps a later short restart from clearing itself. A short restart
+whose audit recovery stops for attention falls back to a full Reconcile.
+The bot separately catches up
 available ban and unban audit actions after a Gateway gap using the same paced
 request budget; this audit-only recovery does not list all members or current
 bans and does not change the original initial-import completion time. The status
@@ -96,9 +103,9 @@ gap before cleanup; a current-member/current-ban absence check alone cannot
 exclude a ban and later unban during that gap. Once available audit recovery
 settles, a targeted absence check allows safe ordinary cleanup, while a
 recovered ban retains that person's known join context.
-If another coverage gap is observed while a requested reconciliation is still
-finishing, that older run cannot clear the newer warning. Another explicit
-Reconcile is needed to establish full current-member/current-ban coverage.
+If another coverage gap is observed while a reconciliation is still
+finishing, that older run cannot clear the newer warning. The bot schedules
+the next full scan when the cooldown expires.
 
 The bot uses its existing Discord HTTP client and rate limiter. Current ban-list
 entries establish present ban state, identity, and any supplied current reason,

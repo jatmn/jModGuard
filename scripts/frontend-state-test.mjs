@@ -1069,7 +1069,7 @@ test('analytics opens with a one-line header, range selector and info tip, then 
   assert.equal(tip.getAttribute('aria-label'), 'About these trends');
   assert.match(panel.querySelector('#analytics-help').textContent, /never added up/);
   // Unverified Members may be recovering on its own, so the tip defers to the Members page instead of demanding Reconcile.
-  assert.match(panel.querySelector('#analytics-help').textContent, /the Members page says whether to Reconcile or wait/);
+  assert.match(panel.querySelector('#analytics-help').textContent, /Open Members to see recovery progress, retry timing, and available controls/);
   assert.equal([...panel.querySelectorAll('.dashboard-note strong')].some((n) => n.textContent === 'About these trends'), false);
   // Range selector: labelled group of pressed-state buttons.
   const range = panel.querySelector('[aria-label="Analytics date range"]');
@@ -1194,15 +1194,33 @@ test('analytics tooltips show exact per-day values on hover and from the keyboar
 });
 
 test('analytics shows member coverage as a badge, never as wrapped inline text', async () => {
-  for (const [coverage, badge] of [['importing', 'partial'], ['uncertain', 'unverified'], ['complete', null]]) {
-    const { app } = harness(async () => response(analyticsSummary(30, { members: { current: 10417, banned: 0, known: 10417, coverage } })));
+  const gapAt = Date.UTC(2026, 10, 23, 12);
+  for (const [coverage, badge, details] of [
+    ['not_started', 'not imported', {}],
+    ['importing', 'partial', {}],
+    ['stalled', 'stalled', { status_reason: 'No import progress', next_attempt_at: gapAt }],
+    ['reconciling', 'reconciling', { reconciliation_reason: 'guild gateway unavailable', gap_at: gapAt }],
+    ['uncertain', 'unverified', { reconciliation_reason: 'gateway continuity interrupted', gap_at: gapAt, status_reason: 'rate_limited' }],
+    ['complete', null, {}],
+  ]) {
+    const { app } = harness(async () => response(analyticsSummary(30, { members: { current: 10417, banned: 0, known: 10417, coverage, ...details } })));
     app.state.config = ANALYTICS_CONFIG;
     const panel = app.tabAnalytics();
     await settle();
     assert.equal(kpiValue(panel, 'Members'), '10.4k', coverage);
     assert.equal(kpi(panel, 'Members').querySelector('.an-kpi-value').getAttribute('title'), '10,417');
-    assert.equal(kpi(panel, 'Members').querySelector('.an-badge')?.textContent ?? null, badge, coverage);
-    assert.doesNotMatch(kpi(panel, 'Members').querySelector('.an-kpi-body').textContent, /\(/);
+    const tile = kpi(panel, 'Members');
+    const badgeNode = tile.querySelector('.an-badge');
+    assert.equal(badgeNode?.textContent ?? null, badge, coverage);
+    const title = badgeNode?.getAttribute('title');
+    if (coverage === 'stalled') assert.match(title, /No import progress.*Next attempt:/);
+    if (coverage === 'reconciling') assert.match(title, /reconnected at .+Discord reported the server as unavailable/);
+    if (coverage === 'uncertain') assert.match(title, /reconnected at .+Discord connection was interrupted.*rate_limited/);
+    if (coverage === 'not_started') {
+      assert.equal(tile.querySelector('a').textContent, 'Import');
+      assert.equal(tile.querySelector('a').getAttribute('href'), `?list=members&guild=${app.state.guildId}`);
+    }
+    assert.doesNotMatch(tile.querySelector('.an-kpi-body').textContent, /\(/);
   }
 });
 
@@ -1943,7 +1961,7 @@ test('Members explains a coverage gap and offers Reconcile inside the notice onl
   sync = { ...base, reconciliation_reason: 'ban audit case persistence unavailable', gap_auto_clear: false };
   panel = h.app.tabMembers();
   await settle();
-  assert.match(textOf(notice(panel)), /The bot could not save a member or ban change at .+, so it may have missed/);
+  assert.match(textOf(notice(panel)), /The bot could not save a member or ban change at .+ \(ban audit case persistence unavailable\), so it may have missed/);
   assert.doesNotMatch(textOf(notice(panel)), /offline/);
 
   h.app.state.me = { ...(h.app.state.me || {}), preview: true };
@@ -1955,6 +1973,52 @@ test('Members explains a coverage gap and offers Reconcile inside the notice onl
   h.app.renderTab();
   await settle();
   assert.equal(h.nodes.get('#preview-banner').className, 'preview-banner alert alert-soft alert-warning');
+});
+
+test('Members shows automatic reconcile progress, cooldown, and a blocked run with its action', async () => {
+  const gapAt = Date.UTC(2026, 10, 23, 12);
+  const base = {
+    status: 'complete', phase: 'complete', run_id: 'done', run_kind: 'initial',
+    initial_completed_at: gapAt - 1000, reconciliation_needed: true,
+    gap_at: gapAt, reconciliation_reason: 'bot stopped unexpectedly', as_of: gapAt,
+  };
+  for (const [sync, message, button] of [
+    [{ ...base, coverage: 'reconciling', run_kind: 'reconcile', phase: 'members', status: 'queued' },
+      /Member list reconciling.*bot stopped unexpectedly.*normal request pace/, 'Pause'],
+    [{ ...base, coverage: 'uncertain', automatic_reconcile_at: gapAt + 3600000 },
+      /Member list may be out of date.*Next automatic Reconcile: .+start sooner/, 'Reconcile from Discord'],
+    [{ ...base, coverage: 'uncertain', run_kind: 'reconcile', phase: 'members', status: 'waiting', status_reason: 'rate_limited', next_attempt_at: gapAt + 60000 },
+      /Member list may be out of date.*retry at the next attempt/, 'Retry'],
+    [{ ...base, coverage: 'uncertain', run_kind: 'reconcile', phase: 'members', status: 'needs_attention', status_reason: 'permission_denied' },
+      /Member list may be out of date.*Resolve the reported error and select Retry/, 'Retry'],
+  ]) {
+    const h = harness(async (url) => response(url.endsWith('/member-sync') ? sync : { members: [] }));
+    h.app.state.tab = 'members';
+    h.app.state.config = { enrollment_id: 'member-enrollment' };
+    const panel = h.app.tabMembers();
+    await settle();
+    const notice = findNode(panel, n => n.id === 'member-coverage-notice');
+    assert.match(textOf(notice), message);
+    assert.ok([...panel.querySelectorAll('button')].some(n => n.textContent === button));
+    if (sync.status_reason) assert.ok(textOf(memberImport(panel)).includes(sync.status_reason));
+    if (sync.next_attempt_at) assert.match(textOf(memberImport(panel)), /Next attempt:/);
+  }
+});
+
+test('Members shows stalled initial import and its saved reason and attempt', async () => {
+  const asOf = Date.UTC(2026, 10, 23, 12);
+  for (const next of [asOf + 60000, null]) {
+    const sync = { status: 'queued', coverage: 'stalled', run_kind: 'initial', run_id: 'seed', phase: 'members',
+      started_at: asOf - 7200000, status_reason: 'Import stopped progressing', next_attempt_at: next, as_of: asOf };
+    const h = harness(async (url) => response(url.endsWith('/member-sync') ? sync : { members: [] }));
+    h.app.state.tab = 'members';
+    h.app.state.config = { enrollment_id: 'member-enrollment' };
+    const panel = h.app.tabMembers();
+    await settle();
+    assert.match(textOf(memberImportStatus(panel)), /Stalled.*Import stopped progressing/);
+    assert.match(textOf(memberImport(panel)), next ? /Next attempt: .+/ : /Next attempt: not scheduled/);
+    assert.ok([...panel.querySelectorAll('button')].some(n => n.textContent === 'Pause'));
+  }
 });
 
 test('Members keeps a restore-interrupted control unconfirmed rather than claiming it applied', async () => {
@@ -11735,7 +11799,7 @@ test('Platform analytics shows every metric together with changes, names, icons 
   assert.match(h.nodes.get('#platform-analytics-help').textContent, /previous period of the same length/);
   // One-line member note for partial totals.
   const status = h.nodes.get('#platform-analytics-status');
-  assert.match(status.textContent, /^Member totals are partial\. Member totals cover 2 of 3 servers; the rest were unavailable\. 1 counted server has a member directory still importing or awaiting Reconcile\.$/);
+  assert.match(status.textContent, /^Member totals are partial\. Member totals cover 2 of 3 servers; the rest were unavailable\. 1 counted server has incomplete member-directory coverage\.$/);
 
   assert.equal(kpiValue(page, 'Servers'), '3');
   assert.equal(kpiValue(page, 'Members'), '40');
@@ -11776,6 +11840,24 @@ test('Platform analytics shows every metric together with changes, names, icons 
   assert.equal(bans.getAttribute('title'), '3 · 75% of fleet');
   assert.equal(parseFloat(bans.querySelector('.pa-share-fill').style.width), 75);
   assert.equal(rows[2].querySelectorAll('td')[3].querySelector('.pa-share-fill'), null);
+});
+
+test('Platform Servers list shows unstarted imports and links to authorized Members pages', async () => {
+  const snapshot = platformSnapshot();
+  snapshot.members.by_guild[PLATFORM_IDS[0]].coverage = 'not_started';
+  snapshot.members.by_guild[PLATFORM_IDS[1]] = { current: 10, coverage: 'uncertain',
+    reconciliation_reason: 'gateway continuity interrupted', gap_at: Date.UTC(2026, 10, 23, 12) };
+  const h = ownerHarness(async () => response(snapshot));
+  h.app.state.guilds = [{ id: PLATFORM_IDS[0], name: 'Alpha', access: 'manage' }];
+  h.app.navigate('platform-analytics');
+  await settle();
+  const [first, second] = platformPanel(h, 'Servers').querySelectorAll('tbody tr');
+  assert.equal(first.querySelector('.an-badge').textContent, 'not imported');
+  assert.equal(first.querySelector('a').textContent, 'Import');
+  assert.equal(first.querySelector('a').getAttribute('href'), `?list=members&guild=${PLATFORM_IDS[0]}`);
+  assert.equal(second.querySelector('.an-badge').textContent, 'unverified');
+  assert.match(second.querySelector('.an-badge').getAttribute('title'), /reconnected at .+Discord connection was interrupted/);
+  assert.equal(second.querySelector('a'), null);
 });
 
 test('Platform analytics ranks active servers, movers and each server\'s share of the fleet', async () => {
@@ -11889,7 +11971,7 @@ test('Platform analytics retains totals, charts and rows through refresh failure
   await settle();
   assertRetained();
   assert.match(h.nodes.get('#platform-analytics-status').textContent, /refresh failed: offline.*stale/i);
-  assert.match(h.nodes.get('#platform-analytics-status').textContent, /1 counted server has a member directory still importing/);
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /1 counted server has incomplete member-directory coverage/);
   await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
   assertRetained();
   assert.match(h.nodes.get('#platform-analytics-status').textContent, /refresh failed: offline.*stale/i, 'retained figures remain stale while retrying');

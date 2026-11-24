@@ -568,6 +568,14 @@ pub struct DirectoryTotals {
     pub banned: i64,
     pub known: i64,
     pub coverage: DirectoryCoverage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconciliation_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gap_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at: Option<i64>,
 }
 
 /// Whether the counts describe the whole server, using the same import and
@@ -577,8 +585,14 @@ pub struct DirectoryTotals {
 pub enum DirectoryCoverage {
     /// The initial import finished and no coverage gap awaits reconciliation.
     Complete,
+    /// The bot has not seeded an initial import for this membership.
+    NotStarted,
     /// The initial import for this membership has not finished.
     Importing,
+    /// The initial import exceeded its expected interval without progress.
+    Stalled,
+    /// A full reconciliation or audit-only gap recovery is queued or running.
+    Reconciling,
     /// A recorded coverage gap still awaits reconciliation.
     Uncertain,
 }
@@ -787,6 +801,120 @@ impl SyncRunKind {
     }
 }
 
+const INITIAL_STALL_MS: i64 = 60 * 60 * 1_000;
+const RECONCILE_COOLDOWN_MS: i64 = 6 * 60 * 60 * 1_000;
+const STALLED_IMPORT_REASON: &str =
+    "Initial import has not made progress within its expected interval";
+const WORKER_UNAVAILABLE_REASON: &str = "worker unavailable; waiting for a new claim";
+
+struct CoverageFacts<'a> {
+    seed_present: bool,
+    initial_completed: bool,
+    reconciliation_needed: bool,
+    gap_auto_clear: bool,
+    audit_state: SyncState<'a>,
+    run_kind: SyncRunKind,
+    state: SyncState<'a>,
+    started_at: Option<i64>,
+    last_progress_at: Option<i64>,
+    lease_until: Option<i64>,
+    expected_page_interval: i64,
+}
+
+impl<'a> CoverageFacts<'a> {
+    fn read(row: &'a Row) -> Result<Self> {
+        Ok(Self {
+            seed_present: row.get(0)?,
+            initial_completed: row.get(1)?,
+            reconciliation_needed: row.get(2)?,
+            gap_auto_clear: row.get(3)?,
+            audit_state: SyncState::parse(row.get_str(4)?),
+            run_kind: SyncRunKind::parse(row.get_str(5)?),
+            state: SyncState::parse(row.get_str(6)?),
+            started_at: row.get(7)?,
+            last_progress_at: row.get(8)?,
+            lease_until: row.get(9)?,
+            expected_page_interval: row.get(10)?,
+        })
+    }
+
+    fn automatic_reconcile_at(&self, now_ms: i64) -> Option<i64> {
+        if !self.initial_completed
+            || !self.reconciliation_needed
+            || self.state != SyncState::Complete
+            || (self.gap_auto_clear && self.audit_state.scheduled())
+        {
+            return None;
+        }
+        // The single retained run records the latest full scan, including a manual
+        // one. A manual override can start sooner, and anchors the next cooldown.
+        Some(if self.run_kind == SyncRunKind::Reconcile {
+            self.started_at.map_or(now_ms, |started| {
+                started.saturating_add(RECONCILE_COOLDOWN_MS)
+            })
+        } else {
+            now_ms
+        })
+    }
+
+    fn worker_expired(&self, now_ms: i64) -> bool {
+        self.state == SyncState::Running && self.lease_until.is_some_and(|until| until < now_ms)
+    }
+
+    fn coverage(&self, now_ms: i64) -> DirectoryCoverage {
+        if !self.seed_present {
+            return DirectoryCoverage::NotStarted;
+        }
+        if !self.initial_completed {
+            let stale_after = INITIAL_STALL_MS.max(self.expected_page_interval.saturating_mul(2));
+            return if matches!(self.state, SyncState::Queued | SyncState::Running)
+                && self
+                    .last_progress_at
+                    .or(self.started_at)
+                    .is_some_and(|anchor| now_ms.saturating_sub(anchor) > stale_after)
+            {
+                DirectoryCoverage::Stalled
+            } else {
+                DirectoryCoverage::Importing
+            };
+        }
+        if !self.reconciliation_needed {
+            return DirectoryCoverage::Complete;
+        }
+        if self.state != SyncState::Complete {
+            return if self.run_kind == SyncRunKind::Reconcile
+                && matches!(self.state, SyncState::Queued | SyncState::Running)
+                && !self.worker_expired(now_ms)
+            {
+                DirectoryCoverage::Reconciling
+            } else {
+                DirectoryCoverage::Uncertain
+            };
+        }
+        if (self.gap_auto_clear
+            && matches!(self.audit_state, SyncState::Queued | SyncState::Running))
+            || self
+                .automatic_reconcile_at(now_ms)
+                .is_some_and(|at| at <= now_ms)
+        {
+            DirectoryCoverage::Reconciling
+        } else {
+            DirectoryCoverage::Uncertain
+        }
+    }
+}
+
+// Keep the coverage and totals in one scoped snapshot and SQL round trip.
+const COVERAGE_JOINS: &str = "FROM (SELECT ?1 AS guild_id, ?2 AS enrollment_id) scope
+    LEFT JOIN guild_member_seed s USING(guild_id,enrollment_id)
+    LEFT JOIN guild_member_sync j ON j.guild_id=s.guild_id AND j.enrollment_id=s.enrollment_id AND j.bot_id=s.bot_id
+    LEFT JOIN guild_member_audit_recovery a ON a.guild_id=s.guild_id AND a.enrollment_id=s.enrollment_id AND a.bot_id=s.bot_id";
+const COVERAGE_COLUMNS: &str = "s.guild_id IS NOT NULL, s.initial_completed_at_ms IS NOT NULL,
+    coalesce(s.reconciliation_needed,0), coalesce(s.gap_auto_clear,0),
+    coalesce(a.status,''), coalesce(j.run_kind,''), coalesce(j.status,''),
+    j.started_at_ms, j.last_progress_at_ms, j.lease_until_ms,
+    max(coalesce(j.pace_ms*j.active_guild_count,0),coalesce(j.member_page_interval_ms,0))";
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SeedState {
     Missing,
@@ -915,6 +1043,8 @@ impl CoverageGap<'_> {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MemberSyncStatus {
+    pub coverage: DirectoryCoverage,
+    pub automatic_reconcile_at: Option<i64>,
     pub initial_completed_at: Option<i64>,
     pub reconciliation_needed: bool,
     pub reconciliation_reason: Option<String>,
@@ -1289,6 +1419,8 @@ fn status(
 ) -> Result<MemberSyncStatus> {
     let seed = ensure_seed_bot(conn, scope, bot_id)?;
     let mut out = MemberSyncStatus {
+        coverage: DirectoryCoverage::NotStarted,
+        automatic_reconcile_at: None,
         initial_completed_at: seed.completed_at(),
         reconciliation_needed: false,
         reconciliation_reason: None,
@@ -1353,6 +1485,15 @@ fn status(
         params![scope.guild_id()],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
+    out.coverage = if seed.completed_at().is_some() {
+        if coverage.0 {
+            DirectoryCoverage::Uncertain
+        } else {
+            DirectoryCoverage::Complete
+        }
+    } else {
+        DirectoryCoverage::Importing
+    };
     out.reconciliation_needed = coverage.0;
     out.reconciliation_reason = coverage.1;
     out.local_history_complete = coverage.2;
@@ -1497,10 +1638,10 @@ fn status(
         out.progress_revision = revision;
         out.started_at = started;
         out.last_progress_at = progress;
-        out.next_attempt_at = if state == SyncState::Complete {
-            None
-        } else {
+        out.next_attempt_at = if state.scheduled() {
             next.into_iter().chain(request_after).max()
+        } else {
+            None
         };
         out.last_success_at = last_success;
         out.last_success_processed = last_success_processed;
@@ -1519,13 +1660,33 @@ fn status(
                 |r| Ok(r.get(0)?),
             )?;
         }
-        if state == SyncState::Running && lease_until.is_some_and(|v| v < now_ms) {
+        let facts = CoverageFacts {
+            seed_present: true,
+            initial_completed: out.initial_completed_at.is_some(),
+            reconciliation_needed: out.reconciliation_needed,
+            gap_auto_clear: out.gap_auto_clear,
+            audit_state: SyncState::parse(out.audit_recovery_status.as_deref().unwrap_or("")),
+            run_kind: SyncRunKind::parse(&kind),
+            state,
+            started_at: started,
+            last_progress_at: progress,
+            lease_until,
+            expected_page_interval: pace_ms
+                .saturating_mul(share)
+                .max(member_page_interval_ms.unwrap_or(0)),
+        };
+        out.coverage = facts.coverage(now_ms);
+        out.automatic_reconcile_at = facts.automatic_reconcile_at(now_ms);
+        if facts.worker_expired(now_ms) {
             out.status = "waiting".into();
-            out.status_reason = Some("worker unavailable; waiting for a new claim".into());
+            out.status_reason = Some(WORKER_UNAVAILABLE_REASON.into());
+        }
+        if out.coverage == DirectoryCoverage::Stalled && out.status_reason.is_none() {
+            out.status_reason = Some(STALLED_IMPORT_REASON.into());
         }
         if phase == "members"
             && SyncState::parse(&out.status).scheduled()
-            && out.status_reason.as_deref() != Some("worker unavailable; waiting for a new claim")
+            && out.status_reason.as_deref() != Some(WORKER_UNAVAILABLE_REASON)
         {
             if let Some(total) = total.filter(|n| *n >= 0) {
                 out.percent = Some(if total == 0 {
@@ -3822,67 +3983,82 @@ impl GuildDataStore {
                 verify_scope(&tx, &expected, &scope, true)?;
                 // One statement: a remote snapshot cannot afford a round trip
                 // per count after scope verification.
-                let (current, banned, known, seed_present, completed, reconcile, names): (
-                    i64,
-                    i64,
-                    i64,
-                    bool,
-                    bool,
-                    bool,
-                    Option<String>,
-                ) = tx.query_row(
-                    "SELECT \
-                       (SELECT COUNT(*) FROM guild_member_directory \
-                        WHERE guild_id=?1 AND enrollment_id=?2 AND is_current=1), \
-                       (SELECT COUNT(*) FROM guild_member_directory \
-                        WHERE guild_id=?1 AND enrollment_id=?2 AND is_banned=1), \
-                       (SELECT COUNT(*) FROM guild_member_directory \
-                        WHERE guild_id=?1 AND enrollment_id=?2), \
-                       EXISTS(SELECT 1 FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2), \
-                       COALESCE((SELECT initial_completed_at_ms IS NOT NULL FROM guild_member_seed \
-                        WHERE guild_id=?1 AND enrollment_id=?2), 0), \
-                       COALESCE((SELECT reconciliation_needed FROM guild_member_seed \
-                        WHERE guild_id=?1 AND enrollment_id=?2), 0), \
-                       (SELECT json_group_array(json_array(user_id, name)) FROM \
-                         (SELECT user_id, COALESCE(NULLIF(nickname,''), NULLIF(global_name,''), \
-                                 NULLIF(username,'')) AS name \
-                          FROM guild_member_directory \
-                          WHERE guild_id=?1 AND enrollment_id=?2 \
-                            AND user_id IN (SELECT value FROM json_each(?3))) \
-                        WHERE name IS NOT NULL)",
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let sql = format!(
+                    "SELECT {COVERAGE_COLUMNS},
+                       (SELECT COUNT(*) FROM guild_member_directory
+                        WHERE guild_id=?1 AND enrollment_id=?2 AND is_current=1),
+                       (SELECT COUNT(*) FROM guild_member_directory
+                        WHERE guild_id=?1 AND enrollment_id=?2 AND is_banned=1),
+                       (SELECT COUNT(*) FROM guild_member_directory
+                        WHERE guild_id=?1 AND enrollment_id=?2),
+                       (SELECT json_group_array(json_array(user_id, name)) FROM
+                         (SELECT user_id, COALESCE(NULLIF(nickname,''), NULLIF(global_name,''),
+                                 NULLIF(username,'')) AS name
+                          FROM guild_member_directory
+                          WHERE guild_id=?1 AND enrollment_id=?2
+                            AND user_id IN (SELECT value FROM json_each(?3)))
+                        WHERE name IS NOT NULL),
+                       s.reconciliation_reason,s.gap_at_ms,j.status_reason,
+                       CASE WHEN j.status IN ('queued','running','waiting')
+                            THEN nullif(max(coalesce(j.next_attempt_at_ms,0),coalesce(j.request_after_ms,0)),0)
+                       END,
+                       a.status_reason,
+                       nullif(max(coalesce(a.next_attempt_at_ms,0),coalesce(a.request_after_ms,0)),0)
+                       {COVERAGE_JOINS}"
+                );
+                let (totals, names) = tx.query_row(
+                    &sql,
                     params![scope.guild_id(), scope.enrollment.id.as_str(), ids],
                     |row| {
+                        let facts = CoverageFacts::read(row)?;
+                        let coverage = facts.coverage(now_ms);
+                        let (status_reason, next_attempt_at) = match coverage {
+                            DirectoryCoverage::Stalled => (
+                                row.get::<Option<String>>(17)?.or_else(|| Some(
+                                    if facts.worker_expired(now_ms) { WORKER_UNAVAILABLE_REASON } else { STALLED_IMPORT_REASON }.into()
+                                )),
+                                row.get(18)?,
+                            ),
+                            DirectoryCoverage::Uncertain | DirectoryCoverage::Reconciling
+                                if facts.state == SyncState::Complete => {
+                                    if facts.gap_auto_clear && facts.audit_state.scheduled() {
+                                        (row.get(19)?, row.get(20)?)
+                                    } else {
+                                        (None, facts.automatic_reconcile_at(now_ms))
+                                    }
+                                }
+                            DirectoryCoverage::Uncertain | DirectoryCoverage::Reconciling => (
+                                if facts.worker_expired(now_ms) {
+                                    Some(WORKER_UNAVAILABLE_REASON.into())
+                                } else {
+                                    row.get(17)?
+                                },
+                                row.get(18)?,
+                            ),
+                            _ => (None, None),
+                        };
                         Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                            row.get(6)?,
+                            DirectoryTotals {
+                                current: row.get(11)?,
+                                banned: row.get(12)?,
+                                known: row.get(13)?,
+                                coverage,
+                                reconciliation_reason: if facts.reconciliation_needed { row.get(15)? } else { None },
+                                gap_at: if facts.reconciliation_needed { row.get(16)? } else { None },
+                                status_reason,
+                                next_attempt_at,
+                            },
+                            row.get::<Option<String>>(14)?,
                         ))
                     },
                 )?;
-                let seed = seed_present.then_some((completed, reconcile));
                 tx.finish_read()?;
-                let coverage = match seed {
-                    Some((true, false)) => DirectoryCoverage::Complete,
-                    Some((true, true)) => DirectoryCoverage::Uncertain,
-                    Some((false, _)) | None => DirectoryCoverage::Importing,
-                };
                 let names: Vec<(i64, String)> = match names {
                     Some(raw) => serde_json::from_str(&raw)?,
                     None => Vec::new(),
                 };
-                Ok((
-                    DirectoryTotals {
-                        current,
-                        banned,
-                        known,
-                        coverage,
-                    },
-                    names,
-                ))
+                Ok((totals, names))
             })
             .await
     }
@@ -4238,6 +4414,43 @@ impl GuildDataStore {
         }).await
     }
 
+    /// Schedule a persisted gap from the bot scan. Recheck the gap, run and
+    /// cooldown under the guild writer lock before replacing a completed run.
+    pub async fn enqueue_automatic_member_reconcile(
+        &self,
+        scope: GuildDataScope,
+        bot_id: i64,
+        now_ms: i64,
+    ) -> Result<bool> {
+        checked_scope(self, &scope)?;
+        anyhow::ensure!(bot_id > 0 && now_ms > 0, MemberSyncError::Invalid);
+        self.refuse_fenced_guild_write(scope.guild_id()).await?;
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let mut tx = conn.transaction_primary_write()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let sql = format!("SELECT {COVERAGE_COLUMNS} {COVERAGE_JOINS} WHERE s.bot_id=?3");
+                let next = tx
+                    .query_row(
+                        &sql,
+                        params![scope.guild_id(), scope.enrollment.id.as_str(), bot_id],
+                        |row| Ok(CoverageFacts::read(row)?.automatic_reconcile_at(now_ms)),
+                    )
+                    .optional()?
+                    .flatten();
+                if next.is_none_or(|at| at > now_ms) {
+                    tx.finish_read()?;
+                    return Ok(false);
+                }
+                tx.ensure_mutation_receipt()?;
+                enqueue_member_reconcile(&tx, scope.guild_id(), now_ms, None)?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await
+    }
+
     pub async fn member_sync_action(
         &self,
         scope: GuildDataScope,
@@ -4269,9 +4482,22 @@ impl GuildDataStore {
                     if state!=SyncState::Complete {tx.member_execute("UPDATE guild_member_sync SET request_after_ms=CASE WHEN ?4=1 AND status_reason='permission_denied' THEN ?2 ELSE request_after_ms END,status='queued',status_reason=NULL,next_attempt_at_ms=?2,lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,progress_revision=progress_revision+1,last_operation_key=?3 WHERE guild_id=?1",params![scope.guild_id(),now_ms,operation_key,action==MemberSyncAction::Retry])?;}
                     else {tx.member_execute("UPDATE guild_member_sync SET last_operation_key=?2,progress_revision=progress_revision+1 WHERE guild_id=?1",params![scope.guild_id(),operation_key])?;}
                 }
-                MemberSyncAction::Reconcile=>{tx.member_execute("UPDATE guild_member_sync SET run_id=?2,run_kind='reconcile',phase='members',status='queued',status_reason=NULL,cursor=NULL,processed=0,member_processed=0,ban_processed=0,verify_processed=0,audit_processed=0,member_page_interval_ms=NULL,inserted=0,updated=0,unchanged=0,total_estimate=NULL,started_at_ms=?3,last_progress_at_ms=NULL,completed_at_ms=NULL,next_attempt_at_ms=?3,reconcile_gap_generation=(SELECT gap_generation FROM guild_member_seed WHERE guild_id=?1),lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,progress_revision=progress_revision+1,last_operation_key=?4 WHERE guild_id=?1",params![scope.guild_id(),random_id(),now_ms,operation_key])?;}
+                MemberSyncAction::Reconcile=>{enqueue_member_reconcile(&tx,scope.guild_id(),now_ms,Some(&operation_key))?;}
             }
             let _=kind;let out=status(&tx,&scope,bot_id,now_ms,true)?;tx.commit()?;Ok(out)
         }).await
     }
+}
+
+fn enqueue_member_reconcile(
+    tx: &impl MemberSqlWrites,
+    guild_id: i64,
+    now_ms: i64,
+    operation_key: Option<&str>,
+) -> Result<()> {
+    tx.member_execute(
+        "UPDATE guild_member_sync SET run_id=?2,run_kind='reconcile',phase='members',status='queued',status_reason=NULL,cursor=NULL,processed=0,member_processed=0,ban_processed=0,verify_processed=0,audit_processed=0,member_page_interval_ms=NULL,inserted=0,updated=0,unchanged=0,total_estimate=NULL,started_at_ms=?3,last_progress_at_ms=NULL,completed_at_ms=NULL,next_attempt_at_ms=?3,reconcile_gap_generation=(SELECT gap_generation FROM guild_member_seed WHERE guild_id=?1),lease_owner=NULL,lease_until_ms=NULL,generation=generation+1,progress_revision=progress_revision+1,last_operation_key=coalesce(?4,last_operation_key) WHERE guild_id=?1",
+        params![guild_id, random_id(), now_ms, operation_key],
+    )?;
+    Ok(())
 }

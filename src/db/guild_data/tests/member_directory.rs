@@ -1025,8 +1025,17 @@ async fn complete_for_checks(store: &GuildDataStore, scope: &GuildDataScope) {
 #[tokio::test]
 async fn directory_totals_report_import_and_gap_coverage() {
     let (_f, store, scope) = ready().await;
+    let missing = store.directory_totals(scope.clone()).await.unwrap();
+    assert_eq!(missing.coverage, DirectoryCoverage::NotStarted);
+    let pending = store
+        .member_sync_status(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    assert_eq!(pending.coverage, DirectoryCoverage::NotStarted);
+    assert!(pending.run_id.is_none());
+    let now = chrono::Utc::now().timestamp_millis();
     store
-        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .initialize_member_directory(scope.clone(), 42, now)
         .await
         .unwrap();
     store
@@ -1063,6 +1072,76 @@ async fn directory_totals_report_import_and_gap_coverage() {
     let gap = store.directory_totals(scope).await.unwrap();
     assert_eq!(gap.current, 1);
     assert_eq!(gap.coverage, DirectoryCoverage::Uncertain);
+    assert_eq!(gap.reconciliation_reason.as_deref(), Some("gateway_gap"));
+    assert_eq!(gap.gap_at, Some(3_000));
+}
+
+#[tokio::test]
+async fn initial_import_stall_uses_the_latest_progress_and_expected_pace() {
+    let (_f, store, scope) = ready().await;
+    let hour_ms = 60 * 60 * 1_000;
+    let start = chrono::Utc::now().timestamp_millis() - 2 * hour_ms;
+    store
+        .initialize_member_directory(scope.clone(), 42, start)
+        .await
+        .unwrap();
+    let boundary = start + hour_ms;
+    let at_bound = store
+        .member_sync_status(scope.clone(), 42, boundary)
+        .await
+        .unwrap();
+    assert_eq!(at_bound.coverage, DirectoryCoverage::Importing);
+    let stalled = store
+        .member_sync_status(scope.clone(), 42, boundary + 1)
+        .await
+        .unwrap();
+    assert_eq!(stalled.coverage, DirectoryCoverage::Stalled);
+    assert_eq!(stalled.status, "queued");
+    assert_eq!(
+        stalled.status_reason.as_deref(),
+        Some("Initial import has not made progress within its expected interval")
+    );
+    assert_eq!(stalled.next_attempt_at, Some(start));
+    let totals = store.directory_totals(scope.clone()).await.unwrap();
+    assert_eq!(totals.coverage, DirectoryCoverage::Stalled);
+    assert_eq!(totals.status_reason, stalled.status_reason);
+    assert_eq!(totals.next_attempt_at, Some(start));
+
+    let claim = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), start, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let expired = store
+        .member_sync_status(scope.clone(), 42, boundary + 1)
+        .await
+        .unwrap();
+    assert_eq!(expired.coverage, DirectoryCoverage::Stalled);
+    assert_eq!(
+        expired.status_reason.as_deref(),
+        Some("worker unavailable; waiting for a new claim")
+    );
+    let mut first_page = page(MemberSyncPhase::Members, None, false);
+    first_page.members.push(observed(77, Some(900), start + 1));
+    first_page.next_cursor = Some("77".into());
+    first_page.pace_ms = hour_ms;
+    let progress_at = start + 1;
+    store
+        .commit_member_page(scope.clone(), claim, first_page, progress_at)
+        .await
+        .unwrap();
+    for (age, expected) in [
+        (hour_ms + 1, DirectoryCoverage::Importing),
+        (2 * hour_ms, DirectoryCoverage::Importing),
+        (2 * hour_ms + 1, DirectoryCoverage::Stalled),
+    ] {
+        let status = store
+            .member_sync_status(scope.clone(), 42, progress_at + age)
+            .await
+            .unwrap();
+        assert_eq!(status.last_progress_at, Some(progress_at));
+        assert_eq!(status.coverage, expected);
+    }
 }
 
 #[tokio::test]
@@ -3784,6 +3863,206 @@ async fn finish_empty_reconcile(store: &GuildDataStore, scope: &GuildDataScope, 
 }
 
 #[tokio::test]
+async fn automatic_reconcile_runs_after_a_gap_and_rechecks_the_durable_cooldown() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    store
+        .backfill_member_case_index(scope.clone(), 42, 100)
+        .await
+        .unwrap();
+    let start = chrono::Utc::now().timestamp_millis();
+    assert!(
+        !store
+            .enqueue_automatic_member_reconcile(scope.clone(), 42, start)
+            .await
+            .unwrap()
+    );
+    store
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            start,
+        )
+        .await
+        .unwrap();
+    let gap = store
+        .member_sync_status(scope.clone(), 42, start)
+        .await
+        .unwrap();
+    assert_eq!(gap.automatic_reconcile_at, Some(start));
+    assert_eq!(gap.coverage, DirectoryCoverage::Reconciling);
+    assert!(
+        store
+            .enqueue_automatic_member_reconcile(scope.clone(), 42, start)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .enqueue_automatic_member_reconcile(scope.clone(), 42, start)
+            .await
+            .unwrap()
+    );
+    let queued = store
+        .member_sync_status(scope.clone(), 42, start)
+        .await
+        .unwrap();
+    assert_ne!(queued.run_id, gap.run_id);
+    assert_eq!(queued.run_kind.as_deref(), Some("reconcile"));
+    assert_eq!(queued.status, "queued");
+    assert_eq!(
+        store
+            .directory_totals(scope.clone())
+            .await
+            .unwrap()
+            .coverage,
+        DirectoryCoverage::Reconciling
+    );
+
+    finish_empty_reconcile(&store, &scope, start).await;
+    let complete = store
+        .member_sync_status(scope.clone(), 42, start + 100_000)
+        .await
+        .unwrap();
+    assert_eq!(complete.coverage, DirectoryCoverage::Complete);
+    assert!(!complete.reconciliation_needed);
+    assert_eq!(
+        (complete.reconciliation_reason, complete.gap_at),
+        (None, None)
+    );
+    assert_eq!(complete.initial_completed_at, gap.initial_completed_at);
+
+    let cooldown = start + 6 * 60 * 60 * 1_000;
+    for now in [start + 100_000, cooldown - 1] {
+        store
+            .mark_member_reconciliation_needed(scope.clone(), CoverageGap::Observed("new_gap"), now)
+            .await
+            .unwrap();
+        let waiting = store
+            .member_sync_status(scope.clone(), 42, now)
+            .await
+            .unwrap();
+        assert_eq!(waiting.automatic_reconcile_at, Some(cooldown));
+        assert_eq!(waiting.coverage, DirectoryCoverage::Uncertain);
+        assert_eq!(waiting.run_id, queued.run_id);
+        assert!(
+            !store
+                .enqueue_automatic_member_reconcile(scope.clone(), 42, now)
+                .await
+                .unwrap()
+        );
+    }
+    assert!(
+        store
+            .enqueue_automatic_member_reconcile(scope.clone(), 42, cooldown)
+            .await
+            .unwrap()
+    );
+    let next = store.member_sync_status(scope, 42, cooldown).await.unwrap();
+    assert_ne!(next.run_id, queued.run_id);
+    assert_eq!(next.coverage, DirectoryCoverage::Reconciling);
+}
+
+#[tokio::test]
+async fn automatic_reconcile_keeps_failure_reason_and_scheduled_retry_visible() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+    let start = chrono::Utc::now().timestamp_millis();
+    store
+        .mark_member_reconciliation_needed(
+            scope.clone(),
+            CoverageGap::Observed("gateway_gap"),
+            start,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .enqueue_automatic_member_reconcile(scope.clone(), 42, start)
+            .await
+            .unwrap()
+    );
+    let claim = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), start, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .member_sync_status(scope.clone(), 42, start)
+            .await
+            .unwrap()
+            .coverage,
+        DirectoryCoverage::Reconciling
+    );
+    let retry_at = start + 120_000;
+    store
+        .defer_member_sync(
+            scope.clone(),
+            claim,
+            "rate_limited".into(),
+            retry_at,
+            start + 1,
+        )
+        .await
+        .unwrap();
+    let waiting = store.directory_totals(scope.clone()).await.unwrap();
+    assert_eq!(waiting.coverage, DirectoryCoverage::Uncertain);
+    assert_eq!(
+        waiting.reconciliation_reason.as_deref(),
+        Some("gateway_gap")
+    );
+    assert_eq!(waiting.gap_at, Some(start));
+    assert_eq!(waiting.status_reason.as_deref(), Some("rate_limited"));
+    assert_eq!(waiting.next_attempt_at, Some(retry_at));
+    assert!(
+        !store
+            .enqueue_automatic_member_reconcile(scope.clone(), 42, retry_at - 1)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .claim_member_sync(scope.clone(), 42, "worker".into(), retry_at - 1, 90_000)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let claim = store
+        .claim_member_sync(scope.clone(), 42, "worker".into(), retry_at, 90_000)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .defer_member_sync(
+            scope.clone(),
+            claim,
+            "permission_denied".into(),
+            retry_at + 1,
+            retry_at,
+        )
+        .await
+        .unwrap();
+    let failed = store
+        .member_sync_status(scope.clone(), 42, retry_at + 1)
+        .await
+        .unwrap();
+    assert_eq!(failed.coverage, DirectoryCoverage::Uncertain);
+    assert!(failed.reconciliation_needed && failed.allows_member_sync_retry());
+    assert_eq!(failed.status_reason.as_deref(), Some("permission_denied"));
+    assert_eq!(failed.next_attempt_at, None);
+    let totals = store.directory_totals(scope.clone()).await.unwrap();
+    assert_eq!(totals.status_reason, failed.status_reason);
+    assert_eq!(totals.next_attempt_at, None);
+    assert!(
+        !store
+            .enqueue_automatic_member_reconcile(scope, 42, start + 6 * 60 * 60 * 1_000)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn newer_gap_survives_reconcile_final_and_last_summary_survives_next_run() {
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
@@ -4695,6 +4974,14 @@ async fn completed_audit_recovery_clears_only_a_short_restart_gap() {
     assert_eq!(
         status.reconciliation_reason.as_deref(),
         Some("bot restarted")
+    );
+    assert_eq!(status.coverage, DirectoryCoverage::Reconciling);
+    assert_eq!(status.automatic_reconcile_at, None);
+    assert!(
+        !store
+            .enqueue_automatic_member_reconcile(scope.clone(), 42, 3_001)
+            .await
+            .unwrap()
     );
     finish_audit_recovery(&store, &scope, 3_001).await;
     let status = store
