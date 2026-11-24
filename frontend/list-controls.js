@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Icon } from "./icons.js";
+import { noAutofill } from "./no-autofill.js";
 
 const h = React.createElement;
 const SEARCH_LIMIT = 200;
@@ -281,23 +282,23 @@ export function ListControls({ controls, UserPicker, userPickerProps, filterOpti
   const { filters } = view;
   const { from: fromLabel = "From", to: toLabel = "To" } = config.dateLabels ?? {};
   const date = (key, label, bounds) => h(ListField, { label },
-    h("input", {
+    h("input", noAutofill({
       className: "input input-sm",
       type: "date",
       value: filters[key],
       ...bounds,
       onChange: (event) => setFilter(key, event.target.value),
-    }),
+    })),
   );
   const text = (key, label, placeholder, type = "text") => h(ListField, { key, label },
-    h("input", {
+    h("input", noAutofill({
       className: "input input-sm",
       type,
       value: drafts[key] ?? filters[key],
       placeholder,
       maxLength: SEARCH_LIMIT * 2,
       onChange: (event) => setText(key, event.target.value),
-    }),
+    })),
   );
   const chips = [
     ...config.filters.filter(({ kind }) => kind !== "user"),

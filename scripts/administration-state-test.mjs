@@ -20,6 +20,8 @@ const chartsSource = fs.readFileSync(new URL("../frontend/charts.js", import.met
   .replaceAll("export const", "const").replaceAll("export function", "function");
 const iconsSource = fs.readFileSync(new URL("../frontend/icons.js", import.meta.url), "utf8")
   .replace(/^import .*;$/gm, "").replaceAll("export const", "const").replaceAll("export function", "function");
+const noAutofillSource = fs.readFileSync(new URL("../frontend/no-autofill.js", import.meta.url), "utf8")
+  .replace("export function", "function");
 const source = fs.readFileSync(path.resolve(import.meta.dirname, "../frontend/administration.js"), "utf8")
   .replace(/^import .*;$/gm, "");
 const NOW_SECONDS = 1800000000;
@@ -64,7 +66,7 @@ function page(fetchImpl = () => new Promise(() => {}), { apiBase = "", origin = 
     Date: { now },
   });
   pages.push({ dom, roots });
-  vm.runInContext(stateSource + "\n" + appearanceSource + "\n" + chartsSource + "\n" + iconsSource + "\n" + source, context);
+  vm.runInContext(stateSource + "\n" + appearanceSource + "\n" + chartsSource + "\n" + iconsSource + "\n" + noAutofillSource + "\n" + source, context);
   return { context, elements: { get: id => document.getElementById(id) }, timers };
 }
 
@@ -960,6 +962,20 @@ test("boot mismatch shows expected and actual startup independently of installed
   assert.doesNotMatch(text, /Application stopped/);
   run(`ui.getSnapshot().snapshot.boot_mismatches = {}; ui.set({ ...ui.getSnapshot() });`, view.context);
   assert.doesNotMatch(textOf(view.elements.get("update-cards")), /Boot mismatch/);
+});
+
+test("Administration fields tell password managers to ignore them", () => {
+  const view = page();
+  render(view, record());
+  const content = view.elements.get("content");
+  assert.ok(content.querySelector("input#alert-channel-id"));
+  for (const field of content.querySelectorAll("input, textarea")) {
+    assert.equal(field.getAttribute("autocomplete"), "off");
+    assert.ok(field.hasAttribute("data-1p-ignore"));
+    assert.equal(field.getAttribute("data-lpignore"), "true");
+    assert.ok(field.hasAttribute("data-bwignore"));
+    assert.equal(field.getAttribute("data-form-type"), "other");
+  }
 });
 
 test("owner saves the boot repair alert channel as a string ID through the API", async () => {

@@ -24,6 +24,7 @@ import {
   useListControls,
 } from "./list-controls.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
+import { noAutofill } from "./no-autofill.js";
 import React, { useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
@@ -108,8 +109,8 @@ function useDraftControl({ draftKey, defaultValue, onChange, ...props }) {
     },
   };
 }
-function Input(props) { return h(HeadlessInput, useDraftControl(props)); }
-function Textarea(props) { return h(HeadlessTextarea, useDraftControl(props)); }
+function Input(props) { return h(HeadlessInput, noAutofill(useDraftControl(props))); }
+function Textarea(props) { return h(HeadlessTextarea, noAutofill(useDraftControl(props))); }
 function Select(props) { return h(HeadlessSelect, useDraftControl(props)); }
 function OwnerTools() {
   const profile = useRef(null);
@@ -1117,14 +1118,14 @@ function PlatformServerTable({ rows, totals, rangeLabel }) {
     h(
       "div",
       { className: "pa-controls" },
-      h("input", {
+      h("input", noAutofill({
         type: "search",
         className: "input input-sm",
         placeholder: "Filter by name or ID",
         "aria-label": "Filter servers",
         value: query,
         onChange: (event) => setQuery(event.target.value),
-      }),
+      })),
       h(
         "select",
         { className: "select select-sm", "aria-label": "Server status", value: filter, onChange: (event) => setFilter(event.target.value) },
@@ -10465,7 +10466,7 @@ function BanReasonCell({ record, names, guildId, editor: reasonEditor, onEdit, o
     return h(
       "div",
       { className: "ban-reason-editor" },
-      h("textarea", {
+      h("textarea", noAutofill({
         className: "textarea textarea-sm",
         "aria-label": "jModGuard reason",
         maxLength: 512,
@@ -10477,7 +10478,7 @@ function BanReasonCell({ record, names, guildId, editor: reasonEditor, onEdit, o
           onDraft(event.target.value.replace(/[\r\n]+/g, " "));
           markDirty();
         },
-      }),
+      })),
       h("p", { className: "field-help" }, "Changes jModGuard's record only. Discord keeps the original reason."),
       h(
         "div",

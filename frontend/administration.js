@@ -1,6 +1,7 @@
 import { createState, useStore } from "./state.js";
 import { Appearance, useAppearance } from "./appearance.js";
 import { ACTION_ICONS, Icon } from "./icons.js";
+import { noAutofill } from "./no-autofill.js";
 /* Owner Administration: component updates. Database Usage and Platform analytics
    are Owner sections of the main workspace. React owns rendering; the API remains
    authoritative. */
@@ -326,8 +327,8 @@ function AlertChannelCard({ revision }) {
       h("p", { className: "muted" }, "The bot posts here once when boot repair can't restore the recorded bot or API release."),
       !saved && h("p", { id: "alert-channel-unset", className: "muted" }, "No alert channel is set. Mismatches are logged and shown on the component cards."),
       h("label", { className: "fieldset field" }, h("span", { className: "fieldset-legend" }, "Alert channel ID"),
-        h("input", { id: "alert-channel-id", className: "input input-sm", inputMode: "numeric", value, disabled: blocked,
-          onChange: event => setValue(event.target.value) })),
+        h("input", noAutofill({ id: "alert-channel-id", className: "input input-sm", inputMode: "numeric", value, disabled: blocked,
+          onChange: event => setValue(event.target.value) }))),
       h("div", { className: "card-actions" },
         h("button", { id: "save-alert-channel", type: "button", className: "btn btn-sm", disabled: blocked || value.trim() === saved,
           onClick: () => mutate({ component: "alerts" }, "Save alert channel",
