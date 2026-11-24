@@ -142,22 +142,23 @@ function px(value) {
   assert.ok(match, `expected a rem/px length, got ${value}`);
   return Number(match[1]) * (match[2] === "rem" ? 16 : 1);
 }
-function mediaBlock(query) {
-  const start = css.indexOf(`@media ${query} {`);
+function mediaBlock(query, source = css) {
+  const start = source.indexOf(`@media ${query} {`);
   assert.ok(start >= 0, `missing @media ${query}`);
   let depth = 0;
-  for (let index = css.indexOf("{", start); index < css.length; index++) {
-    if (css[index] === "{") depth++;
-    if (css[index] === "}" && --depth === 0) return css.slice(css.indexOf("{", start) + 1, index);
+  for (let index = source.indexOf("{", start); index < source.length; index++) {
+    if (source[index] === "{") depth++;
+    if (source[index] === "}" && --depth === 0) return source.slice(source.indexOf("{", start) + 1, index);
   }
   throw new Error(`unterminated @media ${query}`);
 }
 test("public policies use readable dashboard colors in both system themes", () => {
-  const dark = tokens(".legal-site", mediaBlock("screen and (prefers-color-scheme: dark)"));
-  const dashboardDark = tokens(':root[data-theme="dark"]');
-  for (const [token, color] of Object.entries(dark)) assert.equal(color, dashboardDark[token], token);
+  const legalCss = readFileSync(new URL("../crates/api/src/web/legal/style.css", import.meta.url), "utf8");
+  const light = tokens(".legal-site", legalCss);
+  const dark = tokens(".legal-site", mediaBlock("screen and (prefers-color-scheme: dark)", legalCss));
 
-  for (const palette of [tokens(":root"), dark]) {
+  for (const [palette, dashboard] of [[light, tokens(":root")], [dark, tokens(':root[data-theme="dark"]')]]) {
+    for (const [token, color] of Object.entries(palette)) assert.equal(color, dashboard[token], token);
     for (const [foreground, surface] of [
       ["--text", "--bg"], ["--text", "--panel"], ["--text", "--panel2"],
       ["--text", "--hero"], ["--hero-text", "--hero"], ["--muted", "--bg"],

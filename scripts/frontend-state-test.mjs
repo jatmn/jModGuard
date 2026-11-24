@@ -5372,7 +5372,7 @@ test('signed-out landing footer links to public policies on the page origin', as
   const dashboard = fs.readFileSync(new URL('../dist/frontend/index.html', import.meta.url), 'utf8');
   const stylesheet = fs.readFileSync(new URL('../dist/frontend/style.css', import.meta.url), 'utf8');
   assert.match(dashboard, /id="app"/);
-  assert.match(stylesheet, /\.legal-page\b/);
+  assert.match(stylesheet, /\.legal-links\b/);
   for (const splitOrigin of [false, true]) {
     const h = harness(async () => ({
       ok: false,

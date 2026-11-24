@@ -2069,6 +2069,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             .route("/privacy", get(legal::privacy))
             .route("/terms", get(legal::terms))
             .route("/api/legal", get(legal::details))
+            .route("/api/legal/style.css", get(legal::stylesheet))
             .merge(sessioned),
     )
     .layer(axum::middleware::from_fn(resources::count_request))
@@ -3030,9 +3031,29 @@ mod tests {
         let app = test_app();
         for (path, other) in [("/privacy", "/terms"), ("/terms", "/privacy")] {
             let html = public_legal_html(app.clone(), path).await;
+            let (_, stylesheet) = html.split_once(r#"<link rel="stylesheet" href=""#).unwrap();
+            let (stylesheet, _) = stylesheet.split_once('"').unwrap();
+            let response = public_legal_response(app.clone(), stylesheet, None).await;
+            assert!(stylesheet.starts_with("/api/"), "{path}: {stylesheet}");
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/css; charset=utf-8"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let css = std::str::from_utf8(&bytes).unwrap();
+            for rule in [
+                ".legal-summary",
+                ".legal-toc-desktop",
+                ".legal-toc-mobile",
+                "@media print",
+            ] {
+                assert!(css.contains(rule), "{stylesheet}: missing {rule}");
+            }
             assert!(
-                html.contains(r#"<link rel="stylesheet" href="/style.css">"#),
-                "{path}"
+                !css.contains("@import"),
+                "{stylesheet}: must be self-contained"
             );
             assert!(html.contains(r#"<a class="brand" href="/">"#), "{path}");
             assert!(
@@ -3042,8 +3063,7 @@ mod tests {
             assert!(html.contains(&format!(r#"href="{other}""#)), "{path}");
         }
 
-        // In split deployments the dashboard origin serves these two assets
-        // and forwards the policy paths to this router.
+        // The dashboard serves its own assets in split deployments.
         for path in ["/", "/style.css"] {
             let request = Request::builder().uri(path).body(Body::empty()).unwrap();
             let response = app.clone().oneshot(request).await.unwrap();

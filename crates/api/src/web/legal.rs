@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse, Response};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Url;
@@ -54,6 +55,13 @@ pub(super) async fn privacy(State(app): State<Arc<ApiState>>) -> Html<String> {
 
 pub(super) async fn terms(State(app): State<Arc<ApiState>>) -> Html<String> {
     render(Policy::Terms, &app.cfg.legal)
+}
+
+pub(super) async fn stylesheet() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("legal/style.css"),
+    )
 }
 
 const UNCONFIGURED: &str = "Not configured";

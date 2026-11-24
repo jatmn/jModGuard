@@ -22,15 +22,17 @@ Start `jmodguard-bot` once first so the database is migrated, then start
 
 [Privacy Policy](../crates/api/src/web/legal/privacy.html) is served at
 `/privacy` and [Terms of Service](../crates/api/src/web/legal/terms.html) at
-`/terms`. The API serves both in either build. They return HTML without
-sign-in or JavaScript. Both pages and the dashboard use the same public origin
-for navigation and styling. The API fills in the operator details at request
-time. It also exposes them in the public `GET /api/legal` response.
+`/terms`. The API serves both pages and `/api/legal/style.css` in either build.
+The pages return HTML without sign-in or JavaScript. Both pages and the dashboard
+use the same public origin for navigation and styling. The API fills in the
+operator details at request time. It also exposes them in the public
+`GET /api/legal` response.
 
 When the dashboard is hosted separately, forward `/privacy` and `/terms`
 from the public dashboard origin to the API, including when
-`JMODGUARD_API_BASE` is set. Keep serving the home page and stylesheet on
-the dashboard origin. See the [edge rule example](DEPLOY-BUNNY.md#5-point-api-paths-on-the-pull-zone-at-the-api-container).
+`JMODGUARD_API_BASE` is set. The existing `/api*` rule also forwards the
+policy stylesheet. The dashboard host continues to serve its own assets.
+See the [edge rule example](DEPLOY-BUNNY.md#5-point-api-paths-on-the-pull-zone-at-the-api-container).
 Before registering the URLs with Discord, deploy the API and WebUI, then
 verify that the public `/privacy` and `/terms` URLs each return their own HTML
 with HTTP 200 in a signed-out window. Follow each page’s link to the other.
