@@ -45,6 +45,25 @@ async fn onboarding_case_uses_the_legacy_payload_and_survives_legacy_backfill() 
             .unwrap(),
         RecordCase::Created(id.clone())
     );
+    let legacy_private_id = CaseId::try_from("c".repeat(32)).unwrap();
+    let legacy_private = CaseData {
+        source: CaseSource::Application {
+            operation_id: CaseId::new(),
+        },
+        subject_id: 28,
+        ..data.clone()
+    };
+    let mut legacy_payload = serde_json::to_value(&legacy_private).unwrap();
+    legacy_payload["hide_from_member_history"] = serde_json::json!(true);
+    store
+        .insert_unindexed_case_for_test(
+            scope.clone(),
+            legacy_private_id,
+            legacy_private.source.key().unwrap(),
+            legacy_payload.to_string(),
+        )
+        .await
+        .unwrap();
     let visible_id = CaseId::try_from("b".repeat(32)).unwrap();
     store
         .record_case(scope.clone(), visible_id.clone(), self::data(2), limits)
@@ -116,6 +135,44 @@ async fn onboarding_case_uses_the_legacy_payload_and_survives_legacy_backfill() 
             .0
             .is_empty()
     );
+    assert!(
+        reader
+            .member_subject_case_entries(scope.clone(), legacy_private.subject_id, 8)
+            .await
+            .unwrap()
+            .0
+            .is_empty()
+    );
+    let (visible, _) = reader
+        .member_subject_case_entries(scope.clone(), self::data(2).subject_id, 8)
+        .await
+        .unwrap();
+    assert_eq!(visible[0].case_id.as_deref(), Some(visible_id.as_str()));
+
+    store
+        .remove_case_index_for_test(scope.clone(), visible_id.clone())
+        .await
+        .unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .backfill_member_case_index(scope.clone(), 42, 100)
+            .await
+            .unwrap()
+    );
+    for subject in [data.subject_id, legacy_private.subject_id] {
+        assert!(
+            reader
+                .member_subject_case_entries(scope.clone(), subject, 8)
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
     let (visible, _) = reader
         .member_subject_case_entries(scope, self::data(2).subject_id, 8)
         .await
@@ -450,7 +507,7 @@ async fn sql_guards_prevent_overwrite_replacement_and_live_replay_key_deletion()
         .unwrap();
     store.db.with_conn(|c| {
         c.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA recursive_triggers=OFF")?;
-        for sql in ["INSERT OR REPLACE INTO guild_cases SELECT guild_id,enrollment_id,case_id,source_key,payload,deleted FROM guild_cases", "UPDATE guild_cases SET payload='{}'", "DELETE FROM guild_cases", "UPDATE guild_cases SET guild_id=20", "INSERT INTO guild_cases SELECT 20,enrollment_id,case_id,source_key,payload,deleted FROM guild_cases"] {
+        for sql in ["INSERT OR REPLACE INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) SELECT guild_id,enrollment_id,case_id,source_key,payload,deleted FROM guild_cases", "UPDATE guild_cases SET payload='{}'", "DELETE FROM guild_cases", "UPDATE guild_cases SET guild_id=20", "INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) SELECT 20,enrollment_id,case_id,source_key,payload,deleted FROM guild_cases"] {
             assert!(c.execute_batch_bounded(sql, 64 * 1024 * 1024).is_err(),"accepted {sql}");
         }
         c.execute_batch_bounded("CREATE TRIGGER reject_removal BEFORE UPDATE ON guild_cases BEGIN SELECT RAISE(ABORT,'test removal failure'); END", 64 * 1024 * 1024)?;

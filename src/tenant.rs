@@ -431,7 +431,7 @@ impl TenantRuntime {
                     "configured guild store ownership conflicts with the catalog"
                 );
             }
-            if let Err(error) = open_runtime_store(core, store).await {
+            if let Err(error) = open_runtime_store(core, store, StoreOpen::Startup).await {
                 let unpublished = core.is_read_only()
                     && crate::db::is_schema_not_ready(&error)
                     && error.to_string().contains("guild store is not ready");
@@ -692,7 +692,7 @@ impl TenantRuntime {
             );
             return Ok(EpochRaise::Current);
         };
-        let handle = match open_runtime_store(&self.core, resolved).await {
+        let handle = match open_runtime_store(&self.core, resolved, StoreOpen::Runtime).await {
             Ok(handle) => handle,
             Err(error) => {
                 tracing::warn!(
@@ -1175,7 +1175,7 @@ impl TenantRuntime {
             .iter()
             .find(|store| store.registration.id() == id)
             .ok_or(TenantError::Offline)?;
-        let handle = open_runtime_store(&self.core, resolved).await?;
+        let handle = open_runtime_store(&self.core, resolved, StoreOpen::Runtime).await?;
         self.ensure_writer_epoch(&handle).await?;
         let mut cache = self.inner.handles.lock().await;
         if let HandleLookup::Cached(existing) = cache.lookup(id.as_str()) {
@@ -1252,7 +1252,17 @@ impl TenantRuntime {
     }
 }
 
-async fn open_runtime_store(core: &Db, store: &ResolvedStore) -> Result<GuildDataStore> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoreOpen {
+    Startup,
+    Runtime,
+}
+
+async fn open_runtime_store(
+    core: &Db,
+    store: &ResolvedStore,
+    phase: StoreOpen,
+) -> Result<GuildDataStore> {
     let options = store.options.clone();
     let stamped =
         db::run_cancellable_db_work(move || GuildDataStore::existing_registration(options)).await?;
@@ -1291,10 +1301,10 @@ async fn open_runtime_store(core: &Db, store: &ResolvedStore) -> Result<GuildDat
     };
     let options = store.options.clone();
     let opened = db::run_cancellable_db_work(move || {
-        if options.read_only {
-            GuildDataStore::open(options, expected)
-        } else {
+        if phase == StoreOpen::Startup && !options.read_only {
             GuildDataStore::initialize(options, expected)
+        } else {
+            GuildDataStore::open(options, expected)
         }
     })
     .await?;

@@ -63,14 +63,10 @@ pub struct ServerNames {
 fn read_names_row(
     tx: &impl SqlExecutor,
     scope: &GuildDataScope,
-    has_setup: bool,
 ) -> Result<Option<(String, Option<String>, i64)>> {
-    let setup = if has_setup { "onboarding_trap" } else { "NULL" };
     tx.query_row(
-        &format!(
-            "SELECT names, {setup}, observed_at_ms FROM guild_server_names
-                  WHERE guild_id=?1 AND enrollment_id=?2"
-        ),
+        "SELECT names, onboarding_trap, observed_at_ms FROM guild_server_names
+         WHERE guild_id=?1 AND enrollment_id=?2",
         params![scope.guild_id(), scope.enrollment.id.as_str()],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
@@ -168,8 +164,7 @@ impl GuildDataStore {
             .with_conn(move |conn| {
                 let mut tx = conn.transaction_primary_write()?;
                 verify_scope(&tx, &expected, &scope, true)?;
-                let has_setup = has_onboarding_trap_storage(&tx)?;
-                let existing = read_names_row(&tx, &scope, has_setup)?;
+                let existing = read_names_row(&tx, &scope)?;
                 if existing
                     .as_ref()
                     .is_some_and(|(stored, stored_setup, observed)| {
@@ -180,9 +175,6 @@ impl GuildDataStore {
                     return Ok(false);
                 }
                 tx.ensure_mutation_receipt()?;
-                if setup.is_some() && !has_setup {
-                    install_onboarding_trap_storage(&mut tx)?;
-                }
                 tx.execute_rows(
                     "INSERT INTO guild_server_names(guild_id,enrollment_id,names,observed_at_ms)
                      VALUES(?1,?2,?3,?4)
@@ -226,7 +218,7 @@ impl GuildDataStore {
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
-                let row = read_names_row(&tx, &scope, has_onboarding_trap_storage(&tx)?)?;
+                let row = read_names_row(&tx, &scope)?;
                 tx.finish_read()?;
                 Ok(match row {
                     Some((names, setup, observed_at_ms)) => {

@@ -89,6 +89,61 @@ fn case_data(subject: i64) -> CaseData {
 }
 
 #[tokio::test]
+async fn ordinary_store_open_does_not_migrate_onboarding_schema() {
+    let old_path = std::env::temp_dir().join(format!(
+        "jmodguard_onboarding_{:032x}.db",
+        rand::random::<u128>()
+    ));
+    let mut f = Fixture::new();
+    f.extra_stores.push(old_path.clone());
+    let old = ResolvedStore {
+        registration: StoreRegistration::from_parts(StoreId::new(), StorePolicy::Shared),
+        options: GuildStoreOptions {
+            path: old_path.clone(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 2,
+            read_only: false,
+        },
+    };
+    GuildDataStore::create_historical_store(old.options.clone(), old.registration.clone(), 23)
+        .unwrap();
+    let raw = crate::db_compat::Connection::open(&old_path).unwrap();
+    let versions = || {
+        raw.query_row(
+            "SELECT (SELECT user_version FROM pragma_user_version),
+                    (SELECT schema_version FROM pragma_schema_version)",
+            (),
+            |row| Ok((row.get::<i64>(0)?, row.get::<i64>(1)?)),
+        )
+        .unwrap()
+    };
+    let before = versions();
+    assert_eq!(before.0, 23);
+    let error = open_runtime_store(&f.db, &old, StoreOpen::Runtime)
+        .await
+        .err()
+        .expect("ordinary opens must wait for startup migration");
+    assert!(db::is_schema_not_ready(&error), "{error:#}");
+    assert_eq!(versions(), before, "ordinary open must leave schema intact");
+
+    drop(
+        open_runtime_store(&f.db, &old, StoreOpen::Startup)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(versions().0, db::guild_data::SCHEMA_VERSION);
+    assert_ne!(versions().1, before.1, "startup installs the migration");
+    let upgraded = versions();
+    drop(
+        open_runtime_store(&f.db, &old, StoreOpen::Runtime)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(versions(), upgraded);
+}
+
+#[tokio::test]
 async fn shared_and_dedicated_guilds_keep_independent_cases() {
     let dedicated = std::env::temp_dir().join(format!(
         "jmodguard_tenant_{:032x}.dedicated.db",
@@ -2413,7 +2468,7 @@ async fn cold_store_open_yields_to_deadline_and_cancels_remote_probe() {
     let started = Instant::now();
     let result = tokio::time::timeout(
         Duration::from_millis(100),
-        open_runtime_store(&f.db, &resolved),
+        open_runtime_store(&f.db, &resolved, StoreOpen::Runtime),
     )
     .await;
     let elapsed = started.elapsed();

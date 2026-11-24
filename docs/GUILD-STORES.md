@@ -56,7 +56,7 @@ pairs fail instead of falling back to a local file. Synchronous open/initializat
 on a startup or blocking worker, like core database opening.
 
 The separate `jmodguard-guild-1` family starts at the v0.2.0 baseline (schema
-version 17) and applies migrations 0017–0022 to reach version 23. The baseline
+version 17) and applies migrations 0017–0023 to reach version 24. The baseline
 includes the earlier schema changes described below. Version1 introduced an immutable singleton identity (family, store ID,
 shared/dedicated owner), immutable initial
 guild/revision bindings and mutation receipts. Version2 adds captured membership and
@@ -93,16 +93,17 @@ channel names for the rule editor pickers. Names are display data only. Version 
 adds virtual sort keys and scoped indexes for the [Cases list](TENANT-CASES.md).
 Version 22 adds virtual sort keys and scoped indexes for the [Members list](MEMBERS.md#search-and-history).
 Version 23 replaces the virtual Member name key and rebuilds its four indexes to skip empty names.
-The onboarding trap uses an optional extension installed by the bot on its first
-onboarding storage write. Both rollout orders work with schema 23. Older services
-continue reading the existing case and server-name JSON. A new API reads older
-snapshots and shows setup checks as unavailable until it receives a bot observation.
+Version 24 adds separate columns for onboarding setup observations and private
+case visibility. Existing case and server-name JSON keeps its original shape,
+and the dashboard shows setup checks as unavailable until the bot records an
+observation. Deploy matching bot and API images through the
+[paired upgrade](BUNNY-UPDATES.md#schema-upgrades-and-recovery).
 Guild-store migrations run separately from core bootstrap.
 
 | Operation | Contract |
 |---|---|
-| `initialize` | Initialize an empty database atomically, upgrade a matching store at version 17 or later to schema 23, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
-| `open` | Verify the current schema 23 identity and ownership; create no schema or binding. |
+| `initialize` | At bot startup, initialize an empty database atomically, upgrade a matching store at version 17 or later to schema 24, or verify a current identity. Refuse core, foreign, unmarked, newer or mismatched stores without adopting them. |
+| `open` | Verify the current schema 24 identity and ownership. Ordinary runtime opens create no schema or binding. |
 | `bind_initial_placement` | Verify identity and install the catalog's initial guild/revision in one primary transaction. Matching retries write nothing; a different revision or dedicated owner conflicts. |
 | `verify_placement` | Check identity, ownership and the exact stored guild/revision in one primary snapshot; missing bindings fail. This is not authorization for a later separate data operation. |
 

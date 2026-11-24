@@ -156,13 +156,6 @@ async fn server_names_store_a_sorted_bounded_snapshot_and_skip_unchanged_writes(
 #[tokio::test]
 async fn onboarding_observations_keep_legacy_names_and_reject_older_updates() {
     let (_f, store, scope) = ready().await;
-    assert!(
-        !store
-            .db
-            .with_conn(|conn| has_onboarding_trap_storage(conn))
-            .await
-            .unwrap()
-    );
     let legacy_names = ServerNames {
         roles: vec![role("11", "Trap", 1)],
         ..ServerNames::default()
@@ -238,8 +231,8 @@ async fn onboarding_observations_keep_legacy_names_and_reject_older_updates() {
         .await
         .unwrap();
     assert_eq!(
-        current, 23,
-        "previous binaries still see their original schema version"
+        current, SCHEMA_VERSION,
+        "the refreshed snapshot uses the migrated schema"
     );
     store
         .db

@@ -1,5 +1,5 @@
--- Optional schema 23 extension. The bot installs it in a scoped write.
--- Existing column lists, JSON contracts and the schema stamp stay compatible.
+-- Guild schema 24. Keep the existing snapshot and case JSON readable by
+-- consumers that use the legacy projections.
 ALTER TABLE guild_server_names ADD COLUMN onboarding_trap TEXT
     CHECK(onboarding_trap IS NULL OR
           (json_valid(onboarding_trap) AND length(CAST(onboarding_trap AS BLOB)) <= 32768));
@@ -12,8 +12,7 @@ BEFORE UPDATE OF hide_from_member_history ON guild_cases
 WHEN NEW.hide_from_member_history != OLD.hide_from_member_history
 BEGIN SELECT RAISE(ABORT, 'case member visibility is immutable'); END;
 
--- A previous bot can still run its original index backfill after rollback.
--- Ignore attempts to index private cases, including pre-release JSON rows.
+-- Keep private cases out of the projection even with the legacy backfill SQL.
 CREATE TRIGGER guild_member_case_index_hide_private
 AFTER INSERT ON guild_member_case_index
 WHEN EXISTS (
