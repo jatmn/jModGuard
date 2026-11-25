@@ -4844,11 +4844,12 @@ function assertHeatmapGeometry(m, defaultFontSize) {
   }
 }
 
-for (const { defaultFontSize, heatmapOnly, widths } of [
+for (const { defaultFontSize, heatmapOnly, resourceOnly, widths } of [
   { defaultFontSize: 16, widths: [2560, 1280, 1920, 3440, 320] },
   { defaultFontSize: 24, heatmapOnly: true, widths: [360, 320, 390, 480, 1280] },
   { defaultFontSize: 32, widths: [1280, 320] },
   { defaultFontSize: 48, heatmapOnly: true, widths: [1280, 320] },
+  { defaultFontSize: 64, resourceOnly: true, widths: [320] },
 ]) test(`${heatmapOnly ? 'heatmap cells and labels' : 'chart plots and labels'} fit with a ${defaultFontSize}px browser default font`, { timeout: 120000 }, async t => {
   if (!firefoxBinary || !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url))) {
     assert.ok(!process.env.CI, 'CI requires Firefox and the built WebUI');
@@ -4895,7 +4896,8 @@ for (const { defaultFontSize, heatmapOnly, widths } of [
     ['platform-analytics', '#an-membership-readout', '.an-grid > .an-span-7, .an-grid > .an-span-5'],
     ['usage', '.du-gauge-scale', '#usage-cards > .du-card'],
   ];
-  for (const [tab, ready, cards] of chartPages.filter(([tab]) => !heatmapOnly || tab === 'analytics')) {
+  for (const [tab, ready, cards] of chartPages) {
+    if ((heatmapOnly && tab !== 'analytics') || (resourceOnly && tab !== 'resources')) continue;
     await evaluate(`(async () => {
       const waitFor = async selector => {
         for (let i = 0; i < 100; i++) {
@@ -4922,8 +4924,13 @@ for (const { defaultFontSize, heatmapOnly, widths } of [
         const all = selector => [...main.querySelectorAll(selector)];
         const box = node => node.getBoundingClientRect();
         const font = node => parseFloat(getComputedStyle(node).fontSize);
-        const plots = all('.br-chart svg, .an-figure svg, .an-spark, .du-gauge-track, .du-share');
-        const labels = all('.br-chart svg text, .an-figure svg text, .br-legend-item, .an-readout-item, .du-legend, .du-gauge-scale span');
+        const resourcePlots = all('.br-chart svg');
+        const plots = ${resourceOnly === true}
+          ? resourcePlots.filter(plot => plot.getAttribute('aria-label').startsWith('Bot CPU,'))
+          : all('.br-chart svg, .an-figure svg, .an-spark, .du-gauge-track, .du-share');
+        const labels = ${resourceOnly === true}
+          ? plots.flatMap(plot => [...plot.querySelectorAll('text')])
+          : all('.br-chart svg text, .an-figure svg text, .br-legend-item, .an-readout-item, .du-legend, .du-gauge-scale span');
         const overlaps = (a, b) => a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1;
         const collision = groups => groups.flatMap(group => group.flatMap((a, i) =>
           group.slice(i + 1).filter(b => overlaps(box(a), box(b))).map(b => a.textContent + ' / ' + b.textContent)));
@@ -4942,11 +4949,16 @@ for (const { defaultFontSize, heatmapOnly, widths } of [
           }),
           collisions: collision(plots.map(plot => [...plot.querySelectorAll('text')])
             .concat(all('.du-gauge-scale').map(scale => [...scale.querySelectorAll('span')]))),
-          resourceRanges: all('.br-chart svg').map(plot => {
+          resourceRanges: resourcePlots.map(plot => {
             const axis = plot.querySelector('.an-gridline line');
             return { chart: plot.getAttribute('aria-label').split(',')[0], endpoints: [axis.x1.baseVal.value, axis.x2.baseVal.value],
+              valueLabels: [...plot.querySelectorAll('.an-gridline text')].map(node => {
+                const { top, bottom } = box(node);
+                return { top, bottom };
+              }),
               labels: [...plot.querySelectorAll('.an-axis-day')].map(node => ({ text: node.textContent,
-                anchor: node.x.baseVal.getItem(0).value, mark: node.parentElement.querySelector('line').x1.baseVal.value })) };
+                anchor: node.x.baseVal.getItem(0).value, mark: node.parentElement.querySelector('line').x1.baseVal.value,
+                top: box(node).top })) };
           }),
           heights: plots.map(plot => box(plot).height),
           sparks: all('.an-spark').length,
@@ -4960,6 +4972,20 @@ for (const { defaultFontSize, heatmapOnly, widths } of [
       for (const [label, horizontal, vertical] of m.labels) {
         assert.ok(Math.abs(horizontal - m.bodyFont) <= defaultFontSize / 16 && Math.abs(vertical - m.bodyFont) <= defaultFontSize / 16,
           `${name}: ${label} renders at ${horizontal.toFixed(1)} × ${vertical.toFixed(1)} CSS px near ${m.bodyFont}px body text`);
+      }
+      if (resourceOnly) {
+        const botCpu = m.resourceRanges.find(({ chart }) => chart === 'Bot CPU');
+        assert.ok(botCpu, 'bot CPU chart rendered');
+        assert.ok(m.heights.every(height => height === 280), `${name}: plots reach the height cap`);
+        for (const { chart, valueLabels, labels } of m.resourceRanges) {
+          assert.equal(valueLabels.length, 2, `${chart} shows both value labels`);
+          const [upper, lower] = valueLabels;
+          const overlap = upper.bottom - lower.top;
+          assert.ok(overlap <= 1, `${chart} value labels overlap by ${overlap.toFixed(1)}px`);
+          assert.ok(labels.length > 0, `${chart} shows a date label`);
+          assert.ok(labels.every(({ top }) => lower.bottom <= top + 1), `${chart} value labels stay above the date rows`);
+        }
+        assert.equal(new Set(botCpu.labels.map(({ top }) => top)).size, 2, 'Bot CPU uses two date rows at the cap');
       }
       assert.deepEqual(m.clipped, [], `${name}: labels fit the plot`);
       assert.deepEqual(m.collisions, [], `${name}: axis labels have space`);
