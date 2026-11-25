@@ -5055,7 +5055,7 @@ for (const { defaultFontSize, heatmapOnly, resourceOnly, widths } of [
   { defaultFontSize: 24, heatmapOnly: true, widths: [360, 320, 390, 480, 1280] },
   { defaultFontSize: 32, widths: [1280, 320] },
   { defaultFontSize: 48, heatmapOnly: true, widths: [1280, 320] },
-  { defaultFontSize: 64, resourceOnly: true, widths: [320] },
+  { defaultFontSize: 64, resourceOnly: true, widths: [308, 320, 418, 419] },
 ]) test(`${heatmapOnly ? 'heatmap cells and labels' : 'chart plots and labels'} fit with a ${defaultFontSize}px browser default font`, { timeout: 120000 }, async t => {
   if (!firefoxBinary || !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url))) {
     assert.ok(!process.env.CI, 'CI requires Firefox and the built WebUI');
@@ -5132,17 +5132,20 @@ for (const { defaultFontSize, heatmapOnly, resourceOnly, widths } of [
         const font = node => parseFloat(getComputedStyle(node).fontSize);
         const resourcePlots = all('.br-chart svg');
         const plots = ${resourceOnly === true}
-          ? resourcePlots.filter(plot => plot.getAttribute('aria-label').startsWith('Bot CPU,'))
+          ? resourcePlots
           : all('.br-chart svg, .an-figure svg, .an-spark, .du-gauge-track, .du-share');
         const labels = ${resourceOnly === true}
           ? plots.flatMap(plot => [...plot.querySelectorAll('text')])
           : all('.br-chart svg text, .an-figure svg text, .br-legend-item, .an-readout-item, .du-legend, .du-gauge-scale span');
+        const fontLabels = ${resourceOnly === true}
+          ? labels.filter(node => node.matches('.an-axis-day') || node.closest('svg').getAttribute('aria-label').startsWith('Bot CPU,'))
+          : labels;
         const overlaps = (a, b) => a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1;
         const collision = groups => groups.flatMap(group => group.flatMap((a, i) =>
           group.slice(i + 1).filter(b => overlaps(box(a), box(b))).map(b => a.textContent + ' / ' + b.textContent)));
         return JSON.stringify({
           bodyFont: font(document.body),
-          labels: labels.map(node => {
+          labels: fontLabels.map(node => {
             const transform = node.getScreenCTM?.();
             return [node.textContent, font(node) * (transform?.a ?? 1), font(node) * (transform?.d ?? 1)];
           }),
@@ -5195,10 +5198,13 @@ for (const { defaultFontSize, heatmapOnly, resourceOnly, widths } of [
       }
       assert.deepEqual(m.clipped, [], `${name}: labels fit the plot`);
       assert.deepEqual(m.collisions, [], `${name}: axis labels have space`);
-      if (tab === 'resources' && width === 320 && defaultFontSize === 32) {
+      if (tab === 'resources' && (resourceOnly || (width === 320 && defaultFontSize === 32))) {
         assert.ok(m.resourceRanges.some(({ chart }) => chart === 'Bot memory'), 'bot memory chart rendered');
         assert.ok(m.resourceRanges.some(({ chart }) => chart === 'API memory'), 'API memory chart rendered');
         for (const { chart, endpoints, labels } of m.resourceRanges) {
+          const plotWidth = endpoints[1] - endpoints[0];
+          const minimumPlotWidth = resourceOnly ? 32 : 1;
+          assert.ok(plotWidth >= minimumPlotWidth, `${chart} needs a usable plot width at ${name}, got ${plotWidth}px`);
           assert.deepEqual(labels.map(({ text }) => text.slice(0, 6)), ['Nov 17', 'Nov 18'], `${chart} shows both dates`);
           labels.forEach(({ anchor, mark }, i) => {
             assert.equal(anchor, endpoints[i], `${chart} date stays at its endpoint`);
