@@ -37,12 +37,12 @@ async fn ready() -> (Fixture, StoreRegistration, GuildDataStore, GuildDataScope)
 #[tokio::test]
 async fn snapshot_accounting_tracks_edits_consumption_expiry_and_eviction() {
     let (_fixture, _registration, store, scope) = ready().await;
-    for id in [101, 102, 103, 104] {
+    // Let creation order disagree with both insertion order and message ID order.
+    for (id, created_offset) in [(101, 0), (102, 0), (103, -500), (104, 0)] {
+        let mut input = observation(id, Some("A"), None, 1);
+        input.created_at_ms = at(created_offset);
         assert_eq!(
-            store
-                .observe_snapshot(scope.clone(), observation(id, Some("A"), None, 1))
-                .await
-                .unwrap(),
+            store.observe_snapshot(scope.clone(), input).await.unwrap(),
             SnapshotOutcome::Stored
         );
     }
@@ -77,6 +77,22 @@ async fn snapshot_accounting_tracks_edits_consumption_expiry_and_eviction() {
             .is_none()
     );
     assert_eq!(store.evict_snapshots(1, at(300)).await.unwrap(), 1);
+    assert!(
+        store
+            .retained_snapshot(scope.clone(), 20, 103)
+            .await
+            .unwrap()
+            .is_none(),
+        "pressure eviction must remove the oldest observation"
+    );
+    assert!(
+        store
+            .retained_snapshot(scope.clone(), 20, 102)
+            .await
+            .unwrap()
+            .is_some(),
+        "pressure eviction must preserve the newer observation"
+    );
     assert_eq!(
         store.expire_snapshots(100, at(86_400_001)).await.unwrap(),
         1
@@ -352,7 +368,7 @@ async fn queued_observation_cannot_write_after_original_expiry() {
 }
 
 #[tokio::test]
-async fn stale_delete_clock_cannot_report_expired_snapshot() {
+async fn retained_lookup_and_stale_delete_clock_cannot_report_expired_snapshot() {
     let (_, _, store, scope) = ready().await;
     let created = at(-86_400_001);
     let expires = created + 86_400_000;
@@ -368,6 +384,28 @@ async fn stale_delete_clock_cannot_report_expired_snapshot() {
         )?;
         tx.commit()
     }).await.unwrap();
+    assert_eq!(
+        store
+            .observe_snapshot(scope.clone(), observation(94, Some("live"), None, 1))
+            .await
+            .unwrap(),
+        SnapshotOutcome::Stored
+    );
+    assert!(
+        store
+            .retained_snapshot(scope.clone(), 20, 94)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .retained_snapshot(scope.clone(), 20, 93)
+            .await
+            .unwrap()
+            .is_none(),
+        "a persisted observation must be hidden as soon as it expires"
+    );
     assert!(
         store
             .take_snapshot(scope.clone(), 20, 93, created + 2)
