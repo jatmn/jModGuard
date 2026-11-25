@@ -9476,39 +9476,59 @@ function tabSettings() {
     ),
   );
 
-  const [roleBaseline, setRoleBaseline] = useState("");
+  const [roleBaseline, setRoleBaseline] = useState(null);
+  const [accessRoleSettings, setAccessRoleSettings] = useState(null);
   const roleInputRef = useRef(null);
   const roleInput = h(Input, {
     ref: roleInputRef,
     draftKey: "settings:roles",
-    defaultValue: roleBaseline,
+    defaultValue: roleBaseline ?? "",
     type: "text",
     placeholder: "role id, <@&id> mention, comma-separated",
     className: "input",
   });
   const roleRevision = useRef("");
   const roleWriteGeneration = useRef(0);
-  const canEditCaseRemoval = canManageServer() && !isPreview() && selectedGuild()?.can_delete_cases === true;
+  const canManageRoles = canManageServer();
+  const canEditCaseRemoval = canManageRoles && !isPreview() && selectedGuild()?.can_delete_cases === true;
   useEffect(() => {
-    if (!canEditCaseRemoval) return undefined;
+    if (!canManageRoles) return undefined;
     let active = true;
+    const guildId = state.guildId;
     const initialRoleGeneration = roleWriteGeneration.current;
-    apiRead(`/api/guilds/${state.guildId}/case-delete-roles`)
-      .then((roles) => {
-        if (!active || initialRoleGeneration !== roleWriteGeneration.current) return;
-        const loadedValue = (roles.roles || []).join(", ");
-        setRoleBaseline(loadedValue);
-        roleRevision.current = roles.revision || "";
-      })
-      .catch((e) => {
-        if (active && !isUnauthenticated(e)) reportApiError(e);
-      });
+    const load = async () => {
+      const accessPath = `/api/guilds/${guildId}/access-roles`;
+      const readPath = canEditCaseRemoval ? `${accessPath}?include_case_delete_roles=true` : accessPath;
+      const loaded = await apiRead(readPath);
+      if (!active) return;
+      try {
+        if (canEditCaseRemoval) {
+          // Older API versions ignore the projection query. Finish their
+          // follow-up before either card can submit a new save.
+          const caseRoles = loaded.case_delete_roles ??
+            (await apiRead(`/api/guilds/${guildId}/case-delete-roles`)).roles;
+          if (active && initialRoleGeneration === roleWriteGeneration.current) {
+            setRoleBaseline((caseRoles || []).join(", "));
+          }
+        }
+      } finally {
+        if (active) {
+          // Use the access snapshot revision even if the legacy case read
+          // saw a later edit. A save must still detect that conflict.
+          if (initialRoleGeneration === roleWriteGeneration.current) roleRevision.current = loaded.revision || "";
+          setAccessRoleSettings({ roles: accessRoleRows(loaded.roles || []), ttl_secs: loaded.ttl_secs });
+        }
+      }
+    };
+    load().catch((e) => {
+      if (active && !isUnauthenticated(e)) reportApiError(e);
+    });
     return () => {
       active = false;
     };
   }, []);
-  if (canManageServer()) cards.push(
-    h(AccessRolesCard, { key: "access-roles", revision: roleRevision, generation: roleWriteGeneration }),
+  if (canManageRoles) cards.push(
+    h(AccessRolesCard, { key: "access-roles", settings: accessRoleSettings, revision: roleRevision, generation: roleWriteGeneration }),
   );
   if (canEditCaseRemoval) cards.push(
     h(
@@ -9538,7 +9558,7 @@ function tabSettings() {
               onClick: async () => {
                 const saved = await api(`/api/guilds/${state.guildId}/case-delete-roles`, "PUT", {
                   roles: splitIds(roleInputRef.current.value),
-                  revision: roleRevision.current,
+                  revision: roleBaseline === null ? "" : roleRevision.current,
                 }, undefined, () => apiRead(`/api/guilds/${state.guildId}/case-delete-roles`));
                 roleWriteGeneration.current++;
                 roleRevision.current = saved.revision;
@@ -9672,18 +9692,22 @@ const ACCESS_LEVELS = [
   ["settings", "Dashboard and settings"],
 ];
 
+function accessRoleRows(roles) {
+  return roles.map((role) => ({ ...role, key: crypto.randomUUID() }));
+}
+
 // Role -> access mappings for this server. Only Manage Server sees this card;
 // the API refuses the read and the save for everyone else.
 // Access and case-removal roles share one server revision, so both cards use
 // the same revision and write-generation refs from the Settings tab.
-function AccessRolesCard({ revision, generation }) {
+function AccessRolesCard({ settings, revision, generation }) {
   const guildId = state.guildId;
-  const [baselineRows, setBaselineRows] = useState(null);
-  const [ttl, setTtl] = useState(30);
+  const [savedRows, setSavedRows] = useState(null);
+  const baselineRows = savedRows ?? settings?.roles ?? null;
+  const ttl = settings?.ttl_secs || 30;
   const draftKey = "settings:access-roles";
   const draftRows = useStore(ui, ({ drafts }) => drafts[draftKey]?.value);
   const rows = baselineRows === null ? null : draftRows ?? baselineRows;
-  const withKeys = (roles) => roles.map((role) => ({ ...role, key: crypto.randomUUID() }));
   const changeRows = (next) => {
     const values = (items) => JSON.stringify(items.map(({ role_id, level }) => ({ role_id, level })));
     const nextDrafts = { ...currentDrafts() };
@@ -9691,23 +9715,6 @@ function AccessRolesCard({ revision, generation }) {
     else nextDrafts[draftKey] = { value: next, group: "access-roles" };
     ui.set({ drafts: nextDrafts, edits: Object.keys(nextDrafts).length > 0 ? "dirty" : "clean" });
   };
-  useEffect(() => {
-    let active = true;
-    const initialGeneration = generation.current;
-    apiRead(`/api/guilds/${guildId}/access-roles`)
-      .then((loaded) => {
-        if (!active) return;
-        if (initialGeneration === generation.current) revision.current = loaded.revision || "";
-        setTtl(loaded.ttl_secs || 30);
-        setBaselineRows(withKeys(loaded.roles || []));
-      })
-      .catch((e) => {
-        if (active && !isUnauthenticated(e)) reportApiError(e);
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
   const update = (key, patch) => {
     changeRows(rows.map((row) => (row.key === key ? { ...row, ...patch } : row)));
   };
@@ -9783,7 +9790,7 @@ function AccessRolesCard({ revision, generation }) {
                   className: "btn",
                   type: "button",
                   disabled: rows.length >= 32,
-                  onClick: () => changeRows([...rows, ...withKeys([{ role_id: "", level: "dashboard" }])]),
+                  onClick: () => changeRows([...rows, ...accessRoleRows([{ role_id: "", level: "dashboard" }])]),
                 },
                 "Add role",
               ),
@@ -9803,7 +9810,7 @@ function AccessRolesCard({ revision, generation }) {
                     }, undefined, () => apiRead(`/api/guilds/${guildId}/access-roles`));
                     generation.current++;
                     revision.current = saved.revision;
-                    setBaselineRows(withKeys(saved.roles || roles));
+                    setSavedRows(accessRoleRows(saved.roles || roles));
                     const nextDrafts = { ...currentDrafts() };
                     delete nextDrafts[draftKey];
                     ui.set({ drafts: nextDrafts, edits: Object.keys(nextDrafts).length > 0 ? "dirty" : "clean" });

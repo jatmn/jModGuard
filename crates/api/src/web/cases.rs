@@ -72,11 +72,19 @@ async fn scoped(
     Ok((auth, enrollment))
 }
 
-fn can_delete_cases(auth: &AuthCtx, guild_id: u64) -> bool {
+pub(super) fn can_delete_cases(auth: &AuthCtx, guild_id: u64) -> bool {
     auth.guilds
         .iter()
         .find(|guild| guild.id == guild_id.to_string())
         .is_some_and(|guild| guild.administrator_permission())
+}
+
+pub(super) fn case_delete_roles_wire(roles: Vec<i64>, can_delete: bool) -> Vec<String> {
+    if can_delete {
+        roles.into_iter().map(|id| id.to_string()).collect()
+    } else {
+        Vec::new()
+    }
 }
 
 async fn live(
@@ -477,17 +485,8 @@ pub async fn get_case_delete_roles(
     let (store, scope) = live(&app, enrollment).await?;
     let settings = store.tenant_settings(scope).await?;
     let can_delete = can_delete_cases(&auth, guild_id);
-    let roles: Vec<_> = if can_delete {
-        settings
-            .case_delete_roles
-            .into_iter()
-            .map(|id| id.to_string())
-            .collect()
-    } else {
-        Vec::new()
-    };
     Ok(Json(serde_json::json!({
-        "roles": roles,
+        "roles": case_delete_roles_wire(settings.case_delete_roles, can_delete),
         "revision": settings.revision,
         "can_delete": can_delete,
         "delegated_roles_require_member_scope": true,
