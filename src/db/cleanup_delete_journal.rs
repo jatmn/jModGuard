@@ -123,6 +123,25 @@ pub struct CleanupJournalKey<'a> {
     pub enrollment_id: &'a str,
     pub batch: &'a str,
     pub messages: &'a [i64],
+    pub recovery: Option<(&'a str, &'a CleanupRecovery)>,
+}
+
+fn recovery_owner(instance: &str) -> String {
+    // Released recovery rows must remain visible to scans that exclude the
+    // current process's live incidents.
+    format!("recovery:{instance}")
+}
+
+/// Keeps recovery open while a detached arm can still make a row replayable.
+#[derive(Default)]
+pub struct CleanupRecovery {
+    pending: Arc<()>,
+}
+
+impl CleanupRecovery {
+    pub fn has_pending_claims(&self) -> bool {
+        Arc::strong_count(&self.pending) > 1
+    }
 }
 
 pub async fn ensure_cleanup_enrollment(db: &Db, guild: i64, enrollment_id: String) -> Result<()> {
@@ -152,6 +171,7 @@ pub struct CleanupDispatchClaim {
     messages: String,
     count: usize,
     token: i64,
+    _recovery: Option<Arc<()>>,
 }
 
 impl CleanupDispatchClaim {
@@ -165,8 +185,10 @@ impl CleanupDispatchClaim {
             messages: serde_json::to_string(key.messages)?,
             count: key.messages.len(),
             token: rand::random_range(2..=i64::MAX),
+            _recovery: key.recovery.map(|(_, scope)| Arc::clone(&scope.pending)),
         };
-        claim.transition(None, -claim.token).await?;
+        let owner = key.recovery.map(|(instance, _)| recovery_owner(instance));
+        claim.transition(None, -claim.token, owner).await?;
         #[cfg(feature = "test-support")]
         if let Ok(committed) = TEST_CLEANUP_CLAIM_COMMITTED.try_with(Arc::clone) {
             committed.notify_one();
@@ -182,12 +204,21 @@ impl CleanupDispatchClaim {
         let (ready, armed) = tokio::sync::oneshot::channel();
         let (start, started) = tokio::sync::oneshot::channel();
         let claim = self.clone();
+        #[cfg(feature = "test-support")]
+        let probe = TEST_CLEANUP_ARM_COMMITTED.try_with(Clone::clone).ok();
         tokio::spawn(async move {
             if ready.is_closed() {
                 return;
             }
-            let result = claim.transition(Some(-claim.token), claim.token).await;
+            let result = claim
+                .transition(Some(-claim.token), claim.token, None)
+                .await;
             let armed = result.is_ok();
+            #[cfg(feature = "test-support")]
+            if armed && let Some((committed, resume)) = probe {
+                committed.notify_one();
+                resume.notified().await;
+            }
             if ready.send(result).is_ok() && armed && started.await.is_ok() {
                 return;
             }
@@ -220,16 +251,21 @@ impl CleanupDispatchClaim {
 
     /// Recheck an already armed bulk report before sending another part.
     pub async fn verify_armed(&self) -> Result<()> {
-        self.transition(Some(self.token), self.token).await
+        self.transition(Some(self.token), self.token, None).await
     }
 
     /// Reopen only this attempt after cancellation before handoff or a
     /// definitive rejection. A failed arm can leave the recoverable claim as-is.
     pub async fn release(&self) -> Result<()> {
-        self.transition(Some(self.token), 0).await
+        self.transition(Some(self.token), 0, None).await
     }
 
-    async fn transition(&self, expected: Option<i64>, next: i64) -> Result<()> {
+    async fn transition(
+        &self,
+        expected: Option<i64>,
+        next: i64,
+        owner: Option<String>,
+    ) -> Result<()> {
         let Self {
             db,
             guild,
@@ -237,7 +273,7 @@ impl CleanupDispatchClaim {
             batch,
             messages,
             count,
-            token: _,
+            ..
         } = self.clone();
         db.with_conn(move |conn| {
             let mut tx = conn.transaction_primary_write()?;
@@ -252,14 +288,14 @@ impl CleanupDispatchClaim {
             };
             // Releasing this token cannot authorize another send across a fence.
             let changed = tx.execute_bounded(
-                "UPDATE cleanup_delete_journal SET dispatching=?6
+                "UPDATE cleanup_delete_journal SET dispatching=?6, owner=coalesce(?7, owner)
                   WHERE batch=?1 AND message_id IN (SELECT value FROM json_each(?2))
                     AND guild_id=?3 AND enrollment_id=?4
                     AND ((?5 IS NULL AND dispatching<=0) OR dispatching=?5)
                     AND EXISTS (SELECT 1 FROM guild_enrollments e
                                 WHERE e.guild_id=?3 AND e.id=?4 AND e.active=1)
                     AND (?6=0 OR NOT EXISTS (SELECT 1 FROM guild_write_fences f WHERE f.guild_id=?3))",
-                params![batch, messages, guild, enrollment, expected, next],
+                params![batch, messages, guild, enrollment, expected, next, owner],
                 growth,
             )?;
             if next != 0 {
@@ -278,6 +314,7 @@ impl CleanupDispatchClaim {
 tokio::task_local! {
     // Hold the result after the real transaction commits to simulate a lost reply.
     pub static TEST_CLEANUP_CLAIM_COMMITTED: Arc<tokio::sync::Notify>;
+    pub static TEST_CLEANUP_ARM_COMMITTED: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 }
 
 pub async fn settle_cleanup_deletes(db: &Db, keys: Vec<(String, i64)>) -> Result<()> {
@@ -295,18 +332,27 @@ pub async fn settle_cleanup_deletes(db: &Db, keys: Vec<(String, i64)>) -> Result
     .await
 }
 
-pub async fn prune_cleanup_journal(db: &Db, owner: String) -> Result<usize> {
+pub async fn prune_cleanup_journal(
+    db: &Db,
+    owner: String,
+    recovery: &CleanupRecovery,
+) -> Result<usize> {
+    // Once the detached work drains, an armed recovery row left behind by a
+    // failed settlement is subject to the ordinary possibly-sent rule.
+    let recovering = recovery
+        .has_pending_claims()
+        .then(|| recovery_owner(&owner));
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
         tx.prepare_reclaim()?;
         let removed = tx.execute_reclaim(
             "DELETE FROM cleanup_delete_journal WHERE rowid IN (
                  SELECT d.rowid FROM cleanup_delete_journal d
-                  WHERE (d.owner<>?1 AND d.dispatching>0)
+                  WHERE (d.owner<>?1 AND (?2 IS NULL OR d.owner<>?2) AND d.dispatching>0)
                      OR NOT EXISTS (SELECT 1 FROM guild_enrollments e
                          WHERE e.guild_id=d.guild_id AND e.id=d.enrollment_id AND e.active=1)
                   ORDER BY d.rowid LIMIT 256)",
-            params![owner],
+            params![owner, recovering],
         )?;
         tx.commit()?;
         Ok(removed)

@@ -329,15 +329,16 @@ async fn abrupt_restart_recovers_confirmed_deletes_once_as_individual_notices() 
     f.rest(Some(&cleanup), 1, 101).await;
     f.remember(SUBJECT, 2, 102);
     cleanup.begin_purge(PURGE_WINDOW_SECS, BAN_REQUESTED_AT_MS);
-    claim_cleanup_gateway(
+    let observation = claim_cleanup_gateway(
         &f.app,
         GuildId::new(GUILD),
         ChannelId::new(2),
         MessageId::new(102),
         None,
         GatewayDeleteOrigin::Bulk,
-    );
-    persist_cleanup_observations(&f.app).await;
+    )
+    .unwrap();
+    persist_cleanup_observations(&f.app, &[observation]).await;
     cleanup.failed(3, 103, "missing permission");
     let path = Arc::clone(&f.path);
     drop(cleanup);
@@ -484,6 +485,90 @@ async fn interrupted_claim_reply_is_retried_or_recovered_with_one_post() {
 }
 
 #[tokio::test]
+async fn recovery_keeps_a_committed_arm_until_its_unstarted_post_is_reopened() {
+    use std::sync::atomic::Ordering;
+    use tokio::sync::Notify;
+
+    let f = Fixture::new(true).await;
+    f.enroll().await;
+    let cleanup = f.begin().await.unwrap();
+    f.rest(Some(&cleanup), 1, 101).await;
+    drop(cleanup);
+    let path = Arc::clone(&f.path);
+    drop(f);
+    let restarted = BotState::new(Default::default(), db::Db::open(&path.0, 2).unwrap()).unwrap();
+    restarted.activation.mark_lock_held(true);
+    let (http, posts, server) = scripted_discord_proxy(vec![successful_summary_reply()]).await;
+    let http = Arc::new(http);
+    let committed = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    let interrupted_sender = tokio::spawn(db::TEST_CLEANUP_ARM_COMMITTED.scope(
+        (Arc::clone(&committed), Arc::clone(&resume)),
+        {
+            let app = Arc::clone(&restarted);
+            let http = Arc::clone(&http);
+            async move { recover_cleanup_page(&app, http.as_ref(), 0).await }
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(5), committed.notified())
+        .await
+        .unwrap();
+    interrupted_sender.abort();
+    assert!(interrupted_sender.await.unwrap_err().is_cancelled());
+    assert_eq!(posts.load(Ordering::SeqCst), 0);
+
+    let owner = restarted.activation.instance().to_owned();
+    assert_eq!(
+        db::prune_cleanup_journal(&restarted.db, owner, &restarted.cleanup_incidents.recovery)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        recover_cleanup_page(&restarted, http.as_ref(), 0)
+            .await
+            .unwrap(),
+        (None, false)
+    );
+
+    let waiting = Arc::new(Notify::new());
+    let supervisor = tokio::spawn(TEST_RECOVERY_WAITING.scope(Arc::clone(&waiting), {
+        let app = Arc::clone(&restarted);
+        let http = Arc::clone(&http);
+        async move { recover_cleanup_reports(&app, http.as_ref()).await }
+    }));
+    tokio::time::timeout(Duration::from_secs(5), waiting.notified())
+        .await
+        .expect("recovery must wait for the committed arm to reopen");
+    resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while restarted.cleanup_incidents.recovery.has_pending_claims() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(DELIVERY_RETRY).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    let replacement = BotState::new(Default::default(), db::Db::open(&path.0, 2).unwrap()).unwrap();
+    replacement.activation.mark_lock_held(true);
+    assert_eq!(
+        recover_cleanup_page(&replacement, http.as_ref(), 0)
+            .await
+            .unwrap(),
+        (None, false)
+    );
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
 async fn write_fenced_observation_falls_back_after_unfencing_without_blocking_other_guilds() {
     use db::{
         SqlExecutor as _,
@@ -571,13 +656,64 @@ async fn write_fenced_observation_falls_back_after_unfencing_without_blocking_ot
         db::guild_enrollment(&f.app.db, GUILD as i64).await.unwrap(),
         Some(enrollment)
     );
+    // An ordinary Gateway delete contributes no journal keys. It can reach
+    // its normal logging path even while the cleanup journal writer is held.
+    use std::future::Future as _;
+    let observations: Vec<_> = claim_cleanup_gateway(
+        &f.app,
+        GuildId::new(OTHER),
+        ChannelId::new(2),
+        MessageId::new(103),
+        None,
+        GatewayDeleteOrigin::Single,
+    )
+    .into_iter()
+    .collect();
+    assert!(observations.is_empty());
+    let writer = f.app.cleanup_incidents.journal_writer.lock().await;
+    let persist = persist_cleanup_observations(&f.app, &observations);
+    tokio::pin!(persist);
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(persist.as_mut().poll(cx)))
+            .await
+            .is_ready()
+    );
+    drop(writer);
+    // Even a healthy guild's new cleanup work cannot pull the newly
+    // writable record out of the worker's deferred queue.
+    let healthy = f.begin_in(OTHER, SUBJECT).await.unwrap();
+    assert!(
+        healthy
+            .deleted(&f.app, 2, 104, healthy.prepare(&f.app, 2, 104), false)
+            .await
+    );
+    drop(healthy);
+    let journaled = f
+        .app
+        .db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT group_concat(message_id) FROM cleanup_delete_journal",
+                (),
+                |row| Ok(row.get::<String>(0)?),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(journaled, "104");
+
     f.settle().await;
     f.settle().await;
     let notices = f.notices();
-    assert_eq!(notices.len(), 2, "{notices:?}");
-    assert_eq!(f.sink.0.lock()[1].0.get(), DESTINATION);
-    assert!(notices[1].contains("Automod message deleted"));
-    assert!(notices[1].contains("<#1>"));
+    assert_eq!(notices.len(), 3, "{notices:?}");
+    let claims = f.sink.0.lock();
+    let (index, _) = claims
+        .iter()
+        .enumerate()
+        .find(|(_, (channel, _))| channel.get() == DESTINATION)
+        .expect("fenced guild's notice after unfencing");
+    assert!(notices[index].contains("Automod message deleted"));
+    assert!(notices[index].contains("<#1>"));
 }
 
 #[tokio::test]
@@ -1056,7 +1192,7 @@ async fn rejected_purge_replays_bulk_to_its_destination_with_bulk_exclusions() {
     assert!(f.bulk(2, 102).report.is_none());
     assert!(f.bulk(3, 103).report.is_none());
     let prepared = cleanup.prepare(&f.app, 2, 104);
-    claim_cleanup_gateway(
+    let _ = claim_cleanup_gateway(
         &f.app,
         GuildId::new(GUILD),
         ChannelId::new(2),

@@ -1560,7 +1560,7 @@ impl EventHandler for Handler {
         self.app
             .image_spam
             .deleted(guild_id.get(), channel_id.get(), deleted_message_id.get());
-        logging::claim_cleanup_gateway(
+        let observation = logging::claim_cleanup_gateway(
             &self.app,
             guild_id,
             channel_id,
@@ -1574,7 +1574,9 @@ impl EventHandler for Handler {
         self.app
             .text_spam
             .invalidate(guild_id.get(), channel_id.get(), deleted_message_id.get());
-        logging::persist_cleanup_observations(&self.app).await;
+        if let Some(observation) = observation {
+            logging::persist_cleanup_observations(&self.app, &[observation]).await;
+        }
         if !hooked
             && let Some(report) = logging::observed_delete_report(
                 &self.app,
@@ -1609,15 +1611,16 @@ impl EventHandler for Handler {
                 &multiple_deleted_messages_ids,
             );
         }
+        let mut observations = Vec::new();
         for id in &multiple_deleted_messages_ids {
-            logging::claim_cleanup_gateway(
+            observations.extend(logging::claim_cleanup_gateway(
                 &self.app,
                 guild_id,
                 channel_id,
                 *id,
                 None,
                 crate::automod_delete_marks::GatewayDeleteOrigin::Bulk,
-            );
+            ));
             self.app
                 .recent_messages
                 .forget(guild_id.get(), channel_id.get(), id.get());
@@ -1628,7 +1631,7 @@ impl EventHandler for Handler {
                 .text_spam
                 .invalidate(guild_id.get(), channel_id.get(), id.get());
         }
-        logging::persist_cleanup_observations(&self.app).await;
+        logging::persist_cleanup_observations(&self.app, &observations).await;
         if !hooked {
             let ids = crate::snapshot_capture::unique_ids(&multiple_deleted_messages_ids);
             let cfg = self

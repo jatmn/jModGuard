@@ -32,6 +32,7 @@ async fn cleanup_dispatch_requires_every_row_and_an_active_unfenced_enrollment()
         enrollment_id: &enrollment.id,
         batch: "cleanup",
         messages: &[10, 12],
+        recovery: None,
     };
     assert!(CleanupDispatchClaim::reserve(&db, key).await.is_err());
     let key = CleanupJournalKey {

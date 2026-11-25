@@ -15,6 +15,7 @@ const MAX_MESSAGES: usize = 256;
 const MAX_LIFETIME: Duration = Duration::from_secs(30);
 const DELIVERY_RETRY: Duration = Duration::from_secs(10);
 const MAX_DELIVERY_RETRY: Duration = Duration::from_secs(60);
+const JOURNAL_PAGE: usize = 64;
 
 const SUMMARY_TEMPLATE: &str = "Automod cleanup\n\n**User:** {mention} (`{user_id}`)\n**Rule:** {rule} (`{rule_id}`)\n**Action:** {cleanup_action}\n**Deleted:** {cleanup_total}\n**Channels:** {cleanup_channels}\n**Time range:** {cleanup_first} – {cleanup_last}\n**Sample:** {cleanup_sample}\n**Evidence:** {cleanup_evidence}\n**Delete failures:** {cleanup_failures}";
 
@@ -34,6 +35,16 @@ pub(super) fn summary_template(cfg: &crate::state::CachedGuildConfig) -> Option<
 
 type Subject = (u64, u64);
 type Message = (u64, u64);
+pub(crate) type CleanupObservation = (u64, Message);
+
+struct ClaimedDelete {
+    observation: Option<CleanupObservation>,
+}
+
+struct PendingObservation {
+    row: CleanupDeleteRecord,
+    retry_at: Option<Clock>,
+}
 
 #[derive(Default)]
 pub(crate) struct CleanupIncidents {
@@ -41,13 +52,15 @@ pub(crate) struct CleanupIncidents {
     wake: tokio::sync::Notify,
     journal: Mutex<JournalWrites>,
     journal_writer: tokio::sync::Mutex<()>,
+    recovery: db::CleanupRecovery,
 }
 
 #[derive(Default)]
 struct JournalWrites {
-    observed: BTreeMap<(u64, Message), CleanupDeleteRecord>,
-    skipped: BTreeMap<(u64, Message), CleanupDeleteSave>,
+    observed: BTreeMap<CleanupObservation, PendingObservation>,
+    skipped: BTreeMap<CleanupObservation, CleanupDeleteSave>,
     settled: BTreeSet<(u64, i64)>,
+    settlement_retry_at: Option<Clock>,
 }
 
 fn batch_key(nonce: u64) -> String {
@@ -251,17 +264,17 @@ impl Cleanup<'_> {
         } else {
             CleanupDeleteClaim::Rest(prepared)
         };
-        let mut claimed = false;
+        let mut claimed = None;
         self.update(|incident| {
             if !gateway_required || incident.accepts_purge_receipt() {
                 claimed =
                     incident.claim_delete(app, self.subject.0, (channel, message), claim, None);
             }
         });
-        if claimed {
-            persist_cleanup_observations(app).await;
+        if let Some(observation) = claimed.as_ref().and_then(|claim| claim.observation) {
+            persist_cleanup_observations(app, &[observation]).await;
         }
-        claimed
+        claimed.is_some()
     }
 
     pub(crate) async fn purge_sweep_gone(
@@ -272,7 +285,7 @@ impl Cleanup<'_> {
         prepared: PreparedAutomodDelete,
     ) -> bool {
         let guild = self.subject.0;
-        let mut claimed = false;
+        let mut claimed = None;
         let mut deferred = false;
         self.update(|incident| {
             if let Some(until) = incident.purge_receipt_until
@@ -290,13 +303,13 @@ impl Cleanup<'_> {
                 );
             }
         });
-        if claimed || !deferred {
+        if claimed.is_some() || !deferred {
             app.recent_messages.forget(guild, channel, message);
         }
-        if claimed {
-            persist_cleanup_observations(app).await;
+        if let Some(observation) = claimed.as_ref().and_then(|claim| claim.observation) {
+            persist_cleanup_observations(app, &[observation]).await;
         }
-        claimed
+        claimed.is_some()
     }
 
     pub(crate) fn failed(&self, channel: u64, message: u64, reason: &'static str) {
@@ -333,7 +346,7 @@ impl Incident {
         target: Message,
         claim: CleanupDeleteClaim,
         retained: Option<&MessageSnapshot>,
-    ) -> bool {
+    ) -> Option<ClaimedDelete> {
         let (channel, message) = target;
         if let Some(Delete {
             result: Ok(snapshot),
@@ -344,6 +357,7 @@ impl Incident {
             if snapshot.is_none() {
                 *snapshot = retained.cloned().map(Box::new);
             }
+            let mut observation = None;
             if let Some(prepared) = claim.prepared() {
                 let promoted =
                     matches!(claim, CleanupDeleteClaim::Rest(_)) && purge_origin.take().is_some();
@@ -354,23 +368,21 @@ impl Incident {
                     prepared.attempt,
                 );
                 if promoted {
-                    self.journal_delete(app, target, false);
+                    observation = self.journal_delete(app, target, false);
                 }
             }
-            return true;
+            return Some(ClaimedDelete { observation });
         }
         if Clock::now() >= self.deadline
             || (self.messages.len() >= MAX_MESSAGES && !self.messages.contains_key(&target))
         {
-            return false;
+            return None;
         }
-        let Some((snapshot, purge_origin)) = app.automod_delete_marks.claim_cleanup_delete(
+        let (snapshot, purge_origin) = app.automod_delete_marks.claim_cleanup_delete(
             (guild, channel, message),
             claim,
             retained,
-        ) else {
-            return false;
-        };
+        )?;
         self.messages.insert(
             target,
             Delete {
@@ -379,31 +391,43 @@ impl Incident {
                 purge_origin,
             },
         );
-        self.journal_delete(app, target, purge_origin.is_some());
+        let observation = self.journal_delete(app, target, purge_origin.is_some());
         self.touch(Clock::now());
-        true
+        Some(ClaimedDelete { observation })
     }
 
-    fn journal_delete(&self, app: &BotState, target: Message, purge: bool) {
-        let Some(enrollment) = &self.enrollment else {
-            return;
+    fn journal_delete(
+        &self,
+        app: &BotState,
+        target: Message,
+        purge: bool,
+    ) -> Option<CleanupObservation> {
+        let enrollment = self.enrollment.as_ref()?;
+        let key = (self.nonce, target);
+        let row = CleanupDeleteRecord {
+            batch: batch_key(self.nonce),
+            guild_id: enrollment.guild_id,
+            enrollment_id: enrollment.id.clone(),
+            channel_id: target.0 as i64,
+            message_id: target.1 as i64,
+            user_id: self.user as i64,
+            rule_id: clip(&self.rule_id, 80),
+            rule_name: self.rule.clone(),
+            observed_at_ms: self.messages[&target].at.timestamp_millis(),
+            purge,
         };
-        app.cleanup_incidents.journal.lock().observed.insert(
-            (self.nonce, target),
-            CleanupDeleteRecord {
-                batch: batch_key(self.nonce),
-                guild_id: enrollment.guild_id,
-                enrollment_id: enrollment.id.clone(),
-                channel_id: target.0 as i64,
-                message_id: target.1 as i64,
-                user_id: self.user as i64,
-                rule_id: clip(&self.rule_id, 80),
-                rule_name: self.rule.clone(),
-                observed_at_ms: self.messages[&target].at.timestamp_millis(),
-                purge,
-            },
-        );
+        app.cleanup_incidents
+            .journal
+            .lock()
+            .observed
+            .entry(key)
+            .and_modify(|pending| pending.row.purge = purge)
+            .or_insert(PendingObservation {
+                row,
+                retry_at: None,
+            });
         app.cleanup_incidents.wake.notify_one();
+        Some(key)
     }
 }
 
@@ -504,40 +528,42 @@ pub(crate) fn claim_cleanup_gateway(
     message: MessageId,
     retained: Option<&MessageSnapshot>,
     origin: GatewayDeleteOrigin,
-) {
+) -> Option<CleanupObservation> {
     if !app.cfg.log.group_automod_cleanup_deletes {
-        return;
+        return None;
     }
     let guild = guild.get();
     let channel = channel.get();
     let id = message.get();
-    let Some((author, created)) = app
+    let (author, created) = app
         .recent_messages
         .identity(guild, channel, id)
         .or_else(|| {
             let row = retained?;
             Some((row.fields.author_id?.try_into().ok()?, row.created_at_ms))
-        })
-    else {
-        return;
-    };
+        })?;
     let mut state = app.cleanup_incidents.inner.lock();
-    if let Some((_, incident)) = state.active.values_mut().rev().find(|(subject, incident)| {
-        *subject == (guild, author)
-            && incident.accepts_purge_receipt()
-            && incident
-                .purge_from
-                .zip(incident.purge_until)
-                .is_some_and(|(from, until)| (from..=until).contains(&created))
-    }) {
-        incident.claim_delete(
+    let (_, incident) = state
+        .active
+        .values_mut()
+        .rev()
+        .find(|(subject, incident)| {
+            *subject == (guild, author)
+                && incident.accepts_purge_receipt()
+                && incident
+                    .purge_from
+                    .zip(incident.purge_until)
+                    .is_some_and(|(from, until)| (from..=until).contains(&created))
+        })?;
+    incident
+        .claim_delete(
             app,
             guild,
             (channel, id),
             CleanupDeleteClaim::Gateway(origin),
             retained,
-        );
-    }
+        )
+        .and_then(|claim| claim.observation)
 }
 
 pub(crate) fn cleanup_delete_failure(error: &serenity::Error) -> &'static str {
@@ -638,7 +664,16 @@ impl CleanupIncidents {
                 )
                 .min()
         };
-        if let Some(next) = next {
+        let retry = {
+            let journal = self.journal.lock();
+            journal
+                .observed
+                .values()
+                .filter_map(|pending| pending.retry_at)
+                .chain(journal.settlement_retry_at)
+                .min()
+        };
+        if let Some(next) = next.into_iter().chain(retry).min() {
             tokio::select! {
                 _ = self.wake.notified() => {},
                 _ = tokio::time::sleep_until(next) => {},
@@ -836,46 +871,121 @@ fn summary_vars(
     Some((vars, confirmed))
 }
 
-pub(crate) async fn persist_cleanup_observations(app: &BotState) {
-    let queue = &app.cleanup_incidents;
-    {
-        let journal = queue.journal.lock();
-        if journal.observed.is_empty() && journal.settled.is_empty() {
-            return;
+pub(crate) async fn persist_cleanup_observations(app: &BotState, keys: &[CleanupObservation]) {
+    for keys in keys.chunks(JOURNAL_PAGE) {
+        let ready = {
+            let journal = app.cleanup_incidents.journal.lock();
+            keys.iter().any(|key| {
+                journal
+                    .observed
+                    .get(key)
+                    .is_some_and(|pending| pending.retry_at.is_none())
+            })
+        };
+        if ready {
+            persist_observation_chunk(app, keys, false).await;
         }
+    }
+}
+
+async fn persist_observation_chunk(app: &BotState, keys: &[CleanupObservation], background: bool) {
+    let queue = &app.cleanup_incidents;
+    let _writer = queue.journal_writer.lock().await;
+    let now = Clock::now();
+    let records: Vec<_> = {
+        let journal = queue.journal.lock();
+        keys.iter()
+            .filter_map(|key| {
+                let pending = journal.observed.get(key)?;
+                pending
+                    .retry_at
+                    .is_none_or(|at| background && at <= now)
+                    .then(|| (*key, pending.row.clone()))
+            })
+            .collect()
+    };
+    if records.is_empty() {
+        return;
+    }
+    let owner = app.activation.instance().to_owned();
+    let rows = records.iter().map(|(_, row)| row.clone()).collect();
+    let outcomes = db::save_cleanup_deletes(&app.db, owner, rows).await;
+    let retry_at = Clock::now() + DELIVERY_RETRY;
+    let mut journal = queue.journal.lock();
+    match outcomes {
+        Ok(outcomes) => {
+            for ((key, row), outcome) in records.into_iter().zip(outcomes) {
+                if let Some(pending) = journal.observed.get_mut(&key)
+                    && pending.row == row
+                {
+                    if outcome == CleanupDeleteSave::WriteFenced {
+                        pending.retry_at = Some(retry_at);
+                    } else {
+                        journal.observed.remove(&key);
+                    }
+                    if outcome != CleanupDeleteSave::Saved {
+                        journal.skipped.insert(key, outcome);
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not journal confirmed cleanup deletes");
+            for (key, row) in records {
+                if let Some(pending) = journal.observed.get_mut(&key)
+                    && pending.row == row
+                {
+                    pending.retry_at = Some(retry_at);
+                }
+            }
+        }
+    }
+}
+
+async fn persist_cleanup_queue(app: &BotState, shutdown: bool) {
+    let queue = &app.cleanup_incidents;
+    let now = Clock::now();
+    let (fresh, mut due) = {
+        let journal = queue.journal.lock();
+        let mut fresh = Vec::new();
+        let mut due = Vec::new();
+        for (&key, pending) in &journal.observed {
+            match pending.retry_at {
+                None => fresh.push(key),
+                Some(at) if at <= now => due.push((at, key)),
+                Some(_) => {}
+            }
+        }
+        (fresh, due)
+    };
+    for keys in fresh.chunks(JOURNAL_PAGE) {
+        persist_observation_chunk(app, keys, true).await;
+    }
+    due.sort_unstable();
+    let limit = if shutdown { due.len() } else { JOURNAL_PAGE };
+    let keys: Vec<_> = due.into_iter().take(limit).map(|(_, key)| key).collect();
+    for keys in keys.chunks(JOURNAL_PAGE) {
+        persist_observation_chunk(app, keys, true).await;
+    }
+}
+
+async fn settle_cleanup_queue(app: &BotState, shutdown: bool) {
+    let queue = &app.cleanup_incidents;
+    if queue.journal.lock().settled.is_empty() {
+        return;
     }
     let _writer = queue.journal_writer.lock().await;
-    let observed: Vec<_> = queue
-        .journal
-        .lock()
-        .observed
-        .iter()
-        .map(|(key, row)| (*key, row.clone()))
-        .collect();
-    for records in observed.chunks(64) {
-        let owner = app.activation.instance().to_owned();
-        let rows = records.iter().map(|(_, row)| row.clone()).collect();
-        let outcomes = match db::save_cleanup_deletes(&app.db, owner, rows).await {
-            Ok(outcomes) => outcomes,
-            Err(error) => {
-                tracing::warn!(%error, "could not journal confirmed cleanup deletes");
-                break;
-            }
-        };
-        let mut journal = queue.journal.lock();
-        for ((key, row), outcome) in records.iter().zip(outcomes) {
-            if journal.observed.get(key) == Some(row) {
-                if outcome != CleanupDeleteSave::Saved {
-                    journal.skipped.insert(*key, outcome);
-                }
-                if outcome != CleanupDeleteSave::WriteFenced {
-                    journal.observed.remove(key);
-                }
-            }
+    let settled = {
+        let journal = queue.journal.lock();
+        if !shutdown
+            && journal
+                .settlement_retry_at
+                .is_some_and(|at| at > Clock::now())
+        {
+            return;
         }
-    }
-
-    let settled = queue.journal.lock().settled.clone();
+        journal.settled.clone()
+    };
     for targets in settled.into_iter().collect::<Vec<_>>().chunks(256) {
         let keys = targets
             .iter()
@@ -883,6 +993,7 @@ pub(crate) async fn persist_cleanup_observations(app: &BotState) {
             .collect();
         if let Err(error) = db::settle_cleanup_deletes(&app.db, keys).await {
             tracing::warn!(%error, "could not settle cleanup journal");
+            queue.journal.lock().settlement_retry_at = Some(Clock::now() + DELIVERY_RETRY);
             return;
         }
         let mut journal = queue.journal.lock();
@@ -890,11 +1001,12 @@ pub(crate) async fn persist_cleanup_observations(app: &BotState) {
             journal.settled.remove(key);
         }
     }
+    queue.journal.lock().settlement_retry_at = None;
 }
 
 pub(crate) async fn flush(app: &Arc<BotState>, sink: &impl LogDelivery, shutdown: bool) {
     let due = app.cleanup_incidents.queue_due(Clock::now(), shutdown);
-    persist_cleanup_observations(app).await;
+    persist_cleanup_queue(app, shutdown).await;
     for id in due {
         let Some(mut lease) = CleanupIncidents::lease(app, id) else {
             continue;
@@ -907,7 +1019,7 @@ pub(crate) async fn flush(app: &Arc<BotState>, sink: &impl LogDelivery, shutdown
             pending.retry_at = pending.retry_at.max(until);
         }
     }
-    persist_cleanup_observations(app).await;
+    settle_cleanup_queue(app, shutdown).await;
 }
 
 impl PendingIncident {
@@ -1039,6 +1151,7 @@ impl PendingIncident {
                             enrollment_id: &enrollment.id,
                             batch: &batch,
                             messages: &confirmed,
+                            recovery: None,
                         });
                 let delivery = emit_cleanup_summary(
                     app,
@@ -1160,6 +1273,7 @@ impl PendingIncident {
             observed_at: None,
             batch: batch_key(self.incident.nonce),
             enrollment_id: self.incident.enrollment.as_ref().map(|e| e.id.as_str()),
+            recovery: None,
         }
     }
 }
@@ -1173,6 +1287,7 @@ struct IndividualCleanup<'a> {
     observed_at: Option<chrono::DateTime<chrono::Utc>>,
     batch: String,
     enrollment_id: Option<&'a str>,
+    recovery: Option<(&'a str, &'a db::CleanupRecovery)>,
 }
 
 impl IndividualCleanup<'_> {
@@ -1183,6 +1298,7 @@ impl IndividualCleanup<'_> {
                 enrollment_id,
                 batch: &self.batch,
                 messages,
+                recovery: self.recovery,
             })
     }
 
@@ -1323,6 +1439,7 @@ impl<'a> From<&'a CleanupDeleteRecord> for IndividualCleanup<'a> {
             observed_at: chrono::DateTime::from_timestamp_millis(record.observed_at_ms),
             batch: record.batch.clone(),
             enrollment_id: Some(&record.enrollment_id),
+            recovery: None,
         }
     }
 }
@@ -1353,7 +1470,8 @@ async fn recover_cleanup_page(
             retry = true;
             continue;
         }
-        let notice = IndividualCleanup::from(&record);
+        let mut notice = IndividualCleanup::from(&record);
+        notice.recovery = Some((app.activation.instance(), &app.cleanup_incidents.recovery));
         // Without the outcome of the interrupted enforcement, a purge echo
         // has known author identity but might have been an unrelated delete.
         let event = if record.purge {
@@ -1372,7 +1490,7 @@ async fn recover_cleanup_page(
 
 async fn recover_cleanup_reports(app: &Arc<BotState>, sink: &impl LogDelivery) {
     let mut after = 0;
-    let mut retry = false;
+    let mut retry = app.cleanup_incidents.recovery.has_pending_claims();
     loop {
         match recover_cleanup_page(app, sink, after).await {
             Ok((Some(last), failed)) => {
@@ -1381,7 +1499,13 @@ async fn recover_cleanup_reports(app: &Arc<BotState>, sink: &impl LogDelivery) {
                 continue;
             }
             Ok((None, _)) if !retry => loop {
-                match db::prune_cleanup_journal(&app.db, app.activation.instance().into()).await {
+                match db::prune_cleanup_journal(
+                    &app.db,
+                    app.activation.instance().into(),
+                    &app.cleanup_incidents.recovery,
+                )
+                .await
+                {
                     Ok(256) => continue,
                     Ok(_) => return,
                     Err(error) => {
@@ -1393,10 +1517,19 @@ async fn recover_cleanup_reports(app: &Arc<BotState>, sink: &impl LogDelivery) {
             Ok((None, _)) => {}
             Err(error) => tracing::warn!(%error, "could not recover pending cleanup deletes"),
         }
+        #[cfg(test)]
+        let _ = TEST_RECOVERY_WAITING.try_with(|notify| notify.notify_one());
         tokio::time::sleep(DELIVERY_RETRY).await;
         after = 0;
-        retry = false;
+        // Snapshot before scanning. A release can make an earlier row
+        // replayable after a page has already passed its cursor.
+        retry = app.cleanup_incidents.recovery.has_pending_claims();
     }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_RECOVERY_WAITING: Arc<tokio::sync::Notify>;
 }
 
 pub async fn run_cleanup_reports(app: Arc<BotState>, http: Arc<serenity::http::Http>) {

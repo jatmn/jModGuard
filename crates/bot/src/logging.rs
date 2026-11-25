@@ -3490,7 +3490,7 @@ pub(crate) fn place_bulk_delete(
     reserve_pending: bool,
 ) -> BulkDeletePlacement {
     use crate::automod_delete_marks::GatewayDeleteObservation;
-    claim_cleanup_gateway(
+    let _ = claim_cleanup_gateway(
         app,
         guild_id,
         channel,
@@ -3544,7 +3544,7 @@ fn classify_observed_delete(
     retained: Option<&MessageSnapshot>,
 ) -> Option<MessageReport> {
     use crate::automod_delete_marks::GatewayDeleteObservation;
-    claim_cleanup_gateway(
+    let _ = claim_cleanup_gateway(
         app,
         guild_id,
         channel,
