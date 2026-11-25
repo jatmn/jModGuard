@@ -543,6 +543,16 @@ fn cleanup_db(path: &Path) {
     let _ = std::fs::remove_file(format!("{}-shm", path.display()));
 }
 
+// Only copy after closing all source connections. Include any retained WAL
+// alongside the main file and let SQLite rebuild the shared-memory index.
+fn copy_closed_db(source: &Path, destination: &Path) {
+    std::fs::copy(source, destination).unwrap();
+    let wal = format!("{}-wal", source.display());
+    if Path::new(&wal).exists() {
+        std::fs::copy(wal, format!("{}-wal", destination.display())).unwrap();
+    }
+}
+
 /// A migrated database built once and copied for each matrix case, so a case
 /// reopens a current database instead of replaying bootstrap.
 struct MigratedTemplate(PathBuf);
@@ -557,12 +567,7 @@ impl MigratedTemplate {
 
     fn open_copy(&self, label: &str) -> (PathBuf, Db) {
         let path = tmp_db_path(label);
-        for suffix in ["", "-wal"] {
-            let source = format!("{}{suffix}", self.0.display());
-            if Path::new(&source).exists() {
-                std::fs::copy(source, format!("{}{suffix}", path.display())).unwrap();
-            }
-        }
+        copy_closed_db(&self.0, &path);
         let db = Db::open(&path, 2).unwrap();
         (path, db)
     }
