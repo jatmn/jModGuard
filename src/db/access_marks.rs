@@ -163,12 +163,27 @@ pub async fn access_epoch(db: &Db) -> Result<i64> {
 
 /// The newest mark that applies to `user` in `guild`, or 0 when none is kept.
 pub async fn access_mark(db: &Db, guild: i64, user: i64) -> Result<i64> {
-    let keys = [guild_key(guild), member_key(guild, user)];
+    access_mark_for_guilds(db, guild, None, user).await
+}
+
+/// Reads the newest guild or member mark for either guild in one primary snapshot.
+/// An absent second guild contributes no keys to the lookup.
+pub async fn access_mark_for_guilds(
+    db: &Db,
+    guild: i64,
+    other_guild: Option<i64>,
+    user: i64,
+) -> Result<i64> {
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_snapshot()?;
         let mark: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(CAST(value AS INTEGER)), 0) FROM meta WHERE key IN (?1, ?2)",
-            params![keys[0].clone(), keys[1].clone()],
+            "SELECT COALESCE(MAX(CAST(value AS INTEGER)), 0) FROM meta WHERE key IN (?1, ?2, ?3, ?4)",
+            params![
+                guild_key(guild),
+                member_key(guild, user),
+                other_guild.map(guild_key),
+                other_guild.map(|guild| member_key(guild, user)),
+            ],
             |row| Ok(row.get(0)?),
         )?;
         tx.finish_read()?;
