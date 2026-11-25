@@ -101,6 +101,9 @@ pub(super) async fn directory_names(
     ids.sort_unstable();
     ids.dedup();
     ids.truncate(crate::db::guild_data::DIRECTORY_PROFILE_LOOKUP_LIMIT);
+    if ids.is_empty() {
+        return serde_json::Map::new();
+    }
     let profiles = store.member_profiles(scope, ids).await.unwrap_or_default();
     let present = |name: &Option<String>| name.clone().filter(|name| !name.is_empty());
     profiles

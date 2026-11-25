@@ -1252,7 +1252,17 @@ async fn directory_names_come_only_from_stored_rows_in_one_bounded_lookup() {
             .await
             .is_err()
     );
-    assert!(store.member_profiles(scope, vec![0]).await.is_err());
+    assert!(store.member_profiles(scope.clone(), vec![0]).await.is_err());
+
+    store.close_membership(scope.clone()).await.unwrap();
+    let empty = store.member_profiles(scope, Vec::new()).await;
+    assert!(
+        empty
+            .unwrap_err()
+            .downcast_ref::<TenantDataError>()
+            .is_some_and(|error| matches!(error, TenantDataError::Membership)),
+        "empty reads must verify captured membership"
+    );
 }
 
 #[tokio::test]

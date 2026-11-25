@@ -9672,6 +9672,25 @@ async fn role_mapped_moderator_reaches_only_that_guild_at_its_level() {
         let (status, body) = f.request("POST", path, "").await;
         assert_eq!(status, StatusCode::OK, "{path}: {body}");
     }
+    let (status, names) = f
+        .request(
+            "POST",
+            "/api/guilds/10/members/names",
+            r#"{"user_ids":["123"]}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{names}");
+    assert_eq!(names, serde_json::json!({}));
+    let (status, denied) = f
+        .request(
+            "POST",
+            "/api/guilds/20/members/names",
+            r#"{"user_ids":["123"]}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{denied}");
+    assert_eq!(denied["code"], "guild_access_denied");
+
     // A hidden control is not enough: the API refuses the edit itself.
     let (status, denied) = f
         .request("PUT", "/api/guilds/10/settings", r#"{"prefix":"?"}"#)
@@ -10155,6 +10174,123 @@ async fn case_removal_role_ids_require_administrator_or_server_owner() {
                 },
                 "{kind}"
             );
+        }
+    }
+}
+
+#[tokio::test]
+async fn member_names_read_one_bounded_batch_from_the_loaded_guild() {
+    use db::guild_data::MemberObservation;
+    use serde_json::json;
+
+    let f = Fixture::new(false).await;
+    let named = 9_007_199_254_740_993_i64;
+    let nameless = named + 1;
+    let other_guild_only = named + 2;
+    for (guild, rows) in [
+        (10, [(named, "Local nickname"), (nameless, "")]),
+        (
+            20,
+            [
+                (named, "Different nickname"),
+                (other_guild_only, "Other member"),
+            ],
+        ),
+    ] {
+        f.enroll(guild).await;
+        let enrollment = db::guild_enrollment(&f.app.db, guild)
+            .await
+            .unwrap()
+            .unwrap();
+        f.app
+            .tenant
+            .activate(enrollment.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+        store
+            .initialize_member_directory(scope.clone(), 42, 1_000)
+            .await
+            .unwrap();
+        for (user_id, nickname) in rows {
+            store
+                .observe_member(
+                    scope.clone(),
+                    MemberObservation {
+                        user_id,
+                        username: Some(Some(String::new())),
+                        global_name: Some(Some(String::new())),
+                        nickname: Some(Some(nickname.into())),
+                        joined_at_ms: Some(900),
+                        observed_at_ms: 1_500,
+                        is_join: true,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let path = "/api/guilds/10/members/names";
+    let before = f.discord.member_calls.load(Ordering::SeqCst);
+    let mut ids = vec![
+        named.to_string(),
+        nameless.to_string(),
+        named.to_string(),
+        other_guild_only.to_string(),
+        "0".into(),
+        u64::MAX.to_string(),
+    ];
+    ids.extend((100..119).map(|id| id.to_string()));
+    let request = json!({"user_ids": ids}).to_string();
+    let (status, names) = f.request("POST", path, &request).await;
+    assert_eq!(status, StatusCode::OK, "{names}");
+    assert_eq!(
+        names,
+        json!({
+            named.to_string(): "Local nickname",
+            nameless.to_string(): nameless.to_string(),
+        })
+    );
+    let (_, detail) = f
+        .request("POST", &format!("/api/guilds/10/members/{nameless}"), "")
+        .await;
+    assert_eq!(names[nameless.to_string()], detail["display_name"]);
+    let (status, other_names) = f
+        .request("POST", "/api/guilds/20/members/names", &request)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{other_names}");
+    assert_eq!(
+        other_names,
+        json!({
+            named.to_string(): "Different nickname",
+            other_guild_only.to_string(): "Other member",
+        })
+    );
+    assert_eq!(f.discord.member_calls.load(Ordering::SeqCst), before);
+
+    let empty_bodies = [
+        r#"{"user_ids":[]}"#,
+        r#"{"user_ids":["0","18446744073709551615"]}"#,
+    ];
+    for body in empty_bodies {
+        let (status, empty) = f.request("POST", path, body).await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert_eq!(empty, json!({}));
+    }
+    let oversized = json!({"user_ids": vec![named.to_string(); 26]}).to_string();
+    assert_eq!(
+        f.request("POST", path, &oversized).await.0,
+        StatusCode::BAD_REQUEST
+    );
+
+    let wrong_guild = db::guild_enrollment(&f.app.db, 20).await.unwrap().unwrap();
+    for token in [None, Some(wrong_guild.id.as_str())] {
+        for body in [request.as_str()].into_iter().chain(empty_bodies) {
+            let (status, denied) = f.request_token("POST", path, body, token).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{denied}");
+            assert_eq!(denied["code"], "guild_enrollment_changed");
         }
     }
 }

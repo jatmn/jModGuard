@@ -4370,10 +4370,15 @@ function useServerNames(userIds) {
         if (!controller.signal.aborted) setNames((current) => ({ ...current, status: "failed" }));
       },
     );
-    for (const id of (userIds || []).slice(0, 25)) {
-      apiRead(`/api/guilds/${guildId}/members/${id}`, controller.signal).then(
-        (member) => {
-          if (member?.display_name) setNames((current) => ({ ...current, users: new Map(current.users).set(id, member.display_name) }));
+    const ids = [...new Set(userIds)].slice(0, 25);
+    if (ids.length) {
+      api(`/api/guilds/${guildId}/members/names`, "POST", { user_ids: ids }, controller.signal).then(
+        (data) => {
+          if (controller.signal.aborted || state.guildId !== guildId) return;
+          const labels = Object.entries(data ?? {});
+          if (labels.length) {
+            setNames((current) => ({ ...current, users: new Map([...labels, ...current.users]) }));
+          }
         },
         () => {},
       );

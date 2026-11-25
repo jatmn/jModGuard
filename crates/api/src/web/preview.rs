@@ -347,6 +347,7 @@ mod tests {
             "/api/guilds/10/cases/abc",
             "/api/guilds/10/cases/abc/evidence",
             "/api/guilds/10/members",
+            "/api/guilds/10/members/names",
             "/api/guilds/10/members/123",
             "/api/guilds/10/members/123/history",
             "/api/guilds/10/member-sync",
