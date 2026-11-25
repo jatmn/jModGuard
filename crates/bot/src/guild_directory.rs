@@ -295,11 +295,26 @@ async fn backfill_guild(
         refresh_facts,
     }: db::GuildJoinInfoBackfillCandidate,
 ) {
-    if refresh_facts {
-        // Facts are stamped with the time the snapshot was requested, so a gateway
-        // observation that lands while the REST call is in flight is never replaced
-        // by this older answer.
+    let refresh_at = if refresh_facts {
+        // Stamp the refresh before checking current facts so a later Gateway
+        // observation takes precedence even if it arrives before the REST call.
         let observed_at_ns = now_ns();
+        match db::guild_join_info_backfill_refresh_needed(db, guild_id, joined_at_ns).await {
+            Ok(Some(true)) => Some(observed_at_ns),
+            Ok(Some(false)) => None,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    guild_id,
+                    "guild directory freshness check deferred: {error:#}"
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(observed_at_ns) = refresh_at {
         let guild = match http
             .get_guild_with_counts(GuildId::new(guild_id as u64))
             .await
@@ -523,7 +538,7 @@ mod tests {
         let db = backfill_db();
         let joined_ms = 1_790_000_000_000;
         let joined = joined_ms * 1_000_000;
-        for guild in [10, 20, 30, 40] {
+        for guild in [10, 20, 30, 40, 50] {
             db::enroll_guild(&db, guild, joined).await.unwrap();
         }
         for (guild, recorded) in [(10, joined), (30, joined - 1), (40, joined + 1)] {
@@ -564,6 +579,13 @@ mod tests {
                             let guild: i64 = parts.next().unwrap().parse().unwrap();
                             let audit = parts.next() == Some("audit-logs");
                             calls.lock().push((guild, audit));
+
+                            if audit && guild == 10 {
+                                // The paged scan has already queued this guild with missing facts.
+                                db::record_guild_join_info(&db, 50, "Late Gateway", None, Some(5), joined + 1)
+                                    .await
+                                    .unwrap();
+                            }
 
                             if audit && guild == 40 {
                                 // Change membership while the earlier audit request is outstanding.
@@ -617,14 +639,15 @@ mod tests {
                 (20, true),
                 (30, false),
                 (30, true),
-                (40, true)
+                (40, true),
+                (50, true)
             ],
             "only missing and earlier-membership facts require guild-detail requests"
         );
         let fresh_writes = db
             .with_conn(|conn| {
                 conn.query_row(
-                    "SELECT COUNT(*) FROM backfill_fact_updates WHERE guild_id=10",
+                    "SELECT COUNT(*) FROM backfill_fact_updates WHERE guild_id IN (10, 50)",
                     (),
                     |row| Ok(row.get::<i64>(0)?),
                 )
@@ -634,7 +657,12 @@ mod tests {
         assert_eq!(fresh_writes, 0);
 
         let rows = db::owner_guild_directory(&db, 10).await.unwrap();
-        for (guild, name, count) in [(10, "Gateway", 7), (20, "REST", 8), (30, "REST", 8)] {
+        for (guild, name, count) in [
+            (10, "Gateway", 7),
+            (20, "REST", 8),
+            (30, "REST", 8),
+            (50, "Late Gateway", 5),
+        ] {
             let row = rows.iter().find(|row| row.guild_id == guild).unwrap();
             assert_eq!(row.name.as_deref(), Some(name));
             assert_eq!(row.member_count, Some(count));
