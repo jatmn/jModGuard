@@ -44,6 +44,7 @@ still fails, including empty reads. A case ID or entry ID alone never authorizes
 | `append_case_history` | Append a new entry or return its existing ID/sequence for an identical retry. Real writes use existing mutation-receipt recovery. |
 | `case_history_entry` | Read one scoped entry after checking SQL byte length against the supplied entry budget. |
 | `case_history_ids` | Return a bounded sequence-keyset page of ID/sequence references; no history payloads are bulk-loaded. |
+| `case_history_page` | Return a bounded sequence-keyset page with validated payloads in one scoped primary snapshot. The SQL byte limit applies to each entry. |
 
 `CaseHistoryLimits` requires explicit maximum entry count and total serialized history
 payload bytes per case. It reuses `CaseLimits` for individual record bytes and page size;

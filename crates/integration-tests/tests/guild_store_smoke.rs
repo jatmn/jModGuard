@@ -505,7 +505,14 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .case_history_ids(scoped.clone(), case_id.clone(), 0, 1, history_limits)
             .await
             .unwrap(),
-        vec![history_ref]
+        vec![history_ref.clone()]
+    );
+    assert_eq!(
+        reopened
+            .case_history_page(scoped.clone(), case_id.clone(), 0, 1, history_limits)
+            .await
+            .unwrap(),
+        vec![(history_ref, history.clone())]
     );
     assert_eq!(
         reopened
@@ -552,6 +559,13 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
             .await
             .unwrap()
             .is_none()
+    );
+    assert!(
+        reopened
+            .case_history_page(scoped.clone(), case_id.clone(), 0, 1, history_limits)
+            .await
+            .unwrap()
+            .is_empty()
     );
     assert!(
         reopened
