@@ -6397,7 +6397,7 @@ test('rule exception pickers show server names and save only the chosen IDs', as
   const h = harness(async (url, options) => {
     requests.push({ url, method: options.method, enrollment: options.headers['x-jmodguard-enrollment'] });
     if (url.endsWith('/server-names')) return response(names);
-    if (url.includes('/members/9007199254740997')) return response({ user_id: '9007199254740997', display_name: 'Known Member' });
+    if (url.endsWith('/members/names')) return response({ '9007199254740997': 'Known Member' });
     if (url.includes('/members?')) return response({ members: [{ user_id: '9007199254740998', display_name: 'Searched Member' }] });
     if (options.method === 'PUT') saved = JSON.parse(options.body).data;
     return response({ settings: {}, rules: [], commands: [], log_channels: [], badwords: [] });
@@ -6411,6 +6411,7 @@ test('rule exception pickers show server names and save only the chosen IDs', as
   assert.ok(requests.every((r) => r.method === 'POST'), 'picker reads use POST so a CDN cannot reuse them');
   // The API refuses scoped reads without the loaded page's membership.
   assert.deepEqual(requests.filter((r) => r.url.endsWith('/server-names')).map((r) => r.enrollment), ['page-membership']);
+  assert.deepEqual(requests.filter((r) => r.url.endsWith('/members/names')).map((r) => r.enrollment), ['page-membership']);
   const chips = (label) => [...modal.querySelectorAll(`ul.picker-chips[aria-label="${label}"] .picker-chip-text`)].map(textOf);
   assert.deepEqual(chips('Skip roles'), ['@Moderators']);
   assert.deepEqual(chips('Skip users'), ['Known Member']);
@@ -6457,6 +6458,42 @@ const pickerRule = { name: 'Mention spam', rule_id: 'mention_spam', effective: {
 } };
 const pickerLabelled = (modal, label) => findNode(modal, n => n.localName === 'label' && textOf(n) === label).control;
 const pickerByName = (modal, label) => findNode(modal, n => n.getAttribute?.('aria-label') === label);
+
+test('both rule editors batch saved user exception labels and keep missing member fallbacks', async () => {
+  const custom = {
+    ...pickerRule, name: 'Custom pattern', rule_id: 'custom:0123456789abcdef',
+    effective: { ...pickerRule.effective, name: 'Custom pattern', params: { kind: 'pattern', pattern: 'spam' } },
+  };
+  const ids = Array.from({ length: 25 }, (_, i) => String(9007199254740993n + BigInt(i)));
+  for (const rule of [pickerRule, custom]) {
+    for (const saved of [[], [ids[0]], ids, [ids[0], ids[0], ids[1]]]) {
+      const calls = [];
+      const h = harness(async (url, options) => {
+        calls.push({ url, options });
+        if (url.endsWith('/server-names')) return response(pickerNames);
+        if (url.endsWith('/members/names')) return response({ [ids[0]]: 'Stored name', [ids[1]]: ids[1] });
+        return response({});
+      });
+      h.app.state.config = { enrollment_id: 'page-membership' };
+      const modal = await h.app.editRule({ ...rule, effective: { ...rule.effective, whitelist_users: saved } });
+      await settle();
+      const names = calls.filter(({ url }) => url.endsWith('/server-names'));
+      assert.equal(names.length, 1, rule.rule_id);
+      const members = calls.filter(({ url }) => /\/members\//.test(url));
+      assert.equal(members.length, saved.length ? 1 : 0, rule.rule_id);
+      if (saved.length) {
+        const { url, options } = members[0];
+        assert.equal(url, `/api/guilds/${h.app.state.guildId}/members/names`);
+        assert.equal(options.method, 'POST');
+        assert.equal(options.headers['x-jmodguard-enrollment'], 'page-membership');
+        assert.deepEqual(JSON.parse(options.body), { user_ids: [...new Set(saved)] });
+      }
+      const chips = [...modal.querySelectorAll('ul.picker-chips[aria-label="Skip users"] .picker-chip-text')].map(textOf);
+      assert.deepEqual(chips, saved.map(id => id === ids[0] ? 'Stored name' : id === ids[1] ? id : `User ${id}`));
+      assert.equal(h.app.isDirty(), false);
+    }
+  }
+});
 
 test('ID text typed before server names arrive is still saved or refused once names replace the boxes', async () => {
   let release;
@@ -6653,13 +6690,13 @@ const switcherGuilds = [
   { id: '222222222222222222', name: 'Bravo', icon: null, manage: true, access: 'manage' },
   { id: '333333333333333333', name: 'Charlie has a very long server name that cannot fit in the sidebar', icon: 'ffee00', manage: true, access: 'manage' },
 ];
-async function switcherHarness(guilds, confirm = () => true) {
+async function switcherHarness(guilds, confirm = () => true, read) {
   const calls = [];
   const h = harness(async (url, options) => {
     calls.push(`${options?.method || 'GET'} ${url}`);
     if (url.endsWith('/api/me')) return response({ user: { id: '123456789012345678' }, guilds });
     if (url.endsWith('/config')) return response({ enrollment_id: 'membership', settings: { prefix: '!' }, rules: [], commands: [], log_channels: [], badwords: [], templates: [] });
-    return response({});
+    return read?.(url, options) ?? response({});
   }, new Map(), new Map(), confirm);
   await h.app.init(); await settle();
   const trigger = () => h.document.querySelector('#guild-select');
@@ -6817,6 +6854,43 @@ test('server switcher selection runs the guarded switch and keeps drafts when le
   assert.equal(h.app.state.guildId, switcherGuilds[1].id);
   assert.equal(h.app.isDirty(), false, 'switching discards the confirmed drafts');
   assert.deepEqual(calls.slice(before), [`POST /api/guilds/${switcherGuilds[1].id}/config`]);
+});
+
+test('rule exception name batches keep edits and discard the prior guild response', async () => {
+  const saved = '9007199254740997';
+  const draft = '9007199254740998';
+  const pending = [];
+  const { h, trigger, options } = await switcherHarness(switcherGuilds, () => true, (url, request) => {
+    if (url.endsWith('/server-names')) return response(pickerNames);
+    if (url.endsWith('/members/names')) {
+      return new Promise(resolve => pending.push({ url, signal: request.signal, resolve }));
+    }
+  });
+  const rule = { ...pickerRule, effective: { ...pickerRule.effective, whitelist_users: [saved] } };
+
+  await h.app.editRule(rule);
+  assert.equal(pending[0].url, `/api/guilds/${switcherGuilds[0].id}/members/names`);
+  await fire(trigger(), 'click');
+  await fire(options()[1], 'click');
+  assert.equal(pending[0].signal.aborted, true);
+
+  const modal = await h.app.editRule(rule);
+  assert.equal(pending[1].url, `/api/guilds/${switcherGuilds[1].id}/members/names`);
+  const user = pickerLabelled(modal, 'Skip users');
+  user.value = draft;
+  await fire(user, 'input');
+  await fire(user, 'keydown', { key: 'Enter' });
+  const chips = () => [...modal.querySelectorAll('ul[aria-label="Skip users"] .picker-chip-text')].map(textOf);
+  assert.deepEqual(chips(), [`User ${saved}`, `User ${draft}`]);
+
+  pending[0].resolve(response({ [saved]: 'Prior guild name' }));
+  await settle();
+  assert.deepEqual(chips(), [`User ${saved}`, `User ${draft}`]);
+  pending[1].resolve(response({ [saved]: 'Current guild name' }));
+  await settle();
+  assert.deepEqual(chips(), ['Current guild name', `User ${draft}`]);
+  assert.equal(h.app.isDirty(), true);
+  assert.equal(pending.length, 2);
 });
 
 test('server switcher with one server or none', async () => {

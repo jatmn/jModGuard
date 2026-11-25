@@ -1972,6 +1972,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             get_post(members::list_members),
         )
         .route(
+            "/api/guilds/{guild_id}/members/names",
+            axum::routing::post(members::member_names),
+        )
+        .route(
             "/api/guilds/{guild_id}/members/{user_id}",
             get_post(members::get_member),
         )

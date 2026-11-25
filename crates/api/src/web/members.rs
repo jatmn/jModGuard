@@ -17,6 +17,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tower_sessions::Session;
 
@@ -47,6 +48,14 @@ struct MembersCursor {
 pub struct HistoryQuery {
     after: Option<String>,
     limit: Option<u32>,
+}
+
+const MEMBER_NAME_LOOKUP_LIMIT: usize = 25;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemberNamesBody {
+    user_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -237,6 +246,37 @@ pub async fn get_member(
         .await?
         .ok_or_else(|| ApiError(anyhow::anyhow!("member not found")))?;
     Ok(Json(serde_json::to_value(member)?))
+}
+
+pub async fn member_names(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: HeaderMap,
+    Path(guild_id): Path<u64>,
+    Json(body): Json<MemberNamesBody>,
+) -> ApiResult<Json<BTreeMap<String, String>>> {
+    let (_, enrollment) =
+        scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
+    if body.user_ids.len() > MEMBER_NAME_LOOKUP_LIMIT {
+        return Err(ApiError(anyhow::anyhow!("too many member IDs")));
+    }
+    // Saved rule IDs can lie outside the directory's signed integer domain.
+    // An unresolved ID should still fall back independently of the others.
+    let mut ids: Vec<_> = body
+        .user_ids
+        .iter()
+        .filter_map(|id| parse_user_id(id).ok())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let (store, scope) = app.tenant.live(enrollment).await?;
+    let profiles = store.member_profiles(scope, ids).await?;
+    Ok(Json(
+        profiles
+            .into_iter()
+            .map(|member| (member.user_id, member.display_name))
+            .collect(),
+    ))
 }
 
 pub async fn member_history(

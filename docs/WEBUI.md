@@ -533,6 +533,7 @@ PUT    /api/guilds/{id}/settings
 GET    /api/guilds/{id}/rules/{rule}          PUT/DELETE …
 GET    /api/guilds/{id}/server-names   # settings level: bot's latest role/channel names
 POST   /api/guilds/{id}/server-names   # same body as GET; SPA rule editor pickers
+POST   /api/guilds/{id}/members/names  # dashboard level; up to 25 string user_ids, returns ID-to-display-name map
 GET    /api/guilds/{id}/badwords              POST (add) / DELETE /{word_id}
 GET    /api/guilds/{id}/commands              POST (create) / PUT|DELETE /{name}
 GET    /api/guilds/{id}/templates/{event}     PUT/DELETE …
