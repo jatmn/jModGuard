@@ -6950,14 +6950,23 @@ function tabMembers() {
     const schedulePoll = () => {
       clearTimer();
       if (!aliveHere()) return;
-      const active =
-        statusRead === "retry-needed" ||
-        controlPending() ||
-        (latestStatus &&
-          (["queued", "running", "waiting"].includes(latestStatus.status) ||
-            ["queued", "running", "waiting"].includes(latestStatus.audit_recovery_status) ||
-            latestStatus.automatic_reconcile_at));
-      if (!active) {
+      const scheduled = ["queued", "running", "waiting"];
+      const attempts = [];
+      const importAttempt = latestStatus?.next_attempt_at;
+      if (importAttempt != null || scheduled.includes(latestStatus?.status))
+        attempts.push(Number(importAttempt) || 0);
+      const auditAttempt = latestStatus?.audit_recovery_next_attempt_at;
+      const auditStatus = latestStatus?.audit_recovery_status;
+      // Stalled pagination keeps a checkpoint for manual Retry.
+      if (
+        auditStatus !== "complete" &&
+        !auditPaginationStalled(latestStatus) &&
+        (auditAttempt != null || scheduled.includes(auditStatus))
+      )
+        attempts.push(Number(auditAttempt) || 0);
+      const reconcileAttempt = latestStatus?.automatic_reconcile_at;
+      if (reconcileAttempt != null) attempts.push(Number(reconcileAttempt) || 0);
+      if (statusRead !== "retry-needed" && !controlPending() && !attempts.length) {
         pollDueAt = 0;
         return;
       }
@@ -6965,13 +6974,6 @@ function tabMembers() {
         let delay = Math.min(10000 * 2 ** Math.min(pollAttempt, 5), 300000);
         const statusNow = Number(latestStatus?.as_of) || latestStatusReceivedAt;
         const elapsed = Date.now() - latestStatusReceivedAt;
-        const attempts = [];
-        if (["queued", "running", "waiting"].includes(latestStatus?.status))
-          attempts.push(Number(latestStatus.next_attempt_at) || 0);
-        if (["queued", "running", "waiting"].includes(latestStatus?.audit_recovery_status))
-          attempts.push(Number(latestStatus.audit_recovery_next_attempt_at) || 0);
-        if (latestStatus?.automatic_reconcile_at)
-          attempts.push(Number(latestStatus.automatic_reconcile_at));
         // A queued control can change the schedule before the worker's next page.
         if (attempts.length && !controlPending())
           delay = Math.max(delay, Math.min(...attempts) - statusNow - elapsed);

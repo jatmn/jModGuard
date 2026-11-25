@@ -7507,6 +7507,58 @@ for (const audit of [false, true]) test(`Members waits for scheduled ${audit ? '
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
 });
 
+for (const reason of ['permission_denied', 'pagination_stalled']) {
+  test(`Members refreshes only scheduled audit recovery after ${reason}`, async () => {
+    const now = Date.UTC(2026, 10, 23, 12);
+    const retryAt = now + 3600000;
+    const stalled = reason === 'pagination_stalled';
+    const reconcileAt = now + 7200000;
+    const savedImport = {
+      status: 'complete', phase: 'complete', run_id: 'import-1', run_kind: stalled ? 'reconcile' : 'initial',
+      initial_completed_at: now - 60000, progress_revision: 7, next_attempt_at: null,
+    };
+    let reads = 0;
+    const h = harness(async url => {
+      if (!url.endsWith('/member-sync')) return response({ members: [] });
+      reads++;
+      if (reads === 3) return response({
+        ...savedImport, coverage: 'complete', as_of: retryAt + 20000,
+        reconciliation_needed: false, gap_auto_clear: false, automatic_reconcile_at: null,
+        audit_recovery_status: 'complete', audit_recovery_next_attempt_at: null,
+      });
+      return response({
+        ...savedImport, coverage: 'uncertain', as_of: reads === 1 ? now : retryAt,
+        reconciliation_needed: true, reconciliation_reason: 'bot restarted', gap_at: now,
+        gap_auto_clear: true, automatic_reconcile_at: stalled ? reconcileAt : null,
+        audit_recovery_status: 'needs_attention', audit_recovery_reason: reason,
+        audit_recovery_phase: 'ban', audit_recovery_next_attempt_at: retryAt,
+        audit_recovery_pending: !stalled && reads === 2,
+      });
+    });
+    h.app.state.tab = 'members';
+    h.app.state.config = { enrollment_id: 'membership' };
+    const panel = h.app.tabMembers();
+    await settle();
+    assert.equal(reads, 1);
+    assert.match(textOf(panel), /Member list may be out of date/);
+    const delays = () => [...h.timers.values()].map(timer => timer.delay);
+    if (stalled) {
+      assert.ok(delays().includes(reconcileAt - now), 'the scheduled full Reconcile still activates polling');
+      assert.ok(!delays().includes(3600000));
+      assert.ok(!delays().includes(10000));
+      return;
+    }
+    assert.ok(!delays().includes(10000), 'wait for the saved audit retry');
+    await runMemberPoll(h, 3600000);
+    assert.equal(reads, 2);
+    assert.match(textOf(panel), /Member list may be out of date/);
+    await runMemberPoll(h, 20000);
+    assert.equal(reads, 3);
+    assert.doesNotMatch(textOf(panel), /Member list may be out of date|Audit recovery next attempt:/);
+    assert.ok(!delays().includes(10000) && !delays().includes(20000));
+  });
+}
+
 const logJob = (event = 'member_join', guild_id = '987654321098765432') => ({
   id: `${guild_id}-${event}`, guild_id, enrollment_id: 'membership', state: 'pending',
   action: {kind: 'set_log_channel', event, channel_id: '222'},
