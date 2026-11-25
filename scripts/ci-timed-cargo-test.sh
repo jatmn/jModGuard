@@ -542,14 +542,15 @@ chmod +x "$fixture/bin/cargo"
 PATH="$fixture/bin:$PATH"
 
 # Compare execution counts with native Cargo, including zero-match selections.
-# The shim records invocations; append-only markers also catch repeated execution
-# within a single invocation, independently of how the runner chooses its filter.
-for filter_case in multiple substring before mixed skip skip-equals skip-multiple \
+# The shim counts listings and test invocations. Append-only markers also catch
+# repeated execution within a single invocation.
+for filter_case in unfiltered empty-package multiple substring before mixed skip skip-equals skip-multiple \
   exact exact-name exact-skip zero ignored include-ignored ignored-zero literal spaces \
   option-values exclude exclude-equals; do
   filter_cargo=(-p timed-doctest-probe)
   filter_harness=()
   case "$filter_case" in
+    empty-package) filter_cargo=(-p timed-runner-probe) ;;
     substring) filter_harness=(documented) ;;
     before) filter_cargo+=(documented) ;;
     multiple) filter_harness=(second_documented spaced_documented) ;;
@@ -606,6 +607,15 @@ for filter_case in multiple substring before mixed skip skip-equals skip-multipl
   actual_runs=$(grep ' --doc ' "$CARGO_INVOCATION_LOG" | grep -vc ' --list ' || true)
   [ "$actual_runs" -eq "$expected_runs" ] \
     || fail "$filter_case: expected $expected_runs isolated doctest invocations, got $actual_runs"
+  case "$filter_case" in
+    empty-package|zero|ignored-zero) expected_lists=1 ;;
+    unfiltered) expected_lists=2 ;;
+    before|spaces) expected_lists=3 ;; # Filter removal needs a new selector-universe listing.
+    *) continue ;;
+  esac
+  actual_lists=$(grep -c ' --doc -- --list ' "$CARGO_INVOCATION_LOG" || true)
+  [ "$actual_lists" -eq "$expected_lists" ] \
+    || fail "$filter_case: expected $expected_lists doctest listings, got $actual_lists"
 done
 unset TIMED_DOC_MARKERS
 
