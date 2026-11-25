@@ -1881,6 +1881,51 @@ test('Members retries its first failed visible status read and renders the recov
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
 });
 
+for (const retryAfter of [null, '30']) {
+  test(`Members retries a status 503 during audit backoff (Retry-After: ${retryAfter})`, async () => {
+    const now = Date.UTC(2026, 10, 23, 12);
+    const auditDelay = 3600000;
+    const refreshAfter = 60000;
+    const readRetryDelay = retryAfter ? 30000 : 10000;
+    let reads = 0;
+    const h = harness(async url => {
+      if (!url.endsWith('/member-sync')) return response({ members: [] });
+      reads++;
+      if (reads === 2) return {
+        ok: false, status: 503, headers: { get: name => name === 'retry-after' ? retryAfter : null },
+        text: async () => JSON.stringify({ error: 'Member sync status temporarily unavailable' }),
+      };
+      return response({
+        status: 'complete', phase: 'complete', progress_revision: 7,
+        run_id: 'initial-1', run_kind: 'initial', initial_completed_at: now - 60000,
+        coverage: 'uncertain', as_of: reads === 1 ? now : now + refreshAfter + readRetryDelay,
+        reconciliation_needed: true, reconciliation_reason: 'bot restarted', gap_at: now, gap_auto_clear: true,
+        automatic_reconcile_at: null, audit_recovery_status: 'needs_attention', audit_recovery_reason: 'permission_denied',
+        audit_recovery_phase: 'ban', audit_recovery_next_attempt_at: now + auditDelay,
+      });
+    });
+    h.app.state.tab = 'members';
+    h.app.state.config = { enrollment_id: 'membership' };
+    const panel = h.app.tabMembers();
+    await settle();
+    assert.equal(reads, 1);
+    const hasPoll = delay => [...h.timers.values()].some(timer => timer.delay === delay);
+    assert.ok(hasPoll(auditDelay));
+
+    h.advanceTime(refreshAfter);
+    await fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Refresh'), 'click');
+    await settle();
+    assert.equal(reads, 2);
+    assert.match(textOf(panel), /Could not refresh import status/);
+    await runMemberPoll(h, readRetryDelay);
+
+    assert.equal(reads, 3);
+    assert.doesNotMatch(textOf(panel), /Could not refresh import status/);
+    assert.match(textOf(panel), /Member list may be out of date/);
+    assert.ok(hasPoll(auditDelay - refreshAfter - readRetryDelay));
+  });
+}
+
 test('Members accepts a later primary restore status but rejects an older in-flight response', async () => {
   let statusReads = 0;
   let resolveOldRequest;

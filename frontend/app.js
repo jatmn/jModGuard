@@ -6972,11 +6972,12 @@ function tabMembers() {
       }
       if (!pollDueAt) {
         let delay = Math.min(10000 * 2 ** Math.min(pollAttempt, 5), 300000);
-        const statusNow = Number(latestStatus?.as_of) || latestStatusReceivedAt;
-        const elapsed = Date.now() - latestStatusReceivedAt;
-        // A queued control can change the schedule before the worker's next page.
-        if (attempts.length && !controlPending())
+        // Worker deadlines pace successful reads when no control is pending.
+        if (statusRead === "current" && attempts.length && !controlPending()) {
+          const statusNow = Number(latestStatus?.as_of) || latestStatusReceivedAt;
+          const elapsed = Date.now() - latestStatusReceivedAt;
           delay = Math.max(delay, Math.min(...attempts) - statusNow - elapsed);
+        }
         delay = Math.max(delay, lastStatusError?.retryAfterMs || 0);
         pollDueAt = Date.now() + delay;
       }
