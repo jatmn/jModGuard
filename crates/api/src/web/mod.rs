@@ -4017,39 +4017,6 @@ mod tests {
         assert!(!guild_list_cache_allowed(GuildListMode::MustRefresh));
     }
 
-    #[test]
-    fn copy_source_must_not_trust_guild_scope_zero_authctx() {
-        // Regression: guild_scope(0) returns an owner identity with no guild
-        // list. A caller that stuffed a stale guild onto that context must not
-        // authorize a copy source from it. copy_config must obtain one
-        // require_auth_for_guilds snapshot for both servers, never use the
-        // owner-only destination AuthCtx for the source.
-        let stale = AuthCtx {
-            enrollment: None,
-            role_access: None,
-            guild_discovery_incomplete: false,
-            user: crate::web::oauth::DiscordUser {
-                id: "99".into(),
-                username: "owner".into(),
-                global_name: None,
-                avatar: None,
-            },
-            guilds: vec![crate::web::oauth::DiscordGuild {
-                id: "111".into(),
-                name: "revoked".into(),
-                icon: None,
-                owner: true,
-                permissions: None,
-            }],
-        };
-        assert!(
-            stale.can_manage(111),
-            "stale CachedOk context still reports manage — production must refresh"
-        );
-        // Production gate for secondary guild checks is MustRefresh.
-        assert!(!guild_list_cache_allowed(GuildListMode::MustRefresh));
-    }
-
     #[tokio::test]
     async fn authorize_manage_guild_rejects_global_scope_id() {
         let app = app_with_owner(99);

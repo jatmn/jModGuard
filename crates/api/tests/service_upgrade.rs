@@ -8,23 +8,33 @@ use serde_json::{Value, json};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tower::ServiceExt;
 
 const UPDATE_APPLY_ENABLED: &str = "JMODGUARD_UPDATE_APPLY_ENABLED";
 
 /// The production router reads the rollout flag from the process environment.
 fn in_rollout_test_process(test: &str, rollout: &str) -> bool {
+    in_rollout_test_process_with(test, rollout, |_| {})
+}
+
+fn in_rollout_test_process_with(
+    test: &str,
+    rollout: &str,
+    configure: impl FnOnce(&mut Command),
+) -> bool {
     const CHILD: &str = "JMODGUARD_SERVICE_UPGRADE_TEST_CHILD";
     if std::env::var(CHILD).as_deref() == Ok(test) {
         assert_eq!(std::env::var(UPDATE_APPLY_ENABLED).as_deref(), Ok(rollout));
         return true;
     }
-    let output = Command::new(std::env::current_exe().unwrap())
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
         .args(["--exact", test])
         .env(CHILD, test)
-        .env(UPDATE_APPLY_ENABLED, rollout)
-        .output()
-        .unwrap();
+        .env(UPDATE_APPLY_ENABLED, rollout);
+    configure(&mut child);
+    let output = child.output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success() && stdout.contains("1 passed;"),
@@ -80,13 +90,6 @@ impl RecoveryPage {
         let bound = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
             .unwrap()
             .expect("control listener");
-        let lease = "ab".repeat(16);
-        assert!(
-            db::claim_update_lease(&bot.db, "bot", &lease, chrono::Utc::now().timestamp(), 240,)
-                .await
-                .unwrap()
-        );
-
         let mut cfg = ApiProcessConfig::default();
         cfg.db.path = path.clone();
         cfg.db.pool_size = 2;
@@ -167,6 +170,17 @@ async fn read_only_service_upgrade_routes_use_the_writer_link() {
         return;
     }
     let page = RecoveryPage::open().await;
+    assert!(
+        db::claim_update_lease(
+            &page.bot.db,
+            "bot",
+            &"ab".repeat(16),
+            chrono::Utc::now().timestamp(),
+            240,
+        )
+        .await
+        .unwrap()
+    );
     let router = page.router.clone();
     let owner_cookie = page.cookie.clone();
 
@@ -332,6 +346,59 @@ async fn update_check_requires_owner_and_trusted_origin() {
     page.finish();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_update_check_reaches_registry_discovery() {
+    let mut server = None;
+    if !in_rollout_test_process_with(
+        "owner_update_check_reaches_registry_discovery",
+        "0",
+        |child| {
+            let proxy = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+            child
+                .env("https_proxy", &proxy_url)
+                .env("HTTPS_PROXY", &proxy_url)
+                .env_remove("no_proxy")
+                .env_remove("NO_PROXY");
+            proxy.set_nonblocking(true).unwrap();
+            let proxy = tokio::net::TcpListener::from_std(proxy).unwrap();
+            server = Some(tokio::spawn(async move {
+                let (stream, _) = proxy.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut request = String::new();
+                stream.read_line(&mut request).await.unwrap();
+                stream
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                request
+            }));
+        },
+    ) {
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), server.unwrap())
+            .await
+            .expect("the owner check must contact the registry proxy")
+            .unwrap();
+        assert_eq!(request.trim_end(), "CONNECT ghcr.io:443 HTTP/1.1");
+        return;
+    }
+
+    let page = RecoveryPage::open().await;
+    let before = db::component_update(&page.bot.db, "bot").await.unwrap();
+    assert_eq!(before.checked_at, None);
+    assert_eq!(before.check_error, None);
+    let (status, response) = post_owner_update(&page, "check", &json!({"component":"bot"})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["error"], "release check failed");
+    let checked = db::component_update(&page.bot.db, "bot").await.unwrap();
+    assert!(checked.checked_at.is_some());
+    assert!(checked.check_error.is_some());
+    assert_eq!(checked.candidate, None);
+    assert_eq!(checked.desired, None);
+    page.finish();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn update_policy_requires_owner_and_trusted_origin() {
     let page = RecoveryPage::open().await;
@@ -468,6 +535,67 @@ async fn update_install_refuses_when_service_self_update_is_disabled() {
     assert_eq!(
         response["error"],
         "service self-update is disabled or unobserved"
+    );
+    assert_eq!(update_state(&page.bot.db).await, before);
+    page.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_update_install_refuses_when_rollout_is_disabled() {
+    if !in_rollout_test_process("owner_update_install_refuses_when_rollout_is_disabled", "0") {
+        return;
+    }
+    let page = RecoveryPage::open().await;
+    let candidate = checked_api_candidate(&page, true).await;
+    let before = update_state(&page.bot.db).await;
+    let (status, response) = post_owner_update(
+        &page,
+        "install",
+        &json!({"component":"api","digest":candidate.digest}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        response["error"],
+        "on-demand updates are disabled during rollout"
+    );
+    assert_eq!(update_state(&page.bot.db).await, before);
+    page.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_update_install_refuses_an_incompatible_candidate() {
+    if !in_rollout_test_process(
+        "owner_update_install_refuses_an_incompatible_candidate",
+        "1",
+    ) {
+        return;
+    }
+    let page = RecoveryPage::open().await;
+    let mut candidate = checked_api_candidate(&page, true).await;
+    candidate.min_api = 2;
+    candidate.max_api = 2;
+    db::record_update_check(
+        &page.bot.db,
+        "api",
+        "latest",
+        Some(candidate.clone()),
+        None,
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+    .unwrap();
+    let before = update_state(&page.bot.db).await;
+    let (status, response) = post_owner_update(
+        &page,
+        "install",
+        &json!({"component":"api","digest":candidate.digest}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        response["error"],
+        "candidate is incompatible: candidate requires a different API capability"
     );
     assert_eq!(update_state(&page.bot.db).await, before);
     page.finish();
