@@ -1817,10 +1817,55 @@ pub async fn analytics(
         )));
     }
     let key = (enrollment.guild_id, enrollment.id.clone(), days);
+    #[cfg(test)]
+    let load_probe = super::enrollment_tests::analytics_request_started(&key);
+    use super::state::{AnalyticsLoad, AnalyticsLoadResult};
+    let leader = loop {
+        if let Some(cached) = app.analytics_cache.get(&key, std::time::Instant::now()) {
+            return Ok(Json(cached));
+        }
+        match app.analytics_cache.join_load(&key) {
+            AnalyticsLoad::Leader(guard) => break Some(guard),
+            AnalyticsLoad::Follower(mut result) => {
+                let outcome = result
+                    .wait_for(Option::is_some)
+                    .await
+                    .ok()
+                    .and_then(|value| value.clone());
+                match outcome {
+                    Some(AnalyticsLoadResult::Complete(value)) => {
+                        return Ok(Json((*value).clone()));
+                    }
+                    // Keep computing partial results independently during an outage.
+                    Some(AnalyticsLoadResult::Unavailable) => break None,
+                    // An abandoned request leaves waiting readers to elect
+                    // one replacement with the same key.
+                    None => continue,
+                }
+            }
+            AnalyticsLoad::Independent => break None,
+        }
+    };
+    // A complete response can arrive between the original miss and joining.
     if let Some(cached) = app.analytics_cache.get(&key, std::time::Instant::now()) {
+        if let Some(leader) = leader {
+            leader.complete(&cached);
+        }
         return Ok(Json(cached));
     }
-    let result = db::enrolled_guild_analytics(&app.db, enrollment.clone(), days).await?;
+    #[cfg(test)]
+    if let Some(probe) = load_probe {
+        probe.before_aggregate().await;
+    }
+    let result = match db::enrolled_guild_analytics(&app.db, enrollment.clone(), days).await {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(leader) = leader {
+                leader.unavailable();
+            }
+            return Err(error.into());
+        }
+    };
     let moderator_ids = result.moderators.iter().map(|m| m.moderator_id).collect();
     let directory = match app.tenant.live(enrollment).await {
         Ok((store, scope)) => store
@@ -1847,7 +1892,12 @@ pub async fn analytics(
     value["members"] = serde_json::json!(directory.map(|(totals, _)| totals));
     if complete {
         app.analytics_cache
-            .put(key, value.clone(), std::time::Instant::now());
+            .put(key.clone(), value.clone(), std::time::Instant::now());
+        if let Some(leader) = leader {
+            leader.complete(&value);
+        }
+    } else if let Some(leader) = leader {
+        leader.unavailable();
     }
     Ok(Json(value))
 }

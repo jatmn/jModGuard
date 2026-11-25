@@ -10655,3 +10655,239 @@ async fn analytics_serves_each_range_from_stored_data_and_caches_it_per_membersh
         "unknown parameters are refused"
     );
 }
+
+pub(super) struct AnalyticsLoadProbe {
+    key: state::AnalyticsCacheKey,
+    requests: tokio::sync::Semaphore,
+    aggregates: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+thread_local! {
+    // Each test runs on its own current-thread runtime.
+    static ANALYTICS_PROBE: std::cell::RefCell<Option<Arc<AnalyticsLoadProbe>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl AnalyticsLoadProbe {
+    fn install(key: state::AnalyticsCacheKey) -> Arc<Self> {
+        let probe = Arc::new(Self {
+            key,
+            requests: tokio::sync::Semaphore::new(0),
+            aggregates: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        ANALYTICS_PROBE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&probe)));
+        probe
+    }
+
+    async fn wait_for_requests(&self, count: u32) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.requests.acquire_many(count),
+        )
+        .await
+        .expect("authorized analytics requests did not reach the cache")
+        .unwrap()
+        .forget();
+    }
+
+    pub(super) async fn before_aggregate(&self) {
+        self.aggregates.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+    }
+}
+
+pub(super) fn analytics_request_started(
+    key: &state::AnalyticsCacheKey,
+) -> Option<Arc<AnalyticsLoadProbe>> {
+    ANALYTICS_PROBE.with(|slot| {
+        let slot = slot.borrow();
+        let probe = slot.as_ref().filter(|probe| &probe.key == key)?;
+        probe.requests.add_permits(1);
+        Some(Arc::clone(probe))
+    })
+}
+
+#[tokio::test]
+async fn analytics_overlapping_sessions_share_only_the_exact_unexpired_load() {
+    let sql = Arc::new(db::StartupProbe::default());
+    let _probe = db::enter_startup_probe(Some(Arc::clone(&sql)));
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let second = Session::new(None, Arc::new(f.store.clone()), None);
+    second.insert(SESSION_USER, 99u64).await.unwrap();
+    second
+        .insert(SESSION_TOKEN, "other-user-token")
+        .await
+        .unwrap();
+    second.save().await.unwrap();
+    let cookie = format!("{SESSION_COOKIE_NAME}={}", second.id().unwrap());
+    let key = (10, enrollment.id.clone(), 7);
+    let request = |cookie| {
+        owner_router_request_for(
+            &f,
+            "POST",
+            "/api/guilds/10/analytics?days=7",
+            "",
+            cookie,
+            Some(&enrollment.id),
+        )
+    };
+    let sql_counts = || {
+        let counts = |prefix: &str| {
+            sql.primary_labels()
+                .iter()
+                .filter(|label| label.starts_with(prefix))
+                .map(|label| sql.primary_statements(label))
+                .sum::<u64>()
+        };
+        (
+            counts("db/analytics:"),
+            counts("guild db/guild_data/member_directory:"),
+        )
+    };
+
+    for expired in [false, true] {
+        if expired {
+            f.app.analytics_cache.expire_for_test(&key);
+        }
+        let load = AnalyticsLoadProbe::install(key.clone());
+        let before = sql_counts();
+        let (first, second, other_cost) =
+            tokio::join!(request(&f.cookie), request(&cookie), async {
+                load.wait_for_requests(2).await;
+                assert_eq!(load.aggregates.available_permits(), 1, "expired={expired}");
+                let before_other = sql_counts();
+                let other_days = if expired { 90 } else { 30 };
+                let other_path = format!("/api/guilds/10/analytics?days={other_days}");
+                let (status, other) = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    f.request_token("POST", &other_path, "", Some(&enrollment.id)),
+                )
+                .await
+                .expect("another range must progress while the 7-day load is blocked");
+                assert_eq!(status, StatusCode::OK, "{other}");
+                assert_eq!(other["window_days"], other_days);
+                assert!(!other["members"].is_null());
+                let after_other = sql_counts();
+                let other_cost = (
+                    after_other.0 - before_other.0,
+                    after_other.1 - before_other.1,
+                );
+
+                let (status, _) = f
+                    .request_token(
+                        "POST",
+                        "/api/guilds/10/analytics?days=7",
+                        "",
+                        Some("older-enrollment"),
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::CONFLICT);
+                load.release.add_permits(1);
+                other_cost
+            });
+        assert_eq!(first.0, StatusCode::OK, "{}", first.1);
+        assert_eq!(first, second);
+        assert_eq!(first.1["window_days"], 7);
+        assert!(!first.1["members"].is_null());
+        assert_eq!(load.aggregates.available_permits(), 1);
+        let after = sql_counts();
+        // BEGIN/end, one enrollment check and one core aggregate.
+        assert_eq!(after.0 - before.0 - other_cost.0, 4);
+        // Compare the directory query plus scope validation to a single cold
+        // read made by the same handler for the other range.
+        assert!(other_cost.1 > 0);
+        assert_eq!(after.1 - before.1 - other_cost.1, other_cost.1);
+    }
+    f.app.analytics_cache.expire_for_test(&key);
+    let load = AnalyticsLoadProbe::install(key);
+    let mut old_membership = Box::pin(request(&f.cookie));
+    tokio::select! {
+        _ = &mut old_membership => panic!("old membership must wait at the aggregate"),
+        _ = load.wait_for_requests(1) => {}
+    }
+    db::retire_guild_enrollment(&f.app.db, 10, 100)
+        .await
+        .unwrap();
+    db::enroll_guild(&f.app.db, 10, 101).await.unwrap();
+    let replacement = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let (status, current) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        f.request_token(
+            "POST",
+            "/api/guilds/10/analytics?days=7",
+            "",
+            Some(&replacement.id),
+        ),
+    )
+    .await
+    .expect("a replacement enrollment must progress while the old one is blocked");
+    assert_eq!(status, StatusCode::OK, "{current}");
+    assert!(
+        current["members"].is_null(),
+        "the directory still belongs to the old enrollment"
+    );
+    drop(old_membership);
+    ANALYTICS_PROBE.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[tokio::test]
+async fn analytics_retries_after_a_cancelled_load_and_directory_outage() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    let request = || {
+        f.request_token(
+            "POST",
+            "/api/guilds/10/analytics?days=7",
+            "",
+            Some(&enrollment.id),
+        )
+    };
+    let (status, partial) = request().await;
+    assert_eq!(status, StatusCode::OK, "{partial}");
+    assert!(partial["members"].is_null());
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let load = AnalyticsLoadProbe::install((10, enrollment.id.clone(), 7));
+    let mut leader = Box::pin(request());
+    tokio::select! {
+        _ = &mut leader => panic!("leader must wait at the aggregate"),
+        _ = load.wait_for_requests(1) => {}
+    }
+    let mut followers = Box::pin(async { tokio::join!(request(), request()) });
+    tokio::select! {
+        _ = &mut followers => panic!("both followers must wait for the leader"),
+        _ = load.wait_for_requests(2) => {}
+    }
+    assert_eq!(load.aggregates.available_permits(), 1);
+    drop(leader);
+
+    load.release.add_permits(1);
+    let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(5), followers)
+        .await
+        .expect("both followers must share one replacement load after cancellation");
+    assert_eq!(first.0, StatusCode::OK, "{}", first.1);
+    assert_eq!(first, second);
+    assert!(
+        !first.1["members"].is_null(),
+        "retry the directory after it becomes available"
+    );
+    assert_eq!(load.aggregates.available_permits(), 2);
+    ANALYTICS_PROBE.with(|slot| *slot.borrow_mut() = None);
+}
