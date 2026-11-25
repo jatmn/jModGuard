@@ -430,8 +430,133 @@ async fn abrupt_restart_recovers_unenrolled_deletes_once_as_individual_notices()
 }
 
 #[tokio::test]
+async fn cleanup_strike_after_enrollment_keeps_its_confirmed_delete() {
+    let f = Fixture::new(true).await;
+    let earlier = f.begin().await.unwrap();
+    f.rest(Some(&earlier), 1, 101).await;
+    f.enroll().await;
+    let later = f.begin().await.unwrap();
+    f.rest(Some(&later), 2, 102).await;
+    drop((earlier, later));
+
+    tokio::time::pause();
+    f.settle().await;
+    f.settle().await;
+    let notices = f.notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("**Deleted:** 1"));
+    assert!(notices[0].contains("**Channels:** <#2> 1"));
+}
+
+#[tokio::test]
 async fn collector_first_single_cleanup_replays_after_handler_and_restart() {
     collector_first_cleanup_replays(GatewayDeleteOrigin::Single, &[102]).await;
+}
+
+#[tokio::test]
+async fn collector_only_cleanup_replays_after_restart_during_an_unrelated_send() {
+    let f = Fixture::new(true).await;
+    f.enroll().await;
+    let other_guild = GUILD + 100;
+    db::upsert_log_channel(
+        &f.app.db,
+        other_guild as i64,
+        "message_delete",
+        DESTINATION as i64,
+    )
+    .await
+    .unwrap();
+    let unrelated = f.begin_in(other_guild, SUBJECT).await.unwrap();
+    assert!(
+        unrelated
+            .deleted(&f.app, 1, 101, unrelated.prepare(&f.app, 1, 101), false)
+            .await
+    );
+    drop(unrelated);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::resume();
+
+    let blocked = Arc::new(FailsOrBlocks {
+        response: SummaryResponse::Blocked,
+        ..Default::default()
+    });
+    let worker = tokio::spawn({
+        let app = Arc::clone(&f.app);
+        let blocked = Arc::clone(&blocked);
+        async move { run_cleanup_worker(&app, blocked.as_ref()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), blocked.entered.notified())
+        .await
+        .expect("unrelated Discord send must start");
+
+    let cleanup = f.begin().await.unwrap();
+    cleanup.begin_purge(PURGE_WINDOW_SECS, BAN_REQUESTED_AT_MS);
+    let guild = GuildId::new(GUILD);
+    let channel = ChannelId::new(2);
+    let message = MessageId::new(102);
+    assert!(
+        claim_cleanup_gateway(
+            &f.app,
+            guild,
+            channel,
+            message,
+            None,
+            GatewayDeleteOrigin::Single,
+        )
+        .is_none(),
+        "the typed handler has no author and cannot persist the delete"
+    );
+    let mut snapshot = replay_snapshot("collector-only purge echo");
+    snapshot.guild_id = guild.get() as i64;
+    snapshot.channel_id = channel.get() as i64;
+    snapshot.message_id = message.get() as i64;
+    snapshot.fields.author_id = Some(SUBJECT as i64);
+    snapshot.created_at_ms = BAN_REQUESTED_AT_MS - 1_000;
+    assert!(
+        classify_observed_delete(&f.app, guild, channel, message, Some(&snapshot)).is_none(),
+        "the collector claims the delete and suppresses the ordinary notice"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = db::recovered_cleanup_deletes(&f.app.db, "fixture-reader".into(), 0)
+                .await
+                .unwrap();
+            if rows
+                .iter()
+                .any(|(_, row)| row.message_id == message.get() as i64 && row.purge)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("collector handoff must commit while the unrelated send is blocked");
+    assert_eq!(blocked.rejected.lock().len(), 1);
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    let path = Arc::clone(&f.path);
+    drop(cleanup);
+    drop(f);
+
+    let restarted = BotState::new(Default::default(), db::Db::open(&path.0, 2).unwrap()).unwrap();
+    restarted.activation.mark_lock_held(true);
+    let sink = Sink::default();
+    let (last, retry) = recover_cleanup_page(&restarted, &sink, 0).await.unwrap();
+    assert!(last.is_some() && !retry);
+    assert_eq!(
+        recover_cleanup_page(&restarted, &sink, 0).await.unwrap(),
+        (None, false)
+    );
+    let sent = sink.0.lock();
+    let [(destination, payload)] = sent.as_slice() else {
+        panic!("expected one recovered notice, got {sent:?}");
+    };
+    assert_eq!(destination.get(), DESTINATION);
+    let text = log_text(payload);
+    assert!(text.contains("Message deleted"));
+    assert!(text.contains(&format!("/{guild}/{channel}/{message}")));
 }
 
 #[tokio::test]

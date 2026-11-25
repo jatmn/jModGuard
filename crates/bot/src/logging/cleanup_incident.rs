@@ -53,6 +53,7 @@ pub(crate) struct CleanupIncidents {
     inner: Mutex<Incidents>,
     wake: tokio::sync::Notify,
     journal: Mutex<JournalWrites>,
+    journal_wake: tokio::sync::Notify,
     journal_writer: tokio::sync::Mutex<()>,
     recovery: db::CleanupRecovery,
 }
@@ -429,9 +430,9 @@ impl Incident {
                 row,
                 retry_at: None,
             });
-        // This is also the bounded handoff for snapshot-only claims.
-        // The cleanup worker persists them before delivering the incident.
-        app.cleanup_incidents.wake.notify_one();
+        // Snapshot-only claims hand off here without waiting for the primary
+        // or for any in-flight Discord delivery.
+        app.cleanup_incidents.journal_wake.notify_one();
         key
     }
 }
@@ -474,7 +475,7 @@ pub(crate) async fn begin_cleanup<'a>(
         .active
         .iter_mut()
         .rev()
-        .find(|(_, (key, _))| *key == subject)
+        .find(|(_, (key, incident))| *key == subject && incident.enrollment_id == enrollment_id)
         && now < incident.settle_at
     {
         if incident.rule_id != rule.id || incident.action != rule.action {
@@ -684,15 +685,7 @@ impl CleanupIncidents {
                 )
                 .min()
         };
-        let retry = {
-            let journal = self.journal.lock();
-            journal
-                .observed
-                .values()
-                .filter_map(|pending| pending.retry_at)
-                .chain(journal.settlement_retry_at)
-                .min()
-        };
+        let retry = self.journal.lock().settlement_retry_at;
         if let Some(next) = next.into_iter().chain(retry).min() {
             tokio::select! {
                 _ = self.wake.notified() => {},
@@ -700,6 +693,25 @@ impl CleanupIncidents {
             }
         } else {
             self.wake.notified().await;
+        }
+    }
+
+    async fn wait_for_observations(&self) {
+        let now = Clock::now();
+        let next = self
+            .journal
+            .lock()
+            .observed
+            .values()
+            .map(|pending| pending.retry_at.unwrap_or(now))
+            .min();
+        if let Some(next) = next {
+            tokio::select! {
+                _ = self.journal_wake.notified() => {},
+                _ = tokio::time::sleep_until(next) => {},
+            }
+        } else {
+            self.journal_wake.notified().await;
         }
     }
 
@@ -1559,17 +1571,30 @@ tokio::task_local! {
 }
 
 pub async fn run_cleanup_reports(app: Arc<BotState>, http: Arc<serenity::http::Http>) {
+    run_cleanup_worker(&app, http.as_ref()).await;
+}
+
+async fn run_cleanup_worker(app: &Arc<BotState>, sink: &impl LogDelivery) {
+    let journal = async {
+        loop {
+            app.cleanup_incidents.wait_for_observations().await;
+            if app.activation.is_shutting_down() {
+                break;
+            }
+            persist_cleanup_queue(app, false).await;
+        }
+    };
     let live = async {
         while !app.activation.is_shutting_down() {
             app.cleanup_incidents.wait_until_due().await;
             if !app.activation.is_shutting_down() {
-                flush(&app, http.as_ref(), false).await;
+                flush(app, sink, false).await;
             }
         }
     };
     tokio::select! {
         _ = crate::shutdown_signal() => {},
-        _ = async { tokio::join!(recover_cleanup_reports(&app, http.as_ref()), live); } => {},
+        _ = async { tokio::join!(recover_cleanup_reports(app, sink), journal, live); } => {},
     }
 }
 
