@@ -372,19 +372,27 @@ async fn failed_history_reads_are_reused_until_the_next_refresh() {
 
 #[tokio::test]
 async fn session_load_counts_toward_active_sessions() {
-    use tower_sessions::cookie::time::Duration as CookieDuration;
     let inner = MemoryStore::default();
     let store = CountedStore(inner.clone());
     let mut record = tower_sessions::session::Record {
         id: tower_sessions::session::Id::default(),
         data: std::collections::HashMap::new(),
-        expiry_date: tower_sessions::cookie::time::OffsetDateTime::now_utc()
-            + CookieDuration::hours(1),
+        expiry_date: time::Date::MAX.midnight().assume_utc(),
     };
     inner.create(&mut record).await.unwrap();
-    assert_eq!(super::active_sessions(), 0);
-    store.load(&record.id).await.unwrap();
-    assert_eq!(super::active_sessions(), 1);
+    // Other routers in this process also track sessions. Read only this fixture's ID.
+    let tracked_expiry = || {
+        tracked_sessions()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&record.id)
+            .copied()
+    };
+    assert_eq!(tracked_expiry(), None);
+    assert!(store.load(&record.id).await.unwrap().is_some());
+    assert_eq!(tracked_expiry(), Some(record.expiry_date));
+    store.delete(&record.id).await.unwrap();
+    assert_eq!(tracked_expiry(), None);
 }
 
 #[tokio::test]

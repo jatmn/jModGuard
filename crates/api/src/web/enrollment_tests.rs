@@ -9142,20 +9142,33 @@ async fn platform_member_totals_distinguish_empty_unavailable_and_incomplete_fle
     assert_eq!(unavailable["status"], "unavailable", "{unavailable}");
     assert_eq!(unavailable["guilds_unavailable"], 1);
 
-    // A reachable store whose initial import has not finished is counted,
-    // but the totals are not complete.
     let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
-    f.app.tenant.activate(enrollment).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let not_started = platform::member_totals(&f.app).await;
+    assert_eq!(not_started["status"], "partial", "{not_started}");
+    assert_eq!(not_started["guilds_counted"], 1);
+    assert_eq!(not_started["guilds_unavailable"], 0);
+    assert_eq!(not_started["guilds_incomplete"], 1);
+    assert_eq!(not_started["by_guild"]["10"]["current"], 0);
+    assert_eq!(not_started["by_guild"]["10"]["coverage"], "not_started");
+
+    let (status, analytics) = f.request("POST", "/api/guilds/10/analytics", "").await;
+    assert_eq!(status, StatusCode::OK, "{analytics}");
+    assert_eq!(analytics["members"]["coverage"], "not_started");
+
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    // Keep the queued fixture below the stall age regardless of when the test runs.
+    store
+        .initialize_member_directory(scope, 42, i64::MAX)
+        .await
+        .unwrap();
     let importing = platform::member_totals(&f.app).await;
-    assert_eq!(importing["status"], "partial", "{importing}");
-    assert_eq!(importing["guilds_counted"], 1);
-    assert_eq!(importing["guilds_unavailable"], 0);
-    assert_eq!(importing["guilds_incomplete"], 1);
-    assert_eq!(
-        importing["by_guild"]["10"],
-        serde_json::json!({"current": 0, "coverage": "importing"}),
-        "each counted server reports its own directory status"
-    );
+    assert_eq!(importing["by_guild"]["10"]["coverage"], "importing");
 }
 
 #[tokio::test]
