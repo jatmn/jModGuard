@@ -56,6 +56,8 @@ mod nickname_jobs;
 pub use nickname_jobs::*;
 mod gateway_ban_deliveries;
 pub use gateway_ban_deliveries::*;
+mod cleanup_delete_journal;
+pub use cleanup_delete_journal::*;
 mod moderation;
 pub use moderation::*;
 mod analytics;
@@ -98,6 +100,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (26, include_str!("../migrations/0026_guild_join_info.sql")),
     (27, include_str!("../migrations/0027_ban_list.sql")),
     (28, include_str!("../migrations/0028_resource_rollups.sql")),
+    (
+        29,
+        include_str!("../migrations/0029_cleanup_delete_journal.sql"),
+    ),
 ];
 
 /// Completed core schema required by service startup and release observations.

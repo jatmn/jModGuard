@@ -1,5 +1,179 @@
 use super::*;
 
+#[tokio::test]
+async fn cleanup_dispatch_requires_every_row_and_an_active_unfenced_enrollment() {
+    use super::guild_stores::{StoreId, StorePolicy, register_store};
+    use std::future::Future as _;
+
+    let tmp = tmp_db_path("cleanup_dispatch");
+    let db = Db::open(&tmp, 2).unwrap();
+    let enrollment = enroll_guild(&db, 8, 100).await.unwrap().unwrap();
+    let outcomes = save_cleanup_deletes(
+        &db,
+        "previous".into(),
+        vec![CleanupDeleteRecord {
+            batch: "cleanup".into(),
+            guild_id: enrollment.guild_id,
+            enrollment_id: Some(enrollment.id.clone()),
+            channel_id: 9,
+            message_id: 10,
+            user_id: 11,
+            rule_id: "spam".into(),
+            rule_name: "Spam".into(),
+            observed_at_ms: 100,
+            purge: false,
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcomes, [CleanupDeleteSave::Saved]);
+    let key = CleanupJournalKey {
+        guild_id: enrollment.guild_id,
+        enrollment_id: Some(&enrollment.id),
+        batch: "cleanup",
+        messages: &[10, 12],
+        recovery: None,
+    };
+    assert!(CleanupDispatchClaim::reserve(&db, key).await.is_err());
+    let key = CleanupJournalKey {
+        messages: &[10],
+        ..key
+    };
+    // The partial claim must roll back without changing the remaining row.
+    let retryable = recovered_cleanup_deletes(&db, "replacement".into(), 0)
+        .await
+        .unwrap();
+    assert_eq!(retryable.len(), 1);
+    let first = CleanupDispatchClaim::reserve(&db, key).await.unwrap();
+    let next = CleanupDispatchClaim::reserve(&db, key).await.unwrap();
+    assert!(first.arm_for_send().await.is_err());
+    next.arm_for_send().await.unwrap();
+    first.release().await.unwrap();
+    assert!(
+        recovered_cleanup_deletes(&db, "replacement".into(), 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    next.release().await.unwrap();
+    let unstarted = CleanupDispatchClaim::reserve(&db, key).await.unwrap();
+    let mut arm = Box::pin(unstarted.arm_for_send());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(arm.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    // Let the database commit the arm while its consumer is suspended.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !recovered_cleanup_deletes(&db, "replacement".into(), 0)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(arm);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while recovered_cleanup_deletes(&db, "replacement".into(), 0)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let destination = format!("{:032x}", 9u128);
+    register_store(
+        &db,
+        StoreId::parse(&destination).unwrap(),
+        StorePolicy::Shared,
+    )
+    .await
+    .unwrap();
+    db.with_conn(move |conn| {
+        conn.execute_bounded(
+            "INSERT INTO guild_write_fences
+               (guild_id,generation,phase,destination_store_id,destination_revision,created_at)
+             VALUES (8,?1,'freeze',?1,?1,100)",
+            params![destination],
+            1024,
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(CleanupDispatchClaim::reserve(&db, key).await.is_err());
+    assert!(
+        ensure_cleanup_enrollment(&db, enrollment.guild_id, Some(enrollment.id.clone()))
+            .await
+            .is_err()
+    );
+    drop(db);
+    let _ = std::fs::remove_file(tmp);
+}
+
+#[tokio::test]
+async fn unenrolled_cleanup_journal_cannot_dispatch_under_a_new_enrollment() {
+    let tmp = tmp_db_path("unenrolled_cleanup_journal");
+    let db = Db::open(&tmp, 2).unwrap();
+    let record = CleanupDeleteRecord {
+        batch: "cleanup".into(),
+        guild_id: 8,
+        enrollment_id: None,
+        channel_id: 9,
+        message_id: 10,
+        user_id: 11,
+        rule_id: "spam".into(),
+        rule_name: "Spam".into(),
+        observed_at_ms: 100,
+        purge: false,
+    };
+    assert_eq!(
+        save_cleanup_deletes(&db, "previous".into(), vec![record.clone()])
+            .await
+            .unwrap(),
+        [CleanupDeleteSave::Saved]
+    );
+    let key = CleanupJournalKey {
+        guild_id: record.guild_id,
+        enrollment_id: None,
+        batch: &record.batch,
+        messages: &[record.message_id],
+        recovery: None,
+    };
+    let claim = CleanupDispatchClaim::reserve(&db, key).await.unwrap();
+    enroll_guild(&db, record.guild_id, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(claim.arm_for_send().await.is_err());
+    assert!(
+        recovered_cleanup_deletes(&db, "replacement".into(), 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        prune_cleanup_journal(&db, "replacement".into(), &CleanupRecovery::default())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        save_cleanup_deletes(&db, "previous".into(), vec![record])
+            .await
+            .unwrap(),
+        [CleanupDeleteSave::Retired]
+    );
+    drop(db);
+    let _ = std::fs::remove_file(tmp);
+}
+
 #[test]
 fn remote_pool_admission_has_a_deadline() {
     let tmp = tmp_db_path("pool_admission_timeout");

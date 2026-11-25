@@ -2999,6 +2999,7 @@ async fn superseded_clear_receipt_retires_when_no_row_matches() {
 }
 
 const QUEUED_RELEASED_CORE: i64 = 23;
+const BEFORE_CORE_29: &str = "DROP TABLE cleanup_delete_journal;";
 const BEFORE_CORE_28: &str = "DROP TABLE resource_rollups; DROP TABLE resource_status;";
 const BEFORE_CORE_24: &str = "DROP TABLE known_spam;
     DROP INDEX idx_analytics_warns_time;
@@ -3024,6 +3025,7 @@ async fn baked_bot_migrates_queued_protocol3_core_baseline_without_starting_api_
             serde_json::from_str(include_str!("fixtures/queued-core16.json")).unwrap();
         db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(BEFORE_CORE_29, 1024 * 1024)?;
             tx.execute_batch_bounded(BEFORE_CORE_28, 1024 * 1024)?;
             tx.execute_batch_bounded(
                 include_str!("../../../tests/fixtures/before-core-0027.sql"),
@@ -3031,6 +3033,12 @@ async fn baked_bot_migrates_queued_protocol3_core_baseline_without_starting_api_
             )?;
             tx.execute_batch_bounded(BEFORE_CORE_24, 1024 * 1024)?;
             tx.pragma_update(None, "user_version", QUEUED_RELEASED_CORE)?;
+            let journal_exists = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='cleanup_delete_journal')",
+                (),
+                |row| Ok(row.get::<i64>(0)?),
+            )?;
+            assert_eq!(journal_exists, 0);
             for row in fixture["component_updates"].as_array().unwrap() {
                 // Column names are from this committed synthetic fixture only.
                 for (column, value) in row.as_object().unwrap() {
@@ -3189,6 +3197,10 @@ async fn baked_bot_migrates_queued_protocol3_core_baseline_without_starting_api_
             control.schema_version().await.unwrap(),
             db::CORE_SCHEMA_VERSION
         );
+        let pending = db::recovered_cleanup_deletes(&migrated, "fixture".into(), 0)
+            .await
+            .unwrap();
+        assert!(pending.is_empty());
         tokio::fs::remove_file(root.join("hold-baked-bot-ready"))
             .await
             .unwrap();
@@ -3473,6 +3485,7 @@ async fn stale_schema_selections_without_upgrade_are_refused_once_after_migratio
         let fixture = fixture.clone();
         move |conn| {
             let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(BEFORE_CORE_29, 1024 * 1024)?;
             tx.execute_batch_bounded(BEFORE_CORE_28, 1024 * 1024)?;
             tx.execute_batch_bounded(
                 include_str!("../../../tests/fixtures/before-core-0027.sql"),

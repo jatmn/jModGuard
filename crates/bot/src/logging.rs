@@ -15,6 +15,15 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+mod cleanup_incident;
+#[cfg(test)]
+pub(crate) use cleanup_incident::flush as flush_cleanup_reports;
+pub(crate) use cleanup_incident::{
+    Cleanup, CleanupIncidents, CleanupRule, begin_cleanup, claim_cleanup_gateway,
+    cleanup_delete_failure, persist_cleanup_observations,
+};
+pub use cleanup_incident::{flush_cleanup_on_shutdown, run_cleanup_reports};
+
 const SNIPPET_KEEP: Duration = Duration::from_secs(600);
 const SNIPPETS_PER_GUILD: usize = 64;
 pub(crate) const EDIT_REPORT_KEEP: Duration = Duration::from_secs(10);
@@ -1150,13 +1159,33 @@ pub(crate) trait LogDelivery: Sync {
         &self,
         channel: ChannelId,
         message: CreateMessage,
+        attachment: Option<CreateAttachment>,
         still_current: &(dyn Fn() -> bool + Sync),
         _on_global_rate_limit: &crate::discord::OnGlobalRateLimitCallback,
+        attempt: Option<&mut crate::discord::LogAttempt<'_>>,
     ) -> anyhow::Result<bool> {
         if !still_current() {
             return Ok(false);
         }
-        self.send(channel, message).await?;
+        let message = match attachment {
+            Some(file) => message.add_file(file),
+            None => message,
+        };
+        if let Some(attempt) = attempt {
+            attempt.before_send().await?;
+            let result = self.send(channel, message).await;
+            if let Err(error) = &result
+                && let Some((status, _)) = error
+                    .downcast_ref::<serenity::Error>()
+                    .and_then(crate::discord::http_error_response)
+            {
+                attempt.status.observe_status(status);
+                attempt.reset_journal_if_unsent().await?;
+            }
+            result?;
+        } else {
+            self.send(channel, message).await?;
+        }
         Ok(true)
     }
     async fn member_audit(&self, _guild: GuildId, _action: Action) -> anyhow::Result<AuditLogs> {
@@ -1191,15 +1220,19 @@ impl LogDelivery for serenity::http::Http {
         &self,
         channel: ChannelId,
         message: CreateMessage,
+        attachment: Option<CreateAttachment>,
         still_current: &(dyn Fn() -> bool + Sync),
         on_global_rate_limit: &crate::discord::OnGlobalRateLimitCallback,
+        attempt: Option<&mut crate::discord::LogAttempt<'_>>,
     ) -> anyhow::Result<bool> {
         crate::discord::send_discord_log_after_rate_limit(
             self,
             channel,
             message,
+            attachment,
             still_current,
             on_global_rate_limit,
+            attempt,
         )
         .await
     }
@@ -1219,11 +1252,20 @@ impl LogDelivery for std::sync::Arc<serenity::http::Http> {
         &self,
         channel: ChannelId,
         message: CreateMessage,
+        attachment: Option<CreateAttachment>,
         still_current: &(dyn Fn() -> bool + Sync),
         on_global_rate_limit: &crate::discord::OnGlobalRateLimitCallback,
+        attempt: Option<&mut crate::discord::LogAttempt<'_>>,
     ) -> anyhow::Result<bool> {
         self.as_ref()
-            .send_after_rate_limit(channel, message, still_current, on_global_rate_limit)
+            .send_after_rate_limit(
+                channel,
+                message,
+                attachment,
+                still_current,
+                on_global_rate_limit,
+                attempt,
+            )
             .await
     }
 }
@@ -1236,7 +1278,7 @@ pub(crate) enum Delivery {
     Failed,
     /// Skipped because this guild/channel was recently rejected with a permanent error.
     Blocked,
-    /// Admitted rejoin enrichment found nothing to report; do not retry delivery.
+    /// This delivery path found no report to send.
     NothingToSend,
 }
 
@@ -1331,9 +1373,52 @@ pub(crate) async fn emit_to_if(
         commit,
         false,
         None,
+        None,
     )
     .await
     .0
+}
+
+#[derive(PartialEq, Eq)]
+enum SummaryDelivery {
+    Sent,
+    Retry,
+    Fallback,
+    Ambiguous,
+}
+
+async fn emit_cleanup_summary(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild: GuildId,
+    vars: BTreeMap<String, String>,
+    dispatch: &mut crate::discord::LogDispatch,
+    journal: db::CleanupJournalKey<'_>,
+) -> SummaryDelivery {
+    let (delivery, _) = emit_to_observed_with_audit(
+        app,
+        sink,
+        guild,
+        "automod_delete",
+        vars,
+        None,
+        Admission::Immediate,
+        || true,
+        false,
+        None,
+        Some(crate::discord::LogAttempt::new(
+            dispatch,
+            Some((&app.db, journal)),
+        )),
+    )
+    .await;
+    match (delivery, *dispatch) {
+        (Delivery::Sent, _) => SummaryDelivery::Sent,
+        (_, crate::discord::LogDispatch::MayHaveSent) => SummaryDelivery::Ambiguous,
+        (_, crate::discord::LogDispatch::Rejected) => SummaryDelivery::Fallback,
+        (Delivery::Failed | Delivery::Dropped, _) => SummaryDelivery::Retry,
+        _ => SummaryDelivery::Fallback,
+    }
 }
 
 /// Incomplete-notice delivery. The predicate is checked again after a rate-limit wait.
@@ -1355,6 +1440,7 @@ pub(crate) async fn emit_to_if_after_rate_limit(
         Admission::Immediate,
         commit,
         true,
+        None,
         None,
     )
     .await
@@ -1381,6 +1467,7 @@ async fn emit_to_observed(
         || true,
         false,
         None,
+        None,
     )
     .await
     .0
@@ -1398,6 +1485,7 @@ async fn emit_to_observed_with_audit(
     commit: impl Fn() -> bool + Sync,
     after_rate_limit: bool,
     rejoin_enrich_user: Option<&serenity::model::user::User>,
+    mut log_attempt: Option<crate::discord::LogAttempt<'_>>,
 ) -> (Delivery, Option<BTreeMap<String, String>>) {
     // Gateway callers register before their DB awaits. Direct callers register
     // here, before admission/config/filter exits can discard the observation.
@@ -1441,6 +1529,9 @@ async fn emit_to_observed_with_audit(
     };
     let mut matched_audit = None;
     let result = tokio::time::timeout(deadline.saturating_sub(started.elapsed()), async {
+        if let Some(attempt) = &log_attempt {
+            attempt.ensure_current_enrollment().await?;
+        }
         let cfg = app.configs.get(&app.db, guild_id.get()).await?;
         let Some(channel_id) = channel_for(&cfg, event) else {
             return Ok(Delivery::Unconfigured);
@@ -1546,12 +1637,46 @@ async fn emit_to_observed_with_audit(
         {
             return Ok(Delivery::Sent);
         }
-        let template = cfg
-            .templates
-            .get(event)
-            .map(String::as_str)
-            .unwrap_or_else(|| default_template(event));
+        let nonce = vars.remove("cleanup_nonce");
+        let grouped_cleanup = event == "automod_delete" && vars.contains_key("cleanup_total");
+        let template = if grouped_cleanup {
+            if vars.contains_key("cleanup_failure_notice") {
+                cleanup_incident::FAILURE_TEMPLATE
+            } else {
+                let Some(template) = cleanup_incident::summary_template(&cfg) else {
+                    return Ok(Delivery::Unconfigured);
+                };
+                template
+            }
+        } else {
+            let saved = cfg.templates.get(event).map(String::as_str);
+            match saved {
+                Some(saved)
+                    if event == "automod_delete" && templates::uses_automod_cleanup(saved) =>
+                {
+                    cleanup_incident::SINGLE_DELETE_TEMPLATE
+                }
+                Some(saved) => saved,
+                None => default_template(event),
+            }
+        };
         templates::format_log_timestamps(&mut vars);
+        if grouped_cleanup {
+            // A mixed custom template may request values tied to one message.
+            // The summary has no single message or unbounded retained content.
+            for key in templates::template_keys(template) {
+                vars.entry(key.to_owned())
+                    .or_insert_with(|| "unavailable for grouped cleanup".into());
+            }
+        }
+        if grouped_cleanup
+            && templates::render_bounded(template, &vars, 4097)
+                .encode_utf16()
+                .count()
+                > 4096
+        {
+            return Ok(Delivery::NothingToSend);
+        }
         let _ = render_log_template(event, template, &mut vars);
         if !app.activation.may_record() {
             return Ok(Delivery::Dropped);
@@ -1578,18 +1703,24 @@ async fn emit_to_observed_with_audit(
                 crate::handlers::observe_member_sync_rate_limit_wait(&app, wait);
             }
         };
+        let mut message = log_message(event, template, &vars);
+        if let Some(nonce) = nonce {
+            let nonce = serenity::model::channel::Nonce::String(nonce);
+            message = message.nonce(nonce).enforce_nonce(true);
+        }
         let call = crate::discord::race_discord_call(&app.activation, async {
-            if after_rate_limit {
+            if after_rate_limit || log_attempt.is_some() {
                 sink.send_after_rate_limit(
                     channel_id,
-                    log_message(event, template, &vars),
+                    message,
+                    None,
                     &commit,
                     &on_global_rate_limit,
+                    log_attempt.as_mut(),
                 )
                 .await
             } else {
-                sink.send(channel_id, log_message(event, template, &vars))
-                    .await?;
+                sink.send(channel_id, message).await?;
                 Ok(true)
             }
         });
@@ -1615,7 +1746,12 @@ async fn emit_to_observed_with_audit(
     let delivery = match result {
         Ok(Ok(delivery)) => delivery,
         Ok(Err(_)) | Err(_) => {
-            record_delivery_failure(app);
+            // The incident accounts for an uncertain send when it settles.
+            if log_attempt
+                .is_none_or(|attempt| *attempt.status != crate::discord::LogDispatch::MayHaveSent)
+            {
+                record_delivery_failure(app);
+            }
             Delivery::Failed
         }
     };
@@ -1698,6 +1834,11 @@ fn excluded(filter: &db::LogFilter, vars: &BTreeMap<String, String>) -> bool {
     user_match
         || channel_id_excluded(filter, source)
         || channel_id_excluded(filter, vars.get("before_channel_id").map(String::as_str))
+        || vars.get("cleanup_source_channels").is_some_and(|channels| {
+            channels
+                .split(',')
+                .any(|channel| channel_id_excluded(filter, Some(channel)))
+        })
 }
 
 fn channel_id_excluded(filter: &db::LogFilter, raw: Option<&str>) -> bool {
@@ -1967,14 +2108,8 @@ pub(crate) fn render_log_template(
 }
 
 fn substituted_key_count(template: &str, key: &str) -> usize {
-    template
-        .split_inclusive('}')
-        .filter(|chunk| {
-            chunk.ends_with('}')
-                && chunk
-                    .rfind('{')
-                    .is_some_and(|start| &chunk[start + 1..chunk.len() - 1] == key)
-        })
+    templates::template_keys(template)
+        .filter(|candidate| *candidate == key)
         .count()
 }
 
@@ -2420,6 +2555,62 @@ fn bulk_send_definitely_rejected(error: &anyhow::Error) -> bool {
         })
 }
 
+struct BulkSendFailure {
+    error: Option<anyhow::Error>,
+    ambiguous: bool,
+}
+
+async fn send_bulk_message(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    destination: ChannelId,
+    message: CreateMessage,
+    attachment: Option<CreateAttachment>,
+    left: Duration,
+    mut attempt: Option<&mut crate::discord::LogAttempt<'_>>,
+) -> Result<(), BulkSendFailure> {
+    let call = crate::discord::race_discord_call(&app.activation, async {
+        if let Some(attempt) = attempt.as_deref_mut() {
+            let app = Arc::clone(app);
+            let on_global_rate_limit = move |wait| {
+                crate::handlers::observe_member_sync_rate_limit_wait(&app, wait);
+            };
+            sink.send_after_rate_limit(
+                destination,
+                message,
+                attachment,
+                &|| true,
+                &on_global_rate_limit,
+                Some(attempt),
+            )
+            .await
+        } else {
+            let message = match attachment {
+                Some(file) => message.add_file(file),
+                None => message,
+            };
+            sink.send(destination, message).await.map(|()| true)
+        }
+    });
+    let result = tokio::time::timeout(left, call).await;
+    use crate::discord::DiscordCall;
+    let error = match result {
+        Ok(DiscordCall::Finished(Ok(true))) => return Ok(()),
+        Ok(DiscordCall::Finished(Err(error))) => Some(error),
+        _ => None,
+    };
+    let ambiguous = match attempt {
+        Some(attempt) => {
+            attempt.previous_part_sent
+                || *attempt.status == crate::discord::LogDispatch::MayHaveSent
+        }
+        None => error
+            .as_ref()
+            .is_none_or(|error| !bulk_send_definitely_rejected(error)),
+    };
+    Err(BulkSendFailure { error, ambiguous })
+}
+
 struct TextFallbackDelivery {
     outcome: crate::automod_delete_marks::BulkDeliveryOutcome,
     terminal_error: Option<serenity::Error>,
@@ -2438,6 +2629,7 @@ async fn deliver_bulk_text_fallback_parts(
     deadline: Duration,
     started: Instant,
     mut failure_recovery: crate::discord::RecoveryEpoch,
+    mut attempt: Option<&mut crate::discord::LogAttempt<'_>>,
 ) -> TextFallbackDelivery {
     use crate::automod_delete_marks::BulkDeliveryOutcome;
     let parts = fallback_bulk_parts(template, display, transcript);
@@ -2455,36 +2647,31 @@ async fn deliver_bulk_text_fallback_parts(
         failure_recovery = app
             .remembered_discord_targets
             .capture_recovery_epoch(rest_target);
-        match tokio::time::timeout(
-            left,
-            crate::discord::race_discord_call(
-                &app.activation,
-                sink.send(
-                    destination,
-                    log_message(
-                        "message_bulk_delete",
-                        "{details}",
-                        &BTreeMap::from([("details".into(), details)]),
-                    ),
-                ),
+        match send_bulk_message(
+            app,
+            sink,
+            destination,
+            log_message(
+                "message_bulk_delete",
+                "{details}",
+                &BTreeMap::from([("details".into(), details)]),
             ),
+            None,
+            left,
+            attempt.as_deref_mut(),
         )
         .await
         {
-            Ok(crate::discord::DiscordCall::Finished(Ok(()))) => {
+            Ok(()) => {
                 parts_sent += 1;
+                if let Some(attempt) = attempt.as_deref_mut() {
+                    attempt.previous_part_sent = true;
+                }
             }
-            Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
-                let definite = bulk_send_definitely_rejected(&error);
-                terminal_error = error.downcast::<serenity::Error>().ok();
+            Err(failure) => {
+                terminal_error = failure.error.and_then(|error| error.downcast().ok());
                 // A later part's rejection still follows bytes Discord already accepted.
-                // The first part's body-read or transport error does not prove rejection.
-                ambiguous = parts_sent > 0 || !definite;
-                break;
-            }
-            // Timeout or cancellation is ambiguous: do not send another part.
-            _ => {
-                ambiguous = true;
+                ambiguous = parts_sent > 0 || failure.ambiguous;
                 break;
             }
         }
@@ -2517,24 +2704,34 @@ async fn deliver_attached_bulk(
     transcript: &BulkTranscript,
     deadline: Duration,
     started: Instant,
+    mut attempt: Option<&mut crate::discord::LogAttempt<'_>>,
 ) -> crate::automod_delete_marks::BulkDeliveryOutcome {
     use crate::automod_delete_marks::BulkDeliveryOutcome;
-    let message = log_message("message_bulk_delete", template, display).add_file(
-        CreateAttachment::bytes(transcript.finish(), "deleted-messages.txt"),
-    );
+    let message = log_message("message_bulk_delete", template, display);
+    let attachment = CreateAttachment::bytes(transcript.finish(), "deleted-messages.txt");
     let mut terminal_error: Option<serenity::Error> = None;
     let mut failure_recovery = app
         .remembered_discord_targets
         .capture_recovery_epoch(rest_target);
-    let outcome = match tokio::time::timeout(
+    let outcome = match send_bulk_message(
+        app,
+        sink,
+        destination,
+        message,
+        Some(attachment),
         deadline.saturating_sub(started.elapsed()),
-        crate::discord::race_discord_call(&app.activation, sink.send(destination, message)),
+        attempt.as_deref_mut(),
     )
     .await
     {
-        Ok(crate::discord::DiscordCall::Finished(Ok(()))) => BulkDeliveryOutcome::Delivered,
-        Ok(crate::discord::DiscordCall::Finished(Err(discord_err))) => {
-            if attachment_permission_denied(&discord_err) {
+        Ok(()) => BulkDeliveryOutcome::Delivered,
+        Err(failure) => {
+            if !failure.ambiguous
+                && failure
+                    .error
+                    .as_ref()
+                    .is_some_and(attachment_permission_denied)
+            {
                 // Attach Files may be absent while Send Messages still works.
                 let fallback = deliver_bulk_text_fallback_parts(
                     app,
@@ -2547,23 +2744,20 @@ async fn deliver_attached_bulk(
                     deadline,
                     started,
                     failure_recovery,
+                    attempt,
                 )
                 .await;
                 failure_recovery = fallback.recovery;
                 terminal_error = fallback.terminal_error;
                 fallback.outcome
-            } else if bulk_send_definitely_rejected(&discord_err) {
-                terminal_error = discord_err.downcast::<serenity::Error>().ok();
-                BulkDeliveryOutcome::Failed
             } else {
-                terminal_error = discord_err.downcast::<serenity::Error>().ok();
-                BulkDeliveryOutcome::Ambiguous
+                terminal_error = failure.error.and_then(|error| error.downcast().ok());
+                if failure.ambiguous {
+                    BulkDeliveryOutcome::Ambiguous
+                } else {
+                    BulkDeliveryOutcome::Failed
+                }
             }
-        }
-        // Timeout or cancellation is ambiguous: do not send the plain-text fallback.
-        _ => {
-            record_delivery_failure(app);
-            return BulkDeliveryOutcome::Ambiguous;
         }
     };
     finish_bulk_channel_delivery(
@@ -2709,7 +2903,18 @@ pub(crate) async fn emit_retained_bulk_to(
     sink: &impl LogDelivery,
     guild: GuildId,
     channel: ChannelId,
+    transcript: BulkTranscript,
+) -> BulkDeliveryOutcome {
+    emit_retained_bulk_with_journal(app, sink, guild, channel, transcript, None).await
+}
+
+async fn emit_retained_bulk_with_journal(
+    app: &Arc<BotState>,
+    sink: &impl LogDelivery,
+    guild: GuildId,
+    channel: ChannelId,
     mut transcript: BulkTranscript,
+    journal: Option<db::CleanupJournalKey<'_>>,
 ) -> BulkDeliveryOutcome {
     let time = chrono::Utc::now().to_rfc3339();
     let Some(_permit) = acquire_log_delivery(app).await else {
@@ -2736,12 +2941,16 @@ pub(crate) async fn emit_retained_bulk_to(
     ]);
     let deadline = Duration::from_secs(app.cfg.log.discord_timeout_secs);
     let started = Instant::now();
-    let cfg = match tokio::time::timeout(
-        deadline.saturating_sub(started.elapsed()),
-        app.configs.get(&app.db, guild.get()),
-    )
-    .await
-    {
+    let mut status = crate::discord::LogDispatch::Pending;
+    let mut attempt =
+        journal.map(|key| crate::discord::LogAttempt::new(&mut status, Some((&app.db, key))));
+    let routing = tokio::time::timeout(deadline.saturating_sub(started.elapsed()), async {
+        if let Some(attempt) = &attempt {
+            attempt.ensure_current_enrollment().await?;
+        }
+        app.configs.get(&app.db, guild.get()).await
+    });
+    let cfg = match routing.await {
         Ok(Ok(cfg)) => cfg,
         _ => {
             record_delivery_failure(app);
@@ -2788,31 +2997,25 @@ pub(crate) async fn emit_retained_bulk_to(
             record_delivery_failure(app);
             return BulkDeliveryOutcome::Failed;
         }
-        return match tokio::time::timeout(
+        return match send_bulk_message(
+            app,
+            sink,
+            destination,
+            log_message("message_bulk_delete", template, &display),
+            None,
             left,
-            crate::discord::race_discord_call(
-                &app.activation,
-                sink.send(
-                    destination,
-                    log_message("message_bulk_delete", template, &display),
-                ),
-            ),
+            attempt.as_mut(),
         )
         .await
         {
-            Ok(crate::discord::DiscordCall::Finished(Ok(()))) => BulkDeliveryOutcome::Delivered,
-            Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
+            Ok(()) => BulkDeliveryOutcome::Delivered,
+            Err(failure) => {
                 record_delivery_failure(app);
-                if bulk_send_definitely_rejected(&error) {
-                    BulkDeliveryOutcome::Failed
-                } else {
+                if failure.ambiguous {
                     BulkDeliveryOutcome::Ambiguous
+                } else {
+                    BulkDeliveryOutcome::Failed
                 }
-            }
-            // Timeout or cancellation may already have reached Discord.
-            _ => {
-                record_delivery_failure(app);
-                BulkDeliveryOutcome::Ambiguous
             }
         };
     }
@@ -2833,6 +3036,7 @@ pub(crate) async fn emit_retained_bulk_to(
         &transcript,
         deadline,
         started,
+        attempt.as_mut(),
     )
     .await
 }
@@ -3238,6 +3442,7 @@ async fn emit_failure_bulk(
         &transcript,
         deadline,
         started,
+        None,
     )
     .await;
 }
@@ -3285,6 +3490,14 @@ pub(crate) fn place_bulk_delete(
     reserve_pending: bool,
 ) -> BulkDeletePlacement {
     use crate::automod_delete_marks::GatewayDeleteObservation;
+    let _ = claim_cleanup_gateway(
+        app,
+        guild_id,
+        channel,
+        id,
+        retained,
+        crate::automod_delete_marks::GatewayDeleteOrigin::Bulk,
+    );
     let (observation, reserved_pending) = app.automod_delete_marks.observe_and_reserve_bulk_delete(
         guild_id.get(),
         channel.get(),
@@ -3331,6 +3544,14 @@ fn classify_observed_delete(
     retained: Option<&MessageSnapshot>,
 ) -> Option<MessageReport> {
     use crate::automod_delete_marks::GatewayDeleteObservation;
+    let _ = claim_cleanup_gateway(
+        app,
+        guild_id,
+        channel,
+        id,
+        retained,
+        crate::automod_delete_marks::GatewayDeleteOrigin::Single,
+    );
     let retained_for_mark = retained.cloned();
     let observation = app.automod_delete_marks.observe_gateway_delete(
         guild_id.get(),
@@ -3698,6 +3919,7 @@ pub(crate) async fn emit_member_event(
         } else {
             None
         },
+        None,
     )
     .await
 }
@@ -3725,6 +3947,7 @@ pub(crate) async fn emit_verified_member_departure(
         Admission::Immediate,
         || true,
         false,
+        None,
         None,
     )
     .await;

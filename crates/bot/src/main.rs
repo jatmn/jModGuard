@@ -348,6 +348,11 @@ async fn main() -> Result<()> {
     app.install_discord_cache(Arc::clone(&cache));
     app.install_http_member_lookup(Arc::clone(&http));
 
+    let cleanup_reports = tokio::spawn(logging::run_cleanup_reports(
+        Arc::clone(&app),
+        Arc::clone(&http),
+    ));
+
     let poll_start = tokio::time::Instant::now();
     tokio::spawn(jmodguard_bot::access_marks::run(Arc::clone(&app)));
     tokio::spawn(jmodguard_bot::resources::run(
@@ -659,6 +664,8 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         shutdown_signal().await;
         shutdown_activation.begin_shutdown();
+        cleanup_reports.abort();
+        let _ = cleanup_reports.await;
         jmodguard::set_process_ready(false);
         // Date the planned stop now, before the notice drain cuts off recording, and
         // only when every shard that reached Ready still has a connected session.
@@ -678,9 +685,15 @@ async fn main() -> Result<()> {
         let attempted = guild_ids.len();
         jmodguard_bot::activation::drain_for_shutdown_notices(&shutdown_activation, async move {
             shutdown_app.stop_startup_notice_task().await;
-            let sent =
-                logging::emit_shutdown_notices(&shutdown_app, shutdown_http, guild_ids, content)
-                    .await;
+            let (_, sent) = tokio::join!(
+                logging::flush_cleanup_on_shutdown(&shutdown_app, shutdown_http.as_ref()),
+                logging::emit_shutdown_notices(
+                    &shutdown_app,
+                    Arc::clone(&shutdown_http),
+                    guild_ids,
+                    content
+                ),
+            );
             tracing::info!(sent, attempted, "shutdown notice phase complete");
         })
         .await;

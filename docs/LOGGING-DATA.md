@@ -99,12 +99,72 @@ and persistence contracts below are unchanged.
   If both maps are full, deletion still runs and only the gateway reports it,
   without automod attribution. Restart loses these marks; durable replay is
   outside this contract.
+- **Group automod cleanup deletes** is on by default. The bot groups explicit
+  spam deletes, successful tracked ban-sweep deletes, and attributable Discord
+  purge events for the same server, user, and active rule. A purge event must
+  match a previously observed author and fall within the ban's requested
+  message-age window. Unattributed deletes use their usual single or bulk log.
+  Nearby strikes for the same rule join the open incident, including the
+  velocity rule's existing delete fallback after a terminal kick. After 10 seconds
+  of quiet the bot sends one summary to the Automod Delete log, or to its
+  Message Delete fallback. It includes the observed deletion time range,
+  channel counts, a bounded sample and available evidence, and a separate
+  failure count. Source and user exclusions still apply. A definitively
+  rejected ban returns its tentative purge observations to ordinary single
+  or bulk delete logging and that route's exclusions.
+- A saved custom Automod Delete template keeps its per-message presentation
+  unless it uses a supported cleanup variable to opt into grouped notices.
+  A grouped template can use `{mention}`, `{user_id}`, `{rule}`, `{rule_id}`,
+  `{cleanup_action}` (outcome and case), `{cleanup_total}`, `{cleanup_channels}`,
+  `{cleanup_first}`, `{cleanup_last}`, `{cleanup_sample}`, `{cleanup_evidence}`,
+  `{cleanup_failures}`, and `{cleanup_source_channels}` (comma-separated
+  source IDs). Grouped notices mark values tied to a single message unavailable.
+  Individual notices use the built-in single-message presentation without
+  retained text or attachments when a saved template contains grouped variables.
+- To change the settle delay, set `[log].automod_cleanup_settle_secs` or
+  `JMODGUARD_LOG_AUTOMOD_CLEANUP_SETTLE_SECS` to 5–10 seconds. To restore the
+  original per-message behavior, set `[log].group_automod_cleanup_deletes`
+  or `JMODGUARD_LOG_GROUP_AUTOMOD_CLEANUP_DELETES` to `false`. These settings
+  apply to the bot process. A case link opens the Web UI when the bot has a
+  public `bot.about_webui_url`. Otherwise the notice includes the case ID.
+- A cleanup still in progress at the 30-second cap or whose summary cannot
+  be sent falls back to individual delete notices and a separate failure count.
+  A summary waiting for a delivery slot, rate limit, or journal claim remains
+  pending for grouped retry. A committed claim is also eligible for startup
+  recovery until the bot arms it at the transport boundary. The running bot
+  reopens an armed claim if it detects cancellation before handing off the
+  request. An abrupt process loss at the final handoff is treated as possibly
+  delivered, as is a summary whose POST may have been accepted.
+  The bot keeps the echo receipts and sends neither a second summary nor
+  individual notices for the covered deletes. Pending cleanup deliveries
+  share the bounded incident buffer and use exponential retry delays of
+  10 to 60 seconds, extended by Discord's Retry-After when present. Each server
+  can retain up to eight
+  retrying incidents. A ninth evicts that server's oldest retry and counts a
+  delivery failure. Individual cleanup retries reuse the same Discord nonce.
+  Bulk replay follows the ordinary bulk rule for ambiguous sends. On a planned
+  restart the bot uses the existing shutdown window to attempt unfinished
+  deliveries. The replacement bot replays journaled deletes individually
+  from the primary database, even if grouping has since been disabled.
+  Work captured without an active enrollment can replay while the guild
+  remains unenrolled. Later strikes join an incident only within the same
+  captured enrollment. The bot journals snapshot collector handoffs while
+  Discord delivery is in progress.
+  Confirmed REST deletes use Automod Delete. Purge observations with an
+  interrupted enforcement use the ordinary delete route. The journal stores
+  message and rule identifiers and timestamps. It stores no retained message
+  content or attachments. When a guild write fence defers an observation, the
+  bot keeps it within the bounded incident buffer and delivers it individually
+  after the same enrollment becomes writable. Recovery skips requests that may
+  already have reached Discord and work from retired guild memberships.
+  Delete failures and gateway echo receipts stay in memory. The grouped
+  summary has no transcript attachment.
 - Delivery slot pressure queues at most 128 waiting reports across the bot.
   Each waits up to the configured Discord timeout for a slot, then uses the
   existing delivery deadline and filters. Routine reports include admission in
   their total deadline. Full queues and expired waits drop the report and count
-  a delivery failure. This retries admission only: a failed or ambiguous Discord
-  request is never resent. Waiting reports are in memory and are lost on restart.
+  a delivery failure. This queue retries admission only. Waiting reports are
+  in memory and are lost on restart.
 - Join reports use the delivered user and the join timestamp in the Gateway member
   payload; they do not look up a saved directory join date. Leave reports use the
   saved directory stay when an authoritative departure decision is available,

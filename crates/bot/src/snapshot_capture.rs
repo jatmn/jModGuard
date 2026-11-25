@@ -2636,6 +2636,9 @@ fn submit_report(app: &Arc<BotState>, context: &Context, report: MessageReport) 
 }
 
 #[cfg(test)]
+pub(crate) use tests::test_delete_context_with;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3106,7 +3109,190 @@ mod tests {
         test_delete_context_with(Arc::new(serenity::http::Http::new("fixture"))).await
     }
 
-    async fn test_delete_context_with(http: Arc<serenity::http::Http>) -> Context {
+    #[tokio::test]
+    async fn single_snapshot_purge_handoff_progresses_while_cleanup_journal_is_blocked() {
+        assert_snapshot_purge_journal_handoff(false).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_snapshot_purge_handoff_journals_and_replays_after_the_writer_reopens() {
+        assert_snapshot_purge_journal_handoff(true).await;
+    }
+
+    async fn assert_snapshot_purge_journal_handoff(bulk: bool) {
+        use crate::automod_delete_marks::GatewayDeleteObservation;
+        use crate::db::{self, SqlExecutor as _};
+
+        let (app, path) = temp_app("snapshot_cleanup_journal_handoff");
+        let scope = cache_scope(&app, 100).await;
+        let store = app.tenant.store(&scope).await.unwrap();
+        let healthy = db::enroll_guild(&app.db, 790, 100).await.unwrap().unwrap();
+        let healthy_scope = app.tenant.activate(healthy).await.unwrap().unwrap();
+        app.snapshots
+            .scopes
+            .lock()
+            .insert(790, healthy_scope.clone());
+        let healthy_store = app.tenant.store(&healthy_scope).await.unwrap();
+        for (guild, route) in [(789, 901), (790, 902)] {
+            db::upsert_log_channel(&app.db, guild, "message_delete", route)
+                .await
+                .unwrap();
+        }
+        app.invalidate_configs();
+        let now = app.snapshots.started_at_ms;
+        store
+            .observe_snapshot(scope.clone(), cache_observation(111, now, "purge echo"))
+            .await
+            .unwrap();
+        let cleanup = logging::begin_cleanup(
+            &app,
+            789,
+            42,
+            logging::CleanupRule {
+                id: "fixture",
+                name: "Fixture",
+                reason: "Fixture purge",
+                action: "ban",
+                join_only: false,
+                sample: None,
+                hash: None,
+            },
+        )
+        .await
+        .unwrap();
+        cleanup.begin_purge(3_600, now + 1_000);
+
+        let (http, requests, server) = recording_delete_proxy().await;
+        let context = test_delete_context_with(Arc::clone(&http)).await;
+        let writer = app.cleanup_incidents.hold_journal_writer().await;
+        let cleanup_worker = tokio::spawn(logging::run_cleanup_reports(
+            Arc::clone(&app),
+            Arc::clone(&http),
+        ));
+        let mut receiver = app.snapshots.receiver.lock().start().unwrap();
+        assert!(app.snapshots.enqueue(
+            &app,
+            context.clone(),
+            scope.clone(),
+            Body::Delete {
+                guild: GuildId::new(789),
+                channel: ChannelId::new(456),
+                ids: vec![MessageId::new(111)],
+                bulk,
+            },
+        ));
+        assert!(app.snapshots.enqueue(
+            &app,
+            context,
+            healthy_scope.clone(),
+            Body::Create(cache_observation(222, now, "healthy guild snapshot")),
+        ));
+        receiver.close();
+        tokio::time::timeout(Duration::from_secs(5), run(Arc::clone(&app), receiver))
+            .await
+            .expect("the snapshot consumer must finish while the cleanup writer is blocked");
+        let captured = healthy_store
+            .retained_snapshot(healthy_scope, 456, 222)
+            .await
+            .unwrap()
+            .expect("the unrelated guild's snapshot must reach its store");
+        assert_eq!(
+            captured.fields.content.as_deref(),
+            Some("healthy guild snapshot")
+        );
+        assert_eq!(
+            app.automod_delete_marks
+                .observe_gateway_delete(789, 456, 111, None),
+            GatewayDeleteObservation::Suppressed,
+            "the collector must have claimed the purge echo"
+        );
+        assert!(
+            db::recovered_cleanup_deletes(&app.db, "fixture-reader".into(), 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(requests.lock().unwrap().is_empty());
+
+        drop(writer);
+        let saved = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let rows = db::recovered_cleanup_deletes(&app.db, "fixture-reader".into(), 0)
+                    .await
+                    .unwrap();
+                if !rows.is_empty() {
+                    break rows;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cleanup worker must write the delayed observation");
+        let [(_, row)] = saved.as_slice() else {
+            panic!("expected one journal row, got {saved:?}");
+        };
+        assert_eq!(
+            (row.guild_id, row.channel_id, row.message_id),
+            (789, 456, 111)
+        );
+        assert_eq!(
+            row.enrollment_id.as_deref(),
+            Some(scope.enrollment().id.as_str())
+        );
+        assert!(row.purge);
+        cleanup_worker.abort();
+        assert!(cleanup_worker.await.unwrap_err().is_cancelled());
+        drop(cleanup);
+        drop((app, healthy_store, store));
+        assert!(requests.lock().unwrap().is_empty());
+
+        let restarted = BotState::new(Default::default(), db::Db::open(&path, 1).unwrap()).unwrap();
+        restarted.activation.mark_lock_held(true);
+        let recovery = tokio::spawn(logging::run_cleanup_reports(Arc::clone(&restarted), http));
+        wait_for_body(&requests, "recovered purge delete", |body| {
+            body.starts_with("POST ")
+                && body.contains("Message deleted")
+                && body.contains("/456/111")
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let outstanding = restarted
+                    .db
+                    .with_conn(|conn| {
+                        conn.query_row(
+                            "SELECT EXISTS (SELECT 1 FROM cleanup_delete_journal)",
+                            (),
+                            |row| Ok(row.get::<bool>(0)?),
+                        )
+                    })
+                    .await
+                    .unwrap();
+                if !outstanding {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery must settle the journal row");
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|body| body.starts_with("POST "))
+                .count(),
+            1
+        );
+        recovery.abort();
+        assert!(recovery.await.unwrap_err().is_cancelled());
+        server.abort();
+        drop(restarted);
+        remove_db_and_store(&path);
+    }
+
+    pub(crate) async fn test_delete_context_with(http: Arc<serenity::http::Http>) -> Context {
         use serenity::gateway::{
             Shard, ShardManager, ShardManagerOptions, ShardMessenger, ShardRunner,
             ShardRunnerOptions,

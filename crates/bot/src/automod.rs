@@ -714,12 +714,16 @@ async fn automod_try_delete_message(
     rule_id: &str,
     rule_name: &str,
     reason: &str,
+    cleanup: Option<&logging::Cleanup<'_>>,
 ) -> Option<CaseOutcome> {
     let target = automod_delete_target(guild_id, channel);
     if app
         .remembered_discord_targets
         .blocked(target, Instant::now())
     {
+        if let Some(cleanup) = cleanup {
+            cleanup.failed(channel, message, "delete destination unavailable");
+        }
         return None;
     }
     let prepared = app
@@ -760,13 +764,29 @@ async fn automod_try_delete_message(
     match raced {
         Ok(crate::discord::DiscordCall::Finished(Ok(_))) => {
             app.recent_messages.forget(guild_id, channel, message);
-            logging::complete_prepared_automod_delete(
-                app, http, guild_id, channel, message, &prepared, rule_id, rule_name, reason,
-            )
-            .await;
+            let grouped = match cleanup {
+                Some(cleanup) => {
+                    cleanup
+                        .deleted(app, channel, message, prepared, false)
+                        .await
+                }
+                None => false,
+            };
+            if !grouped {
+                logging::complete_prepared_automod_delete(
+                    app, http, guild_id, channel, message, &prepared, rule_id, rule_name, reason,
+                )
+                .await;
+            }
             Some(CaseOutcome::Succeeded)
         }
         Ok(crate::discord::DiscordCall::Finished(Err(error))) => {
+            if let Some(cleanup) = cleanup
+                && !crate::discord::http_error_response(&error)
+                    .is_some_and(|(_, code)| code == 10008)
+            {
+                cleanup.failed(channel, message, logging::cleanup_delete_failure(&error));
+            }
             let removal = app.automod_delete_marks.remove_unconfirmed(
                 guild_id,
                 channel,
@@ -810,6 +830,9 @@ async fn automod_try_delete_message(
             Some(crate::cases::classify_discord(Some(&error)))
         }
         Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
+            if let Some(cleanup) = cleanup {
+                cleanup.failed(channel, message, "delete outcome unknown");
+            }
             let skip_uncertain = {
                 #[cfg(test)]
                 {
@@ -1554,6 +1577,7 @@ async fn execute_live<'a>(
                 pending.rule_id.as_str(),
                 pending.rule_name.as_str(),
                 reason,
+                None,
             )
             .await
         } else {
@@ -1575,6 +1599,44 @@ async fn execute_live<'a>(
         return outcome.map(|outcome| ("delete", outcome));
     }
 
+    // A terminal velocity kick already has an explicit late-strike delete path.
+    // Join only that kick when executing its fallback deletes.
+    let kick_cleanup = if pending.rule_id == "velocity"
+        && matches!(rule.action.as_str(), "kick" | "delete")
+        && pending.matched_rule.as_ref().is_some_and(|matched| {
+            matched
+                .actions
+                .iter()
+                .max_by_key(|step| step.at)
+                .is_some_and(|step| step.at == rule.at && step.action == "kick")
+        }) {
+        logging::begin_cleanup(
+            app,
+            guild_id.get(),
+            target.id.get(),
+            logging::CleanupRule {
+                id: &pending.rule_id,
+                name: &pending.rule_name,
+                reason,
+                action: "kick",
+                join_only: rule.action == "delete",
+                sample: msg_channel
+                    .zip(msg_id)
+                    .filter(|_| rule.action == "delete")
+                    .map(|(channel, message)| {
+                        (
+                            channel,
+                            message,
+                            pending.evidence["content"].as_str().unwrap_or(""),
+                        )
+                    }),
+                hash: None,
+            },
+        )
+        .await
+    } else {
+        None
+    };
     let mut publish_report = true;
     let outcome = match rule.action.as_str() {
         "log" => None,
@@ -1592,6 +1654,7 @@ async fn execute_live<'a>(
                     pending.rule_id.as_str(),
                     pending.rule_name.as_str(),
                     reason,
+                    kick_cleanup.as_ref(),
                 )
                 .await
             } else {
@@ -1774,12 +1837,20 @@ async fn execute_live<'a>(
                 tracing::warn!("automod kick: no guild member for {}", target.id);
                 (false, None)
             };
+            let outcome = crate::cases::discord_attempt_outcome(called, discord_err.as_ref());
+            if let Some(cleanup) = &kick_cleanup {
+                cleanup.outcome(
+                    outcome
+                        .clone()
+                        .unwrap_or(crate::db::guild_data::CaseOutcome::Failed),
+                    None,
+                );
+            }
             if !app.activation.may_record() {
                 return None;
             }
-            let outcome = crate::cases::discord_attempt_outcome(called, discord_err.as_ref());
             if open_case && let Some(outcome) = &outcome {
-                crate::cases::record_application(
+                let case = crate::cases::record_application(
                     app,
                     enrollment.clone(),
                     crate::db::guild_data::CaseAction::Kick,
@@ -1795,6 +1866,9 @@ async fn execute_live<'a>(
                     ),
                 )
                 .await;
+                if let Some(cleanup) = &kick_cleanup {
+                    cleanup.case(outcome, case);
+                }
             }
             outcome
         }
@@ -1907,6 +1981,36 @@ async fn execute_live<'a>(
                                 target.id.get(),
                                 Some(&operation_id),
                             );
+                            let purge_seconds = rule.ban_delete_message_seconds();
+                            let cleanup = if purge_seconds > 0 {
+                                logging::begin_cleanup(
+                                    app,
+                                    guild_id.get(),
+                                    target.id.get(),
+                                    logging::CleanupRule {
+                                        id: &pending.rule_id,
+                                        name: &pending.rule_name,
+                                        reason,
+                                        action: "ban",
+                                        join_only: false,
+                                        sample: msg_channel.zip(msg_id).map(
+                                            |(channel, message)| {
+                                                (
+                                                    channel,
+                                                    message,
+                                                    pending.evidence["content"]
+                                                        .as_str()
+                                                        .unwrap_or(""),
+                                                )
+                                            },
+                                        ),
+                                        hash: None,
+                                    },
+                                )
+                                .await
+                            } else {
+                                None
+                            };
                             let raced = if !dispatch_is_current()
                                 || automod_member_blocked(
                                     app,
@@ -1922,6 +2026,12 @@ async fn execute_live<'a>(
                                             app.remembered_discord_targets
                                                 .capture_recovery_epoch(member_target)
                                         });
+                                if let Some(cleanup) = &cleanup {
+                                    cleanup.begin_purge(
+                                        purge_seconds,
+                                        chrono::Utc::now().timestamp_millis(),
+                                    );
+                                }
                                 Some((
                                     recovery,
                                     crate::discord::race_discord_call(
@@ -1939,6 +2049,12 @@ async fn execute_live<'a>(
                             };
                             match raced {
                                 None => {
+                                    if let Some(cleanup) = &cleanup {
+                                        cleanup.outcome(
+                                            crate::db::guild_data::CaseOutcome::Failed,
+                                            None,
+                                        );
+                                    }
                                     app.release_gateway_case_suppression(suppression);
                                     if app.activation.may_record() {
                                         if let Some(attempt) = attempted {
@@ -1957,6 +2073,12 @@ async fn execute_live<'a>(
                                 }
                                 Some((_, crate::discord::DiscordCall::Cancelled)) => {
                                     ban_outcome = Some(CaseOutcome::Uncertain);
+                                    if let Some(cleanup) = &cleanup {
+                                        cleanup.outcome(
+                                            crate::db::guild_data::CaseOutcome::Uncertain,
+                                            None,
+                                        );
+                                    }
                                     pending_ban
                                         .finish(app, crate::db::guild_data::CaseOutcome::Uncertain)
                                         .await;
@@ -1978,13 +2100,21 @@ async fn execute_live<'a>(
                                     }
                                     let outcome =
                                         crate::cases::classify_discord(discord.err().as_deref());
+                                    if let Some(cleanup) = &cleanup {
+                                        cleanup.outcome(outcome.clone(), None);
+                                    }
                                     ban_outcome = Some(outcome.clone());
                                     if matches!(outcome, CaseOutcome::Failed) {
                                         app.release_gateway_case_suppression(suppression);
                                     }
                                     if app.activation.may_record() {
-                                        if let Some(attempt) = attempted {
-                                            attempt.finish(app, outcome.clone()).await;
+                                        let case = if let Some(attempt) = attempted {
+                                            attempt.finish(app, outcome.clone()).await
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(cleanup) = &cleanup {
+                                            cleanup.case(&outcome, case);
                                         }
                                         pending_ban.finish(app, outcome.clone()).await;
                                     }
@@ -2012,7 +2142,7 @@ async fn execute_live<'a>(
                                         .flatten()
                                         .is_some();
                                         if let Some(enrollment) = &enrollment
-                                            && rule.ban_delete_message_seconds() > 0
+                                            && purge_seconds > 0
                                             && dispatch_is_current()
                                         {
                                             let deleted = crate::recent_messages::sweep_after_ban(
@@ -2020,7 +2150,9 @@ async fn execute_live<'a>(
                                                 http,
                                                 enrollment,
                                                 target.id.get(),
-                                                rule.ban_delete_message_seconds(),
+                                                purge_seconds,
+                                                chrono::Utc::now().timestamp_millis(),
+                                                cleanup.as_ref(),
                                                 dispatch_is_current,
                                             )
                                             .await;
@@ -6967,6 +7099,7 @@ mod tests {
                 "badword",
                 "Bad words",
                 "blocked term",
+                None,
             )
             .await;
         });
@@ -7121,6 +7254,7 @@ mod tests {
                         "badword",
                         "Bad words",
                         "blocked term",
+                        None,
                     )
                     .await;
                 })
