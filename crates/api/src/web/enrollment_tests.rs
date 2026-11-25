@@ -10154,9 +10154,15 @@ async fn member_names_read_one_bounded_batch_from_the_loaded_guild() {
     );
     assert_eq!(f.discord.member_calls.load(Ordering::SeqCst), before);
 
-    let (status, empty) = f.request("POST", path, r#"{"user_ids":[]}"#).await;
-    assert_eq!(status, StatusCode::OK, "{empty}");
-    assert_eq!(empty, json!({}));
+    let empty_bodies = [
+        r#"{"user_ids":[]}"#,
+        r#"{"user_ids":["0","18446744073709551615"]}"#,
+    ];
+    for body in empty_bodies {
+        let (status, empty) = f.request("POST", path, body).await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert_eq!(empty, json!({}));
+    }
     let oversized = json!({"user_ids": vec![named.to_string(); 26]}).to_string();
     assert_eq!(
         f.request("POST", path, &oversized).await.0,
@@ -10165,9 +10171,11 @@ async fn member_names_read_one_bounded_batch_from_the_loaded_guild() {
 
     let wrong_guild = db::guild_enrollment(&f.app.db, 20).await.unwrap().unwrap();
     for token in [None, Some(wrong_guild.id.as_str())] {
-        let (status, denied) = f.request_token("POST", path, &request, token).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{denied}");
-        assert_eq!(denied["code"], "guild_enrollment_changed");
+        for body in [request.as_str()].into_iter().chain(empty_bodies) {
+            let (status, denied) = f.request_token("POST", path, body, token).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{denied}");
+            assert_eq!(denied["code"], "guild_enrollment_changed");
+        }
     }
 }
 

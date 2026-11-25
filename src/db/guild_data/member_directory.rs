@@ -3978,18 +3978,35 @@ impl GuildDataStore {
             user_ids.len() <= DIRECTORY_PROFILE_LOOKUP_LIMIT && user_ids.iter().all(|id| *id > 0),
             MemberSyncError::Invalid
         );
-        if user_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let ids = serde_json::to_string(&user_ids)?;
         let expected = self.expected.clone();
-        self.db.with_conn(move |conn| { let tx=conn.transaction_primary_snapshot()?; verify_scope(&tx,&expected,&scope,true)?;
-            let sql=format!("SELECT {PROFILE_SQL} FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id IN (SELECT value FROM json_each(?3)) ORDER BY user_id");
-            let mut stmt=tx.prepare(&sql)?;
-            let rows=stmt.query_map(params![scope.guild_id(),scope.enrollment.id.as_str(),ids],profile)?;
-            let mut found=Vec::new(); for row in rows { found.push(row?); } drop(stmt);
-            tx.finish_read()?; Ok(found)
-        }).await
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                if user_ids.is_empty() {
+                    tx.finish_read()?;
+                    return Ok(Vec::new());
+                }
+                let ids = serde_json::to_string(&user_ids)?;
+                let sql = format!(
+                    "SELECT {PROFILE_SQL} FROM guild_member_directory
+                     WHERE guild_id=?1 AND enrollment_id=?2
+                     AND user_id IN (SELECT value FROM json_each(?3)) ORDER BY user_id"
+                );
+                let mut stmt = tx.prepare(&sql)?;
+                let rows = stmt.query_map(
+                    params![scope.guild_id(), scope.enrollment.id.as_str(), ids],
+                    profile,
+                )?;
+                let mut found = Vec::new();
+                for row in rows {
+                    found.push(row?);
+                }
+                drop(stmt);
+                tx.finish_read()?;
+                Ok(found)
+            })
+            .await
     }
 
     /// Bounded directory counts for the analytics views: current members,
