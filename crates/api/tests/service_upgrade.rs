@@ -1,11 +1,15 @@
-//! Read-only service-upgrade routes go through the normal router and the bot writer.
+//! Read-only service-upgrade and update routes use the normal router and bot writer.
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode};
 use jmodguard::config::{ApiProcessConfig, BotProcessConfig, ControlSecret};
 use jmodguard::db::{self, Db};
 use jmodguard_api::web::state::ApiState;
-use std::sync::Arc;
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
+use tower::ServiceExt;
 
-async fn owner_cookie(store: &tower_sessions::MemoryStore, uid: u64) -> String {
+async fn session_cookie(store: &tower_sessions::MemoryStore, uid: u64) -> String {
     let session = tower_sessions::Session::new(None, Arc::new(store.clone()), None);
     session.insert("discord_user_id", uid).await.unwrap();
     session.save().await.unwrap();
@@ -16,6 +20,7 @@ struct RecoveryPage {
     path: std::path::PathBuf,
     router: axum::Router,
     cookie: String,
+    store: tower_sessions::MemoryStore,
     probe: Arc<db::StartupProbe>,
     guard: db::StartupProbeGuard,
     flag: Arc<AtomicBool>,
@@ -25,6 +30,10 @@ struct RecoveryPage {
 
 impl RecoveryPage {
     async fn open() -> Self {
+        static ENABLE_APPLY: Once = Once::new();
+        ENABLE_APPLY.call_once(|| unsafe {
+            std::env::set_var("JMODGUARD_UPDATE_APPLY_ENABLED", "1");
+        });
         let path = std::env::temp_dir().join(format!(
             "service-upgrade-{:032x}.db",
             rand::random::<u128>()
@@ -73,15 +82,15 @@ impl RecoveryPage {
         let db = jmodguard_api::startup::open_database(&cfg).await.unwrap();
         assert!(db.is_read_only());
         let api = ApiState::new(cfg, db).unwrap();
-        unsafe { std::env::set_var("JMODGUARD_UPDATE_APPLY_ENABLED", "1") };
         let store = tower_sessions::MemoryStore::default();
-        let cookie = owner_cookie(&store, 123).await;
-        api.install_session_store(store);
+        let cookie = session_cookie(&store, api.cfg.bot.owner_id).await;
+        api.install_session_store(store.clone());
         let router = jmodguard_api::web::router(Arc::clone(&api));
         Self {
             path,
             router,
             cookie,
+            store,
             probe,
             guard,
             flag,
@@ -189,5 +198,236 @@ async fn read_only_service_upgrade_routes_use_the_writer_link() {
         "{cancel_text}"
     );
     assert!(!cancel_text.contains("read-only"), "{cancel_text}");
+    page.finish();
+}
+
+async fn post_update(
+    page: &RecoveryPage,
+    route: &str,
+    body: &Value,
+    cookie: Option<&str>,
+    origin: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut request =
+        Request::post(format!("/api/updates/{route}")).header("content-type", "application/json");
+    if let Some(cookie) = cookie {
+        request = request.header("cookie", cookie);
+    }
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    let response = page
+        .router
+        .clone()
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+async fn update_state(db: &Db) -> (Value, Option<u64>) {
+    (
+        serde_json::to_value(db::component_updates(db).await.unwrap()).unwrap(),
+        db::update_alert_channel(db).await.unwrap(),
+    )
+}
+
+async fn assert_update_route_guards(
+    page: &RecoveryPage,
+    route: &str,
+    body: &Value,
+) -> (StatusCode, Value) {
+    let origin = page.api.cfg.web.base_url.as_str();
+    let foreign = origin.replacen("https://", "http://", 1);
+    let non_owner = session_cookie(&page.store, page.api.cfg.bot.owner_id + 1).await;
+    let owner = Some(page.cookie.as_str());
+    let before = update_state(&page.bot.db).await;
+    for (cookie, origin, status, error) in [
+        (
+            None,
+            Some(origin),
+            StatusCode::UNAUTHORIZED,
+            "sign in required",
+        ),
+        (
+            Some(non_owner.as_str()),
+            Some(origin),
+            StatusCode::FORBIDDEN,
+            "bot owner required",
+        ),
+        (
+            owner,
+            None,
+            StatusCode::FORBIDDEN,
+            "untrusted request origin",
+        ),
+        (
+            owner,
+            Some(foreign.as_str()),
+            StatusCode::FORBIDDEN,
+            "untrusted request origin",
+        ),
+    ] {
+        let (actual_status, response) = post_update(page, route, body, cookie, origin).await;
+        let after = update_state(&page.bot.db).await;
+        assert_eq!(
+            actual_status, status,
+            "{route}: expected {error}, got {response}"
+        );
+        assert_eq!(response["error"], error, "{route}");
+        assert_eq!(after, before, "{route}: {error}");
+    }
+    post_update(page, route, body, owner, Some(origin)).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_check_requires_owner_and_trusted_origin() {
+    let page = RecoveryPage::open().await;
+    let (status, response) =
+        assert_update_route_guards(&page, "check", &json!({"component":"bot"})).await;
+    // The existing bot lease keeps an authorized check local.
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["error"], "release check failed");
+    page.finish();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_policy_requires_owner_and_trusted_origin() {
+    let page = RecoveryPage::open().await;
+    let (status, response) = assert_update_route_guards(
+        &page,
+        "policy",
+        &json!({"component":"api","channel":"stable","cadence":"off"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        db::component_update(&page.bot.db, "api")
+            .await
+            .unwrap()
+            .channel,
+        "stable"
+    );
+    page.finish();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_alert_channel_requires_owner_and_trusted_origin() {
+    let page = RecoveryPage::open().await;
+    let (status, response) =
+        assert_update_route_guards(&page, "alert-channel", &json!({"channel_id":"42"})).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        db::update_alert_channel(&page.bot.db).await.unwrap(),
+        Some(42)
+    );
+    page.finish();
+}
+
+async fn checked_api_candidate(
+    page: &RecoveryPage,
+    self_update_enabled: bool,
+) -> db::ComponentRelease {
+    let db = &page.bot.db;
+    let now = chrono::Utc::now().timestamp();
+    let schema = db::CORE_SCHEMA_VERSION;
+    let guild_schema = db::guild_data::SCHEMA_VERSION;
+    let candidate = db::ComponentRelease {
+        component: "api".into(),
+        channel: "latest".into(),
+        release_id: "update-fixture".into(),
+        source_sha: "a".repeat(40),
+        published_at: chrono::Utc::now().to_rfc3339(),
+        image: "ghcr.io/jatmn/jmodguard-api".into(),
+        digest: format!("sha256:{}", "a".repeat(64)),
+        min_schema: schema,
+        max_schema: schema,
+        result_schema: schema,
+        min_api: 1,
+        max_api: 1,
+        launcher_protocol: 1,
+        launcher: Some(db::LauncherCompatibility {
+            revision: db::LAUNCHER_REVISION,
+            min_revision: db::REQUIRED_LAUNCHER_REVISION,
+        }),
+        base_abi: "debian-bookworm-amd64".into(),
+        upgrade: Some(db::UpgradeCompatibility {
+            control_protocol: db::UPDATE_CONTROL_PROTOCOL,
+            min_core: schema,
+            min_guild: guild_schema,
+            guild_schema,
+        }),
+    };
+    for (role, enabled) in [("bot", true), ("api", self_update_enabled)] {
+        db::record_component_running(
+            db,
+            role,
+            None,
+            db::ComponentObservation {
+                source_sha: "b".repeat(40),
+                executable_sha256: "c".repeat(64),
+                admin_sha256: None,
+                base_image_sha: "b".repeat(40),
+                started_at: now,
+                min_schema: schema,
+                max_schema: schema,
+                api_capability: 1,
+                self_update_enabled: enabled,
+                base_abi: candidate.base_abi.clone(),
+                guild_schema: Some(guild_schema),
+                update_protocol: db::UPDATE_CONTROL_PROTOCOL,
+                launcher_revision: db::LAUNCHER_REVISION,
+                baked_launcher_revision: db::LAUNCHER_REVISION,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    }
+    db::record_update_check(db, "api", "latest", Some(candidate.clone()), None, now)
+        .await
+        .unwrap();
+    candidate
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_install_requires_owner_and_trusted_origin() {
+    let page = RecoveryPage::open().await;
+    let candidate = checked_api_candidate(&page, true).await;
+    let (status, response) = assert_update_route_guards(
+        &page,
+        "install",
+        &json!({"component":"api","digest":candidate.digest}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["queued"], true);
+    let state = db::component_update(&page.bot.db, "api").await.unwrap();
+    assert_eq!(state.state, "queued");
+    assert_eq!(state.desired, Some(candidate));
+    page.finish();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_install_refuses_when_service_self_update_is_disabled() {
+    let page = RecoveryPage::open().await;
+    let candidate = checked_api_candidate(&page, false).await;
+    let before = update_state(&page.bot.db).await;
+    let (status, response) = post_update(
+        &page,
+        "install",
+        &json!({"component":"api","digest":candidate.digest}),
+        Some(&page.cookie),
+        Some(&page.api.cfg.web.base_url),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        response["error"],
+        "service self-update is disabled or unobserved"
+    );
+    assert_eq!(update_state(&page.bot.db).await, before);
     page.finish();
 }

@@ -5,7 +5,10 @@ use jmodguard::db::{
     UPDATE_CONTROL_PROTOCOL, UpdateControl, UpgradeCompatibility,
 };
 
-async fn observed_fixture() -> (UpdateControl, ComponentRelease) {
+const NOW: i64 = 7300;
+const FRESH: i64 = NOW - 100;
+
+async fn observed_fixture(observed_at: [i64; 2]) -> (UpdateControl, ComponentRelease) {
     let path = std::env::temp_dir().join(format!(
         "compatible-control-{:032x}.db",
         rand::random::<u128>()
@@ -36,7 +39,7 @@ async fn observed_fixture() -> (UpdateControl, ComponentRelease) {
         max_schema: core,
         result_schema: core,
         min_api: 1,
-        max_api: 1,
+        max_api: 2,
         launcher_protocol: 1,
         launcher: Some(LauncherCompatibility {
             revision: jmodguard::db::LAUNCHER_REVISION,
@@ -50,13 +53,13 @@ async fn observed_fixture() -> (UpdateControl, ComponentRelease) {
             guild_schema: guild,
         }),
     };
-    for (role, digest) in [("bot", 'a'), ("api", 'b')] {
+    for ((role, digest), seen_at) in [("bot", 'a'), ("api", 'b')].into_iter().zip(observed_at) {
         let mut row = release.clone();
         row.component = role.into();
         row.digest = format!("sha256:{}", digest.to_string().repeat(64));
         row.image = format!("ghcr.io/jatmn/jmodguard-{role}");
         control
-            .checked(role, "latest", Some(row), None, 100)
+            .checked(role, "latest", Some(row), None, FRESH)
             .await
             .unwrap();
         control
@@ -79,7 +82,7 @@ async fn observed_fixture() -> (UpdateControl, ComponentRelease) {
                     launcher_revision: jmodguard::db::LAUNCHER_REVISION,
                     baked_launcher_revision: jmodguard::db::LAUNCHER_REVISION,
                 },
-                100,
+                seen_at,
             )
             .await
             .unwrap();
@@ -90,12 +93,12 @@ async fn observed_fixture() -> (UpdateControl, ComponentRelease) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn update_control_refuses_higher_result_schema() {
-    let (control, release) = observed_fixture().await;
+    let (control, release) = observed_fixture([FRESH; 2]).await;
     let schema = control.schema_version().await.unwrap();
     let mut candidate = release;
     candidate.max_schema = schema + 1;
     candidate.result_schema = schema + 1;
-    let error = compatible_control(&control, &candidate, 200)
+    let error = compatible_control(&control, &candidate, NOW)
         .await
         .unwrap_err();
     assert_eq!(
@@ -107,11 +110,11 @@ async fn update_control_refuses_higher_result_schema() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn update_control_refuses_guild_schema_change() {
-    let (control, release) = observed_fixture().await;
+    let (control, release) = observed_fixture([FRESH; 2]).await;
     let mut candidate = release;
     candidate.upgrade.as_mut().unwrap().guild_schema =
         jmodguard::db::guild_data::SCHEMA_VERSION + 1;
-    let error = compatible_control(&control, &candidate, 200)
+    let error = compatible_control(&control, &candidate, NOW)
         .await
         .unwrap_err();
     assert_eq!(
@@ -122,10 +125,58 @@ async fn update_control_refuses_guild_schema_change() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn update_control_accepts_equal_schema() {
-    let (control, release) = observed_fixture().await;
-    compatible_control(&control, &release, 200)
+    let (control, release) = observed_fixture([FRESH; 2]).await;
+    compatible_control(&control, &release, NOW)
         .await
         .expect("equal schema should be admitted");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_control_refuses_stale_observations_and_incompatible_candidates() {
+    enum Delta {
+        CandidateAbi,
+        OwnObservation,
+        CounterpartObservation,
+        CandidateMinApi,
+    }
+
+    for (delta, expected) in [
+        (
+            Delta::CandidateAbi,
+            "candidate needs a different base runtime ABI",
+        ),
+        (
+            Delta::OwnObservation,
+            "current service observation is stale",
+        ),
+        (
+            Delta::CounterpartObservation,
+            "counterpart observation is stale",
+        ),
+        (
+            Delta::CandidateMinApi,
+            "candidate requires a different API capability",
+        ),
+    ] {
+        let stale = NOW - 7200;
+        let seen = match delta {
+            Delta::OwnObservation => [stale, FRESH],
+            Delta::CounterpartObservation => [FRESH, stale],
+            _ => [FRESH; 2],
+        };
+        let (control, mut candidate) = observed_fixture(seen).await;
+        match delta {
+            Delta::CandidateAbi => candidate.base_abi = "debian-trixie-amd64".into(),
+            Delta::CandidateMinApi => candidate.min_api = 2,
+            Delta::OwnObservation | Delta::CounterpartObservation => {}
+        }
+        let result = compatible_control(&control, &candidate, NOW).await;
+        assert_eq!(
+            result.as_ref().err().map(ToString::to_string).as_deref(),
+            Some(expected),
+            "{result:?}"
+        );
+    }
 }
 
 #[test]

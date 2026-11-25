@@ -5,6 +5,21 @@ use crate::signature::test_support::{
 };
 use chrono::{Duration, Utc};
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+pub fn signing() -> &'static SigningFixture {
+    static FIXTURE: OnceLock<SigningFixture> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let fixture = SigningFixture::default();
+        unsafe {
+            std::env::set_var(
+                "JMODGUARD_TEST_UPDATE_SIGNING_PUBLIC_PEM",
+                &fixture.public_pem,
+            );
+        }
+        fixture
+    })
+}
 
 pub fn signature_not_after_far_future() -> String {
     (Utc::now() + Duration::days(3650))
@@ -28,16 +43,6 @@ impl Default for SigningFixture {
 }
 
 impl SigningFixture {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn apply_env(&self) {
-        unsafe {
-            std::env::set_var("JMODGUARD_TEST_UPDATE_SIGNING_PUBLIC_PEM", &self.public_pem);
-        }
-    }
-
     pub fn sign(
         &self,
         objects: &mut HashMap<String, Vec<u8>>,

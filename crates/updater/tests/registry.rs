@@ -18,11 +18,12 @@ pub mod signature;
 pub mod signing_fixture;
 use oci::Registry;
 use serde_json::json;
-use signature::signature_rejection_phrase;
-use signing_fixture::{
-    BadSignature, SigningFixture, SigningKeyChoice, signature_not_after_far_future,
+use signature::{signature_rejection_phrase, signature_tag_for_digest};
+use signing_fixture::{BadSignature, SigningKeyChoice, signature_not_after_far_future, signing};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
 };
-use std::sync::{Arc, OnceLock};
 use std::{collections::HashMap, io::Write};
 use tokio::sync::RwLock;
 
@@ -32,6 +33,7 @@ struct RegistryFixture {
     objects: HashMap<String, Vec<u8>>,
     delayed_payload: Option<(String, chrono::DateTime<chrono::Utc>)>,
     failed_payload: Option<(String, StatusCode)>,
+    watched_blob: Option<(String, Arc<AtomicUsize>)>,
 }
 
 async fn serve_object(State(state): State<Arc<RwLock<RegistryFixture>>>, uri: Uri) -> Response {
@@ -43,6 +45,11 @@ async fn serve_object(State(state): State<Arc<RwLock<RegistryFixture>>>, uri: Ur
     } else {
         reference
     };
+    if let Some((digest, requests)) = &fixture.watched_blob
+        && key == digest
+    {
+        requests.fetch_add(1, Ordering::Relaxed);
+    }
     if let Some((delayed, expires)) = &fixture.delayed_payload
         && key == delayed
     {
@@ -68,15 +75,6 @@ async fn serve_object(State(state): State<Arc<RwLock<RegistryFixture>>>, uri: Ur
             .body(Body::empty())
             .unwrap(),
     }
-}
-
-fn signing() -> &'static SigningFixture {
-    static FIXTURE: OnceLock<SigningFixture> = OnceLock::new();
-    FIXTURE.get_or_init(|| {
-        let fixture = SigningFixture::new();
-        fixture.apply_env();
-        fixture
-    })
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -306,6 +304,59 @@ async fn signature_policy_refuses_before_staging_download() {
             assert_eq!(signature_rejection_phrase(&error), Some(bad.phrase()));
         }
         server.abort();
+    }
+}
+
+#[tokio::test]
+async fn signature_binding_refuses_before_staging_download() {
+    for mismatch in ["manifest digest", "component"] {
+        let mut fixture = RegistryFixture::default();
+        let approved_source = image(&mut fixture, 'a', b"\x7fELFfirst", "development");
+        let selected = image(&mut fixture, 'b', b"\x7fELFsecond", "development");
+        let selected_tag = signature_tag_for_digest(&selected).unwrap();
+        fixture.objects.remove(&selected_tag).unwrap();
+        if mismatch == "manifest digest" {
+            let source_tag = signature_tag_for_digest(&approved_source).unwrap();
+            let signature = fixture.objects[&source_tag].clone();
+            fixture.objects.insert(selected_tag, signature);
+        } else {
+            signing().sign(
+                &mut fixture.objects,
+                "bot",
+                &selected,
+                &signature_not_after_far_future(),
+                SigningKeyChoice::Current,
+            );
+        }
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fixture.objects[&selected]).unwrap();
+        let layer = manifest["layers"][0]["digest"].as_str().unwrap();
+        let layer_requests = Arc::new(AtomicUsize::new(0));
+        fixture.watched_blob = Some((layer.into(), Arc::clone(&layer_requests)));
+        fixture.tag = selected.clone();
+        let release = api_release(&selected, 'b');
+        let (registry, server) = serve(fixture).await;
+        let discovery = registry.discover("api", "latest").await;
+        let files = registry
+            .files(&release, &["usr/local/bin/jmodguard-api"])
+            .await;
+        server.abort();
+
+        assert_eq!(
+            discovery
+                .as_ref()
+                .err()
+                .and_then(signature_rejection_phrase),
+            Some("bad image signature"),
+            "discovery with wrong {mismatch}: {discovery:?}"
+        );
+        assert_eq!(
+            files.as_ref().err().and_then(signature_rejection_phrase),
+            Some("bad image signature"),
+            "staging download with wrong {mismatch}: {files:?}"
+        );
+        assert_eq!(layer_requests.load(Ordering::Relaxed), 0, "{mismatch}");
     }
 }
 

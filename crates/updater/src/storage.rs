@@ -336,9 +336,7 @@ fn is_managed(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signing_fixture::{
-        SigningFixture, SigningKeyChoice, signature_not_after_far_future,
-    };
+    use crate::signing_fixture::{SigningKeyChoice, signature_not_after_far_future, signing};
     use axum::{
         Router,
         body::Bytes,
@@ -346,10 +344,7 @@ mod tests {
         http::{HeaderMap, Method, StatusCode, Uri},
         routing::any,
     };
-    use std::{
-        collections::HashMap,
-        sync::{Arc, OnceLock},
-    };
+    use std::{collections::HashMap, sync::Arc};
     use tokio::sync::Mutex;
     #[tokio::test]
     async fn storage_status_errors_omit_urls() {
@@ -500,12 +495,7 @@ mod tests {
         HashMap<String, Vec<u8>>,
         tokio::task::JoinHandle<()>,
     ) {
-        static SIGNING: OnceLock<SigningFixture> = OnceLock::new();
-        let signing = SIGNING.get_or_init(|| {
-            let signing = SigningFixture::new();
-            signing.apply_env();
-            signing
-        });
+        let signing = signing();
         let mut release = ComponentRelease {
             upgrade: None,
             component: "webui".into(),
