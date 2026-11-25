@@ -9064,9 +9064,9 @@ async fn platform_member_totals_distinguish_empty_unavailable_and_incomplete_fle
     assert_eq!(analytics["members"]["coverage"], "not_started");
 
     let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
-    let now = chrono::Utc::now().timestamp_millis();
+    // Keep the queued fixture below the stall age regardless of when the test runs.
     store
-        .initialize_member_directory(scope, 42, now)
+        .initialize_member_directory(scope, 42, i64::MAX)
         .await
         .unwrap();
     let importing = platform::member_totals(&f.app).await;

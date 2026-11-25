@@ -1985,11 +1985,15 @@ test('Members shows automatic reconcile progress, cooldown, and a blocked run wi
   for (const [sync, message, button] of [
     [{ ...base, coverage: 'reconciling', run_kind: 'reconcile', phase: 'members', status: 'queued' },
       /Member list reconciling.*bot stopped unexpectedly.*normal request pace/, 'Pause'],
+    [{ ...base, coverage: 'uncertain', automatic_reconcile_at: gapAt },
+      /Member list may be out of date.*can queue an automatic Reconcile/, 'Reconcile from Discord'],
     [{ ...base, coverage: 'uncertain', automatic_reconcile_at: gapAt + 3600000 },
       /Member list may be out of date.*Next automatic Reconcile: .+start sooner/, 'Reconcile from Discord'],
-    [{ ...base, coverage: 'uncertain', run_kind: 'reconcile', phase: 'members', status: 'waiting', status_reason: 'rate_limited', next_attempt_at: gapAt + 60000 },
+    [{ ...base, coverage: 'uncertain', gap_auto_clear: true, audit_recovery_status: 'needs_attention', audit_recovery_reason: 'permission_denied', audit_recovery_next_attempt_at: gapAt + 3600000 },
+      /Member list may be out of date.*retry at the next attempt/, 'Reconcile from Discord'],
+    [{ ...base, coverage: 'uncertain', run_kind: 'reconcile', phase: 'members', status: 'waiting', status_reason: 'permission_denied', next_attempt_at: gapAt + 60000 },
       /Member list may be out of date.*retry at the next attempt/, 'Retry'],
-    [{ ...base, coverage: 'uncertain', run_kind: 'reconcile', phase: 'members', status: 'needs_attention', status_reason: 'permission_denied' },
+    [{ ...base, coverage: 'uncertain', run_kind: 'reconcile', phase: 'members', status: 'needs_attention', status_reason: 'pagination_stalled' },
       /Member list may be out of date.*Resolve the reported error and select Retry/, 'Retry'],
   ]) {
     const h = harness(async (url) => response(url.endsWith('/member-sync') ? sync : { members: [] }));
@@ -2002,6 +2006,9 @@ test('Members shows automatic reconcile progress, cooldown, and a blocked run wi
     assert.ok([...panel.querySelectorAll('button')].some(n => n.textContent === button));
     if (sync.status_reason) assert.ok(textOf(memberImport(panel)).includes(sync.status_reason));
     if (sync.next_attempt_at) assert.match(textOf(memberImport(panel)), /Next attempt:/);
+    if (sync.audit_recovery_reason) {
+      assert.match(textOf(memberImport(panel)), /permission_denied.*Audit recovery next attempt:/);
+    }
   }
 });
 

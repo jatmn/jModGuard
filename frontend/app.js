@@ -7276,7 +7276,9 @@ function tabMembers() {
         const cause = memberGapCause(sync.reconciliation_reason, when);
         let recovery = "Select Reconcile from Discord to re-check the full member and ban lists. This can take a while on large servers.";
         if (sync.automatic_reconcile_at && !reconciling) {
-          recovery = `Next automatic Reconcile: ${asDate(sync.automatic_reconcile_at)}. You can select Reconcile from Discord to start sooner.`;
+          recovery = Number(sync.automatic_reconcile_at) > statusNow
+            ? `Next automatic Reconcile: ${asDate(sync.automatic_reconcile_at)}. You can select Reconcile from Discord to start sooner.`
+            : "The bot can queue an automatic Reconcile. You can select Reconcile from Discord to start sooner.";
         } else if (reconciling) {
           recovery = "The bot will re-check the member and ban lists using its normal request pace.";
         } else if (sync.coverage && !sync.initial_completed_at) {
@@ -7289,7 +7291,8 @@ function tabMembers() {
           recovery = "Select Resume to continue Reconcile.";
         } else if (sync.phase === "complete" && sync.local_history_complete === false) {
           recovery = "The bot is finishing local case history.";
-        } else if (sync.status === "waiting" || sync.audit_recovery_status === "waiting") {
+        } else if (sync.status === "waiting" || sync.audit_recovery_status === "waiting" ||
+                   (sync.gap_auto_clear && sync.audit_recovery_reason === "permission_denied")) {
           recovery = "The bot will retry at the next attempt shown below.";
         }
         coverage = auditRecovery

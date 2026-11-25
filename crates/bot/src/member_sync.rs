@@ -2741,7 +2741,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn gateway_ready_gap_admits_a_paced_reconcile() {
         let (directory, app, store, scope) = enrolled_directory().await;
-        let start = chrono::Utc::now().timestamp_millis() - 120_000;
+        let start = 10_000;
         store
             .initialize_member_directory(scope.clone(), 42, start)
             .await
@@ -2799,7 +2799,7 @@ mod tests {
         drive_until(|| probe.status_reads.load(Ordering::Relaxed) >= 1).await;
         settle_parked(&probe, 1, 1).await;
         let queued = store
-            .member_sync_worker_status(scope, 42, chrono::Utc::now().timestamp_millis())
+            .member_sync_worker_status(scope, 42, start + 120_000)
             .await
             .unwrap();
         assert_eq!(

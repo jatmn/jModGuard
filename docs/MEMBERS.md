@@ -57,8 +57,8 @@ and final counts remain visible independently.
 
 An unfinished import resumes from its durable cursor after restart. A full
 Discord members, bans, or audit page whose cursor repeats or moves the wrong
-way is not committed. That import or audit recovery stops in needs attention
-until an administrator selects Retry; it does not request the same page forever.
+way is not committed. That job stops in needs attention. An administrator can
+select Retry, and a full Reconcile can take over stalled bounded audit recovery.
 A paused
 import stays paused. Completion is durable for the bot identity and enrollment:
 source commits, image releases, schema upgrades, restarts, and redeployments do
@@ -76,8 +76,9 @@ last full Reconcile started. An administrator can select **Reconcile from
 Discord** sooner once the previous run finishes.
 The Members status and Analytics badge show the gap's reason and time.
 Coverage shows **reconciling** when recovery is queued or running and
-**unverified** during cooldown, backoff, or when the job needs attention. A
-blocked run reports why and which control can resume it. Live events and
+**unverified** before the bot queues eligible work, during cooldown or backoff,
+or when the job needs attention. A blocked run reports why and how it resumes.
+Reconcile retries permission errors on its saved backoff. Live events and
 bounded checks for affected users continue throughout recovery.
 A bot process's first Gateway Ready is a restart gap. When a shutdown signal
 stops the previous process while every Ready shard is still connected, it
@@ -91,7 +92,10 @@ or a confirmed release, a restart during the initial import, a longer or
 unknown downtime (including a stop time ahead of the new host's clock), a replaced Gateway session inside one process, an
 unavailable guild, or a failed per-user save still needs Reconcile, and any
 such gap keeps a later short restart from clearing itself. A short restart
-whose audit recovery stops for attention falls back to a full Reconcile.
+whose audit pagination stalls falls back to a full Reconcile. Bounded audit
+recovery retries permission errors on its saved backoff. A full Reconcile
+includes the pending audit window and releases departure cleanup when the
+covered gap and local case history are complete.
 The bot separately catches up
 available ban and unban audit actions after a Gateway gap using the same paced
 request budget; this audit-only recovery does not list all members or current
