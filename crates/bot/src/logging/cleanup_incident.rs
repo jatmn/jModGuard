@@ -24,6 +24,19 @@ pub(super) const FAILURE_TEMPLATE: &str = "Automod cleanup delete failures\n\n**
 /// A grouped template may deliberately omit retained text or attachments.
 pub(super) const SINGLE_DELETE_TEMPLATE: &str = "Automod message deleted\n\n**Channel:** {channel}\n**Rule:** {rule} (`{rule_id}`)\n**Message:** {message_url}\n**Author:** {mention}\n**Time:** `{time}`";
 
+/// Resolve the grouped destination and any additional exclusions on its bulk
+/// fallback. Ordinary deletes keep using their existing routes.
+pub(super) fn summary_route(
+    cfg: &crate::state::CachedGuildConfig,
+) -> Option<(ChannelId, Option<&db::LogFilter>)> {
+    channel_for(cfg, "automod_delete")
+        .map(|channel| (channel, None))
+        .or_else(|| {
+            channel_for(cfg, "message_bulk_delete")
+                .map(|channel| (channel, log_filter_for(cfg, "message_bulk_delete")))
+        })
+}
+
 pub(super) fn summary_template(cfg: &crate::state::CachedGuildConfig) -> Option<&str> {
     match cfg.templates.get("automod_delete").map(String::as_str) {
         None => Some(SUMMARY_TEMPLATE),
@@ -447,7 +460,7 @@ pub(crate) async fn begin_cleanup<'a>(
         return None;
     }
     let cfg = app.configs.get(&app.db, guild).await.ok()?;
-    channel_for(&cfg, "automod_delete")?;
+    summary_route(&cfg)?;
     let enrollment_id = db::guild_enrollment(&app.db, i64::try_from(guild).ok()?)
         .await
         .ok()?
@@ -1149,6 +1162,8 @@ impl PendingIncident {
             self.replay_rejected_purge(app, sink, &cfg).await;
         }
 
+        let route = summary_route(&cfg);
+        let bulk_filter = route.and_then(|(_, filter)| filter);
         let filter = log_filter_for(&cfg, "automod_delete");
         let filtered = self
             .incident
@@ -1156,7 +1171,10 @@ impl PendingIncident {
             .iter()
             .filter(|(target, item)| {
                 !(rejected && item.purge_origin.is_some())
-                    && filter.is_some_and(|filter| excluded_delete(filter, self.subject, target.0))
+                    && [filter, bulk_filter]
+                        .into_iter()
+                        .flatten()
+                        .any(|filter| excluded_delete(filter, self.subject, target.0))
             })
             .map(|(&target, _)| target)
             .collect::<Vec<_>>();
@@ -1237,7 +1255,7 @@ impl PendingIncident {
             let scope = self.individual((0, 0));
             let mut dispatch = LogDispatch::Pending;
             let attempt = LogAttempt::new(&mut dispatch, Some((&app.db, scope.journal(&[]))));
-            if channel_for(&cfg, "automod_delete").is_none()
+            if route.is_none()
                 || emit_to_observed_with_audit(
                     app,
                     sink,

@@ -231,6 +231,59 @@ async fn one_notice_for_rest_and_single_and_bulk_purge_echoes_across_three_chann
 }
 
 #[tokio::test]
+async fn bulk_only_destination_groups_cleanup_and_excludes_filtered_sources() {
+    let f = Fixture::new(true).await;
+    db::delete_log_channel(&f.app.db, GUILD as i64, "message_delete")
+        .await
+        .unwrap();
+    db::upsert_log_channel(&f.app.db, GUILD as i64, "message_bulk_delete", 30)
+        .await
+        .unwrap();
+    f.set_filter(
+        "message_bulk_delete",
+        db::LogFilter {
+            users: vec![],
+            channels: vec!["3".into()],
+        },
+    )
+    .await;
+    f.set_filter(
+        "automod_delete",
+        db::LogFilter {
+            users: vec![],
+            channels: vec!["4".into()],
+        },
+    )
+    .await;
+
+    let cleanup = f.begin().await.expect("bulk-only layout admits cleanup");
+    f.rest(Some(&cleanup), 1, 101).await;
+    f.remember(SUBJECT, 2, 102);
+    f.remember(SUBJECT, 3, 103);
+    f.remember(SUBJECT, 4, 104);
+    cleanup.begin_purge(PURGE_WINDOW_SECS, BAN_REQUESTED_AT_MS);
+    assert!(f.bulk(2, 102).report.is_none());
+    assert!(f.bulk(3, 103).report.is_none());
+    assert!(f.bulk(4, 104).report.is_none());
+    cleanup.outcome(CaseOutcome::Succeeded, None);
+    drop(cleanup);
+
+    assert!(f.notices().is_empty());
+    tokio::time::pause();
+    f.settle().await;
+    assert!(f.bulk(2, 102).report.is_none());
+    let notices = f.sink.0.lock();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].0.get(), 30);
+    let body = log_text(&notices[0].1);
+    assert!(body.contains("Automod cleanup"), "{body}");
+    assert!(body.contains("**Deleted:** 2"), "{body}");
+    assert!(body.contains("<#1> 1, <#2> 1"), "{body}");
+    assert!(!body.contains("<#3>"), "{body}");
+    assert!(!body.contains("<#4>"), "{body}");
+}
+
+#[tokio::test]
 async fn late_strikes_join_and_move_the_settle_time() {
     let f = Fixture::new(true).await;
     let first = f.begin().await.unwrap();
