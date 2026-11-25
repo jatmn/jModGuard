@@ -1465,6 +1465,34 @@ test('template keystrokes update the edited field and its preview without render
   edited.blur();
 });
 
+test('restoring a multiline template clears its draft with browser-normalized newlines', async () => {
+  const { app, document } = harness();
+  const saved = 'first\r\n{user}\rlast';
+  app.state.config = { templates: [{ event: 'member_join', effective: saved }] };
+  app.state.tab = 'templates';
+  app.renderTab();
+  const textarea = document.querySelector('.template-card textarea');
+  const baseline = textarea.value;
+  assert.equal(baseline, 'first\n{user}\nlast');
+
+  for (const restore of ['typing', 'variable']) {
+    textarea.value = 'first\nx\nlast';
+    await fire(textarea, 'input');
+    assert.equal(app.isDirty(), true, restore);
+    if (restore === 'typing') {
+      textarea.value = baseline;
+      await fire(textarea, 'input');
+    } else {
+      textarea.setSelectionRange('first\n'.length, 'first\nx'.length);
+      const user = [...document.querySelectorAll('.template-var-chip')].find(chip => chip.textContent === '{user}');
+      await fire(user, 'click');
+    }
+    assert.equal(textarea.value, baseline, restore);
+    assert.equal(app.isDirty(), false, restore);
+    assert.equal(app.state.config.templates[0].effective, saved, restore);
+  }
+});
+
 test('each template editor offers only its event variables, matching the shipped templates', () => {
   // Shipped templates as served by the API test template_preview_cases_match_the_bot_renderer.
   const golden = JSON.parse(fs.readFileSync(new URL('../crates/api/src/web/template_preview_cases.json', import.meta.url), 'utf8'));

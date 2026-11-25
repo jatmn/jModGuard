@@ -90,16 +90,18 @@ function IconButton({ action, label, className = "btn btn-sm btn-square", ...pro
   );
 }
 const subscribeWithoutDraft = () => () => {};
-function draftBaseline(snapshot, key, fallback) {
-  return String(snapshot.draftBaselines[key] ?? fallback ?? "");
+function draftBaseline(snapshot, key, fallback, multiline) {
+  const baseline = String(snapshot.draftBaselines[key] ?? fallback ?? "");
+  // The DOM exposes textarea values with LF line endings.
+  return multiline ? baseline.replace(/\r\n?/g, "\n") : baseline;
 }
-function useDraftControl({ draftKey, defaultValue, onChange, ...props }) {
+function useDraftControl({ draftKey, defaultValue, onChange, ...props }, multiline = false) {
   const group = useContext(DraftGroup);
   const working = useContext(BusyContext);
   const value = useSyncExternalStore(draftKey ? ui.subscribe : subscribeWithoutDraft, () => {
     if (!draftKey) return undefined;
     const snapshot = ui.getSnapshot();
-    return snapshot.drafts[draftKey]?.value ?? draftBaseline(snapshot, draftKey, defaultValue);
+    return snapshot.drafts[draftKey]?.value ?? draftBaseline(snapshot, draftKey, defaultValue, multiline);
   });
   if (!draftKey) return { ...props, defaultValue, onChange, disabled: working || props.disabled };
   return {
@@ -111,7 +113,7 @@ function useDraftControl({ draftKey, defaultValue, onChange, ...props }) {
       const value = event.target.value;
       const snapshot = ui.getSnapshot();
       const next = { ...snapshot.drafts };
-      if (value === draftBaseline(snapshot, draftKey, defaultValue)) delete next[draftKey];
+      if (value === draftBaseline(snapshot, draftKey, defaultValue, multiline)) delete next[draftKey];
       else next[draftKey] = { value, group };
       ui.set({ drafts: next, edits: Object.keys(next).length > 0 ? "dirty" : "clean" });
       onChange?.(event);
@@ -119,7 +121,7 @@ function useDraftControl({ draftKey, defaultValue, onChange, ...props }) {
   };
 }
 function Input(props) { return h(HeadlessInput, noAutofill(useDraftControl(props))); }
-function Textarea(props) { return h(HeadlessTextarea, noAutofill(useDraftControl(props))); }
+function Textarea(props) { return h(HeadlessTextarea, noAutofill(useDraftControl(props, true))); }
 function Select(props) { return h(HeadlessSelect, useDraftControl(props)); }
 function OwnerTools() {
   const profile = useRef(null);
@@ -6803,14 +6805,14 @@ function tabTemplates() {
 
 // Adds a variable at the editor's cursor through the same draft path as typing.
 function insertTemplateVariable(textarea, draftKey, group, defaultValue, name) {
-  const { drafts, draftBaselines } = ui.getSnapshot();
+  const snapshot = ui.getSnapshot();
   const current = textarea.value;
   const start = textarea.selectionStart ?? current.length;
   const end = textarea.selectionEnd ?? start;
   const token = `{${name}}`;
   const value = current.slice(0, start) + token + current.slice(end);
-  const baseline = String(draftBaselines[draftKey] ?? defaultValue ?? "");
-  const next = { ...drafts };
+  const baseline = draftBaseline(snapshot, draftKey, defaultValue, true);
+  const next = { ...snapshot.drafts };
   if (value === baseline) delete next[draftKey];
   else next[draftKey] = { value, group };
   // Render the new text first: React writing the controlled value moves the caret to the end.
