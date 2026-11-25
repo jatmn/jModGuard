@@ -1377,7 +1377,6 @@ impl EventHandler for Handler {
         }
 
         // automod
-        let member: Option<Member> = msg.member.clone().map(|m| Member::from(*m));
         let member_roles: Vec<u64> = msg
             .member
             .as_deref()
@@ -1430,6 +1429,7 @@ impl EventHandler for Handler {
         };
         let mut stop_commands = false;
         if let Some(pending) = app.automod.evaluate(&cfg, &msg_ctx) {
+            let member = msg.member.as_deref().cloned().map(Member::from);
             let display = member
                 .as_ref()
                 .map(user_display)
@@ -1439,7 +1439,7 @@ impl EventHandler for Handler {
                 &ctx,
                 guild_id,
                 &msg.author,
-                member.clone(),
+                member,
                 &display,
                 Some(msg.id.get()),
                 Some(msg.channel_id.get()),
