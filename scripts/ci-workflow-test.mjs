@@ -586,7 +586,9 @@ source() {
   builtin source "$@"
   checked_request() { printf 'main\\t\\t%s\\n' "$SHA"; }
   read_plan() { printf '%s\\t\\n' "$SHA"; }
-  read_publish_handoff() { return 1; }
+  read_publish_handoff() {
+    printf '{"component":"%s","sign":true,"published_digest":"%s"}\\n' "\${JMODGUARD_PUBLISH_STATE_DIR##*-}" "$NEW"
+  }
   read_publish_state() { return 1; }
   require_signing_secrets() { :; }
   validate_signing_key_pair() { :; }

@@ -13,7 +13,11 @@ publish_fail() {
 
 run_git() { git "$@" || publish_fail "git failed: $*"; }
 run_docker() {
-  if [[ "$1 ${2:-}" == 'buildx build' && "${@: -2:1}" == --metadata-file ]]; then
+  if [[ "$1" == --deadline ]]; then
+    local deadline="$2"
+    shift 2
+    timeout --kill-after=5s "$deadline" docker "$@"
+  elif [[ "$1 ${2:-}" == 'buildx build' && "${@: -2:1}" == --metadata-file ]]; then
     retry_staging_push "$@"
   else
     docker "$@" || publish_fail "docker failed: $*"
@@ -1020,43 +1024,74 @@ JS
 
 registry_manifest_absent() {
   local errfile="$1"
-  grep -Eq ': not found$|manifest unknown' "$errfile" || return 1
-  if grep -Eq 'failed to do request|unauthorized|authentication required|denied:|no such host|timeout|connection refused|connection reset' "$errfile"; then
+  grep -Eiq ': not found$|manifest unknown|unexpected status from (HEAD|GET) request to [^[:space:]]+/manifests/[^[:space:]]+: 404([[:space:]]|$)' "$errfile" || return 1
+  if grep -Eiq 'failed to do request|unauthorized|authentication required|denied:|no such host|timeout|connection refused|connection reset' "$errfile"; then
     return 1
   fi
   return 0
 }
 
+# Status 2 means confirmed absence. Other failed statuses refine diagnostics
+# without making an unknown previous tag eligible for rollback deletion.
 inspect_digest() {
-  local raw="" err rc=0
-  err="$(mktemp)" || return 1
-  set +e
-  raw="$(run_docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>"$err")"
-  rc=$?
-  set -e
-  if [[ "$rc" -ne 0 ]]; then
-    if registry_manifest_absent "$err"; then
-      rm -f "$err"
-      return 2
-    fi
-    cat "$err" >&2
-    rm -f "$err"
-    return 1
+  local raw err lookup_status rc=1
+  local -a options=()
+  if [[ -n "${2:-}" ]]; then
+    options=(--deadline "$2")
   fi
-  rm -f "$err"
-  set +e
-  MANIFEST_JSON="$raw" node --input-type=commonjs - <<'JS'
+  err="$(mktemp)" || return 1
+  if raw="$(run_docker "${options[@]}" buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>"$err")"; then
+    rm -f "$err"
+  else
+    lookup_status=$?
+    if [[ "$lookup_status" -eq 124 || "$lookup_status" -eq 137 ]]; then
+      rc=4
+    elif grep -Eiq 'unauthorized|authentication required|authorization failed|insufficient_scope|forbidden|denied:|(status code[[:space:]]+|:[[:space:]]+)(401|403)([[:space:]]|$)' "$err"; then
+      rc=3
+    elif grep -Eiq 'invalid character .* (looking for beginning of|after (object|array|top-level)|in (literal|string|numeric))|unexpected end of JSON input|json: cannot unmarshal' "$err"; then
+      rc=5
+    elif grep -Eiq 'too many requests|timeout|timed out|deadline exceeded|no such host|temporary failure in name resolution|connection (refused|reset)|unexpected EOF|: EOF$|(status code[[:space:]]+|:[[:space:]]+)(408|429|5[0-9]{2})([[:space:]]|$)' "$err"; then
+      rc=4
+    elif registry_manifest_absent "$err"; then
+      rc=2
+    fi
+    [[ "$rc" -eq 2 ]] || cat "$err" >&2
+    rm -f "$err"
+    return "$rc"
+  fi
+  MANIFEST_JSON="$raw" node --input-type=commonjs - <<'JS' || return 5
 const data = JSON.parse(process.env.MANIFEST_JSON || "");
 const digest = data.digest || (data.Descriptor && data.Descriptor.digest) || "";
 const sizeRaw = data.size ?? (data.Descriptor && data.Descriptor.size);
 const size = Number(sizeRaw);
-if (!/^sha256:[0-9a-f]{64}$/.test(digest)) process.exit(2);
+if (typeof digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(digest)) process.exit(2);
 if (!Number.isInteger(size) || size <= 0) process.exit(2);
 process.stdout.write(`${digest}\t${size}\n`);
 JS
-  rc=$?
-  set -e
-  [[ "$rc" -eq 0 ]] || return 1
+}
+
+inspect_staging_manifest() {
+  local component="$1" ref="$2" manifest attempt rc reason
+  for attempt in 1 2 3; do
+    if manifest="$(inspect_digest "$ref" 30s 2>/dev/null)"; then
+      printf '%s\n' "$manifest"
+      return 0
+    else
+      rc=$?
+    fi
+    case "$rc" in
+      2) reason='manifest absent' ;;
+      3) reason='authorization failed' ;;
+      4) reason='retryable registry or transport error' ;;
+      5) reason='invalid manifest metadata' ;;
+      *) reason='unclassified registry lookup failure' ;;
+    esac
+    if (( attempt == 3 || (rc != 2 && rc != 4) )); then
+      publish_fail "${component}: staging manifest lookup for ${ref}: ${reason}"
+    fi
+    printf '%s: staging manifest lookup for %s: %s (attempt %d); retrying\n' "$component" "$ref" "$reason" "$attempt" >&2
+    sleep "$((5 * attempt))"
+  done
 }
 
 source_image_layout() {
@@ -1256,10 +1291,12 @@ publish_handoff_file() {
 }
 
 write_publish_handoff() {
-  local component="$1" sign="$2"
-  COMPONENT="$component" SIGN="$sign" node --input-type=commonjs - <<'JS' >"$(publish_handoff_file)"
+  local component="$1" sign="$2" digest="${3:-}"
+  COMPONENT="$component" SIGN="$sign" DIGEST="$digest" node --input-type=commonjs - <<'JS' >"$(publish_handoff_file)"
 const sign = process.env.SIGN === "true";
-process.stdout.write(JSON.stringify({ component: process.env.COMPONENT, sign }));
+const handoff = { component: process.env.COMPONENT, sign };
+if (sign) handoff.published_digest = process.env.DIGEST;
+process.stdout.write(JSON.stringify(handoff));
 JS
 }
 
@@ -1404,7 +1441,7 @@ process.stdout.write(JSON.stringify({
 }));
 JS
 )"
-  write_publish_handoff "$component" true
+  write_publish_handoff "$component" true "$published_digest"
   trap - EXIT
   cleanup_publish
 }
@@ -1412,7 +1449,7 @@ JS
 publish_component_sign() {
   local component="$1"
   local selection mode ref head resolved sha label image channel published_digest staging_ref
-  local state handoff sign_flag handoff_sign_expected=""
+  local state handoff sign_flag verified_digest="" manifest
   local username token source_token scratch tag
   selection="$(checked_request)" || return $?
   if [[ "$selection" == "skip" ]]; then
@@ -1428,11 +1465,13 @@ publish_component_sign() {
     if [[ "$(HANDOFF_JSON="$handoff" node --input-type=commonjs -e 'process.stdout.write(JSON.parse(process.env.HANDOFF_JSON).component)')" != "$component" ]]; then
       publish_fail 'publish handoff component mismatch'
     fi
-    handoff_sign_expected="$sign_flag"
     if [[ "$sign_flag" != "true" ]]; then
       echo "${component}: build produced no verified image; skipping promotion"
       return 0
     fi
+    verified_digest="$(HANDOFF_JSON="$handoff" node --input-type=commonjs \
+      -e 'process.stdout.write(JSON.parse(process.env.HANDOFF_JSON).published_digest ?? "")' 2>/dev/null)" \
+      || publish_fail "${component}: invalid verified build digest in publish handoff"
   fi
   resolved="$(read_plan "$mode" "$ref" "$head")" || return $?
   IFS=$'\t' read -r sha label <<<"$resolved"
@@ -1442,16 +1481,17 @@ publish_component_sign() {
   image="ghcr.io/jatmn/jmodguard-${component}"
   staging_ref="$(publish_staging_ref "$image" "$sha")"
   channel="$(channel_for "$mode" "$label" || true)"
-  if ! published_digest="$(inspect_digest "$staging_ref" 2>/dev/null | cut -f1)"; then
-    if [[ "$handoff_sign_expected" == "true" ]]; then
-      publish_fail 'verified staging image is missing from the registry'
-    fi
-    echo "${component}: no verified image to sign; skipping promotion"
-    return 0
-  fi
   if state="$(read_publish_state "$component" 2>/dev/null)"; then
-    assert_publish_state_matches_trusted "$component" "$state" "$image" "$sha" "$label" "$mode" "$channel" "$staging_ref" "$published_digest"
+    if [[ -z "$verified_digest" ]]; then
+      # Older handoffs recorded the verified digest only in the full state.
+      verified_digest="$(STATE_JSON="$state" node --input-type=commonjs \
+        -e 'process.stdout.write(JSON.parse(process.env.STATE_JSON).published_digest ?? "")' 2>/dev/null)" \
+        || publish_fail "${component}: invalid build state for ${staging_ref}"
+    fi
+    assert_publish_state_matches_trusted "$component" "$state" "$image" "$sha" "$label" "$mode" "$channel" "$staging_ref" "$verified_digest"
   fi
+  [[ "$verified_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || publish_fail "${component}: missing or invalid verified build digest for ${staging_ref}"
   if [[ -z "$_JMG_SIGNING_KEY" || -z "$_JMG_SIGNING_PASSWORD" ]]; then
     capture_signing_secrets
   fi
@@ -1469,21 +1509,23 @@ publish_component_sign() {
   trap cleanup_promotion_scratch EXIT
   validate_signing_key_pair
   redact_tokens "$token" "$source_token" "$_JMG_SIGNING_KEY" "$_JMG_SIGNING_PASSWORD"
-  # docker login writes the GHCR token base64-encoded to $DOCKER_CONFIG/config.json and
-  # warns that credentials are stored unencrypted. That warning is expected: the
-  # `docker buildx imagetools` digest checks and tag promotion and `cosign sign`/`verify`
-  # below read auth from this config. It lives only in this run's scratch directory
+  # docker login writes the GHCR token base64-encoded to $DOCKER_CONFIG/config.json.
+  # The manifest lookup, tag promotion and `cosign sign`/`verify` read auth from this
+  # config. It lives only in this run's scratch directory
   # (mode 700), which cleanup_promotion_scratch deletes once promotion is committed or
   # aborted or, otherwise, via the EXIT trap, so the token does not outlive this shell on
   # the ephemeral runner.
   export DOCKER_CONFIG="${scratch}/docker"
   mkdir -m 700 "$DOCKER_CONFIG"
-  printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin >/dev/null
+  (printf '%s' "$token" | run_docker login ghcr.io --username "$username" --password-stdin) >/dev/null 2>&1 \
+    || publish_fail "${component}: registry login failed for ${staging_ref}"
+  manifest="$(inspect_staging_manifest "$component" "$staging_ref")" || return $?
+  published_digest="${manifest%%$'\t'*}"
+  [[ "$published_digest" == "$verified_digest" ]] \
+    || publish_fail "${component}: ${staging_ref} resolved to ${published_digest}; expected verified digest ${verified_digest}"
   ensure_signing_secrets_captured
   persist_signing_secrets_to_files "$scratch"
   signing_secrets_in_environ && publish_fail 'signing secrets must not remain in the process environment'
-  assert_digest_matches_ref "$staging_ref" "$published_digest" \
-    || publish_fail 'staging reference does not match the verified build digest'
   sign_published_digest "$component" "$image" "$published_digest" \
     || publish_fail 'published image failed signing'
   while IFS= read -r tag; do
