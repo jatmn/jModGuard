@@ -106,10 +106,12 @@ and persistence contracts below are unchanged.
   message-age window. Unattributed deletes use their usual single or bulk log.
   Nearby strikes for the same rule join the open incident, including the
   velocity rule's existing delete fallback after a terminal kick. After 10 seconds
-  of quiet the bot sends one summary to the Automod Delete log, or to its
-  Message Delete fallback. It includes the observed deletion time range,
+  of quiet the bot sends one summary to the Automod Delete log when configured.
+  The fallback order is Message Delete followed by Bulk Message Delete.
+  The summary includes the observed deletion time range,
   channel counts, a bounded sample and available evidence, and a separate
-  failure count. Source and user exclusions still apply. A definitively
+  failure count. Source and user exclusions still apply, including Bulk Message
+  Delete exclusions when the summary uses that destination. A definitively
   rejected ban returns its tentative purge observations to ordinary single
   or bulk delete logging and that route's exclusions.
 - A saved custom Automod Delete template keeps its per-message presentation

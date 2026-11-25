@@ -1543,10 +1543,20 @@ async fn emit_to_observed_with_audit(
             attempt.ensure_current_enrollment().await?;
         }
         let cfg = app.configs.get(&app.db, guild_id.get()).await?;
-        let Some(channel_id) = channel_for(&cfg, event) else {
+        let grouped_cleanup = event == "automod_delete" && vars.contains_key("cleanup_total");
+        let route = if grouped_cleanup {
+            cleanup_incident::summary_route(&cfg)
+        } else {
+            channel_for(&cfg, event).map(|channel| (channel, None))
+        };
+        let Some((channel_id, bulk_filter)) = route else {
             return Ok(Delivery::Unconfigured);
         };
-        if log_filter_for(&cfg, event).is_some_and(|filter| excluded(filter, &vars)) {
+        if [log_filter_for(&cfg, event), bulk_filter]
+            .into_iter()
+            .flatten()
+            .any(|filter| excluded(filter, &vars))
+        {
             return Ok(Delivery::Unconfigured);
         }
         if member_audit_action(event).is_some() {
@@ -1648,7 +1658,6 @@ async fn emit_to_observed_with_audit(
             return Ok(Delivery::Sent);
         }
         let nonce = vars.remove("cleanup_nonce");
-        let grouped_cleanup = event == "automod_delete" && vars.contains_key("cleanup_total");
         let template = if grouped_cleanup {
             if vars.contains_key("cleanup_failure_notice") {
                 cleanup_incident::FAILURE_TEMPLATE
