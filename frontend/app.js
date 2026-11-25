@@ -10358,10 +10358,14 @@ function useCachedApiRead(path, shape, { listSize, holdBackgroundResult = false 
         if (!validDisplayRead(data, shape)) throw new Error("The API returned an invalid display response.");
         return data;
       };
+      const holdsBackgroundResult = () => background && snapshot !== null && holdResult.current;
       try {
         const data = listSize === undefined ? await read(path, signal) : await readListPage({
           read, path: endpoint, query, collection: shape, size: listSize, signal,
           beforeChunk: background ? () => waitForReadVisibility(signal) : undefined,
+          // The first scoped read still detects access loss. The editor only
+          // prevents dispatching subsequent chunks that cannot be published.
+          shouldContinue: background ? () => !holdsBackgroundResult() : undefined,
           onProgress: (progress) => {
             if (active === request) setResult((current) => ({ ...current, progress }));
           },
@@ -10370,7 +10374,7 @@ function useCachedApiRead(path, shape, { listSize, holdBackgroundResult = false 
         signal.throwIfAborted();
         // A normal data refresh must not remove an inline reason editor. The
         // access-failure path below still clears the restricted snapshot.
-        if (!(background && snapshot && holdResult.current)) {
+        if (data !== null && !holdsBackgroundResult()) {
           const at = Date.now();
           snapshot = { at, data };
           if (cacheKey) storeRead(cacheKey, data, at);

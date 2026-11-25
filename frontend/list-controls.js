@@ -410,7 +410,7 @@ async function readListChunk(read, path, signal) {
   }
 }
 
-export async function readListPage({ read, path, query, collection, size, signal, onProgress, beforeChunk }) {
+export async function readListPage({ read, path, query, collection, size, signal, onProgress, beforeChunk, shouldContinue }) {
   const target = size === "all" ? Infinity : Number(size);
   const params = new URLSearchParams(query);
   const seen = new Set([params.get("after")]);
@@ -427,6 +427,8 @@ export async function readListPage({ read, path, query, collection, size, signal
       else params.set("include_total", "true");
     }
     if (beforeChunk) await beforeChunk();
+    // Check after the wait. A skipped continuation leaves no complete page.
+    if (first !== undefined && shouldContinue?.() === false) return null;
     const page = await readListChunk(read, `${path}?${params}`, signal);
     first ??= page;
     const batch = page[collection] || [];
