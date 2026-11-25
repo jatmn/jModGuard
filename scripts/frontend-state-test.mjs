@@ -12367,6 +12367,155 @@ test('a background Bans refresh keeps an open reason draft reachable', async () 
   assert.equal(h.app.isDirty(), true);
 });
 
+test('a Bans draft keeps only one scoped background read and still handles access failure', async () => {
+  let count = 501;
+  let failure;
+  const requests = [];
+  const h = harness(async (url, opts) => {
+    const { pathname, searchParams } = new URL(url, 'https://fixture.test');
+    requests.push([pathname, opts.method, opts.headers['x-jmodguard-enrollment'], searchParams]);
+    return failure ?? response(pageSizeFixture('bans', count)(searchParams));
+  }, new Map([['jmodguard.list-page-size.bans', 'all']]));
+  const panel = await bansView(h);
+  const editor = () => panel.querySelector('textarea[aria-label="jModGuard reason"]');
+  const displayed = () => listTable(panel).getAttribute('aria-rowcount');
+  const stamp = () => panel.querySelector('.last-updated')?.textContent;
+  assert.equal(requests.splice(0).length, 3);
+  assert.equal(displayed(), '502');
+  const saved = [...h.session];
+  const originalStamp = stamp();
+  assert.match(originalStamp, /^Last updated /);
+  await fire(panel.querySelector('button[aria-label="Edit reason"]'), 'click');
+  editor().value = 'Unsaved reason';
+  await fire(editor(), 'input');
+
+  count = 2551;
+  h.document.visibilityState = 'hidden';
+  await runReadRefresh(h, 180000);
+  await settle();
+  assert.equal(requests.length, 0, 'a hidden tab does not start the recheck');
+  h.document.visibilityState = 'visible';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  const reads = requests.splice(0);
+  assert.equal(reads.length, 1, 'the draft needs only the first bounded request');
+  const [[pathname, method, enrollment, query]] = reads;
+  assert.equal(pathname, `/api/guilds/${h.app.state.guildId}/bans`);
+  assert.equal(method, 'POST');
+  assert.equal(enrollment, 'membership');
+  assert.equal(query.get('limit'), '250');
+  assert.equal(query.get('after'), null);
+  assert.equal(displayed(), '502');
+  assert.equal(stamp(), originalStamp);
+  assert.deepEqual([...h.session], saved);
+  assert.equal(editor().value, 'Unsaved reason');
+
+  failure = readFailure(503, 'temporarily unavailable');
+  await runReadRefresh(h, 180000);
+  await settle();
+  assert.equal(requests.splice(0).length, 1);
+  assert.equal(displayed(), '502');
+  assert.equal(stamp(), originalStamp);
+  assert.deepEqual([...h.session], saved);
+  assert.equal(editor().value, 'Unsaved reason');
+  assert.match(panel.querySelector('[role="alert"]').textContent, /Refresh failed: temporarily unavailable/);
+
+  failure = undefined;
+  count = 601;
+  await fire(cacheRefreshButton(panel), 'click');
+  assert.deepEqual(requests.splice(0).map(([, , , params]) => params.get('after')), [null, 'cursor:250', 'cursor:500']);
+  assert.equal(displayed(), '602', 'manual refresh still publishes a complete page');
+  assert.notEqual(stamp(), originalStamp);
+  assert.equal(editor().value, 'Unsaved reason');
+
+  failure = readFailure(400, 'you cannot manage this server', 'guild_access_denied');
+  await runReadRefresh(h, 180000);
+  await settle();
+  assert.equal(requests.length, 1);
+  assert.equal(editor(), null);
+  assert.equal(stamp(), undefined);
+  assert.equal(panel.querySelector('button[aria-label="Edit reason"]'), null);
+  assert.match(panel.querySelector('tbody').textContent, /cannot manage this server/);
+  assert.deepEqual(readCacheKeys(h.session), []);
+});
+
+test('Bans checks the reason editor before each continuation and drops a superseded scope', async () => {
+  const requests = [];
+  let count = 501;
+  let pauseNext = false;
+  let release;
+  const h = harness(async (url, opts) => {
+    const query = new URL(url, 'https://fixture.test').searchParams;
+    requests.push({ after: query.get('after'), status: query.get('status'), signal: opts.signal });
+    const payload = pageSizeFixture('bans', count)(query);
+    if (pauseNext) {
+      pauseNext = false;
+      await new Promise(resolve => { release = resolve; });
+    }
+    return response(payload);
+  }, new Map([['jmodguard.list-page-size.bans', 'all']]));
+  const panel = await bansView(h);
+  const open = () => fire(panel.querySelector('button[aria-label="Edit reason"]'), 'click');
+  const rowCount = () => listTable(panel).getAttribute('aria-rowcount');
+  const saved = [...h.session];
+  const stamp = panel.querySelector('.last-updated').textContent;
+  assert.equal(rowCount(), '502');
+  requests.length = 0;
+
+  count = 601;
+  pauseNext = true;
+  await runReadRefresh(h, 180000);
+  await settle();
+  assert.equal(requests.length, 1, 'the first chunk is already in flight');
+  h.document.visibilityState = 'hidden';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  release();
+  await settle();
+  assert.equal(requests.length, 1, 'the continuation is waiting for visibility');
+  await open();
+  h.document.visibilityState = 'visible';
+  h.document.dispatchEvent(new h.window.Event('visibilitychange'));
+  await settle();
+  assert.equal(requests.length, 1, 'opening an editor while waiting stops the continuation');
+  assert.equal(rowCount(), '502');
+  assert.equal(panel.querySelector('.last-updated').textContent, stamp);
+  assert.deepEqual([...h.session], saved);
+  assert.ok(panel.querySelector('textarea[aria-label="jModGuard reason"]'));
+
+  requests.length = 0;
+  pauseNext = true;
+  await runReadRefresh(h, 180000);
+  await settle();
+  assert.equal(requests.length, 1);
+  const cancel = [...panel.querySelectorAll('.ban-reason-editor button')].find(button => button.textContent === 'Cancel');
+  await fire(cancel, 'click');
+  release();
+  await settle();
+  assert.deepEqual(requests.map(request => request.after), [null, 'cursor:250', 'cursor:500']);
+  assert.equal(rowCount(), '602', 'closing the editor before the first response allows a full refresh');
+  assert.notEqual(panel.querySelector('.last-updated').textContent, stamp);
+
+  requests.length = 0;
+  count = 801;
+  pauseNext = true;
+  await runReadRefresh(h, 180000);
+  await settle();
+  const old = requests[0];
+  assert.equal(old.status, null);
+  await open();
+  count = 501;
+  const status = memberLabelled(panel, 'Status');
+  status.value = 'active';
+  await fire(status, 'change');
+  assert.equal(old.signal.aborted, true);
+  release();
+  await settle();
+  assert.deepEqual(requests.map(request => [request.status, request.after]), [
+    [null, null], ['active', null], ['active', 'cursor:250'], ['active', 'cursor:500'],
+  ]);
+  assert.equal(rowCount(), '502');
+});
+
 test('a dirty template guards tab close and survives declined sign-out', async () => {
   const prompts = [];
   const requests = [];
