@@ -4678,26 +4678,17 @@ async fn legacy_case_backfill_retains_only_confirmed_bans() {
     let (_f, store, scope) = ready().await;
     complete_for_checks(&store, &scope).await;
 
-    for user_id in 81..=83 {
-        store
-            .observe_member(scope.clone(), observed(user_id, Some(500), 2_000))
-            .await
-            .unwrap();
-        store
-            .depart_member(scope.clone(), user_id, 3_000)
-            .await
-            .unwrap();
-    }
     for (user_id, outcome) in [
         (81, CaseOutcome::Failed),
         (82, CaseOutcome::Uncertain),
         (83, CaseOutcome::Attempted),
         (84, CaseOutcome::Succeeded),
     ] {
+        let case_id = CaseId::new();
         store
             .record_case(
                 scope.clone(),
-                CaseId::new(),
+                case_id.clone(),
                 CaseData {
                     ban_attempt_tag: None,
                     source: CaseSource::Application {
@@ -4715,8 +4706,13 @@ async fn legacy_case_backfill_retains_only_confirmed_bans() {
             )
             .await
             .unwrap();
+        // Recreate the missing projection of a legacy case after the live insert.
+        store
+            .remove_case_index_for_test(scope.clone(), case_id)
+            .await
+            .unwrap();
     }
-    // Legacy cases predate the live trigger that retains a confirmed ban.
+    // Remove the row made by the live trigger before recording the departures.
     let enrollment_id = scope.enrollment.id.clone();
     store
         .db
@@ -4729,7 +4725,18 @@ async fn legacy_case_backfill_retains_only_confirmed_bans() {
         })
         .await
         .unwrap();
-    assert!(store.get_member(scope.clone(), 84).await.unwrap().is_none());
+    for user_id in 81..=84 {
+        store
+            .observe_member(scope.clone(), observed(user_id, Some(500), 2_000))
+            .await
+            .unwrap();
+        store
+            .depart_member(scope.clone(), user_id, 3_000)
+            .await
+            .unwrap();
+    }
+    let confirmed_departure = store.get_member(scope.clone(), 84).await.unwrap().unwrap();
+    assert!(!confirmed_departure.is_current && !confirmed_departure.ever_banned);
 
     assert!(
         store
@@ -4737,21 +4744,29 @@ async fn legacy_case_backfill_retains_only_confirmed_bans() {
             .await
             .unwrap()
     );
+    for user_id in 81..=84 {
+        let (entries, _) = store
+            .member_case_entries(scope.clone(), user_id, 8, CaseLimits::default())
+            .await
+            .expect("backfill must make the legacy case readable");
+        assert_eq!(
+            entries.len(),
+            1,
+            "backfill must restore each case projection"
+        );
+    }
     for user_id in 81..=83 {
         let member = store
             .get_member(scope.clone(), user_id)
             .await
             .unwrap()
             .unwrap();
-        assert!(!member.ever_banned, "backfill retained subject {user_id}");
+        assert!(!member.ever_banned, "backfill retained an unconfirmed ban");
     }
+    let confirmed_departure = store.get_member(scope.clone(), 84).await.unwrap().unwrap();
     assert!(
-        store
-            .get_member(scope.clone(), 84)
-            .await
-            .unwrap()
-            .unwrap()
-            .ever_banned
+        confirmed_departure.ever_banned,
+        "backfill must retain the confirmed departure"
     );
     // All three ordinary departures remain eligible, including at the same
     // time as the confirmed historic ban, which is retained.
