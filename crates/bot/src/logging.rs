@@ -132,6 +132,23 @@ pub(crate) struct MemberAuditObservation {
 }
 
 impl MemberAuditState {
+    fn unclaimed_subject(
+        &self,
+        observation: &MemberAuditObservation,
+    ) -> Option<(MemberAuditKey, &MemberAuditSubject)> {
+        let generation = observation.generation?;
+        let key = (
+            observation.guild,
+            observation.target,
+            observation.action.num(),
+        );
+        let subject = self.subjects.get(&key)?;
+        (subject.generation == generation
+            && subject.attribution == AuditAttribution::Unresolved
+            && subject.at.elapsed() < MEMBER_AUDIT_KEEP)
+            .then_some((key, subject))
+    }
+
     fn prune(&mut self) {
         self.claimed
             .retain(|_, at| at.elapsed() < MEMBER_AUDIT_KEEP);
@@ -194,6 +211,10 @@ impl MemberAuditClaims {
         observation
     }
 
+    fn has_unclaimed_subject(&self, observation: &MemberAuditObservation) -> bool {
+        self.inner.lock().unclaimed_subject(observation).is_some()
+    }
+
     fn claim(
         &self,
         observation: &MemberAuditObservation,
@@ -207,16 +228,7 @@ impl MemberAuditClaims {
         {
             return None;
         }
-        let generation = observation.generation?;
-        let key = (
-            observation.guild,
-            observation.target,
-            observation.action.num(),
-        );
-        let subject = state.subjects.get(&key)?;
-        if subject.generation != generation || subject.attribution == AuditAttribution::Claimed {
-            return None;
-        }
+        let (key, subject) = state.unclaimed_subject(observation)?;
         let uncertain_through = subject.uncertain_through;
         let (entry, vars) = member_audit_vars(
             logs,
@@ -1047,6 +1059,11 @@ pub(crate) async fn lookup_member_audit(
         for attempt in 0..3 {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            // Stop only on permanent subject ineligibility. The claim still
+            // checks under its lock because the subject can change during I/O.
+            if !app.member_audits.has_unclaimed_subject(observation) {
+                return None;
             }
             let logs = sink.member_audit(guild_id, observation.action).await.ok()?;
             if let Some(context) = app.member_audits.claim(observation, &logs) {
