@@ -549,14 +549,17 @@ impl SnapshotIngress {
                 let Some(observation) = edit_observation(event, chrono::Utc::now()) else {
                     return;
                 };
-                let known = event.guild_id.and_then(|guild| {
-                    crate::logging::known_message_author(
-                        app,
-                        guild.get(),
-                        event.channel_id.get(),
-                        event.id.get(),
-                    )
-                });
+                let known = event
+                    .guild_id
+                    .filter(|_| event.author.is_none())
+                    .and_then(|guild| {
+                        crate::logging::known_message_author(
+                            app,
+                            guild.get(),
+                            event.channel_id.get(),
+                            event.id.get(),
+                        )
+                    });
                 let report = PendingEditReport::from_gateway(app, &context, event, known);
                 let scope = event.guild_id.and_then(|guild| self.scope(guild.get()));
                 let queued = self.edit(
