@@ -162,25 +162,6 @@ function binding(job, key, context) {
   assert.ok(match, "missing workflow binding: " + key);
   return expression(match[1], context);
 }
-// Reusable CI receives the Publish caller's original event context.
-const scheduledPublish = {
-  github: {
-    repository: "jatmn/jModGuard", event: { repository: { private: false } },
-    event_name: "schedule", ref: "refs/heads/main",
-  },
-};
-assert.match(publication, /^  schedule:\n    - cron:/m);
-assert.match(publishValidate[1], /^    uses: \.\/\.github\/workflows\/ci\.yml$/m);
-assert.equal(condition(publishValidate[1], scheduledPublish), true, "scheduled Publish must validate");
-const checksEnv = jobs.get("checks").match(/^    env:\n((?:      [^\n]+\n)+)/m)?.[1];
-assert.ok(checksEnv, "Checks must set the audit mode for its steps");
-assert.equal(binding(checksEnv, "JMODGUARD_AUDIT_FAIL_CLOSED", scheduledPublish), "1",
-  "Nightly must fail closed on Cargo advisories");
-for (const event_name of ["pull_request", "push"]) {
-  const context = { github: { ...scheduledPublish.github, event_name } };
-  assert.equal(binding(checksEnv, "JMODGUARD_AUDIT_FAIL_CLOSED", context), "0",
-    `${event_name} Cargo advisories must remain non-blocking`);
-}
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: "utf8", ...options });
   assert.equal(result.status, 0, result.stderr || result.stdout || String(result.error));
@@ -217,6 +198,41 @@ for (const version of toolVersions) {
 }
 const selectedChecks = jobs.get("checks").match(/^      - name: Run selected checks\n([\s\S]*?)(?=^      - |$(?![\s\S]))/m)?.[1];
 assert.ok(selectedChecks);
+
+// Reusable CI receives the Publish caller's original event context.
+const scheduledPublish = {
+  github: {
+    repository: "jatmn/jModGuard", event: { repository: { private: false } },
+    event_name: "schedule", ref: "refs/heads/main",
+  },
+};
+assert.match(publication, /^  schedule:\n    - cron: (['"]?)[0-5]?\d (?:[01]?\d|2[0-3]) \* \* \*\1(?:[ \t]+#.*)?$/m,
+  "Publish must have a daily schedule");
+assert.match(publishValidate[1], /^    uses: \.\/\.github\/workflows\/ci\.yml$/m);
+assert.equal(condition(publishValidate[1], scheduledPublish), true, "scheduled Publish must validate");
+assert.match(jobs.get("plan"), /^          matrix="\$\(bash scripts\/select-checks\.sh matrix\)"$/m);
+const scheduledMatrix = JSON.parse(run("bash", ["scripts/select-checks.sh", "matrix"], {
+  cwd: root, env: { ...process.env, GITHUB_EVENT_NAME: scheduledPublish.github.event_name },
+}));
+assert.ok(scheduledMatrix.include.some(job => job.groups.split(/\s+/).includes("supply-chain")),
+  "Nightly must run supply-chain checks");
+
+const checksEnv = jobs.get("checks").match(/^    env:\n((?:      [^\n]+\n)+)/m)?.[1];
+const stepAudit = selectedChecks.match(/^          JMODGUARD_AUDIT_FAIL_CLOSED:([^\n]*)$/m)?.[1].trim();
+function auditMode(context) {
+  if (stepAudit === undefined) {
+    assert.ok(checksEnv, "Checks must set the audit mode");
+    return binding(checksEnv, "JMODGUARD_AUDIT_FAIL_CLOSED", context);
+  }
+  const stepExpression = stepAudit.match(/^\$\{\{ (.+) \}\}$/)?.[1];
+  return stepExpression ? expression(stepExpression, context) : stepAudit.replace(/^(['"])(.*)\1$/, "$2");
+}
+assert.equal(auditMode(scheduledPublish), "1", "Nightly must fail closed on Cargo advisories");
+for (const [event_name, ref] of [["pull_request", "refs/pull/797/merge"], ["push", "refs/heads/main"]]) {
+  const context = { github: { ...scheduledPublish.github, event_name, ref } };
+  assert.equal(auditMode(context), "0", `${event_name} Cargo advisories must remain non-blocking`);
+}
+
 assert.doesNotMatch(jobs.get("checks").slice(0, jobs.get("checks").indexOf("      - name: Run selected checks")), /RUSTC_WRAPPER:/);
 // The dependency cache keys on the CARGO_* environment it sees at restore, so the
 // workflow default stays two jobs and the public four-job override stays on this step.
