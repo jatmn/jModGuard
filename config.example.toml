@@ -80,9 +80,11 @@ oauth_client_secret = ""
 # Owner Bot Resources estimates from separate cgroups using local 64 MiB
 # blocks. Override the USD rates with memory_usd_per_block_hour and
 # cpu_usd_per_core_hour.
+# Set assume_disjoint_cgroups only after independently verifying that the
+# sampled Bot and API cgroups are disjoint when ancestry is hidden.
 # On the API, JMODGUARD_HOSTING_ESTIMATE is a JSON object with the same fields
 # and replaces this table when set.
-hosting_estimate = { enabled = false }
+hosting_estimate = { enabled = false, assume_disjoint_cgroups = false }
 
 # Public details for the Privacy Policy and Terms of Service. Fill in the
 # values for your instance. Everything here is visible without signing in.

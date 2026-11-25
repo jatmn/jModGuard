@@ -1461,8 +1461,11 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
   const rates = billing?.rates;
   const memoryRelation = snapshot.cgroup_relation?.memory;
   const cpuRelation = snapshot.cgroup_relation?.cpu;
-  const combineMemory = memoryRelation === "disjoint";
-  const combineCpu = cpuRelation === "disjoint";
+  const memoryDeclared = memoryRelation === "operator_declared_disjoint";
+  const cpuDeclared = cpuRelation === "operator_declared_disjoint";
+  const combineMemory = memoryRelation === "disjoint" || memoryDeclared;
+  const combineCpu = cpuRelation === "disjoint" || cpuDeclared;
+  const declaredMetrics = [memoryDeclared && "memory", rates && cpuDeclared && "CPU"].filter(Boolean);
   const readings = RESOURCE_PROCESSES.map(([id]) => {
     const current = snapshot.processes?.[id]?.current;
     return resourceFreshness(current, snapshot.generated_at_ms, nowMs) === "fresh" ? current : null;
@@ -1496,6 +1499,7 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
   const overlapReason = (relation) => {
     if (relation === "shared") return "the samples share a cgroup";
     if (relation === "overlapping") return "the sampled cgroups overlap";
+    if (relation === "unverified") return "the sampled cgroups have no common visible ancestor";
     return "the sampled cgroups could not be verified as separate";
   };
   const estimateRow = (label, hourly) => h("tr", null,
@@ -1523,6 +1527,14 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
         (combineMemory || combineCpu) && h("p", { className: "an-note muted" }, "Assumes current usage continues. Excludes host system overhead and egress."),
       )
       : h("p", { className: "an-note muted" }, billing ? "Hosting cost estimate is off." : "Hosting cost estimate configuration unavailable."),
+    declaredMetrics.length > 0 && h("p", { className: "an-note muted" },
+      `Using the operator’s cgroup separation declaration for ${declaredMetrics.join(" and ")}.`,
+    ),
+    (memoryRelation === "unverified" || (rates && cpuRelation === "unverified")) && h("p", { className: "an-note muted" },
+      "After independently verifying that the sampled scopes are disjoint, enable ",
+      h("code", null, "web.hosting_estimate.assume_disjoint_cgroups"),
+      " on the API.",
+    ),
   ));
 }
 

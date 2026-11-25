@@ -64,6 +64,9 @@ pub enum CgroupRelation {
     Shared,
     Overlapping,
     Disjoint,
+    /// Both scope identities are available, with inconclusive ancestry.
+    Unverified,
+    /// At least one scope lacks an identity.
     Unknown,
 }
 
@@ -92,7 +95,7 @@ fn scope_relation(left: &[u64], right: &[u64]) -> CgroupRelation {
     } else if left.iter().any(|ancestor| right.contains(ancestor)) {
         CgroupRelation::Disjoint
     } else {
-        CgroupRelation::Unknown
+        CgroupRelation::Unverified
     }
 }
 
@@ -1793,7 +1796,11 @@ mod tests {
         assert_eq!(bot.cpu_relation(&private_bot), CgroupRelation::Shared);
         assert_eq!(
             private_bot.cpu_relation(&private_api),
-            CgroupRelation::Unknown
+            CgroupRelation::Unverified
+        );
+        assert_eq!(
+            private_bot.memory_relation(&private_api),
+            CgroupRelation::Unverified
         );
         let no_boot = read_scoped_cgroup("0::/bot\n", &mount, None, None).scopes;
         assert_eq!(bot.memory_relation(&no_boot), CgroupRelation::Unknown);
@@ -1805,7 +1812,7 @@ mod tests {
             Some("dddddddd-dddd-dddd-dddd-dddddddddddd"),
         )
         .scopes;
-        assert_eq!(bot.cpu_relation(&other_boot), CgroupRelation::Unknown);
+        assert_eq!(bot.cpu_relation(&other_boot), CgroupRelation::Unverified);
     }
 
     #[cfg(target_os = "linux")]

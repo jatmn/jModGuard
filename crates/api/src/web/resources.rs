@@ -126,9 +126,14 @@ pub async fn overview(
     let now_ms = resources::unix_ms_now();
     let (records, history_status) = history(&app, range, now_ms / 1000).await;
     let api_status = ProcessStatus::current(api_interval_ms());
-    let mut response = build_response(range, now_ms, records.as_ref(), history_status, &api_status);
-    response["memory_billing"] = memory_billing(&app.cfg.web.hosting_estimate);
-    Ok(Json(response))
+    Ok(Json(build_response(
+        range,
+        now_ms,
+        records.as_ref(),
+        history_status,
+        &api_status,
+        &app.cfg.web.hosting_estimate,
+    )))
 }
 
 fn memory_billing(config: &HostingEstimateConfig) -> Value {
@@ -205,6 +210,7 @@ fn build_response(
     records: Option<&ResourceRecords>,
     history_status: &str,
     api_status: &ProcessStatus,
+    estimate: &HostingEstimateConfig,
 ) -> Value {
     let (span, window, bucket) = range.shape();
     let now_secs = now_ms / 1000;
@@ -232,6 +238,12 @@ fn build_response(
                     bot.cgroup_scopes.cpu_relation(&api_status.cgroup_scopes),
                 )
             });
+    let estimate_relation = |relation| match relation {
+        CgroupRelation::Unverified if estimate.assume_disjoint_cgroups => {
+            json!("operator_declared_disjoint")
+        }
+        _ => json!(relation),
+    };
     json!({
         "generated_at_ms": now_ms,
         "range": range.label(),
@@ -240,7 +252,11 @@ fn build_response(
         "from_secs": from_secs,
         "to_secs": to_secs,
         "history_status": history_status,
-        "cgroup_relation": {"memory": memory_relation, "cpu": cpu_relation},
+        "cgroup_relation": {
+            "memory": estimate_relation(memory_relation),
+            "cpu": estimate_relation(cpu_relation),
+        },
+        "memory_billing": memory_billing(estimate),
         "processes": {
             "bot": process(bot_status.as_ref(), records.map(|r| &r.bot)),
             "api": process(Some(api_status), records.map(|r| &r.api)),

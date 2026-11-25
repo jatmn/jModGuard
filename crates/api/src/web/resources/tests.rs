@@ -177,6 +177,7 @@ async fn memory_billing_returns_rates_only_when_enabled() {
             enabled,
             memory_usd_per_block_hour: 0.001,
             cpu_usd_per_core_hour: 0.04,
+            ..HostingEstimateConfig::default()
         });
         let owner = signed_in(&f.app, 99).await;
         let Json(value) = overview(State(f.app.clone()), owner, origin(&f.app), range("1h"))
@@ -214,38 +215,61 @@ async fn resources_compare_stored_and_live_scopes_without_exposing_identity() {
     .await
     .unwrap();
     let (records, history_status) = history(&f.app, ResourceRange::Hour, now_secs).await;
-    for (scopes, relation) in [
-        (
-            json!({"memory": [7, 1], "cpu": [8, 2]}),
-            json!({"memory": "shared", "cpu": "shared"}),
-        ),
-        (
-            json!({"memory": [3, 1], "cpu": [4, 2]}),
-            json!({"memory": "disjoint", "cpu": "disjoint"}),
-        ),
-        (
-            json!({"memory": [3], "cpu": []}),
-            json!({"memory": "unknown", "cpu": "unknown"}),
-        ),
-        (
-            json!({"memory": [1], "cpu": [4, 2]}),
-            json!({"memory": "overlapping", "cpu": "disjoint"}),
-        ),
-    ] {
-        let value = build_response(
-            ResourceRange::Hour,
-            now_secs * 1000,
-            records.as_ref(),
-            history_status,
-            &status(scopes),
-        );
-        assert_eq!(value["cgroup_relation"], relation);
-        for role in ["bot", "api"] {
-            assert!(
-                value["processes"][role]["current"]
-                    .get("cgroup_scopes")
-                    .is_none()
+    for assume_disjoint_cgroups in [false, true] {
+        let estimate = HostingEstimateConfig {
+            enabled: true,
+            assume_disjoint_cgroups,
+            ..HostingEstimateConfig::default()
+        };
+        let private_relation = if assume_disjoint_cgroups {
+            "operator_declared_disjoint"
+        } else {
+            "unverified"
+        };
+        for (scopes, memory, cpu) in [
+            (json!({"memory": [7], "cpu": [8]}), "shared", "shared"),
+            (
+                json!({"memory": [3, 1], "cpu": [4, 2]}),
+                "disjoint",
+                "disjoint",
+            ),
+            (
+                json!({"memory": [3], "cpu": [4]}),
+                private_relation,
+                private_relation,
+            ),
+            (json!({"memory": [], "cpu": []}), "unknown", "unknown"),
+            (
+                json!({"memory": [1], "cpu": [2]}),
+                "overlapping",
+                "overlapping",
+            ),
+            (
+                json!({"memory": [1], "cpu": [4]}),
+                "overlapping",
+                private_relation,
+            ),
+        ] {
+            let value = build_response(
+                ResourceRange::Hour,
+                now_secs * 1000,
+                records.as_ref(),
+                history_status,
+                &status(scopes),
+                &estimate,
             );
+            assert_eq!(
+                value["cgroup_relation"],
+                json!({"memory": memory, "cpu": cpu}),
+                "assume_disjoint_cgroups={assume_disjoint_cgroups}"
+            );
+            for role in ["bot", "api"] {
+                assert!(
+                    value["processes"][role]["current"]
+                        .get("cgroup_scopes")
+                        .is_none()
+                );
+            }
         }
     }
 }
@@ -397,6 +421,7 @@ async fn unavailable_history_still_returns_live_api_values() {
         None,
         "unavailable",
         &api,
+        &HostingEstimateConfig::default(),
     );
     assert_eq!(value["history_status"], "unavailable");
     assert!(value["processes"]["api"]["history"].is_null());

@@ -57,11 +57,14 @@ pub struct WebConfig {
     pub hosting_estimate: HostingEstimateConfig,
 }
 
-/// Optional USD rates for the owner resource view. No provider credentials are used.
+/// Local block and USD estimate settings for the owner resource view.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct HostingEstimateConfig {
     pub enabled: bool,
+    /// Operator declaration that the sampled Bot and API scopes are disjoint.
+    /// Applies only when both identities are present and ancestry is inconclusive.
+    pub assume_disjoint_cgroups: bool,
     pub memory_usd_per_block_hour: f64,
     pub cpu_usd_per_core_hour: f64,
 }
@@ -89,6 +92,7 @@ impl Default for HostingEstimateConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            assume_disjoint_cgroups: false,
             memory_usd_per_block_hour: 0.005 / 16.0,
             cpu_usd_per_core_hour: 0.02,
         }
@@ -1339,34 +1343,44 @@ mod tests {
     fn hosting_estimate_is_api_only_and_accepts_custom_rates() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _saved = SavedEnv::capture(&["JMODGUARD_HOSTING_ESTIMATE"]);
-        let raw = "[web.hosting_estimate]\nenabled=true\nmemory_usd_per_block_hour=0.001\ncpu_usd_per_core_hour=0.0";
+        let raw = "[web.hosting_estimate]\nenabled=true\nassume_disjoint_cgroups=true\nmemory_usd_per_block_hour=0.001\ncpu_usd_per_core_hour=0.0";
         let mut api = Config::parse_file(raw, true).unwrap();
         let mut bot = Config::parse_file(raw, false).unwrap();
         assert!(!Config::default().web.hosting_estimate.enabled);
+        assert!(
+            !Config::default()
+                .web
+                .hosting_estimate
+                .assume_disjoint_cgroups
+        );
         assert!(api.web.hosting_estimate.enabled);
+        assert!(api.web.hosting_estimate.assume_disjoint_cgroups);
         assert_eq!(api.web.hosting_estimate.memory_usd_per_block_hour, 0.001);
         assert_eq!(api.web.hosting_estimate.cpu_usd_per_core_hour, 0.0);
         unsafe {
             std::env::set_var(
                 "JMODGUARD_HOSTING_ESTIMATE",
-                r#"{"enabled":true,"cpu_usd_per_core_hour":0.1}"#,
+                r#"{"enabled":true,"assume_disjoint_cgroups":true,"cpu_usd_per_core_hour":0.1}"#,
             );
         }
         api.apply_env_for(true).unwrap();
         bot.apply_env_for(false).unwrap();
         assert!(api.web.hosting_estimate.enabled);
+        assert!(api.web.hosting_estimate.assume_disjoint_cgroups);
         assert_eq!(
             api.web.hosting_estimate.memory_usd_per_block_hour,
             0.0003125
         );
         assert_eq!(api.web.hosting_estimate.cpu_usd_per_core_hour, 0.1);
         assert!(!bot.web.hosting_estimate.enabled);
+        assert!(!bot.web.hosting_estimate.assume_disjoint_cgroups);
 
         unsafe {
             std::env::set_var("JMODGUARD_HOSTING_ESTIMATE", r#"{"enabled":false}"#);
         }
         api.apply_env_for(true).unwrap();
         assert!(!api.web.hosting_estimate.enabled);
+        assert!(!api.web.hosting_estimate.assume_disjoint_cgroups);
 
         unsafe {
             std::env::set_var(

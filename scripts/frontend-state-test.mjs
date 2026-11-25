@@ -12635,6 +12635,7 @@ test('Bot Resources shows one reading and suppresses combined estimates for unpr
   for (const [relation, expectedLabel, reason] of [
     ['shared', 'Shared cgroup memory', /share a cgroup/],
     ['overlapping', 'API cgroup memory', /cgroups overlap/],
+    ['unverified', 'API cgroup memory', /no common visible ancestor/],
     ['unknown', 'API cgroup memory', /could not be verified as separate/],
     [undefined, 'API cgroup memory', /could not be verified as separate/],
   ]) {
@@ -12651,16 +12652,37 @@ test('Bot Resources shows one reading and suppresses combined estimates for unpr
     assert.deepEqual([...panel.querySelectorAll('dt')].map(textOf), [expectedLabel]);
     assert.deepEqual([...panel.querySelectorAll('dd')].map(textOf), ['60 MiB']);
     assert.match(textOf(panel), reason);
+    assert.equal(textOf(panel).includes('web.hosting_estimate.assume_disjoint_cgroups'), relation === 'unverified');
     assert.match(textOf(panel), /Combined CPU cost is unavailable/);
     assert.doesNotMatch(textOf(panel), /headroom|\$[\d.]/);
     assert.equal(panel.querySelector('table'), null);
   }
 });
 
+test('Bot Resources shows estimated blocks and costs with an operator separation declaration', async () => {
+  const mib = 2 ** 20;
+  const rates = { memory_usd_per_block_hour: 0.0003125, cpu_usd_per_core_hour: 0.02 };
+  const snapshot = resourceSnapshot({
+    cgroup_relation: { memory: 'operator_declared_disjoint', cpu: 'operator_declared_disjoint' },
+    memory_billing: { block_mib: 64, rates },
+    bot: { current: resourceCurrent({ memory: { program_bytes: 50 * mib }, cpu_tenths: 125 }) },
+    api: { current: resourceCurrent({ memory: { program_bytes: 60 * mib }, cpu_tenths: 375 }) },
+  });
+  const h = ownerHarness(async () => response(snapshot));
+  h.app.navigate('resources');
+  await settle();
+  const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+  assert.match(textOf(panel), /Combined memory110 MiB/);
+  assert.match(textOf(panel), /2 blocks \(128 MiB\).*18 MiB headroom/);
+  assert.match(textOf(panel), /operator’s cgroup separation declaration for memory and CPU/);
+  assert.deepEqual([...panel.querySelectorAll('tbody td')].map(textOf), ['$0.000625', '$0.45', '$0.01', '$7.20']);
+});
+
 test('Bot Resources measures disjoint CPU and memory cgroups independently', async () => {
   const rates = { memory_usd_per_block_hour: 0.0003125, cpu_usd_per_core_hour: 0.02 };
   for (const [cgroup_relation, label] of [
     [{ memory: 'shared', cpu: 'disjoint' }, 'CPU time'],
+    [{ memory: 'overlapping', cpu: 'operator_declared_disjoint' }, 'CPU time'],
     [{ memory: 'disjoint', cpu: 'unknown' }, 'Memory blocks'],
   ]) {
     const snapshot = resourceSnapshot({ cgroup_relation, memory_billing: { block_mib: 64, rates } });
