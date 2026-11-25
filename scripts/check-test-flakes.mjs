@@ -370,17 +370,29 @@ async function main() {
     const [mode, library, ...packages] = process.argv.slice(2);
     if (mode === "rust-fixture") {
         const root = fileURLToPath(new URL("../tools/dylint/test-flake", import.meta.url));
-        const findings = await runTestFlakeDylint(root, library, ["--test", "catch_unwind"]);
+        const findings = await runTestFlakeDylint(root, library, [
+            "--test", "catch_unwind", "--test", "clock_sleep",
+        ]);
         const retries = [
             "bound_fallback_swallows_failure", "fallback_after_failure", "retry_until_success",
             "swallow_failure", "swallow_failure_inside_assertion",
         ];
         const actual = findings.map(({ kind, file, test }) => `${kind}:${file}:${test}`).sort();
-        const expected = retries.map((test) => `retry:tests/catch_unwind.rs:${test}`);
+        const expected = [
+            ...retries.map((test) => `retry:tests/catch_unwind.rs:${test}`),
+            "clock:tests/clock_sleep.rs:std_clock_is_not_paused_by_tokio",
+            "clock:tests/clock_sleep.rs:std_instant",
+            "clock:tests/clock_sleep.rs:std_system_time",
+            "clock:tests/clock_sleep.rs:tokio_after_resume",
+            "clock:tests/clock_sleep.rs:tokio_unpaused",
+            "sleep:tests/clock_sleep.rs:std_sleep",
+            "sleep:tests/clock_sleep.rs:tokio_after_resume",
+            "sleep:tests/clock_sleep.rs:tokio_unpaused",
+        ].sort();
         if (actual.join("\n") !== expected.join("\n")) {
-            throw new Error(`Unexpected catch_unwind fixture diagnostics:\n${actual.join("\n")}`);
+            throw new Error(`Unexpected test_flake fixture diagnostics:\n${actual.join("\n")}`);
         }
-        console.log("dylint: catch_unwind fixtures passed");
+        console.log("dylint: test_flake fixtures passed");
         return;
     }
     if (!["contracts", "rust", "eslint"].includes(mode)) throw new Error("Select contracts, rust or eslint");
