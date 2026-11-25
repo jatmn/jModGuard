@@ -513,9 +513,35 @@ async fn cosign_payload_fetch_crossing_expiry_is_refused() {
 
 #[test]
 fn normal_library_ignores_test_signing_pem() {
-    let fixture = signing();
+    const TEST_PEM: &str = "JMODGUARD_TEST_UPDATE_SIGNING_PUBLIC_PEM";
+    const SIGNED_ENVELOPE: &str = "JMODGUARD_SIGNING_PEM_TEST_ENVELOPE";
     let manifest = b"manifest-bytes";
     let digest = digest(manifest);
+    let now = "2026-09-23T00:00:00Z".parse().unwrap();
+    if let Ok(envelope) = std::env::var(SIGNED_ENVELOPE) {
+        let inherited_pem = std::env::var(TEST_PEM).unwrap();
+        let _ = signing();
+        assert_eq!(
+            std::env::var(TEST_PEM).as_deref(),
+            Ok(inherited_pem.as_str()),
+            "the test signer must preserve the inherited PEM"
+        );
+        let result = jmodguard_updater::signature::verify_manifest_signature(
+            "api",
+            &digest,
+            manifest,
+            envelope.as_bytes(),
+            now,
+            jmodguard_updater::signature::SignatureExpiry::Enforce,
+        );
+        assert_eq!(
+            jmodguard_updater::signature::signature_rejection_phrase(&result.unwrap_err()),
+            Some("image signature used an untrusted key")
+        );
+        return;
+    }
+
+    let fixture = signing();
     let envelope = signature::test_support::sign_manifest(
         &fixture.private_pem,
         &fixture.public_pem,
@@ -523,16 +549,26 @@ fn normal_library_ignores_test_signing_pem() {
         &digest,
         &signature_not_after_far_future(),
     );
-    let result = jmodguard_updater::signature::verify_manifest_signature(
+    signature::verify_manifest_signature(
         "api",
         &digest,
         manifest,
         &envelope,
-        "2026-09-23T00:00:00Z".parse().unwrap(),
-        jmodguard_updater::signature::SignatureExpiry::Enforce,
-    );
-    assert_eq!(
-        jmodguard_updater::signature::signature_rejection_phrase(&result.unwrap_err()),
-        Some("image signature used an untrusted key")
+        now,
+        signature::SignatureExpiry::Enforce,
+    )
+    .unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "normal_library_ignores_test_signing_pem"])
+        .env(TEST_PEM, &fixture.public_pem)
+        .env(SIGNED_ENVELOPE, String::from_utf8(envelope).unwrap())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed;"),
+        "{}\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
 }

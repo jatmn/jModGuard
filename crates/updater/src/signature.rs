@@ -118,18 +118,14 @@ fn trusted_key(pem: &str) -> Result<TrustedKey> {
     })
 }
 
-/// The committed public key is always trusted. Only unit-test builds may add
-/// a fixture PEM. Previous-key files are not read.
+/// The committed public key is always trusted. Test builds also trust their
+/// shared fixture key.
 fn trusted_keys() -> Result<Vec<TrustedKey>> {
     let keys = vec![trusted_key(CURRENT_PUBLIC_PEM)?];
     #[cfg(test)]
     let keys = {
         let mut keys = keys;
-        if let Ok(pem) = std::env::var("JMODGUARD_TEST_UPDATE_SIGNING_PUBLIC_PEM")
-            && !pem.is_empty()
-        {
-            keys.push(trusted_key(&pem)?);
-        }
+        keys.push(trusted_key(&crate::signing_fixture::signing().public_pem)?);
         keys
     };
     Ok(keys)

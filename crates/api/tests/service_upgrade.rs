@@ -5,9 +5,35 @@ use jmodguard::config::{ApiProcessConfig, BotProcessConfig, ControlSecret};
 use jmodguard::db::{self, Db};
 use jmodguard_api::web::state::ApiState;
 use serde_json::{Value, json};
+use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
 use tower::ServiceExt;
+
+const UPDATE_APPLY_ENABLED: &str = "JMODGUARD_UPDATE_APPLY_ENABLED";
+
+/// The production router reads the rollout flag from the process environment.
+fn in_rollout_test_process(test: &str, rollout: &str) -> bool {
+    const CHILD: &str = "JMODGUARD_SERVICE_UPGRADE_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(test) {
+        assert_eq!(std::env::var(UPDATE_APPLY_ENABLED).as_deref(), Ok(rollout));
+        return true;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test])
+        .env(CHILD, test)
+        .env(UPDATE_APPLY_ENABLED, rollout)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed;"),
+        "{test}: {}\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
 
 async fn session_cookie(store: &tower_sessions::MemoryStore, uid: u64) -> String {
     let session = tower_sessions::Session::new(None, Arc::new(store.clone()), None);
@@ -30,10 +56,6 @@ struct RecoveryPage {
 
 impl RecoveryPage {
     async fn open() -> Self {
-        static ENABLE_APPLY: Once = Once::new();
-        ENABLE_APPLY.call_once(|| unsafe {
-            std::env::set_var("JMODGUARD_UPDATE_APPLY_ENABLED", "1");
-        });
         let path = std::env::temp_dir().join(format!(
             "service-upgrade-{:032x}.db",
             rand::random::<u128>()
@@ -139,8 +161,11 @@ async fn post_apply(page: &RecoveryPage) -> (axum::http::StatusCode, String) {
     (status, String::from_utf8(apply_body.to_vec()).unwrap())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_only_service_upgrade_routes_use_the_writer_link() {
+    if !in_rollout_test_process("read_only_service_upgrade_routes_use_the_writer_link", "1") {
+        return;
+    }
     let page = RecoveryPage::open().await;
     let router = page.router.clone();
     let owner_cookie = page.cookie.clone();
@@ -234,11 +259,7 @@ async fn update_state(db: &Db) -> (Value, Option<u64>) {
     )
 }
 
-async fn assert_update_route_guards(
-    page: &RecoveryPage,
-    route: &str,
-    body: &Value,
-) -> (StatusCode, Value) {
+async fn assert_update_route_guards(page: &RecoveryPage, route: &str, body: &Value) {
     let origin = page.api.cfg.web.base_url.as_str();
     let foreign = origin.replacen("https://", "http://", 1);
     let non_owner = session_cookie(&page.store, page.api.cfg.bot.owner_id + 1).await;
@@ -279,29 +300,44 @@ async fn assert_update_route_guards(
         assert_eq!(response["error"], error, "{route}");
         assert_eq!(after, before, "{route}: {error}");
     }
-    post_update(page, route, body, owner, Some(origin)).await
 }
 
-#[tokio::test(flavor = "multi_thread")]
+async fn post_owner_update(page: &RecoveryPage, route: &str, body: &Value) -> (StatusCode, Value) {
+    post_update(
+        page,
+        route,
+        body,
+        Some(&page.cookie),
+        Some(&page.api.cfg.web.base_url),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_check_requires_owner_and_trusted_origin() {
+    if !in_rollout_test_process("update_check_requires_owner_and_trusted_origin", "0") {
+        return;
+    }
     let page = RecoveryPage::open().await;
+    assert_eq!(
+        std::env::var(UPDATE_APPLY_ENABLED).as_deref(),
+        Ok("0"),
+        "opening the fixture must preserve the inherited rollout setting"
+    );
+    assert_update_route_guards(&page, "check", &json!({"component":"bot"})).await;
     let (status, response) =
-        assert_update_route_guards(&page, "check", &json!({"component":"bot"})).await;
-    // The existing bot lease keeps an authorized check local.
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
-    assert_eq!(response["error"], "release check failed");
+        post_owner_update(&page, "check", &json!({"component":"unsupported"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(response["error"], "invalid component");
     page.finish();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn update_policy_requires_owner_and_trusted_origin() {
     let page = RecoveryPage::open().await;
-    let (status, response) = assert_update_route_guards(
-        &page,
-        "policy",
-        &json!({"component":"api","channel":"stable","cadence":"off"}),
-    )
-    .await;
+    let body = json!({"component":"api","channel":"stable","cadence":"off"});
+    assert_update_route_guards(&page, "policy", &body).await;
+    let (status, response) = post_owner_update(&page, "policy", &body).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(
         db::component_update(&page.bot.db, "api")
@@ -316,8 +352,9 @@ async fn update_policy_requires_owner_and_trusted_origin() {
 #[tokio::test(flavor = "multi_thread")]
 async fn update_alert_channel_requires_owner_and_trusted_origin() {
     let page = RecoveryPage::open().await;
-    let (status, response) =
-        assert_update_route_guards(&page, "alert-channel", &json!({"channel_id":"42"})).await;
+    let body = json!({"channel_id":"42"});
+    assert_update_route_guards(&page, "alert-channel", &body).await;
+    let (status, response) = post_owner_update(&page, "alert-channel", &body).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(
         db::update_alert_channel(&page.bot.db).await.unwrap(),
@@ -392,16 +429,16 @@ async fn checked_api_candidate(
     candidate
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_install_requires_owner_and_trusted_origin() {
+    if !in_rollout_test_process("update_install_requires_owner_and_trusted_origin", "1") {
+        return;
+    }
     let page = RecoveryPage::open().await;
     let candidate = checked_api_candidate(&page, true).await;
-    let (status, response) = assert_update_route_guards(
-        &page,
-        "install",
-        &json!({"component":"api","digest":candidate.digest}),
-    )
-    .await;
+    let body = json!({"component":"api","digest":candidate.digest});
+    assert_update_route_guards(&page, "install", &body).await;
+    let (status, response) = post_owner_update(&page, "install", &body).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["queued"], true);
     let state = db::component_update(&page.bot.db, "api").await.unwrap();
@@ -410,17 +447,21 @@ async fn update_install_requires_owner_and_trusted_origin() {
     page.finish();
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_install_refuses_when_service_self_update_is_disabled() {
+    if !in_rollout_test_process(
+        "update_install_refuses_when_service_self_update_is_disabled",
+        "1",
+    ) {
+        return;
+    }
     let page = RecoveryPage::open().await;
     let candidate = checked_api_candidate(&page, false).await;
     let before = update_state(&page.bot.db).await;
-    let (status, response) = post_update(
+    let (status, response) = post_owner_update(
         &page,
         "install",
         &json!({"component":"api","digest":candidate.digest}),
-        Some(&page.cookie),
-        Some(&page.api.cfg.web.base_url),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{response}");

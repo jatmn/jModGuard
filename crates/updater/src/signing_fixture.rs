@@ -9,16 +9,7 @@ use std::sync::OnceLock;
 
 pub fn signing() -> &'static SigningFixture {
     static FIXTURE: OnceLock<SigningFixture> = OnceLock::new();
-    FIXTURE.get_or_init(|| {
-        let fixture = SigningFixture::default();
-        unsafe {
-            std::env::set_var(
-                "JMODGUARD_TEST_UPDATE_SIGNING_PUBLIC_PEM",
-                &fixture.public_pem,
-            );
-        }
-        fixture
-    })
+    FIXTURE.get_or_init(SigningFixture::default)
 }
 
 pub fn signature_not_after_far_future() -> String {
