@@ -275,7 +275,7 @@ fn matches_role(event: &RoleEvent<'_>, role: RoleId, minutes: u32, now: Timestam
         && (minutes == 0 || age <= chrono::Duration::minutes(i64::from(minutes)))
 }
 
-pub(crate) async fn on_join(app: &Arc<BotState>, http: &Http, cache: &Cache, member: &Member) {
+pub(crate) async fn on_join(app: &Arc<BotState>, http: &Arc<Http>, cache: &Cache, member: &Member) {
     if let Some(joined_at) = member.joined_at {
         check_event(
             app,
@@ -296,7 +296,7 @@ pub(crate) async fn on_join(app: &Arc<BotState>, http: &Http, cache: &Cache, mem
 
 pub(crate) async fn on_update(
     app: &Arc<BotState>,
-    http: &Http,
+    http: &Arc<Http>,
     cache: &Cache,
     old: Option<&Member>,
     event: &GuildMemberUpdateEvent,
@@ -322,7 +322,7 @@ pub(crate) async fn on_update(
     .await;
 }
 
-async fn check_event(app: &Arc<BotState>, http: &Http, cache: &Cache, event: RoleEvent<'_>) {
+async fn check_event(app: &Arc<BotState>, http: &Arc<Http>, cache: &Cache, event: RoleEvent<'_>) {
     if event.roles.is_empty() {
         return;
     }
@@ -456,6 +456,7 @@ async fn check_event(app: &Arc<BotState>, http: &Http, cache: &Cache, event: Rol
                                 rule_id: RULE_ID,
                                 rule_name: &rule.name,
                                 reason: &reason,
+                                log_http: http,
                             },
                             cleanup.as_ref(),
                             || async {

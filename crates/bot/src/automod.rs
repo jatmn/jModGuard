@@ -704,6 +704,12 @@ tokio::task_local! {
     static AUTOMOD_DELETE_CANCEL_PROBE: std::sync::Arc<AutomodDeleteCancelProbe>;
 }
 
+pub(crate) struct SweepDeleteDispatch<'a> {
+    pub deadline: AutomodInstant,
+    pub audit_reason: &'a str,
+    pub log_http: &'a Arc<serenity::http::Http>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn automod_try_delete_message(
     app: &std::sync::Arc<BotState>,
@@ -715,7 +721,7 @@ pub(crate) async fn automod_try_delete_message(
     rule_name: &str,
     reason: &str,
     cleanup: Option<&logging::Cleanup<'_>>,
-    sweep_dispatch: Option<(AutomodInstant, &str)>,
+    sweep_dispatch: Option<SweepDeleteDispatch<'_>>,
 ) -> Option<CaseOutcome> {
     let target = automod_delete_target(guild_id, channel);
     if app
@@ -753,9 +759,9 @@ pub(crate) async fn automod_try_delete_message(
     let raced = if forced_cancel {
         Ok(crate::discord::DiscordCall::Cancelled)
     } else {
-        let (deadline, audit_reason) = sweep_dispatch.map_or_else(
+        let (deadline, audit_reason) = sweep_dispatch.as_ref().map_or_else(
             || (AutomodInstant::now() + Duration::from_secs(10), None),
-            |(deadline, audit_reason)| (deadline, Some(audit_reason)),
+            |sweep| (sweep.deadline, Some(sweep.audit_reason)),
         );
         tokio::time::timeout_at(
             deadline,
@@ -778,10 +784,26 @@ pub(crate) async fn automod_try_delete_message(
                 None => false,
             };
             if !grouped {
-                logging::complete_prepared_automod_delete(
-                    app, http, guild_id, channel, message, &prepared, rule_id, rule_name, reason,
-                )
-                .await;
+                if let Some(sweep) = sweep_dispatch {
+                    logging::spawn_prepared_automod_delete(
+                        Arc::clone(app),
+                        Arc::clone(sweep.log_http),
+                        guild_id,
+                        channel,
+                        message,
+                        prepared,
+                        rule_id.to_owned(),
+                        rule_name.to_owned(),
+                        reason.to_owned(),
+                    )
+                    .await;
+                } else {
+                    logging::complete_prepared_automod_delete(
+                        app, http, guild_id, channel, message, &prepared, rule_id, rule_name,
+                        reason,
+                    )
+                    .await;
+                }
             }
             Some(CaseOutcome::Succeeded)
         }

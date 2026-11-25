@@ -7,6 +7,7 @@ use serenity::http::Http;
 use std::collections::BTreeMap;
 use std::future::{Future, ready};
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -161,6 +162,7 @@ pub(crate) enum TrackedDelete<'a> {
         rule_id: &'a str,
         rule_name: &'a str,
         reason: &'a str,
+        log_http: &'a Arc<Http>,
     },
 }
 
@@ -214,6 +216,7 @@ pub(crate) async fn sweep_tracked_messages<F: Future<Output = bool>>(
             rule_id,
             rule_name,
             reason,
+            log_http,
         } = delete
         {
             if Instant::now() >= deadline {
@@ -229,7 +232,11 @@ pub(crate) async fn sweep_tracked_messages<F: Future<Output = bool>>(
                 rule_name,
                 reason,
                 cleanup,
-                Some((deadline, "automod onboarding trap cleanup")),
+                Some(crate::automod::SweepDeleteDispatch {
+                    deadline,
+                    audit_reason: "automod onboarding trap cleanup",
+                    log_http,
+                }),
             )
             .await;
             deleted += usize::from(matches!(outcome, Some(CaseOutcome::Succeeded)));
