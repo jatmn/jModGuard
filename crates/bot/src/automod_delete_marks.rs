@@ -333,6 +333,10 @@ pub(crate) struct AutomodDeleteMarks {
     /// because the next deadline is still in the future.
     #[cfg(test)]
     bulk_expiry_visits: u64,
+    // Heap peeks during prune, including the first deadline that is not due.
+    #[cfg(test)]
+    mark_expiry_visits: u64,
+    wall_clock: WallClock,
 }
 
 fn snapshot_still_valid(row: &MessageSnapshot, now_ms: i64) -> bool {
@@ -345,8 +349,27 @@ fn now_ms() -> i64 {
 
 /// Drop retained snapshot text when the fixed expiry has passed at settlement time.
 pub(crate) fn settlement_retained(row: Option<MessageSnapshot>) -> Option<MessageSnapshot> {
-    let wall = now_ms();
+    settlement_retained_at(row, now_ms())
+}
+
+fn settlement_retained_at(row: Option<MessageSnapshot>, wall: i64) -> Option<MessageSnapshot> {
     row.filter(|snapshot| snapshot_still_valid(snapshot, wall))
+}
+
+#[derive(Default)]
+struct WallClock {
+    #[cfg(test)]
+    fixed_ms: Option<i64>,
+}
+
+impl WallClock {
+    fn now_ms(&self) -> i64 {
+        #[cfg(test)]
+        if let Some(wall) = self.fixed_ms {
+            return wall;
+        }
+        now_ms()
+    }
 }
 
 impl AutomodDeleteMarks {
@@ -413,10 +436,14 @@ impl AutomodDeleteMarks {
     }
 
     fn settlement_retained_for(
+        &self,
         gateway: &MessageGatewayState,
         entry_retained: Option<MessageSnapshot>,
     ) -> Option<MessageSnapshot> {
-        settlement_retained(gateway.retained.clone().or(entry_retained))
+        settlement_retained_at(
+            gateway.retained.clone().or(entry_retained),
+            self.wall_clock.now_ms(),
+        )
     }
 
     fn compact_order_if_needed(&mut self) {
@@ -458,7 +485,7 @@ impl AutomodDeleteMarks {
         let rule_id = entry.rule_id.clone();
         let rule_name = entry.rule_name.clone();
         let reason = entry.reason.clone();
-        let retained = Self::settlement_retained_for(gateway, entry.retained.clone());
+        let retained = self.settlement_retained_for(gateway, entry.retained.clone());
         let fallback_to_bulk = self
             .gateway
             .get(&target)
@@ -689,7 +716,7 @@ impl AutomodDeleteMarks {
             gateway.receipt = GatewayReceipt::Observed;
         }
         if let Some(row) = retained {
-            self.store_gateway_retained(target, row, now_ms());
+            self.store_gateway_retained(target, row, self.wall_clock.now_ms());
         }
         Some(GatewayDeleteObservation::PendingAutomod)
     }
@@ -728,10 +755,9 @@ impl AutomodDeleteMarks {
         let rule_id = rule_id.to_owned();
         let rule_name = rule_name.to_owned();
         let reason = reason.to_owned();
-        let retained = self
-            .gateway
-            .get(&target)
-            .and_then(|state| settlement_retained(state.retained.clone()));
+        let retained = self.gateway.get(&target).and_then(|state| {
+            settlement_retained_at(state.retained.clone(), self.wall_clock.now_ms())
+        });
         let owner = self
             .gateway
             .get(&target)
@@ -832,10 +858,9 @@ impl AutomodDeleteMarks {
             });
         }
         let observed = row.receipt.is_observed();
-        let retained = self
-            .gateway
-            .get(&target)
-            .and_then(|state| settlement_retained(state.retained.clone()));
+        let retained = self.gateway.get(&target).and_then(|state| {
+            settlement_retained_at(state.retained.clone(), self.wall_clock.now_ms())
+        });
         let still_pending = self.unmarked.get_mut(&target).is_some_and(|row| {
             row.claim_attempt(attempt.0);
             row.pending()
@@ -968,9 +993,12 @@ impl AutomodDeleteMarks {
     fn prune(&mut self, now: Instant) {
         self.expire_bulk_logs(now);
         self.expire_unmarked(now);
-        let wall = now_ms();
-        self.clear_expired_retained(wall);
+        self.clear_expired_retained(self.wall_clock.now_ms());
         while let Some(Reverse((heap_expires, key))) = self.mark_expiry_heap.peek().copied() {
+            #[cfg(test)]
+            {
+                self.mark_expiry_visits = self.mark_expiry_visits.saturating_add(1);
+            }
             if heap_expires > now {
                 break;
             }
@@ -1144,7 +1172,7 @@ impl AutomodDeleteMarks {
             gateway.receipt = GatewayReceipt::Observed;
         }
         if let Some(row) = retained {
-            self.store_gateway_retained(target, row, now_ms());
+            self.store_gateway_retained(target, row, self.wall_clock.now_ms());
         }
         GatewayDeleteObservation::PendingAutomod
     }
@@ -1212,7 +1240,7 @@ impl AutomodDeleteMarks {
         }
         let (covered_by_bulk, bulk_inflight) = self.bulk_coverage(target);
         let gateway = self.gateway.get(&target).cloned().unwrap_or_default();
-        let retained = Self::settlement_retained_for(&gateway, entry.retained.clone());
+        let retained = self.settlement_retained_for(&gateway, entry.retained.clone());
         let remaining_attempts = self
             .mark_keys_for_message(guild, channel, message)
             .into_iter()
@@ -1386,6 +1414,7 @@ impl AutomodDeleteMarks {
         channel: u64,
         ids: &[u64],
         outcome: BulkDeliveryOutcome,
+        monotonic_now: impl Fn() -> Instant,
     ) -> Vec<DeferredBulkReplay> {
         let mut replay = Vec::new();
         for message in ids {
@@ -1406,7 +1435,7 @@ impl AutomodDeleteMarks {
                         }
                         state.retain(BulkSendState::Ambiguous);
                     }
-                    self.note_ambiguous_settled(target, Instant::now());
+                    self.note_ambiguous_settled(target, monotonic_now());
                 }
                 BulkDeliveryOutcome::Failed => {
                     if self
@@ -1428,7 +1457,10 @@ impl AutomodDeleteMarks {
                     } else if matches!(state.plain, DeferredPlainReport::Requested) {
                         replay.push(DeferredBulkReplay {
                             message: *message,
-                            retained: settlement_retained(state.deferred_retained),
+                            retained: settlement_retained_at(
+                                state.deferred_retained,
+                                self.wall_clock.now_ms(),
+                            ),
                             automod: None,
                         });
                     }
@@ -1459,7 +1491,7 @@ impl AutomodDeleteMarks {
         }
         if state.delivery == BulkSendState::InFlight {
             state.plain = DeferredPlainReport::Requested;
-            state.deferred_retained = settlement_retained(retained);
+            state.deferred_retained = settlement_retained_at(retained, self.wall_clock.now_ms());
             return BulkPlainReplay::Deferred;
         }
         BulkPlainReplay::Emit
@@ -1514,17 +1546,18 @@ impl AutomodDeleteMarks {
         now: Instant,
     ) -> Option<MessageSnapshot> {
         self.prune(now);
+        let clock = &self.wall_clock;
         let target = Self::message_target(guild, channel, message);
         if let Some(row) = self
             .gateway
             .get_mut(&target)
-            .and_then(|state| settlement_retained(state.retained.take()))
+            .and_then(|state| settlement_retained_at(state.retained.take(), clock.now_ms()))
         {
             return Some(row);
         }
         for key in self.mark_keys_for_message(guild, channel, message) {
             if let Some(entry) = self.entries.get_mut(&key)
-                && let Some(row) = settlement_retained(entry.retained.take())
+                && let Some(row) = settlement_retained_at(entry.retained.take(), clock.now_ms())
             {
                 return Some(row);
             }
@@ -1809,7 +1842,7 @@ impl AutomodDeleteMarkAccess {
     ) -> Vec<DeferredBulkReplay> {
         self.inner
             .lock()
-            .finish_bulk_delivery(guild, channel, ids, outcome)
+            .finish_bulk_delivery(guild, channel, ids, outcome, Instant::now)
     }
 
     pub(crate) fn claim_or_defer_plain_replay(
@@ -1933,6 +1966,27 @@ fn run_bulk_reserve_gap_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::guild_data::{MessageSnapshot, SnapshotFields};
+    use std::sync::OnceLock;
+
+    const WALL_MS: i64 = 1_000_000;
+    const SNAPSHOT_EXPIRY_MS: i64 = WALL_MS + 3_600_000;
+
+    fn fixture_marks() -> AutomodDeleteMarks {
+        AutomodDeleteMarks {
+            wall_clock: WallClock {
+                fixed_ms: Some(WALL_MS),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn fixture_epoch() -> Instant {
+        // Instant is opaque. Sample one origin and advance only through
+        // explicit durations; the tests never measure elapsed host time.
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        *EPOCH.get_or_init(Instant::now)
+    }
 
     fn attempt_for_message(marks: &AutomodDeleteMarks, message: u64) -> AutomodDeleteAttempt {
         AutomodDeleteAttempt(
@@ -1960,8 +2014,6 @@ mod tests {
         }
     }
 
-    use crate::db::guild_data::{MessageSnapshot, SnapshotFields};
-
     fn sample_retained(message: u64, content: &str) -> MessageSnapshot {
         MessageSnapshot {
             guild_id: 1,
@@ -1976,7 +2028,7 @@ mod tests {
             first_observed_at_ms: 1,
             last_observed_at_ms: 1,
             edit_at_ms: None,
-            expires_at_ms: now_ms() + 3_600_000,
+            expires_at_ms: SNAPSHOT_EXPIRY_MS,
             generation: 1,
             coverage_epoch: 1,
             continuous: true,
@@ -1987,8 +2039,8 @@ mod tests {
 
     #[test]
     fn failed_overflow_expiry_stays_inside_the_cap() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
             marks.insert(1, 2, message, "filler", "Filler", now);
         }
@@ -2062,8 +2114,8 @@ mod tests {
 
     #[test]
     fn insert_after_consume_prunes_at_ttl() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let mut attempts = Vec::new();
         for message in 0..4u64 {
             attempts.push(marks.insert(1, 2, message, "badword", "Bad word", now));
@@ -2082,8 +2134,8 @@ mod tests {
 
     #[test]
     fn ttl_expired_marks_do_not_relabel() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         assert!(
             marks
@@ -2099,8 +2151,8 @@ mod tests {
 
     #[test]
     fn cap_evicts_oldest_without_unbounded_growth() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
             marks.insert(1, 2, message, "badword", "Bad word", now);
         }
@@ -2119,8 +2171,8 @@ mod tests {
 
     #[test]
     fn cap_does_not_evict_unsettled_in_flight_marks() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
             marks.insert(1, 2, message, "badword", "Bad word", now);
         }
@@ -2132,8 +2184,8 @@ mod tests {
 
     #[test]
     fn expired_confirmed_mark_pruned_behind_refreshed_pending_does_not_relabel() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 1, "stale", "Stale rule", now);
         assert!(
             marks
@@ -2157,8 +2209,8 @@ mod tests {
 
     #[test]
     fn cap_does_not_evict_gateway_pending_mark() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
             marks.insert(1, 2, message, "badword", "Bad word", now);
         }
@@ -2173,8 +2225,8 @@ mod tests {
 
     #[test]
     fn prune_drops_expired_mark_behind_extended_front_pending() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 1, "front", "Front", now);
         assert_eq!(
             marks.observe_gateway_delete(1, 2, 1, None, now),
@@ -2189,31 +2241,27 @@ mod tests {
 
     #[test]
     fn prune_clears_expired_retained_behind_extended_front_mark() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 1, "front", "Front", now);
         marks.observe_gateway_delete(1, 2, 1, None, now);
         marks.insert(1, 2, 2, "later", "Later", now);
         marks.observe_gateway_delete(1, 2, 2, Some(sample_retained(2, "stale")), now);
-        marks
-            .gateway
-            .get_mut(&(1, 2, 2))
-            .unwrap()
-            .retained
-            .as_mut()
-            .unwrap()
-            .expires_at_ms = 1;
-        marks.prune(now);
+        let renewed_at = now + AUTOMOD_DELETE_MARK_TTL;
+        marks.wall_clock.fixed_ms = Some(SNAPSHOT_EXPIRY_MS);
+        marks.prune(renewed_at);
+        assert!(marks.contains(1, 2, 1));
+        assert!(marks.gateway[&(1, 2, 2)].retained.is_none());
         let settlement = marks
-            .confirm(1, 2, 2, attempt_for_message(&marks, 2), now)
+            .confirm(1, 2, 2, attempt_for_message(&marks, 2), renewed_at)
             .unwrap();
         assert!(settlement.retained.is_none());
     }
 
     #[test]
     fn retained_payload_count_tracks_mark_capacity() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
             marks.insert(1, 2, message, "badword", "Bad word", now);
         }
@@ -2237,8 +2285,8 @@ mod tests {
 
     #[test]
     fn take_is_single_consumer() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 3, "invite", "Invites", now);
         assert!(
             marks
@@ -2254,8 +2302,8 @@ mod tests {
 
     #[test]
     fn failed_delete_removes_unconfirmed_mark() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         marks.remove_unconfirmed(1, 2, 3, attempt_for_message(&marks, 3), now);
         assert!(!marks.contains(1, 2, 3));
@@ -2263,8 +2311,8 @@ mod tests {
 
     #[test]
     fn race_take_before_confirm_then_failure_leaves_no_mark() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         assert!(marks.take(1, 2, 3, now).is_none());
         marks.remove_unconfirmed(1, 2, 3, attempt_for_message(&marks, 3), now);
@@ -2273,8 +2321,8 @@ mod tests {
 
     #[test]
     fn unconfirmed_mark_stays_until_confirm_or_remove() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         assert!(marks.contains(1, 2, 3));
         assert!(marks.take(1, 2, 3, now).is_none());
@@ -2291,8 +2339,8 @@ mod tests {
 
     #[test]
     fn gateway_pending_mark_survives_prune_until_settled() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         assert_eq!(
             marks.observe_gateway_delete(1, 2, 3, None, now),
@@ -2304,8 +2352,8 @@ mod tests {
 
     #[test]
     fn gateway_first_confirm_returns_rule_for_reconcile_emit() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         assert_eq!(
             marks.observe_gateway_delete(1, 2, 3, None, now),
@@ -2320,8 +2368,8 @@ mod tests {
 
     #[test]
     fn observe_gateway_delete_is_atomic_with_confirm() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         marks.confirm(1, 2, 3, attempt_for_message(&marks, 3), now);
         assert_eq!(
@@ -2338,8 +2386,8 @@ mod tests {
 
     #[test]
     fn retained_snapshot_is_stored_with_gateway_pending_observation() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let row = sample_retained(3, "atomic body");
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         assert_eq!(
@@ -2360,10 +2408,12 @@ mod tests {
 
     #[test]
     fn settlement_drops_expired_retained_snapshot() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         marks.observe_gateway_delete(1, 2, 3, Some(sample_retained(3, "stale body")), now);
+        // Leave the expiry index unchanged to exercise the settlement check
+        // even when the heap has not already stripped the payload.
         marks
             .gateway
             .get_mut(&(1, 2, 3))
@@ -2371,25 +2421,15 @@ mod tests {
             .retained
             .as_mut()
             .unwrap()
-            .expires_at_ms = 1;
+            .expires_at_ms = WALL_MS;
         let settlement = marks
             .confirm(1, 2, 3, attempt_for_message(&marks, 3), now)
             .unwrap();
         assert!(settlement.retained.is_none());
-        let mut marks = AutomodDeleteMarks::default();
+        let mut marks = fixture_marks();
         marks.insert(1, 2, 4, "badword", "Bad word", now);
         marks.observe_gateway_delete(1, 2, 4, Some(sample_retained(4, "stale uncertain")), now);
-        marks
-            .gateway
-            .get_mut(&(1, 2, 4))
-            .unwrap()
-            .retained
-            .as_mut()
-            .unwrap()
-            .expires_at_ms = 1;
-        marks
-            .gateway_retained_expiry_heap
-            .push(Reverse((1, (1, 2, 4))));
+        marks.wall_clock.fixed_ms = Some(SNAPSHOT_EXPIRY_MS);
         marks.prune(now);
         assert!(
             marks
@@ -2408,8 +2448,8 @@ mod tests {
 
     #[test]
     fn cancel_without_gateway_observation_clears_unconfirmed_mark() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         assert!(marks.contains(1, 2, 3));
         assert!(
@@ -2423,8 +2463,8 @@ mod tests {
 
     #[test]
     fn uncertain_gateway_observation_keeps_plain_delete_attribution() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         marks.observe_gateway_delete(1, 2, 3, Some(sample_retained(3, "uncertain")), now);
         assert!(
@@ -2447,8 +2487,8 @@ mod tests {
 
     #[test]
     fn overlapping_delete_attempts_settle_with_own_rule_identity() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let first = marks.insert(1, 2, 3, "badword", "Bad word", now);
         let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
         assert_eq!(
@@ -2465,8 +2505,8 @@ mod tests {
 
     #[test]
     fn overlapping_gateway_success_then_sibling_failure_emits_one_report_class() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let first = marks.insert(1, 2, 3, "badword", "Bad word", now);
         let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
         assert_eq!(
@@ -2480,8 +2520,8 @@ mod tests {
 
     #[test]
     fn overlapping_gateway_owner_failure_transfers_to_sibling_before_plain_replay() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let first = marks.insert(1, 2, 3, "badword", "Bad word", now);
         let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
         marks.observe_gateway_delete(1, 2, 3, None, now);
@@ -2494,8 +2534,8 @@ mod tests {
 
     #[test]
     fn overlapping_gateway_all_fail_replays_plain_once() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let first = marks.insert(1, 2, 3, "badword", "Bad word", now);
         let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
         marks.observe_gateway_delete(1, 2, 3, None, now);
@@ -2511,8 +2551,8 @@ mod tests {
 
     #[test]
     fn later_insert_does_not_erase_gateway_pending_on_earlier_attempt() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let first = marks.insert(1, 2, 3, "badword", "Bad word", now);
         assert_eq!(
             marks.observe_gateway_delete(1, 2, 3, None, now),
@@ -2524,8 +2564,8 @@ mod tests {
 
     #[test]
     fn confirmed_sibling_blocks_plain_replay_when_owner_cancelled() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let first = marks.insert(1, 2, 3, "badword", "Bad word", now);
         let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
         assert!(marks.confirm(1, 2, 3, second, now).is_none());
@@ -2545,8 +2585,8 @@ mod tests {
 
     #[test]
     fn gateway_retained_survives_owner_transfer_to_sibling() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let first = marks.insert(1, 2, 3, "badword", "Bad word", now);
         let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
         marks.observe_gateway_delete(1, 2, 3, Some(sample_retained(3, "transferred body")), now);
@@ -2565,8 +2605,8 @@ mod tests {
     fn review_successful_consumption_must_not_grow_forever() {
         use std::time::Duration;
 
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         for batch in 0..2u64 {
             let at = now + Duration::from_secs(batch * 601);
             for message in batch * 256..(batch + 1) * 256 {
@@ -2592,8 +2632,8 @@ mod tests {
 
     #[test]
     fn expiry_heaps_stay_bounded_across_many_completed_marks() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         for message in 0..5_000u64 {
             let attempt = marks.insert(1, 2, message, "badword", "Bad words", now);
             assert!(marks.confirm(1, 2, message, attempt, now).is_none());
@@ -2614,8 +2654,8 @@ mod tests {
 
     #[test]
     fn gateway_after_younger_confirm_does_not_replay_plain_on_older_failure() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let first = marks.insert(1, 2, 3, "badword", "Bad words", now);
         let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
         assert!(marks.confirm(1, 2, 3, second, now).is_none());
@@ -2630,8 +2670,8 @@ mod tests {
 
     #[test]
     fn uncertain_older_attempt_releases_deferred_younger_success() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let first = marks.insert(1, 2, 3, "badword", "Bad words", now);
         let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
         assert_eq!(
@@ -2648,8 +2688,8 @@ mod tests {
 
     #[test]
     fn review_confirmed_sibling_must_not_replay_plain() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let first = marks.insert(1, 2, 3, "badword", "Bad words", now);
         let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
         assert_eq!(
@@ -2667,8 +2707,8 @@ mod tests {
 
     #[test]
     fn review_owner_transfer_must_keep_retained_snapshot() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let first = marks.insert(1, 2, 3, "badword", "Bad words", now);
         let second = marks.insert(1, 2, 3, "repeat_text", "Repeated text", now);
         let snapshot = sample_retained(3, "retained observation");
@@ -2682,23 +2722,15 @@ mod tests {
 
     #[test]
     fn prune_uses_retained_expiry_heap_without_full_map_scan() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         marks.insert(1, 2, 3, "badword", "Bad word", now);
         marks.observe_gateway_delete(1, 2, 3, Some(sample_retained(3, "heap body")), now);
         let target = AutomodDeleteMarks::message_target(1, 2, 3);
-        marks
-            .gateway
-            .get_mut(&target)
-            .unwrap()
-            .retained
-            .as_mut()
-            .unwrap()
-            .expires_at_ms = 1;
-        marks
-            .gateway_retained_expiry_heap
-            .push(Reverse((1, target)));
+        marks.wall_clock.fixed_ms = Some(SNAPSHOT_EXPIRY_MS);
         marks.prune(now);
+        assert!(marks.gateway[&target].retained.is_none());
+        assert_eq!(marks.gateway_retained_expiry_heap_len(), 0);
         let settlement = marks
             .confirm(1, 2, 3, attempt_for_message(&marks, 3), now)
             .unwrap();
@@ -2707,8 +2739,8 @@ mod tests {
 
     #[test]
     fn bulk_log_ttl_keeps_ambiguous_inflight_and_deferred_rows() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         for message in 1..=4 {
             marks.insert(1, 2, message, "badword", "Bad words", now);
             assert_eq!(
@@ -2717,12 +2749,12 @@ mod tests {
             );
             assert!(marks.reserve_bulk_delivery(1, 2, message, now));
         }
-        marks.finish_bulk_delivery(1, 2, &[1], BulkDeliveryOutcome::Ambiguous);
+        marks.finish_bulk_delivery(1, 2, &[1], BulkDeliveryOutcome::Ambiguous, || now);
         assert_eq!(
             marks.claim_or_defer_plain_replay(1, 2, 3, None),
             BulkPlainReplay::Deferred
         );
-        marks.finish_bulk_delivery(1, 2, &[4], BulkDeliveryOutcome::Delivered);
+        marks.finish_bulk_delivery(1, 2, &[4], BulkDeliveryOutcome::Delivered, || now);
 
         let expired = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
         marks.prune(expired);
@@ -2755,7 +2787,8 @@ mod tests {
             !marks.bulk_logs.contains_key(&(1, 2, 4)),
             "a delivered row should expire so the cap stays usable"
         );
-        let replay = marks.finish_bulk_delivery(1, 2, &[2, 3], BulkDeliveryOutcome::Failed);
+        let replay =
+            marks.finish_bulk_delivery(1, 2, &[2, 3], BulkDeliveryOutcome::Failed, || expired);
         assert_eq!(replay.len(), 2, "TTL dropped a deferred replay");
         assert_eq!(
             marks.claim_or_defer_plain_replay(1, 2, 1, None),
@@ -2770,7 +2803,7 @@ mod tests {
             GatewayDeleteObservation::PendingAutomod
         );
         assert!(marks.reserve_bulk_delivery(1, 2, message, now));
-        marks.finish_bulk_delivery(1, 2, &[message], BulkDeliveryOutcome::Delivered);
+        marks.finish_bulk_delivery(1, 2, &[message], BulkDeliveryOutcome::Delivered, || now);
     }
 
     fn hold_bulk_row(
@@ -2786,14 +2819,14 @@ mod tests {
         );
         assert!(marks.reserve_bulk_delivery(1, 2, message, now));
         if let Some(outcome) = outcome {
-            marks.finish_bulk_delivery(1, 2, &[message], outcome);
+            marks.finish_bulk_delivery(1, 2, &[message], outcome, || now);
         }
     }
 
     #[test]
     fn bulk_expiry_pops_only_due_entries() {
-        let mut marks = AutomodDeleteMarks::default();
-        let early = Instant::now();
+        let mut marks = fixture_marks();
+        let early = fixture_epoch();
         let later = early + Duration::from_secs(30);
         // A fresher deadline is indexed first. The older delivered row has to
         // land at the front without a scan of the live map.
@@ -2847,8 +2880,8 @@ mod tests {
 
     #[test]
     fn fresh_bulk_coverage_does_not_slow_unrelated_observations() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
             deliver_covered_bulk(&mut marks, message, now);
         }
@@ -2856,14 +2889,12 @@ mod tests {
         assert_eq!(marks.bulk_expiry.len(), MAX_AUTOMOD_DELETE_MARKS);
         let pops = marks.bulk_expiry_pops;
         let visits = marks.bulk_expiry_visits;
-        let started = Instant::now();
         for message in 0..10_000u64 {
             assert_eq!(
                 marks.observe_gateway_delete(9, 9, message, None, now),
                 GatewayDeleteObservation::Plain
             );
         }
-        let elapsed = started.elapsed();
         assert_eq!(
             marks.bulk_expiry_pops, pops,
             "prune popped bulk rows when nothing was due"
@@ -2875,20 +2906,16 @@ mod tests {
         );
         assert_eq!(marks.bulk_logs.len(), MAX_AUTOMOD_DELETE_MARKS);
         assert_eq!(marks.bulk_expiry.len(), MAX_AUTOMOD_DELETE_MARKS);
-        assert!(
-            elapsed < Duration::from_millis(150),
-            "10k observations took {elapsed:?}; scanning every delivered bulk row was about 421ms"
-        );
     }
 
     #[test]
     fn capacity_rejection_does_not_walk_live_marks() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
             marks.insert(1, 2, message, "badword", "Bad word", now);
         }
-        let started = Instant::now();
+        let visits = marks.mark_expiry_visits;
         for offset in 0..10_000u64 {
             marks.insert(
                 1,
@@ -2899,7 +2926,6 @@ mod tests {
                 now,
             );
         }
-        let elapsed = started.elapsed();
         assert_eq!(marks.len(), MAX_AUTOMOD_DELETE_MARKS);
         assert_eq!(marks.order.len(), MAX_AUTOMOD_DELETE_MARKS);
         assert!(marks.contains(1, 2, 0));
@@ -2909,20 +2935,21 @@ mod tests {
             marks.bulk_expiry_visits, 0,
             "capacity rejection walked bulk expiry"
         );
-        assert!(
-            elapsed < Duration::from_millis(400),
-            "10k rejected inserts took {elapsed:?}; walking every live mark was about 2.81s"
+        assert_eq!(
+            marks.mark_expiry_visits,
+            visits + 10_000,
+            "each rejected insert should peek only the first live deadline"
         );
     }
 
     #[test]
     fn settled_ambiguous_coverage_expires_after_its_suppression_window() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         hold_bulk_row(&mut marks, 1, now, Some(BulkDeliveryOutcome::Ambiguous));
         hold_bulk_row(&mut marks, 2, now, None);
-        let past_ttl = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
-        marks.prune(past_ttl);
+        let settled_at = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
+        marks.prune(settled_at);
         assert!(
             marks.bulk_logs.contains_key(&(1, 2, 1)),
             "unsettled ambiguous coverage expired"
@@ -2932,75 +2959,77 @@ mod tests {
             "in-flight bulk row expired"
         );
         let attempt = attempt_for_message(&marks, 1);
-        assert!(marks.confirm(1, 2, 1, attempt, now).is_some());
-        marks.prune(now + AUTOMOD_DELETE_MARK_TTL - Duration::from_secs(1));
+        assert!(marks.confirm(1, 2, 1, attempt, settled_at).is_some());
+        let expires_at = settled_at + AUTOMOD_DELETE_MARK_TTL;
+        marks.prune(expires_at - Duration::from_secs(1));
         assert!(marks.bulk_logs.contains_key(&(1, 2, 1)));
         assert_eq!(
             marks.claim_or_defer_plain_replay(1, 2, 1, None),
             BulkPlainReplay::Covered
         );
         let pops = marks.bulk_expiry_pops;
-        marks.prune(past_ttl);
+        marks.prune(expires_at);
         assert_eq!(marks.bulk_expiry_pops, pops + 1);
         assert!(
             !marks.bulk_logs.contains_key(&(1, 2, 1)),
             "settled ambiguous coverage stayed after its window"
         );
         assert!(marks.bulk_logs.contains_key(&(1, 2, 2)));
-        marks.insert(1, 2, 9, "badword", "Bad word", past_ttl);
+        marks.insert(1, 2, 9, "badword", "Bad word", expires_at);
         assert_eq!(
-            marks.observe_gateway_delete(1, 2, 9, None, past_ttl),
+            marks.observe_gateway_delete(1, 2, 9, None, expires_at),
             GatewayDeleteObservation::PendingAutomod
         );
-        assert!(marks.reserve_bulk_delivery(1, 2, 9, past_ttl));
+        assert!(marks.reserve_bulk_delivery(1, 2, 9, expires_at));
     }
 
     #[test]
     fn failed_rest_settlement_also_starts_the_ambiguous_window() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         hold_bulk_row(&mut marks, 4, now, Some(BulkDeliveryOutcome::Ambiguous));
-        let past_ttl = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
-        marks.prune(past_ttl);
+        let settled_at = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
+        marks.prune(settled_at);
         assert!(marks.bulk_logs.contains_key(&(1, 2, 4)));
         let attempt = attempt_for_message(&marks, 4);
-        let removal = marks.remove_unconfirmed(1, 2, 4, attempt, now);
+        let removal = marks.remove_unconfirmed(1, 2, 4, attempt, settled_at);
         assert!(removal.covered_by_bulk);
         assert_eq!(
             marks.claim_or_defer_plain_replay(1, 2, 4, None),
             BulkPlainReplay::Covered
         );
         assert!(marks.bulk_logs.contains_key(&(1, 2, 4)));
-        marks.prune(past_ttl);
+        marks.prune(settled_at + AUTOMOD_DELETE_MARK_TTL);
         assert!(!marks.bulk_logs.contains_key(&(1, 2, 4)));
     }
 
     #[test]
     fn a_new_attempt_keeps_ambiguous_coverage_until_it_settles() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         hold_bulk_row(&mut marks, 5, now, Some(BulkDeliveryOutcome::Ambiguous));
         let first = attempt_for_message(&marks, 5);
         assert!(marks.confirm(1, 2, 5, first, now).is_some());
         let later = now + Duration::from_secs(30);
         marks.insert(1, 2, 5, "badword", "Bad word", later);
-        marks.prune(now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1));
+        let settled_at = now + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
+        marks.prune(settled_at);
         assert!(
             marks.bulk_logs.contains_key(&(1, 2, 5)),
             "a new attempt lost ambiguous suppression"
         );
         assert!(marks.contains(1, 2, 5));
         let second = attempt_for_message(&marks, 5);
-        let removal = marks.remove_unconfirmed(1, 2, 5, second, later);
+        let removal = marks.remove_unconfirmed(1, 2, 5, second, settled_at);
         assert!(removal.covered_by_bulk);
-        marks.prune(later + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1));
+        marks.prune(settled_at + AUTOMOD_DELETE_MARK_TTL);
         assert!(!marks.bulk_logs.contains_key(&(1, 2, 5)));
     }
 
     #[test]
     fn bulk_placement_owner_suppresses_a_second_success_report() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let attempt = marks.insert(1, 2, 3, "badword", "Bad words", now);
         assert_eq!(
             marks.observe_gateway_delete(1, 2, 3, None, now),
@@ -3013,7 +3042,7 @@ mod tests {
             marks.observe_gateway_delete(1, 2, 3, None, now),
             GatewayDeleteObservation::Suppressed
         );
-        let replay = marks.finish_bulk_delivery(1, 2, &[3], BulkDeliveryOutcome::Failed);
+        let replay = marks.finish_bulk_delivery(1, 2, &[3], BulkDeliveryOutcome::Failed, || now);
         assert_eq!(replay.len(), 1);
         let automod = replay[0]
             .automod
@@ -3027,8 +3056,8 @@ mod tests {
 
     #[test]
     fn delivered_and_ambiguous_bulk_drop_deferred_success() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         for (message, outcome) in [
             (3, BulkDeliveryOutcome::Delivered),
             (4, BulkDeliveryOutcome::Ambiguous),
@@ -3041,7 +3070,7 @@ mod tests {
             assert!(marks.reserve_bulk_delivery(1, 2, message, now));
             marks.note_report_owner(1, 2, message, ReportOwner::BulkTranscript);
             assert!(marks.confirm(1, 2, message, attempt, now).is_none());
-            let replay = marks.finish_bulk_delivery(1, 2, &[message], outcome);
+            let replay = marks.finish_bulk_delivery(1, 2, &[message], outcome, || now);
             assert!(
                 replay.is_empty(),
                 "settled bulk send must not release a second report: {outcome:?}"
@@ -3051,8 +3080,8 @@ mod tests {
 
     #[test]
     fn peeled_placement_keeps_bulk_fallback_on_the_settlement() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         let attempt = marks.insert(1, 2, 3, "badword", "Bad words", now);
         assert_eq!(
             marks.observe_gateway_delete(1, 2, 3, None, now),
@@ -3066,8 +3095,8 @@ mod tests {
 
     #[test]
     fn saturated_insert_stays_automod_until_the_action_path_emits() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         for message in 0..MAX_AUTOMOD_DELETE_MARKS as u64 {
             marks.insert(1, 2, message, "filler", "Filler", now);
         }
@@ -3109,8 +3138,8 @@ mod tests {
 
     #[test]
     fn overlapping_overflow_attempts_share_one_owner() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         fill_live_marks(&mut marks, now);
         let message = 50_000;
         let first = marks.insert(1, 2, message, "badword", "Bad words", now);
@@ -3145,7 +3174,7 @@ mod tests {
             GatewayDeleteObservation::Suppressed
         );
 
-        let mut marks = AutomodDeleteMarks::default();
+        let mut marks = fixture_marks();
         fill_live_marks(&mut marks, now);
         let first = marks.insert(1, 2, message, "badword", "Bad words", now);
         let second = marks.insert(1, 2, message, "badword", "Bad words", now);
@@ -3175,7 +3204,7 @@ mod tests {
             GatewayDeleteObservation::Suppressed
         );
 
-        let mut marks = AutomodDeleteMarks::default();
+        let mut marks = fixture_marks();
         fill_live_marks(&mut marks, now);
         let first = marks.insert(1, 2, message, "badword", "Bad words", now);
         let second = marks.insert(1, 2, message, "badword", "Bad words", now);
@@ -3197,8 +3226,8 @@ mod tests {
 
     #[test]
     fn overflow_success_keeps_the_successful_attempts_rule() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         fill_live_marks(&mut marks, now);
         let message = 50_020;
         let first = marks.insert(1, 2, message, "badword", "Bad words", now);
@@ -3230,8 +3259,8 @@ mod tests {
 
     #[test]
     fn overflow_gateway_state_is_reclaimed_with_its_owner() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         // Fillers outlive both overflow batches so the cap stays full while
         // those rows expire.
         let fillers_at = now + AUTOMOD_DELETE_MARK_TTL * 4;
@@ -3315,8 +3344,8 @@ mod tests {
 
     #[test]
     fn inflight_overflow_success_keeps_a_bulk_destination() {
-        let mut marks = AutomodDeleteMarks::default();
-        let now = Instant::now();
+        let mut marks = fixture_marks();
+        let now = fixture_epoch();
         fill_live_marks(&mut marks, now);
         let message = 50_010;
         let attempt = marks.insert(1, 2, message, "badword", "Bad words", now);
@@ -3342,7 +3371,8 @@ mod tests {
                 )
                 .is_none()
         );
-        let replay = marks.finish_bulk_delivery(1, 2, &[message], BulkDeliveryOutcome::Failed);
+        let replay =
+            marks.finish_bulk_delivery(1, 2, &[message], BulkDeliveryOutcome::Failed, || now);
         let automod = replay[0]
             .automod
             .clone()
