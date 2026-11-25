@@ -1051,7 +1051,7 @@ const kpi = (panel, label) => [...panel.querySelectorAll('.an-kpi')].find((tile)
 const kpiValue = (panel, label) => kpi(panel, label).querySelector('.an-kpi-value').textContent;
 function chartHelpers() {
   const context = vm.createContext({ React, useState, h: React.createElement });
-  return vm.runInContext(`${chartsSource}\n({ formatCount, formatExact, formatDelta, niceTicks, dayTickIndices, heatLevel, KpiTile, RangeSelector })`, context);
+  return vm.runInContext(`${chartsSource}\n({ formatCount, formatExact, formatDelta, niceTicks, dayTickIndices, heatLevel, layoutTicks, horizontalTicks, KpiTile, RangeSelector })`, context);
 }
 
 test('analytics opens with a one-line header, range selector and info tip, then fills every panel progressively', async () => {
@@ -1163,6 +1163,25 @@ test('analytics range switching fetches each range once and reuses loaded ranges
   assert.equal(pending.length, 1, 'no summary survives the session');
 });
 
+function assertEnforcementScale(chart) {
+  for (const row of chart.querySelectorAll('.an-row')) {
+    const bars = [...row.querySelectorAll('.an-bar')];
+    const max = row.querySelector('.an-axis-value');
+    const zero = row.querySelector('.an-axis-min');
+    if (!bars.length) {
+      assert.equal(max, null);
+      assert.equal(zero, null);
+      continue;
+    }
+    const barTop = Math.min(...bars.map(bar => Number(bar.getAttribute('y'))));
+    assert.ok(Math.abs(Number(max.getAttribute('y')) - barTop) < 0.01,
+      `${row.querySelector('.an-axis-label').textContent}: maximum aligns with the top of the tallest bar`);
+    assert.equal(zero.textContent, '0');
+    assert.equal(Number(zero.getAttribute('y')), Number(row.querySelector('.an-baseline').getAttribute('y1')),
+      'zero aligns with the baseline');
+  }
+}
+
 test('analytics tooltips show exact per-day values on hover and from the keyboard', async () => {
   const series = analyticsDays(7, (i) => ({ warns: i === 6 ? 1234567 : i, joins: i, leaves: i === 2 ? 3 : 0 }));
   const { app } = harness(async () => response(analyticsSummary(30, { series })));
@@ -1170,6 +1189,7 @@ test('analytics tooltips show exact per-day values on hover and from the keyboar
   const panel = app.tabAnalytics();
   await settle();
   const [enforcement, membership] = panel.querySelectorAll('svg[role="img"]');
+  assertEnforcementScale(enforcement);
   const readout = panel.querySelector('#an-enforcement-readout');
   assert.equal(readout.getAttribute('aria-live'), 'polite');
   assert.equal(enforcement.getAttribute('aria-describedby'), 'an-enforcement-readout');
@@ -1278,6 +1298,48 @@ test('analytics formats very large numbers compactly and keeps exact values in l
   const html = renderToStaticMarkup(React.createElement(c.KpiTile, { label: 'Warnings', value: 2e12, delta: c.formatDelta(2e12, 0), values: [1, 2], rangeLabel: '7 days' }));
   assert.match(html, /<span class="an-kpi-value" title="2,000,000,000,000">2T<\/span>/);
   assert.match(html, /aria-label="Warnings: 2,000,000,000,000, up 2,000,000,000,000 vs previous 7 days"/);
+});
+
+test('shared tick layout keeps true positions through re-anchoring and thinning', () => {
+  const { layoutTicks } = chartHelpers();
+  const measureLabel = text => 8 * text.length;
+  const gap = 4;
+  for (const width of [54, 90, 160, 210, 360]) {
+    const labels = [18, 0, 6, 12, 24].map(hour => ({ key: hour, text: `${hour}:00`, x: hour * width / 24 }));
+    const placed = layoutTicks({ width, gap, measureLabel }, labels, 1);
+    assert.ok(placed.some(({ key }) => key === 18), 'the priority tick is retained');
+    const bounds = Array.from(placed, ({ key, text, x, anchor }) => {
+      assert.equal(x, labels.find(label => label.key === key).x, `tick ${key} stays at its column at width ${width}`);
+      const size = measureLabel(text);
+      const left = x - size * { start: 0, middle: 0.5, end: 1 }[anchor];
+      assert.ok(left >= 0 && left + size <= width, `tick ${key} fits at width ${width}`);
+      return [left, left + size];
+    }).sort(([a], [b]) => a - b);
+    bounds.slice(1).forEach(([left], i) => assert.ok(left >= bounds[i][1] + gap, `labels do not overlap at width ${width}`));
+  }
+});
+
+test('shared horizontal tick layout tries both endpoints before dropping one', () => {
+  const { horizontalTicks } = chartHelpers();
+  const labels = (layout, ticks) => Array.from(horizontalTicks(layout, ticks, { y: 20, axisY: 8 }), group => {
+    const [mark, text] = group.props.children;
+    assert.equal(mark.props.x1, text.props.x, 'the label stays at its tick');
+    return [text.props.children, text.props.x, text.props.textAnchor];
+  });
+  const dates = [
+    { key: 'start', text: 'Nov 17 12:10', shortText: 'Nov 17', x: 141, anchor: 'start' },
+    { key: 'end', text: 'Nov 18 12:10', shortText: 'Nov 18', x: 241, anchor: 'end' },
+  ];
+  const measureLabel = text => text.length === 6 ? 93 : 161;
+  assert.deepEqual(labels({ width: 250, gap: 9, measureLabel }, dates), [
+    ['Nov 17', 141, 'end'], ['Nov 18', 241, 'end'],
+  ], 'both compact dates fit with positive clearance at their true positions');
+  assert.deepEqual(labels({ width: 550, gap: 9, measureLabel }, [{ ...dates[0], x: 20 }, { ...dates[1], x: 530 }]), [
+    ['Nov 17 12:10', 20, 'start'], ['Nov 18 12:10', 530, 'end'],
+  ], 'full dates keep their preferred anchors when there is room');
+  assert.deepEqual(labels({ width: 160, gap: 5, measureLabel: () => 50 }, [
+    { key: 'first', text: 'First', x: 0 }, { key: 'last', text: 'Last', x: 90, anchor: 'end' },
+  ]), [['First', 0, 'start'], ['Last', 90, 'middle']], 'an alternate anchor for the last label makes room for both');
 });
 
 test('workspace survives a fresh JS context and keeps snowflakes exact', () => {
@@ -4269,8 +4331,9 @@ async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', 
   return server;
 }
 
-async function launchFirefox() {
+async function launchFirefox(defaultFontSize) {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'jmodguard-firefox-'));
+  if (defaultFontSize) fs.writeFileSync(path.join(profile, 'user.js'), `user_pref("font.size.variable.x-western", ${defaultFontSize});\n`);
   // Own process group: Firefox's content processes are stopped with it.
   const child = spawn(firefoxBinary, ['--headless', '--no-remote', '--profile', profile, '--remote-debugging-port=0'],
     { detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
@@ -4723,6 +4786,253 @@ test('analytics dashboard shows enforcement and membership above the fold in bot
     }
   }
   assert.equal(bars.size, 2, 'series colors follow the theme');
+});
+
+const heatmapGeometryProbe = `(async () => {
+  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  const plot = document.querySelector('.an-heatmap');
+  const box = node => {
+    const { x, y, width, height } = node.getBBox();
+    return { x, y, width, height };
+  };
+  return JSON.stringify({
+    font: parseFloat(getComputedStyle(document.body).fontSize),
+    width: plot.clientWidth, height: plot.clientHeight,
+    cells: [...plot.querySelectorAll('.an-heat')].map(box),
+    labels: [...plot.querySelectorAll('text')].map(node => ({ ...box(node), text: node.textContent,
+      name: node.getAttribute('aria-label'), center: Number(node.getAttribute('y')), anchorX: Number(node.getAttribute('x')),
+      markX: node.parentElement.querySelector('line')?.x1.baseVal.value ?? null })),
+  });
+})()`;
+
+function assertHeatmapGeometry(m, defaultFontSize) {
+  assert.equal(m.font, defaultFontSize * 0.875, 'browser font preference applied');
+  assert.ok(m.height > 0 && m.height <= 280, 'heatmap stays within the height cap');
+  assert.equal(m.cells.length, 168, 'seven weekdays have 24 cells each');
+  const fits = ({ x, y, width, height }) => width > 0 && height > 0 && x >= -0.01 && y >= -0.01
+    && x + width <= m.width + 0.01 && y + height <= m.height + 0.01;
+  const outside = m.cells.find(cell => !fits(cell));
+  assert.equal(outside, undefined, `all cells fit the ${m.width}px plot, including the first and last hour`);
+  assert.ok(m.cells[0].x <= m.width / 2, 'at least half the width is reserved for cells');
+  const rows = [...new Map(m.cells.map(cell => [cell.y, cell.height]))];
+  assert.equal(rows.length, 7, 'seven rows are visible');
+  const weekdays = m.labels.filter(({ text }) => /^[A-Z][a-z]{0,2}$/.test(text));
+  const names = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const compact = ['U', 'M', 'T', 'W', 'R', 'F', 'S'];
+  assert.equal(weekdays.length, 7, 'all rows have visible weekday labels');
+  assert.equal(new Set(weekdays.map(({ text }) => text)).size, 7, 'labels distinguish every weekday');
+  weekdays.forEach(({ text, name, center, x, width }, i) => {
+    assert.ok([names[i].slice(0, 3), names[i].slice(0, 2), compact[i]].includes(text), `${text} identifies ${names[i]}`);
+    if (text.length < 3) assert.equal(name, names[i], 'compact labels carry the full weekday name');
+    assert.ok(rows[i][0] < center && center < rows[i][0] + rows[i][1], `${text} aligns with its row`);
+    assert.ok(x + width <= m.cells[0].x, `${text} stays in the gutter`);
+  });
+  assert.ok(m.labels.some(({ text }) => text === '00:00' || text === '00'), 'midnight is labeled');
+  assert.ok(m.labels.some(({ text }) => text === '18:00' || text === '18'), '18:00 is labeled');
+  for (const { text, anchorX, markX } of m.labels.filter(({ text }) => /^\d{2}(:00)?$/.test(text)).reverse()) {
+    const column = m.cells[parseInt(text, 10)].x;
+    assert.ok(Math.abs(anchorX - column) < 0.01, `${text} anchors at ${anchorX}px for its column at ${column}px`);
+    assert.ok(markX !== null && Math.abs(markX - column) < 0.01, `${text} has a tick at its column`);
+  }
+  for (const [i, a] of m.labels.entries()) {
+    assert.ok(fits({ ...a, y: a.y + 1, height: a.height - 2 }), `${a.text} fits the chart`);
+    for (const b of m.labels.slice(i + 1)) {
+      const overlaps = a.x < b.x + b.width - 1 && b.x < a.x + a.width - 1
+        && a.y < b.y + b.height - 1 && b.y < a.y + a.height - 1;
+      assert.equal(overlaps, false, `${a.text} and ${b.text} have separate space`);
+    }
+  }
+}
+
+for (const { defaultFontSize, heatmapOnly, widths } of [
+  { defaultFontSize: 16, widths: [2560, 1280, 1920, 3440, 320] },
+  { defaultFontSize: 24, heatmapOnly: true, widths: [360, 320, 390, 480, 1280] },
+  { defaultFontSize: 32, widths: [1280, 320] },
+  { defaultFontSize: 48, heatmapOnly: true, widths: [1280, 320] },
+]) test(`${heatmapOnly ? 'heatmap cells and labels' : 'chart plots and labels'} fit with a ${defaultFontSize}px browser default font`, { timeout: 120000 }, async t => {
+  if (!firefoxBinary || !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url))) {
+    assert.ok(!process.env.CI, 'CI requires Firefox and the built WebUI');
+    return t.skip('Firefox or the built WebUI is unavailable');
+  }
+  const domEvent = globalThis.Event;
+  globalThis.Event = NodeEvent;
+  let server, browser;
+  t.after(async () => {
+    await browser?.close();
+    if (server) await new Promise(resolve => server.close(resolve));
+    globalThis.Event = domEvent;
+  });
+  server = await serveBuiltApp(() => false, undefined, {}, (url, json) => {
+    const days = Number(url.searchParams.get('days')) || 30;
+    if (url.pathname === '/api/owner/resources') json(resourceSnapshot());
+    else if (url.pathname.endsWith('/analytics')) {
+      const analytics = browserAnalytics(days);
+      const series = days === 90 ? analytics.series.map((day, i) => ({ ...day, warns: 9900 + i })) : analytics.series;
+      if (url.pathname === '/api/platform/analytics') {
+        // A positive bar for every day lets the test match bars and hit targets in order.
+        json({ ...platformSnapshot(days), series: days === 90 ? series : series.map((day, i) => ({ ...day, joins: i % 5, leaves: 1 })) });
+      } else json({ ...analytics, series });
+    }
+    else if (url.pathname === '/api/database-usage') json(usageOverview([usageDatabase(), usageDatabase({ id: 'shared', kind: 'guild' })]));
+    else return false;
+    return true;
+  });
+  browser = await launchFirefox(defaultFontSize);
+  const evaluate = async (expression) => {
+    const result = await browser.send('script.evaluate', {
+      expression, target: { context: browser.context }, awaitPromise: true,
+    });
+    assert.equal(result.type, 'success', result.exceptionDetails?.text);
+    return result.result.value;
+  };
+  await browser.send('browsingContext.navigate', {
+    context: browser.context, url: `http://${server.address().address}:${server.address().port}/`, wait: 'complete',
+  });
+
+  const chartPages = [
+    ['resources', '.br-legend', '#resources-cards > .br-card'],
+    ['analytics', '.an-heatmap', '.an-grid > .an-span-7, .an-grid > .an-span-5'],
+    ['platform-analytics', '#an-membership-readout', '.an-grid > .an-span-7, .an-grid > .an-span-5'],
+    ['usage', '.du-gauge-scale', '#usage-cards > .du-card'],
+  ];
+  for (const [tab, ready, cards] of chartPages.filter(([tab]) => !heatmapOnly || tab === 'analytics')) {
+    await evaluate(`(async () => {
+      const waitFor = async selector => {
+        for (let i = 0; i < 100; i++) {
+          const node = document.querySelector(selector);
+          if (node) return node;
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        throw new Error('Missing ' + selector);
+      };
+      (await waitFor('#tabs [data-tab="${tab}"]')).click();
+      await waitFor('${ready}');
+    })()`);
+    let heights;
+    for (const width of widths) {
+      const name = `${tab} at ${width}px`;
+      await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height: 900 } });
+      if (tab === 'analytics' && defaultFontSize > 16) await t.test(`${name}: heatmap cells and labels fit`, async () => {
+        assertHeatmapGeometry(JSON.parse(await evaluate(heatmapGeometryProbe)), defaultFontSize);
+      });
+      if (heatmapOnly) continue;
+      const m = JSON.parse(await evaluate(`(async () => {
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const main = document.querySelector('#content');
+        const all = selector => [...main.querySelectorAll(selector)];
+        const box = node => node.getBoundingClientRect();
+        const font = node => parseFloat(getComputedStyle(node).fontSize);
+        const plots = all('.br-chart svg, .an-figure svg, .an-spark, .du-gauge-track, .du-share');
+        const labels = all('.br-chart svg text, .an-figure svg text, .br-legend-item, .an-readout-item, .du-legend, .du-gauge-scale span');
+        const overlaps = (a, b) => a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1;
+        const collision = groups => groups.flatMap(group => group.flatMap((a, i) =>
+          group.slice(i + 1).filter(b => overlaps(box(a), box(b))).map(b => a.textContent + ' / ' + b.textContent)));
+        return JSON.stringify({
+          bodyFont: font(document.body),
+          labels: labels.map(node => {
+            const transform = node.getScreenCTM?.();
+            return [node.textContent, font(node) * (transform?.a ?? 1), font(node) * (transform?.d ?? 1)];
+          }),
+          clipped: labels.flatMap(node => {
+            const bounds = node.closest('svg, .du-gauge-scale');
+            if (!bounds) return [];
+            const a = box(node), b = box(bounds);
+            const overflow = Math.max(b.left - a.left, a.right - b.right, b.top - a.top, a.bottom - b.bottom);
+            return overflow > 1 ? [node.textContent + ' by ' + overflow.toFixed(1) + 'px'] : [];
+          }),
+          collisions: collision(plots.map(plot => [...plot.querySelectorAll('text')])
+            .concat(all('.du-gauge-scale').map(scale => [...scale.querySelectorAll('span')]))),
+          resourceRanges: all('.br-chart svg').map(plot => {
+            const axis = plot.querySelector('.an-gridline line');
+            return { chart: plot.getAttribute('aria-label').split(',')[0], endpoints: [axis.x1.baseVal.value, axis.x2.baseVal.value],
+              labels: [...plot.querySelectorAll('.an-axis-day')].map(node => ({ text: node.textContent,
+                anchor: node.x.baseVal.getItem(0).value, mark: node.parentElement.querySelector('line').x1.baseVal.value })) };
+          }),
+          heights: plots.map(plot => box(plot).height),
+          sparks: all('.an-spark').length,
+          contentWidth: box(main).width,
+          overflow: document.documentElement.scrollWidth - innerWidth,
+          cardTops: all('${cards}').map(card => Math.round(box(card).top)),
+        });
+      })()`));
+      assert.equal(m.bodyFont, defaultFontSize * 0.875, `${name}: browser font preference applied`);
+      assert.ok(m.labels.length > 0, `${name}: chart labels rendered`);
+      for (const [label, horizontal, vertical] of m.labels) {
+        assert.ok(Math.abs(horizontal - m.bodyFont) <= defaultFontSize / 16 && Math.abs(vertical - m.bodyFont) <= defaultFontSize / 16,
+          `${name}: ${label} renders at ${horizontal.toFixed(1)} × ${vertical.toFixed(1)} CSS px near ${m.bodyFont}px body text`);
+      }
+      assert.deepEqual(m.clipped, [], `${name}: labels fit the plot`);
+      assert.deepEqual(m.collisions, [], `${name}: axis labels have space`);
+      if (tab === 'resources' && width === 320 && defaultFontSize === 32) {
+        assert.ok(m.resourceRanges.some(({ chart }) => chart === 'Bot memory'), 'bot memory chart rendered');
+        assert.ok(m.resourceRanges.some(({ chart }) => chart === 'API memory'), 'API memory chart rendered');
+        for (const { chart, endpoints, labels } of m.resourceRanges) {
+          assert.deepEqual(labels.map(({ text }) => text.slice(0, 6)), ['Nov 17', 'Nov 18'], `${chart} shows both dates`);
+          labels.forEach(({ anchor, mark }, i) => {
+            assert.equal(anchor, endpoints[i], `${chart} date stays at its endpoint`);
+            assert.equal(mark, endpoints[i], `${chart} tick stays at its endpoint`);
+          });
+        }
+      }
+      assert.ok(m.heights.length > 0 && m.heights.every(height => height > 0 && height <= 280), `${name}: bounded plots`);
+      heights ??= m.heights;
+      assert.deepEqual(m.heights, heights, `${name}: plot heights are independent of width`);
+      if (tab.includes('analytics')) assert.ok(m.sparks > 0, `${name}: KPI sparklines are covered`);
+      assert.ok(m.contentWidth <= 1440, `${name}: capped content`);
+      assert.equal(m.cardTops.length, 2, `${name}: both cards present`);
+      if (defaultFontSize === 16) {
+        assert.ok(m.overflow <= 0, `${name}: no horizontal page overflow`);
+        assert.equal(m.cardTops[0] === m.cardTops[1], width >= 1280, `${name}: desktop cards align and mobile cards stack`);
+      }
+    }
+    if (tab.includes('analytics') && defaultFontSize === 32) await t.test(`${tab} at 320px: 90-day bars stay inside their hover columns`, async () => {
+      const probes = JSON.parse(await evaluate(`(async () => {
+        const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        document.querySelector('[aria-label="Last 90 days"]').click();
+        const charts = [
+          ['enforcement', '.an-warns .an-bar'],
+          ['membership', '.an-joins.an-bar'],
+        ];
+        const plot = kind => document.querySelector('svg[aria-describedby="an-' + kind + '-readout"]');
+        for (let i = 0; i < 100 && charts.some(([kind]) => plot(kind)?.querySelectorAll('.an-hit').length !== 90); i++) await frame();
+        const results = [];
+        for (const [kind, selector] of charts) {
+          const svg = plot(kind);
+          const bars = [...svg.querySelectorAll(selector)];
+          const hits = [...svg.querySelectorAll('.an-hit')];
+          const escaped = bars.flatMap((bar, i) => {
+            const target = hits[i]?.getBBox();
+            const mark = bar.getBBox();
+            const fits = target && mark.width > 0 && mark.x >= target.x - 0.001 && mark.x + mark.width <= target.x + target.width + 0.001
+              && mark.y >= target.y - 0.01 && mark.y + mark.height <= target.y + target.height + 0.01;
+            return fits ? [] : [i];
+          });
+          const bar = bars[0];
+          svg.scrollIntoView({block: 'center'});
+          await frame();
+          const box = bar.getBoundingClientRect();
+          const hovered = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+          hovered?.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
+          await frame();
+          const target = hits[0].getBBox();
+          const cursor = svg.querySelector('.an-cursor')?.getBBox();
+          results.push({ kind, bars: bars.length, hits: hits.length, slotWidth: hits[0].getBBox().width, escaped,
+            hoveredIndex: hits.indexOf(hovered), day: document.querySelector('#an-' + kind + '-readout strong')?.textContent,
+            cursorAligned: cursor?.x === target.x && cursor?.width === target.width });
+        }
+        return JSON.stringify(results);
+      })()`));
+      for (const { kind, bars, hits, slotWidth, escaped, hoveredIndex, day, cursorAligned } of probes) {
+        assert.equal(hits, 90, `${kind}: every day has a hover column`);
+        assert.equal(bars, hits, `${kind}: every day has a bar in the tested series`);
+        assert.ok(slotWidth < 1, `${kind}: exercises subpixel day slots (${slotWidth}px)`);
+        assert.deepEqual(escaped, [], `${kind}: every bar lies inside its own day column`);
+        assert.equal(hoveredIndex, 0, `${kind}: hit testing the first bar selects the first day`);
+        assert.equal(day, 'Aug 15', `${kind}: hover readout reports the first day`);
+        assert.ok(cursorAligned, `${kind}: cursor matches the hovered day column`);
+      }
+    });
+  }
 });
 
 // Opens the Members partial-import explanation, which sits mid-line after the status badge (#620).
@@ -12113,6 +12423,7 @@ test('Platform analytics shows every metric together with changes, names, icons 
   // Every enforcement metric is drawn at once; an empty series says so.
   const charts = [...page.querySelectorAll('.an-panel svg[role="img"]')];
   assert.equal(charts.length, 2);
+  assertEnforcementScale(charts[0]);
   assert.match(charts[0].getAttribute('aria-label'), /^Daily enforcement from .+: Warnings 5, Bans 4, Spam hits 7, Mod actions 2, Timeouts 0\./);
   assert.match(charts[1].getAttribute('aria-label'), /joins 5, leaves 3, net up 2/);
   const timeouts = charts[0].querySelector('.an-row.an-timeouts');
