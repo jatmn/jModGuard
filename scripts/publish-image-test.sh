@@ -315,13 +315,12 @@ for mode in main tag manual nightly; do
 done
 
 # Every component must describe the core schema in the selected build source.
-# Migration 0016 is already active; advertising 15 admitted a bot-only migration
-# and then stranded the old API behind the same compatibility check.
+# Exact runtime ranges keep the bot and API paired when the schema advances.
 for component in bot api webui; do
   readarray -d '' -t schema_args < <(build_args "$component" "$HEAD_SHA" "" . "" current "$(staging_ref "$component")")
   for field in min-schema max-schema result-schema; do
-    contains_arg "io.jmodguard.${field}=28" "${schema_args[@]}" \
-      || fail "${component} must advertise current schema28 (${field})"
+    contains_arg "io.jmodguard.${field}=29" "${schema_args[@]}" \
+      || fail "${component} must advertise current schema 29 (${field})"
   done
 done
 

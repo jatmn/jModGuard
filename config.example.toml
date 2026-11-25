@@ -147,6 +147,9 @@ directory = "logs"
 # These bootstrap controls will move into Administration.
 discord_concurrency = 8       # JMODGUARD_LOG_DISCORD_CONCURRENCY
 discord_timeout_secs = 10     # JMODGUARD_LOG_DISCORD_TIMEOUT_SECS
+# Group automod cleanup deletes across channels.
+group_automod_cleanup_deletes = true  # JMODGUARD_LOG_GROUP_AUTOMOD_CLEANUP_DELETES
+automod_cleanup_settle_secs = 10      # JMODGUARD_LOG_AUTOMOD_CLEANUP_SETTLE_SECS (5–10)
 
 # Administrative action policy; set the same values in bot and API.
 # Environment overrides and protocol bounds: docs/BOT-ACTIONS.md.
