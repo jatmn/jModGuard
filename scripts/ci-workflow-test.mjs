@@ -791,28 +791,30 @@ function runRegistryDelete(tag, responses, options = {}) {
   fs.writeFileSync(responsesFile, JSON.stringify(responses));
   const timeoutCommand = spawnSync("bash", ["-c", "command -v timeout"], { encoding: "utf8" });
   assert.equal(timeoutCommand.status, 0, timeoutCommand.stderr);
-  // Record production arguments in every case; shorten only the stalling cases.
+  // Record the production timeout arguments. The page fixture models expiry
+  // after it has written the first page, independently of process startup time.
   fs.writeFileSync(path.join(bin, "timeout"), `#!/bin/bash
 set -euo pipefail
 printf '%s\\n' "$*" >>${JSON.stringify(timeoutLog)}
-${options.stallFrom ? 'shift 2\nset -- --kill-after=1s 1s "$@"' : ""}
 exec "$REAL_TIMEOUT" "$@"
 `);
   fs.chmodSync(path.join(bin, "timeout"), 0o755);
   fs.writeFileSync(path.join(dir, "emit-pages.mjs"), [
-    'import { appendFileSync, readFileSync } from "node:fs";',
-    'import { setTimeout } from "node:timers/promises";',
+    'import { appendFileSync, readFileSync, writeSync } from "node:fs";',
     'const responses = JSON.parse(readFileSync(process.argv[2], "utf8"));',
     'const index = Number(process.argv[3]);',
     'const emitAll = process.argv[4] === "1";',
     'const entry = responses[Math.min(index, responses.length) - 1];',
     'const multi = Array.isArray(entry) && entry.length > 0 && entry.every((item) => Array.isArray(item));',
     'const pages = multi ? entry : [entry];',
-    'const stall = Number(process.argv[5]) > 0 && index >= Number(process.argv[5]);',
+    'const timeoutFrom = Number(process.argv[5]);',
     'for (const [pageIndex, page] of (emitAll ? pages : pages.slice(0, 1)).entries()) {',
-    '  process.stdout.write(JSON.stringify(page) + "\\n");',
+    '  writeSync(process.stdout.fd, JSON.stringify(page) + "\\n");',
     '  appendFileSync(process.argv[6], `${index}:${pageIndex + 1}\\n`);',
-    '  if (stall && emitAll && pageIndex === 0 && pages.length > 1) await setTimeout(5000);',
+    '  if (timeoutFrom > 0 && index >= timeoutFrom && emitAll && pageIndex === 0 && pages.length > 1) {',
+    '    process.exitCode = 124; // GNU timeout status, with one page already in the pipe.',
+    '    break;',
+    '  }',
     '}',
     '',
   ].join("\n"));
@@ -844,7 +846,7 @@ n=\$((n + 1))
 printf '%s' "\$n" >${JSON.stringify(stateFile)}
 emit_all=0
 if [[ "\$has_paginate" == 1 && "\$has_per_page" == 1 ]]; then emit_all=1; fi
-node ${JSON.stringify(path.join(dir, "emit-pages.mjs"))} ${JSON.stringify(responsesFile)} "\$n" "\$emit_all" ${options.stallFrom || 0} ${JSON.stringify(pagesLog)}
+node ${JSON.stringify(path.join(dir, "emit-pages.mjs"))} ${JSON.stringify(responsesFile)} "\$n" "\$emit_all" ${options.timeoutFrom || 0} ${JSON.stringify(pagesLog)}
 `);
   fs.writeFileSync(path.join(bin, "docker"), `#!/bin/bash
 printf '%s\\n' "\$*" >>${JSON.stringify(dockerLog)}
@@ -926,7 +928,7 @@ assert.equal(single.dockerText, "");
 const timedOutInitial = runRegistryDelete(singleTag, [[
   [packageVersion(11, [singleTag])],
   [packageVersion(12, [singleTag])],
-]], { stallFrom: 1 });
+]], { timeoutFrom: 1 });
 assertUserPackageRoute(timedOutInitial);
 assert.deepEqual(timedOutInitial.pages, ["1:1"], "the same paginate invocation must stall before its second page");
 assert.notEqual(timedOutInitial.status, 0, "a timed-out partial list must fail");
@@ -1003,7 +1005,7 @@ function assertNoPartialUntag(outcome, message) {
 const timedOutDetached = runRegistryDelete(stagedTag, sharedThen([
   [packageVersion(21, [stagingName], preservedDigest), packageVersion(99, [stagedTag])],
   [packageVersion(100, [stagedTag])],
-]), { stallFrom: 2 });
+]), { timeoutFrom: 2 });
 assertNoPartialUntag(timedOutDetached, /package version list failed/);
 assert.deepEqual(timedOutDetached.pages, ["1:1", "2:1", "3:1", "4:1"], "each retry must stall before its second page");
 assert.equal(timedOutDetached.calls.filter(call => call.method === "GET").length, 4);
