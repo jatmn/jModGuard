@@ -304,7 +304,6 @@ clock	src/db/analytics/tests.rs	db::analytics::tests::member_daily_counters_prun
 clock	src/db/guild_data/tests/snapshots.rs	db::guild_data::tests::snapshots::measure_sustained_snapshot_workload_and_cleanup_reuse	15	#666
 sleep	src/db/tests.rs	db::tests::api_open_retries_while_bot_holds_sqlite_lock	1	#666
 clock	src/db/tests.rs	db::tests::api_write_fails_fast_while_the_bot_holds_the_write_lock	1	#666
-sleep	src/db/tests/moderation_enrollments.rs	db::tests::moderation_enrollments::delayed_bot_echo_with_handler_timestamps_keeps_manual_gateway_ban	1	#666
 clock	src/db/update_control.rs	db::update_control::tests::late_launcher_cas_never_extends_confirmed_deadline	2	#666
 sleep	src/db/update_control.rs	db::update_control::tests::late_launcher_cas_never_extends_confirmed_deadline	2	#666
 sleep	src/evidence_transfer/tests.rs	evidence_transfer::tests::caller_cancellation_and_removal_cannot_release_a_live_writer_lock	1	#666

@@ -2877,7 +2877,7 @@ async fn delayed_bot_echo_with_handler_timestamps_keeps_manual_gateway_ban() {
         55,
         None,
         None,
-        None,
+        Some("2024-01-01T00:00:00.000+00:00"),
         true,
         Some("old-attempt"),
         true,
@@ -2893,7 +2893,7 @@ async fn delayed_bot_echo_with_handler_timestamps_keeps_manual_gateway_ban() {
         55,
         Some("member"),
         None,
-        None,
+        Some("2024-01-01T00:00:00.100+00:00"),
         false,
         None,
         true,
@@ -2914,14 +2914,14 @@ async fn delayed_bot_echo_with_handler_timestamps_keeps_manual_gateway_ban() {
     )
     .await
     .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    // The old attempt reaches the handler after the manual ban.
     let resumed = record_gateway_ban(
         &f.db,
         Some(scope.clone()),
         55,
         None,
         None,
-        None,
+        Some("2024-01-01T00:00:00.105+00:00"),
         true,
         Some("old-attempt"),
         true,
