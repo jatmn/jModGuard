@@ -3083,9 +3083,9 @@ test('settings patches send only changed fields to the selected server', async (
   assert.ok(calls.some((c) => c.method === 'POST' && c.url.endsWith('/access-roles?include_case_delete_roles=true')));
 });
 
-test('legacy role reads preserve case-role revisions and wait for both card baselines', async () => {
+test('legacy role reads keep each card paired with its own revision', async () => {
   const calls = [];
-  let nextRevision = 2;
+  let nextRevision = 3;
   let releaseCaseRoles;
   const cfg = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
   const h = harness(async (url, options) => {
@@ -3095,9 +3095,13 @@ test('legacy role reads preserve case-role revisions and wait for both card base
       return response({ roles: [], revision: 'revision-1' });
     }
     if (url.endsWith('/case-delete-roles') && options.method === 'POST') {
-      return new Promise(resolve => { releaseCaseRoles = () => resolve(response({ roles: ['1'], revision: 'revision-1' })); });
+      return new Promise(resolve => { releaseCaseRoles = () => resolve(response({ roles: ['1'], revision: 'revision-2' })); });
     }
-    if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
+    if (/\/(case-delete-roles|access-roles)$/.test(url) && options.method === 'PUT') {
+      if (body.revision !== `revision-${nextRevision - 1}`) {
+        return { ok: false, status: 409, headers: { get: () => null }, text: async () => '{"error":"tenant settings changed"}' };
+      }
+      assert.ok(url.endsWith('/case-delete-roles'), 'stale access roles must not be accepted');
       return response({ revision: `revision-${nextRevision++}` });
     }
     return response(cfg);
@@ -3128,10 +3132,54 @@ test('legacy role reads preserve case-role revisions and wait for both card base
   assert.equal(h.app.isDirty(), true, 'an unrelated settings draft must remain dirty');
 
   const puts = calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles'));
-  assert.equal(puts.length, 2);
-  assert.equal(puts[0].body.revision, 'revision-1');
-  assert.equal(puts[1].body.revision, 'revision-2');
+  assert.deepEqual(puts.map(c => c.body.revision), ['revision-2', 'revision-3']);
+
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Add role'), 'click');
+  const accessInput = h.elements.find(n => n.localName === 'input' && n.closest('.access-role-row'));
+  accessInput.value = '555';
+  await fire(accessInput, 'input');
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save access roles'), 'click');
+  assert.equal(calls.find(c => c.method === 'PUT' && c.url.endsWith('/access-roles')).body.revision, 'revision-1');
+  assert.match(h.nodes.get('#toast').textContent, /tenant settings changed/);
 });
+
+for (const [status, code] of [[503, 'unavailable'], [401, 'auth_lost'], [403, 'guild_access_denied'], [409, 'guild_enrollment_changed']]) {
+  test(`case-role reads on projected access-role error ${status}`, async () => {
+    const calls = [];
+    const cfg = { enrollment_id: 'page-membership', settings: { prefix: '!', bot_name: '' }, settings_override: {}, global_settings: { prefix: '/' } };
+    const h = harness(async (url, options) => {
+      const body = options.body ? JSON.parse(options.body) : null;
+      calls.push({ url, method: options.method, body, enrollment: options.headers['x-jmodguard-enrollment'] });
+      if (url.endsWith('/access-roles?include_case_delete_roles=true')) {
+        return { ok: false, status, headers: { get: () => null }, text: async () => JSON.stringify({ error: code, code }) };
+      }
+      if (url.endsWith('/case-delete-roles') && options.method === 'POST') {
+        return response({ roles: ['777'], revision: 'case-revision' });
+      }
+      if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
+        return response({ revision: 'saved-revision' });
+      }
+      return response(cfg);
+    });
+    h.app.state.config = cfg;
+    h.app.state.tab = 'settings';
+    h.app.renderTab();
+    await settle();
+    const caseReads = calls.filter(c => c.url.endsWith('/case-delete-roles') && c.method === 'POST');
+    assert.equal(caseReads.length, status === 503 ? 1 : 0);
+    if (status !== 503) return;
+    assert.equal(caseReads[0].enrollment, 'page-membership');
+    const input = h.elements.find(n => n.localName === 'input' && /comma-separated/.test(n.getAttribute('placeholder') || ''));
+    assert.equal(input.value, '777');
+    input.value = '778';
+    await fire(input, 'input');
+    await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles'), 'click');
+    const save = calls.find(c => c.url.endsWith('/case-delete-roles') && c.method === 'PUT');
+    assert.deepEqual(save.body, { roles: ['778'], revision: 'case-revision' });
+    assert.equal(save.enrollment, 'page-membership');
+    assert.equal(h.app.isDirty(), false);
+  });
+}
 
 test('queued log-channel saves clear dirty state and survive in-app navigation', async () => {
   let confirmations = 0;
