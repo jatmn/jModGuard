@@ -128,23 +128,32 @@ pub async fn owner_guild_directory(db: &Db, departed_limit: i64) -> Result<Vec<O
     .await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuildJoinInfoBackfillCandidate {
+    pub guild_id: i64,
+    pub joined_at_ns: i64,
+    /// Facts are absent or were last observed before this membership began.
+    pub refresh_facts: bool,
+}
+
 /// Active enrollments whose current membership has no captured adder (no row,
-/// no adder, or an adder captured for an earlier membership), in guild-id
-/// order after `after_guild_id`, with each membership's join time for the
-/// adder recency window. The bot's startup pass walks these pages once, so an
-/// unresolved server cannot starve later ones.
+/// no adder, or an adder captured for an earlier membership), in guild-ID
+/// order after `after_guild_id`. Include the join time for the adder recency
+/// window and whether this enrollment needs a fresh fact observation.
 pub async fn guild_join_info_backfill_candidates(
     db: &Db,
     after_guild_id: i64,
     limit: i64,
-) -> Result<Vec<(i64, i64)>> {
+) -> Result<Vec<GuildJoinInfoBackfillCandidate>> {
     anyhow::ensure!(after_guild_id >= 0, "invalid backfill cursor");
     anyhow::ensure!((1..=4096).contains(&limit), "invalid backfill limit");
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_snapshot()?;
         let rows = tx
             .prepare(
-                "SELECT e.guild_id,e.joined_at_ns FROM guild_enrollments e
+                "SELECT e.guild_id,e.joined_at_ns,
+                        (j.guild_id IS NULL OR j.recorded_at_ns < e.joined_at_ns)
+                 FROM guild_enrollments e
                  LEFT JOIN guild_join_info j ON j.guild_id=e.guild_id
                  WHERE e.active=1 AND e.guild_id>?1
                    AND (j.guild_id IS NULL OR j.added_by_joined_at_ns IS NOT e.joined_at_ns)
@@ -152,7 +161,11 @@ pub async fn guild_join_info_backfill_candidates(
                  LIMIT ?2",
             )?
             .query_map(params![after_guild_id, limit], |row| {
-                Ok((row.get::<i64>(0)?, row.get::<i64>(1)?))
+                Ok(GuildJoinInfoBackfillCandidate {
+                    guild_id: row.get(0)?,
+                    joined_at_ns: row.get(1)?,
+                    refresh_facts: row.get(2)?,
+                })
             })?
             .collect::<std::result::Result<Vec<_>, anyhow::Error>>()?;
         tx.finish_read()?;

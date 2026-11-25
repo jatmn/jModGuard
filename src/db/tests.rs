@@ -6852,7 +6852,11 @@ async fn guild_adder_belongs_to_one_membership_across_a_rejoin() {
         guild_join_info_backfill_candidates(&db, 0, 100)
             .await
             .unwrap(),
-        vec![(70, 5_000)],
+        vec![GuildJoinInfoBackfillCandidate {
+            guild_id: 70,
+            joined_at_ns: 5_000,
+            refresh_facts: false,
+        }],
         "the rejoined server awaits its own adder capture"
     );
 
@@ -6912,8 +6916,19 @@ async fn guild_join_info_backfill_targets_only_unresolved_active_servers() {
         .unwrap();
     assert_eq!(
         candidates,
-        vec![(61, 1_000), (62, 1_000)],
-        "candidates carry the membership join time for the adder recency window"
+        vec![
+            GuildJoinInfoBackfillCandidate {
+                guild_id: 61,
+                joined_at_ns: 1_000,
+                refresh_facts: true,
+            },
+            GuildJoinInfoBackfillCandidate {
+                guild_id: 62,
+                joined_at_ns: 1_000,
+                refresh_facts: false,
+            },
+        ],
+        "candidates carry the join time and distinguish missing facts from a missing adder"
     );
 
     // The update-only adder write keeps display facts and fills the identity.
@@ -6930,7 +6945,7 @@ async fn guild_join_info_backfill_targets_only_unresolved_active_servers() {
             .await
             .unwrap()
             .iter()
-            .all(|(guild, _)| *guild == 61)
+            .all(|candidate| candidate.guild_id == 61)
     );
     // A row that is missing cannot take an adder; it waits for its facts.
     record_guild_adder(&db, 61, 1_000, "123", "Nobody")
@@ -6960,18 +6975,23 @@ async fn guild_join_info_backfill_pages_past_unresolved_servers() {
     }
     // The first page is whatever the lowest ids are; paging continues past
     // them even though none were resolved.
+    let candidate = |guild_id| GuildJoinInfoBackfillCandidate {
+        guild_id,
+        joined_at_ns: 1_000,
+        refresh_facts: true,
+    };
     let first = guild_join_info_backfill_candidates(&db, 0, 2)
         .await
         .unwrap();
-    assert_eq!(first, vec![(100, 1_000), (101, 1_000)]);
+    assert_eq!(first, vec![candidate(100), candidate(101)]);
     let second = guild_join_info_backfill_candidates(&db, 101, 2)
         .await
         .unwrap();
-    assert_eq!(second, vec![(102, 1_000), (103, 1_000)]);
+    assert_eq!(second, vec![candidate(102), candidate(103)]);
     let third = guild_join_info_backfill_candidates(&db, 103, 2)
         .await
         .unwrap();
-    assert_eq!(third, vec![(104, 1_000)]);
+    assert_eq!(third, vec![candidate(104)]);
     assert!(
         guild_join_info_backfill_candidates(&db, 104, 2)
             .await
