@@ -9969,7 +9969,7 @@ test('access-role saves send string role IDs, levels and the loaded revision', a
   const panel = h.document.querySelector('.test-panel');
   assert.equal(panel.querySelector('.access-role-row option[value="dashboard"]').textContent, 'Dashboard');
   assert.match(panel.textContent, /Discord’s Ban Members permission allows ban actions at either access level/);
-  assert.match(panel.textContent, /Removing case records requires Discord’s Administrator permission or server ownership\./);
+  assert.match(panel.textContent, /Removing case records requires server ownership or both Manage Server and Administrator permissions\./);
   assert.doesNotMatch(panel.textContent, /case removal[^.]*need Manage Server/);
   assert.match(panel.textContent, /stops working as soon as the bot sees the change, and within 4 minutes at most/);
   const add = h.elements.find((n) => n.localName === 'button' && n.textContent === 'Add role');
