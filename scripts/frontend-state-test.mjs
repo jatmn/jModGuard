@@ -4630,7 +4630,57 @@ test('analytics dashboard shows enforcement and membership above the fold in bot
   assert.equal(bars.size, 2, 'series colors follow the theme');
 });
 
-for (const defaultFontSize of [16, 32]) test(`chart plots and labels fit with a ${defaultFontSize}px browser default font`, { timeout: 120000 }, async t => {
+const heatmapGeometryProbe = `(async () => {
+  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  const plot = document.querySelector('.an-heatmap');
+  const box = node => {
+    const { x, y, width, height } = node.getBBox();
+    return { x, y, width, height };
+  };
+  return JSON.stringify({
+    font: parseFloat(getComputedStyle(document.body).fontSize),
+    width: plot.clientWidth, height: plot.clientHeight,
+    cells: [...plot.querySelectorAll('.an-heat')].map(box),
+    labels: [...plot.querySelectorAll('text')].map(node => ({ ...box(node), text: node.textContent,
+      name: node.getAttribute('aria-label'), center: Number(node.getAttribute('y')) })),
+  });
+})()`;
+
+function assertHeatmapGeometry(m, defaultFontSize) {
+  assert.equal(m.font, defaultFontSize * 0.875, 'browser font preference applied');
+  assert.ok(m.height > 0 && m.height <= 280, 'heatmap stays within the height cap');
+  assert.equal(m.cells.length, 168, 'seven weekdays have 24 cells each');
+  const fits = ({ x, y, width, height }) => width > 0 && height > 0 && x >= -0.01 && y >= -0.01
+    && x + width <= m.width + 0.01 && y + height <= m.height + 0.01;
+  const outside = m.cells.find(cell => !fits(cell));
+  assert.equal(outside, undefined, `all cells fit the ${m.width}px plot, including the first and last hour`);
+  assert.ok(m.cells[0].x <= m.width / 2, 'at least half the width is reserved for cells');
+  const rows = [...new Map(m.cells.map(cell => [cell.y, cell.height]))];
+  assert.equal(rows.length, 7, 'seven rows are visible');
+  const weekdays = m.labels.filter(({ text }) => /^[A-Z][a-z]{0,2}$/.test(text));
+  const names = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const compact = ['U', 'M', 'T', 'W', 'R', 'F', 'S'];
+  assert.equal(weekdays.length, 7, 'all rows have visible weekday labels');
+  assert.equal(new Set(weekdays.map(({ text }) => text)).size, 7, 'labels distinguish every weekday');
+  weekdays.forEach(({ text, name, center, x, width }, i) => {
+    assert.ok([names[i].slice(0, 3), names[i].slice(0, 2), compact[i]].includes(text), `${text} identifies ${names[i]}`);
+    if (text.length < 3) assert.equal(name, names[i], 'compact labels carry the full weekday name');
+    assert.ok(rows[i][0] < center && center < rows[i][0] + rows[i][1], `${text} aligns with its row`);
+    assert.ok(x + width <= m.cells[0].x, `${text} stays in the gutter`);
+  });
+  assert.ok(m.labels.some(({ text }) => text === '00:00' || text === '00'), 'midnight is labeled');
+  assert.ok(m.labels.some(({ text }) => text === '18:00' || text === '18'), '18:00 is labeled');
+  for (const [i, a] of m.labels.entries()) {
+    assert.ok(fits({ ...a, y: a.y + 1, height: a.height - 2 }), `${a.text} fits the chart`);
+    for (const b of m.labels.slice(i + 1)) {
+      const overlaps = a.x < b.x + b.width - 1 && b.x < a.x + a.width - 1
+        && a.y < b.y + b.height - 1 && b.y < a.y + a.height - 1;
+      assert.equal(overlaps, false, `${a.text} and ${b.text} have separate space`);
+    }
+  }
+}
+
+for (const defaultFontSize of [16, 32, 48]) test(`${defaultFontSize === 48 ? 'heatmap cells and labels' : 'chart plots and labels'} fit with a ${defaultFontSize}px browser default font`, { timeout: 120000 }, async t => {
   if (!firefoxBinary || !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url))) {
     assert.ok(!process.env.CI, 'CI requires Firefox and the built WebUI');
     return t.skip('Firefox or the built WebUI is unavailable');
@@ -4670,12 +4720,13 @@ for (const defaultFontSize of [16, 32]) test(`chart plots and labels fit with a 
     context: browser.context, url: `http://${server.address().address}:${server.address().port}/`, wait: 'complete',
   });
 
-  for (const [tab, ready, cards] of [
+  const chartPages = [
     ['resources', '.br-legend', '#resources-cards > .br-card'],
     ['analytics', '.an-heatmap', '.an-grid > .an-span-7, .an-grid > .an-span-5'],
     ['platform-analytics', '#an-membership-readout', '.an-grid > .an-span-7, .an-grid > .an-span-5'],
     ['usage', '.du-gauge-scale', '#usage-cards > .du-card'],
-  ]) {
+  ];
+  for (const [tab, ready, cards] of chartPages.filter(([tab]) => defaultFontSize < 48 || tab === 'analytics')) {
     await evaluate(`(async () => {
       const waitFor = async selector => {
         for (let i = 0; i < 100; i++) {
@@ -4692,6 +4743,10 @@ for (const defaultFontSize of [16, 32]) test(`chart plots and labels fit with a 
     for (const width of defaultFontSize === 16 ? [2560, 1280, 1920, 3440, 320] : [1280, 320]) {
       const name = `${tab} at ${width}px`;
       await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height: 900 } });
+      if (tab === 'analytics' && defaultFontSize >= 32) await t.test(`${name}: heatmap cells and labels fit`, async () => {
+        assertHeatmapGeometry(JSON.parse(await evaluate(heatmapGeometryProbe)), defaultFontSize);
+      });
+      if (defaultFontSize === 48) continue;
       const m = JSON.parse(await evaluate(`(async () => {
         await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
         const main = document.querySelector('#content');
@@ -4703,8 +4758,6 @@ for (const defaultFontSize of [16, 32]) test(`chart plots and labels fit with a 
         const overlaps = (a, b) => a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1;
         const collision = groups => groups.flatMap(group => group.flatMap((a, i) =>
           group.slice(i + 1).filter(b => overlaps(box(a), box(b))).map(b => a.textContent + ' / ' + b.textContent)));
-        const weekdays = all('.an-heatmap text').filter(node => /^[A-Z][a-z]{2}$/.test(node.textContent));
-        const heatmapRows = [...new Map(all('.an-heatmap .an-heat').map(cell => [cell.y.baseVal.value, cell.height.baseVal.value]))];
         return JSON.stringify({
           bodyFont: font(document.body),
           labels: labels.map(node => {
@@ -4725,8 +4778,6 @@ for (const defaultFontSize of [16, 32]) test(`chart plots and labels fit with a 
           contentWidth: box(main).width,
           overflow: document.documentElement.scrollWidth - innerWidth,
           cardTops: all('${cards}').map(card => Math.round(box(card).top)),
-          weekdays: weekdays.map(node => [node.textContent, Number(node.getAttribute('y'))]),
-          heatmapRows,
         });
       })()`));
       assert.equal(m.bodyFont, defaultFontSize * 0.875, `${name}: browser font preference applied`);
@@ -4747,14 +4798,6 @@ for (const defaultFontSize of [16, 32]) test(`chart plots and labels fit with a 
         assert.ok(m.overflow <= 0, `${name}: no horizontal page overflow`);
         assert.equal(m.cardTops[0] === m.cardTops[1], width >= 1280, `${name}: desktop cards align and mobile cards stack`);
       }
-      if (tab === 'analytics' && defaultFontSize === 32) await t.test(`${name}: all seven heatmap rows are labeled`, () => {
-        assert.deepEqual(m.weekdays.map(([day]) => day), ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']);
-        assert.equal(m.heatmapRows.length, 7);
-        m.heatmapRows.forEach(([top, height], i) => {
-          const [day, y] = m.weekdays[i];
-          assert.ok(top < y && y < top + height, `${day} label aligns with its row`);
-        });
-      });
     }
     if (tab.includes('analytics') && defaultFontSize === 32) await t.test(`${tab} at 320px: 90-day bars stay inside their hover columns`, async () => {
       const probes = JSON.parse(await evaluate(`(async () => {

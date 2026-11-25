@@ -78,6 +78,34 @@ function horizontalTicks(layout, labels, y, className = "an-axis-day") {
     axisText(text, { key, className, x, y, textAnchor: anchor }));
 }
 
+function staggeredRowLabels({ width, lineHeight, gap, measureLabel }, rowHeight, variants) {
+  // Reserve at least half the SVG for the data, even with enlarged labels.
+  const budget = width / 2;
+  const columns = Math.min(variants[0].length, Math.ceil(lineHeight / rowHeight));
+  for (const [variant, labels] of variants.entries()) {
+    const padding = variant === 0 ? gap : Math.max(1, gap / 3);
+    const sizes = Array(columns).fill(0);
+    labels.forEach((text, row) => {
+      const column = row % columns;
+      sizes[column] = Math.max(sizes[column], measureLabel(text));
+    });
+    let gutter = padding;
+    const starts = sizes.map((size) => {
+      const x = gutter;
+      gutter += size + padding;
+      return x;
+    });
+    if (gutter <= budget) return { width: gutter, labels: labels.map((text, row) => ({ text, x: starts[row % columns] })) };
+  }
+
+  // If compact labels cannot fit at the inherited size, use one fitted column.
+  const labels = variants[0];
+  const widest = Math.max(...labels.map(measureLabel));
+  const padding = Math.min(gap, budget / 4);
+  const scale = Math.min(rowHeight / lineHeight, (budget - 2 * padding) / widest);
+  return { width: 2 * padding + widest * scale, fontSize: `${scale}em`, labels: labels.map((text) => ({ text, x: padding })) };
+}
+
 // Shared trend rendering for the workspace and owner analytics views. Charts
 // are dependency-free SVG: the data arrives already bucketed per UTC day.
 export const TREND_METRICS = [
@@ -597,7 +625,10 @@ export function RankList({ rows, label, empty, color = "an-mod" }) {
   );
 }
 
-const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const WEEKDAYS = WEEKDAY_NAMES.map((day) => day.slice(0, 3));
+// Single-letter schedules use U for Sunday and R for Thursday.
+const WEEKDAY_LABELS = [WEEKDAYS, WEEKDAY_NAMES.map((day) => day.slice(0, 2)), ["U", "M", "T", "W", "R", "F", "S"]];
 
 export function heatLevel(value, max) {
   if (!value) return 0;
@@ -616,16 +647,24 @@ export function ActivityHeatmap({ cells }) {
   }));
   const layout = useChartLayout(798);
   const { width, lineHeight, gap: labelGap, measureLabel, ref } = layout;
-  const top = lineHeight + labelGap;
+  const top = Math.min(lineHeight + labelGap, MAX_PLOT_HEIGHT / 3);
   const height = Math.min(MAX_PLOT_HEIGHT, Math.max(167, top + WEEKDAYS.length * (lineHeight + 1) + labelGap));
-  const rowHeight = (height - top - labelGap) / WEEKDAYS.length;
-  // Stagger labels horizontally when the cap leaves less than one line per row.
-  const weekdayColumns = Math.ceil(lineHeight / rowHeight);
-  const weekdayColumnWidth = Math.max(...WEEKDAYS.map(measureLabel)) + labelGap;
-  const left = weekdayColumns * weekdayColumnWidth + labelGap;
-  const slot = Math.max(1, width - left) / 24;
+  const bottom = Math.min(height / 4, Math.max(labelGap, lineHeight / 2));
+  const rowHeight = (height - top - bottom) / WEEKDAYS.length;
+  const weekdays = staggeredRowLabels(layout, rowHeight, WEEKDAY_LABELS);
+  const left = weekdays.width;
+  const plotWidth = width - left;
+  const slot = plotWidth / 24;
   const gap = Math.min(2, slot / 4);
   const hourLabel = (hour) => `${String(hour).padStart(2, "0")}:00`;
+  const hourScale = Math.min(1, (top - 2) / lineHeight);
+  const measureHour = (text) => Math.ceil(measureLabel(text) * hourScale);
+  const hourGap = Math.min(labelGap, plotWidth / 12);
+  const shortHours = measureHour("00:00") + measureHour("18:00") + hourGap + 2 > plotWidth;
+  // Keep the first and last labeled hours when intermediate ticks would collide.
+  const hourTicks = layoutTicks({ width: plotWidth, gap: hourGap, measureLabel: measureHour }, [0, 18, 6, 12].map((hour) => ({
+    key: hour, x: hour * slot, text: shortHours ? hourLabel(hour).slice(0, 2) : hourLabel(hour),
+  })), 1).sort((first, second) => first.key - second.key);
   const summary = peak
     ? `Busiest hour: ${WEEKDAYS[peak.weekday]} ${hourLabel(peak.hour)} UTC with ${formatExact(peak.count)} actions.`
     : "No enforcement actions in this range.";
@@ -635,10 +674,14 @@ export function ActivityHeatmap({ cells }) {
     h(ChartReadout, { id: "an-heatmap-readout" }, active ? `${WEEKDAYS[active.weekday]} ${hourLabel(active.hour)} UTC: ${formatExact(active.count)} actions` : summary),
     h(
       ChartPlot,
-      { ref, height, className: "an-heatmap", role: "img", "aria-label": `Enforcement actions by weekday and UTC hour. ${summary}`, "aria-describedby": "an-heatmap-readout", onMouseLeave: () => setActive(null) },
-      ...horizontalTicks(layout, [0, 6, 12, 18].map((hour) => ({ key: `h${hour}`, x: left + hour * slot, text: hourLabel(hour) })), lineHeight / 2 + 2),
-      ...WEEKDAYS.map((day, weekday) => axisText(day, { key: day, className: "an-axis-day",
-        x: labelGap / 2 + (weekday % weekdayColumns) * weekdayColumnWidth, y: top + (weekday + 0.5) * rowHeight })),
+      { ref, height, className: "an-heatmap", role: "img", "aria-label": `Enforcement actions by weekday and UTC hour. Rows run Sunday through Saturday. ${summary}`, "aria-describedby": "an-heatmap-readout", onMouseLeave: () => setActive(null) },
+      ...hourTicks.map(({ key, text, x }) => axisText(text, { key: `h${key}`, className: "an-axis-day", x: left + x, y: top / 2,
+        fontSize: hourScale < 1 ? `${hourScale}em` : undefined })),
+      ...weekdays.labels.map(({ text, x }, weekday) => h("g", { key: WEEKDAYS[weekday] },
+        h("title", {}, WEEKDAY_NAMES[weekday]),
+        axisText(text, { className: "an-axis-day", x, y: top + (weekday + 0.5) * rowHeight,
+          fontSize: weekdays.fontSize, "aria-label": WEEKDAY_NAMES[weekday] }),
+      )),
       ...grid.flatMap((row, weekday) =>
         row.map((count, hour) =>
           h(
