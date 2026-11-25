@@ -1773,6 +1773,9 @@ async fn queued_eta_is_anchored_then_becomes_unknown_without_progress() {
         .unwrap();
     assert_eq!(first_status.status, "queued");
     let finish = first_status.phase_finish_at.unwrap();
+    // Ten remaining data pages and a terminal request share the 15s pace
+    // across three active guilds after the next request becomes due.
+    assert_eq!(finish, 16_001 + 11 * 45_000);
     let later = store
         .member_sync_status(scope.clone(), 42, 10_001)
         .await
@@ -4668,6 +4671,124 @@ async fn version_ten_upgrade_preserves_existing_run_and_marks_old_phase_counts_u
         .await
         .unwrap();
     assert_eq!(version, VERSION);
+}
+
+#[tokio::test]
+async fn legacy_case_backfill_retains_only_confirmed_bans() {
+    let (_f, store, scope) = ready().await;
+    complete_for_checks(&store, &scope).await;
+
+    for (user_id, outcome) in [
+        (81, CaseOutcome::Failed),
+        (82, CaseOutcome::Uncertain),
+        (83, CaseOutcome::Attempted),
+        (84, CaseOutcome::Succeeded),
+    ] {
+        let case_id = CaseId::new();
+        store
+            .record_case(
+                scope.clone(),
+                case_id.clone(),
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::Application {
+                        operation_id: CaseId::new(),
+                    },
+                    action: CaseAction::Ban,
+                    outcome,
+                    subject_id: user_id,
+                    actor_id: Some(42),
+                    occurred_at_ms: 4_000,
+                    reason: None,
+                    evidence: CaseEvidence::Unavailable,
+                },
+                CaseLimits::default(),
+            )
+            .await
+            .unwrap();
+        // Recreate the missing projection of a legacy case after the live insert.
+        store
+            .remove_case_index_for_test(scope.clone(), case_id)
+            .await
+            .unwrap();
+    }
+    // Remove the row made by the live trigger before recording the departures.
+    let enrollment_id = scope.enrollment.id.clone();
+    store
+        .db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "DELETE FROM guild_member_directory WHERE guild_id=10 AND enrollment_id=?1 AND user_id=84",
+                params![enrollment_id.as_str()],
+                65_536,
+            )
+        })
+        .await
+        .unwrap();
+    for user_id in 81..=84 {
+        store
+            .observe_member(scope.clone(), observed(user_id, Some(500), 2_000))
+            .await
+            .unwrap();
+        store
+            .depart_member(scope.clone(), user_id, 3_000)
+            .await
+            .unwrap();
+    }
+    let confirmed_departure = store.get_member(scope.clone(), 84).await.unwrap().unwrap();
+    assert!(!confirmed_departure.is_current && !confirmed_departure.ever_banned);
+
+    assert!(
+        store
+            .backfill_member_case_index(scope.clone(), 42, 100)
+            .await
+            .unwrap()
+    );
+    for user_id in 81..=84 {
+        let (entries, _) = store
+            .member_case_entries(scope.clone(), user_id, 8, CaseLimits::default())
+            .await
+            .expect("backfill must make the legacy case readable");
+        assert_eq!(
+            entries.len(),
+            1,
+            "backfill must restore each case projection"
+        );
+    }
+    for user_id in 81..=83 {
+        let member = store
+            .get_member(scope.clone(), user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!member.ever_banned, "backfill retained an unconfirmed ban");
+    }
+    let confirmed_departure = store.get_member(scope.clone(), 84).await.unwrap().unwrap();
+    assert!(
+        confirmed_departure.ever_banned,
+        "backfill must retain the confirmed departure"
+    );
+    // All three ordinary departures remain eligible, including at the same
+    // time as the confirmed historic ban, which is retained.
+    for _ in 0..3 {
+        let candidate = store
+            .next_member_cleanup_candidate(scope.clone(), 303_000)
+            .await
+            .unwrap()
+            .expect("ordinary departure remains eligible for cleanup");
+        assert!((81..=83).contains(&candidate.user_id));
+        store
+            .settle_member_cleanup(scope.clone(), candidate, false, 303_001)
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .next_member_cleanup_candidate(scope, 303_001)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
