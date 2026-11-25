@@ -845,11 +845,26 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
   const axisFontSize = axisScale < 1 ? `${axisScale}em` : undefined;
   const axisGap = Math.ceil(gap * axisScale);
   const measureAxisLabel = (text) => Math.ceil(measureLabel(text) * axisScale);
-  const padLeft = Math.max(...ticks.map((value) => measureAxisLabel(format(value)))) + 2 * axisGap;
   const padRight = axisGap;
+  const dates = [utcClock(from, withDay), utcClock(to, withDay)].map((text) => ({
+    text, shortText: withDay ? text.slice(0, -6) : undefined,
+  }));
+  const valueWidth = Math.max(...ticks.map((value) => measureAxisLabel(format(value))));
+  let fittedWidth = valueWidth;
+  if (valueWidth + 2 * axisGap >= width - padRight) {
+    // Make room for data. The compact start date can extend left of its
+    // tick, or center on it when the plot starts too far left.
+    const startDate = dates[0];
+    const dateWidth = measureAxisLabel(startDate.shortText ?? startDate.text);
+    const plotStartLimit = width - padRight - 2 * axisGap;
+    const dateAnchorLimit = dateWidth <= plotStartLimit ? plotStartLimit : width - Math.ceil(dateWidth / 2);
+    fittedWidth = Math.max(1, Math.min(plotStartLimit, dateAnchorLimit) - 2 * axisGap);
+  }
+  const valueScale = axisScale * Math.min(1, fittedWidth / valueWidth);
+  const valueFontSize = valueScale < 1 ? `${valueScale}em` : undefined;
+  const padLeft = fittedWidth + 2 * axisGap;
   const innerWidth = Math.max(1, width - padLeft - padRight);
-  const dates = [utcClock(from, withDay), utcClock(to, withDay)];
-  const dateTicks = dates.map((text, i) => ({ key: i, text, shortText: withDay ? text.slice(0, -6) : undefined,
+  const dateTicks = dates.map((date, i) => ({ key: i, ...date,
     x: i === 0 ? padLeft : width - padRight, anchor: i === 0 ? "start" : "end" }));
   // Large text and a wide value axis can leave room for only one date per row.
   const dateLabels = horizontalTickLayout({ width, gap: axisGap, measureLabel: measureAxisLabel }, dateTicks, maxDateRows);
@@ -886,7 +901,7 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
       ...ticks.map((value) =>
         h("g", { key: `g${value}`, className: "an-gridline" },
           h("line", { x1: padLeft, x2: width - padRight, y1: y(value).toFixed(1), y2: y(value).toFixed(1) }),
-          axisText(format(value), { x: padLeft - axisGap, y: y(value), textAnchor: "end", fontSize: axisFontSize }),
+          axisText(format(value), { x: padLeft - axisGap, y: y(value), textAnchor: "end", fontSize: valueFontSize }),
         ),
       ),
       ...lines.flatMap((line) =>
