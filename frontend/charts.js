@@ -107,19 +107,26 @@ function fitEndpointPair(layout, first, last) {
   return [];
 }
 
-function horizontalTicks(layout, labels, { y, axisY, origin = 0, className = "an-axis-day", fontSize }) {
+function horizontalTickLayout(layout, labels, rows = 1) {
   const first = labels[0];
   const last = labels.at(-1);
   const interior = labels.slice(1, -1).reverse();
   const endpoints = labels.length > 1 ? fitEndpointPair(layout, first, last) : [];
-  const priority = endpoints.length ? interior : labels.length > 1 ? [last, first, ...interior] : labels;
-  const ticks = layoutTicks(layout, priority, 1, endpoints);
+  const priority = endpoints.length ? interior : labels.length > 1 && rows === 1 ? [last, first, ...interior] : labels;
+  return layoutTicks(layout, priority, rows, endpoints).sort((a, b) => a.x - b.x);
+}
+
+function renderHorizontalTicks(ticks, { y, axisY, origin = 0, className = "an-axis-day", fontSize, rowStep = 0 }) {
   const tickEnd = axisY + (y < axisY ? -3 : 3);
-  return ticks.sort((a, b) => a.x - b.x).map(({ key, text, x, anchor }) =>
+  return ticks.map(({ key, text, x, anchor, row }) =>
     h("g", { key },
       h("line", { className: "chart-axis-tick", x1: origin + x, x2: origin + x, y1: axisY, y2: tickEnd }),
-      axisText(text, { className, x: origin + x, y, textAnchor: anchor, fontSize }),
+      axisText(text, { className, x: origin + x, y: y + row * rowStep, textAnchor: anchor, fontSize }),
     ));
+}
+
+function horizontalTicks(layout, labels, options) {
+  return renderHorizontalTicks(horizontalTickLayout(layout, labels), options);
 }
 
 function staggeredRowLabels({ width, lineHeight, gap, measureLabel }, rowHeight, variants) {
@@ -808,7 +815,7 @@ function utcClock(seconds, withDay) {
 export function ResourceChart({ points, series, max, format, label, from, to }) {
   const layout = useChartLayout(480);
   const { width, lineHeight, gap, measureLabel, ref } = layout;
-  const height = Math.min(MAX_PLOT_HEIGHT, Math.max(120, 4 * lineHeight));
+  const height = Math.min(MAX_PLOT_HEIGHT, Math.max(120, 5 * lineHeight));
   const lines = series.map((line) => ({ ...line, values: points.map((point) => {
     const value = line.value(point);
     return value == null || !Number.isFinite(value) ? null : value;
@@ -829,10 +836,13 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
   const padRight = gap;
   const inset = lineHeight / 2 + 2;
   const innerWidth = Math.max(1, width - padLeft - padRight);
-  const innerHeight = Math.max(1, height - 2 * inset - lineHeight - gap);
   const dates = [utcClock(from, withDay), utcClock(to, withDay)];
   const dateTicks = dates.map((text, i) => ({ key: i, text, shortText: withDay ? text.slice(0, -6) : undefined,
     x: i === 0 ? padLeft : width - padRight, anchor: i === 0 ? "start" : "end" }));
+  // Large text and a wide value axis can leave room for only one date per row.
+  const dateLabels = horizontalTickLayout(layout, dateTicks, 2);
+  const extraDateSpace = dateLabels.some(({ row }) => row === 1) ? lineHeight : 0;
+  const innerHeight = Math.max(1, height - 2 * inset - lineHeight - gap - extraDateSpace);
   const count = points.length;
   const x = (index) => padLeft + (count <= 1 ? innerWidth / 2 : (index * innerWidth) / (count - 1));
   const y = (value) => inset + innerHeight - Math.min(1, Math.max(0, value / top)) * innerHeight;
@@ -874,7 +884,7 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
             : h("polyline", { key: `${line.key}-${i}`, className: `br-line ${line.tone}`, points: run.map(([index, value]) => `${x(index).toFixed(1)},${y(value).toFixed(1)}`).join(" ") }),
         ),
       ),
-      ...horizontalTicks(layout, dateTicks, { y: height - inset, axisY: y(0) }),
+      ...renderHorizontalTicks(dateLabels, { y: height - inset - extraDateSpace, axisY: y(0), rowStep: lineHeight }),
     ),
     lines.length > 1 &&
       h(
