@@ -8,7 +8,9 @@ import { spawnSync } from "node:child_process";
 const root = path.resolve(import.meta.dirname, "..");
 const workflow = fs.readFileSync(path.join(root, ".github/workflows/ci.yml"), "utf8");
 const publication = fs.readFileSync(path.join(root, ".github/workflows/publish.yml"), "utf8");
-const combined = workflow + "\n" + publication.replace(/^  ci:\n[\s\S]*?(?=^  release:)/m, "");
+const publishValidate = publication.match(/^  ci:\n([\s\S]*?)(?=^  release:)/m);
+assert.ok(publishValidate, "missing Publish validation job");
+const combined = workflow + "\n" + publication.replace(publishValidate[0], "");
 const jobs = new Map([...combined.matchAll(/^  ([a-z][a-z-]*):\n([\s\S]*?)(?=^  [a-z][a-z-]*:\n|$(?![\s\S]))/gm)]
   .map(match => [match[1], match[2]]));
 for (const name of ["plan", "checks", "ci", "release", "prepare-publication", "publish-build", "publish-promote"]) {
@@ -159,6 +161,25 @@ function binding(job, key, context) {
   const match = job.match(new RegExp(`^ +${key}: \\$\\{\\{ (.+) \\}\\}$`, "m"));
   assert.ok(match, "missing workflow binding: " + key);
   return expression(match[1], context);
+}
+// Reusable CI receives the Publish caller's original event context.
+const scheduledPublish = {
+  github: {
+    repository: "jatmn/jModGuard", event: { repository: { private: false } },
+    event_name: "schedule", ref: "refs/heads/main",
+  },
+};
+assert.match(publication, /^  schedule:\n    - cron:/m);
+assert.match(publishValidate[1], /^    uses: \.\/\.github\/workflows\/ci\.yml$/m);
+assert.equal(condition(publishValidate[1], scheduledPublish), true, "scheduled Publish must validate");
+const checksEnv = jobs.get("checks").match(/^    env:\n((?:      [^\n]+\n)+)/m)?.[1];
+assert.ok(checksEnv, "Checks must set the audit mode for its steps");
+assert.equal(binding(checksEnv, "JMODGUARD_AUDIT_FAIL_CLOSED", scheduledPublish), "1",
+  "Nightly must fail closed on Cargo advisories");
+for (const event_name of ["pull_request", "push"]) {
+  const context = { github: { ...scheduledPublish.github, event_name } };
+  assert.equal(binding(checksEnv, "JMODGUARD_AUDIT_FAIL_CLOSED", context), "0",
+    `${event_name} Cargo advisories must remain non-blocking`);
 }
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: "utf8", ...options });
