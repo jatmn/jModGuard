@@ -32,6 +32,7 @@ pub mod image_spam;
 pub mod known_spam;
 pub mod log_embeds;
 pub mod normalize;
+pub mod onboarding_trap;
 mod remote_https;
 pub mod templates;
 pub mod text_spam;

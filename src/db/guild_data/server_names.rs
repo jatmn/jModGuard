@@ -39,14 +39,39 @@ pub struct ServerChannelName {
     pub position: i64,
 }
 
+/// Gateway observations for onboarding setup. They are display-only and may
+/// lag Discord. Unknown bot permissions are distinct from a known denial.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OnboardingTrapSetup {
+    pub bot_can_kick: Option<bool>,
+    pub roles_at_or_above_bot: Vec<String>,
+    pub roles_with_grants: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles_with_member_grants: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ServerNames {
     pub roles: Vec<ServerRoleName>,
     pub channels: Vec<ServerChannelName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboarding_trap: Option<OnboardingTrapSetup>,
     /// When the bot last changed this snapshot; None before its first one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at_ms: Option<i64>,
+}
+
+fn read_names_row(
+    tx: &impl SqlExecutor,
+    scope: &GuildDataScope,
+) -> Result<Option<(String, Option<String>, i64)>> {
+    tx.query_row(
+        "SELECT names, onboarding_trap, observed_at_ms FROM guild_server_names
+         WHERE guild_id=?1 AND enrollment_id=?2",
+        params![scope.guild_id(), scope.enrollment.id.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
 }
 
 fn snowflake(id: &str) -> bool {
@@ -90,6 +115,19 @@ impl ServerNames {
         });
         self.roles.dedup_by(|a, b| a.id == b.id);
         self.roles.truncate(SERVER_NAME_ROLE_LIMIT);
+        if let Some(setup) = self.onboarding_trap.as_mut() {
+            let retained: std::collections::HashSet<_> =
+                self.roles.iter().map(|role| role.id.as_str()).collect();
+            for ids in [
+                &mut setup.roles_at_or_above_bot,
+                &mut setup.roles_with_grants,
+                &mut setup.roles_with_member_grants,
+            ] {
+                ids.retain(|id| retained.contains(id.as_str()));
+                ids.sort_unstable();
+                ids.dedup();
+            }
+        }
         self.channels.sort_by(|a, b| {
             a.position
                 .cmp(&b.position)
@@ -113,7 +151,13 @@ impl GuildDataStore {
     ) -> Result<bool> {
         self.check_target(&scope.placement)?;
         anyhow::ensure!(observed_at_ms > 0, TenantDataError::Setting);
-        let encoded = serde_json::to_string(&names.normalized()?)?;
+        let mut names = names.normalized()?;
+        let setup = names
+            .onboarding_trap
+            .take()
+            .map(|setup| serde_json::to_string(&setup))
+            .transpose()?;
+        let encoded = serde_json::to_string(&names)?;
         anyhow::ensure!(encoded.len() <= NAMES_MAX_BYTES, TenantDataError::Setting);
         self.refuse_fenced_guild_write(scope.guild_id()).await?;
         let expected = self.expected.clone();
@@ -121,29 +165,45 @@ impl GuildDataStore {
             .with_conn(move |conn| {
                 let mut tx = conn.transaction_primary_write()?;
                 verify_scope(&tx, &expected, &scope, true)?;
-                let existing = tx
-                    .query_row(
-                        "SELECT names FROM guild_server_names WHERE guild_id=?1 AND enrollment_id=?2",
-                        params![scope.guild_id(), scope.enrollment.id.as_str()],
-                        |r| Ok(r.get::<String>(0)?),
-                    )
-                    .optional()?;
-                if existing.as_deref() == Some(encoded.as_str()) {
+                let existing = read_names_row(&tx, &scope)?;
+                if existing
+                    .as_ref()
+                    .is_some_and(|(stored, stored_setup, observed)| {
+                        *observed > observed_at_ms || (stored == &encoded && stored_setup == &setup)
+                    })
+                {
                     tx.finish_read()?;
                     return Ok(false);
                 }
                 tx.ensure_mutation_receipt()?;
                 tx.execute_rows(
-                    "INSERT INTO guild_server_names(guild_id,enrollment_id,names,observed_at_ms) VALUES(?1,?2,?3,?4)
-                     ON CONFLICT(guild_id) DO UPDATE SET names=excluded.names,observed_at_ms=excluded.observed_at_ms",
+                    "INSERT INTO guild_server_names(guild_id,enrollment_id,names,observed_at_ms)
+                     VALUES(?1,?2,?3,?4)
+                     ON CONFLICT(guild_id) DO UPDATE SET names=excluded.names,
+                       observed_at_ms=excluded.observed_at_ms
+                     WHERE guild_server_names.enrollment_id=excluded.enrollment_id
+                       AND guild_server_names.observed_at_ms<=excluded.observed_at_ms",
                     params![
                         scope.guild_id(),
                         scope.enrollment.id.as_str(),
                         encoded,
-                        observed_at_ms
+                        observed_at_ms,
                     ],
                     1,
                 )?;
+                if let Some(setup) = setup {
+                    tx.execute_rows(
+                        "UPDATE guild_server_names SET onboarding_trap=?3
+                         WHERE guild_id=?1 AND enrollment_id=?2 AND observed_at_ms=?4",
+                        params![
+                            scope.guild_id(),
+                            scope.enrollment.id.as_str(),
+                            setup,
+                            observed_at_ms
+                        ],
+                        1,
+                    )?;
+                }
                 tx.commit()?;
                 Ok(true)
             })
@@ -159,19 +219,17 @@ impl GuildDataStore {
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
-                let row = tx
-                    .query_row(
-                        "SELECT names,observed_at_ms FROM guild_server_names WHERE guild_id=?1 AND enrollment_id=?2",
-                        params![scope.guild_id(), scope.enrollment.id.as_str()],
-                        |r| Ok((r.get::<String>(0)?, r.get::<i64>(1)?)),
-                    )
-                    .optional()?;
+                let row = read_names_row(&tx, &scope)?;
                 tx.finish_read()?;
                 Ok(match row {
-                    Some((names, observed_at_ms)) => ServerNames {
-                        observed_at_ms: Some(observed_at_ms),
-                        ..serde_json::from_str(&names)?
-                    },
+                    Some((names, setup, observed_at_ms)) => {
+                        let mut names: ServerNames = serde_json::from_str(&names)?;
+                        names.observed_at_ms = Some(observed_at_ms);
+                        if let Some(setup) = setup {
+                            names.onboarding_trap = Some(serde_json::from_str(&setup)?);
+                        }
+                        names
+                    }
                     None => ServerNames::default(),
                 })
             })

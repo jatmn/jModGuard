@@ -2977,6 +2977,104 @@ async fn rule_save_legacy_ack_omits_custom_patch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn onboarding_trap_bot_and_dashboard_saves_compare_the_same_base() {
+    use db::SqlExecutor;
+    let mut f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let bot = f.attach_save_writer().await;
+    let id = jmodguard::onboarding_trap::RULE_ID;
+    let path = format!("/api/guilds/10/rules/{id}");
+    let mut rule = db::get_rule(&bot.db, 0, id).await.unwrap().unwrap();
+    let role = (1_u64 << 60) + 3;
+    rule.params["role_id"] = serde_json::json!(role);
+    let legacy = serde_json::to_string(&rule).unwrap();
+    bot.db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO rules(guild_id,rule_id,data) VALUES(10,?1,?2)",
+                db::params![id, legacy],
+                65536,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let (status, response) = f.request("GET", &path, "").await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let before: crate::types::RuleDef =
+        serde_json::from_value(response["effective"].clone()).unwrap();
+    assert_eq!(
+        before.params["role_id"].as_str(),
+        Some(role.to_string().as_str())
+    );
+    let (status, config) = f.request("POST", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    let listed = config["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rule_id"] == id)
+        .unwrap();
+    assert_eq!(
+        listed["effective"]["params"]["role_id"],
+        before.params["role_id"]
+    );
+
+    let mut slash = before.clone();
+    slash.dry_run = false;
+    let mut dashboard = before.clone();
+    dashboard.params["join_window_minutes"] = serde_json::json!(15);
+    dashboard.params["role_id"] = serde_json::json!(role);
+    let payload =
+        serde_json::json!({"scope":"guild","data":dashboard,"expected":before}).to_string();
+    let (bot_save, (api_status, api_save)) = tokio::join!(
+        db::compare_and_set_onboarding_trap(&bot.db, 10, None, &before, &slash),
+        f.request("PUT", &path, &payload),
+    );
+    assert_ne!(
+        bot_save.is_ok(),
+        api_status == StatusCode::OK,
+        "{bot_save:?} {api_save}"
+    );
+    let saved = db::get_rule(&bot.db, 10, id).await.unwrap().unwrap();
+    assert_eq!(saved.params["role_id"], before.params["role_id"]);
+    if bot_save.is_ok() {
+        assert!(!saved.dry_run);
+        assert_eq!(saved.params["join_window_minutes"], 30);
+        assert!(
+            api_save.to_string().contains("Reload the rule"),
+            "{api_save}"
+        );
+    } else {
+        assert!(saved.dry_run);
+        assert_eq!(saved.params["join_window_minutes"], 15);
+        assert_eq!(
+            api_save["config_patch"]["value"]["params"]["role_id"],
+            before.params["role_id"]
+        );
+    }
+
+    // A fresh dashboard edit carries forward whichever change already won.
+    let mut replacement = saved.clone();
+    replacement.params["join_window_minutes"] = serde_json::json!(12);
+    replacement.params["role_id"] = serde_json::json!(role);
+    let payload =
+        serde_json::json!({"scope":"guild","data":replacement,"expected":saved}).to_string();
+    let (status, reply) = f.request("PUT", &path, &payload).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["config_patch"]["value"]["dry_run"], saved.dry_run);
+    assert_eq!(
+        reply["config_patch"]["value"]["params"]["role_id"],
+        before.params["role_id"]
+    );
+    assert_eq!(
+        db::get_rule(&bot.db, 10, id).await.unwrap().unwrap().params["role_id"],
+        before.params["role_id"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn invite_description_save_patch_uses_canonical_rule() {
     use db::SqlExecutor;
     const OLD: &str =
@@ -9730,6 +9828,12 @@ async fn server_names_serve_the_bot_snapshot_with_string_ids_and_no_discord_call
             position: 0,
         }],
         observed_at_ms: None,
+        onboarding_trap: Some(db::guild_data::OnboardingTrapSetup {
+            bot_can_kick: Some(false),
+            roles_at_or_above_bot: vec!["9007199254740993".into()],
+            roles_with_grants: vec!["9007199254740993".into()],
+            roles_with_member_grants: vec!["9007199254740993".into()],
+        }),
     };
     assert!(
         store
@@ -9749,6 +9853,12 @@ async fn server_names_serve_the_bot_snapshot_with_string_ids_and_no_discord_call
                 "roles": [{"id": "9007199254740993", "name": "Moderators", "color": 3447003, "position": 3, "managed": false}],
                 "channels": [{"id": "9007199254740995", "name": "general", "kind": "text", "parent_id": null, "position": 0}],
                 "observed_at_ms": 1700,
+                "onboarding_trap": {
+                    "bot_can_kick": false,
+                    "roles_at_or_above_bot": ["9007199254740993"],
+                    "roles_with_grants": ["9007199254740993"],
+                    "roles_with_member_grants": ["9007199254740993"],
+                },
                 "media_preset_channel_kinds": ["text", "announcement", "voice", "stage"],
             })
         );

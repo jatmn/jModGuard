@@ -188,7 +188,7 @@ async fn version_six_upgrade_preserves_ownership_and_rolls_back_failed_extension
     .unwrap();
     raw.execute_batch_bounded("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", 64 * 1024 * 1024).unwrap();
     raw.execute_bounded(
-        "INSERT INTO guild_cases VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,'discord:1',?2,0)",
+        "INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,'discord:1',?2,0)",
         params![case.as_str(), serde_json::to_string(&data(1)).unwrap()],
         64 * 1024 * 1024,
     )

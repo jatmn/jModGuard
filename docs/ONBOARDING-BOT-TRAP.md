@@ -1,0 +1,65 @@
+# Onboarding bot trap
+
+The trap catches members who select a decoy role in Discord Onboarding. It
+starts disabled. When enabled, it checks whether the configured role arrived
+with a join or was added in a member update. Moderators, administrators and the
+server owner are always exempt.
+
+Kick is the available moderation action. Recent-message cleanup and role removal
+are follow-up work in #786.
+
+## Create the Anti-bot role
+
+1. In Discord, open **Server Settings → Roles** and create **Anti-bot**.
+2. Give the role zero server permissions. Check category and channel permission
+   overrides, and leave the role without access grants. The setup check also
+   reports individual channel grants for members with the role that the bot
+   has seen. Review any member-specific grants in Discord.
+3. Move **Anti-bot** below jModGuard's highest role. Give jModGuard **Kick
+   Members**. jModGuard must also outrank the members it kicks.
+
+## Add the onboarding question
+
+1. Open **Server Settings → Onboarding → Questions**.
+2. Add **Do not select this role - You will be kicked**.
+3. Add a single answer named **Anti-bot role** with the description **Selecting
+   this will prevent you from joining**. Set the answer to grant **Anti-bot**.
+4. Turn on **Ask before a member joins** and **Allow multiple answers**. Leave
+   **Make Required** off. Members can skip the question, while bots that choose
+   every option will take the decoy role.
+5. Publish the onboarding changes.
+
+See the [Discord Community Onboarding FAQ](https://support.discord.com/hc/en-us/articles/11074987197975-Community-Onboarding-FAQ)
+for the Community server setup and preview requirements.
+
+## Configure and test the trap
+
+1. In jModGuard's **Log channels** tab, set **Member kick** and **Automod** to
+   staff-only channels. These logs show the kick case and the rule match.
+2. Open **Automod → Onboarding bot trap** and choose **Anti-bot**. Review the
+   kick action and reason. The default reason is
+   `[Automod] Kicked for suspected bot (onboarding)`. Turn off any existing
+   custom Honeypot role rule for **Anti-bot** so only one rule handles it.
+3. Keep **Dry-run (log only)** selected, turn on **Enabled**, and save. The
+   default join window is 30 minutes. Set it to 0 to check role grants at any
+   time. Keeping a window helps protect members from accidental later grants.
+4. In **Server Settings → Onboarding**, use **Preview** to view the server as
+   a new member. Then join with a test account that has ordinary member
+   permissions and select the decoy answer. Confirm the dry-run entry in
+   **Automod**. Dry-run leaves the account in the server and creates no case.
+5. Turn off dry-run and save. Rejoin with the test account and select the decoy
+   again. Confirm the kick, the **Member kicked** log and the **Automod** entry.
+   Find the kick case in the private dashboard **Cases** page and check its
+   outcome and reason. Trap cases stay out of member histories and Discord
+   `userinfo` case summaries.
+
+## Troubleshooting
+
+- If the kick fails, check **Kick Members** and move jModGuard's highest role
+  above the trap role and the test account's highest role.
+- Keep the role exclusive to the onboarding answer. Check reaction roles,
+  other bots and manual grants. A grant inside the configured join window can
+  trigger the trap regardless of who applied it.
+- If the trap is quiet, verify the saved role and join window, the test account's
+  permissions and the configured log channels.
+- If you share screenshots of your setup, redact real server, role and user IDs.

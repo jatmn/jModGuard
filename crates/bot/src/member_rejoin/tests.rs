@@ -641,10 +641,12 @@ fn rejected_departure_keeps_rejoin_delivery_guard() {
 #[test]
 fn guild_member_addition_retries_rejoin_without_double_posting() {
     let source = include_str!("../handlers.rs");
-    let start = source
-        .find("async fn guild_member_addition")
+    let (_, additions) = source
+        .split_once("async fn guild_member_addition")
         .expect("guild_member_addition");
-    let body = &source[start..start + 3_200];
+    let (body, _) = additions
+        .split_once("async fn guild_member_removal")
+        .expect("guild_member_removal");
     let reserve = body
         .find("begin_in_flight")
         .expect("join handler must reserve rejoin delivery");

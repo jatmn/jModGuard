@@ -435,7 +435,7 @@ async fn raw_sql_guards_protect_sources_and_rollback_parent_insert() {
             "INSERT INTO guild_case_sources SELECT guild_id,enrollment_id,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',source_key,source_kind FROM guild_case_sources",
             "INSERT INTO guild_case_sources SELECT guild_id,enrollment_id,case_id,'discord:2',0 FROM guild_case_sources LIMIT 1",
             "INSERT INTO guild_case_sources SELECT guild_id,enrollment_id,case_id,'discord:01',1 FROM guild_case_sources LIMIT 1",
-            "INSERT INTO guild_cases SELECT guild_id,enrollment_id,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',s.source_key,'{}',0 FROM guild_case_sources s WHERE source_kind=0",
+            "INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) SELECT guild_id,enrollment_id,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',s.source_key,'{}',0 FROM guild_case_sources s WHERE source_kind=0",
         ] { assert!(c.execute_batch_bounded(sql, 64 * 1024 * 1024).is_err(), "accepted {sql}"); }
         assert_eq!(c.query_row("SELECT COUNT(*) FROM guild_cases", (), |r| Ok(r.get::<i64>(0)?))?, 1);
         c.execute_batch_bounded("CREATE TRIGGER refuse_source BEFORE INSERT ON guild_case_sources BEGIN SELECT RAISE(ABORT,'retain'); END", 64 * 1024 * 1024)?;
@@ -493,7 +493,7 @@ async fn version_four_upgrade_indexes_live_removed_and_closed_cases() {
         raw.execute_batch_bounded("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", 64 * 1024 * 1024).unwrap();
         for (n, id) in ids.iter().enumerate() {
             raw.execute_bounded(
-                "INSERT INTO guild_cases VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,?2,?3,0)",
+                "INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,?2,?3,0)",
                 params![
                     id.as_str(),
                     audit(n as i64 + 1).key().unwrap(),

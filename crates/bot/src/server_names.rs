@@ -3,11 +3,13 @@
 //! never affects live moderation. Each refresh stores the whole snapshot again, so a missed
 //! event heals on the next role or channel change or Gateway reconnect.
 
-use crate::db::guild_data::{ServerChannelName, ServerNames, ServerRoleName};
+use crate::db::guild_data::{OnboardingTrapSetup, ServerChannelName, ServerNames, ServerRoleName};
 use crate::state::BotState;
 use serenity::model::{
-    channel::{ChannelType, GuildChannel},
-    guild::Role,
+    channel::{ChannelType, GuildChannel, PermissionOverwriteType},
+    guild::{Guild, Role},
+    id::{RoleId, UserId},
+    permissions::Permissions,
 };
 use serenity::prelude::Context;
 use std::collections::HashMap;
@@ -55,6 +57,91 @@ pub fn snapshot<'a>(
             })
             .collect(),
         observed_at_ms: None,
+        onboarding_trap: None,
+    }
+}
+
+fn onboarding_setup(guild: &Guild, bot_id: UserId) -> OnboardingTrapSetup {
+    let bot_permissions = guild.members.get(&bot_id).and_then(|bot| {
+        let everyone = guild.roles.get(&RoleId::new(guild.id.get()))?;
+        let mut permissions = everyone.permissions;
+        let mut top = everyone;
+        for id in &bot.roles {
+            let role = guild.roles.get(id)?;
+            permissions |= role.permissions;
+            if top == everyone || role > top {
+                top = role;
+            }
+        }
+        Some((permissions, top))
+    });
+    let roles_at_or_above_bot = bot_permissions.map_or_else(Vec::new, |(_, top)| {
+        guild
+            .roles
+            .values()
+            .filter(|role| {
+                role.id.get() != guild.id.get() && (top.id.get() == guild.id.get() || *role >= top)
+            })
+            .map(|role| role.id.to_string())
+            .collect()
+    });
+    let mut grants: std::collections::HashSet<RoleId> = guild
+        .roles
+        .values()
+        .filter(|role| !role.permissions.is_empty())
+        .map(|role| role.id)
+        .collect();
+    let mut member_grants = std::collections::HashSet::new();
+    for overwrite in guild
+        .channels
+        .values()
+        .flat_map(|channel| &channel.permission_overwrites)
+    {
+        if overwrite.allow.is_empty() {
+            continue;
+        }
+        match overwrite.kind {
+            PermissionOverwriteType::Role(role) => {
+                grants.insert(role);
+            }
+            PermissionOverwriteType::Member(user) => {
+                if let Some(member) = guild.members.get(&user) {
+                    member_grants.extend(member.roles.iter().copied());
+                }
+            }
+            _ => {}
+        }
+    }
+    OnboardingTrapSetup {
+        bot_can_kick: bot_permissions.map(|(permissions, _)| {
+            guild.owner_id == bot_id
+                || permissions.intersects(Permissions::ADMINISTRATOR | Permissions::KICK_MEMBERS)
+        }),
+        roles_at_or_above_bot,
+        roles_with_grants: grants.into_iter().map(|role| role.to_string()).collect(),
+        roles_with_member_grants: member_grants
+            .into_iter()
+            .map(|role| role.to_string())
+            .collect(),
+    }
+}
+
+pub(crate) fn refresh_for_member_grants(
+    app: &Arc<BotState>,
+    ctx: &Context,
+    guild_id: u64,
+    user_id: UserId,
+) {
+    let affects_setup = ctx.cache.guild(guild_id).is_some_and(|guild| {
+        guild.channels.values().any(|channel| {
+            channel.permission_overwrites.iter().any(|overwrite| {
+                overwrite.kind == PermissionOverwriteType::Member(user_id)
+                    && !overwrite.allow.is_empty()
+            })
+        })
+    });
+    if affects_setup {
+        refresh_from_cache(app, ctx, guild_id);
     }
 }
 
@@ -75,12 +162,14 @@ pub fn refresh_from_cache(app: &Arc<BotState>, ctx: &Context, guild_id: u64) {
     tokio::spawn(async move {
         loop {
             // Owned data is copied before any await.
-            let names = ctx
-                .cache
-                .guild(guild_id)
-                .map(|guild| snapshot(guild.roles.values(), guild.channels.values()));
+            let observed_at_ms = jmodguard::control::now_ms();
+            let names = ctx.cache.guild(guild_id).map(|guild| {
+                let mut names = snapshot(guild.roles.values(), guild.channels.values());
+                names.onboarding_trap = Some(onboarding_setup(&guild, ctx.cache.current_user().id));
+                names
+            });
             if let Some(names) = names {
-                record(&app, guild_id, names).await;
+                record(&app, guild_id, names, observed_at_ms).await;
             }
             if !finish(guild_id) {
                 break;
@@ -123,7 +212,7 @@ fn finish(guild_id: u64) -> bool {
     }
 }
 
-async fn record(app: &BotState, guild_id: u64, names: ServerNames) {
+async fn record(app: &BotState, guild_id: u64, names: ServerNames, observed_at_ms: i64) {
     let Some(enrollment) = crate::cases::capture(app, guild_id).await else {
         return;
     };
@@ -135,7 +224,7 @@ async fn record(app: &BotState, guild_id: u64, names: ServerNames) {
         }
     };
     if let Err(error) = store
-        .replace_server_names(scope, names, jmodguard::control::now_ms())
+        .replace_server_names(scope, names, observed_at_ms)
         .await
     {
         tracing::warn!(guild_id, "server names not saved: {error:#}");
@@ -145,6 +234,94 @@ async fn record(app: &BotState, guild_id: u64, names: ServerNames) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn onboarding_trap_setup_reports_hierarchy_kick_permission_and_role_grants() {
+        use serenity::all::{GuildId, Member, PermissionOverwrite};
+
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(10);
+        let bot_id = UserId::new(3);
+        let everyone = RoleId::new(10);
+        let higher_on_tie = RoleId::new(20);
+        let bot_role = RoleId::new(21);
+        let channel_grant = RoleId::new(22);
+        let server_grant = RoleId::new(23);
+        for (id, position, permissions) in [
+            (everyone, 0, Permissions::empty()),
+            (higher_on_tie, 2, Permissions::empty()),
+            (bot_role, 2, Permissions::empty()),
+            (channel_grant, 1, Permissions::empty()),
+            (server_grant, 1, Permissions::VIEW_CHANNEL),
+        ] {
+            let mut role = Role::default();
+            role.id = id;
+            role.position = position;
+            role.permissions = permissions;
+            guild.roles.insert(id, role);
+        }
+        let mut bot = Member::default();
+        bot.roles = vec![bot_role];
+        guild.members.insert(bot_id, bot);
+        let mut channel = GuildChannel::default();
+        channel.permission_overwrites.push(PermissionOverwrite {
+            allow: Permissions::VIEW_CHANNEL,
+            deny: Permissions::empty(),
+            kind: PermissionOverwriteType::Role(channel_grant),
+        });
+        guild.channels.insert(channel.id, channel);
+
+        let setup = onboarding_setup(&guild, bot_id);
+        assert_eq!(setup.bot_can_kick, Some(false));
+        assert!(
+            setup
+                .roles_at_or_above_bot
+                .contains(&higher_on_tie.to_string())
+        );
+        assert!(
+            !setup
+                .roles_at_or_above_bot
+                .contains(&channel_grant.to_string())
+        );
+        assert!(setup.roles_with_grants.contains(&channel_grant.to_string()));
+        assert!(setup.roles_with_grants.contains(&server_grant.to_string()));
+        assert!(!setup.roles_with_grants.contains(&higher_on_tie.to_string()));
+
+        guild.roles.get_mut(&bot_role).unwrap().permissions = Permissions::ADMINISTRATOR;
+        assert_eq!(onboarding_setup(&guild, bot_id).bot_can_kick, Some(true));
+        guild.roles.remove(&bot_role);
+        assert_eq!(onboarding_setup(&guild, bot_id).bot_can_kick, None);
+    }
+
+    #[test]
+    fn onboarding_trap_separates_member_channel_allows_from_role_grants() {
+        use serenity::all::{Member, PermissionOverwrite};
+
+        let mut guild = Guild::default();
+        let trap = RoleId::new(22);
+        let user = UserId::new(8);
+        let mut member = Member::default();
+        member.roles.push(trap);
+        guild.members.insert(user, member);
+        let mut channel = GuildChannel::default();
+        channel.permission_overwrites.push(PermissionOverwrite {
+            kind: PermissionOverwriteType::Member(user),
+            allow: Permissions::VIEW_CHANNEL,
+            deny: Permissions::empty(),
+        });
+        guild.channels.insert(channel.id, channel);
+
+        let setup = onboarding_setup(&guild, UserId::new(3));
+        assert!(setup.roles_with_grants.is_empty());
+        assert_eq!(setup.roles_with_member_grants, [trap.to_string()]);
+
+        guild.members.get_mut(&user).unwrap().roles.clear();
+        assert!(
+            onboarding_setup(&guild, UserId::new(3))
+                .roles_with_member_grants
+                .is_empty()
+        );
+    }
 
     #[test]
     fn refreshes_coalesce_per_guild_and_repeat_after_a_late_change() {

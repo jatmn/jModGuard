@@ -25,6 +25,7 @@ pub mod member_directory;
 pub mod member_rejoin;
 pub mod member_sync;
 pub mod nickname_worker;
+mod onboarding_trap;
 mod recent_messages;
 pub mod recovery;
 pub mod resources;

@@ -267,6 +267,7 @@ pub async fn update_settings(
 pub struct RuleBody {
     scope: Option<String>,
     data: RuleDef,
+    expected: Option<RuleDef>,
     #[serde(default)]
     clear_guild_override: bool,
     #[serde(default)]
@@ -337,19 +338,27 @@ pub async fn put_rule(
     }
     let write = super::configuration_write_scope(&app, &auth, guild_id, scope)?;
     let (request, target) = write.to_wires();
-    let (_, saved) = app
-        .commit_json_actor(
-            dashboard_actor(&auth),
-            db::ControlOp::UpsertRule {
-                request,
-                target,
-                id: rule_id.clone(),
-                rule: body.data.clone(),
-                clear_guild_override: body.clear_guild_override,
-                replace_velocity_limit: body.replace_velocity_limit,
-            },
-        )
-        .await?;
+    let op = if rule_id == jmodguard::onboarding_trap::RULE_ID {
+        db::ControlOp::SaveOnboardingTrap {
+            scope: target,
+            expected: body.expected.ok_or_else(|| {
+                ApiError(anyhow::anyhow!(
+                    "Reload the dashboard to save the onboarding trap"
+                ))
+            })?,
+            rule: body.data,
+        }
+    } else {
+        db::ControlOp::UpsertRule {
+            request,
+            target,
+            id: rule_id.clone(),
+            rule: body.data,
+            clear_guild_override: body.clear_guild_override,
+            replace_velocity_limit: body.replace_velocity_limit,
+        }
+    };
+    let (_, saved) = app.commit_json_actor(dashboard_actor(&auth), op).await?;
     // Legacy bots acknowledge saves without a rule body. Let the dashboard
     // reload authoritative configuration instead of applying a reset/delete.
     if saved.is_null() {

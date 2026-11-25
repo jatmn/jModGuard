@@ -30,6 +30,7 @@ pub struct AutomodEngine {
     /// (guild, user) -> window history and per-rule strike buckets
     state: DashMap<(u64, u64), AuthorState>,
     member_joins: DashMap<(u64, u64), Instant>,
+    pub(crate) onboarding_matches: crate::onboarding_trap::RecentMatches,
     last_prune: Mutex<AutomodInstant>,
     replies: channel_reply::Replies,
 }
@@ -287,6 +288,7 @@ impl AutomodEngine {
         Self {
             state: DashMap::new(),
             member_joins: DashMap::new(),
+            onboarding_matches: Default::default(),
             last_prune: Mutex::new(AutomodInstant::now()),
             replies: channel_reply::Replies::default(),
         }
@@ -338,6 +340,7 @@ impl AutomodEngine {
         let joined_now = Instant::now();
         self.member_joins
             .retain(|_, t| joined_now.duration_since(*t) < Duration::from_secs(24 * 3600));
+        self.onboarding_matches.prune();
         self.replies.prune(now);
         *self.last_prune.lock() = now;
     }
@@ -878,7 +881,7 @@ async fn automod_try_delete_message(
     }
 }
 
-fn automod_member_blocked(app: &BotState, guild: u64, user: u64, action: &str) -> bool {
+pub(crate) fn automod_member_blocked(app: &BotState, guild: u64, user: u64, action: &str) -> bool {
     automod_member_target(guild, user, action).is_some_and(|target| {
         app.remembered_discord_targets
             .blocked(target, Instant::now())
@@ -901,6 +904,48 @@ fn automod_remember_member_failure(
             Instant::now(),
         );
     }
+}
+
+pub(crate) async fn kick_with_recovery(
+    app: &BotState,
+    http: &serenity::http::Http,
+    guild_id: GuildId,
+    member: &Member,
+    reason: &str,
+) -> Option<serenity::Error> {
+    let guild = guild_id.get();
+    let user = member.user.id.get();
+    let recovery = automod_member_target(guild, user, "kick").map(|target| {
+        app.remembered_discord_targets
+            .capture_recovery_epoch(target)
+    });
+    let result = member.kick_with_reason(http, reason).await;
+    if let (Some(recovery), Err(error)) = (recovery, &result) {
+        automod_remember_member_failure(app, recovery, guild, user, "kick", error);
+    }
+    result.err()
+}
+
+pub(crate) fn action_vars(
+    target: &serenity::model::user::User,
+    display_name: &str,
+    rule_name: &str,
+    rule: &ActionDef,
+    strikes: u32,
+    msg_channel: Option<u64>,
+) -> (std::collections::BTreeMap<String, String>, String) {
+    let mut vars = crate::templates::user_vars(target.id.get(), &target.name, display_name);
+    if let Some(channel) = msg_channel {
+        vars.insert("source_channel_id".into(), channel.to_string());
+    }
+    vars.insert("rule".into(), rule_name.to_owned());
+    vars.insert("action".into(), rule.action.clone());
+    vars.insert("strikes".into(), strikes.to_string());
+    vars.insert("time".into(), chrono::Utc::now().to_rfc3339());
+    let rendered_reason = crate::templates::render(&rule.reason, &vars);
+    let reason = jmodguard::ban_reason::without_tag(&rendered_reason).to_owned();
+    vars.insert("reason".into(), reason.clone());
+    (vars, reason)
 }
 
 /// Executes a decided automod action. Returns true if the action entered the
@@ -1712,33 +1757,16 @@ async fn execute_live<'a>(
                 if automod_member_blocked(app, guild_id.get(), target.id.get(), "kick") {
                     (false, None)
                 } else {
-                    let recovery = automod_member_target(guild_id.get(), target.id.get(), "kick")
-                        .map(|member_target| {
-                            app.remembered_discord_targets
-                                .capture_recovery_epoch(member_target)
-                        });
                     let discord_err = match crate::discord::race_discord_call(
                         &app.activation,
-                        member.kick_with_reason(http, reason),
+                        kick_with_recovery(app, http, guild_id, &member, reason),
                     )
                     .await
                     {
                         crate::discord::DiscordCall::Cancelled => {
                             Some(crate::discord::cutoff_discord_error())
                         }
-                        crate::discord::DiscordCall::Finished(result) => {
-                            if let (Some(recovery), Err(error)) = (recovery, &result) {
-                                automod_remember_member_failure(
-                                    app,
-                                    recovery,
-                                    guild_id.get(),
-                                    target.id.get(),
-                                    "kick",
-                                    error,
-                                );
-                            }
-                            result.err()
-                        }
+                        crate::discord::DiscordCall::Finished(error) => error,
                     };
                     (true, discord_err)
                 }

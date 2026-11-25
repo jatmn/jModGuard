@@ -600,7 +600,7 @@ mod tests {
         db::guild_data::GuildDataStore::create_historical_store(
             guild_options(guild.clone(), false),
             registration.clone(),
-            17,
+            db::guild_data::SCHEMA_VERSION - 1,
         )
         .unwrap();
         let cfg = api_config(&path);
@@ -642,7 +642,7 @@ mod tests {
         );
         assert!(
             !serving.is_finished(),
-            "startup must not exit while the guild store is older than 15"
+            "startup must wait while the guild store is on the previous schema"
         );
         std::thread::spawn(move || {
             db::guild_data::GuildDataStore::initialize(guild_options(guild, false), registration)

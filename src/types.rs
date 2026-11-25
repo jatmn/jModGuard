@@ -41,7 +41,7 @@ pub fn velocity_window_secs(params: &serde_json::Value) -> u64 {
 }
 
 /// All automod rule identifiers (fixed set; per-rule behavior is configurable).
-pub const RULE_IDS: [&str; 9] = [
+pub const RULE_IDS: [&str; 10] = [
     "mention_spam",
     "attachment_flood",
     "repeat_text",
@@ -50,6 +50,7 @@ pub const RULE_IDS: [&str; 9] = [
     "invite",
     "velocity",
     "account_age",
+    crate::onboarding_trap::RULE_ID,
     "known_spam",
 ];
 

@@ -1649,6 +1649,32 @@ fn config_parts_loads_effective_rules() {
 }
 
 #[test]
+fn copying_a_configured_onboarding_trap_requires_a_destination_role() {
+    let tmp = tmp_db_path("copy_onboarding_trap");
+    let db = Db::open(&tmp, 2).unwrap();
+    let id = crate::onboarding_trap::RULE_ID;
+    tokio_test_block_on(async {
+        let mut rule = get_rule(&db, 0, id).await.unwrap().unwrap();
+        rule.enabled = true;
+        rule.dry_run = false;
+        rule.params["role_id"] = serde_json::json!("30");
+        upsert_rule(&db, 10, id, &rule).await.unwrap();
+        copy_guild_config(&db, 10, 20, vec!["rules".into()])
+            .await
+            .unwrap();
+        let copied = get_rule(&db, 20, id).await.unwrap().unwrap();
+        assert!(!copied.enabled);
+        assert_eq!(
+            copied.params,
+            serde_json::json!({"role_id": null, "join_window_minutes": 30})
+        );
+        assert!(get_rule(&db, 10, id).await.unwrap().unwrap().enabled);
+    });
+    drop(db);
+    cleanup_db(&tmp);
+}
+
+#[test]
 fn slash_registry_version_bumps_only_on_command_writes() {
     let tmp = tmp_db_path("slashver");
     let db = Db::open(&tmp, 2).unwrap();
