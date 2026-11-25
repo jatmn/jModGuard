@@ -673,7 +673,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn automod_delete_target(guild: u64, channel: u64) -> crate::discord::DiscordRestTarget {
+pub(crate) fn automod_delete_target(guild: u64, channel: u64) -> crate::discord::DiscordRestTarget {
     crate::discord::DiscordRestTarget::AutomodDelete { guild, channel }
 }
 
@@ -705,7 +705,7 @@ tokio::task_local! {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn automod_try_delete_message(
+pub(crate) async fn automod_try_delete_message(
     app: &std::sync::Arc<BotState>,
     http: &serenity::http::Http,
     guild_id: u64,
@@ -715,6 +715,7 @@ async fn automod_try_delete_message(
     rule_name: &str,
     reason: &str,
     cleanup: Option<&logging::Cleanup<'_>>,
+    sweep_dispatch: Option<(AutomodInstant, &str)>,
 ) -> Option<CaseOutcome> {
     let target = automod_delete_target(guild_id, channel);
     if app
@@ -752,11 +753,15 @@ async fn automod_try_delete_message(
     let raced = if forced_cancel {
         Ok(crate::discord::DiscordCall::Cancelled)
     } else {
-        tokio::time::timeout(
-            Duration::from_secs(10),
+        let (deadline, audit_reason) = sweep_dispatch.map_or_else(
+            || (AutomodInstant::now() + Duration::from_secs(10), None),
+            |(deadline, audit_reason)| (deadline, Some(audit_reason)),
+        );
+        tokio::time::timeout_at(
+            deadline,
             crate::discord::race_discord_call(
                 &app.activation,
-                http.delete_message(channel.into(), message.into(), None),
+                http.delete_message(channel.into(), message.into(), audit_reason),
             ),
         )
         .await
@@ -1578,6 +1583,7 @@ async fn execute_live<'a>(
                 pending.rule_name.as_str(),
                 reason,
                 None,
+                None,
             )
             .await
         } else {
@@ -1655,6 +1661,7 @@ async fn execute_live<'a>(
                     pending.rule_name.as_str(),
                     reason,
                     kick_cleanup.as_ref(),
+                    None,
                 )
                 .await
             } else {
@@ -7100,6 +7107,7 @@ mod tests {
                 "Bad words",
                 "blocked term",
                 None,
+                None,
             )
             .await;
         });
@@ -7254,6 +7262,7 @@ mod tests {
                         "badword",
                         "Bad words",
                         "blocked term",
+                        None,
                         None,
                     )
                     .await;

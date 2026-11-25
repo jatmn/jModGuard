@@ -452,7 +452,11 @@ async fn check_event(app: &Arc<BotState>, http: &Http, cache: &Cache, event: Rol
                             &enrollment,
                             event.user.id.get(),
                             cutoff..=started_at_ms,
-                            "automod onboarding trap cleanup",
+                            crate::recent_messages::TrackedDelete::Onboarding {
+                                rule_id: RULE_ID,
+                                rule_name: &rule.name,
+                                reason: &reason,
+                            },
                             cleanup.as_ref(),
                             || async {
                                 let mut dry_run = false;

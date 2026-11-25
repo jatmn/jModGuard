@@ -1,5 +1,6 @@
 //! Bounded Gateway message identities for automod cleanup.
 use crate::db::GuildEnrollment;
+use crate::db::guild_data::CaseOutcome;
 use crate::state::BotState;
 use parking_lot::Mutex;
 use serenity::http::Http;
@@ -147,11 +148,20 @@ pub(crate) async fn sweep_after_ban(
         enrollment,
         author,
         cutoff..=sweep_at_ms,
-        "automod ban purge",
+        TrackedDelete::BanPurge,
         cleanup,
         || ready(still_admitted()),
     )
     .await
+}
+
+pub(crate) enum TrackedDelete<'a> {
+    BanPurge,
+    Onboarding {
+        rule_id: &'a str,
+        rule_name: &'a str,
+        reason: &'a str,
+    },
 }
 
 /// Delete only identities already observed through the Gateway. Admission can
@@ -163,7 +173,7 @@ pub(crate) async fn sweep_tracked_messages<F: Future<Output = bool>>(
     enrollment: &GuildEnrollment,
     author: u64,
     window_ms: RangeInclusive<i64>,
-    audit_reason: &str,
+    delete: TrackedDelete<'_>,
     cleanup: Option<&crate::logging::Cleanup<'_>>,
     still_admitted: impl Fn() -> F,
 ) -> usize {
@@ -180,6 +190,14 @@ pub(crate) async fn sweep_tracked_messages<F: Future<Output = bool>>(
     let mut deleted = 0;
     let deadline = Instant::now() + MAX_SWEEP_TIME;
     for (channel, message) in messages {
+        if matches!(delete, TrackedDelete::Onboarding { .. })
+            && app.remembered_discord_targets.blocked(
+                crate::automod::automod_delete_target(guild, channel),
+                std::time::Instant::now(),
+            )
+        {
+            continue;
+        }
         if !matches!(
             tokio::time::timeout_at(deadline, still_admitted()).await,
             Ok(true)
@@ -192,6 +210,33 @@ pub(crate) async fn sweep_tracked_messages<F: Future<Output = bool>>(
         {
             continue;
         }
+        if let TrackedDelete::Onboarding {
+            rule_id,
+            rule_name,
+            reason,
+        } = delete
+        {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let outcome = crate::automod::automod_try_delete_message(
+                app,
+                http,
+                guild,
+                channel,
+                message,
+                rule_id,
+                rule_name,
+                reason,
+                cleanup,
+                Some((deadline, "automod onboarding trap cleanup")),
+            )
+            .await;
+            deleted += usize::from(matches!(outcome, Some(CaseOutcome::Succeeded)));
+            continue;
+        }
+
+        let audit_reason = "automod ban purge";
         let prepared = cleanup.map(|cleanup| cleanup.prepare(app, channel, message));
         let result = tokio::time::timeout_at(
             deadline,

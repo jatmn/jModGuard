@@ -3,7 +3,7 @@ use crate::db::guild_data::{CaseAction, CaseOutcome};
 use crate::handlers::Handler;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Response, Server};
-use serenity::all::{EventHandler, Guild, HttpBuilder, Permissions, Role};
+use serenity::all::{ChannelId, EventHandler, Guild, HttpBuilder, MessageId, Permissions, Role};
 use std::convert::Infallible;
 use std::future::poll_fn;
 use std::pin::{Pin, pin};
@@ -253,7 +253,13 @@ async fn gateway_case(
         "onboarding_trap_{:032x}.db",
         rand::random::<u128>()
     ));
-    let app = BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+    let ungrouped = event_kind == "cleanup ungrouped";
+    let rejections = event_kind == "cleanup rejected destination";
+    let mut config = jmodguard::config::BotProcessConfig::default();
+    if ungrouped {
+        config.log.group_automod_cleanup_deletes = false;
+    }
+    let app = BotState::new(config, crate::db::Db::open(&path, 2).unwrap()).unwrap();
     assert!(
         crate::db::claim_active_bot(
             &app.db,
@@ -298,12 +304,23 @@ async fn gateway_case(
         ] {
             app.recent_messages.remember(guild, author, 77, id, at_ms);
         }
+        if rejections {
+            for (channel, id) in [(78, 109), (78, 108), (77, 107)] {
+                app.recent_messages
+                    .remember(GUILD, MEMBER, channel, id, now_ms - 1_000);
+            }
+        }
     }
     crate::db::upsert_rule(&app.db, GUILD as i64, RULE_ID, &rule)
         .await
         .unwrap();
     for (event, channel) in [("member_kick", 70), ("automod", 71)] {
         crate::db::upsert_log_channel(&app.db, GUILD as i64, event, channel)
+            .await
+            .unwrap();
+    }
+    if ungrouped {
+        crate::db::upsert_log_channel(&app.db, GUILD as i64, "automod_delete", 72)
             .await
             .unwrap();
     }
@@ -413,6 +430,12 @@ async fn gateway_case(
                             (200, body)
                         }
                         Method::GET => (200, guild_json),
+                        Method::DELETE if rejections && call.path.contains("/channels/78/messages/") => (
+                            403, r#"{"code":50013,"message":"Missing Permissions"}"#.into(),
+                        ),
+                        Method::DELETE if rejections && call.path.ends_with("/channels/77/messages/107") => (
+                            404, r#"{"code":10008,"message":"Unknown Message"}"#.into(),
+                        ),
                         Method::DELETE => (204, String::new()),
                         Method::POST => (200, serde_json::json!({
                             "id": "91", "channel_id": "70",
@@ -683,6 +706,16 @@ async fn gateway_case(
             .unwrap();
         app.invalidate_configs();
     }
+    if ungrouped {
+        handler
+            .message_delete(
+                ctx.clone(),
+                ChannelId::new(77),
+                MessageId::new(101),
+                Some(GuildId::new(GUILD)),
+            )
+            .await;
+    }
     if expected_kick || dry {
         // Both events can replay an uncached old state. The server deliberately
         // still reports the same member so we exercise the process replay guard.
@@ -703,7 +736,7 @@ async fn gateway_case(
         .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
         .await
         .unwrap();
-    let effects = calls
+    let mut effects = calls
         .lock()
         .iter()
         .filter(|call| call.method != Method::GET)
@@ -716,18 +749,31 @@ async fn gateway_case(
             )
         })
         .collect::<Vec<_>>();
+    if ungrouped {
+        let reports = effects
+            .iter()
+            .filter(|effect| {
+                effect.0 == Method::POST && effect.1.ends_with("/channels/72/messages")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 1, "REST success and its echo: {effects:?}");
+        assert!(reports[0].2.contains(&rule.name));
+        assert!(reports[0].2.contains("/channels/10/77/101"));
+        effects.retain(|effect| !effect.1.ends_with("/channels/72/messages"));
+    }
     let effects = if downgraded {
         &effects[1..]
     } else {
         &effects[..]
     };
     if expected_kick {
-        let deletes_recent = event_kind == "cleanup";
-        assert_eq!(
-            effects.len(),
-            3 + usize::from(deletes_recent),
-            "{event_kind}: {effects:?}"
-        );
+        let deletes_recent = event_kind == "cleanup" || ungrouped;
+        let delete_count = if rejections {
+            3
+        } else {
+            usize::from(deletes_recent)
+        };
+        assert_eq!(effects.len(), 3 + delete_count, "{event_kind}: {effects:?}");
         assert_eq!(effects[0].0, Method::DELETE);
         assert!(
             effects[0]
@@ -785,6 +831,20 @@ async fn gateway_case(
             assert!(effects[2].1.ends_with("/channels/77/messages/101"));
             assert!(effects[3].2.contains("tracked messages deleted (1)"));
         }
+        if rejections {
+            let destinations = effects[2..5]
+                .iter()
+                .map(|effect| {
+                    assert_eq!(effect.0, Method::DELETE);
+                    effect.1.split("/channels/").last().unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                destinations,
+                ["78/messages/109", "77/messages/107", "77/messages/101"]
+            );
+            assert!(effects[5].2.contains("tracked messages deleted (1)"));
+        }
         let automod_log = effects.last().unwrap();
         assert!(automod_log.1.ends_with("/channels/71/messages"));
         assert!(automod_log.2.contains(REASON));
@@ -835,6 +895,44 @@ async fn trap_cleans_only_tracked_messages_in_the_stay_after_a_confirmed_kick() 
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn trap_cleanup_attributes_the_delete_once_without_grouping() {
+    let member = member(
+        MEMBER,
+        &[TRAP_ROLE],
+        Timestamp::from_millis(Timestamp::now().timestamp_millis() - 60_000).unwrap(),
+    );
+    gateway_case(
+        member.clone(),
+        member,
+        guild(Permissions::empty()),
+        "cleanup ungrouped",
+        30,
+        false,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn trap_cleanup_skips_denied_destinations_but_not_unknown_messages() {
+    let member = member(
+        MEMBER,
+        &[TRAP_ROLE],
+        Timestamp::from_millis(Timestamp::now().timestamp_millis() - 60_000).unwrap(),
+    );
+    gateway_case(
+        member.clone(),
+        member,
+        guild(Permissions::empty()),
+        "cleanup rejected destination",
+        30,
+        false,
+        true,
+    )
+    .await;
 }
 
 #[tokio::test]
