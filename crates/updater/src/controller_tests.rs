@@ -4,21 +4,12 @@
 use super::*;
 use crate::signature::signature_rejection_phrase;
 use crate::signature::signature_tag_for_digest;
-use crate::signing_fixture::{BadSignature, SigningFixture, SigningKeyChoice};
+use crate::signing_fixture::{BadSignature, SigningKeyChoice, signing as test_signing};
 use axum::{Router, body::Body, extract::State, http::Uri, response::Response, routing::get};
 use db::{Db, DbOpenOptions, SqlExecutor, params};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
-
-fn test_signing() -> &'static SigningFixture {
-    static FIXTURE: OnceLock<SigningFixture> = OnceLock::new();
-    FIXTURE.get_or_init(|| {
-        let fixture = SigningFixture::new();
-        fixture.apply_env();
-        fixture
-    })
-}
+use std::sync::Arc;
 
 async fn object(State(objects): State<Arc<HashMap<String, Vec<u8>>>>, uri: Uri) -> Response {
     match objects.get(uri.path().rsplit('/').next().unwrap_or("")) {
@@ -7817,6 +7808,83 @@ async fn reopen_supervisor(mut bot: Supervisor) -> Supervisor {
 }
 
 const TRIXIE: &str = "debian-trixie-amd64";
+
+#[tokio::test]
+async fn bookworm_controller_refuses_a_desired_trixie_release() {
+    let root = std::env::temp_dir().join(format!("desired-abi-{:032x}", rand::random::<u128>()));
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let baked = executable(&root, "old-bot").await;
+    let next = executable(&root, "new-bot").await;
+    let mut objects = HashMap::new();
+    let image = image(&mut objects, "bot", &tokio::fs::read(next).await.unwrap());
+    let mut candidate = release_at("bot", 'c', db::CORE_SCHEMA_VERSION);
+    candidate.digest = image.digest;
+    candidate.base_abi = TRIXIE.into();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let registry = Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .fallback(get(object))
+                .with_state(Arc::new(objects)),
+        )
+        .await
+        .unwrap();
+    });
+
+    let (db, control) = open_launcher_db(&root).await;
+    let mut bot = controller("bot", baked, registry, control.clone(), &root);
+    wait_for_bot_ready(&mut bot).await;
+    let old_pid = bot.running.as_ref().unwrap().child.id().unwrap();
+    let stamp = now();
+    let mut recorded = fresh_observation(stamp);
+    control
+        .running("api", None, recorded.clone(), stamp)
+        .await
+        .unwrap();
+    // The stored observation can come from a previous container. Make the
+    // shared admission check pass so only the live controller ABI can refuse.
+    recorded.base_abi = TRIXIE.into();
+    control.running("bot", None, recorded, stamp).await.unwrap();
+    compatible_control(&control, &candidate, stamp)
+        .await
+        .unwrap();
+    control
+        .checked("bot", "latest", Some(candidate.clone()), None, stamp)
+        .await
+        .unwrap();
+    db::request_component_install(&db, "bot", &candidate.digest, stamp)
+        .await
+        .unwrap();
+
+    let reexec = bot.tick().await.unwrap();
+    let state = control.component("bot").await.unwrap();
+    let staged = tokio::fs::try_exists(&bot.staging).await.unwrap();
+    let running_pid = bot.running.as_mut().and_then(|running| {
+        if running.child.try_wait().unwrap().is_some() {
+            return None;
+        }
+        running.child.id()
+    });
+    bot.stop_application().await.unwrap();
+    bot.end_idle().await.unwrap();
+    server.abort();
+    drop((bot, control, db));
+    tokio::fs::remove_dir_all(root).await.unwrap();
+
+    assert_eq!(
+        state.last_error.as_deref(),
+        Some("compatibility: candidate needs a different base runtime ABI")
+    );
+    assert_eq!(state.state, "failed");
+    assert!(state.desired.is_none());
+    assert!(!staged);
+    assert!(!reexec);
+    assert_eq!(running_pid, Some(old_pid));
+}
 
 /// Rewrite one recorded observation field, as a launcher of another image
 /// would have recorded it.

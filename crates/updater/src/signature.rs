@@ -118,18 +118,14 @@ fn trusted_key(pem: &str) -> Result<TrustedKey> {
     })
 }
 
-/// The committed public key is always trusted. Only unit-test builds may add
-/// a fixture PEM. Previous-key files are not read.
+/// The committed public key is always trusted. Test builds also trust their
+/// shared fixture key.
 fn trusted_keys() -> Result<Vec<TrustedKey>> {
     let keys = vec![trusted_key(CURRENT_PUBLIC_PEM)?];
     #[cfg(test)]
     let keys = {
         let mut keys = keys;
-        if let Ok(pem) = std::env::var("JMODGUARD_TEST_UPDATE_SIGNING_PUBLIC_PEM")
-            && !pem.is_empty()
-        {
-            keys.push(trusted_key(&pem)?);
-        }
+        keys.push(trusted_key(&crate::signing_fixture::signing().public_pem)?);
         keys
     };
     Ok(keys)
@@ -356,16 +352,15 @@ pub mod test_support {
         EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8, &rng).unwrap()
     }
 
-    fn payload(component: &str, manifest_digest: &str, not_after: &str) -> Vec<u8> {
-        serde_json::to_vec(&json!({
+    fn payload(component: &str, manifest_digest: &str, not_after: &str) -> serde_json::Value {
+        json!({
             "critical": {
                 "identity": {"docker-reference": docker_reference(component).unwrap()},
                 "image": {"docker-manifest-digest": manifest_digest},
                 "type": SIGNATURE_TYPE
             },
             "optional": {"io.jmodguard.not-after": not_after}
-        }))
-        .unwrap()
+        })
     }
 
     /// OCI manifest Cosign stores at the `.sig` tag, plus the config and payload blobs.
@@ -378,7 +373,7 @@ pub mod test_support {
     ) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
         let rng = SystemRandom::new();
         let key_pair = signing_key(private_pem);
-        let payload = payload(component, manifest_digest, not_after);
+        let payload = serde_json::to_vec(&payload(component, manifest_digest, not_after)).unwrap();
         let signature = key_pair.sign(&rng, &payload).unwrap();
         let sig_b64 = STANDARD.encode(signature.as_ref());
         let config = b"{}";
@@ -415,10 +410,30 @@ pub mod test_support {
         manifest_digest: &str,
         not_after: &str,
     ) -> Vec<u8> {
+        sign_manifest_with(
+            private_pem,
+            public_pem,
+            component,
+            manifest_digest,
+            not_after,
+            |_| {},
+        )
+    }
+
+    pub(super) fn sign_manifest_with(
+        private_pem: &str,
+        public_pem: &str,
+        component: &str,
+        manifest_digest: &str,
+        not_after: &str,
+        edit_payload: impl FnOnce(&mut serde_json::Value),
+    ) -> Vec<u8> {
         let rng = SystemRandom::new();
         let key_pair = signing_key(private_pem);
         let trusted = trusted_key(public_pem).unwrap();
-        let payload = payload(component, manifest_digest, not_after);
+        let mut payload = payload(component, manifest_digest, not_after);
+        edit_payload(&mut payload);
+        let payload = serde_json::to_vec(&payload).unwrap();
         let signature = key_pair.sign(&rng, &payload).unwrap();
         serde_json::to_vec(&json!({
             "payloadType": PAYLOAD_TYPE,
@@ -483,5 +498,57 @@ mod tests {
             signature_rejection_phrase(&error),
             Some(BAD_IMAGE_SIGNATURE)
         );
+    }
+
+    #[test]
+    fn signed_payload_requires_the_signature_type_and_expiry() {
+        let signer = crate::signing_fixture::signing();
+        let manifest = b"manifest-bytes";
+        let digest = format!("sha256:{}", crate::oci::sha256_hex(manifest));
+        let verify = |envelope: &[u8]| {
+            verify_manifest_signature(
+                "api",
+                &digest,
+                manifest,
+                envelope,
+                "2026-09-23T00:00:00Z".parse().unwrap(),
+                SignatureExpiry::Enforce,
+            )
+        };
+        let not_after = "2026-09-24T00:00:00Z";
+        verify(&test_support::sign_manifest(
+            &signer.private_pem,
+            &signer.public_pem,
+            "api",
+            &digest,
+            not_after,
+        ))
+        .unwrap();
+
+        for (field, expected) in [
+            ("critical.type", BAD_IMAGE_SIGNATURE),
+            ("io.jmodguard.not-after", EXPIRED_IMAGE_SIGNATURE),
+        ] {
+            let envelope = test_support::sign_manifest_with(
+                &signer.private_pem,
+                &signer.public_pem,
+                "api",
+                &digest,
+                not_after,
+                |payload| {
+                    if field == "critical.type" {
+                        payload["critical"]["type"] = serde_json::json!("wrong type");
+                    } else {
+                        payload["optional"].as_object_mut().unwrap().remove(field);
+                    }
+                },
+            );
+            let result = verify(&envelope);
+            assert_eq!(
+                result.as_ref().err().and_then(signature_rejection_phrase),
+                Some(expected),
+                "{field}: {result:?}"
+            );
+        }
     }
 }
