@@ -518,6 +518,7 @@ mock_publish_helpers() {
     esac
   }
   run_docker() {
+    [[ "$1" != --deadline ]] || shift 2
     printf 'docker %s\n' "$*" >>"$TRACE_FILE"
     if [[ "$1" == login ]]; then
       cat >"${TRACE_FILE}.login"
@@ -1228,6 +1229,7 @@ record_imagetools_promote() {
 }
 published_signature_still_valid() { return 0; }
 run_docker() {
+  [[ "$1" != --deadline ]] || shift 2
   if [[ "$1" == login ]]; then cat >/dev/null; return 0; fi
   if [[ "$1 $2 $3" == 'buildx imagetools create' ]]; then
     record_imagetools_promote "$@"
@@ -1326,6 +1328,7 @@ run_git() {
 read_publication_plan() { printf '%s\n' "$PLAN_JSON"; }
 redact_tokens() { :; }
 run_docker() {
+  [[ "$1" != --deadline ]] || shift 2
   if [[ "$1" == login ]]; then cat >/dev/null; return 0; fi
   if [[ "$1 $2 $3" == 'buildx imagetools create' ]]; then
     record_imagetools_promote "$@"
@@ -1473,6 +1476,7 @@ unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR
 
 # Sign phase must derive digest and promotion targets from the plan and registry, not build state.
 reload_publisher
+eval "$(declare -f run_docker | sed '1s/^run_docker/real_run_docker/')"
 mock_publish_helpers
 FAIL_SIGN=0
 trusted_sign_dir="$(mktemp -d "${TMPDIR:-/tmp}/publish-trusted-sign-XXXXXX")"
@@ -1530,43 +1534,67 @@ grep_array CALLS -q -- "--tag ghcr.io/jatmn/jmodguard-api:${FORGED_SHA}" \
   JMODGUARD_DEFER_PROMOTION=1
   eval "$(declare -f run_docker | sed '1s/^run_docker/mock_sign_docker/')"
   run_docker() {
-    if [[ "$*" != "buildx imagetools inspect $TRUSTED_STAGING --format {{json .Manifest}}" ]]; then
+    local -a original=("$@")
+    [[ "$1" != --deadline ]] || shift 2
+    if [[ "$*" == "buildx imagetools inspect $TRUSTED_STAGING --format {{json .Manifest}}" ]]; then
+      real_run_docker "${original[@]}"
+    else
       mock_sign_docker "$@"
-      return
     fi
-    printf 'staging lookup\n' >>"$TRACE_FILE"
-    [[ "$(grep -c '^docker login ' "$TRACE_FILE")" == 2 ]] \
-      || { echo 'unauthorized: authenticate before inspecting staging' >&2; return 1; }
-    local attempt
-    attempt="$(grep -c '^staging lookup$' "$TRACE_FILE")"
-    case "$lookup_case:$attempt" in
-      recovery:1)
-        echo 'unexpected status from HEAD request: 503 Service Unavailable (private diagnostic)' >&2
-        return 1 ;;
-      recovery:2)
-        echo 'failed to do request: TLS handshake timeout (private diagnostic)' >&2
-        return 1 ;;
-      absent:1)
-        echo "$TRUSTED_STAGING: not found" >&2
-        return 1 ;;
-      absent:*)
-        echo "unexpected status from GET request to https://ghcr.io/v2/jatmn/jmodguard-api/manifests/${TRUSTED_STAGING##*:}: 404 Not Found" >&2
-        return 1 ;;
-      authorization:*)
-        echo 'unexpected status from HEAD request: 401 Unauthorized (private diagnostic)' >&2
-        return 1 ;;
-      invalid:*)
-        printf '%s\n' 'private diagnostic'
-        return 0 ;;
-      mismatch:*)
-        printf '{"digest":"%s","size":10}\n' "$FORGED_DIGEST"
-        return 0 ;;
-    esac
-    mock_sign_docker "$@"
+  }
+  cat >"$trusted_sign_dir/docker" <<'SH'
+#!/bin/bash
+set -euo pipefail
+printf 'staging lookup\n' >>"$TRACE_FILE"
+[[ "$(grep -c '^docker login ' "$TRACE_FILE")" == 2 ]] \
+  || { echo 'unauthorized: authenticate before inspecting staging' >&2; exit 1; }
+attempt="$(grep -c '^staging lookup$' "$TRACE_FILE")"
+case "$lookup_case:$attempt" in
+  recovery:1)
+    echo 'unexpected status from HEAD request: 503 Service Unavailable (private diagnostic)' >&2
+    exit 1 ;;
+  recovery:2)
+    echo 'failed to do request: TLS handshake timeout (private diagnostic)' >&2
+    exit 1 ;;
+  stall:1)
+    exec sleep 4 ;;
+  absent:1)
+    echo "$TRUSTED_STAGING: not found" >&2
+    exit 1 ;;
+  absent:*)
+    echo "unexpected status from GET request to https://ghcr.io/v2/jatmn/jmodguard-api/manifests/${TRUSTED_STAGING##*:}: 404 Not Found" >&2
+    exit 1 ;;
+  authorization:*)
+    echo 'unexpected status from HEAD request: 401 Unauthorized (private diagnostic)' >&2
+    exit 1 ;;
+  bearer-scope:*)
+    echo 'insufficient_scope: authorization failed (private diagnostic)' >&2
+    exit 1 ;;
+  invalid:*)
+    printf '%s\n' 'private diagnostic'
+    exit 0 ;;
+  decode:*)
+    echo "invalid character 'p' looking for beginning of value (private diagnostic)" >&2
+    exit 1 ;;
+  mismatch:*)
+    printf '{"digest":"%s","size":10}\n' "$FORGED_DIGEST"
+    exit 0 ;;
+esac
+printf '{"digest":"%s","size":10}\n' "$MOCK_BUILD_DIGEST"
+SH
+  chmod +x "$trusted_sign_dir/docker"
+  export PATH="$trusted_sign_dir:$PATH"
+  export TRACE_FILE TRUSTED_STAGING FORGED_DIGEST MOCK_BUILD_DIGEST lookup_case
+  timeout() {
+    if [[ "$1 $2 $3" == '--kill-after=5s 30s docker' && "${7:-}" == "$TRUSTED_STAGING" ]]; then
+      command timeout --kill-after=1s 1s "${@:3}"
+    else
+      command timeout "$@"
+    fi
   }
   sleep() { printf 'sleep %s\n' "$1" >>"$TRACE_FILE"; }
 
-  for lookup_case in recovery absent authorization invalid mismatch; do
+  for lookup_case in recovery stall absent authorization bearer-scope invalid decode mismatch; do
     : >"$TRACE_FILE"
     if lookup_output="$(
       exec 2>&1
@@ -1574,7 +1602,7 @@ grep_array CALLS -q -- "--tag ghcr.io/jatmn/jmodguard-api:${FORGED_SHA}" \
       publish_component api || exit $?
       finish_deferred_promotions
     )"; then
-      [[ "$lookup_case" == recovery ]] || fail "$lookup_case must prevent tag promotion"
+      [[ "$lookup_case" == recovery || "$lookup_case" == stall ]] || fail "$lookup_case must prevent tag promotion"
       grep -q "^sign api ghcr.io/jatmn/jmodguard-api ${MOCK_BUILD_DIGEST}$" "$TRACE_FILE" \
         || fail 'recovered lookup must sign the verified digest'
       for component in bot api; do
@@ -1582,7 +1610,8 @@ grep_array CALLS -q -- "--tag ghcr.io/jatmn/jmodguard-api:${FORGED_SHA}" \
           || fail "successful deferred finish must promote $component"
       done
     else
-      [[ "$lookup_case" != recovery ]] || fail "authenticated retry did not recover: $lookup_output"
+      [[ "$lookup_case" != recovery && "$lookup_case" != stall ]] \
+        || fail "authenticated retry did not recover ($lookup_case): $lookup_output"
       grep -q '^sign bot ' "$TRACE_FILE" || fail 'earlier component must reach signing before the failure'
       if grep -Eq '^sign api |^docker buildx imagetools create ' "$TRACE_FILE"; then
         fail "$lookup_case must prevent signing the failed image and moving any queued tags"
@@ -1590,9 +1619,10 @@ grep_array CALLS -q -- "--tag ghcr.io/jatmn/jmodguard-api:${FORGED_SHA}" \
     fi
     case "$lookup_case" in
       recovery) expected='retryable registry or transport error'; attempts=3 ;;
+      stall) expected='retryable registry or transport error'; attempts=2 ;;
       absent) expected='manifest absent'; attempts=3 ;;
-      authorization) expected='authorization failed'; attempts=1 ;;
-      invalid) expected='invalid manifest metadata'; attempts=1 ;;
+      authorization|bearer-scope) expected='authorization failed'; attempts=1 ;;
+      invalid|decode) expected='invalid manifest metadata'; attempts=1 ;;
       mismatch) expected='expected verified digest'; attempts=1 ;;
     esac
     [[ "$lookup_output" == *"api:"*"${TRUSTED_STAGING}"*"$expected"* ]] \

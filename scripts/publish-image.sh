@@ -13,7 +13,11 @@ publish_fail() {
 
 run_git() { git "$@" || publish_fail "git failed: $*"; }
 run_docker() {
-  if [[ "$1 ${2:-}" == 'buildx build' && "${@: -2:1}" == --metadata-file ]]; then
+  if [[ "$1" == --deadline ]]; then
+    local deadline="$2"
+    shift 2
+    timeout --kill-after=5s "$deadline" docker "$@"
+  elif [[ "$1 ${2:-}" == 'buildx build' && "${@: -2:1}" == --metadata-file ]]; then
     retry_staging_push "$@"
   else
     docker "$@" || publish_fail "docker failed: $*"
@@ -1030,11 +1034,22 @@ registry_manifest_absent() {
 # Status 2 means confirmed absence. Other failed statuses refine diagnostics
 # without making an unknown previous tag eligible for rollback deletion.
 inspect_digest() {
-  local raw err rc=1
+  local raw err lookup_status rc=1
+  local -a options=()
+  if [[ -n "${2:-}" ]]; then
+    options=(--deadline "$2")
+  fi
   err="$(mktemp)" || return 1
-  if ! raw="$(run_docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>"$err")"; then
-    if grep -Eiq 'unauthorized|authentication required|forbidden|denied:|(status code[[:space:]]+|:[[:space:]]+)(401|403)([[:space:]]|$)' "$err"; then
+  if raw="$(run_docker "${options[@]}" buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>"$err")"; then
+    rm -f "$err"
+  else
+    lookup_status=$?
+    if [[ "$lookup_status" -eq 124 || "$lookup_status" -eq 137 ]]; then
+      rc=4
+    elif grep -Eiq 'unauthorized|authentication required|authorization failed|insufficient_scope|forbidden|denied:|(status code[[:space:]]+|:[[:space:]]+)(401|403)([[:space:]]|$)' "$err"; then
       rc=3
+    elif grep -Eiq 'invalid character .* (looking for beginning of|after (object|array|top-level)|in (literal|string|numeric))|unexpected end of JSON input|json: cannot unmarshal' "$err"; then
+      rc=5
     elif grep -Eiq 'too many requests|timeout|timed out|deadline exceeded|no such host|temporary failure in name resolution|connection (refused|reset)|unexpected EOF|: EOF$|(status code[[:space:]]+|:[[:space:]]+)(408|429|5[0-9]{2})([[:space:]]|$)' "$err"; then
       rc=4
     elif registry_manifest_absent "$err"; then
@@ -1044,7 +1059,6 @@ inspect_digest() {
     rm -f "$err"
     return "$rc"
   fi
-  rm -f "$err"
   MANIFEST_JSON="$raw" node --input-type=commonjs - <<'JS' || return 5
 const data = JSON.parse(process.env.MANIFEST_JSON || "");
 const digest = data.digest || (data.Descriptor && data.Descriptor.digest) || "";
@@ -1059,7 +1073,7 @@ JS
 inspect_staging_manifest() {
   local component="$1" ref="$2" manifest attempt rc reason
   for attempt in 1 2 3; do
-    if manifest="$(inspect_digest "$ref" 2>/dev/null)"; then
+    if manifest="$(inspect_digest "$ref" 30s 2>/dev/null)"; then
       printf '%s\n' "$manifest"
       return 0
     else
