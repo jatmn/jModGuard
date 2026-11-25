@@ -927,14 +927,7 @@ async fn punish_proven_match(
                                             )
                                             && write_generation == app.db.config_write_generation()
                                     };
-                                    // The API can save while the ban is in flight. Confirm on
-                                    // the primary before sending separate sweep DELETEs.
-                                    if app
-                                        .configs
-                                        .primary_version_matches(&app.db, found.token.1)
-                                        .await
-                                        && dispatch_is_current()
-                                    {
+                                    if dispatch_is_current() {
                                         deleted_count += crate::recent_messages::sweep_after_ban(
                                             app,
                                             http.as_ref(),
@@ -1810,6 +1803,12 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            let scope = crate::db::ScopeWire {
+                global: false,
+                guild_id: enrollment.guild_id,
+                enrollment_id: enrollment.id.clone(),
+                joined_at_ns: enrollment.joined_at_ns,
+            };
             app.tenant.activate(enrollment).await.unwrap();
             let mut rule = crate::defaults::default_rules().remove(2);
             rule.skip_moderators = false;
@@ -1861,13 +1860,7 @@ pub(crate) mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let server_lines = Arc::clone(&lines);
             let server_stop = Arc::clone(&stop);
-            // The pre-sweep check must also observe a save from a different
-            // process, whose writes do not advance the bot's generation.
-            let db = if disable_on == Some(ban) {
-                crate::db::Db::open(&path, 2).unwrap()
-            } else {
-                app.db.clone()
-            };
+            let writer = Arc::clone(&app);
             let runtime = tokio::runtime::Handle::current();
             rule.enabled = false;
             let server = std::thread::spawn(move || {
@@ -1877,9 +1870,22 @@ pub(crate) mod tests {
                     server_stop,
                     move |method, path, _| {
                         if disable_on == Some((method, path)) {
-                            runtime
-                                .block_on(crate::db::upsert_rule(&db, 10, "repeat_text", &rule))
+                            let saved = runtime
+                                .block_on(crate::db::apply_control(
+                                    &writer.db,
+                                    Some(&writer.tenant),
+                                    crate::db::ControlOp::UpsertRule {
+                                        request: scope.clone(),
+                                        target: scope.clone(),
+                                        id: "repeat_text".into(),
+                                        rule: rule.clone(),
+                                        clear_guild_override: false,
+                                        replace_velocity_limit: false,
+                                    },
+                                    Some(writer.activation.instance()),
+                                ))
                                 .unwrap();
+                            assert!(matches!(saved, crate::db::ControlReply::Saved { .. }));
                         }
                         None
                     },
