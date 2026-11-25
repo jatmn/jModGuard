@@ -7,7 +7,7 @@ use crate::commands::{PermLevel, permission_level};
 use crate::discord::{DiscordCall, race_discord_call};
 use crate::state::BotState;
 use crate::{cases, db, logging};
-use jmodguard::onboarding_trap::{RULE_ID, join_window_minutes, role_id};
+use jmodguard::onboarding_trap::{RULE_ID, cleanup_window_minutes, join_window_minutes, role_id};
 use jmodguard::types::RuleDef;
 use parking_lot::Mutex;
 use serenity::all::{
@@ -355,22 +355,29 @@ async fn check_event(app: &Arc<BotState>, http: &Http, cache: &Cache, event: Rol
     };
     let (mut vars, reason) =
         action_vars(event.user, event.display_name, &rule.name, action, 1, None);
+    let cleanup_window = cleanup_window_minutes(rule).filter(|minutes| *minutes > 0);
 
     // Supersession cancels enrollment and preflight, but the cutoff race also
     // covers the committed kick. Claim completion is synchronous at handoff.
     let dispatch = async {
-        let (enrollment, member, dry_run) = claim
+        let (enrollment, member, dry_run, role_exemptions) = claim
             .preflight(async {
                 let enrollment = cases::capture(app, event.guild.get()).await?;
-                let (member, dry_run) =
+                let (member, dry_run, role_exemptions) =
                     member_at_dispatch(app, http, cache, &event, &enrollment, rule, &claim).await?;
-                Some((enrollment, member, dry_run))
+                Some((enrollment, member, dry_run, role_exemptions))
             })
             .await?;
         let dispatched = if dry_run {
             Dispatch::DryRun
         } else {
-            Dispatch::Kick(kick_with_recovery(app, http, event.guild, &member, &reason).await)
+            let started_at_ms = Timestamp::now().timestamp_millis();
+            let error = kick_with_recovery(app, http, event.guild, &member, &reason).await;
+            Dispatch::Kick {
+                started_at_ms,
+                error,
+                role_exemptions,
+            }
         };
         Some((enrollment, dispatched))
     };
@@ -385,12 +392,19 @@ async fn check_event(app: &Arc<BotState>, http: &Http, cache: &Cache, event: Rol
     }
     match dispatched {
         Dispatch::DryRun => {
-            vars.insert(
-                "action".into(),
-                format!("[DRY RUN] would kick: {}", action.reason),
-            );
+            let mut action_text = format!("[DRY RUN] would kick: {}", action.reason);
+            if let Some(minutes) = cleanup_window {
+                action_text.push_str(&format!(
+                    " and would clean tracked messages from the last {minutes} minutes"
+                ));
+            }
+            vars.insert("action".into(), action_text);
         }
-        Dispatch::Kick(error) => {
+        Dispatch::Kick {
+            started_at_ms,
+            error,
+            role_exemptions,
+        } => {
             let outcome = cases::classify_discord(error.as_ref());
             let case_id = cases::record_onboarding_kick(
                 app,
@@ -409,6 +423,63 @@ async fn check_event(app: &Arc<BotState>, http: &Http, cache: &Cache, event: Rol
                             format!("Automod · case `{}`", case_id.as_str()),
                         );
                         logging::emit_to(app, http, event.guild, "member_kick", case_vars).await;
+                    }
+                    if let Some(minutes) = cleanup_window {
+                        let cleanup = logging::begin_cleanup(
+                            app,
+                            event.guild.get(),
+                            event.user.id.get(),
+                            logging::CleanupRule {
+                                id: RULE_ID,
+                                name: &rule.name,
+                                reason: &reason,
+                                action: "kick",
+                                join_only: false,
+                                sample: None,
+                                hash: None,
+                            },
+                        )
+                        .await;
+                        if let Some(cleanup) = &cleanup {
+                            // The private kick case belongs in the Member kick log.
+                            cleanup.outcome(db::guild_data::CaseOutcome::Succeeded, None);
+                        }
+                        let cutoff = (started_at_ms - i64::from(minutes) * 60_000)
+                            .max(event.joined_at.timestamp_millis());
+                        let deleted = crate::recent_messages::sweep_tracked_messages(
+                            app,
+                            http,
+                            &enrollment,
+                            event.user.id.get(),
+                            cutoff..=started_at_ms,
+                            "automod onboarding trap cleanup",
+                            cleanup.as_ref(),
+                            || async {
+                                let mut dry_run = false;
+                                refresh_rule(app, &enrollment, rule, &mut dry_run)
+                                    .await
+                                    .is_some_and(|current| {
+                                        // The kick removed the member, so any change to the
+                                        // admitted role exemptions stops cleanup.
+                                        !dry_run
+                                            && cleanup_window_minutes(&current) == Some(minutes)
+                                            && current.whitelist_roles == role_exemptions
+                                            && !jmodguard::custom_rules::rule_scope_skips(
+                                                &current,
+                                                event.user.id.get(),
+                                                0,
+                                                &[],
+                                                false,
+                                                false,
+                                            )
+                                    })
+                            },
+                        )
+                        .await;
+                        vars.insert(
+                            "action".into(),
+                            format!("kick, tracked messages deleted ({deleted})"),
+                        );
                     }
                 }
                 db::guild_data::CaseOutcome::Failed => {
@@ -443,7 +514,11 @@ async fn check_event(app: &Arc<BotState>, http: &Http, cache: &Cache, event: Rol
 
 enum Dispatch {
     DryRun,
-    Kick(Option<serenity::Error>),
+    Kick {
+        started_at_ms: i64,
+        error: Option<serenity::Error>,
+        role_exemptions: Vec<u64>,
+    },
 }
 
 /// Refresh after each potentially slow pre-dispatch operation. Once a match
@@ -478,7 +553,7 @@ async fn member_at_dispatch(
     enrollment: &db::GuildEnrollment,
     matched: &RuleDef,
     claim: &MatchClaim<'_>,
-) -> Option<(Member, bool)> {
+) -> Option<(Member, bool, Vec<u64>)> {
     let (guild_id, user_id) = (event.guild, event.user.id);
     let joined_at = event.joined_at;
     let role = RoleId::new(role_id(matched)?);
@@ -543,5 +618,5 @@ async fn member_at_dispatch(
     {
         return None;
     }
-    Some((member, dry_run))
+    Some((member, dry_run, rule.whitelist_roles))
 }

@@ -7498,6 +7498,7 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   let modal = await edit();
   assert.equal(pickerLabelled(modal, 'Enabled').disabled, true);
   assert.equal(pickerLabelled(modal, 'Join window (minutes)').value, '30');
+  assert.equal(pickerLabelled(modal, 'Recent-message cleanup (minutes)').value, '0');
   assert.equal(pickerLabelled(modal, 'Kick reason').value, reason);
   await chooseOption(pickerLabelled(modal, 'Trap role'), '@Anti-bot');
   const enabled = pickerLabelled(modal, 'Enabled');
@@ -7509,8 +7510,8 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   assert.match(textOf(modal), /below jModGuard’s highest role/);
   assert.match(textOf(modal), /grants permissions or channel access/);
   assert.match(textOf(modal), /individual channel permission grant/);
-  assert.match(textOf(modal), /Kick is the available moderation action/);
   await typeValue(pickerLabelled(modal, 'Join window (minutes)'), '0');
+  await typeValue(pickerLabelled(modal, 'Recent-message cleanup (minutes)'), '25');
   await save(modal);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].scope, 'guild');
@@ -7518,18 +7519,21 @@ test('built-in onboarding trap starts off, warns on unsafe setup, and saves a gu
   assert.equal(calls[0].data.enabled, true);
   assert.equal(calls[0].data.dry_run, true);
   assert.equal(calls[0].data.skip_moderators, true);
-  assert.deepEqual(calls[0].data.params, { role_id: roleId, join_window_minutes: 0 });
+  assert.deepEqual(calls[0].data.params, { role_id: roleId, join_window_minutes: 0, cleanup_window_minutes: 25 });
   assert.deepEqual(calls[0].data.actions, [{ at: 1, action: 'kick', reason }]);
   await settle();
   assert.match(textOf(card), /lacks Kick Members/);
   assert.match(textOf(card), /individual channel permission grant/);
 
   modal = await edit();
+  assert.equal(pickerLabelled(modal, 'Recent-message cleanup (minutes)').value, '25');
+  await typeValue(pickerLabelled(modal, 'Recent-message cleanup (minutes)'), '0');
   await fire(pickerByName(modal, 'Remove @Anti-bot'), 'click');
   assert.equal(pickerLabelled(modal, 'Enabled').disabled, true);
   await save(modal);
   assert.equal(calls[1].data.enabled, false);
   assert.equal(calls[1].data.params.role_id, null);
+  assert.equal(calls[1].data.params.cleanup_window_minutes, 0);
   assert.deepEqual(calls[1].expected, calls[0].data);
 });
 

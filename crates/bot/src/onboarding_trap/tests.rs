@@ -282,6 +282,23 @@ async fn gateway_case(
     rule.dry_run = dry;
     rule.params =
         serde_json::json!({ "role_id": TRAP_ROLE.to_string(), "join_window_minutes": minutes });
+    if event_kind.starts_with("cleanup") {
+        if event_kind != "cleanup off" {
+            rule.params["cleanup_window_minutes"] = serde_json::json!(5);
+        }
+        let now_ms = Timestamp::now().timestamp_millis();
+        let joined_at_ms = member.joined_at.unwrap().timestamp_millis();
+        for (guild, author, id, at_ms) in [
+            (GUILD, MEMBER, 101, now_ms - 1_000),
+            (GUILD, MEMBER, 102, joined_at_ms - 1),
+            (GUILD, MEMBER, 103, now_ms - 301_000),
+            (GUILD, MEMBER, 104, now_ms + 60_000),
+            (GUILD, MEMBER + 1, 105, now_ms - 1_000),
+            (GUILD + 1, MEMBER, 106, now_ms - 1_000),
+        ] {
+            app.recent_messages.remember(guild, author, 77, id, at_ms);
+        }
+    }
     crate::db::upsert_rule(&app.db, GUILD as i64, RULE_ID, &rule)
         .await
         .unwrap();
@@ -337,7 +354,11 @@ async fn gateway_case(
     let member_with_new_role_json = serde_json::to_string(&member_with_new_role).unwrap();
     let new_role_granted = Arc::new(AtomicBool::new(false));
     let server_new_role_granted = Arc::clone(&new_role_granted);
-    let pause = event_kind.starts_with("during dispatch").then(|| {
+    let change_cleanup_on_kick = matches!(
+        event_kind,
+        "cleanup disabled during kick" | "cleanup user exemption" | "cleanup role exemption"
+    );
+    let pause = (event_kind.starts_with("during dispatch") || change_cleanup_on_kick).then(|| {
         Arc::new((
             tokio::sync::Notify::new(),
             tokio::sync::Notify::new(),
@@ -372,8 +393,9 @@ async fn gateway_case(
                         audit_reason: parts.headers.get("x-audit-log-reason")
                             .map(|value| value.to_str().unwrap().to_owned()).unwrap_or_default(),
                     };
+                    let paused_method = if change_cleanup_on_kick { Method::DELETE } else { Method::GET };
                     if let Some(pause) = pause
-                        && call.method == Method::GET && call.path.contains("/members/")
+                        && call.method == paused_method && call.path.contains("/members/")
                         && pause.2.swap(false, Ordering::Relaxed)
                     {
                         pause.0.notify_one();
@@ -508,6 +530,26 @@ async fn gateway_case(
                         new_role_granted.store(true, Ordering::Relaxed);
                         latest.roles.push(RoleId::new(NEW_TRAP_ROLE));
                     }
+                }
+                "cleanup disabled during kick"
+                | "cleanup user exemption"
+                | "cleanup role exemption" => {
+                    match event_kind {
+                        "cleanup disabled during kick" => {
+                            changed_rule.params["cleanup_window_minutes"] = serde_json::json!(0);
+                        }
+                        "cleanup user exemption" => changed_rule.whitelist_users.push(MEMBER),
+                        _ => changed_rule.whitelist_roles.push(TRAP_ROLE),
+                    }
+                    db::compare_and_set_onboarding_trap(
+                        &app.db,
+                        GUILD as i64,
+                        None,
+                        &rule,
+                        &changed_rule,
+                    )
+                    .await
+                    .unwrap();
                 }
                 _ => unreachable!(),
             }
@@ -680,7 +722,12 @@ async fn gateway_case(
         &effects[..]
     };
     if expected_kick {
-        assert_eq!(effects.len(), 3, "{event_kind}: {effects:?}");
+        let deletes_recent = event_kind == "cleanup";
+        assert_eq!(
+            effects.len(),
+            3 + usize::from(deletes_recent),
+            "{event_kind}: {effects:?}"
+        );
         assert_eq!(effects[0].0, Method::DELETE);
         assert!(
             effects[0]
@@ -733,14 +780,23 @@ async fn gateway_case(
         assert_eq!(case.reason.as_deref(), Some(REASON));
         assert!(effects[1].1.ends_with("/channels/70/messages"));
         assert!(effects[1].2.contains(cases[0].as_str()));
-        assert!(effects[2].1.ends_with("/channels/71/messages"));
-        assert!(effects[2].2.contains(REASON));
+        if deletes_recent {
+            assert_eq!(effects[2].0, Method::DELETE);
+            assert!(effects[2].1.ends_with("/channels/77/messages/101"));
+            assert!(effects[3].2.contains("tracked messages deleted (1)"));
+        }
+        let automod_log = effects.last().unwrap();
+        assert!(automod_log.1.ends_with("/channels/71/messages"));
+        assert!(automod_log.2.contains(REASON));
     } else {
         assert!(cases.is_empty(), "{event_kind}: {cases:?}");
         if dry {
             assert_eq!(effects.len(), 1, "{effects:?}");
             assert!(effects[0].1.ends_with("/channels/71/messages"));
             assert!(effects[0].2.contains("[DRY RUN]"));
+            if event_kind == "cleanup" {
+                assert!(effects[0].2.contains("would clean tracked messages"));
+            }
         } else {
             assert!(effects.is_empty(), "{event_kind}: {effects:?}");
         }
@@ -750,6 +806,35 @@ async fn gateway_case(
     drop(app);
     crate::tenant::remove_sidecars(&path);
     std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn trap_cleans_only_tracked_messages_in_the_stay_after_a_confirmed_kick() {
+    for (event, dry, joined_minutes_ago) in [
+        ("cleanup", false, 1),
+        ("cleanup", false, 10),
+        ("cleanup", true, 1),
+        ("cleanup off", false, 1),
+        ("cleanup disabled during kick", false, 1),
+        ("cleanup user exemption", false, 1),
+        ("cleanup role exemption", false, 1),
+    ] {
+        let joined_at = Timestamp::from_millis(
+            Timestamp::now().timestamp_millis() - joined_minutes_ago * 60_000,
+        )
+        .unwrap();
+        let member = member(MEMBER, &[TRAP_ROLE], joined_at);
+        gateway_case(
+            member.clone(),
+            member,
+            guild(Permissions::empty()),
+            event,
+            30,
+            dry,
+            !dry,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]

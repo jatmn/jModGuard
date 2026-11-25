@@ -1,9 +1,11 @@
-//! Bounded Gateway message identities for automod's ban purge.
+//! Bounded Gateway message identities for automod cleanup.
 use crate::db::GuildEnrollment;
 use crate::state::BotState;
 use parking_lot::Mutex;
 use serenity::http::Http;
 use std::collections::BTreeMap;
+use std::future::{Future, ready};
+use std::ops::RangeInclusive;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -101,8 +103,12 @@ impl RecentMessages {
             })
     }
 
-    fn for_ban(&self, guild: u64, author: u64, seconds: u32, now_ms: i64) -> Vec<(u64, u64)> {
-        let cutoff = now_ms - i64::from(seconds) * 1000;
+    fn in_window(
+        &self,
+        guild: u64,
+        author: u64,
+        window_ms: RangeInclusive<i64>,
+    ) -> Vec<(u64, u64)> {
         self.entries
             .lock()
             .iter()
@@ -111,7 +117,7 @@ impl RecentMessages {
                 *id == guild
                     && item.author == author
                     && item.purge_echo_until.is_none()
-                    && (cutoff..=now_ms).contains(&item.created_ms)
+                    && window_ms.contains(&item.created_ms)
             })
             .map(|((message, _), item)| (item.channel, *message))
             .collect()
@@ -131,9 +137,38 @@ pub(crate) async fn sweep_after_ban(
     cleanup: Option<&crate::logging::Cleanup<'_>>,
     still_admitted: impl Fn() -> bool,
 ) -> usize {
+    if seconds == 0 {
+        return 0;
+    }
+    let cutoff = sweep_at_ms - i64::from(seconds) * 1000;
+    sweep_tracked_messages(
+        app,
+        http,
+        enrollment,
+        author,
+        cutoff..=sweep_at_ms,
+        "automod ban purge",
+        cleanup,
+        || ready(still_admitted()),
+    )
+    .await
+}
+
+/// Delete only identities already observed through the Gateway. Admission can
+/// be refreshed before each request, within the same deadline as the sweep.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn sweep_tracked_messages<F: Future<Output = bool>>(
+    app: &std::sync::Arc<BotState>,
+    http: &Http,
+    enrollment: &GuildEnrollment,
+    author: u64,
+    window_ms: RangeInclusive<i64>,
+    audit_reason: &str,
+    cleanup: Option<&crate::logging::Cleanup<'_>>,
+    still_admitted: impl Fn() -> F,
+) -> usize {
     let guild = enrollment.guild_id as u64;
-    if seconds == 0
-        || !app.activation.may_record()
+    if !app.activation.may_record()
         || crate::db::guild_stores::guild_is_write_fenced(&app.db, enrollment.guild_id)
             .await
             .unwrap_or(true)
@@ -141,13 +176,14 @@ pub(crate) async fn sweep_after_ban(
     {
         return 0;
     }
-    let messages = app
-        .recent_messages
-        .for_ban(guild, author, seconds, sweep_at_ms);
+    let messages = app.recent_messages.in_window(guild, author, window_ms);
     let mut deleted = 0;
     let deadline = Instant::now() + MAX_SWEEP_TIME;
     for (channel, message) in messages {
-        if !still_admitted() {
+        if !matches!(
+            tokio::time::timeout_at(deadline, still_admitted()).await,
+            Ok(true)
+        ) {
             break;
         }
         if !app
@@ -161,7 +197,7 @@ pub(crate) async fn sweep_after_ban(
             deadline,
             crate::discord::race_discord_call(
                 &app.activation,
-                http.delete_message(channel.into(), message.into(), Some("automod ban purge")),
+                http.delete_message(channel.into(), message.into(), Some(audit_reason)),
             ),
         )
         .await;
@@ -204,7 +240,7 @@ pub(crate) async fn sweep_after_ban(
                     app.recent_messages.forget(guild, channel, message);
                 }
                 if !gone {
-                    tracing::debug!(guild, channel, message, %error, "automod ban purge could not delete tracked message");
+                    tracing::debug!(guild, channel, message, %error, audit_reason, "automod cleanup could not delete tracked message");
                 }
             }
             Ok(crate::discord::DiscordCall::Cancelled) | Err(_) => {
@@ -213,7 +249,8 @@ pub(crate) async fn sweep_after_ban(
                         guild,
                         author,
                         deleted,
-                        "automod ban purge reached its deadline"
+                        audit_reason,
+                        "automod cleanup reached its deadline"
                     );
                 }
                 if let Some((cleanup, prepared)) = cleanup.zip(prepared)
