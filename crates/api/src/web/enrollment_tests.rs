@@ -6943,13 +6943,6 @@ async fn fresh_login_config_refetches_only_after_callback_snapshot_freshness_exp
 struct DiscordRateLimitLog(Arc<std::sync::Mutex<Vec<String>>>);
 
 impl tracing::Subscriber for DiscordRateLimitLog {
-    fn register_callsite(
-        &self,
-        _: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        tracing::subscriber::Interest::sometimes()
-    }
-
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true
     }
@@ -6970,6 +6963,28 @@ impl tracing::Subscriber for DiscordRateLimitLog {
 #[tokio::test]
 async fn fresh_login_during_discord_429_has_identity_and_retries_discovery() {
     use tracing::instrument::WithSubscriber as _;
+
+    // A parallel test can register the shared warning callsite on an unscoped
+    // thread and cache Interest::never. Run the capture in its own test process.
+    const CAPTURE_CHILD: &str = "JMODGUARD_DISCORD_429_CAPTURE_CHILD";
+    if std::env::var_os(CAPTURE_CHILD).is_none() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let test =
+            format!("{module}::fresh_login_during_discord_429_has_identity_and_retries_discovery");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test])
+            .env(CAPTURE_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed;"),
+            "{test}: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
 
     let mut f = Fixture::new(false).await;
     f.enroll(10).await;
@@ -8464,7 +8479,11 @@ async fn removed_case_list_checks_for_a_row_past_the_maximum_page() {
 
 #[tokio::test]
 async fn case_list_deadline_includes_waiting_for_a_local_connection() {
+    use std::future::poll_fn;
+    use std::task::Poll;
     use std::time::Duration;
+    use tokio::time;
+
     let f = Fixture::new(false).await;
     f.enroll(10).await;
     let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
@@ -8481,12 +8500,12 @@ async fn case_list_deadline_includes_waiting_for_a_local_connection() {
     for _ in 0..2 {
         let db = f.app.db.clone();
         let entered = entered.clone();
-        let (release, wait) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
         releases.push(release);
         blockers.push(tokio::spawn(async move {
             db.with_conn(move |_| {
                 entered.send(()).unwrap();
-                wait.recv().unwrap();
+                let _ = wait.recv();
                 Ok(())
             })
             .await
@@ -8495,23 +8514,36 @@ async fn case_list_deadline_includes_waiting_for_a_local_connection() {
     }
     received.recv().await.unwrap();
     received.recv().await.unwrap();
-    let result = tokio::time::timeout(
-        Duration::from_secs(21),
-        f.request_token(
+    time::pause();
+    let budget = Duration::from_secs(20);
+    let deadline = time::Instant::now() + budget;
+    let result = {
+        let mut request = std::pin::pin!(f.request_token(
             "POST",
             "/api/guilds/10/cases?limit=50&removed=false",
             "",
             Some(&enrollment.id),
-        ),
-    )
-    .await;
-    for release in releases {
-        release.send(()).unwrap();
-    }
+        ));
+        // Poll into the pool wait so the handler has registered its timer.
+        poll_fn(|cx| {
+            assert!(request.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        // The blocking pool holders prevent Tokio from auto-advancing.
+        time::advance(budget + Duration::from_millis(1)).await;
+        // Wait for the timer driver to process the deadline we advanced past.
+        time::sleep_until(deadline).await;
+        poll_fn(|cx| Poll::Ready(request.as_mut().poll(cx))).await
+    };
+    time::resume();
+    drop(releases);
     for blocker in blockers {
         blocker.await.unwrap();
     }
-    let (status, body) = result.expect("Cases handler exceeded its request budget");
+    let Poll::Ready((status, body)) = result else {
+        panic!("Cases handler exceeded its request budget");
+    };
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(
         body["error"]

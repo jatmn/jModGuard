@@ -1231,14 +1231,6 @@ async fn background_check_skips_install_after_failed_renew() {
     let (bot, app, path, _enrollment) = linked_writer("bg-renew-fail").await;
     let bot_slot = Arc::new(std::sync::Mutex::new(Some(bot)));
     let db = writer_db(&bot_slot);
-    let now = CHECKED_AT;
-    app.commit(db::ControlOp::RecordBakedComponentRunning {
-        component: "bot".into(),
-        observation: running_observation(now),
-        now,
-    })
-    .await
-    .unwrap();
     app.commit(db::ControlOp::SetUpdatePolicy {
         component: "bot".into(),
         channel: "stable".into(),
@@ -1248,15 +1240,30 @@ async fn background_check_skips_install_after_failed_renew() {
     .await
     .unwrap();
     let seed = promoted_release("bot", "stable", '4');
-    app.commit(db::ControlOp::RecordUpdateCheck {
-        component: "bot".into(),
-        channel: "stable".into(),
-        candidate: Some(seed),
-        error: None,
-        now,
-    })
-    .await
-    .unwrap();
+    let initial = record_release_checks(
+        &app,
+        |component, channel| {
+            let release = promoted_release(component, channel, '4');
+            Box::pin(async move { Ok(release) })
+        },
+        RELEASE_LOOKUP_TIMEOUT,
+        pending_shutdown(),
+    )
+    .await;
+    assert!(initial.finished);
+    let checked = db::component_update(&db, "bot").await.unwrap();
+    assert_eq!(checked.candidate.as_ref(), Some(&seed));
+    // Use the completed check's UTC timestamp for both compatibility observations.
+    let now = checked.checked_at.expect("initial bot check was recorded");
+    for component in ["bot", "api"] {
+        app.commit(db::ControlOp::RecordBakedComponentRunning {
+            component: component.into(),
+            observation: running_observation(now),
+            now,
+        })
+        .await
+        .unwrap();
+    }
     let gate = Arc::new(tokio::sync::Notify::new());
     let gate_release = Arc::clone(&gate);
     let (bot_entered_tx, mut bot_entered_rx) = tokio::sync::mpsc::channel(1);
@@ -1307,15 +1314,22 @@ async fn background_check_skips_install_after_failed_renew() {
         .await
         .expect("release checks did not finish in time")
         .unwrap();
+    assert!(batch.finished);
     assert!(batch.lease_held.contains("bot"));
+    let candidate = db::component_update(&db, "bot")
+        .await
+        .unwrap()
+        .candidate
+        .expect("bot candidate available to the scheduler");
     let before = install_snapshot(&db, "bot").await;
-    poll_scheduled_installs(
-        &app,
-        &batch.lease_held,
-        ScheduledInstallPolicy::enabled(true, true),
-    )
-    .await;
+    let apply = ScheduledInstallPolicy::enabled(true, true);
+    poll_scheduled_installs(&app, &batch.lease_held, apply).await;
     assert_install_unchanged(&db, "bot", &before).await;
+    // With only the skip set removed, the same writer must queue the eligible candidate.
+    poll_scheduled_installs(&app, &std::collections::HashSet::new(), apply).await;
+    let queued = install_snapshot(&db, "bot").await;
+    assert_eq!(queued.state, "queued");
+    assert_eq!(queued.desired, Some(candidate));
     drop(app);
     drop(bot_slot);
     cleanup(&path);
