@@ -5,8 +5,11 @@
 //! `config_version` to pick up cross-process changes within `config_poll_secs`.
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_sessions::Session;
@@ -1806,7 +1809,7 @@ pub async fn analytics(
     headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
     Query(query): Query<AnalyticsQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Response> {
     let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
@@ -1817,8 +1820,15 @@ pub async fn analytics(
         )));
     }
     let key = (enrollment.guild_id, enrollment.id.clone(), days);
+    let json_response = |body: Bytes| {
+        (
+            [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+            body,
+        )
+            .into_response()
+    };
     if let Some(cached) = app.analytics_cache.get(&key, std::time::Instant::now()) {
-        return Ok(Json(cached));
+        return Ok(json_response(cached));
     }
     let result = db::enrolled_guild_analytics(&app.db, enrollment.clone(), days).await?;
     let moderator_ids = result.moderators.iter().map(|m| m.moderator_id).collect();
@@ -1845,11 +1855,17 @@ pub async fn analytics(
     }
     let complete = directory.is_some();
     value["members"] = serde_json::json!(directory.map(|(totals, _)| totals));
+    let body = match serde_json::to_vec(&value) {
+        Ok(encoded) => Bytes::from(encoded.into_boxed_slice()),
+        Err(error) => {
+            return Ok((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response());
+        }
+    };
     if complete {
         app.analytics_cache
-            .put(key, value.clone(), std::time::Instant::now());
+            .put(key, body.clone(), std::time::Instant::now());
     }
-    Ok(Json(value))
+    Ok(json_response(body))
 }
 
 pub(super) async fn enqueue_action(
