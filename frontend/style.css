@@ -508,11 +508,6 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 .trend-card .card-body { gap: 10px; }
 .trend-picker { display: flex; flex-wrap: wrap; gap: 6px; }
 .trend-pick-active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
-.trend-chart { margin: 0; min-width: 0; }
-.trend-grid line { stroke: var(--shell-border); stroke-width: 1; }
-.trend-grid text, .trend-day { fill: var(--muted); }
-.trend-area { fill: var(--accent); opacity: 0.14; }
-.trend-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .platform-stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); overflow: visible; background: var(--panel); border: 1px solid var(--shell-border); margin-bottom: 6px; }
 .platform-stats .stat { min-width: 0; border-right: 1px solid var(--shell-border); }
 .platform-stats .stat:last-child { border-right: 0; }

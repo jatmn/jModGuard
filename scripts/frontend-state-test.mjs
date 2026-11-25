@@ -1270,7 +1270,16 @@ test('analytics shows unavailable instead of zeros when the read fails', async (
   assert.equal([...panel.querySelectorAll('.an-panel .an-empty')].filter((n) => n.textContent === 'Unavailable').length, 6);
 });
 
-test('analytics renders empty and single-day data without errors or false trends', async () => {
+test('analytics distinguishes missing daily data from observed zeros and single days', async () => {
+  const missing = harness(async () => response(analyticsSummary(30, { series: [] })));
+  missing.app.state.config = ANALYTICS_CONFIG;
+  const missingPanel = missing.app.tabAnalytics();
+  await settle();
+  for (const id of ['an-enforcement', 'an-membership']) {
+    const section = missingPanel.querySelector(`[aria-labelledby="${id}"]`);
+    assert.equal(section.querySelector('svg[role="img"]'), null, id);
+    assert.match(section.querySelector('.an-empty').textContent, /No trend data in this range\./);
+  }
   const empty = harness(async () => response(analyticsSummary(30, { series: analyticsDays(30), previous: { warns: 0, bans: 0, automod: 0, mod_actions: 0, timeouts: 0, joins: null, leaves: null }, top_rules: [], mod_action_kinds: [], moderators: [], heatmap: [], members: null })));
   empty.app.state.config = ANALYTICS_CONFIG;
   const panel = empty.app.tabAnalytics();
@@ -1279,6 +1288,9 @@ test('analytics renders empty and single-day data without errors or false trends
   assert.equal(kpiValue(panel, 'Warnings'), '0');
   assert.equal(kpi(panel, 'Joins').querySelector('.an-delta'), null, 'no comparison without a recorded previous window');
   assert.equal(panel.querySelectorAll('svg .an-bar').length, 0);
+  for (const id of ['an-enforcement', 'an-membership']) {
+    assert.equal(panel.querySelectorAll(`[aria-labelledby="${id}"] .an-hit`).length, 30, 'zero-valued days remain charted');
+  }
   assert.deepEqual([...panel.querySelectorAll('.an-panel .an-empty')].map((n) => n.textContent),
     ['No automod enforcement in this range.', 'No mod actions in this range.', 'No attributed mod actions in this range.']);
   assert.match(panel.querySelector('#an-heatmap-readout').textContent, /No enforcement actions in this range\./);
@@ -12841,9 +12853,14 @@ test('Platform analytics retains totals, charts and rows through refresh failure
   const panel = () => h.nodes.get('#content');
   const totals = () => [...panel().querySelectorAll('.an-kpi-value')].map(el => el.textContent);
   const originalTotals = totals();
+  const [enforcement, membership] = panel().querySelectorAll('.an-panel svg[role="img"]');
+  await fire(enforcement, 'keydown', { key: 'End' });
+  await fire(membership.querySelector('.an-hit'), 'mouseover');
+  assert.equal(panel().querySelectorAll('.an-cursor').length, 2, 'keyboard and hover select a day');
   const assertRetained = () => {
     assert.deepEqual(totals(), originalTotals);
     assert.equal(panel().querySelectorAll('.an-panel svg[role="img"]').length, 2);
+    assert.equal(panel().querySelectorAll('.an-cursor').length, 2, 'the retained daily data keeps its cursor');
     assert.match(platformPanel(h, 'Servers').querySelector('table').textContent, /Alpha900000000000000001/);
   };
   await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
@@ -12873,6 +12890,11 @@ test('Platform analytics retains totals, charts and rows through refresh failure
   await settle();
   assert.equal(totals()[0], '4');
   assert.equal(h.nodes.get('#platform-analytics-status'), null, 'complete totals need no note');
+  assert.equal(panel().querySelectorAll('.an-cursor').length, 0, 'new daily data clears both cursors');
+  assert.equal(panel().querySelector('.an-panel svg[role="img"]'), enforcement, 'the keyboard-operated chart remains mounted');
+  await fire(enforcement, 'keydown', { key: 'ArrowRight' });
+  assert.equal(enforcement.querySelector('.an-cursor').getAttribute('x'), enforcement.querySelector('.an-hit').getAttribute('x'),
+    'the next keyboard move starts at the first day of the new response');
 });
 
 test('Platform analytics initial failure reports unavailability and retry restores the view', async () => {

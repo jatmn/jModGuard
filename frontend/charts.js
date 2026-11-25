@@ -178,67 +178,12 @@ export function useTrendMetric(initial) {
   return [metric, setMetric];
 }
 
-function scale(value, max) {
-  return value / max;
-}
-
 function dayLabel(day) {
   // YYYY-MM-DD to "Nov 12" without locale-dependent output.
   const [year, month, date] = String(day).split("-").map(Number);
   const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   if (!year || !month || !date) return String(day);
   return `${months[month - 1]} ${date}`;
-}
-
-export function TrendChart({ points, metric, title }) {
-  const layout = useChartLayout(720);
-  const { width, lineHeight, gap, measureLabel, ref } = layout;
-  const height = 240;
-  const values = points.map((point) => point[metric] ?? 0);
-  const count = points.length;
-  const max = Math.max(1, ...values);
-  const padLeft = measureLabel(String(Math.round(max))) + 2 * gap;
-  const padTop = lineHeight / 2 + 2;
-  const innerWidth = Math.max(1, width - padLeft - gap);
-  const innerHeight = Math.max(1, height - 2 * padTop - lineHeight - gap);
-  const x = (index) => padLeft + (count <= 1 ? innerWidth / 2 : (index * innerWidth) / (count - 1));
-  const y = (value) => padTop + innerHeight - scale(value, max) * innerHeight;
-  const linePoints = values
-    .map((value, index) => `${x(index).toFixed(1)},${y(value).toFixed(1)}`)
-    .join(" ");
-  const area = `M${x(0).toFixed(1)},${y(0).toFixed(1)} L${linePoints.split(" ").join(" L ")} L${x(count - 1).toFixed(1)},${y(0).toFixed(1)} Z`;
-  const gridValues = innerHeight / 2 >= lineHeight ? [max, max / 2, 0] : [max, 0];
-  const latest = values[count - 1] ?? 0;
-  const first = points[0]?.day ?? "";
-  const last = points[count - 1]?.day ?? "";
-  return h(
-    "figure",
-    { className: "trend-chart" },
-    h(
-      ChartPlot,
-      {
-        ref,
-        height,
-        role: "img",
-        "aria-label": `${title} per day from ${first} to ${last}; latest day ${latest}.`,
-      },
-      // Horizontal gridlines with their value labels.
-      ...gridValues.map((value) =>
-        h("g", { key: `grid-${value}`, className: "trend-grid" },
-          h("line", { x1: padLeft, x2: width - gap, y1: y(value).toFixed(1), y2: y(value).toFixed(1) }),
-          axisText(String(Math.round(value)), { x: padLeft - gap, y: y(value), textAnchor: "end" }),
-        ),
-      ),
-      h("path", { className: "trend-area", d: area }),
-      h("polyline", { className: "trend-line", points: linePoints }),
-      // Day labels under both ends of the window.
-      ...horizontalTicks(layout, [
-        { key: "first", text: dayLabel(first), x: padLeft },
-        { key: "last", text: dayLabel(last), x: width - gap, anchor: "end" },
-      ], { y: height - padTop, axisY: y(0), className: "trend-day" }),
-    ),
-    h("figcaption", { className: "sr-only" }, `${title} per day, ${first} through ${last}.`),
-  );
 }
 
 export function TrendMetricPicker({ metric, onChange }) {
@@ -376,8 +321,15 @@ function dayTicks(layout, points, slots, y) {
 
 // One hover/focus position shared by every chart in a panel. Arrow keys move
 // it so tooltips are reachable without a pointer; Escape clears it.
-export function useChartCursor(count) {
+export function useChartCursor(points) {
   const [index, setIndex] = useState(null);
+  const [previousPoints, setPreviousPoints] = useState(points);
+  // Reset for a replacement series while keeping the chart element and its focus.
+  if (previousPoints !== points) {
+    setPreviousPoints(points);
+    setIndex(null);
+  }
+  const count = points.length;
   const onKeyDown = (event) => {
     const last = count - 1;
     if (last < 0) return;
@@ -466,7 +418,7 @@ function ChartReadout({ id, children }) {
 // Small multiples: one aligned daily bar strip per enforcement metric, sharing
 // one x axis and one hover day so metrics compare without being summed.
 export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
-  const cursor = useChartCursor(points.length);
+  const cursor = useChartCursor(points);
   const layout = useChartLayout(640);
   const { width, lineHeight, gap: labelGap, measureLabel, ref } = layout;
   const inset = lineHeight / 2 + 2;
@@ -557,7 +509,7 @@ export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
 // Joins above and leaves below a zero baseline, with the running net change
 // across the range drawn as a line with points.
 export function MembershipChart({ points }) {
-  const cursor = useChartCursor(points.length);
+  const cursor = useChartCursor(points);
   const layout = useChartLayout(440);
   const { width, lineHeight, gap: labelGap, measureLabel, ref } = layout;
   const height = Math.min(MAX_PLOT_HEIGHT, Math.max(196, 9 * lineHeight));
