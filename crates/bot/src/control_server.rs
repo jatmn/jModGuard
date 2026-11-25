@@ -160,12 +160,15 @@ pub fn spawn(app: Arc<BotState>) -> anyhow::Result<Option<std::net::SocketAddr>>
         app,
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     )
 }
 
 fn spawn_listener(
     app: Arc<BotState>,
     #[cfg(test)] mut completion: Option<tokio::sync::oneshot::Sender<String>>,
+    #[cfg(test)] mut waiting_for_moderation: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> anyhow::Result<Option<std::net::SocketAddr>> {
     let key = match control::load_writer_key(app.cfg.bot.control_secret.as_str()) {
         Ok(key) => key,
@@ -202,6 +205,10 @@ fn spawn_listener(
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             while worker.activation.moderation_depth() > 0 && worker.activation.may_record() {
+                #[cfg(test)]
+                if let Some(waiting) = waiting_for_moderation.take() {
+                    let _ = waiting.send(());
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             let reply = if !worker.activation.may_record() {
@@ -608,6 +615,22 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    async fn submit_during_moderation(
+        bot: &Arc<BotState>,
+        frame: Vec<u8>,
+    ) -> tokio::task::JoinHandle<ControlReply> {
+        let (waiting, admitted) = tokio::sync::oneshot::channel();
+        let bound = spawn_listener(Arc::clone(bot), None, Some(waiting))
+            .unwrap()
+            .unwrap();
+        let pending = tokio::task::spawn_blocking(move || submit(bound, frame));
+        tokio::time::timeout(Duration::from_secs(3), admitted)
+            .await
+            .expect("worker did not reach the moderation hold")
+            .expect("worker dropped the moderation wait signal");
+        pending
+    }
+
     fn key() -> Vec<u8> {
         control::load_writer_key(&"x".repeat(32)).unwrap()
     }
@@ -956,16 +979,13 @@ mod tests {
             let permitted = guild != 10 || allowed.load(Ordering::SeqCst);
             async move { ControlMemberFetch::Found(Box::new(actor_member(guild, permitted))) }
         });
-        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
         let hold = bot.activation.hold_rule();
         let op = db::ControlOp::CopyGuildConfig {
             source: scope(&source),
             destination: scope(&destination),
             sections: vec!["settings".into()],
         };
-        let frame = seal(&op, 7);
-        let pending = tokio::task::spawn_blocking(move || submit(bound, frame));
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let pending = submit_during_moderation(&bot, seal(&op, 7)).await;
         source_allowed.store(false, Ordering::SeqCst);
         drop(hold);
         let reply = pending.await.unwrap();
@@ -1006,7 +1026,6 @@ mod tests {
             let permitted = guild != 10 || allowed.load(Ordering::SeqCst);
             async move { ControlMemberFetch::Found(Box::new(actor_member(guild, permitted))) }
         });
-        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
         let hold = bot.activation.hold_rule();
         let op = db::ControlOp::UpsertRule {
             clear_guild_override: false,
@@ -1035,9 +1054,7 @@ mod tests {
                 open_case: true,
             },
         };
-        let frame = seal(&op, 7);
-        let pending = tokio::task::spawn_blocking(move || submit(bound, frame));
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let pending = submit_during_moderation(&bot, seal(&op, 7)).await;
         source_allowed.store(false, Ordering::SeqCst);
         drop(hold);
         let reply = pending.await.unwrap();
@@ -1107,11 +1124,8 @@ mod tests {
         let (bot, path) = writer_bot().await;
         let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
         allow_actor(&bot);
-        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
         let hold = bot.activation.hold_rule();
-        let frame = seal(&patch(&enrollment, "!queued"), 7);
-        let pending = tokio::task::spawn_blocking(move || submit(bound, frame));
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let pending = submit_during_moderation(&bot, seal(&patch(&enrollment, "!queued"), 7)).await;
         bot.activation.note_lease_lost();
         drop(hold);
         let reply = pending.await.unwrap();
@@ -1130,7 +1144,7 @@ mod tests {
         let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
         allow_actor(&bot);
         let (completion, completed) = tokio::sync::oneshot::channel();
-        let bound = spawn_listener(Arc::clone(&bot), Some(completion))
+        let bound = spawn_listener(Arc::clone(&bot), Some(completion), None)
             .unwrap()
             .unwrap();
         let hold = bot.activation.hold_rule();
