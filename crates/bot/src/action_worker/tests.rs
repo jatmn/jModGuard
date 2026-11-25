@@ -448,6 +448,26 @@ async fn copied_claim_can_dispatch_only_once_and_audit_is_atomic() {
 }
 
 #[tokio::test]
+async fn idle_queue_poll_opens_no_transaction_and_next_poll_dispatches() {
+    let probe = std::sync::Arc::new(db::StartupProbe::default());
+    let f = {
+        let _probe = db::enter_startup_probe(Some(probe.clone()));
+        Fixture::new()
+    };
+    let discord = MockDiscord::default();
+    let limits = WorkerLimits::default();
+    let transactions = probe.transactions();
+    drain(&f.db, &discord, &limits).await.unwrap();
+    assert_eq!(probe.transactions(), transactions);
+    assert_eq!(discord.calls.load(Ordering::SeqCst), 0);
+
+    let job = f.enqueue(10, "between-polls", unban(99)).await;
+    drain(&f.db, &discord, &limits).await.unwrap();
+    assert_eq!(discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.status(&job).await.state, "succeeded");
+}
+
+#[tokio::test]
 async fn production_drain_records_one_stable_truthful_case_for_a_queued_unban() {
     for (label, outcome, expected) in [
         (
@@ -2289,7 +2309,11 @@ async fn timed_ban_expiry_skips_an_unavailable_guild_without_starving_later_guil
 // Paused: retry times count from each check's end on the runtime clock.
 #[tokio::test(start_paused = true)]
 async fn timed_ban_expiry_retry_delay_keeps_failing_guilds_from_starving_later_guilds() {
-    let f = Fixture::new();
+    let probe = std::sync::Arc::new(db::StartupProbe::default());
+    let f = {
+        let _probe = db::enter_startup_probe(Some(probe.clone()));
+        Fixture::new()
+    };
     let limits = WorkerLimits::default();
     let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
     app.activation.mark_lock_held(true);
@@ -2324,7 +2348,13 @@ async fn timed_ban_expiry_retry_delay_keeps_failing_guilds_from_starving_later_g
     // The next poll skips them until their saved retry time.
     assert_eq!(poll(215).await, vec![healthy]);
     assert_eq!(*discord.unbans.lock().unwrap(), vec![(healthy, 20)]);
+    let transactions = probe.transactions();
     assert!(poll(259).await.is_empty());
+    assert_eq!(
+        probe.transactions(),
+        transactions,
+        "a poll with only waiting retries opens no transaction"
+    );
     // Each guild is checked again at its retry time; another failure doubles
     // the delay up to the bound.
     let base = EXPIRY_CHECK_RETRY_BASE_SECS;
