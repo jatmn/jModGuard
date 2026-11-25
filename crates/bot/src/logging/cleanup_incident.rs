@@ -429,6 +429,8 @@ impl Incident {
                 row,
                 retry_at: None,
             });
+        // This is also the bounded handoff for snapshot-only claims.
+        // The cleanup worker persists them before delivering the incident.
         app.cleanup_incidents.wake.notify_one();
         Some(key)
     }
@@ -652,6 +654,11 @@ impl Incidents {
 }
 
 impl CleanupIncidents {
+    #[cfg(test)]
+    pub(crate) async fn hold_journal_writer(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.journal_writer.lock().await
+    }
+
     async fn wait_until_due(&self) {
         let next = {
             let state = self.inner.lock();
@@ -895,27 +902,6 @@ pub(crate) async fn persist_cleanup_observations(app: &BotState, keys: &[Cleanup
         if ready {
             persist_observation_chunk(app, keys, false).await;
         }
-    }
-}
-
-pub(crate) async fn persist_gateway_cleanup_observations(
-    app: &BotState,
-    guild: GuildId,
-    channel: ChannelId,
-    ids: &[MessageId],
-) {
-    if !app.cfg.log.group_automod_cleanup_deletes {
-        return;
-    }
-    for ids in ids.chunks(JOURNAL_PAGE) {
-        let keys: Vec<_> = {
-            let journal = app.cleanup_incidents.journal.lock();
-            ids.iter()
-                .map(|id| (guild.get(), (channel.get(), id.get())))
-                .filter(|key| journal.observed.contains_key(key))
-                .collect()
-        };
-        persist_cleanup_observations(app, &keys).await;
     }
 }
 

@@ -20,7 +20,7 @@ mod cleanup_incident;
 pub(crate) use cleanup_incident::flush as flush_cleanup_reports;
 pub(crate) use cleanup_incident::{
     Cleanup, CleanupIncidents, CleanupRule, begin_cleanup, claim_cleanup_gateway,
-    cleanup_delete_failure, persist_cleanup_observations, persist_gateway_cleanup_observations,
+    cleanup_delete_failure, persist_cleanup_observations,
 };
 pub use cleanup_incident::{flush_cleanup_on_shutdown, run_cleanup_reports};
 
