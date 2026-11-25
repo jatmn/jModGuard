@@ -179,9 +179,20 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
   const nodes = { get: selector => document.querySelector(selector) };
   const collect = () => Array.from(document.querySelectorAll('#content *, .modal-overlay *, #owner-tools *, .test-panel *'));
   const elements = { find: predicate => collect().find(predicate), filter: predicate => collect().filter(predicate), some: predicate => collect().some(predicate), [Symbol.iterator]: function* () { yield* collect(); } };
+  function measureDraftRenders() {
+    const counts = new Map();
+    const instrument = vm.runInContext(`(count) => {
+      const originalTextarea = Textarea, originalSelect = Select, originalServerPicker = ServerPicker;
+      Textarea = (props) => { count(props.draftKey); return originalTextarea(props); };
+      Select = (props) => { count(props.draftKey); return originalSelect(props); };
+      ServerPicker = (props) => { count('sidebar'); return originalServerPicker(props); };
+    }`, context);
+    instrument(key => counts.set(key, (counts.get(key) || 0) + 1));
+    return counts;
+  }
   vm.runInContext('root.render(h(App));', context);
   pages.push({dom, roots});
-  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, advanceTime(ms) { clockOffsetMs += ms; } };
+  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, advanceTime(ms) { clockOffsetMs += ms; } };
 }
 
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
@@ -1414,6 +1425,44 @@ test('template variable help lists each variable with its meaning and an example
   const firstGroup = [...reference.querySelectorAll('.template-variable-group')][0];
   for (const name of ['{user}', '{guild}', '{channel}', '{time}']) assert.ok(textOf(firstGroup).includes(name), `first group lists ${name}`);
   assert.match(textOf(reference), /A variable marked \? isn't always filled in; point at it to see what shows instead\./);
+});
+
+test('template keystrokes update the edited field and its preview without rendering unrelated fields or the sidebar', async () => {
+  const { app, document, measureDraftRenders } = harness();
+  const counts = measureDraftRenders();
+  app.state.config = { templates: [
+    { event: 'member_join', effective: 'Saved join' },
+    { event: 'member_leave', effective: 'Saved leave' },
+  ] };
+  app.state.tab = 'templates';
+  app.renderTab();
+  const fields = [...document.querySelectorAll('.template-card textarea')];
+  assert.equal(fields.length, 2);
+  const [edited, unrelated] = fields;
+  const status = document.getElementById('workspace-status');
+  edited.focus();
+  const type = async (value) => {
+    edited.value = value;
+    await fire(edited, 'input');
+    assert.equal(edited.value, value);
+    assert.equal(document.activeElement, edited);
+    assert.equal(document.querySelector('.template-card .log-embed-description').textContent, value);
+  };
+  await type('Draft');
+  assert.equal(app.isDirty(), true);
+  assert.equal(status.textContent, 'Unsaved changes');
+
+  const observed = ['template:member_join:text', 'template:member_leave:text', 'template:member_join:scope', 'sidebar'];
+  for (const key of observed) assert.ok(counts.get(key), `${key} is mounted and counted`);
+  const before = new Map(counts);
+  for (const value of ['Draft a', 'Draft ab', 'Draft abc']) await type(value);
+  assert.equal(unrelated.value, 'Saved leave');
+  assert.deepEqual(observed.map(key => counts.get(key) - before.get(key)), [3, 0, 0, 0], 'renders of the edited text, other text, save scope, and sidebar');
+
+  await type('Saved join');
+  assert.equal(app.isDirty(), false);
+  assert.equal(status.textContent, 'Changes saved with each action');
+  edited.blur();
 });
 
 test('each template editor offers only its event variables, matching the shipped templates', () => {

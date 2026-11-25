@@ -19,6 +19,6 @@ export function createState(initial) {
   };
 }
 
-export function useStore(store) {
-  return useSyncExternalStore(store.subscribe, store.getSnapshot);
+export function useStore(store, select = snapshot => snapshot) {
+  return useSyncExternalStore(store.subscribe, () => select(store.getSnapshot()));
 }
