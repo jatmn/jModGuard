@@ -35,6 +35,7 @@ pub(super) fn summary_template(cfg: &crate::state::CachedGuildConfig) -> Option<
 
 type Subject = (u64, u64);
 type Message = (u64, u64);
+/// Guild, channel and message identity shared by the collector and handler.
 pub(crate) type CleanupObservation = (u64, Message);
 
 struct ClaimedDelete {
@@ -42,6 +43,7 @@ struct ClaimedDelete {
 }
 
 struct PendingObservation {
+    batch: u64,
     row: CleanupDeleteRecord,
     retry_at: Option<Clock>,
 }
@@ -58,7 +60,7 @@ pub(crate) struct CleanupIncidents {
 #[derive(Default)]
 struct JournalWrites {
     observed: BTreeMap<CleanupObservation, PendingObservation>,
-    skipped: BTreeMap<CleanupObservation, CleanupDeleteSave>,
+    skipped: BTreeMap<(u64, Message), CleanupDeleteSave>,
     settled: BTreeSet<(u64, i64)>,
     settlement_retry_at: Option<Clock>,
 }
@@ -403,7 +405,7 @@ impl Incident {
         purge: bool,
     ) -> Option<CleanupObservation> {
         let enrollment = self.enrollment.as_ref()?;
-        let key = (self.nonce, target);
+        let key = (enrollment.guild_id as u64, target);
         let row = CleanupDeleteRecord {
             batch: batch_key(self.nonce),
             guild_id: enrollment.guild_id,
@@ -423,6 +425,7 @@ impl Incident {
             .entry(key)
             .and_modify(|pending| pending.row.purge = purge)
             .or_insert(PendingObservation {
+                batch: self.nonce,
                 row,
                 retry_at: None,
             });
@@ -535,35 +538,42 @@ pub(crate) fn claim_cleanup_gateway(
     let guild = guild.get();
     let channel = channel.get();
     let id = message.get();
-    let (author, created) = app
+    let identity = app
         .recent_messages
         .identity(guild, channel, id)
         .or_else(|| {
             let row = retained?;
             Some((row.fields.author_id?.try_into().ok()?, row.created_at_ms))
-        })?;
-    let mut state = app.cleanup_incidents.inner.lock();
-    let (_, incident) = state
-        .active
-        .values_mut()
-        .rev()
-        .find(|(subject, incident)| {
+        });
+    if let Some((author, created)) = identity {
+        let mut state = app.cleanup_incidents.inner.lock();
+        if let Some((_, incident)) = state.active.values_mut().rev().find(|(subject, incident)| {
             *subject == (guild, author)
                 && incident.accepts_purge_receipt()
                 && incident
                     .purge_from
                     .zip(incident.purge_until)
                     .is_some_and(|(from, until)| (from..=until).contains(&created))
-        })?;
-    incident
-        .claim_delete(
-            app,
-            guild,
-            (channel, id),
-            CleanupDeleteClaim::Gateway(origin),
-            retained,
-        )
-        .and_then(|claim| claim.observation)
+        }) {
+            let _ = incident.claim_delete(
+                app,
+                guild,
+                (channel, id),
+                CleanupDeleteClaim::Gateway(origin),
+                retained,
+            );
+        }
+    }
+    // The collector may already have claimed the echo using a retained row.
+    // Persisting that event doesn't require knowing its author again or finding
+    // the incident still open for new claims.
+    let key = (guild, (channel, id));
+    app.cleanup_incidents
+        .journal
+        .lock()
+        .observed
+        .contains_key(&key)
+        .then_some(key)
 }
 
 pub(crate) fn cleanup_delete_failure(error: &serenity::Error) -> &'static str {
@@ -888,6 +898,27 @@ pub(crate) async fn persist_cleanup_observations(app: &BotState, keys: &[Cleanup
     }
 }
 
+pub(crate) async fn persist_gateway_cleanup_observations(
+    app: &BotState,
+    guild: GuildId,
+    channel: ChannelId,
+    ids: &[MessageId],
+) {
+    if !app.cfg.log.group_automod_cleanup_deletes {
+        return;
+    }
+    for ids in ids.chunks(JOURNAL_PAGE) {
+        let keys: Vec<_> = {
+            let journal = app.cleanup_incidents.journal.lock();
+            ids.iter()
+                .map(|id| (guild.get(), (channel.get(), id.get())))
+                .filter(|key| journal.observed.contains_key(key))
+                .collect()
+        };
+        persist_cleanup_observations(app, &keys).await;
+    }
+}
+
 async fn persist_observation_chunk(app: &BotState, keys: &[CleanupObservation], background: bool) {
     let queue = &app.cleanup_incidents;
     let _writer = queue.journal_writer.lock().await;
@@ -918,13 +949,14 @@ async fn persist_observation_chunk(app: &BotState, keys: &[CleanupObservation], 
                 if let Some(pending) = journal.observed.get_mut(&key)
                     && pending.row == row
                 {
+                    let batch = pending.batch;
                     if outcome == CleanupDeleteSave::WriteFenced {
                         pending.retry_at = Some(retry_at);
                     } else {
                         journal.observed.remove(&key);
                     }
                     if outcome != CleanupDeleteSave::Saved {
-                        journal.skipped.insert(key, outcome);
+                        journal.skipped.insert((batch, key.1), outcome);
                     }
                 }
             }
@@ -1030,7 +1062,14 @@ impl PendingIncident {
             if self.incident.enrollment.is_some() {
                 let mut journal = app.cleanup_incidents.journal.lock();
                 let batch = self.incident.nonce;
-                journal.observed.remove(&(batch, target));
+                let key = (self.subject.0, target);
+                if journal
+                    .observed
+                    .get(&key)
+                    .is_some_and(|pending| pending.batch == batch)
+                {
+                    journal.observed.remove(&key);
+                }
                 journal.skipped.remove(&(batch, target));
                 journal.settled.insert((batch, target.1 as i64));
             }
@@ -1078,7 +1117,12 @@ impl PendingIncident {
             let batch = self.incident.nonce;
             let targets = (batch, (0, 0))..=(batch, (u64::MAX, u64::MAX));
             let journal = app.cleanup_incidents.journal.lock();
-            let awaiting = journal.observed.range(targets.clone()).next().is_some();
+            let awaiting = self.incident.messages.keys().any(|&target| {
+                journal
+                    .observed
+                    .get(&(self.subject.0, target))
+                    .is_some_and(|pending| pending.batch == batch)
+            });
             let mut fenced = false;
             let mut retired = false;
             for (_, outcome) in journal.skipped.range(targets) {

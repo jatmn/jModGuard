@@ -1687,22 +1687,27 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                             .first()
                             .and_then(|id| app.snapshots.take_recent(&work.scope, channel, *id));
                         app.snapshots.mark_deleted(guild, channel, &ids);
-                        if let Some(id) = ids.first()
-                            && let Some(mut report) = logging::observed_delete_report(
+                        if let Some(id) = ids.first() {
+                            let report = logging::observed_delete_report(
                                 &app,
                                 guild,
                                 channel,
                                 *id,
                                 cached.as_ref(),
+                            );
+                            logging::persist_gateway_cleanup_observations(
+                                &app, guild, channel, &ids,
                             )
-                        {
-                            if cached.is_none() {
-                                report.vars.insert(
-                                    "coverage".into(),
-                                    "snapshot storage unavailable".into(),
-                                );
+                            .await;
+                            if let Some(mut report) = report {
+                                if cached.is_none() {
+                                    report.vars.insert(
+                                        "coverage".into(),
+                                        "snapshot storage unavailable".into(),
+                                    );
+                                }
+                                submit_report(&app, &work.context, report);
                             }
-                            submit_report(&app, &work.context, report);
                         }
                     }
                     Body::Delete {
@@ -2169,6 +2174,8 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                     dispatch_observed_report(&app, &work.context, report);
                 }
                 if *bulk {
+                    logging::persist_gateway_cleanup_observations(&app, *guild, *channel, ids)
+                        .await;
                     let pending = transcript.pending_automod.clone();
                     if transcript.worth_sending() {
                         submit_bulk_report(&app, &work.context, *guild, *channel, transcript).await;
@@ -2183,21 +2190,24 @@ async fn run(app: Arc<BotState>, mut receiver: mpsc::Receiver<Work>) {
                         )
                         .await;
                     }
-                } else if let Some(id) = ids.first()
-                    && let Some(mut report) = logging::observed_delete_report(
+                } else if let Some(id) = ids.first() {
+                    let report = logging::observed_delete_report(
                         &app,
                         *guild,
                         *channel,
                         *id,
                         single.as_ref(),
-                    )
-                {
-                    if single_unknown {
-                        report
-                            .vars
-                            .insert("coverage".into(), "snapshot storage unavailable".into());
+                    );
+                    logging::persist_gateway_cleanup_observations(&app, *guild, *channel, ids)
+                        .await;
+                    if let Some(mut report) = report {
+                        if single_unknown {
+                            report
+                                .vars
+                                .insert("coverage".into(), "snapshot storage unavailable".into());
+                        }
+                        submit_report(&app, &work.context, report);
                     }
-                    submit_report(&app, &work.context, report);
                 }
             }
         }
@@ -2548,6 +2558,7 @@ async fn submit_peeled_bulk_deletes_admitted(
             &ignored_authors,
         ));
     }
+    logging::persist_gateway_cleanup_observations(app, guild, channel, &ids).await;
     // This task already holds the report permit. Emit peeled automod reports
     // here instead of acquiring a second report slot.
     for report in peeled {
@@ -2634,6 +2645,9 @@ fn submit_report(app: &Arc<BotState>, context: &Context, report: MessageReport) 
     // admits the send. Neither branch spawns before its permit is held.
     dispatch_observed_report(app, context, report);
 }
+
+#[cfg(test)]
+pub(crate) use tests::test_delete_context_with;
 
 #[cfg(test)]
 mod tests {
@@ -3106,7 +3120,7 @@ mod tests {
         test_delete_context_with(Arc::new(serenity::http::Http::new("fixture"))).await
     }
 
-    async fn test_delete_context_with(http: Arc<serenity::http::Http>) -> Context {
+    pub(crate) async fn test_delete_context_with(http: Arc<serenity::http::Http>) -> Context {
         use serenity::gateway::{
             Shard, ShardManager, ShardManagerOptions, ShardMessenger, ShardRunner,
             ShardRunnerOptions,

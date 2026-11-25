@@ -385,6 +385,113 @@ async fn abrupt_restart_recovers_confirmed_deletes_once_as_individual_notices() 
 }
 
 #[tokio::test]
+async fn collector_first_single_cleanup_replays_after_handler_and_restart() {
+    collector_first_cleanup_replays(GatewayDeleteOrigin::Single, &[102]).await;
+}
+
+#[tokio::test]
+async fn collector_first_bulk_cleanup_replays_after_handler_and_restart() {
+    collector_first_cleanup_replays(GatewayDeleteOrigin::Bulk, &[102, 103]).await;
+}
+
+async fn collector_first_cleanup_replays(origin: GatewayDeleteOrigin, ids: &[u64]) {
+    use serenity::client::EventHandler as _;
+    use std::sync::atomic::Ordering;
+
+    let f = Fixture::new(true).await;
+    let enrollment = f.enroll().await;
+    let cleanup = f.begin().await.unwrap();
+    cleanup.begin_purge(PURGE_WINDOW_SECS, BAN_REQUESTED_AT_MS);
+    for &message in ids {
+        f.remember(SUBJECT, 2, message);
+        match origin {
+            GatewayDeleteOrigin::Single => {
+                assert!(f.single(2, message).is_none());
+                // The typed handler can no longer recover the author from
+                // the recent-message tracker, but the event already owns a row.
+                f.app.recent_messages.forget(GUILD, 2, message);
+            }
+            GatewayDeleteOrigin::Bulk => assert!(f.bulk(2, message).report.is_none()),
+        }
+    }
+    f.remember(SUBJECT, 3, 104);
+    assert!(f.single(3, 104).is_none());
+    assert_eq!(
+        f.app.cleanup_incidents.journal.lock().observed.len(),
+        ids.len() + 1
+    );
+    assert!(
+        db::recovered_cleanup_deletes(&f.app.db, "fixture-reader".into(), 0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the collector claimed the events before any journal write"
+    );
+
+    let (http, posts, server) = scripted_discord_proxy(Vec::new()).await;
+    let context = crate::snapshot_capture::test_delete_context_with(Arc::new(http)).await;
+    let handler = crate::handlers::Handler {
+        app: Arc::clone(&f.app),
+    };
+    f.app.activation.note_discord_connected();
+    let guild = Some(GuildId::new(GUILD));
+    let channel = ChannelId::new(2);
+    match origin {
+        GatewayDeleteOrigin::Single => {
+            handler
+                .message_delete(context, channel, MessageId::new(ids[0]), guild)
+                .await;
+        }
+        GatewayDeleteOrigin::Bulk => {
+            let messages = ids.iter().copied().map(MessageId::new).collect();
+            handler
+                .message_delete_bulk(context, channel, messages, guild)
+                .await;
+        }
+    }
+    assert_eq!(posts.load(Ordering::SeqCst), 0, "collection owns the logs");
+    server.abort();
+    let path = Arc::clone(&f.path);
+    drop((handler, cleanup));
+    drop(f); // no worker or shutdown flush
+
+    let restarted = BotState::new(Default::default(), db::Db::open(&path.0, 2).unwrap()).unwrap();
+    restarted.activation.mark_lock_held(true);
+    let recovered =
+        db::recovered_cleanup_deletes(&restarted.db, restarted.activation.instance().into(), 0)
+            .await
+            .unwrap();
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|(_, row)| row.message_id as u64)
+            .collect::<Vec<_>>(),
+        ids,
+        "the handler must persist its own event and leave unrelated pending rows alone"
+    );
+    assert!(
+        recovered
+            .iter()
+            .all(|(_, row)| row.purge && row.enrollment_id == enrollment.id)
+    );
+    let sink = Sink::default();
+    let (last, retry) = recover_cleanup_page(&restarted, &sink, 0).await.unwrap();
+    assert!(last.is_some() && !retry);
+    assert_eq!(
+        recover_cleanup_page(&restarted, &sink, 0).await.unwrap(),
+        (None, false)
+    );
+    let sent = sink.0.lock();
+    assert_eq!(sent.len(), ids.len());
+    for ((channel, payload), id) in sent.iter().zip(ids) {
+        assert_eq!(channel.get(), DESTINATION);
+        let text = log_text(payload);
+        assert!(text.contains("Message deleted"), "{text}");
+        assert!(text.contains(&format!("/{id}")), "{text}");
+    }
+}
+
+#[tokio::test]
 async fn a_summary_dispatched_before_an_abrupt_restart_is_not_replayed() {
     let f = Fixture::new(true).await;
     f.enroll().await;
