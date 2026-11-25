@@ -2,22 +2,80 @@ import React, { useState } from "react";
 
 const h = React.createElement;
 
-// Without a viewBox, one SVG unit is one CSS pixel. Recompute horizontal
-// coordinates only, keeping the plot height, strokes and text independent of width.
-function useChartPlot(height, initialWidth) {
-  const [width, setWidth] = useState(initialWidth);
-  const ref = React.useCallback((plot) => {
-    if (!plot) return;
+const MAX_PLOT_HEIGHT = 280;
+
+// Without a viewBox, one SVG unit is one CSS pixel. Measure the available width
+// and the inherited font so the plots can reserve room for the rendered labels.
+function useChartLayout(initialWidth) {
+  const [layout, setLayout] = useState({ width: initialWidth, gap: 5, lineHeight: 20, measureLabel: (text) => text.length * 7 });
+  const ref = React.useCallback((element) => {
+    if (!element || !window.ResizeObserver) return;
+    const canvas = element.ownerDocument.createElement("canvas").getContext("2d");
     const measure = () => {
-      const measured = plot.clientWidth;
-      if (measured > 0) setWidth(measured);
+      const width = element.clientWidth;
+      if (!width) return;
+      const style = window.getComputedStyle(element);
+      const fontSize = parseFloat(style.fontSize);
+      const font = `${style.fontSize} ${style.fontFamily}`;
+      if (canvas) canvas.font = font;
+      const metrics = canvas?.measureText("0");
+      const fontHeight = (metrics?.fontBoundingBoxAscent ?? 0) + (metrics?.fontBoundingBoxDescent ?? 0);
+      const lineHeight = Math.ceil(Math.max(fontSize * 1.5, fontHeight));
+      const measureLabel = canvas
+        ? (text) => Math.ceil(canvas.measureText(text).width)
+        : (text) => Math.ceil(text.length * fontSize * 0.65);
+      setLayout((previous) => previous.width === width && previous.font === font
+        ? previous : { width, font, gap: Math.ceil(fontSize / 3), lineHeight, measureLabel });
     };
     measure();
-    const observer = window.ResizeObserver && new window.ResizeObserver(measure);
-    observer?.observe(plot);
-    return () => observer?.disconnect();
+    const observer = new window.ResizeObserver(measure);
+    observer.observe(element);
+    observer.observe(element.firstElementChild);
+    return () => observer.disconnect();
   }, []);
-  return { width, plotProps: { className: "chart-plot", ref, height } };
+  return { ...layout, ref };
+}
+
+function ChartPlot({ children, className = "", ...props }) {
+  // The hidden em-square changes size with the font even when the viewport is stable.
+  return h("svg", { ...props, className: `chart-plot ${className}` },
+    h("rect", { width: "1em", height: "1em", visibility: "hidden", "aria-hidden": "true" }), children);
+}
+
+function axisText(text, props) {
+  return h("text", { dominantBaseline: "central", ...props }, text);
+}
+
+function fitLabel(text, available, measureLabel) {
+  if (measureLabel(text) <= available) return text;
+  for (let length = text.length - 1; length > 0; length--) {
+    const shorter = `${text.slice(0, length).trimEnd()}…`;
+    if (measureLabel(shorter) <= available) return shorter;
+  }
+  return "";
+}
+
+function layoutTicks({ width, gap, measureLabel }, labels, maxRows) {
+  const placed = [];
+  const rows = Array.from({ length: maxRows }, () => []);
+  for (const { text, x, anchor = "start", key } of labels) {
+    const size = measureLabel(text);
+    if (!text || size + 2 > width) continue;
+    const offset = anchor === "start" ? 0 : anchor === "end" ? size : size / 2;
+    const left = Math.max(1, Math.min(width - size - 1, x - offset));
+    const right = left + size;
+    const row = rows.findIndex((ticks) => ticks.every((tick) => right + gap <= tick.left || left >= tick.right + gap));
+    if (row < 0) continue;
+    rows[row].push({ left, right });
+    placed.push({ key, text, left, row, x: left + offset, anchor });
+  }
+  return placed;
+}
+
+function horizontalTicks(layout, labels, y, className = "an-axis-day") {
+  // Keep the last endpoint when the available space cannot hold every tick.
+  return layoutTicks(layout, [...labels].reverse(), 1).reverse().map(({ key, text, x, anchor }) =>
+    axisText(text, { key, className, x, y, textAnchor: anchor }));
 }
 
 // Shared trend rendering for the workspace and owner analytics views. Charts
@@ -41,12 +99,6 @@ export function useTrendMetric(initial) {
   return [metric, setMetric];
 }
 
-const CHART_HEIGHT = 240;
-const PAD_LEFT = 72;
-const PAD_RIGHT = 14;
-const PAD_TOP = 16;
-const PAD_BOTTOM = 30;
-
 function scale(value, max) {
   return value / max;
 }
@@ -60,19 +112,23 @@ function dayLabel(day) {
 }
 
 export function TrendChart({ points, metric, title }) {
-  const { width, plotProps } = useChartPlot(CHART_HEIGHT, 720);
+  const layout = useChartLayout(720);
+  const { width, lineHeight, gap, measureLabel, ref } = layout;
+  const height = 240;
   const values = points.map((point) => point[metric] ?? 0);
   const count = points.length;
   const max = Math.max(1, ...values);
-  const innerWidth = Math.max(1, width - PAD_LEFT - PAD_RIGHT);
-  const innerHeight = CHART_HEIGHT - PAD_TOP - PAD_BOTTOM;
-  const x = (index) => PAD_LEFT + (count <= 1 ? innerWidth / 2 : (index * innerWidth) / (count - 1));
-  const y = (value) => PAD_TOP + innerHeight - scale(value, max) * innerHeight;
+  const padLeft = measureLabel(String(Math.round(max))) + 2 * gap;
+  const padTop = lineHeight / 2 + 2;
+  const innerWidth = Math.max(1, width - padLeft - gap);
+  const innerHeight = Math.max(1, height - 2 * padTop - lineHeight - gap);
+  const x = (index) => padLeft + (count <= 1 ? innerWidth / 2 : (index * innerWidth) / (count - 1));
+  const y = (value) => padTop + innerHeight - scale(value, max) * innerHeight;
   const linePoints = values
     .map((value, index) => `${x(index).toFixed(1)},${y(value).toFixed(1)}`)
     .join(" ");
-  const area = `M${x(0).toFixed(1)},${(PAD_TOP + innerHeight).toFixed(1)} L${linePoints.split(" ").join(" L ")} L${x(count - 1).toFixed(1)},${(PAD_TOP + innerHeight).toFixed(1)} Z`;
-  const gridValues = [max, max / 2, 0];
+  const area = `M${x(0).toFixed(1)},${y(0).toFixed(1)} L${linePoints.split(" ").join(" L ")} L${x(count - 1).toFixed(1)},${y(0).toFixed(1)} Z`;
+  const gridValues = innerHeight / 2 >= lineHeight ? [max, max / 2, 0] : [max, 0];
   const latest = values[count - 1] ?? 0;
   const first = points[0]?.day ?? "";
   const last = points[count - 1]?.day ?? "";
@@ -80,24 +136,27 @@ export function TrendChart({ points, metric, title }) {
     "figure",
     { className: "trend-chart" },
     h(
-      "svg",
+      ChartPlot,
       {
-        ...plotProps,
+        ref,
+        height,
         role: "img",
         "aria-label": `${title} per day from ${first} to ${last}; latest day ${latest}.`,
       },
       // Horizontal gridlines with their value labels.
       ...gridValues.map((value) =>
         h("g", { key: `grid-${value}`, className: "trend-grid" },
-          h("line", { x1: PAD_LEFT, x2: PAD_LEFT + innerWidth, y1: y(value).toFixed(1), y2: y(value).toFixed(1) }),
-          h("text", { x: PAD_LEFT - 8, y: (y(value) + 4).toFixed(1), textAnchor: "end" }, String(Math.round(value))),
+          h("line", { x1: padLeft, x2: width - gap, y1: y(value).toFixed(1), y2: y(value).toFixed(1) }),
+          axisText(String(Math.round(value)), { x: padLeft - gap, y: y(value), textAnchor: "end" }),
         ),
       ),
       h("path", { className: "trend-area", d: area }),
       h("polyline", { className: "trend-line", points: linePoints }),
       // Day labels under both ends of the window.
-      h("text", { className: "trend-day", x: PAD_LEFT, y: CHART_HEIGHT - 8, textAnchor: "start" }, dayLabel(first)),
-      h("text", { className: "trend-day", x: PAD_LEFT + innerWidth, y: CHART_HEIGHT - 8, textAnchor: "end" }, dayLabel(last)),
+      ...horizontalTicks(layout, [
+        { key: "first", text: dayLabel(first), x: padLeft },
+        { key: "last", text: dayLabel(last), x: width - gap, anchor: "end" },
+      ], height - padTop, "trend-day"),
     ),
     h("figcaption", { className: "sr-only" }, `${title} per day, ${first} through ${last}.`),
   );
@@ -196,11 +255,9 @@ export function niceTicks(max) {
   return ticks;
 }
 
-// Keep the last date and space earlier ticks by both range and available room.
-export function dayTickIndices(count, slot = Infinity) {
-  const rangeStep = count <= 8 ? 1 : count <= 31 ? 7 : 15;
-  // Allow room for the full label at an edge and half of its neighbor.
-  const step = Math.max(rangeStep, Math.ceil(72 / slot));
+// Keep the last date and space candidate ticks across the selected range.
+export function dayTickIndices(count) {
+  const step = count <= 8 ? 1 : count <= 31 ? 7 : 15;
   const ticks = [];
   for (let i = count - 1; i >= 0; i -= step) ticks.unshift(i);
   return ticks;
@@ -217,12 +274,12 @@ function dayAnchor(index, count) {
   return "middle";
 }
 
-function dayTicks(points, left, slot, y) {
-  return dayTickIndices(points.length, slot).map((index) => {
-    const textAnchor = dayAnchor(index, points.length);
-    const offset = textAnchor === "start" ? 0 : textAnchor === "end" ? 1 : 0.5;
-    return h("text", { key: `t${index}`, className: "an-axis-day", x: (left + (index + offset) * slot).toFixed(2), y, textAnchor }, shortDay(points[index].day));
-  });
+function dayTicks(layout, points, left, slot, y) {
+  return horizontalTicks(layout, dayTickIndices(points.length).map((index) => {
+    const anchor = dayAnchor(index, points.length);
+    const offset = anchor === "start" ? 0 : anchor === "end" ? 1 : 0.5;
+    return { key: `t${index}`, anchor, x: left + (index + offset) * slot, text: shortDay(points[index].day) };
+  }), y);
 }
 
 // One hover/focus position shared by every chart in a panel. Arrow keys move
@@ -317,36 +374,49 @@ function ChartReadout({ id, children }) {
 // one x axis and one hover day so metrics compare without being summed.
 export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
   const cursor = useChartCursor(points.length);
-  const rowHeight = 40;
-  const labelWidth = 104;
-  const axisHeight = 20;
-  const height = metrics.length * rowHeight + axisHeight;
-  const { width, plotProps } = useChartPlot(height, 640);
-  const innerWidth = Math.max(1, width - labelWidth - 8);
+  const layout = useChartLayout(640);
+  const { width, lineHeight, gap: labelGap, measureLabel, ref } = layout;
+  const inset = lineHeight / 2 + 2;
+  const axisHeight = lineHeight + labelGap;
+  const height = Math.min(MAX_PLOT_HEIGHT, Math.max(220, 2 * inset + axisHeight + metrics.length * (lineHeight + 4)));
+  const rowHeight = (height - 2 * inset - axisHeight) / Math.max(1, metrics.length);
+  const series = metrics.map(([key, label, color]) => {
+    const values = points.map((point) => point[key] ?? 0);
+    return { key, label, color, values, max: Math.max(0, ...values) };
+  });
+  const padRight = measureLabel("0") + 2 * labelGap;
+  const maxTickWidth = Math.max(0, ...series.map(({ max }) => measureLabel(formatCount(max))));
+  const titleBudget = width - maxTickWidth - padRight - 3 * labelGap - Math.min(48, width / 5);
+  const titles = series.map(({ label }) => fitLabel(label, titleBudget, measureLabel));
+  const titleWidth = Math.max(0, ...titles.map(measureLabel));
+  const labelWidth = titleWidth + maxTickWidth + 3 * labelGap;
+  const innerWidth = Math.max(1, width - labelWidth - padRight);
+  const emptyLabel = fitLabel("None in this range", innerWidth - labelGap, measureLabel);
   const slot = points.length ? innerWidth / points.length : innerWidth;
   const gap = points.length > 45 ? 0.6 : Math.min(3, slot * 0.25);
   const first = points[0]?.day ?? "";
   const last = points.at(-1)?.day ?? "";
   const active = cursor.index != null ? points[cursor.index] : null;
-  const rows = metrics.map(([key, label, color], row) => {
-    const values = points.map((p) => p[key] ?? 0);
-    const max = Math.max(1, ...values);
-    const empty = values.every((value) => !(value > 0));
-    const top = row * rowHeight + 4;
-    const usable = rowHeight - 10;
+  const rows = series.map(({ key, label, color, values, max }, row) => {
+    const top = inset + row * rowHeight;
+    const usable = Math.max(1, rowHeight - labelGap / 2);
+    const baseline = top + usable;
+    const middle = top + usable / 2;
     return h(
       "g",
       { key, className: `an-row ${color}` },
-      h("text", { className: "an-axis-label", x: 0, y: top + 11 }, label),
+      axisText(titles[row], { className: "an-axis-label", x: labelGap / 2, y: middle, "aria-label": label }),
       // An empty row says so instead of drawing a scale for values it does not have.
-      empty
-        ? h("text", { className: "an-row-empty", x: labelWidth + 4, y: top + usable / 2 + 4 }, "None in this range")
-        : h("text", { className: "an-axis-value", x: labelWidth - 6, y: top + usable + 1, textAnchor: "end" }, formatCount(max)),
-      h("line", { className: "an-baseline", x1: labelWidth, x2: width - 8, y1: top + usable, y2: top + usable }),
+      max > 0 ? [
+        axisText(formatCount(max), { key: "max", className: "an-axis-value", x: labelWidth - labelGap, y: top, textAnchor: "end" }),
+        // Opposite gutters keep adjacent rows' maximum and zero labels apart.
+        axisText("0", { key: "min", className: "an-axis-min", x: width - labelGap, y: baseline, textAnchor: "end" }),
+      ] : axisText(emptyLabel, { className: "an-row-empty", x: labelWidth + labelGap / 2, y: middle }),
+      h("line", { className: "an-baseline", x1: labelWidth, x2: width - padRight, y1: baseline, y2: baseline }),
       ...values.map((value, i) => {
-        const barHeight = value > 0 ? Math.max(2, (value / max) * usable) : 0;
+        const barHeight = value > 0 ? Math.min(usable, Math.max(2, (value / max) * usable)) : 0;
         return barHeight
-          ? h("rect", { key: i, className: "an-bar", x: (labelWidth + i * slot + gap / 2).toFixed(2), y: (top + usable - barHeight).toFixed(2), width: Math.max(0.8, slot - gap).toFixed(2), height: barHeight.toFixed(2) })
+          ? h("rect", { key: i, className: "an-bar", x: (labelWidth + i * slot + gap / 2).toFixed(2), y: (baseline - barHeight).toFixed(2), width: Math.max(0.8, slot - gap).toFixed(2), height: barHeight.toFixed(2) })
           : null;
       }),
     );
@@ -362,9 +432,10 @@ export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
         : h("span", { className: "muted" }, "Hover or use arrow keys for daily values"),
     ),
     h(
-      "svg",
+      ChartPlot,
       {
-        ...plotProps,
+        ref,
+        height,
         role: "img",
         tabIndex: 0,
         "aria-label": `Daily enforcement from ${first} to ${last}: ${metrics.map(([key, label]) => `${label} ${formatExact(sumSeries(points, key))}`).join(", ")}. Use arrow keys to read each day.`,
@@ -377,7 +448,7 @@ export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
       cursor.index != null
         ? h("rect", { className: "an-cursor", x: (labelWidth + cursor.index * slot).toFixed(2), y: 0, width: slot.toFixed(2), height: height - axisHeight })
         : null,
-      ...dayTicks(points, labelWidth, slot, height - 6),
+      ...dayTicks(layout, points, labelWidth, slot, height - inset),
       // Transparent day columns carry the pointer and native tooltips.
       ...points.map((p, i) =>
         h(
@@ -394,21 +465,26 @@ export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
 // across the range drawn as a line with points.
 export function MembershipChart({ points }) {
   const cursor = useChartCursor(points.length);
-  const height = 196;
-  const { width, plotProps } = useChartPlot(height, 440);
-  const padLeft = 48;
-  const padRight = 54;
-  const padTop = 14;
-  const axisHeight = 30;
-  const innerWidth = Math.max(1, width - padLeft - padRight);
-  const half = (height - padTop - axisHeight) / 2;
-  const zero = padTop + half;
+  const layout = useChartLayout(440);
+  const { width, lineHeight, gap: labelGap, measureLabel, ref } = layout;
+  const height = Math.min(MAX_PLOT_HEIGHT, Math.max(196, 9 * lineHeight));
+  const inset = lineHeight / 2 + 2;
+  const axisHeight = inset + lineHeight + labelGap;
+  const half = Math.max(1, (height - inset - axisHeight) / 2);
+  const zero = inset + half;
   const maxBar = Math.max(1, ...points.map((p) => Math.max(p.joins ?? 0, p.leaves ?? 0)));
   const ticks = niceTicks(maxBar);
   const tickMax = ticks.at(-1);
   let running = 0;
   const net = points.map((p) => (running += (p.joins ?? 0) - (p.leaves ?? 0)));
   const netExtent = Math.max(1, ...net.map((v) => Math.abs(v)));
+  const netLabels = [`+${formatCount(netExtent)}`, formatDelta(-netExtent, 0).text];
+  const padLeft = Math.max(...ticks.map((tick) => measureLabel(formatCount(tick)))) + 2 * labelGap;
+  const padRight = Math.max(...netLabels.map(measureLabel)) + 2 * labelGap;
+  const innerWidth = Math.max(1, width - padLeft - padRight);
+  const tickStride = Math.ceil((lineHeight * (ticks.length - 1)) / half);
+  const labeledTicks = new Set(ticks.filter((tick, i) => tick === 0 || tick === tickMax
+    || ((ticks.length - 1 - i) % tickStride === 0 && (tick / tickMax) * half >= lineHeight)));
   const slot = points.length ? innerWidth / points.length : innerWidth;
   const gap = points.length > 45 ? 0.6 : Math.min(3, slot * 0.25);
   const x = (i) => padLeft + i * slot + slot / 2;
@@ -438,9 +514,10 @@ export function MembershipChart({ points }) {
           ],
     ),
     h(
-      "svg",
+      ChartPlot,
       {
-        ...plotProps,
+        ref,
+        height,
         role: "img",
         tabIndex: 0,
         "aria-label": `Membership from ${first} to ${last}: joins ${formatExact(sumSeries(points, "joins"))}, leaves ${formatExact(sumSeries(points, "leaves"))}, net ${formatDelta(netTotal, 0).exact}. Use arrow keys to read each day.`,
@@ -455,15 +532,14 @@ export function MembershipChart({ points }) {
             "g",
             { key: `g${signed}`, className: "an-gridline" },
             h("line", { x1: padLeft, x2: width - padRight, y1: (zero - (signed / tickMax) * half).toFixed(2), y2: (zero - (signed / tickMax) * half).toFixed(2) }),
-            h("text", { x: padLeft - 6, y: (zero - (signed / tickMax) * half + 4).toFixed(2), textAnchor: "end" }, formatCount(Math.abs(signed))),
+            labeledTicks.has(tick) && axisText(formatCount(tick), { x: padLeft - labelGap, y: zero - (signed / tickMax) * half, textAnchor: "end" }),
           ),
         ),
       ),
       points.every((p) => !(p.joins > 0) && !(p.leaves > 0))
-        ? h("text", { className: "an-row-empty", x: width / 2, y: zero - 14, textAnchor: "middle" }, "No joins or leaves in this range")
+        ? axisText(fitLabel("No joins or leaves in this range", innerWidth, measureLabel), { className: "an-row-empty", x: padLeft + innerWidth / 2, y: zero - half / 2, textAnchor: "middle" })
         : null,
-      h("text", { className: "an-axis-net", x: width - padRight + 6, y: padTop + 8 }, `+${formatCount(netExtent)}`),
-      h("text", { className: "an-axis-net", x: width - padRight + 6, y: zero + half }, formatDelta(-netExtent, 0).text),
+      ...netLabels.map((text, i) => axisText(text, { key: i, className: "an-axis-net", x: width - padRight + labelGap, y: i === 0 ? inset : zero + half })),
       ...points.flatMap((p, i) => {
         const bars = [];
         const left = (padLeft + i * slot + gap / 2).toFixed(2);
@@ -477,13 +553,13 @@ export function MembershipChart({ points }) {
         : null,
       ...net.map((v, i) => h("circle", { key: `n${i}`, className: "an-net-point an-net", cx: x(i).toFixed(2), cy: yNet(v).toFixed(2), r: points.length > 45 ? 1.4 : 2.4 })),
       cursor.index != null
-        ? h("rect", { className: "an-cursor", x: (padLeft + cursor.index * slot).toFixed(2), y: padTop, width: slot.toFixed(2), height: half * 2 })
+        ? h("rect", { className: "an-cursor", x: (padLeft + cursor.index * slot).toFixed(2), y: inset, width: slot.toFixed(2), height: half * 2 })
         : null,
-      ...dayTicks(points, padLeft, slot, height - 6),
+      ...dayTicks(layout, points, padLeft, slot, height - inset),
       ...points.map((p, i) =>
         h(
           "rect",
-          { key: `hit${i}`, className: "an-hit", x: (padLeft + i * slot).toFixed(2), y: padTop, width: slot.toFixed(2), height: half * 2, onMouseEnter: () => cursor.setIndex(i) },
+          { key: `hit${i}`, className: "an-hit", x: (padLeft + i * slot).toFixed(2), y: inset, width: slot.toFixed(2), height: half * 2, onMouseEnter: () => cursor.setIndex(i) },
           h("title", {}, `${p.day}: joins ${formatExact(p.joins)}, leaves ${formatExact(p.leaves)}, net so far ${formatDelta(net[i], 0).exact}`),
         ),
       ),
@@ -528,10 +604,13 @@ export function ActivityHeatmap({ cells }) {
   grid.forEach((row, weekday) => row.forEach((count, hour) => {
     if (count > 0 && (!peak || count > peak.count)) peak = { weekday, hour, count };
   }));
-  const left = 36;
-  const top = 20;
-  const rowHeight = 21;
-  const { width, plotProps } = useChartPlot(top + 7 * rowHeight, 798);
+  const layout = useChartLayout(798);
+  const { width, lineHeight, gap: labelGap, measureLabel, ref } = layout;
+  const left = Math.max(...WEEKDAYS.map(measureLabel)) + 2 * labelGap;
+  const top = lineHeight + labelGap;
+  const height = Math.min(MAX_PLOT_HEIGHT, Math.max(167, top + WEEKDAYS.length * (lineHeight + 1) + labelGap));
+  const rowHeight = (height - top - labelGap) / WEEKDAYS.length;
+  const weekdayStride = Math.ceil(lineHeight / rowHeight);
   const slot = Math.max(1, width - left) / 24;
   const gap = Math.min(2, slot / 4);
   const hourLabel = (hour) => `${String(hour).padStart(2, "0")}:00`;
@@ -543,10 +622,11 @@ export function ActivityHeatmap({ cells }) {
     { className: "an-figure" },
     h(ChartReadout, { id: "an-heatmap-readout" }, active ? `${WEEKDAYS[active.weekday]} ${hourLabel(active.hour)} UTC: ${formatExact(active.count)} actions` : summary),
     h(
-      "svg",
-      { ...plotProps, className: `${plotProps.className} an-heatmap`, role: "img", "aria-label": `Enforcement actions by weekday and UTC hour. ${summary}`, "aria-describedby": "an-heatmap-readout", onMouseLeave: () => setActive(null) },
-      ...[0, 6, 12, 18].map((hour) => h("text", { key: `h${hour}`, className: "an-axis-day", x: left + hour * slot, y: 14 }, hourLabel(hour))),
-      ...WEEKDAYS.map((day, weekday) => h("text", { key: day, className: "an-axis-day", x: 0, y: top + weekday * rowHeight + 12 }, day)),
+      ChartPlot,
+      { ref, height, className: "an-heatmap", role: "img", "aria-label": `Enforcement actions by weekday and UTC hour. ${summary}`, "aria-describedby": "an-heatmap-readout", onMouseLeave: () => setActive(null) },
+      ...horizontalTicks(layout, [0, 6, 12, 18].map((hour) => ({ key: `h${hour}`, x: left + hour * slot, text: hourLabel(hour) })), lineHeight / 2 + 2),
+      ...WEEKDAYS.map((day, weekday) => weekday % weekdayStride === 0
+        ? axisText(day, { key: day, className: "an-axis-day", x: labelGap / 2, y: top + (weekday + 0.5) * rowHeight }) : null),
       ...grid.flatMap((row, weekday) =>
         row.map((count, hour) =>
           h(
@@ -572,6 +652,15 @@ function sharePercent(value, total) {
 // One database from zero to its hard limit. `used` null means the allocation
 // is unknown: the bar stays empty and dashed, never drawn as free capacity.
 export function CapacityGauge({ used, limit, marks, tone, summary }) {
+  const layout = useChartLayout(480);
+  const ticks = [{ key: "zero", text: "0 MB", x: 0 }, ...marks.map((mark, index) => ({
+    key: mark.key,
+    text: mark.short,
+    x: layout.width * sharePercent(mark.bytes, limit) / 100,
+    anchor: index === marks.length - 1 ? "end" : "middle",
+  }))];
+  const labels = layoutTicks(layout, [...ticks].reverse(), ticks.length).reverse();
+  const labelRows = Math.max(1, ...labels.map(({ row }) => row + 1));
   return h(
     "div",
     { className: "du-gauge", role: "img", "aria-label": summary },
@@ -583,9 +672,9 @@ export function CapacityGauge({ used, limit, marks, tone, summary }) {
     ),
     h(
       "div",
-      { className: "du-gauge-scale", "aria-hidden": "true" },
-      h("span", { style: { left: "0%" } }, "0 MB"),
-      ...marks.map((mark) => h("span", { key: mark.key, style: { left: `${sharePercent(mark.bytes, limit).toFixed(2)}%` } }, mark.short)),
+      { className: "du-gauge-scale", "aria-hidden": "true", ref: layout.ref, style: { height: `${labelRows}lh` } },
+      h("i", { className: "chart-font-probe" }),
+      ...labels.map(({ key, text, left, row }) => h("span", { key, style: { left, top: `${row}lh` } }, text)),
     ),
   );
 }
@@ -618,14 +707,9 @@ function utcClock(seconds, withDay) {
 // `series` entries: { key, label, tone, value(point) -> number | null }.
 // `max` fixes the top of the scale (for example 100 for a percentage of a limit).
 export function ResourceChart({ points, series, max, format, label, from, to }) {
-  const height = 120;
-  const { width, plotProps } = useChartPlot(height, 480);
-  const padLeft = 90;
-  const padRight = 8;
-  const padTop = 14;
-  const axis = 30;
-  const innerWidth = Math.max(1, width - padLeft - padRight);
-  const innerHeight = height - padTop - axis;
+  const layout = useChartLayout(480);
+  const { width, lineHeight, gap, measureLabel, ref } = layout;
+  const height = Math.min(MAX_PLOT_HEIGHT, Math.max(120, 4 * lineHeight));
   const lines = series.map((line) => ({ ...line, values: points.map((point) => {
     const value = line.value(point);
     return value == null || !Number.isFinite(value) ? null : value;
@@ -641,9 +725,18 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
     );
   }
   const top = max ?? (Math.max(...known) * 1.1 || 1);
+  const ticks = [top, 0];
+  const padLeft = Math.max(...ticks.map((value) => measureLabel(format(value)))) + 2 * gap;
+  const padRight = gap;
+  const inset = lineHeight / 2 + 2;
+  const innerWidth = Math.max(1, width - padLeft - padRight);
+  const innerHeight = Math.max(1, height - 2 * inset - lineHeight - gap);
+  const dates = [utcClock(from, withDay), utcClock(to, withDay)];
+  const shortDates = withDay && dates.reduce((total, text) => total + measureLabel(text), 0) + 3 * gap > width;
+  const dateTicks = dates.map((text, i) => ({ key: i, text: shortDates ? text.slice(0, -6) : text, x: i === 0 ? gap : width - gap, anchor: i === 0 ? "start" : "end" }));
   const count = points.length;
   const x = (index) => padLeft + (count <= 1 ? innerWidth / 2 : (index * innerWidth) / (count - 1));
-  const y = (value) => padTop + innerHeight - Math.min(1, Math.max(0, value / top)) * innerHeight;
+  const y = (value) => inset + innerHeight - Math.min(1, Math.max(0, value / top)) * innerHeight;
   const runs = (values) => {
     const out = [];
     let run = [];
@@ -667,12 +760,12 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
     "figure",
     { className: "br-chart" },
     h(
-      "svg",
-      { ...plotProps, role: "img", "aria-label": `${label}, ${range}: ${summary}.` },
-      ...[top, 0].map((value) =>
+      ChartPlot,
+      { ref, height, role: "img", "aria-label": `${label}, ${range}: ${summary}.` },
+      ...ticks.map((value) =>
         h("g", { key: `g${value}`, className: "an-gridline" },
           h("line", { x1: padLeft, x2: width - padRight, y1: y(value).toFixed(1), y2: y(value).toFixed(1) }),
-          h("text", { x: padLeft - 4, y: (y(value) + 3).toFixed(1), textAnchor: "end" }, format(value)),
+          axisText(format(value), { x: padLeft - gap, y: y(value), textAnchor: "end" }),
         ),
       ),
       ...lines.flatMap((line) =>
@@ -682,8 +775,7 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
             : h("polyline", { key: `${line.key}-${i}`, className: `br-line ${line.tone}`, points: run.map(([index, value]) => `${x(index).toFixed(1)},${y(value).toFixed(1)}`).join(" ") }),
         ),
       ),
-      h("text", { className: "an-axis-day", x: Math.min(padLeft, width / 4), y: height - 6 }, utcClock(from, withDay)),
-      h("text", { className: "an-axis-day", x: width - padRight, y: height - 6, textAnchor: "end" }, utcClock(to, withDay)),
+      ...horizontalTicks(layout, dateTicks, height - inset),
     ),
     lines.length > 1 &&
       h(

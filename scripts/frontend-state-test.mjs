@@ -1163,6 +1163,25 @@ test('analytics range switching fetches each range once and reuses loaded ranges
   assert.equal(pending.length, 1, 'no summary survives the session');
 });
 
+function assertEnforcementScale(chart) {
+  for (const row of chart.querySelectorAll('.an-row')) {
+    const bars = [...row.querySelectorAll('.an-bar')];
+    const max = row.querySelector('.an-axis-value');
+    const zero = row.querySelector('.an-axis-min');
+    if (!bars.length) {
+      assert.equal(max, null);
+      assert.equal(zero, null);
+      continue;
+    }
+    const barTop = Math.min(...bars.map(bar => Number(bar.getAttribute('y'))));
+    assert.ok(Math.abs(Number(max.getAttribute('y')) - barTop) < 0.01,
+      `${row.querySelector('.an-axis-label').textContent}: maximum aligns with the top of the tallest bar`);
+    assert.equal(zero.textContent, '0');
+    assert.equal(Number(zero.getAttribute('y')), Number(row.querySelector('.an-baseline').getAttribute('y1')),
+      'zero aligns with the baseline');
+  }
+}
+
 test('analytics tooltips show exact per-day values on hover and from the keyboard', async () => {
   const series = analyticsDays(7, (i) => ({ warns: i === 6 ? 1234567 : i, joins: i, leaves: i === 2 ? 3 : 0 }));
   const { app } = harness(async () => response(analyticsSummary(30, { series })));
@@ -1170,6 +1189,7 @@ test('analytics tooltips show exact per-day values on hover and from the keyboar
   const panel = app.tabAnalytics();
   await settle();
   const [enforcement, membership] = panel.querySelectorAll('svg[role="img"]');
+  assertEnforcementScale(enforcement);
   const readout = panel.querySelector('#an-enforcement-readout');
   assert.equal(readout.getAttribute('aria-live'), 'polite');
   assert.equal(enforcement.getAttribute('aria-describedby'), 'an-enforcement-readout');
@@ -4153,8 +4173,9 @@ async function serveBuiltApp(previewMode, guilds = [{ id: '200000000000000002', 
   return server;
 }
 
-async function launchFirefox() {
+async function launchFirefox(defaultFontSize) {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'jmodguard-firefox-'));
+  if (defaultFontSize) fs.writeFileSync(path.join(profile, 'user.js'), `user_pref("font.size.variable.x-western", ${defaultFontSize});\n`);
   // Own process group: Firefox's content processes are stopped with it.
   const child = spawn(firefoxBinary, ['--headless', '--no-remote', '--profile', profile, '--remote-debugging-port=0'],
     { detached: true, stdio: ['ignore', 'ignore', 'pipe'] });
@@ -4609,7 +4630,7 @@ test('analytics dashboard shows enforcement and membership above the fold in bot
   assert.equal(bars.size, 2, 'series colors follow the theme');
 });
 
-test('chart plots and labels keep their size from mobile to ultrawide', { timeout: 120000 }, async t => {
+for (const defaultFontSize of [16, 32]) test(`chart plots and labels fit with a ${defaultFontSize}px browser default font`, { timeout: 120000 }, async t => {
   if (!firefoxBinary || !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url))) {
     assert.ok(!process.env.CI, 'CI requires Firefox and the built WebUI');
     return t.skip('Firefox or the built WebUI is unavailable');
@@ -4632,7 +4653,7 @@ test('chart plots and labels keep their size from mobile to ultrawide', { timeou
     else return false;
     return true;
   });
-  browser = await launchFirefox();
+  browser = await launchFirefox(defaultFontSize);
   const evaluate = async (expression) => {
     const result = await browser.send('script.evaluate', {
       expression, target: { context: browser.context }, awaitPromise: true,
@@ -4663,7 +4684,7 @@ test('chart plots and labels keep their size from mobile to ultrawide', { timeou
       await waitFor('${ready}');
     })()`);
     let heights;
-    for (const width of [2560, 1280, 1920, 3440, 320]) {
+    for (const width of defaultFontSize === 16 ? [2560, 1280, 1920, 3440, 320] : [1280, 320]) {
       const name = `${tab} at ${width}px`;
       await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height: 900 } });
       const m = JSON.parse(await evaluate(`(async () => {
@@ -4691,7 +4712,7 @@ test('chart plots and labels keep their size from mobile to ultrawide', { timeou
             return overflow > 1 ? [node.textContent + ' by ' + overflow.toFixed(1) + 'px'] : [];
           }),
           collisions: collision(plots.map(plot => [...plot.querySelectorAll('text')])
-            .concat(all('.du-gauge-scale').map(scale => [...scale.children]))),
+            .concat(all('.du-gauge-scale').map(scale => [...scale.querySelectorAll('span')]))),
           heights: plots.map(plot => box(plot).height),
           sparks: all('.an-spark').length,
           contentWidth: box(main).width,
@@ -4699,9 +4720,10 @@ test('chart plots and labels keep their size from mobile to ultrawide', { timeou
           cardTops: all('${cards}').map(card => Math.round(box(card).top)),
         });
       })()`));
+      assert.equal(m.bodyFont, defaultFontSize * 0.875, `${name}: browser font preference applied`);
       assert.ok(m.labels.length > 0, `${name}: chart labels rendered`);
       for (const [label, horizontal, vertical] of m.labels) {
-        assert.ok(Math.abs(horizontal - m.bodyFont) <= 1 && Math.abs(vertical - m.bodyFont) <= 1,
+        assert.ok(Math.abs(horizontal - m.bodyFont) <= defaultFontSize / 16 && Math.abs(vertical - m.bodyFont) <= defaultFontSize / 16,
           `${name}: ${label} renders at ${horizontal.toFixed(1)} × ${vertical.toFixed(1)} CSS px near ${m.bodyFont}px body text`);
       }
       assert.deepEqual(m.clipped, [], `${name}: labels fit the plot`);
@@ -4710,9 +4732,12 @@ test('chart plots and labels keep their size from mobile to ultrawide', { timeou
       heights ??= m.heights;
       assert.deepEqual(m.heights, heights, `${name}: plot heights are independent of width`);
       if (tab.includes('analytics')) assert.ok(m.sparks > 0, `${name}: KPI sparklines are covered`);
-      assert.ok(m.contentWidth <= 1440 && m.overflow <= 0, `${name}: capped content without horizontal overflow`);
+      assert.ok(m.contentWidth <= 1440, `${name}: capped content`);
       assert.equal(m.cardTops.length, 2, `${name}: both cards present`);
-      assert.equal(m.cardTops[0] === m.cardTops[1], width >= 1280, `${name}: desktop cards align and mobile cards stack`);
+      if (defaultFontSize === 16) {
+        assert.ok(m.overflow <= 0, `${name}: no horizontal page overflow`);
+        assert.equal(m.cardTops[0] === m.cardTops[1], width >= 1280, `${name}: desktop cards align and mobile cards stack`);
+      }
     }
   }
 });
@@ -11975,6 +12000,7 @@ test('Platform analytics shows every metric together with changes, names, icons 
   // Every enforcement metric is drawn at once; an empty series says so.
   const charts = [...page.querySelectorAll('.an-panel svg[role="img"]')];
   assert.equal(charts.length, 2);
+  assertEnforcementScale(charts[0]);
   assert.match(charts[0].getAttribute('aria-label'), /^Daily enforcement from .+: Warnings 5, Bans 4, Spam hits 7, Mod actions 2, Timeouts 0\./);
   assert.match(charts[1].getAttribute('aria-label'), /joins 5, leaves 3, net up 2/);
   const timeouts = charts[0].querySelector('.an-row.an-timeouts');

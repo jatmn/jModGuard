@@ -500,8 +500,8 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 
 /* Shared chart layout. SVG plots supply their fixed height. */
 #content:has(> .chart-page) { max-width: 1440px; margin-inline: auto; }
-.chart-plot { display: block; width: 100%; }
-.chart-plot text { font-size: var(--ui-font-size-sm); }
+.chart-plot { display: block; width: 100%; font-size: var(--ui-font-size-sm); }
+.chart-font-probe { position: absolute; width: 1em; height: 1em; visibility: hidden; }
 
 /* Analytics trend charts (workspace and owner views). */
 .trend-card .card-body { gap: 10px; }
@@ -620,7 +620,7 @@ svg.icon-neutral { color: var(--icon-neutral); }
 .an-swatch-line { height: 2px; }
 .an-bar { fill: currentColor; }
 .an-baseline, .an-gridline line { stroke: var(--shell-border); stroke-width: 1; }
-.an-gridline text, .an-axis-day, .an-axis-value, .an-axis-net { fill: var(--muted); font-variant-numeric: tabular-nums; }
+.an-gridline text, .an-axis-day, .an-axis-value, .an-axis-min, .an-axis-net { fill: var(--muted); font-variant-numeric: tabular-nums; }
 .an-axis-label { fill: var(--text); }
 .an-net-line { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linejoin: round; }
 .an-net-point { fill: currentColor; }
@@ -692,12 +692,8 @@ svg.icon-neutral { color: var(--icon-neutral); }
 .du-share-part + .du-share-part { border-left: 2px solid var(--panel); }
 .du-gauge-mark { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--text); }
 .du-gauge-mark:last-child { margin-left: -2px; }
-.du-gauge-scale { position: relative; height: 2lh; color: var(--muted); font-size: var(--ui-font-size-sm); line-height: 1.25; font-variant-numeric: tabular-nums; }
-.du-gauge-scale span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
-/* Stagger the thresholds so the closely spaced labels fit on narrow cards. */
-.du-gauge-scale span:nth-child(odd):not(:first-child) { top: 1lh; }
-.du-gauge-scale span:first-child { transform: none; }
-.du-gauge-scale span:last-child { transform: translateX(-100%); }
+.du-gauge-scale { position: relative; color: var(--muted); font-size: var(--ui-font-size-sm); line-height: 1.25; font-variant-numeric: tabular-nums; }
+.du-gauge-scale span { position: absolute; white-space: nowrap; }
 .du-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 6px 12px; }
 .du-metric { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .du-metric-label { color: var(--muted); font-size: .6875rem; font-weight: 600; }
