@@ -7006,6 +7006,7 @@ test('command deletion and reset send no request until confirmed', async () => {
     let allowed = false;
     const prompts = [];
     const { h, writes, reads } = commandEditorHarness({
+      commands: [record],
       confirm(message) {
         prompts.push(message);
         return allowed;
@@ -7014,11 +7015,13 @@ test('command deletion and reset send no request until confirmed', async () => {
     const modal = await h.app.editCommand(record);
     const button = findNode(modal, n => n.localName === 'button' && n.textContent === label);
     assert.ok(button && !button.hidden, label);
+    const commandsBefore = structuredClone(h.app.state.config.commands);
     await fire(button, 'click');
     assert.deepEqual(prompts, [prompt]);
     assert.deepEqual(writes, [], `declining ${label} sends no command request`);
     assert.deepEqual(reads, [], `declining ${label} avoids a configuration reload`);
     assert.equal(modal.isConnected, true, `declining ${label} keeps the editor open`);
+    assert.deepEqual(h.app.state.config.commands, commandsBefore, `declining ${label} keeps the loaded command`);
 
     allowed = true;
     await fire(button, 'click');
