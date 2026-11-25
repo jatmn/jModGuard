@@ -3472,6 +3472,7 @@ function tabDashboard() {
   const guildId = useRef(state.guildId).current;
   const g = selectedGuild();
   const cfg = state.config;
+  const botNickname = cfg.settings?.bot_name;
   const rules = cfg.rules ?? [];
   const commands = cfg.commands ?? [];
   const rulesOn = rules.filter((r) => r.effective?.enabled).length;
@@ -3552,7 +3553,7 @@ function tabDashboard() {
         stat("Bans", count("bans"), "bans"),
         stat("Cases", count("cases"), "cases"),
         stat("Prefix", cfg.settings?.prefix, "prefix"),
-        stat("Bot name", cfg.settings?.bot_name || "default", "bot-name"),
+        stat("Bot nickname", botNickname === "" ? "Not set" : botNickname ?? "Unavailable", "bot-name"),
         stat("Badword patterns", (cfg.badwords ?? []).length, "badword-patterns"),
       ),
     ),
