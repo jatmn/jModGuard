@@ -684,7 +684,7 @@ page or action it counts, so a tile matches its sidebar item:
 | Bans | hammer (as Bans) | red |
 | Cases | briefcase (as Cases) | amber |
 | Prefix | sliders (as Settings) | gray |
-| Bot name | robot | blue |
+| Bot nickname | robot | blue |
 | Badword patterns | speech bubble with x (as Badwords) | amber |
 
 The **Getting started** links show the sidebar icon of the page they open, where a text arrow

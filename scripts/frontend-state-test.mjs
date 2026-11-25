@@ -910,7 +910,7 @@ test('dashboard shows the configured and measured stats in one compact grid', as
   const expected = [
     ['Rules enabled', '1 / 2'], ['Rules in dry-run', '1'], ['Commands enabled', '1 / 2'], ['Log channels', '1'],
     ['Moderation records', '7'], ['Warns', '2'], ['Bans', '1'], ['Cases', '4'],
-    ['Prefix', '!'], ['Bot name', 'Guard'], ['Badword patterns', '3'],
+    ['Prefix', '!'], ['Bot nickname', 'Guard'], ['Badword patterns', '3'],
   ];
   assert.equal(value('Routine chat collection'), undefined);
   assert.equal(grids[0].children.length, expected.length, 'no stat dropped or duplicated');
@@ -925,6 +925,22 @@ test('dashboard shows the configured and measured stats in one compact grid', as
   assert.match(header.querySelector('.page-header-detail').textContent, /First/);
   assert.deepEqual(Array.from(header.querySelectorAll('button')).map((b) => b.textContent), ['Review protection', 'View audit log']);
   for (const button of header.querySelectorAll('button')) assert.match(button.className, /\bbtn-sm\b/);
+});
+
+test('dashboard distinguishes an unset bot nickname from unavailable settings', async () => {
+  for (const [settings, expected] of [
+    [{ prefix: '!', bot_name: '' }, 'Not set'],
+    [undefined, 'Unavailable'],
+  ]) {
+    const { app } = harness(async () => response({ events: 0, warns: 0, bans: 0, cases: 0 }));
+    app.state.config = { ...configuredDashboard(), settings };
+    const dashboard = app.tabDashboard();
+    await settle();
+    const tile = [...dashboard.querySelectorAll('.dashboard-stats > .stat')]
+      .find((stat) => stat.querySelector('.stat-title').textContent === 'Bot nickname');
+    assert.ok(tile, 'dashboard includes the bot nickname tile');
+    assert.equal(tile.querySelector('.stat-value').textContent, expected);
+  }
 });
 
 test('dashboard count explainer is an accessible, keyboard-reachable tooltip', async () => {
@@ -12073,7 +12089,7 @@ const DASHBOARD_TILES = [
   ['Bans', 'bans', 'hammer', 'danger', 'bans'],
   ['Cases', 'cases', 'briefcase', 'warning', 'cases'],
   ['Prefix', 'prefix', 'sliders', 'neutral', 'settings'],
-  ['Bot name', 'bot-name', 'bot', 'info', 'actions'],
+  ['Bot nickname', 'bot-name', 'bot', 'info', 'actions'],
   ['Badword patterns', 'badword-patterns', 'message-x', 'warning', 'badwords'],
 ];
 const SETUP_LINKS = [
