@@ -169,9 +169,13 @@ these constraints on Rust updates.
 - Axum 0.8.9 pins matchit to 0.8.4, and crypto-common 0.1.7 pins
   generic-array to 0.14.7. Cargo can advance those copies when the parents
   relax their exact requirements.
-- The Chrono advisory has no patched release. Its timestamp and serialization
-  types are shared with Serenity. Track [Chrono maintenance](https://github.com/chronotope/chrono/issues/1768)
-  before changing that contract.
+- On 2026-11-25, we retained Chrono 0.4.45 because the workspace shares its
+  timestamp and serialization types with Serenity 0.12.5. RustSec reports an
+  informational maintenance warning on every release. Keep the warning visible
+  in `cargo audit` and revisit the decision when Serenity releases its Jiff
+  timestamp backend or RustSec updates the advisory. See
+  [RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543.html) and
+  [Serenity's Jiff change](https://github.com/serenity-rs/serenity/pull/3619).
 
 Dependabot alerts and security updates are separate repository settings.
 Keep both enabled under **Settings → Advanced Security → Dependabot**;
