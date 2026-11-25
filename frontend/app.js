@@ -7394,17 +7394,36 @@ const memberSyncStatusLabels = {
   complete: "Complete",
 };
 
+function MemberImportStatus({ store }) {
+  const { coverage, summary, notes, details, error } = useStore(store);
+  return h(
+    React.Fragment,
+    null,
+    coverage,
+    h(
+      "section",
+      { "aria-label": "Member import status" },
+      h("div", { className: "row" }, ...summary),
+      // Fixed slots keep an opened Details disclosure open across status refreshes.
+      h("div", null, ...notes),
+      details,
+      error,
+    ),
+  );
+}
+
 function tabMembers() {
   const guildId = state.guildId;
   const enrollmentId = state.config?.enrollment_id;
   const handlers = useRef({});
-  const [syncView, setSyncView] = useState({
+  // Only the import status subscribes to countdown and status refreshes.
+  const [syncView] = useState(() => createState({
     coverage: null,
     summary: [h("p", { key: "loading" }, "Loading import status…")],
     notes: [],
     details: null,
     error: null,
-  });
+  }));
   const [memberRows, setMemberRows] = useState({});
   const [progress, setProgress] = useState(null);
   const [detailParts, setDetailParts] = useState([]);
@@ -7999,7 +8018,7 @@ function tabMembers() {
           ),
         );
       }
-      setSyncView({ coverage, summary, notes, details, error: null });
+      syncView.set({ coverage, summary, notes, details, error: null });
     };
     const loadStatus = async () => {
       if (!aliveHere()) return;
@@ -8062,9 +8081,8 @@ function tabMembers() {
         statusRead = "retry-needed";
         lastStatusError = error;
         if (latestStatus) renderStatus(latestStatus);
-        else setSyncView({ coverage: null, summary: [], notes: [], details: null, error: null });
-        setSyncView((view) => ({
-          ...view,
+        else syncView.set({ coverage: null, summary: [], notes: [], details: null });
+        syncView.set({
           error: h(
             "p",
             { className: "err", role: "status" },
@@ -8072,7 +8090,7 @@ function tabMembers() {
               ? "Could not refresh import status. Showing the last saved status; retrying shortly while visible."
               : "Could not load import status. Retrying shortly while visible.",
           ),
-        }));
+        });
         schedulePoll();
       } finally {
         if (request === statusRequest) statusAbort = null;
@@ -8360,16 +8378,7 @@ function tabMembers() {
       { className: "muted" },
       "Search saved member identities and known join dates. Default order is newest join first.",
     ),
-    syncView.coverage,
-    h(
-      "section",
-      { "aria-label": "Member import status" },
-      h("div", { className: "row" }, ...syncView.summary),
-      // Fixed slots keep an opened Details disclosure open across status refreshes.
-      h("div", null, ...syncView.notes),
-      syncView.details,
-      syncView.error,
-    ),
+    h(MemberImportStatus, { store: syncView }),
     h(
       "section",
       { className: "card bg-base-100 card-border" },

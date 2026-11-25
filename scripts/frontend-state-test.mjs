@@ -190,9 +190,20 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     instrument(key => counts.set(key, (counts.get(key) || 0) + 1));
     return counts;
   }
+  function measureMemberRowRenders() {
+    let renders = 0;
+    const instrument = vm.runInContext(`(count) => {
+      const original = PagedTable;
+      PagedTable = ({ renderRow, ...props }) => h(original, {
+        ...props, renderRow: renderRow && ((...args) => { count(); return renderRow(...args); }),
+      });
+    }`, context);
+    instrument(() => { ++renders; });
+    return () => renders;
+  }
   vm.runInContext('root.render(h(App));', context);
   pages.push({dom, roots});
-  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, advanceTime(ms) { clockOffsetMs += ms; } };
+  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, measureMemberRowRenders, advanceTime(ms) { clockOffsetMs += ms; } };
 }
 
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
@@ -2737,7 +2748,7 @@ test('Members labels its filters and counts first, middle, last and empty pages'
     [null, 'c1', 'c2', null, null]);
 });
 
-test('Members shows a live rate-limit countdown, separate progress time, and a prior successful run', async () => {
+test('Members updates the live rate-limit countdown without rendering directory rows', async () => {
   const asOf = 1790000000000;
   const statuses = [
     { status: 'waiting', status_reason: 'rate_limited', estimate_reason: 'rate_limited',
@@ -2753,14 +2764,21 @@ test('Members shows a live rate-limit countdown, separate progress time, and a p
     { status: 'queued', estimate_reason: 'worker_offline', phase_remaining_seconds: 240,
       phase_finish_at: asOf + 240000, as_of: asOf },
   ];
-  let reads = 0;
-  const h = harness(async (url) => url.endsWith('/member-sync')
-    ? response({ phase: 'members', run_id: 'initial-1', progress_revision: reads + 1, ...statuses[reads++] })
-    : response({ members: [], next_cursor: null }));
-  h.app.state.tab = 'members';
-  h.app.state.config = { enrollment_id: 'member-enrollment' };
-  const panel = h.app.tabMembers();
+  let reads = 0, directoryReads = 0;
+  const h = harness(async (url) => {
+    if (url.endsWith('/member-sync'))
+      return response({ phase: 'members', run_id: 'initial-1', progress_revision: reads + 1, ...statuses[reads++] });
+    ++directoryReads;
+    return response({ members: Array.from({ length: 50 }, (_, i) => ({
+      user_id: String(20000 + i), display_name: `Directory read ${directoryReads}, member ${i + 1}`, is_current: true,
+    })), next_cursor: null });
+  });
+  const rowRenders = h.measureMemberRowRenders();
+  const panel = memberView(h);
   await settle();
+  const initialRowRenders = rowRenders();
+  assert.ok(initialRowRenders >= 50, 'the counter observes the populated directory');
+  assert.match(textOf(panel), /Directory read 1, member 50/);
   let copy = textOf(panel);
   assert.match(copy, /Rate limit: retry in 1m 30s/);
   assert.match(copy, /Remaining: about 4 minutes for this phase · Expected finish: (?!Unknown)/);
@@ -2773,27 +2791,33 @@ test('Members shows a live rate-limit countdown, separate progress time, and a p
   assert(countdown, 'known rate limit schedules a visible countdown');
   h.advanceTime(1500);
   h.timers.delete(countdown[0]);
-  countdown[1].fn();
+  await countdown[1].fn();
   assert.match(textOf(panel), /Rate limit: retry in 1m 29s/);
+  assert.equal(rowRenders() - initialRowRenders, 0, 'countdown tick renders zero directory rows');
+  visibility(h, 'hidden');
+  assert.equal([...h.timers.values()].some(timer => timer.delay === 1000), false);
   h.advanceTime(60000);
-  const laterCountdown = [...h.timers].find(([, timer]) => timer.delay === 1000);
-  assert(laterCountdown);
-  h.timers.delete(laterCountdown[0]);
-  laterCountdown[1].fn();
+  assert.match(textOf(panel), /Rate limit: retry in 1m 29s/);
+  visibility(h, 'visible');
+  await settle();
   assert.match(textOf(panel), /Remaining: about 3 minutes for this phase/);
   assert.match(textOf(panel), /Rate limit: retry in 0m 29s/);
   h.advanceTime(190000);
   const expiredCountdown = [...h.timers].find(([, timer]) => timer.delay === 1000);
   assert(expiredCountdown);
   h.timers.delete(expiredCountdown[0]);
-  expiredCountdown[1].fn();
+  await expiredCountdown[1].fn();
   assert.match(textOf(panel), /Remaining: Unknown · Expected finish: Unknown/);
   assert.match(textOf(panel), /Rate limit: retry due now/);
+  assert.equal(rowRenders() - initialRowRenders, 0, 'visibility and retry-due updates render zero directory rows');
+  assert.deepEqual([reads, directoryReads], [1, 1], 'the countdown makes no requests');
   const refresh = findNode(panel, n => n.localName === 'button' && textOf(n) === 'Refresh');
   for (const reason of ['discord_unavailable', 'paused', 'worker_offline']) {
-    fire(refresh, 'click');
-    await settle();
+    const before = rowRenders();
+    await fire(refresh, 'click');
     copy = textOf(panel);
+    assert.ok(rowRenders() > before, 'a fresh page renders updated directory rows');
+    assert.match(copy, new RegExp(`Directory read ${directoryReads}, member 50`));
     assert.match(copy, /Remaining: Unknown · Expected finish: Unknown|Remaining: Unknown until worker activity is confirmed · Expected finish: Unknown/);
     assert.doesNotMatch(copy, /Rate limit: retry in/);
     assert.equal([...h.timers.values()].filter(timer => timer.delay === 1000).length, 0, reason);
