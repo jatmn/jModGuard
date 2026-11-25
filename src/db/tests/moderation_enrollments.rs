@@ -276,6 +276,26 @@ async fn gateway_ban_identity_survives_scoped_read_and_reopen() {
 }
 
 #[tokio::test]
+async fn enrolled_warn_persists_without_changing_configuration() {
+    let f = Fixture::new();
+    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
+    let before = get_primary_versions(&f.db).await.unwrap();
+
+    let id = add_enrolled_warn(&f.db, Some(scope), 99, 42, "warning reason")
+        .await
+        .unwrap();
+
+    let warns = list_warns(&f.db, 10, 99).await.unwrap();
+    assert_eq!(warns.len(), 1);
+    assert_eq!(warns[0].id, id);
+    assert_eq!(warns[0].moderator_id, 42);
+    assert_eq!(warns[0].reason.as_deref(), Some("warning reason"));
+    let after = get_primary_versions(&f.db).await.unwrap();
+    assert_eq!(after.config, before.config);
+    assert_eq!(after.config_revision, before.config_revision);
+}
+
+#[tokio::test]
 async fn moderation_reads_create_no_receipts_or_version_changes_and_fail_closed() {
     let probe = Arc::new(crate::db_compat::StartupProbe::default());
     let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));

@@ -161,14 +161,22 @@ async fn shared_store_member_cleanup_and_erasure_preserve_the_other_guild() {
     assert_eq!(departed.joined_at_ms, Some(500));
     assert_neighbor("before cleanup").await;
 
+    // Ordinary departures are eligible at five minutes, not a millisecond sooner.
+    assert!(
+        store
+            .next_member_cleanup_candidate(scope.clone(), 302_499)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let candidate = store
-        .next_member_cleanup_candidate(scope.clone(), 400_000)
+        .next_member_cleanup_candidate(scope.clone(), 302_500)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(candidate.user_id, shared_user);
     store
-        .settle_member_cleanup(scope.clone(), candidate, false, 400_001)
+        .settle_member_cleanup(scope.clone(), candidate, false, 302_501)
         .await
         .unwrap();
     assert!(
