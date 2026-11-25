@@ -76,6 +76,18 @@ async fn snapshot_accounting_tracks_edits_consumption_expiry_and_eviction() {
             .unwrap()
             .is_none()
     );
+    // Make the fixture's index order disagree with oldest-first eviction.
+    store
+        .db
+        .with_conn_sync(|conn| {
+            conn.execute_batch_bounded(
+                "DROP INDEX guild_snapshot_expiry;
+                 CREATE INDEX guild_snapshot_expiry ON guild_message_snapshots
+                     (expires_at_ms DESC, guild_id, enrollment_id, channel_id, message_id)",
+                64 * 1024 * 1024,
+            )
+        })
+        .unwrap();
     assert_eq!(store.evict_snapshots(1, at(300)).await.unwrap(), 1);
     assert!(
         store
