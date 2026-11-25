@@ -4569,6 +4569,7 @@ async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
     for (position, permissions) in [
         (20, Permissions::BAN_MEMBERS),
         (25, Permissions::empty()),
+        (27, Permissions::BAN_MEMBERS),
         (30, Permissions::BAN_MEMBERS),
     ] {
         let mut role = Role::default();
@@ -4591,6 +4592,8 @@ async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
     let actor_permission = Arc::clone(&may_ban);
     let has_rejoined = Arc::new(AtomicBool::new(false));
     let target_rejoined = Arc::clone(&has_rejoined);
+    let demote_during_check = Arc::new(AtomicBool::new(false));
+    let actor_demotion = Arc::clone(&demote_during_check);
     let server = Server::bind(&([127, 0, 0, 1], 0).into());
     let http = serenity::http::HttpBuilder::new("fixture")
         .proxy(format!("http://{}", server.local_addr()))
@@ -4601,6 +4604,7 @@ async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
         let captured_requests = Arc::clone(&captured_requests);
         let actor_permission = Arc::clone(&actor_permission);
         let target_rejoined = Arc::clone(&target_rejoined);
+        let actor_demotion = Arc::clone(&actor_demotion);
         async move {
             Ok::<_, Infallible>(service_fn(move |request: Request<Body>| {
                 let path = request.uri().path();
@@ -4615,6 +4619,20 @@ async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
                         let mut actor = replies[2].clone();
                         if !actor_permission.load(Ordering::SeqCst) {
                             actor["roles"] = json!([]);
+                        } else if actor_demotion.load(Ordering::SeqCst) {
+                            // The first bot member read checks enrollment.
+                            // The second models a demotion during hierarchy lookup.
+                            let bot_reads = captured_requests
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|(method, path)| {
+                                    *method == Method::GET && path == "/api/v10/guilds/10/members/7"
+                                })
+                                .count();
+                            if bot_reads < 2 {
+                                actor["roles"] = json!(["27"]);
+                            }
                         }
                         (200, actor)
                     }
@@ -4685,6 +4703,13 @@ async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
             Outcome::failed("target_role_not_below_moderator"),
         ),
         (
+            "demoted",
+            99,
+            true,
+            true,
+            Outcome::failed("target_role_not_below_moderator"),
+        ),
+        (
             "unknown-user",
             100,
             false,
@@ -4715,6 +4740,7 @@ async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
     ] {
         has_rejoined.store(rejoined, Ordering::SeqCst);
         may_ban.store(authorized, Ordering::SeqCst);
+        demote_during_check.store(label == "demoted", Ordering::SeqCst);
         let job = db::enqueue_bot_action(
             &f.db,
             10,

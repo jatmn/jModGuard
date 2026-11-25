@@ -182,34 +182,11 @@ impl LiveDiscord<'_> {
 
     async fn check_ban_hierarchy(
         &self,
-        job: &BotAction,
+        guild: &PartialGuild,
+        bot: &Member,
+        actor: &Member,
         user: i64,
-        guild_actor: Option<(PartialGuild, Member)>,
     ) -> Result<Option<&'static str>> {
-        if user == i64::try_from(self.bot_user_id.get()).unwrap_or(0) {
-            return Ok(Some("cannot_ban_bot"));
-        }
-        let (guild, actor) = match guild_actor {
-            Some((guild, actor)) => (guild, Some(actor)),
-            None => (
-                self.http
-                    .get_guild(GuildId::new(job.guild_id as u64))
-                    .await?,
-                None,
-            ),
-        };
-        if guild.owner_id.get() == user as u64 {
-            return Ok(Some("cannot_ban_owner"));
-        }
-        let bot = self.http.get_member(guild.id, self.bot_user_id).await?;
-        let actor = match actor {
-            Some(actor) => actor,
-            None => {
-                self.http
-                    .get_member(guild.id, UserId::new(job.actor_id as u64))
-                    .await?
-            }
-        };
         // Someone who is not in the server is banned by ID; no hierarchy applies.
         let target = match self
             .http
@@ -229,7 +206,7 @@ impl LiveDiscord<'_> {
             }
             Err(error) => return Err(error.into()),
         };
-        Ok(ban_refusal(&guild, &bot, &actor, target.as_ref(), user))
+        Ok(ban_refusal(guild, bot, actor, target.as_ref(), user))
     }
 }
 #[serenity::async_trait]
@@ -314,18 +291,53 @@ impl DiscordActions for LiveDiscord<'_> {
         }
     }
     async fn validate_ban(&self, job: &BotAction, user: i64) -> Option<&'static str> {
+        // Take the shared guild and actor snapshot after the bot lookup so
+        // changes during that lookup still affect the moderator's hierarchy.
+        let bot = if user == i64::try_from(self.bot_user_id.get()).unwrap_or(0) {
+            None
+        } else {
+            Some(
+                self.http
+                    .get_member(GuildId::new(job.guild_id as u64), self.bot_user_id)
+                    .await,
+            )
+        };
         let Ok((guild, actor)) = self.guild_and_actor(job).await else {
             return Some("permission_check_unavailable");
         };
         if !actor_authorized(&guild, &actor, &job.action) {
             return Some("permission_revoked");
         }
-        self.check_ban_hierarchy(job, user, Some((guild, actor)))
+        let Some(bot) = bot else {
+            return Some("cannot_ban_bot");
+        };
+        if guild.owner_id.get() == user as u64 {
+            return Some("cannot_ban_owner");
+        }
+        let Ok(bot) = bot else {
+            return Some("ban_check_unavailable");
+        };
+        self.check_ban_hierarchy(&guild, &bot, &actor, user)
             .await
             .unwrap_or(Some("ban_check_unavailable"))
     }
     async fn ban_refusal(&self, job: &BotAction, user: i64) -> Result<Option<&'static str>> {
-        self.check_ban_hierarchy(job, user, None).await
+        if user == i64::try_from(self.bot_user_id.get()).unwrap_or(0) {
+            return Ok(Some("cannot_ban_bot"));
+        }
+        let guild = self
+            .http
+            .get_guild(GuildId::new(job.guild_id as u64))
+            .await?;
+        if guild.owner_id.get() == user as u64 {
+            return Ok(Some("cannot_ban_owner"));
+        }
+        let bot = self.http.get_member(guild.id, self.bot_user_id).await?;
+        let actor = self
+            .http
+            .get_member(guild.id, UserId::new(job.actor_id as u64))
+            .await?;
+        self.check_ban_hierarchy(&guild, &bot, &actor, user).await
     }
     async fn ban(&self, guild: i64, user: i64, delete_message_days: u8, reason: &str) -> Outcome {
         match crate::discord::race_discord_call(
