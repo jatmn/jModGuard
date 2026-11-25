@@ -1235,7 +1235,8 @@ function PlatformAnalytics() {
   const loading = !snapshot && result.loading;
   const failed = !snapshot && Boolean(result.error);
   const rangeLabel = `${days} days`;
-  const points = toTrendPoints(snapshot?.series);
+  const series = snapshot?.series;
+  const points = React.useMemo(() => toTrendPoints(series), [series]);
   const previous = snapshot?.previous ?? null;
   const members = snapshot?.members;
   const rows = platformRows(snapshot);
@@ -3693,7 +3694,8 @@ function tabAnalytics() {
   const data = result.data;
   const loading = result.loading;
   const failed = Boolean(result.error) && !data;
-  const points = toTrendPoints(data?.series);
+  const series = data?.series;
+  const points = React.useMemo(() => toTrendPoints(series), [series]);
   const previous = data?.previous ?? null;
   const rangeLabel = `${days} days`;
   const members = data?.members ?? null;
@@ -3720,6 +3722,7 @@ function tabAnalytics() {
   const pending = (text) => h("p", { className: "an-empty muted", "aria-busy": "true" }, text);
   const unavailable = h("p", { className: "an-empty muted" }, "Unavailable");
   const body = (render) => (data ? render() : failed ? unavailable : pending("Loading…"));
+  const noTrendData = h("p", { className: "an-empty muted" }, "No trend data in this range.");
   return h(
     "div",
     { className: "contents chart-page analytics-page" },
@@ -3766,8 +3769,8 @@ function tabAnalytics() {
     h(
       "div",
       { className: "an-grid" },
-      analyticsPanel("Enforcement per day", "an-enforcement", body(() => h(EnforcementChart, { points })), "an-span-7"),
-      analyticsPanel("Membership per day", "an-membership", body(() => h(MembershipChart, { points })), "an-span-5"),
+      analyticsPanel("Enforcement per day", "an-enforcement", body(() => points.length ? h(EnforcementChart, { points }) : noTrendData), "an-span-7"),
+      analyticsPanel("Membership per day", "an-membership", body(() => points.length ? h(MembershipChart, { points }) : noTrendData), "an-span-5"),
       analyticsPanel(
         "Top automod rules",
         "an-rules",
