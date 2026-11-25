@@ -41,6 +41,29 @@ impl Fixture {
             .await
             .unwrap();
     }
+    async fn fence_guild(&self, guild: i64) {
+        let destination = db::guild_stores::StoreId::new();
+        db::guild_stores::register_store(
+            &self.db,
+            destination.clone(),
+            db::guild_stores::StorePolicy::Dedicated { guild_id: guild },
+        )
+        .await
+        .unwrap();
+        self.db
+            .with_conn(move |conn| {
+                conn.execute_bounded(
+                    "INSERT INTO guild_write_fences(
+                        guild_id,generation,phase,destination_store_id,destination_revision,created_at
+                     ) VALUES(?1,?2,'freeze',?3,?2,unixepoch())",
+                    params![guild, format!("{:032x}", 9u128), destination.as_str()],
+                    64 * 1024 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
     fn request_key(&self, label: &str) -> String {
         format!("{}_{}", self.request_time, label)
     }
@@ -2091,28 +2114,7 @@ async fn timed_ban_dispatch_rejects_rearmed_cancelled_replaced_and_blocked_claim
                     .unwrap()
                     .unwrap();
             }
-            "fence" => {
-                let destination = db::guild_stores::StoreId::new();
-                db::guild_stores::register_store(
-                    &f.db,
-                    destination.clone(),
-                    db::guild_stores::StorePolicy::Dedicated { guild_id: 10 },
-                )
-                .await
-                .unwrap();
-                f.db.with_conn(move |conn| {
-                    conn.execute_bounded(
-                        "INSERT INTO guild_write_fences(
-                        guild_id,generation,phase,destination_store_id,destination_revision,created_at
-                     ) VALUES(10,?1,'freeze',?2,?1,unixepoch())",
-                        params![format!("{:032x}", 9u128), destination.as_str()],
-                        64 * 1024 * 1024,
-                    )?;
-                    Ok(())
-                })
-                .await
-                .unwrap();
-            }
+            "fence" => f.fence_guild(10).await,
             _ => unreachable!(),
         }
         let blocked = matches!(change, "rejoin" | "fence");
@@ -2577,8 +2579,106 @@ async fn timed_ban_expiry_retries_cannot_fill_every_poll() {
     assert!(run(&discord, bound, recovered).await.is_some());
 }
 
+#[tokio::test(start_paused = true)]
+async fn timed_ban_expiry_preserves_due_retry_across_stale_fence() {
+    let probe = std::sync::Arc::new(db::StartupProbe::default());
+    let primary = {
+        let _probe = db::enter_startup_probe(Some(probe.clone()));
+        Fixture::new()
+    };
+    let replica = Fixture::new();
+    let app = crate::state::BotState::new(Default::default(), primary.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    let limits = WorkerLimits::default();
+    let unavailable = MockDiscord {
+        check_error: Some("membership"),
+        ..MockDiscord::default()
+    };
+    let available = MockDiscord::default();
+    let (guild, user, deadline) = (10, 20, 100);
+    let base_delay = EXPIRY_CHECK_RETRY_BASE_SECS;
+    for fixture in [&primary, &replica] {
+        let enrollment = db::enroll_guild(&fixture.db, guild, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        db::record_ban(&fixture.db, guild, user, None, "temporary")
+            .await
+            .unwrap();
+        arm_expiry(&fixture.db, enrollment, user, deadline)
+            .await
+            .unwrap();
+    }
+    expire_bans(&primary.db, Some(&app), &unavailable, deadline, &limits)
+        .await
+        .unwrap();
+    let due = deadline + base_delay;
+    assert_eq!(app.expiry_check_retries.due(due), vec![guild]);
+
+    primary.fence_guild(guild).await;
+    replica.fence_guild(guild).await;
+    primary
+        .db
+        .with_conn(move |conn| {
+            assert_eq!(
+                conn.execute_bounded(
+                    "DELETE FROM guild_write_fences WHERE guild_id=?1",
+                    params![guild],
+                    64 * 1024 * 1024,
+                )?,
+                1
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(
+        db::expired_ban_may_be_due(&primary.db, due, &[])
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db::expired_ban_may_be_due(&replica.db, due, &[])
+            .await
+            .unwrap()
+    );
+    let transactions = probe.transactions();
+    expire_bans_with_advisory_db(
+        &primary.db,
+        &replica.db,
+        Some(&app),
+        &available,
+        due,
+        &limits,
+    )
+    .await
+    .unwrap();
+    assert_eq!(probe.transactions(), transactions);
+    assert_eq!(available.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        app.expiry_check_retries.due(due),
+        vec![guild],
+        "a stale advisory fence must preserve the due retry"
+    );
+
+    // The next poll sees the fence removal. Another failure doubles the
+    // delay, and a successful check at that retry time processes the ban.
+    let visible = due + 1;
+    expire_bans(&primary.db, Some(&app), &unavailable, visible, &limits)
+        .await
+        .unwrap();
+    let next_due = visible + 2 * base_delay;
+    assert_eq!(app.expiry_check_retries.waiting(next_due - 1), vec![guild]);
+    assert_eq!(app.expiry_check_retries.due(next_due), vec![guild]);
+    expire_bans(&primary.db, Some(&app), &available, next_due, &limits)
+        .await
+        .unwrap();
+    assert_eq!(available.calls.load(Ordering::SeqCst), 1);
+    assert!(!db::list_bans(&primary.db, guild, 10).await.unwrap()[0].active);
+}
+
 #[tokio::test]
-async fn timed_ban_expiry_stale_retries_stay_within_the_poll_budget() {
+async fn timed_ban_expiry_preserves_idle_retries_until_primary_exhaustion() {
     // Guilds whose checks failed, then whose bans were lifted or whose
     // memberships retired: their retry times remain, with no due expiry left.
     let f = Fixture::new();
@@ -2590,19 +2690,29 @@ async fn timed_ban_expiry_stale_retries_stay_within_the_poll_budget() {
         app.expiry_check_retries.failed(guild, guild - 1000);
     }
     let now = 2000;
-    assert_eq!(app.expiry_check_retries.due(now).len(), stale.len());
+    let discord = MockDiscord::default();
     EXPIRY_SELECTIONS.set(0);
-    expire_bans(&f.db, Some(&app), &MockDiscord::default(), now, &limits)
+    expire_bans(&f.db, Some(&app), &discord, now, &limits)
         .await
         .unwrap();
-    let selections = EXPIRY_SELECTIONS.get();
-    assert!(
-        selections <= limits.batch_size as usize,
-        "{selections} selections for a batch of {}",
-        limits.batch_size
+    assert_eq!(EXPIRY_SELECTIONS.get(), 0);
+    assert_eq!(app.expiry_check_retries.due(now), stale);
+
+    let enrollment = db::enroll_guild(&f.db, 10, 1).await.unwrap().unwrap();
+    db::record_ban(&f.db, 10, 20, None, "temporary")
+        .await
+        .unwrap();
+    arm_expiry(&f.db, enrollment, 20, now + 1).await.unwrap();
+    expire_bans(&f.db, Some(&app), &discord, now + 1, &limits)
+        .await
+        .unwrap();
+    assert_eq!(
+        EXPIRY_SELECTIONS.get(),
+        2,
+        "one selection and one exhaustion"
     );
-    // That poll reached every due expiry, so the stale entries are forgotten.
-    assert!(app.expiry_check_retries.due(now).is_empty());
+    assert_eq!(discord.calls.load(Ordering::SeqCst), 1);
+    assert!(app.expiry_check_retries.due(now + 1).is_empty());
 }
 
 #[tokio::test]
