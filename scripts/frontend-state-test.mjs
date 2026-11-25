@@ -6786,7 +6786,7 @@ function commandFixture(name, behavior, extra = {}) {
 }
 // `ack` answers a command write; `served` is the server's command list in the
 // configuration read (crates/api command_config_rows).
-function commandEditorHarness({ owner = false, refuse = 0, commands = [], ack = (body, method) => response(method === 'POST' ? { ok: true, name: body.data.name } : { ok: true }), served = () => [] } = {}) {
+function commandEditorHarness({ owner = false, refuse = 0, commands = [], ack = (body, method) => response(method === 'POST' ? { ok: true, name: body.data.name } : { ok: true }), served = () => [], confirm } = {}) {
   const writes = [];
   const reads = [];
   let refusals = refuse;
@@ -6804,7 +6804,7 @@ function commandEditorHarness({ owner = false, refuse = 0, commands = [], ack = 
       return response({ enrollment_id: 'page-membership', settings: { prefix: '!' }, rules: [], commands: served(), badwords: [], templates: [], event_types: [], log_channels: COMMAND_LOG_EVENTS.map(event => ({ event })) });
     }
     return response({});
-  });
+  }, new Map(), new Map(), confirm);
   h.app.state.me.is_bot_owner = owner;
   h.app.state.config = { enrollment_id: 'page-membership', commands, settings: { prefix: '!' }, event_types: [], log_channels: COMMAND_LOG_EVENTS.map(event => ({ event })) };
   h.app.state.tab = 'commands';
@@ -6993,6 +6993,42 @@ test('built-in commands save per-server overrides within their permission floor 
   modal = await h.app.editCommand(builtinRecord(stats));
   assert.match(textOf(modal), /Built-ins are changed one server at a time/);
   assert.equal(commandSave(modal).hidden, true);
+});
+
+test('command deletion and reset send no request until confirmed', async () => {
+  const stats = commandFixture('stats', { kind: 'stats' }, { permission: 'admin' });
+  const greet = commandFixture('greet', { kind: 'plan', params: { steps: [{ type: 'reply', template: 'Hello' }] } });
+  const cases = [
+    [builtinRecord(stats, { guild_override: stats }), 'Reset to default', 'Reset stats to its default?'],
+    [{ name: 'greet', scope: 'guild', effective: greet, guild_override: greet }, 'Delete', 'Delete command greet?'],
+  ];
+  for (const [record, label, prompt] of cases) {
+    let allowed = false;
+    const prompts = [];
+    const { h, writes, reads } = commandEditorHarness({
+      confirm(message) {
+        prompts.push(message);
+        return allowed;
+      },
+    });
+    const modal = await h.app.editCommand(record);
+    const button = findNode(modal, n => n.localName === 'button' && n.textContent === label);
+    assert.ok(button && !button.hidden, label);
+    await fire(button, 'click');
+    assert.deepEqual(prompts, [prompt]);
+    assert.deepEqual(writes, [], `declining ${label} sends no command request`);
+    assert.deepEqual(reads, [], `declining ${label} avoids a configuration reload`);
+    assert.equal(modal.isConnected, true, `declining ${label} keeps the editor open`);
+
+    allowed = true;
+    await fire(button, 'click');
+    assert.deepEqual(prompts, [prompt, prompt]);
+    assert.deepEqual(writes, [{
+      url: `/api/guilds/${h.app.state.guildId}/commands/${record.name}`,
+      method: 'DELETE',
+      body: { scope: 'guild' },
+    }]);
+  }
 });
 
 test('a command save shows the server effective aliases of every command, not the saved row', async () => {
