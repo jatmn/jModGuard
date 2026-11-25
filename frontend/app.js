@@ -9675,7 +9675,8 @@ function AccessRolesCard({ revision, generation }) {
         items: [
           "Discord’s Ban Members permission allows ban actions at either access level.",
           "Settings access can also edit rules, badwords, known spam and images, templates, log channels and bot settings.",
-          "Commands, copying configuration, member import controls, case notes, case removal and this list need Manage Server.",
+          "Commands, copying configuration, member import controls, case notes and this list need Manage Server.",
+          "Removing case records requires server ownership or both Manage Server and Administrator permissions.",
           `A removed role stops working as soon as the bot sees the change, and within ${ttl >= 120 ? `${Math.round(ttl / 60)} minutes` : `${ttl} seconds`} at most.`,
         ],
       }),
