@@ -3247,6 +3247,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_write_rechecks_cleanup_pause_after_admission() {
+        use std::future::Future;
+
+        let (app, path) = temp_app("snapshot_pause_after_admission");
+        let scope = cache_scope(&app, 100).await;
+        let store = app.tenant.store(&scope).await.unwrap();
+        crate::db::upsert_log_channel(&app.db, 789, "message_delete", 456)
+            .await
+            .unwrap();
+        assert!(capture_enabled(
+            &app.configs.get(&app.db, 789).await.unwrap()
+        ));
+        let now = app.snapshots.started_at_ms;
+
+        let mut write = Box::pin(observe_configured_creates(
+            &app,
+            &store,
+            &scope,
+            vec![cache_observation(1, now, "before pause")],
+        ));
+        std::future::poll_fn(|cx| match write.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(_) => panic!("configured capture must yield after admission"),
+        })
+        .await;
+        app.snapshots.maintain_at(&app, Some(-1)).await;
+        assert!(app.snapshots.capture_paused(&scope));
+        assert_eq!(write.await.unwrap(), vec![None]);
+        assert!(
+            store
+                .retained_snapshot(scope, 456, 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(store);
+        drop(app);
+        remove_db_and_store(&path);
+    }
+
+    #[tokio::test]
     async fn batch_write_rechecks_deletion_after_admission() {
         use std::future::Future;
 
@@ -3485,6 +3526,112 @@ mod tests {
             "mentions": [], "mention_roles": [], "attachments": [], "embeds": [],
             "pinned": false, "type": 0
         })
+    }
+
+    #[tokio::test]
+    async fn member_leave_report_without_join_context_sends_without_fetching_the_roster() {
+        let (app, path) = temp_app("leave_no_roster");
+        crate::db::upsert_log_channel(&app.db, 789, "member_leave", 901)
+            .await
+            .unwrap();
+        let (http, bodies, server) = recording_delete_proxy().await;
+        let ctx = test_delete_context_with(http).await;
+        let mut user = serenity::model::user::User::default();
+        user.id = serenity::model::id::UserId::new(42);
+        user.name = "departed-member".into();
+        let observed =
+            chrono::DateTime::from_timestamp_millis(app.snapshots.started_at_ms).unwrap();
+        let (delivery, _) = logging::emit_member_event(
+            &app,
+            &ctx,
+            GuildId::new(789),
+            "member_leave",
+            &user,
+            logging::member_join_vars(None, observed),
+            None,
+        )
+        .await;
+        assert_eq!(delivery, logging::Delivery::Sent);
+        {
+            let requests = bodies.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0].matches("Unavailable").count(), 2);
+            let start = requests[0].lines().next().unwrap();
+            assert!(
+                start.starts_with("POST ") && start.contains("/channels/901/messages "),
+                "{start}"
+            );
+        }
+        server.abort();
+        drop(app);
+        remove_db(&path);
+    }
+
+    #[tokio::test]
+    async fn snapshot_creates_keep_the_last_eligible_memory_copy_when_config_reads_fail() {
+        let (app, path) = temp_app("snapshot_last_config");
+        let scope = cache_scope(&app, 100).await;
+        let store = app.tenant.store(&scope).await.unwrap();
+        crate::db::upsert_log_channel(&app.db, 789, "message_delete", 456)
+            .await
+            .unwrap();
+        assert!(capture_enabled(
+            &app.configs.get(&app.db, 789).await.unwrap()
+        ));
+        // A committed edit forces a reload without clearing the last-known entry.
+        crate::db::upsert_log_channel(&app.db, 789, "message_delete", 457)
+            .await
+            .unwrap();
+        app.db
+            .with_conn(|conn| {
+                conn.execute_batch_bounded(
+                    "ALTER TABLE log_channels RENAME TO offline_log_channels",
+                    65_536,
+                )
+            })
+            .await
+            .unwrap();
+        assert!(app.configs.get(&app.db, 789).await.is_err());
+
+        let now = app.snapshots.started_at_ms;
+        assert_eq!(
+            observe_configured_creates(
+                &app,
+                &store,
+                &scope,
+                vec![cache_observation(1, now, "batched")],
+            )
+            .await
+            .unwrap(),
+            vec![None]
+        );
+
+        let mut receiver = app.snapshots.receiver.lock().start().unwrap();
+        assert!(app.snapshots.enqueue(
+            &app,
+            test_delete_context().await,
+            scope.clone(),
+            Body::Create(cache_observation(2, now, "queued")),
+        ));
+        receiver.close();
+        run(Arc::clone(&app), receiver).await;
+        for (id, expected) in [(1, "batched"), (2, "queued")] {
+            assert!(
+                store
+                    .retained_snapshot(scope.clone(), 456, id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let cached = app
+                .snapshots
+                .take_recent(&scope, ChannelId::new(456), MessageId::new(id as u64))
+                .unwrap();
+            assert_eq!(cached.fields.content.as_deref(), Some(expected));
+        }
+        drop(store);
+        drop(app);
+        remove_db_and_store(&path);
     }
 
     async fn assert_gateway_capture_eligibility(enabled: bool) {
@@ -5166,24 +5313,23 @@ mod tests {
         );
         assert!(!transcript.worth_sending());
         let sink = RecordingSink::default();
-        if let Some(settlement) =
-            app.automod_delete_marks
-                .confirm(789, 456, blocked, blocked_attempt)
-        {
-            logging::emit_reconciled_automod_delete(
-                &app,
-                &sink,
-                789,
-                456,
-                blocked,
-                &settlement.rule_id,
-                &settlement.rule_name,
-                &settlement.reason,
-                settlement.retained.as_ref(),
-                settlement.fallback_to_bulk,
-            )
-            .await;
-        }
+        let settlement = app
+            .automod_delete_marks
+            .confirm(789, 456, blocked, blocked_attempt)
+            .expect("an unreserved mark settles on confirmation");
+        logging::emit_reconciled_automod_delete(
+            &app,
+            &sink,
+            789,
+            456,
+            blocked,
+            &settlement.rule_id,
+            &settlement.rule_name,
+            &settlement.reason,
+            settlement.retained.as_ref(),
+            settlement.fallback_to_bulk,
+        )
+        .await;
         assert!(
             sink.messages.lock().unwrap().is_empty(),
             "bulk-only success has no individual destination: {:?}",
@@ -5340,7 +5486,22 @@ mod tests {
             );
             let usage = store.measure_usage(false).await.unwrap();
             assert_eq!(usage.snapshot_count, Some(0));
-            assert_eq!(usage.snapshot_health.unwrap().expired_count, 401);
+            let health = usage.snapshot_health.unwrap();
+            assert_eq!(health.expired_count, 401);
+            assert_eq!(health.state, "active");
+            assert_eq!(health.reason, None);
+
+            app.snapshots.content_access.lock().remove(&789);
+            let after = now + 2 * 3_600_000 + 2;
+            app.snapshots.maintain_at(&app, Some(after)).await;
+            let health = store
+                .measure_usage(false)
+                .await
+                .unwrap()
+                .snapshot_health
+                .unwrap();
+            assert_eq!(health.state, "unavailable");
+            assert_eq!(health.reason.as_deref(), Some("content_access"));
             // A verified cleanup error pauses growing capture for this store;
             // a later successful check and measurement admit it again.
             app.snapshots.maintain_at(&app, Some(-1)).await;
@@ -5361,6 +5522,28 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_maintenance_reports_disabled_capture_even_with_content_access() {
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.bot.message_capture_enabled = false;
+        let (app, path) = temp_app_with_config("snapshot_disabled_health", cfg);
+        let scope = cache_scope(&app, 100).await;
+        let store = app.tenant.store(&scope).await.unwrap();
+        app.snapshots.content_access.lock().insert(789);
+        app.snapshots.maintain_at(&app, None).await;
+        let health = store
+            .measure_usage(false)
+            .await
+            .unwrap()
+            .snapshot_health
+            .unwrap();
+        assert_eq!(health.state, "disabled");
+        assert_eq!(health.reason.as_deref(), Some("disabled"));
+        drop(store);
+        drop(app);
+        remove_db_and_store(&path);
     }
 
     #[tokio::test]

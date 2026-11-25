@@ -395,7 +395,7 @@ async fn capturing_proxy_for_commands(
     Arc<std::sync::Mutex<Vec<String>>>,
     tokio::task::JoinHandle<()>,
 ) {
-    capturing_proxy_with(success, false, None).await
+    capturing_proxy_with(success, false, None, Vec::new()).await
 }
 
 /// `reject_embeds` answers any request carrying an embed with Discord's
@@ -404,6 +404,7 @@ async fn capturing_proxy_with(
     success: bool,
     reject_embeds: bool,
     deleted: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    messages: Vec<serenity::model::channel::Message>,
 ) -> (
     serenity::http::Http,
     Arc<std::sync::Mutex<Vec<String>>>,
@@ -473,6 +474,8 @@ async fn capturing_proxy_with(
                 channel.id = ChannelId::new(1);
                 channel.guild_id = GuildId::new(10);
                 ("200 OK", serde_json::to_string(&channel).unwrap())
+            } else if route.starts_with("POST ") && route.contains("/messages/bulk-delete") {
+                ("204 No Content", String::new())
             } else if (route.starts_with("POST ") && route.contains("/messages"))
                 || (route.starts_with("PATCH ") && route.contains("/webhooks/"))
             {
@@ -480,7 +483,7 @@ async fn capturing_proxy_with(
                 message.id = serenity::model::id::MessageId::new(77);
                 ("200 OK", serde_json::to_string(&message).unwrap())
             } else if route.starts_with("GET ") && route.contains("/messages") {
-                ("200 OK", "[]".into())
+                ("200 OK", serde_json::to_string(&messages).unwrap())
             } else {
                 ("204 No Content", String::new())
             };
@@ -2408,6 +2411,117 @@ async fn command_mod_action_existing_ban_keeps_outcome_row() {
     assert_configured_command_mod_action(cmd, "91 test reason", true, 2).await;
 }
 #[tokio::test]
+async fn command_plan_requires_moderator_permission_and_a_target_where_applicable() {
+    use crate::types::{Behavior, PlanStep};
+
+    let path =
+        std::env::temp_dir().join(format!("targeted-plan-{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+    app.activation.mark_lock_held(true);
+    let cache = Arc::new(Cache::new());
+    remember_guild(&cache, 10, Some(target_member(10, 91, None)), None);
+    let mut guild = cache.guild(GuildId::new(10)).unwrap().clone();
+    guild
+        .members
+        .insert(UserId::new(7), target_member(10, 7, None));
+    let mut event: GuildCreateEvent =
+        serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+    cache.update(&mut event);
+    let (http, requests, server) = capturing_proxy_for_commands(true).await;
+    let ctx = test_context(cache, Arc::new(http)).await;
+
+    for (step, permission, args, expected_error, expected_write) in [
+        (
+            PlanStep::AddRole { role_id: 50 },
+            "everyone",
+            "91",
+            Some("targeted action plans require the command permission to be mod or higher"),
+            None,
+        ),
+        (
+            PlanStep::Kick,
+            "everyone",
+            "91",
+            Some("targeted action plans require the command permission to be mod or higher"),
+            None,
+        ),
+        (
+            PlanStep::Kick,
+            "mod",
+            "",
+            Some("Missing argument `user`."),
+            None,
+        ),
+        (
+            PlanStep::AddRole { role_id: 50 },
+            "everyone",
+            "",
+            None,
+            Some(("PUT", "/guilds/10/members/7/roles/50")),
+        ),
+        (
+            PlanStep::AddRole { role_id: 50 },
+            "mod",
+            "91",
+            None,
+            Some(("PUT", "/guilds/10/members/91/roles/50")),
+        ),
+        (
+            PlanStep::Kick,
+            "mod",
+            "91",
+            None,
+            Some(("DELETE", "/guilds/10/members/91")),
+        ),
+    ] {
+        let mut cmd = jmodguard::defaults::default_commands()
+            .into_iter()
+            .find(|cmd| cmd.name == "warn")
+            .unwrap();
+        cmd.name = "custom-plan".into();
+        cmd.permission = permission.into();
+        cmd.behavior = Behavior::Plan { steps: vec![step] };
+        let outcome = crate::commands::run_command(crate::commands::CmdEnv::new(
+            &app,
+            &ctx,
+            &cmd,
+            GuildId::new(10),
+            ChannelId::new(1),
+            UserId::new(7),
+            target_member(10, 7, None),
+            Args::new(args),
+            false,
+            None,
+        ))
+        .await;
+        if let Some(error) = expected_error {
+            assert_eq!(
+                outcome.err().expect("plan must be denied").to_string(),
+                error
+            );
+        } else {
+            assert!(outcome.is_ok(), "{:?}", outcome.err());
+        }
+        let captured = std::mem::take(&mut *requests.lock().unwrap());
+        let writes: Vec<_> = captured
+            .iter()
+            .filter_map(|request| {
+                let mut line = request.lines().next()?.split_whitespace();
+                let method = line.next()?;
+                let uri = line.next()?;
+                let path = uri.split_once("/api/v10").map_or(uri, |(_, path)| path);
+                (method != "GET").then_some((method, path))
+            })
+            .collect();
+        assert_eq!(writes, expected_write.into_iter().collect::<Vec<_>>());
+    }
+    server.abort();
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn command_mod_action_targeted_plan_with_and_without_log_step() {
     use crate::types::{Behavior, PlanStep};
     for explicit_log in [true, false] {
@@ -2523,6 +2637,83 @@ async fn command_log_context_timeout_events_and_duration() {
             Some(("{command}|{channel}|{target}|{target_id}|{user}|{mention}|{user_id}|{actor}|{actor_id}|{minutes}|{duration}|{reason}", &expected)),
         ).await;
     }
+}
+
+#[tokio::test]
+async fn command_purge_caps_the_fetch_and_deletes_the_returned_messages() {
+    let path =
+        std::env::temp_dir().join(format!("command-purge-{:032x}.db", rand::random::<u128>()));
+    let app = BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+    app.activation.mark_lock_held(true);
+    let cmd = jmodguard::defaults::default_commands()
+        .into_iter()
+        .find(|cmd| cmd.name == "purge")
+        .unwrap();
+
+    // 256 would wrap to zero when passed to Serenity as u8 without the clamp.
+    for (count, ids) in [("256", &[41, 42][..]), ("1", &[41][..])] {
+        let messages = ids
+            .iter()
+            .map(|&id| {
+                let mut message = serenity::model::channel::Message::default();
+                message.id = serenity::model::id::MessageId::new(id);
+                message.channel_id = ChannelId::new(1);
+                message
+            })
+            .collect();
+        let (http, requests, server) = capturing_proxy_with(true, false, None, messages).await;
+        let ctx = test_context(Arc::new(Cache::new()), Arc::new(http)).await;
+        let outcome = crate::commands::run_command(crate::commands::CmdEnv::new(
+            &app,
+            &ctx,
+            &cmd,
+            GuildId::new(10),
+            ChannelId::new(1),
+            UserId::new(7),
+            target_member(10, 7, None),
+            Args::new(count),
+            false,
+            None,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(outcome.vars["count"], ids.len().to_string());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        let get = requests[0].lines().next().unwrap();
+        let (path, query) = get
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .split_once('?')
+            .unwrap();
+        let limit = if count == "1" { "limit=1" } else { "limit=100" };
+        assert!(
+            get.starts_with("GET ") && path.ends_with("/channels/1/messages"),
+            "{get}"
+        );
+        assert!(query.split('&').any(|param| param == limit), "{get}");
+        let delete = requests[1].lines().next().unwrap();
+        if ids.len() == 1 {
+            assert!(
+                delete.starts_with("DELETE ") && delete.contains("/channels/1/messages/41 "),
+                "{delete}"
+            );
+        } else {
+            assert!(
+                delete.starts_with("POST ") && delete.contains("/channels/1/messages/bulk-delete "),
+                "{delete}"
+            );
+            assert_eq!(
+                request_json(&requests[1])["messages"],
+                serde_json::json!(["41", "42"])
+            );
+        }
+        server.abort();
+    }
+    drop(app);
+    crate::tenant::remove_sidecars(&path);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -2700,7 +2891,7 @@ impl StatsDispatch {
         let cache = Arc::new(Cache::new());
         let (deletions, deleted) = tokio::sync::mpsc::unbounded_channel();
         let (http, captured, server) =
-            capturing_proxy_with(true, reject_embeds, Some(deletions)).await;
+            capturing_proxy_with(true, reject_embeds, Some(deletions), Vec::new()).await;
         let http = Arc::new(http);
         let ctx = test_context(Arc::clone(&cache), Arc::clone(&http)).await;
         let cfg = Arc::new(crate::state::CachedGuildConfig {

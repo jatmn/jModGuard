@@ -1992,20 +1992,22 @@ async fn gateway_unban_event_allows_a_later_manual_ban() {
 async fn nullable_reason_active_mirror_is_handled() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
-    f.db.with_conn(|conn| {
-        let mut tx = conn.transaction_primary_write()?;
-        tx.ensure_mutation_receipt()?;
-        tx.execute_bounded(
-            "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active)
+    let row_id =
+        f.db.with_conn(|conn| {
+            let mut tx = conn.transaction_primary_write()?;
+            tx.ensure_mutation_receipt()?;
+            tx.execute_bounded(
+                "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active)
              VALUES (?1, ?2, NULL, NULL, ?3, 1)",
-            params![10_i64, 55_i64, "2024-01-01T00:00:00+00:00"],
-            64 * 1024 * 1024,
-        )?;
-        tx.commit()?;
-        Ok(())
-    })
-    .await
-    .unwrap();
+                params![10_i64, 55_i64, "2024-01-01T00:00:00+00:00"],
+                64 * 1024 * 1024,
+            )?;
+            let row_id = tx.last_insert_rowid();
+            tx.commit()?;
+            Ok(row_id)
+        })
+        .await
+        .unwrap();
     let write = record_gateway_ban(
         &f.db,
         Some(scope.clone()),
@@ -2019,10 +2021,17 @@ async fn nullable_reason_active_mirror_is_handled() {
     )
     .await
     .unwrap();
-    assert!(matches!(
-        write,
-        GatewayBanWrite::Recorded { .. } | GatewayBanWrite::Existing { .. }
-    ));
+    assert_eq!(write, GatewayBanWrite::Existing { row_id });
+    let (bans, active, events) = f.db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*), SUM(active),
+                    (SELECT COUNT(*) FROM events WHERE guild_id=10 AND user_id=55 AND event_type='member_ban')
+             FROM bans WHERE guild_id=10 AND user_id=55",
+            (),
+            |row| Ok((row.get::<i64>(0)?, row.get::<i64>(1)?, row.get::<i64>(2)?)),
+        )
+    }).await.unwrap();
+    assert_eq!((bans, active, events), (1, 1, 0));
 }
 
 #[tokio::test]

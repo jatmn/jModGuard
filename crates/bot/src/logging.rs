@@ -961,11 +961,21 @@ pub(crate) fn known_message_author(
     channel: u64,
     message: u64,
 ) -> Option<u64> {
+    known_message_author_at(app, guild, channel, message, Instant::now)
+}
+
+fn known_message_author_at(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    now: impl FnOnce() -> Instant,
+) -> Option<u64> {
     app.log_snippets
         .inner
         .lock()
         .get(&(guild, channel, message))
-        .filter(|snippet| snippet.at.elapsed() < SNIPPET_KEEP)
+        .filter(|snippet| now().duration_since(snippet.at) < SNIPPET_KEEP)
         .map(|snippet| snippet.author)
 }
 

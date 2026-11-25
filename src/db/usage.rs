@@ -316,9 +316,9 @@ mod tests {
         ));
         let db = Db::open(&path, 2).unwrap();
         let core_only = measure_database_usage(&db, true, None).await.unwrap();
-        if core_only.breakdown_quality == BreakdownQuality::Measured {
-            assert_eq!(core_only.categories.snapshot_data_bytes, Some(0));
-        }
+        assert_eq!(core_only.breakdown_quality, BreakdownQuality::Measured);
+        assert_eq!(core_only.breakdown_error_code, None);
+        assert_eq!(core_only.categories.snapshot_data_bytes, Some(0));
         db.with_conn(|conn| {
             conn.execute_batch_bounded("CREATE TABLE guild_message_snapshots (id INTEGER PRIMARY KEY, encoded_bytes INTEGER NOT NULL, body TEXT); CREATE INDEX test_usage_snapshot_index ON guild_message_snapshots(body); INSERT INTO guild_message_snapshots(encoded_bytes,body) VALUES(20,'sample'); CREATE TABLE guild_cases(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO guild_cases(body) VALUES('case');", 64_000_000)?;
             Ok(())
@@ -333,25 +333,45 @@ mod tests {
         // must never fall back to a full COUNT/SUM over snapshot bodies.
         assert_eq!(detail.snapshot_count, None);
         assert_eq!(detail.snapshot_logical_bytes, None);
-        if detail.breakdown_quality == BreakdownQuality::Measured {
-            let parts = &detail.categories;
-            let total = parts.snapshot_data_bytes.unwrap_or(0)
-                + parts.moderation_evidence_data_bytes.unwrap()
-                + parts.configuration_data_bytes.unwrap()
-                + parts.operational_data_bytes.unwrap()
-                + parts.index_bytes.unwrap()
-                + parts.reusable_bytes
-                + parts.system_unattributed_bytes.unwrap();
-            assert_eq!(total, detail.allocated_bytes);
-            assert!(parts.snapshot_data_bytes.unwrap() >= detail.page_size);
-            assert!(parts.moderation_evidence_data_bytes.unwrap() >= detail.page_size);
-            assert!(parts.configuration_data_bytes.unwrap() >= detail.page_size);
-            assert!(parts.index_bytes.unwrap() >= detail.page_size);
-        } else {
-            assert_eq!(detail.breakdown_quality, BreakdownQuality::Unavailable);
-            assert!(detail.categories.operational_data_bytes.is_none());
-            assert!(detail.categories.index_bytes.is_none());
+        assert_eq!(detail.breakdown_quality, BreakdownQuality::Measured);
+        assert_eq!(detail.breakdown_error_code, None);
+        let parts = &detail.categories;
+        let total = parts.snapshot_data_bytes.unwrap_or(0)
+            + parts.moderation_evidence_data_bytes.unwrap()
+            + parts.configuration_data_bytes.unwrap()
+            + parts.operational_data_bytes.unwrap()
+            + parts.index_bytes.unwrap()
+            + parts.reusable_bytes
+            + parts.system_unattributed_bytes.unwrap();
+        assert_eq!(total, detail.allocated_bytes);
+        assert!(parts.snapshot_data_bytes.unwrap() >= detail.page_size);
+        assert!(parts.moderation_evidence_data_bytes.unwrap() >= detail.page_size);
+        assert!(parts.configuration_data_bytes.unwrap() >= detail.page_size);
+        assert!(parts.index_bytes.unwrap() >= detail.page_size);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[tokio::test]
+    async fn failed_dbstat_probe_leaves_physical_categories_unavailable() {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_usage_unavailable_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        let db = Db::open(&path, 2).unwrap();
+        db.with_conn(|conn| {
+            // A real table shadows the eponymous dbstat virtual table.
+            conn.execute_batch_bounded("CREATE TABLE dbstat (fixture INTEGER)", 64_000_000)
+        })
+        .await
+        .unwrap();
+        let detail = measure_database_usage(&db, true, None).await.unwrap();
+        assert_eq!(detail.breakdown_quality, BreakdownQuality::Unavailable);
+        assert_eq!(detail.breakdown_error_code, Some("dbstat_probe_failed"));
+        assert_eq!(detail.categories.operational_data_bytes, None);
+        assert_eq!(detail.categories.index_bytes, None);
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

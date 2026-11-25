@@ -90,6 +90,18 @@ impl RecoveryPage {
         let bound = jmodguard_bot::control_server::spawn(Arc::clone(&bot))
             .unwrap()
             .expect("control listener");
+        assert!(
+            db::claim_update_lease(
+                &bot.db,
+                "bot",
+                &"ab".repeat(16),
+                chrono::Utc::now().timestamp(),
+                240,
+            )
+            .await
+            .unwrap()
+        );
+
         let mut cfg = ApiProcessConfig::default();
         cfg.db.path = path.clone();
         cfg.db.pool_size = 2;
@@ -170,17 +182,6 @@ async fn read_only_service_upgrade_routes_use_the_writer_link() {
         return;
     }
     let page = RecoveryPage::open().await;
-    assert!(
-        db::claim_update_lease(
-            &page.bot.db,
-            "bot",
-            &"ab".repeat(16),
-            chrono::Utc::now().timestamp(),
-            240,
-        )
-        .await
-        .unwrap()
-    );
     let router = page.router.clone();
     let owner_cookie = page.cookie.clone();
 
@@ -385,6 +386,9 @@ async fn owner_update_check_reaches_registry_discovery() {
     }
 
     let page = RecoveryPage::open().await;
+    db::release_update_lease(&page.bot.db, "bot", &"ab".repeat(16))
+        .await
+        .unwrap();
     let before = db::component_update(&page.bot.db, "bot").await.unwrap();
     assert_eq!(before.checked_at, None);
     assert_eq!(before.check_error, None);
@@ -433,6 +437,7 @@ async fn update_alert_channel_requires_owner_and_trusted_origin() {
 async fn checked_api_candidate(
     page: &RecoveryPage,
     self_update_enabled: bool,
+    candidate_api_capability: i64,
 ) -> db::ComponentRelease {
     let db = &page.bot.db;
     let now = chrono::Utc::now().timestamp();
@@ -449,8 +454,8 @@ async fn checked_api_candidate(
         min_schema: schema,
         max_schema: schema,
         result_schema: schema,
-        min_api: 1,
-        max_api: 1,
+        min_api: candidate_api_capability,
+        max_api: candidate_api_capability,
         launcher_protocol: 1,
         launcher: Some(db::LauncherCompatibility {
             revision: db::LAUNCHER_REVISION,
@@ -502,7 +507,7 @@ async fn update_install_requires_owner_and_trusted_origin() {
         return;
     }
     let page = RecoveryPage::open().await;
-    let candidate = checked_api_candidate(&page, true).await;
+    let candidate = checked_api_candidate(&page, true, 1).await;
     let body = json!({"component":"api","digest":candidate.digest});
     assert_update_route_guards(&page, "install", &body).await;
     let (status, response) = post_owner_update(&page, "install", &body).await;
@@ -523,7 +528,7 @@ async fn update_install_refuses_when_service_self_update_is_disabled() {
         return;
     }
     let page = RecoveryPage::open().await;
-    let candidate = checked_api_candidate(&page, false).await;
+    let candidate = checked_api_candidate(&page, false, 1).await;
     let before = update_state(&page.bot.db).await;
     let (status, response) = post_owner_update(
         &page,
@@ -546,7 +551,7 @@ async fn owner_update_install_refuses_when_rollout_is_disabled() {
         return;
     }
     let page = RecoveryPage::open().await;
-    let candidate = checked_api_candidate(&page, true).await;
+    let candidate = checked_api_candidate(&page, true, 1).await;
     let before = update_state(&page.bot.db).await;
     let (status, response) = post_owner_update(
         &page,
@@ -572,19 +577,7 @@ async fn owner_update_install_refuses_an_incompatible_candidate() {
         return;
     }
     let page = RecoveryPage::open().await;
-    let mut candidate = checked_api_candidate(&page, true).await;
-    candidate.min_api = 2;
-    candidate.max_api = 2;
-    db::record_update_check(
-        &page.bot.db,
-        "api",
-        "latest",
-        Some(candidate.clone()),
-        None,
-        chrono::Utc::now().timestamp(),
-    )
-    .await
-    .unwrap();
+    let candidate = checked_api_candidate(&page, true, 2).await;
     let before = update_state(&page.bot.db).await;
     let (status, response) = post_owner_update(
         &page,

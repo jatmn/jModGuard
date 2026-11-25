@@ -223,13 +223,14 @@ async fn expiry_scope_and_erasure_keep_other_guild_rows() {
         .observe_snapshot(other.clone(), observation(41, Some("other"), None, 1))
         .await
         .unwrap();
-    assert!(
-        store
-            .take_snapshot(other.clone(), 20, 41, at(5))
+    for (tenant, expected) in [(other.clone(), "other"), (scope.clone(), "private")] {
+        let snapshot = store
+            .take_snapshot(tenant, 20, 41, at(5))
             .await
             .unwrap()
-            .is_some()
-    );
+            .unwrap();
+        assert_eq!(snapshot.fields.content.as_deref(), Some(expected));
+    }
     let mut other_later = observation(42, Some("other"), None, 1);
     other_later.created_at_ms = at(1000);
     store
@@ -240,9 +241,13 @@ async fn expiry_scope_and_erasure_keep_other_guild_rows() {
         .observe_snapshot(scope.clone(), observation(45, Some("expire"), None, 1))
         .await
         .unwrap();
+    store
+        .observe_snapshot(scope.clone(), observation(46, Some("boundary"), None, 1))
+        .await
+        .unwrap();
     assert!(
         store
-            .take_snapshot(scope.clone(), 20, 41, at(86_400_000))
+            .take_snapshot(scope.clone(), 20, 46, at(86_400_000))
             .await
             .unwrap()
             .is_none()
