@@ -498,14 +498,18 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 
 .administration-info { display: grid; gap: var(--ui-gap); }
 
+/* Shared chart layout. SVG plots supply their fixed height. */
+#content:has(> .chart-page) { max-width: 1440px; margin-inline: auto; }
+.chart-plot { display: block; width: 100%; }
+.chart-plot text { font-size: var(--ui-font-size-sm); }
+
 /* Analytics trend charts (workspace and owner views). */
 .trend-card .card-body { gap: 10px; }
 .trend-picker { display: flex; flex-wrap: wrap; gap: 6px; }
 .trend-pick-active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
 .trend-chart { margin: 0; min-width: 0; }
-.trend-chart svg { display: block; width: 100%; height: auto; }
 .trend-grid line { stroke: var(--shell-border); stroke-width: 1; }
-.trend-grid text, .trend-day { fill: var(--muted); font-size: 11px; }
+.trend-grid text, .trend-day { fill: var(--muted); }
 .trend-area { fill: var(--accent); opacity: 0.14; }
 .trend-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .platform-stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); overflow: visible; background: var(--panel); border: 1px solid var(--shell-border); margin-bottom: 6px; }
@@ -594,7 +598,7 @@ svg.icon-neutral { color: var(--icon-neutral); }
 .an-delta { color: var(--muted); font-size: .75rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .an-badge { flex-shrink: 0; padding: 0 5px; border: 1px solid currentColor; border-radius: 999px; font-size: .6875rem; line-height: 1.35; white-space: nowrap; }
 .an-badge-warn { color: var(--warn); }
-.an-spark { display: block; width: 100%; height: 18px; fill: currentColor; }
+.an-spark { fill: currentColor; }
 .an-spark-zero { opacity: .35; }
 /* Panel grid: 12 columns on desktop, two at medium widths, one when narrow. */
 .an-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: var(--ui-gap); }
@@ -603,9 +607,8 @@ svg.icon-neutral { color: var(--icon-neutral); }
 #content .an-panel-title { margin: 0 0 4px; font-size: .8125rem; font-weight: 600; }
 .an-empty { margin: 0; padding: 12px 0; font-size: .8125rem; }
 .an-panel .an-figure { display: block; margin: 0; min-width: 0; }
-.an-figure svg { display: block; width: 100%; height: auto; }
 .an-figure svg:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-.an-readout { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; min-height: 1.25rem; font-size: .75rem; font-variant-numeric: tabular-nums; color: var(--text); }
+.an-readout { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; min-height: 1.25rem; font-size: var(--ui-font-size-sm); font-variant-numeric: tabular-nums; color: var(--text); }
 .an-readout-item { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .an-readout-item, .an-readout strong { color: var(--text); }
 .an-swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: currentColor; }
@@ -617,8 +620,8 @@ svg.icon-neutral { color: var(--icon-neutral); }
 .an-swatch-line { height: 2px; }
 .an-bar { fill: currentColor; }
 .an-baseline, .an-gridline line { stroke: var(--shell-border); stroke-width: 1; }
-.an-gridline text, .an-axis-day, .an-axis-value, .an-axis-net { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
-.an-axis-label { fill: var(--text); font-size: 11px; }
+.an-gridline text, .an-axis-day, .an-axis-value, .an-axis-net { fill: var(--muted); font-variant-numeric: tabular-nums; }
+.an-axis-label { fill: var(--text); }
 .an-net-line { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linejoin: round; }
 .an-net-point { fill: currentColor; }
 .an-cursor { fill: var(--accent); opacity: .12; pointer-events: none; }
@@ -631,7 +634,7 @@ svg.icon-neutral { color: var(--icon-neutral); }
 .an-rank-track { height: 8px; border-radius: 4px; background: var(--panel2); overflow: hidden; }
 .an-rank-fill { display: block; height: 100%; border-radius: 4px; background: currentColor; }
 .an-rank-count { text-align: right; color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.an-row-empty { fill: var(--muted); font-size: 10px; font-style: italic; }
+.an-row-empty { fill: var(--muted); font-style: italic; }
 .an-note { margin: 0; font-size: .8125rem; }
 @media (max-width: 1100px) {
   .an-span-5, .an-span-7 { grid-column: span 12; }
@@ -689,15 +692,17 @@ svg.icon-neutral { color: var(--icon-neutral); }
 .du-share-part + .du-share-part { border-left: 2px solid var(--panel); }
 .du-gauge-mark { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--text); }
 .du-gauge-mark:last-child { margin-left: -2px; }
-.du-gauge-scale { position: relative; height: 12px; color: var(--muted); font-size: .625rem; line-height: 12px; font-variant-numeric: tabular-nums; }
+.du-gauge-scale { position: relative; height: 2lh; color: var(--muted); font-size: var(--ui-font-size-sm); line-height: 1.25; font-variant-numeric: tabular-nums; }
 .du-gauge-scale span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
+/* Stagger the thresholds so the closely spaced labels fit on narrow cards. */
+.du-gauge-scale span:nth-child(odd):not(:first-child) { top: 1lh; }
 .du-gauge-scale span:first-child { transform: none; }
 .du-gauge-scale span:last-child { transform: translateX(-100%); }
 .du-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 6px 12px; }
 .du-metric { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .du-metric-label { color: var(--muted); font-size: .6875rem; font-weight: 600; }
 .du-metric-caption { display: flex; flex-wrap: wrap; gap: 0 6px; color: var(--muted); font-size: .75rem; font-variant-numeric: tabular-nums; }
-.du-legend { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.du-legend { display: inline-flex; align-items: center; gap: 4px; font-size: var(--ui-font-size-sm); white-space: nowrap; }
 .du-legend::before { content: ""; width: 8px; height: 8px; border-radius: 2px; background: var(--du-tone); }
 .du-trend-empty { display: block; height: 8px; border: 1px dashed var(--shell-border); border-radius: 4px; }
 .du-details { border-top: 1px solid var(--shell-border); padding-top: 6px; font-size: .75rem; }
@@ -821,13 +826,12 @@ svg.icon-neutral { color: var(--icon-neutral); }
 .br-section { border-top: 1px solid var(--shell-border); padding-top: 6px; font-size: .75rem; }
 .br-link { min-height: 0; height: auto; padding: 0; vertical-align: baseline; }
 .br-chart { display: block; margin: 0; min-width: 0; }
-.br-chart svg { display: block; width: 100%; height: auto; }
 .br-chart-empty p { margin: 0; padding: 8px 0; font-size: .75rem; }
 .br-line { fill: none; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
 .br-tone-avg { --br-tone: var(--accent); } .br-tone-max { --br-tone: var(--warn); }
 .br-line.br-tone-avg, .br-line.br-tone-max { stroke: var(--br-tone); }
 .br-dot.br-tone-avg, .br-dot.br-tone-max { fill: var(--br-tone); }
-.br-legend { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: .75rem; }
+.br-legend { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: var(--ui-font-size-sm); }
 .br-legend-item { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .br-swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: var(--br-tone); }
 .br-pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(20rem, 100%), 1fr)); gap: 8px 16px; margin-top: 8px; }

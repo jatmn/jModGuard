@@ -924,7 +924,7 @@ function DatabaseUsage() {
   const databases = snapshot?.databases ?? [];
   return h(
     "div",
-    { className: "contents database-usage-page" },
+    { className: "contents chart-page database-usage-page" },
     pageHeader(
       "Database Usage",
       snapshot ? `Response ${usageAge(snapshot.generated_at) ?? "time unknown"} · catalog ${snapshot.catalog_status || "unknown"}` : "Every physical database",
@@ -1234,7 +1234,7 @@ function PlatformAnalytics() {
     : snapshot && members?.status !== "complete" && h("p", { id: "platform-analytics-status", className: "an-note muted", role: "status" }, platformMemberStatus(members));
   return h(
     "div",
-    { className: "contents analytics-page platform-page" },
+    { className: "contents chart-page analytics-page platform-page" },
     pageHeader(
       "Platform analytics",
       `All servers · last ${rangeLabel} (UTC)`,
@@ -1577,7 +1577,7 @@ function BotResources() {
     h("tr", { key: name }, h("th", { scope: "row" }, label), ...[botHistory, apiHistory].map((history, i) => h("td", { key: i }, resourceValue(format(rangeRate(history, name))))));
   return h(
     "div",
-    { className: "contents analytics-page resources-page" },
+    { className: "contents chart-page analytics-page resources-page" },
     pageHeader(
       "Bot Resources",
       snapshot ? `Bot and API · ${rangeLabel} (UTC) · response ${formatDuration(Math.max(0, Date.now() - snapshot.generated_at_ms)) ?? "just now"} old` : "Bot and API",
@@ -3562,7 +3562,7 @@ function tabAnalytics() {
   const body = (render) => (data ? render() : failed ? unavailable : pending("Loading…"));
   return h(
     "div",
-    { className: "contents analytics-page" },
+    { className: "contents chart-page analytics-page" },
     pageHeader(
       "Analytics",
       g ? `${g.name} · last ${rangeLabel} (UTC)` : `Last ${rangeLabel} (UTC)`,

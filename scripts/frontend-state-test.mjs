@@ -4609,6 +4609,114 @@ test('analytics dashboard shows enforcement and membership above the fold in bot
   assert.equal(bars.size, 2, 'series colors follow the theme');
 });
 
+test('chart plots and labels keep their size from mobile to ultrawide', { timeout: 120000 }, async t => {
+  if (!firefoxBinary || !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url))) {
+    assert.ok(!process.env.CI, 'CI requires Firefox and the built WebUI');
+    return t.skip('Firefox or the built WebUI is unavailable');
+  }
+  const domEvent = globalThis.Event;
+  globalThis.Event = NodeEvent;
+  let server, browser;
+  t.after(async () => {
+    await browser?.close();
+    if (server) await new Promise(resolve => server.close(resolve));
+    globalThis.Event = domEvent;
+  });
+  server = await serveBuiltApp(() => false, undefined, {}, (url, json) => {
+    const days = Number(url.searchParams.get('days')) || 30;
+    if (url.pathname === '/api/owner/resources') json(resourceSnapshot());
+    else if (url.pathname === '/api/platform/analytics') json({
+      ...platformSnapshot(days), series: browserAnalytics(days).series.map((day, i) => ({ ...day, joins: i % 5, leaves: 1 })),
+    });
+    else if (url.pathname === '/api/database-usage') json(usageOverview([usageDatabase(), usageDatabase({ id: 'shared', kind: 'guild' })]));
+    else return false;
+    return true;
+  });
+  browser = await launchFirefox();
+  const evaluate = async (expression) => {
+    const result = await browser.send('script.evaluate', {
+      expression, target: { context: browser.context }, awaitPromise: true,
+    });
+    assert.equal(result.type, 'success', result.exceptionDetails?.text);
+    return result.result.value;
+  };
+  await browser.send('browsingContext.navigate', {
+    context: browser.context, url: `http://${server.address().address}:${server.address().port}/`, wait: 'complete',
+  });
+
+  for (const [tab, ready, cards] of [
+    ['resources', '.br-legend', '#resources-cards > .br-card'],
+    ['analytics', '.an-heatmap', '.an-grid > .an-span-7, .an-grid > .an-span-5'],
+    ['platform-analytics', '#an-membership-readout', '.an-grid > .an-span-7, .an-grid > .an-span-5'],
+    ['usage', '.du-gauge-scale', '#usage-cards > .du-card'],
+  ]) {
+    await evaluate(`(async () => {
+      const waitFor = async selector => {
+        for (let i = 0; i < 100; i++) {
+          const node = document.querySelector(selector);
+          if (node) return node;
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        throw new Error('Missing ' + selector);
+      };
+      (await waitFor('#tabs [data-tab="${tab}"]')).click();
+      await waitFor('${ready}');
+    })()`);
+    let heights;
+    for (const width of [2560, 1280, 1920, 3440, 320]) {
+      const name = `${tab} at ${width}px`;
+      await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height: 900 } });
+      const m = JSON.parse(await evaluate(`(async () => {
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const main = document.querySelector('#content');
+        const all = selector => [...main.querySelectorAll(selector)];
+        const box = node => node.getBoundingClientRect();
+        const font = node => parseFloat(getComputedStyle(node).fontSize);
+        const plots = all('.br-chart svg, .an-figure svg, .an-spark, .du-gauge-track, .du-share');
+        const labels = all('.br-chart svg text, .an-figure svg text, .br-legend-item, .an-readout-item, .du-legend, .du-gauge-scale span');
+        const overlaps = (a, b) => a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1;
+        const collision = groups => groups.flatMap(group => group.flatMap((a, i) =>
+          group.slice(i + 1).filter(b => overlaps(box(a), box(b))).map(b => a.textContent + ' / ' + b.textContent)));
+        return JSON.stringify({
+          bodyFont: font(document.body),
+          labels: labels.map(node => {
+            const transform = node.getScreenCTM?.();
+            return [node.textContent, font(node) * (transform?.a ?? 1), font(node) * (transform?.d ?? 1)];
+          }),
+          clipped: labels.flatMap(node => {
+            const bounds = node.closest('svg, .du-gauge-scale');
+            if (!bounds) return [];
+            const a = box(node), b = box(bounds);
+            const overflow = Math.max(b.left - a.left, a.right - b.right, b.top - a.top, a.bottom - b.bottom);
+            return overflow > 1 ? [node.textContent + ' by ' + overflow.toFixed(1) + 'px'] : [];
+          }),
+          collisions: collision(plots.map(plot => [...plot.querySelectorAll('text')])
+            .concat(all('.du-gauge-scale').map(scale => [...scale.children]))),
+          heights: plots.map(plot => box(plot).height),
+          sparks: all('.an-spark').length,
+          contentWidth: box(main).width,
+          overflow: document.documentElement.scrollWidth - innerWidth,
+          cardTops: all('${cards}').map(card => Math.round(box(card).top)),
+        });
+      })()`));
+      assert.ok(m.labels.length > 0, `${name}: chart labels rendered`);
+      for (const [label, horizontal, vertical] of m.labels) {
+        assert.ok(Math.abs(horizontal - m.bodyFont) <= 1 && Math.abs(vertical - m.bodyFont) <= 1,
+          `${name}: ${label} renders at ${horizontal.toFixed(1)} × ${vertical.toFixed(1)} CSS px near ${m.bodyFont}px body text`);
+      }
+      assert.deepEqual(m.clipped, [], `${name}: labels fit the plot`);
+      assert.deepEqual(m.collisions, [], `${name}: axis labels have space`);
+      assert.ok(m.heights.length > 0 && m.heights.every(height => height > 0 && height <= 280), `${name}: bounded plots`);
+      heights ??= m.heights;
+      assert.deepEqual(m.heights, heights, `${name}: plot heights are independent of width`);
+      if (tab.includes('analytics')) assert.ok(m.sparks > 0, `${name}: KPI sparklines are covered`);
+      assert.ok(m.contentWidth <= 1440 && m.overflow <= 0, `${name}: capped content without horizontal overflow`);
+      assert.equal(m.cardTops.length, 2, `${name}: both cards present`);
+      assert.equal(m.cardTops[0] === m.cardTops[1], width >= 1280, `${name}: desktop cards align and mobile cards stack`);
+    }
+  }
+});
+
 // Opens the Members partial-import explanation, which sits mid-line after the status badge (#620).
 const memberHelpProbe = `(async () => {
   const wait = () => new Promise(resolve => setTimeout(resolve, 50));

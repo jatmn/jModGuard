@@ -2,6 +2,24 @@ import React, { useState } from "react";
 
 const h = React.createElement;
 
+// Without a viewBox, one SVG unit is one CSS pixel. Recompute horizontal
+// coordinates only, keeping the plot height, strokes and text independent of width.
+function useChartPlot(height, initialWidth) {
+  const [width, setWidth] = useState(initialWidth);
+  const ref = React.useCallback((plot) => {
+    if (!plot) return;
+    const measure = () => {
+      const measured = plot.clientWidth;
+      if (measured > 0) setWidth(measured);
+    };
+    measure();
+    const observer = window.ResizeObserver && new window.ResizeObserver(measure);
+    observer?.observe(plot);
+    return () => observer?.disconnect();
+  }, []);
+  return { width, plotProps: { className: "chart-plot", ref, height } };
+}
+
 // Shared trend rendering for the workspace and owner analytics views. Charts
 // are dependency-free SVG: the data arrives already bucketed per UTC day.
 export const TREND_METRICS = [
@@ -23,9 +41,8 @@ export function useTrendMetric(initial) {
   return [metric, setMetric];
 }
 
-const CHART_WIDTH = 720;
 const CHART_HEIGHT = 240;
-const PAD_LEFT = 46;
+const PAD_LEFT = 72;
 const PAD_RIGHT = 14;
 const PAD_TOP = 16;
 const PAD_BOTTOM = 30;
@@ -43,10 +60,11 @@ function dayLabel(day) {
 }
 
 export function TrendChart({ points, metric, title }) {
+  const { width, plotProps } = useChartPlot(CHART_HEIGHT, 720);
   const values = points.map((point) => point[metric] ?? 0);
   const count = points.length;
   const max = Math.max(1, ...values);
-  const innerWidth = CHART_WIDTH - PAD_LEFT - PAD_RIGHT;
+  const innerWidth = Math.max(1, width - PAD_LEFT - PAD_RIGHT);
   const innerHeight = CHART_HEIGHT - PAD_TOP - PAD_BOTTOM;
   const x = (index) => PAD_LEFT + (count <= 1 ? innerWidth / 2 : (index * innerWidth) / (count - 1));
   const y = (value) => PAD_TOP + innerHeight - scale(value, max) * innerHeight;
@@ -64,14 +82,14 @@ export function TrendChart({ points, metric, title }) {
     h(
       "svg",
       {
-        viewBox: `0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`,
+        ...plotProps,
         role: "img",
         "aria-label": `${title} per day from ${first} to ${last}; latest day ${latest}.`,
       },
       // Horizontal gridlines with their value labels.
       ...gridValues.map((value) =>
         h("g", { key: `grid-${value}`, className: "trend-grid" },
-          h("line", { x1: PAD_LEFT, x2: CHART_WIDTH - PAD_RIGHT, y1: y(value).toFixed(1), y2: y(value).toFixed(1) }),
+          h("line", { x1: PAD_LEFT, x2: PAD_LEFT + innerWidth, y1: y(value).toFixed(1), y2: y(value).toFixed(1) }),
           h("text", { x: PAD_LEFT - 8, y: (y(value) + 4).toFixed(1), textAnchor: "end" }, String(Math.round(value))),
         ),
       ),
@@ -79,7 +97,7 @@ export function TrendChart({ points, metric, title }) {
       h("polyline", { className: "trend-line", points: linePoints }),
       // Day labels under both ends of the window.
       h("text", { className: "trend-day", x: PAD_LEFT, y: CHART_HEIGHT - 8, textAnchor: "start" }, dayLabel(first)),
-      h("text", { className: "trend-day", x: CHART_WIDTH - PAD_RIGHT, y: CHART_HEIGHT - 8, textAnchor: "end" }, dayLabel(last)),
+      h("text", { className: "trend-day", x: PAD_LEFT + innerWidth, y: CHART_HEIGHT - 8, textAnchor: "end" }, dayLabel(last)),
     ),
     h("figcaption", { className: "sr-only" }, `${title} per day, ${first} through ${last}.`),
   );
@@ -178,12 +196,11 @@ export function niceTicks(max) {
   return ticks;
 }
 
-// Indices that get an x-axis day label: every day for a week, otherwise
-// evenly spaced so labels never collide.
-export function dayTickIndices(count) {
-  if (count <= 0) return [];
-  if (count <= 8) return Array.from({ length: count }, (_, i) => i);
-  const step = count <= 31 ? 7 : 15;
+// Keep the last date and space earlier ticks by both range and available room.
+export function dayTickIndices(count, slot = Infinity) {
+  const rangeStep = count <= 8 ? 1 : count <= 31 ? 7 : 15;
+  // Allow room for the full label at an edge and half of its neighbor.
+  const step = Math.max(rangeStep, Math.ceil(72 / slot));
   const ticks = [];
   for (let i = count - 1; i >= 0; i -= step) ticks.unshift(i);
   return ticks;
@@ -198,6 +215,14 @@ function dayAnchor(index, count) {
   if (count > 1 && index === 0) return "start";
   if (count > 1 && index === count - 1) return "end";
   return "middle";
+}
+
+function dayTicks(points, left, slot, y) {
+  return dayTickIndices(points.length, slot).map((index) => {
+    const textAnchor = dayAnchor(index, points.length);
+    const offset = textAnchor === "start" ? 0 : textAnchor === "end" ? 1 : 0.5;
+    return h("text", { key: `t${index}`, className: "an-axis-day", x: (left + (index + offset) * slot).toFixed(2), y, textAnchor }, shortDay(points[index].day));
+  });
 }
 
 // One hover/focus position shared by every chart in a panel. Arrow keys move
@@ -233,7 +258,7 @@ function Sparkline({ values, className }) {
   const bar = Math.max(1, slot - (values.length > 40 ? 0.4 : 1));
   return h(
     "svg",
-    { className: `an-spark ${className ?? ""}`, viewBox: `0 0 ${width} ${height}`, "aria-hidden": "true", focusable: "false", preserveAspectRatio: "none" },
+    { className: `chart-plot an-spark ${className ?? ""}`, height, viewBox: `0 0 ${width} ${height}`, "aria-hidden": "true", focusable: "false", preserveAspectRatio: "none" },
     ...values.map((value, i) => {
       const barHeight = value > 0 ? Math.max(1.5, (value / max) * height) : 0.75;
       return h("rect", { key: i, x: (i * slot).toFixed(2), y: (height - barHeight).toFixed(2), width: bar.toFixed(2), height: barHeight.toFixed(2), className: value > 0 ? "an-spark-bar" : "an-spark-zero" });
@@ -292,12 +317,12 @@ function ChartReadout({ id, children }) {
 // one x axis and one hover day so metrics compare without being summed.
 export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
   const cursor = useChartCursor(points.length);
-  const width = 640;
-  const rowHeight = 34;
-  const labelWidth = 92;
-  const axisHeight = 16;
-  const innerWidth = width - labelWidth - 8;
+  const rowHeight = 40;
+  const labelWidth = 104;
+  const axisHeight = 20;
   const height = metrics.length * rowHeight + axisHeight;
+  const { width, plotProps } = useChartPlot(height, 640);
+  const innerWidth = Math.max(1, width - labelWidth - 8);
   const slot = points.length ? innerWidth / points.length : innerWidth;
   const gap = points.length > 45 ? 0.6 : Math.min(3, slot * 0.25);
   const first = points[0]?.day ?? "";
@@ -312,11 +337,11 @@ export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
     return h(
       "g",
       { key, className: `an-row ${color}` },
-      h("text", { className: "an-axis-label", x: 0, y: top + usable / 2 + 4 }, label),
+      h("text", { className: "an-axis-label", x: 0, y: top + 11 }, label),
       // An empty row says so instead of drawing a scale for values it does not have.
       empty
         ? h("text", { className: "an-row-empty", x: labelWidth + 4, y: top + usable / 2 + 4 }, "None in this range")
-        : h("text", { className: "an-axis-value", x: labelWidth - 6, y: top + 9, textAnchor: "end" }, formatCount(max)),
+        : h("text", { className: "an-axis-value", x: labelWidth - 6, y: top + usable + 1, textAnchor: "end" }, formatCount(max)),
       h("line", { className: "an-baseline", x1: labelWidth, x2: width - 8, y1: top + usable, y2: top + usable }),
       ...values.map((value, i) => {
         const barHeight = value > 0 ? Math.max(2, (value / max) * usable) : 0;
@@ -339,7 +364,7 @@ export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
     h(
       "svg",
       {
-        viewBox: `0 0 ${width} ${height}`,
+        ...plotProps,
         role: "img",
         tabIndex: 0,
         "aria-label": `Daily enforcement from ${first} to ${last}: ${metrics.map(([key, label]) => `${label} ${formatExact(sumSeries(points, key))}`).join(", ")}. Use arrow keys to read each day.`,
@@ -352,9 +377,7 @@ export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
       cursor.index != null
         ? h("rect", { className: "an-cursor", x: (labelWidth + cursor.index * slot).toFixed(2), y: 0, width: slot.toFixed(2), height: height - axisHeight })
         : null,
-      ...dayTickIndices(points.length).map((i) =>
-        h("text", { key: `t${i}`, className: "an-axis-day", x: (labelWidth + i * slot + [0, slot / 2, slot][["start", "middle", "end"].indexOf(dayAnchor(i, points.length))]).toFixed(2), y: height - 3, textAnchor: dayAnchor(i, points.length) }, shortDay(points[i].day)),
-      ),
+      ...dayTicks(points, labelWidth, slot, height - 6),
       // Transparent day columns carry the pointer and native tooltips.
       ...points.map((p, i) =>
         h(
@@ -371,13 +394,13 @@ export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
 // across the range drawn as a line with points.
 export function MembershipChart({ points }) {
   const cursor = useChartCursor(points.length);
-  const width = 440;
-  const height = 176;
-  const padLeft = 34;
-  const padRight = 36;
-  const padTop = 8;
-  const axisHeight = 16;
-  const innerWidth = width - padLeft - padRight;
+  const height = 196;
+  const { width, plotProps } = useChartPlot(height, 440);
+  const padLeft = 48;
+  const padRight = 54;
+  const padTop = 14;
+  const axisHeight = 30;
+  const innerWidth = Math.max(1, width - padLeft - padRight);
   const half = (height - padTop - axisHeight) / 2;
   const zero = padTop + half;
   const maxBar = Math.max(1, ...points.map((p) => Math.max(p.joins ?? 0, p.leaves ?? 0)));
@@ -417,7 +440,7 @@ export function MembershipChart({ points }) {
     h(
       "svg",
       {
-        viewBox: `0 0 ${width} ${height}`,
+        ...plotProps,
         role: "img",
         tabIndex: 0,
         "aria-label": `Membership from ${first} to ${last}: joins ${formatExact(sumSeries(points, "joins"))}, leaves ${formatExact(sumSeries(points, "leaves"))}, net ${formatDelta(netTotal, 0).exact}. Use arrow keys to read each day.`,
@@ -437,7 +460,7 @@ export function MembershipChart({ points }) {
         ),
       ),
       points.every((p) => !(p.joins > 0) && !(p.leaves > 0))
-        ? h("text", { className: "an-row-empty", x: padLeft + innerWidth / 2, y: zero - 6, textAnchor: "middle" }, "No joins or leaves in this range")
+        ? h("text", { className: "an-row-empty", x: width / 2, y: zero - 14, textAnchor: "middle" }, "No joins or leaves in this range")
         : null,
       h("text", { className: "an-axis-net", x: width - padRight + 6, y: padTop + 8 }, `+${formatCount(netExtent)}`),
       h("text", { className: "an-axis-net", x: width - padRight + 6, y: zero + half }, formatDelta(-netExtent, 0).text),
@@ -456,9 +479,7 @@ export function MembershipChart({ points }) {
       cursor.index != null
         ? h("rect", { className: "an-cursor", x: (padLeft + cursor.index * slot).toFixed(2), y: padTop, width: slot.toFixed(2), height: half * 2 })
         : null,
-      ...dayTickIndices(points.length).map((i) =>
-        h("text", { key: `t${i}`, className: "an-axis-day", x: (padLeft + i * slot + [0, slot / 2, slot][["start", "middle", "end"].indexOf(dayAnchor(i, points.length))]).toFixed(2), y: height - 3, textAnchor: dayAnchor(i, points.length) }, shortDay(points[i].day)),
-      ),
+      ...dayTicks(points, padLeft, slot, height - 6),
       ...points.map((p, i) =>
         h(
           "rect",
@@ -507,14 +528,12 @@ export function ActivityHeatmap({ cells }) {
   grid.forEach((row, weekday) => row.forEach((count, hour) => {
     if (count > 0 && (!peak || count > peak.count)) peak = { weekday, hour, count };
   }));
-  // Wide cells fill a full-width panel while keeping the grid short.
-  const cell = 30;
-  const cellHeight = 13;
-  const gap = 2;
-  const left = 30;
-  const top = 14;
-  const width = left + 24 * (cell + gap);
-  const height = top + 7 * (cellHeight + gap);
+  const left = 36;
+  const top = 20;
+  const rowHeight = 21;
+  const { width, plotProps } = useChartPlot(top + 7 * rowHeight, 798);
+  const slot = Math.max(1, width - left) / 24;
+  const gap = Math.min(2, slot / 4);
   const hourLabel = (hour) => `${String(hour).padStart(2, "0")}:00`;
   const summary = peak
     ? `Busiest hour: ${WEEKDAYS[peak.weekday]} ${hourLabel(peak.hour)} UTC with ${formatExact(peak.count)} actions.`
@@ -525,14 +544,14 @@ export function ActivityHeatmap({ cells }) {
     h(ChartReadout, { id: "an-heatmap-readout" }, active ? `${WEEKDAYS[active.weekday]} ${hourLabel(active.hour)} UTC: ${formatExact(active.count)} actions` : summary),
     h(
       "svg",
-      { className: "an-heatmap", viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": `Enforcement actions by weekday and UTC hour. ${summary}`, "aria-describedby": "an-heatmap-readout", onMouseLeave: () => setActive(null) },
-      ...[0, 6, 12, 18].map((hour) => h("text", { key: `h${hour}`, className: "an-axis-day", x: left + hour * (cell + gap), y: 10 }, hourLabel(hour))),
-      ...WEEKDAYS.map((day, weekday) => h("text", { key: day, className: "an-axis-day", x: 0, y: top + weekday * (cellHeight + gap) + cellHeight - 3 }, day)),
+      { ...plotProps, className: `${plotProps.className} an-heatmap`, role: "img", "aria-label": `Enforcement actions by weekday and UTC hour. ${summary}`, "aria-describedby": "an-heatmap-readout", onMouseLeave: () => setActive(null) },
+      ...[0, 6, 12, 18].map((hour) => h("text", { key: `h${hour}`, className: "an-axis-day", x: left + hour * slot, y: 14 }, hourLabel(hour))),
+      ...WEEKDAYS.map((day, weekday) => h("text", { key: day, className: "an-axis-day", x: 0, y: top + weekday * rowHeight + 12 }, day)),
       ...grid.flatMap((row, weekday) =>
         row.map((count, hour) =>
           h(
             "rect",
-            { key: `${weekday}-${hour}`, className: `an-heat an-heat-${heatLevel(count, max)}`, x: left + hour * (cell + gap), y: top + weekday * (cellHeight + gap), width: cell, height: cellHeight, rx: 2, onMouseEnter: () => setActive({ weekday, hour, count }) },
+            { key: `${weekday}-${hour}`, className: `an-heat an-heat-${heatLevel(count, max)}`, x: left + hour * slot, y: top + weekday * rowHeight, width: slot - gap, height: rowHeight - 3, rx: 2, onMouseEnter: () => setActive({ weekday, hour, count }) },
             h("title", {}, `${WEEKDAYS[weekday]} ${hourLabel(hour)} UTC: ${formatExact(count)}`),
           ),
         ),
@@ -599,13 +618,13 @@ function utcClock(seconds, withDay) {
 // `series` entries: { key, label, tone, value(point) -> number | null }.
 // `max` fixes the top of the scale (for example 100 for a percentage of a limit).
 export function ResourceChart({ points, series, max, format, label, from, to }) {
-  const width = 480;
-  const height = 92;
-  const padLeft = 62;
+  const height = 120;
+  const { width, plotProps } = useChartPlot(height, 480);
+  const padLeft = 90;
   const padRight = 8;
-  const padTop = 6;
-  const axis = 14;
-  const innerWidth = width - padLeft - padRight;
+  const padTop = 14;
+  const axis = 30;
+  const innerWidth = Math.max(1, width - padLeft - padRight);
   const innerHeight = height - padTop - axis;
   const lines = series.map((line) => ({ ...line, values: points.map((point) => {
     const value = line.value(point);
@@ -649,7 +668,7 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
     { className: "br-chart" },
     h(
       "svg",
-      { viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": `${label}, ${range}: ${summary}.` },
+      { ...plotProps, role: "img", "aria-label": `${label}, ${range}: ${summary}.` },
       ...[top, 0].map((value) =>
         h("g", { key: `g${value}`, className: "an-gridline" },
           h("line", { x1: padLeft, x2: width - padRight, y1: y(value).toFixed(1), y2: y(value).toFixed(1) }),
@@ -663,8 +682,8 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
             : h("polyline", { key: `${line.key}-${i}`, className: `br-line ${line.tone}`, points: run.map(([index, value]) => `${x(index).toFixed(1)},${y(value).toFixed(1)}`).join(" ") }),
         ),
       ),
-      h("text", { className: "an-axis-day", x: padLeft, y: height - 2, textAnchor: "start" }, utcClock(from, withDay)),
-      h("text", { className: "an-axis-day", x: width - padRight, y: height - 2, textAnchor: "end" }, utcClock(to, withDay)),
+      h("text", { className: "an-axis-day", x: Math.min(padLeft, width / 4), y: height - 6 }, utcClock(from, withDay)),
+      h("text", { className: "an-axis-day", x: width - padRight, y: height - 6, textAnchor: "end" }, utcClock(to, withDay)),
     ),
     lines.length > 1 &&
       h(
