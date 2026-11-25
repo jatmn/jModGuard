@@ -132,11 +132,34 @@ async fn update_control_accepts_equal_schema() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn update_control_refuses_stale_observations_and_incompatible_candidates() {
+async fn update_control_checks_each_observation_at_the_staleness_boundary() {
+    for (index, expected) in [
+        (0, "current service observation is stale"),
+        (1, "counterpart observation is stale"),
+    ] {
+        let mut seen = [FRESH; 2];
+        seen[index] = NOW - 7199;
+        let (control, release) = observed_fixture(seen).await;
+        compatible_control(&control, &release, NOW)
+            .await
+            .unwrap_or_else(|error| panic!("7199-second observation {index}: {error}"));
+
+        seen[index] = NOW - 7200;
+        let (control, release) = observed_fixture(seen).await;
+        assert_eq!(
+            compatible_control(&control, &release, NOW)
+                .await
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_control_refuses_incompatible_candidates() {
     enum Delta {
         CandidateAbi,
-        OwnObservation,
-        CounterpartObservation,
         CandidateMinApi,
     }
 
@@ -146,29 +169,14 @@ async fn update_control_refuses_stale_observations_and_incompatible_candidates()
             "candidate needs a different base runtime ABI",
         ),
         (
-            Delta::OwnObservation,
-            "current service observation is stale",
-        ),
-        (
-            Delta::CounterpartObservation,
-            "counterpart observation is stale",
-        ),
-        (
             Delta::CandidateMinApi,
             "candidate requires a different API capability",
         ),
     ] {
-        let stale = NOW - 7200;
-        let seen = match delta {
-            Delta::OwnObservation => [stale, FRESH],
-            Delta::CounterpartObservation => [FRESH, stale],
-            _ => [FRESH; 2],
-        };
-        let (control, mut candidate) = observed_fixture(seen).await;
+        let (control, mut candidate) = observed_fixture([FRESH; 2]).await;
         match delta {
             Delta::CandidateAbi => candidate.base_abi = "debian-trixie-amd64".into(),
             Delta::CandidateMinApi => candidate.min_api = 2,
-            Delta::OwnObservation | Delta::CounterpartObservation => {}
         }
         let result = compatible_control(&control, &candidate, NOW).await;
         assert_eq!(

@@ -328,15 +328,9 @@ async fn main() -> Result<()> {
         | GatewayIntents::GUILD_MODERATION
         | GatewayIntents::GUILD_VOICE_STATES;
 
-    let mut cache_settings = CacheSettings::default();
-    cache_settings.max_messages = 0; // no general message history in RAM or SQL
-    cache_settings.cache_guilds = true;
-    cache_settings.cache_channels = true;
-    cache_settings.cache_users = true;
-
     let discord_http = serenity::http::Http::new(&cfg.discord.token);
     let mut client = serenity::client::ClientBuilder::new_with_http(discord_http, intents)
-        .cache_settings(cache_settings)
+        .cache_settings(bot_cache_settings())
         .event_handler(Handler {
             app: Arc::clone(&app),
         })
@@ -725,8 +719,22 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn bot_cache_settings() -> CacheSettings {
+    let mut cache_settings = CacheSettings::default();
+    cache_settings.max_messages = 0; // no general message history in RAM or SQL
+    cache_settings.cache_guilds = true;
+    cache_settings.cache_channels = true;
+    cache_settings.cache_users = true;
+    cache_settings
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bot_client_disables_general_message_caching() {
+        assert_eq!(super::bot_cache_settings().max_messages, 0);
+    }
+
     #[test]
     fn planned_stop_needs_every_ready_shard_connected() {
         use serenity::gateway::ConnectionStage::{Connected, Connecting, Resuming};

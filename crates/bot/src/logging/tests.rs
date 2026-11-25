@@ -153,10 +153,7 @@ fn plain_bulk_fallback_accounts_for_complete_entries_and_does_not_claim_attachme
         long.push(MessageId::new(id), None);
     }
     let bounded = fallback_bulk_parts("{details}", &display, &long);
-    assert!(
-        bounded.len() > 1,
-        "large transcripts must split across messages"
-    );
+    assert_eq!(bounded.len(), 3, "large transcripts stop after three parts");
     let shown: usize = bounded
         .iter()
         .map(|part| part.matches(" | retained content unavailable").count())
@@ -1017,6 +1014,39 @@ fn observed_delete_reports_keep_only_recent_snippet_identity() {
 }
 
 #[test]
+fn message_identity_snippets_expire_and_evict_only_within_their_guild() {
+    let f = Fixture::new();
+    let author = |guild, message| known_message_author(&f.app, guild, 456, message);
+    remember_message(&f.app, 789, 456, 1, Some(42), None, None);
+    remember_message(&f.app, 790, 456, 1, Some(43), None, None);
+    {
+        let mut snippets = f.app.log_snippets.inner.lock();
+        let first = snippets.get_mut(&(789, 456, 1)).unwrap();
+        first.at -= Duration::from_secs(1);
+    }
+    for id in 2..=64 {
+        remember_message(&f.app, 789, 456, id, Some(42), None, None);
+    }
+    assert_eq!(author(789, 1), Some(42));
+    remember_message(&f.app, 789, 456, 65, Some(42), None, None);
+    assert_eq!(author(789, 1), None);
+    for id in 2..=65 {
+        assert_eq!(author(789, id), Some(42));
+    }
+    assert_eq!(author(790, 1), Some(43));
+
+    let stored_at = f.app.log_snippets.inner.lock()[&(790, 456, 1)].at;
+    assert_eq!(
+        known_message_author_at(&f.app, 790, 456, 1, || stored_at + Duration::from_secs(599)),
+        Some(43)
+    );
+    assert_eq!(
+        known_message_author_at(&f.app, 790, 456, 1, || stored_at + Duration::from_secs(600)),
+        None
+    );
+}
+
+#[test]
 fn snippet_preserves_author_for_filtering_without_exposing_unretained_payload() {
     let path =
         std::env::temp_dir().join(format!("log_identity_{:032x}.db", rand::random::<u128>()));
@@ -1507,6 +1537,28 @@ async fn shutdown_phase_expires_even_when_all_delivery_slots_stay_busy() {
 }
 
 #[tokio::test]
+async fn shutdown_notices_spend_at_most_three_seconds_waiting_for_capacity() {
+    let f = Fixture::with_timeout(60);
+    let _busy = f.app.log_delivery_slots.acquire().await.unwrap();
+    let http = Arc::new(serenity::http::HttpBuilder::new("fixture").build());
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let sent = emit_shutdown_notices(
+        &f.app,
+        http,
+        vec![GuildId::new(789)],
+        shutdown_notice_content(1),
+    )
+    .await;
+    assert_eq!(sent, 0);
+    let elapsed = start.elapsed();
+    assert!(
+        (Duration::from_secs(3)..Duration::from_millis(3010)).contains(&elapsed),
+        "phase budget elapsed after {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn shutdown_stops_pending_start_notices_before_sending_stop() {
     let f = Fixture::new();
     db::upsert_log_channel(&f.app.db, 789, "system", 456)
@@ -1654,6 +1706,50 @@ async fn disabled_reports_and_expired_admission_do_not_send() {
             .load(std::sync::atomic::Ordering::Relaxed),
         1
     );
+}
+
+#[tokio::test]
+async fn full_log_delivery_wait_queue_drops_and_counts_the_next_report() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let f = Fixture::new();
+    let sink = Sink::default();
+    db::upsert_log_channel(&f.app.db, 789, "message_delete", 456)
+        .await
+        .unwrap();
+    let held_slot = reserve_log_delivery(&f.app).unwrap();
+    let waiters: Vec<_> = (0..128)
+        .map(|_| {
+            let reservation = reserve_log_delivery(&f.app).expect("128 reports may wait");
+            assert!(matches!(
+                reservation,
+                LogDeliveryReservation::Waiting { .. }
+            ));
+            reservation
+        })
+        .collect();
+    let mut report = std::pin::pin!(emit_to(
+        &f.app,
+        &sink,
+        GuildId::new(789),
+        "message_delete",
+        BTreeMap::new(),
+    ));
+    let delivery = std::future::poll_fn(|cx| match report.as_mut().poll(cx) {
+        Poll::Ready(delivery) => Poll::Ready(delivery),
+        Poll::Pending => panic!("a full queue must drop immediately"),
+    })
+    .await;
+    assert_eq!(delivery, Delivery::Dropped);
+    assert!(sink.messages.lock().unwrap().is_empty());
+    assert_eq!(
+        f.app
+            .log_delivery_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    drop((held_slot, waiters));
 }
 
 struct StalledSink;
@@ -2093,6 +2189,55 @@ async fn late_audit_is_retried_but_disabled_reports_do_not_lookup() {
     );
     assert_eq!(sink.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     assert!(log_text(&sink.sink.messages.lock().unwrap()[0].1).contains("**Reason:** spam"));
+}
+
+#[tokio::test]
+async fn audit_lookup_stops_after_three_empty_reads_and_sends_fallback() {
+    #[derive(Default)]
+    struct EmptyAudit {
+        sink: Sink,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[serenity::async_trait]
+    impl LogDelivery for EmptyAudit {
+        async fn send(&self, channel: ChannelId, message: CreateMessage) -> anyhow::Result<()> {
+            self.sink.send(channel, message).await
+        }
+
+        async fn member_audit(&self, _: GuildId, action: Action) -> anyhow::Result<AuditLogs> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut logs = audit_fixture(action, 123, 1_700_000_000_000, None);
+            logs.entries.clear();
+            Ok(logs)
+        }
+    }
+
+    let f = Fixture::with_timeout(10);
+    let sink = EmptyAudit::default();
+    db::upsert_log_channel(&f.app.db, 789, "member_ban", 456)
+        .await
+        .unwrap();
+    f.app.configs.get(&f.app.db, 789).await.unwrap();
+    tokio::time::pause();
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &sink,
+            GuildId::new(789),
+            "member_ban",
+            templates::user_vars(123, "user", "User")
+        )
+        .await,
+        Delivery::Sent
+    );
+    assert_eq!(sink.calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+    let sent = sink.sink.messages.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    let report = log_text(&sent[0].1);
+    assert!(report.contains("**Moderator:** unavailable"), "{report}");
+    assert!(report.contains("**Reason:** unavailable"), "{report}");
 }
 
 fn unclaimed_audit_vars(
@@ -3868,6 +4013,49 @@ async fn truncated_success_body_stays_ambiguous_for_attachment_fallback_and_coun
         .collect();
     assert_eq!(bodies.len(), 1, "{bodies:?}");
     assert!(bodies[0].contains("last observed: bulk fallback body"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn partly_sent_bulk_text_fallback_stays_ambiguous_after_rejection() {
+    let f = Fixture::with_timeout(30);
+    let sink = defer_inflight_bulk_only(&f).await;
+    let (http, requests, calls, server) = sequenced_bulk_proxy(vec![
+        SequencedProxyReply::Status {
+            status: 403,
+            body: r#"{"code":50013,"message":"fixture"}"#,
+        },
+        SequencedProxyReply::Status {
+            status: 200,
+            body: CREATED_MESSAGE_JSON,
+        },
+        SequencedProxyReply::Status {
+            status: 500,
+            body: r#"{"code":0,"message":"fixture"}"#,
+        },
+    ])
+    .await;
+    let outcome = emit_retained_bulk_to(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        ChannelId::new(456),
+        pending_bulk_transcript(200),
+    )
+    .await;
+    assert_eq!(outcome, BulkDeliveryOutcome::Ambiguous);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    {
+        let requests = requests.lock().unwrap();
+        assert!(request_names_transcript(&requests[0]));
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| !request_names_transcript(request))
+        );
+    }
+    settle_pending_bulk(&f, &sink, outcome).await;
+    assert!(sink.messages.lock().unwrap().is_empty());
     server.abort();
 }
 

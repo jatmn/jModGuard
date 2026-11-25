@@ -1406,6 +1406,9 @@ fn rest_actor_permissions_use_current_roles_and_action_specific_authority() {
     let mut role = Role::default();
     role.id = RoleId::new(20);
     member.roles = vec![role.id];
+    let sync = Action::MemberSync {
+        operation: jmodguard::bot_actions::MemberSyncOperation::Retry,
+    };
     for (permissions, can_unban, can_configure) in [
         (Permissions::empty(), false, false),
         (Permissions::MANAGE_GUILD, false, true),
@@ -1415,6 +1418,8 @@ fn rest_actor_permissions_use_current_roles_and_action_specific_authority() {
         role.permissions = permissions;
         guild.roles.insert(role.id, role.clone());
         assert_eq!(actor_authorized(&guild, &member, &unban(99)), can_unban);
+        assert_eq!(actor_authorized(&guild, &member, &ban(99, None)), can_unban);
+        assert_eq!(actor_authorized(&guild, &member, &sync), can_configure);
         assert_eq!(
             actor_authorized(&guild, &member, &log_channel(None)),
             can_configure
@@ -2802,6 +2807,7 @@ async fn timed_ban_expiry_saves_a_confirmed_unban_to_the_member_directory() {
             .await
             .unwrap();
         let discord = MockDiscord {
+            bot_id: Some(42),
             outcome: Outcome::succeeded(code),
             ..Default::default()
         };
@@ -2811,9 +2817,34 @@ async fn timed_ban_expiry_saves_a_confirmed_unban_to_the_member_directory() {
         assert_eq!(discord.calls.load(Ordering::SeqCst), 1, "{code}");
         let gaps = app.pending_member_gaps(10);
         if let Some((store, scope)) = live {
-            let member = store.get_member(scope, 20).await.unwrap().unwrap();
+            let member = store.get_member(scope.clone(), 20).await.unwrap().unwrap();
             assert_eq!(Some(member.is_banned), still_banned, "{code}");
             assert!(gaps.is_empty(), "{code}");
+            let limits = crate::tenant::case_limits();
+            let ids = store
+                .case_ids(scope.clone(), None, 10, limits)
+                .await
+                .unwrap();
+            assert_eq!(ids.len(), 1, "{code}");
+            let case = store
+                .case(scope, ids[0].clone(), limits)
+                .await
+                .unwrap()
+                .unwrap();
+            use crate::db::guild_data::{CaseAction, CaseOutcome};
+            assert_eq!(case.action, CaseAction::Unban);
+            assert_eq!(
+                case.outcome,
+                if code == "unbanned" {
+                    CaseOutcome::Succeeded
+                } else {
+                    CaseOutcome::Attempted
+                },
+                "{code}"
+            );
+            assert_eq!(case.subject_id, 20);
+            assert_eq!(case.actor_id, Some(42));
+            assert_eq!(case.reason.as_deref(), Some("Ban duration expired"));
         } else {
             assert_eq!(gaps.len(), 1);
             assert_eq!(

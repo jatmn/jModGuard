@@ -779,6 +779,39 @@ async fn copy_requires_both_enrollments_even_with_global_destination() {
 }
 
 #[tokio::test]
+async fn copy_requires_manage_permission_on_source_for_guild_and_global_destinations() {
+    let f = Fixture::new(true).await;
+    for (guild, prefix) in [(0, "global"), (10, "source"), (20, "destination")] {
+        if guild != 0 {
+            f.enroll(guild).await;
+        }
+        db::patch_settings(&f.app.db, guild, Some(Some(prefix.into())), None, None)
+            .await
+            .unwrap();
+    }
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    *f.discord.guilds.lock().unwrap() = vec![member_guild(10), managed_guild(20)];
+    for (destination, prefix) in [(20, "destination"), (0, "global")] {
+        let (status, body) = f
+            .request(
+                "POST",
+                &format!("/api/guilds/{destination}/copy"),
+                r#"{"from_guild_id":10,"sections":["settings"]}"#,
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "you cannot manage the source server");
+        assert_eq!(
+            db::get_settings(&f.app.db, destination)
+                .await
+                .unwrap()
+                .prefix,
+            prefix
+        );
+    }
+}
+
+#[tokio::test]
 async fn unavailable_membership_database_fails_closed_without_leaking_details() {
     let f = Fixture::new(true).await;
     f.enroll(10).await;
@@ -9248,6 +9281,194 @@ async fn set_access_roles(f: &Fixture, guild: i64, roles: Vec<db::guild_data::Ac
         .set_access_roles(scope, &revision, roles)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn dashboard_role_cannot_use_settings_routes() {
+    use db::guild_data::{AccessLevel, AccessRole};
+    use serde_json::json;
+
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let request = |method, path: &str, body: serde_json::Value| {
+        let path = format!("/api/guilds/10/{path}");
+        let body = if body.is_null() {
+            String::new()
+        } else {
+            body.to_string()
+        };
+        let f = &f;
+        async move { f.request(method, &path, &body).await }
+    };
+    let (status, badword) = request("POST", "badwords", json!({"pattern":"saved"})).await;
+    assert_eq!(status, StatusCode::OK, "{badword}");
+    let (status, spam) = request(
+        "POST",
+        "known-spam",
+        json!({"kind":"sample","value":"a saved spam sample"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{spam}");
+    let saved_hash = "a".repeat(64);
+    let (status, image) = request("POST", "known-bad-images", json!({"hash":saved_hash})).await;
+    assert_eq!(status, StatusCode::OK, "{image}");
+    let (status, action) = request(
+        "PUT",
+        "logchannels/message_edit",
+        json!({"channel_id":"55","request_id":fresh_request_key("cancel")}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{action}");
+
+    demote_to_member(&f).await;
+    f.discord
+        .member_roles
+        .lock()
+        .unwrap()
+        .insert(10, vec!["555".into()]);
+    set_access_roles(
+        &f,
+        10,
+        vec![AccessRole {
+            role_id: 555,
+            level: AccessLevel::Dashboard,
+        }],
+    )
+    .await;
+
+    let badword_path = format!("badwords/{}", badword["id"]);
+    let spam_path = format!("known-spam/{}", spam["id"]);
+    let image_path = format!("known-bad-images/{saved_hash}");
+    let action_path = format!("actions/{}", action["id"].as_str().unwrap());
+    let rules = jmodguard::defaults::default_rules();
+    let rule = rules
+        .iter()
+        .find(|rule| rule.name == "Message velocity")
+        .unwrap();
+    let routes = [
+        ("PUT", "settings", json!({"prefix":"?"}), StatusCode::OK),
+        (
+            "PUT",
+            "rules/velocity",
+            json!({"data":rule}),
+            StatusCode::OK,
+        ),
+        ("DELETE", "rules/velocity", json!({}), StatusCode::OK),
+        ("POST", "badwords", json!({"pattern":"new"}), StatusCode::OK),
+        ("DELETE", &badword_path, json!(null), StatusCode::OK),
+        (
+            "PUT",
+            "templates/message_edit",
+            json!({"template":"fixture"}),
+            StatusCode::OK,
+        ),
+        (
+            "DELETE",
+            "templates/message_edit",
+            json!({}),
+            StatusCode::OK,
+        ),
+        (
+            "PUT",
+            "logfilters/message_edit",
+            json!({"users":["55"],"channels":[]}),
+            StatusCode::OK,
+        ),
+        (
+            "PUT",
+            "logchannels/member_leave",
+            json!({"channel_id":"56","request_id":fresh_request_key("set")}),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            "DELETE",
+            "logchannels/member_join",
+            json!({"request_id":fresh_request_key("clear")}),
+            StatusCode::ACCEPTED,
+        ),
+        (
+            "POST",
+            "known-bad-images",
+            json!({"hash":"b".repeat(64)}),
+            StatusCode::OK,
+        ),
+        ("DELETE", &image_path, json!(null), StatusCode::OK),
+        (
+            "POST",
+            "known-spam",
+            json!({"kind":"sample","value":"a new spam sample"}),
+            StatusCode::OK,
+        ),
+        ("DELETE", &spam_path, json!(null), StatusCode::OK),
+        (
+            "POST",
+            "testbadwords",
+            json!({"sample":"saved"}),
+            StatusCode::OK,
+        ),
+        (
+            "POST",
+            "testregex",
+            json!({"pattern":"saved","sample":"saved"}),
+            StatusCode::OK,
+        ),
+        ("POST", "server-names", json!(null), StatusCode::OK),
+        ("DELETE", &action_path, json!(null), StatusCode::OK),
+    ];
+
+    let version = db::get_config_version(&f.app.db).await.unwrap();
+    let jobs = || async {
+        json!(
+            db::recent_enrolled_bot_actions(&f.app.db, &enrollment)
+                .await
+                .unwrap()
+        )
+    };
+    let before_jobs = jobs().await;
+    for (method, path, body, _) in &routes {
+        let (status, response) = request(*method, path, body.clone()).await;
+        if *path == action_path {
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{method} {path}: {response}"
+            );
+            assert_eq!(response["error"], "action not available");
+        } else {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {response}");
+            assert_eq!(response["code"], "guild_access_denied", "{method} {path}");
+        }
+        assert_eq!(
+            db::get_config_version(&f.app.db).await.unwrap(),
+            version,
+            "{method} {path}"
+        );
+        assert_eq!(jobs().await, before_jobs, "{method} {path}");
+    }
+
+    set_access_roles(
+        &f,
+        10,
+        vec![AccessRole {
+            role_id: 555,
+            level: AccessLevel::Settings,
+        }],
+    )
+    .await;
+    for (method, path, body, expected) in routes {
+        let (status, response) = request(method, path, body).await;
+        assert_eq!(status, expected, "{method} {path}: {response}");
+    }
+    assert_eq!(db::get_settings(&f.app.db, 10).await.unwrap().prefix, "?");
+    assert_ne!(jobs().await, before_jobs);
 }
 
 #[tokio::test]

@@ -2502,19 +2502,18 @@ async fn run_job(
             let disposition = crate::spam_actions::report(
                 app,
                 ctx,
-                crate::spam_actions::Match {
-                    kind: crate::spam_actions::Kind::Image,
-                    guild,
-                    author,
+                verified_spam_match(
+                    DownloadAccount {
+                        guild,
+                        author,
+                        token,
+                    },
                     channel,
-                    policy: crate::spam_actions::MatchPolicy::Image(current_policy),
-                    token,
-                    messages: messages.clone(),
+                    current_policy,
+                    match_reason(&image_match, &policy),
+                    image_match,
                     excerpts,
-                    proving_hashes: image_match.proving.clone(),
-                    attachments: Vec::new(), // Exact-image evidence is hash-only; never capture bytes.
-                    reason: match_reason(&image_match, &policy),
-                },
+                ),
             )
             .await;
             finish_verified_report_window(
@@ -2528,6 +2527,29 @@ async fn run_job(
         }
     }
 }
+fn verified_spam_match(
+    account: DownloadAccount,
+    channel: u64,
+    policy: Policy,
+    reason: String,
+    image_match: ImageMatch,
+    excerpts: Vec<jmodguard::db::guild_data::TextEvidence>,
+) -> crate::spam_actions::Match {
+    crate::spam_actions::Match {
+        kind: crate::spam_actions::Kind::Image,
+        guild: account.guild,
+        author: account.author,
+        channel,
+        policy: crate::spam_actions::MatchPolicy::Image(policy),
+        token: account.token,
+        messages: image_match.messages,
+        excerpts,
+        proving_hashes: image_match.proving,
+        attachments: Vec::new(), // Exact-image evidence is hash-only.
+        reason,
+    }
+}
+
 fn format_hashes(hashes: &[Hash]) -> String {
     hashes
         .iter()
@@ -3479,6 +3501,11 @@ mod tests {
             crate::spam_actions::ReportDisposition::Consumed,
             now + Duration::from_secs(1),
         );
+        assert_eq!(
+            d.state.lock().guilds[&1].authors[&2].reported_until,
+            reported_until,
+            "consuming the report must preserve the throttle"
+        );
     }
 
     #[test]
@@ -3658,6 +3685,33 @@ mod tests {
             .expect("automod template");
         let mut vars = vars.clone();
         crate::logging::render_log_template("automod", template, &mut vars)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_image_match_passes_hashes_without_attachments_to_enforcement() {
+        let now = tokio::time::Instant::now().into_std();
+        let detector = Detector::new(Limits::default()).unwrap();
+        let policy = policy();
+        let Report::Verified(image_match) =
+            complete_report(&detector, job(&detector, now), &policy, false, now).unwrap()
+        else {
+            panic!("expected a hash-proven image match");
+        };
+        let reason = match_reason(&image_match, &policy);
+        let found = verified_spam_match(
+            DownloadAccount {
+                guild: 1,
+                author: 2,
+                token: (0, 0),
+            },
+            12,
+            policy,
+            reason,
+            image_match,
+            Vec::new(),
+        );
+        assert_eq!(found.proving_hashes, [[1; 32], [2; 32]]);
+        assert!(found.attachments.is_empty());
     }
 
     #[test]
@@ -7067,15 +7121,16 @@ mod tests {
         ));
         assert!(!d.state.lock().guilds[&1].authors[&2].notice.is_incomplete());
         assert!(admit(&d, 21, 121, now).is_none());
+        let retry_at = now + Duration::from_secs(1);
         finish_verified_report_window(
             &d,
             1,
             2,
             window,
             crate::spam_actions::ReportDisposition::Retryable,
-            now + Duration::from_secs(1),
+            retry_at,
         );
-        assert!(admit(&d, 22, 122, now).is_none());
+        assert!(admit(&d, 22, 122, retry_at).is_some());
     }
 
     #[test]

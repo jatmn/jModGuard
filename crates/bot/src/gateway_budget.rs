@@ -204,6 +204,17 @@ mod tests {
     }
 
     #[test]
+    fn identify_budget_is_scarce_strictly_below_ten_percent() {
+        let age = Some(Duration::from_secs(1));
+        for (remaining, wait_ms) in [(99, 871_727), (100, 4_000)] {
+            assert_eq!(
+                identify_delay(&limit(remaining, 86_400_000, 1000, 1), age),
+                Duration::from_millis(wait_ms)
+            );
+        }
+    }
+
+    #[test]
     fn future_or_equal_timestamp_is_a_zero_age() {
         assert_eq!(identify_age(Some(50), 40), Some(Duration::ZERO));
         assert_eq!(

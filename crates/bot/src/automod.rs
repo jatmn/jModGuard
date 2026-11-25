@@ -6804,7 +6804,7 @@ mod tests {
             &pending,
         )
         .await;
-        let _ = stub.finish();
+        assert!(stub.finish().is_empty());
         assert!(!app.automod_delete_marks.inner.lock().contains(10, 70, 42));
         drop(app);
         let _ = std::fs::remove_file(&path);

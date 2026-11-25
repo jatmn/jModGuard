@@ -851,7 +851,12 @@ async fn ban_retains_stay_and_same_state_delivery_remains_unresolved_observation
         .unwrap();
     assert!(!ended_unknown);
     assert!(store.observe_unban(scope.clone(), 77, 4_000).await.unwrap());
-    assert!(store.observe_ban(scope.clone(), 77, 5_000).await.unwrap());
+    assert!(
+        store
+            .backfill_member_case_index(scope.clone(), 42, 100)
+            .await
+            .unwrap()
+    );
     assert!(
         store
             .next_member_cleanup_candidate(scope.clone(), 10_000_000)
@@ -859,6 +864,15 @@ async fn ban_retains_stay_and_same_state_delivery_remains_unresolved_observation
             .unwrap()
             .is_none()
     );
+    assert!(
+        store
+            .next_member_target_check(scope.clone(), 10_000_000)
+            .await
+            .unwrap()
+            .is_none(),
+        "retained member must not be queued for departure cleanup"
+    );
+    assert!(store.observe_ban(scope.clone(), 77, 5_000).await.unwrap());
     let profile = store.get_member(scope, 77).await.unwrap().unwrap();
     assert!(profile.ever_banned);
 }
@@ -6089,10 +6103,24 @@ async fn confirmed_unban_without_prior_local_ban_retains_departed_member() {
     assert_eq!(retained.joined_at_ms, Some(1_500));
     assert!(
         store
+            .backfill_member_case_index(scope.clone(), 42, 100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
             .next_member_cleanup_candidate(scope.clone(), 400_000)
             .await
             .unwrap()
             .is_none()
+    );
+    assert!(
+        store
+            .next_member_target_check(scope.clone(), 400_000)
+            .await
+            .unwrap()
+            .is_none(),
+        "retained member must not be queued for departure cleanup"
     );
 }
 

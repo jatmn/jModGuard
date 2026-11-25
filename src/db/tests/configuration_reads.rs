@@ -250,14 +250,11 @@ async fn configuration_read_keeps_prior_membership_without_waiting_for_the_write
     let during = tokio::time::timeout(std::time::Duration::from_millis(500), &mut read)
         .await
         .expect("a primary snapshot must finish while a writer holds the lock");
-    assert!(
-        !during
-            .as_ref()
-            .is_err_and(|error| error.is::<EnrollmentChanged>()),
-        "the snapshot must still show the membership committed before the writer: {during:?}"
-    );
     release.send(()).unwrap();
     writer.await.unwrap();
+    let layers =
+        during.expect("the snapshot must still show the membership committed before the writer");
+    assert_eq!((layers.guild, layers.global), (None, None));
     assert!(
         get_enrolled_template(&f.db, scope, "absent")
             .await
