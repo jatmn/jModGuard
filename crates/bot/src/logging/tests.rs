@@ -1018,7 +1018,7 @@ fn message_identity_snippets_expire_and_evict_only_within_their_guild() {
     let f = Fixture::new();
     let author = |guild, message| known_message_author(&f.app, guild, 456, message);
     remember_message(&f.app, 789, 456, 1, Some(42), None, None);
-    remember_message(&f.app, 790, 456, 1, Some(43), None, None);
+    remember_message_create(&f.app, 790, 456, 1, Some(43), None, None, true);
     {
         let mut snippets = f.app.log_snippets.inner.lock();
         let first = snippets.get_mut(&(789, 456, 1)).unwrap();
@@ -1037,11 +1037,11 @@ fn message_identity_snippets_expire_and_evict_only_within_their_guild() {
 
     let stored_at = f.app.log_snippets.inner.lock()[&(790, 456, 1)].at;
     assert_eq!(
-        known_message_author_at(&f.app, 790, 456, 1, || stored_at + Duration::from_secs(599)),
-        Some(43)
+        known_message_identity_at(&f.app, 790, 456, 1, || stored_at + Duration::from_secs(599)),
+        Some((43, true))
     );
     assert_eq!(
-        known_message_author_at(&f.app, 790, 456, 1, || stored_at + Duration::from_secs(600)),
+        known_message_identity_at(&f.app, 790, 456, 1, || stored_at + Duration::from_secs(600)),
         None
     );
 }

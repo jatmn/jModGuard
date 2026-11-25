@@ -490,23 +490,33 @@ fn departure_joined_at_ms(
 }
 
 fn select_update_authors(
-    event_author: Option<u64>,
-    text_author: Option<u64>,
-    image_author: Option<u64>,
-    snippet_author: Option<u64>,
-    snippet_webhook: bool,
-    edited: bool,
+    event: &MessageUpdateEvent,
+    text_author: impl FnOnce(u64, u64, u64) -> Option<u64>,
+    image_author: impl FnOnce(u64, u64, u64) -> Option<u64>,
+    snippet_identity: impl FnOnce(u64, u64, u64) -> Option<(u64, bool)>,
 ) -> (Option<u64>, Option<u64>) {
-    let detector_author = event_author.or(text_author).or(image_author);
-    let known_author = detector_author.or(snippet_author);
+    let Some(guild) = event.guild_id else {
+        return (None, None);
+    };
+    let guild = guild.get();
+    let channel = event.channel_id.get();
+    let message = event.id.get();
+    if let Some(author) = event
+        .author
+        .as_ref()
+        .map(|user| user.id.get())
+        .or_else(|| text_author(guild, channel, message))
+        .or_else(|| image_author(guild, channel, message))
+    {
+        return (Some(author), Some(author));
+    }
+    let Some((author, webhook)) = snippet_identity(guild, channel, message) else {
+        return (None, None);
+    };
     // A cached author identifies a message for logging, but an untimestamped
     // refresh cannot turn an untracked old message into a new spam candidate.
-    let update_author = if edited && !snippet_webhook {
-        known_author
-    } else {
-        detector_author
-    };
-    (known_author, update_author)
+    let update_author = (event.edited_timestamp.is_some() && !webhook).then_some(author);
+    (Some(author), update_author)
 }
 
 pub(crate) struct UpdateObservation {
@@ -1463,22 +1473,14 @@ impl EventHandler for Handler {
         let received_at = chrono::Utc::now();
         let image_revision = self.app.image_spam.revision();
         let text_revision = self.app.text_spam.revision();
-        let (known_author_id, detector_update_author_id) = event
-            .guild_id
-            .map(|guild| {
-                let guild = guild.get();
-                let channel = event.channel_id.get();
-                let message = event.id.get();
-                select_update_authors(
-                    event.author.as_ref().map(|user| user.id.get()),
-                    self.app.text_spam.author_of(guild, channel, message),
-                    self.app.image_spam.author_of(guild, channel, message),
-                    logging::known_message_author(&self.app, guild, channel, message),
-                    logging::known_message_webhook(&self.app, guild, channel, message),
-                    event.edited_timestamp.is_some(),
-                )
-            })
-            .unwrap_or_default();
+        let (known_author_id, detector_update_author_id) = select_update_authors(
+            &event,
+            |guild, channel, message| self.app.text_spam.author_of(guild, channel, message),
+            |guild, channel, message| self.app.image_spam.author_of(guild, channel, message),
+            |guild, channel, message| {
+                logging::known_message_identity(&self.app, guild, channel, message)
+            },
+        );
         logging::remember_message_update(&self.app, &event, known_author_id);
         if !self.app.snapshots.collector_active(&ctx) {
             self.app.snapshots.report_unhooked_edit(
@@ -3861,29 +3863,66 @@ mod tests {
     }
 
     #[test]
-    fn update_author_prefers_event_then_detector_and_only_uses_snippet_for_real_edits() {
+    fn gateway_update_looks_up_only_the_author_fallbacks_it_needs() {
+        use std::cell::RefCell;
+
+        let mut event: MessageUpdateEvent = serde_json::from_value(serde_json::json!({
+            "id":"123", "channel_id":"456", "guild_id":"789"
+        }))
+        .unwrap();
+        let mut author = serenity::model::user::User::default();
+        author.id = serenity::model::id::UserId::new(1);
+        let resolve = |event: &MessageUpdateEvent, text, image, snippet, visited: &[&str]| {
+            let lookups = RefCell::new(Vec::new());
+            let observe = |source, guild, channel, message| {
+                assert_eq!((guild, channel, message), (789, 456, 123));
+                lookups.borrow_mut().push(source);
+            };
+            let authors = select_update_authors(
+                event,
+                |guild, channel, message| {
+                    observe("text", guild, channel, message);
+                    text
+                },
+                |guild, channel, message| {
+                    observe("image", guild, channel, message);
+                    image
+                },
+                |guild, channel, message| {
+                    observe("snippet", guild, channel, message);
+                    snippet
+                },
+            );
+            assert_eq!(lookups.into_inner(), visited);
+            authors
+        };
+
+        let snippet = Some((4, false));
+        event.author = Some(author);
         assert_eq!(
-            select_update_authors(Some(1), Some(2), Some(3), Some(4), false, false),
+            resolve(&event, Some(2), Some(3), snippet, &[]),
             (Some(1), Some(1))
         );
+        event.author = None;
         assert_eq!(
-            select_update_authors(None, Some(2), Some(3), Some(4), false, false),
+            resolve(&event, Some(2), Some(3), snippet, &["text"]),
             (Some(2), Some(2))
         );
         assert_eq!(
-            select_update_authors(None, None, Some(3), Some(4), false, false),
+            resolve(&event, None, Some(3), snippet, &["text", "image"]),
             (Some(3), Some(3))
         );
+        let all = ["text", "image", "snippet"];
+        assert_eq!(resolve(&event, None, None, snippet, &all), (Some(4), None));
+        event.edited_timestamp = Some(serenity::model::Timestamp::from_unix_timestamp(1).unwrap());
         assert_eq!(
-            select_update_authors(None, None, None, Some(4), false, false),
-            (Some(4), None)
-        );
-        assert_eq!(
-            select_update_authors(None, None, None, Some(4), false, true),
+            resolve(&event, None, None, snippet, &all),
             (Some(4), Some(4))
         );
+        assert_eq!(resolve(&event, None, None, None, &all), (None, None));
+        event.guild_id = None;
         assert_eq!(
-            select_update_authors(None, None, None, None, false, true),
+            resolve(&event, Some(2), Some(3), snippet, &[]),
             (None, None)
         );
     }
@@ -3895,7 +3934,7 @@ mod tests {
         let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
         logging::remember_message_create(&app, 789, 456, 123, Some(42), Some(""), None, true);
         // A partial edit can omit webhook_id, including while changing attachments.
-        let update: MessageUpdateEvent = serde_json::from_value(serde_json::json!({
+        let mut update: MessageUpdateEvent = serde_json::from_value(serde_json::json!({
             "id":"123", "channel_id":"456", "guild_id":"789",
             "edited_timestamp":"2026-09-21T00:00:01.000Z",
             "attachments":[{
@@ -3904,18 +3943,21 @@ mod tests {
             }]
         })).unwrap();
         logging::remember_message_update(&app, &update, Some(42));
-        let author = logging::known_message_author(&app, 789, 456, 123);
-        let webhook = logging::known_message_webhook(&app, 789, 456, 123);
-        assert_eq!(author, Some(42));
-        assert!(webhook);
-        assert_eq!(
-            select_update_authors(None, None, None, author, webhook, true),
-            (Some(42), None)
-        );
-        assert_eq!(
-            select_update_authors(None, None, None, author, webhook, false),
-            (Some(42), None)
-        );
+        let resolve = |event: &MessageUpdateEvent| {
+            select_update_authors(
+                event,
+                |guild, channel, message| app.text_spam.author_of(guild, channel, message),
+                |guild, channel, message| app.image_spam.author_of(guild, channel, message),
+                |guild, channel, message| {
+                    logging::known_message_identity(&app, guild, channel, message)
+                },
+            )
+        };
+        assert_eq!(resolve(&update), (Some(42), None));
+        update.edited_timestamp = None;
+        assert_eq!(resolve(&update), (Some(42), None));
+        update.channel_id = ChannelId::new(457);
+        assert_eq!(resolve(&update), (None, None));
         let _ = std::fs::remove_file(path);
     }
 
