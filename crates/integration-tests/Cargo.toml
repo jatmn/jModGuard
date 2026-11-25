@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [dev-dependencies]
-jmodguard = { path = "../.." }
+jmodguard = { path = "../..", features = ["test-support"] }
 jmodguard-bot = { path = "../bot" }
 jmodguard-api = { path = "../api" }
 anyhow = "1"

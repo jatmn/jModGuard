@@ -385,7 +385,7 @@ function Sparkline({ values, className }) {
 
 // Compact KPI tile: label, short number (exact in the title), change against
 // the previous window and an optional daily sparkline.
-export function KpiTile({ label, value, delta, values, color, badge, loading, unavailable, rangeLabel }) {
+export function KpiTile({ label, value, delta, values, color, badge, action, loading, unavailable, rangeLabel }) {
   const shown = loading ? "…" : unavailable ? "—" : formatCount(value);
   const exact = loading ? "loading" : unavailable ? "unavailable" : formatExact(value);
   const deltaText = delta ? `${delta.exact} vs previous ${rangeLabel}` : null;
@@ -399,6 +399,7 @@ export function KpiTile({ label, value, delta, values, color, badge, loading, un
       h("span", { className: "an-kpi-value", title: exact }, shown),
       delta ? h("span", { className: `an-delta an-delta-${delta.direction}`, title: deltaText }, delta.text) : null,
       badge ? h("span", { className: `an-badge an-badge-${badge.tone}`, title: badge.title }, badge.label) : null,
+      action,
     ),
     values?.length ? h(Sparkline, { values, className: color }) : null,
   );

@@ -964,11 +964,41 @@ const PLATFORM_METRICS = [
 const PLATFORM_HELP =
   "Counts come from records the bot stored, bucketed by UTC day; days before recording started show zero. Changes compare with the previous period of the same length; joins and leaves have no 90-day comparison. Actions count automod enforcement and moderator commands once each. Share is a server's part of the fleet total.";
 
-const PLATFORM_COVERAGE = {
-  importing: { label: "importing", tone: "warn", title: "The initial member import is still running." },
-  uncertain: { label: "unverified", tone: "warn", title: "A coverage gap awaits Reconcile on the Members page." },
+const MEMBER_DIRECTORY_COVERAGE = {
+  not_started: { label: "not imported", tone: "warn", title: "Open Members to check initial import availability." },
+  importing: { label: "importing", tone: "warn", title: "The initial member import has yet to finish." },
+  stalled: { label: "stalled", tone: "warn", title: "The initial member import has stopped progressing." },
+  reconciling: { label: "reconciling", tone: "warn", title: "The bot is scheduled to recover member coverage." },
+  uncertain: { label: "unverified", tone: "warn", title: "The member list may be out of date. Open Members for recovery options." },
   unavailable: { label: "unavailable", tone: "warn", title: "This server's member directory could not be read." },
 };
+
+function memberDirectoryBadge(directory, guildId, importingLabel = "importing") {
+  const coverage = directory?.coverage;
+  if (!Object.hasOwn(MEMBER_DIRECTORY_COVERAGE, coverage)) return null;
+  const badge = MEMBER_DIRECTORY_COVERAGE[coverage];
+  const details = [badge.title];
+  if (directory.reconciliation_reason || directory.gap_at) {
+    details.push(memberGapCause(directory.reconciliation_reason, memberGapWhen(directory.gap_at)) + ".");
+  }
+  if (directory.status_reason) details.push(directory.status_reason);
+  if (directory.next_attempt_at) details.push(`Next attempt: ${memberTime(directory.next_attempt_at)}`);
+  else if (coverage === "stalled") details.push("Next attempt: not scheduled");
+  const canOpenImport = coverage === "not_started" && !isPreview() &&
+    state.guilds.some((guild) => guild.id === guildId && guildAccessRank[guild.access] >= guildAccessRank.dashboard);
+  return {
+    ...badge,
+    label: coverage === "importing" ? importingLabel : badge.label,
+    title: details.join(" "),
+    importLink: canOpenImport
+      ? `?list=members&guild=${encodeURIComponent(guildId)}`
+      : null,
+  };
+}
+
+function memberImportLink(badge) {
+  return badge?.importLink && h("a", { className: "link", href: badge.importLink, title: badge.title }, "Import");
+}
 
 const PLATFORM_SERVER_FILTERS = [
   ["all", "All servers"],
@@ -984,7 +1014,7 @@ function platformMemberStatus(members) {
     ? ` Member totals cover ${members.guilds_counted ?? 0} of ${members.servers ?? 0} servers; the rest were unavailable.`
     : "";
   const incomplete = members.guilds_incomplete
-    ? ` ${members.guilds_incomplete} counted ${members.guilds_incomplete === 1 ? "server has" : "servers have"} a member directory still importing or awaiting Reconcile.`
+    ? ` ${members.guilds_incomplete} counted ${members.guilds_incomplete === 1 ? "server has" : "servers have"} incomplete member-directory coverage.`
     : "";
   return `Member totals are ${members.status || "complete"}.${unavailable}${incomplete}`;
 }
@@ -1010,6 +1040,7 @@ function platformRows(snapshot) {
       actions: platformActions(guild),
       previousActions: platformActions(guild.previous),
       members: directory ? directory.current : null,
+      directory,
       coverage: !guild.active ? null : !directory ? "unavailable" : directory.coverage === "complete" ? null : directory.coverage,
     };
   });
@@ -1150,7 +1181,7 @@ function PlatformServerTable({ rows, totals, rangeLabel }) {
           shown.length
             ? shown.map((row) => {
                 const delta = formatDelta(row.actions, row.previousActions);
-                const coverage = PLATFORM_COVERAGE[row.coverage];
+                const coverage = memberDirectoryBadge(row.directory || { coverage: row.coverage }, row.guild_id);
                 return h(
                   "tr",
                   { key: row.guild_id },
@@ -1175,6 +1206,7 @@ function PlatformServerTable({ rows, totals, rangeLabel }) {
                     { className: "pa-metric" },
                     h("span", { className: "pa-num", title: row.members == null ? undefined : formatExact(row.members) }, row.active ? (row.members == null ? "—" : formatCount(row.members)) : "—"),
                     coverage && h("span", { className: `an-badge an-badge-${coverage.tone}`, title: coverage.title }, coverage.label),
+                    memberImportLink(coverage),
                   ),
                   h(
                     "td",
@@ -2033,6 +2065,10 @@ function closeOverlay() {
   ui.set({ editor: null, edits: "clean" });
 }
 function editRule(record) {
+  if (record.rule_id === ONBOARDING_TRAP_RULE) {
+    ui.set({ editor: h(OnboardingTrapEditor, { record }) });
+    return;
+  }
   if (isCustomRuleId(record.rule_id)) {
     ui.set({ editor: h(CustomRuleEditor, { record, creating: false }) });
     return;
@@ -3429,7 +3465,7 @@ const ANALYTICS_HELP = [
   "Some numbers overlap (a warn is also a mod action), so they're never added up.",
   "The heat map counts each automod action, moderator command and spam ban once.",
   "Members is partial while the first import runs.",
-  "If Members shows unverified, the Members page says whether to Reconcile or wait for it to clear.",
+  "Open Members to see recovery progress, retry timing, and available controls.",
 ];
 
 // Loaded analytics summaries per guild, page membership and range. Switching
@@ -3537,10 +3573,7 @@ function tabAnalytics() {
   const total = (key) => sumSeries(points, key);
   const prev = (key) => (previous ? previous[key] : null);
   const daily = (key) => points.map((point) => point[key] ?? 0);
-  const coverage = {
-    importing: { label: "partial", tone: "warn", title: "The initial member import is still running." },
-    uncertain: { label: "unverified", tone: "warn", title: "A coverage gap awaits Reconcile on the Members page." },
-  }[members?.coverage];
+  const coverage = memberDirectoryBadge(members, guildId, "partial");
   const tile = (label, key, color) =>
     h(KpiTile, {
       key: label,
@@ -3586,6 +3619,7 @@ function tabAnalytics() {
         loading,
         unavailable: failed || (data && !members),
         badge: coverage,
+        action: memberImportLink(coverage),
         rangeLabel,
       }),
       h(KpiTile, {
@@ -3686,6 +3720,9 @@ function newCustomRuleDraft() {
   };
 }
 
+const ONBOARDING_TRAP_RULE = "onboarding_bot_trap";
+const ONBOARDING_TRAP_GUIDE = "https://github.com/jatmn/jModGuard/blob/main/docs/ONBOARDING-BOT-TRAP.md";
+
 const MEDIA_RULE_PRESET = "no_links_or_media";
 const CHANNEL_REPLY_DEFAULT = {
   template: "{user} No links or media are allowed in {channel}.",
@@ -3724,7 +3761,8 @@ function newMediaRuleDraft() {
 }
 
 function tabRules() {
-  const rules = state.config.rules.filter((r) => r.rule_id !== "known_spam");
+  const rules = state.config.rules.filter((r) => r.rule_id !== "known_spam" &&
+    (state.guildId !== "0" || r.rule_id !== ONBOARDING_TRAP_RULE));
   return h(
     "div",
     {},
@@ -3766,6 +3804,7 @@ function tabRules() {
 
 function ruleCard(r) {
   const rule = r.effective;
+  const trap = r.rule_id === ONBOARDING_TRAP_RULE;
   const spam = !isCustomRuleId(r.rule_id) && spamRule(r.rule_id);
   const supported = !spam || spamConfigured(r.rule_id, rule);
   const badge = !rule.enabled || !supported ? "off" : rule.dry_run ? "dry" : "on";
@@ -3804,7 +3843,7 @@ function ruleCard(r) {
             r.guild_override
               ? h("span", { className: "badge badge-soft badge-sm badge-neutral override-tag" }, "server override")
               : null,
-            r.global ? h("span", { className: "badge badge-soft badge-sm badge-primary scope-tag" }, "global") : null,
+            r.global && !trap ? h("span", { className: "badge badge-soft badge-sm badge-primary scope-tag" }, "global") : null,
           ),
         ),
         h(
@@ -3814,6 +3853,10 @@ function ruleCard(r) {
         ),
       ),
       h("p", {}, r.description),
+      trap ? h("p", {}, h("a", { href: ONBOARDING_TRAP_GUIDE, className: "link" }, "Onboarding bot trap setup guide")) : null,
+      trap && rule.enabled && canEditSettings()
+        ? h(SavedOnboardingTrapWarnings, { roleId: String(rule.params?.role_id ?? "") })
+        : null,
     ),
   );
 }
@@ -4146,6 +4189,7 @@ function useServerNames(userIds) {
           status: "loaded",
           roles: Array.isArray(data?.roles) ? data.roles : [],
           channels: Array.isArray(data?.channels) ? data.channels : [],
+          onboardingTrap: data?.onboarding_trap,
           mediaPresetChannelKinds: Array.isArray(data?.media_preset_channel_kinds) ? data.media_preset_channel_kinds : [],
         })),
       () => {
@@ -4801,6 +4845,112 @@ function CustomRuleEditor({ record: r, creating }) {
             "Delete",
           )
         : null,
+      h(ActionButton, { className: "btn btn-outline", onClick: () => canLeave() && closeOverlay() }, "Cancel"),
+    ),
+  );
+}
+
+function OnboardingTrapWarnings({ names, roleId }) {
+  if (names.status === "loading") return null;
+  const setup = names.onboardingTrap;
+  const warnings = [];
+  if (!setup || setup.bot_can_kick == null) warnings.push("Bot setup checks are unavailable. Check jModGuard’s role and permissions in Discord.");
+  if (setup?.bot_can_kick === false) warnings.push("jModGuard lacks Kick Members.");
+  if (setup?.roles_at_or_above_bot?.includes(roleId)) warnings.push("Move the trap role below jModGuard’s highest role.");
+  if (setup?.roles_with_grants?.includes(roleId)) warnings.push("The trap role grants permissions or channel access. Remove those grants in Discord.");
+  if (setup?.roles_with_member_grants?.includes(roleId)) warnings.push("A member with the trap role has an individual channel permission grant. Review their channel overrides in Discord.");
+  if (setup && !names.roles.some((role) => role.id === roleId)) warnings.push("The selected trap role is missing from the bot’s server snapshot.");
+  return warnings.length ? h("ul", { className: "field-help", role: "status" }, ...warnings.map((warning) =>
+    h("li", { key: warning }, warning))) : null;
+}
+
+function SavedOnboardingTrapWarnings({ roleId }) {
+  const [names] = useServerNames([]);
+  return h(OnboardingTrapWarnings, { names, roleId });
+}
+
+function OnboardingTrapEditor({ record }) {
+  const [expected] = useState(() => record.effective);
+  const [rule] = useState(() => JSON.parse(JSON.stringify(record.effective)));
+  const [roleIds] = useState(() => rule.params?.role_id ? [String(rule.params.role_id)] : []);
+  const [windowMinutes, setWindowMinutes] = useState(() => String(rule.params?.join_window_minutes ?? 30));
+  const [names] = useServerNames([]);
+  const [, setRevision] = useState(0);
+  const refresh = () => setRevision((value) => value + 1);
+  const pending = useRef(new Set()).current;
+  const hasRole = roleIds.length > 0 && roleIds[0] !== state.guildId;
+  return h(
+    DialogPanel,
+    { className: "modal-box rule-editor", onInput: trackDraft },
+    h(RuleEditorHeader, {
+      key: hasRole,
+      title: record.name,
+      enabled: rule.enabled && hasRole,
+      dryRun: rule.dry_run,
+      disabled: !hasRole,
+      onEnabled: (on) => { rule.enabled = on; refresh(); },
+      onDryRun: (on) => { rule.dry_run = on; refresh(); },
+    }),
+    h(
+      EditorSection,
+      { title: "Trigger" },
+      h(IdPicker, {
+        kind: "role",
+        label: "Trap role",
+        hint: "Pick the role granted by the optional Discord Onboarding answer.",
+        ids: roleIds,
+        names: { ...names, roles: names.roles.filter((role) => role.id !== state.guildId && !role.managed) },
+        pending,
+        single: true,
+        onChange: () => {
+          if (!roleIds.length || roleIds[0] === state.guildId) rule.enabled = false;
+          refresh();
+        },
+      }),
+      rule.enabled && hasRole ? h(OnboardingTrapWarnings, { names, roleId: roleIds[0] }) : null,
+      h(Field, {},
+        h(Label, {}, "Join window (minutes)"),
+        h(Input, {
+          type: "number", className: "input", min: 0, max: 1440, step: 1, required: true,
+          value: windowMinutes, onChange: (event) => setWindowMinutes(event.target.value),
+        }),
+      ),
+      h("p", { className: "field-help" }, "Use 0 to check role additions at any time. Moderators, administrators and the server owner are always skipped."),
+    ),
+    h(
+      EditorSection,
+      { title: "Action" },
+      h("p", {}, "Kick is the available moderation action. It opens a private case and posts to the Member kick and Automod logs."),
+      h(Field, {},
+        h(Label, {}, "Kick reason"),
+        h(Input, { className: "input", value: rule.actions[0].reason, onChange: (event) => {
+          rule.actions[0].reason = event.target.value;
+          refresh();
+        } }),
+      ),
+    ),
+    h("p", {}, h("a", { href: ONBOARDING_TRAP_GUIDE, className: "link" }, "Onboarding bot trap setup guide")),
+    h(
+      "div",
+      { className: "modal-action" },
+      h(ActionButton, {
+        className: "btn btn-primary",
+        onClick: async () => {
+          if (!flushPendingIds(pending)) return;
+          const roleId = roleIds[0] || null;
+          if (roleId === state.guildId) throw new Error("Choose a role other than @everyone");
+          if (!/^\d+$/.test(windowMinutes) || Number(windowMinutes) > 1440) throw new Error("Enter a join window from 0 to 1440 minutes");
+          const data = {
+            ...rule,
+            enabled: rule.enabled && roleId !== null,
+            params: { ...rule.params, role_id: roleId, join_window_minutes: Number(windowMinutes) },
+          };
+          await reloadAfter(() => api(`/api/guilds/${state.guildId}/rules/${record.rule_id}`, "PUT", { scope: "guild", data, expected }), () => {
+            toast("Rule saved", "success");
+            closeOverlay();
+          });
+        },
+      }, "Save"),
       h(ActionButton, { className: "btn btn-outline", onClick: () => canLeave() && closeOverlay() }, "Cancel"),
     ),
   );
@@ -6971,7 +7121,13 @@ function memberGapCause(reason, when) {
   const label = Object.hasOwn(MEMBER_CONNECTION_GAPS, reason || "") ? MEMBER_CONNECTION_GAPS[reason] : null;
   return label
     ? `The bot was offline or reconnected${when} (${label})`
-    : `The bot could not save a member or ban change${when}`;
+    : reason
+      ? `The bot could not save a member or ban change${when} (${reason})`
+      : `The bot recorded a coverage gap${when}`;
+}
+
+function memberGapWhen(gapAt) {
+  return gapAt ? ` at ${memberTime(gapAt)}` : "";
 }
 
 function memberInstant(value) {
@@ -7098,28 +7254,34 @@ function tabMembers() {
     const schedulePoll = () => {
       clearTimer();
       if (!aliveHere()) return;
-      const active =
-        statusRead === "retry-needed" ||
-        controlPending() ||
-        (latestStatus &&
-          (["queued", "running", "waiting"].includes(latestStatus.status) ||
-            ["queued", "running", "waiting"].includes(latestStatus.audit_recovery_status)));
-      if (!active) {
+      const scheduled = ["queued", "running", "waiting"];
+      const attempts = [];
+      const importAttempt = latestStatus?.next_attempt_at;
+      if (importAttempt != null || scheduled.includes(latestStatus?.status))
+        attempts.push(Number(importAttempt) || 0);
+      const auditAttempt = latestStatus?.audit_recovery_next_attempt_at;
+      const auditStatus = latestStatus?.audit_recovery_status;
+      // Stalled pagination keeps a checkpoint for manual Retry.
+      if (
+        auditStatus !== "complete" &&
+        !auditPaginationStalled(latestStatus) &&
+        (auditAttempt != null || scheduled.includes(auditStatus))
+      )
+        attempts.push(Number(auditAttempt) || 0);
+      const reconcileAttempt = latestStatus?.automatic_reconcile_at;
+      if (reconcileAttempt != null) attempts.push(Number(reconcileAttempt) || 0);
+      if (statusRead !== "retry-needed" && !controlPending() && !attempts.length) {
         pollDueAt = 0;
         return;
       }
       if (!pollDueAt) {
         let delay = Math.min(10000 * 2 ** Math.min(pollAttempt, 5), 300000);
-        const statusNow = Number(latestStatus?.as_of) || latestStatusReceivedAt;
-        const elapsed = Date.now() - latestStatusReceivedAt;
-        const attempts = [];
-        if (["queued", "running", "waiting"].includes(latestStatus?.status))
-          attempts.push(Number(latestStatus.next_attempt_at) || 0);
-        if (["queued", "running", "waiting"].includes(latestStatus?.audit_recovery_status))
-          attempts.push(Number(latestStatus.audit_recovery_next_attempt_at) || 0);
-        // A queued control can change the schedule before the worker's next page.
-        if (attempts.length && !controlPending())
+        // Worker deadlines pace successful reads when no control is pending.
+        if (statusRead === "current" && attempts.length && !controlPending()) {
+          const statusNow = Number(latestStatus?.as_of) || latestStatusReceivedAt;
+          const elapsed = Date.now() - latestStatusReceivedAt;
           delay = Math.max(delay, Math.min(...attempts) - statusNow - elapsed);
+        }
         delay = Math.max(delay, lastStatusError?.retryAfterMs || 0);
         pollDueAt = Date.now() + delay;
       }
@@ -7153,8 +7315,9 @@ function tabMembers() {
         sync.phase === "complete" && sync.status !== "complete" && sync.local_history_complete === false
           ? phases.indexOf("local_history")
           : phases.indexOf(String(sync.phase || ""));
-      const statusLabel = memberSyncStatusLabels[sync.status || "needs_attention"] || String(sync.status);
-      const statusTone =
+      const stalled = sync.coverage === "stalled";
+      const statusLabel = stalled ? "Stalled" : memberSyncStatusLabels[sync.status || "needs_attention"] || String(sync.status);
+      const statusTone = stalled ? "badge-warning" :
         { complete: "badge-success", needs_attention: "badge-error", paused: "badge-warning", waiting: "badge-warning" }[
           sync.status
         ] || "badge-info";
@@ -7269,7 +7432,7 @@ function tabMembers() {
           (sync.started_at ? Math.max(0, (statusNow - Number(sync.started_at)) / 1000) : null);
         const workerUnconfirmed = ["worker_unconfirmed", "worker_offline"].includes(sync.estimate_reason);
         const forecastUnknown =
-          workerUnconfirmed ||
+          stalled || workerUnconfirmed ||
           ["paused", "needs_attention"].includes(sync.status) ||
           (sync.status === "waiting" && sync.estimate_reason !== "rate_limited") ||
           sync.estimate_reason === "discord_unavailable";
@@ -7349,6 +7512,8 @@ function tabMembers() {
           }
         }
         notes.push(h("p", { className: "muted" }, retryText));
+      } else if (stalled) {
+        notes.push(h("p", { className: "muted" }, "Next attempt: not scheduled"));
       }
       function syncControlButton(operation, label) {
         // Mirror the API's validate_member_sync_operation: omit controls this state can never accept.
@@ -7406,16 +7571,38 @@ function tabMembers() {
           label,
         );
       }
-      // Live coverage is its own status line or banner, separate from the import summary.
-      // A short planned restart clears itself when audit recovery finishes, unless
-      // that recovery stopped for attention. Anything else needs Reconcile.
-      const autoClearing = sync.gap_auto_clear && sync.audit_recovery_status !== "needs_attention";
-      const reconcileInNotice = sync.reconciliation_needed && !autoClearing && !isPreview() && canManageServer();
+      const reconciling = sync.coverage === "reconciling";
+      const auditRecovery = sync.gap_auto_clear && sync.status === "complete" &&
+        (reconciling || sync.coverage == null) &&
+        ["queued", "running", undefined].includes(sync.audit_recovery_status);
+      const reconcileInNotice = sync.reconciliation_needed && !reconciling && !auditRecovery && !isPreview() && canManageServer();
       const reconcileButton = reconcileInNotice && syncControlButton("reconcile", "Reconcile from Discord");
       let coverage;
       if (sync.reconciliation_needed) {
-        const when = sync.gap_at ? ` at ${asDate(sync.gap_at)}` : "";
-        coverage = autoClearing
+        const when = memberGapWhen(sync.gap_at);
+        const cause = memberGapCause(sync.reconciliation_reason, when);
+        let recovery = "Select Reconcile from Discord to re-check the full member and ban lists. This can take a while on large servers.";
+        if (sync.automatic_reconcile_at && !reconciling) {
+          recovery = Number(sync.automatic_reconcile_at) > statusNow
+            ? `Next automatic Reconcile: ${asDate(sync.automatic_reconcile_at)}. You can select Reconcile from Discord to start sooner.`
+            : "The bot can queue an automatic Reconcile. You can select Reconcile from Discord to start sooner.";
+        } else if (reconciling) {
+          recovery = "The bot will re-check the member and ban lists using its normal request pace.";
+        } else if (sync.coverage && !sync.initial_completed_at) {
+          recovery = "The bot can reconcile this gap after the initial import finishes.";
+        } else if (sync.coverage && !sync.run_id) {
+          recovery = "The saved import job needs repair before Reconcile can run.";
+        } else if (sync.run_kind === "reconcile" && sync.status === "needs_attention") {
+          recovery = "Resolve the reported error and select Retry to resume Reconcile.";
+        } else if (sync.run_kind === "reconcile" && sync.status === "paused") {
+          recovery = "Select Resume to continue Reconcile.";
+        } else if (sync.phase === "complete" && sync.local_history_complete === false) {
+          recovery = "The bot is finishing local case history.";
+        } else if (sync.status === "waiting" || sync.audit_recovery_status === "waiting" ||
+                   (sync.gap_auto_clear && sync.audit_recovery_reason === "permission_denied")) {
+          recovery = "The bot will retry at the next attempt shown below.";
+        }
+        coverage = auditRecovery
           ? h(
               "p",
               { id: "member-coverage-notice", className: "muted", role: "status" },
@@ -7423,16 +7610,12 @@ function tabMembers() {
             )
           : h(
               "div",
-              { id: "member-coverage-notice", className: "alert alert-soft alert-warning alert-wrap", role: "status" },
+              { id: "member-coverage-notice", className: reconciling ? "muted" : "alert alert-soft alert-warning alert-wrap", role: "status" },
               h(
                 "div",
                 {},
-                h("strong", {}, "Member list may be out of date"),
-                h(
-                  "p",
-                  {},
-                  `${memberGapCause(sync.reconciliation_reason, when)}, so it may have missed some joins, leaves, or bans. Select Reconcile from Discord to re-check the full member and ban lists. This can take a while on large servers.`,
-                ),
+                h("strong", {}, reconciling ? "Member list reconciling" : "Member list may be out of date"),
+                h("p", {}, `${cause}, so it may have missed some joins, leaves, or bans. ${recovery}`),
               ),
               reconcileButton && h("div", { className: "row" }, reconcileButton),
             );
@@ -7442,7 +7625,9 @@ function tabMembers() {
           { id: "member-coverage-notice", className: "muted", role: "status" },
           complete
             ? "Member list: up to date"
-            : [
+            : sync.coverage === "not_started"
+              ? "Member list: not imported"
+              : [
                 "Member list: ",
                 h("span", { key: "partial", className: "badge badge-soft badge-sm badge-warning" }, "partial"),
                 " ",

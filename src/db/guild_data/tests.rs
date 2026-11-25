@@ -1591,7 +1591,12 @@ async fn released_guild_stores_upgrade_with_data_and_reopen() {
     )
     .unwrap();
 
-    for released in [GUILD_BASELINE_VERSION, V0_2_1_GUILD_VERSION] {
+    for (released, draft_extension) in [
+        (GUILD_BASELINE_VERSION, false),
+        (V0_2_1_GUILD_VERSION, false),
+        (23, false),
+        (23, true),
+    ] {
         let historical = path("released_guild_upgrade");
         let opts = options(&historical);
         GuildDataStore::create_historical_store(opts.clone(), registration.clone(), released)
@@ -1612,6 +1617,27 @@ async fn released_guild_stores_upgrade_with_data_and_reopen() {
             1024 * 1024,
         )
         .unwrap();
+        if released >= 20 {
+            conn.execute_bounded(
+                "INSERT INTO guild_server_names(guild_id,enrollment_id,names,observed_at_ms)
+                 VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,1000)",
+                params![r#"{"roles":[],"channels":[]}"#],
+                64 * 1024,
+            )
+            .unwrap();
+        }
+        if draft_extension {
+            conn.execute_batch_bounded(ONBOARDING_TRAP_SCHEMA, 1024 * 1024)
+                .unwrap();
+            conn.execute_bounded(
+                "UPDATE guild_server_names SET onboarding_trap=?1 WHERE guild_id=10",
+                params![
+                    r#"{"bot_can_kick":true,"roles_at_or_above_bot":[],"roles_with_grants":[]}"#
+                ],
+                64 * 1024,
+            )
+            .unwrap();
+        }
         drop(conn);
         let reader = GuildStoreOptions {
             read_only: true,
@@ -1629,6 +1655,12 @@ async fn released_guild_stores_upgrade_with_data_and_reopen() {
             assert_eq!(
                 store.log_channels(scope.clone()).await.unwrap().channels(),
                 &[("system".into(), 12)]
+            );
+            let names = store.server_names(scope.clone()).await.unwrap();
+            assert_eq!(names.observed_at_ms, (released >= 20).then_some(1_000));
+            assert_eq!(
+                names.onboarding_trap.and_then(|setup| setup.bot_can_kick),
+                draft_extension.then_some(true)
             );
             let conn = Connection::open(&historical).unwrap();
             assert_eq!(user_version(&conn), VERSION);

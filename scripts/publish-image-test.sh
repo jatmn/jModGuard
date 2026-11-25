@@ -326,24 +326,24 @@ for component in bot api webui; do
 done
 
 # Migration origins are distinct from exact application runtime ranges.
-for field in update-control=3 upgrade-min-core=23 upgrade-min-guild=17 guild-schema=23; do
+for field in update-control=3 upgrade-min-core=23 upgrade-min-guild=17 guild-schema=24; do
   contains_arg "io.jmodguard.${field}" "${schema_args[@]}" || fail "missing coordinated metadata ${field}"
 done
 
 # Capability labels come from the selected source, independently of SHA.
 readarray -d '' -t launcher_args < <(build_args bot "$HEAD_SHA" "" . "" current "$(staging_ref bot)")
-for field in launcher-revision=48 min-launcher-revision=7 base-abi=debian-trixie-amd64; do
+for field in launcher-revision=49 min-launcher-revision=7 base-abi=debian-trixie-amd64; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "missing launcher requirement ${field}"
 done
 launcher_source="$(mktemp -d)"
 mkdir -p "$launcher_source/src/db" "$launcher_source/migrations/guild"
 cp src/db.rs "$launcher_source/src/db.rs"
 cp migrations/guild/current_version.txt "$launcher_source/migrations/guild/current_version.txt"
-sed -e 's/^pub const LAUNCHER_REVISION: u32 = 48;$/pub const LAUNCHER_REVISION: u32 = 49;/' \
+sed -e 's/^pub const LAUNCHER_REVISION: u32 = 49;$/pub const LAUNCHER_REVISION: u32 = 50;/' \
     src/db/update_control.rs >"$launcher_source/src/db/update_control.rs"
 readarray -d '' -t launcher_args < <(build_args api "$HEAD_SHA" "" "$launcher_source" "" current "$(staging_ref api)")
 # A selected service source without a declared runtime predates Trixie.
-for field in launcher-revision=49 min-launcher-revision=7 base-abi=debian-bookworm-amd64; do
+for field in launcher-revision=50 min-launcher-revision=7 base-abi=debian-bookworm-amd64; do
   contains_arg "io.jmodguard.${field}" "${launcher_args[@]}" || fail "selected source lost ${field}"
 done
 

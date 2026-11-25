@@ -2022,6 +2022,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             oauth: Arc::clone(&app.oauth),
             control: recovery_control(&app),
             apply_enabled: std::env::var("JMODGUARD_UPDATE_APPLY_ENABLED").as_deref() == Ok("1"),
+            now: recovery::current_timestamp,
             api: Some(Arc::clone(&app)),
             writer: None,
             launcher: recovery::launcher_link(&app.cfg),

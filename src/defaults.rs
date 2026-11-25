@@ -35,7 +35,7 @@ pub fn default_rules() -> Vec<RuleDef> {
     out
 }
 
-fn rule(id: &str) -> RuleDef {
+pub(crate) fn rule(id: &str) -> RuleDef {
     let (name, description, params, actions) = match id {
         "mention_spam" => (
             "Mention spam",
@@ -109,19 +109,34 @@ fn rule(id: &str) -> RuleDef {
                 0,
             )],
         ),
+        crate::onboarding_trap::RULE_ID => (
+            "Onboarding bot trap",
+            "Kick members who select the trap role in Discord Onboarding.",
+            json!({"role_id": null, "join_window_minutes": crate::onboarding_trap::DEFAULT_JOIN_WINDOW}),
+            vec![action(
+                1,
+                "kick",
+                "[Automod] Kicked for suspected bot (onboarding)",
+                0,
+                0,
+            )],
+        ),
         _ => unreachable!(),
     };
     RuleDef {
         name: name.into(),
         description: description.into(),
-        enabled: true,
-        dry_run: id == "attachment_flood" || id == "repeat_text",
+        enabled: id != crate::onboarding_trap::RULE_ID,
+        dry_run: matches!(
+            id,
+            "attachment_flood" | "repeat_text" | crate::onboarding_trap::RULE_ID
+        ),
         params,
         actions,
         whitelist_roles: vec![],
         whitelist_channels: vec![],
         whitelist_users: vec![],
-        skip_moderators: false,
+        skip_moderators: id == crate::onboarding_trap::RULE_ID,
         include_channels: vec![],
         log_automod: true,
         open_case: true,

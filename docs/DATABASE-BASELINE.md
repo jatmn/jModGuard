@@ -119,8 +119,8 @@ across guilds ([MEMBERS.md](MEMBERS.md)).
 
 ## Separate guild-store family
 
-The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version 23,
-using `migrations/guild/0016_baseline.sql` through `0022_member_name_sort_key.sql`.
+The `GuildDataStore` library initializes/verifies `jmodguard-guild-1`, version 24,
+using `migrations/guild/0016_baseline.sql` through `0023_onboarding_trap.sql`.
 The v0.2.0 baseline includes the version 16 payload format with optional immutable
 ban attempt tags, and the version 17 `guild_member_pending_rejoin_notes` table for
 durable member-rejoin log delivery.
@@ -132,12 +132,17 @@ Version 20 adds `guild_server_names` (the bot's latest role and channel names fo
 WebUI pickers, display only); upgraded stores start empty until the bot's next
 Gateway snapshot. Version 21 adds virtual keys and scoped indexes for case list sorting.
 Version 22 adds virtual keys and scoped indexes for member directory sorting.
+Version 23 corrects the virtual member name sort key for empty names.
+Version 24 stores onboarding setup observations and private case visibility in
+separate columns, preserving legacy JSON payloads. For stores on schema 23, use
+matching bot and API images with the [paired upgrade](BUNNY-UPDATES.md#schema-upgrades-and-recovery).
+The new bot migrates the stores before the matching API starts.
 Earlier binaries must not open stores that use a newer guild schema. This separate
 database holds identity, placement bindings, receipts, membership/log-channel
 settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings, bounded latest-message snapshots and the bounded
 [member directory](MEMBERS.md). Initialize verifies and upgrades a matching earlier
-store atomically. Opening an initialized store requires version 23. See
+store atomically at bot startup. Ordinary opens require version 24. See
 [tenant runtime](TENANT-RUNTIME.md). Core is at migration 0028. Each opener refuses
 the other family. No records are moved by startup.
 Guild migration 0009 adds bounded latest-message snapshots with fixed 24-hour expiry

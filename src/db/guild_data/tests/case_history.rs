@@ -562,8 +562,8 @@ async fn version_three_upgrade_preserves_cases_and_removal_markers() {
         )
         .unwrap();
         raw.execute_batch_bounded("INSERT INTO guild_memberships VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',100,1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", 64 * 1024 * 1024).unwrap();
-        raw.execute_bounded("INSERT INTO guild_cases VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,'discord:1',?2,0)",params![id.as_str(),serde_json::to_string(&data(1)).unwrap()], 64 * 1024 * 1024).unwrap();
-        raw.execute_bounded("INSERT INTO guild_cases VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,'discord:2',NULL,1)",params![removed.as_str()], 64 * 1024 * 1024).unwrap();
+        raw.execute_bounded("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,'discord:1',?2,0)",params![id.as_str(),serde_json::to_string(&data(1)).unwrap()], 64 * 1024 * 1024).unwrap();
+        raw.execute_bounded("INSERT INTO guild_cases(guild_id,enrollment_id,case_id,source_key,payload,deleted) VALUES(10,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?1,'discord:2',NULL,1)",params![removed.as_str()], 64 * 1024 * 1024).unwrap();
         apply_guild_fixture(&raw, 3, GUILD_BASELINE_VERSION).unwrap();
     }
     assert!(GuildDataStore::open(f.options(), reg.clone()).is_err());

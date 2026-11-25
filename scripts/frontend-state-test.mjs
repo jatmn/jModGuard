@@ -1069,7 +1069,7 @@ test('analytics opens with a one-line header, range selector and info tip, then 
   assert.equal(tip.getAttribute('aria-label'), 'About these trends');
   assert.match(panel.querySelector('#analytics-help').textContent, /never added up/);
   // Unverified Members may be recovering on its own, so the tip defers to the Members page instead of demanding Reconcile.
-  assert.match(panel.querySelector('#analytics-help').textContent, /the Members page says whether to Reconcile or wait/);
+  assert.match(panel.querySelector('#analytics-help').textContent, /Open Members to see recovery progress, retry timing, and available controls/);
   assert.equal([...panel.querySelectorAll('.dashboard-note strong')].some((n) => n.textContent === 'About these trends'), false);
   // Range selector: labelled group of pressed-state buttons.
   const range = panel.querySelector('[aria-label="Analytics date range"]');
@@ -1214,15 +1214,33 @@ test('analytics tooltips show exact per-day values on hover and from the keyboar
 });
 
 test('analytics shows member coverage as a badge, never as wrapped inline text', async () => {
-  for (const [coverage, badge] of [['importing', 'partial'], ['uncertain', 'unverified'], ['complete', null]]) {
-    const { app } = harness(async () => response(analyticsSummary(30, { members: { current: 10417, banned: 0, known: 10417, coverage } })));
+  const gapAt = Date.UTC(2026, 10, 23, 12);
+  for (const [coverage, badge, details] of [
+    ['not_started', 'not imported', {}],
+    ['importing', 'partial', {}],
+    ['stalled', 'stalled', { status_reason: 'No import progress', next_attempt_at: gapAt }],
+    ['reconciling', 'reconciling', { reconciliation_reason: 'guild gateway unavailable', gap_at: gapAt }],
+    ['uncertain', 'unverified', { reconciliation_reason: 'gateway continuity interrupted', gap_at: gapAt, status_reason: 'rate_limited' }],
+    ['complete', null, {}],
+  ]) {
+    const { app } = harness(async () => response(analyticsSummary(30, { members: { current: 10417, banned: 0, known: 10417, coverage, ...details } })));
     app.state.config = ANALYTICS_CONFIG;
     const panel = app.tabAnalytics();
     await settle();
     assert.equal(kpiValue(panel, 'Members'), '10.4k', coverage);
     assert.equal(kpi(panel, 'Members').querySelector('.an-kpi-value').getAttribute('title'), '10,417');
-    assert.equal(kpi(panel, 'Members').querySelector('.an-badge')?.textContent ?? null, badge, coverage);
-    assert.doesNotMatch(kpi(panel, 'Members').querySelector('.an-kpi-body').textContent, /\(/);
+    const tile = kpi(panel, 'Members');
+    const badgeNode = tile.querySelector('.an-badge');
+    assert.equal(badgeNode?.textContent ?? null, badge, coverage);
+    const title = badgeNode?.getAttribute('title');
+    if (coverage === 'stalled') assert.match(title, /No import progress.*Next attempt:/);
+    if (coverage === 'reconciling') assert.match(title, /reconnected at .+Discord reported the server as unavailable/);
+    if (coverage === 'uncertain') assert.match(title, /reconnected at .+Discord connection was interrupted.*rate_limited/);
+    if (coverage === 'not_started') {
+      assert.equal(tile.querySelector('a').textContent, 'Import');
+      assert.equal(tile.querySelector('a').getAttribute('href'), `?list=members&guild=${app.state.guildId}`);
+    }
+    assert.doesNotMatch(tile.querySelector('.an-kpi-body').textContent, /\(/);
   }
 });
 
@@ -1902,6 +1920,51 @@ test('Members retries its first failed visible status read and renders the recov
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
 });
 
+for (const retryAfter of [null, '30']) {
+  test(`Members retries a status 503 during audit backoff (Retry-After: ${retryAfter})`, async () => {
+    const now = Date.UTC(2026, 10, 23, 12);
+    const auditDelay = 3600000;
+    const refreshAfter = 60000;
+    const readRetryDelay = retryAfter ? 30000 : 10000;
+    let reads = 0;
+    const h = harness(async url => {
+      if (!url.endsWith('/member-sync')) return response({ members: [] });
+      reads++;
+      if (reads === 2) return {
+        ok: false, status: 503, headers: { get: name => name === 'retry-after' ? retryAfter : null },
+        text: async () => JSON.stringify({ error: 'Member sync status temporarily unavailable' }),
+      };
+      return response({
+        status: 'complete', phase: 'complete', progress_revision: 7,
+        run_id: 'initial-1', run_kind: 'initial', initial_completed_at: now - 60000,
+        coverage: 'uncertain', as_of: reads === 1 ? now : now + refreshAfter + readRetryDelay,
+        reconciliation_needed: true, reconciliation_reason: 'bot restarted', gap_at: now, gap_auto_clear: true,
+        automatic_reconcile_at: null, audit_recovery_status: 'needs_attention', audit_recovery_reason: 'permission_denied',
+        audit_recovery_phase: 'ban', audit_recovery_next_attempt_at: now + auditDelay,
+      });
+    });
+    h.app.state.tab = 'members';
+    h.app.state.config = { enrollment_id: 'membership' };
+    const panel = h.app.tabMembers();
+    await settle();
+    assert.equal(reads, 1);
+    const hasPoll = delay => [...h.timers.values()].some(timer => timer.delay === delay);
+    assert.ok(hasPoll(auditDelay));
+
+    h.advanceTime(refreshAfter);
+    await fire(findNode(panel, n => n.localName === 'button' && textOf(n) === 'Refresh'), 'click');
+    await settle();
+    assert.equal(reads, 2);
+    assert.match(textOf(panel), /Could not refresh import status/);
+    await runMemberPoll(h, readRetryDelay);
+
+    assert.equal(reads, 3);
+    assert.doesNotMatch(textOf(panel), /Could not refresh import status/);
+    assert.match(textOf(panel), /Member list may be out of date/);
+    assert.ok(hasPoll(auditDelay - refreshAfter - readRetryDelay));
+  });
+}
+
 test('Members accepts a later primary restore status but rejects an older in-flight response', async () => {
   let statusReads = 0;
   let resolveOldRequest;
@@ -1982,7 +2045,7 @@ test('Members explains a coverage gap and offers Reconcile inside the notice onl
   sync = { ...base, reconciliation_reason: 'ban audit case persistence unavailable', gap_auto_clear: false };
   panel = h.app.tabMembers();
   await settle();
-  assert.match(textOf(notice(panel)), /The bot could not save a member or ban change at .+, so it may have missed/);
+  assert.match(textOf(notice(panel)), /The bot could not save a member or ban change at .+ \(ban audit case persistence unavailable\), so it may have missed/);
   assert.doesNotMatch(textOf(notice(panel)), /offline/);
 
   h.app.state.me = { ...(h.app.state.me || {}), preview: true };
@@ -1994,6 +2057,59 @@ test('Members explains a coverage gap and offers Reconcile inside the notice onl
   h.app.renderTab();
   await settle();
   assert.equal(h.nodes.get('#preview-banner').className, 'preview-banner alert alert-soft alert-warning');
+});
+
+test('Members shows automatic reconcile progress, cooldown, and a blocked run with its action', async () => {
+  const gapAt = Date.UTC(2026, 10, 23, 12);
+  const base = {
+    status: 'complete', phase: 'complete', run_id: 'done', run_kind: 'initial',
+    initial_completed_at: gapAt - 1000, reconciliation_needed: true,
+    gap_at: gapAt, reconciliation_reason: 'bot stopped unexpectedly', as_of: gapAt,
+  };
+  for (const [sync, message, button] of [
+    [{ ...base, coverage: 'reconciling', run_kind: 'reconcile', phase: 'members', status: 'queued' },
+      /Member list reconciling.*bot stopped unexpectedly.*normal request pace/, 'Pause'],
+    [{ ...base, coverage: 'uncertain', automatic_reconcile_at: gapAt },
+      /Member list may be out of date.*can queue an automatic Reconcile/, 'Reconcile from Discord'],
+    [{ ...base, coverage: 'uncertain', automatic_reconcile_at: gapAt + 3600000 },
+      /Member list may be out of date.*Next automatic Reconcile: .+start sooner/, 'Reconcile from Discord'],
+    [{ ...base, coverage: 'uncertain', gap_auto_clear: true, audit_recovery_status: 'needs_attention', audit_recovery_reason: 'permission_denied', audit_recovery_next_attempt_at: gapAt + 3600000 },
+      /Member list may be out of date.*retry at the next attempt/, 'Reconcile from Discord'],
+    [{ ...base, coverage: 'uncertain', run_kind: 'reconcile', phase: 'members', status: 'waiting', status_reason: 'permission_denied', next_attempt_at: gapAt + 60000 },
+      /Member list may be out of date.*retry at the next attempt/, 'Retry'],
+    [{ ...base, coverage: 'uncertain', run_kind: 'reconcile', phase: 'members', status: 'needs_attention', status_reason: 'pagination_stalled' },
+      /Member list may be out of date.*Resolve the reported error and select Retry/, 'Retry'],
+  ]) {
+    const h = harness(async (url) => response(url.endsWith('/member-sync') ? sync : { members: [] }));
+    h.app.state.tab = 'members';
+    h.app.state.config = { enrollment_id: 'member-enrollment' };
+    const panel = h.app.tabMembers();
+    await settle();
+    const notice = findNode(panel, n => n.id === 'member-coverage-notice');
+    assert.match(textOf(notice), message);
+    assert.ok([...panel.querySelectorAll('button')].some(n => n.textContent === button));
+    if (sync.status_reason) assert.ok(textOf(memberImport(panel)).includes(sync.status_reason));
+    if (sync.next_attempt_at) assert.match(textOf(memberImport(panel)), /Next attempt:/);
+    if (sync.audit_recovery_reason) {
+      assert.match(textOf(memberImport(panel)), /permission_denied.*Audit recovery next attempt:/);
+    }
+  }
+});
+
+test('Members shows stalled initial import and its saved reason and attempt', async () => {
+  const asOf = Date.UTC(2026, 10, 23, 12);
+  for (const next of [asOf + 60000, null]) {
+    const sync = { status: 'queued', coverage: 'stalled', run_kind: 'initial', run_id: 'seed', phase: 'members',
+      started_at: asOf - 7200000, status_reason: 'Import stopped progressing', next_attempt_at: next, as_of: asOf };
+    const h = harness(async (url) => response(url.endsWith('/member-sync') ? sync : { members: [] }));
+    h.app.state.tab = 'members';
+    h.app.state.config = { enrollment_id: 'member-enrollment' };
+    const panel = h.app.tabMembers();
+    await settle();
+    assert.match(textOf(memberImportStatus(panel)), /Stalled.*Import stopped progressing/);
+    assert.match(textOf(memberImport(panel)), next ? /Next attempt: .+/ : /Next attempt: not scheduled/);
+    assert.ok([...panel.querySelectorAll('button')].some(n => n.textContent === 'Pause'));
+  }
 });
 
 test('Members keeps a restore-interrupted control unconfirmed rather than claiming it applied', async () => {
@@ -7191,6 +7307,84 @@ test('honeypot switch shows the kick action that save submits', async () => {
   assert.equal(action.value, 'kick');
 });
 
+test('built-in onboarding trap starts off, warns on unsafe setup, and saves a guild role', async () => {
+  const calls = [];
+  const id = 'onboarding_bot_trap';
+  const roleId = '22';
+  const reason = '[Automod] Kicked for suspected bot (onboarding)';
+  const record = {
+    rule_id: id,
+    name: 'Onboarding bot trap',
+    description: 'Kick members who select the trap role in Discord Onboarding.',
+    effective: {
+      enabled: false, dry_run: true, skip_moderators: true, log_automod: true, open_case: true,
+      params: { role_id: null, join_window_minutes: 30 },
+      actions: [{ at: 1, action: 'kick', reason }],
+    },
+  };
+  const original = record.effective;
+  const h = harness(async (url, options) => {
+    if (url.endsWith('/server-names')) return response({
+      roles: [{ id: roleId, name: 'Anti-bot', managed: false }],
+      channels: [],
+      onboarding_trap: { bot_can_kick: false, roles_at_or_above_bot: [roleId], roles_with_grants: [roleId], roles_with_member_grants: [roleId] },
+    });
+    assert.equal(options.method, 'PUT');
+    assert.match(url, new RegExp(`/rules/${id}$`));
+    const body = JSON.parse(options.body);
+    calls.push(body);
+    return response({ config_patch: { kind: 'rule', id, scope: 'guild', value: body.data } });
+  });
+  h.app.state.config = { enrollment_id: 'membership', rules: [record] };
+  h.app.navigate('rules');
+  const card = h.nodes.get('#content');
+  assert.match(textOf(card), /Onboarding bot trap.*disabled/s);
+  const guide = findNode(card, n => n.localName === 'a' && textOf(n) === 'Onboarding bot trap setup guide');
+  assert.match(guide.getAttribute('href'), /docs\/ONBOARDING-BOT-TRAP\.md$/);
+  const edit = async () => {
+    await fire(findNode(card, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Edit'), 'click');
+    await settle();
+    return h.document.querySelector('.modal-overlay');
+  };
+  const save = (modal) => fire(findNode(modal, n => n.localName === 'button' && textOf(n) === 'Save'), 'click');
+  let modal = await edit();
+  assert.equal(pickerLabelled(modal, 'Enabled').disabled, true);
+  assert.equal(pickerLabelled(modal, 'Join window (minutes)').value, '30');
+  assert.equal(pickerLabelled(modal, 'Kick reason').value, reason);
+  await chooseOption(pickerLabelled(modal, 'Trap role'), '@Anti-bot');
+  const enabled = pickerLabelled(modal, 'Enabled');
+  assert.equal(enabled.checked, false);
+  assert.equal(enabled.disabled, false);
+  enabled.checked = true;
+  await fire(enabled, 'change');
+  assert.match(textOf(modal), /lacks Kick Members/);
+  assert.match(textOf(modal), /below jModGuard’s highest role/);
+  assert.match(textOf(modal), /grants permissions or channel access/);
+  assert.match(textOf(modal), /individual channel permission grant/);
+  assert.match(textOf(modal), /Kick is the available moderation action/);
+  await typeValue(pickerLabelled(modal, 'Join window (minutes)'), '0');
+  await save(modal);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].scope, 'guild');
+  assert.deepEqual(calls[0].expected, original);
+  assert.equal(calls[0].data.enabled, true);
+  assert.equal(calls[0].data.dry_run, true);
+  assert.equal(calls[0].data.skip_moderators, true);
+  assert.deepEqual(calls[0].data.params, { role_id: roleId, join_window_minutes: 0 });
+  assert.deepEqual(calls[0].data.actions, [{ at: 1, action: 'kick', reason }]);
+  await settle();
+  assert.match(textOf(card), /lacks Kick Members/);
+  assert.match(textOf(card), /individual channel permission grant/);
+
+  modal = await edit();
+  await fire(pickerByName(modal, 'Remove @Anti-bot'), 'click');
+  assert.equal(pickerLabelled(modal, 'Enabled').disabled, true);
+  await save(modal);
+  assert.equal(calls[1].data.enabled, false);
+  assert.equal(calls[1].data.params.role_id, null);
+  assert.deepEqual(calls[1].expected, calls[0].data);
+});
+
 test('custom pattern draft save uses dry_run and custom id', () => {
   const h = harness();
   const draft = h.app.buildCustomRuleSaveBody(
@@ -7821,6 +8015,58 @@ for (const audit of [false, true]) test(`Members waits for scheduled ${audit ? '
   assert.ok([...h.timers.values()].some(timer => timer.delay >= 299000 && timer.delay <= 300000));
   assert.equal([...h.timers.values()].filter(timer => timer.delay === 10000).length, 0);
 });
+
+for (const reason of ['permission_denied', 'pagination_stalled']) {
+  test(`Members refreshes only scheduled audit recovery after ${reason}`, async () => {
+    const now = Date.UTC(2026, 10, 23, 12);
+    const retryAt = now + 3600000;
+    const stalled = reason === 'pagination_stalled';
+    const reconcileAt = now + 7200000;
+    const savedImport = {
+      status: 'complete', phase: 'complete', run_id: 'import-1', run_kind: stalled ? 'reconcile' : 'initial',
+      initial_completed_at: now - 60000, progress_revision: 7, next_attempt_at: null,
+    };
+    let reads = 0;
+    const h = harness(async url => {
+      if (!url.endsWith('/member-sync')) return response({ members: [] });
+      reads++;
+      if (reads === 3) return response({
+        ...savedImport, coverage: 'complete', as_of: retryAt + 20000,
+        reconciliation_needed: false, gap_auto_clear: false, automatic_reconcile_at: null,
+        audit_recovery_status: 'complete', audit_recovery_next_attempt_at: null,
+      });
+      return response({
+        ...savedImport, coverage: 'uncertain', as_of: reads === 1 ? now : retryAt,
+        reconciliation_needed: true, reconciliation_reason: 'bot restarted', gap_at: now,
+        gap_auto_clear: true, automatic_reconcile_at: stalled ? reconcileAt : null,
+        audit_recovery_status: 'needs_attention', audit_recovery_reason: reason,
+        audit_recovery_phase: 'ban', audit_recovery_next_attempt_at: retryAt,
+        audit_recovery_pending: !stalled && reads === 2,
+      });
+    });
+    h.app.state.tab = 'members';
+    h.app.state.config = { enrollment_id: 'membership' };
+    const panel = h.app.tabMembers();
+    await settle();
+    assert.equal(reads, 1);
+    assert.match(textOf(panel), /Member list may be out of date/);
+    const delays = () => [...h.timers.values()].map(timer => timer.delay);
+    if (stalled) {
+      assert.ok(delays().includes(reconcileAt - now), 'the scheduled full Reconcile still activates polling');
+      assert.ok(!delays().includes(3600000));
+      assert.ok(!delays().includes(10000));
+      return;
+    }
+    assert.ok(!delays().includes(10000), 'wait for the saved audit retry');
+    await runMemberPoll(h, 3600000);
+    assert.equal(reads, 2);
+    assert.match(textOf(panel), /Member list may be out of date/);
+    await runMemberPoll(h, 20000);
+    assert.equal(reads, 3);
+    assert.doesNotMatch(textOf(panel), /Member list may be out of date|Audit recovery next attempt:/);
+    assert.ok(!delays().includes(10000) && !delays().includes(20000));
+  });
+}
 
 const logJob = (event = 'member_join', guild_id = '987654321098765432') => ({
   id: `${guild_id}-${event}`, guild_id, enrollment_id: 'membership', state: 'pending',
@@ -12121,7 +12367,7 @@ test('Platform analytics shows every metric together with changes, names, icons 
   assert.match(h.nodes.get('#platform-analytics-help').textContent, /previous period of the same length/);
   // One-line member note for partial totals.
   const status = h.nodes.get('#platform-analytics-status');
-  assert.match(status.textContent, /^Member totals are partial\. Member totals cover 2 of 3 servers; the rest were unavailable\. 1 counted server has a member directory still importing or awaiting Reconcile\.$/);
+  assert.match(status.textContent, /^Member totals are partial\. Member totals cover 2 of 3 servers; the rest were unavailable\. 1 counted server has incomplete member-directory coverage\.$/);
 
   assert.equal(kpiValue(page, 'Servers'), '3');
   assert.equal(kpiValue(page, 'Members'), '40');
@@ -12163,6 +12409,24 @@ test('Platform analytics shows every metric together with changes, names, icons 
   assert.equal(bans.getAttribute('title'), '3 · 75% of fleet');
   assert.equal(parseFloat(bans.querySelector('.pa-share-fill').style.width), 75);
   assert.equal(rows[2].querySelectorAll('td')[3].querySelector('.pa-share-fill'), null);
+});
+
+test('Platform Servers list shows unstarted imports and links to authorized Members pages', async () => {
+  const snapshot = platformSnapshot();
+  snapshot.members.by_guild[PLATFORM_IDS[0]].coverage = 'not_started';
+  snapshot.members.by_guild[PLATFORM_IDS[1]] = { current: 10, coverage: 'uncertain',
+    reconciliation_reason: 'gateway continuity interrupted', gap_at: Date.UTC(2026, 10, 23, 12) };
+  const h = ownerHarness(async () => response(snapshot));
+  h.app.state.guilds = [{ id: PLATFORM_IDS[0], name: 'Alpha', access: 'manage' }];
+  h.app.navigate('platform-analytics');
+  await settle();
+  const [first, second] = platformPanel(h, 'Servers').querySelectorAll('tbody tr');
+  assert.equal(first.querySelector('.an-badge').textContent, 'not imported');
+  assert.equal(first.querySelector('a').textContent, 'Import');
+  assert.equal(first.querySelector('a').getAttribute('href'), `?list=members&guild=${PLATFORM_IDS[0]}`);
+  assert.equal(second.querySelector('.an-badge').textContent, 'unverified');
+  assert.match(second.querySelector('.an-badge').getAttribute('title'), /reconnected at .+Discord connection was interrupted/);
+  assert.equal(second.querySelector('a'), null);
 });
 
 test('Platform analytics ranks active servers, movers and each server\'s share of the fleet', async () => {
@@ -12276,7 +12540,7 @@ test('Platform analytics retains totals, charts and rows through refresh failure
   await settle();
   assertRetained();
   assert.match(h.nodes.get('#platform-analytics-status').textContent, /refresh failed: offline.*stale/i);
-  assert.match(h.nodes.get('#platform-analytics-status').textContent, /1 counted server has a member directory still importing/);
+  assert.match(h.nodes.get('#platform-analytics-status').textContent, /1 counted server has incomplete member-directory coverage/);
   await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
   assertRetained();
   assert.match(h.nodes.get('#platform-analytics-status').textContent, /refresh failed: offline.*stale/i, 'retained figures remain stale while retrying');

@@ -12,8 +12,10 @@ This routing does not move a populated guild between stores.
 
 ## Routing and handles
 
-`TenantRuntime` registers configured stores, creates an empty matching store or reopens
-the same identity, and caches a small number of handles (default 8). An empty configured
+`TenantRuntime` registers configured stores and caches a small number of handles
+(default 8). At startup, the bot creates empty stores and upgrades matching older
+stores. During service, a cache miss reopens the expected identity at the current
+schema. An empty configured
 store `id` rediscovers the stamped store identity, then the matching catalog row; a new
 id is minted only when both are absent. There is no
 per-guild task or connection pool. A dedicated store is used only for its owner guild;

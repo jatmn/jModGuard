@@ -60,6 +60,11 @@ pub enum ControlOp {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         replace_velocity_limit: bool,
     },
+    SaveOnboardingTrap {
+        scope: ScopeWire,
+        expected: RuleDef,
+        rule: RuleDef,
+    },
     DeleteRule {
         request: ScopeWire,
         target: ScopeWire,
@@ -413,6 +418,7 @@ const ADMINISTRATOR_BIT: u64 = 1 << 3;
 pub fn control_actor_need(op: &ControlOp) -> ControlActorNeed {
     match op {
         ControlOp::PatchSettings { scope, .. }
+        | ControlOp::SaveOnboardingTrap { scope, .. }
         | ControlOp::AddKnownBadImage { scope, .. }
         | ControlOp::RemoveKnownBadImage { scope, .. } => scope_actor_need(scope),
         ControlOp::UpsertRule { target, .. }
@@ -540,6 +546,7 @@ pub fn control_actor_needs(op: &ControlOp) -> Vec<ControlActorNeed> {
 pub fn settings_role_scope(op: &ControlOp) -> Option<&ScopeWire> {
     let (request, target) = match op {
         ControlOp::PatchSettings { scope, .. }
+        | ControlOp::SaveOnboardingTrap { scope, .. }
         | ControlOp::AddKnownBadImage { scope, .. }
         | ControlOp::RemoveKnownBadImage { scope, .. } => (scope, scope),
         ControlOp::UpsertRule {
@@ -786,6 +793,10 @@ async fn apply_control_inner(
             clear_guild_override,
             replace_velocity_limit,
         } => {
+            anyhow::ensure!(
+                id != crate::onboarding_trap::RULE_ID,
+                "Reload the dashboard to save the onboarding trap"
+            );
             let saved = if clear_guild_override {
                 anyhow::ensure!(
                     target.global,
@@ -812,6 +823,21 @@ async fn apply_control_inner(
                 )
                 .await?
             };
+            Ok(ControlReply::Saved {
+                body: serde_json::to_value(saved)?,
+            })
+        }
+        ControlOp::SaveOnboardingTrap {
+            scope,
+            expected,
+            rule,
+        } => {
+            let scope = scope_of(scope)?;
+            let guild_id = scope.guild_id();
+            let scope = ConfigurationWriteScope::new(scope.clone(), scope)?;
+            let saved =
+                compare_and_set_onboarding_trap(db, guild_id, Some(scope), &expected, &rule)
+                    .await?;
             Ok(ControlReply::Saved {
                 body: serde_json::to_value(saved)?,
             })

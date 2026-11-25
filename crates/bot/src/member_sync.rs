@@ -51,7 +51,7 @@ impl ReadyObservation {
     /// process; a first acknowledgement after one also covers that in-process
     /// gap. A crash only proves lease liveness, not Gateway coverage. A stop
     /// time ahead of this host's clock gives no usable downtime. Anything else
-    /// still needs Reconcile.
+    /// needs a full Reconcile.
     fn gap_mark(
         self,
         previous: Option<db::PreviousBotStop>,
@@ -1116,7 +1116,7 @@ async fn run_loop(
                     continue;
                 }
             }
-            let status = if observation == ReadyObservation::First {
+            let mut status = if observation == ReadyObservation::First {
                 match store
                     .initialize_member_directory(scope.clone(), bot_id, now_ms)
                     .await
@@ -1150,12 +1150,10 @@ async fn run_loop(
                     }
                 }
             };
-            earliest_attempt_ms = earlier_attempt(earliest_attempt_ms, status.next_attempt_at);
-            earliest_attempt_ms =
-                earlier_attempt(earliest_attempt_ms, status.audit_recovery_next_attempt_at);
-            if observation.coverage_gap(
+            let gap_recorded = observation.coverage_gap(
                 status.initial_completed_at.is_some() || status.last_progress_at.is_some(),
-            ) {
+            );
+            if gap_recorded {
                 let previous = if observation == ReadyObservation::First {
                     // Read once per process; a failed read is retried for the next guild.
                     if previous_stop.is_none() {
@@ -1183,6 +1181,52 @@ async fn run_loop(
                 }
             }
             ready_coverage.acknowledge(key.clone(), ready_generation);
+            if gap_recorded {
+                match store
+                    .member_sync_worker_status(scope.clone(), bot_id, now_ms)
+                    .await
+                {
+                    Ok(updated) => status = updated,
+                    Err(error) => {
+                        tracing::warn!(
+                            guild_id = gid,
+                            "member sync status after gap unavailable: {error:#}"
+                        );
+                        continue;
+                    }
+                }
+            }
+            if status.automatic_reconcile_at.is_some_and(|at| at <= now_ms) {
+                match store
+                    .enqueue_automatic_member_reconcile(scope.clone(), bot_id, now_ms)
+                    .await
+                {
+                    Ok(_) => match store
+                        .member_sync_worker_status(scope.clone(), bot_id, now_ms)
+                        .await
+                    {
+                        Ok(updated) => status = updated,
+                        Err(error) => {
+                            tracing::warn!(
+                                guild_id = gid,
+                                "member sync status after reconcile admission unavailable: {error:#}"
+                            );
+                            continue;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            guild_id = gid,
+                            "automatic member reconcile admission deferred: {error:#}"
+                        );
+                    }
+                }
+            }
+            earliest_attempt_ms = earlier_attempt(earliest_attempt_ms, status.next_attempt_at);
+            earliest_attempt_ms =
+                earlier_attempt(earliest_attempt_ms, status.audit_recovery_next_attempt_at);
+            earliest_attempt_ms =
+                earlier_attempt(earliest_attempt_ms, status.automatic_reconcile_at);
             if !backfilled.contains(&key) {
                 match store
                     .backfill_member_case_index(scope.clone(), bot_id, 100)
@@ -2216,6 +2260,8 @@ mod tests {
 
     fn completed_import_with_audit_recovery() -> db::guild_data::MemberSyncStatus {
         db::guild_data::MemberSyncStatus {
+            coverage: db::guild_data::DirectoryCoverage::Uncertain,
+            automatic_reconcile_at: None,
             initial_completed_at: Some(1),
             reconciliation_needed: true,
             reconciliation_reason: Some("gateway continuity interrupted".into()),
@@ -2298,6 +2344,8 @@ mod tests {
     #[test]
     fn stalled_audit_recovery_does_not_schedule_worker_claims() {
         let status = db::guild_data::MemberSyncStatus {
+            coverage: db::guild_data::DirectoryCoverage::Uncertain,
+            automatic_reconcile_at: None,
             initial_completed_at: Some(1),
             reconciliation_needed: false,
             reconciliation_reason: None,
@@ -2684,6 +2732,89 @@ mod tests {
         settle_parked(&probe, 1, 1).await;
         app.invalidate_member_sync_scope();
         drive_until(|| probe.scope_lookups.load(Ordering::Relaxed) >= 2).await;
+        worker.abort();
+        let _ = worker.await;
+        drop((store, app));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gateway_ready_gap_admits_a_paced_reconcile() {
+        let (directory, app, store, scope) = enrolled_directory().await;
+        let start = 10_000;
+        store
+            .initialize_member_directory(scope.clone(), 42, start)
+            .await
+            .unwrap();
+        store
+            .backfill_member_case_index(scope.clone(), 42, 100)
+            .await
+            .unwrap();
+        for (index, phase) in [
+            MemberSyncPhase::Members,
+            MemberSyncPhase::Bans,
+            MemberSyncPhase::Audit,
+            MemberSyncPhase::Audit,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let now = start + index as i64 * 15_001;
+            let claim = store
+                .claim_member_sync(scope.clone(), 42, "setup".into(), now, 90_000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.phase, phase);
+            store
+                .commit_member_page(
+                    scope.clone(),
+                    claim.clone(),
+                    MemberSyncPage {
+                        phase,
+                        expected_cursor: claim.cursor,
+                        next_cursor: None,
+                        members: vec![],
+                        bans: vec![],
+                        audits: vec![],
+                        terminal: true,
+                        total_estimate: None,
+                        page_size: 100,
+                        pace_ms: 15_000,
+                        active_guild_count: 1,
+                        verification: None,
+                    },
+                    now + 1,
+                )
+                .await
+                .unwrap();
+        }
+        let probe = Arc::new(LoopProbe::default());
+        let worker = tokio::spawn(run_loop(
+            app.clone(),
+            Arc::new(Http::new("unused")),
+            gateway_cache(10),
+            probe.clone(),
+        ));
+        drive_until(|| probe.status_reads.load(Ordering::Relaxed) >= 1).await;
+        settle_parked(&probe, 1, 1).await;
+        let queued = store
+            .member_sync_worker_status(scope, 42, start + 120_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            queued.reconciliation_reason.as_deref(),
+            Some("gateway continuity interrupted")
+        );
+        assert_eq!(
+            queued.coverage,
+            db::guild_data::DirectoryCoverage::Reconciling
+        );
+        assert_eq!(queued.run_kind.as_deref(), Some("reconcile"));
+        assert_eq!(
+            queued.status, "queued",
+            "the request gate has not reached its first slot"
+        );
         worker.abort();
         let _ = worker.await;
         drop((store, app));

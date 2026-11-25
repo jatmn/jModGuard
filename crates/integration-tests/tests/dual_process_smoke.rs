@@ -56,6 +56,60 @@ fn open_dual(path: &Path) -> (Db, Db) {
 }
 
 #[tokio::test]
+async fn bot_startup_migrates_previous_guild_schema_for_read_only_api() {
+    use db::guild_data::{GuildDataStore, GuildStoreOptions, SCHEMA_VERSION};
+    use db::guild_stores::{StoreId, StorePolicy, StoreRegistration};
+
+    let path = tmp_db_path("guild_schema_startup");
+    {
+        let mut bot_cfg = BotProcessConfig::default();
+        bot_cfg.db.path = path.clone();
+        bot_cfg.db.pool_size = 2;
+        let api_cfg = ApiProcessConfig {
+            db: bot_cfg.db.clone(),
+            ..Default::default()
+        };
+        drop(Db::open(&path, 2).unwrap());
+        let mut guild_path = path.as_os_str().to_owned();
+        guild_path.push(".guild.db");
+        GuildDataStore::create_historical_store(
+            GuildStoreOptions {
+                path: guild_path.into(),
+                url: String::new(),
+                token: String::new(),
+                pool_size: 2,
+                read_only: false,
+            },
+            StoreRegistration::for_test(StoreId::new(), StorePolicy::Shared),
+            SCHEMA_VERSION - 1,
+        )
+        .unwrap();
+
+        let api_db = jmodguard_api::startup::open_database(&api_cfg)
+            .await
+            .unwrap();
+        assert!(api_db.is_read_only());
+        let error = ApiState::new(api_cfg.clone(), api_db.clone())
+            .err()
+            .expect("API state must reject the previous guild schema");
+        assert!(db::is_schema_not_ready(&error), "{error:#}");
+
+        let bot_db = jmodguard_bot::startup::open_database(&bot_cfg)
+            .await
+            .unwrap();
+        let _bot = jmodguard_bot::startup::build_state(bot_cfg, bot_db)
+            .await
+            .expect("bot startup must open and migrate the previous guild schema");
+
+        // Open once so a missing bot migration fails instead of entering the
+        // API startup retry loop.
+        ApiState::new(api_cfg, api_db)
+            .expect("read-only API state must open the guild store after bot startup");
+    }
+    cleanup_db(&path);
+}
+
+#[tokio::test]
 async fn smoke_dual_process_config_sync() {
     let tmp = tmp_db_path("e2e");
     {

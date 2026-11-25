@@ -11,11 +11,13 @@ pub const PAIRED_LAUNCHER_REQUIRED: &str = "paired bot and API upgrades need rev
 /// After a failed pair the API supervisor serves maintenance from its baked
 /// binary, so that image must also route owner recovery to the bot launcher.
 pub const PAIRED_RECOVERY_REQUIRED: &str = "paired bot and API upgrades need a revision-38 API image for owner recovery; a launcher-only update is not enough, install a new API image first";
+/// First bot launcher that admits a paired guild schema migration.
+const PAIRED_GUILD_MIGRATION_REVISION: u32 = 49;
 pub const APP_ONLY_SCHEMA_CHANGE_REFUSED: &str =
     "app-only update cannot change the database schema";
 /// Monotonic updater capability, independent of source SHA and shell protocol.
 /// Bump when shipping launcher changes; raise the minimum only when required.
-pub const LAUNCHER_REVISION: u32 = 48;
+pub const LAUNCHER_REVISION: u32 = 49;
 // Selected bots need the auth-exit hold before the readiness deadline check.
 pub const REQUIRED_LAUNCHER_REVISION: u32 = 7;
 /// First launcher that verifies an image signature before staging.
@@ -1552,7 +1554,8 @@ impl UpdateControl {
             let recovering = existing.as_ref().filter(|value| value.phase.active() && recover);
             let irreversible = recovering.is_some_and(|value| value.irreversible);
             let from_guild = if let Some(previous) = recovering {
-                previous.bot.release.upgrade.as_ref().context("missing prior upgrade contract")?.guild_schema.max(previous.from_guild)
+                // A failed bot startup may have migrated only some stores.
+                previous.from_guild
             } else {
                 let bot_seen = bot.observed.as_ref().context("bot has not been observed")?;
                 let api_seen = api.observed.as_ref().context("API has not been observed")?;
@@ -1565,12 +1568,25 @@ impl UpdateControl {
                 APP_ONLY_SCHEMA_CHANGE_REFUSED
             );
             anyhow::ensure!(
-                bot_contract.guild_schema == from_guild,
-                APP_ONLY_SCHEMA_CHANGE_REFUSED
+                schema >= bot_contract.min_core
+                    && from_guild >= bot_contract.min_guild
+                    && (from_guild..=from_guild.saturating_add(1)).contains(&bot_contract.guild_schema),
+                "release cannot upgrade the current databases; use a compatible pair at the current or next guild schema"
             );
-            anyhow::ensure!(schema >= bot_contract.min_core && schema <= target_bot.result_schema
-                && from_guild >= bot_contract.min_guild && from_guild <= bot_contract.guild_schema,
-                "release cannot upgrade the current databases; downgrades are not allowed");
+            if let Some(previous) = recovering.filter(|value| value.irreversible) {
+                let previous_guild = previous.bot.release.upgrade.as_ref()
+                    .context("missing prior upgrade contract")?.guild_schema;
+                anyhow::ensure!(
+                    bot_contract.guild_schema >= previous_guild,
+                    "guild schema cannot be downgraded after the migration boundary"
+                );
+            }
+            if bot_contract.guild_schema > from_guild {
+                anyhow::ensure!(
+                    bot.observed.as_ref().is_some_and(|seen| seen.launcher_revision >= PAIRED_GUILD_MIGRATION_REVISION),
+                    "paired guild schema migrations need a revision-49 or newer bot launcher"
+                );
+            }
             for (state, target) in [(&bot, &target_bot), (&api, &target_api)] {
                 let observed = state.observed.as_ref().context("service has not been observed")?;
                 anyhow::ensure!(observed.launcher_revision >= PAIRED_LAUNCHER_REVISION, PAIRED_LAUNCHER_REQUIRED);
@@ -2162,7 +2178,8 @@ mod tests {
 
     #[tokio::test]
     async fn pair_pins_both_candidates_and_fences_irreversible_recovery() {
-        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
+        let from_guild = guild_data::SCHEMA_VERSION;
+        let f = Fixture::new(CORE_SCHEMA_VERSION, from_guild + 1).await;
         assert!(f.queue(false, 7400).await.is_err());
         let op = f.queue(false, 100).await.unwrap();
         assert_eq!(op.phase, UpgradePhase::Preparing);
@@ -2223,9 +2240,37 @@ mod tests {
         assert!(f.queue(true, 100).await.is_err());
         f.ack(&op.id, "bot", UpgradeAcknowledgement::Stopped).await;
         assert!(f.control.upgrade().await.unwrap().unwrap().error.is_some());
+
+        let mut older_bot = op.bot.release.clone();
+        let mut older_api = op.api.release.clone();
+        for (release, digit) in [(&mut older_bot, 'e'), (&mut older_api, 'f')] {
+            release.source_sha = "d".repeat(40);
+            release.digest = format!("sha256:{}", digit.to_string().repeat(64));
+            release.upgrade.as_mut().unwrap().guild_schema = from_guild;
+            f.control
+                .checked(
+                    &release.component,
+                    "latest",
+                    Some(release.clone()),
+                    None,
+                    100,
+                )
+                .await
+                .unwrap();
+        }
+        let refused = f
+            .control
+            .request_upgrade(&older_bot.digest, &older_api.digest, true, 100)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            "guild schema cannot be downgraded after the migration boundary"
+        );
         let retry = f.queue(true, 8000).await.unwrap(); // pinned retry survives stale discovery
         assert_ne!(retry.id, op.id);
         assert!(retry.irreversible);
+        assert_eq!(retry.from_guild, from_guild);
         assert!(f.control.abort_upgrade(&retry.id).await.is_err());
         assert!(
             f.control
@@ -2325,7 +2370,7 @@ mod tests {
     async fn paired_queue_refuses_a_lower_guild_schema() {
         let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION - 1).await;
         let error = f.queue(false, 100).await.unwrap_err();
-        assert_eq!(error.to_string(), APP_ONLY_SCHEMA_CHANGE_REFUSED);
+        assert!(error.to_string().contains("current or next guild schema"));
         f.assert_pair_not_queued().await;
     }
 
@@ -2938,7 +2983,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn app_only_paired_queue_refuses_higher_result_schema() {
+    async fn paired_queue_refuses_higher_core_schema() {
         let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
         let schema = f.control.schema_version().await.unwrap();
         for role in ["bot", "api"] {
@@ -2957,22 +3002,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn app_only_paired_queue_refuses_guild_schema_change() {
-        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION).await;
-        let mut release = f.control.component("bot").await.unwrap().candidate.unwrap();
-        release.upgrade.as_mut().unwrap().guild_schema = guild_data::SCHEMA_VERSION + 1;
+    async fn paired_queue_refuses_skipping_a_guild_schema() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION + 2).await;
+        let error = f.queue(false, 100).await.unwrap_err();
+        assert!(error.to_string().contains("current or next guild schema"));
+        f.assert_pair_not_queued().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paired_guild_migration_needs_a_capable_bot_launcher() {
+        let f = Fixture::new(CORE_SCHEMA_VERSION, guild_data::SCHEMA_VERSION + 1).await;
         f.control
-            .checked("bot", "latest", Some(release.clone()), None, 200)
+            .observe_launcher("bot", PAIRED_GUILD_MIGRATION_REVISION - 1, None)
             .await
             .unwrap();
-        let mut api = f.control.component("api").await.unwrap().candidate.unwrap();
-        api.upgrade.as_mut().unwrap().guild_schema = guild_data::SCHEMA_VERSION + 1;
-        f.control
-            .checked("api", "latest", Some(api), None, 200)
-            .await
-            .unwrap();
-        let error = f.queue(false, 200).await.unwrap_err();
-        assert_eq!(error.to_string(), APP_ONLY_SCHEMA_CHANGE_REFUSED);
+        let error = f.queue(false, 100).await.unwrap_err();
+        assert!(
+            error.to_string().contains("newer bot launcher"),
+            "{error:#}"
+        );
+        f.assert_pair_not_queued().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -100,7 +100,14 @@ pub(super) async fn member_totals(app: &Arc<ApiState>) -> Value {
                 }
                 by_guild.insert(
                     guild_id,
-                    json!({"current": totals.current, "coverage": totals.coverage}),
+                    json!({
+                        "current": totals.current,
+                        "coverage": totals.coverage,
+                        "reconciliation_reason": totals.reconciliation_reason,
+                        "gap_at": totals.gap_at,
+                        "status_reason": totals.status_reason,
+                        "next_attempt_at": totals.next_attempt_at,
+                    }),
                 );
             }
             _ => unavailable += 1,
