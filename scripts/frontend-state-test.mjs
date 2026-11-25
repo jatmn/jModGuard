@@ -4947,7 +4947,7 @@ for (const { defaultFontSize, heatmapOnly, resourceOnly, widths } of [
   { defaultFontSize: 24, heatmapOnly: true, widths: [360, 320, 390, 480, 1280] },
   { defaultFontSize: 32, widths: [1280, 320] },
   { defaultFontSize: 48, heatmapOnly: true, widths: [1280, 320] },
-  { defaultFontSize: 64, resourceOnly: true, widths: [320, 308] },
+  { defaultFontSize: 64, resourceOnly: true, widths: [308, 320, 418, 419] },
 ]) test(`${heatmapOnly ? 'heatmap cells and labels' : 'chart plots and labels'} fit with a ${defaultFontSize}px browser default font`, { timeout: 120000 }, async t => {
   if (!firefoxBinary || !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url))) {
     assert.ok(!process.env.CI, 'CI requires Firefox and the built WebUI');
@@ -5090,11 +5090,13 @@ for (const { defaultFontSize, heatmapOnly, resourceOnly, widths } of [
       }
       assert.deepEqual(m.clipped, [], `${name}: labels fit the plot`);
       assert.deepEqual(m.collisions, [], `${name}: axis labels have space`);
-      if (tab === 'resources' && width === 320 && defaultFontSize >= 32) {
+      if (tab === 'resources' && (resourceOnly || (width === 320 && defaultFontSize === 32))) {
         assert.ok(m.resourceRanges.some(({ chart }) => chart === 'Bot memory'), 'bot memory chart rendered');
         assert.ok(m.resourceRanges.some(({ chart }) => chart === 'API memory'), 'API memory chart rendered');
         for (const { chart, endpoints, labels } of m.resourceRanges) {
-          assert.ok(endpoints[0] < endpoints[1], `${chart} has a positive plot width`);
+          const plotWidth = endpoints[1] - endpoints[0];
+          const minimumPlotWidth = resourceOnly ? 32 : 1;
+          assert.ok(plotWidth >= minimumPlotWidth, `${chart} needs a usable plot width at ${name}, got ${plotWidth}px`);
           assert.deepEqual(labels.map(({ text }) => text.slice(0, 6)), ['Nov 17', 'Nov 18'], `${chart} shows both dates`);
           labels.forEach(({ anchor, mark }, i) => {
             assert.equal(anchor, endpoints[i], `${chart} date stays at its endpoint`);

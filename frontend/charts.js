@@ -850,19 +850,20 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
     text, shortText: withDay ? text.slice(0, -6) : undefined,
   }));
   const valueWidth = Math.max(...ticks.map((value) => measureAxisLabel(format(value))));
-  let fittedWidth = valueWidth;
-  if (valueWidth + 2 * axisGap >= width - padRight) {
-    // Make room for data. The compact start date can extend left of its
-    // tick, or center on it when the plot starts too far left.
-    const startDate = dates[0];
-    const dateWidth = measureAxisLabel(startDate.shortText ?? startDate.text);
-    const plotStartLimit = width - padRight - 2 * axisGap;
-    const dateAnchorLimit = dateWidth <= plotStartLimit ? plotStartLimit : width - Math.ceil(dateWidth / 2);
-    fittedWidth = Math.max(1, Math.min(plotStartLimit, dateAnchorLimit) - 2 * axisGap);
+  const minPadLeft = 2 * axisGap + 1;
+  // Keep 32 CSS pixels for the time series when the gutter is constrained.
+  const plotStartLimit = width - padRight - 32;
+  let padLeft = Math.max(minPadLeft, Math.min(valueWidth + 2 * axisGap, plotStartLimit));
+  const startDate = dates[0];
+  const dateWidth = measureAxisLabel(startDate.shortText ?? startDate.text);
+  if (dateWidth <= width && padLeft < dateWidth && padLeft + dateWidth > width) {
+    // The date cannot start or end at this tick. Fit it centered if the tick
+    // reaches its left half-width, otherwise leave room to start at the tick.
+    const dateLimit = padLeft >= dateWidth / 2 ? width - Math.ceil(dateWidth / 2) : width - dateWidth;
+    padLeft = Math.max(minPadLeft, Math.min(padLeft, dateLimit));
   }
-  const valueScale = axisScale * Math.min(1, fittedWidth / valueWidth);
+  const valueScale = axisScale * Math.min(1, (padLeft - 2 * axisGap) / valueWidth);
   const valueFontSize = valueScale < 1 ? `${valueScale}em` : undefined;
-  const padLeft = fittedWidth + 2 * axisGap;
   const innerWidth = Math.max(1, width - padLeft - padRight);
   const dateTicks = dates.map((date, i) => ({ key: i, ...date,
     x: i === 0 ? padLeft : width - padRight, anchor: i === 0 ? "start" : "end" }));
