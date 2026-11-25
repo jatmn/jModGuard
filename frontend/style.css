@@ -501,6 +501,7 @@ pre.code { background: var(--panel2); border: 1px solid var(--shell-border); bor
 /* Shared chart layout. SVG plots supply their fixed height. */
 #content:has(> .chart-page) { max-width: 1440px; margin-inline: auto; }
 .chart-plot { display: block; width: 100%; font-size: var(--ui-font-size-sm); }
+.chart-axis-tick { stroke: var(--muted); pointer-events: none; }
 .chart-font-probe { position: absolute; width: 1em; height: 1em; visibility: hidden; }
 
 /* Analytics trend charts (workspace and owner views). */

@@ -55,27 +55,46 @@ function fitLabel(text, available, measureLabel) {
   return "";
 }
 
+const ANCHOR_FRACTIONS = { start: 0, middle: 0.5, end: 1 };
+
 function layoutTicks({ width, gap, measureLabel }, labels, maxRows) {
   const placed = [];
   const rows = Array.from({ length: maxRows }, () => []);
-  for (const { text, x, anchor = "start", key } of labels) {
+  for (const { text, x, anchor: preferred = "start", key } of labels) {
     const size = measureLabel(text);
-    if (!text || size + 2 > width) continue;
-    const offset = anchor === "start" ? 0 : anchor === "end" ? size : size / 2;
-    const left = Math.max(1, Math.min(width - size - 1, x - offset));
-    const right = left + size;
-    const row = rows.findIndex((ticks) => ticks.every((tick) => right + gap <= tick.left || left >= tick.right + gap));
-    if (row < 0) continue;
-    rows[row].push({ left, right });
-    placed.push({ key, text, left, row, x: left + offset, anchor });
+    if (!text || size > width) continue;
+    // Change the text anchor at an edge instead of moving the tick off its column.
+    const candidates = [...new Set([preferred, "middle", "start", "end"])].map((anchor) => {
+      const left = x - size * ANCHOR_FRACTIONS[anchor];
+      return { anchor, left, right: left + size };
+    }).filter(({ left, right }) => left >= 0 && right <= width);
+    for (const [row, ticks] of rows.entries()) {
+      const fit = candidates.find(({ left, right }) => ticks.every((tick) => right + gap <= tick.left || left >= tick.right + gap));
+      if (!fit) continue;
+      ticks.push(fit);
+      placed.push({ key, text, x, anchor: fit.anchor, row });
+      break;
+    }
   }
   return placed;
 }
 
-function horizontalTicks(layout, labels, y, className = "an-axis-day") {
-  // Keep the last endpoint when the available space cannot hold every tick.
-  return layoutTicks(layout, [...labels].reverse(), 1).reverse().map(({ key, text, x, anchor }) =>
-    axisText(text, { key, className, x, y, textAnchor: anchor }));
+function horizontalTicks(layout, labels, { y, axisY, origin = 0, className = "an-axis-day", fontSize }) {
+  // Reserve space for endpoints before intermediate ticks, with the latest first.
+  const priority = labels.length < 2 ? labels : [labels.at(-1), labels[0], ...labels.slice(1, -1).reverse()];
+  const endpoints = new Set([labels[0]?.key, labels.at(-1)?.key]);
+  const countEndpoints = (ticks) => ticks.filter(({ key }) => endpoints.has(key)).length;
+  let ticks = layoutTicks(layout, priority, 1);
+  if (countEndpoints(ticks) < endpoints.size && priority.some(({ shortText }) => shortText)) {
+    const compact = layoutTicks(layout, priority.map((tick) => ({ ...tick, text: tick.shortText ?? tick.text })), 1);
+    if (countEndpoints(compact) > countEndpoints(ticks)) ticks = compact;
+  }
+  const tickEnd = axisY + (y < axisY ? -3 : 3);
+  return ticks.sort((a, b) => a.x - b.x).map(({ key, text, x, anchor }) =>
+    h("g", { key },
+      h("line", { className: "chart-axis-tick", x1: origin + x, x2: origin + x, y1: axisY, y2: tickEnd }),
+      axisText(text, { className, x: origin + x, y, textAnchor: anchor, fontSize }),
+    ));
 }
 
 function staggeredRowLabels({ width, lineHeight, gap, measureLabel }, rowHeight, variants) {
@@ -184,7 +203,7 @@ export function TrendChart({ points, metric, title }) {
       ...horizontalTicks(layout, [
         { key: "first", text: dayLabel(first), x: padLeft },
         { key: "last", text: dayLabel(last), x: width - gap, anchor: "end" },
-      ], height - padTop, "trend-day"),
+      ], { y: height - padTop, axisY: y(0), className: "trend-day" }),
     ),
     h("figcaption", { className: "sr-only" }, `${title} per day, ${first} through ${last}.`),
   );
@@ -320,7 +339,7 @@ function dayTicks(layout, points, slots, y) {
     const anchor = dayAnchor(index, points.length);
     const { x, center, end } = slots[index];
     return { key: `t${index}`, anchor, x: anchor === "start" ? x : anchor === "end" ? end : center, text: shortDay(points[index].day) };
-  }), y);
+  }), { y, axisY: y - layout.lineHeight / 2 - 4 });
 }
 
 // One hover/focus position shared by every chart in a panel. Arrow keys move
@@ -660,11 +679,9 @@ export function ActivityHeatmap({ cells }) {
   const hourScale = Math.min(1, (top - 2) / lineHeight);
   const measureHour = (text) => Math.ceil(measureLabel(text) * hourScale);
   const hourGap = Math.min(labelGap, plotWidth / 12);
-  const shortHours = measureHour("00:00") + measureHour("18:00") + hourGap + 2 > plotWidth;
-  // Keep the first and last labeled hours when intermediate ticks would collide.
-  const hourTicks = layoutTicks({ width: plotWidth, gap: hourGap, measureLabel: measureHour }, [0, 18, 6, 12].map((hour) => ({
-    key: hour, x: hour * slot, text: shortHours ? hourLabel(hour).slice(0, 2) : hourLabel(hour),
-  })), 1).sort((first, second) => first.key - second.key);
+  const hourTicks = [0, 6, 12, 18].map((hour) => ({
+    key: hour, x: hour * slot, text: hourLabel(hour), shortText: hourLabel(hour).slice(0, 2),
+  }));
   const summary = peak
     ? `Busiest hour: ${WEEKDAYS[peak.weekday]} ${hourLabel(peak.hour)} UTC with ${formatExact(peak.count)} actions.`
     : "No enforcement actions in this range.";
@@ -675,8 +692,8 @@ export function ActivityHeatmap({ cells }) {
     h(
       ChartPlot,
       { ref, height, className: "an-heatmap", role: "img", "aria-label": `Enforcement actions by weekday and UTC hour. Rows run Sunday through Saturday. ${summary}`, "aria-describedby": "an-heatmap-readout", onMouseLeave: () => setActive(null) },
-      ...hourTicks.map(({ key, text, x }) => axisText(text, { key: `h${key}`, className: "an-axis-day", x: left + x, y: top / 2,
-        fontSize: hourScale < 1 ? `${hourScale}em` : undefined })),
+      ...horizontalTicks({ width: plotWidth, gap: hourGap, measureLabel: measureHour }, hourTicks,
+        { y: top / 2, axisY: top, origin: left, fontSize: hourScale < 1 ? `${hourScale}em` : undefined }),
       ...weekdays.labels.map(({ text, x }, weekday) => h("g", { key: WEEKDAYS[weekday] },
         h("title", {}, WEEKDAY_NAMES[weekday]),
         axisText(text, { className: "an-axis-day", x, y: top + (weekday + 0.5) * rowHeight,
@@ -729,7 +746,8 @@ export function CapacityGauge({ used, limit, marks, tone, summary }) {
       "div",
       { className: "du-gauge-scale", "aria-hidden": "true", ref: layout.ref, style: { height: `${labelRows}lh` } },
       h("i", { className: "chart-font-probe" }),
-      ...labels.map(({ key, text, left, row }) => h("span", { key, style: { left, top: `${row}lh` } }, text)),
+      ...labels.map(({ key, text, x, anchor, row }) => h("span", { key,
+        style: { left: x, top: `${row}lh`, transform: `translateX(${-100 * ANCHOR_FRACTIONS[anchor]}%)` } }, text)),
     ),
   );
 }
@@ -787,8 +805,8 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
   const innerWidth = Math.max(1, width - padLeft - padRight);
   const innerHeight = Math.max(1, height - 2 * inset - lineHeight - gap);
   const dates = [utcClock(from, withDay), utcClock(to, withDay)];
-  const shortDates = withDay && dates.reduce((total, text) => total + measureLabel(text), 0) + 3 * gap > width;
-  const dateTicks = dates.map((text, i) => ({ key: i, text: shortDates ? text.slice(0, -6) : text, x: i === 0 ? gap : width - gap, anchor: i === 0 ? "start" : "end" }));
+  const dateTicks = dates.map((text, i) => ({ key: i, text, shortText: withDay ? text.slice(0, -6) : undefined,
+    x: i === 0 ? padLeft : width - padRight, anchor: i === 0 ? "start" : "end" }));
   const count = points.length;
   const x = (index) => padLeft + (count <= 1 ? innerWidth / 2 : (index * innerWidth) / (count - 1));
   const y = (value) => inset + innerHeight - Math.min(1, Math.max(0, value / top)) * innerHeight;
@@ -830,7 +848,7 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
             : h("polyline", { key: `${line.key}-${i}`, className: `br-line ${line.tone}`, points: run.map(([index, value]) => `${x(index).toFixed(1)},${y(value).toFixed(1)}`).join(" ") }),
         ),
       ),
-      ...horizontalTicks(layout, dateTicks, height - inset),
+      ...horizontalTicks(layout, dateTicks, { y: height - inset, axisY: y(0) }),
     ),
     lines.length > 1 &&
       h(

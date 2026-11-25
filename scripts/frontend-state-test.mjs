@@ -1051,7 +1051,7 @@ const kpi = (panel, label) => [...panel.querySelectorAll('.an-kpi')].find((tile)
 const kpiValue = (panel, label) => kpi(panel, label).querySelector('.an-kpi-value').textContent;
 function chartHelpers() {
   const context = vm.createContext({ React, useState, h: React.createElement });
-  return vm.runInContext(`${chartsSource}\n({ formatCount, formatExact, formatDelta, niceTicks, dayTickIndices, heatLevel, KpiTile, RangeSelector })`, context);
+  return vm.runInContext(`${chartsSource}\n({ formatCount, formatExact, formatDelta, niceTicks, dayTickIndices, heatLevel, layoutTicks, KpiTile, RangeSelector })`, context);
 }
 
 test('analytics opens with a one-line header, range selector and info tip, then fills every panel progressively', async () => {
@@ -1280,6 +1280,25 @@ test('analytics formats very large numbers compactly and keeps exact values in l
   const html = renderToStaticMarkup(React.createElement(c.KpiTile, { label: 'Warnings', value: 2e12, delta: c.formatDelta(2e12, 0), values: [1, 2], rangeLabel: '7 days' }));
   assert.match(html, /<span class="an-kpi-value" title="2,000,000,000,000">2T<\/span>/);
   assert.match(html, /aria-label="Warnings: 2,000,000,000,000, up 2,000,000,000,000 vs previous 7 days"/);
+});
+
+test('shared tick layout keeps true positions through re-anchoring and thinning', () => {
+  const { layoutTicks } = chartHelpers();
+  const measureLabel = text => 8 * text.length;
+  const gap = 4;
+  for (const width of [54, 90, 160, 210, 360]) {
+    const labels = [18, 0, 6, 12, 24].map(hour => ({ key: hour, text: `${hour}:00`, x: hour * width / 24 }));
+    const placed = layoutTicks({ width, gap, measureLabel }, labels, 1);
+    assert.ok(placed.some(({ key }) => key === 18), 'the priority tick is retained');
+    const bounds = Array.from(placed, ({ key, text, x, anchor }) => {
+      assert.equal(x, labels.find(label => label.key === key).x, `tick ${key} stays at its column at width ${width}`);
+      const size = measureLabel(text);
+      const left = x - size * { start: 0, middle: 0.5, end: 1 }[anchor];
+      assert.ok(left >= 0 && left + size <= width, `tick ${key} fits at width ${width}`);
+      return [left, left + size];
+    }).sort(([a], [b]) => a - b);
+    bounds.slice(1).forEach(([left], i) => assert.ok(left >= bounds[i][1] + gap, `labels do not overlap at width ${width}`));
+  }
 });
 
 test('workspace survives a fresh JS context and keeps snowflakes exact', () => {
@@ -4642,7 +4661,8 @@ const heatmapGeometryProbe = `(async () => {
     width: plot.clientWidth, height: plot.clientHeight,
     cells: [...plot.querySelectorAll('.an-heat')].map(box),
     labels: [...plot.querySelectorAll('text')].map(node => ({ ...box(node), text: node.textContent,
-      name: node.getAttribute('aria-label'), center: Number(node.getAttribute('y')) })),
+      name: node.getAttribute('aria-label'), center: Number(node.getAttribute('y')), anchorX: Number(node.getAttribute('x')),
+      markX: node.parentElement.querySelector('line')?.x1.baseVal.value ?? null })),
   });
 })()`;
 
@@ -4670,6 +4690,11 @@ function assertHeatmapGeometry(m, defaultFontSize) {
   });
   assert.ok(m.labels.some(({ text }) => text === '00:00' || text === '00'), 'midnight is labeled');
   assert.ok(m.labels.some(({ text }) => text === '18:00' || text === '18'), '18:00 is labeled');
+  for (const { text, anchorX, markX } of m.labels.filter(({ text }) => /^\d{2}(:00)?$/.test(text)).reverse()) {
+    const column = m.cells[parseInt(text, 10)].x;
+    assert.ok(Math.abs(anchorX - column) < 0.01, `${text} anchors at ${anchorX}px for its column at ${column}px`);
+    assert.ok(markX !== null && Math.abs(markX - column) < 0.01, `${text} has a tick at its column`);
+  }
   for (const [i, a] of m.labels.entries()) {
     assert.ok(fits({ ...a, y: a.y + 1, height: a.height - 2 }), `${a.text} fits the chart`);
     for (const b of m.labels.slice(i + 1)) {
@@ -4680,7 +4705,12 @@ function assertHeatmapGeometry(m, defaultFontSize) {
   }
 }
 
-for (const defaultFontSize of [16, 32, 48]) test(`${defaultFontSize === 48 ? 'heatmap cells and labels' : 'chart plots and labels'} fit with a ${defaultFontSize}px browser default font`, { timeout: 120000 }, async t => {
+for (const { defaultFontSize, heatmapOnly, widths } of [
+  { defaultFontSize: 16, widths: [2560, 1280, 1920, 3440, 320] },
+  { defaultFontSize: 24, heatmapOnly: true, widths: [360, 320, 390, 480, 1280] },
+  { defaultFontSize: 32, widths: [1280, 320] },
+  { defaultFontSize: 48, heatmapOnly: true, widths: [1280, 320] },
+]) test(`${heatmapOnly ? 'heatmap cells and labels' : 'chart plots and labels'} fit with a ${defaultFontSize}px browser default font`, { timeout: 120000 }, async t => {
   if (!firefoxBinary || !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url))) {
     assert.ok(!process.env.CI, 'CI requires Firefox and the built WebUI');
     return t.skip('Firefox or the built WebUI is unavailable');
@@ -4726,7 +4756,7 @@ for (const defaultFontSize of [16, 32, 48]) test(`${defaultFontSize === 48 ? 'he
     ['platform-analytics', '#an-membership-readout', '.an-grid > .an-span-7, .an-grid > .an-span-5'],
     ['usage', '.du-gauge-scale', '#usage-cards > .du-card'],
   ];
-  for (const [tab, ready, cards] of chartPages.filter(([tab]) => defaultFontSize < 48 || tab === 'analytics')) {
+  for (const [tab, ready, cards] of chartPages.filter(([tab]) => !heatmapOnly || tab === 'analytics')) {
     await evaluate(`(async () => {
       const waitFor = async selector => {
         for (let i = 0; i < 100; i++) {
@@ -4740,13 +4770,13 @@ for (const defaultFontSize of [16, 32, 48]) test(`${defaultFontSize === 48 ? 'he
       await waitFor('${ready}');
     })()`);
     let heights;
-    for (const width of defaultFontSize === 16 ? [2560, 1280, 1920, 3440, 320] : [1280, 320]) {
+    for (const width of widths) {
       const name = `${tab} at ${width}px`;
       await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height: 900 } });
-      if (tab === 'analytics' && defaultFontSize >= 32) await t.test(`${name}: heatmap cells and labels fit`, async () => {
+      if (tab === 'analytics' && defaultFontSize > 16) await t.test(`${name}: heatmap cells and labels fit`, async () => {
         assertHeatmapGeometry(JSON.parse(await evaluate(heatmapGeometryProbe)), defaultFontSize);
       });
-      if (defaultFontSize === 48) continue;
+      if (heatmapOnly) continue;
       const m = JSON.parse(await evaluate(`(async () => {
         await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
         const main = document.querySelector('#content');
