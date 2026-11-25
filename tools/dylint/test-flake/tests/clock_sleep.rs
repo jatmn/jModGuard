@@ -28,6 +28,13 @@ async fn tokio_starts_paused() {
 }
 
 #[tokio::test]
+async fn tokio_before_later_pause() {
+    let _ = tokio::time::Instant::now();
+    tokio::time::sleep(Duration::ZERO).await;
+    tokio::time::pause();
+}
+
+#[tokio::test]
 async fn tokio_pauses_explicitly() {
     tokio::time::pause();
     let _ = tokio::time::Instant::now();

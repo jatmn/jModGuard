@@ -384,9 +384,11 @@ async function main() {
             "clock:tests/clock_sleep.rs:std_instant",
             "clock:tests/clock_sleep.rs:std_system_time",
             "clock:tests/clock_sleep.rs:tokio_after_resume",
+            "clock:tests/clock_sleep.rs:tokio_before_later_pause",
             "clock:tests/clock_sleep.rs:tokio_unpaused",
             "sleep:tests/clock_sleep.rs:std_sleep",
             "sleep:tests/clock_sleep.rs:tokio_after_resume",
+            "sleep:tests/clock_sleep.rs:tokio_before_later_pause",
             "sleep:tests/clock_sleep.rs:tokio_unpaused",
         ].sort();
         if (actual.join("\n") !== expected.join("\n")) {
