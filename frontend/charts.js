@@ -57,38 +57,63 @@ function fitLabel(text, available, measureLabel) {
 
 const ANCHOR_FRACTIONS = { start: 0, middle: 0.5, end: 1 };
 
-function layoutTicks({ width, gap, measureLabel }, labels, maxRows) {
-  const placed = [];
-  const rows = Array.from({ length: maxRows }, () => []);
-  for (const { text, x, anchor: preferred = "start", key } of labels) {
-    const size = measureLabel(text);
-    if (!text || size > width) continue;
-    // Change the text anchor at an edge instead of moving the tick off its column.
-    const candidates = [...new Set([preferred, "middle", "start", "end"])].map((anchor) => {
-      const left = x - size * ANCHOR_FRACTIONS[anchor];
-      return { anchor, left, right: left + size };
-    }).filter(({ left, right }) => left >= 0 && right <= width);
+function tickPlacements({ width, measureLabel }, { text, x, anchor: preferred = "start", key }) {
+  if (!text) return [];
+  const size = measureLabel(text);
+  // Keep the tick at x while trying the text on either side or centered.
+  return [...new Set([preferred, "middle", "start", "end"])].map((anchor) => {
+    const left = x - size * ANCHOR_FRACTIONS[anchor];
+    return { key, text, x, anchor, left, right: left + size };
+  }).filter(({ left, right }) => left >= 0 && right <= width);
+}
+
+function tickVariants(layout, tick) {
+  const variants = [tickPlacements(layout, tick)];
+  if (tick.shortText) variants.push(tickPlacements(layout, { ...tick, text: tick.shortText }));
+  return variants;
+}
+
+function layoutTicks(layout, labels, maxRows, reserved = []) {
+  const { gap } = layout;
+  const placed = [...reserved];
+  const rows = Array.from({ length: maxRows }, (_, row) => reserved.filter((tick) => tick.row === row));
+  for (const tick of labels) {
+    const candidates = tickVariants(layout, tick).flat();
     for (const [row, ticks] of rows.entries()) {
       const fit = candidates.find(({ left, right }) => ticks.every((tick) => right + gap <= tick.left || left >= tick.right + gap));
       if (!fit) continue;
       ticks.push(fit);
-      placed.push({ key, text, x, anchor: fit.anchor, row });
+      placed.push({ ...fit, row });
       break;
     }
   }
   return placed;
 }
 
-function horizontalTicks(layout, labels, { y, axisY, origin = 0, className = "an-axis-day", fontSize }) {
-  // Reserve space for endpoints before intermediate ticks, with the latest first.
-  const priority = labels.length < 2 ? labels : [labels.at(-1), labels[0], ...labels.slice(1, -1).reverse()];
-  const endpoints = new Set([labels[0]?.key, labels.at(-1)?.key]);
-  const countEndpoints = (ticks) => ticks.filter(({ key }) => endpoints.has(key)).length;
-  let ticks = layoutTicks(layout, priority, 1);
-  if (countEndpoints(ticks) < endpoints.size && priority.some(({ shortText }) => shortText)) {
-    const compact = layoutTicks(layout, priority.map((tick) => ({ ...tick, text: tick.shortText ?? tick.text })), 1);
-    if (countEndpoints(compact) > countEndpoints(ticks)) ticks = compact;
+function fitEndpointPair(layout, first, last) {
+  const starts = tickVariants(layout, first);
+  const ends = tickVariants(layout, last);
+  // Prefer the normal gap, then allow a tighter pair with positive clearance.
+  for (const gap of new Set([layout.gap, Math.min(layout.gap, 2)])) {
+    for (const startForm of starts) {
+      for (const endForm of ends) {
+        for (const start of startForm) {
+          const end = endForm.find((tick) => start.right + gap <= tick.left);
+          if (end) return [{ ...start, row: 0 }, { ...end, row: 0 }];
+        }
+      }
+    }
   }
+  return [];
+}
+
+function horizontalTicks(layout, labels, { y, axisY, origin = 0, className = "an-axis-day", fontSize }) {
+  const first = labels[0];
+  const last = labels.at(-1);
+  const interior = labels.slice(1, -1).reverse();
+  const endpoints = labels.length > 1 ? fitEndpointPair(layout, first, last) : [];
+  const priority = endpoints.length ? interior : labels.length > 1 ? [last, first, ...interior] : labels;
+  const ticks = layoutTicks(layout, priority, 1, endpoints);
   const tickEnd = axisY + (y < axisY ? -3 : 3);
   return ticks.sort((a, b) => a.x - b.x).map(({ key, text, x, anchor }) =>
     h("g", { key },

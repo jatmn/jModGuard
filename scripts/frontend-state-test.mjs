@@ -1051,7 +1051,7 @@ const kpi = (panel, label) => [...panel.querySelectorAll('.an-kpi')].find((tile)
 const kpiValue = (panel, label) => kpi(panel, label).querySelector('.an-kpi-value').textContent;
 function chartHelpers() {
   const context = vm.createContext({ React, useState, h: React.createElement });
-  return vm.runInContext(`${chartsSource}\n({ formatCount, formatExact, formatDelta, niceTicks, dayTickIndices, heatLevel, layoutTicks, KpiTile, RangeSelector })`, context);
+  return vm.runInContext(`${chartsSource}\n({ formatCount, formatExact, formatDelta, niceTicks, dayTickIndices, heatLevel, layoutTicks, horizontalTicks, KpiTile, RangeSelector })`, context);
 }
 
 test('analytics opens with a one-line header, range selector and info tip, then fills every panel progressively', async () => {
@@ -1317,6 +1317,29 @@ test('shared tick layout keeps true positions through re-anchoring and thinning'
     }).sort(([a], [b]) => a - b);
     bounds.slice(1).forEach(([left], i) => assert.ok(left >= bounds[i][1] + gap, `labels do not overlap at width ${width}`));
   }
+});
+
+test('shared horizontal tick layout tries both endpoints before dropping one', () => {
+  const { horizontalTicks } = chartHelpers();
+  const labels = (layout, ticks) => Array.from(horizontalTicks(layout, ticks, { y: 20, axisY: 8 }), group => {
+    const [mark, text] = group.props.children;
+    assert.equal(mark.props.x1, text.props.x, 'the label stays at its tick');
+    return [text.props.children, text.props.x, text.props.textAnchor];
+  });
+  const dates = [
+    { key: 'start', text: 'Nov 17 12:10', shortText: 'Nov 17', x: 141, anchor: 'start' },
+    { key: 'end', text: 'Nov 18 12:10', shortText: 'Nov 18', x: 241, anchor: 'end' },
+  ];
+  const measureLabel = text => text.length === 6 ? 93 : 161;
+  assert.deepEqual(labels({ width: 250, gap: 9, measureLabel }, dates), [
+    ['Nov 17', 141, 'end'], ['Nov 18', 241, 'end'],
+  ], 'both compact dates fit with positive clearance at their true positions');
+  assert.deepEqual(labels({ width: 550, gap: 9, measureLabel }, [{ ...dates[0], x: 20 }, { ...dates[1], x: 530 }]), [
+    ['Nov 17 12:10', 20, 'start'], ['Nov 18 12:10', 530, 'end'],
+  ], 'full dates keep their preferred anchors when there is room');
+  assert.deepEqual(labels({ width: 160, gap: 5, measureLabel: () => 50 }, [
+    { key: 'first', text: 'First', x: 0 }, { key: 'last', text: 'Last', x: 90, anchor: 'end' },
+  ]), [['First', 0, 'start'], ['Last', 90, 'middle']], 'an alternate anchor for the last label makes room for both');
 });
 
 test('workspace survives a fresh JS context and keeps snowflakes exact', () => {
@@ -4919,6 +4942,12 @@ for (const { defaultFontSize, heatmapOnly, widths } of [
           }),
           collisions: collision(plots.map(plot => [...plot.querySelectorAll('text')])
             .concat(all('.du-gauge-scale').map(scale => [...scale.querySelectorAll('span')]))),
+          resourceRanges: all('.br-chart svg').map(plot => {
+            const axis = plot.querySelector('.an-gridline line');
+            return { chart: plot.getAttribute('aria-label').split(',')[0], endpoints: [axis.x1.baseVal.value, axis.x2.baseVal.value],
+              labels: [...plot.querySelectorAll('.an-axis-day')].map(node => ({ text: node.textContent,
+                anchor: node.x.baseVal.getItem(0).value, mark: node.parentElement.querySelector('line').x1.baseVal.value })) };
+          }),
           heights: plots.map(plot => box(plot).height),
           sparks: all('.an-spark').length,
           contentWidth: box(main).width,
@@ -4934,6 +4963,17 @@ for (const { defaultFontSize, heatmapOnly, widths } of [
       }
       assert.deepEqual(m.clipped, [], `${name}: labels fit the plot`);
       assert.deepEqual(m.collisions, [], `${name}: axis labels have space`);
+      if (tab === 'resources' && width === 320 && defaultFontSize === 32) {
+        assert.ok(m.resourceRanges.some(({ chart }) => chart === 'Bot memory'), 'bot memory chart rendered');
+        assert.ok(m.resourceRanges.some(({ chart }) => chart === 'API memory'), 'API memory chart rendered');
+        for (const { chart, endpoints, labels } of m.resourceRanges) {
+          assert.deepEqual(labels.map(({ text }) => text.slice(0, 6)), ['Nov 17', 'Nov 18'], `${chart} shows both dates`);
+          labels.forEach(({ anchor, mark }, i) => {
+            assert.equal(anchor, endpoints[i], `${chart} date stays at its endpoint`);
+            assert.equal(mark, endpoints[i], `${chart} tick stays at its endpoint`);
+          });
+        }
+      }
       assert.ok(m.heights.length > 0 && m.heights.every(height => height > 0 && height <= 280), `${name}: bounded plots`);
       heights ??= m.heights;
       assert.deepEqual(m.heights, heights, `${name}: plot heights are independent of width`);
