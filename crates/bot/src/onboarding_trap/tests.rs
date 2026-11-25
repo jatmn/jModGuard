@@ -111,6 +111,43 @@ fn saturated_replay_history_keeps_new_live_stays_eligible() {
 }
 
 #[test]
+fn replay_history_pressure_keeps_other_guilds_recent_matches() {
+    let recent = RecentMatches::default();
+    let quiet = (GuildId::new(GUILD), UserId::new(MEMBER));
+    let busy_guild = GuildId::new(GUILD + 1);
+    let role = RoleId::new(TRAP_ROLE);
+    let joined_at = Timestamp::from_millis(1).unwrap();
+
+    for dry_run in [false, true] {
+        let claim = recent
+            .claim(quiet, joined_at, role, dry_run, (0, 0))
+            .unwrap();
+        assert!(claim.complete(dry_run, |_| true));
+        drop(claim);
+
+        for index in 0..MATCH_LIMIT {
+            let subject = (busy_guild, UserId::new(100 + index as u64));
+            let claim = recent
+                .claim(subject, joined_at, role, dry_run, (0, 0))
+                .unwrap();
+            assert!(claim.complete(dry_run, |_| true));
+        }
+
+        assert!(
+            recent
+                .claim(quiet, joined_at, role, dry_run, (0, 0))
+                .is_none()
+        );
+        let oldest_busy = (busy_guild, UserId::new(100));
+        assert!(
+            recent
+                .claim(oldest_busy, joined_at, role, dry_run, (0, 0))
+                .is_some()
+        );
+    }
+}
+
+#[test]
 fn invalidated_claim_cannot_complete_or_release_its_successor() {
     let recent = RecentMatches::default();
     let subject = (GuildId::new(GUILD), UserId::new(MEMBER));
@@ -218,7 +255,7 @@ fn committed_kick_keeps_same_stay_reserved_even_if_replay_history_is_evicted() {
         .claim(subject, joined_at, RoleId::new(TRAP_ROLE), false, (0, 1))
         .unwrap();
     assert!(claim.complete(false, |_| true));
-    recent.claims.lock().history[0].evict_oldest();
+    recent.claims.lock().history[0].evict_oldest(None);
     recent.observe(subject.0, subject.1, Some((joined_at, &[])));
     assert!(
         recent

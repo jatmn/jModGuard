@@ -97,12 +97,21 @@ impl ReplayHistory {
             .front()
             .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= MATCH_RETENTION)
         {
-            self.evict_oldest();
+            self.evict_oldest(None);
         }
     }
 
-    fn evict_oldest(&mut self) {
-        if let Some((_, key)) = self.order.pop_front() {
+    fn evict_oldest(&mut self, guild: Option<GuildId>) {
+        // At capacity, replace the dispatching guild's oldest marker when it
+        // has one. Expiry and a guild without history use the global oldest.
+        let index = guild
+            .and_then(|guild| {
+                self.order
+                    .iter()
+                    .position(|&(_, ((entry_guild, _), _))| entry_guild == guild)
+            })
+            .unwrap_or(0);
+        if let Some((_, key)) = self.order.remove(index) {
             self.completed.remove(&key);
         }
     }
@@ -150,7 +159,8 @@ impl MatchClaim<'_> {
             return false;
         }
         if mode.completed.len() >= MATCH_LIMIT {
-            mode.evict_oldest();
+            let ((guild, _), _) = self.key;
+            mode.evict_oldest(Some(guild));
         }
         mode.completed.insert(self.key);
         mode.order.push_back((now, self.key));
