@@ -4646,9 +4646,14 @@ for (const defaultFontSize of [16, 32]) test(`chart plots and labels fit with a 
   server = await serveBuiltApp(() => false, undefined, {}, (url, json) => {
     const days = Number(url.searchParams.get('days')) || 30;
     if (url.pathname === '/api/owner/resources') json(resourceSnapshot());
-    else if (url.pathname === '/api/platform/analytics') json({
-      ...platformSnapshot(days), series: browserAnalytics(days).series.map((day, i) => ({ ...day, joins: i % 5, leaves: 1 })),
-    });
+    else if (url.pathname.endsWith('/analytics')) {
+      const analytics = browserAnalytics(days);
+      const series = days === 90 ? analytics.series.map((day, i) => ({ ...day, warns: 9900 + i })) : analytics.series;
+      if (url.pathname === '/api/platform/analytics') {
+        // A positive bar for every day lets the test match bars and hit targets in order.
+        json({ ...platformSnapshot(days), series: days === 90 ? series : series.map((day, i) => ({ ...day, joins: i % 5, leaves: 1 })) });
+      } else json({ ...analytics, series });
+    }
     else if (url.pathname === '/api/database-usage') json(usageOverview([usageDatabase(), usageDatabase({ id: 'shared', kind: 'guild' })]));
     else return false;
     return true;
@@ -4698,6 +4703,8 @@ for (const defaultFontSize of [16, 32]) test(`chart plots and labels fit with a 
         const overlaps = (a, b) => a.left < b.right - 1 && b.left < a.right - 1 && a.top < b.bottom - 1 && b.top < a.bottom - 1;
         const collision = groups => groups.flatMap(group => group.flatMap((a, i) =>
           group.slice(i + 1).filter(b => overlaps(box(a), box(b))).map(b => a.textContent + ' / ' + b.textContent)));
+        const weekdays = all('.an-heatmap text').filter(node => /^[A-Z][a-z]{2}$/.test(node.textContent));
+        const heatmapRows = [...new Map(all('.an-heatmap .an-heat').map(cell => [cell.y.baseVal.value, cell.height.baseVal.value]))];
         return JSON.stringify({
           bodyFont: font(document.body),
           labels: labels.map(node => {
@@ -4718,6 +4725,8 @@ for (const defaultFontSize of [16, 32]) test(`chart plots and labels fit with a 
           contentWidth: box(main).width,
           overflow: document.documentElement.scrollWidth - innerWidth,
           cardTops: all('${cards}').map(card => Math.round(box(card).top)),
+          weekdays: weekdays.map(node => [node.textContent, Number(node.getAttribute('y'))]),
+          heatmapRows,
         });
       })()`));
       assert.equal(m.bodyFont, defaultFontSize * 0.875, `${name}: browser font preference applied`);
@@ -4738,7 +4747,62 @@ for (const defaultFontSize of [16, 32]) test(`chart plots and labels fit with a 
         assert.ok(m.overflow <= 0, `${name}: no horizontal page overflow`);
         assert.equal(m.cardTops[0] === m.cardTops[1], width >= 1280, `${name}: desktop cards align and mobile cards stack`);
       }
+      if (tab === 'analytics' && defaultFontSize === 32) await t.test(`${name}: all seven heatmap rows are labeled`, () => {
+        assert.deepEqual(m.weekdays.map(([day]) => day), ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']);
+        assert.equal(m.heatmapRows.length, 7);
+        m.heatmapRows.forEach(([top, height], i) => {
+          const [day, y] = m.weekdays[i];
+          assert.ok(top < y && y < top + height, `${day} label aligns with its row`);
+        });
+      });
     }
+    if (tab.includes('analytics') && defaultFontSize === 32) await t.test(`${tab} at 320px: 90-day bars stay inside their hover columns`, async () => {
+      const probes = JSON.parse(await evaluate(`(async () => {
+        const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        document.querySelector('[aria-label="Last 90 days"]').click();
+        const charts = [
+          ['enforcement', '.an-warns .an-bar'],
+          ['membership', '.an-joins.an-bar'],
+        ];
+        const plot = kind => document.querySelector('svg[aria-describedby="an-' + kind + '-readout"]');
+        for (let i = 0; i < 100 && charts.some(([kind]) => plot(kind)?.querySelectorAll('.an-hit').length !== 90); i++) await frame();
+        const results = [];
+        for (const [kind, selector] of charts) {
+          const svg = plot(kind);
+          const bars = [...svg.querySelectorAll(selector)];
+          const hits = [...svg.querySelectorAll('.an-hit')];
+          const escaped = bars.flatMap((bar, i) => {
+            const target = hits[i]?.getBBox();
+            const mark = bar.getBBox();
+            const fits = target && mark.width > 0 && mark.x >= target.x - 0.001 && mark.x + mark.width <= target.x + target.width + 0.001
+              && mark.y >= target.y - 0.01 && mark.y + mark.height <= target.y + target.height + 0.01;
+            return fits ? [] : [i];
+          });
+          const bar = bars[0];
+          svg.scrollIntoView({block: 'center'});
+          await frame();
+          const box = bar.getBoundingClientRect();
+          const hovered = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+          hovered?.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
+          await frame();
+          const target = hits[0].getBBox();
+          const cursor = svg.querySelector('.an-cursor')?.getBBox();
+          results.push({ kind, bars: bars.length, hits: hits.length, slotWidth: hits[0].getBBox().width, escaped,
+            hoveredIndex: hits.indexOf(hovered), day: document.querySelector('#an-' + kind + '-readout strong')?.textContent,
+            cursorAligned: cursor?.x === target.x && cursor?.width === target.width });
+        }
+        return JSON.stringify(results);
+      })()`));
+      for (const { kind, bars, hits, slotWidth, escaped, hoveredIndex, day, cursorAligned } of probes) {
+        assert.equal(hits, 90, `${kind}: every day has a hover column`);
+        assert.equal(bars, hits, `${kind}: every day has a bar in the tested series`);
+        assert.ok(slotWidth < 1, `${kind}: exercises subpixel day slots (${slotWidth}px)`);
+        assert.deepEqual(escaped, [], `${kind}: every bar lies inside its own day column`);
+        assert.equal(hoveredIndex, 0, `${kind}: hit testing the first bar selects the first day`);
+        assert.equal(day, 'Aug 15', `${kind}: hover readout reports the first day`);
+        assert.ok(cursorAligned, `${kind}: cursor matches the hovered day column`);
+      }
+    });
   }
 });
 

@@ -274,11 +274,24 @@ function dayAnchor(index, count) {
   return "middle";
 }
 
-function dayTicks(layout, points, left, slot, y) {
+function daySlots(left, plotWidth, count) {
+  const step = plotWidth / Math.max(1, count);
+  const maxGap = count > 45 ? 0.6 : 3;
+  return Array.from({ length: count }, (_, index) => {
+    const x = left + index * step;
+    const end = left + (index + 1) * step;
+    const width = end - x;
+    // Keep the bar centered and inside its hover column, even below one pixel.
+    const gap = Math.min(maxGap, width / 4);
+    return { x, end, width, center: x + width / 2, bar: { x: x + gap / 2, width: width - gap } };
+  });
+}
+
+function dayTicks(layout, points, slots, y) {
   return horizontalTicks(layout, dayTickIndices(points.length).map((index) => {
     const anchor = dayAnchor(index, points.length);
-    const offset = anchor === "start" ? 0 : anchor === "end" ? 1 : 0.5;
-    return { key: `t${index}`, anchor, x: left + (index + offset) * slot, text: shortDay(points[index].day) };
+    const { x, center, end } = slots[index];
+    return { key: `t${index}`, anchor, x: anchor === "start" ? x : anchor === "end" ? end : center, text: shortDay(points[index].day) };
   }), y);
 }
 
@@ -392,8 +405,8 @@ export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
   const labelWidth = titleWidth + maxTickWidth + 3 * labelGap;
   const innerWidth = Math.max(1, width - labelWidth - padRight);
   const emptyLabel = fitLabel("None in this range", innerWidth - labelGap, measureLabel);
-  const slot = points.length ? innerWidth / points.length : innerWidth;
-  const gap = points.length > 45 ? 0.6 : Math.min(3, slot * 0.25);
+  const slots = daySlots(labelWidth, innerWidth, points.length);
+  const cursorSlot = slots[cursor.index];
   const first = points[0]?.day ?? "";
   const last = points.at(-1)?.day ?? "";
   const active = cursor.index != null ? points[cursor.index] : null;
@@ -416,7 +429,7 @@ export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
       ...values.map((value, i) => {
         const barHeight = value > 0 ? Math.min(usable, Math.max(2, (value / max) * usable)) : 0;
         return barHeight
-          ? h("rect", { key: i, className: "an-bar", x: (labelWidth + i * slot + gap / 2).toFixed(2), y: (baseline - barHeight).toFixed(2), width: Math.max(0.8, slot - gap).toFixed(2), height: barHeight.toFixed(2) })
+          ? h("rect", { key: i, className: "an-bar", ...slots[i].bar, y: (baseline - barHeight).toFixed(2), height: barHeight.toFixed(2) })
           : null;
       }),
     );
@@ -445,15 +458,15 @@ export function EnforcementChart({ points, metrics = ENFORCEMENT_METRICS }) {
         onBlur: () => cursor.setIndex(null),
       },
       ...rows,
-      cursor.index != null
-        ? h("rect", { className: "an-cursor", x: (labelWidth + cursor.index * slot).toFixed(2), y: 0, width: slot.toFixed(2), height: height - axisHeight })
+      cursorSlot
+        ? h("rect", { className: "an-cursor", x: cursorSlot.x, y: 0, width: cursorSlot.width, height: height - axisHeight })
         : null,
-      ...dayTicks(layout, points, labelWidth, slot, height - inset),
+      ...dayTicks(layout, points, slots, height - inset),
       // Transparent day columns carry the pointer and native tooltips.
       ...points.map((p, i) =>
         h(
           "rect",
-          { key: `hit${i}`, className: "an-hit", x: (labelWidth + i * slot).toFixed(2), y: 0, width: slot.toFixed(2), height: height - axisHeight, onMouseEnter: () => cursor.setIndex(i) },
+          { key: `hit${i}`, className: "an-hit", x: slots[i].x, y: 0, width: slots[i].width, height: height - axisHeight, onMouseEnter: () => cursor.setIndex(i) },
           h("title", {}, `${p.day}: ${metrics.map(([key, label]) => `${label} ${formatExact(p[key])}`).join(", ")}`),
         ),
       ),
@@ -485,9 +498,8 @@ export function MembershipChart({ points }) {
   const tickStride = Math.ceil((lineHeight * (ticks.length - 1)) / half);
   const labeledTicks = new Set(ticks.filter((tick, i) => tick === 0 || tick === tickMax
     || ((ticks.length - 1 - i) % tickStride === 0 && (tick / tickMax) * half >= lineHeight)));
-  const slot = points.length ? innerWidth / points.length : innerWidth;
-  const gap = points.length > 45 ? 0.6 : Math.min(3, slot * 0.25);
-  const x = (i) => padLeft + i * slot + slot / 2;
+  const slots = daySlots(padLeft, innerWidth, points.length);
+  const cursorSlot = slots[cursor.index];
   const yBar = (v) => (v / tickMax) * half;
   const yNet = (v) => zero - (v / netExtent) * half;
   const active = cursor.index != null ? points[cursor.index] : null;
@@ -542,24 +554,22 @@ export function MembershipChart({ points }) {
       ...netLabels.map((text, i) => axisText(text, { key: i, className: "an-axis-net", x: width - padRight + labelGap, y: i === 0 ? inset : zero + half })),
       ...points.flatMap((p, i) => {
         const bars = [];
-        const left = (padLeft + i * slot + gap / 2).toFixed(2);
-        const barWidth = Math.max(0.8, slot - gap).toFixed(2);
-        if (p.joins > 0) bars.push(h("rect", { key: `j${i}`, className: "an-bar an-joins", x: left, y: (zero - Math.max(1.5, yBar(p.joins))).toFixed(2), width: barWidth, height: Math.max(1.5, yBar(p.joins)).toFixed(2) }));
-        if (p.leaves > 0) bars.push(h("rect", { key: `l${i}`, className: "an-bar an-leaves", x: left, y: zero.toFixed(2), width: barWidth, height: Math.max(1.5, yBar(p.leaves)).toFixed(2) }));
+        if (p.joins > 0) bars.push(h("rect", { key: `j${i}`, className: "an-bar an-joins", ...slots[i].bar, y: (zero - Math.max(1.5, yBar(p.joins))).toFixed(2), height: Math.max(1.5, yBar(p.joins)).toFixed(2) }));
+        if (p.leaves > 0) bars.push(h("rect", { key: `l${i}`, className: "an-bar an-leaves", ...slots[i].bar, y: zero.toFixed(2), height: Math.max(1.5, yBar(p.leaves)).toFixed(2) }));
         return bars;
       }),
       points.length > 1
-        ? h("polyline", { className: "an-net-line an-net", points: net.map((v, i) => `${x(i).toFixed(2)},${yNet(v).toFixed(2)}`).join(" ") })
+        ? h("polyline", { className: "an-net-line an-net", points: net.map((v, i) => `${slots[i].center},${yNet(v).toFixed(2)}`).join(" ") })
         : null,
-      ...net.map((v, i) => h("circle", { key: `n${i}`, className: "an-net-point an-net", cx: x(i).toFixed(2), cy: yNet(v).toFixed(2), r: points.length > 45 ? 1.4 : 2.4 })),
-      cursor.index != null
-        ? h("rect", { className: "an-cursor", x: (padLeft + cursor.index * slot).toFixed(2), y: inset, width: slot.toFixed(2), height: half * 2 })
+      ...net.map((v, i) => h("circle", { key: `n${i}`, className: "an-net-point an-net", cx: slots[i].center, cy: yNet(v).toFixed(2), r: points.length > 45 ? 1.4 : 2.4 })),
+      cursorSlot
+        ? h("rect", { className: "an-cursor", x: cursorSlot.x, y: inset, width: cursorSlot.width, height: half * 2 })
         : null,
-      ...dayTicks(layout, points, padLeft, slot, height - inset),
+      ...dayTicks(layout, points, slots, height - inset),
       ...points.map((p, i) =>
         h(
           "rect",
-          { key: `hit${i}`, className: "an-hit", x: (padLeft + i * slot).toFixed(2), y: inset, width: slot.toFixed(2), height: half * 2, onMouseEnter: () => cursor.setIndex(i) },
+          { key: `hit${i}`, className: "an-hit", x: slots[i].x, y: inset, width: slots[i].width, height: half * 2, onMouseEnter: () => cursor.setIndex(i) },
           h("title", {}, `${p.day}: joins ${formatExact(p.joins)}, leaves ${formatExact(p.leaves)}, net so far ${formatDelta(net[i], 0).exact}`),
         ),
       ),
@@ -606,11 +616,13 @@ export function ActivityHeatmap({ cells }) {
   }));
   const layout = useChartLayout(798);
   const { width, lineHeight, gap: labelGap, measureLabel, ref } = layout;
-  const left = Math.max(...WEEKDAYS.map(measureLabel)) + 2 * labelGap;
   const top = lineHeight + labelGap;
   const height = Math.min(MAX_PLOT_HEIGHT, Math.max(167, top + WEEKDAYS.length * (lineHeight + 1) + labelGap));
   const rowHeight = (height - top - labelGap) / WEEKDAYS.length;
-  const weekdayStride = Math.ceil(lineHeight / rowHeight);
+  // Stagger labels horizontally when the cap leaves less than one line per row.
+  const weekdayColumns = Math.ceil(lineHeight / rowHeight);
+  const weekdayColumnWidth = Math.max(...WEEKDAYS.map(measureLabel)) + labelGap;
+  const left = weekdayColumns * weekdayColumnWidth + labelGap;
   const slot = Math.max(1, width - left) / 24;
   const gap = Math.min(2, slot / 4);
   const hourLabel = (hour) => `${String(hour).padStart(2, "0")}:00`;
@@ -625,8 +637,8 @@ export function ActivityHeatmap({ cells }) {
       ChartPlot,
       { ref, height, className: "an-heatmap", role: "img", "aria-label": `Enforcement actions by weekday and UTC hour. ${summary}`, "aria-describedby": "an-heatmap-readout", onMouseLeave: () => setActive(null) },
       ...horizontalTicks(layout, [0, 6, 12, 18].map((hour) => ({ key: `h${hour}`, x: left + hour * slot, text: hourLabel(hour) })), lineHeight / 2 + 2),
-      ...WEEKDAYS.map((day, weekday) => weekday % weekdayStride === 0
-        ? axisText(day, { key: day, className: "an-axis-day", x: labelGap / 2, y: top + (weekday + 0.5) * rowHeight }) : null),
+      ...WEEKDAYS.map((day, weekday) => axisText(day, { key: day, className: "an-axis-day",
+        x: labelGap / 2 + (weekday % weekdayColumns) * weekdayColumnWidth, y: top + (weekday + 0.5) * rowHeight })),
       ...grid.flatMap((row, weekday) =>
         row.map((count, hour) =>
           h(
