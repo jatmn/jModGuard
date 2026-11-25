@@ -1423,6 +1423,86 @@ function resourceFacts(rows) {
   ];
 }
 
+// Billing MB use 1024² bytes, consistent with the 16 blocks per billed GB in #782.
+const BILLING_MB_BYTES = 2 ** 20;
+const ESTIMATE_HOURS_30_DAYS = 30 * 24;
+const billingMbFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
+const hourlyCostFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 8 });
+
+function billingMemory(bytes) {
+  if (bytes == null) return null;
+  const mb = bytes / BILLING_MB_BYTES;
+  if (mb > 0 && mb < 0.01) return "<0.01 MB";
+  return `${billingMbFormat.format(mb)} MB`;
+}
+
+function memoryBlocks(bytes, blockMb) {
+  const blockBytes = blockMb * BILLING_MB_BYTES;
+  const count = Math.max(1, Math.ceil(bytes / blockBytes));
+  const remaining = count * blockBytes - bytes;
+  const headroom = Math.floor(remaining / BILLING_MB_BYTES * 100) / 100;
+  return {
+    count,
+    capacity: count * blockMb,
+    headroom: remaining > 0 && headroom === 0 ? "<0.01 MB" : `${billingMbFormat.format(headroom)} MB`,
+  };
+}
+
+function hostingCost(hourly, hours) {
+  const cost = hourly * hours;
+  if (hourly == null || !Number.isFinite(cost)) return null;
+  const minimum = hours === 1 ? 0.00000001 : 0.01;
+  const formatted = hours === 1 ? hourlyCostFormat.format(cost) : cost.toFixed(2);
+  return cost > 0 && cost < minimum ? `<$${minimum.toFixed(hours === 1 ? 8 : 2)}` : `$${formatted}`;
+}
+
+function MemoryBillingPanel({ snapshot, nowMs }) {
+  const billing = snapshot.memory_billing;
+  const blockMb = billing?.block_mb;
+  const rates = billing?.rates;
+  const readings = RESOURCE_PROCESSES.map(([id]) => {
+    const current = snapshot.processes?.[id]?.current;
+    return resourceFreshness(current, snapshot.generated_at_ms, nowMs) === "fresh" ? current : null;
+  });
+  const byteCounts = readings.map((reading) => {
+    const bytes = reading?.memory?.program_bytes;
+    return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : null;
+  });
+  const [botBytes, apiBytes] = byteCounts;
+  const total = botBytes != null && apiBytes != null && Number.isSafeInteger(botBytes + apiBytes) ? botBytes + apiBytes : null;
+  const blocks = total != null && blockMb > 0 ? memoryBlocks(total, blockMb) : null;
+  const memoryHourly = blocks && rates ? blocks.count * rates.memory_usd_per_block_hour : null;
+  const cpuTenths = readings.map((reading) => reading?.cpu_tenths);
+  const cpuHourly = rates && cpuTenths.every((value) => value != null)
+    ? cpuTenths.reduce((sum, value) => sum + value, 0) / 1000 * rates.cpu_usd_per_core_hour
+    : null;
+  const blockText = blocks && `${formatExact(blocks.count)} block${blocks.count === 1 ? "" : "s"} (${formatExact(blocks.capacity)} MB) · ${blocks.headroom} to next block`;
+  const estimateRow = (label, hourly) => h("tr", null,
+    h("th", { scope: "row" }, label),
+    h("td", null, resourceValue(hostingCost(hourly, 1))),
+    h("td", null, resourceValue(hostingCost(hourly, ESTIMATE_HOURS_30_DAYS))),
+  );
+  return analyticsPanel("Memory billing blocks", "resources-memory-billing", h("div", null,
+    h("dl", { className: "du-facts" },
+      ...[["Combined memory", billingMemory(total)], ["Bot memory", billingMemory(botBytes)], ["API memory", billingMemory(apiBytes)], ["Billing blocks", blockText]]
+        .map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, resourceValue(value)))),
+    ),
+    blockMb > 0
+      ? h("p", { className: "an-note muted" }, `Uses fresh cgroup samples and rounds the combined reading up in ${blockMb} MB blocks (minimum one). 1 MB = 1,048,576 bytes.`)
+      : h("p", { className: "an-note muted" }, "Billing block size unavailable."),
+    rates
+      ? h("div", null,
+        h("h4", { id: "resources-hosting-estimate", className: "du-metric-label" }, "Hosting cost estimate (USD)"),
+        h("table", { className: "table table-sm", "aria-labelledby": "resources-hosting-estimate" },
+          h("thead", null, h("tr", null, h("th", { scope: "col" }, "Resource"), h("th", { scope: "col" }, "Hourly"), h("th", { scope: "col" }, "30 days"))),
+          h("tbody", null, estimateRow("Memory blocks", memoryHourly), estimateRow("CPU time", cpuHourly)),
+        ),
+        h("p", { className: "an-note muted" }, "Assumes current usage continues. Excludes host system overhead and egress."),
+      )
+      : h("p", { className: "an-note muted" }, billing ? "Hosting cost estimate is off." : "Hosting cost estimate configuration unavailable."),
+  ));
+}
+
 function diskRows(disks) {
   const labels = { container_root: "Container filesystem", tmp: "Temporary files", logs: "Log files" };
   if (!disks?.length) return [["Container filesystem", null], ["Temporary files", null]];
@@ -1619,6 +1699,7 @@ function BotResources() {
     ),
     note,
     !snapshot && !result.error && h("p", { className: "muted", role: "status", "aria-busy": "true" }, "Loading Bot Resources…"),
+    snapshot && h(MemoryBillingPanel, { snapshot, nowMs }),
     snapshot &&
       h(
         "div",
@@ -1724,7 +1805,7 @@ function BotResources() {
             h("div", null, h("h4", { className: "du-metric-label" }, "Bot primary BEGIN latency"), h(RankList, { rows: breakdownRows(botHistory, "db_primary_begin_ms"), label: "Bot primary BEGIN latency", empty: botHistory?.minutes ? "No primary transactions in this range." : UNAVAILABLE })),
             h("div", null, h("h4", { className: "du-metric-label" }, "API primary BEGIN latency"), h(RankList, { rows: breakdownRows(apiHistory, "db_primary_begin_ms"), label: "API primary BEGIN latency", empty: apiHistory?.minutes ? "No primary transactions in this range." : UNAVAILABLE })),
           ),
-          h("p", { key: "provider", className: "an-note muted" }, "Provider billing (Bunny) is not shown: no scoped read-only key is configured, and nothing is estimated. API response bytes count responses with a known length."),
+          h("p", { key: "response-bytes", className: "an-note muted" }, "API response bytes count responses with a known length."),
         ]),
         "an-span-12",
       ),

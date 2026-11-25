@@ -10,6 +10,7 @@ use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
+use jmodguard::config::HostingEstimateConfig;
 use jmodguard::db::{self, ResourceRecords};
 use jmodguard::resources::{
     self, HOUR_SECS, MINUTE_SECS, ProcessStatus, Rollup, RollupBuilder, latency_quantile_ms,
@@ -124,13 +125,22 @@ pub async fn overview(
     let now_ms = resources::unix_ms_now();
     let (records, history_status) = history(&app, range, now_ms / 1000).await;
     let api_status = ProcessStatus::current(api_interval_ms());
-    Ok(Json(build_response(
-        range,
-        now_ms,
-        records.as_ref(),
-        history_status,
-        &api_status,
-    )))
+    let mut response = build_response(range, now_ms, records.as_ref(), history_status, &api_status);
+    response["memory_billing"] = memory_billing(&app.cfg.web.hosting_estimate);
+    Ok(Json(response))
+}
+
+fn memory_billing(config: &HostingEstimateConfig) -> Value {
+    let rates = config.enabled.then(|| {
+        json!({
+            "memory_usd_per_block_hour": config.memory_usd_per_block_hour,
+            "cpu_usd_per_core_hour": config.cpu_usd_per_core_hour,
+        })
+    });
+    json!({
+        "block_mb": HostingEstimateConfig::MEMORY_BLOCK_MB,
+        "rates": rates,
+    })
 }
 
 fn api_interval_ms() -> u64 {

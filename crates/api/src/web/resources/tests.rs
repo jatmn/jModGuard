@@ -21,6 +21,10 @@ impl Drop for Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_estimate(HostingEstimateConfig::default())
+}
+
+fn fixture_with_estimate(estimate: HostingEstimateConfig) -> Fixture {
     let path = std::env::temp_dir().join(format!(
         "jmodguard_api_resources_{:032x}.db",
         rand::random::<u128>()
@@ -29,6 +33,7 @@ fn fixture() -> Fixture {
     let mut cfg = jmodguard::config::ApiProcessConfig::default();
     cfg.bot.owner_id = 99;
     cfg.db.path = path.clone();
+    cfg.web.hosting_estimate = estimate;
     Fixture {
         app: ApiState::new(cfg, db).unwrap(),
         path,
@@ -162,6 +167,30 @@ async fn resources_are_owner_only_and_reject_unknown_ranges() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn memory_billing_returns_rates_only_when_enabled() {
+    for enabled in [false, true] {
+        let f = fixture_with_estimate(HostingEstimateConfig {
+            enabled,
+            memory_usd_per_block_hour: 0.001,
+            cpu_usd_per_core_hour: 0.04,
+        });
+        let owner = signed_in(&f.app, 99).await;
+        let Json(value) = overview(State(f.app.clone()), owner, origin(&f.app), range("1h"))
+            .await
+            .unwrap();
+        assert_eq!(value["memory_billing"]["block_mb"], 64);
+        assert_eq!(
+            value["memory_billing"]["rates"],
+            if enabled {
+                json!({"memory_usd_per_block_hour": 0.001, "cpu_usd_per_core_hour": 0.04})
+            } else {
+                Value::Null
+            }
+        );
     }
 }
 

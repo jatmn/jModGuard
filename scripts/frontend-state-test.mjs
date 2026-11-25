@@ -12467,6 +12467,7 @@ function resourceSnapshot({ bot = {}, api = {}, ...overrides } = {}) {
   return {
     generated_at_ms: RESOURCE_NOW_MS, range: '24h', span_secs: 60, bucket_secs: 600, from_secs: RESOURCE_TO - 86400, to_secs: RESOURCE_TO,
     history_status: 'available',
+    memory_billing: { block_mb: 64, rates: null },
     processes: {
       bot: { current: resourceCurrent({ interval_ms: 60000, stale_after_ms: 125000, age_ms: 20000 }), history: resourceHistory(), ...bot },
       api: {
@@ -12531,7 +12532,7 @@ test('Bot Resources shows both processes against their limits with activity and 
   assert.deepEqual(costs['Database round trips'], ['20.0', '20.0']);
   assert.deepEqual(costs['API response bytes'], ['—', '200.0 KB/min']);
   assert.match(costs['Database rows read'][0], /^Unavailable/);
-  assert.match(textOf(page), /Provider billing \(Bunny\) is not shown/);
+  assert.match(textOf(page), /Hosting cost estimate is off/);
   // A bucket without samples breaks the line; it is not drawn at zero.
   const cpuChart = bot.querySelector('.br-metric svg');
   assert.equal(cpuChart.querySelectorAll('polyline.br-tone-avg').length, 1, 'the two samples before the gap');
@@ -12566,6 +12567,62 @@ test('Bot Resources says Unavailable for unread values and never shows them as z
   const costs = [...h.nodes.get('#content').querySelectorAll('.br-costs tbody tr')].map((row) => textOf(row));
   assert.ok(costs.every((row) => !/\b0(\.0+)?\b/.test(row)), costs.join(' | '));
   assert.ok([...h.nodes.get('#content').querySelectorAll('.br-chart-empty')].length >= 4, 'empty charts say so');
+});
+
+test('Bot Resources rounds combined memory up from bytes, including zero and block boundaries', async () => {
+  const mb = 2 ** 20;
+  for (const [botBytes, apiBytes, blocks, capacity, headroom] of [
+    [0, 0, 1, '64', '64'],
+    [40 * mb, 24 * mb, 1, '64', '0'],
+    [40 * mb, 24 * mb + 1, 2, '128', '63.99'],
+    [50 * mb, 60 * mb, 2, '128', '18'],
+    [1024 ** 4, 1, 16385, '1,048,640', '63.99'],
+  ]) {
+    const snapshot = resourceSnapshot({
+      bot: { current: resourceCurrent({ memory: { program_bytes: botBytes } }) },
+      api: { current: resourceCurrent({ memory: { program_bytes: apiBytes } }) },
+    });
+    const h = ownerHarness(async () => response(snapshot));
+    h.app.navigate('resources');
+    await settle();
+    const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+    assert.ok(panel);
+    assert.ok(textOf(panel).includes(`${blocks.toLocaleString('en-US')} block${blocks === 1 ? '' : 's'} (${capacity} MB)`));
+    assert.ok(textOf(panel).includes(`${headroom} MB to next block`));
+    if (botBytes === 50 * mb) {
+      assert.match(textOf(panel), /Combined memory110 MB/);
+      assert.match(textOf(panel), /Bot memory50 MB/);
+      assert.match(textOf(panel), /API memory60 MB/);
+    }
+  }
+});
+
+test('Bot Resources estimates memory and CPU run rates from fresh samples at configured prices', async () => {
+  const snapshot = resourceSnapshot({
+    memory_billing: { block_mb: 64, rates: { memory_usd_per_block_hour: 0.0003125, cpu_usd_per_core_hour: 0.02 } },
+    bot: { current: resourceCurrent({ memory: { program_bytes: 50 * 2 ** 20 }, cpu_tenths: 125 }) },
+    api: { current: resourceCurrent({ memory: { program_bytes: 60 * 2 ** 20 }, cpu_tenths: 375 }) },
+  });
+  const check = async (memory, cpu) => {
+    const h = ownerHarness(async () => response(snapshot));
+    h.app.navigate('resources');
+    await settle();
+    const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+    assert.match(textOf(panel), /Hosting cost estimate \(USD\)/);
+    assert.match(textOf(panel), /Excludes host system overhead and egress/);
+    const rows = [...panel.querySelectorAll('tbody tr')].map(row => [...row.querySelectorAll('td')].map(cell => cell.textContent));
+    assert.deepEqual(rows, [memory, cpu]);
+  };
+  await check(['$0.000625', '$0.45'], ['$0.01', '$7.20']);
+  snapshot.memory_billing.rates = { memory_usd_per_block_hour: 0.001, cpu_usd_per_core_hour: 0 };
+  snapshot.processes.bot.current.memory.program_bytes = 0;
+  snapshot.processes.api.current.memory.program_bytes = 0;
+  await check(['$0.001', '$0.72'], ['$0', '$0.00']);
+  snapshot.processes.bot.current.stale = true;
+  await check(['Unavailable', 'Unavailable'], ['Unavailable', 'Unavailable']);
+  snapshot.processes.bot.current.stale = false;
+  snapshot.processes.bot.current.cpu_tenths = null;
+  await check(['$0.001', '$0.72'], ['Unavailable', 'Unavailable']);
 });
 
 test('Bot Resources marks an old status stale and re-reads on range change and Refresh', async () => {
