@@ -13182,6 +13182,129 @@ const resourceFact = (card, label) => [...card.querySelectorAll('.du-facts > div
 const resourceTileValue = (h, label) => [...h.nodes.get('#content').querySelectorAll('.br-kpi')]
   .find((tile) => tile.querySelector('.an-kpi-label').textContent === label).querySelector('.an-kpi-value').textContent;
 
+const ownerResourcePath = '/api/owner/resources?range=24h';
+const workspaceConfigPath = guild => `/api/guilds/${guild.id}/config`;
+const workspaceStatsPath = guild => `/api/guilds/${guild.id}/stats`;
+function restoreResourcesFixture(guilds, configRead, preview = false, identity = {}) {
+  const calls = [];
+  const user = { id: '123456789012345678' };
+  const h = harness(async (url, options) => {
+    calls.push({ url, method: options.method, headers: options.headers });
+    if (url === '/api/me') return response({ user, guilds, is_bot_owner: true, preview, ...identity });
+    if (url === ownerResourcePath) return response(resourceSnapshot());
+    if (url.endsWith('/config')) return configRead(url);
+    if (url.endsWith('/stats')) return response({});
+    throw new Error(`unexpected request ${url}`);
+  });
+  if (preview) h.session.set('jmodguard_preview', 'fixture-preview');
+  h.storage.set(h.app.workspaceKey(), JSON.stringify({ guildId: guilds[0]?.id, tab: 'resources' }));
+  return { h, calls, urls: () => calls.map(({ url }) => url) };
+}
+
+test('restored Bot Resources defers a slow guild configuration until Dashboard opens', async () => {
+  const [guild] = switcherGuilds;
+  const config = Promise.withResolvers();
+  const { h, calls, urls } = restoreResourcesFixture([guild], () => config.promise);
+  const startup = h.app.init();
+  await settle();
+  assert.deepEqual(urls(), ['/api/me', ownerResourcePath]);
+  await startup;
+  assert.equal(h.nodes.get('#content h2')?.textContent, 'Bot Resources');
+
+  await fire(h.nodes.get('#tabs [data-tab="dashboard"]'), 'click');
+  assert.deepEqual(urls(), ['/api/me', ownerResourcePath, workspaceConfigPath(guild)]);
+  assert.match(h.nodes.get('#content').textContent, /Loading your workspace/);
+  config.resolve(response({ enrollment_id: 'guild-membership' }));
+  await settle();
+  assert.deepEqual(urls(), ['/api/me', ownerResourcePath, workspaceConfigPath(guild), workspaceStatsPath(guild)]);
+  assert.deepEqual(calls.map(({ method }) => method), ['POST', 'POST', 'POST', 'POST']);
+  assert.equal(calls.at(-1).headers['x-jmodguard-enrollment'], 'guild-membership');
+});
+
+for (const switchServer of [false, true]) {
+  test(`Bot Resources stays mounted when delayed guild config arrives ${switchServer ? 'after a server switch' : 'for the same server'}`, async () => {
+    const [first, second] = switcherGuilds;
+    const pending = Promise.withResolvers();
+    const { h, calls, urls } = restoreResourcesFixture([first, second], url => url === workspaceConfigPath(first)
+      ? pending.promise : response({ enrollment_id: 'second-membership' }));
+    const startup = h.app.init();
+    await settle();
+    assert.deepEqual(urls(), ['/api/me', ownerResourcePath]);
+    await startup;
+
+    await fire(h.nodes.get('#tabs [data-tab="dashboard"]'), 'click');
+    assert.equal(urls().at(-1), workspaceConfigPath(first));
+    await fire(h.nodes.get('#tabs [data-tab="resources"]'), 'click');
+    const header = h.nodes.get('#content h2');
+    assert.equal(header?.textContent, 'Bot Resources');
+    const ownerCalls = ['/api/me', ownerResourcePath, workspaceConfigPath(first), ownerResourcePath];
+    if (switchServer) {
+      await fire(h.nodes.get('#guild-select'), 'click');
+      await fire(h.document.querySelectorAll('#guild-select-list [role=option]')[1], 'click');
+      assert.equal(h.app.state.guildId, second.id);
+      assert.equal(h.nodes.get('#guild-select-value').textContent, second.name);
+    }
+    pending.resolve(response({ enrollment_id: 'first-membership' }));
+    await settle();
+    assert.deepEqual(urls(), ownerCalls);
+    assert.equal(h.nodes.get('#content h2'), header);
+
+    await fire(h.nodes.get('#tabs [data-tab="dashboard"]'), 'click');
+    assert.deepEqual(urls().slice(ownerCalls.length), switchServer
+      ? [workspaceConfigPath(second), workspaceStatsPath(second)] : [workspaceStatsPath(first)]);
+    assert.equal(calls.at(-1).headers['x-jmodguard-enrollment'], switchServer ? 'second-membership' : 'first-membership');
+  });
+}
+
+test('retrying server discovery on Bot Resources defers a fresh enrollment until Dashboard opens', async () => {
+  const [guild] = switcherGuilds;
+  const identity = { role_discovery_incomplete: true };
+  let enrollment = 'old-membership';
+  const { h, calls, urls } = restoreResourcesFixture(
+    [guild], () => response({ enrollment_id: enrollment }), false, identity,
+  );
+  await h.app.init();
+  const tab = name => h.nodes.get(`#tabs [data-tab="${name}"]`);
+  await fire(tab('dashboard'), 'click');
+  await settle();
+  assert.equal(calls.at(-1).headers['x-jmodguard-enrollment'], 'old-membership');
+  await fire(tab('resources'), 'click');
+
+  enrollment = 'replacement-membership';
+  identity.role_discovery_incomplete = false;
+  const beforeRetry = calls.length;
+  const retry = [...h.document.querySelectorAll('button')].find(button => button.textContent === 'Retry server discovery');
+  assert.ok(retry);
+  await fire(retry, 'click');
+  await settle();
+  const discoveryCalls = urls().slice(beforeRetry).filter(url => url === '/api/me' || url === workspaceConfigPath(guild));
+  assert.deepEqual(discoveryCalls, ['/api/me']);
+
+  const beforeDashboard = calls.length;
+  await fire(tab('dashboard'), 'click');
+  await settle();
+  assert.deepEqual(urls().slice(beforeDashboard), [workspaceConfigPath(guild), workspaceStatsPath(guild)]);
+  assert.equal(calls.at(-1).headers['x-jmodguard-enrollment'], 'replacement-membership');
+});
+
+test('restored Bot Resources honors preview permissions and owner sessions without servers', async () => {
+  const [guild] = switcherGuilds;
+  const preview = restoreResourcesFixture([{ ...guild, access: 'dashboard' }], () => response({ enrollment_id: 'preview-membership' }), true);
+  await preview.h.app.init();
+  await settle();
+  assert.deepEqual(preview.urls(), ['/api/me', workspaceConfigPath(guild), workspaceStatsPath(guild)]);
+  assert.ok(preview.calls.every(({ headers }) => headers['x-jmodguard-preview'] === 'fixture-preview'));
+  assert.equal(preview.h.nodes.get('#tabs [data-tab="resources"]'), null);
+  assert.ok(preview.h.nodes.get('#preview-banner'));
+
+  const owner = restoreResourcesFixture([], () => { throw new Error('no selected server'); });
+  await owner.h.app.init();
+  await settle();
+  assert.deepEqual(owner.urls(), ['/api/me', ownerResourcePath]);
+  assert.equal(owner.h.nodes.get('#content h2')?.textContent, 'Bot Resources');
+  assert.equal(owner.h.nodes.get('#guild-select'), null);
+});
+
 test('Bot Resources shows both processes against their limits with activity and cost drivers', async () => {
   const calls = [];
   const h = ownerHarness(async (url, options) => { calls.push([url, options.method]); return response(resourceSnapshot()); });
