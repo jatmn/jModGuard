@@ -1193,6 +1193,43 @@ async fn unfinished_cleanup_uses_per_message_fallback_at_the_cap() {
 }
 
 #[tokio::test]
+async fn bulk_only_cleanup_fallback_counts_user_filtered_deletes() {
+    let f = Fixture::new(true).await;
+    db::delete_log_channel(&f.app.db, GUILD as i64, "message_delete")
+        .await
+        .unwrap();
+    let bulk_destination = 30;
+    db::upsert_log_channel(
+        &f.app.db,
+        GUILD as i64,
+        "message_bulk_delete",
+        bulk_destination,
+    )
+    .await
+    .unwrap();
+    f.set_filter(
+        "message_bulk_delete",
+        db::LogFilter {
+            users: vec![SUBJECT.to_string()],
+            channels: vec![],
+        },
+    )
+    .await;
+    let cleanup = f.begin().await.unwrap();
+    f.rest(Some(&cleanup), 1, 101).await;
+
+    tokio::time::pause();
+    tokio::time::advance(MAX_LIFETIME).await;
+    flush(&f.app, &f.sink, false).await;
+    let notices = f.sink.0.lock();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].0.get(), bulk_destination as u64);
+    let body = log_text(&notices[0].1);
+    assert!(body.contains("1 excluded by user filter"), "{body}");
+    assert!(!body.contains("Message 101"), "{body}");
+}
+
+#[tokio::test]
 async fn rejected_ban_replays_pending_purge_as_plain_delete() {
     let f = Fixture::new(true).await;
     let cleanup = f.begin().await.unwrap();

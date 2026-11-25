@@ -796,7 +796,7 @@ fn channel_counts(counts: BTreeMap<u64, usize>) -> String {
 fn summary_vars(
     subject: Subject,
     incident: &Incident,
-    filter: Option<&db::LogFilter>,
+    filters: [Option<&db::LogFilter>; 2],
     failures_only: bool,
 ) -> Option<(BTreeMap<String, String>, Vec<i64>)> {
     let (_, user) = subject;
@@ -806,7 +806,11 @@ fn summary_vars(
         ("rule".into(), incident.rule.clone()),
         ("rule_id".into(), clip(&incident.rule_id, 80)),
     ]);
-    if filter.is_some_and(|filter| excluded(filter, &vars)) {
+    if filters
+        .into_iter()
+        .flatten()
+        .any(|filter| excluded(filter, &vars))
+    {
         return None;
     }
     let mut channels = BTreeMap::new();
@@ -820,7 +824,10 @@ fn summary_vars(
     for (&(channel, message), item) in &incident.messages {
         if (incident.outcome == Some(CaseOutcome::Failed) && item.purge_origin.is_some())
             || (failures_only && item.result.is_ok())
-            || filter.is_some_and(|filter| channel_id_excluded(filter, Some(&channel.to_string())))
+            || filters
+                .into_iter()
+                .flatten()
+                .any(|filter| channel_id_excluded(filter, Some(&channel.to_string())))
         {
             continue;
         }
@@ -1165,16 +1172,20 @@ impl PendingIncident {
         let route = summary_route(&cfg);
         let bulk_filter = route.and_then(|(_, filter)| filter);
         let filter = log_filter_for(&cfg, "automod_delete");
+        let summary_filters = [filter, bulk_filter];
+        // Ordinary bulk fallback still counts confirmed deletes excluded by user.
         let filtered = self
             .incident
             .messages
             .iter()
             .filter(|(target, item)| {
                 !(rejected && item.purge_origin.is_some())
-                    && [filter, bulk_filter]
-                        .into_iter()
-                        .flatten()
-                        .any(|filter| excluded_delete(filter, self.subject, target.0))
+                    && (filter
+                        .is_some_and(|filter| excluded_delete(filter, self.subject, target.0))
+                        || (item.result.is_err()
+                            && bulk_filter.is_some_and(|filter| {
+                                excluded_delete(filter, self.subject, target.0)
+                            })))
             })
             .map(|(&target, _)| target)
             .collect::<Vec<_>>();
@@ -1184,7 +1195,7 @@ impl PendingIncident {
 
         if !shutdown && !self.fallback {
             if let Some((mut vars, confirmed)) =
-                summary_vars(self.subject, &self.incident, filter, false)
+                summary_vars(self.subject, &self.incident, summary_filters, false)
             {
                 if let Some(case) = &self.incident.case {
                     let id = case.as_str();
@@ -1246,7 +1257,9 @@ impl PendingIncident {
             }
         }
 
-        if let Some((mut vars, _)) = summary_vars(self.subject, &self.incident, filter, true) {
+        if let Some((mut vars, _)) =
+            summary_vars(self.subject, &self.incident, summary_filters, true)
+        {
             vars.insert("cleanup_failure_notice".into(), String::new());
             vars.insert(
                 "cleanup_nonce".into(),
