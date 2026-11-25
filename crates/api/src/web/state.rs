@@ -78,10 +78,10 @@ impl AnalyticsCache {
 mod analytics_cache_tests {
     use super::*;
 
-    #[test]
-    fn analytics_cache_expires_and_stays_bounded() {
+    #[tokio::test(start_paused = true)]
+    async fn analytics_cache_expires_and_stays_bounded() {
         let cache = AnalyticsCache::default();
-        let start = Instant::now();
+        let start = tokio::time::Instant::now().into_std();
         let key = |guild: i64, days: i64| (guild, "membership".to_owned(), days);
         cache.put(key(1, 7), serde_json::json!(7), start);
         assert_eq!(cache.get(&key(1, 7), start), Some(serde_json::json!(7)));
@@ -157,6 +157,14 @@ fn open_writer_link(cfg: &ApiProcessConfig) -> Option<jmodguard::control::Writer
 impl ApiState {
     pub fn new(cfg: ApiProcessConfig, db: Db) -> Result<Arc<Self>> {
         let oauth = OAuthClient::from_config(&cfg)?;
+        Self::with_oauth(cfg, db, oauth)
+    }
+
+    pub(super) fn with_oauth(
+        cfg: ApiProcessConfig,
+        db: Db,
+        oauth: OAuthClient,
+    ) -> Result<Arc<Self>> {
         match super::discord_retry::load_deadlines(&db) {
             Ok(deadlines) => oauth.restore_deadlines(deadlines),
             Err(error) => {

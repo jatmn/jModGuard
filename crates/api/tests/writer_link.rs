@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+const CHECKED_AT: i64 = 1_700_000_000;
+
 fn temp_db(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "api_writer_{label}_{}_{}.db",
@@ -431,7 +433,7 @@ async fn owner_check_through_the_control_link_stores_a_fresh_candidate() {
     let db = Db::open_with(cfg.db_open_options()).unwrap();
     let app = Arc::new(ApiState::new(cfg, db).unwrap());
     let state = db::component_update(&app.db, "bot").await.unwrap();
-    let now = chrono::Utc::now().timestamp();
+    let now = CHECKED_AT;
     let candidate = db::ComponentRelease {
         component: "bot".into(),
         channel: state.channel.clone(),
@@ -546,7 +548,7 @@ async fn background_check_records_the_channel_digest_and_does_not_install() {
         channel: db::component_update(&app.db, "bot").await.unwrap().channel,
         candidate: None,
         error: Some("seed".into()),
-        now: chrono::Utc::now().timestamp(),
+        now: CHECKED_AT,
     })
     .await
     .unwrap();
@@ -637,19 +639,21 @@ async fn background_check_records_a_lookup_timeout_and_does_not_install() {
         ("api", install_snapshot(&bot.db, "api").await),
         ("webui", install_snapshot(&bot.db, "webui").await),
     ];
-    let started = std::time::Instant::now();
     assert!(
-        record_release_checks(
-            &app,
-            // A lookup that never answers can only end at the lookup timeout.
-            |_component, _channel| Box::pin(std::future::pending()),
-            Duration::from_millis(50),
-            pending_shutdown(),
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            record_release_checks(
+                &app,
+                // A lookup that never answers can only end at the lookup timeout.
+                |_component, _channel| Box::pin(std::future::pending()),
+                Duration::from_millis(50),
+                pending_shutdown(),
+            )
         )
         .await
+        .expect("release checks exceeded their timeout budget")
         .finished
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
     for component in ["bot", "api", "webui"] {
         let stored = db::component_update(&bot.db, component).await.unwrap();
         assert!(
@@ -1018,19 +1022,24 @@ async fn background_check_stops_on_shutdown_without_installing() {
         let row = db::component_update(&bot.db, component).await.unwrap();
         assert_ne!(row.state, "queued");
     }
-    let now = chrono::Utc::now().timestamp();
     for component in ["bot", "api", "webui"] {
         let owner = format!("{:032x}", rand::random::<u128>());
         let claim = app
             .commit(db::ControlOp::ClaimUpdateLease {
                 component: component.into(),
                 owner,
-                now,
+                now: CHECKED_AT,
                 ttl: 240,
             })
             .await
             .unwrap();
-        assert!(matches!(claim, db::ControlReply::Saved { .. }), "{claim:?}");
+        assert_eq!(
+            claim,
+            db::ControlReply::Saved {
+                body: serde_json::json!(true)
+            },
+            "{component} lease must be free after shutdown"
+        );
     }
     drop(app);
     drop(bot);
@@ -1222,7 +1231,7 @@ async fn background_check_skips_install_after_failed_renew() {
     let (bot, app, path, _enrollment) = linked_writer("bg-renew-fail").await;
     let bot_slot = Arc::new(std::sync::Mutex::new(Some(bot)));
     let db = writer_db(&bot_slot);
-    let now = chrono::Utc::now().timestamp();
+    let now = CHECKED_AT;
     app.commit(db::ControlOp::RecordBakedComponentRunning {
         component: "bot".into(),
         observation: running_observation(now),

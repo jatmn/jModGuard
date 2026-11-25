@@ -553,7 +553,7 @@ async fn check_one_with(
     {
         anyhow::bail!("another update operation is running");
     }
-    with_update_lease(Some(app), &app.db, component, &lease, 240, async {
+    let check = async {
         let state = db::component_update(&app.db, component).await?;
         let checked = match discover(component, &state.channel).await {
             Ok(candidate) => {
@@ -622,8 +622,21 @@ async fn check_one_with(
             }
         }
         Ok(checked)
-    })
+    };
+    with_update_lease(
+        Some(app),
+        &app.db,
+        component,
+        &lease,
+        240,
+        utc_seconds,
+        check,
+    )
     .await
+}
+
+fn utc_seconds() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 async fn with_update_lease<T, F>(
@@ -632,30 +645,21 @@ async fn with_update_lease<T, F>(
     component: &str,
     lease: &str,
     ttl: i64,
+    now: impl Fn() -> i64,
     work: F,
 ) -> anyhow::Result<T>
 where
     F: Future<Output = anyhow::Result<T>>,
 {
     anyhow::ensure!(
-        renew_any(
-            app,
-            db,
-            component,
-            lease,
-            chrono::Utc::now().timestamp(),
-            ttl
-        )
-        .await?
-            == db::UpdateLeaseStatus::Held,
+        renew_any(app, db, component, lease, now(), ttl).await? == db::UpdateLeaseStatus::Held,
         "update lease expired before work began"
     );
     let watchdog = async {
         loop {
             tokio::time::sleep(Duration::from_secs((ttl / 4).max(1) as u64)).await;
-            let now = chrono::Utc::now().timestamp();
             anyhow::ensure!(
-                renew_any(app, db, component, lease, now, ttl).await?
+                renew_any(app, db, component, lease, now(), ttl).await?
                     == db::UpdateLeaseStatus::Held,
                 "update lease expired or changed"
             );
@@ -668,8 +672,7 @@ where
         failure = watchdog => { failure?; unreachable!() },
         result = work => result,
     };
-    let now = chrono::Utc::now().timestamp();
-    let owned = renew_any(app, db, component, lease, now, ttl).await?;
+    let owned = renew_any(app, db, component, lease, now(), ttl).await?;
     release_any(app, db, component, lease).await?;
     anyhow::ensure!(
         owned == db::UpdateLeaseStatus::Held,
@@ -954,7 +957,7 @@ where
             lease_held.insert(component);
             continue;
         }
-        let work = with_update_lease(Some(app), &app.db, component, &lease, 240, async {
+        let check = async {
             let outcome = tokio::select! {
                 biased;
                 _ = &mut shutdown => anyhow::bail!("release check shutdown"),
@@ -1031,7 +1034,16 @@ where
                 }
             }
             Ok(())
-        });
+        };
+        let work = with_update_lease(
+            Some(app),
+            &app.db,
+            component,
+            &lease,
+            240,
+            utc_seconds,
+            check,
+        );
         match work.await {
             Ok(()) => {}
             Err(error) if error.to_string() == "release check shutdown" => {
@@ -1618,7 +1630,7 @@ async fn run_webui_install(
     release: ComponentRelease,
     lease: &str,
 ) -> anyhow::Result<()> {
-    with_update_lease(Some(app), &app.db, "webui", lease, 600, async {
+    let install = async {
         let result = apply_webui(app, &release).await;
         if let Err(error) = &result {
             via_bot!(
@@ -1635,7 +1647,16 @@ async fn run_webui_install(
             }
         }
         result
-    })
+    };
+    with_update_lease(
+        Some(app),
+        &app.db,
+        "webui",
+        lease,
+        600,
+        utc_seconds,
+        install,
+    )
     .await
 }
 
@@ -1711,6 +1732,8 @@ mod tests {
     struct PurgeFixture {
         statuses: Vec<StatusCode>,
         requests: Vec<(String, String, String)>,
+        publication_complete: bool,
+        publication_at_request: Vec<bool>,
     }
 
     /// Notifies when a Pull Zone purge attempt is logged as failed.
@@ -1753,6 +1776,8 @@ mod tests {
             body: String,
         ) -> StatusCode {
             let mut fixture = state.lock().await;
+            let published = fixture.publication_complete;
+            fixture.publication_at_request.push(published);
             let key = headers
                 .get("AccessKey")
                 .and_then(|value| value.to_str().ok())
@@ -1942,8 +1967,9 @@ mod tests {
                     db::webui_purge_pending(&app.db).await.unwrap().as_deref(),
                     Some(PURGE_PENDING_DURING_INSTALL)
                 );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                assert!(state.lock().await.requests.is_empty());
+                let mut fixture = state.lock().await;
+                assert!(fixture.requests.is_empty());
+                fixture.publication_complete = true;
                 published.set(true);
                 Ok("published")
             },
@@ -1954,6 +1980,7 @@ mod tests {
         assert_eq!(result.unwrap(), "published");
         assert!(published.get());
         assert_eq!(state.lock().await.requests.len(), 1);
+        assert_eq!(state.lock().await.publication_at_request, [true]);
         assert!(db::webui_purge_pending(&app.db).await.unwrap().is_none());
         // A publication failure keeps an earlier unresolved purge.
         db::set_webui_purge_pending(&app.db, Some("earlier purge failed".into()))
@@ -2948,7 +2975,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn live_webui_worker_renews_lease_through_slow_work() {
         let path = std::env::temp_dir().join(format!(
             "jmodguard_webui_renew_{:032x}.db",
@@ -2957,30 +2984,28 @@ mod tests {
         let db = Db::open(&path, 2).unwrap();
         let first = "a".repeat(32);
         let second = "b".repeat(32);
-        let now = chrono::Utc::now().timestamp();
+        let started = tokio::time::Instant::now();
+        let now = || 1_700_000_000 + i64::try_from(started.elapsed().as_secs()).unwrap();
         assert!(
-            db::claim_update_lease(&db, "webui", &first, now, 4)
+            db::claim_update_lease(&db, "webui", &first, now(), 4)
                 .await
                 .unwrap()
         );
-        with_update_lease(None, &db, "webui", &first, 4, async {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            assert!(
-                !db::claim_update_lease(&db, "webui", &second, chrono::Utc::now().timestamp(), 4,)
-                    .await?
-            );
+        with_update_lease(None, &db, "webui", &first, 4, now, async {
+            tokio::time::sleep_until(started + Duration::from_secs(5)).await;
+            assert!(!db::claim_update_lease(&db, "webui", &second, now(), 4).await?);
             Ok(())
         })
         .await
         .unwrap();
         assert!(
-            db::claim_update_lease(&db, "webui", &second, chrono::Utc::now().timestamp(), 4,)
+            db::claim_update_lease(&db, "webui", &second, now(), 4)
                 .await
                 .unwrap()
         );
         let started = std::cell::Cell::new(false);
         assert!(
-            with_update_lease(None, &db, "webui", &first, 4, async {
+            with_update_lease(None, &db, "webui", &first, 4, now, async {
                 started.set(true);
                 Ok(())
             })

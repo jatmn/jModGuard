@@ -30,12 +30,17 @@ pub struct OAuthClient {
 
 type GuildFlightSender = tokio::sync::watch::Sender<GuildFlightUpdate>;
 
+#[cfg(test)]
+pub(super) const TEST_RECEIVED_MS: i64 = 1_700_000_000_000;
+
 pub(crate) struct GuildListGate {
     /// Route key → earliest instant another request for that route may start.
     cooldowns: HashMap<String, RouteCooldown>,
     /// Durable unix-millis deadlines. `Instant` values do not survive a restart.
     deadlines_ms: HashMap<String, i64>,
     generation: u64,
+    #[cfg(test)]
+    fixed_time: Option<(Instant, i64)>,
 }
 
 /// A cooldown that cannot be added to `Instant` stays until this process exits,
@@ -78,7 +83,25 @@ impl GuildListGate {
             cooldowns: HashMap::new(),
             deadlines_ms: HashMap::new(),
             generation: 0,
+            #[cfg(test)]
+            fixed_time: None,
         }
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some((now, _)) = self.fixed_time {
+            return now;
+        }
+        Instant::now()
+    }
+
+    fn now_ms(&self) -> i64 {
+        #[cfg(test)]
+        if let Some((_, now_ms)) = self.fixed_time {
+            return now_ms;
+        }
+        chrono::Utc::now().timestamp_millis()
     }
 
     fn await_body(&mut self, user_key: &str) {
@@ -88,7 +111,7 @@ impl GuildListGate {
     }
 
     fn remaining(&mut self, token: &str) -> Option<Duration> {
-        let now = Instant::now();
+        let now = self.now();
         self.cooldowns
             .retain(|_, cooldown| match cooldown.deadline() {
                 Cooldown::RestOfProcess | Cooldown::AwaitingBody => true,
@@ -159,7 +182,7 @@ impl GuildListGate {
     }
 
     fn durable_snapshot(&mut self) -> RetryDeadlineSnapshot {
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = self.now_ms();
         self.deadlines_ms
             .retain(|key, millis| *millis > now && super::discord_retry::durable_key(key));
         while self.deadlines_ms.len() > 64 {
@@ -764,12 +787,41 @@ impl OAuthClient {
         self.route_remaining(&format!("g:{user_id}")).is_some()
     }
 
-    fn hold_for_body(&self, user_key: &str) {
+    fn hold_for_body(&self, user_key: &str) -> (Instant, i64) {
         let mut gate = self
             .guild_list
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         gate.await_body(user_key);
+        (gate.now(), gate.now_ms())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_test_time(&self, now: Instant, now_ms: i64) {
+        self.guild_list.lock().unwrap().fixed_time = Some((now, now_ms));
+    }
+
+    #[cfg(test)]
+    pub(super) fn freeze_test_time(&self) -> Instant {
+        let origin = Instant::now();
+        self.set_test_time(origin, TEST_RECEIVED_MS);
+        origin
+    }
+
+    #[cfg(test)]
+    async fn wait_for_429_headers(&self, key: &str, budget: Duration) {
+        tokio::time::timeout(budget, async {
+            loop {
+                let waiting = self.guild_list.lock().unwrap().cooldowns.get(key)
+                    == Some(&RouteCooldown::Explicit429(Cooldown::AwaitingBody));
+                if waiting {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("429 headers should reach the gate before its body");
     }
 
     fn begin_flight(&self, user_key: &str) -> FlightJoin {
@@ -826,8 +878,7 @@ impl OAuthClient {
             1,
         );
         jmodguard::resources::count_labelled("discord_429_routes", route, 1);
-        let received = Instant::now();
-        let received_ms = chrono::Utc::now().timestamp_millis();
+        let (received, received_ms) = self.hold_for_body(key);
         let headers = response.headers().clone();
         let key = key.to_owned();
         let gate = std::sync::Arc::clone(&self.guild_list);
@@ -841,7 +892,6 @@ impl OAuthClient {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        self.hold_for_body(&key);
         // Finish recording and logging the response even if its browser
         // request is dropped (including the member discovery time budget).
         use tracing::instrument::WithSubscriber as _;
@@ -883,9 +933,13 @@ impl OAuthClient {
                 if durable && let Some(db) = db {
                     Self::persist_deadlines(&gate, db, writer).await;
                 }
+                let now = gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .now();
                 retry_after
                     .unwrap_or(Duration::from_secs(1))
-                    .saturating_sub(received.elapsed())
+                    .saturating_sub(now.saturating_duration_since(received))
             }
             .with_current_subscriber(),
         )
@@ -905,20 +959,19 @@ impl OAuthClient {
         // A depleted bucket can pace this process. Only explicit 429 waits
         // become durable or supersede a cooldown already in effect.
         if gate.remaining(key).is_none() {
-            gate.cooldowns.insert(
-                key.to_owned(),
-                RouteCooldown::BucketReset(cooldown_deadline(Instant::now(), retry_after)),
-            );
+            let until = cooldown_deadline(gate.now(), retry_after);
+            gate.cooldowns
+                .insert(key.to_owned(), RouteCooldown::BucketReset(until));
         }
     }
 
     pub(crate) fn restore_deadlines(&self, deadlines: std::collections::BTreeMap<String, i64>) {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let now = Instant::now();
         let mut gate = self
             .guild_list
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now_ms = gate.now_ms();
+        let now = gate.now();
         for (key, millis) in deadlines {
             if millis <= now_ms || millis == i64::MAX || !super::discord_retry::durable_key(&key) {
                 continue;
@@ -1273,8 +1326,8 @@ mod tests {
         assert_eq!(all.last().unwrap().id, "200");
     }
 
-    #[test]
-    fn discord_retry_after_honors_header_and_json_seconds() {
+    #[tokio::test(start_paused = true)]
+    async fn discord_retry_after_honors_header_and_json_seconds() {
         assert_eq!(discord_retry_after(Some("2"), b"{}").as_secs(), 2);
         assert_eq!(
             discord_retry_after(Some("2"), br#"{"retry_after":4.5}"#).as_millis(),
@@ -1309,12 +1362,13 @@ mod tests {
             discord_retry_after(None, br#"{"retry_after":1e400}"#),
             Duration::from_secs(1)
         );
+        let origin = tokio::time::Instant::now().into_std();
         assert!(matches!(
-            cooldown_deadline(Instant::now(), Duration::MAX),
+            cooldown_deadline(origin, Duration::MAX),
             Cooldown::RestOfProcess
         ));
         assert!(matches!(
-            cooldown_deadline(Instant::now(), Duration::from_secs(90_000)),
+            cooldown_deadline(origin, Duration::from_secs(90_000)),
             Cooldown::Until(_)
         ));
         assert_eq!(
@@ -1374,12 +1428,10 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
             .expect("slow lookup did not reach Discord");
-        let started = Instant::now();
         tokio::time::timeout(Duration::from_millis(250), client.my_guilds(2, "fast"))
             .await
             .expect("fast lookup must not wait for the slow one")
             .unwrap();
-        assert!(started.elapsed() < Duration::from_millis(250));
         assert!(!slow.is_finished());
         release_slow.send(true).unwrap();
         slow.await.unwrap().unwrap();
@@ -1442,8 +1494,6 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let seen = std::sync::Arc::clone(&calls);
-        let headers_sent = std::sync::Arc::new(tokio::sync::Notify::new());
-        let headers_signal = std::sync::Arc::clone(&headers_sent);
         // The body stays unsent until the test has checked the second lookup.
         let (release_body, body_released) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
@@ -1452,7 +1502,6 @@ mod tests {
                     break;
                 };
                 let seen = std::sync::Arc::clone(&seen);
-                let headers_signal = std::sync::Arc::clone(&headers_signal);
                 let mut body_released = body_released.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 2048];
@@ -1460,11 +1509,10 @@ mod tests {
                     seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     socket
                         .write_all(
-                            b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 1\r\ncontent-length: 20\r\nconnection: close\r\n\r\n",
+                            b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 1\r\ncontent-length: 18\r\nconnection: close\r\n\r\n",
                         )
                         .await
                         .unwrap();
-                    headers_signal.notify_one();
                     let _ = body_released.wait_for(|released| *released).await;
                     let _ = socket.write_all(br#"{"retry_after":30}"#).await;
                 });
@@ -1487,19 +1535,24 @@ mod tests {
             me_endpoint: None,
             member_endpoint: None,
         });
+        let received = client.freeze_test_time();
         let first_client = std::sync::Arc::clone(&client);
         let first = tokio::spawn(async move { first_client.my_guilds(9, "first").await });
-        tokio::time::timeout(Duration::from_secs(2), headers_sent.notified())
-            .await
-            .expect("first lookup did not reach Discord");
-        // Outlast the header's retry-after on the gate's std::time::Instant.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        client
+            .wait_for_429_headers("g:9", Duration::from_secs(2))
+            .await;
+        // Cross the header's one-second retry boundary while the body is still held.
+        client.set_test_time(received + Duration::from_secs(2), TEST_RECEIVED_MS + 2_000);
         let second = client.my_guilds(9, "second").await.unwrap_err();
         assert!(matches!(second, GuildListError::RateLimited { .. }));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!first.is_finished());
         release_body.send(true).unwrap();
-        let _ = first.await.unwrap();
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(GuildListError::RateLimited { retry_after, fresh: true })
+                if retry_after == Duration::from_secs(28)
+        ));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -1856,6 +1909,7 @@ mod tests {
             Some(format!("http://{}/me", me.local_addr().unwrap())),
         ));
         client.attach_retry_store(db.clone());
+        let origin = client.freeze_test_time();
 
         let (release_body, body_released) = tokio::sync::oneshot::channel();
         let guilds_server = tokio::spawn(async move {
@@ -1886,13 +1940,10 @@ mod tests {
 
         let guilds_client = std::sync::Arc::clone(&client);
         let short = tokio::spawn(async move { guilds_client.my_guilds(42, "token").await });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while client.route_remaining("g:42").is_none() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("guilds response headers should reach the gate before its body");
+        client
+            .wait_for_429_headers("g:42", Duration::from_secs(5))
+            .await;
+        client.set_test_time(origin + Duration::from_secs(1), TEST_RECEIVED_MS + 1_000);
 
         let long = client.me(42, "token").await.unwrap_err();
         let long_wait = long.downcast_ref::<DiscordRateLimit>().unwrap().retry_after;
@@ -1910,6 +1961,7 @@ mod tests {
         let reloaded = load_deadlines(&db).unwrap();
         let reloaded_deadline = reloaded["global"];
         let restarted = test_oauth(http_client_builder().build().unwrap(), None, None, None);
+        restarted.set_test_time(origin + Duration::from_secs(1), TEST_RECEIVED_MS + 1_000);
         restarted.restore_deadlines(reloaded);
         let restored_wait = restarted.route_remaining("global").unwrap();
 
@@ -1929,6 +1981,7 @@ mod tests {
     #[test]
     fn scoped_explicit_429_replaces_bucket_hint_and_only_extends_another_429() {
         let client = test_oauth(http_client_builder().build().unwrap(), None, None, None);
+        let received = client.freeze_test_time();
         let key = "g:42";
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
@@ -1936,8 +1989,7 @@ mod tests {
         client.note_bucket_reset(key, &headers);
         assert!(client.route_remaining(key).unwrap() > Duration::from_secs(20));
 
-        let received = Instant::now();
-        let received_ms = chrono::Utc::now().timestamp_millis();
+        let received_ms = TEST_RECEIVED_MS;
         let short = Duration::from_secs(2);
         let long = Duration::from_secs(10);
         let mut gate = client.guild_list.lock().unwrap();
