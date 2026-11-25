@@ -991,15 +991,21 @@ async fn guild_access_mark(app: &ApiState, user_id: u64, guilds: &[u64]) -> ApiR
     let Ok(user) = i64::try_from(user_id) else {
         return Ok(0);
     };
+    let mut guilds = guilds
+        .iter()
+        .filter_map(|guild| i64::try_from(*guild).ok())
+        .filter(|guild| *guild > 0);
     let mut newest = 0;
-    for guild in guilds.iter().filter_map(|guild| i64::try_from(*guild).ok()) {
-        if guild <= 0 {
-            continue;
-        }
-        match crate::db::access_mark(&app.db, guild, user).await {
+    while let Some(guild) = guilds.next() {
+        let other_guild = guilds.next();
+        match crate::db::access_mark_for_guilds(&app.db, guild, other_guild, user).await {
             Ok(mark) => newest = newest.max(mark),
             Err(error) => {
-                tracing::warn!(guild_id = guild, "access marks unavailable: {error:#}");
+                tracing::warn!(
+                    guild_id = guild,
+                    ?other_guild,
+                    "access marks unavailable: {error:#}"
+                );
                 return Err(ApiError(GuildAccessError::Unverified.into()));
             }
         }

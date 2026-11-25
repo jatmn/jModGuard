@@ -5552,18 +5552,56 @@ async fn concurrent_rejected_tokens_refresh_once_or_die_without_more_discord_cal
 
 #[tokio::test]
 async fn copy_uses_one_permission_snapshot() {
-    let f = Fixture::new(true).await;
-    f.enroll(10).await;
-    f.enroll(20).await;
-    let (status, body) = f
-        .request(
-            "POST",
-            "/api/guilds/20/copy",
-            r#"{"from_guild_id":10,"sections":["settings"]}"#,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    let copy_body = r#"{"from_guild_id":10,"sections":["settings"]}"#;
+    for revoked in [10, 20] {
+        let probe = Arc::new(db::StartupProbe::default());
+        let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let access_mark_statements = || {
+            probe
+                .primary_labels()
+                .iter()
+                .filter(|label| label.starts_with("db/access_marks:"))
+                .map(|label| probe.primary_statements(label))
+                .sum::<u64>()
+        };
+        let f = Fixture::new(false).await;
+        f.enroll(10).await;
+        f.enroll(20).await;
+        let (status, body) = f.request("POST", "/api/guilds/20/copy", copy_body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+
+        db::record_access_marks(&f.app.db, vec![], vec![(10, 99), (20, 99)])
+            .await
+            .unwrap();
+        let before = access_mark_statements();
+        let (status, body) = f.request("POST", "/api/guilds/20/copy", copy_body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            access_mark_statements() - before,
+            3,
+            "one access-mark snapshot (begin, select, end)"
+        );
+
+        *f.discord.guilds.lock().unwrap() = [10, 20]
+            .into_iter()
+            .filter(|guild| *guild != revoked)
+            .map(managed_guild)
+            .collect();
+        if revoked == 10 {
+            db::record_access_marks(&f.app.db, vec![], vec![(10, 42)])
+                .await
+                .unwrap();
+        } else {
+            db::record_access_marks(&f.app.db, vec![20], vec![])
+                .await
+                .unwrap();
+        }
+        let (status, body) = f.request("POST", "/api/guilds/20/copy", copy_body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "guild {revoked}: {body}");
+        assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+    }
 }
 
 #[tokio::test]
