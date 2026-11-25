@@ -563,12 +563,17 @@ GET    /api/guilds/{id}/cases/{case}/evidence
 POST   /api/guilds/{id}/cases/{case}/evidence  # same body as GET
 GET    /api/guilds/{id}/cases/{case}/history   # POST on this path adds a note
 GET    /api/guilds/{id}/case-delete-roles
-POST   /api/guilds/{id}/case-delete-roles  # same body as GET; SPA settings load
+POST   /api/guilds/{id}/case-delete-roles  # same body as GET
 PUT    /api/guilds/{id}/case-delete-roles
 GET    /api/guilds/{id}/access-roles       # Manage Server only
-POST   /api/guilds/{id}/access-roles       # same body as GET; SPA settings load
+POST   /api/guilds/{id}/access-roles       # same options and body as GET
 PUT    /api/guilds/{id}/access-roles       # {roles:[{role_id,level}], revision}
 ```
+
+Settings reads both role cards with `POST /api/guilds/{id}/access-roles?include_case_delete_roles=true`.
+The opt-in `case_delete_roles` array shares the access-role read's enrollment and revision.
+It contains role IDs for callers who also have Administrator permission or own that server,
+and is empty for other Manage Server callers. The two role saves still use their respective PUT routes.
 
 Scopes in request bodies: `"scope": "guild" | "global"` (`global` requires
 bot owner).

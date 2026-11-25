@@ -1,10 +1,11 @@
 //! Per-guild Discord role -> Web UI access level mappings. Only Manage Server
-//! (or the guild owner) may read or change them; mapped roles never can.
+//! (or the guild owner) may read or change them. Settings can request the
+//! separately authorized case-removal roles from the same snapshot.
 use super::state::ApiState;
 use super::{ApiError, ApiResult, authorize_manage_guild};
 use crate::db::guild_data::{AccessLevel, AccessRole};
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -24,6 +25,12 @@ pub struct AccessRolesBody {
     revision: String,
 }
 
+#[derive(Deserialize)]
+pub struct AccessRolesRead {
+    #[serde(default)]
+    include_case_delete_roles: bool,
+}
+
 fn roles_wire(roles: Vec<AccessRole>) -> Vec<serde_json::Value> {
     roles
         .into_iter()
@@ -36,17 +43,26 @@ pub async fn get_access_roles(
     session: Session,
     headers: HeaderMap,
     Path(guild_id): Path<u64>,
+    Query(query): Query<AccessRolesRead>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let auth = authorize_manage_guild(&app, &session, guild_id).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
     let (store, scope) = app.tenant.live(enrollment).await?;
     let settings = store.tenant_settings(scope).await?;
-    Ok(Json(serde_json::json!({
+    let mut response = serde_json::json!({
         "roles": roles_wire(settings.access_roles),
         "revision": settings.revision,
         "ttl_secs": super::MEMBER_ROLES_TTL.as_secs(),
-    })))
+    });
+    if query.include_case_delete_roles {
+        let can_delete = super::cases::can_delete_cases(&auth, guild_id);
+        response["case_delete_roles"] = serde_json::json!(super::cases::case_delete_roles_wire(
+            settings.case_delete_roles,
+            can_delete
+        ));
+    }
+    Ok(Json(response))
 }
 
 pub async fn put_access_roles(

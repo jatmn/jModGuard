@@ -5190,6 +5190,10 @@ async fn preview_profiles_apply_distinct_permission_views() {
                 matches!(access, Some("manage" | "settings")),
             ),
             ("access-roles", access == Some("manage")),
+            (
+                "access-roles?include_case_delete_roles=true",
+                access == Some("manage"),
+            ),
         ] {
             let path = format!("/api/guilds/10/{route}");
             let (status, body) = f.request_preview("POST", &path, "", token).await;
@@ -10107,6 +10111,16 @@ async fn access_role_limit_rejects_oversized_requests_without_changing_mappings(
 #[tokio::test]
 async fn case_removal_role_ids_require_administrator_or_server_owner() {
     use db::guild_data::{AccessLevel, AccessRole};
+    let probe = Arc::new(db::StartupProbe::default());
+    let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+    let settings_statements = || {
+        probe
+            .primary_labels()
+            .iter()
+            .filter(|label| label.starts_with("guild db/guild_data/tenant_settings:"))
+            .map(|label| probe.primary_statements(label))
+            .sum::<u64>()
+    };
     let f = Fixture::new(false).await;
     f.enroll(10).await;
     let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
@@ -10136,7 +10150,14 @@ async fn case_removal_role_ids_require_administrator_or_server_owner() {
         .lock()
         .unwrap()
         .insert(10, vec!["555".into()]);
-    for kind in ["administrator", "owner", "manage", "settings", "dashboard"] {
+    for kind in [
+        "administrator",
+        "administrator_manager",
+        "owner",
+        "manage",
+        "settings",
+        "dashboard",
+    ] {
         if kind == "dashboard" {
             set_access_roles(
                 &f,
@@ -10152,28 +10173,60 @@ async fn case_removal_role_ids_require_administrator_or_server_owner() {
         guild.owner = kind == "owner";
         guild.permissions = Some(oauth::PermissionsField::Number(match kind {
             "administrator" => 1 << 3,
+            "administrator_manager" => (1 << 3) | (1 << 5),
             "manage" => 1 << 5,
             _ => 0,
         }));
         expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
         *f.discord.guilds.lock().unwrap() = vec![guild.clone()];
         tests::seed_auth_caches(&f.app, 42, vec![guild]);
+        let privileged = matches!(kind, "administrator" | "administrator_manager" | "owner");
+        let expected_case_roles = if privileged {
+            serde_json::json!(["777"])
+        } else {
+            serde_json::json!([])
+        };
+        let mut case_revision = serde_json::Value::Null;
         for method in ["GET", "POST"] {
             let (status, body) = f
                 .request(method, "/api/guilds/10/case-delete-roles", "")
                 .await;
             assert_eq!(status, StatusCode::OK, "{kind}: {body}");
-            let privileged = matches!(kind, "administrator" | "owner");
             assert_eq!(body["can_delete"], privileged);
+            assert_eq!(body["roles"], expected_case_roles, "{kind}");
+            case_revision = body["revision"].clone();
+        }
+
+        let combined_path = "/api/guilds/10/access-roles?include_case_delete_roles=true";
+        let before = settings_statements();
+        let (status, combined) = f.request("POST", combined_path, "").await;
+        let combined_statements = settings_statements() - before;
+        if matches!(kind, "administrator_manager" | "owner" | "manage") {
+            assert_eq!(status, StatusCode::OK, "{kind}: {combined}");
+            assert_eq!(combined["case_delete_roles"], expected_case_roles, "{kind}");
+            assert_eq!(combined["revision"], case_revision);
+            let before = settings_statements();
+            let (status, legacy) = f.request("POST", "/api/guilds/10/access-roles", "").await;
+            assert_eq!(status, StatusCode::OK, "{kind}: {legacy}");
+            assert!(legacy.get("case_delete_roles").is_none());
+            assert_eq!(combined["roles"], legacy["roles"]);
             assert_eq!(
-                body["roles"],
-                if privileged {
-                    serde_json::json!(["777"])
-                } else {
-                    serde_json::json!([])
-                },
-                "{kind}"
+                combined["roles"],
+                serde_json::json!([{"role_id":"555","level":"settings"}])
             );
+            assert_eq!(combined["ttl_secs"], legacy["ttl_secs"]);
+            assert_eq!(combined["revision"], legacy["revision"]);
+            assert!(combined_statements > 0);
+            assert_eq!(combined_statements, settings_statements() - before);
+            let (status, stale) = f
+                .request_token("POST", combined_path, "", Some("earlier-membership"))
+                .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(stale["code"], "guild_enrollment_changed");
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{kind}: {combined}");
+            assert_eq!(combined["code"], "guild_access_denied");
+            assert_eq!(combined_statements, 0);
         }
     }
 }

@@ -3062,7 +3062,7 @@ function settingsHarness() {
         },
       });
     }
-    if (url.endsWith('/case-delete-roles')) return response({ roles: [], revision: '' });
+    if (url.endsWith('/access-roles?include_case_delete_roles=true')) return response({ roles: [], case_delete_roles: [], revision: 'r1' });
     return response(cfg);
   });
   h.app.state.config = cfg;
@@ -3080,20 +3080,28 @@ test('settings patches send only changed fields to the selected server', async (
   const put = calls.find((c) => c.method === 'PUT' && c.url.endsWith('/settings'));
   assert.deepEqual(put, { url: '/api/guilds/987654321098765432/settings', method: 'PUT', body: { prefix: '?' } });
   assert.equal(calls.filter((c) => c.url.endsWith('/config')).length, 0);
-  assert.ok(calls.some((c) => c.method === 'POST' && c.url.endsWith('/case-delete-roles')));
+  assert.ok(calls.some((c) => c.method === 'POST' && c.url.endsWith('/access-roles?include_case_delete_roles=true')));
 });
 
-test('case-delete-role saves advance their revision token', async () => {
+test('legacy role reads keep each card paired with its own revision', async () => {
   const calls = [];
-  let nextRevision = 2;
+  let nextRevision = 3;
+  let releaseCaseRoles;
   const cfg = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
   const h = harness(async (url, options) => {
     const body = options.body ? JSON.parse(options.body) : null;
     calls.push({ url, method: options.method, body });
-    if (url.endsWith('/case-delete-roles') && options.method === 'POST') {
-      return response({ roles: ['1'], revision: 'revision-1' });
+    if (url.endsWith('/access-roles?include_case_delete_roles=true') && options.method === 'POST') {
+      return response({ roles: [], revision: 'revision-1' });
     }
-    if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
+    if (url.endsWith('/case-delete-roles') && options.method === 'POST') {
+      return new Promise(resolve => { releaseCaseRoles = () => resolve(response({ roles: ['1'], revision: 'revision-2' })); });
+    }
+    if (/\/(case-delete-roles|access-roles)$/.test(url) && options.method === 'PUT') {
+      if (body.revision !== `revision-${nextRevision - 1}`) {
+        return { ok: false, status: 409, headers: { get: () => null }, text: async () => '{"error":"tenant settings changed"}' };
+      }
+      assert.ok(url.endsWith('/case-delete-roles'), 'stale access roles must not be accepted');
       return response({ revision: `revision-${nextRevision++}` });
     }
     return response(cfg);
@@ -3102,6 +3110,11 @@ test('case-delete-role saves advance their revision token', async () => {
   h.app.state.tab = 'settings';
   h.app.renderTab();
   await settle();
+  assert.ok(releaseCaseRoles, 'older APIs use the separate case-role read');
+  assert.ok(!h.elements.some(n => n.localName === 'button' && n.textContent === 'Save access roles'));
+  releaseCaseRoles();
+  await settle();
+  assert.ok(h.elements.some(n => n.localName === 'button' && n.textContent === 'Save access roles'));
 
   const roleInput = h.elements.find(n => n.localName === 'input' && /role id/i.test(n.getAttribute("placeholder") || ''));
   const saveRoles = h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles');
@@ -3119,10 +3132,54 @@ test('case-delete-role saves advance their revision token', async () => {
   assert.equal(h.app.isDirty(), true, 'an unrelated settings draft must remain dirty');
 
   const puts = calls.filter(c => c.method === 'PUT' && c.url.endsWith('/case-delete-roles'));
-  assert.equal(puts.length, 2);
-  assert.equal(puts[0].body.revision, 'revision-1');
-  assert.equal(puts[1].body.revision, 'revision-2');
+  assert.deepEqual(puts.map(c => c.body.revision), ['revision-2', 'revision-3']);
+
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Add role'), 'click');
+  const accessInput = h.elements.find(n => n.localName === 'input' && n.closest('.access-role-row'));
+  accessInput.value = '555';
+  await fire(accessInput, 'input');
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save access roles'), 'click');
+  assert.equal(calls.find(c => c.method === 'PUT' && c.url.endsWith('/access-roles')).body.revision, 'revision-1');
+  assert.match(h.nodes.get('#toast').textContent, /tenant settings changed/);
 });
+
+for (const [status, code] of [[503, 'unavailable'], [401, 'auth_lost'], [403, 'guild_access_denied'], [409, 'guild_enrollment_changed']]) {
+  test(`case-role reads on projected access-role error ${status}`, async () => {
+    const calls = [];
+    const cfg = { enrollment_id: 'page-membership', settings: { prefix: '!', bot_name: '' }, settings_override: {}, global_settings: { prefix: '/' } };
+    const h = harness(async (url, options) => {
+      const body = options.body ? JSON.parse(options.body) : null;
+      calls.push({ url, method: options.method, body, enrollment: options.headers['x-jmodguard-enrollment'] });
+      if (url.endsWith('/access-roles?include_case_delete_roles=true')) {
+        return { ok: false, status, headers: { get: () => null }, text: async () => JSON.stringify({ error: code, code }) };
+      }
+      if (url.endsWith('/case-delete-roles') && options.method === 'POST') {
+        return response({ roles: ['777'], revision: 'case-revision' });
+      }
+      if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
+        return response({ revision: 'saved-revision' });
+      }
+      return response(cfg);
+    });
+    h.app.state.config = cfg;
+    h.app.state.tab = 'settings';
+    h.app.renderTab();
+    await settle();
+    const caseReads = calls.filter(c => c.url.endsWith('/case-delete-roles') && c.method === 'POST');
+    assert.equal(caseReads.length, status === 503 ? 1 : 0);
+    if (status !== 503) return;
+    assert.equal(caseReads[0].enrollment, 'page-membership');
+    const input = h.elements.find(n => n.localName === 'input' && /comma-separated/.test(n.getAttribute('placeholder') || ''));
+    assert.equal(input.value, '777');
+    input.value = '778';
+    await fire(input, 'input');
+    await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Save case-removal roles'), 'click');
+    const save = calls.find(c => c.url.endsWith('/case-delete-roles') && c.method === 'PUT');
+    assert.deepEqual(save.body, { roles: ['778'], revision: 'case-revision' });
+    assert.equal(save.enrollment, 'page-membership');
+    assert.equal(h.app.isDirty(), false);
+  });
+}
 
 test('queued log-channel saves clear dirty state and survive in-app navigation', async () => {
   let confirmations = 0;
@@ -3245,12 +3302,15 @@ for (const failRead of [false, true]) {
     const calls = [];
     let reads = 0, writes = 0, unavailable = failRead;
     const h = harness(async (url, opts) => {
+      if (url.endsWith('/access-roles?include_case_delete_roles=true') && opts.method === 'POST') {
+        reads++;
+        return response({ roles: [], case_delete_roles: ['1'], revision: 'revision-1' });
+      }
       assert.ok(url.endsWith('/case-delete-roles'));
       const body = opts.body ? JSON.parse(opts.body) : null;
       calls.push({ opts, body });
       if (opts.method === 'POST') {
         reads++;
-        if (reads === 1) return response({ roles: ['1'], revision: 'revision-1' });
         if (unavailable) throw new Error('current roles unavailable');
         return response({ roles: ['3'], revision: 'revision-3' });
       }
@@ -3539,8 +3599,8 @@ test('case-delete-role save rejects invalid IDs instead of clearing roles', asyn
   const h = harness(async (url, options) => {
     const body = options.body ? JSON.parse(options.body) : null;
     calls.push({ url, method: options.method, body });
-    if (url.endsWith('/case-delete-roles') && options.method === 'POST') {
-      return response({ roles: ['1'], revision: 'revision-1' });
+    if (url.endsWith('/access-roles?include_case_delete_roles=true') && options.method === 'POST') {
+      return response({ roles: [], case_delete_roles: ['1'], revision: 'revision-1' });
     }
     if (url.endsWith('/case-delete-roles') && options.method === 'PUT') {
       return response({ revision: 'revision-2' });
@@ -8172,6 +8232,9 @@ for (const reload of [false, true]) test(`role retry preserves its captured revi
   const fetchRoles = async (url,opts) => {
     const body=opts.body ? JSON.parse(opts.body):null;
     calls.push({url,opts,body});
+    if (url.endsWith('/access-roles?include_case_delete_roles=true') && opts.method === 'POST') {
+      return response({ roles: [], case_delete_roles: roles, revision });
+    }
     if(url.endsWith('/case-delete-roles') && opts.method==='POST') return response({roles,revision});
     if(url.endsWith('/case-delete-roles') && opts.method==='PUT') {
       if(opts.headers['x-jmodguard-save-lookup']==='1') {
@@ -8228,14 +8291,15 @@ for (const recovering of [false, true]) test(`role save with a pending initial r
   const calls = [], session = new Map();
   const originalRevision = '1'.repeat(32), currentRevision = '3'.repeat(32);
   const config = { enrollment_id: 'membership', settings: { prefix: '!', bot_name: '' }, settings_override: {}, global_settings: { prefix: '/' } };
-  let resolveInitialRead, reads = 0, writes = 0, receipt;
+  let resolveInitialRead, writes = 0, receipt;
   const fetchRoles = async (url, opts) => {
+    if (url.endsWith('/access-roles?include_case_delete_roles=true') && opts.method === 'POST') {
+      return new Promise(resolve => { resolveInitialRead = resolve; });
+    }
     assert.ok(url.endsWith('/case-delete-roles'));
     const body = opts.body ? JSON.parse(opts.body) : null;
     calls.push({ opts, body });
     if (opts.method === 'POST') {
-      reads++;
-      if (reads === 1) return new Promise(resolve => { resolveInitialRead = resolve; });
       return response({ roles: ['3'], revision: currentRevision });
     }
     if (opts.headers['x-jmodguard-save-lookup'] === '1') {
@@ -8277,7 +8341,7 @@ for (const recovering of [false, true]) test(`role save with a pending initial r
     assert.equal(h.app.isDirty(), true);
     assert.match(h.nodes.get('#toast').textContent, /roles.*load/i);
   }
-  resolveInitialRead(response({ roles: ['1'], revision: originalRevision })); await settle();
+  resolveInitialRead(response({ roles: [], case_delete_roles: ['1'], revision: originalRevision })); await settle();
   if (recovering) {
     assert.equal(input().value, '3', 'the late initial read must not replace reconciled roles');
     input().value = '4'; await fire(input(), 'input');
@@ -10221,13 +10285,12 @@ test('access-role saves send string role IDs, levels and the loaded revision', a
   const h = harness(async (url, options) => {
     const body = options.body ? JSON.parse(options.body) : null;
     calls.push({ url, method: options.method, body });
-    if (url.endsWith('/access-roles') && options.method === 'POST') {
-      return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], revision: 'revision-1', ttl_secs: 240 });
+    if (url.endsWith('/access-roles?include_case_delete_roles=true') && options.method === 'POST') {
+      return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], case_delete_roles: [], revision: 'revision-1', ttl_secs: 240 });
     }
     if (url.endsWith('/access-roles') && options.method === 'PUT') {
       return response({ revision: 'revision-2', roles: body.roles });
     }
-    if (url.endsWith('/case-delete-roles')) return response({ roles: [], revision: 'revision-1' });
     return response(cfg);
   });
   h.app.state.config = cfg;
@@ -10282,15 +10345,18 @@ test('settings role access shows commands without edit controls', async () => {
   assert.ok(!buttons.includes('+ New custom command'), buttons.join(','));
 });
 
-test('access-role and case-removal saves share the server role revision', async () => {
+test('Settings loads both role cards once and saves independent drafts with the shared revision', async () => {
   const calls = [];
   let revision = 1;
-  const cfg = { settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
+  const cfg = { enrollment_id: 'page-membership', settings: { prefix: '!', bot_name: 'Guard' }, settings_override: {}, global_settings: { prefix: '/' } };
   const h = harness(async (url, options) => {
     const body = options.body ? JSON.parse(options.body) : null;
-    calls.push({ url, method: options.method, body });
+    calls.push({ url, method: options.method, body, enrollment: options.headers['x-jmodguard-enrollment'] });
+    if (url.endsWith('/access-roles?include_case_delete_roles=true') && options.method === 'POST') {
+      return response({ roles: [], case_delete_roles: ['777'], revision: `revision-${revision}`, ttl_secs: 30 });
+    }
     if (url.endsWith('/access-roles') && options.method === 'POST') return response({ roles: [], revision: `revision-${revision}`, ttl_secs: 30 });
-    if (url.endsWith('/case-delete-roles') && options.method === 'POST') return response({ roles: [], revision: `revision-${revision}` });
+    if (url.endsWith('/case-delete-roles') && options.method === 'POST') return response({ roles: ['777'], revision: `revision-${revision}` });
     if (options.method === 'PUT' && /\/(access-roles|case-delete-roles)$/.test(url)) {
       revision += 1;
       return response({ revision: `revision-${revision}` });
@@ -10302,12 +10368,28 @@ test('access-role and case-removal saves share the server role revision', async 
   h.app.state.tab = 'settings';
   h.app.tabSettings();
   await settle();
+  const roleReads = calls.filter(c => c.method === 'POST' && /\/(?:access-roles|case-delete-roles)(?:\?|$)/.test(c.url));
+  assert.equal(roleReads.length, 1, 'mount Settings with one role-settings read');
+  assert.equal(roleReads[0].url, '/api/guilds/987654321098765432/access-roles?include_case_delete_roles=true');
+  assert.equal(roleReads[0].enrollment, 'page-membership');
   const sources = h.elements.filter((n) => n.localName === 'option').map((n) => n.textContent);
   assert.ok(!sources.includes('Second'), 'a role-only server cannot be a copy source');
+  const caseInput = h.elements.find(n => n.localName === 'input' && /comma-separated/.test(n.getAttribute('placeholder') || ''));
+  assert.equal(caseInput.value, '777');
+  caseInput.value = '778';
+  await fire(caseInput, 'input');
+  await fire(h.elements.find(n => n.localName === 'button' && n.textContent === 'Add role'), 'click', {});
+  const accessInput = h.elements.find(n => n.localName === 'input' && n.closest('.access-role-row'));
+  accessInput.value = '555';
+  await fire(accessInput, 'input');
   await fire(h.elements.find((n) => n.localName === 'button' && n.textContent === 'Save access roles'), 'click', {});
+  assert.equal(caseInput.value, '778');
+  assert.deepEqual(Object.keys(h.app.currentDrafts()), ['settings:roles']);
   await fire(h.elements.find((n) => n.localName === 'button' && n.textContent === 'Save case-removal roles'), 'click', {});
   const puts = calls.filter((c) => c.method === 'PUT');
   assert.deepEqual(puts.map((c) => c.body.revision), ['revision-1', 'revision-2']);
+  assert.deepEqual(puts.map((c) => c.body.roles), [[{ role_id: '555', level: 'dashboard' }], ['778']]);
+  assert.equal(h.app.isDirty(), false);
 });
 
 test('access-role drafts survive another Settings save including empty mappings', async () => {
@@ -10317,9 +10399,8 @@ test('access-role drafts survive another Settings save including empty mappings'
     const h = harness(async (url, options) => {
       const body = options.body ? JSON.parse(options.body) : null;
       calls.push({ url, method: options.method, body });
-      if (url.endsWith('/access-roles') && options.method === 'POST') return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], revision: 'r1' });
+      if (url.endsWith('/access-roles?include_case_delete_roles=true') && options.method === 'POST') return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], case_delete_roles: [], revision: 'r1' });
       if (url.endsWith('/access-roles') && options.method === 'PUT') return response({ roles: body.roles, revision: 'r2' });
-      if (url.endsWith('/case-delete-roles')) return response({ roles: [], revision: 'r1' });
       if (url.endsWith('/settings') && options.method === 'PUT') {
         cfg.settings.prefix = body.prefix;
         return response({ ok: true, config_patch: { kind: 'settings', scope: 'guild', settings: cfg.settings, prefix_present: true, prefix: body.prefix } });
@@ -10406,12 +10487,11 @@ test('access-role fields stay locked until a delayed save acknowledgement settle
   let acknowledge;
   let submitted;
   const h = harness(async (url, options) => {
-    if (url.endsWith('/access-roles') && options.method === 'POST') return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], revision: 'r1' });
+    if (url.endsWith('/access-roles?include_case_delete_roles=true') && options.method === 'POST') return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], case_delete_roles: [], revision: 'r1' });
     if (url.endsWith('/access-roles') && options.method === 'PUT') {
       submitted = JSON.parse(options.body);
       return new Promise(resolve => { acknowledge = () => resolve(response({ roles: submitted.roles, revision: 'r2' })); });
     }
-    if (url.endsWith('/case-delete-roles')) return response({ roles: [], revision: 'r1' });
     return response(cfg);
   });
   h.app.state.config = cfg;
@@ -11651,8 +11731,7 @@ test('Commands and Automod rules edit with blue pencils and remove steps with re
 
 test('Templates keep only form-footer text buttons and Settings role rows remove with icons', async () => {
   const h = harness(async (url, options) => {
-    if (url.endsWith('/access-roles') && options.method === 'POST') return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], revision: 'r1' });
-    if (url.endsWith('/case-delete-roles')) return response({ roles: [], revision: 'r1' });
+    if (url.endsWith('/access-roles?include_case_delete_roles=true') && options.method === 'POST') return response({ roles: [{ role_id: '111111111111111111', level: 'dashboard' }], case_delete_roles: [], revision: 'r1' });
     return response({});
   });
   h.app.state.config = { templates: [{ event: 'member_join', global: 'Hi {user}', guild_override: null, effective: 'Hi {user}' }] };
