@@ -1502,6 +1502,14 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
     if (relation === "unverified") return "the sampled cgroups have no common visible ancestor";
     return "the sampled cgroups could not be verified as separate";
   };
+  let blockNote = "Estimated block size unavailable.";
+  if (blocks) {
+    blockNote = `The estimate rounds fresh cgroup readings up in ${blockMib} MiB blocks, with a one-block minimum.`;
+  } else if (!combineMemory) {
+    blockNote = `Combined memory and block estimates are unavailable because ${overlapReason(memoryRelation)}.`;
+  } else if (total == null) {
+    blockNote = "Combined block estimate unavailable. Both processes need fresh, usable memory readings.";
+  }
   const estimateRow = (label, hourly) => h("tr", null,
     h("th", { scope: "row" }, label),
     h("td", null, resourceValue(hostingCost(hourly, 1))),
@@ -1511,11 +1519,7 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
     h("dl", { className: "du-facts" },
       ...memoryRows.map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, resourceValue(value)))),
     ),
-    !combineMemory
-      ? h("p", { className: "an-note muted" }, `Combined memory and block estimates are unavailable because ${overlapReason(memoryRelation)}.`)
-      : h("p", { className: "an-note muted" }, blockMib > 0
-        ? `The estimate rounds fresh cgroup readings up in ${blockMib} MiB blocks, with a one-block minimum.`
-        : "Estimated block size unavailable."),
+    h("p", { className: "an-note muted" }, blockNote),
     rates
       ? h("div", null,
         h("h4", { id: "resources-hosting-estimate", className: "du-metric-label" }, "Hosting cost estimate (USD)"),

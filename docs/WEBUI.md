@@ -421,18 +421,14 @@ directories it writes; the container's root filesystem is not measured because i
 totals belong to the host; database size is on Database Usage), and process facts
 (version, commit, uptime, last restart, restarts in the range, pod, region, ready).
 The memory panel shows estimated capacity and headroom in local 64 MiB blocks
-for fresh, disjoint cgroup readings. Private cgroup mounts can hide the
-ancestry needed to verify separation. After independently verifying that
-the sampled Bot and API cgroups are disjoint, set
-`web.hosting_estimate.assume_disjoint_cgroups = true` on the API, or set
-`"assume_disjoint_cgroups": true` in the `JMODGUARD_HOSTING_ESTIMATE` JSON
-object. This setting defaults to off and applies to identified scopes with
-inconclusive ancestry. The panel identifies estimates that use the declaration.
-For shared, overlapping, or otherwise unresolved memory scopes, the panel
-shows one available reading and explains why the combined figure is hidden.
-Set `enabled` in the same configuration to show hourly and 30-day USD estimates.
-Each estimate uses its own memory or CPU scope comparison and excludes host
-overhead and egress.
+for fresh, usable readings from disjoint cgroups. The panel explains when
+a combined figure is unavailable. For shared, overlapping, or unverified
+memory scopes, it shows one available reading. Private mounts can hide the
+ancestry needed to verify separation. Operators can independently verify
+separation and enable a default-off declaration, which the panel labels
+when used. Optional hourly and 30-day USD estimates use the scope comparison
+for each metric and exclude host overhead and egress.
+See [hosting estimate configuration](CONFIGURATION.md#hosting-estimates).
 Below are bot activity (Gateway events per minute and by type, logical Discord REST requests,
 429s and rate-limit waits by bucket, shard latency, writer-lease generation and margin,
 guilds, capture queue), API activity (requests per minute, p50/p95 latency, 4xx/5xx,
