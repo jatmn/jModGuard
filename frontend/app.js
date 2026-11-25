@@ -334,10 +334,10 @@ async function switchGuild(guildId) {
   state.guildId = guildId;
   state.tab = workspaceTab(state.tab);
   syncListLocation();
-  state.config = null;
+  resetGuildConfig();
   ui.set({ edits: "clean" });
   persistWorkspace();
-  if (await loadConfig()) renderTab();
+  await loadWorkspaceConfig();
 }
 
 function directoryStatusLabel(server, receipt) {
@@ -2163,9 +2163,7 @@ function Content() {
           ActionButton,
           {
             className: "btn btn-primary",
-            onClick: async () => {
-              if (await loadConfig()) renderTab();
-            },
+            onClick: loadWorkspaceConfig,
           },
           "Retry",
         ),
@@ -2234,11 +2232,11 @@ async function init() {
     state.guilds = state.me.guilds;
     restoreWorkspace();
     if (state.guildId !== previousGuild || guildAccess() !== previousAccess) {
-      state.config = null;
+      resetGuildConfig();
       ui.set({ editor: null });
     }
     showView("main-view");
-    if (await loadConfig()) renderTab();
+    await loadWorkspaceConfig();
   } catch (error) {
     if (!handleAuthLoss(error)) {
       showView("startup-view");
@@ -2282,6 +2280,12 @@ let state = {
 // Request generation fences publication; retained configuration is independent
 // of read activity and the most recent read error.
 let configRequest = 0;
+function resetGuildConfig() {
+  ++configRequest;
+  state.config = null;
+  state.configRead = { activity: "idle", error: null };
+}
+
 function ownsConfigRead(request, guildId) {
   return request === configRequest && guildId === state.guildId;
 }
@@ -2407,7 +2411,11 @@ function navigate(tab) {
     setCaseListLocation(state.guildId, pendingCase.caseId);
   }
   persistWorkspace();
-  renderTab();
+  if (tabNeedsGuildConfig() && !state.config && state.configRead.activity !== "loading") {
+    void loadWorkspaceConfig();
+  } else {
+    renderTab();
+  }
   return true;
 }
 
@@ -2452,6 +2460,16 @@ function tabAllowed(tab) {
 function workspaceTab(tab) {
   if (tabAllowed(tab)) return tab;
   return tabAllowed("dashboard") ? "dashboard" : null;
+}
+
+function tabNeedsGuildConfig() {
+  const access = tabAccess.get(state.tab);
+  return access !== undefined && access !== "owner";
+}
+
+async function loadWorkspaceConfig() {
+  // Navigation may show an owner panel while the selected guild's read is pending.
+  if (tabNeedsGuildConfig() && await loadConfig() && tabNeedsGuildConfig()) renderTab();
 }
 
 let previewCapability = { kind: "absent" };
@@ -3262,11 +3280,11 @@ async function loadConfig() {
     state.config = null;
     ui.set({ editor: null });
     state.configRead.error = e.message || String(e);
-    toast("Could not refresh configuration: " + state.configRead.error, "error");
+    if (tabNeedsGuildConfig()) toast("Could not refresh configuration: " + state.configRead.error, "error");
   } finally {
     if (request === configRequest) {
       state.configRead.activity = "idle";
-      if (state.configRead.error) renderTab();
+      if (state.configRead.error && tabNeedsGuildConfig()) renderTab();
     }
   }
 }
