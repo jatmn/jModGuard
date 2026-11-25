@@ -1494,7 +1494,7 @@ process.stdout.write(JSON.stringify({
 }));
 JS
 )"
-write_publish_handoff api true
+write_publish_handoff api true "$MOCK_BUILD_DIGEST"
 JMODGUARD_PUBLISH_PHASE=sign
 export JMODGUARD_PUBLISH_PHASE
 with_main
@@ -1521,6 +1521,86 @@ grep_array CALLS -q -- "--tag ghcr.io/jatmn/jmodguard-api:${HEAD_SHA}" \
   || fail 'sign phase must promote tags derived from the publication plan SHA'
 grep_array CALLS -q -- "--tag ghcr.io/jatmn/jmodguard-api:${FORGED_SHA}" \
   && fail 'sign phase must not promote tags from forged build state'
+
+# The real sign phase must authenticate before inspecting staging. If a later
+# component cannot be signed, the earlier component's queued tags stay put.
+(
+  mkdir "$trusted_sign_dir/bot"
+  JMODGUARD_PUBLISH_STATE_DIR="$trusted_sign_dir/bot" write_publish_handoff bot true "$MOCK_BUILD_DIGEST"
+  JMODGUARD_DEFER_PROMOTION=1
+  eval "$(declare -f run_docker | sed '1s/^run_docker/mock_sign_docker/')"
+  run_docker() {
+    if [[ "$*" != "buildx imagetools inspect $TRUSTED_STAGING --format {{json .Manifest}}" ]]; then
+      mock_sign_docker "$@"
+      return
+    fi
+    printf 'staging lookup\n' >>"$TRACE_FILE"
+    [[ "$(grep -c '^docker login ' "$TRACE_FILE")" == 2 ]] \
+      || { echo 'unauthorized: authenticate before inspecting staging' >&2; return 1; }
+    local attempt
+    attempt="$(grep -c '^staging lookup$' "$TRACE_FILE")"
+    case "$lookup_case:$attempt" in
+      recovery:1)
+        echo 'unexpected status from HEAD request: 503 Service Unavailable (private diagnostic)' >&2
+        return 1 ;;
+      recovery:2)
+        echo 'failed to do request: TLS handshake timeout (private diagnostic)' >&2
+        return 1 ;;
+      absent:1)
+        echo "$TRUSTED_STAGING: not found" >&2
+        return 1 ;;
+      absent:*)
+        echo "unexpected status from GET request to https://ghcr.io/v2/jatmn/jmodguard-api/manifests/${TRUSTED_STAGING##*:}: 404 Not Found" >&2
+        return 1 ;;
+      authorization:*)
+        echo 'unexpected status from HEAD request: 401 Unauthorized (private diagnostic)' >&2
+        return 1 ;;
+      invalid:*)
+        printf '%s\n' 'private diagnostic'
+        return 0 ;;
+      mismatch:*)
+        printf '{"digest":"%s","size":10}\n' "$FORGED_DIGEST"
+        return 0 ;;
+    esac
+    mock_sign_docker "$@"
+  }
+  sleep() { printf 'sleep %s\n' "$1" >>"$TRACE_FILE"; }
+
+  for lookup_case in recovery absent authorization invalid mismatch; do
+    : >"$TRACE_FILE"
+    if lookup_output="$(
+      exec 2>&1
+      JMODGUARD_PUBLISH_STATE_DIR="$trusted_sign_dir/bot" publish_component bot || exit $?
+      publish_component api || exit $?
+      finish_deferred_promotions
+    )"; then
+      [[ "$lookup_case" == recovery ]] || fail "$lookup_case must prevent tag promotion"
+      grep -q "^sign api ghcr.io/jatmn/jmodguard-api ${MOCK_BUILD_DIGEST}$" "$TRACE_FILE" \
+        || fail 'recovered lookup must sign the verified digest'
+      for component in bot api; do
+        grep -Fq -- "--tag ghcr.io/jatmn/jmodguard-${component}:latest " "$TRACE_FILE" \
+          || fail "successful deferred finish must promote $component"
+      done
+    else
+      [[ "$lookup_case" != recovery ]] || fail "authenticated retry did not recover: $lookup_output"
+      grep -q '^sign bot ' "$TRACE_FILE" || fail 'earlier component must reach signing before the failure'
+      if grep -Eq '^sign api |^docker buildx imagetools create ' "$TRACE_FILE"; then
+        fail "$lookup_case must prevent signing the failed image and moving any queued tags"
+      fi
+    fi
+    case "$lookup_case" in
+      recovery) expected='retryable registry or transport error'; attempts=3 ;;
+      absent) expected='manifest absent'; attempts=3 ;;
+      authorization) expected='authorization failed'; attempts=1 ;;
+      invalid) expected='invalid manifest metadata'; attempts=1 ;;
+      mismatch) expected='expected verified digest'; attempts=1 ;;
+    esac
+    [[ "$lookup_output" == *"api:"*"${TRUSTED_STAGING}"*"$expected"* ]] \
+      || fail "expected component, reference, and $expected: $lookup_output"
+    [[ "$lookup_output" != *'private diagnostic'* ]] || fail 'registry details must not leak into the sign log'
+    assert_eq "$(grep -c '^staging lookup$' "$TRACE_FILE")" "$attempts"
+  done
+)
 rm -rf "$trusted_sign_dir"
 unset JMODGUARD_PUBLISH_PHASE JMODGUARD_PUBLISH_STATE_DIR
 
