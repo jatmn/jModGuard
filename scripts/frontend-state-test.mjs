@@ -9417,14 +9417,15 @@ test('known spam dedicated page adds samples and URL wildcards and confirms scop
   assert.equal(JSON.parse(requests[1].options.body).kind, 'url');
   panel = h.app.tabKnownSpam(); await settle();
   assert.match(panel.textContent, /tinyurl.com/);
-  const urlRow = [...panel.querySelectorAll('tbody tr')].find(row => row.textContent.includes('tinyurl.com/*'));
+  const findUrlRow = () => [...panel.querySelectorAll('tbody tr')].find(row => row.cells[0].textContent === 'tinyurl.com/*');
+  const urlRow = findUrlRow();
   assert.ok(urlRow, 'the URL pattern has its own row');
   const remove = iconAction(urlRow, 'Remove');
   const removals = () => requests.filter(({ options }) => options.method === 'DELETE').map(({ url }) => url);
   await fire(remove, 'click');
   assert.deepEqual(removals(), [], 'declining sends no removal request');
   assert.deepEqual(prompts, [removalPrompt]);
-  assert.match(panel.textContent, /tinyurl\.com\/\*/);
+  assert.ok(findUrlRow(), 'declining leaves the URL pattern in the table');
 
   allowRemoval = true;
   await fire(remove, 'click');
