@@ -395,12 +395,12 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
         // can defer a poll but never authorizes dispatch: claim below is primary.
         // Housekeeping (expiry/uncertain) is independent of write fences. Claim
         // selection still excludes fenced guilds in the UPDATE/SELECT below.
-        let due: i64 = conn.query_row(
+        let due: bool = conn.query_row_advisory(
             &poll_due_sql(),
             params![now],
             |r| Ok(r.get(0)?),
         )?;
-        if due == 0 {
+        if !due {
             return Ok(None);
         }
         let tx = conn.transaction_immediate()?;

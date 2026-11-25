@@ -199,9 +199,10 @@ and deadline-aware log completion. Mock outcomes do not validate live Discord be
 The same bot task lifts due timed bans (`!ban <user> --minutes N`, see
 [COMMANDS.md](COMMANDS.md)) after each queue drain, examining at most `batch_size` due
 bans per poll and making at most `batch_size` database reads to find them. A poll first
-makes one advisory read; when no active ban's deadline has passed it stops there and opens
-no primary transaction. Replica lag can defer an expiry to a later poll, but selection and
-the claim stay on the primary. Expiries in a fenced guild wait until the fence is cleared. Before consuming a deadline the worker
+makes one advisory read for a due ban under an active enrollment in an unfenced guild
+whose retry time has arrived or is unset. An advisory miss skips the poll without opening
+a primary transaction or clearing retry history. Replica lag can defer an expiry to a
+later poll. Selection and claim use the primary. Before consuming a deadline the worker
 checks the bot's own join timestamp through REST, as the executor does. An unavailable
 check defers that guild's expiries; the rest of the poll continues with other guilds. The
 guild is then skipped until a retry time held in the bot process: 60 seconds after that
@@ -210,13 +211,12 @@ cleared by a successful check. Checks in one poll run in turn and each may wait 
 request timeout, so the delay counts from that check's end rather than the poll's start. A
 poll checks guilds without a retry time first. Guilds whose retry time has arrived come
 after them, earliest retry time first; one read passes over those that no longer have a
-due expiry. A failure count is forgotten only once a poll finds that guild has no due
-expiry: the poll reaches every due expiry without checking that guild again, or passes
-over it to reach a later retry. Guilds that keep failing therefore cannot fill every
-poll's batch and starve other guilds, even when there are enough of them to keep every
-poll busy. A restart checks each guild again. A newer join repairs the enrollment; the old
-membership's deadline is then never dispatched. That check did answer, so it clears the
-guild's retry time instead of setting one. While the deadline is consumed and the unban
+due expiry. Primary selection can discard a stale retry when it exhausts eligible work
+or passes over the guild to reach a later retry. Guilds that keep failing therefore
+cannot fill every poll's batch and starve other guilds, even when there are enough of
+them to keep every poll busy. A restart checks each guild again. A newer join repairs the
+enrollment. The old membership's deadline is then never dispatched. That check answered,
+so it clears the guild's retry time. While the deadline is consumed and the unban
 runs, the worker holds the same in-process slot as a ban command, so a concurrent ban of
 that user is refused instead of being undone. A command that holds the slot defers the
 expiry.
