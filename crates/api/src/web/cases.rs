@@ -326,36 +326,21 @@ pub async fn list_history(
         .limit
         .unwrap_or(32)
         .clamp(1, tenant::history_limits().entry.max_page_size);
-    let refs = store
-        .case_history_ids(
-            scope.clone(),
-            case.clone(),
-            after,
-            limit,
-            tenant::history_limits(),
-        )
+    let page = store
+        .case_history_page(scope.clone(), case, after, limit, tenant::history_limits())
         .await?;
-    let mut entries = Vec::new();
-    let mut actors = Vec::new();
-    for item in refs {
-        if let Some(data) = store
-            .case_history_entry(
-                scope.clone(),
-                case.clone(),
-                item.id.clone(),
-                tenant::history_limits(),
-            )
-            .await?
-        {
-            actors.extend(data.actor_id);
-            entries.push(serde_json::json!({
+    let actors = page.iter().filter_map(|(_, data)| data.actor_id);
+    let names = directory_names(&store, scope, actors).await;
+    let entries: Vec<_> = page
+        .into_iter()
+        .map(|(item, data)| {
+            serde_json::json!({
                 "id": item.id.as_str(),
                 "sequence": item.sequence.to_string(),
                 "entry": data,
-            }));
-        }
-    }
-    let names = directory_names(&store, scope, actors).await;
+            })
+        })
+        .collect();
     Ok(Json(
         serde_json::json!({ "history": entries, "names": names }),
     ))

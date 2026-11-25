@@ -121,6 +121,15 @@ fn validate(data: &CaseHistoryData, limits: CaseHistoryLimits) -> Result<()> {
     Ok(())
 }
 
+fn decode_history_payload(
+    payload: Option<String>,
+    limits: CaseHistoryLimits,
+) -> Result<CaseHistoryData> {
+    let data = serde_json::from_str(&payload.ok_or(CaseError::Limit)?)?;
+    validate(&data, limits)?;
+    Ok(data)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HistoryParent {
     Live,
@@ -263,14 +272,73 @@ impl GuildDataStore {
             verify_scope(&tx,&expected,&scope,true)?;
             if history_parent(&tx,&scope,&case)? == HistoryParent::Unavailable { tx.finish_read()?; return Ok(None); }
             let row=tx.query_row("SELECT CASE WHEN length(CAST(payload AS BLOB))<=?5 THEN payload ELSE NULL END FROM guild_case_history WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND entry_id=?4",params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str(),id.as_str(),i64::from(limits.entry.max_record_bytes)],|r|Ok(r.get::<Option<String>>(0)?)).optional()?;
-            let result=match row {
-                None=>None,
-                Some(None)=>return Err(CaseError::Limit.into()),
-                Some(Some(payload))=>{let data:CaseHistoryData=serde_json::from_str(&payload)?;validate(&data,limits)?;Some(data)}
-            };
+            let result = row.map(|payload| decode_history_payload(payload, limits)).transpose()?;
             tx.finish_read()?;
             Ok(result)
         }).await
+    }
+
+    /// Read one bounded sequence page with its payloads in a single primary snapshot.
+    /// Missing or removed parents yield an empty page after scope verification.
+    pub async fn case_history_page(
+        &self,
+        scope: GuildDataScope,
+        case: CaseId,
+        after_sequence: i64,
+        count: u32,
+        limits: CaseHistoryLimits,
+    ) -> Result<Vec<(CaseHistoryRef, CaseHistoryData)>> {
+        self.check_target(&scope.placement)?;
+        limits.validate()?;
+        limits.entry.page(count)?;
+        anyhow::ensure!(after_sequence >= 0, CaseError::Invalid);
+        let expected = self.expected.clone();
+        self.db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                if history_parent(&tx, &scope, &case)? == HistoryParent::Unavailable {
+                    tx.finish_read()?;
+                    return Ok(Vec::new());
+                }
+                let mut stmt = tx.prepare(
+                    "SELECT entry_id, sequence,
+                        CASE WHEN length(CAST(payload AS BLOB))<=?6 THEN payload END
+                 FROM guild_case_history
+                 WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND sequence>?4
+                 ORDER BY sequence LIMIT ?5",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        scope.guild_id(),
+                        scope.enrollment.id.as_str(),
+                        case.as_str(),
+                        after_sequence,
+                        i64::from(count),
+                        i64::from(limits.entry.max_record_bytes)
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<String>(0)?,
+                            row.get::<i64>(1)?,
+                            row.get::<Option<String>>(2)?,
+                        ))
+                    },
+                )?;
+                let mut page = Vec::new();
+                for row in rows {
+                    let (id, sequence, payload) = row?;
+                    let reference = CaseHistoryRef {
+                        id: CaseId::try_from(id)?,
+                        sequence,
+                    };
+                    page.push((reference, decode_history_payload(payload, limits)?));
+                }
+                drop(stmt);
+                tx.finish_read()?;
+                Ok(page)
+            })
+            .await
     }
 
     /// Sequence keyset page of IDs only. Missing/removed parent yields an empty page;

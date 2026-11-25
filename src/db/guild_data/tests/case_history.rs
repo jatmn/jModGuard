@@ -38,6 +38,8 @@ fn created(result: AppendCaseHistory) -> CaseHistoryRef {
 
 #[tokio::test]
 async fn ordered_history_preserves_original_and_isolates_parent_and_guild() {
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let _guard = crate::db_compat::enter_startup_probe(Some(probe.clone()));
     let f = Fixture::new();
     let reg = f.registration(StoreId::new(), StorePolicy::Shared).await;
     let store = GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
@@ -99,6 +101,18 @@ async fn ordered_history_preserves_original_and_isolates_parent_and_guild() {
             .unwrap(),
         vec![second.clone()]
     );
+    let before = probe.transactions();
+    assert_eq!(
+        store
+            .case_history_page(a.clone(), case.clone(), 0, 2, limits())
+            .await
+            .unwrap(),
+        vec![
+            (first.clone(), note("context")),
+            (second.clone(), correction.clone())
+        ]
+    );
+    assert_eq!(probe.transactions() - before, 1);
     let reopened = GuildDataStore::open(f.options(), reg).unwrap();
     assert_eq!(
         reopened
@@ -250,6 +264,14 @@ async fn budgets_cover_count_aggregate_bytes_and_read_size_without_eviction() {
             .await
             .is_err()
     );
+    assert!(matches!(
+        store
+            .case_history_page(a.clone(), case.clone(), 0, 1, tiny)
+            .await
+            .unwrap_err()
+            .downcast_ref::<CaseError>(),
+        Some(CaseError::Limit)
+    ));
     assert_eq!(
         store
             .case_history_ids(a.clone(), case.clone(), 0, 1, tiny)
@@ -273,10 +295,51 @@ async fn budgets_cover_count_aggregate_bytes_and_read_size_without_eviction() {
     );
     assert!(
         store
-            .case_history_ids(a, case, 0, 101, limits())
+            .case_history_ids(a.clone(), case.clone(), 0, 101, limits())
             .await
             .is_err()
     );
+    for (after, count) in [(-1, 1), (0, 0), (0, 101)] {
+        assert!(
+            store
+                .case_history_page(a.clone(), case.clone(), after, count, limits())
+                .await
+                .is_err()
+        );
+    }
+    let (guild, enrollment, case_key) = (
+        a.guild_id(),
+        a.enrollment.id.clone(),
+        case.as_str().to_owned(),
+    );
+    let blank_note = serde_json::to_string(&note(" ")).unwrap();
+    store
+        .db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "INSERT INTO guild_case_history (guild_id, enrollment_id, case_id, entry_id, sequence, payload)
+                 VALUES (?1, ?2, ?3, ?4, 2, ?5)",
+                params![
+                    guild,
+                    enrollment,
+                    case_key,
+                    CaseId::new().as_str(),
+                    blank_note
+                ],
+                64 * 1024 * 1024,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .case_history_page(a, case, 0, 2, limits())
+            .await
+            .unwrap_err()
+            .downcast_ref::<CaseError>(),
+        Some(CaseError::Invalid)
+    ));
 }
 
 #[tokio::test]
@@ -392,6 +455,14 @@ async fn failed_child_removal_rolls_back_parent_and_closed_cleanup_cascades() {
         Some(note("retained"))
     );
     store.close_membership(a.clone()).await.unwrap();
+    assert!(matches!(
+        store
+            .case_history_page(a.clone(), case.clone(), 1, 1, limits())
+            .await
+            .unwrap_err()
+            .downcast_ref::<TenantDataError>(),
+        Some(TenantDataError::Membership)
+    ));
     assert!(
         store
             .purge_closed_cases(a.clone(), 1, CaseLimits::default())

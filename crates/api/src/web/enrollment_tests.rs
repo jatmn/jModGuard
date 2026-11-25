@@ -7659,9 +7659,104 @@ async fn case_list_summary_pages_preserve_cursor_and_private_fields() {
 }
 
 #[tokio::test]
+async fn case_history_pages_use_one_history_snapshot() {
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseEvidence, CaseHistoryBody, CaseHistoryData, CaseId, CaseOutcome,
+        CaseSource,
+    };
+
+    let probe = Arc::new(db::StartupProbe::default());
+    let _guard = db::enter_startup_probe(Some(probe.clone()));
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    let case = CaseId::new();
+    store
+        .record_case(
+            scope.clone(),
+            case.clone(),
+            CaseData {
+                ban_attempt_tag: None,
+                source: CaseSource::DiscordAudit { entry_id: 1 },
+                action: CaseAction::Ban,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: 42,
+                actor_id: None,
+                occurred_at_ms: 1,
+                reason: None,
+                evidence: CaseEvidence::Unavailable,
+            },
+            crate::tenant::case_limits(),
+        )
+        .await
+        .unwrap();
+
+    let mut expected = Vec::new();
+    for sequence in 1..=33 {
+        let stamp = 34 - sequence;
+        let id = CaseId::try_from(format!("{stamp:032x}")).unwrap();
+        // Anonymous entries isolate history reads from the optional actor name lookup.
+        let data = CaseHistoryData {
+            actor_id: None,
+            recorded_at_ms: stamp,
+            body: CaseHistoryBody::Note {
+                text: format!("Note {sequence}"),
+            },
+        };
+        store
+            .append_case_history(
+                scope.clone(),
+                case.clone(),
+                id.clone(),
+                data.clone(),
+                crate::tenant::history_limits(),
+            )
+            .await
+            .unwrap();
+        expected.push(serde_json::json!({
+            "id": id.as_str(),
+            "sequence": sequence.to_string(),
+            "entry": data,
+        }));
+    }
+
+    let url = format!("/api/guilds/10/cases/{}/history", case.as_str());
+    let mut transactions = Vec::new();
+    for (query, page) in [
+        ("?after=33", &expected[..0]),
+        ("?after=1&limit=1", &expected[1..2]),
+        ("", &expected[..32]),
+    ] {
+        let before = probe.transactions();
+        let (status, response) = f.request("GET", &format!("{url}{query}"), "").await;
+        transactions.push(probe.transactions() - before);
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(
+            response,
+            serde_json::json!({ "history": page, "names": {} })
+        );
+    }
+    assert!(transactions[0] > 0);
+    assert_eq!(transactions, [transactions[0]; 3]);
+
+    assert!(store.remove_case(scope, case).await.unwrap());
+    let (status, response) = f.request("GET", &url, "").await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response, serde_json::json!({ "history": [], "names": {} }));
+}
+
+#[tokio::test]
 async fn case_reads_filter_the_list_and_name_known_members() {
     use crate::db::guild_data::{
-        CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource, TextEvidence,
+        CaseAction, CaseData, CaseEvidence, CaseHistoryBody, CaseHistoryData, CaseId, CaseOutcome,
+        CaseSource, TextEvidence,
     };
     let f = Fixture::new(false).await;
     f.enroll(10).await;
@@ -7813,11 +7908,32 @@ async fn case_reads_filter_the_list_and_name_known_members() {
     let note = serde_json::json!({"entry_id": "b".repeat(32), "text": "checked"}).to_string();
     let (status, added) = f.request("POST", &note_url, &note).await;
     assert_eq!(status, StatusCode::OK, "{added}");
+    store
+        .append_case_history(
+            scope,
+            kick,
+            CaseId::new(),
+            CaseHistoryData {
+                actor_id: Some(moderator),
+                recorded_at_ms: 1,
+                body: CaseHistoryBody::Note {
+                    text: "Confirmed".into(),
+                },
+            },
+            crate::tenant::history_limits(),
+        )
+        .await
+        .unwrap();
     let (status, history) = f.request("GET", &note_url, "").await;
     assert_eq!(status, StatusCode::OK, "{history}");
-    assert_eq!(history["history"].as_array().unwrap().len(), 1);
-    // The fixture's session user has no directory row, so no name is invented.
-    assert_eq!(history["names"], serde_json::json!({}));
+    assert_eq!(history["history"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        history["names"],
+        serde_json::json!({
+            moderator.to_string(): { "display_name": "kit.mod", "username": "kit.mod" },
+        }),
+        "only the history actor with a known name is returned"
+    );
 }
 
 #[tokio::test]
