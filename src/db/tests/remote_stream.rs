@@ -3229,6 +3229,7 @@ async fn snapshot_rollback_stops_inside_the_read_budget() {
 async fn snapshot_rollback_after_expired_budget_uses_the_short_release() {
     let fixture = HranaFixture::start().await;
     let db = fixture.db_with_operation_timeout(Duration::from_secs(30));
+    let clock = install_clock(&db);
     fixture.hang_rollback();
     let first_connection = Arc::new(std::sync::Mutex::new(0usize));
     let record_connection = Arc::clone(&first_connection);
@@ -3245,15 +3246,21 @@ async fn snapshot_rollback_after_expired_budget_uses_the_short_release() {
     )
     .await
     .expect("expired snapshot never sent ROLLBACK");
-    let release_started = std::time::Instant::now();
+    // Advance the rollback deadline only after the fixture has parked the request.
+    let expected_release = Duration::from_millis(300);
+    let last_tick = Duration::from_millis(1);
+    clock.advance(expected_release - last_tick);
+    assert!(
+        matches!(
+            call.recv_timeout(Duration::from_millis(150)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "ROLLBACK returned before the short release deadline"
+    );
+    clock.advance(last_tick);
     call.recv_timeout(Duration::from_secs(2))
         .expect("expired-budget ROLLBACK waited on the pool deadline")
         .expect("a stalled ROLLBACK must not fail the collected snapshot");
-    let release = release_started.elapsed();
-    assert!(
-        release >= Duration::from_millis(150) && release < Duration::from_secs(2),
-        "expired read budget must use the short release, not the pool deadline: {release:?}"
-    );
     assert_eq!(
         db.connections.idle.lock().unwrap().len(),
         1,
