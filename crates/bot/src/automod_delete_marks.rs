@@ -6,6 +6,93 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+#[cfg(not(test))]
+type ScanTrackedMap<K, V> = HashMap<K, V>;
+#[cfg(test)]
+use scan_tracking::ScanTrackedMap;
+
+#[cfg(test)]
+mod scan_tracking {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::collections::hash_map::{Entry, Iter, Keys, Values};
+    use std::hash::Hash;
+
+    // Count iterator creation at the map boundary, including short-circuiting
+    // scans. Keep the raw map private so new traversal APIs must opt in here.
+    pub(super) struct ScanTrackedMap<K, V> {
+        map: HashMap<K, V>,
+        scans: Cell<u64>,
+    }
+
+    impl<K, V> Default for ScanTrackedMap<K, V> {
+        fn default() -> Self {
+            Self {
+                map: HashMap::new(),
+                scans: Cell::new(0),
+            }
+        }
+    }
+
+    impl<K: Eq + Hash, V> ScanTrackedMap<K, V> {
+        pub(super) fn len(&self) -> usize {
+            self.map.len()
+        }
+
+        pub(super) fn contains_key(&self, key: &K) -> bool {
+            self.map.contains_key(key)
+        }
+
+        pub(super) fn get(&self, key: &K) -> Option<&V> {
+            self.map.get(key)
+        }
+
+        pub(super) fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+            self.map.get_mut(key)
+        }
+
+        pub(super) fn insert(&mut self, key: K, value: V) -> Option<V> {
+            self.map.insert(key, value)
+        }
+
+        pub(super) fn entry(&mut self, key: K) -> Entry<'_, K, V> {
+            self.map.entry(key)
+        }
+
+        pub(super) fn remove(&mut self, key: &K) -> Option<V> {
+            self.map.remove(key)
+        }
+
+        pub(super) fn scans(&self) -> u64 {
+            self.scans.get()
+        }
+
+        pub(super) fn iter(&self) -> Iter<'_, K, V> {
+            self.scans.set(self.scans.get() + 1);
+            self.map.iter()
+        }
+
+        pub(super) fn keys(&self) -> Keys<'_, K, V> {
+            self.scans.set(self.scans.get() + 1);
+            self.map.keys()
+        }
+
+        pub(super) fn values(&self) -> Values<'_, K, V> {
+            self.scans.set(self.scans.get() + 1);
+            self.map.values()
+        }
+    }
+
+    impl<'a, K: Eq + Hash, V> IntoIterator for &'a ScanTrackedMap<K, V> {
+        type Item = (&'a K, &'a V);
+        type IntoIter = Iter<'a, K, V>;
+
+        fn into_iter(self) -> Self::IntoIter {
+            self.iter()
+        }
+    }
+}
+
 const AUTOMOD_DELETE_MARK_TTL: Duration = Duration::from_secs(10 * 60);
 pub(crate) const MAX_AUTOMOD_DELETE_MARKS: usize = 4096;
 
@@ -311,11 +398,11 @@ impl UnmarkedDelete {
 pub(crate) struct AutomodDeleteMarks {
     next_attempt: u64,
     order: VecDeque<MarkKey>,
-    entries: HashMap<MarkKey, AutomodDeleteMark>,
+    entries: ScanTrackedMap<MarkKey, AutomodDeleteMark>,
     by_message: HashMap<MessageTarget, Vec<MarkKey>>,
     gateway: HashMap<MessageTarget, MessageGatewayState>,
     /// Pending ids kept in a bulk transcript, keyed until delivery settles.
-    bulk_logs: HashMap<MessageTarget, BulkLogState>,
+    bulk_logs: ScanTrackedMap<MessageTarget, BulkLogState>,
     /// Deadlines for delivered rows and for ambiguous rows whose REST attempts
     /// have settled, earliest at the front. In-flight, deferred, and unsettled
     /// ambiguous rows are not indexed. Prune only pops entries that are already due.
@@ -2844,9 +2931,15 @@ mod tests {
         }
         let pops = marks.bulk_expiry_pops;
         let visits = marks.bulk_expiry_visits;
+        let scans = marks.bulk_logs.scans();
         let due = early + AUTOMOD_DELETE_MARK_TTL + Duration::from_secs(1);
         assert!(due < later + AUTOMOD_DELETE_MARK_TTL);
         marks.prune(due);
+        assert_eq!(
+            marks.bulk_logs.scans(),
+            scans,
+            "prune scanned live bulk logs"
+        );
         assert_eq!(marks.bulk_expiry_pops, pops + 1);
         assert_eq!(
             marks.bulk_expiry_visits,
@@ -2889,6 +2982,7 @@ mod tests {
         assert_eq!(marks.bulk_expiry.len(), MAX_AUTOMOD_DELETE_MARKS);
         let pops = marks.bulk_expiry_pops;
         let visits = marks.bulk_expiry_visits;
+        let scans = marks.bulk_logs.scans();
         for message in 0..10_000u64 {
             assert_eq!(
                 marks.observe_gateway_delete(9, 9, message, None, now),
@@ -2896,13 +2990,18 @@ mod tests {
             );
         }
         assert_eq!(
+            marks.bulk_logs.scans(),
+            scans,
+            "prune scanned live bulk logs"
+        );
+        assert_eq!(
             marks.bulk_expiry_pops, pops,
             "prune popped bulk rows when nothing was due"
         );
         assert_eq!(
             marks.bulk_expiry_visits,
             visits + 10_000,
-            "each observation should peek one undued deadline, not the live rows"
+            "each observation should peek only the first deadline that was not due"
         );
         assert_eq!(marks.bulk_logs.len(), MAX_AUTOMOD_DELETE_MARKS);
         assert_eq!(marks.bulk_expiry.len(), MAX_AUTOMOD_DELETE_MARKS);
@@ -2916,6 +3015,7 @@ mod tests {
             marks.insert(1, 2, message, "badword", "Bad word", now);
         }
         let visits = marks.mark_expiry_visits;
+        let scans = marks.entries.scans();
         for offset in 0..10_000u64 {
             marks.insert(
                 1,
@@ -2926,6 +3026,11 @@ mod tests {
                 now,
             );
         }
+        assert_eq!(
+            marks.entries.scans(),
+            scans,
+            "capacity rejection scanned live marks"
+        );
         assert_eq!(marks.len(), MAX_AUTOMOD_DELETE_MARKS);
         assert_eq!(marks.order.len(), MAX_AUTOMOD_DELETE_MARKS);
         assert!(marks.contains(1, 2, 0));
