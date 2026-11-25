@@ -10,6 +10,7 @@ use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
+use jmodguard::cgroup::CgroupRelation;
 use jmodguard::config::HostingEstimateConfig;
 use jmodguard::db::{self, ResourceRecords};
 use jmodguard::resources::{
@@ -138,7 +139,7 @@ fn memory_billing(config: &HostingEstimateConfig) -> Value {
         })
     });
     json!({
-        "block_mb": HostingEstimateConfig::MEMORY_BLOCK_MB,
+        "block_mib": HostingEstimateConfig::MEMORY_BLOCK_MIB,
         "rates": rates,
     })
 }
@@ -222,6 +223,15 @@ fn build_response(
             "history": rows.map(|rows| history_json(rows, from_secs, to_secs, bucket)),
         })
     };
+    let (memory_relation, cpu_relation) =
+        bot_status
+            .as_ref()
+            .map_or((CgroupRelation::Unknown, CgroupRelation::Unknown), |bot| {
+                (
+                    bot.cgroup_scopes.memory_relation(&api_status.cgroup_scopes),
+                    bot.cgroup_scopes.cpu_relation(&api_status.cgroup_scopes),
+                )
+            });
     json!({
         "generated_at_ms": now_ms,
         "range": range.label(),
@@ -230,6 +240,7 @@ fn build_response(
         "from_secs": from_secs,
         "to_secs": to_secs,
         "history_status": history_status,
+        "cgroup_relation": {"memory": memory_relation, "cpu": cpu_relation},
         "processes": {
             "bot": process(bot_status.as_ref(), records.map(|r| &r.bot)),
             "api": process(Some(api_status), records.map(|r| &r.api)),
@@ -251,19 +262,20 @@ fn current(status: Option<&ProcessStatus>, now_ms: i64) -> Value {
     let age_ms = status
         .sampled_at_ms
         .map(|at| u64::try_from(now_ms.saturating_sub(at)).unwrap_or(0));
-    let mut value = serde_json::to_value(status).unwrap_or(Value::Null);
-    value["availability"] = json!(if status.sampled_at_ms.is_some() {
-        "available"
-    } else {
-        "unavailable"
-    });
-    value["age_ms"] = json!(age_ms);
-    value["stale_after_ms"] = json!(stale_after_ms);
-    value["stale"] = json!(age_ms.is_none_or(|age| age > stale_after_ms));
-    value["uptime_ms"] = json!(
-        (status.info.started_at_ms > 0).then(|| now_ms.saturating_sub(status.info.started_at_ms))
-    );
-    value
+    json!({
+        "sampled_at_ms": status.sampled_at_ms,
+        "interval_ms": status.interval_ms,
+        "info": status.info,
+        "cpu_tenths": status.cpu_tenths,
+        "memory": status.memory,
+        "disk": status.disk,
+        "gauges": status.gauges,
+        "availability": if status.sampled_at_ms.is_some() { "available" } else { "unavailable" },
+        "age_ms": age_ms,
+        "stale_after_ms": stale_after_ms,
+        "stale": age_ms.is_none_or(|age| age > stale_after_ms),
+        "uptime_ms": (status.info.started_at_ms > 0).then(|| now_ms.saturating_sub(status.info.started_at_ms)),
+    })
 }
 
 /// Downsamples stored rollups onto a fixed grid of `bucket`-second points.

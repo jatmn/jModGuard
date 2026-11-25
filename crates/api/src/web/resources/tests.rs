@@ -182,7 +182,7 @@ async fn memory_billing_returns_rates_only_when_enabled() {
         let Json(value) = overview(State(f.app.clone()), owner, origin(&f.app), range("1h"))
             .await
             .unwrap();
-        assert_eq!(value["memory_billing"]["block_mb"], 64);
+        assert_eq!(value["memory_billing"]["block_mib"], 64);
         assert_eq!(
             value["memory_billing"]["rates"],
             if enabled {
@@ -191,6 +191,62 @@ async fn memory_billing_returns_rates_only_when_enabled() {
                 Value::Null
             }
         );
+    }
+}
+
+#[tokio::test]
+async fn resources_compare_stored_and_live_scopes_without_exposing_identity() {
+    let f = fixture();
+    let now_secs = resources::unix_ms_now() / 1000;
+    let status = |scopes| ProcessStatus {
+        sampled_at_ms: Some(now_secs * 1000),
+        interval_ms: 60_000,
+        cgroup_scopes: serde_json::from_value(scopes).unwrap(),
+        ..ProcessStatus::default()
+    };
+    let bot = status(json!({"memory": [7, 1], "cpu": [8, 2]}));
+    db::record_resource_rollups(
+        &f.app.db,
+        Vec::new(),
+        Some((ResourceProcess::Bot, bot)),
+        now_secs,
+    )
+    .await
+    .unwrap();
+    let (records, history_status) = history(&f.app, ResourceRange::Hour, now_secs).await;
+    for (scopes, relation) in [
+        (
+            json!({"memory": [7, 1], "cpu": [8, 2]}),
+            json!({"memory": "shared", "cpu": "shared"}),
+        ),
+        (
+            json!({"memory": [3, 1], "cpu": [4, 2]}),
+            json!({"memory": "disjoint", "cpu": "disjoint"}),
+        ),
+        (
+            json!({"memory": [3], "cpu": []}),
+            json!({"memory": "unknown", "cpu": "unknown"}),
+        ),
+        (
+            json!({"memory": [1], "cpu": [4, 2]}),
+            json!({"memory": "overlapping", "cpu": "disjoint"}),
+        ),
+    ] {
+        let value = build_response(
+            ResourceRange::Hour,
+            now_secs * 1000,
+            records.as_ref(),
+            history_status,
+            &status(scopes),
+        );
+        assert_eq!(value["cgroup_relation"], relation);
+        for role in ["bot", "api"] {
+            assert!(
+                value["processes"][role]["current"]
+                    .get("cgroup_scopes")
+                    .is_none()
+            );
+        }
     }
 }
 
@@ -241,6 +297,10 @@ async fn saved_bot_history_and_status_reach_the_owner_response() {
     assert_eq!(api["history"]["totals"]["api_requests"], 30);
     assert_eq!(api["history"]["per_minute"]["api_requests"], 30.0);
     assert_eq!(api["current"]["info"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        value["cgroup_relation"],
+        json!({"memory": "unknown", "cpu": "unknown"})
+    );
 }
 
 #[test]

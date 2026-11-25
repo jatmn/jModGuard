@@ -1423,28 +1423,27 @@ function resourceFacts(rows) {
   ];
 }
 
-// Billing MB use 1024² bytes, consistent with the 16 blocks per billed GB in #782.
-const BILLING_MB_BYTES = 2 ** 20;
+const BYTES_PER_MIB = 2 ** 20;
 const ESTIMATE_HOURS_30_DAYS = 30 * 24;
-const billingMbFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
+const memoryMibFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 const hourlyCostFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 8 });
 
-function billingMemory(bytes) {
-  if (bytes == null) return null;
-  const mb = bytes / BILLING_MB_BYTES;
-  if (mb > 0 && mb < 0.01) return "<0.01 MB";
-  return `${billingMbFormat.format(mb)} MB`;
+function formatMemoryMiB(bytes) {
+  if (!Number.isFinite(bytes)) return null;
+  const mib = bytes / BYTES_PER_MIB;
+  if (mib > 0 && mib < 0.01) return "<0.01 MiB";
+  return `${memoryMibFormat.format(mib)} MiB`;
 }
 
-function memoryBlocks(bytes, blockMb) {
-  const blockBytes = blockMb * BILLING_MB_BYTES;
+function memoryBlocks(bytes, blockMib) {
+  const blockBytes = blockMib * BYTES_PER_MIB;
   const count = Math.max(1, Math.ceil(bytes / blockBytes));
   const remaining = count * blockBytes - bytes;
-  const headroom = Math.floor(remaining / BILLING_MB_BYTES * 100) / 100;
+  const headroom = Math.floor(remaining / BYTES_PER_MIB * 100) / 100;
   return {
     count,
-    capacity: count * blockMb,
-    headroom: remaining > 0 && headroom === 0 ? "<0.01 MB" : `${billingMbFormat.format(headroom)} MB`,
+    capacity: count * blockMib,
+    headroom: remaining > 0 && headroom === 0 ? "<0.01 MiB" : `${memoryMibFormat.format(headroom)} MiB`,
   };
 }
 
@@ -1458,8 +1457,12 @@ function hostingCost(hourly, hours) {
 
 function MemoryBillingPanel({ snapshot, nowMs }) {
   const billing = snapshot.memory_billing;
-  const blockMb = billing?.block_mb;
+  const blockMib = billing?.block_mib;
   const rates = billing?.rates;
+  const memoryRelation = snapshot.cgroup_relation?.memory;
+  const cpuRelation = snapshot.cgroup_relation?.cpu;
+  const combineMemory = memoryRelation === "disjoint";
+  const combineCpu = cpuRelation === "disjoint";
   const readings = RESOURCE_PROCESSES.map(([id]) => {
     const current = snapshot.processes?.[id]?.current;
     return resourceFreshness(current, snapshot.generated_at_ms, nowMs) === "fresh" ? current : null;
@@ -1469,35 +1472,55 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
     return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : null;
   });
   const [botBytes, apiBytes] = byteCounts;
-  const total = botBytes != null && apiBytes != null && Number.isSafeInteger(botBytes + apiBytes) ? botBytes + apiBytes : null;
-  const blocks = total != null && blockMb > 0 ? memoryBlocks(total, blockMb) : null;
+  const total = combineMemory && botBytes != null && apiBytes != null && Number.isSafeInteger(botBytes + apiBytes)
+    ? botBytes + apiBytes : null;
+  const blocks = total != null && blockMib > 0 ? memoryBlocks(total, blockMib) : null;
   const memoryHourly = blocks && rates ? blocks.count * rates.memory_usd_per_block_hour : null;
   const cpuTenths = readings.map((reading) => reading?.cpu_tenths);
-  const cpuHourly = rates && cpuTenths.every((value) => value != null)
+  const cpuHourly = combineCpu && rates && cpuTenths.every((value) => value != null)
     ? cpuTenths.reduce((sum, value) => sum + value, 0) / 1000 * rates.cpu_usd_per_core_hour
     : null;
-  const blockText = blocks && `${formatExact(blocks.count)} block${blocks.count === 1 ? "" : "s"} (${formatExact(blocks.capacity)} MB) · ${blocks.headroom} to next block`;
+  const blockText = blocks && `${formatExact(blocks.count)} block${blocks.count === 1 ? "" : "s"} (${formatExact(blocks.capacity)} MiB) · ${blocks.headroom} headroom to the next block in this estimate`;
+  const useApiMemory = apiBytes != null && (botBytes == null || readings[1].age_ms <= readings[0].age_ms);
+  const memoryRows = combineMemory
+    ? [
+      ["Combined memory", formatMemoryMiB(total)],
+      ["Bot memory", formatMemoryMiB(botBytes)],
+      ["API memory", formatMemoryMiB(apiBytes)],
+      ["Estimated blocks", blockText],
+    ]
+    : [[
+      memoryRelation === "shared" ? "Shared cgroup memory" : useApiMemory ? "API cgroup memory" : botBytes != null ? "Bot cgroup memory" : "Cgroup memory",
+      formatMemoryMiB(useApiMemory ? apiBytes : botBytes),
+    ]];
+  const overlapReason = (relation) => {
+    if (relation === "shared") return "the samples share a cgroup";
+    if (relation === "overlapping") return "the sampled cgroups overlap";
+    return "the sampled cgroups could not be verified as separate";
+  };
   const estimateRow = (label, hourly) => h("tr", null,
     h("th", { scope: "row" }, label),
     h("td", null, resourceValue(hostingCost(hourly, 1))),
     h("td", null, resourceValue(hostingCost(hourly, ESTIMATE_HOURS_30_DAYS))),
   );
-  return analyticsPanel("Memory billing blocks", "resources-memory-billing", h("div", null,
+  return analyticsPanel("Memory block estimate", "resources-memory-billing", h("div", null,
     h("dl", { className: "du-facts" },
-      ...[["Combined memory", billingMemory(total)], ["Bot memory", billingMemory(botBytes)], ["API memory", billingMemory(apiBytes)], ["Billing blocks", blockText]]
-        .map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, resourceValue(value)))),
+      ...memoryRows.map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, resourceValue(value)))),
     ),
-    blockMb > 0
-      ? h("p", { className: "an-note muted" }, `Uses fresh cgroup samples and rounds the combined reading up in ${blockMb} MB blocks (minimum one). 1 MB = 1,048,576 bytes.`)
-      : h("p", { className: "an-note muted" }, "Billing block size unavailable."),
+    !combineMemory
+      ? h("p", { className: "an-note muted" }, `Combined memory and block estimates are unavailable because ${overlapReason(memoryRelation)}.`)
+      : h("p", { className: "an-note muted" }, blockMib > 0
+        ? `The estimate rounds fresh cgroup readings up in ${blockMib} MiB blocks, with a one-block minimum.`
+        : "Estimated block size unavailable."),
     rates
       ? h("div", null,
         h("h4", { id: "resources-hosting-estimate", className: "du-metric-label" }, "Hosting cost estimate (USD)"),
-        h("table", { className: "table table-sm", "aria-labelledby": "resources-hosting-estimate" },
+        (combineMemory || combineCpu) && h("table", { className: "table table-sm", "aria-labelledby": "resources-hosting-estimate" },
           h("thead", null, h("tr", null, h("th", { scope: "col" }, "Resource"), h("th", { scope: "col" }, "Hourly"), h("th", { scope: "col" }, "30 days"))),
-          h("tbody", null, estimateRow("Memory blocks", memoryHourly), estimateRow("CPU time", cpuHourly)),
+          h("tbody", null, combineMemory && estimateRow("Memory blocks", memoryHourly), combineCpu && estimateRow("CPU time", cpuHourly)),
         ),
-        h("p", { className: "an-note muted" }, "Assumes current usage continues. Excludes host system overhead and egress."),
+        !combineCpu && h("p", { className: "an-note muted" }, `Combined CPU cost is unavailable because ${overlapReason(cpuRelation)}.`),
+        (combineMemory || combineCpu) && h("p", { className: "an-note muted" }, "Assumes current usage continues. Excludes host system overhead and egress."),
       )
       : h("p", { className: "an-note muted" }, billing ? "Hosting cost estimate is off." : "Hosting cost estimate configuration unavailable."),
   ));
@@ -1573,10 +1596,10 @@ function ResourceCard({ id, title, process, generatedAtMs, nowMs, range, chartFr
         ),
         resourceMetric(
           "Memory",
-          memory == null ? null : `${formatBytes(memory)}${memoryLimit ? ` of ${formatBytes(memoryLimit)} (${formatRate((memory * 100) / memoryLimit)}%)` : current?.memory?.limit === "Unlimited" ? " (no memory limit)" : ""}`,
-          [source ? h("span", { key: "s" }, `Source: ${source}`) : null, h("span", { key: "p" }, `peak ${formatBytes(history?.memory_peak_bytes) ?? "unavailable"} in ${range}`)],
+          memory == null ? null : `${formatMemoryMiB(memory)}${memoryLimit ? ` of ${formatMemoryMiB(memoryLimit)} (${formatRate((memory * 100) / memoryLimit)}%)` : current?.memory?.limit === "Unlimited" ? " (no memory limit)" : ""}`,
+          [source ? h("span", { key: "s" }, `Source: ${source}`) : null, h("span", { key: "p" }, `peak ${formatMemoryMiB(history?.memory_peak_bytes) ?? "unavailable"} in ${range}`)],
           h(ResourceChart, {
-            points, label: `${title} memory`, from: chartFrom, to: chartTo, max: memoryLimit, format: (value) => formatBytes(value) ?? "—",
+            points, label: `${title} memory`, from: chartFrom, to: chartTo, max: memoryLimit, format: (value) => formatMemoryMiB(value) ?? "—",
             series: [
               { key: "avg", label: "Average", tone: "br-tone-avg", value: (p) => p.memory_avg_bytes },
               { key: "max", label: "Peak", tone: "br-tone-max", value: (p) => p.memory_max_bytes },

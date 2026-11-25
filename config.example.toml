@@ -77,8 +77,9 @@ oauth_client_secret = ""
 # hostname than the API (not the Bunny design). Bunny same-origin CDN proxy
 # leaves this empty. Env: JMODGUARD_CORS_ORIGINS. `*` is not allowed.
 # cors_origins = ["https://admin.example.com"]
-# Owner Bot Resources uses the Magic Containers rates when enabled. Override
-# the USD rates with memory_usd_per_block_hour and cpu_usd_per_core_hour.
+# Owner Bot Resources estimates from separate cgroups using local 64 MiB
+# blocks. Override the USD rates with memory_usd_per_block_hour and
+# cpu_usd_per_core_hour.
 # On the API, JMODGUARD_HOSTING_ESTIMATE is a JSON object with the same fields
 # and replaces this table when set.
 hosting_estimate = { enabled = false }

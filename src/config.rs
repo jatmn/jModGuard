@@ -66,9 +66,9 @@ pub struct HostingEstimateConfig {
     pub cpu_usd_per_core_hour: f64,
 }
 
-// Bunny Magic Containers billing increment and default rates from issue #782 (2026-11-24).
+// Local 64 MiB block assumption and default rates from issue #782 (2026-11-24).
 impl HostingEstimateConfig {
-    pub const MEMORY_BLOCK_MB: u64 = 64;
+    pub const MEMORY_BLOCK_MIB: u64 = 64;
 
     fn apply_env(&mut self) -> Result<()> {
         if let Some(raw) = nonempty_env("JMODGUARD_HOSTING_ESTIMATE") {

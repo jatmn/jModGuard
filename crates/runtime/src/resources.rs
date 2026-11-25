@@ -7,7 +7,7 @@
 //! rollups for both processes; the API keeps its recent minutes in memory for
 //! the bot to collect over the private read link.
 
-use crate::cgroup::{ContainerSample, CpuLimit, MemoryUse};
+use crate::cgroup::{CgroupScopes, ContainerSample, CpuLimit, MemoryUse};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -646,6 +646,8 @@ pub struct ProcessStatus {
     pub info: ProcessInfo,
     pub cpu_tenths: Option<u32>,
     pub memory: Option<MemoryUse>,
+    #[serde(default, skip_serializing_if = "CgroupScopes::is_empty")]
+    pub cgroup_scopes: CgroupScopes,
     #[serde(default)]
     pub disk: Vec<DiskUse>,
     #[serde(default)]
@@ -656,13 +658,14 @@ impl ProcessStatus {
     /// This process's status now, with the last disk measurement kept by
     /// [`set_disk`] (walking directories is left to the minute task).
     pub fn current(interval_ms: u64) -> Self {
-        let sample = crate::cgroup::latest_container_sample();
+        let (sample, sampled_at, cgroup_scopes) = crate::cgroup::latest_status_sample();
         Self {
-            sampled_at_ms: crate::cgroup::latest_container_sample_at().map(unix_ms),
+            sampled_at_ms: sampled_at.map(unix_ms),
             interval_ms,
             info: ProcessInfo::current(),
             cpu_tenths: sample.cpu_tenths,
             memory: sample.memory,
+            cgroup_scopes,
             disk: DISK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
