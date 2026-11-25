@@ -25,7 +25,7 @@ import {
 } from "./list-controls.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import { noAutofill } from "./no-autofill.js";
-import React, { useState, useEffect, useLayoutEffect, useRef, createContext, useContext } from "react";
+import React, { useState, useEffect, useLayoutEffect, useRef, useSyncExternalStore, createContext, useContext } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import {
@@ -89,20 +89,31 @@ function IconButton({ action, label, className = "btn btn-sm btn-square", ...pro
     h(Icon, { name: icon, intent }),
   );
 }
-function useDraftControl({ draftKey, defaultValue, onChange, ...props }) {
+const subscribeWithoutDraft = () => () => {};
+function draftBaseline(snapshot, key, fallback, multiline) {
+  const baseline = String(snapshot.draftBaselines[key] ?? fallback ?? "");
+  // The DOM exposes textarea values with LF line endings.
+  return multiline ? baseline.replace(/\r\n?/g, "\n") : baseline;
+}
+function useDraftControl({ draftKey, defaultValue, onChange, ...props }, multiline = false) {
   const group = useContext(DraftGroup);
   const working = useContext(BusyContext);
-  const { drafts, draftBaselines } = useStore(ui);
+  const value = useSyncExternalStore(draftKey ? ui.subscribe : subscribeWithoutDraft, () => {
+    if (!draftKey) return undefined;
+    const snapshot = ui.getSnapshot();
+    return snapshot.drafts[draftKey]?.value ?? draftBaseline(snapshot, draftKey, defaultValue, multiline);
+  });
   if (!draftKey) return { ...props, defaultValue, onChange, disabled: working || props.disabled };
-  const baseline = String(draftBaselines[draftKey] ?? defaultValue ?? "");
   return {
     ...props,
-    value: drafts[draftKey]?.value ?? baseline,
+    "data-no-draft": true,
+    value,
     disabled: working || props.disabled,
     onChange: event => {
       const value = event.target.value;
-      const next = { ...ui.getSnapshot().drafts };
-      if (value === baseline) delete next[draftKey];
+      const snapshot = ui.getSnapshot();
+      const next = { ...snapshot.drafts };
+      if (value === draftBaseline(snapshot, draftKey, defaultValue, multiline)) delete next[draftKey];
       else next[draftKey] = { value, group };
       ui.set({ drafts: next, edits: Object.keys(next).length > 0 ? "dirty" : "clean" });
       onChange?.(event);
@@ -110,7 +121,7 @@ function useDraftControl({ draftKey, defaultValue, onChange, ...props }) {
   };
 }
 function Input(props) { return h(HeadlessInput, noAutofill(useDraftControl(props))); }
-function Textarea(props) { return h(HeadlessTextarea, noAutofill(useDraftControl(props))); }
+function Textarea(props) { return h(HeadlessTextarea, noAutofill(useDraftControl(props, true))); }
 function Select(props) { return h(HeadlessSelect, useDraftControl(props)); }
 function OwnerTools() {
   const profile = useRef(null);
@@ -1862,9 +1873,24 @@ function PolicyLinks() {
   );
 }
 
+// Keep the workspace snapshot stable while only field values or baselines change.
+const WORKSPACE_FIELDS = ["view", "startupStatus", "previewAvailability", "contentRevision", "editor", "notification", "activity", "edits"];
+const WORKSPACE_STATE_FIELDS = ["me", "guilds", "guildId", "tab"];
+let workspaceSnapshot;
+function selectWorkspace(snapshot) {
+  if (!workspaceSnapshot || WORKSPACE_FIELDS.some(key => workspaceSnapshot[key] !== snapshot[key]) ||
+    WORKSPACE_STATE_FIELDS.some(key => workspaceSnapshot[key] !== state[key])) {
+    workspaceSnapshot = Object.fromEntries([
+      ...WORKSPACE_FIELDS.map(key => [key, snapshot[key]]),
+      ...WORKSPACE_STATE_FIELDS.map(key => [key, state[key]]),
+    ]);
+  }
+  return workspaceSnapshot;
+}
+
 function App() {
   const appearance = useAppearance();
-  const display = useStore(ui);
+  const display = useStore(ui, selectWorkspace);
 
   useEffect(() => {
     const beforeUnload = (event) => {
@@ -1901,11 +1927,11 @@ function App() {
               h("span", { className: "brand-mark", "aria-hidden": true }, "jG"),
               h("span", null, "jModGuard", h("small", null, "MODERATION WORKSPACE")),
             ),
-            state.guilds.length > 0 && h(
+            display.guilds.length > 0 && h(
               ServerPicker,
-              { guilds: state.guilds, selectedId: state.guildId, onSelect: switchGuild },
+              { guilds: display.guilds, selectedId: display.guildId, onSelect: switchGuild },
             ),
-            state.me?.role_discovery_incomplete && h("p", { className: "muted", role: "status" },
+            display.me?.role_discovery_incomplete && h("p", { className: "muted", role: "status" },
               "Some server access checks could not finish. ",
               h(ActionButton, { className: "btn btn-xs", onClick: async () => {
                 if (canLeave()) await init();
@@ -1927,8 +1953,8 @@ function App() {
                         ActionButton,
                         {
                           "data-tab": tab,
-                          className: state.tab === tab ? "active menu-active btn-active" : "",
-                          "aria-current": state.tab === tab ? "page" : undefined,
+                          className: display.tab === tab ? "active menu-active btn-active" : "",
+                          "aria-current": display.tab === tab ? "page" : undefined,
                           onClick: () => navigate(tab),
                         },
                         h(Icon, { name: NAV_ICONS[tab].icon, intent: NAV_ICONS[tab].intent, className: "nav-icon" }),
@@ -1950,7 +1976,7 @@ function App() {
                 h(
                   "span",
                   { id: "user-chip" },
-                  `${state.me?.user.username} (${state.me?.user.global_name || ""})`.trim(),
+                  `${display.me?.user.username} (${display.me?.user.global_name || ""})`.trim(),
                 ),
                 h(
                   ActionButton,
@@ -2086,7 +2112,7 @@ function Notification() {
     }, ui.getSnapshot().notification.message),
   );
 }
-// Searches, filters and controls that save at once (data-no-draft) are not unsaved edits.
+// Searches, filters, and controls with their own save or draft handling opt out.
 function trackDraft(event) {
   if (
     event.target.matches("input, textarea, select") &&
@@ -2223,9 +2249,9 @@ async function init() {
 }
 async function logout() {
   if (!canLeave()) return;
-  ui.set({ edits: "clean" });
   stopPrivateWatchers();
   state.guildId = null;
+  ui.set({ edits: "clean" });
   if (isPreview()) {
     try {
       await api("/api/preview", "DELETE");
@@ -5548,13 +5574,17 @@ const BADWORD_AUTO_HANDLED = [
 ];
 const BADWORD_MATCH_SOURCES = { saved: "Saved list", draft: "Draft above" };
 
+function BadwordEntryCount({ mode }) {
+  const pattern = useStore(ui, ({ drafts }) => drafts["badwords:pattern"]?.value ?? "");
+  const entryCount = pattern.split(/[,\n\r]/).filter((entry) => entry.trim()).length;
+  return h("p", { className: "field-help entry-count", "aria-live": "polite" },
+    mode === "regex" ? "One pattern, up to 512 bytes." : `${entryCount}/${BADWORD_MAX_ENTRIES} entries`);
+}
+
 function tabBadwords() {
   const words = state.config.badwords;
-  const { drafts, draftBaselines } = useStore(ui);
-  const mode = drafts["badwords:mode"]?.value || "words";
-  const entryCount = String(drafts["badwords:pattern"]?.value ?? "")
-    .split(/[,\n\r]/)
-    .filter((entry) => entry.trim()).length;
+  const mode = useStore(ui, ({ drafts }) => drafts["badwords:mode"]?.value || "words");
+  const testerOpen = useStore(ui, ({ draftBaselines }) => Boolean(draftBaselines["badwords:tester-open"]));
   const patternRef = useRef(null);
   const noteRef = useRef(null);
   const scopeRef = useRef(null);
@@ -5622,11 +5652,7 @@ function tabBadwords() {
               ? "Checked as written and as a lowercase copy with disguises removed. Add \\b for whole words."
               : "Matches whole words and catches common disguises.",
           ),
-          h(
-            "p",
-            { className: "field-help entry-count", "aria-live": "polite" },
-            mode === "regex" ? "One pattern, up to 512 bytes." : `${entryCount}/${BADWORD_MAX_ENTRIES} entries`,
-          ),
+          h(BadwordEntryCount, { mode }),
         ),
         h(
           ListFormSubmit,
@@ -5720,7 +5746,7 @@ function tabBadwords() {
         {
           className: "card bg-base-100 card-border list-card list-extra",
           // Open stays open after the remount each save makes; it resets on leaving the page.
-          open: Boolean(draftBaselines["badwords:tester-open"]),
+          open: testerOpen,
           onToggle: (event) => {
             const open = event.currentTarget.open;
             if (open !== Boolean(ui.getSnapshot().draftBaselines["badwords:tester-open"]))
@@ -6782,14 +6808,14 @@ function tabTemplates() {
 
 // Adds a variable at the editor's cursor through the same draft path as typing.
 function insertTemplateVariable(textarea, draftKey, group, defaultValue, name) {
-  const { drafts, draftBaselines } = ui.getSnapshot();
+  const snapshot = ui.getSnapshot();
   const current = textarea.value;
   const start = textarea.selectionStart ?? current.length;
   const end = textarea.selectionEnd ?? start;
   const token = `{${name}}`;
   const value = current.slice(0, start) + token + current.slice(end);
-  const baseline = String(draftBaselines[draftKey] ?? defaultValue ?? "");
-  const next = { ...drafts };
+  const baseline = draftBaseline(snapshot, draftKey, defaultValue, true);
+  const next = { ...snapshot.drafts };
   if (value === baseline) delete next[draftKey];
   else next[draftKey] = { value, group };
   // Render the new text first: React writing the controlled value moves the caret to the end.
@@ -6912,17 +6938,8 @@ function LogEmbedPreview({ embed }) {
   )));
 }
 
-function TemplateCard({ record: t }) {
-  const textRef = useRef(null);
-  const text = h(Textarea, {
-    ref: textRef,
-    draftKey: `template:${t.event}:text`,
-    className: "mono template-input textarea",
-    rows: 8,
-    spellCheck: false,
-    defaultValue: t.effective,
-  });
-  const template = ui.getSnapshot().drafts[`template:${t.event}:text`]?.value ?? t.effective;
+function TemplatePreview({ record: t }) {
+  const template = useStore(ui, ({ drafts }) => drafts[`template:${t.event}:text`]?.value ?? t.effective);
   const keys = [...template.matchAll(/[^}]*}/g)].flatMap(([chunk]) => {
     const start = chunk.lastIndexOf("{");
     return start === -1 ? [] : [chunk.slice(start + 1, -1)];
@@ -6943,6 +6960,25 @@ function TemplateCard({ record: t }) {
     }
   }
   const preview = templateEmbedPreview(t, template, samples);
+  return h(
+    "div",
+    { className: "template-preview" },
+    h("strong", {}, groupedCleanup ? "Grouped cleanup preview" : "Preview"),
+    groupedCleanup && h("p", { className: "muted" }, "Individual notices use the built-in layout."),
+    h(LogEmbedPreview, { embed: preview }),
+  );
+}
+
+function TemplateCard({ record: t }) {
+  const textRef = useRef(null);
+  const text = h(Textarea, {
+    ref: textRef,
+    draftKey: `template:${t.event}:text`,
+    className: "mono template-input textarea",
+    rows: 8,
+    spellCheck: false,
+    defaultValue: t.effective,
+  });
   const scopeSelRef = useRef(null);
   const scopeSel = scopeSelect(scopeSelRef, "This server", "Global", true, `template:${t.event}:scope`);
   return h(
@@ -6967,13 +7003,7 @@ function TemplateCard({ record: t }) {
             defaultValue: t.effective,
           }),
         ),
-        h(
-          "div",
-          { className: "template-preview" },
-          h("strong", {}, groupedCleanup ? "Grouped cleanup preview" : "Preview"),
-          groupedCleanup && h("p", { className: "muted" }, "Individual notices use the built-in layout."),
-          h(LogEmbedPreview, { embed: preview }),
-        ),
+        h(TemplatePreview, { record: t }),
       ),
       canEditSettings() && h(
         "div",
@@ -9635,9 +9665,9 @@ function AccessRolesCard({ revision, generation }) {
   const guildId = state.guildId;
   const [baselineRows, setBaselineRows] = useState(null);
   const [ttl, setTtl] = useState(30);
-  const { drafts } = useStore(ui);
   const draftKey = "settings:access-roles";
-  const rows = baselineRows === null ? null : drafts[draftKey]?.value ?? baselineRows;
+  const draftRows = useStore(ui, ({ drafts }) => drafts[draftKey]?.value);
+  const rows = baselineRows === null ? null : draftRows ?? baselineRows;
   const withKeys = (roles) => roles.map((role) => ({ ...role, key: crypto.randomUUID() }));
   const changeRows = (next) => {
     const values = (items) => JSON.stringify(items.map(({ role_id, level }) => ({ role_id, level })));
@@ -10657,19 +10687,24 @@ function setKnownSpamAddError(key, error) {
   ui.set({ drafts: { ...drafts, [key]: error ? { ...draft, error } : draft } });
 }
 
+function KnownSpamAddError({ draftKey }) {
+  const error = useStore(ui, ({ drafts }) => drafts[draftKey]?.error);
+  return error ? h("p", { className: "error", role: "alert" }, error) : null;
+}
+
 function tabKnownSpam() {
-  const { drafts, draftBaselines } = useStore(ui);
   const scopeRef = useRef(null);
   const guildId = state.guildId;
   const rows = state.config.known_spam || [];
   const rule = (state.config.rules || []).find((r) => r.rule_id === "known_spam");
   // The chosen form is view state, not an edit: it lives with the baselines, so it
   // survives the remount after each save and resets on leaving the page.
-  const kind = draftBaselines["known-spam:kind"] || "sample";
+  const kind = useStore(ui, ({ draftBaselines }) => draftBaselines["known-spam:kind"] || "sample");
   const setKind = (value) =>
     ui.set({ draftBaselines: { ...ui.getSnapshot().draftBaselines, "known-spam:kind": value } });
   const add = async (kind) => {
     const key = kind === "sample" ? "known-spam:sample" : "known-spam:url";
+    const drafts = currentDrafts();
     const value = drafts[key]?.value || "";
     if (!value.trim()) return toast("Enter a full sample or URL pattern", "error");
     const scope = scopeRef.current.value;
@@ -10692,7 +10727,6 @@ function tabKnownSpam() {
       throw error;
     }
   };
-  const addErrorFor = (key) => drafts[key]?.error ? h("p", { className: "error", role: "alert" }, drafts[key].error) : null;
   const sample = kind === "sample";
   return h("div", { className: "list-page" },
     h("h2", null, "Known spam"),
@@ -10746,7 +10780,7 @@ function tabKnownSpam() {
             ? h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:sample", "known-spam:note", "known-spam:scope"], onClick: () => add("sample") }, "Add sample")
             : h(ActionButton, { className: "btn btn-primary", savedFields: ["known-spam:url", "known-spam:note", "known-spam:scope"], onClick: () => add("url") }, "Add URL pattern"),
         ),
-        addErrorFor(sample ? "known-spam:sample" : "known-spam:url"),
+        h(KnownSpamAddError, { draftKey: sample ? "known-spam:sample" : "known-spam:url" }),
       ),
     ),
     h(ListTable, {
@@ -10793,9 +10827,25 @@ function knownBadTrigger(rule) {
   return `When someone posts a listed image, or ${RULE_TRIGGERS.attachment_flood.phrase(shown).replace(/^When someone /, "")}`;
 }
 
+function AddKnownBadImage({ guildId }) {
+  const validHash = useStore(ui, ({ drafts }) => /^[a-fA-F0-9]{64}$/.test(drafts["known-bad:hash"]?.value ?? ""));
+  return h(ActionButton, {
+    className: "btn btn-primary",
+    disabled: !validHash,
+    savedFields: ["known-bad:hash", "known-bad:note"],
+    onClick: async () => {
+      const drafts = currentDrafts();
+      const hash = drafts["known-bad:hash"]?.value ?? "";
+      const note = drafts["known-bad:note"]?.value ?? "";
+      await reloadAfter(
+        () => api(`/api/guilds/${guildId}/known-bad-images`, "POST", { hash, note: note || null }),
+        (result) => toast(result.changed ? "Hash added." : "Hash already listed.", "success"),
+      );
+    },
+  }, "Add hash");
+}
+
 function tabKnownBadImages() {
-  const { drafts } = useStore(ui);
-  const hashDraft = drafts["known-bad:hash"]?.value ?? "";
   const guildId = state.guildId;
   const rows = state.config.known_bad_images || [];
   const rule = (state.config.rules || []).find((r) => r.rule_id === "attachment_flood");
@@ -10829,19 +10879,7 @@ function tabKnownBadImages() {
           field("Note (optional)", h(Input, {
             className: "input", draftKey: "known-bad:note", "data-note": true, maxLength: 256,
           })),
-          h(ActionButton, {
-            className: "btn btn-primary",
-            disabled: !/^[a-fA-F0-9]{64}$/.test(hashDraft),
-            savedFields: ["known-bad:hash", "known-bad:note"],
-            onClick: async () => {
-              const hash = drafts["known-bad:hash"]?.value ?? "";
-              const note = drafts["known-bad:note"]?.value ?? "";
-              await reloadAfter(
-                () => api(`/api/guilds/${guildId}/known-bad-images`, "POST", { hash, note: note || null }),
-                (result) => toast(result.changed ? "Hash added." : "Hash already listed.", "success"),
-              );
-            },
-          }, "Add hash"),
+          h(AddKnownBadImage, { guildId }),
         ),
       ),
     ),
