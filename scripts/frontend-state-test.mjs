@@ -13185,12 +13185,12 @@ const resourceTileValue = (h, label) => [...h.nodes.get('#content').querySelecto
 const ownerResourcePath = '/api/owner/resources?range=24h';
 const workspaceConfigPath = guild => `/api/guilds/${guild.id}/config`;
 const workspaceStatsPath = guild => `/api/guilds/${guild.id}/stats`;
-function restoreResourcesFixture(guilds, configRead, preview = false) {
+function restoreResourcesFixture(guilds, configRead, preview = false, identity = {}) {
   const calls = [];
   const user = { id: '123456789012345678' };
   const h = harness(async (url, options) => {
     calls.push({ url, method: options.method, headers: options.headers });
-    if (url === '/api/me') return response({ user, guilds, is_bot_owner: true, preview });
+    if (url === '/api/me') return response({ user, guilds, is_bot_owner: true, preview, ...identity });
     if (url === ownerResourcePath) return response(resourceSnapshot());
     if (url.endsWith('/config')) return configRead(url);
     if (url.endsWith('/stats')) return response({});
@@ -13255,6 +13255,37 @@ for (const switchServer of [false, true]) {
     assert.equal(calls.at(-1).headers['x-jmodguard-enrollment'], switchServer ? 'second-membership' : 'first-membership');
   });
 }
+
+test('retrying server discovery on Bot Resources defers a fresh enrollment until Dashboard opens', async () => {
+  const [guild] = switcherGuilds;
+  const identity = { role_discovery_incomplete: true };
+  let enrollment = 'old-membership';
+  const { h, calls, urls } = restoreResourcesFixture(
+    [guild], () => response({ enrollment_id: enrollment }), false, identity,
+  );
+  await h.app.init();
+  const tab = name => h.nodes.get(`#tabs [data-tab="${name}"]`);
+  await fire(tab('dashboard'), 'click');
+  await settle();
+  assert.equal(calls.at(-1).headers['x-jmodguard-enrollment'], 'old-membership');
+  await fire(tab('resources'), 'click');
+
+  enrollment = 'replacement-membership';
+  identity.role_discovery_incomplete = false;
+  const beforeRetry = calls.length;
+  const retry = [...h.document.querySelectorAll('button')].find(button => button.textContent === 'Retry server discovery');
+  assert.ok(retry);
+  await fire(retry, 'click');
+  await settle();
+  const discoveryCalls = urls().slice(beforeRetry).filter(url => url === '/api/me' || url === workspaceConfigPath(guild));
+  assert.deepEqual(discoveryCalls, ['/api/me']);
+
+  const beforeDashboard = calls.length;
+  await fire(tab('dashboard'), 'click');
+  await settle();
+  assert.deepEqual(urls().slice(beforeDashboard), [workspaceConfigPath(guild), workspaceStatsPath(guild)]);
+  assert.equal(calls.at(-1).headers['x-jmodguard-enrollment'], 'replacement-membership');
+});
 
 test('restored Bot Resources honors preview permissions and owner sessions without servers', async () => {
   const [guild] = switcherGuilds;

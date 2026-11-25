@@ -2231,10 +2231,10 @@ async function init() {
     const previousAccess = guildAccess();
     state.guilds = state.me.guilds;
     restoreWorkspace();
-    if (state.guildId !== previousGuild || guildAccess() !== previousAccess) {
-      resetGuildConfig();
-      ui.set({ editor: null });
-    }
+    const guildContextChanged = state.guildId !== previousGuild || guildAccess() !== previousAccess;
+    // An owner tab skips the refresh, so defer a fresh read to the next guild tab.
+    if (guildContextChanged || !tabNeedsGuildConfig()) resetGuildConfig();
+    if (guildContextChanged) ui.set({ editor: null });
     showView("main-view");
     await loadWorkspaceConfig();
   } catch (error) {
