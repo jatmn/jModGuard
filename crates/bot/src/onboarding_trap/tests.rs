@@ -3,7 +3,7 @@ use crate::db::guild_data::{CaseAction, CaseOutcome};
 use crate::handlers::Handler;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Response, Server};
-use serenity::all::{EventHandler, Guild, HttpBuilder, Permissions, Role};
+use serenity::all::{ChannelId, EventHandler, Guild, HttpBuilder, MessageId, Permissions, Role};
 use std::convert::Infallible;
 use std::future::poll_fn;
 use std::pin::{Pin, pin};
@@ -240,6 +240,15 @@ struct Call {
     audit_reason: String,
 }
 
+#[derive(Default)]
+struct DelayedCleanupLog {
+    first_delete: Notify,
+    release_delete: Notify,
+    log_post: Notify,
+    release_log: Notify,
+    next_delete: Notify,
+}
+
 async fn gateway_case(
     member: Member,
     discord_member: Member,
@@ -253,7 +262,18 @@ async fn gateway_case(
         "onboarding_trap_{:032x}.db",
         rand::random::<u128>()
     ));
-    let app = BotState::new(Default::default(), crate::db::Db::open(&path, 2).unwrap()).unwrap();
+    let delayed_log =
+        (event_kind == "cleanup slow delete log").then(|| Arc::new(DelayedCleanupLog::default()));
+    let ungrouped = event_kind == "cleanup ungrouped" || delayed_log.is_some();
+    let rejections = event_kind == "cleanup rejected destination";
+    let mut config = jmodguard::config::BotProcessConfig::default();
+    if ungrouped {
+        config.log.group_automod_cleanup_deletes = false;
+    }
+    if delayed_log.is_some() {
+        config.log.discord_timeout_secs = 15;
+    }
+    let app = BotState::new(config, crate::db::Db::open(&path, 2).unwrap()).unwrap();
     assert!(
         crate::db::claim_active_bot(
             &app.db,
@@ -282,11 +302,43 @@ async fn gateway_case(
     rule.dry_run = dry;
     rule.params =
         serde_json::json!({ "role_id": TRAP_ROLE.to_string(), "join_window_minutes": minutes });
+    if event_kind.starts_with("cleanup") {
+        if event_kind != "cleanup off" {
+            rule.params["cleanup_window_minutes"] = serde_json::json!(5);
+        }
+        let now_ms = Timestamp::now().timestamp_millis();
+        let joined_at_ms = member.joined_at.unwrap().timestamp_millis();
+        for (guild, author, id, at_ms) in [
+            (GUILD, MEMBER, 101, now_ms - 1_000),
+            (GUILD, MEMBER, 102, joined_at_ms - 1),
+            (GUILD, MEMBER, 103, now_ms - 301_000),
+            (GUILD, MEMBER, 104, now_ms + 60_000),
+            (GUILD, MEMBER + 1, 105, now_ms - 1_000),
+            (GUILD + 1, MEMBER, 106, now_ms - 1_000),
+        ] {
+            app.recent_messages.remember(guild, author, 77, id, at_ms);
+        }
+        if rejections {
+            for (channel, id) in [(78, 109), (78, 108), (77, 107)] {
+                app.recent_messages
+                    .remember(GUILD, MEMBER, channel, id, now_ms - 1_000);
+            }
+        }
+        if delayed_log.is_some() {
+            app.recent_messages
+                .remember(GUILD, MEMBER, 77, 110, now_ms - 1_000);
+        }
+    }
     crate::db::upsert_rule(&app.db, GUILD as i64, RULE_ID, &rule)
         .await
         .unwrap();
     for (event, channel) in [("member_kick", 70), ("automod", 71)] {
         crate::db::upsert_log_channel(&app.db, GUILD as i64, event, channel)
+            .await
+            .unwrap();
+    }
+    if ungrouped {
+        crate::db::upsert_log_channel(&app.db, GUILD as i64, "automod_delete", 72)
             .await
             .unwrap();
     }
@@ -337,7 +389,11 @@ async fn gateway_case(
     let member_with_new_role_json = serde_json::to_string(&member_with_new_role).unwrap();
     let new_role_granted = Arc::new(AtomicBool::new(false));
     let server_new_role_granted = Arc::clone(&new_role_granted);
-    let pause = event_kind.starts_with("during dispatch").then(|| {
+    let change_cleanup_on_kick = matches!(
+        event_kind,
+        "cleanup disabled during kick" | "cleanup user exemption" | "cleanup role exemption"
+    );
+    let pause = (event_kind.starts_with("during dispatch") || change_cleanup_on_kick).then(|| {
         Arc::new((
             tokio::sync::Notify::new(),
             tokio::sync::Notify::new(),
@@ -345,6 +401,7 @@ async fn gateway_case(
         ))
     });
     let server_pause = pause.clone();
+    let server_delayed_log = delayed_log.clone();
     let server = tokio::spawn(server.serve(make_service_fn(move |_| {
         let captured = Arc::clone(&captured);
         let (guild_json, member_json) = (guild_json.clone(), member_json.clone());
@@ -353,6 +410,7 @@ async fn gateway_case(
         let new_role_granted = Arc::clone(&server_new_role_granted);
         let member_with_new_role_json = member_with_new_role_json.clone();
         let pause = server_pause.clone();
+        let delayed_log = server_delayed_log.clone();
         async move {
             Ok::<_, Infallible>(service_fn(move |request| {
                 let captured = Arc::clone(&captured);
@@ -362,6 +420,7 @@ async fn gateway_case(
                 let new_role_granted = Arc::clone(&new_role_granted);
                 let member_with_new_role_json = member_with_new_role_json.clone();
                 let pause = pause.clone();
+                let delayed_log = delayed_log.clone();
                 async move {
                     let (parts, body) = request.into_parts();
                     let body = hyper::body::to_bytes(body).await.unwrap();
@@ -372,12 +431,21 @@ async fn gateway_case(
                         audit_reason: parts.headers.get("x-audit-log-reason")
                             .map(|value| value.to_str().unwrap().to_owned()).unwrap_or_default(),
                     };
+                    let paused_method = if change_cleanup_on_kick { Method::DELETE } else { Method::GET };
                     if let Some(pause) = pause
-                        && call.method == Method::GET && call.path.contains("/members/")
+                        && call.method == paused_method && call.path.contains("/members/")
                         && pause.2.swap(false, Ordering::Relaxed)
                     {
                         pause.0.notify_one();
                         pause.1.notified().await;
+                    }
+                    if let Some(delayed) = &delayed_log && call.method == Method::DELETE {
+                        if call.path.ends_with("/channels/77/messages/110") {
+                            delayed.first_delete.notify_one();
+                            delayed.release_delete.notified().await;
+                        } else if call.path.ends_with("/channels/77/messages/101") {
+                            delayed.next_delete.notify_one();
+                        }
                     }
                     let (status, body) = match call.method {
                         Method::GET if call.path.contains("/members/") => {
@@ -391,6 +459,12 @@ async fn gateway_case(
                             (200, body)
                         }
                         Method::GET => (200, guild_json),
+                        Method::DELETE if rejections && call.path.contains("/channels/78/messages/") => (
+                            403, r#"{"code":50013,"message":"Missing Permissions"}"#.into(),
+                        ),
+                        Method::DELETE if rejections && call.path.ends_with("/channels/77/messages/107") => (
+                            404, r#"{"code":10008,"message":"Unknown Message"}"#.into(),
+                        ),
                         Method::DELETE => (204, String::new()),
                         Method::POST => (200, serde_json::json!({
                             "id": "91", "channel_id": "70",
@@ -401,7 +475,12 @@ async fn gateway_case(
                         }).to_string()),
                         _ => (500, String::new()),
                     };
+                    let park_log = call.method == Method::POST && call.path.ends_with("/channels/72/messages");
                     captured.lock().push(call);
+                    if let Some(delayed) = &delayed_log && park_log {
+                        delayed.log_post.notify_one();
+                        delayed.release_log.notified().await;
+                    }
                     Ok::<_, Infallible>(Response::builder()
                         .status(status).header("content-type", "application/json")
                         .body(Body::from(body)).unwrap())
@@ -509,6 +588,26 @@ async fn gateway_case(
                         latest.roles.push(RoleId::new(NEW_TRAP_ROLE));
                     }
                 }
+                "cleanup disabled during kick"
+                | "cleanup user exemption"
+                | "cleanup role exemption" => {
+                    match event_kind {
+                        "cleanup disabled during kick" => {
+                            changed_rule.params["cleanup_window_minutes"] = serde_json::json!(0);
+                        }
+                        "cleanup user exemption" => changed_rule.whitelist_users.push(MEMBER),
+                        _ => changed_rule.whitelist_roles.push(TRAP_ROLE),
+                    }
+                    db::compare_and_set_onboarding_trap(
+                        &app.db,
+                        GUILD as i64,
+                        None,
+                        &rule,
+                        &changed_rule,
+                    )
+                    .await
+                    .unwrap();
+                }
                 _ => unreachable!(),
             }
             if removed_before_claim {
@@ -588,6 +687,35 @@ async fn gateway_case(
             pause.1.notify_one();
         };
         tokio::join!(trigger, contradict);
+    } else if let Some(delayed) = &delayed_log {
+        let trigger = handler.guild_member_update(
+            ctx.clone(),
+            Some(old),
+            Some(member.clone()),
+            update(&member),
+        );
+        let echo = async {
+            tokio::time::timeout(Duration::from_secs(5), delayed.first_delete.notified())
+                .await
+                .expect("the first DELETE must start");
+            handler
+                .message_delete(
+                    ctx.clone(),
+                    ChannelId::new(77),
+                    MessageId::new(110),
+                    Some(GuildId::new(GUILD)),
+                )
+                .await;
+            delayed.release_delete.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), delayed.log_post.notified())
+                .await
+                .expect("REST completion must report the early Gateway echo");
+            let next =
+                tokio::time::timeout(Duration::from_secs(3), delayed.next_delete.notified()).await;
+            delayed.release_log.notify_one();
+            next.expect("the next DELETE must reach Discord while the log POST is parked");
+        };
+        tokio::join!(trigger, echo);
     } else {
         match event_kind {
             "join" => {
@@ -641,6 +769,16 @@ async fn gateway_case(
             .unwrap();
         app.invalidate_configs();
     }
+    if ungrouped && delayed_log.is_none() {
+        handler
+            .message_delete(
+                ctx.clone(),
+                ChannelId::new(77),
+                MessageId::new(101),
+                Some(GuildId::new(GUILD)),
+            )
+            .await;
+    }
     if expected_kick || dry {
         // Both events can replay an uncached old state. The server deliberately
         // still reports the same member so we exercise the process replay guard.
@@ -661,7 +799,7 @@ async fn gateway_case(
         .case_ids(scope.clone(), None, 10, crate::tenant::case_limits())
         .await
         .unwrap();
-    let effects = calls
+    let mut effects = calls
         .lock()
         .iter()
         .filter(|call| call.method != Method::GET)
@@ -674,13 +812,38 @@ async fn gateway_case(
             )
         })
         .collect::<Vec<_>>();
+    if ungrouped {
+        let reports = effects
+            .iter()
+            .filter(|effect| {
+                effect.0 == Method::POST && effect.1.ends_with("/channels/72/messages")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 1, "REST success and its echo: {effects:?}");
+        assert!(reports[0].2.contains(&rule.name));
+        let logged_message = if delayed_log.is_some() { 110 } else { 101 };
+        assert!(
+            reports[0]
+                .2
+                .contains(&format!("/channels/10/77/{logged_message}"))
+        );
+        effects.retain(|effect| !effect.1.ends_with("/channels/72/messages"));
+    }
     let effects = if downgraded {
         &effects[1..]
     } else {
         &effects[..]
     };
     if expected_kick {
-        assert_eq!(effects.len(), 3, "{event_kind}: {effects:?}");
+        let deletes_recent = event_kind == "cleanup" || ungrouped;
+        let delete_count = if rejections {
+            3
+        } else if delayed_log.is_some() {
+            2
+        } else {
+            usize::from(deletes_recent)
+        };
+        assert_eq!(effects.len(), 3 + delete_count, "{event_kind}: {effects:?}");
         assert_eq!(effects[0].0, Method::DELETE);
         assert!(
             effects[0]
@@ -733,14 +896,43 @@ async fn gateway_case(
         assert_eq!(case.reason.as_deref(), Some(REASON));
         assert!(effects[1].1.ends_with("/channels/70/messages"));
         assert!(effects[1].2.contains(cases[0].as_str()));
-        assert!(effects[2].1.ends_with("/channels/71/messages"));
-        assert!(effects[2].2.contains(REASON));
+        if delayed_log.is_some() {
+            assert_eq!(effects[2].0, Method::DELETE);
+            assert!(effects[2].1.ends_with("/channels/77/messages/110"));
+            assert_eq!(effects[3].0, Method::DELETE);
+            assert!(effects[3].1.ends_with("/channels/77/messages/101"));
+            assert!(effects[4].2.contains("tracked messages deleted (2)"));
+        } else if deletes_recent {
+            assert_eq!(effects[2].0, Method::DELETE);
+            assert!(effects[2].1.ends_with("/channels/77/messages/101"));
+            assert!(effects[3].2.contains("tracked messages deleted (1)"));
+        }
+        if rejections {
+            let destinations = effects[2..5]
+                .iter()
+                .map(|effect| {
+                    assert_eq!(effect.0, Method::DELETE);
+                    effect.1.split("/channels/").last().unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                destinations,
+                ["78/messages/109", "77/messages/107", "77/messages/101"]
+            );
+            assert!(effects[5].2.contains("tracked messages deleted (1)"));
+        }
+        let automod_log = effects.last().unwrap();
+        assert!(automod_log.1.ends_with("/channels/71/messages"));
+        assert!(automod_log.2.contains(REASON));
     } else {
         assert!(cases.is_empty(), "{event_kind}: {cases:?}");
         if dry {
             assert_eq!(effects.len(), 1, "{effects:?}");
             assert!(effects[0].1.ends_with("/channels/71/messages"));
             assert!(effects[0].2.contains("[DRY RUN]"));
+            if event_kind == "cleanup" {
+                assert!(effects[0].2.contains("would clean tracked messages"));
+            }
         } else {
             assert!(effects.is_empty(), "{event_kind}: {effects:?}");
         }
@@ -750,6 +942,89 @@ async fn gateway_case(
     drop(app);
     crate::tenant::remove_sidecars(&path);
     std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn trap_cleans_only_tracked_messages_in_the_stay_after_a_confirmed_kick() {
+    for (event, dry, joined_minutes_ago) in [
+        ("cleanup", false, 1),
+        ("cleanup", false, 10),
+        ("cleanup", true, 1),
+        ("cleanup off", false, 1),
+        ("cleanup disabled during kick", false, 1),
+        ("cleanup user exemption", false, 1),
+        ("cleanup role exemption", false, 1),
+    ] {
+        let joined_at = Timestamp::from_millis(
+            Timestamp::now().timestamp_millis() - joined_minutes_ago * 60_000,
+        )
+        .unwrap();
+        let member = member(MEMBER, &[TRAP_ROLE], joined_at);
+        gateway_case(
+            member.clone(),
+            member,
+            guild(Permissions::empty()),
+            event,
+            30,
+            dry,
+            !dry,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn trap_cleanup_attributes_the_delete_once_without_grouping() {
+    let member = member(
+        MEMBER,
+        &[TRAP_ROLE],
+        Timestamp::from_millis(Timestamp::now().timestamp_millis() - 60_000).unwrap(),
+    );
+    gateway_case(
+        member.clone(),
+        member,
+        guild(Permissions::empty()),
+        "cleanup ungrouped",
+        30,
+        false,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn trap_cleanup_skips_denied_destinations_but_not_unknown_messages() {
+    let member = member(
+        MEMBER,
+        &[TRAP_ROLE],
+        Timestamp::from_millis(Timestamp::now().timestamp_millis() - 60_000).unwrap(),
+    );
+    gateway_case(
+        member.clone(),
+        member,
+        guild(Permissions::empty()),
+        "cleanup rejected destination",
+        30,
+        false,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn trap_cleanup_dispatches_next_delete_while_the_previous_log_is_parked() {
+    let joined_at = Timestamp::from_millis(Timestamp::now().timestamp_millis() - 60_000).unwrap();
+    let member = member(MEMBER, &[TRAP_ROLE], joined_at);
+    gateway_case(
+        member.clone(),
+        member,
+        guild(Permissions::empty()),
+        "cleanup slow delete log",
+        30,
+        false,
+        true,
+    )
+    .await;
 }
 
 #[tokio::test]

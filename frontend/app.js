@@ -5030,6 +5030,7 @@ function OnboardingTrapEditor({ record }) {
   const [rule] = useState(() => JSON.parse(JSON.stringify(record.effective)));
   const [roleIds] = useState(() => rule.params?.role_id ? [String(rule.params.role_id)] : []);
   const [windowMinutes, setWindowMinutes] = useState(() => String(rule.params?.join_window_minutes ?? 30));
+  const [cleanupMinutes, setCleanupMinutes] = useState(() => String(rule.params?.cleanup_window_minutes ?? 0));
   const [names] = useServerNames([]);
   const [, setRevision] = useState(0);
   const refresh = () => setRevision((value) => value + 1);
@@ -5075,8 +5076,8 @@ function OnboardingTrapEditor({ record }) {
     ),
     h(
       EditorSection,
-      { title: "Action" },
-      h("p", {}, "Kick is the available moderation action. It opens a private case and posts to the Member kick and Automod logs."),
+      { title: "Actions" },
+      h("p", {}, "The trap opens a private kick case and posts to the Member kick and Automod logs."),
       h(Field, {},
         h(Label, {}, "Kick reason"),
         h(Input, { className: "input", value: rule.actions[0].reason, onChange: (event) => {
@@ -5084,6 +5085,14 @@ function OnboardingTrapEditor({ record }) {
           refresh();
         } }),
       ),
+      h(Field, {},
+        h(Label, {}, "Recent-message cleanup (minutes)"),
+        h(Input, {
+          type: "number", className: "input", min: 0, max: 60, step: 1, required: true,
+          value: cleanupMinutes, onChange: (event) => setCleanupMinutes(event.target.value),
+        }),
+      ),
+      h("p", { className: "field-help" }, "After a successful kick, delete tracked messages the member sent since joining within this window. Use 0 to leave their messages in place."),
     ),
     h("p", {}, h("a", { href: ONBOARDING_TRAP_GUIDE, className: "link" }, "Onboarding bot trap setup guide")),
     h(
@@ -5096,10 +5105,16 @@ function OnboardingTrapEditor({ record }) {
           const roleId = roleIds[0] || null;
           if (roleId === state.guildId) throw new Error("Choose a role other than @everyone");
           if (!/^\d+$/.test(windowMinutes) || Number(windowMinutes) > 1440) throw new Error("Enter a join window from 0 to 1440 minutes");
+          if (!/^\d+$/.test(cleanupMinutes) || Number(cleanupMinutes) > 60) throw new Error("Enter a cleanup window from 0 to 60 minutes");
           const data = {
             ...rule,
             enabled: rule.enabled && roleId !== null,
-            params: { ...rule.params, role_id: roleId, join_window_minutes: Number(windowMinutes) },
+            params: {
+              ...rule.params,
+              role_id: roleId,
+              join_window_minutes: Number(windowMinutes),
+              cleanup_window_minutes: Number(cleanupMinutes),
+            },
           };
           await reloadAfter(() => api(`/api/guilds/${state.guildId}/rules/${record.rule_id}`, "PUT", { scope: "guild", data, expected }), () => {
             toast("Rule saved", "success");

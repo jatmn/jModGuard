@@ -673,7 +673,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn automod_delete_target(guild: u64, channel: u64) -> crate::discord::DiscordRestTarget {
+pub(crate) fn automod_delete_target(guild: u64, channel: u64) -> crate::discord::DiscordRestTarget {
     crate::discord::DiscordRestTarget::AutomodDelete { guild, channel }
 }
 
@@ -704,8 +704,14 @@ tokio::task_local! {
     static AUTOMOD_DELETE_CANCEL_PROBE: std::sync::Arc<AutomodDeleteCancelProbe>;
 }
 
+pub(crate) struct SweepDeleteDispatch<'a> {
+    pub deadline: AutomodInstant,
+    pub audit_reason: &'a str,
+    pub log_http: &'a Arc<serenity::http::Http>,
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn automod_try_delete_message(
+pub(crate) async fn automod_try_delete_message(
     app: &std::sync::Arc<BotState>,
     http: &serenity::http::Http,
     guild_id: u64,
@@ -715,6 +721,7 @@ async fn automod_try_delete_message(
     rule_name: &str,
     reason: &str,
     cleanup: Option<&logging::Cleanup<'_>>,
+    sweep_dispatch: Option<SweepDeleteDispatch<'_>>,
 ) -> Option<CaseOutcome> {
     let target = automod_delete_target(guild_id, channel);
     if app
@@ -752,11 +759,15 @@ async fn automod_try_delete_message(
     let raced = if forced_cancel {
         Ok(crate::discord::DiscordCall::Cancelled)
     } else {
-        tokio::time::timeout(
-            Duration::from_secs(10),
+        let (deadline, audit_reason) = sweep_dispatch.as_ref().map_or_else(
+            || (AutomodInstant::now() + Duration::from_secs(10), None),
+            |sweep| (sweep.deadline, Some(sweep.audit_reason)),
+        );
+        tokio::time::timeout_at(
+            deadline,
             crate::discord::race_discord_call(
                 &app.activation,
-                http.delete_message(channel.into(), message.into(), None),
+                http.delete_message(channel.into(), message.into(), audit_reason),
             ),
         )
         .await
@@ -773,10 +784,26 @@ async fn automod_try_delete_message(
                 None => false,
             };
             if !grouped {
-                logging::complete_prepared_automod_delete(
-                    app, http, guild_id, channel, message, &prepared, rule_id, rule_name, reason,
-                )
-                .await;
+                if let Some(sweep) = sweep_dispatch {
+                    logging::spawn_prepared_automod_delete(
+                        Arc::clone(app),
+                        Arc::clone(sweep.log_http),
+                        guild_id,
+                        channel,
+                        message,
+                        prepared,
+                        rule_id.to_owned(),
+                        rule_name.to_owned(),
+                        reason.to_owned(),
+                    )
+                    .await;
+                } else {
+                    logging::complete_prepared_automod_delete(
+                        app, http, guild_id, channel, message, &prepared, rule_id, rule_name,
+                        reason,
+                    )
+                    .await;
+                }
             }
             Some(CaseOutcome::Succeeded)
         }
@@ -1578,6 +1605,7 @@ async fn execute_live<'a>(
                 pending.rule_name.as_str(),
                 reason,
                 None,
+                None,
             )
             .await
         } else {
@@ -1655,6 +1683,7 @@ async fn execute_live<'a>(
                     pending.rule_name.as_str(),
                     reason,
                     kick_cleanup.as_ref(),
+                    None,
                 )
                 .await
             } else {
@@ -7100,6 +7129,7 @@ mod tests {
                 "Bad words",
                 "blocked term",
                 None,
+                None,
             )
             .await;
         });
@@ -7254,6 +7284,7 @@ mod tests {
                         "badword",
                         "Bad words",
                         "blocked term",
+                        None,
                         None,
                     )
                     .await;

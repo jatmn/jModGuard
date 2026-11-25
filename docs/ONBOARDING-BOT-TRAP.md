@@ -5,8 +5,8 @@ starts disabled. When enabled, it checks whether the configured role arrived
 with a join or was added in a member update. Moderators, administrators and the
 server owner are always exempt.
 
-Kick is the available moderation action. Recent-message cleanup and role removal
-are follow-up work in #786.
+The trap kicks matching members and can clean up their recent messages after
+Discord confirms the kick. Role removal remains tracked in #786.
 
 ## Create the Anti-bot role
 
@@ -43,10 +43,17 @@ for the Community server setup and preview requirements.
 3. Keep **Dry-run (log only)** selected, turn on **Enabled**, and save. The
    default join window is 30 minutes. Set it to 0 to check role grants at any
    time. Keeping a window helps protect members from accidental later grants.
+   Set **Recent-message cleanup** to 1–60 minutes to delete messages the bot
+   observed during the member's current stay and within that time before the
+   kick. The default is 0 (off). Cleanup needs **Manage Messages** in each
+   affected channel and uses the bot's bounded in-memory message tracking.
+   In a staggered deployment, cleanup takes effect after the running bot is
+   upgraded.
 4. In **Server Settings → Onboarding**, use **Preview** to view the server as
    a new member. Then join with a test account that has ordinary member
    permissions and select the decoy answer. Confirm the dry-run entry in
-   **Automod**. Dry-run leaves the account in the server and creates no case.
+   **Automod**. Dry-run leaves the account and messages in place and creates
+   no case.
 5. Turn off dry-run and save. Rejoin with the test account and select the decoy
    again. Confirm the kick, the **Member kicked** log and the **Automod** entry.
    Find the kick case in the private dashboard **Cases** page and check its

@@ -5,6 +5,7 @@ use anyhow::{Context, Result, ensure};
 pub const RULE_ID: &str = "onboarding_bot_trap";
 pub const DEFAULT_JOIN_WINDOW: u32 = 30;
 const MAX_JOIN_WINDOW: u64 = 1440;
+const MAX_CLEANUP_WINDOW: u64 = 60;
 
 pub fn role_id(rule: &RuleDef) -> Option<u64> {
     let value = rule.params.get("role_id")?;
@@ -29,6 +30,14 @@ pub fn join_window_minutes(rule: &RuleDef) -> Option<u32> {
     (minutes <= MAX_JOIN_WINDOW).then_some(minutes as u32)
 }
 
+pub fn cleanup_window_minutes(rule: &RuleDef) -> Option<u32> {
+    let minutes = match rule.params.get("cleanup_window_minutes") {
+        Some(value) => value.as_u64()?,
+        None => 0,
+    };
+    (minutes <= MAX_CLEANUP_WINDOW).then_some(minutes as u32)
+}
+
 pub(crate) fn validate(guild_id: i64, rule: &RuleDef) -> Result<()> {
     let role = role_id(rule);
     if let Some(value) = rule.params.get("role_id")
@@ -47,6 +56,10 @@ pub(crate) fn validate(guild_id: i64, rule: &RuleDef) -> Result<()> {
     ensure!(
         join_window_minutes(rule).is_some(),
         "The onboarding trap join window must be 0–1440 minutes"
+    );
+    ensure!(
+        cleanup_window_minutes(rule).is_some(),
+        "The onboarding trap cleanup window must be 0–60 minutes"
     );
     ensure!(
         rule.skip_moderators,
@@ -79,6 +92,7 @@ mod tests {
         assert!(!rule.enabled);
         assert!(rule.dry_run && rule.skip_moderators && rule.log_automod && rule.open_case);
         assert_eq!(join_window_minutes(&rule), Some(30));
+        assert_eq!(cleanup_window_minutes(&rule), Some(0));
         assert_eq!(
             rule.actions[0].reason,
             "[Automod] Kicked for suspected bot (onboarding)"
@@ -98,6 +112,13 @@ mod tests {
         rule.params["join_window_minutes"] = json!(1441);
         assert!(validate(10, &rule).is_err());
         rule.params["join_window_minutes"] = json!(30);
+        rule.params["cleanup_window_minutes"] = json!(60);
+        validate(10, &rule).unwrap();
+        for invalid in [json!(61), json!(-1), json!("20"), json!(null)] {
+            rule.params["cleanup_window_minutes"] = invalid;
+            assert!(validate(10, &rule).is_err());
+        }
+        rule.params["cleanup_window_minutes"] = json!(0);
         rule.skip_moderators = false;
         assert!(validate(10, &rule).is_err());
         rule.skip_moderators = true;
