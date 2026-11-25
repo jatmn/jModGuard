@@ -3529,8 +3529,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_leave_report_without_join_context_sends_without_fetching_the_roster() {
+    async fn gateway_member_removal_reports_unknown_join_without_fetching_roster() {
+        use serenity::client::EventHandler;
+
         let (app, path) = temp_app("leave_no_roster");
+        app.activation.note_discord_connected();
+        let enrollment = crate::db::enroll_guild(&app.db, 789, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
+        assert!(
+            app.tenant
+                .store(&scope)
+                .await
+                .unwrap()
+                .get_member(scope, 42)
+                .await
+                .unwrap()
+                .is_none()
+        );
         crate::db::upsert_log_channel(&app.db, 789, "member_leave", 901)
             .await
             .unwrap();
@@ -3539,32 +3557,38 @@ mod tests {
         let mut user = serenity::model::user::User::default();
         user.id = serenity::model::id::UserId::new(42);
         user.name = "departed-member".into();
-        let observed =
-            chrono::DateTime::from_timestamp_millis(app.snapshots.started_at_ms).unwrap();
-        let (delivery, _) = logging::emit_member_event(
-            &app,
-            &ctx,
-            GuildId::new(789),
-            "member_leave",
-            &user,
-            logging::member_join_vars(None, observed),
-            None,
-        )
-        .await;
-        assert_eq!(delivery, logging::Delivery::Sent);
+        let handler = crate::handlers::Handler { app };
+        handler
+            .guild_member_removal(ctx, GuildId::new(789), user, None)
+            .await;
+
         {
             let requests = bodies.lock().unwrap();
-            assert_eq!(requests.len(), 1, "{requests:?}");
-            assert_eq!(requests[0].matches("Unavailable").count(), 2);
-            let start = requests[0].lines().next().unwrap();
-            assert!(
-                start.starts_with("POST ") && start.contains("/channels/901/messages "),
-                "{start}"
+            let [request] = requests.as_slice() else {
+                panic!("expected only the leave log POST, got {requests:?}");
+            };
+            let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                headers.lines().next(),
+                Some("POST /api/v10/channels/901/messages HTTP/1.1")
             );
+            let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+            let [report] = payload["embeds"].as_array().unwrap().as_slice() else {
+                panic!("expected one leave report, got {payload}");
+            };
+            assert!(report["title"].as_str().unwrap().ends_with("Member left"));
+            let fields = report["fields"].as_array().unwrap();
+            for label in ["Time in server", "Joined at"] {
+                let field = fields
+                    .iter()
+                    .find(|field| field["name"].as_str().unwrap().ends_with(label))
+                    .unwrap_or_else(|| panic!("missing {label} in {report}"));
+                assert_eq!(field["value"], "`Unavailable`", "{label}");
+            }
         }
         server.abort();
-        drop(app);
-        remove_db(&path);
+        drop(handler);
+        remove_db_and_store(&path);
     }
 
     #[tokio::test]
