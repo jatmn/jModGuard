@@ -204,8 +204,8 @@ impl Backfill {
     }
 }
 
-/// Resolve the adder of every active server whose current membership has none,
-/// one paced REST lookup per guild. Called at Ready and after each startup
+/// Resolve each missing adder, refreshing missing or earlier-membership facts
+/// as needed. One visit per guild, paced. Called at Ready and after each startup
 /// enrollment (a membership recorded without a fresh-join capture).
 pub(crate) fn request_backfill(
     app: &Arc<BotState>,
@@ -218,15 +218,15 @@ pub(crate) fn request_backfill(
     let app = Arc::clone(app);
     let http = Arc::clone(http);
     tokio::spawn(async move {
-        let resolver_app = Arc::clone(&app);
+        let resolver_db = app.db.clone();
         run_backfill(
             &app.db,
             &app.directory_backfill,
             BACKFILL_GUILD_PACE,
-            move |guild_id, joined_at_ns| {
-                let app = Arc::clone(&resolver_app);
+            move |candidate| {
+                let db = resolver_db.clone();
                 let http = Arc::clone(&http);
-                async move { backfill_guild(&app, &http, bot_user_id, guild_id, joined_at_ns).await }
+                async move { backfill_guild(&db, &http, bot_user_id, candidate).await }
             },
         )
         .await;
@@ -238,7 +238,7 @@ pub(crate) fn request_backfill(
 /// startup; shutdown ends the run cleanly.
 async fn run_backfill<F, Fut>(db: &db::Db, backfill: &Backfill, pace: Duration, mut resolve: F)
 where
-    F: FnMut(i64, i64) -> Fut,
+    F: FnMut(db::GuildJoinInfoBackfillCandidate) -> Fut,
     Fut: Future<Output = ()>,
 {
     let mut visited = false;
@@ -258,11 +258,11 @@ where
                     break;
                 }
             };
-            let Some(&(last_guild_id, _)) = candidates.last() else {
+            let Some(last_guild_id) = candidates.last().map(|candidate| candidate.guild_id) else {
                 break;
             };
-            for (guild_id, joined_at_ns) in candidates {
-                if !backfill.first_attempt(guild_id, joined_at_ns) {
+            for candidate in candidates {
+                if !backfill.first_attempt(candidate.guild_id, candidate.joined_at_ns) {
                     continue;
                 }
                 if visited {
@@ -275,7 +275,7 @@ where
                     }
                 }
                 visited = true;
-                resolve(guild_id, joined_at_ns).await;
+                resolve(candidate).await;
             }
             after_guild_id = last_guild_id;
         }
@@ -286,47 +286,66 @@ where
 }
 
 async fn backfill_guild(
-    app: &Arc<BotState>,
+    db: &db::Db,
     http: &serenity::http::Http,
     bot_user_id: UserId,
-    guild_id: i64,
-    joined_at_ns: i64,
+    db::GuildJoinInfoBackfillCandidate {
+        guild_id,
+        joined_at_ns,
+        refresh_facts,
+    }: db::GuildJoinInfoBackfillCandidate,
 ) {
-    // Facts are stamped with the time the snapshot was requested, so a gateway
-    // observation that lands while the REST call is in flight is never replaced
-    // by this older answer.
-    let observed_at_ns = now_ns();
-    let guild = match http
-        .get_guild_with_counts(GuildId::new(guild_id as u64))
+    let refresh_at = if refresh_facts {
+        // Stamp the refresh before checking current facts so a later Gateway
+        // observation takes precedence even if it arrives before the REST call.
+        let observed_at_ns = now_ns();
+        match db::guild_join_info_backfill_refresh_needed(db, guild_id, joined_at_ns).await {
+            Ok(Some(true)) => Some(observed_at_ns),
+            Ok(Some(false)) => None,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    guild_id,
+                    "guild directory freshness check deferred: {error:#}"
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(observed_at_ns) = refresh_at {
+        let guild = match http
+            .get_guild_with_counts(GuildId::new(guild_id as u64))
+            .await
+        {
+            Ok(guild) => guild,
+            Err(error) => {
+                tracing::warn!(guild_id, "guild directory lookup deferred: {error:#}");
+                return;
+            }
+        };
+        let icon_hash = guild.icon.as_ref().map(|hash| hash.to_string());
+        if let Err(error) = db::record_guild_join_info(
+            db,
+            guild_id,
+            &guild.name,
+            icon_hash.as_deref(),
+            guild
+                .approximate_member_count
+                .and_then(|count| i64::try_from(count).ok()),
+            observed_at_ns,
+        )
         .await
-    {
-        Ok(guild) => guild,
-        Err(error) => {
-            tracing::warn!(guild_id, "guild directory lookup deferred: {error:#}");
+        {
+            tracing::warn!(guild_id, "guild directory facts not recorded: {error:#}");
             return;
         }
-    };
-    let icon_hash = guild.icon.as_ref().map(|hash| hash.to_string());
-    if let Err(error) = db::record_guild_join_info(
-        &app.db,
-        guild_id,
-        &guild.name,
-        icon_hash.as_deref(),
-        guild
-            .approximate_member_count
-            .and_then(|count| i64::try_from(count).ok()),
-        observed_at_ns,
-    )
-    .await
-    {
-        tracing::warn!(guild_id, "guild directory facts not recorded: {error:#}");
-        return;
     }
     match capture_bot_adder(http, guild_id, bot_user_id.get(), joined_at_ns).await {
         Ok(Some((added_by, added_by_name))) => {
             if let Err(error) =
-                db::record_guild_adder(&app.db, guild_id, joined_at_ns, &added_by, &added_by_name)
-                    .await
+                db::record_guild_adder(db, guild_id, joined_at_ns, &added_by, &added_by_name).await
             {
                 tracing::warn!(guild_id, "guild adder observation not recorded: {error:#}");
             }
@@ -445,10 +464,10 @@ mod tests {
     {
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let recorded = Arc::clone(&seen);
-        run_backfill(db, backfill, Duration::ZERO, |guild_id, joined_at_ns| {
+        run_backfill(db, backfill, Duration::ZERO, |candidate| {
             let first = {
                 let mut seen = recorded.lock();
-                seen.push((guild_id, joined_at_ns));
+                seen.push((candidate.guild_id, candidate.joined_at_ns));
                 seen.len() == 1
             };
             let hook = if first { Some(during()) } else { None };
@@ -506,6 +525,157 @@ mod tests {
         // The lookup left the server unresolved: this process does not repeat it.
         assert!(backfill.begin());
         assert!(visits(&db, &backfill, || async {}).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_backfill_refreshes_only_missing_or_earlier_membership_facts() {
+        use db::SqlExecutor as _;
+        use hyper::service::{make_service_fn, service_fn};
+        use hyper::{Body, Response, Server};
+        use serde_json::json;
+        use std::convert::Infallible;
+
+        let db = backfill_db();
+        let joined_ms = 1_790_000_000_000;
+        let joined = joined_ms * 1_000_000;
+        for guild in [10, 20, 30, 40, 50] {
+            db::enroll_guild(&db, guild, joined).await.unwrap();
+        }
+        for (guild, recorded) in [(10, joined), (30, joined - 1), (40, joined + 1)] {
+            db::record_guild_join_info(&db, guild, "Gateway", None, Some(7), recorded)
+                .await
+                .unwrap();
+        }
+        db.with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "CREATE TABLE backfill_fact_updates(guild_id INTEGER);
+                 CREATE TRIGGER count_backfill_fact_update
+                 AFTER UPDATE OF name,icon_hash,member_count,recorded_at_ns ON guild_join_info
+                 BEGIN
+                   INSERT INTO backfill_fact_updates VALUES(NEW.guild_id);
+                 END;",
+                4096,
+            )
+        })
+        .await
+        .unwrap();
+
+        let calls = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let server = Server::bind(&([127, 0, 0, 1], 0).into());
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .proxy(format!("http://{}", server.local_addr()))
+            .ratelimiter_disabled(true)
+            .build();
+        let server = tokio::spawn(server.serve(make_service_fn({
+            let calls = calls.clone();
+            let db = db.clone();
+            move |_| {
+                let (calls, db) = (calls.clone(), db.clone());
+                async move {
+                    Ok::<_, Infallible>(service_fn(move |request: hyper::Request<Body>| {
+                        let (calls, db) = (calls.clone(), db.clone());
+                        async move {
+                            let mut parts = request.uri().path().split("/guilds/").nth(1).unwrap().split('/');
+                            let guild: i64 = parts.next().unwrap().parse().unwrap();
+                            let audit = parts.next() == Some("audit-logs");
+                            calls.lock().push((guild, audit));
+
+                            if audit && guild == 10 {
+                                // The paged scan has already queued this guild with missing facts.
+                                db::record_guild_join_info(&db, 50, "Late Gateway", None, Some(5), joined + 1)
+                                    .await
+                                    .unwrap();
+                            }
+
+                            if audit && guild == 40 {
+                                // Change membership while the earlier audit request is outstanding.
+                                db::retire_guild_enrollment(&db, guild, joined).await.unwrap();
+                                db::enroll_guild(&db, guild, joined + 2).await.unwrap();
+                                db::record_guild_join_info(&db, guild, "Rejoined", None, Some(9), joined + 3)
+                                    .await
+                                    .unwrap();
+                            }
+
+                            let body = if audit {
+                                json!({
+                                    "audit_log_entries": [
+                                        {"id":entry_id(joined_ms),"target_id":"42","user_id":"99","action_type":BOT_ADD}
+                                    ],
+                                    "users": [], "application_commands": [], "auto_moderation_rules": [],
+                                    "guild_scheduled_events": [], "integrations": [], "threads": [], "webhooks": []
+                                })
+                            } else {
+                                assert!(request.uri().query().unwrap_or_default().split('&')
+                                    .any(|pair| pair == "with_counts=true"));
+                                json!({
+                                    "id":guild.to_string(), "name":"REST", "owner_id":"11", "verification_level":0,
+                                    "default_message_notifications":0, "explicit_content_filter":0, "roles":[],
+                                    "emojis":[], "features":[], "mfa_level":0, "system_channel_flags":0,
+                                    "premium_tier":0, "preferred_locale":"en-US", "nsfw_level":0,
+                                    "stickers":[], "premium_progress_bar_enabled":false, "approximate_member_count":8
+                                })
+                            };
+                            Ok::<_, Infallible>(Response::new(Body::from(body.to_string())))
+                        }
+                    }))
+                }
+            }
+        })));
+
+        let backfill = Backfill::default();
+        assert!(backfill.begin());
+        run_backfill(&db, &backfill, Duration::ZERO, |candidate| {
+            backfill_guild(&db, &http, UserId::new(42), candidate)
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(
+            *calls.lock(),
+            vec![
+                (10, true),
+                (20, false),
+                (20, true),
+                (30, false),
+                (30, true),
+                (40, true),
+                (50, true)
+            ],
+            "only missing and earlier-membership facts require guild-detail requests"
+        );
+        let fresh_writes = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM backfill_fact_updates WHERE guild_id IN (10, 50)",
+                    (),
+                    |row| Ok(row.get::<i64>(0)?),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(fresh_writes, 0);
+
+        let rows = db::owner_guild_directory(&db, 10).await.unwrap();
+        for (guild, name, count) in [
+            (10, "Gateway", 7),
+            (20, "REST", 8),
+            (30, "REST", 8),
+            (50, "Late Gateway", 5),
+        ] {
+            let row = rows.iter().find(|row| row.guild_id == guild).unwrap();
+            assert_eq!(row.name.as_deref(), Some(name));
+            assert_eq!(row.member_count, Some(count));
+            assert_eq!(row.added_by.as_deref(), Some("99"));
+        }
+        let row = rows.iter().find(|row| row.guild_id == 40).unwrap();
+        assert_eq!(row.joined_at_ns, joined + 2);
+        assert_eq!(row.name.as_deref(), Some("Rejoined"));
+        assert_eq!(row.member_count, Some(9));
+        assert_eq!(
+            row.added_by, None,
+            "the earlier membership's adder is ignored"
+        );
     }
 
     #[test]

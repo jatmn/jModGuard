@@ -128,35 +128,77 @@ pub async fn owner_guild_directory(db: &Db, departed_limit: i64) -> Result<Vec<O
     .await
 }
 
+const BACKFILL_FACTS_NEED_REFRESH: &str =
+    "(j.guild_id IS NULL OR j.recorded_at_ns < e.joined_at_ns)";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuildJoinInfoBackfillCandidate {
+    pub guild_id: i64,
+    pub joined_at_ns: i64,
+    /// The page saw no facts or an observation from before this membership.
+    pub refresh_facts: bool,
+}
+
 /// Active enrollments whose current membership has no captured adder (no row,
-/// no adder, or an adder captured for an earlier membership), in guild-id
-/// order after `after_guild_id`, with each membership's join time for the
-/// adder recency window. The bot's startup pass walks these pages once, so an
-/// unresolved server cannot starve later ones.
+/// no adder, or an adder captured for an earlier membership), in guild-ID
+/// order after `after_guild_id`. Include the join time for the adder recency
+/// window and whether this enrollment needs a fresh fact observation.
 pub async fn guild_join_info_backfill_candidates(
     db: &Db,
     after_guild_id: i64,
     limit: i64,
-) -> Result<Vec<(i64, i64)>> {
+) -> Result<Vec<GuildJoinInfoBackfillCandidate>> {
     anyhow::ensure!(after_guild_id >= 0, "invalid backfill cursor");
     anyhow::ensure!((1..=4096).contains(&limit), "invalid backfill limit");
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_snapshot()?;
         let rows = tx
-            .prepare(
-                "SELECT e.guild_id,e.joined_at_ns FROM guild_enrollments e
+            .prepare(&format!(
+                "SELECT e.guild_id,e.joined_at_ns,{BACKFILL_FACTS_NEED_REFRESH}
+                 FROM guild_enrollments e
                  LEFT JOIN guild_join_info j ON j.guild_id=e.guild_id
                  WHERE e.active=1 AND e.guild_id>?1
                    AND (j.guild_id IS NULL OR j.added_by_joined_at_ns IS NOT e.joined_at_ns)
                  ORDER BY e.guild_id ASC
-                 LIMIT ?2",
-            )?
+                 LIMIT ?2"
+            ))?
             .query_map(params![after_guild_id, limit], |row| {
-                Ok((row.get::<i64>(0)?, row.get::<i64>(1)?))
+                Ok(GuildJoinInfoBackfillCandidate {
+                    guild_id: row.get(0)?,
+                    joined_at_ns: row.get(1)?,
+                    refresh_facts: row.get(2)?,
+                })
             })?
             .collect::<std::result::Result<Vec<_>, anyhow::Error>>()?;
         tx.finish_read()?;
         Ok(rows)
+    })
+    .await
+}
+
+/// Recheck a queued fact refresh just before the detail request. No row means
+/// the captured enrollment is no longer active.
+pub async fn guild_join_info_backfill_refresh_needed(
+    db: &Db,
+    guild_id: i64,
+    joined_at_ns: i64,
+) -> Result<Option<bool>> {
+    db.with_conn(move |conn| {
+        let tx = conn.transaction_primary_snapshot()?;
+        let refresh_facts = tx
+            .query_row(
+                &format!(
+                    "SELECT {BACKFILL_FACTS_NEED_REFRESH}
+                     FROM guild_enrollments e
+                     LEFT JOIN guild_join_info j ON j.guild_id=e.guild_id
+                     WHERE e.guild_id=?1 AND e.active=1 AND e.joined_at_ns=?2"
+                ),
+                params![guild_id, joined_at_ns],
+                |row| Ok(row.get(0)?),
+            )
+            .optional()?;
+        tx.finish_read()?;
+        Ok(refresh_facts)
     })
     .await
 }
