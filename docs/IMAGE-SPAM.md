@@ -87,8 +87,9 @@ A match in delete-and-ban mode rechecks current configuration, enrollment and
 exemptions, then deletes each matched message and bans the author. Fresh spam
 defaults select **Ban and purge (previous hour)**. This sends
 `delete_message_seconds=3600` on the Ban Member request. After Discord confirms
-the ban, the bot also sweeps the author's remaining tracked messages across
-guild channels within the same window. **Ban** keeps the zero-second Discord
+the ban, the bot checks that the matching configuration is still current before
+sweeping the author's remaining tracked messages across guild channels within
+the same window. **Ban** keeps the zero-second Discord
 window. Matched-message deletes happen in both modes. Dry-run never bans or
 purges. Saved keep-messages and legacy day windows still apply. See
 [AUTOMOD.md](AUTOMOD.md). The log counts successful individual deletes. A 404

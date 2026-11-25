@@ -2536,6 +2536,14 @@ impl ConfigCache {
             .map(|entry| Arc::clone(&entry))
     }
 
+    /// Confirm the durable version and its lineage on the primary.
+    pub(crate) async fn primary_version_matches(&self, db: &Db, durable_version: u64) -> bool {
+        db::get_primary_versions(db).await.is_ok_and(|primary| {
+            primary.config == durable_version
+                && primary.config_revision == *self.accepted_revision.lock()
+        })
+    }
+
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
         let required = self
             .durable_floor
