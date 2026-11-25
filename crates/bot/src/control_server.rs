@@ -623,11 +623,11 @@ mod tests {
         let bound = spawn_listener(Arc::clone(bot), None, Some(waiting))
             .unwrap()
             .unwrap();
-        let pending = tokio::task::spawn_blocking(move || submit(bound, frame));
-        tokio::time::timeout(Duration::from_secs(3), admitted)
-            .await
-            .expect("worker did not reach the moderation hold")
-            .expect("worker dropped the moderation wait signal");
+        let mut pending = tokio::task::spawn_blocking(move || submit(bound, frame));
+        tokio::select! {
+            signal = admitted => signal.expect("worker dropped the moderation wait signal"),
+            reply = &mut pending => panic!("submission ended before the moderation hold: {reply:?}"),
+        }
         pending
     }
 
