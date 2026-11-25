@@ -1915,7 +1915,15 @@ fn main() {
             Ok((mut stream, _)) => {
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
                 let mut buf = [0u8; 1024];
-                let n = stream.read(&mut buf).unwrap_or(0);
+                // TCP may deliver the request head over more than one read.
+                let mut n = 0;
+                while n < buf.len() && !buf[..n].ends_with(b"\r\n\r\n") {
+                    let Ok(read @ 1..) = stream.read(&mut buf[n..]) else { break; };
+                    n += read;
+                }
+                if !buf[..n].ends_with(b"\r\n\r\n") {
+                    continue;
+                }
                 let line = String::from_utf8_lossy(&buf[..n]);
                 let (status, body) = if line.starts_with("GET /health") {
                     ("200 OK", "ok")
