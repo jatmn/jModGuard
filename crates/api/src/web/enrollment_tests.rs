@@ -1086,6 +1086,7 @@ async fn display_refreshes_a_cold_user_when_discord_is_not_rate_limited() {
 #[tokio::test]
 async fn stale_display_discovery_stays_incomplete_until_cooldown_expires() {
     let f = Fixture::new(false).await;
+    let received = f.app.oauth.freeze_test_time();
     age_guild_cache(&f.app, 42);
     *f.discord.retry_after.lock().unwrap() = "120".into();
     f.discord.rate_limited.store(true, Ordering::SeqCst);
@@ -1101,14 +1102,13 @@ async fn stale_display_discovery_stays_incomplete_until_cooldown_expires() {
         assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
     }
 
-    // Shorten the stored deadline to simulate elapsed cooldown time without a
-    // two-minute wait. The production gate must evict it when the time passes.
+    // Cross the original cooldown boundary so the next request must evict it.
     f.discord.rate_limited.store(false, Ordering::SeqCst);
     *f.discord.guilds.lock().unwrap() = vec![managed_guild(20)];
-    f.app
-        .oauth
-        .restore_deadlines([("g:42".into(), chrono::Utc::now().timestamp_millis() + 50)].into());
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    f.app.oauth.set_test_time(
+        received + std::time::Duration::from_secs(120),
+        oauth::TEST_RECEIVED_MS + 120_000,
+    );
     let (status, me) = f.request("POST", "/api/me", "").await;
     assert_eq!(status, StatusCode::OK, "{me}");
     assert_eq!(me["role_discovery_incomplete"], false);
@@ -1119,6 +1119,7 @@ async fn stale_display_discovery_stays_incomplete_until_cooldown_expires() {
 #[tokio::test]
 async fn guild_list_cooldown_survives_a_new_api_process() {
     let f = Fixture::new(false).await;
+    let received = f.app.oauth.freeze_test_time();
     f.enroll(10).await;
     f.app.guild_cache.clear();
     *f.discord.retry_after.lock().unwrap() = "120".into();
@@ -1133,19 +1134,19 @@ async fn guild_list_cooldown_survives_a_new_api_process() {
     let g42 = deadlines
         .get("g:42")
         .expect("expected g:42 deadline after first 429");
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    assert!(
-        *g42 > now_ms + 60_000,
-        "g:42 deadline {g42} is not more than 60s ahead of now {now_ms}"
-    );
+    assert_eq!(*g42, oauth::TEST_RECEIVED_MS + 120_000);
 
-    let endpoint = f.app.oauth.guilds_endpoint.clone().unwrap();
-    let cfg = (*f.app.cfg).clone();
+    let new_api = |db, elapsed: u64| {
+        let mut oauth = oauth::OAuthClient::from_config(&f.app.cfg).unwrap();
+        oauth.guilds_endpoint = f.app.oauth.guilds_endpoint.clone();
+        oauth.set_test_time(
+            received + std::time::Duration::from_millis(elapsed),
+            oauth::TEST_RECEIVED_MS + i64::try_from(elapsed).unwrap(),
+        );
+        ApiState::with_oauth((*f.app.cfg).clone(), db, oauth).unwrap()
+    };
     let db = db::Db::open(&f.path, 2).unwrap();
-    let mut restarted = ApiState::new(cfg.clone(), db).unwrap();
-    std::sync::Arc::get_mut(&mut std::sync::Arc::get_mut(&mut restarted).unwrap().oauth)
-        .unwrap()
-        .guilds_endpoint = Some(endpoint.clone());
+    let restarted = new_api(db, 60_000);
     let err = restarted
         .oauth
         .my_guilds(42, "fixture-token")
@@ -1175,10 +1176,7 @@ async fn guild_list_cooldown_survives_a_new_api_process() {
         rand::random::<u128>()
     ));
     let other_db = db::Db::open(&other_path, 2).unwrap();
-    let mut other_state = ApiState::new(cfg.clone(), other_db).unwrap();
-    std::sync::Arc::get_mut(&mut std::sync::Arc::get_mut(&mut other_state).unwrap().oauth)
-        .unwrap()
-        .guilds_endpoint = Some(endpoint.clone());
+    let other_state = new_api(other_db, 60_000);
     let err = other_state
         .oauth
         .my_guilds(42, "fixture-token")
@@ -1195,16 +1193,8 @@ async fn guild_list_cooldown_survives_a_new_api_process() {
         let _ = std::fs::remove_file(format!("{}{suffix}", other_path.display()));
     }
 
-    let expired_ms = chrono::Utc::now().timestamp_millis() - 600_000;
-    let expired_json = format!(r#"{{"g:42":{expired_ms}}}"#);
     let expired_db = db::Db::open(&f.path, 2).unwrap();
-    super::discord_retry::store_deadlines(&expired_db, expired_json)
-        .await
-        .unwrap();
-    let mut expired_state = ApiState::new(cfg, expired_db).unwrap();
-    std::sync::Arc::get_mut(&mut std::sync::Arc::get_mut(&mut expired_state).unwrap().oauth)
-        .unwrap()
-        .guilds_endpoint = Some(endpoint);
+    let expired_state = new_api(expired_db, 120_000);
     let err = expired_state
         .oauth
         .my_guilds(42, "fixture-token")
@@ -1630,6 +1620,8 @@ async fn configuration_snapshot_checks_its_captured_membership() {
         .unwrap();
 }
 
+const MEMBER_FIXTURE_MS: i64 = 1_700_000_000_000;
+
 fn action_key(label: &str) -> String {
     format!("{}_{}", chrono::Utc::now().timestamp(), label)
 }
@@ -1678,7 +1670,7 @@ async fn member_sync_controls_require_an_existing_job_and_missing_job_receipt_fa
     assert_eq!(actions.as_array().unwrap().len(), 0);
 
     let seeded = store
-        .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .initialize_member_directory(scope.clone(), 42, MEMBER_FIXTURE_MS)
         .await
         .unwrap();
     assert!(seeded.run_id.is_some());
@@ -1721,7 +1713,7 @@ async fn member_sync_controls_require_an_existing_job_and_missing_job_receipt_fa
     assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
     assert_eq!(rejected["code"], "member_sync_missing_job");
     let still_missing = store
-        .initialize_member_directory(scope, 42, chrono::Utc::now().timestamp_millis())
+        .initialize_member_directory(scope, 42, MEMBER_FIXTURE_MS)
         .await
         .unwrap();
     assert!(still_missing.run_id.is_none());
@@ -1741,7 +1733,7 @@ async fn member_sync_controls_reject_invalid_operations_before_queueing() {
         .unwrap();
     let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
     store
-        .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .initialize_member_directory(scope.clone(), 42, MEMBER_FIXTURE_MS)
         .await
         .unwrap();
     let path = "/api/guilds/10/member-sync/actions";
@@ -1765,7 +1757,7 @@ async fn member_sync_controls_reject_invalid_operations_before_queueing() {
         .unwrap()
         .execute(
             "UPDATE guild_member_sync SET status='needs_attention',status_reason='permission_denied',request_after_ms=? WHERE guild_id=10",
-            libsql::params![chrono::Utc::now().timestamp_millis() + 60_000],
+            libsql::params![i64::MAX],
         )
         .await
         .unwrap();
@@ -1804,10 +1796,10 @@ async fn member_sync_retry_admits_audit_pagination_stall_after_initial_complete(
     let enrollment_id = enrollment.id.clone();
     let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
     store
-        .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .initialize_member_directory(scope.clone(), 42, MEMBER_FIXTURE_MS)
         .await
         .unwrap();
-    let completed_at = chrono::Utc::now().timestamp_millis();
+    let completed_at = MEMBER_FIXTURE_MS;
     let mut guild_path = f.path.as_os_str().to_owned();
     guild_path.push(".guild.db");
     let guild_db_path = std::path::PathBuf::from(guild_path.clone());
@@ -1887,7 +1879,7 @@ async fn member_sync_status_uses_persisted_bot_identity_not_oauth_client_id() {
         .unwrap();
     let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
     store
-        .initialize_member_directory(scope.clone(), 42, chrono::Utc::now().timestamp_millis())
+        .initialize_member_directory(scope.clone(), 42, MEMBER_FIXTURE_MS)
         .await
         .unwrap();
     let (status, body) = f.request("GET", "/api/guilds/10/member-sync", "").await;
@@ -2734,7 +2726,7 @@ async fn claimed_work_and_stuck_log_channels_can_be_cancelled_for_recovery() {
             &serde_json::json!({"request_id":action_key("claimed"),"user_id":"99"}).to_string(),
         )
         .await;
-    let claimed = db::claim_bot_action(&f.app.db, chrono::Utc::now().timestamp())
+    let claimed = db::claim_bot_action(&f.app.db, unban["created_at"].as_i64().unwrap())
         .await
         .unwrap()
         .unwrap();
@@ -2765,13 +2757,13 @@ async fn claimed_work_and_stuck_log_channels_can_be_cancelled_for_recovery() {
             &serde_json::json!({"request_id":action_key("log-run"),"channel_id":"123"}).to_string(),
         )
         .await;
-    let running = db::claim_bot_action(&f.app.db, chrono::Utc::now().timestamp())
+    let running = db::claim_bot_action(&f.app.db, log["created_at"].as_i64().unwrap())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(running.id, log["id"].as_str().unwrap());
     assert!(
-        db::begin_bot_action(&f.app.db, &running, chrono::Utc::now().timestamp())
+        db::begin_bot_action(&f.app.db, &running, running.created_at)
             .await
             .unwrap()
     );
@@ -2803,13 +2795,14 @@ async fn claimed_work_and_stuck_log_channels_can_be_cancelled_for_recovery() {
                 .to_string(),
         )
         .await;
-    let running_unban = db::claim_bot_action(&f.app.db, chrono::Utc::now().timestamp())
-        .await
-        .unwrap()
-        .unwrap();
+    let running_unban =
+        db::claim_bot_action(&f.app.db, running_unban_job["created_at"].as_i64().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
     assert_eq!(running_unban.id, running_unban_job["id"].as_str().unwrap());
     assert!(
-        db::begin_bot_action(&f.app.db, &running_unban, chrono::Utc::now().timestamp())
+        db::begin_bot_action(&f.app.db, &running_unban, running_unban.created_at)
             .await
             .unwrap()
     );
@@ -2863,7 +2856,7 @@ async fn action_requests_require_ids_reject_forged_authority_and_report_expiry()
             "action_request_invalid",
         ),
         (
-            format!("{}_old", chrono::Utc::now().timestamp() - 10 * 86400),
+            "1_old".to_owned(),
             StatusCode::GONE,
             "action_request_expired",
         ),
@@ -2912,7 +2905,7 @@ async fn action_key_errors_survive_the_bot_control_link() {
     f.use_writer_link(target);
     for (key, status, code) in [
         (
-            format!("{}_old", chrono::Utc::now().timestamp() - 10 * 86400),
+            "1_old".to_owned(),
             StatusCode::GONE,
             "action_request_expired",
         ),
@@ -3425,15 +3418,17 @@ async fn delayed_save_is_pending_then_retrievable_without_another_insert() {
         .unwrap();
     let pending: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(pending["code"], "save_pending");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let saved = loop {
-        let response = request(true, "retry-once").await.unwrap();
-        if response.status() != StatusCode::ACCEPTED {
-            break response;
+    let saved = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let response = request(true, "retry-once").await.unwrap();
+            if response.status() != StatusCode::ACCEPTED {
+                break response;
+            }
+            tokio::task::yield_now().await;
         }
-        assert!(std::time::Instant::now() < deadline);
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    };
+    })
+    .await
+    .expect("released save must reach a terminal receipt");
     assert_eq!(saved.status(), StatusCode::OK);
     let bytes = axum::body::to_bytes(saved.into_body(), 4096).await.unwrap();
     let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -5223,6 +5218,7 @@ async fn preview_profiles_apply_distinct_permission_views() {
 #[tokio::test]
 async fn expired_preview_is_removed_and_returns_a_distinct_lifecycle_error() {
     let f = Fixture::new(true).await;
+    let cached_at = f.app.user_cache.get(&42).unwrap().value().0;
     let token = "expired-preview".to_string();
     f.app.preview.insert(
         token.clone(),
@@ -5231,7 +5227,7 @@ async fn expired_preview_is_removed_and_returns_a_distinct_lifecycle_error() {
             actor_id: 42,
             guild_id: 10,
             profile: preview::PreviewProfile::Member,
-            expires: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            expires: cached_at,
         },
     );
     let (status, body) = f.request_preview("GET", "/api/me", "", &token).await;
@@ -5658,6 +5654,7 @@ async fn recovery_routes_require_an_authenticated_owner() {
     assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
     assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
     let f = Fixture::new(true).await;
+    let cached_at = f.app.user_cache.get(&42).unwrap().value().0;
     let token = "synthetic-preview";
     f.app.preview.insert(
         token.into(),
@@ -5666,7 +5663,7 @@ async fn recovery_routes_require_an_authenticated_owner() {
             actor_id: 42,
             guild_id: 10,
             profile: preview::PreviewProfile::Administrator,
-            expires: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            expires: cached_at + std::time::Duration::from_secs(60),
         },
     );
     for (method, route, input) in routes {
@@ -6357,20 +6354,17 @@ async fn coordinator_sweep_bounds_idle_entries_without_splitting_active_owner() 
     require_auth_fresh(&f.app, &session).await.ok().unwrap();
     let entry = refresh_state(&f).await;
     let mut refreshing = entry.lock().await;
-    refreshing.last_used = Some(
-        std::time::Instant::now()
-            .checked_sub(AUTH_SESSION_IDLE_TTL)
-            .unwrap(),
-    );
+    let sweep_at = refreshing.last_used.unwrap();
+    refreshing.last_used = Some(sweep_at.checked_sub(AUTH_SESSION_IDLE_TTL).unwrap());
     // Refresh holds this exact mutex across token recovery. A sweep must not
     // replace its owner, even when its recorded activity has expired.
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions(std::time::Instant::now());
+    f.app.sweep_auth_sessions(sweep_at);
     assert!(f.app.auth_sessions.contains_key(&id));
     drop(refreshing);
     // A loaded request queued on this Arc must also retain the same owner.
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions(std::time::Instant::now());
+    f.app.sweep_auth_sessions(sweep_at);
     assert!(Arc::ptr_eq(
         f.app.auth_sessions.get(&id).unwrap().value(),
         &entry
@@ -6378,7 +6372,7 @@ async fn coordinator_sweep_bounds_idle_entries_without_splitting_active_owner() 
     let old_owner = Arc::downgrade(&entry);
     drop(entry);
     // The preceding sweep is rate-limited, even though the entry is now idle.
-    f.app.sweep_auth_sessions(std::time::Instant::now());
+    f.app.sweep_auth_sessions(sweep_at);
     assert!(f.app.auth_sessions.contains_key(&id));
     allow_coordinator_sweep(&f.app);
     // Exercise the production sweep trigger, then recreate from the live store.
@@ -6388,20 +6382,16 @@ async fn coordinator_sweep_bounds_idle_entries_without_splitting_active_owner() 
         "idle coordinator was retained"
     );
     let replacement = refresh_state(&f).await;
-    assert!(replacement.lock().await.last_used.unwrap().elapsed() < AUTH_SESSION_IDLE_TTL);
+    assert!(replacement.lock().await.last_used.unwrap() >= sweep_at);
     drop(replacement);
     // An abandoned record is bounded by coordinator inactivity, regardless of
     // whether MemoryStore has already removed it.
     let entry = refresh_state(&f).await;
-    entry.lock().await.last_used = Some(
-        std::time::Instant::now()
-            .checked_sub(AUTH_SESSION_IDLE_TTL)
-            .unwrap(),
-    );
+    let last_used = entry.lock().await.last_used.unwrap();
     drop(entry);
     session.delete().await.unwrap();
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions(std::time::Instant::now());
+    f.app.sweep_auth_sessions(last_used + AUTH_SESSION_IDLE_TTL);
     assert!(f.app.auth_sessions.is_empty());
 }
 
@@ -6435,7 +6425,11 @@ async fn coordinator_sweep_keeps_fresh_dead_marker_until_named_ttl() {
     assert_coordinator_payload_released(&entry).await;
     drop(entry);
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions(std::time::Instant::now());
+    let SessionLifecycle::Retired { since } = refresh_state(&f).await.lock().await.lifecycle else {
+        panic!("permanent refusal must retire the coordinator");
+    };
+    f.app
+        .sweep_auth_sessions(since + AUTH_SESSION_DEAD_TTL - std::time::Duration::from_secs(1));
     assert!(f.app.auth_sessions.contains_key(&id));
     let calls = f.discord.token_calls.load(Ordering::SeqCst);
     assert!(
@@ -6447,15 +6441,8 @@ async fn coordinator_sweep_keeps_fresh_dead_marker_until_named_ttl() {
             .is::<AuthLost>()
     );
     assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), calls);
-    let entry = refresh_state(&f).await;
-    entry.lock().await.lifecycle = SessionLifecycle::Retired {
-        since: std::time::Instant::now()
-            .checked_sub(AUTH_SESSION_DEAD_TTL)
-            .unwrap(),
-    };
-    drop(entry);
     allow_coordinator_sweep(&f.app);
-    f.app.sweep_auth_sessions(std::time::Instant::now());
+    f.app.sweep_auth_sessions(since + AUTH_SESSION_DEAD_TTL);
     assert!(f.app.auth_sessions.is_empty());
     assert!(f.app.retired_auth_sessions.contains_key(&id));
     // Tombstone retirement metadata is independent of the 30-second payload marker.
@@ -6720,15 +6707,13 @@ async fn retired_delayed_response_save_cannot_restore_authority() {
                 f.request("GET", "/api/guilds/10/config", "").await.0,
                 StatusCode::UNAUTHORIZED
             );
-            let entry = refresh_state(&f).await;
-            entry.lock().await.lifecycle = SessionLifecycle::Retired {
-                since: std::time::Instant::now()
-                    .checked_sub(AUTH_SESSION_DEAD_TTL)
-                    .unwrap(),
+            let SessionLifecycle::Retired { since } =
+                refresh_state(&f).await.lock().await.lifecycle
+            else {
+                panic!("permanent refusal must retire the coordinator");
             };
-            drop(entry);
             allow_coordinator_sweep(&f.app);
-            f.app.sweep_auth_sessions(std::time::Instant::now());
+            f.app.sweep_auth_sessions(since + AUTH_SESSION_DEAD_TTL);
         } else {
             let mut headers = HeaderMap::new();
             let origin = reqwest::Url::parse(&f.app.cfg.web.base_url)
@@ -7010,6 +6995,30 @@ impl tracing::Subscriber for DiscordRateLimitLog {
 
 #[tokio::test]
 async fn fresh_login_during_discord_429_has_identity_and_retries_discovery() {
+    use tracing::instrument::WithSubscriber as _;
+
+    // A parallel test can register the shared warning callsite on an unscoped
+    // thread and cache Interest::never. Run the capture in its own test process.
+    const CAPTURE_CHILD: &str = "JMODGUARD_DISCORD_429_CAPTURE_CHILD";
+    if std::env::var_os(CAPTURE_CHILD).is_none() {
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let test =
+            format!("{module}::fresh_login_during_discord_429_has_identity_and_retries_discovery");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test])
+            .env(CAPTURE_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed;"),
+            "{test}: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
     let mut f = Fixture::new(false).await;
     f.enroll(10).await;
     *f.discord.retry_after.lock().unwrap() = "120".into();
@@ -7017,13 +7026,15 @@ async fn fresh_login_during_discord_429_has_identity_and_retries_discovery() {
     f.discord.rate_limited.store(true, Ordering::SeqCst);
 
     let logs = DiscordRateLimitLog::default();
-    let before = chrono::Utc::now().timestamp_millis();
-    let guard = tracing::subscriber::set_default(logs.clone());
-    login_without_cached_discord_data(&mut f).await;
-    let (status, me) = f.request("POST", "/api/me", "").await;
-    let (again, _) = f.request("POST", "/api/me", "").await;
-    drop(guard);
-    let after = chrono::Utc::now().timestamp_millis();
+    f.app.oauth.freeze_test_time();
+    let ((status, me), (again, _)) = async {
+        login_without_cached_discord_data(&mut f).await;
+        let first = f.request("POST", "/api/me", "").await;
+        let second = f.request("POST", "/api/me", "").await;
+        (first, second)
+    }
+    .with_subscriber(logs.clone())
+    .await;
     assert_eq!(status, StatusCode::OK, "{me}");
     assert_eq!(again, StatusCode::OK);
     assert_eq!(me["user"]["username"], "live-profile");
@@ -7059,7 +7070,7 @@ async fn fresh_login_during_discord_429_has_identity_and_retries_discovery() {
 
     let deadlines = super::discord_retry::load_deadlines(&f.app.db).unwrap();
     assert_eq!(deadlines.len(), 1, "{deadlines:?}");
-    assert!((before + 119_250..=after + 119_250).contains(&deadlines["g:42"]));
+    assert_eq!(deadlines["g:42"], oauth::TEST_RECEIVED_MS + 119_250);
     assert_eq!(
         f.request("GET", "/api/guilds/10/config", "").await.0,
         StatusCode::TOO_MANY_REQUESTS,
@@ -7152,15 +7163,13 @@ async fn recovery_rejects_late_save(definitive_refusal: bool) {
             let (status, body) = f.request("POST", "/api/me", "").await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
             assert_eq!(body["code"], "auth_lost");
-            let entry = refresh_state(&f).await;
-            entry.lock().await.lifecycle = SessionLifecycle::Retired {
-                since: std::time::Instant::now()
-                    .checked_sub(AUTH_SESSION_DEAD_TTL)
-                    .unwrap(),
+            let SessionLifecycle::Retired { since } =
+                refresh_state(&f).await.lock().await.lifecycle
+            else {
+                panic!("permanent refusal must retire the coordinator");
             };
-            drop(entry);
             allow_coordinator_sweep(&f.app);
-            f.app.sweep_auth_sessions(std::time::Instant::now());
+            f.app.sweep_auth_sessions(since + AUTH_SESSION_DEAD_TTL);
         } else {
             assert_eq!(
                 blocker_request(&f, "POST", "/logout", "").await.0,
@@ -8503,7 +8512,11 @@ async fn removed_case_list_checks_for_a_row_past_the_maximum_page() {
 
 #[tokio::test]
 async fn case_list_deadline_includes_waiting_for_a_local_connection() {
-    use std::time::{Duration, Instant};
+    use std::future::poll_fn;
+    use std::task::Poll;
+    use std::time::Duration;
+    use tokio::time;
+
     let f = Fixture::new(false).await;
     f.enroll(10).await;
     let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
@@ -8520,12 +8533,12 @@ async fn case_list_deadline_includes_waiting_for_a_local_connection() {
     for _ in 0..2 {
         let db = f.app.db.clone();
         let entered = entered.clone();
-        let (release, wait) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
         releases.push(release);
         blockers.push(tokio::spawn(async move {
             db.with_conn(move |_| {
                 entered.send(()).unwrap();
-                wait.recv().unwrap();
+                let _ = wait.recv();
                 Ok(())
             })
             .await
@@ -8534,25 +8547,36 @@ async fn case_list_deadline_includes_waiting_for_a_local_connection() {
     }
     received.recv().await.unwrap();
     received.recv().await.unwrap();
-    let started = Instant::now();
-    let result = tokio::time::timeout(
-        Duration::from_secs(22),
-        f.request_token(
+    time::pause();
+    let budget = Duration::from_secs(20);
+    let deadline = time::Instant::now() + budget;
+    let result = {
+        let mut request = std::pin::pin!(f.request_token(
             "POST",
             "/api/guilds/10/cases?limit=50&removed=false",
             "",
             Some(&enrollment.id),
-        ),
-    )
-    .await;
-    let elapsed = started.elapsed();
-    for release in releases {
-        release.send(()).unwrap();
-    }
+        ));
+        // Poll into the pool wait so the handler has registered its timer.
+        poll_fn(|cx| {
+            assert!(request.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        // The blocking pool holders prevent Tokio from auto-advancing.
+        time::advance(budget + Duration::from_millis(1)).await;
+        // Wait for the timer driver to process the deadline we advanced past.
+        time::sleep_until(deadline).await;
+        poll_fn(|cx| Poll::Ready(request.as_mut().poll(cx))).await
+    };
+    time::resume();
+    drop(releases);
     for blocker in blockers {
         blocker.await.unwrap();
     }
-    let (status, body) = result.expect("Cases handler exceeded its request budget");
+    let Poll::Ready((status, body)) = result else {
+        panic!("Cases handler exceeded its request budget");
+    };
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(
         body["error"]
@@ -8561,7 +8585,6 @@ async fn case_list_deadline_includes_waiting_for_a_local_connection() {
             .contains("Cases request timed out"),
         "{body}"
     );
-    assert!(elapsed < Duration::from_secs(21), "{elapsed:?}");
     // The cancelled pool waiter must neither consume a slot nor leave more work.
     let (status, body) = f.request("POST", "/api/guilds/10/cases", "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -9050,16 +9073,19 @@ async fn owner_leave_admits_only_the_owner_against_an_active_enrollment() {
 
     // The directory receipt surface serves departures only: an admin's unban
     // receipt is not readable through it even with its exact id.
+    // Reuse the timestamp embedded in this fixture's fresh request key.
+    let unban_key = fresh_request_key("unban-row");
+    let unban_at = unban_key.split_once('_').unwrap().0.parse().unwrap();
     let unban = db::enqueue_bot_action(
         &f.app.db,
         55,
         42,
-        &fresh_request_key("unban-row"),
+        &unban_key,
         jmodguard::bot_actions::Action::Unban {
             user_id: 500,
             reason: "dashboard unban".into(),
         },
-        chrono::Utc::now().timestamp(),
+        unban_at,
         f.app.cfg.actions.clone(),
     )
     .await
@@ -9131,10 +9157,7 @@ async fn owner_leave_is_bound_to_the_membership_the_directory_showed() {
     assert_eq!(status, StatusCode::CONFLICT, "{stale}");
     assert_eq!(stale["code"], "action_enrollment_changed");
     assert!(
-        db::claim_bot_action(&f.app.db, chrono::Utc::now().timestamp())
-            .await
-            .unwrap()
-            .is_none(),
+        db::claim_bot_action(&f.app.db, 0).await.unwrap().is_none(),
         "a stale intent never queues a departure for the new membership"
     );
 
@@ -9792,14 +9815,11 @@ async fn role_cache_stays_bounded_with_live_entries() {
         .lock()
         .unwrap()
         .insert(10, vec!["555".into()]);
+    let cached_at = f.app.user_cache.get(&42).unwrap().value().0;
     for i in 0..MEMBER_ROLES_MAX_ENTRIES {
         f.app.member_roles.lock().unwrap().insert(
             (1000 + i as u64, 10),
-            Arc::new(tokio::sync::Mutex::new(Some((
-                std::time::Instant::now(),
-                vec![555],
-                0,
-            )))),
+            Arc::new(tokio::sync::Mutex::new(Some((cached_at, vec![555], 0)))),
         );
     }
     let (status, body) = f.request("POST", "/api/guilds/10/stats", "").await;

@@ -4,6 +4,8 @@ use jmodguard::db::{self, ComponentObservation, ComponentRelease, Db};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+const OBSERVED_AT: i64 = 1_700_000_000;
+
 fn temp_db(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "api_observe_{label}_{}_{}.db",
@@ -79,7 +81,7 @@ async fn read_only_api_launcher_forwards_observations_and_the_counterpart_gate_p
         .with_writer_link(link);
     assert!(!reader.writes_locally());
     let schema = reader.schema_version().await.unwrap();
-    let now = chrono::Utc::now().timestamp();
+    let now = OBSERVED_AT;
     let running = observation(&"a".repeat(40), schema, now);
     reader
         .running("api", None, running.clone(), now)
@@ -217,7 +219,7 @@ async fn queue(
     bot: &jmodguard_bot::state::BotState,
     release: &ComponentRelease,
 ) -> ComponentRelease {
-    let now = chrono::Utc::now().timestamp();
+    let now = OBSERVED_AT;
     db::record_update_check(&bot.db, "api", "latest", Some(release.clone()), None, now)
         .await
         .unwrap();
@@ -250,7 +252,7 @@ async fn read_only_api_failure_and_rollback_clear_desired_so_the_next_poll_has_n
             .contains("compatibility")
     );
     let rolled = queue(&linked.bot, &api_release(schema, 'b')).await;
-    let now = chrono::Utc::now().timestamp();
+    let now = OBSERVED_AT;
     linked
         .reader
         .rolled_back(
@@ -305,7 +307,7 @@ async fn read_only_api_stores_required_launcher_selection_and_applies_every_rece
     let selected = linked.reader.component("api").await.unwrap();
     assert_eq!(selected.desired_launcher.unwrap().digest, release.digest);
     assert_eq!(selected.desired.unwrap().digest, release.digest);
-    let now = chrono::Utc::now().timestamp();
+    let now = OBSERVED_AT;
     let hash = "ab".repeat(32);
     linked
         .reader
@@ -399,7 +401,7 @@ async fn refused_activation_is_retried_until_the_writer_stores_installed() {
     let linked = linked(false).await;
     let schema = linked.reader.schema_version().await.unwrap();
     let release = queue(&linked.bot, &api_release(schema, 'f')).await;
-    let now = chrono::Utc::now().timestamp();
+    let now = OBSERVED_AT;
     let seen = observation(&"1".repeat(40), schema, now);
     let refused = linked
         .reader

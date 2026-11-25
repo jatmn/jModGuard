@@ -517,9 +517,10 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn recovery_session_store_errors_are_generic_and_retryable() {
         use std::sync::atomic::Ordering::SeqCst;
+        let retired_at = tokio::time::Instant::now().into_std();
         let path =
             std::env::temp_dir().join(format!("recovery-store-{:032x}.db", rand::random::<u128>()));
         let db = Db::open(&path, 2).unwrap();
@@ -574,8 +575,7 @@ mod tests {
                         "nonowner" => {}
                         "load" => store.fail_load.store(true, SeqCst),
                         "retired" => {
-                            app.retired_auth_sessions
-                                .insert(id, std::time::Instant::now());
+                            app.retired_auth_sessions.insert(id, retired_at);
                             store.fail_delete.store(true, SeqCst);
                         }
                         "dead" => {
@@ -583,7 +583,7 @@ mod tests {
                                 id,
                                 Arc::new(tokio::sync::Mutex::new(SessionAuth {
                                     lifecycle: crate::web::SessionLifecycle::Retired {
-                                        since: std::time::Instant::now(),
+                                        since: retired_at,
                                     },
                                     ..Default::default()
                                 })),
@@ -661,9 +661,10 @@ mod tests {
         crate::tenant::remove_sidecars(&path);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn require_auth_session_failures_are_generic_and_retryable() {
         use std::sync::atomic::Ordering::SeqCst;
+        let retired_at = tokio::time::Instant::now().into_std();
         let path =
             std::env::temp_dir().join(format!("auth-store-{:032x}.db", rand::random::<u128>()));
         let db = Db::open(&path, 2).unwrap();
@@ -695,17 +696,14 @@ mod tests {
                     app.auth_sessions.insert(
                         id,
                         Arc::new(tokio::sync::Mutex::new(SessionAuth {
-                            lifecycle: crate::web::SessionLifecycle::Retired {
-                                since: std::time::Instant::now(),
-                            },
+                            lifecycle: crate::web::SessionLifecycle::Retired { since: retired_at },
                             ..Default::default()
                         })),
                     );
                     store.fail_delete.store(true, SeqCst);
                 }
                 "retired" => {
-                    app.retired_auth_sessions
-                        .insert(id, std::time::Instant::now());
+                    app.retired_auth_sessions.insert(id, retired_at);
                     store.fail_delete.store(true, SeqCst);
                 }
                 _ => {}
@@ -1035,7 +1033,8 @@ mod tests {
         writable.read_only = false;
         let control = UpdateControl::open(&writable).unwrap().unwrap();
         assert!(control.writes_locally());
-        let now = chrono::Utc::now().timestamp();
+        const NOW: i64 = 1_700_000_000;
+        let now = NOW;
         let store_schema = db::CORE_SCHEMA_VERSION + 1;
         let store_guild = db::guild_data::SCHEMA_VERSION;
         for (role, digit) in [("bot", 'a'), ("api", 'b')] {
@@ -1088,7 +1087,7 @@ mod tests {
             cfg: Arc::new(cfg),
             control: reader,
             apply_enabled: true,
-            now: current_timestamp,
+            now: || NOW,
             api: None,
             writer: None,
         });

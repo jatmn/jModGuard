@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+const CHECKED_AT: i64 = 1_700_000_000;
+
 fn temp_db(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "api_writer_{label}_{}_{}.db",
@@ -431,7 +433,7 @@ async fn owner_check_through_the_control_link_stores_a_fresh_candidate() {
     let db = Db::open_with(cfg.db_open_options()).unwrap();
     let app = Arc::new(ApiState::new(cfg, db).unwrap());
     let state = db::component_update(&app.db, "bot").await.unwrap();
-    let now = chrono::Utc::now().timestamp();
+    let now = CHECKED_AT;
     let candidate = db::ComponentRelease {
         component: "bot".into(),
         channel: state.channel.clone(),
@@ -546,7 +548,7 @@ async fn background_check_records_the_channel_digest_and_does_not_install() {
         channel: db::component_update(&app.db, "bot").await.unwrap().channel,
         candidate: None,
         error: Some("seed".into()),
-        now: chrono::Utc::now().timestamp(),
+        now: CHECKED_AT,
     })
     .await
     .unwrap();
@@ -637,19 +639,21 @@ async fn background_check_records_a_lookup_timeout_and_does_not_install() {
         ("api", install_snapshot(&bot.db, "api").await),
         ("webui", install_snapshot(&bot.db, "webui").await),
     ];
-    let started = std::time::Instant::now();
     assert!(
-        record_release_checks(
-            &app,
-            // A lookup that never answers can only end at the lookup timeout.
-            |_component, _channel| Box::pin(std::future::pending()),
-            Duration::from_millis(50),
-            pending_shutdown(),
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            record_release_checks(
+                &app,
+                // A lookup that never answers can only end at the lookup timeout.
+                |_component, _channel| Box::pin(std::future::pending()),
+                Duration::from_millis(50),
+                pending_shutdown(),
+            )
         )
         .await
+        .expect("release checks exceeded their timeout budget")
         .finished
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
     for component in ["bot", "api", "webui"] {
         let stored = db::component_update(&bot.db, component).await.unwrap();
         assert!(
@@ -1018,19 +1022,24 @@ async fn background_check_stops_on_shutdown_without_installing() {
         let row = db::component_update(&bot.db, component).await.unwrap();
         assert_ne!(row.state, "queued");
     }
-    let now = chrono::Utc::now().timestamp();
     for component in ["bot", "api", "webui"] {
         let owner = format!("{:032x}", rand::random::<u128>());
         let claim = app
             .commit(db::ControlOp::ClaimUpdateLease {
                 component: component.into(),
                 owner,
-                now,
+                now: CHECKED_AT,
                 ttl: 240,
             })
             .await
             .unwrap();
-        assert!(matches!(claim, db::ControlReply::Saved { .. }), "{claim:?}");
+        assert_eq!(
+            claim,
+            db::ControlReply::Saved {
+                body: serde_json::json!(true)
+            },
+            "{component} lease must be free after shutdown"
+        );
     }
     drop(app);
     drop(bot);
@@ -1222,14 +1231,6 @@ async fn background_check_skips_install_after_failed_renew() {
     let (bot, app, path, _enrollment) = linked_writer("bg-renew-fail").await;
     let bot_slot = Arc::new(std::sync::Mutex::new(Some(bot)));
     let db = writer_db(&bot_slot);
-    let now = chrono::Utc::now().timestamp();
-    app.commit(db::ControlOp::RecordBakedComponentRunning {
-        component: "bot".into(),
-        observation: running_observation(now),
-        now,
-    })
-    .await
-    .unwrap();
     app.commit(db::ControlOp::SetUpdatePolicy {
         component: "bot".into(),
         channel: "stable".into(),
@@ -1239,15 +1240,30 @@ async fn background_check_skips_install_after_failed_renew() {
     .await
     .unwrap();
     let seed = promoted_release("bot", "stable", '4');
-    app.commit(db::ControlOp::RecordUpdateCheck {
-        component: "bot".into(),
-        channel: "stable".into(),
-        candidate: Some(seed),
-        error: None,
-        now,
-    })
-    .await
-    .unwrap();
+    let initial = record_release_checks(
+        &app,
+        |component, channel| {
+            let release = promoted_release(component, channel, '4');
+            Box::pin(async move { Ok(release) })
+        },
+        RELEASE_LOOKUP_TIMEOUT,
+        pending_shutdown(),
+    )
+    .await;
+    assert!(initial.finished);
+    let checked = db::component_update(&db, "bot").await.unwrap();
+    assert_eq!(checked.candidate.as_ref(), Some(&seed));
+    // Use the completed check's UTC timestamp for both compatibility observations.
+    let now = checked.checked_at.expect("initial bot check was recorded");
+    for component in ["bot", "api"] {
+        app.commit(db::ControlOp::RecordBakedComponentRunning {
+            component: component.into(),
+            observation: running_observation(now),
+            now,
+        })
+        .await
+        .unwrap();
+    }
     let gate = Arc::new(tokio::sync::Notify::new());
     let gate_release = Arc::clone(&gate);
     let (bot_entered_tx, mut bot_entered_rx) = tokio::sync::mpsc::channel(1);
@@ -1298,15 +1314,22 @@ async fn background_check_skips_install_after_failed_renew() {
         .await
         .expect("release checks did not finish in time")
         .unwrap();
+    assert!(batch.finished);
     assert!(batch.lease_held.contains("bot"));
+    let candidate = db::component_update(&db, "bot")
+        .await
+        .unwrap()
+        .candidate
+        .expect("bot candidate available to the scheduler");
     let before = install_snapshot(&db, "bot").await;
-    poll_scheduled_installs(
-        &app,
-        &batch.lease_held,
-        ScheduledInstallPolicy::enabled(true, true),
-    )
-    .await;
+    let apply = ScheduledInstallPolicy::enabled(true, true);
+    poll_scheduled_installs(&app, &batch.lease_held, apply).await;
     assert_install_unchanged(&db, "bot", &before).await;
+    // With only the skip set removed, the same writer must queue the eligible candidate.
+    poll_scheduled_installs(&app, &std::collections::HashSet::new(), apply).await;
+    let queued = install_snapshot(&db, "bot").await;
+    assert_eq!(queued.state, "queued");
+    assert_eq!(queued.desired, Some(candidate));
     drop(app);
     drop(bot_slot);
     cleanup(&path);

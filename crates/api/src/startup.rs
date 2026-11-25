@@ -369,7 +369,7 @@ mod tests {
         cleanup(&path);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(start_paused = true)]
     async fn starting_state_read_retries_then_succeeds_without_writing_defaults() {
         let path = temp_db("retry");
         let prepared = prepare_bot(&path);
@@ -380,7 +380,7 @@ mod tests {
 
         db::test_fail_starting_state_read(&path, 1);
         let cfg = api_config(&path);
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let db = open_database(&cfg).await.unwrap();
         let app = build_state(cfg, db)
             .await
