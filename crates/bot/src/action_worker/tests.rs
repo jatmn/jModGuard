@@ -4543,7 +4543,7 @@ async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
     use serenity::model::guild::{Guild, Member, Role};
     use serenity::model::id::RoleId;
     use std::convert::Infallible;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
     let f = Fixture::new();
     let joined_at = serenity::model::Timestamp::parse("2026-01-01T00:00:00Z").unwrap();
@@ -4555,24 +4555,42 @@ async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
     bot.user.id = UserId::new(7);
     bot.roles = vec![RoleId::new(30)];
     bot.joined_at = Some(joined_at);
-    let mut owner = Member::default();
-    owner.user.id = UserId::new(42);
-    let mut role = Role::default();
-    role.id = bot.roles[0];
-    role.permissions = Permissions::BAN_MEMBERS;
-    role.position = 30;
+    let mut actor = Member::default();
+    actor.user.id = UserId::new(42);
+    actor.roles = vec![RoleId::new(20)];
+    let mut ordinary_target = Member::default();
+    ordinary_target.user.id = UserId::new(98);
+    let mut rejoined_target = Member::default();
+    rejoined_target.user.id = UserId::new(99);
+    rejoined_target.roles = vec![RoleId::new(25)];
     let mut guild = Guild::default();
     guild.id = GuildId::new(10);
-    guild.owner_id = owner.user.id;
-    guild.roles.insert(role.id, role);
+    guild.owner_id = UserId::new(11);
+    for (position, permissions) in [
+        (20, Permissions::BAN_MEMBERS),
+        (25, Permissions::empty()),
+        (30, Permissions::BAN_MEMBERS),
+    ] {
+        let mut role = Role::default();
+        role.id = RoleId::new(u64::from(position));
+        role.permissions = permissions;
+        role.position = position;
+        guild.roles.insert(role.id, role);
+    }
 
     let replies = Arc::new([
         to_value(guild).unwrap(),
         to_value(bot).unwrap(),
-        to_value(owner).unwrap(),
+        to_value(actor).unwrap(),
+        to_value(ordinary_target).unwrap(),
+        to_value(rejoined_target).unwrap(),
     ]);
-    let ban_requests = Arc::new(Mutex::new(Vec::new()));
-    let captured_bans = Arc::clone(&ban_requests);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured_requests = Arc::clone(&requests);
+    let may_ban = Arc::new(AtomicBool::new(true));
+    let actor_permission = Arc::clone(&may_ban);
+    let has_rejoined = Arc::new(AtomicBool::new(false));
+    let target_rejoined = Arc::clone(&has_rejoined);
     let server = Server::bind(&([127, 0, 0, 1], 0).into());
     let http = serenity::http::HttpBuilder::new("fixture")
         .proxy(format!("http://{}", server.local_addr()))
@@ -4580,14 +4598,32 @@ async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
         .build();
     let server = tokio::spawn(server.serve(make_service_fn(move |_| {
         let replies = Arc::clone(&replies);
-        let captured_bans = Arc::clone(&captured_bans);
+        let captured_requests = Arc::clone(&captured_requests);
+        let actor_permission = Arc::clone(&actor_permission);
+        let target_rejoined = Arc::clone(&target_rejoined);
         async move {
             Ok::<_, Infallible>(service_fn(move |request: Request<Body>| {
                 let path = request.uri().path();
+                captured_requests
+                    .lock()
+                    .unwrap()
+                    .push((request.method().clone(), path.to_owned()));
                 let (status, body) = match (request.method(), path) {
                     (&Method::GET, "/api/v10/guilds/10") => (200, replies[0].clone()),
                     (&Method::GET, "/api/v10/guilds/10/members/7") => (200, replies[1].clone()),
-                    (&Method::GET, "/api/v10/guilds/10/members/42") => (200, replies[2].clone()),
+                    (&Method::GET, "/api/v10/guilds/10/members/42") => {
+                        let mut actor = replies[2].clone();
+                        if !actor_permission.load(Ordering::SeqCst) {
+                            actor["roles"] = json!([]);
+                        }
+                        (200, actor)
+                    }
+                    (&Method::GET, "/api/v10/guilds/10/members/98") => (200, replies[3].clone()),
+                    (&Method::GET, "/api/v10/guilds/10/members/99")
+                        if target_rejoined.load(Ordering::SeqCst) =>
+                    {
+                        (200, replies[4].clone())
+                    }
                     (&Method::GET, "/api/v10/guilds/10/members/99") => {
                         (404, json!({"code": 10007, "message": "Unknown Member"}))
                     }
@@ -4600,10 +4636,12 @@ async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
                     (&Method::GET, "/api/v10/guilds/10/members/102") => {
                         (503, json!({"code": 0, "message": "Service unavailable"}))
                     }
-                    (&Method::PUT, _) => {
-                        captured_bans.lock().unwrap().push(path.to_owned());
-                        (408, json!({"code": 0, "message": "Request Timeout"}))
+                    (&Method::PUT, "/api/v10/guilds/10/bans/99") => {
+                        // Leave a definitive receipt so a later attempt can
+                        // verify this target's roles after it joins.
+                        (400, json!({"code": 0, "message": "Bad request"}))
                     }
+                    (&Method::PUT, _) => (408, json!({"code": 0, "message": "Request Timeout"})),
                     _ => panic!("unexpected Discord request: {} {path}", request.method()),
                 };
                 std::future::ready(Ok::<_, Infallible>(
@@ -4624,17 +4662,64 @@ async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
         activation: &activation,
     };
 
-    for (target, expected) in [
-        (99, Outcome::uncertain("discord_outcome_unknown")),
-        (100, Outcome::failed("unknown_user")),
-        (101, Outcome::failed("ban_check_unavailable")),
-        (102, Outcome::failed("ban_check_unavailable")),
+    for (label, target, rejoined, authorized, expected) in [
+        (
+            "present",
+            98,
+            false,
+            true,
+            Outcome::uncertain("discord_outcome_unknown"),
+        ),
+        (
+            "absent",
+            99,
+            false,
+            true,
+            Outcome::failed("discord_rejected"),
+        ),
+        (
+            "rejoined",
+            99,
+            true,
+            true,
+            Outcome::failed("target_role_not_below_moderator"),
+        ),
+        (
+            "unknown-user",
+            100,
+            false,
+            true,
+            Outcome::failed("unknown_user"),
+        ),
+        (
+            "rate-limited",
+            101,
+            false,
+            true,
+            Outcome::failed("ban_check_unavailable"),
+        ),
+        (
+            "unavailable",
+            102,
+            false,
+            true,
+            Outcome::failed("ban_check_unavailable"),
+        ),
+        (
+            "revoked",
+            103,
+            false,
+            false,
+            Outcome::failed("permission_revoked"),
+        ),
     ] {
+        has_rejoined.store(rejoined, Ordering::SeqCst);
+        may_ban.store(authorized, Ordering::SeqCst);
         let job = db::enqueue_bot_action(
             &f.db,
             10,
             42,
-            &f.request_key(&format!("ban-{target}")),
+            &f.request_key(label),
             Action::Ban {
                 user_id: target,
                 reason: "fixture".into(),
@@ -4653,13 +4738,51 @@ async fn queued_ban_checks_discord_lookup_and_timeout_responses() {
         assert_eq!(
             (state.as_str(), outcome.as_deref()),
             (expected.state, Some(expected.code)),
-            "target {target}"
+            "{label}"
         );
+        let recorded = std::mem::take(&mut *requests.lock().unwrap());
+        for path in ["/api/v10/guilds/10", "/api/v10/guilds/10/members/42"] {
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|(method, h)| *method == Method::GET && h == path)
+                    .count(),
+                1,
+                "{label} must read {path} once"
+            );
+        }
+        let mutations: Vec<_> = recorded
+            .iter()
+            .filter(|(method, _)| *method == Method::PUT)
+            .map(|(_, path)| path.as_str())
+            .collect();
+        if matches!(
+            expected.code,
+            "discord_outcome_unknown" | "discord_rejected"
+        ) {
+            assert_eq!(mutations, [format!("/api/v10/guilds/10/bans/{target}")]);
+        } else {
+            assert!(mutations.is_empty(), "{label} should not dispatch");
+        }
     }
-    assert_eq!(
-        *ban_requests.lock().unwrap(),
-        ["/api/v10/guilds/10/bans/99"]
-    );
+    let admission = now() - 1000;
+    let expired = db::enqueue_bot_action(
+        &f.db,
+        10,
+        42,
+        &format!("{admission}_expired-ban"),
+        ban(104, None),
+        admission,
+        Limits::default(),
+    )
+    .await
+    .unwrap();
+    drain(&f.db, &discord, &WorkerLimits::default())
+        .await
+        .unwrap();
+    assert_eq!(f.status(&expired).await.state, "expired");
+    assert!(requests.lock().unwrap().is_empty());
     assert!(db::list_bans(&f.db, 10, 10).await.unwrap().is_empty());
     server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
