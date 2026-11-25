@@ -1423,6 +1423,125 @@ function resourceFacts(rows) {
   ];
 }
 
+const BYTES_PER_MIB = 2 ** 20;
+const ESTIMATE_HOURS_30_DAYS = 30 * 24;
+const memoryMibFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
+const hourlyCostFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 8 });
+
+function formatMemoryMiB(bytes) {
+  if (!Number.isFinite(bytes)) return null;
+  const mib = bytes / BYTES_PER_MIB;
+  if (mib > 0 && mib < 0.01) return "<0.01 MiB";
+  return `${memoryMibFormat.format(mib)} MiB`;
+}
+
+function memoryBlocks(bytes, blockMib) {
+  const blockBytes = blockMib * BYTES_PER_MIB;
+  const count = Math.max(1, Math.ceil(bytes / blockBytes));
+  const remaining = count * blockBytes - bytes;
+  const headroom = Math.floor(remaining / BYTES_PER_MIB * 100) / 100;
+  return {
+    count,
+    capacity: count * blockMib,
+    headroom: remaining > 0 && headroom === 0 ? "<0.01 MiB" : `${memoryMibFormat.format(headroom)} MiB`,
+  };
+}
+
+function hostingCost(hourly, hours) {
+  const cost = hourly * hours;
+  if (hourly == null || !Number.isFinite(cost)) return null;
+  const minimum = hours === 1 ? 0.00000001 : 0.01;
+  const formatted = hours === 1 ? hourlyCostFormat.format(cost) : cost.toFixed(2);
+  return cost > 0 && cost < minimum ? `<$${minimum.toFixed(hours === 1 ? 8 : 2)}` : `$${formatted}`;
+}
+
+function MemoryBillingPanel({ snapshot, nowMs }) {
+  const billing = snapshot.memory_billing;
+  const blockMib = billing?.block_mib;
+  const rates = billing?.rates;
+  const memoryRelation = snapshot.cgroup_relation?.memory;
+  const cpuRelation = snapshot.cgroup_relation?.cpu;
+  const memoryDeclared = memoryRelation === "operator_declared_disjoint";
+  const cpuDeclared = cpuRelation === "operator_declared_disjoint";
+  const combineMemory = memoryRelation === "disjoint" || memoryDeclared;
+  const combineCpu = cpuRelation === "disjoint" || cpuDeclared;
+  const declaredMetrics = [memoryDeclared && "memory", rates && cpuDeclared && "CPU"].filter(Boolean);
+  const readings = RESOURCE_PROCESSES.map(([id]) => {
+    const current = snapshot.processes?.[id]?.current;
+    return resourceFreshness(current, snapshot.generated_at_ms, nowMs) === "fresh" ? current : null;
+  });
+  const byteCounts = readings.map((reading) => {
+    const bytes = reading?.memory?.program_bytes;
+    return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : null;
+  });
+  const [botBytes, apiBytes] = byteCounts;
+  const total = combineMemory && botBytes != null && apiBytes != null && Number.isSafeInteger(botBytes + apiBytes)
+    ? botBytes + apiBytes : null;
+  const blocks = total != null && blockMib > 0 ? memoryBlocks(total, blockMib) : null;
+  const memoryHourly = blocks && rates ? blocks.count * rates.memory_usd_per_block_hour : null;
+  const cpuTenths = readings.map((reading) => reading?.cpu_tenths);
+  const cpuHourly = combineCpu && rates && cpuTenths.every((value) => value != null)
+    ? cpuTenths.reduce((sum, value) => sum + value, 0) / 1000 * rates.cpu_usd_per_core_hour
+    : null;
+  const blockText = blocks && `${formatExact(blocks.count)} block${blocks.count === 1 ? "" : "s"} (${formatExact(blocks.capacity)} MiB) · ${blocks.headroom} headroom to the next block in this estimate`;
+  const useApiMemory = apiBytes != null && (botBytes == null || readings[1].age_ms <= readings[0].age_ms);
+  const memoryRows = combineMemory
+    ? [
+      ["Combined memory", formatMemoryMiB(total)],
+      ["Bot memory", formatMemoryMiB(botBytes)],
+      ["API memory", formatMemoryMiB(apiBytes)],
+      ["Estimated blocks", blockText],
+    ]
+    : [[
+      memoryRelation === "shared" ? "Shared cgroup memory" : useApiMemory ? "API cgroup memory" : botBytes != null ? "Bot cgroup memory" : "Cgroup memory",
+      formatMemoryMiB(useApiMemory ? apiBytes : botBytes),
+    ]];
+  const overlapReason = (relation) => {
+    if (relation === "shared") return "the samples share a cgroup";
+    if (relation === "overlapping") return "the sampled cgroups overlap";
+    if (relation === "unverified") return "the sampled cgroups have no common visible ancestor";
+    return "the sampled cgroups could not be verified as separate";
+  };
+  let blockNote = "Estimated block size unavailable.";
+  if (blocks) {
+    blockNote = `The estimate rounds fresh cgroup readings up in ${blockMib} MiB blocks, with a one-block minimum.`;
+  } else if (!combineMemory) {
+    blockNote = `Combined memory and block estimates are unavailable because ${overlapReason(memoryRelation)}.`;
+  } else if (total == null) {
+    blockNote = "Combined block estimate unavailable. Both processes need fresh, usable memory readings.";
+  }
+  const estimateRow = (label, hourly) => h("tr", null,
+    h("th", { scope: "row" }, label),
+    h("td", null, resourceValue(hostingCost(hourly, 1))),
+    h("td", null, resourceValue(hostingCost(hourly, ESTIMATE_HOURS_30_DAYS))),
+  );
+  return analyticsPanel("Memory block estimate", "resources-memory-billing", h("div", null,
+    h("dl", { className: "du-facts" },
+      ...memoryRows.map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, resourceValue(value)))),
+    ),
+    h("p", { className: "an-note muted" }, blockNote),
+    rates
+      ? h("div", null,
+        h("h4", { id: "resources-hosting-estimate", className: "du-metric-label" }, "Hosting cost estimate (USD)"),
+        (combineMemory || combineCpu) && h("table", { className: "table table-sm", "aria-labelledby": "resources-hosting-estimate" },
+          h("thead", null, h("tr", null, h("th", { scope: "col" }, "Resource"), h("th", { scope: "col" }, "Hourly"), h("th", { scope: "col" }, "30 days"))),
+          h("tbody", null, combineMemory && estimateRow("Memory blocks", memoryHourly), combineCpu && estimateRow("CPU time", cpuHourly)),
+        ),
+        !combineCpu && h("p", { className: "an-note muted" }, `Combined CPU cost is unavailable because ${overlapReason(cpuRelation)}.`),
+        (combineMemory || combineCpu) && h("p", { className: "an-note muted" }, "Assumes current usage continues. Excludes host system overhead and egress."),
+      )
+      : h("p", { className: "an-note muted" }, billing ? "Hosting cost estimate is off." : "Hosting cost estimate configuration unavailable."),
+    declaredMetrics.length > 0 && h("p", { className: "an-note muted" },
+      `Using the operator’s cgroup separation declaration for ${declaredMetrics.join(" and ")}.`,
+    ),
+    (memoryRelation === "unverified" || (rates && cpuRelation === "unverified")) && h("p", { className: "an-note muted" },
+      "After independently verifying that the sampled scopes are disjoint, enable ",
+      h("code", null, "web.hosting_estimate.assume_disjoint_cgroups"),
+      " on the API.",
+    ),
+  ));
+}
+
 function diskRows(disks) {
   const labels = { container_root: "Container filesystem", tmp: "Temporary files", logs: "Log files" };
   if (!disks?.length) return [["Container filesystem", null], ["Temporary files", null]];
@@ -1493,10 +1612,10 @@ function ResourceCard({ id, title, process, generatedAtMs, nowMs, range, chartFr
         ),
         resourceMetric(
           "Memory",
-          memory == null ? null : `${formatBytes(memory)}${memoryLimit ? ` of ${formatBytes(memoryLimit)} (${formatRate((memory * 100) / memoryLimit)}%)` : current?.memory?.limit === "Unlimited" ? " (no memory limit)" : ""}`,
-          [source ? h("span", { key: "s" }, `Source: ${source}`) : null, h("span", { key: "p" }, `peak ${formatBytes(history?.memory_peak_bytes) ?? "unavailable"} in ${range}`)],
+          memory == null ? null : `${formatMemoryMiB(memory)}${memoryLimit ? ` of ${formatMemoryMiB(memoryLimit)} (${formatRate((memory * 100) / memoryLimit)}%)` : current?.memory?.limit === "Unlimited" ? " (no memory limit)" : ""}`,
+          [source ? h("span", { key: "s" }, `Source: ${source}`) : null, h("span", { key: "p" }, `peak ${formatMemoryMiB(history?.memory_peak_bytes) ?? "unavailable"} in ${range}`)],
           h(ResourceChart, {
-            points, label: `${title} memory`, from: chartFrom, to: chartTo, max: memoryLimit, format: (value) => formatBytes(value) ?? "—",
+            points, label: `${title} memory`, from: chartFrom, to: chartTo, max: memoryLimit, format: (value) => formatMemoryMiB(value) ?? "—",
             series: [
               { key: "avg", label: "Average", tone: "br-tone-avg", value: (p) => p.memory_avg_bytes },
               { key: "max", label: "Peak", tone: "br-tone-max", value: (p) => p.memory_max_bytes },
@@ -1619,6 +1738,7 @@ function BotResources() {
     ),
     note,
     !snapshot && !result.error && h("p", { className: "muted", role: "status", "aria-busy": "true" }, "Loading Bot Resources…"),
+    snapshot && h(MemoryBillingPanel, { snapshot, nowMs }),
     snapshot &&
       h(
         "div",
@@ -1724,7 +1844,7 @@ function BotResources() {
             h("div", null, h("h4", { className: "du-metric-label" }, "Bot primary BEGIN latency"), h(RankList, { rows: breakdownRows(botHistory, "db_primary_begin_ms"), label: "Bot primary BEGIN latency", empty: botHistory?.minutes ? "No primary transactions in this range." : UNAVAILABLE })),
             h("div", null, h("h4", { className: "du-metric-label" }, "API primary BEGIN latency"), h(RankList, { rows: breakdownRows(apiHistory, "db_primary_begin_ms"), label: "API primary BEGIN latency", empty: apiHistory?.minutes ? "No primary transactions in this range." : UNAVAILABLE })),
           ),
-          h("p", { key: "provider", className: "an-note muted" }, "Provider billing (Bunny) is not shown: no scoped read-only key is configured, and nothing is estimated. API response bytes count responses with a known length."),
+          h("p", { key: "response-bytes", className: "an-note muted" }, "API response bytes count responses with a known length."),
         ]),
         "an-span-12",
       ),

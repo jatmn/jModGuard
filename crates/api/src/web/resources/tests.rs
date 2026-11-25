@@ -21,6 +21,10 @@ impl Drop for Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_estimate(HostingEstimateConfig::default())
+}
+
+fn fixture_with_estimate(estimate: HostingEstimateConfig) -> Fixture {
     let path = std::env::temp_dir().join(format!(
         "jmodguard_api_resources_{:032x}.db",
         rand::random::<u128>()
@@ -29,6 +33,7 @@ fn fixture() -> Fixture {
     let mut cfg = jmodguard::config::ApiProcessConfig::default();
     cfg.bot.owner_id = 99;
     cfg.db.path = path.clone();
+    cfg.web.hosting_estimate = estimate;
     Fixture {
         app: ApiState::new(cfg, db).unwrap(),
         path,
@@ -166,6 +171,110 @@ async fn resources_are_owner_only_and_reject_unknown_ranges() {
 }
 
 #[tokio::test]
+async fn memory_billing_returns_rates_only_when_enabled() {
+    for enabled in [false, true] {
+        let f = fixture_with_estimate(HostingEstimateConfig {
+            enabled,
+            memory_usd_per_block_hour: 0.001,
+            cpu_usd_per_core_hour: 0.04,
+            ..HostingEstimateConfig::default()
+        });
+        let owner = signed_in(&f.app, 99).await;
+        let Json(value) = overview(State(f.app.clone()), owner, origin(&f.app), range("1h"))
+            .await
+            .unwrap();
+        assert_eq!(value["memory_billing"]["block_mib"], 64);
+        assert_eq!(
+            value["memory_billing"]["rates"],
+            if enabled {
+                json!({"memory_usd_per_block_hour": 0.001, "cpu_usd_per_core_hour": 0.04})
+            } else {
+                Value::Null
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn resources_compare_stored_and_live_scopes_without_exposing_identity() {
+    let f = fixture();
+    let now_secs = resources::unix_ms_now() / 1000;
+    let status = |scopes| ProcessStatus {
+        sampled_at_ms: Some(now_secs * 1000),
+        interval_ms: 60_000,
+        cgroup_scopes: serde_json::from_value(scopes).unwrap(),
+        ..ProcessStatus::default()
+    };
+    let bot = status(json!({"memory": [7, 1], "cpu": [8, 2]}));
+    db::record_resource_rollups(
+        &f.app.db,
+        Vec::new(),
+        Some((ResourceProcess::Bot, bot)),
+        now_secs,
+    )
+    .await
+    .unwrap();
+    let (records, history_status) = history(&f.app, ResourceRange::Hour, now_secs).await;
+    for assume_disjoint_cgroups in [false, true] {
+        let estimate = HostingEstimateConfig {
+            enabled: true,
+            assume_disjoint_cgroups,
+            ..HostingEstimateConfig::default()
+        };
+        let private_relation = if assume_disjoint_cgroups {
+            "operator_declared_disjoint"
+        } else {
+            "unverified"
+        };
+        for (scopes, memory, cpu) in [
+            (json!({"memory": [7], "cpu": [8]}), "shared", "shared"),
+            (
+                json!({"memory": [3, 1], "cpu": [4, 2]}),
+                "disjoint",
+                "disjoint",
+            ),
+            (
+                json!({"memory": [3], "cpu": [4]}),
+                private_relation,
+                private_relation,
+            ),
+            (json!({"memory": [], "cpu": []}), "unknown", "unknown"),
+            (
+                json!({"memory": [1], "cpu": [2]}),
+                "overlapping",
+                "overlapping",
+            ),
+            (
+                json!({"memory": [1], "cpu": [4]}),
+                "overlapping",
+                private_relation,
+            ),
+        ] {
+            let value = build_response(
+                ResourceRange::Hour,
+                now_secs * 1000,
+                records.as_ref(),
+                history_status,
+                &status(scopes),
+                &estimate,
+            );
+            assert_eq!(
+                value["cgroup_relation"],
+                json!({"memory": memory, "cpu": cpu}),
+                "assume_disjoint_cgroups={assume_disjoint_cgroups}"
+            );
+            for role in ["bot", "api"] {
+                assert!(
+                    value["processes"][role]["current"]
+                        .get("cgroup_scopes")
+                        .is_none()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn saved_bot_history_and_status_reach_the_owner_response() {
     let f = fixture();
     let now_secs = resources::unix_ms_now() / 1000;
@@ -212,6 +321,10 @@ async fn saved_bot_history_and_status_reach_the_owner_response() {
     assert_eq!(api["history"]["totals"]["api_requests"], 30);
     assert_eq!(api["history"]["per_minute"]["api_requests"], 30.0);
     assert_eq!(api["current"]["info"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        value["cgroup_relation"],
+        json!({"memory": "unknown", "cpu": "unknown"})
+    );
 }
 
 #[test]
@@ -308,6 +421,7 @@ async fn unavailable_history_still_returns_live_api_values() {
         None,
         "unavailable",
         &api,
+        &HostingEstimateConfig::default(),
     );
     assert_eq!(value["history_status"], "unavailable");
     assert!(value["processes"]["api"]["history"].is_null());

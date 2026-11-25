@@ -415,11 +415,20 @@ per-metric share bars and member directory status (importing, unverified or unav
 **Bot Resources** is the system status view for the bot and API processes over a
 1-hour, 24-hour, 7-day or 30-day range (`GET` or `POST /api/owner/resources?range=`,
 owner only; others get 401 or 403). Each process has a card with CPU as a share of its
-cgroup quota (with the quota and schedulable CPUs), program memory against
+cgroup quota (with the quota and schedulable CPUs), program memory in MiB against
 `memory.max` with its source and the range peak, disk (the temporary and file-log
 directories it writes; the container's root filesystem is not measured because its
 totals belong to the host; database size is on Database Usage), and process facts
 (version, commit, uptime, last restart, restarts in the range, pod, region, ready).
+The memory panel shows estimated capacity and headroom in local 64 MiB blocks
+for fresh, usable readings from disjoint cgroups. The panel explains when
+a combined figure is unavailable. For shared, overlapping, or unverified
+memory scopes, it shows one available reading. Private mounts can hide the
+ancestry needed to verify separation. Operators can independently verify
+separation and enable a default-off declaration, which the panel labels
+when used. Optional hourly and 30-day USD estimates use the scope comparison
+for each metric and exclude host overhead and egress.
+See [hosting estimate configuration](CONFIGURATION.md#hosting-estimates).
 Below are bot activity (Gateway events per minute and by type, logical Discord REST requests,
 429s and rate-limit waits by bucket, shard latency, writer-lease generation and margin,
 guilds, capture queue), API activity (requests per minute, p50/p95 latency, 4xx/5xx,
@@ -444,8 +453,8 @@ every 5 seconds (one statement, about 720 an hour) and its update-control reads.
 separately before comparing the core total with the provider's primary-forwarded queries.
 Each logical Discord request counts once, including direct bot log deliveries. Internal
 rate-limit retries share the original request count.
-Database rows read and Bunny billing are shown as unavailable: the database client does
-not report rows read, and no scoped read-only provider key exists. The API's values are
+The database client does not report rows read. Hosting estimates use local readings.
+The API's values are
 live (5-second samples); the bot saves its status and both processes' history once a
 minute (the API's minutes reach it over the private read link). A value older than two
 sample intervals is marked **Stale**, one that could not be read says **Unavailable**,

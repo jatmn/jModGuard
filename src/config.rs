@@ -54,6 +54,49 @@ pub struct WebConfig {
     /// Empty = same-origin only (no CORS layer). Env: `JMODGUARD_CORS_ORIGINS`
     /// (comma-separated).
     pub cors_origins: Vec<String>,
+    pub hosting_estimate: HostingEstimateConfig,
+}
+
+/// Local block and USD estimate settings for the owner resource view.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct HostingEstimateConfig {
+    pub enabled: bool,
+    /// Operator declaration that the sampled Bot and API scopes are disjoint.
+    /// Applies only when both identities are present and ancestry is inconclusive.
+    pub assume_disjoint_cgroups: bool,
+    pub memory_usd_per_block_hour: f64,
+    pub cpu_usd_per_core_hour: f64,
+}
+
+// Local 64 MiB block assumption and default rates from issue #782 (2026-11-24).
+impl HostingEstimateConfig {
+    pub const MEMORY_BLOCK_MIB: u64 = 64;
+
+    fn apply_env(&mut self) -> Result<()> {
+        if let Some(raw) = nonempty_env("JMODGUARD_HOSTING_ESTIMATE") {
+            *self = serde_json::from_str(&raw)
+                .context("JMODGUARD_HOSTING_ESTIMATE must be a hosting estimate JSON object")?;
+        }
+        anyhow::ensure!(
+            [self.memory_usd_per_block_hour, self.cpu_usd_per_core_hour]
+                .into_iter()
+                .all(|price| price.is_finite() && price >= 0.0),
+            "hosting estimate prices must be finite and nonnegative"
+        );
+        Ok(())
+    }
+}
+
+impl Default for HostingEstimateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            assume_disjoint_cgroups: false,
+            memory_usd_per_block_hour: 0.005 / 16.0,
+            cpu_usd_per_core_hour: 0.02,
+        }
+    }
 }
 
 /// Operator-supplied public policy details. These fields are published by the API.
@@ -95,6 +138,7 @@ impl std::fmt::Debug for WebConfig {
             .field("oauth_client_id", &self.oauth_client_id)
             .field("oauth_client_secret", &"<redacted>")
             .field("cors_origins", &self.cors_origins)
+            .field("hosting_estimate", &self.hosting_estimate)
             .finish()
     }
 }
@@ -364,6 +408,7 @@ impl Default for WebConfig {
             oauth_client_id: String::new(),
             oauth_client_secret: String::new(),
             cors_origins: Vec::new(),
+            hosting_estimate: HostingEstimateConfig::default(),
         }
     }
 }
@@ -916,6 +961,7 @@ impl Config {
                     .filter(|s| !s.is_empty())
                     .collect();
             }
+            self.web.hosting_estimate.apply_env()?;
         }
         if let Ok(value) = env::var("JMODGUARD_CONTROL_SECRET") {
             self.bot.control_secret = ControlSecret(value);
@@ -1291,6 +1337,58 @@ mod tests {
         assert!(Config::parse_file("[web]\nbind=[", false).is_err());
         assert!(Config::parse_file("[discord]\ntoken=123", false).is_err());
         assert!(Config::parse_file("[discord]\ntoken=123", true).is_ok());
+    }
+
+    #[test]
+    fn hosting_estimate_is_api_only_and_accepts_custom_rates() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _saved = SavedEnv::capture(&["JMODGUARD_HOSTING_ESTIMATE"]);
+        let raw = "[web.hosting_estimate]\nenabled=true\nassume_disjoint_cgroups=true\nmemory_usd_per_block_hour=0.001\ncpu_usd_per_core_hour=0.0";
+        let mut api = Config::parse_file(raw, true).unwrap();
+        let mut bot = Config::parse_file(raw, false).unwrap();
+        assert!(!Config::default().web.hosting_estimate.enabled);
+        assert!(
+            !Config::default()
+                .web
+                .hosting_estimate
+                .assume_disjoint_cgroups
+        );
+        assert!(api.web.hosting_estimate.enabled);
+        assert!(api.web.hosting_estimate.assume_disjoint_cgroups);
+        assert_eq!(api.web.hosting_estimate.memory_usd_per_block_hour, 0.001);
+        assert_eq!(api.web.hosting_estimate.cpu_usd_per_core_hour, 0.0);
+        unsafe {
+            std::env::set_var(
+                "JMODGUARD_HOSTING_ESTIMATE",
+                r#"{"enabled":true,"assume_disjoint_cgroups":true,"cpu_usd_per_core_hour":0.1}"#,
+            );
+        }
+        api.apply_env_for(true).unwrap();
+        bot.apply_env_for(false).unwrap();
+        assert!(api.web.hosting_estimate.enabled);
+        assert!(api.web.hosting_estimate.assume_disjoint_cgroups);
+        assert_eq!(
+            api.web.hosting_estimate.memory_usd_per_block_hour,
+            0.0003125
+        );
+        assert_eq!(api.web.hosting_estimate.cpu_usd_per_core_hour, 0.1);
+        assert!(!bot.web.hosting_estimate.enabled);
+        assert!(!bot.web.hosting_estimate.assume_disjoint_cgroups);
+
+        unsafe {
+            std::env::set_var("JMODGUARD_HOSTING_ESTIMATE", r#"{"enabled":false}"#);
+        }
+        api.apply_env_for(true).unwrap();
+        assert!(!api.web.hosting_estimate.enabled);
+        assert!(!api.web.hosting_estimate.assume_disjoint_cgroups);
+
+        unsafe {
+            std::env::set_var(
+                "JMODGUARD_HOSTING_ESTIMATE",
+                r#"{"memory_usd_per_block_hour":-1}"#,
+            );
+        }
+        assert!(api.apply_env_for(true).is_err());
     }
 
     #[test]

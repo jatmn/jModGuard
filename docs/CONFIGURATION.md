@@ -24,6 +24,7 @@ the bot loads its bot token; the API uses OAuth and queues administrative action
 | `web.oauth_client_id` | — | Discord OAuth client ID (env: `JMODGUARD_OAUTH_CLIENT_ID`) |
 | `web.oauth_client_secret` | — | Discord OAuth client secret (env: `JMODGUARD_OAUTH_CLIENT_SECRET`) |
 | `web.cors_origins` | `[]` | Extra SPA origins only for a split-origin UI (env: `JMODGUARD_CORS_ORIGINS`). Empty = same-origin. Bunny CDN proxies `/api` onto the UI hostname, so this stays empty. |
+| `web.hosting_estimate` | Cost estimate and cgroup declaration off | API-only TOML table for local Bot Resources estimates (env: `JMODGUARD_HOSTING_ESTIMATE`). See [hosting estimates](#hosting-estimates). |
 | `bot.default_prefix` | `!` | seeded into the global settings row on first boot; synced to durable `meta.settings_terminal_defaults` on bot migrate-open (final fallback when global/guild omit the field) (env: `JMODGUARD_DEFAULT_PREFIX`) |
 | `bot.owner_id` | `0` | owner user ID (owner commands + global WebUI config) (env: `JMODGUARD_OWNER_ID`) |
 | `bot.status` | `moderating` | presence text (env: `JMODGUARD_BOT_STATUS`) |
@@ -42,6 +43,26 @@ accepted, not target directives. See [diagnostics setup](SETUP.md#11-troubleshoo
 Per-message and per-guild diagnostics require `debug`.
 Enable it only briefly: diagnostic metadata can reveal per-user activity even
 though the per-message line omits author IDs and message text. Restrict log access.
+
+### Hosting estimates
+
+The API loads the `[web.hosting_estimate]` table on startup. A nonblank
+`JMODGUARD_HOSTING_ESTIMATE` replaces the entire table with a JSON object
+using the same fields. Omitted fields use the defaults below.
+
+| Key in `web.hosting_estimate` | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | Boolean | `false` | Show hourly and 30-day USD estimates on the owner-only Bot Resources page. Local memory blocks are shown when the readings qualify, regardless of this setting. |
+| `assume_disjoint_cgroups` | Boolean | `false` | Declare that the sampled Bot and API cgroups are disjoint. Enable only after independently verifying separation. Applies when both scopes are identified but their visible ancestry is inconclusive. Shared or overlapping scopes and missing identities still prevent combined estimates. |
+| `memory_usd_per_block_hour` | Number | `0.0003125` | USD per local 64 MiB memory block per hour. |
+| `cpu_usd_per_core_hour` | Number | `0.02` | USD per CPU core-hour used. |
+
+Rates must be finite and nonnegative. Combined estimates require fresh,
+usable readings for the relevant metric. The local memory model rounds up
+to 64 MiB blocks with a one-block minimum. The 30-day estimate assumes
+current usage continues for 720 hours. Both cost estimates exclude host
+overhead and egress. They use local readings and make no calls to billing providers.
+See [Bot Resources](WEBUI.md#tabs).
 
 ### Public legal details
 

@@ -12778,6 +12778,8 @@ function resourceSnapshot({ bot = {}, api = {}, ...overrides } = {}) {
   return {
     generated_at_ms: RESOURCE_NOW_MS, range: '24h', span_secs: 60, bucket_secs: 600, from_secs: RESOURCE_TO - 86400, to_secs: RESOURCE_TO,
     history_status: 'available',
+    cgroup_relation: { memory: 'disjoint', cpu: 'disjoint' },
+    memory_billing: { block_mib: 64, rates: null },
     processes: {
       bot: { current: resourceCurrent({ interval_ms: 60000, stale_after_ms: 125000, age_ms: 20000 }), history: resourceHistory(), ...bot },
       api: {
@@ -12814,9 +12816,9 @@ test('Bot Resources shows both processes against their limits with activity and 
   assert.equal(bot.querySelector('.du-health').textContent, 'Ready');
   assert.equal(resourceMetricValue(bot, 'CPU'), '25.0% of 0.50 CPU limit');
   assert.match(textOf(bot.querySelector('.br-metric')), /2 schedulable CPUs/);
-  assert.equal(resourceMetricValue(api, 'Memory'), '256.0 MB of 512.0 MB (50.0%)');
+  assert.equal(resourceMetricValue(api, 'Memory'), '244.14 MiB of 488.28 MiB (50.0%)');
   assert.match(textOf(api), /Source: cgroup stat/);
-  assert.match(textOf(api), /peak 300\.0 MB in last 24 hours/);
+  assert.match(textOf(api), /peak 286\.1 MiB in last 24 hours/);
   assert.equal(resourceFact(bot, 'Commit'), '0123456789ab');
   assert.equal(resourceFact(bot, 'Pod'), 'pod-7');
   assert.equal(resourceFact(bot, 'Uptime'), '3 h 0 min');
@@ -12842,7 +12844,7 @@ test('Bot Resources shows both processes against their limits with activity and 
   assert.deepEqual(costs['Database round trips'], ['20.0', '20.0']);
   assert.deepEqual(costs['API response bytes'], ['—', '200.0 KB/min']);
   assert.match(costs['Database rows read'][0], /^Unavailable/);
-  assert.match(textOf(page), /Provider billing \(Bunny\) is not shown/);
+  assert.match(textOf(page), /Hosting cost estimate is off/);
   // A bucket without samples breaks the line; it is not drawn at zero.
   const cpuChart = bot.querySelector('.br-metric svg');
   assert.equal(cpuChart.querySelectorAll('polyline.br-tone-avg').length, 1, 'the two samples before the gap');
@@ -12877,6 +12879,138 @@ test('Bot Resources says Unavailable for unread values and never shows them as z
   const costs = [...h.nodes.get('#content').querySelectorAll('.br-costs tbody tr')].map((row) => textOf(row));
   assert.ok(costs.every((row) => !/\b0(\.0+)?\b/.test(row)), costs.join(' | '));
   assert.ok([...h.nodes.get('#content').querySelectorAll('.br-chart-empty')].length >= 4, 'empty charts say so');
+});
+
+test('Bot Resources rounds combined memory up from bytes, including zero and block boundaries', async () => {
+  const mib = 2 ** 20;
+  for (const [botBytes, apiBytes, blocks, capacity, headroom] of [
+    [0, 0, 1, '64', '64'],
+    [40 * mib, 24 * mib, 1, '64', '0'],
+    [40 * mib, 24 * mib + 1, 2, '128', '63.99'],
+    [50 * mib, 60 * mib, 2, '128', '18'],
+    [1024 ** 4, 1, 16385, '1,048,640', '63.99'],
+  ]) {
+    const snapshot = resourceSnapshot({
+      bot: { current: resourceCurrent({ memory: { program_bytes: botBytes } }) },
+      api: { current: resourceCurrent({ memory: { program_bytes: apiBytes } }) },
+    });
+    const h = ownerHarness(async () => response(snapshot));
+    h.app.navigate('resources');
+    await settle();
+    const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+    assert.ok(panel);
+    assert.ok(textOf(panel).includes(`${blocks.toLocaleString('en-US')} block${blocks === 1 ? '' : 's'} (${capacity} MiB)`));
+    assert.ok(textOf(panel).includes(`${headroom} MiB headroom to the next block in this estimate`));
+    if (botBytes === 50 * mib) {
+      assert.match(textOf(panel), /Combined memory110 MiB/);
+      assert.match(textOf(panel), /Bot memory50 MiB/);
+      assert.match(textOf(panel), /API memory60 MiB/);
+      const [bot, api] = resourceCards(h);
+      assert.equal(resourceMetricValue(bot, 'Memory'), '50 MiB');
+      assert.equal(resourceMetricValue(api, 'Memory'), '60 MiB');
+    }
+  }
+});
+
+test('Bot Resources estimates memory and CPU run rates from fresh samples at configured prices', async () => {
+  const snapshot = resourceSnapshot({
+    memory_billing: { block_mib: 64, rates: { memory_usd_per_block_hour: 0.0003125, cpu_usd_per_core_hour: 0.02 } },
+    bot: { current: resourceCurrent({ memory: { program_bytes: 50 * 2 ** 20 }, cpu_tenths: 125 }) },
+    api: { current: resourceCurrent({ memory: { program_bytes: 60 * 2 ** 20 }, cpu_tenths: 375 }) },
+  });
+  const check = async (memory, cpu) => {
+    const h = ownerHarness(async () => response(snapshot));
+    h.app.navigate('resources');
+    await settle();
+    const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+    assert.match(textOf(panel), /Hosting cost estimate \(USD\)/);
+    assert.match(textOf(panel), /Excludes host system overhead and egress/);
+    const rows = [...panel.querySelectorAll('tbody tr')].map(row => [...row.querySelectorAll('td')].map(cell => cell.textContent));
+    assert.deepEqual(rows, [memory, cpu]);
+    return textOf(panel);
+  };
+  const roundingNote = /rounds fresh cgroup readings up in 64 MiB blocks/;
+  const fresh = await check(['$0.000625', '$0.45'], ['$0.01', '$7.20']);
+  assert.match(fresh, roundingNote);
+  snapshot.memory_billing.rates = { memory_usd_per_block_hour: 0.001, cpu_usd_per_core_hour: 0 };
+  snapshot.processes.bot.current.memory.program_bytes = 0;
+  snapshot.processes.api.current.memory.program_bytes = 0;
+  await check(['$0.001', '$0.72'], ['$0', '$0.00']);
+  snapshot.processes.bot.current.stale = true;
+  const stale = await check(['Unavailable', 'Unavailable'], ['Unavailable', 'Unavailable']);
+  assert.match(stale, /Combined memoryUnavailable/);
+  assert.match(stale, /Estimated blocksUnavailable/);
+  assert.match(stale, /Both processes need fresh, usable memory readings/);
+  assert.doesNotMatch(stale, roundingNote);
+  snapshot.processes.bot.current.stale = false;
+  snapshot.processes.bot.current.cpu_tenths = null;
+  await check(['$0.001', '$0.72'], ['Unavailable', 'Unavailable']);
+});
+
+test('Bot Resources shows one reading and suppresses combined estimates for unproven cgroup separation', async () => {
+  const mib = 2 ** 20;
+  const rates = { memory_usd_per_block_hour: 0.0003125, cpu_usd_per_core_hour: 0.02 };
+  for (const [relation, expectedLabel, reason] of [
+    ['shared', 'Shared cgroup memory', /share a cgroup/],
+    ['overlapping', 'API cgroup memory', /cgroups overlap/],
+    ['unverified', 'API cgroup memory', /no common visible ancestor/],
+    ['unknown', 'API cgroup memory', /could not be verified as separate/],
+    [undefined, 'API cgroup memory', /could not be verified as separate/],
+  ]) {
+    const snapshot = resourceSnapshot({
+      cgroup_relation: relation && { memory: relation, cpu: relation },
+      memory_billing: { block_mib: 64, rates },
+      bot: { current: resourceCurrent({ memory: { program_bytes: 50 * mib }, age_ms: 4000 }) },
+      api: { current: resourceCurrent({ memory: { program_bytes: 60 * mib } }) },
+    });
+    const h = ownerHarness(async () => response(snapshot));
+    h.app.navigate('resources');
+    await settle();
+    const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+    assert.deepEqual([...panel.querySelectorAll('dt')].map(textOf), [expectedLabel]);
+    assert.deepEqual([...panel.querySelectorAll('dd')].map(textOf), ['60 MiB']);
+    assert.match(textOf(panel), reason);
+    assert.equal(textOf(panel).includes('web.hosting_estimate.assume_disjoint_cgroups'), relation === 'unverified');
+    assert.match(textOf(panel), /Combined CPU cost is unavailable/);
+    assert.doesNotMatch(textOf(panel), /headroom|\$[\d.]/);
+    assert.equal(panel.querySelector('table'), null);
+  }
+});
+
+test('Bot Resources shows estimated blocks and costs with an operator separation declaration', async () => {
+  const mib = 2 ** 20;
+  const rates = { memory_usd_per_block_hour: 0.0003125, cpu_usd_per_core_hour: 0.02 };
+  const snapshot = resourceSnapshot({
+    cgroup_relation: { memory: 'operator_declared_disjoint', cpu: 'operator_declared_disjoint' },
+    memory_billing: { block_mib: 64, rates },
+    bot: { current: resourceCurrent({ memory: { program_bytes: 50 * mib }, cpu_tenths: 125 }) },
+    api: { current: resourceCurrent({ memory: { program_bytes: 60 * mib }, cpu_tenths: 375 }) },
+  });
+  const h = ownerHarness(async () => response(snapshot));
+  h.app.navigate('resources');
+  await settle();
+  const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+  assert.match(textOf(panel), /Combined memory110 MiB/);
+  assert.match(textOf(panel), /2 blocks \(128 MiB\).*18 MiB headroom/);
+  assert.match(textOf(panel), /operator’s cgroup separation declaration for memory and CPU/);
+  assert.deepEqual([...panel.querySelectorAll('tbody td')].map(textOf), ['$0.000625', '$0.45', '$0.01', '$7.20']);
+});
+
+test('Bot Resources measures disjoint CPU and memory cgroups independently', async () => {
+  const rates = { memory_usd_per_block_hour: 0.0003125, cpu_usd_per_core_hour: 0.02 };
+  for (const [cgroup_relation, label] of [
+    [{ memory: 'shared', cpu: 'disjoint' }, 'CPU time'],
+    [{ memory: 'overlapping', cpu: 'operator_declared_disjoint' }, 'CPU time'],
+    [{ memory: 'disjoint', cpu: 'unknown' }, 'Memory blocks'],
+  ]) {
+    const snapshot = resourceSnapshot({ cgroup_relation, memory_billing: { block_mib: 64, rates } });
+    const h = ownerHarness(async () => response(snapshot));
+    h.app.navigate('resources');
+    await settle();
+    const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+    assert.deepEqual([...panel.querySelectorAll('tbody th')].map(textOf), [label]);
+    assert.equal(Boolean(panel.querySelector('dt')?.textContent === 'Combined memory'), label === 'Memory blocks');
+  }
 });
 
 test('Bot Resources marks an old status stale and re-reads on range change and Refresh', async () => {

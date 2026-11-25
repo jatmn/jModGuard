@@ -35,8 +35,69 @@ const KEY_CPU_FILES: [&str; 5] = [
 ];
 const LAYOUT_LINE_BYTES: usize = 2048;
 
-static LATEST: Mutex<ContainerSample> = Mutex::new(ContainerSample::unavailable());
-static LATEST_AT: Mutex<Option<SystemTime>> = Mutex::new(None);
+static LATEST: Mutex<LatestSample> = Mutex::new(LatestSample {
+    sample: ContainerSample::unavailable(),
+    at: None,
+    scopes: CgroupScopes {
+        memory: Vec::new(),
+        cpu: Vec::new(),
+    },
+});
+
+struct LatestSample {
+    sample: ContainerSample,
+    at: Option<SystemTime>,
+    scopes: CgroupScopes,
+}
+
+/// Private status metadata. Each lineage starts at the directory that supplied
+/// the metric and stops at the mount boundary. Only comparisons belong in the API.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CgroupScopes {
+    memory: Vec<u64>,
+    cpu: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CgroupRelation {
+    Shared,
+    Overlapping,
+    Disjoint,
+    /// Both scope identities are available, with inconclusive ancestry.
+    Unverified,
+    /// At least one scope lacks an identity.
+    Unknown,
+}
+
+impl CgroupScopes {
+    pub fn is_empty(&self) -> bool {
+        self.memory.is_empty() && self.cpu.is_empty()
+    }
+
+    pub fn memory_relation(&self, other: &Self) -> CgroupRelation {
+        scope_relation(&self.memory, &other.memory)
+    }
+
+    pub fn cpu_relation(&self, other: &Self) -> CgroupRelation {
+        scope_relation(&self.cpu, &other.cpu)
+    }
+}
+
+fn scope_relation(left: &[u64], right: &[u64]) -> CgroupRelation {
+    let (Some(left_group), Some(right_group)) = (left.first(), right.first()) else {
+        return CgroupRelation::Unknown;
+    };
+    if left_group == right_group {
+        CgroupRelation::Shared
+    } else if left.contains(right_group) || right.contains(left_group) {
+        CgroupRelation::Overlapping
+    } else if left.iter().any(|ancestor| right.contains(ancestor)) {
+        CgroupRelation::Disjoint
+    } else {
+        CgroupRelation::Unverified
+    }
+}
 
 /// Memory in use, and which input measured it (see [`MemorySource`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,14 +186,28 @@ pub fn read_process_cgroup() -> CgroupReading {
 }
 
 fn read_proc_cgroup(proc: &Path, mount_root: &Path) -> CgroupReading {
+    read_scoped_proc_cgroup(proc, mount_root).counters
+}
+
+#[derive(Default)]
+struct ScopedReading {
+    counters: CgroupReading,
+    scopes: CgroupScopes,
+}
+
+fn read_scoped_proc_cgroup(proc: &Path, mount_root: &Path) -> ScopedReading {
     let host_total = host_memory_total(proc);
     let Some(text) = read_limited(&proc.join("self/cgroup")) else {
-        return read_mount_root(mount_root, host_total);
+        return ScopedReading {
+            counters: read_mount_root(mount_root, host_total),
+            ..ScopedReading::default()
+        };
     };
     let Some(mountinfo) = read_limited(&proc.join("self/mountinfo")) else {
-        return CgroupReading::default();
+        return ScopedReading::default();
     };
-    read_mounted_cgroup(&text, &mountinfo, host_total)
+    let boot_id = read_limited(&proc.join("sys/kernel/random/boot_id"));
+    read_scoped_cgroup(&text, &mountinfo, host_total, boot_id.as_deref())
 }
 
 /// This process's cgroup CPU quota. `None` when no quota file is readable.
@@ -169,14 +244,22 @@ pub fn latest_container_sample() -> ContainerSample {
     let guard = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard
+    guard.sample
 }
 
 /// When the sampler last published, `None` before its first pass.
 pub fn latest_container_sample_at() -> Option<SystemTime> {
-    *LATEST_AT
+    LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .at
+}
+
+pub(crate) fn latest_status_sample() -> (ContainerSample, Option<SystemTime>, CgroupScopes) {
+    let latest = LATEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    (latest.sample, latest.at, latest.scopes.clone())
 }
 
 /// Start the process-local sampler. Later calls do nothing.
@@ -191,7 +274,7 @@ pub fn spawn_container_usage_sampler() {
 }
 
 struct Observation {
-    reading: CgroupReading,
+    reading: ScopedReading,
     at: Instant,
 }
 
@@ -202,6 +285,7 @@ enum CpuRate {
     Tracking {
         usage: Duration,
         at: Instant,
+        scope: Option<u64>,
     },
 }
 
@@ -216,24 +300,28 @@ impl CpuRate {
         *self = Self::AwaitingBaseline;
     }
 
-    fn observe(&mut self, usage: Duration, at: Instant) -> CpuStep {
+    fn observe(&mut self, usage: Duration, at: Instant, scope: Option<u64>) -> CpuStep {
         let (previous_usage, previous_at) = match *self {
-            Self::AwaitingBaseline => {
-                *self = Self::Tracking { usage, at };
+            Self::Tracking {
+                usage,
+                at,
+                scope: previous_scope,
+            } if previous_scope == scope => (usage, at),
+            _ => {
+                *self = Self::Tracking { usage, at, scope };
                 return CpuStep::Pending;
             }
-            Self::Tracking { usage, at } => (usage, at),
         };
         let wall = at.saturating_duration_since(previous_at);
         if wall.is_zero() {
             return CpuStep::Unchanged;
         }
         if usage < previous_usage {
-            *self = Self::Tracking { usage, at };
+            *self = Self::Tracking { usage, at, scope };
             return CpuStep::Pending;
         }
         let tenths = usage_tenths(usage.saturating_sub(previous_usage), wall);
-        *self = Self::Tracking { usage, at };
+        *self = Self::Tracking { usage, at, scope };
         CpuStep::Percent(tenths)
     }
 }
@@ -251,10 +339,11 @@ fn fold_sample(
     rate: &mut CpuRate,
     previous_cpu: Option<u32>,
     reading: CgroupReading,
+    cpu_scope: Option<u64>,
     at: Instant,
 ) -> ContainerSample {
     let cpu_tenths = match reading.cpu {
-        Some(counter) => match rate.observe(counter.usage, at) {
+        Some(counter) => match rate.observe(counter.usage, at, cpu_scope) {
             CpuStep::Percent(tenths) => Some(tenths),
             CpuStep::Pending => None,
             CpuStep::Unchanged => previous_cpu,
@@ -270,15 +359,15 @@ fn fold_sample(
     }
 }
 
-fn publish(sample: ContainerSample) {
+fn publish(sample: ContainerSample, scopes: CgroupScopes) {
     let mut guard = LATEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = sample;
-    drop(guard);
-    *LATEST_AT
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SystemTime::now());
+    *guard = LatestSample {
+        sample,
+        at: Some(SystemTime::now()),
+        scopes,
+    };
 }
 
 fn observe_process() -> Observation {
@@ -287,8 +376,8 @@ fn observe_process() -> Observation {
         let layout = memory_layout(Path::new("/proc"), Path::new("/sys/fs/cgroup"));
         tracing::info!("{}", layout.line());
     });
-    let reading = read_process_cgroup();
-    report_memory_source(reading.memory);
+    let reading = read_scoped_proc_cgroup(Path::new("/proc"), Path::new("/sys/fs/cgroup"));
+    report_memory_source(reading.counters.memory);
     Observation {
         reading,
         at: Instant::now(),
@@ -308,12 +397,18 @@ async fn sample_loop() {
         let observed = tokio::task::spawn_blocking(observe_process)
             .await
             .unwrap_or_else(|_| Observation {
-                reading: CgroupReading::default(),
+                reading: ScopedReading::default(),
                 at: Instant::now(),
             });
-        let sample = fold_sample(&mut rate, cpu_tenths, observed.reading, observed.at);
+        let sample = fold_sample(
+            &mut rate,
+            cpu_tenths,
+            observed.reading.counters,
+            observed.reading.scopes.cpu.first().copied(),
+            observed.at,
+        );
         cpu_tenths = sample.cpu_tenths;
-        publish(sample);
+        publish(sample, observed.reading.scopes);
     }
 }
 
@@ -368,34 +463,91 @@ struct CgroupEntry {
     path: String,
 }
 
-fn read_mounted_cgroup(
+fn read_scoped_cgroup(
     cgroup_text: &str,
     mountinfo: &str,
     host_total: Option<u64>,
-) -> CgroupReading {
+    boot_id: Option<&str>,
+) -> ScopedReading {
     let (memory_dirs, cpu_dirs) = cgroup_dirs(cgroup_text, mountinfo);
     let memory = first_reading(&memory_dirs, |dir| read_memory(dir, host_total));
-    CgroupReading {
-        memory: memory.map(|(_, memory)| memory),
-        cpu: first_reading(&cpu_dirs, read_cpu).map(|(_, cpu)| cpu),
+    let cpu = first_reading(&cpu_dirs, read_cpu);
+    let boot_id = boot_id.map(str::trim).filter(|id| {
+        id.len() == 36
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    });
+    let lineage = |dir: &CgroupDir| boot_id.map(|id| dir.lineage(id)).unwrap_or_default();
+    ScopedReading {
+        counters: CgroupReading {
+            memory: memory.map(|(_, memory)| memory),
+            cpu: cpu.map(|(_, cpu)| cpu),
+        },
+        scopes: CgroupScopes {
+            memory: memory.map(|(dir, _)| lineage(dir)).unwrap_or_default(),
+            cpu: cpu.map(|(dir, _)| lineage(dir)).unwrap_or_default(),
+        },
+    }
+}
+
+#[derive(Clone)]
+struct CgroupDir {
+    path: PathBuf,
+    mount: PathBuf,
+}
+
+impl CgroupDir {
+    #[cfg(target_os = "linux")]
+    fn lineage(&self, boot_id: &str) -> Vec<u64> {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        use std::os::unix::fs::MetadataExt;
+
+        const MAX_ANCESTORS: usize = 32;
+        let mut lineage = Vec::new();
+        let mut device = None;
+        for ancestor in self.path.ancestors().take(MAX_ANCESTORS) {
+            let Ok(metadata) = std::fs::metadata(ancestor) else {
+                break;
+            };
+            if !metadata.is_dir() || device.is_some_and(|dev| metadata.dev() != dev) {
+                break;
+            }
+            device = Some(metadata.dev());
+            let mut token = DefaultHasher::new();
+            (boot_id, metadata.dev(), metadata.ino()).hash(&mut token);
+            lineage.push(token.finish());
+            if ancestor == self.mount {
+                break;
+            }
+        }
+        lineage
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn lineage(&self, _boot_id: &str) -> Vec<u64> {
+        Vec::new()
     }
 }
 
 // The first candidate that yields a reading, shared by the reader and the layout line.
-fn first_reading<T>(dirs: &[PathBuf], read: impl Fn(&Path) -> Option<T>) -> Option<(&PathBuf, T)> {
-    dirs.iter().find_map(|dir| Some((dir, read(dir)?)))
+fn first_reading<T>(
+    dirs: &[CgroupDir],
+    read: impl Fn(&Path) -> Option<T>,
+) -> Option<(&CgroupDir, T)> {
+    dirs.iter().find_map(|dir| Some((dir, read(&dir.path)?)))
 }
 
 // The directory supplying the reading, or the first candidate when none does.
-fn supplying_dir<T>(dirs: &[PathBuf], read: impl Fn(&Path) -> Option<T>) -> Option<PathBuf> {
+fn supplying_dir<T>(dirs: &[CgroupDir], read: impl Fn(&Path) -> Option<T>) -> Option<PathBuf> {
     first_reading(dirs, read)
         .map(|(dir, _)| dir)
         .or(dirs.first())
-        .cloned()
+        .map(|dir| dir.path.clone())
 }
 
 /// Candidate memory and CPU directories, in reading order.
-fn cgroup_dirs(cgroup_text: &str, mountinfo: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
+fn cgroup_dirs(cgroup_text: &str, mountinfo: &str) -> (Vec<CgroupDir>, Vec<CgroupDir>) {
     let mounts = parse_mountinfo(mountinfo);
     let mut memory_dirs = Vec::new();
     let mut cpu_dirs = Vec::new();
@@ -418,6 +570,17 @@ fn cgroup_dirs(cgroup_text: &str, mountinfo: &str) -> (Vec<PathBuf>, Vec<PathBuf
             let matched = longest_root_mounts(&mounts, &entry.path, MountedCgroup::is_v1_cpu);
             let ordered = prefer_cpuacct(&matched);
             cpu_dirs.extend(mount_dirs(&ordered, &entry.path));
+        }
+    }
+    // A nested bind can keep the same device number across its mount boundary.
+    for dir in memory_dirs.iter_mut().chain(&mut cpu_dirs) {
+        if let Some(boundary) = mounts
+            .iter()
+            .map(|mount| &mount.point)
+            .filter(|point| dir.path.starts_with(point) && point.starts_with(&dir.mount))
+            .max_by_key(|point| point.as_os_str().len())
+        {
+            dir.mount.clone_from(boundary);
         }
     }
     (memory_dirs, cpu_dirs)
@@ -612,14 +775,17 @@ fn prefer_cpuacct<'a>(mounts: &[&'a MountedCgroup]) -> Vec<&'a MountedCgroup> {
     preferred
 }
 
-fn mount_dirs(mounts: &[&MountedCgroup], cgroup_path: &str) -> Vec<PathBuf> {
+fn mount_dirs(mounts: &[&MountedCgroup], cgroup_path: &str) -> Vec<CgroupDir> {
     let mut dirs = Vec::new();
     for mount in mounts {
         let Some(relative) = cgroup_relative(cgroup_path, &mount.root) else {
             continue;
         };
         if let Some(dir) = join_cgroup(&mount.point, relative) {
-            dirs.push(dir);
+            dirs.push(CgroupDir {
+                path: dir,
+                mount: mount.point.clone(),
+            });
         }
     }
     dirs
@@ -1048,6 +1214,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    fn read_mounted_cgroup(
+        cgroup_text: &str,
+        mountinfo: &str,
+        host_total: Option<u64>,
+    ) -> CgroupReading {
+        read_scoped_cgroup(cgroup_text, mountinfo, host_total, None).counters
+    }
+
     struct TempTree {
         path: PathBuf,
     }
@@ -1212,6 +1386,7 @@ mod tests {
             &mut CpuRate::default(),
             None,
             reading,
+            None,
             tokio::time::Instant::now().into_std(),
         );
         assert_eq!(sample, ContainerSample::unavailable());
@@ -1549,7 +1724,7 @@ mod tests {
                 usage: Duration::from_millis(1_000),
             }),
         };
-        let first = fold_sample(&mut rate, None, baseline, started);
+        let first = fold_sample(&mut rate, None, baseline, Some(1), started);
         assert_eq!(first.cpu_tenths, None);
         assert_eq!(first.memory.unwrap().program_bytes, 900);
         assert!(started.elapsed() < Duration::from_millis(200));
@@ -1564,6 +1739,7 @@ mod tests {
             &mut rate,
             first.cpu_tenths,
             next,
+            Some(1),
             started + Duration::from_secs(1),
         );
         assert_eq!(second.cpu_tenths, Some(250));
@@ -1578,9 +1754,92 @@ mod tests {
             &mut rate,
             second.cpu_tenths,
             reset,
+            Some(1),
             started + Duration::from_secs(2),
         );
         assert_eq!(third.cpu_tenths, None);
+        let moved = fold_sample(
+            &mut rate,
+            third.cpu_tenths,
+            next,
+            Some(2),
+            started + Duration::from_secs(3),
+        );
+        assert_eq!(moved.cpu_tenths, None, "a new cgroup needs a new baseline");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scope_comparison_uses_the_counter_directories_and_visible_ancestry() {
+        let root = temp_tree();
+        let files = [
+            ("memory.current", "100\n"),
+            ("cpu.stat", "usage_usec 1000\n"),
+        ];
+        for dir in ["/", "/bot", "/api", "/bot/child"] {
+            write_files(&root.path.join(dir.trim_start_matches('/')), &files);
+        }
+        let boot = Some("aabbccdd-aabb-ccdd-aabb-aabbccddaabb");
+        let mount = v2_mount_line("/", &root.path);
+        let read = |path| read_scoped_cgroup(path, &mount, None, boot).scopes;
+        let bot = read("0::/bot\n");
+        let api = read("0::/api\n");
+        let child = read("0::/bot/child\n");
+        assert_eq!(bot.memory_relation(&api), CgroupRelation::Disjoint);
+        assert_eq!(bot.cpu_relation(&api), CgroupRelation::Disjoint);
+        assert_eq!(bot.memory_relation(&child), CgroupRelation::Overlapping);
+
+        let bot_mount = v2_mount_line("/bot", &root.path.join("bot"));
+        let api_mount = v2_mount_line("/api", &root.path.join("api"));
+        let private_bot = read_scoped_cgroup("0::/bot\n", &bot_mount, None, boot).scopes;
+        let private_api = read_scoped_cgroup("0::/api\n", &api_mount, None, boot).scopes;
+        assert_eq!(bot.cpu_relation(&private_bot), CgroupRelation::Shared);
+        assert_eq!(
+            private_bot.cpu_relation(&private_api),
+            CgroupRelation::Unverified
+        );
+        assert_eq!(
+            private_bot.memory_relation(&private_api),
+            CgroupRelation::Unverified
+        );
+        let no_boot = read_scoped_cgroup("0::/bot\n", &mount, None, None).scopes;
+        assert_eq!(bot.memory_relation(&no_boot), CgroupRelation::Unknown);
+
+        let other_boot = read_scoped_cgroup(
+            "0::/bot\n",
+            &mount,
+            None,
+            Some("dddddddd-dddd-dddd-dddd-dddddddddddd"),
+        )
+        .scopes;
+        assert_eq!(bot.cpu_relation(&other_boot), CgroupRelation::Unverified);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v1_scope_comparison_keeps_memory_and_cpu_controllers_separate() {
+        let root = temp_tree();
+        let memory = root.path.join("memory");
+        let cpu = root.path.join("cpu");
+        write_files(
+            &memory.join("shared"),
+            &[("memory.usage_in_bytes", "100\n")],
+        );
+        for name in ["bot", "api"] {
+            write_files(&cpu.join(name), &[("cpuacct.usage", "100\n")]);
+        }
+        let mount = [
+            v1_mount_line("/", &memory, "memory"),
+            v1_mount_line("/", &cpu, "cpuacct"),
+        ]
+        .join("\n");
+        let boot = Some("aabbccdd-aabb-ccdd-aabb-aabbccddaabb");
+        let bot =
+            read_scoped_cgroup("1:memory:/shared\n2:cpuacct:/bot\n", &mount, None, boot).scopes;
+        let api =
+            read_scoped_cgroup("1:memory:/shared\n2:cpuacct:/api\n", &mount, None, boot).scopes;
+        assert_eq!(bot.memory_relation(&api), CgroupRelation::Shared);
+        assert_eq!(bot.cpu_relation(&api), CgroupRelation::Disjoint);
     }
 
     #[test]
