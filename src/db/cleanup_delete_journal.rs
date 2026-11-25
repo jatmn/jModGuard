@@ -6,7 +6,7 @@ use super::*;
 pub struct CleanupDeleteRecord {
     pub batch: String,
     pub guild_id: i64,
-    pub enrollment_id: String,
+    pub enrollment_id: Option<String>,
     pub channel_id: i64,
     pub message_id: i64,
     pub user_id: i64,
@@ -33,11 +33,11 @@ pub async fn save_cleanup_deletes(
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
         let outcomes = tx.prepare(
-            "SELECT e.id IS NOT NULL, f.guild_id IS NOT NULL
+            "SELECT e.id IS (j.value->>'enrollment_id'), f.guild_id IS NOT NULL
                FROM json_each(?1) j
                LEFT JOIN guild_enrollments e
-                 ON e.guild_id=j.value->>'guild_id' AND e.id=j.value->>'enrollment_id' AND e.active=1
-               LEFT JOIN guild_write_fences f ON f.guild_id=e.guild_id
+                 ON e.guild_id=j.value->>'guild_id' AND e.active=1
+               LEFT JOIN guild_write_fences f ON f.guild_id=j.value->>'guild_id'
               ORDER BY j.key",
         )?.query_map(params![rows.clone()], |row| {
             Ok(if !row.get::<bool>(0)? {
@@ -54,17 +54,20 @@ pub async fn save_cleanup_deletes(
             return Ok(outcomes);
         }
         tx.ensure_mutation_receipt()?;
+        // An empty enrollment ID encodes an unenrolled scope in the existing
+        // non-null column. Membership IDs are always nonempty.
         let changed = tx.execute_bounded(
             "INSERT INTO cleanup_delete_journal
                 (batch,message_id,owner,guild_id,enrollment_id,channel_id,user_id,
                  rule_id,rule_name,observed_at_ms,purge)
-             SELECT j.value->>'batch',j.value->>'message_id',?1,e.guild_id,e.id,
+             SELECT j.value->>'batch',j.value->>'message_id',?1,j.value->>'guild_id',coalesce(e.id,''),
                     j.value->>'channel_id',j.value->>'user_id',j.value->>'rule_id',
                     j.value->>'rule_name',j.value->>'observed_at_ms',j.value->>'purge'
                FROM json_each(?2) j
-               JOIN guild_enrollments e
-                 ON e.guild_id=j.value->>'guild_id' AND e.id=j.value->>'enrollment_id' AND e.active=1
-              WHERE NOT EXISTS (SELECT 1 FROM guild_write_fences f WHERE f.guild_id=e.guild_id)
+               LEFT JOIN guild_enrollments e
+                 ON e.guild_id=j.value->>'guild_id' AND e.active=1
+              WHERE e.id IS (j.value->>'enrollment_id')
+                AND NOT EXISTS (SELECT 1 FROM guild_write_fences f WHERE f.guild_id=j.value->>'guild_id')
              ON CONFLICT(batch,message_id) DO UPDATE SET purge=excluded.purge
               WHERE cleanup_delete_journal.guild_id=excluded.guild_id
                 AND cleanup_delete_journal.enrollment_id=excluded.enrollment_id
@@ -90,11 +93,12 @@ pub async fn recovered_cleanup_deletes(
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_snapshot()?;
         let rows = tx.prepare(
-            "SELECT d.rowid,d.batch,d.guild_id,d.enrollment_id,d.channel_id,d.message_id,
+            "SELECT d.rowid,d.batch,d.guild_id,nullif(d.enrollment_id,''),d.channel_id,d.message_id,
                     d.user_id,d.rule_id,d.rule_name,d.observed_at_ms,d.purge
                FROM cleanup_delete_journal d
-               JOIN guild_enrollments e ON e.guild_id=d.guild_id AND e.id=d.enrollment_id AND e.active=1
+               LEFT JOIN guild_enrollments e ON e.guild_id=d.guild_id AND e.active=1
               WHERE d.rowid>?1 AND d.owner<>?2 AND d.dispatching<=0
+                AND e.id IS nullif(d.enrollment_id,'')
                 AND NOT EXISTS (SELECT 1 FROM guild_write_fences f WHERE f.guild_id=d.guild_id)
               ORDER BY d.rowid LIMIT 32",
         )?.query_map(params![after, owner], |row| {
@@ -120,7 +124,7 @@ pub async fn recovered_cleanup_deletes(
 #[derive(Clone, Copy)]
 pub struct CleanupJournalKey<'a> {
     pub guild_id: i64,
-    pub enrollment_id: &'a str,
+    pub enrollment_id: Option<&'a str>,
     pub batch: &'a str,
     pub messages: &'a [i64],
     pub recovery: Option<(&'a str, &'a CleanupRecovery)>,
@@ -144,13 +148,17 @@ impl CleanupRecovery {
     }
 }
 
-pub async fn ensure_cleanup_enrollment(db: &Db, guild: i64, enrollment_id: String) -> Result<()> {
+pub async fn ensure_cleanup_enrollment(
+    db: &Db,
+    guild: i64,
+    enrollment_id: Option<String>,
+) -> Result<()> {
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_snapshot()?;
         let current = active_enrollment_conn(&tx, guild)?;
         anyhow::ensure!(
-            current.is_some_and(|enrollment| enrollment.id == enrollment_id),
-            "cleanup enrollment is no longer active"
+            current.map(|enrollment| enrollment.id) == enrollment_id,
+            "cleanup enrollment has changed"
         );
         super::guild_stores::refuse_fenced_write(&tx, guild)?;
         tx.finish_read()
@@ -166,7 +174,7 @@ pub async fn ensure_cleanup_enrollment(db: &Db, guild: i64, enrollment_id: Strin
 pub struct CleanupDispatchClaim {
     db: Db,
     guild: i64,
-    enrollment: String,
+    enrollment: Option<String>,
     batch: String,
     messages: String,
     count: usize,
@@ -180,7 +188,7 @@ impl CleanupDispatchClaim {
         let claim = Self {
             db: db.clone(),
             guild: key.guild_id,
-            enrollment: key.enrollment_id.to_owned(),
+            enrollment: key.enrollment_id.map(str::to_owned),
             batch: key.batch.to_owned(),
             messages: serde_json::to_string(key.messages)?,
             count: key.messages.len(),
@@ -290,10 +298,10 @@ impl CleanupDispatchClaim {
             let changed = tx.execute_bounded(
                 "UPDATE cleanup_delete_journal SET dispatching=?6, owner=coalesce(?7, owner)
                   WHERE batch=?1 AND message_id IN (SELECT value FROM json_each(?2))
-                    AND guild_id=?3 AND enrollment_id=?4
+                    AND guild_id=?3 AND enrollment_id=coalesce(?4,'')
                     AND ((?5 IS NULL AND dispatching<=0) OR dispatching=?5)
-                    AND EXISTS (SELECT 1 FROM guild_enrollments e
-                                WHERE e.guild_id=?3 AND e.id=?4 AND e.active=1)
+                    AND ?4 IS (SELECT e.id FROM guild_enrollments e
+                                WHERE e.guild_id=?3 AND e.active=1)
                     AND (?6=0 OR NOT EXISTS (SELECT 1 FROM guild_write_fences f WHERE f.guild_id=?3))",
                 params![batch, messages, guild, enrollment, expected, next, owner],
                 growth,
@@ -349,8 +357,8 @@ pub async fn prune_cleanup_journal(
             "DELETE FROM cleanup_delete_journal WHERE rowid IN (
                  SELECT d.rowid FROM cleanup_delete_journal d
                   WHERE (d.owner<>?1 AND (?2 IS NULL OR d.owner<>?2) AND d.dispatching>0)
-                     OR NOT EXISTS (SELECT 1 FROM guild_enrollments e
-                         WHERE e.guild_id=d.guild_id AND e.id=d.enrollment_id AND e.active=1)
+                     OR nullif(d.enrollment_id,'') IS NOT (SELECT e.id FROM guild_enrollments e
+                         WHERE e.guild_id=d.guild_id AND e.active=1)
                   ORDER BY d.rowid LIMIT 256)",
             params![owner, recovering],
         )?;

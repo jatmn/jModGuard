@@ -385,6 +385,51 @@ async fn abrupt_restart_recovers_confirmed_deletes_once_as_individual_notices() 
 }
 
 #[tokio::test]
+async fn abrupt_restart_recovers_unenrolled_deletes_once_as_individual_notices() {
+    let f = Fixture::new(true).await;
+    assert!(
+        db::guild_enrollment(&f.app.db, GUILD as i64)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let cleanup = f.begin().await.unwrap();
+    f.rest(Some(&cleanup), 1, 101).await;
+    f.rest(Some(&cleanup), 2, 102).await;
+    let path = Arc::clone(&f.path);
+    drop(cleanup);
+    assert!(f.notices().is_empty());
+    drop(f);
+
+    let restarted = BotState::new(Default::default(), db::Db::open(&path.0, 2).unwrap()).unwrap();
+    restarted.activation.mark_lock_held(true);
+    let sink = Sink::default();
+    let (last, retry) = recover_cleanup_page(&restarted, &sink, 0).await.unwrap();
+    assert!(last.is_some() && !retry);
+    assert_eq!(
+        recover_cleanup_page(&restarted, &sink, 0).await.unwrap(),
+        (None, false)
+    );
+    let notices = sink.0.lock();
+    assert_eq!(notices.len(), 2);
+    for (channel, message) in [(1, 101), (2, 102)] {
+        let url = format!("https://discord.com/channels/{GUILD}/{channel}/{message}");
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|(destination, payload)| {
+                    let text = log_text(payload);
+                    destination.get() == DESTINATION
+                        && text.contains("Automod message deleted")
+                        && text.contains(&url)
+                })
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
 async fn collector_first_single_cleanup_replays_after_handler_and_restart() {
     collector_first_cleanup_replays(GatewayDeleteOrigin::Single, &[102]).await;
 }
@@ -472,7 +517,8 @@ async fn collector_first_cleanup_replays(origin: GatewayDeleteOrigin, ids: &[u64
     assert!(
         recovered
             .iter()
-            .all(|(_, row)| row.purge && row.enrollment_id == enrollment.id)
+            .all(|(_, row)| row.purge
+                && row.enrollment_id.as_deref() == Some(enrollment.id.as_str()))
     );
     let sink = Sink::default();
     let (last, retry) = recover_cleanup_page(&restarted, &sink, 0).await.unwrap();
@@ -849,7 +895,7 @@ async fn recovered_delete_cannot_use_rejoined_membership_after_admission() {
         let [(_, record)] = records.as_slice() else {
             panic!("expected one recovered delete");
         };
-        assert_eq!(record.enrollment_id, old.id);
+        assert_eq!(record.enrollment_id.as_deref(), Some(old.id.as_str()));
         let notice = IndividualCleanup::from(record);
         let cfg = restarted.configs.get(&restarted.db, GUILD).await.unwrap();
         let slots = &restarted.log_delivery_slots;
@@ -1422,7 +1468,7 @@ async fn sweep_10008_keeps_identity_for_a_later_gateway_delete_without_snapshot(
 }
 
 struct StubDiscord {
-    http: serenity::http::Http,
+    http: Arc<serenity::http::Http>,
     requests: Arc<Mutex<Vec<(hyper::Method, String)>>>,
     server: tokio::task::JoinHandle<Result<(), hyper::Error>>,
 }
@@ -1471,7 +1517,7 @@ impl StubDiscord {
             .ratelimiter_disabled(true)
             .build();
         Self {
-            http,
+            http: Arc::new(http),
             requests,
             server: tokio::spawn(server),
         }
@@ -1529,6 +1575,7 @@ async fn live_velocity_kick_groups_its_existing_late_strike_deletes() {
             author_id: SUBJECT,
             content: "message from the flood",
             attachment_count: 0,
+            sticker_count: 0,
             everyone_mentions: 0,
             here_mentions: 0,
             role_mentions: 0,

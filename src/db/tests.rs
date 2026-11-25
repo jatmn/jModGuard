@@ -14,7 +14,7 @@ async fn cleanup_dispatch_requires_every_row_and_an_active_unfenced_enrollment()
         vec![CleanupDeleteRecord {
             batch: "cleanup".into(),
             guild_id: enrollment.guild_id,
-            enrollment_id: enrollment.id.clone(),
+            enrollment_id: Some(enrollment.id.clone()),
             channel_id: 9,
             message_id: 10,
             user_id: 11,
@@ -29,7 +29,7 @@ async fn cleanup_dispatch_requires_every_row_and_an_active_unfenced_enrollment()
     assert_eq!(outcomes, [CleanupDeleteSave::Saved]);
     let key = CleanupJournalKey {
         guild_id: enrollment.guild_id,
-        enrollment_id: &enrollment.id,
+        enrollment_id: Some(&enrollment.id),
         batch: "cleanup",
         messages: &[10, 12],
         recovery: None,
@@ -109,9 +109,66 @@ async fn cleanup_dispatch_requires_every_row_and_an_active_unfenced_enrollment()
     .unwrap();
     assert!(CleanupDispatchClaim::reserve(&db, key).await.is_err());
     assert!(
-        ensure_cleanup_enrollment(&db, enrollment.guild_id, enrollment.id.clone())
+        ensure_cleanup_enrollment(&db, enrollment.guild_id, Some(enrollment.id.clone()))
             .await
             .is_err()
+    );
+    drop(db);
+    let _ = std::fs::remove_file(tmp);
+}
+
+#[tokio::test]
+async fn unenrolled_cleanup_journal_cannot_dispatch_under_a_new_enrollment() {
+    let tmp = tmp_db_path("unenrolled_cleanup_journal");
+    let db = Db::open(&tmp, 2).unwrap();
+    let record = CleanupDeleteRecord {
+        batch: "cleanup".into(),
+        guild_id: 8,
+        enrollment_id: None,
+        channel_id: 9,
+        message_id: 10,
+        user_id: 11,
+        rule_id: "spam".into(),
+        rule_name: "Spam".into(),
+        observed_at_ms: 100,
+        purge: false,
+    };
+    assert_eq!(
+        save_cleanup_deletes(&db, "previous".into(), vec![record.clone()])
+            .await
+            .unwrap(),
+        [CleanupDeleteSave::Saved]
+    );
+    let key = CleanupJournalKey {
+        guild_id: record.guild_id,
+        enrollment_id: None,
+        batch: &record.batch,
+        messages: &[record.message_id],
+        recovery: None,
+    };
+    let claim = CleanupDispatchClaim::reserve(&db, key).await.unwrap();
+    enroll_guild(&db, record.guild_id, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(claim.arm_for_send().await.is_err());
+    assert!(
+        recovered_cleanup_deletes(&db, "replacement".into(), 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        prune_cleanup_journal(&db, "replacement".into(), &CleanupRecovery::default())
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        save_cleanup_deletes(&db, "previous".into(), vec![record])
+            .await
+            .unwrap(),
+        [CleanupDeleteSave::Retired]
     );
     drop(db);
     let _ = std::fs::remove_file(tmp);

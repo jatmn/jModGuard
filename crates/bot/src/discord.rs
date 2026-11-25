@@ -170,8 +170,12 @@ impl<'a> LogAttempt<'a> {
 
     pub async fn ensure_current_enrollment(&self) -> Result<()> {
         if let Some((db, key)) = self.journal {
-            crate::db::ensure_cleanup_enrollment(db, key.guild_id, key.enrollment_id.to_owned())
-                .await?;
+            crate::db::ensure_cleanup_enrollment(
+                db,
+                key.guild_id,
+                key.enrollment_id.map(str::to_owned),
+            )
+            .await?;
         }
         Ok(())
     }

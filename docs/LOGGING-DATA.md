@@ -146,6 +146,8 @@ and persistence contracts below are unchanged.
   restart the bot uses the existing shutdown window to attempt unfinished
   deliveries. The replacement bot replays journaled deletes individually
   from the primary database, even if grouping has since been disabled.
+  Work captured without an active enrollment can replay while the guild
+  remains unenrolled.
   Confirmed REST deletes use Automod Delete. Purge observations with an
   interrupted enforcement use the ordinary delete route. The journal stores
   message and rule identifiers and timestamps. It stores no retained message

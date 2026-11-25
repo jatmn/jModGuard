@@ -3235,7 +3235,10 @@ mod tests {
             (row.guild_id, row.channel_id, row.message_id),
             (789, 456, 111)
         );
-        assert_eq!(row.enrollment_id, scope.enrollment().id);
+        assert_eq!(
+            row.enrollment_id.as_deref(),
+            Some(scope.enrollment().id.as_str())
+        );
         assert!(row.purge);
         cleanup_worker.abort();
         assert!(cleanup_worker.await.unwrap_err().is_cancelled());

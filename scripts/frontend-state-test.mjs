@@ -9922,7 +9922,7 @@ test('a list link for an inaccessible server falls back to Dashboard on an acces
   const h = harness(async (url) => response(url.endsWith('/api/me')
     ? { user: { id: '42' }, guilds: [{ id: '20', name: 'Second', access: 'dashboard' }] }
     : { enrollment_id: 'membership', rules: [], commands: [] }));
-  h.location.search = '?list=cases&guild=10&sort=date';
+  h.location.search = `?list=cases&guild=10&sort=date&case=${CASE_ID}`;
   await h.app.init();
   assert.equal(h.app.state.guildId, '20');
   assert.equal(h.app.state.tab, 'dashboard');

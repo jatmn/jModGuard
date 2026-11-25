@@ -120,6 +120,7 @@ impl RecentMessages {
 
 /// A successful ban supplies Discord's server-side deletion window. Sweep any
 /// remaining tracked messages for the same enrollment without fetching history.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sweep_after_ban(
     app: &std::sync::Arc<BotState>,
     http: &Http,

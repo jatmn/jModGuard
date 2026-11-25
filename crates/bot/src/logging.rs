@@ -1393,7 +1393,7 @@ async fn emit_cleanup_summary(
     guild: GuildId,
     vars: BTreeMap<String, String>,
     dispatch: &mut crate::discord::LogDispatch,
-    journal: Option<db::CleanupJournalKey<'_>>,
+    journal: db::CleanupJournalKey<'_>,
 ) -> SummaryDelivery {
     let (delivery, _) = emit_to_observed_with_audit(
         app,
@@ -1408,7 +1408,7 @@ async fn emit_cleanup_summary(
         None,
         Some(crate::discord::LogAttempt::new(
             dispatch,
-            journal.map(|key| (&app.db, key)),
+            Some((&app.db, journal)),
         )),
     )
     .await;

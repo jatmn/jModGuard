@@ -88,7 +88,7 @@ pub(crate) struct CleanupRule<'a> {
 
 struct Incident {
     nonce: u64,
-    enrollment: Option<db::GuildEnrollment>,
+    enrollment_id: Option<String>,
     user: u64,
     rule_id: String,
     rule: String,
@@ -370,7 +370,7 @@ impl Incident {
                     prepared.attempt,
                 );
                 if promoted {
-                    observation = self.journal_delete(app, target, false);
+                    observation = Some(self.journal_delete(app, guild, target, false));
                 }
             }
             return Some(ClaimedDelete { observation });
@@ -393,7 +393,7 @@ impl Incident {
                 purge_origin,
             },
         );
-        let observation = self.journal_delete(app, target, purge_origin.is_some());
+        let observation = Some(self.journal_delete(app, guild, target, purge_origin.is_some()));
         self.touch(Clock::now());
         Some(ClaimedDelete { observation })
     }
@@ -401,15 +401,15 @@ impl Incident {
     fn journal_delete(
         &self,
         app: &BotState,
+        guild: u64,
         target: Message,
         purge: bool,
-    ) -> Option<CleanupObservation> {
-        let enrollment = self.enrollment.as_ref()?;
-        let key = (enrollment.guild_id as u64, target);
+    ) -> CleanupObservation {
+        let key = (guild, target);
         let row = CleanupDeleteRecord {
             batch: batch_key(self.nonce),
-            guild_id: enrollment.guild_id,
-            enrollment_id: enrollment.id.clone(),
+            guild_id: guild as i64,
+            enrollment_id: self.enrollment_id.clone(),
             channel_id: target.0 as i64,
             message_id: target.1 as i64,
             user_id: self.user as i64,
@@ -432,7 +432,7 @@ impl Incident {
         // This is also the bounded handoff for snapshot-only claims.
         // The cleanup worker persists them before delivering the incident.
         app.cleanup_incidents.wake.notify_one();
-        Some(key)
+        key
     }
 }
 
@@ -447,7 +447,10 @@ pub(crate) async fn begin_cleanup<'a>(
     }
     let cfg = app.configs.get(&app.db, guild).await.ok()?;
     channel_for(&cfg, "automod_delete")?;
-    let enrollment = crate::cases::capture(app, guild).await;
+    let enrollment_id = db::guild_enrollment(&app.db, i64::try_from(guild).ok()?)
+        .await
+        .ok()?
+        .map(|enrollment| enrollment.id);
     let mut state = app.cleanup_incidents.inner.lock();
     if app.activation.is_shutting_down() {
         return None;
@@ -495,7 +498,7 @@ pub(crate) async fn begin_cleanup<'a>(
             subject,
             Incident {
                 nonce: rand::random(),
-                enrollment,
+                enrollment_id,
                 user,
                 rule_id: rule.id.to_owned(),
                 rule: clip(rule.name, 100),
@@ -1045,20 +1048,19 @@ impl PendingIncident {
         if let Some(item) = self.incident.messages.remove(&target)
             && item.result.is_ok()
         {
-            if self.incident.enrollment.is_some() {
-                let mut journal = app.cleanup_incidents.journal.lock();
-                let batch = self.incident.nonce;
-                let key = (self.subject.0, target);
-                if journal
-                    .observed
-                    .get(&key)
-                    .is_some_and(|pending| pending.batch == batch)
-                {
-                    journal.observed.remove(&key);
-                }
-                journal.skipped.remove(&(batch, target));
-                journal.settled.insert((batch, target.1 as i64));
+            let mut journal = app.cleanup_incidents.journal.lock();
+            let batch = self.incident.nonce;
+            let key = (self.subject.0, target);
+            if journal
+                .observed
+                .get(&key)
+                .is_some_and(|pending| pending.batch == batch)
+            {
+                journal.observed.remove(&key);
             }
+            journal.skipped.remove(&(batch, target));
+            journal.settled.insert((batch, target.1 as i64));
+            drop(journal);
             app.automod_delete_marks
                 .finish_cleanup_delete((self.subject.0, target.0, target.1));
         }
@@ -1172,17 +1174,13 @@ impl PendingIncident {
                     format!("cleanup-s{:016x}", self.incident.nonce),
                 );
                 let batch = batch_key(self.incident.nonce);
-                let journal =
-                    self.incident
-                        .enrollment
-                        .as_ref()
-                        .map(|enrollment| db::CleanupJournalKey {
-                            guild_id: enrollment.guild_id,
-                            enrollment_id: &enrollment.id,
-                            batch: &batch,
-                            messages: &confirmed,
-                            recovery: None,
-                        });
+                let journal = db::CleanupJournalKey {
+                    guild_id: guild as i64,
+                    enrollment_id: self.incident.enrollment_id.as_deref(),
+                    batch: &batch,
+                    messages: &confirmed,
+                    recovery: None,
+                };
                 let delivery = emit_cleanup_summary(
                     app,
                     sink,
@@ -1226,9 +1224,7 @@ impl PendingIncident {
             );
             let scope = self.individual((0, 0));
             let mut dispatch = LogDispatch::Pending;
-            let attempt = scope
-                .journal(&[])
-                .map(|key| LogAttempt::new(&mut dispatch, Some((&app.db, key))));
+            let attempt = LogAttempt::new(&mut dispatch, Some((&app.db, scope.journal(&[]))));
             if channel_for(&cfg, "automod_delete").is_none()
                 || emit_to_observed_with_audit(
                     app,
@@ -1241,7 +1237,7 @@ impl PendingIncident {
                     || true,
                     false,
                     None,
-                    attempt,
+                    Some(attempt),
                 )
                 .await
                 .0 == Delivery::Sent
@@ -1302,7 +1298,7 @@ impl PendingIncident {
             reason: &self.incident.reason,
             observed_at: None,
             batch: batch_key(self.incident.nonce),
-            enrollment_id: self.incident.enrollment.as_ref().map(|e| e.id.as_str()),
+            enrollment_id: self.incident.enrollment_id.as_deref(),
             recovery: None,
         }
     }
@@ -1321,15 +1317,14 @@ struct IndividualCleanup<'a> {
 }
 
 impl IndividualCleanup<'_> {
-    fn journal<'a>(&'a self, messages: &'a [i64]) -> Option<db::CleanupJournalKey<'a>> {
-        self.enrollment_id
-            .map(|enrollment_id| db::CleanupJournalKey {
-                guild_id: self.subject.0 as i64,
-                enrollment_id,
-                batch: &self.batch,
-                messages,
-                recovery: self.recovery,
-            })
+    fn journal<'a>(&'a self, messages: &'a [i64]) -> db::CleanupJournalKey<'a> {
+        db::CleanupJournalKey {
+            guild_id: self.subject.0 as i64,
+            enrollment_id: self.enrollment_id,
+            batch: &self.batch,
+            messages,
+            recovery: self.recovery,
+        }
     }
 
     /// A true result is a delivered report or an explicit routing/filter decision.
@@ -1386,9 +1381,7 @@ impl IndividualCleanup<'_> {
         }
         let mut dispatch = LogDispatch::Pending;
         let messages = [message as i64];
-        let attempt = self
-            .journal(&messages)
-            .map(|key| LogAttempt::new(&mut dispatch, Some((&app.db, key))));
+        let attempt = LogAttempt::new(&mut dispatch, Some((&app.db, self.journal(&messages))));
         let (delivery, _) = emit_to_observed_with_audit(
             app,
             sink,
@@ -1400,7 +1393,7 @@ impl IndividualCleanup<'_> {
             || true,
             false,
             None,
-            attempt,
+            Some(attempt),
         )
         .await;
         if dispatch == LogDispatch::MayHaveSent && delivery != Delivery::Sent {
@@ -1451,7 +1444,7 @@ impl IndividualCleanup<'_> {
             GuildId::new(guild),
             ChannelId::new(source),
             transcript,
-            self.journal(&messages),
+            Some(self.journal(&messages)),
         )
         .await
             != BulkDeliveryOutcome::Failed
@@ -1468,7 +1461,7 @@ impl<'a> From<&'a CleanupDeleteRecord> for IndividualCleanup<'a> {
             reason: "Automod cleanup interrupted by restart",
             observed_at: chrono::DateTime::from_timestamp_millis(record.observed_at_ms),
             batch: record.batch.clone(),
-            enrollment_id: Some(&record.enrollment_id),
+            enrollment_id: record.enrollment_id.as_deref(),
             recovery: None,
         }
     }
@@ -1495,8 +1488,11 @@ async fn recover_cleanup_page(
             continue;
         };
         // The active membership may have changed since the page was read.
-        let enrollment = crate::cases::capture(app, guild).await;
-        if enrollment.is_none_or(|enrollment| enrollment.id != record.enrollment_id) {
+        let Ok(enrollment) = db::guild_enrollment(&app.db, record.guild_id).await else {
+            retry = true;
+            continue;
+        };
+        if enrollment.map(|enrollment| enrollment.id) != record.enrollment_id {
             retry = true;
             continue;
         }

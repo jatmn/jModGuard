@@ -2100,10 +2100,10 @@ async fn execute_live<'a>(
                                     }
                                     let outcome =
                                         crate::cases::classify_discord(discord.err().as_deref());
-                                    ban_outcome = Some(outcome.clone());
                                     if let Some(cleanup) = &cleanup {
                                         cleanup.outcome(outcome.clone(), None);
                                     }
+                                    ban_outcome = Some(outcome.clone());
                                     if matches!(outcome, CaseOutcome::Failed) {
                                         app.release_gateway_case_suppression(suppression);
                                     }
