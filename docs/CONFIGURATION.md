@@ -33,6 +33,8 @@ the bot loads its bot token; the API uses OAuth and queues administrative action
 | `bot.config_poll_secs` | `5` | how often each process polls durable `config_version` (env: `JMODGUARD_CONFIG_POLL_SECS`) |
 | `log.level` | `info` | tracing level (env: `JMODGUARD_LOG_LEVEL`) |
 | `log.directory` | `logs` | rolling log directory (env: `JMODGUARD_LOG_DIRECTORY`; empty = console only). Bot writes `jmodguard-bot.log`; API writes `jmodguard-api.log`. Container images default this env var to empty for platform logging |
+| `log.group_automod_cleanup_deletes` | `true` | Bot only. Group eligible automod cleanup deletes across channels into one summary (env: `JMODGUARD_LOG_GROUP_AUTOMOD_CLEANUP_DELETES`) |
+| `log.automod_cleanup_settle_secs` | `10` | Bot only. Require 5–10 seconds of quiet before sending a grouped cleanup summary (env: `JMODGUARD_LOG_AUTOMOD_CLEANUP_SETTLE_SECS`) |
 
 Use `info` for production. `JMODGUARD_LOG_LEVEL` overrides `log.level` and
 is the only environment override for tracing; `RUST_LOG` is ignored. The
