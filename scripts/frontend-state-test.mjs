@@ -2119,11 +2119,23 @@ test('Members accepts a later primary restore status but rejects an older in-fli
 
 test('Members explains a coverage gap and offers Reconcile inside the notice only when it is needed', async () => {
   const actions = [];
+  const prompts = [];
+  const reconcilePrompt = 'Request a full current-member and current-ban reconciliation from Discord? This can take a while.';
+  let allowReconcile = false;
   let sync;
   const h = harness(async (url, init) => {
-    if (url.endsWith('/member-sync/actions')) { actions.push(JSON.parse(init.body).operation); return response({ id: 'action', state: 'pending' }); }
+    if (url.endsWith('/member-sync/actions')) {
+      actions.push({ url, method: init.method, operation: JSON.parse(init.body).operation });
+      return response({
+        id: 'action', state: 'pending', guild_id: h.app.state.guildId,
+        actor_id: h.app.state.me.user.id, enrollment_id: 'member-enrollment',
+      });
+    }
     if (url.endsWith('/member-sync')) return response(sync);
     return response({ members: [], next_cursor: null });
+  }, new Map(), new Map(), message => {
+    prompts.push(message);
+    return allowReconcile;
   });
   h.app.state.tab = 'members';
   h.app.state.config = { enrollment_id: 'member-enrollment' };
@@ -2144,8 +2156,15 @@ test('Members explains a coverage gap and offers Reconcile inside the notice onl
   assert.equal(reconcileButtons(panel).length, 1, 'Reconcile moves into the notice instead of repeating in the controls row');
   assert.ok(findNode(notice(panel), n => n.localName === 'button' && textOf(n) === 'Reconcile from Discord'));
   await fire(reconcileButtons(panel)[0], 'click');
-  await settle();
-  assert.deepEqual(actions, ['reconcile']);
+  assert.deepEqual(actions, [], 'declining sends no reconcile request');
+  assert.deepEqual(prompts, [reconcilePrompt]);
+
+  allowReconcile = true;
+  await fire(reconcileButtons(panel)[0], 'click');
+  assert.deepEqual(prompts, [reconcilePrompt, reconcilePrompt]);
+  assert.deepEqual(actions, [{
+    url: `/api/guilds/${h.app.state.guildId}/member-sync/actions`, method: 'POST', operation: 'reconcile',
+  }]);
 
   sync = { ...base, reconciliation_reason: 'bot restarted', gap_auto_clear: true };
   panel = h.app.tabMembers();
@@ -9354,9 +9373,12 @@ test('list page status toggles save the rule with only that change and show the 
 // Known spam's add form shows the sample or the URL entry, picked by its Entry type.
 const knownSpamType = root => [...root.querySelectorAll('select')].find(s => [...s.options].some(o => o.textContent === 'URL pattern'));
 
- test('known spam dedicated page adds samples and URL wildcards, displays and removes scoped rows', async () => {
+test('known spam dedicated page adds samples and URL wildcards and confirms scoped removal', async () => {
   let rows = [];
   const requests = [];
+  const prompts = [];
+  const removalPrompt = 'Remove this known spam entry?';
+  let allowRemoval = false;
   const config = () => ({ enrollment_id: 'fixture-membership', known_spam: rows, rules: [], log_channels: [] });
   const h = harness(async (url, options) => {
     if (url.endsWith('/config')) return response(config());
@@ -9366,6 +9388,9 @@ const knownSpamType = root => [...root.querySelectorAll('select')].find(s => [..
       rows.push({ id: String(rows.length + 1), guild_id: h.app.state.guildId, ...body });
     } else if (options.method === 'DELETE') rows = rows.filter(row => !url.endsWith('/' + row.id));
     return response({ok: true});
+  }, new Map(), new Map(), message => {
+    prompts.push(message);
+    return allowRemoval;
   });
   h.app.state.config = config();
   h.app.state.tab = 'known-spam';
@@ -9392,10 +9417,22 @@ const knownSpamType = root => [...root.querySelectorAll('select')].find(s => [..
   assert.equal(JSON.parse(requests[1].options.body).kind, 'url');
   panel = h.app.tabKnownSpam(); await settle();
   assert.match(panel.textContent, /tinyurl.com/);
-  await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
-  assert.equal(requests[2].options.method, 'DELETE');
-  assert.equal(h.app.state.config.known_spam.length, 1);
- });
+  const findUrlRow = () => [...panel.querySelectorAll('tbody tr')].find(row => row.cells[0].textContent === 'tinyurl.com/*');
+  const urlRow = findUrlRow();
+  assert.ok(urlRow, 'the URL pattern has its own row');
+  const remove = iconAction(urlRow, 'Remove');
+  const removals = () => requests.filter(({ options }) => options.method === 'DELETE').map(({ url }) => url);
+  await fire(remove, 'click');
+  assert.deepEqual(removals(), [], 'declining sends no removal request');
+  assert.deepEqual(prompts, [removalPrompt]);
+  assert.ok(findUrlRow(), 'declining leaves the URL pattern in the table');
+
+  allowRemoval = true;
+  await fire(remove, 'click');
+  assert.deepEqual(prompts, [removalPrompt, removalPrompt]);
+  assert.deepEqual(removals(), [`/api/guilds/${h.app.state.guildId}/known-spam/2`]);
+  assert.deepEqual(Array.from(h.app.state.config.known_spam, row => row.id), ['1']);
+});
 
 test('known spam Global add keeps Global selected without an unsaved draft and keeps the other unsaved entry', async () => {
   const rows = [];
@@ -10404,6 +10441,36 @@ function caseFixture(overrides = {}) {
   };
   return { calls, fetchImpl };
 }
+
+test('removing a case record waits for confirmation', async () => {
+  const prompts = [];
+  const removalPrompt = 'Remove this case record? This does not undo the Discord action.';
+  let allowRemoval = false;
+  const { calls, fetchImpl } = caseFixture({
+    [`/cases/${CASE_ID}`]: (_url, options) => options.method === 'DELETE'
+      ? response({ removed: true, cleanup_pending: false })
+      : response({ id: CASE_ID, case: caseRecord(), can_delete: true, names: caseNames }),
+  });
+  const h = harness(fetchImpl, new Map(), new Map(), message => {
+    prompts.push(message);
+    return allowRemoval;
+  });
+  const root = await casesView(h);
+  await fire(iconAction(root, `Open case ${CASE_ID}`), 'click');
+  const dialog = caseDialog(h);
+  const remove = findNode(dialog, n => n.localName === 'button' && n.textContent === 'Remove case record');
+  const removals = () => calls.filter(call => call.method === 'DELETE').map(call => call.url);
+  await fire(remove, 'click');
+  assert.deepEqual(removals(), [], 'declining sends no case removal request');
+  assert.deepEqual(prompts, [removalPrompt]);
+  assert.equal(caseDialog(h), dialog, 'declining leaves the case open');
+
+  allowRemoval = true;
+  await fire(remove, 'click');
+  assert.deepEqual(prompts, [removalPrompt, removalPrompt]);
+  assert.deepEqual(removals(), [`/api/guilds/${h.app.state.guildId}/cases/${CASE_ID}`]);
+  assert.equal(caseDialog(h), null, 'removing the case closes the dialog');
+});
 
 test('Case view opens the last row of a full page in a dialog and loads case, history, evidence and names together', async () => {
   const ids = Array.from({ length: 50 }, (_, i) => (i + 1).toString(16).padStart(32, '0'));
