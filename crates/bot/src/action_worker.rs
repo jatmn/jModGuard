@@ -6,6 +6,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result};
 use serenity::model::{
+    guild::{Member, PartialGuild},
     id::{ChannelId, GuildId, UserId},
     permissions::Permissions,
 };
@@ -129,6 +130,18 @@ pub trait DiscordActions: Send + Sync {
     }
     async fn valid_log_channel(&self, guild: i64, channel: i64) -> Result<bool>;
     async fn unban(&self, guild: i64, user: i64, reason: &str) -> Outcome;
+    /// Check the actor's permission and the target's ban eligibility for one
+    /// dispatch attempt. Return the failed outcome code, if any.
+    async fn validate_ban(&self, job: &BotAction, user: i64) -> Option<&'static str> {
+        match self.authorized(job).await {
+            Ok(true) => self
+                .ban_refusal(job, user)
+                .await
+                .unwrap_or(Some("ban_check_unavailable")),
+            Ok(false) => Some("permission_revoked"),
+            Err(_) => Some("permission_check_unavailable"),
+        }
+    }
     /// The checks a queued ban needs before Discord is called: never the bot or
     /// the server owner, the bot must hold Ban Members, and a present member's
     /// top role must be below both the bot's and the requesting moderator's.
@@ -153,6 +166,48 @@ pub struct LiveDiscord<'a> {
     pub http: &'a serenity::http::Http,
     pub bot_user_id: UserId,
     pub activation: &'a crate::activation::Activation,
+}
+impl LiveDiscord<'_> {
+    async fn guild_and_actor(&self, job: &BotAction) -> Result<(PartialGuild, Member)> {
+        let guild = self
+            .http
+            .get_guild(GuildId::new(job.guild_id as u64))
+            .await?;
+        let actor = self
+            .http
+            .get_member(guild.id, UserId::new(job.actor_id as u64))
+            .await?;
+        Ok((guild, actor))
+    }
+
+    async fn check_ban_hierarchy(
+        &self,
+        guild: &PartialGuild,
+        bot: &Member,
+        actor: &Member,
+        user: i64,
+    ) -> Result<Option<&'static str>> {
+        // Someone who is not in the server is banned by ID; no hierarchy applies.
+        let target = match self
+            .http
+            .get_member(guild.id, UserId::new(user as u64))
+            .await
+        {
+            Ok(member) => Some(member),
+            Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(r)))
+                if r.status_code.as_u16() == 404 && r.error.code == 10013 =>
+            {
+                return Ok(Some("unknown_user"));
+            }
+            Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(r)))
+                if r.status_code.as_u16() == 404 && r.error.code == 10007 =>
+            {
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(ban_refusal(guild, bot, actor, target.as_ref(), user))
+    }
 }
 #[serenity::async_trait]
 impl DiscordActions for LiveDiscord<'_> {
@@ -182,15 +237,8 @@ impl DiscordActions for LiveDiscord<'_> {
             .filter(|joined| *joined > 0))
     }
     async fn authorized(&self, job: &BotAction) -> Result<bool> {
-        let guild = self
-            .http
-            .get_guild(GuildId::new(job.guild_id as u64))
-            .await?;
-        let member = self
-            .http
-            .get_member(guild.id, UserId::new(job.actor_id as u64))
-            .await?;
-        Ok(actor_authorized(&guild, &member, &job.action))
+        let (guild, actor) = self.guild_and_actor(job).await?;
+        Ok(actor_authorized(&guild, &actor, &job.action))
     }
     async fn actor_roles(&self, job: &BotAction) -> Result<Vec<i64>> {
         let member = self
@@ -242,6 +290,37 @@ impl DiscordActions for LiveDiscord<'_> {
             }
         }
     }
+    async fn validate_ban(&self, job: &BotAction, user: i64) -> Option<&'static str> {
+        // Take the shared guild and actor snapshot after the bot lookup so
+        // changes during that lookup still affect the moderator's hierarchy.
+        let bot = if user == i64::try_from(self.bot_user_id.get()).unwrap_or(0) {
+            None
+        } else {
+            Some(
+                self.http
+                    .get_member(GuildId::new(job.guild_id as u64), self.bot_user_id)
+                    .await,
+            )
+        };
+        let Ok((guild, actor)) = self.guild_and_actor(job).await else {
+            return Some("permission_check_unavailable");
+        };
+        if !actor_authorized(&guild, &actor, &job.action) {
+            return Some("permission_revoked");
+        }
+        let Some(bot) = bot else {
+            return Some("cannot_ban_bot");
+        };
+        if guild.owner_id.get() == user as u64 {
+            return Some("cannot_ban_owner");
+        }
+        let Ok(bot) = bot else {
+            return Some("ban_check_unavailable");
+        };
+        self.check_ban_hierarchy(&guild, &bot, &actor, user)
+            .await
+            .unwrap_or(Some("ban_check_unavailable"))
+    }
     async fn ban_refusal(&self, job: &BotAction, user: i64) -> Result<Option<&'static str>> {
         if user == i64::try_from(self.bot_user_id.get()).unwrap_or(0) {
             return Ok(Some("cannot_ban_bot"));
@@ -258,26 +337,7 @@ impl DiscordActions for LiveDiscord<'_> {
             .http
             .get_member(guild.id, UserId::new(job.actor_id as u64))
             .await?;
-        // Someone who is not in the server is banned by ID; no hierarchy applies.
-        let target = match self
-            .http
-            .get_member(guild.id, UserId::new(user as u64))
-            .await
-        {
-            Ok(member) => Some(member),
-            Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(r)))
-                if r.status_code.as_u16() == 404 && r.error.code == 10013 =>
-            {
-                return Ok(Some("unknown_user"));
-            }
-            Err(serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(r)))
-                if r.status_code.as_u16() == 404 && r.error.code == 10007 =>
-            {
-                None
-            }
-            Err(error) => return Err(error.into()),
-        };
-        Ok(ban_refusal(&guild, &bot, &actor, target.as_ref(), user))
+        self.check_ban_hierarchy(&guild, &bot, &actor, user).await
     }
     async fn ban(&self, guild: i64, user: i64, delete_message_days: u8, reason: &str) -> Outcome {
         match crate::discord::race_discord_call(
@@ -593,12 +653,18 @@ async fn execute_inner(
         if chrono::Utc::now().timestamp() >= job.expires_at {
             return Outcome::failed("expired_before_execution");
         }
-        if matches!(job.action, Action::LeaveGuild {}) {
-            // Owner-only platform action admitted by the API's owner gate. The
-            // actor is not a guild member, so there is no permission to check.
-            // Fresh bot membership above remains required to depart a guild.
-        } else {
-            match discord.authorized(job).await {
+        match &job.action {
+            Action::LeaveGuild {} => {
+                // Owner-only platform action admitted by the API's owner gate.
+                // The actor is not a guild member, so there is no guild
+                // permission to check. Fresh bot membership remains required.
+            }
+            Action::Ban { user_id, .. } => {
+                if let Some(code) = discord.validate_ban(job, *user_id).await {
+                    return Outcome::failed(code);
+                }
+            }
+            _ => match discord.authorized(job).await {
                 Ok(true) => {}
                 Ok(false) => match settings_role_authorized(tenant, discord, job).await {
                     Ok(true) => {}
@@ -606,14 +672,7 @@ async fn execute_inner(
                     Err(_) => return Outcome::failed("permission_check_unavailable"),
                 },
                 Err(_) => return Outcome::failed("permission_check_unavailable"),
-            }
-        }
-        if let Action::Ban { user_id, .. } = &job.action {
-            match discord.ban_refusal(job, *user_id).await {
-                Ok(None) => {}
-                Ok(Some(code)) => return Outcome::failed(code),
-                Err(_) => return Outcome::failed("ban_check_unavailable"),
-            }
+            },
         }
         if chrono::Utc::now().timestamp() >= job.expires_at {
             return Outcome::failed("expired_before_execution");
