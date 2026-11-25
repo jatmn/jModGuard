@@ -1892,6 +1892,78 @@ impl LogDelivery for AuditSink {
 }
 
 #[tokio::test]
+async fn member_audit_skips_permanently_ineligible_observations() {
+    use std::sync::atomic::Ordering;
+
+    let f = Fixture::with_timeout(4);
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = 1_790_086_832_000;
+    let superseded = claims.observe(guild.get(), action, 123, observed);
+    let current = claims.observe(guild.get(), action, 123, observed + 6_000);
+    let logs = audit_fixture(action, 123, observed + 6_000, Some("spam"));
+    assert!(claims.claim(&current, &logs).is_some());
+    let untracked = MemberAuditObservation {
+        guild: guild.get(),
+        target: 456,
+        action,
+        observed_ms: observed,
+        generation: None,
+    };
+    let sink = AuditSink {
+        sink: Sink::default(),
+        calls: Default::default(),
+        missing_first: false,
+        stalled: false,
+    };
+
+    tokio::time::pause();
+    for (label, observation) in [
+        ("superseded", superseded),
+        ("claimed", current),
+        ("untracked", untracked),
+    ] {
+        assert!(
+            lookup_member_audit(&f.app, &sink, guild, &observation)
+                .await
+                .is_none()
+        );
+        assert_eq!(sink.calls.load(Ordering::Relaxed), 0, "{label}");
+    }
+}
+
+#[tokio::test]
+async fn member_audit_rechecks_eligibility_after_the_retry_delay() {
+    use std::future::Future;
+    use std::sync::atomic::Ordering;
+
+    let f = Fixture::with_timeout(4);
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = 1_790_086_832_000;
+    let original = claims.observe(guild.get(), action, 123, observed);
+    let sink = AuditSink {
+        sink: Sink::default(),
+        calls: Default::default(),
+        missing_first: true,
+        stalled: false,
+    };
+
+    tokio::time::pause();
+    let mut lookup = Box::pin(lookup_member_audit(&f.app, &sink, guild, &original));
+    let first_poll =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(lookup.as_mut().poll(cx))).await;
+    assert!(first_poll.is_pending());
+    assert_eq!(sink.calls.load(Ordering::Relaxed), 1);
+
+    claims.observe(guild.get(), action, 123, observed + 6_000);
+    assert!(lookup.await.is_none());
+    assert_eq!(sink.calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
 async fn member_reports_render_audit_context_and_apply_actor_filters() {
     let f = Fixture::new();
     for event in ["member_ban", "member_unban"] {
