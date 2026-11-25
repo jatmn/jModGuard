@@ -43,6 +43,7 @@ struct Claims {
 struct ReplayHistory {
     completed: HashSet<MatchKey>,
     order: VecDeque<(Instant, MatchKey)>,
+    guild_counts: HashMap<GuildId, usize>,
 }
 
 struct ActiveMatch {
@@ -102,17 +103,30 @@ impl ReplayHistory {
     }
 
     fn evict_oldest(&mut self, guild: Option<GuildId>) {
-        // At capacity, replace the dispatching guild's oldest marker when it
-        // has one. Expiry and a guild without history use the global oldest.
         let index = guild
             .and_then(|guild| {
-                self.order
-                    .iter()
-                    .position(|&(_, ((entry_guild, _), _))| entry_guild == guild)
+                let retained = self.guild_counts.get(&guild).copied().unwrap_or(0);
+                let represented = self.guild_counts.len() + usize::from(retained == 0);
+                let share = MATCH_LIMIT / represented;
+                // Let a guild with a thin history grow by giving it a slot
+                // from a guild above its share. Otherwise reuse its own slots.
+                self.order.iter().position(|&(_, ((entry_guild, _), _))| {
+                    if retained < share {
+                        self.guild_counts.get(&entry_guild).copied().unwrap_or(0) > share
+                    } else {
+                        entry_guild == guild
+                    }
+                })
             })
             .unwrap_or(0);
-        if let Some((_, key)) = self.order.remove(index) {
+        if let Some((_, key @ ((guild, _), _))) = self.order.remove(index) {
             self.completed.remove(&key);
+            if let Some(count) = self.guild_counts.get_mut(&guild) {
+                *count -= 1;
+                if *count == 0 {
+                    self.guild_counts.remove(&guild);
+                }
+            }
         }
     }
 }
@@ -158,12 +172,13 @@ impl MatchClaim<'_> {
         if mode.completed.contains(&self.key) {
             return false;
         }
+        let ((guild, _), _) = self.key;
         if mode.completed.len() >= MATCH_LIMIT {
-            let ((guild, _), _) = self.key;
             mode.evict_oldest(Some(guild));
         }
         mode.completed.insert(self.key);
         mode.order.push_back((now, self.key));
+        *mode.guild_counts.entry(guild).or_default() += 1;
         active.phase = ClaimPhase::Dispatched;
         true
     }

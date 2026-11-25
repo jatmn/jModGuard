@@ -148,6 +148,41 @@ fn replay_history_pressure_keeps_other_guilds_recent_matches() {
 }
 
 #[test]
+fn saturated_replay_history_lets_a_new_guild_retain_multiple_stays() {
+    let recent = RecentMatches::default();
+    let busy_guild = GuildId::new(GUILD);
+    let fresh_guild = GuildId::new(GUILD + 1);
+    let role = RoleId::new(TRAP_ROLE);
+    let joined_at = Timestamp::from_millis(1).unwrap();
+
+    for dry_run in [false, true] {
+        for id in 100..100 + MATCH_LIMIT as u64 {
+            let subject = (busy_guild, UserId::new(id));
+            let claim = recent
+                .claim(subject, joined_at, role, dry_run, (0, 0))
+                .unwrap();
+            assert!(claim.complete(dry_run, |_| true));
+        }
+
+        let fresh_subjects = [MEMBER, MEMBER + 1].map(|id| (fresh_guild, UserId::new(id)));
+        for subject in fresh_subjects {
+            let claim = recent
+                .claim(subject, joined_at, role, dry_run, (0, 0))
+                .unwrap();
+            assert!(claim.complete(dry_run, |_| true));
+        }
+        for subject in fresh_subjects {
+            assert!(
+                recent
+                    .claim(subject, joined_at, role, dry_run, (0, 0))
+                    .is_none(),
+                "both new stays should still reject replay"
+            );
+        }
+    }
+}
+
+#[test]
 fn invalidated_claim_cannot_complete_or_release_its_successor() {
     let recent = RecentMatches::default();
     let subject = (GuildId::new(GUILD), UserId::new(MEMBER));
