@@ -25,7 +25,7 @@ function useChartLayout(initialWidth) {
         ? (text) => Math.ceil(canvas.measureText(text).width)
         : (text) => Math.ceil(text.length * fontSize * 0.65);
       setLayout((previous) => previous.width === width && previous.font === font
-        ? previous : { width, font, gap: Math.ceil(fontSize / 3), lineHeight, measureLabel });
+        ? previous : { width, font, gap: Math.ceil(fontSize / 3), lineHeight, fontHeight: fontHeight || lineHeight, measureLabel });
     };
     measure();
     const observer = new window.ResizeObserver(measure);
@@ -814,8 +814,7 @@ function utcClock(seconds, withDay) {
 // `max` fixes the top of the scale (for example 100 for a percentage of a limit).
 export function ResourceChart({ points, series, max, format, label, from, to }) {
   const layout = useChartLayout(480);
-  const { width, lineHeight, gap, measureLabel, ref } = layout;
-  const height = Math.min(MAX_PLOT_HEIGHT, Math.max(120, 5 * lineHeight));
+  const { width, lineHeight, fontHeight = lineHeight, gap, measureLabel, ref } = layout;
   const lines = series.map((line) => ({ ...line, values: points.map((point) => {
     const value = line.value(point);
     return value == null || !Number.isFinite(value) ? null : value;
@@ -832,17 +831,30 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
   }
   const top = max ?? (Math.max(...known) * 1.1 || 1);
   const ticks = [top, 0];
-  const padLeft = Math.max(...ticks.map((value) => measureLabel(format(value)))) + 2 * gap;
-  const padRight = gap;
-  const inset = lineHeight / 2 + 2;
+  const maxDateRows = 2;
+  const labelRows = ticks.length + maxDateRows;
+  const edgePadding = 2;
+  // Fit both value labels and both possible date rows within the height cap.
+  const minDateGap = Math.min(gap, 2);
+  const rowStep = Math.min(lineHeight, (MAX_PLOT_HEIGHT - 2 * edgePadding - minDateGap) / labelRows);
+  const height = Math.min(MAX_PLOT_HEIGHT, Math.max(120, (labelRows + 1) * lineHeight));
+  const dateGap = Math.min(gap, height - 2 * edgePadding - labelRows * rowStep);
+  const inset = rowStep / 2 + edgePadding;
+  // Keep the inherited font whenever its rendered box fits the tighter rows.
+  const axisScale = Math.min(1, rowStep / fontHeight);
+  const axisFontSize = axisScale < 1 ? `${axisScale}em` : undefined;
+  const axisGap = Math.ceil(gap * axisScale);
+  const measureAxisLabel = (text) => Math.ceil(measureLabel(text) * axisScale);
+  const padLeft = Math.max(...ticks.map((value) => measureAxisLabel(format(value)))) + 2 * axisGap;
+  const padRight = axisGap;
   const innerWidth = Math.max(1, width - padLeft - padRight);
   const dates = [utcClock(from, withDay), utcClock(to, withDay)];
   const dateTicks = dates.map((text, i) => ({ key: i, text, shortText: withDay ? text.slice(0, -6) : undefined,
     x: i === 0 ? padLeft : width - padRight, anchor: i === 0 ? "start" : "end" }));
   // Large text and a wide value axis can leave room for only one date per row.
-  const dateLabels = horizontalTickLayout(layout, dateTicks, 2);
-  const extraDateSpace = dateLabels.some(({ row }) => row === 1) ? lineHeight : 0;
-  const innerHeight = Math.max(1, height - 2 * inset - lineHeight - gap - extraDateSpace);
+  const dateLabels = horizontalTickLayout({ width, gap: axisGap, measureLabel: measureAxisLabel }, dateTicks, maxDateRows);
+  const firstDateY = height - inset - (dateLabels.some(({ row }) => row === 1) ? rowStep : 0);
+  const innerHeight = firstDateY - rowStep - dateGap - inset;
   const count = points.length;
   const x = (index) => padLeft + (count <= 1 ? innerWidth / 2 : (index * innerWidth) / (count - 1));
   const y = (value) => inset + innerHeight - Math.min(1, Math.max(0, value / top)) * innerHeight;
@@ -874,7 +886,7 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
       ...ticks.map((value) =>
         h("g", { key: `g${value}`, className: "an-gridline" },
           h("line", { x1: padLeft, x2: width - padRight, y1: y(value).toFixed(1), y2: y(value).toFixed(1) }),
-          axisText(format(value), { x: padLeft - gap, y: y(value), textAnchor: "end" }),
+          axisText(format(value), { x: padLeft - axisGap, y: y(value), textAnchor: "end", fontSize: axisFontSize }),
         ),
       ),
       ...lines.flatMap((line) =>
@@ -884,7 +896,7 @@ export function ResourceChart({ points, series, max, format, label, from, to }) 
             : h("polyline", { key: `${line.key}-${i}`, className: `br-line ${line.tone}`, points: run.map(([index, value]) => `${x(index).toFixed(1)},${y(value).toFixed(1)}`).join(" ") }),
         ),
       ),
-      ...renderHorizontalTicks(dateLabels, { y: height - inset - extraDateSpace, axisY: y(0), rowStep: lineHeight }),
+      ...renderHorizontalTicks(dateLabels, { y: firstDateY, axisY: y(0), rowStep, fontSize: axisFontSize }),
     ),
     lines.length > 1 &&
       h(
