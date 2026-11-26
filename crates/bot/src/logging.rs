@@ -12,8 +12,9 @@ use crate::db::guild_data::MessageSnapshot;
 use crate::state::BotState;
 use crate::{db, templates};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
+use tokio::{sync::watch, time::Instant as TokioInstant};
 
 mod cleanup_incident;
 #[cfg(test)]
@@ -34,6 +35,7 @@ pub(crate) const REJOIN_NOTE_DELIVERY_LIMIT: usize = 4096;
 const REJOIN_NOTE_PRUNE_BATCH: usize = 64;
 const MEMBER_AUDIT_KEEP: Duration = Duration::from_secs(30);
 const MEMBER_AUDIT_LIMIT: usize = 4096;
+const MEMBER_AUDIT_RETRY_DELAY: Duration = Duration::from_millis(500);
 const SHUTDOWN_NOTICE_PHASE: Duration = Duration::from_secs(3);
 
 #[cfg(test)]
@@ -42,6 +44,7 @@ type AutomodVarsCaptureSlot = Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>
 #[cfg(test)]
 tokio::task_local! {
     static AUTOMOD_VARS_CAPTURE: AutomodVarsCaptureSlot;
+    static BEFORE_EDIT_DESTINATION_RECHECK: Box<dyn Fn() + Send + Sync>;
 }
 
 #[cfg(test)]
@@ -97,9 +100,60 @@ where
 #[derive(Default)]
 pub struct MemberAuditClaims {
     inner: Mutex<MemberAuditState>,
+    fetches: MemberAuditFetches,
 }
 
 type MemberAuditKey = (u64, u64, u8);
+type MemberAuditFetchKey = (GuildId, u8);
+type MemberAuditPage = Result<Arc<AuditLogs>, ()>;
+type MemberAuditPageSender = watch::Sender<Option<MemberAuditPage>>;
+type MemberAuditFetches = Mutex<HashMap<MemberAuditFetchKey, MemberAuditFetch>>;
+
+struct MemberAuditFetch {
+    started: TokioInstant,
+    sender: MemberAuditPageSender,
+}
+
+enum MemberAuditPageRequest<'a> {
+    Fetch(MemberAuditFetchGuard<'a>),
+    Wait(watch::Receiver<Option<MemberAuditPage>>),
+}
+
+/// Keeps only the current in-progress request discoverable. An older request
+/// may finish for its original waiters after a fresher request starts.
+struct MemberAuditFetchGuard<'a> {
+    fetches: &'a MemberAuditFetches,
+    key: MemberAuditFetchKey,
+    sender: Option<MemberAuditPageSender>,
+}
+
+impl MemberAuditFetchGuard<'_> {
+    fn unregister(&mut self) -> Option<MemberAuditPageSender> {
+        let sender = self.sender.take()?;
+        let mut fetches = self.fetches.lock();
+        if fetches
+            .get(&self.key)
+            .is_some_and(|fetch| fetch.sender.same_channel(&sender))
+        {
+            fetches.remove(&self.key);
+        }
+        Some(sender)
+    }
+
+    fn publish(mut self, page: MemberAuditPage) {
+        // New readers must fetch a new page as soon as this one finishes.
+        if let Some(sender) = self.unregister() {
+            sender.send_replace(Some(page));
+        }
+    }
+}
+
+impl Drop for MemberAuditFetchGuard<'_> {
+    fn drop(&mut self) {
+        // Cancellation closes the channel, so a waiter can fetch for itself.
+        drop(self.unregister());
+    }
+}
 
 #[derive(Default)]
 struct MemberAuditState {
@@ -128,6 +182,7 @@ pub(crate) struct MemberAuditObservation {
     target: u64,
     action: Action,
     observed_ms: i64,
+    observed_at: TokioInstant,
     generation: Option<u64>,
 }
 
@@ -175,6 +230,7 @@ impl MemberAuditClaims {
         target: u64,
         observed_ms: i64,
     ) -> MemberAuditObservation {
+        let observed_at = TokioInstant::now();
         let mut state = self.inner.lock();
         state.prune();
         let key = (guild, target, action.num());
@@ -183,6 +239,7 @@ impl MemberAuditClaims {
             target,
             action,
             observed_ms,
+            observed_at,
             generation: None,
         };
         if state.subjects.len() >= MEMBER_AUDIT_LIMIT && !state.subjects.contains_key(&key) {
@@ -213,6 +270,86 @@ impl MemberAuditClaims {
 
     fn has_unclaimed_subject(&self, observation: &MemberAuditObservation) -> bool {
         self.inner.lock().unclaimed_subject(observation).is_some()
+    }
+
+    fn join_page_request(
+        &self,
+        key: MemberAuditFetchKey,
+        earliest_start: TokioInstant,
+    ) -> MemberAuditPageRequest<'_> {
+        let mut fetches = self.fetches.lock();
+        let now = TokioInstant::now();
+        if let Some(fetch) = fetches.get(&key)
+            && now.saturating_duration_since(fetch.started) < MEMBER_AUDIT_RETRY_DELAY
+            && fetch.started >= earliest_start
+        {
+            return MemberAuditPageRequest::Wait(fetch.sender.subscribe());
+        }
+        // Gateway bans and report enrichment both hold a log delivery slot
+        // for the lookup. Those slots bound concurrent registrations.
+        let (sender, _) = watch::channel(None);
+        fetches.insert(
+            key,
+            MemberAuditFetch {
+                started: now,
+                sender: sender.clone(),
+            },
+        );
+        MemberAuditPageRequest::Fetch(MemberAuditFetchGuard {
+            fetches: &self.fetches,
+            key,
+            sender: Some(sender),
+        })
+    }
+
+    async fn fetch_page(
+        &self,
+        sink: &impl LogDelivery,
+        guild: GuildId,
+        observation: &MemberAuditObservation,
+        earliest_start: TokioInstant,
+        deadline: TokioInstant,
+    ) -> Option<Arc<AuditLogs>> {
+        let key = (guild, observation.action.num());
+        let now = TokioInstant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        let share_until = now + (remaining / 2).min(MEMBER_AUDIT_RETRY_DELAY);
+        while self.has_unclaimed_subject(observation) {
+            let now = TokioInstant::now();
+            if now >= deadline {
+                return None;
+            }
+            if now >= share_until {
+                // Leave the original request running and use the rest of
+                // this round's budget for an independent GET.
+                return sink
+                    .member_audit(guild, observation.action)
+                    .await
+                    .ok()
+                    .map(Arc::new);
+            }
+            match self.join_page_request(key, earliest_start) {
+                MemberAuditPageRequest::Fetch(request) => {
+                    let page = sink
+                        .member_audit(guild, observation.action)
+                        .await
+                        .map(Arc::new)
+                        .map_err(|_| ());
+                    request.publish(page.clone());
+                    return page.ok();
+                }
+                MemberAuditPageRequest::Wait(mut waiter) => {
+                    if let Ok(Ok(page)) =
+                        tokio::time::timeout_at(share_until, waiter.wait_for(Option::is_some)).await
+                    {
+                        return page.clone().and_then(Result::ok);
+                    }
+                    // Recheck eligibility before sharing again or fetching
+                    // independently once the shared wait expires.
+                }
+            }
+        }
+        None
     }
 
     fn claim(
@@ -261,7 +398,16 @@ impl MemberAuditClaims {
 /// or message archive. Serenity does not retain Message.member in its cache.
 #[derive(Default)]
 pub struct MemberJoinContext {
-    inner: Mutex<HashMap<(u64, u64), (serenity::model::Timestamp, Instant)>>,
+    inner: Mutex<MemberJoinEntries>,
+}
+
+type MemberJoinKey = (u64, u64);
+
+#[derive(Default)]
+struct MemberJoinEntries {
+    by_member: HashMap<MemberJoinKey, (serenity::model::Timestamp, Instant)>,
+    // One age key per member under the same lock, including after refreshes.
+    by_age: BTreeSet<(Instant, MemberJoinKey)>,
 }
 
 type RejoinStayKey = (u64, u64, String);
@@ -724,33 +870,55 @@ impl RejoinNoteDeliveries {
     }
 }
 
+impl MemberJoinEntries {
+    fn remember(&mut self, key: MemberJoinKey, joined: serenity::model::Timestamp, now: Instant) {
+        while let Some(&(seen, expired)) = self.by_age.first()
+            && now.duration_since(seen) >= MEMBER_JOINS_KEEP
+        {
+            self.by_age.pop_first();
+            self.by_member.remove(&expired);
+        }
+
+        if let Some(entry) = self.by_member.get_mut(&key) {
+            self.by_age.remove(&(entry.1, key));
+            *entry = (joined, now);
+        } else {
+            if self.by_member.len() >= MEMBER_JOINS_LIMIT
+                && let Some((_, oldest)) = self.by_age.pop_first()
+            {
+                self.by_member.remove(&oldest);
+            }
+            self.by_member.insert(key, (joined, now));
+        }
+        self.by_age.insert((now, key));
+    }
+}
+
 impl MemberJoinContext {
     pub fn remember(&self, guild: u64, user: u64, joined: Option<serenity::model::Timestamp>) {
         let Some(joined) = joined else { return };
-        let mut entries = self.inner.lock();
-        entries.retain(|_, (_, seen)| seen.elapsed() < MEMBER_JOINS_KEEP);
-        if entries.len() >= MEMBER_JOINS_LIMIT
-            && !entries.contains_key(&(guild, user))
-            && let Some(oldest) = entries
-                .iter()
-                .min_by_key(|(_, (_, at))| *at)
-                .map(|(key, _)| *key)
-        {
-            entries.remove(&oldest);
-        }
-        entries.insert((guild, user), (joined, Instant::now()));
+        self.inner
+            .lock()
+            .remember((guild, user), joined, Instant::now());
     }
 
     pub fn take(&self, guild: u64, user: u64) -> Option<serenity::model::Timestamp> {
-        self.inner
-            .lock()
-            .remove(&(guild, user))
-            .filter(|(_, seen)| seen.elapsed() < MEMBER_JOINS_KEEP)
-            .map(|(joined, _)| joined)
+        let key = (guild, user);
+        let mut entries = self.inner.lock();
+        let (joined, seen) = entries.by_member.remove(&key)?;
+        entries.by_age.remove(&(seen, key));
+        (seen.elapsed() < MEMBER_JOINS_KEEP).then_some(joined)
     }
 
     pub fn clear_guild(&self, guild: u64) {
-        self.inner.lock().retain(|(id, _), _| *id != guild);
+        let MemberJoinEntries { by_member, by_age } = &mut *self.inner.lock();
+        by_member.retain(|&key, &mut (_, seen)| {
+            if key.0 != guild {
+                return true;
+            }
+            by_age.remove(&(seen, key));
+            false
+        });
     }
 }
 
@@ -851,8 +1019,18 @@ impl EditReportDedup {
 
 #[derive(Default)]
 pub struct SnippetCache {
-    inner: Mutex<HashMap<(u64, u64, u64), Snippet>>,
+    inner: Mutex<SnippetEntries>,
 }
+
+type SnippetKey = (u64, u64, u64);
+
+#[derive(Default)]
+struct SnippetEntries {
+    by_guild: HashMap<u64, HashMap<(u64, u64), Snippet>>,
+    oldest: Option<SnippetKey>,
+    newest: Option<SnippetKey>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MessageOrigin {
     Unmarked,
@@ -868,34 +1046,99 @@ impl MessageOrigin {
 #[derive(Clone)]
 struct Snippet {
     at: Instant,
-    guild: u64,
     author: u64,
     origin: MessageOrigin,
+    older: Option<SnippetKey>,
+    newer: Option<SnippetKey>,
 }
 
+impl SnippetEntries {
+    fn get(&self, (guild, channel, message): SnippetKey) -> Option<&Snippet> {
+        self.by_guild.get(&guild)?.get(&(channel, message))
+    }
+
+    fn get_mut(&mut self, (guild, channel, message): SnippetKey) -> Option<&mut Snippet> {
+        self.by_guild.get_mut(&guild)?.get_mut(&(channel, message))
+    }
+
+    fn unlink(&mut self, older: Option<SnippetKey>, newer: Option<SnippetKey>) {
+        if let Some(older) = older {
+            self.get_mut(older).unwrap().newer = newer;
+        } else {
+            self.oldest = newer;
+        }
+        if let Some(newer) = newer {
+            self.get_mut(newer).unwrap().older = older;
+        } else {
+            self.newest = older;
+        }
+    }
+
+    fn remove(&mut self, (guild, channel, message): SnippetKey) -> Option<Snippet> {
+        let entries = self.by_guild.get_mut(&guild)?;
+        let removed = entries.remove(&(channel, message))?;
+        if entries.is_empty() {
+            self.by_guild.remove(&guild);
+        }
+        self.unlink(removed.older, removed.newer);
+        Some(removed)
+    }
+
+    fn expire(&mut self, now: Instant) {
+        // The links follow the observation order under the cache lock. Every
+        // live identity owns one place in this list, even across refreshes.
+        while let Some(key) = self.oldest
+            && now.duration_since(self.get(key).unwrap().at) >= SNIPPET_KEEP
+        {
+            self.remove(key);
+        }
+    }
+
+    fn remember(&mut self, key: SnippetKey, author: Option<u64>, webhook: bool, now: Instant) {
+        self.expire(now);
+        let previous = self.get(key);
+        let Some(author) = author
+            .filter(|id| *id != 0)
+            .or_else(|| previous.map(|entry| entry.author))
+        else {
+            return;
+        };
+        let origin = previous
+            .map_or(MessageOrigin::Unmarked, |entry| entry.origin)
+            .observe(webhook);
+        let (guild, channel, message) = key;
+        if let Some(previous) = previous {
+            self.unlink(previous.older, previous.newer);
+        } else if let Some(entries) = self.by_guild.get(&guild)
+            && entries.len() >= SNIPPETS_PER_GUILD
+            && let Some((&(old_channel, old_message), _)) =
+                entries.iter().min_by_key(|(_, entry)| entry.at)
+        {
+            self.remove((guild, old_channel, old_message));
+        }
+
+        let older = self.newest;
+        if let Some(older) = older {
+            self.get_mut(older).unwrap().newer = Some(key);
+        } else {
+            self.oldest = Some(key);
+        }
+        self.newest = Some(key);
+        self.by_guild.entry(guild).or_default().insert(
+            (channel, message),
+            Snippet {
+                at: now,
+                author,
+                origin,
+                older,
+                newer: None,
+            },
+        );
+    }
+}
+
+/// Remember an author without adding a webhook marker. Payload capture is separate.
 pub fn remember_message(
-    app: &BotState,
-    guild: u64,
-    channel: u64,
-    message: u64,
-    author: Option<u64>,
-    text: Option<&str>,
-    attachments: Option<&[String]>,
-) {
-    remember_message_create(
-        app,
-        guild,
-        channel,
-        message,
-        author,
-        text,
-        attachments,
-        false,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn remember_message_create(
     app: &BotState,
     guild: u64,
     channel: u64,
@@ -903,39 +1146,23 @@ pub(crate) fn remember_message_create(
     author: Option<u64>,
     _text: Option<&str>,
     _attachments: Option<&[String]>,
+) {
+    remember_message_create(app, guild, channel, message, author, false);
+}
+
+pub(crate) fn remember_message_create(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    author: Option<u64>,
     webhook: bool,
 ) {
-    let mut cache = app.log_snippets.inner.lock();
-    cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
-    let key = (guild, channel, message);
-    let Some(author) = author
-        .filter(|id| *id != 0)
-        .or_else(|| cache.get(&key).map(|s| s.author))
-    else {
-        return;
-    };
-    if cache.values().filter(|s| s.guild == guild).count() >= SNIPPETS_PER_GUILD
-        && !cache.contains_key(&key)
-        && let Some(oldest) = cache
-            .iter()
-            .filter(|(_, s)| s.guild == guild)
-            .min_by_key(|(_, s)| s.at)
-            .map(|(key, _)| *key)
-    {
-        cache.remove(&oldest);
-    }
-    let origin = cache
-        .get(&key)
-        .map_or(MessageOrigin::Unmarked, |old| old.origin)
-        .observe(webhook);
-    cache.insert(
-        key,
-        Snippet {
-            at: Instant::now(),
-            guild,
-            author,
-            origin,
-        },
+    app.log_snippets.inner.lock().remember(
+        (guild, channel, message),
+        author,
+        webhook,
+        Instant::now(),
     );
 }
 
@@ -957,8 +1184,6 @@ pub(crate) fn remember_message_update(
         event.channel_id.get(),
         event.id.get(),
         author,
-        None,
-        None,
         matches!(event.webhook_id, Some(Some(_))),
     );
 }
@@ -991,21 +1216,21 @@ fn known_message_identity_at(
     app.log_snippets
         .inner
         .lock()
-        .get(&(guild, channel, message))
+        .get((guild, channel, message))
         .filter(|snippet| now().duration_since(snippet.at) < SNIPPET_KEEP)
         .map(|snippet| (snippet.author, snippet.origin == MessageOrigin::Webhook))
 }
 
 fn take_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Option<Snippet> {
     let mut cache = app.log_snippets.inner.lock();
-    cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
-    cache.remove(&(guild, channel, message))
+    cache.expire(Instant::now());
+    cache.remove((guild, channel, message))
 }
 
 fn peek_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Option<Snippet> {
     let cache = app.log_snippets.inner.lock();
     cache
-        .get(&(guild, channel, message))
+        .get((guild, channel, message))
         .filter(|snippet| snippet.at.elapsed() < SNIPPET_KEEP)
         .cloned()
 }
@@ -1051,20 +1276,27 @@ pub(crate) async fn lookup_member_audit(
     let budget = Duration::from_secs(app.cfg.log.discord_timeout_secs)
         .div_f64(2.0)
         .min(Duration::from_secs(3));
-    tokio::time::timeout(budget, async {
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+    let deadline = TokioInstant::now() + budget;
+    tokio::time::timeout_at(deadline, async {
+        let mut retry_at = None;
+        for _ in 0..3 {
+            if let Some(retry_at) = retry_at {
+                tokio::time::sleep_until(retry_at).await;
             }
-            // Stop only on permanent subject ineligibility. The claim still
-            // checks under its lock because the subject can change during I/O.
-            if !app.member_audits.has_unclaimed_subject(observation) {
-                return None;
-            }
-            let logs = sink.member_audit(guild_id, observation.action).await.ok()?;
+            let logs = app
+                .member_audits
+                .fetch_page(
+                    sink,
+                    guild_id,
+                    observation,
+                    retry_at.unwrap_or(observation.observed_at),
+                    deadline,
+                )
+                .await?;
             if let Some(context) = app.member_audits.claim(observation, &logs) {
                 return Some(context);
             }
+            retry_at = Some(TokioInstant::now() + MEMBER_AUDIT_RETRY_DELAY);
         }
         None
     })
@@ -1639,29 +1871,6 @@ async fn emit_to_observed_with_audit(
         if !commit() {
             return Ok(Delivery::Dropped);
         }
-        if event == "message_edit"
-            && vars
-                .get("channel")
-                .is_some_and(|value| value.starts_with("<#"))
-            && let Some(id) = vars
-                .get("channel_id")
-                .and_then(|id| id.parse::<u64>().ok())
-                .filter(|id| *id != 0)
-        {
-            let budget = deadline
-                .saturating_sub(started.elapsed())
-                .div_f64(2.0)
-                .min(Duration::from_secs(3));
-            let name =
-                tokio::time::timeout(budget, sink.edit_channel_name(guild_id, ChannelId::new(id)))
-                    .await
-                    .ok()
-                    .flatten();
-            vars.insert(
-                "channel".into(),
-                format!("#{}", name.unwrap_or_else(|| id.to_string())),
-            );
-        }
         #[cfg(test)]
         if event == "automod"
             && AUTOMOD_VARS_CAPTURE
@@ -1692,6 +1901,44 @@ async fn emit_to_observed_with_audit(
                 None => default_template(event),
             }
         };
+        let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
+            guild: guild_id.get(),
+            channel: channel_id.get(),
+        };
+        // Optional enrichment: only a deliverable report that shows the source
+        // channel spends a Discord request on its name.
+        if event == "message_edit"
+            && substituted_key_count(template, "channel") > 0
+            && vars
+                .get("channel")
+                .is_some_and(|value| value.starts_with("<#"))
+            && let Some(id) = vars
+                .get("channel_id")
+                .and_then(|id| id.parse::<u64>().ok())
+                .filter(|id| *id != 0)
+        {
+            let name = if app.activation.may_record()
+                && !app
+                    .remembered_discord_targets
+                    .blocked(rest_target, Instant::now())
+            {
+                let budget = deadline
+                    .saturating_sub(started.elapsed())
+                    .div_f64(2.0)
+                    .min(Duration::from_secs(3));
+                tokio::time::timeout(budget, sink.edit_channel_name(guild_id, ChannelId::new(id)))
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                // A destination can recover before the final send checks.
+                None
+            };
+            vars.insert(
+                "channel".into(),
+                format!("#{}", name.unwrap_or_else(|| id.to_string())),
+            );
+        }
         templates::format_log_timestamps(&mut vars);
         if grouped_cleanup {
             // A mixed custom template may request values tied to one message.
@@ -1709,14 +1956,14 @@ async fn emit_to_observed_with_audit(
         {
             return Ok(Delivery::NothingToSend);
         }
-        let _ = render_log_template(event, template, &mut vars);
+        bound_log_template_vars(event, template, &mut vars);
+        #[cfg(test)]
+        if event == "message_edit" {
+            let _ = BEFORE_EDIT_DESTINATION_RECHECK.try_with(|recover| recover());
+        }
         if !app.activation.may_record() {
             return Ok(Delivery::Dropped);
         }
-        let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
-            guild: guild_id.get(),
-            channel: channel_id.get(),
-        };
         if app
             .remembered_discord_targets
             .blocked(rest_target, Instant::now())
@@ -2116,14 +2363,31 @@ fn split_automod_proving_content(content: &str) -> (Option<String>, String) {
     (None, content.to_string())
 }
 
-/// Flat review body with the existing evidence bounds. The embed delivery path
-/// reuses these variable bounds before rendering fields or a custom description.
-/// Automod `{content}` is bounded for every template, including a guild override.
+#[cfg(test)]
+thread_local! {
+    static FLAT_LOG_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn flat_log_renders() -> usize {
+    FLAT_LOG_RENDERS.with(std::cell::Cell::get)
+}
+
+/// Flat review body for evidence-bound tests.
+#[cfg(test)]
 pub(crate) fn render_log_template(
     event: &str,
     template: &str,
     vars: &mut BTreeMap<String, String>,
 ) -> String {
+    FLAT_LOG_RENDERS.with(|renders| renders.set(renders.get() + 1));
+    bound_log_template_vars(event, template, vars);
+    templates::render_bounded(template, vars, 2000)
+}
+
+/// Evidence bounds applied before rendering fields or a custom description.
+/// Automod `{content}` is bounded for every template, including a guild override.
+fn bound_log_template_vars(event: &str, template: &str, vars: &mut BTreeMap<String, String>) {
     if template == default_template(event) {
         bound_default_message_vars(event, vars);
     }
@@ -2136,7 +2400,6 @@ pub(crate) fn render_log_template(
             bound_automod_content_var(template, vars, 2000);
         }
     }
-    templates::render_bounded(template, vars, 2000)
 }
 
 fn substituted_key_count(template: &str, key: &str) -> usize {
@@ -4011,11 +4274,7 @@ fn verified_member_departure_vars(
 }
 
 fn default_template(event: &str) -> &'static str {
-    crate::defaults::rendered_log_templates()
-        .into_iter()
-        .find(|(e, _)| *e == event)
-        .map(|(_, t)| t)
-        .unwrap_or("**{event}**\n{content}")
+    crate::defaults::rendered_log_template(event).unwrap_or("**{event}**\n{content}")
 }
 
 #[cfg(test)]

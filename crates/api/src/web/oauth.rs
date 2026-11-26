@@ -4,6 +4,8 @@ use jmodguard_updater::http_client_builder;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use super::ObservedGuilds;
+
 pub struct OAuthClient {
     pub client_id: String,
     pub client_secret: String,
@@ -636,20 +638,22 @@ impl OAuthClient {
         &self,
         user_id: u64,
         access_token: &str,
-    ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
-        self.my_guilds_at(user_id, access_token, 0).await
+    ) -> std::result::Result<super::GuildList, GuildListError> {
+        self.my_guilds_at(user_id, access_token, 0)
+            .await
+            .map(|(_, guilds)| guilds)
     }
 
     /// The user's guild list. `access_epoch` is the gateway access epoch the
     /// caller read before this call: only lookups that read the same epoch
     /// share one request, so no caller keeps a result that started before a
     /// change its own epoch already includes.
-    pub async fn my_guilds_at(
+    pub(super) async fn my_guilds_at(
         &self,
         user_id: u64,
         access_token: &str,
         access_epoch: i64,
-    ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
+    ) -> std::result::Result<ObservedGuilds, GuildListError> {
         let user_key = format!("g:{user_id}");
         if let Some(retry_after) = self.route_remaining(&user_key) {
             return Err(GuildListError::RateLimited {
@@ -671,7 +675,12 @@ impl OAuthClient {
                     guard.finish(&error_outcome(&error));
                     return Err(error);
                 }
-                let result = self.fetch_guild_pages(&user_key, access_token).await;
+                // Followers may wake much later than this completed lookup.
+                // Share the payload and its observation time together.
+                let result = self
+                    .fetch_guild_pages(&user_key, access_token)
+                    .await
+                    .map(|guilds| (Instant::now(), guilds.into()));
                 guard.finish(&shared_outcome(&result));
                 result
             }
@@ -787,6 +796,18 @@ impl OAuthClient {
         self.route_remaining(&format!("g:{user_id}")).is_some()
     }
 
+    pub(super) fn guild_refresh_now(&self) -> Instant {
+        #[cfg(test)]
+        {
+            self.guild_list
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .now()
+        }
+        #[cfg(not(test))]
+        Instant::now()
+    }
+
     fn hold_for_body(&self, user_key: &str) -> (Instant, i64) {
         let mut gate = self
             .guild_list
@@ -845,7 +866,7 @@ impl OAuthClient {
     async fn wait_for_flight(
         &self,
         mut receiver: tokio::sync::watch::Receiver<GuildFlightUpdate>,
-    ) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
+    ) -> std::result::Result<ObservedGuilds, GuildListError> {
         loop {
             if let GuildFlightUpdate::Settled(outcome) = receiver.borrow().clone() {
                 return outcome_to_result(&outcome);
@@ -1117,14 +1138,14 @@ impl Drop for FlightGuard {
 
 #[derive(Clone)]
 enum SharedGuildOutcome {
-    Ok(Vec<DiscordGuild>),
+    Ok(ObservedGuilds),
     Limited { retry_after: Duration, fresh: bool },
     Unauthorized,
     Failed(String),
 }
 
 fn shared_outcome(
-    result: &std::result::Result<Vec<DiscordGuild>, GuildListError>,
+    result: &std::result::Result<ObservedGuilds, GuildListError>,
 ) -> SharedGuildOutcome {
     match result {
         Ok(guilds) => SharedGuildOutcome::Ok(guilds.clone()),
@@ -1145,7 +1166,7 @@ fn error_outcome(error: &GuildListError) -> SharedGuildOutcome {
 
 fn outcome_to_result(
     outcome: &SharedGuildOutcome,
-) -> std::result::Result<Vec<DiscordGuild>, GuildListError> {
+) -> std::result::Result<ObservedGuilds, GuildListError> {
     match outcome {
         SharedGuildOutcome::Ok(guilds) => Ok(guilds.clone()),
         SharedGuildOutcome::Limited { retry_after, fresh } => Err(GuildListError::RateLimited {

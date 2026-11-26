@@ -5,6 +5,7 @@ pub mod api;
 pub mod cases;
 mod directory;
 mod discord_retry;
+mod display_cache;
 mod legal;
 pub mod list_controls;
 pub mod members;
@@ -26,6 +27,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get};
 use axum::{Json, Router};
 use std::sync::Arc;
+use std::time::Instant;
 use tower_sessions::cookie::time::Duration as CookieDuration;
 use tower_sessions::cookie::{Cookie, SameSite};
 use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer};
@@ -33,6 +35,9 @@ use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer};
 use self::oauth::{DiscordGuild, DiscordUser};
 use self::state::ApiState;
 use crate::db::guild_data::AccessLevel;
+
+type GuildList = Arc<[DiscordGuild]>;
+type ObservedGuilds = (Instant, GuildList);
 
 const SESSION_USER: &str = "discord_user_id";
 const SESSION_TOKEN: &str = "access_token";
@@ -269,7 +274,7 @@ impl GuildAccess {
 #[derive(Clone)]
 pub struct AuthCtx {
     pub user: DiscordUser,
-    pub guilds: Vec<DiscordGuild>,
+    pub guilds: GuildList,
     enrollment: Option<crate::db::GuildEnrollment>,
     /// Role-mapped access verified for one guild during this request.
     role_access: Option<(u64, AccessLevel)>,
@@ -381,7 +386,7 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
             global_name: None,
             avatar: None,
         },
-        guilds: Vec::new(),
+        guilds: Arc::from([]),
         enrollment: None,
         role_access: None,
         guild_discovery_incomplete: false,
@@ -458,6 +463,7 @@ pub async fn require_auth_for_guilds(
 // as access marks invalidate it for that guild on the next request.
 const GUILD_REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
 const GUILD_REFRESH_JITTER_MS: u64 = 30_000;
+const GUILD_REFRESH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 const GUILD_AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(240);
 const GUILD_AUTH_MAX_STALE: std::time::Duration = std::time::Duration::from_secs(300);
 const _: () = assert!(
@@ -534,15 +540,27 @@ impl GuildSnapshotAge {
     }
 }
 
+#[derive(Clone)]
+struct GuildSnapshot {
+    /// Background authorization age starts at lookup initiation.
+    age_from: Instant,
+    /// Display observations are ordered by successful guild fetch completion.
+    observed_at: Instant,
+    guilds: GuildList,
+}
+
 #[derive(Default)]
 pub(super) struct SessionAuth {
     token: Option<String>,
     refresh: Option<String>,
-    guilds: Option<(std::time::Instant, Vec<DiscordGuild>)>,
+    guilds: Option<GuildSnapshot>,
     /// Access epoch read before `guilds` was fetched.
     guilds_epoch: i64,
     /// A background refresh of `guilds` is running.
     refreshing: bool,
+    /// Only background retries wait here. Foreground authorization uses the
+    /// snapshot's original observation time and the Discord rate-limit gate.
+    guild_refresh_retry_at: Option<std::time::Instant>,
     lifecycle: SessionLifecycle,
     last_used: Option<std::time::Instant>,
     refresh_hold: Option<RefreshHold>,
@@ -556,6 +574,7 @@ impl SessionAuth {
         self.token = None;
         self.refresh = None;
         self.guilds = None;
+        self.guild_refresh_retry_at = None;
         self.refresh_hold = None;
         self.refresh_backoff = std::time::Duration::ZERO;
     }
@@ -759,10 +778,10 @@ async fn require_auth_with(
         let cached = if guild_list_cache_allowed(guild_mode) {
             take_cached_guilds(guild_mode, app, user_id, false)
         } else {
-            state.guilds.as_ref().and_then(|(at, guilds)| {
-                GuildSnapshotAge::from_age(at.elapsed())
+            state.guilds.as_ref().and_then(|snapshot| {
+                GuildSnapshotAge::from_age(snapshot.age_from.elapsed())
                     .permits(cause)
-                    .then(|| (guilds.clone(), false))
+                    .then(|| (Arc::clone(&snapshot.guilds), false))
             })
         };
         if let Some((guilds, guild_discovery_incomplete)) = cached
@@ -812,6 +831,7 @@ async fn require_auth_with(
         state.release_refresh_hold();
         state.token = Some(refreshed.access_token.clone());
         state.guilds = None;
+        state.guild_refresh_retry_at = None;
         session
             .insert(SESSION_TOKEN, &refreshed.access_token)
             .await
@@ -864,10 +884,9 @@ async fn load_auth(
     state: &mut SessionAuth,
     shared: &Arc<tokio::sync::Mutex<SessionAuth>>,
 ) -> ApiResult<AuthCtx> {
-    let now = std::time::Instant::now();
     let cached_user = cached_user(app, user_id);
-    if let Some((at, _)) = &state.guilds {
-        let age = at.elapsed();
+    if let Some(snapshot) = &state.guilds {
+        let age = snapshot.age_from.elapsed();
         if age >= guild_refresh_after(user_id)
             && GuildSnapshotAge::from_age(age) == GuildSnapshotAge::Fresh
         {
@@ -882,24 +901,31 @@ async fn load_auth(
         return display_auth(app, user_id, token, cached_user, guilds, incomplete).await;
     }
 
-    let guilds = if let Some((at, guilds)) = &state.guilds
-        && GuildSnapshotAge::from_age(at.elapsed()) == GuildSnapshotAge::Fresh
+    let (snapshot, guilds_fetched) = if let Some(snapshot) = &state.guilds
+        && GuildSnapshotAge::from_age(snapshot.age_from.elapsed()) == GuildSnapshotAge::Fresh
     {
-        guilds.clone()
+        (snapshot.clone(), false)
     } else {
         let epoch = current_access_epoch(app).await;
         match app.oauth.my_guilds_at(user_id, token, epoch).await {
-            Ok(guilds) => {
-                state.guilds = Some((std::time::Instant::now(), guilds.clone()));
+            Ok((observed_at, guilds)) => {
+                let snapshot = GuildSnapshot {
+                    age_from: Instant::now(),
+                    observed_at,
+                    guilds,
+                };
+                state.guilds = Some(snapshot.clone());
                 state.guilds_epoch = epoch;
-                guilds
+                state.guild_refresh_retry_at = None;
+                (snapshot, true)
             }
             Err(oauth::GuildListError::RateLimited { .. })
-                if state.guilds.as_ref().is_some_and(|(at, _)| {
-                    GuildSnapshotAge::from_age(at.elapsed()).permits(RefreshFailure::RateLimited)
+                if state.guilds.as_ref().is_some_and(|snapshot| {
+                    GuildSnapshotAge::from_age(snapshot.age_from.elapsed())
+                        .permits(RefreshFailure::RateLimited)
                 }) =>
             {
-                state.guilds.as_ref().unwrap().1.clone()
+                (state.guilds.as_ref().unwrap().clone(), false)
             }
             Err(error) => {
                 return finish_guild_list(app, guild_mode, user_id, token, cached_user, error)
@@ -908,19 +934,28 @@ async fn load_auth(
         }
     };
 
-    let user = match cached_user {
-        Some(u) => u,
-        None => app.oauth.me(user_id, token).await.map_err(ApiError)?,
-    };
-
-    app.guild_cache.insert(user_id, (now, guilds.clone()));
-    app.user_cache.insert(user_id, (now, user.clone()));
+    // The accepted guild snapshot supplies permissions. A profile cooldown
+    // can use the signed-in identity even when the display entry was evicted.
+    let (user, source) = profile_for_guilds(app, user_id, token, cached_user).await?;
+    if source == ProfileSource::Live {
+        app.user_cache
+            .insert(user_id, (Instant::now(), user.clone()));
+    }
+    // Publish a successful guild lookup even if the profile is cooling down.
+    // A profile fallback alone does not refill a missing guild cache entry.
+    if guilds_fetched || source != ProfileSource::RateLimited {
+        app.guild_cache.insert(
+            user_id,
+            (snapshot.observed_at, Arc::clone(&snapshot.guilds)),
+        );
+    }
     let mut auth = AuthCtx {
         user,
-        guilds,
+        guilds: snapshot.guilds,
         enrollment: None,
         role_access: None,
-        guild_discovery_incomplete: false,
+        guild_discovery_incomplete: guild_list_cache_allowed(guild_mode)
+            && app.oauth.guild_route_limited(user_id),
     };
     preview::apply_overlay(&mut auth)?;
     Ok(auth)
@@ -936,23 +971,38 @@ fn start_guild_refresh(
     user_id: u64,
     token: &str,
 ) {
-    if state.refreshing {
+    if state.refreshing
+        || state
+            .guild_refresh_retry_at
+            .is_some_and(|at| at > app.oauth.guild_refresh_now())
+        || app.oauth.guild_route_limited(user_id)
+    {
         return;
     }
     state.refreshing = true;
     let refresh_profile = app
         .user_cache
         .get(&user_id)
-        .is_none_or(|entry| entry.value().0.elapsed() >= guild_refresh_after(user_id));
+        .is_none_or(|entry| entry.0.elapsed() >= guild_refresh_after(user_id));
     let app = Arc::clone(app);
     let shared = Arc::clone(shared);
     let token = token.to_owned();
     tokio::spawn(async move {
+        // Another session or Discord route can close the gate after scheduling.
+        if app.oauth.guild_route_limited(user_id) {
+            shared.lock().await.refreshing = false;
+            return;
+        }
         let started = std::time::Instant::now();
         let epoch = current_access_epoch(&app).await;
         let guilds = app.oauth.my_guilds_at(user_id, &token, epoch).await;
         let user = match (&guilds, refresh_profile) {
-            (Ok(_), true) => app.oauth.me(user_id, &token).await.ok(),
+            (Ok(_), true) => app
+                .oauth
+                .me(user_id, &token)
+                .await
+                .ok()
+                .map(|user| (Instant::now(), user)),
             _ => None,
         };
         let mut state = shared.lock().await;
@@ -960,15 +1010,31 @@ fn start_guild_refresh(
         if state.lifecycle.is_retired() || state.token.as_deref() != Some(token.as_str()) {
             return;
         }
-        if let Ok(guilds) = guilds
-            && state.guilds.as_ref().is_none_or(|(at, _)| *at <= started)
+        if state
+            .guilds
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.age_from <= started)
         {
-            state.guilds = Some((started, guilds.clone()));
-            state.guilds_epoch = epoch;
-            app.guild_cache.insert(user_id, (started, guilds));
+            match guilds {
+                Ok((observed_at, guilds)) => {
+                    state.guilds = Some(GuildSnapshot {
+                        age_from: started,
+                        observed_at,
+                        guilds: Arc::clone(&guilds),
+                    });
+                    state.guilds_epoch = epoch;
+                    state.guild_refresh_retry_at = None;
+                    app.guild_cache.insert(user_id, (observed_at, guilds));
+                }
+                Err(oauth::GuildListError::Unauthorized | oauth::GuildListError::Failed(_)) => {
+                    state.guild_refresh_retry_at =
+                        Some(app.oauth.guild_refresh_now() + GUILD_REFRESH_RETRY_DELAY);
+                }
+                Err(oauth::GuildListError::RateLimited { .. }) => {}
+            }
         }
-        if let Some(user) = user {
-            app.user_cache.insert(user_id, (started, user));
+        if let Some((observed_at, user)) = user {
+            app.user_cache.insert(user_id, (observed_at, user));
         }
     });
 }
@@ -1034,13 +1100,13 @@ async fn display_auth(
     user_id: u64,
     token: &str,
     cached_user: Option<DiscordUser>,
-    guilds: Vec<DiscordGuild>,
+    guilds: GuildList,
     guild_discovery_incomplete: bool,
 ) -> ApiResult<AuthCtx> {
-    let (user, source) = display_identity(app, user_id, token, cached_user).await?;
-    if source == DisplayIdentitySource::Live {
+    let (user, source) = profile_for_guilds(app, user_id, token, cached_user).await?;
+    if source == ProfileSource::Live {
         app.user_cache
-            .insert(user_id, (std::time::Instant::now(), user.clone()));
+            .insert(user_id, (Instant::now(), user.clone()));
     }
     let mut auth = AuthCtx {
         user,
@@ -1071,7 +1137,7 @@ fn guild_list_failure(user_id: u64, error: oauth::GuildListError) -> ApiError {
 
 fn cached_user(app: &ApiState, user_id: u64) -> Option<DiscordUser> {
     let entry = app.user_cache.get(&user_id)?;
-    let (fetched_at, user) = entry.value();
+    let (fetched_at, user) = entry.as_ref();
     if fetched_at.elapsed() < USER_CACHE_TTL {
         Some(user.clone())
     } else {
@@ -1080,33 +1146,34 @@ fn cached_user(app: &ApiState, user_id: u64) -> Option<DiscordUser> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DisplayIdentitySource {
-    CachedOrFallback,
+enum ProfileSource {
+    Cached,
+    RateLimited,
     Live,
 }
 
-/// Identity for a display response that is already returning cached guilds.
+/// Identity after the caller has selected a usable guild list.
 ///
 /// The fresh profile cache is used as-is. Otherwise live `/users/@me` still
 /// runs. When that call is rate-limited, the profile still stored after the
 /// five-minute profile TTL — or the session Discord user id — is enough to
-/// return the display list. Other `me` failures still fail the request.
+/// complete the guild response. Other `me` failures still fail the request.
 /// The fallback does not renew `user_cache`, so the next display read tries
 /// `me` again once Discord is no longer limiting it.
-async fn display_identity(
+async fn profile_for_guilds(
     app: &ApiState,
     user_id: u64,
     token: &str,
     cached_user: Option<DiscordUser>,
-) -> ApiResult<(DiscordUser, DisplayIdentitySource)> {
+) -> ApiResult<(DiscordUser, ProfileSource)> {
     if let Some(user) = cached_user {
-        return Ok((user, DisplayIdentitySource::CachedOrFallback));
+        return Ok((user, ProfileSource::Cached));
     }
     match app.oauth.me(user_id, token).await {
-        Ok(user) => Ok((user, DisplayIdentitySource::Live)),
+        Ok(user) => Ok((user, ProfileSource::Live)),
         Err(error) if error.downcast_ref::<oauth::DiscordRateLimit>().is_some() => Ok((
             display_user_during_limit(app, user_id),
-            DisplayIdentitySource::CachedOrFallback,
+            ProfileSource::RateLimited,
         )),
         Err(error) => Err(ApiError(error)),
     }
@@ -1114,7 +1181,7 @@ async fn display_identity(
 
 fn display_user_during_limit(app: &ApiState, user_id: u64) -> DiscordUser {
     if let Some(entry) = app.user_cache.get(&user_id) {
-        return entry.value().1.clone();
+        return entry.1.clone();
     }
     DiscordUser {
         id: user_id.to_string(),
@@ -1133,7 +1200,7 @@ fn take_cached_guilds(
     app: &ApiState,
     user_id: u64,
     lookup_rate_limited: bool,
-) -> Option<(Vec<DiscordGuild>, bool)> {
+) -> Option<(GuildList, bool)> {
     if !guild_list_cache_allowed(mode) {
         return None;
     }
@@ -1142,14 +1209,10 @@ fn take_cached_guilds(
         .guild_cache
         .get(&user_id)
         .filter(|entry| {
-            guild_display_usable(
-                entry.value().0.elapsed(),
-                GUILD_DISPLAY_CACHE_TTL,
-                incomplete,
-            )
+            guild_display_usable(entry.0.elapsed(), GUILD_DISPLAY_CACHE_TTL, incomplete)
         })
-        .map(|entry| entry.value().1.clone())
-        .or_else(|| lookup_rate_limited.then(Vec::new))?;
+        .map(|entry| Arc::clone(&entry.1))
+        .or_else(|| lookup_rate_limited.then(|| Arc::from([])))?;
     Some((guilds, incomplete))
 }
 
@@ -1460,6 +1523,7 @@ async fn callback_response(
             return finish(error_page(&format!("failed to fetch user: {e:#}")));
         }
     };
+    let profile_observed_at = Instant::now();
     let uid = user.id.parse::<u64>().unwrap_or(0);
     // Wait for any old-session refresh before rotation, then clear its payload.
     if let Some(app) = app
@@ -1479,13 +1543,12 @@ async fn callback_response(
         return finish(error_page("failed to rotate session"));
     }
     if let Some(app) = app {
-        app.user_cache
-            .insert(uid, (std::time::Instant::now(), user));
+        app.user_cache.insert(uid, (profile_observed_at, user));
         // Only a complete guild list enters either cache. A 429 leaves any
         // previous display list intact and the cooldown guides the next /api/me.
         let epoch = current_access_epoch(app).await;
-        if let Ok(guilds) = oauth.my_guilds_at(uid, &tok.access_token, epoch).await {
-            let observed_at = std::time::Instant::now();
+        if let Ok((observed_at, guilds)) = oauth.my_guilds_at(uid, &tok.access_token, epoch).await {
+            let age_from = Instant::now();
             // Rotation leaves the session without an ID until the store creates
             // the new record. Publish the permission snapshot before the
             // middleware returns the new session cookie.
@@ -1500,15 +1563,19 @@ async fn callback_response(
                 );
             }
             if let Some(id) = session.id() {
-                app.sweep_auth_sessions(observed_at);
+                app.sweep_auth_sessions(age_from);
                 app.auth_sessions.insert(
                     id,
                     Arc::new(tokio::sync::Mutex::new(SessionAuth {
                         token: Some(tok.access_token),
                         refresh: tok.refresh_token,
-                        guilds: Some((observed_at, guilds.clone())),
+                        guilds: Some(GuildSnapshot {
+                            age_from,
+                            observed_at,
+                            guilds: Arc::clone(&guilds),
+                        }),
                         guilds_epoch: epoch,
-                        last_used: Some(observed_at),
+                        last_used: Some(age_from),
                         ..SessionAuth::default()
                     })),
                 );
@@ -1692,6 +1759,36 @@ async fn app_js() -> impl IntoResponse {
 }
 
 #[cfg(feature = "embed-ui")]
+async fn webui_runtime(headers: HeaderMap) -> Response {
+    use axum::http::header::{ETAG, IF_NONE_MATCH};
+    use std::sync::LazyLock;
+
+    const CONTENT: &str = include_str!("../../../../dist/frontend/webui-runtime.js");
+    static TAG: LazyLock<HeaderValue> = LazyLock::new(|| {
+        let digest = jmodguard_updater::oci::sha256_hex(CONTENT.as_bytes());
+        HeaderValue::from_str(&format!("\"{digest}\"")).expect("valid hexadecimal ETag")
+    });
+    let not_modified = headers.get_all(IF_NONE_MATCH).iter().any(|value| {
+        let value = value.as_bytes().trim_ascii();
+        value == b"*"
+            || value.split(|byte| *byte == b',').any(|tag| {
+                let tag = tag.trim_ascii();
+                tag.strip_prefix(b"W/").unwrap_or(tag) == TAG.as_bytes()
+            })
+    });
+    let mut response = if not_modified {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        static_handler(CONTENT, "application/javascript; charset=utf-8").into_response()
+    };
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(ETAG, TAG.clone());
+    response
+}
+
+#[cfg(feature = "embed-ui")]
 async fn style_css() -> impl IntoResponse {
     static_handler(
         include_str!("../../../../dist/frontend/style.css"),
@@ -1832,6 +1929,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route("/administration", get(administration_index))
         .route("/administration/index.html", get(administration_index))
         .route("/administration.js", get(administration_js))
+        .route("/webui-runtime.js", get(webui_runtime))
         .route("/style.css", get(style_css));
     let sessioned = sessioned
         .route("/login", get(login))
@@ -1856,6 +1954,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route(
             "/api/platform/analytics",
             axum::routing::post(platform::analytics),
+        )
+        .route(
+            "/api/platform/analytics/members",
+            axum::routing::post(platform::members),
         )
         .route(
             "/api/database-usage/{id}",
@@ -3664,6 +3766,44 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK, "GET {path}");
         }
+        let runtime = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/webui-runtime.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.status(), StatusCode::OK);
+        assert_eq!(
+            runtime.headers()[axum::http::header::CONTENT_TYPE],
+            "application/javascript; charset=utf-8"
+        );
+        let tag = runtime.headers()[axum::http::header::ETAG]
+            .to_str()
+            .unwrap();
+        for (condition, expected) in [
+            (tag.to_owned(), StatusCode::NOT_MODIFIED),
+            (format!(r#""other,tag", W/{tag}"#), StatusCode::NOT_MODIFIED),
+            ("*".to_owned(), StatusCode::NOT_MODIFIED),
+            (r#"W/"previous-runtime""#.to_owned(), StatusCode::OK),
+        ] {
+            let revalidated = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/webui-runtime.js")
+                        .header(axum::http::header::IF_NONE_MATCH, &condition)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(revalidated.status(), expected, "If-None-Match: {condition}");
+            assert_eq!(revalidated.headers()[axum::http::header::ETAG], tag);
+        }
     }
 
     #[tokio::test]
@@ -3833,7 +3973,7 @@ mod tests {
                 global_name: None,
                 avatar: None,
             },
-            guilds: vec![],
+            guilds: Arc::from([]),
         }
     }
 
@@ -3943,7 +4083,7 @@ mod tests {
         };
         let now = std::time::Instant::now();
         app.user_cache.insert(user_id, (now, user));
-        app.guild_cache.insert(user_id, (now, guilds));
+        app.guild_cache.insert(user_id, (now, guilds.into()));
     }
 
     #[tokio::test]

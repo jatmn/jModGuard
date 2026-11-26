@@ -21,7 +21,7 @@ import {
 import {
   clearListLocation, ListControls, ListEmptyRow, ListLoadProgress, ListSortHeading, readListLocation,
   flushPendingListSearch, listLoadProgress, openFilteredList, readListPage, rememberListLocation, restoreListLocation,
-  setCaseListLocation, useListControls,
+  SEARCH_DELAY_MS, setCaseListLocation, useListControls,
 } from "./list-controls.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import { noAutofill } from "./no-autofill.js";
@@ -960,8 +960,8 @@ function DatabaseUsage() {
   );
 }
 
-// Platform analytics (#618): the fleet-wide owner view. One owner-only read
-// per range or Refresh; every panel renders from that response.
+// Platform analytics (#618): historical activity is range-dependent, while
+// current directory coverage stays with the mounted owner page.
 const PLATFORM_METRICS = [
   ["warns", "Warnings", "an-warns"],
   ["bans", "Bans", "an-bans"],
@@ -1041,18 +1041,24 @@ function platformServerLabel(row) {
 }
 
 // One server row with its display facts, enforcement actions and directory state.
-function platformRows(snapshot) {
-  const byGuild = snapshot?.members?.by_guild ?? {};
+function platformRows(snapshot, members, membersLoading, snapshotGuildIds) {
+  const byGuild = members?.by_guild ?? {};
   return (snapshot?.guilds ?? []).map((guild) => {
-    // An active server missing from the directory totals could not be read.
+    const outsideSnapshot = snapshotGuildIds && !snapshotGuildIds.has(guild.guild_id);
     const directory = guild.active ? byGuild[guild.guild_id] : null;
+    let coverage = null;
+    if (guild.active && !membersLoading) {
+      if (outsideSnapshot) coverage = "outside_snapshot";
+      else if (!directory) coverage = "unavailable";
+      else if (directory.coverage !== "complete") coverage = directory.coverage;
+    }
     return {
       ...guild,
       actions: platformActions(guild),
       previousActions: platformActions(guild.previous),
       members: directory ? directory.current : null,
       directory,
-      coverage: !guild.active ? null : !directory ? "unavailable" : directory.coverage === "complete" ? null : directory.coverage,
+      coverage,
     };
   });
 }
@@ -1192,7 +1198,9 @@ function PlatformServerTable({ rows, totals, rangeLabel }) {
           shown.length
             ? shown.map((row) => {
                 const delta = formatDelta(row.actions, row.previousActions);
-                const coverage = memberDirectoryBadge(row.directory || { coverage: row.coverage }, row.guild_id);
+                const coverage = row.coverage === "outside_snapshot"
+                  ? { label: "not in snapshot", tone: "warn", title: "This server was outside the saved member totals. Refresh to include it." }
+                  : memberDirectoryBadge(row.directory || { coverage: row.coverage }, row.guild_id);
                 return h(
                   "tr",
                   { key: row.guild_id },
@@ -1241,16 +1249,30 @@ function TabPlatformAnalytics() {
 
 function PlatformAnalytics() {
   const [days, setDays] = useState(30);
-  const result = useApiRead(`/api/platform/analytics?days=${days}`, { retainData: true });
+  const [legacy, setLegacy] = useState(false);
+  const historyPath = `/api/platform/analytics?days=${days}`;
+  const result = useApiRead(legacy ? historyPath : `${historyPath}&include_members=false`, { retainData: true });
+  const directory = useApiRead(legacy ? null : "/api/platform/analytics/members", { retainData: true });
+  const splitMissing = !legacy && directory.error?.status === 404;
+  useEffect(() => {
+    if (splitMissing) setLegacy(true);
+  }, [splitMissing]);
   const snapshot = result.data;
-  const loading = !snapshot && result.loading;
-  const failed = !snapshot && Boolean(result.error);
+  const checkingLegacy = splitMissing || (!legacy && directory.loading && result.error?.status === 400);
+  const historyError = checkingLegacy ? null : result.error;
+  const loading = !snapshot && !historyError;
+  const failed = !snapshot && Boolean(historyError);
   const rangeLabel = `${days} days`;
   const series = snapshot?.series;
   const points = React.useMemo(() => toTrendPoints(series), [series]);
   const previous = snapshot?.previous ?? null;
-  const members = snapshot?.members;
-  const rows = platformRows(snapshot);
+  const members = legacy ? snapshot?.members : directory.error?.status === 403 ? null : directory.data;
+  const membersLoading = !members && (legacy ? loading : splitMissing || (directory.loading && !directory.error));
+  const snapshotGuildIds = Array.isArray(members?.snapshot_guild_ids) ? new Set(members.snapshot_guild_ids) : null;
+  const rows = platformRows(snapshot, members, membersLoading, snapshotGuildIds);
+  const activeRows = rows.filter(row => row.active);
+  const fleetChanged = snapshot && snapshotGuildIds &&
+    (activeRows.length !== snapshotGuildIds.size || activeRows.some(row => row.coverage === "outside_snapshot"));
   const totals = Object.fromEntries(PLATFORM_METRICS.map(([field]) => [field, sumSeries(points, field === "mod_actions" ? "modActions" : field)]));
   const rankings = platformRankings(rows, totals);
   const tile = (label, field, color) =>
@@ -1265,17 +1287,22 @@ function PlatformAnalytics() {
       unavailable: failed,
       rangeLabel,
     });
-  const membersUnavailable = failed || (snapshot && (!members || members.status === "unavailable"));
-  const memberBadge = members?.status === "partial" ? { label: "partial", tone: "warn", title: platformMemberStatus(members) } : null;
+  const membersUnavailable = !members || members.status === "unavailable";
+  const fleetWarning = fleetChanged ? "Member totals and activity cover different sets of servers. Refresh to update both." : "";
+  const memberBadge = fleetChanged && !membersUnavailable
+    ? { label: "different server set", tone: "warn", title: fleetWarning }
+    : members?.status === "partial" ? { label: "partial", tone: "warn", title: platformMemberStatus(members) } : null;
   const netPrevious = previous?.joins == null || previous?.leaves == null ? null : previous.joins - previous.leaves;
   const body = (render) =>
     snapshot ? render() : h("p", { className: "an-empty muted", "aria-busy": loading ? "true" : "false" }, failed ? "Unavailable" : "Loading…");
   const rank = (title, id, props) => analyticsPanel(title, id, body(() => h(RankList, props)), "an-span-4");
-  const note = result.error
-    ? h("p", { id: "platform-analytics-status", className: "alert alert-soft alert-warning", role: "status" }, snapshot
-        ? `Platform analytics refresh failed: ${result.error.message}. Showing the last successful response (stale). ${members?.status === "complete" ? "" : platformMemberStatus(members)}`.trim()
-        : `Platform analytics unavailable: ${result.error.message}`)
-    : snapshot && members?.status !== "complete" && h("p", { id: "platform-analytics-status", className: "an-note muted", role: "status" }, platformMemberStatus(members));
+  const memberStatus = !membersLoading && members?.status !== "complete" ? platformMemberStatus(members) : "";
+  const memberWarning = directory.error && !splitMissing
+    ? members
+      ? `Member totals refresh failed. ${directory.error.message}. Showing the last successful response (stale). ${memberStatus}`.trim()
+      : `Member totals unavailable. ${directory.error.message}`
+    : "";
+  const memberNote = [memberWarning || memberStatus, fleetWarning].filter(Boolean).join(" ");
   return h(
     "div",
     { className: "contents chart-page analytics-page platform-page" },
@@ -1283,10 +1310,17 @@ function PlatformAnalytics() {
       "Platform analytics",
       `All servers · last ${rangeLabel} (UTC)`,
       h(RangeSelector, { value: days, onChange: setDays }),
-      h(ActionButton, { id: "refresh-platform-analytics", className: "btn btn-sm", onClick: () => result.refresh() }, "Refresh"),
+      h(ActionButton, { id: "refresh-platform-analytics", className: "btn btn-sm", onClick: () => {
+        result.refresh();
+        if (!legacy) directory.refresh();
+      } }, "Refresh"),
       h(InfoTip, { id: "platform-analytics-help", label: "About these figures" }, PLATFORM_HELP),
     ),
-    note,
+    historyError && h("p", { id: "platform-analytics-status", className: "alert alert-soft alert-warning", role: "status" },
+      snapshot
+        ? `Platform analytics refresh failed: ${historyError.message}. Showing the last successful response (stale).`
+        : `Platform analytics unavailable: ${historyError.message}`),
+    memberNote && h("p", { id: "platform-members-status", className: memberWarning ? "alert alert-soft alert-warning" : "an-note muted", role: "status" }, memberNote),
     h(
       "div",
       { id: "platform-analytics", className: "contents" },
@@ -1294,7 +1328,7 @@ function PlatformAnalytics() {
         "section",
         { className: "an-kpis", "aria-label": `Fleet totals for the last ${rangeLabel}` },
         h(KpiTile, { label: "Servers", value: snapshot?.servers ?? 0, loading, unavailable: failed, rangeLabel }),
-        h(KpiTile, { label: "Members", value: members?.current ?? 0, loading, unavailable: membersUnavailable, badge: memberBadge, rangeLabel }),
+        h(KpiTile, { label: "Members", value: members?.current ?? 0, loading: membersLoading, unavailable: membersUnavailable, badge: memberBadge, rangeLabel }),
         h(KpiTile, {
           label: "Net growth",
           value: totals.joins - totals.leaves,
@@ -3304,14 +3338,44 @@ function selectedGuild() {
   return state.guilds.find((g) => g.id === state.guildId);
 }
 
+function applySpamListPatch(config, patch) {
+  const rows = config[patch.kind];
+  if (!Array.isArray(rows) || patch.previous_revision !== config.config_revision ||
+    !/^[a-f0-9]{32}$/.test(patch.previous_revision) || !/^[a-f0-9]{32}$/.test(patch.revision)) return false;
+  const knownSpam = patch.kind === "known_spam";
+  const key = knownSpam ? "id" : "hash";
+  if (patch.operation === "add" && typeof patch.value?.[key] === "string") {
+    const row = patch.value;
+    if (knownSpam && row.guild_id !== "0" && row.guild_id !== state.guildId) return false;
+    // An unchanged row absent from this snapshot may be outside its bounded list.
+    if (patch.previous_revision === patch.revision && !rows.some((entry) => entry[key] === row[key])) return false;
+    const orderedKey = (entry) => knownSpam ? BigInt(entry.id) : entry.hash;
+    const updated = [...rows.filter((entry) => entry[key] !== row[key]), row];
+    updated.sort((a, b) => {
+      const left = orderedKey(a), right = orderedKey(b);
+      return left < right ? -1 : left > right ? 1 : 0;
+    });
+    config[patch.kind] = updated;
+  } else if (patch.operation === "delete" && typeof patch.value === "string") {
+    config[patch.kind] = rows.filter((entry) => entry[key] !== patch.value);
+  } else {
+    return false;
+  }
+  config.config_revision = patch.revision;
+  return true;
+}
+
 function applyConfigPatch(res) {
   const patch = res?.config_patch;
   const config = state.config;
   if (!patch || !config) return false;
+  const spamList = patch.kind === "known_spam" || patch.kind === "known_bad_images";
+  if (spamList && !applySpamListPatch(config, patch)) return false;
   // Any snapshot requested before this acknowledged commit is now stale.
   ++configRequest;
   state.configRead.activity = "idle";
   state.configRead.error = null;
+  if (spamList) return true;
   if (patch.kind === "rule") {
     const custom = isCustomRuleId(patch.id);
     if (custom && patch.value == null) {
@@ -3397,9 +3461,16 @@ function applyConfigPatch(res) {
   return false;
 }
 
-async function reloadAfter(work, onSuccess) {
+async function reloadAfter(work, onSuccess, capturedGuild) {
+  const request = configRequest;
+  const enrollment = state.config?.enrollment_id;
+  const user = state.me?.user.id;
   const res = await work();
-  if (!applyConfigPatch(res) && !(await loadConfig())) return;
+  const scoped = capturedGuild !== undefined;
+  if (scoped && (state.guildId !== capturedGuild || state.me?.user.id !== user)) return;
+  const canPatch = !scoped || (request === configRequest &&
+    state.configRead.activity !== "loading" && state.config?.enrollment_id === enrollment);
+  if (!(canPatch && applyConfigPatch(res)) && !(await loadConfig())) return;
   if (onSuccess) onSuccess(res);
   renderTab();
 }
@@ -4441,6 +4512,7 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
   const [found, setFound] = useState(null);
   const [error, setError] = useState("");
   const searchAbort = useRef(null);
+  const searchTimer = useRef(null);
   const flushRef = useRef(null);
   // Only results for the text now in the box can be chosen.
   const results = found && found.query === text.trim() ? found.members : null;
@@ -4455,9 +4527,15 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
     if (!id || ids.includes(id)) return;
     update(single ? [id] : [...ids, id]);
   };
-  // Drop shown results and ignore any search still in flight.
-  const clearSearch = () => {
+  // Stop a search still waiting for typing to settle or still in flight.
+  const cancelSearch = () => {
+    clearTimeout(searchTimer.current);
+    searchTimer.current = null;
     searchAbort.current?.abort();
+  };
+  // Drop shown results and ignore any pending search.
+  const clearSearch = () => {
+    cancelSearch();
     setFound(null);
   };
   const addTyped = () => {
@@ -4490,17 +4568,25 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
         : [];
   const useSelect = channelKinds !== null || (kind !== "user" && names.status === "loaded" && options.length > 0);
   const noun = kind === "role" ? "role" : kind === "channel" ? "channel" : "member";
-  const search = async (value) => {
-    searchAbort.current?.abort();
+  // Names wait for typing to settle, as list search does, so one name sends one read.
+  const search = (value) => {
+    cancelSearch();
     const q = value.trim();
     if (kind !== "user" || names.status === "unavailable" || !q || parseSnowflake(q)) {
       setFound(null);
       return;
     }
+    const guildId = state.guildId;
+    searchTimer.current = setTimeout(() => {
+      searchTimer.current = null;
+      if (state.guildId === guildId) return readMembers(guildId, q);
+    }, SEARCH_DELAY_MS);
+  };
+  const readMembers = async (guildId, q) => {
     const controller = new AbortController();
     searchAbort.current = controller;
     try {
-      const page = await apiRead(`/api/guilds/${state.guildId}/members?${new URLSearchParams({ q, limit: "8", status: memberStatus })}`, controller.signal);
+      const page = await apiRead(`/api/guilds/${guildId}/members?${new URLSearchParams({ q, limit: "8", status: memberStatus })}`, controller.signal);
       if (searchAbort.current === controller && !controller.signal.aborted) {
         setFound({ query: q, members: Array.isArray(page?.members) ? page.members : [] });
       }
@@ -4511,7 +4597,7 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
       }
     }
   };
-  useEffect(() => () => searchAbort.current?.abort(), []);
+  useEffect(() => cancelSearch, []);
   flushRef.current = addTyped;
   useEffect(() => {
     if (!pending) return undefined;
@@ -4537,10 +4623,17 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
         search(e.target.value);
       },
       onKeyDown: (e) => {
-        if (e.key !== "Enter") return;
+        // Enter that confirms an input method candidate belongs to the input method.
+        if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
         e.preventDefault();
         if (results?.length === 1 && !parseSnowflake(text)) {
           choose(results[0]);
+          return;
+        }
+        // A name still waiting for typing to settle is searched now, not rejected as an ID.
+        if (searchTimer.current && text.split(",").some((part) => !parseSnowflake(part))) {
+          cancelSearch();
+          readMembers(state.guildId, text.trim());
           return;
         }
         addTyped();
@@ -8769,24 +8862,17 @@ function openCaseView(props) {
   });
 }
 
+// The case-history contract admits at most this many entries per case, so one
+// page of this size holds the whole history.
+const CASE_HISTORY_MAX_ENTRIES = 64;
+
 async function loadCaseHistory(base, signal) {
-  // The history contract admits at most 64 entries; read on only when a page is full.
-  const limit = 64;
-  const entries = [];
-  let names = {};
-  let after = "0";
-  for (;;) {
-    const page = await api(`${base}/history?limit=${limit}&after=${after}`, "GET", null, signal);
-    const found = page?.history || [];
-    entries.push(...found);
-    names = { ...names, ...(page?.names || {}) };
-    if (found.length < limit) return { entries, names };
-    after = found[found.length - 1].sequence;
-  }
+  const page = await api(`${base}/history?limit=${CASE_HISTORY_MAX_ENTRIES}&after=0`, "GET", null, signal);
+  return { entries: page?.history || [], names: page?.names || {} };
 }
 
-// The case file dialog (#624). Opens at once with a loading state, then reads the
-// case, its history, its evidence and the server's channel names together.
+// The case file dialog (#624). Opens at once and reads the case, its history,
+// and its evidence together. Evidence channel names can arrive after rendering.
 function CaseView({ guildId, caseId, onRemoved, onFilter }) {
   const base = `/api/guilds/${guildId}/cases/${caseId}`;
   const [attempt, setAttempt] = useState(0);
@@ -8795,8 +8881,11 @@ function CaseView({ guildId, caseId, onRemoved, onFilter }) {
   const note = useRef({ intent: { kind: "empty" }, activity: "idle" }).current;
   useEffect(() => {
     const controller = new AbortController();
+    const enrollment = pageEnrollment(base, "POST");
+    const canReadChannelNames = () =>
+      state.guildId === guildId && pageEnrollment(base, "POST") === enrollment && tabAllowed("settings");
     let timedOut = false;
-    const timer = setTimeout(() => {
+    let timer = setTimeout(() => {
       timedOut = true;
       controller.abort();
     }, 30000);
@@ -8805,20 +8894,31 @@ function CaseView({ guildId, caseId, onRemoved, onFilter }) {
       apiRead(base, controller.signal),
       loadCaseHistory(base, controller.signal),
       apiRead(`${base}/evidence`, controller.signal),
-      // Channel names are a settings-level read; read-only access keeps channel IDs.
-      tabAllowed("settings") ? apiRead(`/api/guilds/${guildId}/server-names`, controller.signal).catch(() => null) : null,
     ]).then(
-      ([payload, history, evidence, serverNames]) => {
+      ([payload, history, evidence]) => {
+        clearTimeout(timer);
         if (controller.signal.aborted) return;
+        const c = payload?.case || {};
+        const files = Array.isArray(evidence?.evidence) ? evidence.evidence : [];
         setView({
           status: "ready",
-          c: payload?.case || {},
+          c,
           canDelete: !!payload?.can_delete,
           names: { ...(payload?.names || {}), ...history.names },
           history: history.entries,
-          files: Array.isArray(evidence?.evidence) ? evidence.evidence : [],
-          channels: Array.isArray(serverNames?.channels) ? serverNames.channels : [],
+          files,
+          channels: [],
         });
+        const texts = Array.isArray(c.evidence?.text) ? c.evidence.text : [];
+        if (!canReadChannelNames() || !(texts.some((item) => item.channel_id) || files.some((item) => item.channel_id))) return;
+        timer = setTimeout(() => controller.abort(), 30000);
+        return apiRead(`/api/guilds/${guildId}/server-names`, controller.signal).then(
+          (data) => {
+            if (controller.signal.aborted || !canReadChannelNames() || !Array.isArray(data?.channels)) return;
+            setView((current) => ({ ...current, channels: data.channels }));
+          },
+          () => {},
+        );
       },
       (error) => {
         if (controller.signal.aborted && !timedOut) return;
@@ -10176,10 +10276,13 @@ function CommandStep({ step, index, names, pending, onChange, remove }) {
 // whose Discord data has its own refresh interval. Sign-out and auth loss clear it.
 const READ_CACHE_PREFIX = "jmodguard.read:";
 const READ_CACHE_ENTRIES = 32;
-// Bound the combined length of stored keys and values to leave room for request identities.
+// Bound the combined length of keys and serialized values, both in storage (leaving
+// room for request identities) and for the copies kept in memory. That length is an
+// admission proxy, not JS heap bytes. A visible view keeps its own data either way.
 const READ_CACHE_STORAGE_LIMIT = 1024 * 1024;
 const READ_REFRESH_MS = 3 * 60 * 1000;
 const readCache = new Map();
+let readCacheWeight = 0;
 let readSessionEnding = false;
 
 function readCacheKey(path, listSize, enrollment) {
@@ -10188,14 +10291,28 @@ function readCacheKey(path, listSize, enrollment) {
   return READ_CACHE_PREFIX + JSON.stringify([apiBase(), user, path, listSize, enrollment]);
 }
 
-function rememberRead(key, entry) {
+function forgetRead(key) {
+  const old = readCache.get(key);
+  if (!old) return;
   readCache.delete(key);
-  readCache.set(key, entry);
-  if (readCache.size > READ_CACHE_ENTRIES) readCache.delete(readCache.keys().next().value);
+  readCacheWeight -= old.weight;
+}
+
+function rememberRead(key, entry, weight) {
+  const old = readCache.get(key);
+  weight ??= old?.entry === entry ? old.weight : key.length + JSON.stringify(entry).length;
+  forgetRead(key);
+  if (weight > READ_CACHE_STORAGE_LIMIT) return;
+  readCache.set(key, { entry, weight });
+  readCacheWeight += weight;
+  for (const oldKey of readCache.keys()) {
+    if (readCache.size <= READ_CACHE_ENTRIES && readCacheWeight <= READ_CACHE_STORAGE_LIMIT) break;
+    forgetRead(oldKey);
+  }
 }
 
 function cachedRead(key, shape) {
-  if (readCache.has(key)) return readCache.get(key);
+  if (readCache.has(key)) return readCache.get(key).entry;
   try {
     const saved = JSON.parse(window.sessionStorage.getItem(key));
     if (saved && Number.isSafeInteger(saved.at) && saved.at >= 0 && saved.at <= 8.64e15 && validDisplayRead(saved.data, shape)) {
@@ -10227,11 +10344,18 @@ function setSessionItemWithReadCacheFallback(storage, key, value) {
 
 function storeRead(key, data, at) {
   const entry = { at, data };
-  rememberRead(key, entry);
+  let value;
+  try {
+    value = JSON.stringify(entry);
+  } catch (_) {
+    // A response too large to serialize is too large to cache.
+    discardRead(key);
+    return;
+  }
+  const size = key.length + value.length;
+  rememberRead(key, entry, size);
   try {
     const storage = window.sessionStorage;
-    const value = JSON.stringify(entry);
-    const size = key.length + value.length;
     if (size > READ_CACHE_STORAGE_LIMIT) {
       storage.removeItem(key);
       return;
@@ -10250,7 +10374,7 @@ function storeRead(key, data, at) {
 }
 
 function discardRead(key) {
-  readCache.delete(key);
+  forgetRead(key);
   try {
     window.sessionStorage.removeItem(key);
   } catch (_) { /* Optional storage can be unavailable. */ }
@@ -10264,6 +10388,7 @@ function readAccessFailed(error, enrollment) {
 
 function clearReadCache() {
   readCache.clear();
+  readCacheWeight = 0;
   try {
     const storage = window.sessionStorage;
     for (const key of storedReadKeys(storage)) storage.removeItem(key);
@@ -10469,6 +10594,7 @@ function useApiRead(path, { retainData = false, listSize, collection } = {}) {
   const [result, setResult] = useState({ kind: "loading" });
   const cancel = useRef(null);
   useEffect(() => {
+    if (!path) return;
     const controller = new AbortController();
     let publication = "current";
     const timeout = collection ? null : setTimeout(() => controller.abort(), 30000);
@@ -10515,7 +10641,7 @@ function useApiRead(path, { retainData = false, listSize, collection } = {}) {
     };
   }, [path, revision, retainData, collection, listSize]);
   return {
-    loading: result.kind === "loading",
+    loading: Boolean(path) && result.kind === "loading",
     data: retainData ? (result.path === path ? result.data ?? null : null) : result.kind === "loaded" ? result.data : null,
     error: retainData ? (result.path === path ? result.error ?? null : null) : result.kind === "failed" ? result.error : null,
     progress: result.progress ?? null,
@@ -10807,6 +10933,9 @@ function tabKnownSpam() {
     const value = drafts[key]?.value || "";
     if (!value.trim()) return toast("Enter a full sample or URL pattern", "error");
     const scope = scopeRef.current.value;
+    const enrollment = state.config?.enrollment_id;
+    const samePage = () => state.guildId === guildId && state.tab === "known-spam" &&
+      state.config?.enrollment_id === enrollment;
     setKnownSpamAddError(key, null);
     try {
       await reloadAfter(async () => {
@@ -10814,15 +10943,15 @@ function tabKnownSpam() {
           scope, kind, value, note: drafts["known-spam:note"]?.value || null,
         });
         // Acknowledged: keep this scope selected, without a draft, even if the refresh fails.
-        ui.set({ draftBaselines: { ...ui.getSnapshot().draftBaselines, "known-spam:scope": scope } });
+        if (samePage()) ui.set({ draftBaselines: { ...ui.getSnapshot().draftBaselines, "known-spam:scope": scope } });
         return res;
-      }, () => toast("Known spam entry added", "success"));
+      }, () => toast("Known spam entry added", "success"), guildId);
     } catch (error) {
       // The browser cannot tell a rejected save from one whose outcome is unknown
       // or pending, so state only that the add was not confirmed.
       const label = kind === "sample" ? "Sample" : "URL pattern";
       const lookup = error?.saveLookup ? " Retrying the same entry, note and scope only looks up the earlier request; no new save was sent." : "";
-      setKnownSpamAddError(key, `${label} not confirmed as added: ${error?.message || error}${lookup}`);
+      if (samePage()) setKnownSpamAddError(key, `${label} not confirmed as added: ${error?.message || error}${lookup}`);
       throw error;
     }
   };
@@ -10901,8 +11030,7 @@ function tabKnownSpam() {
         h("td", null, canEditSettings() && (String(row.guild_id) !== "0" || isBotOwner() ? h(IconButton, { action: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm("Remove this known spam entry?")) return;
-            await api(`/api/guilds/${guildId}/known-spam/${row.id}`, "DELETE");
-            if (state.guildId === guildId && await loadConfig()) renderTab();
+            await reloadAfter(() => api(`/api/guilds/${guildId}/known-spam/${row.id}`, "DELETE"), undefined, guildId);
           },
         }) : h("span", { className: "muted" }, "Owner only"))),
       ),
@@ -10939,6 +11067,7 @@ function AddKnownBadImage({ guildId }) {
       await reloadAfter(
         () => api(`/api/guilds/${guildId}/known-bad-images`, "POST", { hash, note: note || null }),
         (result) => toast(result.changed ? "Hash added." : "Hash already listed.", "success"),
+        guildId,
       );
     },
   }, "Add hash");
@@ -10996,8 +11125,7 @@ function tabKnownBadImages() {
         h("td", null, canEditSettings() && h(IconButton, { action: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm(`Remove SHA-256 ${row.hash}?`)) return;
-            await api(`/api/guilds/${guildId}/known-bad-images/${row.hash}`, "DELETE");
-            if (state.guildId === guildId && await loadConfig()) renderTab();
+            await reloadAfter(() => api(`/api/guilds/${guildId}/known-bad-images/${row.hash}`, "DELETE"), undefined, guildId);
           },
         })),
       ),

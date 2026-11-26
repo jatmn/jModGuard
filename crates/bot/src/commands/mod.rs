@@ -1016,45 +1016,23 @@ async fn set_slash_commands(
     registry: &std::collections::HashMap<String, CommandDef>,
     target: u64,
     revision: &str,
-    registrations: &mut std::collections::HashMap<u64, serde_json::Value>,
+    registrations: &mut crate::state::SlashRegistrations,
 ) -> bool {
-    let mut commands: Vec<CreateCommand> = Vec::new();
-    let mut ordered: Vec<_> = registry.iter().collect();
-    ordered.sort_unstable_by_key(|(name, _)| *name);
-    for (_, cmd) in ordered {
-        if !cmd.enabled {
-            continue;
-        }
-        // Legacy rows predate WebUI validation. Keep their previous behavior
-        // rather than silently dropping commands when rebuilding Discord's
-        // whole guild command set after an upgrade.
-        let name = sanitize_slash_name(&cmd.name);
-        let description = slash_description(&cmd.description);
-        let mut builder = CreateCommand::new(name).description(description);
-        for opt in behaviors::slash_spec(&cmd.behavior) {
-            let description = templates::render(opt.description, &BTreeMap::new());
-            let mut o =
-                CreateCommandOption::new(opt.kind, opt.name, &description).required(opt.required);
-            if opt.kind == CommandOptionType::Integer {
-                o = o.min_int_value(0);
-            }
-            builder = builder.add_option(o);
-        }
-        commands.push(builder);
-    }
-    let payload = match serde_json::to_value(&commands) {
+    let commands = slash_commands(registry);
+    // Serenity sends this same serialization as the PUT body.
+    let payload = match serde_json::to_string(&commands) {
         Ok(payload) => payload,
         Err(error) => {
             tracing::warn!("slash sync: cannot serialize commands for {guild_id}: {error}");
             return false;
         }
     };
-    if registrations.get(&guild_id.get()) == Some(&payload) {
+    if registrations.matches(guild_id.get(), &payload) {
         return true;
     }
     // A failed or cancelled PUT may still reach Discord. Do not retain the
     // previous payload as proof that a later edit reverting to it needs no PUT.
-    registrations.remove(&guild_id.get());
+    registrations.remove(guild_id.get());
     tracing::info!(
         guild_id = guild_id.get(),
         target,
@@ -1097,6 +1075,34 @@ async fn set_slash_commands(
             false
         }
     }
+}
+
+fn slash_commands(registry: &std::collections::HashMap<String, CommandDef>) -> Vec<CreateCommand> {
+    let mut commands: Vec<CreateCommand> = Vec::new();
+    let mut ordered: Vec<_> = registry.iter().collect();
+    ordered.sort_unstable_by_key(|(name, _)| *name);
+    for (_, cmd) in ordered {
+        if !cmd.enabled {
+            continue;
+        }
+        // Legacy rows predate WebUI validation. Keep their previous behavior
+        // rather than silently dropping commands when rebuilding Discord's
+        // whole guild command set after an upgrade.
+        let name = sanitize_slash_name(&cmd.name);
+        let description = slash_description(&cmd.description);
+        let mut builder = CreateCommand::new(name).description(description);
+        for opt in behaviors::slash_spec(&cmd.behavior) {
+            let description = templates::render(opt.description, &BTreeMap::new());
+            let mut o =
+                CreateCommandOption::new(opt.kind, opt.name, &description).required(opt.required);
+            if opt.kind == CommandOptionType::Integer {
+                o = o.min_int_value(0);
+            }
+            builder = builder.add_option(o);
+        }
+        commands.push(builder);
+    }
+    commands
 }
 
 fn sanitize_slash_name(name: &str) -> String {
@@ -2523,6 +2529,13 @@ mod tests {
                         .collect::<Vec<_>>(),
                     vec![10, 20, 30]
                 );
+                {
+                    // Guild 10 keeps its local edit; the others share one payload.
+                    let registrations = app.slash_registrations.lock().await;
+                    assert!(registrations.shares_payload(20, 30));
+                    assert!(!registrations.shares_payload(10, 20));
+                    assert_eq!(registrations.distinct_payloads(), 2);
+                }
                 app.commit_slash_registry_version(changed);
 
                 // A second save during a PUT must survive completion of the old pass.
@@ -2655,8 +2668,14 @@ mod tests {
                 app.retry_slash_registry_version();
                 app.plan_slash_resync(changed, &[10, 20, 30]);
                 assert!(!app.finish_slash_resync(changed, [10].into_iter().collect()));
+                assert_eq!(app.slash_registrations.lock().await.distinct_payloads(), 2);
                 app.forget_slash_guild(10).await;
-                assert!(!app.slash_registrations.lock().await.contains_key(&10));
+                {
+                    let registrations = app.slash_registrations.lock().await;
+                    assert!(!registrations.contains(10));
+                    assert_eq!(registrations.distinct_payloads(), 1, "unused payload freed");
+                    assert!(registrations.shares_payload(20, 30));
+                }
                 let cache = Arc::new(serenity::cache::Cache::default());
                 requests.lock().clear();
                 // An older poll can still hold the departed guild's ID.
@@ -2665,7 +2684,7 @@ mod tests {
                         .await
                 );
                 assert!(requests.lock().is_empty());
-                assert!(!app.slash_registrations.lock().await.contains_key(&10));
+                assert!(!app.slash_registrations.lock().await.contains(10));
                 assert!(!app.finish_slash_resync(changed, [10].into_iter().collect()));
                 let crate::state::SlashResyncPlan::Sync { guilds, .. } =
                     app.plan_slash_resync(changed, &[20, 30])
@@ -2943,6 +2962,49 @@ mod tests {
         };
         assert!(!dm);
         assert_eq!(args.rest(), "use --dm");
+    }
+
+    /// Manual measurement of successful-registration state for 1,000 guilds on
+    /// the default commands, ten with a local override. Builds and compares the
+    /// real payloads; no Discord request is made. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "manual slash registration retention measurement"]
+    fn measure_slash_registration_retention() {
+        const GUILDS: u64 = 1_000;
+        let defaults: std::collections::HashMap<String, CommandDef> =
+            crate::defaults::default_commands()
+                .into_iter()
+                .map(|cmd| (cmd.name.clone(), cmd))
+                .collect();
+        let registry = |guild: u64| {
+            let mut registry = defaults.clone();
+            if guild.is_multiple_of(100) {
+                let mut cmd = crate::defaults::custom_command_fixture("local");
+                cmd.description = format!("guild {guild} override");
+                registry.insert(cmd.name.clone(), cmd);
+            }
+            registry
+        };
+        let registries: Vec<_> = (1..=GUILDS).map(registry).collect();
+        let mut registrations = crate::state::SlashRegistrations::default();
+        for (guild, registry) in (1..=GUILDS).zip(&registries) {
+            let payload = serde_json::to_string(&slash_commands(registry)).unwrap();
+            assert!(!registrations.matches(guild, &payload));
+            registrations.remove(guild);
+            registrations.insert(guild, payload);
+        }
+        let mut unshared = 0;
+        for (guild, registry) in (1..=GUILDS).zip(&registries) {
+            let payload = serde_json::to_string(&slash_commands(registry)).unwrap();
+            assert!(registrations.matches(guild, &payload));
+            unshared += payload.len();
+        }
+        assert_eq!(registrations.distinct_payloads(), 11);
+        println!(
+            "guilds={GUILDS} distinct_payloads={} retained_payload_bytes={} unshared_payload_bytes={unshared}",
+            registrations.distinct_payloads(),
+            registrations.payload_bytes(),
+        );
     }
 
     #[test]
@@ -3703,14 +3765,13 @@ mod tests {
             super::resolve_actor_member_for_enforcement(actor, Some(invocation), Some(cached))
                 .expect("invocation or cache member");
 
-        let (app, path) = temp_command_test_db();
+        let fixture = CommandTestFixture::new();
+        let app = &fixture.app;
         assert_eq!(
-            super::perm_level(&app, &guild_roles, &resolved),
+            super::perm_level(app, &guild_roles, &resolved),
             PermLevel::Everyone,
             "stale cached moderator roles must not override invocation payload"
         );
-        drop(app);
-        remove_command_test_db(&path);
     }
 
     #[test]
@@ -3729,14 +3790,13 @@ mod tests {
         let resolved = super::resolve_actor_member_for_enforcement(actor, None, Some(cached))
             .expect("cached member");
 
-        let (app, path) = temp_command_test_db();
+        let fixture = CommandTestFixture::new();
+        let app = &fixture.app;
         assert_eq!(
-            super::perm_level(&app, &guild_roles, &resolved),
+            super::perm_level(app, &guild_roles, &resolved),
             PermLevel::Mod,
             "cache remains the fallback when invocation member data is absent"
         );
-        drop(app);
-        remove_command_test_db(&path);
     }
 
     #[test]
@@ -3761,7 +3821,8 @@ mod tests {
             super::resolve_actor_member_for_enforcement(actor, Some(invocation), Some(cached))
                 .expect("member");
 
-        let (app, path) = temp_command_test_db();
+        let fixture = CommandTestFixture::new();
+        let app = &fixture.app;
         let cfg = CachedGuildConfig {
             version: 1,
             durable_version: 1,
@@ -3775,6 +3836,7 @@ mod tests {
             known_bad_hashes: None,
             known_spam: Default::default(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: HashMap::new(),
         };
         let ban_behavior = jmodguard::defaults::default_commands()
@@ -3799,14 +3861,12 @@ mod tests {
             builtin_override: false,
         };
         let denied =
-            super::check_enforcement(&app, &cfg, &cmd, &guild_roles, &member, ChannelId::new(1))
+            super::check_enforcement(app, &cfg, &cmd, &guild_roles, &member, ChannelId::new(1))
                 .expect_err("demoted caller must not pass mod-gated enforcement");
         assert!(
             denied.contains("permission"),
             "expected permission denial, got {denied}"
         );
-        drop(app);
-        remove_command_test_db(&path);
     }
 
     #[test]
@@ -3982,6 +4042,7 @@ mod tests {
             known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: HashMap::new(),
         };
         let roles = [];
@@ -4258,7 +4319,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_outcome_suppresses_reply_when_cutoff_wins_during_await() {
-        let (app, path) = temp_command_test_db();
+        let fixture = CommandTestFixture::new();
+        let app = &fixture.app;
         app.activation.mark_lock_held(true);
         cutoff_cancels_pending_discord_write(std::sync::Arc::clone(&app.activation)).await;
         let http = serenity::http::HttpBuilder::new("fixture")
@@ -4266,11 +4328,9 @@ mod tests {
             .ratelimiter_disabled(true)
             .build();
         assert_eq!(
-            raced_channel_say(&app, ChannelId::new(1), &http, 10, "pong".into()).await,
+            raced_channel_say(app, ChannelId::new(1), &http, 10, "pong".into()).await,
             RacedWrite::Cutoff
         );
-        drop(app);
-        remove_command_test_db(&path);
     }
 
     #[tokio::test]
@@ -4331,25 +4391,66 @@ mod tests {
         (http, calls, server)
     }
 
-    fn temp_command_test_db() -> (Arc<BotState>, std::path::PathBuf) {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("cmd_test_{:032x}.db", rand::random::<u128>()));
-        let db = db::Db::open(&path, 2).unwrap();
-        (BotState::new(Default::default(), db).unwrap(), path)
+    struct CommandTestDirectory(std::path::PathBuf);
+
+    impl Drop for CommandTestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
-    fn remove_command_test_db(path: &std::path::Path) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    struct CommandTestFixture {
+        // Fields drop in order, so the database closes before its directory is removed.
+        app: Arc<BotState>,
+        _directory: CommandTestDirectory,
+    }
+
+    impl CommandTestFixture {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("cmd_test_{:032x}", rand::random::<u128>()));
+            std::fs::create_dir(&path).unwrap();
+            let directory = CommandTestDirectory(path);
+            let db = db::Db::open(&directory.0.join("core.db"), 2).unwrap();
+            let app = BotState::new(Default::default(), db).unwrap();
+            Self {
+                app,
+                _directory: directory,
+            }
         }
-        crate::tenant::remove_sidecars(path);
+    }
+
+    #[test]
+    fn command_test_fixture_removes_its_scratch_directory_on_drop_and_unwind() {
+        let fixture = CommandTestFixture::new();
+        let path = fixture.app.db.path();
+        assert!(path.is_file());
+        let directory = path.parent().unwrap().to_path_buf();
+        assert_eq!(directory.parent(), Some(std::env::temp_dir().as_path()));
+        drop(fixture);
+        assert!(!directory.exists());
+
+        let fixture = CommandTestFixture::new();
+        let directory = fixture.app.db.path().parent().unwrap().to_path_buf();
+        let failure = std::thread::spawn(move || {
+            let _fixture = fixture;
+            std::panic::panic_any("command fixture unwind probe");
+        })
+        .join()
+        .expect_err("the test thread must unwind");
+        assert_eq!(
+            failure.downcast_ref::<&str>(),
+            Some(&"command fixture unwind probe")
+        );
+        assert!(!directory.exists());
     }
 
     #[tokio::test]
     async fn send_outcome_still_logs_when_confirmation_send_fails() {
         use std::sync::atomic::Ordering;
         let (http, calls, server) = discord_rejecting_proxy().await;
-        let (app, path) = temp_command_test_db();
+        let fixture = CommandTestFixture::new();
+        let app = &fixture.app;
         app.activation.mark_lock_held(true);
         db::upsert_log_channel(&app.db, 1, "mod_action", 99)
             .await
@@ -4359,7 +4460,7 @@ mod tests {
         let mut cmd = say_cmd("ok");
         cmd.log_event = "mod_action".into();
         send_outcome(
-            &app,
+            app,
             http.as_ref(),
             &cache,
             &cmd,
@@ -4374,15 +4475,14 @@ mod tests {
             "a failed confirmation must not skip the configured command log"
         );
         server.abort();
-        drop(app);
-        remove_command_test_db(&path);
     }
 
     #[tokio::test]
     async fn slash_success_still_logs_when_confirmation_edit_fails() {
         use std::sync::atomic::Ordering;
         let (http, calls, server) = discord_rejecting_proxy().await;
-        let (app, path) = temp_command_test_db();
+        let fixture = CommandTestFixture::new();
+        let app = &fixture.app;
         app.activation.mark_lock_held(true);
         db::upsert_log_channel(&app.db, 1, "mod_action", 99)
             .await
@@ -4414,7 +4514,7 @@ mod tests {
         assert_ne!(write, RacedWrite::Cutoff);
         if write != RacedWrite::Cutoff {
             log_outcome(
-                &app,
+                app,
                 http.as_ref(),
                 &cache,
                 &cmd,
@@ -4430,8 +4530,6 @@ mod tests {
             "a failed slash confirmation must not skip the configured command log"
         );
         server.abort();
-        drop(app);
-        remove_command_test_db(&path);
     }
 
     #[tokio::test]
@@ -4454,15 +4552,16 @@ mod tests {
             .application_id(serenity::model::id::ApplicationId::new(1))
             .ratelimiter_disabled(true)
             .build();
-        let (app, path) = temp_command_test_db();
+        let fixture = Arc::new(CommandTestFixture::new());
+        let app = &fixture.app;
         app.activation.mark_lock_held(true);
         let http = Arc::new(http);
         let task = tokio::spawn({
-            let app = Arc::clone(&app);
+            let fixture = Arc::clone(&fixture);
             let http = Arc::clone(&http);
             async move {
                 prefix_unknown_command_reply(
-                    &app,
+                    &fixture.app,
                     ChannelId::new(20),
                     http.as_ref(),
                     10,
@@ -4486,53 +4585,49 @@ mod tests {
             .expect("cutoff must cancel the unknown-command reply without waiting for REST timeout")
             .unwrap();
         server.abort();
-        drop(app);
-        remove_command_test_db(&path);
     }
 
     #[tokio::test]
     async fn raced_channel_say_skips_after_permanent_channel_failure() {
         use std::sync::atomic::Ordering;
         let (http, calls, server) = discord_rejecting_proxy().await;
-        let (app, path) = temp_command_test_db();
+        let fixture = CommandTestFixture::new();
+        let app = &fixture.app;
         app.activation.mark_lock_held(true);
-        raced_channel_say(&app, ChannelId::new(30), &http, 10, "hello".into()).await;
+        raced_channel_say(app, ChannelId::new(30), &http, 10, "hello".into()).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        raced_channel_say(&app, ChannelId::new(30), &http, 10, "hello".into()).await;
+        raced_channel_say(app, ChannelId::new(30), &http, 10, "hello".into()).await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
             "remembered 403 must not issue another REST call"
         );
         app.invalidate_configs();
-        raced_channel_say(&app, ChannelId::new(30), &http, 10, "hello".into()).await;
+        raced_channel_say(app, ChannelId::new(30), &http, 10, "hello".into()).await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
             "config invalidation must clear remembered channel failures"
         );
         server.abort();
-        drop(app);
-        remove_command_test_db(&path);
     }
 
     #[tokio::test]
     async fn oversized_prefix_reply_does_not_block_valid_follow_up() {
         use std::sync::atomic::Ordering;
         let (http, calls, server) = discord_rejecting_proxy().await;
-        let (app, path) = temp_command_test_db();
+        let fixture = CommandTestFixture::new();
+        let app = &fixture.app;
         app.activation.mark_lock_held(true);
-        raced_channel_say(&app, ChannelId::new(40), &http, 10, "x".repeat(2001)).await;
+        raced_channel_say(app, ChannelId::new(40), &http, 10, "x".repeat(2001)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        raced_channel_say(&app, ChannelId::new(40), &http, 10, "hello".into()).await;
+        raced_channel_say(app, ChannelId::new(40), &http, 10, "hello".into()).await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
             "payload validation failures must not park the channel"
         );
         server.abort();
-        drop(app);
-        remove_command_test_db(&path);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4560,7 +4655,8 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
-        let (app, path) = temp_command_test_db();
+        let fixture = CommandTestFixture::new();
+        let app = &fixture.app;
         let cfg = Arc::new(CachedGuildConfig {
             version: 1,
             durable_version: 1,
@@ -4577,6 +4673,7 @@ mod tests {
             known_spam: Default::default(),
             log_filters: Default::default(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: Default::default(),
         });
         let mut msg = serenity::model::channel::Message::default();
@@ -4584,7 +4681,7 @@ mod tests {
         msg.guild_id = Some(GuildId::new(10));
         msg.author.id = UserId::new(2);
         let result = handle_prefix(
-            &app,
+            app,
             &serenity::http::Http::new("unused"),
             &serenity::cache::Cache::default(),
             cfg,
@@ -4600,8 +4697,6 @@ mod tests {
             "must exercise the diagnostic"
         );
         assert!(!logs.contains("SENTINEL_PRIVATE_MESSAGE"));
-        drop(app);
-        remove_command_test_db(&path);
     }
 
     #[test]
@@ -4625,7 +4720,7 @@ mod tests {
         const WORKERS: usize = 8;
         const ROUNDS: usize = 50;
         let barrier = Arc::new(Barrier::new(WORKERS + 1));
-        let (app, path) = temp_command_test_db();
+        let fixture = Arc::new(CommandTestFixture::new());
         let cfg = Arc::new(CachedGuildConfig {
             version: 1,
             durable_version: 1,
@@ -4642,12 +4737,13 @@ mod tests {
             known_spam: Default::default(),
             log_filters: Default::default(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: Default::default(),
         });
         let mut workers = Vec::with_capacity(WORKERS);
         for _ in 0..WORKERS {
             let barrier = Arc::clone(&barrier);
-            let app = Arc::clone(&app);
+            let fixture = Arc::clone(&fixture);
             let cfg = Arc::clone(&cfg);
             workers.push(thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -4661,7 +4757,7 @@ mod tests {
                         msg.guild_id = Some(GuildId::new(10));
                         msg.author.id = UserId::new(3);
                         handle_prefix(
-                            &app,
+                            &fixture.app,
                             &serenity::http::Http::new("unused"),
                             &serenity::cache::Cache::default(),
                             Arc::clone(&cfg),
@@ -4695,7 +4791,7 @@ mod tests {
                 msg.guild_id = Some(GuildId::new(10));
                 msg.author.id = UserId::new(2);
                 let result = handle_prefix(
-                    &app,
+                    &fixture.app,
                     &serenity::http::Http::new("unused"),
                     &serenity::cache::Cache::default(),
                     Arc::clone(&cfg),
@@ -4719,8 +4815,6 @@ mod tests {
         for worker in workers {
             worker.join().unwrap();
         }
-        drop(app);
-        remove_command_test_db(&path);
     }
 
     #[tokio::test]
@@ -4734,7 +4828,8 @@ mod tests {
         use std::time::Instant;
 
         let (http, calls, server) = discord_rejecting_proxy().await;
-        let (app, path) = temp_command_test_db();
+        let fixture = CommandTestFixture::new();
+        let app = &fixture.app;
         app.activation.mark_lock_held(true);
         let cache = serenity::cache::Cache::default();
         let settings = GuildSettings {
@@ -4754,6 +4849,7 @@ mod tests {
             known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: HashMap::new(),
         });
         let mut author = User::default();
@@ -4764,7 +4860,7 @@ mod tests {
         msg.channel_id = ChannelId::new(20);
         msg.author = author;
         let http = Arc::new(http);
-        let result = handle_prefix(&app, http.as_ref(), &cache, cfg, &msg, None)
+        let result = handle_prefix(app, http.as_ref(), &cache, cfg, &msg, None)
             .await
             .expect("prefix dispatch should complete");
         assert!(!result);
@@ -4774,7 +4870,5 @@ mod tests {
             "unknown-command feedback must attempt exactly one raced channel send"
         );
         server.abort();
-        drop(app);
-        remove_command_test_db(&path);
     }
 }

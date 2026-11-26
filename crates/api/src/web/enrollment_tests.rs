@@ -9,6 +9,8 @@ use tower::ServiceExt;
 
 struct DiscordStub {
     guilds: std::sync::Mutex<Vec<oauth::DiscordGuild>>,
+    guild_responses:
+        std::sync::Mutex<std::collections::HashMap<&'static str, Arc<GuildResponseGate>>>,
     failed: AtomicBool,
     calls: AtomicUsize,
     token_calls: AtomicUsize,
@@ -18,6 +20,7 @@ struct DiscordStub {
     refresh_server_retry_after: std::sync::Mutex<Option<String>>,
     still_unauthorized: AtomicBool,
     me_unauthorized: AtomicBool,
+    me_rate_limited: AtomicBool,
     spent_budget: AtomicBool,
     rate_limited: AtomicBool,
     /// Discord marked the 429 as the shared global limit, which also closes `oauth.me`.
@@ -38,6 +41,12 @@ struct DiscordStub {
     member_rate_limited: AtomicBool,
     member_delay: std::sync::atomic::AtomicU64,
     member_calls: AtomicUsize,
+}
+
+#[derive(Default)]
+struct GuildResponseGate {
+    captured: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl DiscordStub {
@@ -112,6 +121,7 @@ impl Fixture {
     ) -> Self {
         let discord = Arc::new(DiscordStub {
             guilds: std::sync::Mutex::new(vec![managed_guild(10), managed_guild(20)]),
+            guild_responses: std::sync::Mutex::new(std::collections::HashMap::new()),
             failed: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
             token_calls: AtomicUsize::new(0),
@@ -121,6 +131,7 @@ impl Fixture {
             refresh_server_retry_after: std::sync::Mutex::new(None),
             still_unauthorized: AtomicBool::new(false),
             me_unauthorized: AtomicBool::new(false),
+            me_rate_limited: AtomicBool::new(false),
             spent_budget: AtomicBool::new(false),
             rate_limited: AtomicBool::new(false),
             global_scope: AtomicBool::new(false),
@@ -217,6 +228,9 @@ impl Fixture {
                         if handler.me_unauthorized.load(Ordering::SeqCst) {
                             return StatusCode::FORBIDDEN.into_response();
                         }
+                        if handler.me_rate_limited.load(Ordering::SeqCst) {
+                            return handler.rate_limit_response();
+                        }
                         let id = if headers.get("authorization").and_then(|value| value.to_str().ok())
                             == Some("Bearer other-user-token")
                         {
@@ -288,9 +302,16 @@ impl Fixture {
                     }
                     let guilds = if handler.limit_on_next_page.load(Ordering::SeqCst) {
                         (0..200).map(managed_guild).collect::<Vec<_>>()
+                    } else if query.contains_key("after") {
+                        Vec::new()
                     } else {
                         handler.guilds.lock().unwrap().clone()
                     };
+                    let gate = handler.guild_responses.lock().unwrap().remove(bearer);
+                    if let Some(gate) = gate {
+                        gate.captured.notify_one();
+                        gate.release.notified().await;
+                    }
                     let mut headers = HeaderMap::new();
                     if handler.spent_budget.load(Ordering::SeqCst) {
                         headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
@@ -979,29 +1000,144 @@ fn profile_older_than_user_ttl() -> std::time::Instant {
 }
 
 fn age_user_cache(app: &ApiState, user_id: u64) {
-    let user = {
-        app.user_cache
-            .get(&user_id)
-            .expect("seeded user")
-            .value()
-            .1
-            .clone()
-    };
     app.user_cache
-        .insert(user_id, (profile_older_than_user_ttl(), user));
+        .set_observed_at_for_test(&user_id, profile_older_than_user_ttl());
 }
 
 fn age_guild_cache(app: &ApiState, user_id: u64) {
-    let guilds = {
-        app.guild_cache
-            .get(&user_id)
-            .expect("seeded guilds")
-            .value()
-            .1
-            .clone()
-    };
     app.guild_cache
-        .insert(user_id, (profile_older_than_user_ttl(), guilds));
+        .set_observed_at_for_test(&user_id, profile_older_than_user_ttl());
+}
+
+#[tokio::test]
+async fn display_cache_churn_keeps_hot_users_and_evicts_cold_payloads() {
+    let f = Fixture::new(false).await;
+    const VISITORS: u64 = 4096;
+    const FIRST_VISITOR: u64 = 1000;
+    let mut hot_visits = 0;
+    let observed_at = f.app.user_cache.get(&42).unwrap().0;
+    for offset in 0..VISITORS {
+        let user_id = FIRST_VISITOR + offset;
+        let visit_at = observed_at + std::time::Duration::from_nanos(offset + 1);
+        let user = DiscordUser {
+            id: user_id.to_string(),
+            username: "synthetic-user".into(),
+            global_name: Some("Synthetic Display Name".into()),
+            avatar: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+        };
+        let list_len = [1, 4, 24, 200][offset as usize % 4];
+        let guilds = (0..list_len)
+            .map(|index| DiscordGuild {
+                id: (100_000_000_000_000_000u64 + index).to_string(),
+                name: "A synthetic guild with a descriptive name".into(),
+                icon: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+                owner: false,
+                permissions: Some(oauth::PermissionsField::String("36".into())),
+            })
+            .collect::<Vec<_>>();
+        f.app.user_cache.insert(user_id, (visit_at, user));
+        f.app.guild_cache.insert(user_id, (visit_at, guilds.into()));
+        if offset.is_multiple_of(32) {
+            let (status, me) = f.request("POST", "/api/me", "").await;
+            assert_eq!(status, StatusCode::OK, "{me}");
+            assert_eq!(me["user"]["username"], "tester");
+            assert_eq!(me["guilds"][0]["id"], "10");
+            hot_visits += 1;
+        }
+    }
+    let guild_calls = f.discord.calls.load(Ordering::SeqCst);
+    let profile_calls = f.discord.me_calls.load(Ordering::SeqCst);
+    let (profiles, profile_bytes) = f.app.user_cache.usage();
+    let (lists, guild_bytes) = f.app.guild_cache.usage();
+    eprintln!(
+        "Display churn: {profiles} profiles ({profile_bytes} payload bytes), {lists} guild lists ({guild_bytes} payload bytes), {hot_visits} hot hits, {profile_calls} profile calls, {guild_calls} guild calls"
+    );
+    assert_eq!((hot_visits, profile_calls, guild_calls), (128, 0, 0));
+    assert!(
+        f.app.user_cache.get(&FIRST_VISITOR).is_none(),
+        "cold profile retained"
+    );
+    assert!(
+        f.app.guild_cache.get(&FIRST_VISITOR).is_none(),
+        "cold guild list retained"
+    );
+
+    f.enroll(10).await;
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    let session = refresh_state(&f).await;
+    let last_guild_observation = session.lock().await.guilds.as_ref().unwrap().observed_at;
+    let user = f.app.user_cache.get(&42).unwrap().1.clone();
+
+    // Churn without returning to the once-hot user. Eviction must leave the
+    // token-bound snapshot available when a request still owns the session.
+    for offset in VISITORS..2 * VISITORS {
+        let visitor = FIRST_VISITOR + offset;
+        let visit_at = observed_at + std::time::Duration::from_nanos(offset + 1);
+        f.app.user_cache.insert(visitor, (visit_at, user.clone()));
+        f.app.guild_cache.insert(visitor, (visit_at, Arc::from([])));
+    }
+    assert!(f.app.user_cache.get(&42).is_none());
+    assert!(f.app.guild_cache.get(&42).is_none());
+    assert_eq!(
+        session.lock().await.guilds.as_ref().unwrap().observed_at,
+        last_guild_observation
+    );
+
+    *f.discord.retry_after.lock().unwrap() = "120".into();
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    f.discord.global_scope.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        f.app.oauth.my_guilds(42, "fixture-token").await,
+        Err(oauth::GuildListError::RateLimited { fresh: true, .. })
+    ));
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["user"]["id"], "42");
+    assert_eq!(me["user"]["username"], "");
+    assert_eq!(me["guilds"][0]["id"], "10");
+    assert_eq!(me["role_discovery_incomplete"], true);
+    assert!(
+        f.app.user_cache.get(&42).is_none(),
+        "fallback must not renew data"
+    );
+    assert!(
+        f.app.guild_cache.get(&42).is_none(),
+        "fallback must not renew data"
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
+
+    let (authorized_status, _) = f.request("GET", "/api/guilds/10/config", "").await;
+    assert!(f.app.guild_cache.get(&42).is_none());
+    let recovered_at = observed_at + std::time::Duration::from_nanos(2 * VISITORS + 1);
+    f.app.user_cache.insert(42, (recovered_at, user));
+    let (display_status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(me["guilds"][0]["id"], "10");
+    assert_eq!(
+        (
+            authorized_status,
+            display_status,
+            me["role_discovery_incomplete"].as_bool()
+        ),
+        (StatusCode::OK, StatusCode::OK, Some(true)),
+        "valid settings access and the display retry indicator survive eviction during cooldown"
+    );
+
+    // Keep a last-good display list and invalidate the permission snapshot.
+    // Display residency must never satisfy a marked authorization check.
+    tests::seed_auth_caches(&f.app, 42, vec![managed_guild(10)]);
+    db::record_access_marks(&f.app.db, vec![], vec![(10, 42)])
+        .await
+        .unwrap();
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+    assert!(session.lock().await.guilds.is_none());
 }
 
 #[tokio::test]
@@ -1026,7 +1162,6 @@ async fn display_keeps_cached_guilds_when_the_user_cache_is_cold_during_a_global
             .guild_cache
             .get(&42)
             .expect("warm guild list")
-            .value()
             .0
             .elapsed()
             < GUILD_DISPLAY_CACHE_TTL
@@ -5305,7 +5440,7 @@ async fn preview_profiles_apply_distinct_permission_views() {
 #[tokio::test]
 async fn expired_preview_is_removed_and_returns_a_distinct_lifecycle_error() {
     let f = Fixture::new(true).await;
-    let cached_at = f.app.user_cache.get(&42).unwrap().value().0;
+    let cached_at = f.app.user_cache.get(&42).unwrap().0;
     let token = "expired-preview".to_string();
     f.app.preview.insert(
         token.clone(),
@@ -5345,8 +5480,8 @@ async fn expire_auth_cache(app: &ApiState, age: std::time::Duration) {
         .map(|e| Arc::clone(e.value()))
         .collect();
     for entry in entries {
-        if let Some((at, _)) = &mut entry.lock().await.guilds {
-            *at = std::time::Instant::now().checked_sub(age).unwrap();
+        if let Some(snapshot) = &mut entry.lock().await.guilds {
+            snapshot.age_from = std::time::Instant::now().checked_sub(age).unwrap();
         }
     }
 }
@@ -5376,6 +5511,63 @@ async fn session_guild_requests_reuse_coalesce_and_refetch_after_expiry() {
         StatusCode::OK
     );
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn warm_authorization_shares_guilds_without_leaking_preview_permissions() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    *f.discord.guilds.lock().unwrap() = (1..=200)
+        .map(|id| oauth::DiscordGuild {
+            name: format!("synthetic guild {id}"),
+            icon: Some(format!("icon-{id}")),
+            permissions: Some(oauth::PermissionsField::String("32".into())),
+            ..managed_guild(id)
+        })
+        .collect();
+    let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+    let session = Session::new(Some(id), Arc::new(f.store.clone()), None);
+    let authorize = || async {
+        require_auth_for_guilds(&f.app, &session, &[10])
+            .await
+            .unwrap_or_else(|error| panic!("{:#}", error.0))
+    };
+    let first = authorize().await;
+    assert_eq!(first.guilds.len(), 200);
+    let observed_at = f.app.guild_cache.get(&42).unwrap().0;
+    let warm = authorize().await;
+    assert!(warm.can_manage(10));
+    assert!(std::ptr::eq(first.guilds.as_ptr(), warm.guilds.as_ptr()));
+
+    let (status, grant) = f
+        .request(
+            "POST",
+            "/api/preview",
+            r#"{"guild_id":"10","profile":"settings"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{grant}");
+    let token = grant["token"].as_str().unwrap();
+    let (status, preview) = f.request_preview("POST", "/api/me", "", token).await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let shown = preview["guilds"].as_array().unwrap();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0]["id"], "10");
+    assert_eq!(shown[0]["manage"], false);
+    assert_eq!(shown[0]["access"], "settings");
+
+    let normal = authorize().await;
+    assert!(normal.can_manage(10));
+    assert!(normal.can_manage(20));
+    assert!(std::ptr::eq(first.guilds.as_ptr(), normal.guilds.as_ptr()));
+    let display = f.app.guild_cache.get(&42).unwrap();
+    assert_eq!(display.0, observed_at);
+    assert!(std::ptr::eq(first.guilds.as_ptr(), display.1.as_ptr()));
+    assert_eq!(
+        f.discord.calls.load(Ordering::SeqCst),
+        2,
+        "only initial pages"
+    );
 }
 
 /// Waits until no session has a background guild refresh running.
@@ -5408,6 +5600,30 @@ fn revalidating_age() -> std::time::Duration {
     let age = GUILD_REFRESH_AFTER + std::time::Duration::from_millis(GUILD_REFRESH_JITTER_MS);
     assert!(age < GUILD_AUTH_CACHE_TTL);
     age
+}
+
+#[tokio::test]
+async fn warm_authorization_leaves_the_profile_due_for_background_refresh() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let read = || f.request("GET", "/api/guilds/10/config", "");
+    assert_eq!(read().await.0, StatusCode::OK);
+    let due_at = f.app.user_cache.get(&42).unwrap().0 - revalidating_age();
+    f.app.user_cache.set_observed_at_for_test(&42, due_at);
+    for _ in 0..3 {
+        assert_eq!(read().await.0, StatusCode::OK);
+    }
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
+
+    expire_auth_cache(&f.app, revalidating_age()).await;
+    assert_eq!(read().await.0, StatusCode::OK);
+    background_refreshes_finished(&f.app).await;
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
+    let profile = f.app.user_cache.get(&42).unwrap();
+    assert!(profile.0 > due_at);
+    assert_eq!(profile.1.username, "live-profile");
 }
 
 #[tokio::test]
@@ -5456,32 +5672,100 @@ async fn guild_reads_reuse_the_snapshot_for_minutes_and_refresh_it_in_the_backgr
 }
 
 #[tokio::test]
-async fn rate_limited_background_refresh_serves_the_snapshot_until_the_cooldown_ends() {
+async fn failed_background_refresh_paces_sequential_warm_reads() {
+    use std::time::Duration;
+
     let f = Fixture::new(false).await;
     f.enroll(10).await;
-    assert_eq!(
-        f.request("GET", "/api/guilds/10/config", "").await.0,
-        StatusCode::OK
-    );
+    let read = || f.request("GET", "/api/guilds/10/config", "");
+    assert_eq!(read().await.0, StatusCode::OK);
     expire_auth_cache(&f.app, revalidating_age()).await;
+    let received = f.app.oauth.freeze_test_time();
+    f.discord.failed.store(true, Ordering::SeqCst);
+
+    for (elapsed, expected_calls) in [(0, 2), (9, 2), (10, 3), (19, 3)] {
+        f.app.oauth.set_test_time(
+            received + Duration::from_secs(elapsed),
+            oauth::TEST_RECEIVED_MS + i64::try_from(elapsed).unwrap() * 1_000,
+        );
+        for _ in 0..3 {
+            let (status, body) = read().await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            background_refreshes_finished(&f.app).await;
+            assert_eq!(
+                f.discord.calls.load(Ordering::SeqCst),
+                expected_calls,
+                "guild-list attempts after {elapsed}s"
+            );
+        }
+    }
+
+    // The last failure gave a soft retry deadline at 20s. A hard-age lookup
+    // still runs immediately, and a 5xx may not authorize from the old list.
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    assert!(!read().await.0.is_success());
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
+    f.discord.failed.store(false, Ordering::SeqCst);
+    assert_eq!(read().await.0, StatusCode::OK);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test]
+async fn rate_limited_background_refresh_serves_the_snapshot_until_the_cooldown_ends() {
+    use std::time::Duration;
+
+    let probe = Arc::new(db::StartupProbe::default());
+    let _scope = db::enter_startup_probe(Some(Arc::clone(&probe)));
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let read = || f.request("GET", "/api/guilds/10/config", "");
+    assert_eq!(read().await.0, StatusCode::OK);
+    // This cold authorization reads the epoch but has no cached snapshot to
+    // check for marks. Identify the epoch's SQL path before warm reads add
+    // mark lookups under the same module.
+    let access_paths: Vec<_> = probe
+        .primary_labels()
+        .into_iter()
+        .filter(|label| label.starts_with("db/access_marks:"))
+        .collect();
+    let [epoch_path] = access_paths.as_slice() else {
+        panic!("expected one access epoch path: {access_paths:?}");
+    };
+    let epoch_statements = || probe.primary_statements(epoch_path);
+    let one_epoch_read = epoch_statements();
+    assert!(one_epoch_read > 0);
+
+    expire_auth_cache(&f.app, revalidating_age()).await;
+    let received = f.app.oauth.freeze_test_time();
     *f.discord.retry_after.lock().unwrap() = "120".into();
     f.discord.rate_limited.store(true, Ordering::SeqCst);
-    assert_eq!(
-        f.request("GET", "/api/guilds/10/config", "").await.0,
-        StatusCode::OK
-    );
+    assert_eq!(read().await.0, StatusCode::OK);
     background_refreshes_finished(&f.app).await;
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(epoch_statements(), 2 * one_epoch_read);
+
     for _ in 0..3 {
-        let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+        let (status, body) = read().await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        background_refreshes_finished(&f.app).await;
+        assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            epoch_statements(),
+            2 * one_epoch_read,
+            "cooling down must skip the background epoch query"
+        );
     }
-    background_refreshes_finished(&f.app).await;
-    assert_eq!(
-        f.discord.calls.load(Ordering::SeqCst),
-        2,
-        "the cooldown blocks further refreshes without failing reads"
+
+    f.discord.rate_limited.store(false, Ordering::SeqCst);
+    f.app.oauth.set_test_time(
+        received + Duration::from_secs(120),
+        oauth::TEST_RECEIVED_MS + 120_000,
     );
+    assert_eq!(read().await.0, StatusCode::OK);
+    background_refreshes_finished(&f.app).await;
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(epoch_statements(), 3 * one_epoch_read);
 }
 
 #[tokio::test]
@@ -5700,6 +5984,29 @@ async fn display_saves_live_profile_while_guilds_are_cooling_down() {
 }
 
 #[tokio::test]
+async fn display_publishes_new_guilds_during_profile_cooldown() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    tests::seed_auth_caches(&f.app, 42, vec![managed_guild(10)]);
+    age_user_cache(&f.app, 42);
+    *f.discord.retry_after.lock().unwrap() = "120".into();
+    f.discord.me_rate_limited.store(true, Ordering::SeqCst);
+
+    let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
+
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["guilds"][1]["id"], "20", "new guild observation lost");
+    assert_eq!(me["role_discovery_incomplete"], false);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn authorization_snapshots_are_not_shared_between_sessions_or_tokens() {
     let f = Fixture::new(false).await;
     let first = tests::session_for_user(42).await;
@@ -5734,6 +6041,141 @@ async fn authorization_snapshots_are_not_shared_between_sessions_or_tokens() {
             .guilds
             .is_empty()
     );
+    assert!(f.app.guild_cache.get(&42).unwrap().1.is_empty());
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn background_guild_observation_supersedes_overlapping_foreground_response() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let read = || f.request("GET", "/api/guilds/10/config", "");
+    assert_eq!(read().await.0, StatusCode::OK);
+    expire_auth_cache(&f.app, revalidating_age()).await;
+
+    let foreground = Arc::new(GuildResponseGate::default());
+    f.discord
+        .guild_responses
+        .lock()
+        .unwrap()
+        .insert("Bearer refreshed-token", Arc::clone(&foreground));
+    let old_request = {
+        let app = Arc::clone(&f.app);
+        tokio::spawn(async move {
+            let session = tests::session_for_user(42).await;
+            session
+                .insert(SESSION_TOKEN, "refreshed-token")
+                .await
+                .unwrap();
+            require_auth_fresh(&app, &session)
+                .await
+                .unwrap_or_else(|error| panic!("{:#}", error.0))
+        })
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        foreground.captured.notified(),
+    )
+    .await
+    .expect("foreground captures the old list");
+
+    *f.discord.guilds.lock().unwrap() = vec![managed_guild(20)];
+    let background = Arc::new(GuildResponseGate::default());
+    f.discord
+        .guild_responses
+        .lock()
+        .unwrap()
+        .insert("Bearer fixture-token", Arc::clone(&background));
+    assert_eq!(read().await.0, StatusCode::OK);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        background.captured.notified(),
+    )
+    .await
+    .expect("background captures the new list");
+
+    foreground.release.notify_one();
+    assert!(old_request.await.unwrap().can_manage(10));
+    let foreground_observed_at = f.app.guild_cache.get(&42).unwrap().0;
+    background.release.notify_one();
+    background_refreshes_finished(&f.app).await;
+
+    let observed_at = f.app.guild_cache.get(&42).unwrap().0;
+    let session = refresh_state(&f).await;
+    let snapshot = session.lock().await.guilds.clone().unwrap();
+    assert!(snapshot.age_from <= foreground_observed_at);
+    assert!(observed_at > foreground_observed_at);
+    assert_eq!(observed_at, snapshot.observed_at);
+
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let guilds = me["guilds"].as_array().unwrap();
+    assert_eq!(guilds.len(), 1, "{me}");
+    assert_eq!(guilds[0]["id"], "20");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn delayed_guild_follower_keeps_the_original_observation() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let gate = Arc::new(GuildResponseGate::default());
+    f.discord
+        .guild_responses
+        .lock()
+        .unwrap()
+        .insert("Bearer fixture-token", Arc::clone(&gate));
+    let mut leader = std::pin::pin!(f.app.oauth.my_guilds_at(42, "fixture-token", 0));
+    tokio::select! {
+        result = &mut leader => panic!("leader must remain in flight: {result:?}"),
+        captured = tokio::time::timeout(std::time::Duration::from_secs(10), gate.captured.notified()) => {
+            captured.expect("leader captures the old guild list");
+        }
+    }
+
+    let mut follower = std::pin::pin!(f.app.oauth.my_guilds_at(42, "fixture-token", 0));
+    // Poll once to subscribe to the flight. Do not poll it again until the
+    // later independent request has already published its display result.
+    tokio::select! {
+        biased;
+        result = &mut follower => panic!("follower must wait for the leader: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    gate.release.notify_one();
+    let (leader_observed_at, leader_guilds) = leader.await.unwrap();
+    *f.discord.guilds.lock().unwrap() = vec![managed_guild(20)];
+    let session = tests::session_for_user(42).await;
+    session
+        .insert(SESSION_TOKEN, "refreshed-token")
+        .await
+        .unwrap();
+    let newer = require_auth_fresh(&f.app, &session)
+        .await
+        .unwrap_or_else(|error| panic!("{:#}", error.0));
+    assert!(!newer.can_manage(10));
+
+    let (observed_at, guilds) = follower.await.unwrap();
+    let shares_payload = Arc::ptr_eq(&leader_guilds, &guilds);
+    f.app
+        .guild_cache
+        .insert(42, (observed_at, Arc::clone(&guilds)));
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let shown = me["guilds"].as_array().unwrap();
+    assert_eq!(shown.len(), 1, "{me}");
+    assert_eq!(shown[0]["id"], "20");
+
+    // The delayed observation also cannot repopulate the slot after eviction.
+    f.app.guild_cache.remove(&42);
+    f.app.guild_cache.insert(42, (observed_at, guilds));
+    assert!(
+        f.app.guild_cache.get(&42).is_none(),
+        "evicted newer guilds cannot be replaced by an old observation"
+    );
+    assert_eq!(observed_at, leader_observed_at);
+    assert!(shares_payload);
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
 }
 
@@ -5779,7 +6221,7 @@ async fn recovery_routes_require_an_authenticated_owner() {
     assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
     assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
     let f = Fixture::new(true).await;
-    let cached_at = f.app.user_cache.get(&42).unwrap().value().0;
+    let cached_at = f.app.user_cache.get(&42).unwrap().0;
     let token = "synthetic-preview";
     f.app.preview.insert(
         token.into(),
@@ -5840,6 +6282,7 @@ async fn owner_routes_reject_a_discord_administrator() {
         ("POST", "/api/database-usage", ""),
         ("POST", "/api/database-usage/{id}", ""),
         ("POST", "/api/platform/analytics", ""),
+        ("POST", "/api/platform/analytics/members", ""),
         ("GET", "/api/updates", ""),
         ("POST", "/api/updates", ""),
         ("POST", "/api/updates/check", r#"{"component":"api"}"#),
@@ -7028,7 +7471,7 @@ async fn fresh_login_config_reuses_callback_snapshot_when_bucket_is_exhausted() 
     f.enroll(10).await;
     f.discord.spent_budget.store(true, Ordering::SeqCst);
     login_without_cached_discord_data(&mut f).await;
-    let observed_at = f.app.guild_cache.get(&42).unwrap().value().0;
+    let observed_at = f.app.guild_cache.get(&42).unwrap().0;
 
     let (status, me) = f.request("POST", "/api/me", "").await;
     assert_eq!(status, StatusCode::OK, "{me}");
@@ -7042,7 +7485,7 @@ async fn fresh_login_config_reuses_callback_snapshot_when_bucket_is_exhausted() 
     {
         let state = state.lock().await;
         assert_eq!(state.token.as_deref(), Some("refreshed-token"));
-        assert_eq!(state.guilds.as_ref().unwrap().0, observed_at);
+        assert_eq!(state.guilds.as_ref().unwrap().observed_at, observed_at);
     }
 
     let login_cookie = f.cookie.clone();
@@ -7584,10 +8027,87 @@ async fn known_bad_image_routes_require_current_page_and_live_permission() {
 }
 
 #[tokio::test]
+async fn known_bad_image_http_omits_stale_patch_after_writer_recovers_a_lost_reply() {
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_op(
+        listener: &TcpListener,
+        nonces: &Mutex<jmodguard::control::NonceWindow>,
+    ) -> (TcpStream, db::ControlOp, String) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut frame = vec![0; stream.read_u32().await.unwrap() as usize];
+        stream.read_exact(&mut frame).await.unwrap();
+        let (op, actor, _, id) =
+            jmodguard::control::open_frame(&[b'x'; 32], &frame, nonces).unwrap();
+        assert_eq!(actor, 42);
+        (stream, op, id)
+    }
+
+    for captured_save in [true, false] {
+        let mut f = Fixture::new(false).await;
+        f.enroll(10).await;
+        let writer = f.app.db.clone();
+        let enrollment = db::guild_enrollment(&writer, 10).await.unwrap().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        f.use_writer_link(listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let nonces = Mutex::new(jmodguard::control::NonceWindow::new());
+            let (first, op, id) = read_op(&listener, &nonces).await;
+            let db::ControlOp::AddKnownBadImage { scope, hash, .. } = &op else {
+                panic!("expected the original image add, got {op:?}");
+            };
+            let remove = db::ControlOp::RemoveKnownBadImage {
+                scope: scope.clone(),
+                hash: hash.clone(),
+            };
+            let reply = db::apply_control(&writer, None, op, None).await.unwrap();
+            assert!(matches!(&reply, db::ControlReply::Saved { body }
+                if body["changed"] == true && body["config_patch"]["kind"] == "known_bad_images"));
+            // Another moderator's write lands while the original reply is lost.
+            let removed = db::apply_control(&writer, None, remove, None)
+                .await
+                .unwrap();
+            assert!(matches!(removed, db::ControlReply::Saved { .. }));
+            drop(first);
+            let (mut lookup, op, lookup_id) = read_op(&listener, &nonces).await;
+            assert!(matches!(op, db::ControlOp::LookupResult));
+            assert_eq!(lookup_id, id);
+            let frame = serde_json::to_vec(&reply).unwrap();
+            lookup.write_u32(frame.len() as u32).await.unwrap();
+            lookup.write_all(&frame).await.unwrap();
+        });
+
+        let path = "/api/guilds/10/known-bad-images";
+        let image = serde_json::json!({"hash": "ab".repeat(32)});
+        let (status, saved) = if captured_save {
+            f.request_save(
+                "POST",
+                path,
+                &image,
+                (&"1".repeat(64), false),
+                &enrollment.id,
+            )
+            .await
+        } else {
+            f.request("POST", path, &image.to_string()).await
+        };
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        peer.await.unwrap();
+        let (status, current) = f.request("POST", "/api/guilds/10/config", "").await;
+        assert_eq!(status, StatusCode::OK, "{current}");
+        assert!(current["known_bad_images"].as_array().unwrap().is_empty());
+        assert_eq!(saved, serde_json::json!({"ok": true, "changed": true}));
+    }
+}
+
+#[tokio::test]
 async fn known_bad_image_http_add_list_remove_accepts_only_safe_metadata() {
     let f = Fixture::new(false).await;
     f.enroll(10).await;
     let hash = "ab".repeat(32);
+    let (_, before) = f.request("POST", "/api/guilds/10/config", "").await;
     let body =
         serde_json::json!({"hash": hash.to_uppercase(), "note": "confirmed spam"}).to_string();
     let (status, saved) = f
@@ -7603,6 +8123,14 @@ async fn known_bad_image_http_add_list_remove_accepts_only_safe_metadata() {
     assert_eq!(rows[0]["actor"], "unknown");
     assert_eq!(rows[0]["added_via"], "webui");
     assert_eq!(rows[0].as_object().unwrap().len(), 5);
+    assert_eq!(
+        saved["config_patch"],
+        serde_json::json!({
+            "kind": "known_bad_images", "operation": "add", "value": rows[0],
+            "previous_revision": before["config_revision"], "revision": config["config_revision"]
+        })
+    );
+    assert_ne!(before["config_revision"], config["config_revision"]);
     for invalid in [
         serde_json::json!({"hash": "unknown"}),
         serde_json::json!({"note": "missing digest"}),
@@ -7619,27 +8147,39 @@ async fn known_bad_image_http_add_list_remove_accepts_only_safe_metadata() {
             StatusCode::OK
         );
     }
-    assert_eq!(
-        f.request("POST", "/api/guilds/10/known-bad-images", &body)
-            .await
-            .1["changed"],
-        false
-    );
-    assert_eq!(
-        f.request(
-            "DELETE",
-            &format!("/api/guilds/10/known-bad-images/{hash}"),
-            ""
+    let duplicate = serde_json::json!({"hash": hash.to_uppercase(), "note": "a different note"});
+    let (status, saved) = f
+        .request(
+            "POST",
+            "/api/guilds/10/known-bad-images",
+            &duplicate.to_string(),
         )
-        .await
-        .0,
-        StatusCode::OK
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["changed"], false);
+    assert_eq!(saved["config_patch"]["value"], rows[0]);
+    assert_eq!(
+        saved["config_patch"]["previous_revision"],
+        config["config_revision"]
     );
-    assert!(
-        f.request("POST", "/api/guilds/10/config", "").await.1["known_bad_images"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+    assert_eq!(saved["config_patch"]["revision"], config["config_revision"]);
+
+    let (status, removed) = f
+        .request(
+            "DELETE",
+            &format!("/api/guilds/10/known-bad-images/{}", hash.to_uppercase()),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    let (_, after) = f.request("POST", "/api/guilds/10/config", "").await;
+    assert!(after["known_bad_images"].as_array().unwrap().is_empty());
+    assert_eq!(
+        removed["config_patch"],
+        serde_json::json!({
+            "kind": "known_bad_images", "operation": "delete", "value": hash,
+            "previous_revision": config["config_revision"], "revision": after["config_revision"]
+        })
     );
 }
 
@@ -8221,6 +8761,249 @@ async fn case_reads_filter_the_list_and_name_known_members() {
         }),
         "only the history actor with a known name is returned"
     );
+}
+
+#[tokio::test]
+async fn bans_and_audit_log_open_the_directory_store_only_for_people_to_name() {
+    let probe = Arc::new(db::StartupProbe::default());
+    let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+    let guild_statements = |prefix: &str| {
+        probe
+            .primary_labels()
+            .iter()
+            .filter(|label| label.starts_with(prefix))
+            .map(|label| probe.primary_statements(label))
+            .sum::<u64>()
+    };
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment.clone()).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store
+        .observe_member(
+            scope,
+            db::guild_data::MemberObservation {
+                user_id: 7,
+                username: Some(Some("seven".into())),
+                global_name: Some(None),
+                nickname: Some(None),
+                joined_at_ms: Some(900),
+                observed_at_ms: 1_500,
+                is_join: true,
+            },
+        )
+        .await
+        .unwrap();
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                r#"INSERT INTO events (id, guild_id, event_type, user_id, actor_id, data, created_at) VALUES
+                    (31, 10, 'system', NULL, NULL, '{}', '2026-01-02T00:00:00Z'),
+                    (32, 10, 'member_ban', 7, NULL, '{}', '2026-01-03T00:00:00Z');"#,
+                65_536,
+            )
+        })
+        .await
+        .unwrap();
+    let page = |path: &'static str, rows: &'static str| {
+        let f = &f;
+        async move {
+            let (status, page) = f.request("POST", path, "").await;
+            assert_eq!(status, StatusCode::OK, "{path}: {page}");
+            (page[rows].as_array().unwrap().len(), page["names"].clone())
+        }
+    };
+
+    // No person to name: the core read still runs, but enrichment never
+    // opens the directory store. A numeric subject needs no name search.
+    for (path, rows, expected_rows) in [
+        ("/api/guilds/10/bans", "bans", 0),
+        ("/api/guilds/10/events?sort=date&subject=777", "events", 0),
+        ("/api/guilds/10/events?sort=date&event=system", "events", 1),
+    ] {
+        let before = guild_statements("guild ");
+        let (count, names) = page(path, rows).await;
+        assert_eq!(count, expected_rows, "{path}");
+        assert_eq!(names, serde_json::json!({}), "{path}");
+        assert_eq!(
+            guild_statements("guild ") - before,
+            0,
+            "{path} must not open the directory store for names"
+        );
+    }
+
+    // People on the page: the live membership check and directory read still run.
+    db::record_enrolled_ban(&f.app.db, Some(enrollment), 7, None, "spam")
+        .await
+        .unwrap();
+    for (path, rows) in [
+        ("/api/guilds/10/bans", "bans"),
+        ("/api/guilds/10/events?sort=date&subject=7", "events"),
+    ] {
+        let membership = guild_statements("guild db/guild_data/tenant_logs:");
+        let directory = guild_statements("guild db/guild_data/member_directory:");
+        let (count, names) = page(path, rows).await;
+        assert_eq!(count, 1, "{path}");
+        assert_eq!(
+            names,
+            serde_json::json!({"7": {"display_name": "seven", "username": "seven"}}),
+            "{path}"
+        );
+        assert!(
+            guild_statements("guild db/guild_data/tenant_logs:") > membership,
+            "{path} must check live membership"
+        );
+        assert!(
+            guild_statements("guild db/guild_data/member_directory:") > directory,
+            "{path} must read directory names"
+        );
+    }
+}
+
+#[tokio::test]
+async fn moderation_pages_name_people_from_empty_missing_and_mixed_directory_rows() {
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource,
+    };
+    const NAMED: i64 = 101;
+    const NO_NICK: i64 = 102;
+    const USERNAME_ONLY: i64 = 103;
+    const NO_USERNAME: i64 = 104;
+    const NAMELESS: i64 = 105;
+    const MISSING: i64 = 106;
+    // Snowflakes above 2^53 must reach the browser as exact strings.
+    const BIG: i64 = 9_007_199_254_740_993;
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment.clone()).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let rows = [
+        (NAMED, Some(NO_NICK)),
+        (USERNAME_ONLY, Some(NO_USERNAME)),
+        (NAMELESS, Some(MISSING)),
+        (BIG, None),
+    ];
+    for (n, (subject, actor)) in (1..).zip(rows) {
+        store
+            .record_case(
+                scope.clone(),
+                CaseId::try_from(format!("{n:032x}")).unwrap(),
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::DiscordAudit { entry_id: n },
+                    action: CaseAction::Ban,
+                    outcome: CaseOutcome::Succeeded,
+                    subject_id: subject,
+                    actor_id: actor,
+                    occurred_at_ms: n,
+                    reason: None,
+                    evidence: CaseEvidence::Unavailable,
+                },
+                crate::tenant::case_limits(),
+            )
+            .await
+            .unwrap();
+        db::record_enrolled_ban(&f.app.db, Some(enrollment.clone()), subject, actor, "spam")
+            .await
+            .unwrap();
+        let actor = actor.map_or("NULL".to_owned(), |id| id.to_string());
+        f.app
+            .db
+            .with_conn(move |conn| {
+                conn.execute_batch_bounded(
+                    &format!(
+                        "INSERT INTO events (id, guild_id, event_type, user_id, actor_id, data, created_at)
+                         VALUES ({n}, 10, 'member_ban', {subject}, {actor}, '{{}}', '2026-01-02T00:00:00Z');"
+                    ),
+                    65_536,
+                )
+            })
+            .await
+            .unwrap();
+    }
+    let names = |path: &'static str| {
+        let f = &f;
+        async move {
+            let (status, page) = f.request("POST", path, "").await;
+            assert_eq!(status, StatusCode::OK, "{path}: {page}");
+            page["names"].clone()
+        }
+    };
+    let pages = [
+        "/api/guilds/10/cases",
+        "/api/guilds/10/bans",
+        // Without list controls the Audit Log keeps its legacy bare array.
+        "/api/guilds/10/events?sort=date",
+    ];
+    // Pages without rows name nobody.
+    for path in [
+        "/api/guilds/10/cases?action=unban",
+        "/api/guilds/10/bans?subject=nobody",
+        "/api/guilds/10/events?subject=nobody",
+    ] {
+        assert_eq!(names(path).await, serde_json::json!({}), "{path}");
+    }
+    // An empty directory names nobody on populated pages.
+    for path in pages {
+        assert_eq!(names(path).await, serde_json::json!({}), "{path}");
+    }
+    for (user_id, username, global_name, nickname) in [
+        (NAMED, Some("named"), Some("Global"), Some("Nick")),
+        (NO_NICK, Some("no.nick"), Some("Global Two"), Some("")),
+        (USERNAME_ONLY, Some("only.user"), Some(""), None),
+        (NO_USERNAME, Some(""), None, Some("Nick Four")),
+        (NAMELESS, Some(""), Some(""), Some("")),
+        (BIG, Some("big"), None, None),
+    ] {
+        store
+            .observe_member(
+                scope.clone(),
+                db::guild_data::MemberObservation {
+                    user_id,
+                    username: Some(username.map(str::to_owned)),
+                    global_name: Some(global_name.map(str::to_owned)),
+                    nickname: Some(nickname.map(str::to_owned)),
+                    joined_at_ms: Some(900),
+                    observed_at_ms: 1_500,
+                    is_join: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    // Nickname, then global name, then username; blank names are skipped,
+    // a blank username is null, and nameless or unknown people are left out.
+    let expected = serde_json::json!({
+        NAMED.to_string(): {"display_name": "Nick", "username": "named"},
+        NO_NICK.to_string(): {"display_name": "Global Two", "username": "no.nick"},
+        USERNAME_ONLY.to_string(): {"display_name": "only.user", "username": "only.user"},
+        NO_USERNAME.to_string(): {"display_name": "Nick Four", "username": null},
+        BIG.to_string(): {"display_name": "big", "username": "big"},
+    });
+    for path in pages {
+        assert_eq!(names(path).await, expected, "{path}");
+    }
 }
 
 #[tokio::test]
@@ -9237,11 +10020,17 @@ async fn known_spam_http_validates_lists_and_removes_with_captured_scopes() {
         ),
         ("global", "url", "tinyurl.com/*", None),
     ] {
-        let input =
-            serde_json::json!({"scope":scope,"kind":kind,"value":value,"note":note}).to_string();
-        let (status, body) = f.request("POST", "/api/guilds/10/known-spam", &input).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let id = body["id"].as_i64().unwrap();
+        let (_, before) = f.request("POST", "/api/guilds/10/config", "").await;
+        let input_value = if kind == "url" {
+            "HTTPS://TinyURL.COM/*"
+        } else {
+            value
+        };
+        let input = serde_json::json!({"scope":scope,"kind":kind,"value":input_value,"note":note})
+            .to_string();
+        let (status, saved) = f.request("POST", "/api/guilds/10/known-spam", &input).await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        let id = saved["id"].as_i64().unwrap();
         let (status, _) = f.request("POST", "/api/guilds/10/known-spam", &input).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (_, cfg) = f.request("POST", "/api/guilds/10/config", "").await;
@@ -9253,10 +10042,27 @@ async fn known_spam_http_validates_lists_and_removes_with_captured_scopes() {
             .unwrap();
         assert_eq!(row["value"], value);
         assert_eq!(row["note"], serde_json::json!(note));
+        assert_eq!(row["guild_id"], if scope == "global" { "0" } else { "10" });
+        assert_eq!(
+            saved["config_patch"],
+            serde_json::json!({
+                "kind": "known_spam", "operation": "add", "value": row,
+                "previous_revision": before["config_revision"], "revision": cfg["config_revision"]
+            })
+        );
         let (status, body) = f
             .request("DELETE", &format!("/api/guilds/10/known-spam/{id}"), "")
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, after) = f.request("POST", "/api/guilds/10/config", "").await;
+        assert_eq!(
+            body["config_patch"],
+            serde_json::json!({
+                "kind": "known_spam", "operation": "delete", "value": wire_id,
+                "previous_revision": cfg["config_revision"], "revision": after["config_revision"]
+            })
+        );
+        assert!(after["known_spam"].as_array().unwrap().is_empty());
     }
     let (status, _) = f
         .request_token(
@@ -9591,15 +10397,21 @@ async fn owner_leave_and_receipt_reject_non_owner_sessions() {
 #[tokio::test]
 async fn platform_member_totals_distinguish_empty_unavailable_and_incomplete_fleets() {
     let f = Fixture::new(true).await;
-    let empty = platform::member_totals(&f.app).await;
+    let read_members =
+        || owner_router_request(&f, "POST", "/api/platform/analytics/members", "", &f.cookie);
+    let (status, empty) = read_members().await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
     assert_eq!(empty["status"], "complete", "{empty}");
     assert_eq!(empty["servers"], 0);
     assert_eq!(empty["current"], 0);
+    assert_eq!(empty["snapshot_guild_ids"], serde_json::json!([]));
 
     f.enroll(10).await;
-    let unavailable = platform::member_totals(&f.app).await;
+    let (status, unavailable) = read_members().await;
+    assert_eq!(status, StatusCode::OK, "{unavailable}");
     assert_eq!(unavailable["status"], "unavailable", "{unavailable}");
     assert_eq!(unavailable["guilds_unavailable"], 1);
+    assert_eq!(unavailable["snapshot_guild_ids"], serde_json::json!(["10"]));
 
     let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
     f.app
@@ -9608,7 +10420,8 @@ async fn platform_member_totals_distinguish_empty_unavailable_and_incomplete_fle
         .await
         .unwrap()
         .unwrap();
-    let not_started = platform::member_totals(&f.app).await;
+    let (status, not_started) = read_members().await;
+    assert_eq!(status, StatusCode::OK, "{not_started}");
     assert_eq!(not_started["status"], "partial", "{not_started}");
     assert_eq!(not_started["guilds_counted"], 1);
     assert_eq!(not_started["guilds_unavailable"], 0);
@@ -9626,8 +10439,94 @@ async fn platform_member_totals_distinguish_empty_unavailable_and_incomplete_fle
         .initialize_member_directory(scope, 42, i64::MAX)
         .await
         .unwrap();
-    let importing = platform::member_totals(&f.app).await;
+    let (status, importing) = read_members().await;
+    assert_eq!(status, StatusCode::OK, "{importing}");
     assert_eq!(importing["by_guild"]["10"]["coverage"], "importing");
+}
+
+struct PlatformDirectoryHold {
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+thread_local! {
+    static PLATFORM_DIRECTORY_HOLD: std::cell::RefCell<Option<PlatformDirectoryHold>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) async fn before_platform_directory_totals() {
+    if let Some(hold) = PLATFORM_DIRECTORY_HOLD.with_borrow_mut(Option::take) {
+        hold.reached.send(()).unwrap();
+        hold.resume.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn platform_history_skips_tenant_reads_while_member_totals_are_pending() {
+    let sql = Arc::new(db::StartupProbe::default());
+    let _probe = db::enter_startup_probe(Some(Arc::clone(&sql)));
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app.tenant.activate(enrollment).await.unwrap().unwrap();
+    let guild_statements = || {
+        sql.primary_labels()
+            .iter()
+            .filter(|label| label.starts_with("guild "))
+            .map(|label| sql.primary_statements(label))
+            .sum::<u64>()
+    };
+
+    let (reached, started) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    PLATFORM_DIRECTORY_HOLD.with_borrow_mut(|slot| {
+        *slot = Some(PlatformDirectoryHold { reached, resume });
+    });
+    let before_members = guild_statements();
+    let read = |path| owner_router_request(&f, "POST", path, "", &f.cookie);
+    let mut members = Box::pin(read("/api/platform/analytics/members"));
+    tokio::select! {
+        result = &mut members => panic!("the directory query should wait: {result:?}"),
+        started = tokio::time::timeout(std::time::Duration::from_secs(5), started) => {
+            started.expect("the request did not reach the guild store").unwrap();
+        }
+    }
+    let pending_members = guild_statements();
+    assert!(
+        pending_members > before_members,
+        "the member request reached the real store"
+    );
+    for days in [30, 7, 90] {
+        let path = format!("/api/platform/analytics?days={days}&include_members=false");
+        let (status, history) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            owner_router_request(&f, "POST", &path, "", &f.cookie),
+        )
+        .await
+        .expect("history should return before the member request finishes");
+        assert_eq!(status, StatusCode::OK, "{history}");
+        assert_eq!(history["series"].as_array().unwrap().len(), days);
+        assert!(history.get("members").is_none());
+        assert_eq!(guild_statements(), pending_members, "range {days}");
+    }
+
+    release.send(()).unwrap();
+    let (status, mut totals) = members.await;
+    assert_eq!(status, StatusCode::OK, "{totals}");
+    assert_eq!(totals["status"], "partial");
+    assert_eq!(
+        totals.as_object_mut().unwrap().remove("snapshot_guild_ids"),
+        Some(serde_json::json!(["10"]))
+    );
+    assert!(
+        guild_statements() > pending_members,
+        "the released store query was observed"
+    );
+
+    let (status, legacy) = read("/api/platform/analytics?days=7").await;
+    assert_eq!(status, StatusCode::OK, "{legacy}");
+    assert_eq!(legacy["series"].as_array().unwrap().len(), 7);
+    assert_eq!(legacy["members"], totals);
 }
 
 #[tokio::test]
@@ -9654,15 +10553,13 @@ async fn platform_analytics_accepts_only_dashboard_ranges() {
     assert_eq!(body["error"], "analytics range must be 7, 30 or 90 days");
 
     let other = Fixture::new(false).await;
-    let (status, body) = owner_router_request(
-        &other,
-        "POST",
+    for path in [
         "/api/platform/analytics?days=7",
-        "",
-        &other.cookie,
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        "/api/platform/analytics?days=7&include_members=false",
+    ] {
+        let (status, body) = owner_router_request(&other, "POST", path, "", &other.cookie).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
 }
 
 fn member_guild(id: u64) -> oauth::DiscordGuild {
@@ -10237,7 +11134,7 @@ async fn role_cache_stays_bounded_with_live_entries() {
         .lock()
         .unwrap()
         .insert(10, vec!["555".into()]);
-    let cached_at = f.app.user_cache.get(&42).unwrap().value().0;
+    let cached_at = f.app.user_cache.get(&42).unwrap().0;
     for i in 0..MEMBER_ROLES_MAX_ENTRIES {
         f.app.member_roles.lock().unwrap().insert(
             (1000 + i as u64, 10),

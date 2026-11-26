@@ -19,6 +19,15 @@ async fn object(State(objects): State<Arc<HashMap<String, Vec<u8>>>>, uri: Uri) 
 }
 
 fn image(objects: &mut HashMap<String, Vec<u8>>, role: &str, binary: &[u8]) -> ComponentRelease {
+    image_with_inventory_hash(objects, role, binary, None)
+}
+
+fn image_with_inventory_hash(
+    objects: &mut HashMap<String, Vec<u8>>,
+    role: &str,
+    binary: &[u8],
+    component_hash: Option<&str>,
+) -> ComponentRelease {
     let config = serde_json::to_vec(&json!({"architecture":"amd64","os":"linux","config":{"Labels":{
         "org.opencontainers.image.revision":"c".repeat(40), "io.jmodguard.release-id":"paired-fixture"
     }}})).unwrap();
@@ -26,10 +35,10 @@ fn image(objects: &mut HashMap<String, Vec<u8>>, role: &str, binary: &[u8]) -> C
     {
         let mut tar = tar::Builder::new(&mut layer);
         let name = format!("usr/local/bin/jmodguard-{role}");
-        let inventory = format!(
-            "{hash}  bin/jmodguard-{role}\n{hash}  bin/jmodguard-launcher\n",
-            hash = sha256_hex(binary)
-        );
+        let hash = sha256_hex(binary);
+        let component_hash = component_hash.unwrap_or(&hash);
+        let inventory =
+            format!("{component_hash}  bin/jmodguard-{role}\n{hash}  bin/jmodguard-launcher\n");
         for (path, bytes) in [
             (name.as_str(), binary),
             ("usr/local/bin/jmodguard-launcher", binary),
@@ -113,126 +122,182 @@ fn publish_exit_code_sync(path: &std::path::Path, code: impl std::fmt::Display) 
     std::fs::rename(&pending, path).unwrap();
 }
 
-async fn executable(root: &Path, name: &str) -> PathBuf {
-    let path = root.join(name);
-    let code = format!(
-        r#"
-use std::io::{{Read, Write}};
-use std::sync::atomic::{{AtomicBool, Ordering}};
+/// The child fixture reads its root and role name from a trailer appended to
+/// its own executable, so one compiled program serves every case while each
+/// (root, name) copy keeps a distinct artifact digest.
+const CHILD: &str = r#"
+use std::io::{Read, Seek, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 static STOP: AtomicBool = AtomicBool::new(false);
-extern "C" fn stop(_: i32) {{ STOP.store(true, Ordering::SeqCst); }}
-unsafe extern "C" {{ fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize; }}
-fn complete_exit_code(raw: &str) -> Option<i32> {{
-    if !raw.ends_with('\n') {{
+extern "C" fn stop(_: i32) { STOP.store(true, Ordering::SeqCst); }
+unsafe extern "C" { fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize; }
+fn complete_exit_code(raw: &str) -> Option<i32> {
+    if !raw.ends_with('\n') {
         return None;
-    }}
+    }
     let text = raw.trim();
-    if text.is_empty() {{
+    if text.is_empty() {
         return None;
-    }}
+    }
     Some(text.parse().expect("exit-code record is not an integer"))
-}}
-fn main() {{
-    unsafe {{ signal(15, stop); }}
-    let root = std::path::Path::new({root:?});
+}
+fn identity() -> (std::path::PathBuf, String) {
+    let mut image = std::fs::File::open("/proc/self/exe").unwrap();
+    let mut length = [0; 4];
+    image.seek(std::io::SeekFrom::End(-4)).unwrap();
+    image.read_exact(&mut length).unwrap();
+    let length = u32::from_le_bytes(length);
+    let mut trailer = vec![0; length as usize];
+    image.seek(std::io::SeekFrom::End(-4 - i64::from(length))).unwrap();
+    image.read_exact(&mut trailer).unwrap();
+    let trailer = String::from_utf8(trailer).unwrap();
+    let (root, name) = trailer.rsplit_once('\n').unwrap();
+    (root.into(), name.to_owned())
+}
+fn main() {
+    unsafe { signal(15, stop); }
+    let (root, name) = identity();
+    let (root, name) = (root.as_path(), name.as_str());
     let maintenance = std::env::var("JMODGUARD_UPDATE_MAINTENANCE").as_deref() == Ok("1");
-    let event = |suffix: &str| {{
+    let event = |suffix: &str| {
         let mut log = std::fs::OpenOptions::new().create(true).append(true).open(root.join("events")).unwrap();
-        writeln!(log, "{name}.{{suffix}}").unwrap();
-    }};
+        writeln!(log, "{name}.{suffix}").unwrap();
+    };
     // Optional real maintenance socket for outage liveness regressions.
-    let maintenance_listener = if maintenance && root.join("bind-maintenance-{name}").exists() {{
-        let bind = std::fs::read_to_string(root.join("bind-maintenance-{name}")).unwrap();
+    let maintenance_listener = if maintenance && root.join(format!("bind-maintenance-{name}")).exists() {
+        let bind = std::fs::read_to_string(root.join(format!("bind-maintenance-{name}"))).unwrap();
         let listener = std::net::TcpListener::bind(bind.trim()).unwrap();
         listener.set_nonblocking(true).unwrap();
         Some(listener)
-    }} else {{ None }};
-    if !maintenance {{
+    } else { None };
+    if !maintenance {
         event("start");
-        let _health = if root.join("bind-health-{name}").exists() {{
-            let bind = std::fs::read_to_string(root.join("bind-health-{name}")).unwrap();
+        let _health = if root.join(format!("bind-health-{name}")).exists() {
+            let bind = std::fs::read_to_string(root.join(format!("bind-health-{name}"))).unwrap();
             let listener = std::net::TcpListener::bind(&bind).unwrap();
-            let bound = root.join("health-bound-{name}");
+            let bound = root.join(format!("health-bound-{name}"));
             let pending = bound.with_extension("tmp");
             std::fs::write(&pending, listener.local_addr().unwrap().to_string()).unwrap();
             std::fs::rename(pending, bound).unwrap();
-            while !root.join("exit-code-{name}").exists() && !STOP.load(Ordering::SeqCst) {{
+            while !root.join(format!("exit-code-{name}")).exists() && !STOP.load(Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(5));
-            }}
+            }
             Some(listener)
-        }} else {{ None }};
-        if let Ok(mut raw) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
-            if let Some(code) = complete_exit_code(&raw) {{
+        } else { None };
+        if let Ok(mut raw) = std::fs::read_to_string(root.join(format!("exit-code-{name}"))) {
+            if let Some(code) = complete_exit_code(&raw) {
                 std::process::exit(code);
-            }} else {{
+            } else {
                 event("exit-partial");
                 let incomplete_start = std::time::Instant::now();
                 while !STOP.load(Ordering::SeqCst)
                     && incomplete_start.elapsed() < std::time::Duration::from_millis(200)
-                {{
+                {
                     std::thread::sleep(std::time::Duration::from_millis(5));
-                    match std::fs::read_to_string(root.join("exit-code-{name}")) {{
-                        Ok(updated) => {{
+                    match std::fs::read_to_string(root.join(format!("exit-code-{name}"))) {
+                        Ok(updated) => {
                             raw = updated;
-                            if let Some(code) = complete_exit_code(&raw) {{
+                            if let Some(code) = complete_exit_code(&raw) {
                                 std::process::exit(code);
-                            }}
+                            }
                             event("exit-partial");
-                        }}
+                        }
                         Err(_) => break,
-                    }}
-                }}
-            }}
-        }}
-        if root.join("fail-{name}").exists() {{
+                    }
+                }
+            }
+        }
+        if root.join(format!("fail-{name}")).exists() {
             std::fs::write(std::env::var("JMODGUARD_READY_FILE").unwrap(), "stale marker").unwrap();
             std::process::exit(7);
-        }}
-        while root.join("hold-{name}-ready").exists() && !STOP.load(Ordering::SeqCst) {{ std::thread::sleep(std::time::Duration::from_millis(5)); }}
-        if STOP.load(Ordering::SeqCst) {{ event("stop"); return; }}
+        }
+        while root.join(format!("hold-{name}-ready")).exists() && !STOP.load(Ordering::SeqCst) { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        if STOP.load(Ordering::SeqCst) { event("stop"); return; }
         std::fs::write(std::env::var("JMODGUARD_READY_FILE").unwrap(), "ready").unwrap();
         event("ready");
-    }}
-    while !STOP.load(Ordering::SeqCst) {{
+    }
+    while !STOP.load(Ordering::SeqCst) {
         if let Some(listener) = &maintenance_listener
             && let Ok((mut stream, _)) = listener.accept()
-        {{
+        {
             stream.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
             let mut request = [0; 1024];
             let _ = stream.read(&mut request);
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-        }}
-        if !maintenance && let Ok(raw) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
-            if let Some(code) = complete_exit_code(&raw) {{
+        }
+        if !maintenance && let Ok(raw) = std::fs::read_to_string(root.join(format!("exit-code-{name}"))) {
+            if let Some(code) = complete_exit_code(&raw) {
                 std::process::exit(code);
-            }}
-        }}
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(5));
-    }}
-    if !maintenance {{
+    }
+    if !maintenance {
         event("stopping");
-        while root.join("hold-{name}-stop").exists() {{ std::thread::sleep(std::time::Duration::from_millis(5)); }}
+        while root.join(format!("hold-{name}-stop")).exists() { std::thread::sleep(std::time::Duration::from_millis(5)); }
         event("stop");
-    }}
-}}
-"#,
-        root = root.to_str().unwrap(),
-        name = name
-    );
-    let source = root.join(format!("{}.rs", name.replace('-', "_")));
-    tokio::fs::write(&source, code).await.unwrap();
-    let output = Command::new("rustc")
-        .args(["--edition=2024", "-C", "debuginfo=0", "-o"])
-        .arg(&path)
-        .arg(&source)
-        .output()
+    }
+}
+"#;
+
+/// Compiles a fixture program once per source text and returns the binary.
+/// Separate test processes started from this test executable share the cache
+/// beside it; a file lock lets one process compile while the others wait.
+fn compiled_fixture(source: &str) -> PathBuf {
+    let cache = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("controller-test-fixtures");
+    std::fs::create_dir_all(&cache).unwrap();
+    let key = sha256_hex(source.as_bytes());
+    let binary = cache.join(&key);
+    if binary.exists() {
+        return binary;
+    }
+    let lock = std::fs::File::create(cache.join(format!("{key}.lock"))).unwrap();
+    lock.lock().unwrap();
+    if !binary.exists() {
+        let code = cache.join(format!("fixture_{key}.rs"));
+        let pending = cache.join(format!("{key}.tmp"));
+        std::fs::write(&code, source).unwrap();
+        let output = std::process::Command::new("rustc")
+            .args(["--edition=2024", "-C", "debuginfo=0", "-o"])
+            .arg(&pending)
+            .arg(&code)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::rename(&pending, &binary).unwrap();
+    }
+    binary
+}
+
+/// Publishes an executable copy of fixture bytes at `path`.
+async fn install_fixture(path: &Path, image: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    let pending = path.with_extension("fixture-tmp");
+    tokio::fs::write(&pending, image).await.unwrap();
+    tokio::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o755))
         .await
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    tokio::fs::rename(&pending, path).await.unwrap();
+}
+
+async fn executable(root: &Path, name: &str) -> PathBuf {
+    let path = root.join(name);
+    let compiled = tokio::task::spawn_blocking(|| compiled_fixture(CHILD))
+        .await
+        .unwrap();
+    let mut image = tokio::fs::read(compiled).await.unwrap();
+    let identity = format!("{}\n{name}", root.to_str().unwrap());
+    image.extend_from_slice(identity.as_bytes());
+    image.extend_from_slice(&u32::try_from(identity.len()).unwrap().to_le_bytes());
+    install_fixture(&path, &image).await;
     path
 }
 
@@ -1893,7 +1958,6 @@ async fn revision_two_controller_keeps_a_revision_three_launcher_selection() {
 
 async fn http_application(root: &Path) -> PathBuf {
     let path = root.join("http-api");
-    let source = root.join("http_api.rs");
     let code = r#"
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1946,19 +2010,10 @@ fn main() {
     }
 }
 "#;
-    tokio::fs::write(&source, code).await.unwrap();
-    let output = Command::new("rustc")
-        .args(["--edition=2024", "-C", "debuginfo=0", "-o"])
-        .arg(&path)
-        .arg(&source)
-        .output()
+    let compiled = tokio::task::spawn_blocking(move || compiled_fixture(code))
         .await
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    install_fixture(&path, &tokio::fs::read(compiled).await.unwrap()).await;
     path
 }
 
@@ -3007,6 +3062,9 @@ async fn superseded_clear_receipt_retires_when_no_row_matches() {
 }
 
 const QUEUED_RELEASED_CORE: i64 = 23;
+const BEFORE_CORE_30: &str = "DROP INDEX idx_events_list_date;
+     ALTER TABLE events DROP COLUMN list_id;
+     ALTER TABLE events DROP COLUMN list_date;";
 const BEFORE_CORE_29: &str = "DROP TABLE cleanup_delete_journal;";
 const BEFORE_CORE_28: &str = "DROP TABLE resource_rollups; DROP TABLE resource_status;";
 const BEFORE_CORE_24: &str = "DROP TABLE known_spam;
@@ -3033,6 +3091,7 @@ async fn baked_bot_migrates_queued_protocol3_core_baseline_without_starting_api_
             serde_json::from_str(include_str!("fixtures/queued-core16.json")).unwrap();
         db.with_conn(move |conn| {
             let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(BEFORE_CORE_30, 1024 * 1024)?;
             tx.execute_batch_bounded(BEFORE_CORE_29, 1024 * 1024)?;
             tx.execute_batch_bounded(BEFORE_CORE_28, 1024 * 1024)?;
             tx.execute_batch_bounded(
@@ -3493,6 +3552,7 @@ async fn stale_schema_selections_without_upgrade_are_refused_once_after_migratio
         let fixture = fixture.clone();
         move |conn| {
             let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(BEFORE_CORE_30, 1024 * 1024)?;
             tx.execute_batch_bounded(BEFORE_CORE_29, 1024 * 1024)?;
             tx.execute_batch_bounded(BEFORE_CORE_28, 1024 * 1024)?;
             tx.execute_batch_bounded(
@@ -9408,6 +9468,80 @@ async fn expired_installed_launcher_handoff_restores_only_the_recorded_release()
     }
     drop((db, control));
     tokio::fs::remove_dir_all(root).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_stage_keeps_the_staged_executable_and_no_temporaries() {
+    let root = std::env::temp_dir().join(format!("stage-failure-{:032x}", rand::random::<u128>()));
+    let mut objects = HashMap::new();
+    let installed = image(&mut objects, "bot", b"\x7fELFinstalled");
+    let layer_of = |objects: &HashMap<String, Vec<u8>>, release: &ComponentRelease| {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&objects[&release.digest]).unwrap();
+        manifest["layers"][0]["digest"].as_str().unwrap().to_owned()
+    };
+    let corrupt = image(&mut objects, "bot", b"\x7fELFcorrupt");
+    let layer = objects.get_mut(&layer_of(&objects, &corrupt)).unwrap();
+    *layer.last_mut().unwrap() ^= 1;
+    let truncated = image(&mut objects, "bot", b"\x7fELFtruncated");
+    objects
+        .get_mut(&layer_of(&objects, &truncated))
+        .unwrap()
+        .truncate(512);
+    let not_elf = image(&mut objects, "bot", b"#!/bin/sh\n");
+    let wrong_inventory = image_with_inventory_hash(
+        &mut objects,
+        "bot",
+        b"\x7fELFcandidate",
+        Some(&sha256_hex(b"\x7fELFdifferent")),
+    );
+    let (registry, server) = serve_objects(objects).await;
+    let staging = root.join("staged-bot");
+    let target = stage(
+        &registry,
+        &installed,
+        "jmodguard-bot",
+        &staging,
+        StageTrust::NewInstall,
+    )
+    .await
+    .unwrap();
+    let hash = sha256_hex(b"\x7fELFinstalled");
+    assert_eq!(target, staging.join(format!("bot-{hash}")));
+    let listing = || {
+        std::fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>()
+    };
+    for (release, expected) in [
+        (corrupt, "blob digest mismatch"),
+        (truncated, "blob size mismatch"),
+        (not_elf, "invalid linux/amd64 executable"),
+        (
+            wrong_inventory,
+            "executable does not match image file inventory",
+        ),
+    ] {
+        let error = stage(
+            &registry,
+            &release,
+            "jmodguard-bot",
+            &staging,
+            StageTrust::NewInstall,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(listing(), [format!("bot-{hash}")], "{expected}");
+        assert_eq!(file_sha256(&target).await.unwrap(), hash, "{expected}");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    server.abort();
+    tokio::fs::remove_dir_all(&root).await.unwrap();
 }
 
 #[tokio::test]

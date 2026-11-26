@@ -1842,7 +1842,7 @@ async fn bot_owned_echo_keeps_the_same_attempt_and_replaces_a_stale_one() {
 }
 
 #[tokio::test]
-async fn concurrent_placeholder_deliveries_with_false_precheck_stay_idempotent() {
+async fn sequential_same_audit_redeliveries_with_false_precheck_keep_the_original_row() {
     let f = Fixture::new();
     let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
     let first = record_gateway_ban_with_audit(
@@ -1862,29 +1862,32 @@ async fn concurrent_placeholder_deliveries_with_false_precheck_stay_idempotent()
     let GatewayBanWrite::Recorded { row_id } = first else {
         panic!("first delivery must insert, got {first:?}");
     };
-    let again = record_gateway_ban_with_audit(
-        &f.db,
-        Some(scope.clone()),
-        55,
-        None,
-        None,
-        Some("2024-03-01T00:00:01+00:00"),
-        false,
-        None,
-        false,
-        Some(4_001),
-    )
-    .await
-    .unwrap();
-    assert_eq!(again, GatewayBanWrite::Existing { row_id });
-    assert_eq!(
-        member_ban_events(
-            &query_enrolled_events(&f.db, scope, Some("member_ban"), Some(55), 50)
-                .await
-                .unwrap()
-        ),
-        1
-    );
+    for at in ["2024-03-01T00:00:01+00:00", "2024-03-01T00:00:03+00:00"] {
+        let again = record_gateway_ban_with_audit(
+            &f.db,
+            Some(scope.clone()),
+            55,
+            None,
+            None,
+            Some(at),
+            false,
+            None,
+            false,
+            Some(4_001),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, GatewayBanWrite::Existing { row_id }, "{at}");
+        assert_eq!(
+            member_ban_events(
+                &query_enrolled_events(&f.db, scope.clone(), Some("member_ban"), Some(55), 50)
+                    .await
+                    .unwrap()
+            ),
+            1,
+            "{at}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2173,52 +2176,6 @@ async fn delayed_old_bot_echo_does_not_replace_an_attributed_manual_gateway_ban(
     .await
     .unwrap();
     assert_eq!(resumed, GatewayBanWrite::Existing { row_id: manual_id });
-}
-
-#[tokio::test]
-async fn false_precheck_gateway_redelivery_three_seconds_later_stays_idempotent() {
-    let f = Fixture::new();
-    let scope = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
-    let first = record_gateway_ban_with_audit(
-        &f.db,
-        Some(scope.clone()),
-        55,
-        None,
-        None,
-        Some("2024-03-01T00:00:00+00:00"),
-        false,
-        None,
-        false,
-        Some(4_101),
-    )
-    .await
-    .unwrap();
-    let GatewayBanWrite::Recorded { row_id } = first else {
-        panic!("first delivery must insert, got {first:?}");
-    };
-    let again = record_gateway_ban_with_audit(
-        &f.db,
-        Some(scope.clone()),
-        55,
-        None,
-        None,
-        Some("2024-03-01T00:00:03+00:00"),
-        false,
-        None,
-        false,
-        Some(4_101),
-    )
-    .await
-    .unwrap();
-    assert_eq!(again, GatewayBanWrite::Existing { row_id });
-    assert_eq!(
-        member_ban_events(
-            &query_enrolled_events(&f.db, scope, Some("member_ban"), Some(55), 50)
-                .await
-                .unwrap()
-        ),
-        1
-    );
 }
 
 #[tokio::test]

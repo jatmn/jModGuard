@@ -679,7 +679,7 @@ fn guild_member_addition_retries_rejoin_without_double_posting() {
         "settled rejoin delivery must clear the durable receipt"
     );
     assert!(
-        body.contains("retain_current_stay") && body.contains("current_member_stay_id"),
+        body.contains("retain_current_stay") && body.matches("current_rejoin_note").count() == 1,
         "in-memory retries must key to the current stay"
     );
 }
@@ -688,6 +688,8 @@ fn guild_member_addition_retries_rejoin_without_double_posting() {
 async fn durable_pending_rejoin_note_survives_stale_member_add_without_refresh() {
     const GUILD: i64 = 10;
     const USER: i64 = 42;
+    let probe = Arc::new(db::StartupProbe::default());
+    let _probe = db::enter_startup_probe(Some(probe.clone()));
     let f = Fixture::new();
     let enrollment = db::enroll_guild(&f.app.db, GUILD, 100)
         .await
@@ -751,7 +753,77 @@ async fn durable_pending_rejoin_note_survives_stale_member_add_without_refresh()
         .await
         .unwrap();
     assert!(!stale.membership_refresh);
-    assert!(crate::member_directory::pending_rejoin_note(&f.app, GUILD as u64, USER as u64).await);
+    let enrollment_statements = || {
+        probe
+            .primary_labels()
+            .iter()
+            .filter(|label| label.starts_with("db/enrollments:"))
+            .map(|label| probe.primary_statements(label))
+            .sum::<u64>()
+    };
+    let before = enrollment_statements();
+    let (stay, pending) =
+        crate::member_directory::current_rejoin_note(&f.app, GUILD as u64, USER as u64).await;
+    assert!(stay.is_some());
+    assert!(pending);
+    // One enrollment lookup sends BEGIN, the enrollment SELECT, and ROLLBACK.
+    assert_eq!(enrollment_statements() - before, 3);
+}
+
+#[tokio::test]
+async fn receipt_read_error_keeps_current_stay_and_marks_member_gap() {
+    const GUILD: i64 = 10;
+    const USER: i64 = 42;
+    let f = Fixture::new();
+    let read = |guild| crate::member_directory::current_rejoin_note(&f.app, guild, USER as u64);
+    assert_eq!(read(GUILD as u64).await, (None, false));
+    let enrollment = db::enroll_guild(&f.app.db, GUILD, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    f.app.tenant.activate(enrollment.clone()).await.unwrap();
+    let (store, scope) = ready_directory(&f.app, &enrollment).await;
+    store
+        .observe_member(
+            scope.clone(),
+            MemberObservation {
+                user_id: USER,
+                username: Some(Some("member".into())),
+                global_name: None,
+                nickname: None,
+                joined_at_ms: Some(3_000),
+                observed_at_ms: 3_000,
+                is_join: true,
+            },
+        )
+        .await
+        .unwrap();
+    let (stay, pending) = read(GUILD as u64).await;
+    assert!(stay.is_some());
+    assert!(pending);
+
+    // Fail the receipt query while retaining the directory and verified scope.
+    let database = libsql::Builder::new_local(format!("{}.guild.db", f.path.display()))
+        .build()
+        .await
+        .unwrap();
+    database
+        .connect()
+        .unwrap()
+        .execute(
+            "ALTER TABLE guild_member_pending_rejoin_notes RENAME COLUMN stay_id TO unused_stay_id",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read(GUILD as u64).await, (stay, false));
+    let check = store
+        .next_member_target_check(scope, i64::MAX)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(check.user_id, USER);
+    assert_eq!(check.reason, "member rejoin receipt unavailable");
 }
 
 #[tokio::test]

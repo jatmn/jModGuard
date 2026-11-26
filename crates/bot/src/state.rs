@@ -2,15 +2,23 @@
 
 use anyhow::{Context as _, Result};
 use dashmap::DashMap;
+use jmodguard::custom_rules::{WordDictionary, is_custom_id};
 use parking_lot::Mutex;
 use regex::Regex;
-use serenity::model::id::ChannelId;
+use serenity::gateway::{CollectorCallback, ShardManager, ShardRunnerMessage, VoiceGatewayManager};
+use serenity::model::{
+    Timestamp,
+    event::Event,
+    id::{ChannelId, GuildId, ShardId, UserId},
+    voice::VoiceState,
+};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 use crate::automod::AutomodEngine;
 use crate::config::BotProcessConfig;
@@ -42,6 +50,75 @@ struct SlashRetry {
     target: u64,
     revision: String,
     retry: crate::discord::RestRetry,
+}
+
+/// Last successful serialized Discord slash payload per guild. Guilds with
+/// identical payloads share one allocation, which is freed when the last
+/// guild referencing it is replaced or removed. Equality compares the full
+/// serialized text.
+#[derive(Default)]
+pub(crate) struct SlashRegistrations {
+    guilds: HashMap<u64, Arc<str>>,
+    payloads: HashSet<Arc<str>>,
+}
+
+impl SlashRegistrations {
+    pub(crate) fn matches(&self, guild: u64, payload: &str) -> bool {
+        self.guilds
+            .get(&guild)
+            .is_some_and(|current| **current == *payload)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, guild: u64) -> bool {
+        self.guilds.contains_key(&guild)
+    }
+
+    pub(crate) fn insert(&mut self, guild: u64, payload: String) {
+        let shared = match self.payloads.get(payload.as_str()) {
+            Some(existing) => Arc::clone(existing),
+            None => {
+                let shared = Arc::<str>::from(payload);
+                self.payloads.insert(Arc::clone(&shared));
+                shared
+            }
+        };
+        if let Some(previous) = self.guilds.insert(guild, shared) {
+            self.release(previous);
+        }
+    }
+
+    pub(crate) fn remove(&mut self, guild: u64) {
+        if let Some(previous) = self.guilds.remove(&guild) {
+            self.release(previous);
+        }
+    }
+
+    fn release(&mut self, payload: Arc<str>) {
+        // References live only in this struct: the interned copy plus this one
+        // means no guild still uses the payload.
+        if Arc::strong_count(&payload) == 2 {
+            self.payloads.remove(&*payload);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn distinct_payloads(&self) -> usize {
+        self.payloads.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn payload_bytes(&self) -> usize {
+        self.payloads.iter().map(|payload| payload.len()).sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_payload(&self, a: u64, b: u64) -> bool {
+        match (self.guilds.get(&a), self.guilds.get(&b)) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -926,7 +1003,7 @@ pub struct BotState {
     slash_retries: Mutex<HashMap<u64, SlashRetry>>,
     /// Last successful Discord payload per guild. Hold this lock across the
     /// versioned read and PUT so startup, join and poll cannot register out of order.
-    pub(crate) slash_registrations: tokio::sync::Mutex<HashMap<u64, serde_json::Value>>,
+    pub(crate) slash_registrations: tokio::sync::Mutex<SlashRegistrations>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
     pub(crate) cleanup_incidents: crate::logging::CleanupIncidents,
     pub(crate) automod_delete_marks: crate::automod_delete_marks::AutomodDeleteMarkAccess,
@@ -1041,7 +1118,7 @@ impl BotState {
             slash_sync_progress: Mutex::new(None),
             slash_unauthorized: AtomicBool::new(false),
             slash_retries: Mutex::new(HashMap::new()),
-            slash_registrations: tokio::sync::Mutex::new(HashMap::new()),
+            slash_registrations: tokio::sync::Mutex::new(SlashRegistrations::default()),
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
             cleanup_incidents: Default::default(),
             automod_delete_marks: crate::automod_delete_marks::AutomodDeleteMarkAccess {
@@ -1258,7 +1335,6 @@ impl BotState {
     }
 
     pub fn install_discord_cache(&self, cache: Arc<serenity::cache::Cache>) {
-        self.configs.track_gateway_membership(Arc::clone(&cache));
         *self.discord_cache.lock() = Some(cache);
     }
 
@@ -2258,7 +2334,7 @@ impl BotState {
 
     pub(crate) async fn forget_slash_guild(&self, guild: u64) {
         // Wait for any in-flight PUT before forgetting its result.
-        self.slash_registrations.lock().await.remove(&guild);
+        self.slash_registrations.lock().await.remove(guild);
         self.reset_slash_guild_retry(guild);
         // Discard an in-flight pass's failure set too: a confirmed leave must
         // not leave reconciliation waiting for that guild to return to cache.
@@ -2359,9 +2435,24 @@ pub struct CachedGuildConfig {
     pub regexes: Vec<Regex>,
     pub known_spam: jmodguard::known_spam::CompiledList,
     pub custom_patterns: HashMap<String, Regex>,
+    pub(crate) custom_words: HashMap<String, WordDictionary>,
 }
 
 impl CachedGuildConfig {
+    pub(crate) fn compile_custom_words(
+        rules: &HashMap<String, RuleDef>,
+    ) -> HashMap<String, WordDictionary> {
+        rules
+            .iter()
+            .filter(|(id, rule)| {
+                rule.enabled && is_custom_id(id) && rule.params["kind"].as_str() == Some("word")
+            })
+            .filter_map(|(id, rule)| {
+                WordDictionary::from_rule(rule).map(|words| (id.clone(), words))
+            })
+            .collect()
+    }
+
     fn from_parts(version: u64, durable_version: u64, parts: db::ConfigParts) -> Self {
         let mut regexes = Vec::new();
         for pattern in &parts.badwords {
@@ -2385,6 +2476,7 @@ impl CachedGuildConfig {
             loaded_at: Instant::now(),
             known_bad_hashes: (!known_bad_hashes.is_empty()).then(|| Arc::new(known_bad_hashes)),
             known_spam: jmodguard::known_spam::CompiledList::new(&parts.known_spam),
+            custom_words: Self::compile_custom_words(&parts.rules),
             settings: parts.settings,
             rules: parts.rules,
             commands: parts.commands,
@@ -2415,7 +2507,7 @@ impl CachedGuildConfig {
         let lower = name.to_lowercase();
         if let Some(primary) = jmodguard::defaults::builtin_command_for_label(&lower) {
             // A server override may drop a shipped alias; the label then runs nothing.
-            return self.commands.get(&primary).filter(|c| c.matches(&lower));
+            return self.commands.get(primary).filter(|c| c.matches(&lower));
         }
         self.commands.values().find(|c| c.matches(&lower))
     }
@@ -2448,42 +2540,230 @@ enum ConfigReadRoute {
     Primary,
 }
 
-/// A guild's Gateway membership in the installed Serenity cache.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GatewayMembership {
-    /// No Gateway cache is installed (tests, early startup).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ConfigMembership {
     Untracked,
     Absent,
-    Unavailable,
-    Joined(serenity::model::Timestamp),
+    Active(u64),
 }
 
-impl GatewayMembership {
-    /// Whether a load that began under `self` may publish under `now`: never
-    /// for a guild that is not a member, nor across a leave and rejoin.
-    fn admits(self, now: Self) -> bool {
-        match (self, now) {
-            (Self::Absent, _) | (_, Self::Absent) => false,
-            (Self::Joined(began), Self::Joined(now)) => began == now,
-            _ => true,
+struct GatewayConfigMember {
+    epoch: u64,
+    shard: ShardId,
+    joined_at: Option<Timestamp>,
+}
+
+#[derive(Default)]
+struct GatewayConfigMemberships {
+    active: HashMap<i64, GatewayConfigMember>,
+    next_epoch: u64,
+}
+
+impl GatewayConfigMemberships {
+    fn join(&mut self, guild: i64, shard: ShardId, joined_at: Option<Timestamp>) {
+        self.next_epoch += 1;
+        self.active.insert(
+            guild,
+            GatewayConfigMember {
+                epoch: self.next_epoch,
+                shard,
+                joined_at,
+            },
+        );
+    }
+}
+
+/// Installs the configuration collector before the shard dispatches READY.
+/// Serenity's ordinary event callbacks can run out of order.
+pub struct ConfigCacheGateway {
+    app: Weak<BotState>,
+    manager: OnceLock<Weak<ShardManager>>,
+}
+
+impl ConfigCacheGateway {
+    pub fn new(app: &Arc<BotState>) -> Self {
+        app.configs.track_gateway_membership();
+        Self {
+            app: Arc::downgrade(app),
+            manager: OnceLock::new(),
+        }
+    }
+
+    pub fn attach(&self, manager: &Arc<ShardManager>) {
+        let _ = self.manager.set(Arc::downgrade(manager));
+    }
+
+    pub(crate) fn collector(app: Weak<BotState>, shard: ShardId) -> CollectorCallback {
+        let saw_ready = AtomicBool::new(false);
+        CollectorCallback(Box::new(move |event| {
+            match event {
+                Event::Ready(_) => {
+                    // The runner installs a fresh collector for each READY.
+                    if saw_ready.swap(true, Ordering::Relaxed) {
+                        return false;
+                    }
+                }
+                Event::GuildCreate(event) if !event.guild.unavailable => {}
+                Event::GuildDelete(event) if !event.guild.unavailable => {}
+                _ => return true,
+            }
+            let Some(app) = app.upgrade() else {
+                return false;
+            };
+            app.configs.observe_gateway_event(shard, event);
+            true
+        }))
+    }
+}
+
+#[serenity::async_trait]
+impl VoiceGatewayManager for ConfigCacheGateway {
+    async fn initialise(&self, _: u32, _: UserId) {}
+
+    async fn register_shard(
+        &self,
+        shard: u32,
+        _: serenity::futures::channel::mpsc::UnboundedSender<ShardRunnerMessage>,
+    ) {
+        let Some(manager) = self.manager.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let shard = ShardId(shard);
+        // Serenity starts the runner just before publishing its messenger. The
+        // registration hook holds READY until this collector is in place.
+        while self
+            .app
+            .upgrade()
+            .is_some_and(|app| !app.activation.is_shutting_down())
+        {
+            if let Some(runner) = manager.runners.lock().await.get(&shard) {
+                runner
+                    .runner_tx
+                    .add_collector(Self::collector(self.app.clone(), shard));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    async fn deregister_shard(&self, _: u32) {}
+
+    async fn server_update(&self, _: GuildId, _: &Option<String>, _: &str) {}
+
+    async fn state_update(&self, _: GuildId, _: &VoiceState) {}
+}
+
+type ConfigLoadKey = (i64, u64, ConfigMembership);
+type ConfigLoadSender = watch::Sender<Option<ConfigLoadFailure>>;
+
+#[derive(Debug)]
+struct SharedConfigReadError(Arc<anyhow::Error>);
+
+impl std::fmt::Display for SharedConfigReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("guild configuration snapshot failed")
+    }
+}
+
+impl std::error::Error for SharedConfigReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
+
+struct ConfigLoadFailure {
+    route: ConfigReadRoute,
+    rejected_replica: Option<(u64, String)>,
+    error: Arc<anyhow::Error>,
+}
+
+#[derive(Default)]
+struct ConfigLoads {
+    active: Mutex<HashMap<ConfigLoadKey, ConfigLoadSender>>,
+}
+
+struct ConfigLoad<'a> {
+    loads: Option<&'a ConfigLoads>,
+    key: ConfigLoadKey,
+    rejected_replica: Option<(u64, String)>,
+}
+
+impl ConfigLoad<'_> {
+    fn release(&mut self) -> Option<ConfigLoadSender> {
+        self.loads.take()?.active.lock().remove(&self.key)
+    }
+
+    fn finish_with_error(&mut self, route: ConfigReadRoute, error: anyhow::Error) -> anyhow::Error {
+        if let Some(sender) = self.release()
+            && sender.receiver_count() > 0
+        {
+            // Only callers already subscribed to the removed flight can see this error.
+            let error = Arc::new(error);
+            sender.send_replace(Some(ConfigLoadFailure {
+                route,
+                rejected_replica: self.rejected_replica.take(),
+                error: Arc::clone(&error),
+            }));
+            return SharedConfigReadError(error).into();
+        }
+        error
+    }
+
+    fn retry_primary(&mut self, route: &mut ConfigReadRoute, version: u64, revision: String) {
+        if *route == ConfigReadRoute::Replica {
+            self.rejected_replica = Some((version, revision));
+            *route = ConfigReadRoute::Primary;
         }
     }
 }
 
+impl Drop for ConfigLoad<'_> {
+    fn drop(&mut self) {
+        // Channel closure wakes waiters on publication and cancellation.
+        self.release();
+    }
+}
+
 #[derive(Clone)]
+struct ConfigCacheEntry {
+    config: Arc<CachedGuildConfig>,
+    validated_at: tokio::time::Instant,
+    proof: Option<db::BotConfigProof>,
+}
+
 pub struct ConfigCache {
-    map: DashMap<i64, Arc<CachedGuildConfig>>,
+    map: Arc<DashMap<i64, ConfigCacheEntry>>,
+    loads: ConfigLoads,
+    gateway: Arc<Mutex<Option<GatewayConfigMemberships>>>,
     version: Arc<AtomicU64>,
-    /// Serenity applies a Gateway event before its handler runs, so a
-    /// confirmed departure is visible here before `forget_guild`.
-    gateway: Arc<parking_lot::RwLock<Option<Arc<serenity::cache::Cache>>>>,
-    /// Guilds removed while Serenity still holds their stale unavailable
-    /// marker. Each record lasts only as long as that marker.
-    removed_while_unavailable: Arc<DashMap<u64, ()>>,
+    invalidated: watch::Sender<()>,
     ttl: Duration,
     durable_floor: Arc<AtomicU64>,
     publication_lock: Arc<parking_lot::Mutex<()>>,
     accepted_revision: Arc<parking_lot::Mutex<String>>,
+}
+
+impl Clone for ConfigCache {
+    fn clone(&self) -> Self {
+        // Standalone caches copy published entries and keep their own flights.
+        // Gateway-backed handles share the map so departure releases all cache ownership.
+        let (map, gateway) = if self.gateway.lock().is_some() {
+            (Arc::clone(&self.map), Arc::clone(&self.gateway))
+        } else {
+            (Arc::new(self.map.as_ref().clone()), Arc::default())
+        };
+        Self {
+            map,
+            loads: ConfigLoads::default(),
+            gateway,
+            version: Arc::clone(&self.version),
+            invalidated: self.invalidated.clone(),
+            ttl: self.ttl,
+            durable_floor: Arc::clone(&self.durable_floor),
+            publication_lock: Arc::clone(&self.publication_lock),
+            accepted_revision: Arc::clone(&self.accepted_revision),
+        }
+    }
 }
 
 impl Default for ConfigCache {
@@ -2495,10 +2775,11 @@ impl Default for ConfigCache {
 impl ConfigCache {
     pub fn new(durable_floor: u64, revision: String) -> Self {
         Self {
-            map: DashMap::new(),
+            map: Arc::default(),
+            loads: ConfigLoads::default(),
+            gateway: Arc::default(),
             version: Arc::new(AtomicU64::new(0)),
-            gateway: Arc::new(parking_lot::RwLock::new(None)),
-            removed_while_unavailable: Arc::new(DashMap::new()),
+            invalidated: watch::channel(()).0,
             ttl: Duration::from_secs(15),
             durable_floor: Arc::new(AtomicU64::new(durable_floor)),
             publication_lock: Arc::new(parking_lot::Mutex::new(())),
@@ -2508,8 +2789,7 @@ impl ConfigCache {
 
     pub fn invalidate(&self) {
         let _publication = self.publication_lock.lock();
-        self.version.fetch_add(1, Ordering::Relaxed);
-        self.map.clear();
+        self.clear_publication();
     }
 
     pub fn require_version(&self, version: u64) {
@@ -2517,55 +2797,99 @@ impl ConfigCache {
         self.invalidate();
     }
 
-    pub(crate) fn track_gateway_membership(&self, cache: Arc<serenity::cache::Cache>) {
-        *self.gateway.write() = Some(cache);
-    }
-
-    fn gateway_membership(&self, guild_id: u64) -> GatewayMembership {
-        let Some(cache) = self.gateway.read().clone() else {
-            return GatewayMembership::Untracked;
-        };
-        let Some(guild) =
-            std::num::NonZeroU64::new(guild_id).map(serenity::model::id::GuildId::from)
-        else {
-            return GatewayMembership::Absent;
-        };
-        if let Some(cached) = cache.guild(guild) {
-            self.removed_while_unavailable.remove(&guild_id);
-            return GatewayMembership::Joined(cached.joined_at);
-        }
-        // Serenity keeps a guild here if it was unavailable when it left.
-        if cache.unavailable_guilds().get(&guild).is_none() {
-            self.removed_while_unavailable.remove(&guild_id);
-            GatewayMembership::Absent
-        } else if self.removed_while_unavailable.contains_key(&guild_id) {
-            GatewayMembership::Absent
-        } else {
-            GatewayMembership::Unavailable
-        }
-    }
-
-    /// A Gateway `GuildCreate` starts a new membership, so an earlier removal
-    /// during an outage no longer describes this guild.
-    pub(crate) fn observe_gateway_guild(&self, guild_id: u64) {
-        self.removed_while_unavailable.remove(&guild_id);
-    }
-
-    /// Releases a confirmed-departed guild's configuration. Loads publish only
-    /// while the guild is a Gateway member, so departed work cannot restore it.
-    pub(crate) fn forget_guild(&self, guild_id: u64) {
+    fn track_gateway_membership(&self) {
         let _publication = self.publication_lock.lock();
-        if self.gateway_membership(guild_id) == GatewayMembership::Unavailable {
-            self.removed_while_unavailable.insert(guild_id, ());
+        let mut gateway = self.gateway.lock();
+        if gateway.is_none() {
+            *gateway = Some(GatewayConfigMemberships::default());
+            self.map.clear();
         }
-        self.map.remove(&(guild_id as i64));
+    }
+
+    fn membership(&self, guild: i64) -> ConfigMembership {
+        match self.gateway.lock().as_ref() {
+            None => ConfigMembership::Untracked,
+            Some(gateway) => gateway
+                .active
+                .get(&guild)
+                .map_or(ConfigMembership::Absent, |member| {
+                    ConfigMembership::Active(member.epoch)
+                }),
+        }
+    }
+
+    fn observe_gateway_event(&self, shard: ShardId, event: &Event) {
+        let _publication = self.publication_lock.lock();
+        let mut gateway = self.gateway.lock();
+        let Some(gateway) = gateway.as_mut() else {
+            return;
+        };
+        match event {
+            Event::Ready(event) => {
+                let guilds: HashSet<_> = event
+                    .ready
+                    .guilds
+                    .iter()
+                    .map(|guild| guild.id.get() as i64)
+                    .collect();
+                gateway.active.retain(|guild, member| {
+                    let retain = member.shard != shard || guilds.contains(guild);
+                    if !retain {
+                        self.map.remove(guild);
+                    }
+                    retain
+                });
+                // A new session may have missed events. Preserve the fallback
+                // for listed guilds while fencing reads from the old session.
+                for guild in guilds {
+                    let joined_at = gateway
+                        .active
+                        .get(&guild)
+                        .and_then(|member| member.joined_at);
+                    gateway.join(guild, shard, joined_at);
+                }
+            }
+            Event::GuildCreate(event) => {
+                let guild = event.guild.id.get() as i64;
+                let joined_at = event.guild.joined_at;
+                if let Some(member) = gateway.active.get_mut(&guild)
+                    && member
+                        .joined_at
+                        .is_none_or(|previous| previous == joined_at)
+                {
+                    // The first create after READY or an outage recovery.
+                    member.joined_at = Some(joined_at);
+                } else {
+                    self.map.remove(&guild);
+                    gateway.join(guild, shard, Some(joined_at));
+                }
+            }
+            Event::GuildDelete(event) => {
+                let guild = event.guild.id.get() as i64;
+                gateway.active.remove(&guild);
+                self.map.remove(&guild);
+            }
+            _ => {}
+        }
     }
 
     fn require_primary_revision(&self, version: u64, revision: String) {
         let _publication = self.publication_lock.lock();
         self.durable_floor.store(version, Ordering::SeqCst);
         *self.accepted_revision.lock() = revision;
-        self.version.fetch_add(1, Ordering::Relaxed);
+        self.clear_publication();
+    }
+
+    // Called under the publication lock. Advancing the generation and closing
+    // its old flights are atomic with respect to new flight registrations.
+    fn clear_publication(&self) {
+        {
+            let mut active = self.loads.active.lock();
+            self.version.fetch_add(1, Ordering::Relaxed);
+            active.clear();
+        }
+        // Copies share generation changes and keep their own flights.
+        self.invalidated.send_replace(());
         self.map.clear();
     }
 
@@ -2590,32 +2914,115 @@ impl ConfigCache {
     pub(crate) fn last_known(&self, guild_id: u64) -> Option<Arc<CachedGuildConfig>> {
         self.map
             .get(&(guild_id as i64))
-            .map(|entry| Arc::clone(&entry))
+            .map(|entry| Arc::clone(&entry.config))
     }
 
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
-        let required = self
-            .durable_floor
-            .load(Ordering::SeqCst)
-            .max(db.required_config_version());
-        if let Some(entry) = self.map.get(&(guild_id as i64))
-            && entry.version == self.version.load(Ordering::Relaxed)
-            && entry.loaded_at.elapsed() < self.ttl
-            && entry.durable_version >= required
-        {
-            return Ok(Arc::clone(&entry));
-        }
-        let membership = self.gateway_membership(guild_id);
+        let guild_id = guild_id as i64;
         let mut route = ConfigReadRoute::Replica;
         let mut last_observed = 0;
-        let mut last_required = required;
-        for _ in 0..3 {
+        let mut last_required = 0;
+        let mut attempt = 0;
+        let mut load: Option<ConfigLoad<'_>> = None;
+        let mut membership = None;
+        while attempt < 3 {
+            if attempt == 0 {
+                let required = self
+                    .durable_floor
+                    .load(Ordering::SeqCst)
+                    .max(db.required_config_version());
+                if let Some(entry) = self.map.get(&guild_id)
+                    && entry.config.version == self.version.load(Ordering::Relaxed)
+                    && entry.validated_at.elapsed() < self.ttl
+                    && entry.config.durable_version >= required
+                {
+                    return Ok(Arc::clone(&entry.config));
+                }
+            }
+
+            let membership = *membership.get_or_insert_with(|| self.membership(guild_id));
             let version = self.version.load(Ordering::Relaxed);
-            let (durable_version, revision, parts) = if route == ConfigReadRoute::Primary {
-                db::load_config_parts_with_version_primary(db, guild_id as i64).await?
-            } else {
-                db::load_config_parts_with_version(db, guild_id as i64).await?
-            };
+            let key = (guild_id, version, membership);
+            if load.as_ref().is_none_or(|load| load.key != key) {
+                drop(load.take());
+                let mut invalidated = self.invalidated.subscribe();
+                let waiting = {
+                    let mut active = self.loads.active.lock();
+                    if self.version.load(Ordering::Relaxed) != version {
+                        continue;
+                    }
+                    match active.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            Some(entry.get().subscribe())
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(watch::channel(None).0);
+                            None
+                        }
+                    }
+                };
+                if let Some(mut waiting) = waiting {
+                    tokio::select! {
+                        biased;
+                        // A notification can arrive after this generation's flight
+                        // was already registered. Only superseded flights must wake.
+                        _ = invalidated.wait_for(|_| self.version.load(Ordering::Relaxed) != version) => {}
+                        _ = waiting.changed() => {
+                            if self.version.load(Ordering::Relaxed) == version
+                                && let Some(failure) = waiting.borrow().as_ref()
+                                && (failure.route == route
+                                    || (route == ConfigReadRoute::Replica
+                                        && failure.rejected_replica.as_ref().is_some_and(
+                                            |(version, revision)| {
+                                                *version
+                                                    < self.durable_floor.load(Ordering::SeqCst)
+                                                        .max(db.required_config_version())
+                                                    || *revision != *self.accepted_revision.lock()
+                                            },
+                                        )))
+                            {
+                                return Err(SharedConfigReadError(Arc::clone(&failure.error)).into());
+                            }
+                        }
+                    }
+                } else {
+                    load = Some(ConfigLoad {
+                        loads: Some(&self.loads),
+                        key,
+                        rejected_replica: None,
+                    });
+                }
+                // A prior owner may have published while we were entering the
+                // flight. Every caller rechecks its own floor before reading.
+                continue;
+            }
+            let owner = load.as_mut().expect("registered config load");
+            let required = self
+                .durable_floor
+                .load(Ordering::SeqCst)
+                .max(db.required_config_version());
+            let (previous, proof) = self
+                .map
+                .get(&guild_id)
+                .filter(|entry| {
+                    entry.config.version == version && entry.config.durable_version >= required
+                })
+                .and_then(|entry| {
+                    entry
+                        .proof
+                        .clone()
+                        .map(|proof| (Arc::clone(&entry.config), proof))
+                })
+                .unzip();
+            attempt += 1;
+            let db::BotConfigRead {
+                version: durable_version,
+                revision,
+                proof,
+                parts,
+            } = db::read_bot_config(db, guild_id, route == ConfigReadRoute::Primary, proof)
+                .await
+                .map_err(|error| owner.finish_with_error(route, error))?;
             let required_after = self
                 .durable_floor
                 .load(Ordering::SeqCst)
@@ -2632,14 +3039,16 @@ impl ConfigCache {
                 // Replica lag is expected after a successful remote write. Do
                 // not drop moderation/commands while waiting for convergence:
                 // retry through one primary-routed, single-snapshot read.
-                route = ConfigReadRoute::Primary;
+                owner.retry_primary(&mut route, durable_version, revision);
                 continue;
             }
-            let cfg = Arc::new(CachedGuildConfig::from_parts(
-                version,
-                durable_version,
-                parts,
-            ));
+            let cfg = parts.map(|parts| {
+                Arc::new(CachedGuildConfig::from_parts(
+                    version,
+                    durable_version,
+                    parts,
+                ))
+            });
             {
                 // Publication and invalidation share one lock, closing the
                 // check→insert window that could republish a stale snapshot
@@ -2650,19 +3059,55 @@ impl ConfigCache {
                     .load(Ordering::SeqCst)
                     .max(db.required_config_version());
                 let accepted_revision = self.accepted_revision.lock().clone();
-                if self.version.load(Ordering::Relaxed) != version
-                    || durable_version < required_now
-                    || revision != accepted_revision
+                let current_version = self.version.load(Ordering::Relaxed);
+                let snapshot_matches =
+                    durable_version >= required_now && revision == accepted_revision;
+                // A coherent replica read superseded only by invalidation can
+                // reuse a newer publication. An authoritative retry still runs
+                // when a floor or revision mismatch required primary routing.
+                if current_version != version
+                    && route == ConfigReadRoute::Replica
+                    && snapshot_matches
+                    && let Some(entry) = self.map.get(&guild_id)
+                    && entry.config.version == current_version
+                    && entry.validated_at.elapsed() < self.ttl
+                    && entry.config.durable_version >= required_now
                 {
-                    route = ConfigReadRoute::Primary;
+                    return Ok(Arc::clone(&entry.config));
+                }
+                if current_version != version || !snapshot_matches {
+                    owner.retry_primary(&mut route, durable_version, revision);
                     continue;
                 }
-                if !membership.admits(self.gateway_membership(guild_id)) {
-                    // Serve a load for a departed guild, but do not retain it.
+                if membership == ConfigMembership::Absent || membership != self.membership(guild_id)
+                {
+                    // The caller may use its result, but this read no longer
+                    // owns a current membership's cache entry.
+                    if let Some(config) = cfg.or(previous) {
+                        return Ok(config);
+                    }
+                    continue;
+                }
+                let validated_at = tokio::time::Instant::now();
+                if let Some(cfg) = cfg {
+                    self.map.insert(
+                        guild_id,
+                        ConfigCacheEntry {
+                            config: Arc::clone(&cfg),
+                            validated_at,
+                            proof,
+                        },
+                    );
                     return Ok(cfg);
                 }
-                self.map.insert(guild_id as i64, Arc::clone(&cfg));
-                return Ok(cfg);
+                // Renew only the entry that supplied this snapshot's proof.
+                if let Some(previous) = previous
+                    && let Some(mut entry) = self.map.get_mut(&guild_id)
+                    && Arc::ptr_eq(&entry.config, &previous)
+                {
+                    entry.validated_at = validated_at;
+                    return Ok(previous);
+                }
             }
         }
         anyhow::bail!(
@@ -2674,6 +3119,42 @@ impl ConfigCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slash_registrations_share_identical_payloads_until_unused() {
+        let defaults = r#"[{"name":"ping","description":"Ping"}]"#;
+        let changed = r#"[{"name":"ping","description":"Pong"}]"#;
+        let mut registrations = SlashRegistrations::default();
+        for guild in 1..=3 {
+            registrations.insert(guild, defaults.to_owned());
+        }
+        assert!(registrations.shares_payload(1, 2));
+        assert!(registrations.shares_payload(2, 3));
+        assert_eq!(registrations.distinct_payloads(), 1);
+        assert_eq!(registrations.payload_bytes(), defaults.len());
+        assert!(registrations.matches(3, defaults));
+        // Same length, different content: exact comparison detects it.
+        assert_eq!(defaults.len(), changed.len());
+        assert!(!registrations.matches(3, changed));
+        assert!(!registrations.matches(4, defaults));
+
+        registrations.insert(3, changed.to_owned());
+        assert!(registrations.matches(3, changed));
+        assert!(!registrations.shares_payload(2, 3));
+        assert_eq!(registrations.distinct_payloads(), 2);
+        registrations.remove(3);
+        assert!(!registrations.contains(3));
+        assert_eq!(registrations.distinct_payloads(), 1);
+        registrations.remove(1);
+        assert!(registrations.matches(2, defaults));
+        assert_eq!(registrations.distinct_payloads(), 1);
+        registrations.insert(2, changed.to_owned());
+        assert_eq!(registrations.distinct_payloads(), 1);
+        assert_eq!(registrations.payload_bytes(), changed.len());
+        registrations.remove(2);
+        registrations.remove(2);
+        assert_eq!(registrations.distinct_payloads(), 0);
+    }
 
     #[tokio::test]
     async fn ban_observation_release_and_restart_keep_registration_bounded() {
@@ -2706,6 +3187,401 @@ mod tests {
         assert!(next.audit_after_ms() >= before_restart);
         next.finish().await;
         drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn config_flight_database() -> (std::path::PathBuf, Db) {
+        let directory = std::env::temp_dir().join(format!(
+            "jmodguard_config_flight_{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let db = Db::open(&directory.join("core.db"), 2).unwrap();
+        (directory, db)
+    }
+
+    async fn hold_config_connection(
+        db: &Db,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let db = db.clone();
+        let task = tokio::spawn(async move {
+            db.with_conn(move |_| {
+                entered.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(15))?;
+                Ok(())
+            })
+            .await
+        });
+        ready.await.unwrap();
+        (release, task)
+    }
+
+    async fn poll_config_miss<F: Future>(mut call: Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn config_flight_shares_one_snapshot_and_compiled_config() {
+        let probe = Arc::new(db::StartupProbe::default());
+        let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let (directory, db) = config_flight_database();
+        db::patch_settings(&db, 42, Some(Some("guild!".into())), None, None)
+            .await
+            .unwrap();
+        let versions = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        let (release_first, first) = hold_config_connection(&db).await;
+        let (release_second, second) = hold_config_connection(&db).await;
+        let before = probe.transactions();
+        {
+            let mut calls: Vec<_> = (0..32).map(|_| Box::pin(cache.get(&db, 42))).collect();
+            for call in &mut calls {
+                poll_config_miss(call.as_mut()).await;
+            }
+            release_first.send(()).unwrap();
+            release_second.send(()).unwrap();
+            let config = calls[0].as_mut().await.unwrap();
+            assert_eq!(config.settings.prefix, "guild!");
+            let mut reused = 1;
+            for call in &mut calls[1..] {
+                let loaded = call.as_mut().await.unwrap();
+                reused += usize::from(Arc::ptr_eq(&config, &loaded));
+            }
+            assert_eq!(
+                (probe.transactions() - before, reused),
+                (1, 32),
+                "all callers share one snapshot and compiled result"
+            );
+        }
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert!(cache.loads.active.lock().is_empty());
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn config_flight_shares_one_expired_revalidation_and_existing_config() {
+        let probe = Arc::new(db::StartupProbe::default());
+        let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let (directory, db) = config_flight_database();
+        let versions = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        let original = cache.get(&db, 42).await.unwrap();
+        assert!(cache.map.get(&42).unwrap().proof.is_some());
+        let held = [
+            hold_config_connection(&db).await,
+            hold_config_connection(&db).await,
+        ];
+        tokio::time::advance(Duration::from_secs(16)).await;
+        let before = probe.transactions();
+        {
+            let mut calls: Vec<_> = (0..32).map(|_| Box::pin(cache.get(&db, 42))).collect();
+            for call in &mut calls {
+                poll_config_miss(call.as_mut()).await;
+            }
+            for (release, task) in held {
+                release.send(()).unwrap();
+                task.await.unwrap().unwrap();
+            }
+            for call in calls {
+                assert!(Arc::ptr_eq(&original, &call.await.unwrap()));
+            }
+        }
+        assert_eq!(
+            probe.transactions() - before,
+            1,
+            "one lightweight revalidation"
+        );
+        assert!(Arc::ptr_eq(&original, &cache.get(&db, 42).await.unwrap()));
+        assert_eq!(probe.transactions() - before, 1, "fresh hit does no reads");
+        assert!(cache.loads.active.lock().is_empty());
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_flight_other_guild_and_new_generation_do_not_wait_for_old_load() {
+        let (directory, db) = config_flight_database();
+        let separate_pool = Db::open(&directory.join("core.db"), 2).unwrap();
+        let versions = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        let held = [
+            hold_config_connection(&db).await,
+            hold_config_connection(&db).await,
+        ];
+        let mut old_load = Box::pin(cache.get(&db, 42));
+        let mut old_waiter = Box::pin(cache.get(&db, 42));
+        poll_config_miss(old_load.as_mut()).await;
+        poll_config_miss(old_waiter.as_mut()).await;
+
+        let parallel = tokio::time::timeout(Duration::from_secs(10), async {
+            let other_guild = cache.get(&separate_pool, 43).await.unwrap();
+            assert!(Arc::ptr_eq(&other_guild, &cache.last_known(43).unwrap()));
+            assert!(cache.last_known(42).is_none());
+
+            db::patch_settings(
+                &separate_pool,
+                42,
+                Some(Some("new guild!".into())),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let versions = db::get_primary_versions(&separate_pool).await.unwrap();
+            cache.require_primary_revision(versions.config, versions.config_revision);
+            assert!(cache.last_known(43).is_none());
+            let new_generation = cache.get(&separate_pool, 42).await.unwrap();
+            assert_eq!(new_generation.settings.prefix, "new guild!");
+            let waiter = old_waiter.await.unwrap();
+            assert!(Arc::ptr_eq(&new_generation, &waiter));
+            new_generation
+        })
+        .await
+        .expect(
+            "unrelated guild, new generation and old waiter complete while the old load is held",
+        );
+
+        for (release, task) in held {
+            release.send(()).unwrap();
+            task.await.unwrap().unwrap();
+        }
+        let previous_caller = old_load.await.unwrap();
+        assert_eq!(previous_caller.settings.prefix, "new guild!");
+        assert_eq!(previous_caller.durable_version, parallel.durable_version);
+        assert!(Arc::ptr_eq(&previous_caller, &parallel));
+        assert!(cache.loads.active.lock().is_empty());
+        drop((db, separate_pool));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn config_flight_preserves_primary_retry_after_replica_mismatch() {
+        let probe = Arc::new(db::StartupProbe::default());
+        let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let (directory, db) = config_flight_database();
+        let reader = Db::open(&directory.join("core.db"), 2).unwrap();
+        let stale = db::load_config_parts_with_version(&db, 42).await.unwrap();
+        db::patch_settings(&reader, 42, Some(Some("primary!".into())), None, None)
+            .await
+            .unwrap();
+        let versions = db::get_primary_versions(&reader).await.unwrap();
+        assert!(stale.0 < versions.config);
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        let held = [
+            hold_config_connection(&db).await,
+            hold_config_connection(&db).await,
+        ];
+        db.test_inject_next_config_snapshot(stale.clone());
+        let mut owner = Box::pin(cache.get(&db, 42));
+        poll_config_miss(owner.as_mut()).await;
+
+        cache.invalidate();
+        let published = cache.get(&reader, 42).await.unwrap();
+        assert!(cache.map.get(&42).unwrap().proof.is_some());
+        // An ordinary read would consume this stale snapshot instead of
+        // verifying the published proof through the primary route.
+        db.test_inject_next_config_snapshot(stale);
+        let before = probe.transactions();
+        for (release, task) in held {
+            release.send(()).unwrap();
+            task.await.unwrap().unwrap();
+        }
+        let verified = owner.await.unwrap();
+        assert_eq!(verified.settings.prefix, "primary!");
+        assert!(Arc::ptr_eq(&verified, &published));
+        assert_eq!(
+            probe.transactions() - before,
+            2,
+            "the caller verifies both the old and new generation on the primary"
+        );
+        drop((db, reader));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_flight_invalidation_wakes_waiter_in_copied_cache() {
+        let (directory, db) = config_flight_database();
+        let reader = Db::open(&directory.join("core.db"), 2).unwrap();
+        let versions = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        let copied = Arc::new(cache.clone());
+        let held = [
+            hold_config_connection(&db).await,
+            hold_config_connection(&db).await,
+        ];
+        let mut old_owner = Box::pin(copied.get(&db, 42));
+        poll_config_miss(old_owner.as_mut()).await;
+
+        let (joined, ready) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn({
+            let copied = Arc::clone(&copied);
+            let reader = reader.clone();
+            async move {
+                let mut call = Box::pin(copied.get(&reader, 42));
+                poll_config_miss(call.as_mut()).await;
+                joined.send(()).unwrap();
+                call.await
+            }
+        });
+        ready.await.unwrap();
+        assert!(!waiter.is_finished());
+        assert_eq!(
+            copied
+                .loads
+                .active
+                .lock()
+                .values()
+                .next()
+                .unwrap()
+                .receiver_count(),
+            1
+        );
+
+        db::patch_settings(&reader, 42, Some(Some("updated!".into())), None, None)
+            .await
+            .unwrap();
+        cache.require_version(db::get_primary_versions(&reader).await.unwrap().config);
+        let config = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("invalidation wakes a copied waiter while its old owner is held")
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.settings.prefix, "updated!");
+        assert!(cache.last_known(42).is_none());
+        let original = cache.get(&reader, 42).await.unwrap();
+        assert!(!Arc::ptr_eq(&config, &original));
+
+        for (release, task) in held {
+            release.send(()).unwrap();
+            task.await.unwrap().unwrap();
+        }
+        let late = old_owner.await.unwrap();
+        assert!(Arc::ptr_eq(&late, &config));
+        assert!(copied.loads.active.lock().is_empty());
+        drop((db, reader));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_flight_cancelled_owner_releases_waiter() {
+        let (directory, db) = config_flight_database();
+        let versions = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        let held = [
+            hold_config_connection(&db).await,
+            hold_config_connection(&db).await,
+        ];
+        let mut owner = Box::pin(cache.get(&db, 42));
+        let mut waiter = Box::pin(cache.get(&db, 42));
+        poll_config_miss(owner.as_mut()).await;
+        poll_config_miss(waiter.as_mut()).await;
+        drop(owner);
+        assert!(cache.loads.active.lock().is_empty());
+
+        for (release, task) in held {
+            release.send(()).unwrap();
+            task.await.unwrap().unwrap();
+        }
+        let config = waiter.await.unwrap();
+        assert!(Arc::ptr_eq(&config, &cache.last_known(42).unwrap()));
+        assert!(cache.loads.active.lock().is_empty());
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_flight_shares_one_failed_snapshot_without_caching_the_error() {
+        let probe = Arc::new(db::StartupProbe::default());
+        let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let (directory, db) = config_flight_database();
+        assert_config_flight_shares_one_failed_snapshot(directory, db, &probe).await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn config_flight_shares_one_primary_failure_after_replica_mismatch() {
+        let probe = Arc::new(db::StartupProbe::default());
+        let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let (directory, db) = config_flight_database();
+        let (version, _revision, parts) =
+            db::load_config_parts_with_version(&db, 42).await.unwrap();
+        db.test_inject_next_config_snapshot((version, "old revision".into(), parts));
+        assert_config_flight_shares_one_failed_snapshot(directory, db, &probe).await;
+    }
+
+    async fn assert_config_flight_shares_one_failed_snapshot(
+        directory: std::path::PathBuf,
+        db: Db,
+        probe: &db::StartupProbe,
+    ) {
+        let versions = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        // Start the new generation before its invalidation signal arrives.
+        cache.version.fetch_add(1, Ordering::Relaxed);
+        db.with_conn(|conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded("ALTER TABLE rules RENAME TO held_rules", 65_536)?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+        let held = [
+            hold_config_connection(&db).await,
+            hold_config_connection(&db).await,
+        ];
+        let before = probe.transactions();
+        {
+            let mut calls: Vec<_> = (0..32).map(|_| Box::pin(cache.get(&db, 42))).collect();
+            for call in &mut calls {
+                poll_config_miss(call.as_mut()).await;
+            }
+            // Every waiter has joined the new generation. The delayed signal
+            // must not detach them from the error that flight is about to send.
+            cache.invalidated.send_replace(());
+            for (release, task) in held {
+                release.send(()).unwrap();
+                task.await.unwrap().unwrap();
+            }
+            for call in calls {
+                let Err(error) = call.await else {
+                    panic!("a missing config table should fail all joined calls");
+                };
+                assert!(format!("{error:#}").contains("no such table: rules"));
+            }
+        }
+        assert_eq!(probe.transactions() - before, 1, "one failed snapshot");
+        assert!(cache.last_known(42).is_none());
+        assert!(cache.loads.active.lock().is_empty());
+        assert!(cache.get(&db, 42).await.is_err());
+        assert_eq!(
+            probe.transactions() - before,
+            2,
+            "a later caller starts a fresh snapshot during the outage"
+        );
+
+        db.with_conn(|conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded("ALTER TABLE held_rules RENAME TO rules", 65_536)?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+        let config = cache.get(&db, 42).await.unwrap();
+        assert!(Arc::ptr_eq(&config, &cache.last_known(42).unwrap()));
+        assert!(cache.loads.active.lock().is_empty());
+        drop(db);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4259,5 +5135,144 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
         crate::tenant::remove_sidecars(&tmp);
+    }
+
+    fn config_revalidation_test_database() -> Db {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_config_revalidation_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        Db::open(&path, 2).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_config_reuses_unchanged_compiled_rules() {
+        let probe = Arc::new(db::StartupProbe::default());
+        let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let db = config_revalidation_test_database();
+        let current = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(current.config, current.config_revision);
+        let before = probe.transactions();
+        let first = cache.get(&db, 42).await.unwrap();
+        assert_eq!(probe.transactions() - before, 1);
+        for reads in 2..=4 {
+            tokio::time::advance(Duration::from_secs(16)).await;
+            let next = cache.get(&db, 42).await.unwrap();
+            assert!(
+                Arc::ptr_eq(&first, &next),
+                "reuse the one compiled snapshot"
+            );
+            assert_eq!(probe.transactions() - before, reads);
+            assert!(Arc::ptr_eq(&next, &cache.get(&db, 42).await.unwrap()));
+            assert_eq!(
+                probe.transactions() - before,
+                reads,
+                "fresh hit does no reads"
+            );
+        }
+
+        db::patch_settings(&db, 0, Some(Some("global!".into())), None, None)
+            .await
+            .unwrap();
+        let inherited = cache.get(&db, 42).await.unwrap();
+        assert_eq!(inherited.settings.prefix, "global!");
+        assert!(!Arc::ptr_eq(&inherited, &first));
+
+        db::patch_settings(&db, 42, Some(Some("guild!".into())), None, None)
+            .await
+            .unwrap();
+        let guild = cache.get(&db, 42).await.unwrap();
+        assert_eq!(guild.settings.prefix, "guild!");
+        assert!(!Arc::ptr_eq(&guild, &inherited));
+
+        cache.invalidate();
+        assert!(!Arc::ptr_eq(&guild, &cache.get(&db, 42).await.unwrap()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_config_reloads_legacy_revision_after_restore() {
+        let db = config_revalidation_test_database();
+        db.with_conn(|conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(
+                "DELETE FROM meta WHERE key = 'config_revision';
+                 UPDATE rules SET data = json_set(data, '$.name', 'Old invite')
+                 WHERE guild_id = 0 AND rule_id = 'invite'",
+                65_536,
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+        let legacy = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(legacy.config, legacy.config_revision.clone());
+        let first = cache.get(&db, 42).await.unwrap();
+        assert_eq!(first.rules["invite"].name, "Old invite");
+
+        db.with_conn(|conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(
+                "UPDATE rules SET data = json_set(data, '$.name', 'Restored invite')
+                 WHERE guild_id = 0 AND rule_id = 'invite'",
+                65_536,
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+        assert_eq!(db::get_primary_versions(&db).await.unwrap(), legacy);
+        tokio::time::advance(Duration::from_secs(16)).await;
+        let restored = cache.get(&db, 42).await.unwrap();
+        assert_eq!(restored.rules["invite"].name, "Restored invite");
+        assert!(!Arc::ptr_eq(&first, &restored));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_config_reloads_after_unversioned_rule_markers_change() {
+        const LEGACY_INVITE: &str = "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).";
+        const UPGRADED_INVITE: &str =
+            "Discord invite links, except invite codes configured in allowlist_codes.";
+        let db = config_revalidation_test_database();
+        db.with_conn(|conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(
+                "DELETE FROM meta WHERE key IN ('invite_description_v1', 'velocity_default_dry_run');
+                 DELETE FROM rules WHERE guild_id = 0 AND rule_id = 'velocity'",
+                65_536,
+            )?;
+            db::SqlExecutor::execute_bounded(
+                &tx,
+                "UPDATE rules SET data = json_set(data, '$.description', ?1)
+                 WHERE guild_id = 0 AND rule_id = 'invite'",
+                db::params![LEGACY_INVITE],
+                65_536,
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+        let current = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(current.config, current.config_revision.clone());
+        let first = cache.get(&db, 42).await.unwrap();
+        assert_eq!(first.rules["invite"].description, LEGACY_INVITE);
+        assert!(!first.rules["velocity"].dry_run);
+
+        for marker in ["invite_description_v1", "velocity_default_dry_run"] {
+            db.with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                db::write_meta_string_conn(&tx, marker, "1")?;
+                tx.commit()
+            })
+            .await
+            .unwrap();
+            assert_eq!(db::get_primary_versions(&db).await.unwrap(), current);
+            tokio::time::advance(Duration::from_secs(16)).await;
+            let refreshed = cache.get(&db, 42).await.unwrap();
+            assert_eq!(refreshed.rules["invite"].description, UPGRADED_INVITE);
+            assert_eq!(
+                refreshed.rules["velocity"].dry_run,
+                marker == "velocity_default_dry_run"
+            );
+        }
     }
 }

@@ -38,6 +38,32 @@ function loadFrontend(fetchImpl, clock, timers) {
   );
 }
 
+// Retry sleeps resume on a microtask and leave the logical clock to the
+// scenario. Abort timers stay pending so the test can see them cleared. The
+// cap turns a retry loop that never ends into a failure instead of a hang.
+function immediateRetryTimers() {
+  const retries = [];
+  const aborts = new Map();
+  let nextId = 0;
+  return {
+    retries,
+    aborts,
+    setTimeout(fn, ms) {
+      nextId += 1;
+      if (ms === 90_000) aborts.set(nextId, fn);
+      else {
+        retries.push(ms);
+        if (retries.length > 10) throw new Error("waitForApiMe kept retrying");
+        queueMicrotask(fn);
+      }
+      return nextId;
+    },
+    clearTimeout(id) {
+      aborts.delete(id);
+    },
+  };
+}
+
 test("isOriginStarting retries proxy and network failures until axum answers", () => {
   const { isOriginStarting, isApiWarmup, apiError } = loadFrontend(async () => {});
   assert.equal(isApiWarmup(apiError("not ready", 503, 0)), true);
@@ -142,10 +168,13 @@ test("waitForApiMe keeps retrying warmup until axum answers", async () => {
       text: async () => JSON.stringify({ user: { username: "ok" }, guilds: [] }),
     };
   };
-  const { waitForApiMe } = loadFrontend(fetchImpl);
+  const timers = immediateRetryTimers();
+  const { waitForApiMe } = loadFrontend(fetchImpl, undefined, timers);
   const me = await waitForApiMe();
   assert.equal(calls, 3);
   assert.equal(me.user.username, "ok");
+  assert.equal(timers.retries.length, 2);
+  assert.equal(timers.aborts.size, 0);
 });
 
 test("waitForApiMe does not treat unauthenticated as warmup", async () => {
@@ -180,12 +209,15 @@ test("waitForApiMe gives up on persistent origin failures", async () => {
       text: async () => "Bad Gateway",
     };
   };
-  const { waitForApiMe, originGaveUpMessage, apiError } = loadFrontend(fetchImpl, clock);
+  const timers = immediateRetryTimers();
+  const { waitForApiMe, originGaveUpMessage, apiError } = loadFrontend(fetchImpl, clock, timers);
   await assert.rejects(waitForApiMe, (err) => {
     assert.equal(calls, 2);
     assert.equal(err.message, originGaveUpMessage(apiError("HTTP 502", 502, 0)));
     return true;
   });
+  assert.equal(timers.retries.length, 1);
+  assert.equal(timers.aborts.size, 0);
 });
 
 test("waitForApiMe does not spend warmup time on a late 502", async () => {
@@ -219,10 +251,13 @@ test("waitForApiMe does not spend warmup time on a late 502", async () => {
       text: async () => JSON.stringify({ user: { username: "ok" }, guilds: [] }),
     };
   };
-  const { waitForApiMe } = loadFrontend(fetchImpl, clock);
+  const timers = immediateRetryTimers();
+  const { waitForApiMe } = loadFrontend(fetchImpl, clock, timers);
   const me = await waitForApiMe();
   assert.equal(calls, 4);
   assert.equal(me.user.username, "ok");
+  assert.equal(timers.retries.length, 3);
+  assert.equal(timers.aborts.size, 0);
 });
 
 test("waitForApiMe warmup budget is longer than origin reachability", () => {

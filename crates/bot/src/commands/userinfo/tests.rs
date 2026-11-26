@@ -933,6 +933,81 @@ fn clip_drops_roles_but_keeps_user_id() {
     assert!(body.contains("clipped"));
 }
 
+fn limit_snapshot(roles: Vec<String>) -> MemberSnapshot {
+    MemberSnapshot {
+        user_id: 42,
+        username: Some("u".into()),
+        global_name: None,
+        nick: None,
+        joined_at: None,
+        roles,
+        roles_cached: true,
+        voice: VoiceSnapshot::NotInChannel,
+        member_cached: true,
+        guild_cached: true,
+    }
+}
+
+#[test]
+fn reply_at_exact_limit_keeps_roles_and_one_unit_more_clips_them() {
+    // One role of 1 + 999 surrogate pairs + a literal "…" is exactly 2,000 UTF-16 units.
+    let exact = format!("a{}…", "🦀".repeat(999));
+    let body = render_userinfo_message(
+        "{roles}{clipped}",
+        &limit_snapshot(vec![exact.clone()]),
+        &WarnsField::Count(0),
+        vec![],
+    );
+    assert_eq!(body, exact);
+    let over = format!("ab{}…", "🦀".repeat(999));
+    let body = render_userinfo_message(
+        "{roles}{clipped}",
+        &limit_snapshot(vec![over]),
+        &WarnsField::Count(0),
+        vec![],
+    );
+    assert_eq!(body, format!("{MISSING}{CLIPPED_SUFFIX}"));
+}
+
+#[test]
+fn repeated_case_placeholder_clips_roles_before_dropping_oldest_cases() {
+    // Without roles, "missing " (8) + two copies of two cases (2 × 991) + the
+    // clipped marker (10) is exactly 2,000 UTF-16 units.
+    let template = "{roles} {cases}{cases}{clipped}";
+    let newest = format!("{}…", "🦀".repeat(247));
+    let older = format!("{}…", "x".repeat(494));
+    let roles = vec!["r".repeat(100)];
+    let body = render_userinfo_message(
+        template,
+        &limit_snapshot(roles.clone()),
+        &WarnsField::Count(0),
+        vec![newest.clone(), older.clone(), "oldest".into()],
+    );
+    let two = format!("{newest}\n{older}");
+    assert_eq!(body, format!("{MISSING} {two}{two}{CLIPPED_SUFFIX}"));
+    assert_eq!(body.encode_utf16().count(), 2000);
+
+    let older_by_one = format!("{older}y");
+    let body = render_userinfo_message(
+        template,
+        &limit_snapshot(roles.clone()),
+        &WarnsField::Count(0),
+        vec![newest.clone(), older_by_one, "oldest".into()],
+    );
+    assert_eq!(body, format!("{MISSING} {newest}{newest}{CLIPPED_SUFFIX}"));
+
+    let body = render_userinfo_message(
+        template,
+        &limit_snapshot(roles),
+        &WarnsField::Count(0),
+        vec!["🦀".repeat(1000)],
+    );
+    assert_eq!(
+        body,
+        format!("{MISSING} {CASES_UNAVAILABLE}{CASES_UNAVAILABLE}{CLIPPED_SUFFIX}")
+    );
+}
+
 #[tokio::test]
 async fn omitted_user_argument_defaults_to_actor() {
     let path = std::env::temp_dir().join(format!(
@@ -1293,6 +1368,7 @@ async fn test_context(
         data: Arc::clone(&data),
         event_handlers: vec![],
         raw_event_handlers: vec![],
+        voice_manager: None,
         shard_index: 0,
         shard_init: 0,
         shard_total: 1,
@@ -1306,6 +1382,7 @@ async fn test_context(
         data: Arc::clone(&data),
         event_handlers: vec![],
         raw_event_handlers: vec![],
+        voice_manager: None,
         manager: Arc::clone(&manager),
         shard,
         cache: Arc::clone(&cache),
@@ -1400,6 +1477,7 @@ async fn userinfo_prefix_and_slash_hide_voice_the_caller_cannot_view() {
         known_spam: Default::default(),
         log_filters: Default::default(),
         regexes: Vec::new(),
+        custom_words: Default::default(),
         custom_patterns: Default::default(),
     });
 
@@ -1726,6 +1804,7 @@ async fn userinfo_prefix_and_slash_reject_invalid_mention_ids() {
         known_spam: Default::default(),
         log_filters: Default::default(),
         regexes: Vec::new(),
+        custom_words: Default::default(),
         custom_patterns: Default::default(),
     });
     let mut author = User::default();
@@ -1891,6 +1970,7 @@ async fn userinfo_prefix_and_slash_hide_private_threads_without_access() {
         known_spam: Default::default(),
         log_filters: Default::default(),
         regexes: Vec::new(),
+        custom_words: Default::default(),
         custom_patterns: Default::default(),
     });
 
@@ -2918,6 +2998,7 @@ impl StatsDispatch {
             known_spam: Default::default(),
             log_filters: Default::default(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: Default::default(),
         });
         Self {

@@ -3415,6 +3415,20 @@ mod tests {
     }
 
     pub(crate) async fn test_delete_context_with(http: Arc<serenity::http::Http>) -> Context {
+        let (ctx, manager, _, _) = test_gateway_with(http, None).await;
+        manager.shutdown_all().await;
+        ctx
+    }
+
+    async fn test_gateway_with(
+        http: Arc<serenity::http::Http>,
+        observer: Option<Arc<dyn serenity::gateway::VoiceGatewayManager>>,
+    ) -> (
+        Context,
+        Arc<serenity::gateway::ShardManager>,
+        serenity::gateway::ShardRunner,
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) {
         use serenity::gateway::{
             Shard, ShardManager, ShardManagerOptions, ShardMessenger, ShardRunner,
             ShardRunnerOptions,
@@ -3454,6 +3468,7 @@ mod tests {
             data: Arc::clone(&data),
             event_handlers: vec![],
             raw_event_handlers: vec![],
+            voice_manager: observer.clone(),
             shard_index: 0,
             shard_init: 0,
             shard_total: 1,
@@ -3467,6 +3482,7 @@ mod tests {
             data: Arc::clone(&data),
             event_handlers: vec![],
             raw_event_handlers: vec![],
+            voice_manager: observer,
             manager: Arc::clone(&manager),
             shard,
             cache: Arc::clone(&cache),
@@ -3479,10 +3495,7 @@ mod tests {
             http,
             cache,
         };
-        manager.shutdown_all().await;
-        drop(runner);
-        drop(socket);
-        ctx
+        (ctx, manager, runner, socket)
     }
 
     #[tokio::test]
@@ -3968,6 +3981,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_work_from_a_departed_guild_does_not_republish_its_configuration() {
+        use crate::state::ConfigCacheGateway;
         use serenity::client::EventHandler;
         use serenity::model::event::GuildDeleteEvent;
 
@@ -3979,8 +3993,10 @@ mod tests {
             .unwrap();
         app.invalidate_configs();
         let ctx = test_delete_context().await;
-        app.install_discord_cache(Arc::clone(&ctx.cache));
-        cache_fixture_guild(&ctx.cache, 789, 100);
+        let _gateway = ConfigCacheGateway::new(&app);
+        let collector = ConfigCacheGateway::collector(Arc::downgrade(&app), ctx.shard_id);
+        let joined = cache_fixture_guild(&ctx.cache, 789, 100);
+        assert!((collector.0)(&Event::GuildCreate(joined)));
 
         // Work queued while the bot was a member waits behind the departure,
         // so its first configuration read starts after cleanup.
@@ -3993,6 +4009,7 @@ mod tests {
         ));
         let mut delete: GuildDeleteEvent =
             serde_json::from_value(serde_json::json!({"id": "789", "unavailable": false})).unwrap();
+        assert!((collector.0)(&Event::GuildDelete(delete.clone())));
         ctx.cache.update(&mut delete);
         let handler = crate::handlers::Handler {
             app: Arc::clone(&app),
@@ -4006,7 +4023,8 @@ mod tests {
         );
 
         // A real rejoin caches normally.
-        cache_fixture_guild(&ctx.cache, 789, 200);
+        let rejoin = cache_fixture_guild(&ctx.cache, 789, 200);
+        assert!((collector.0)(&Event::GuildCreate(rejoin)));
         let rejoined = app.configs.get(&app.db, 789).await.unwrap();
         assert!(
             app.configs
@@ -4015,6 +4033,97 @@ mod tests {
         );
         drop(rejoined);
         drop(handler);
+        drop(app);
+        remove_db_and_store(&path);
+    }
+
+    #[tokio::test]
+    async fn ordered_config_collector_receives_ready_and_departure_on_the_shard_runner() {
+        use crate::state::ConfigCacheGateway;
+        use serenity::futures::SinkExt;
+        use serenity::gateway::{ConnectionStage, ShardRunnerInfo};
+        use tokio_tungstenite::tungstenite::Message as Frame;
+
+        let (app, path) = temp_app("ordered_config_gateway");
+        let observer = Arc::new(ConfigCacheGateway::new(&app));
+        let (ctx, manager, mut runner, mut socket) = test_gateway_with(
+            Arc::new(serenity::http::Http::new("fixture")),
+            Some(observer.clone()),
+        )
+        .await;
+        observer.attach(&manager);
+        manager.runners.lock().await.insert(
+            ctx.shard_id,
+            ShardRunnerInfo {
+                latency: None,
+                runner_tx: ctx.shard.clone(),
+                stage: ConnectionStage::Disconnected,
+            },
+        );
+        let runner = tokio::spawn(async move { runner.run().await });
+        socket
+            .send(Frame::Text(
+                serde_json::json!({"op": 10, "d": {"heartbeat_interval": 60_000}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        socket
+            .send(Frame::Text(
+                serde_json::json!({
+                    "op": 0, "t": "READY", "s": 1,
+                    "d": {
+                        "v": 10,
+                        "user": {"id": "4242", "username": "our-bot", "bot": true},
+                        "guilds": [{"id": "789", "unavailable": true}],
+                        "session_id": "fixture",
+                        "resume_gateway_url": "wss://gateway.example.test",
+                        "application": {"id": "4242", "flags": 0}
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ctx.cache.current_user().id.get() != 4242 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("READY must reach Serenity's cache");
+        let config = app.configs.get(&app.db, 789).await.unwrap();
+        assert!(Arc::ptr_eq(&config, &app.configs.last_known(789).unwrap()));
+        let weak = Arc::downgrade(&config);
+        drop(config);
+
+        socket
+            .send(Frame::Text(
+                serde_json::json!({
+                    "op": 0, "t": "GUILD_DELETE", "s": 2,
+                    "d": {"id": "789", "unavailable": false}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("confirmed departure must release the compiled config before any handler");
+        assert!(app.configs.last_known(789).is_none());
+
+        runner.abort();
+        assert!(runner.await.unwrap_err().is_cancelled());
+        manager.runners.lock().await.remove(&ctx.shard_id);
+        manager.shutdown_all().await;
+        drop(socket);
         drop(app);
         remove_db_and_store(&path);
     }
@@ -4542,7 +4651,11 @@ mod tests {
         scope
     }
 
-    fn cache_fixture_guild(cache: &Cache, guild: u64, joined_at_ns: i64) {
+    fn cache_fixture_guild(
+        cache: &Cache,
+        guild: u64,
+        joined_at_ns: i64,
+    ) -> serenity::model::event::GuildCreateEvent {
         use serenity::model::event::GuildCreateEvent;
         use serenity::model::guild::Guild;
 
@@ -4552,6 +4665,7 @@ mod tests {
         let mut event: GuildCreateEvent =
             serde_json::from_value(serde_json::to_value(cached).unwrap()).unwrap();
         cache.update(&mut event);
+        event
     }
 
     fn remove_db_and_store(path: &std::path::Path) {

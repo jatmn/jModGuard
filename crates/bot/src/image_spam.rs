@@ -4103,6 +4103,7 @@ mod tests {
             data: Arc::clone(&data),
             event_handlers: vec![],
             raw_event_handlers: vec![],
+            voice_manager: None,
             shard_index: 0,
             shard_init: 0,
             shard_total: 1,
@@ -4116,6 +4117,7 @@ mod tests {
             data: Arc::clone(&data),
             event_handlers: vec![],
             raw_event_handlers: vec![],
+            voice_manager: None,
             manager: Arc::clone(&manager),
             shard,
             cache: Arc::clone(&cache),
@@ -7984,6 +7986,7 @@ mod tests {
             known_bad_hashes: None,
             known_spam: Default::default(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: HashMap::new(),
         };
         let author = ctx.cache.current_user().id.get().saturating_add(4).max(4);

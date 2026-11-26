@@ -1,6 +1,8 @@
 //! API-owned dashboard state without moderation or compiled guild caches.
 //! Discord mutations are admitted to the bot queue; this state has no bot token/client.
-use super::oauth::{DiscordGuild, DiscordUser, OAuthClient};
+use super::GuildList;
+use super::display_cache::DisplayCache;
+use super::oauth::{DiscordUser, OAuthClient};
 use crate::config::ApiProcessConfig;
 use crate::db::{self, Db};
 use anyhow::{Context as _, Result};
@@ -142,11 +144,17 @@ impl AnalyticsCache {
 
     pub fn put(&self, key: AnalyticsCacheKey, body: Bytes, now: Instant) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if entries.len() >= ANALYTICS_CACHE_MAX {
+        if entries.len() >= ANALYTICS_CACHE_MAX && !entries.contains_key(&key) {
             entries.retain(|_, (at, _)| now.saturating_duration_since(*at) < ANALYTICS_CACHE_TTL);
-        }
-        if entries.len() >= ANALYTICS_CACHE_MAX {
-            entries.clear();
+            // Admitting a new key costs only the oldest fresh summary.
+            if entries.len() >= ANALYTICS_CACHE_MAX
+                && let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(oldest, _)| oldest.clone())
+            {
+                entries.remove(&oldest);
+            }
         }
         entries.insert(key, (now, body));
     }
@@ -204,7 +212,7 @@ mod analytics_cache_tests {
             None,
             "entries expire after the TTL"
         );
-        // Filling past the bound drops expired entries first, then everything.
+        // Filling past the bound drops expired entries first, then one summary.
         for guild in 0..ANALYTICS_CACHE_MAX as i64 {
             cache.put(key(guild + 10, 30), Bytes::from_static(b"null"), later);
         }
@@ -214,6 +222,64 @@ mod analytics_cache_tests {
         assert_eq!(cache.get(&key(5, 90), later), Some(new));
         assert!(!cache.entries.lock().unwrap().contains_key(&key(1, 7)));
         assert_eq!(held.as_ref(), b"7", "eviction keeps active responses valid");
+    }
+
+    fn full_cache(start: Instant) -> (AnalyticsCache, Vec<AnalyticsCacheKey>) {
+        let cache = AnalyticsCache::default();
+        let keys: Vec<_> = (0..ANALYTICS_CACHE_MAX as i64)
+            .map(|guild| (guild, "membership".to_owned(), 7))
+            .collect();
+        for (offset, key) in keys.iter().enumerate() {
+            let at = start + std::time::Duration::from_millis(offset as u64);
+            cache.put(key.clone(), Bytes::from(key.0.to_string()), at);
+        }
+        (cache, keys)
+    }
+
+    fn hits(cache: &AnalyticsCache, keys: &[AnalyticsCacheKey], now: Instant) -> usize {
+        keys.iter()
+            .filter(|key| cache.get(key, now) == Some(Bytes::from(key.0.to_string())))
+            .count()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_analytics_cache_replaces_an_existing_key_in_place() {
+        let start = tokio::time::Instant::now().into_std();
+        let (cache, keys) = full_cache(start);
+        let now = start + std::time::Duration::from_secs(1);
+        let replaced = Bytes::from_static(b"replaced");
+        cache.put(keys[0].clone(), replaced.clone(), now);
+        assert_eq!(cache.get(&keys[0], now), Some(replaced));
+        assert_eq!(hits(&cache, &keys[1..], now), ANALYTICS_CACHE_MAX - 1);
+        assert_eq!(cache.entries.lock().unwrap().len(), ANALYTICS_CACHE_MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_analytics_cache_admits_a_new_key_by_evicting_one_fresh_summary() {
+        let start = tokio::time::Instant::now().into_std();
+        let (cache, keys) = full_cache(start);
+        let now = start + std::time::Duration::from_secs(1);
+        let new = (-1, "membership".to_owned(), 7);
+        cache.put(new.clone(), Bytes::from_static(b"new"), now);
+        assert_eq!(cache.get(&new, now), Some(Bytes::from_static(b"new")));
+        assert_eq!(hits(&cache, &keys, now), ANALYTICS_CACHE_MAX - 1);
+        assert_eq!(cache.get(&keys[0], now), None, "the oldest summary leaves");
+        assert_eq!(cache.entries.lock().unwrap().len(), ANALYTICS_CACHE_MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_analytics_cache_evicts_expired_summaries_before_fresh_ones() {
+        let start = tokio::time::Instant::now().into_std();
+        let (cache, keys) = full_cache(start);
+        // The first two summaries expire; every later one is still fresh.
+        let now = start + ANALYTICS_CACHE_TTL + std::time::Duration::from_millis(1);
+        let new = (-1, "membership".to_owned(), 7);
+        cache.put(new.clone(), Bytes::from_static(b"new"), now);
+        assert_eq!(cache.get(&new, now), Some(Bytes::from_static(b"new")));
+        assert_eq!(hits(&cache, &keys[2..], now), ANALYTICS_CACHE_MAX - 2);
+        let entries = cache.entries.lock().unwrap();
+        assert_eq!(entries.len(), ANALYTICS_CACHE_MAX - 1);
+        assert!(!entries.contains_key(&keys[0]) && !entries.contains_key(&keys[1]));
     }
 }
 
@@ -230,7 +296,7 @@ pub struct ApiState {
     pub oauth: Arc<OAuthClient>,
     writer: Option<jmodguard::control::WriterLink>,
     /// Display caches only. Authorization must refresh the guild list.
-    pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
+    pub(super) guild_cache: DisplayCache<GuildList>,
     pub(super) auth_sessions:
         DashMap<tower_sessions::session::Id, Arc<tokio::sync::Mutex<super::SessionAuth>>>,
     // One small ID/timestamp per retirement, bounded by sign-outs/rotations
@@ -238,7 +304,7 @@ pub struct ApiState {
     // if a persistent store is added, persist tombstones there or clear it on startup.
     pub(super) retired_auth_sessions: DashMap<tower_sessions::session::Id, Instant>,
     pub(super) auth_sessions_swept_at: std::sync::Mutex<Option<Instant>>,
-    pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
+    pub(super) user_cache: DisplayCache<DiscordUser>,
     /// Discord role IDs per (user, guild) for Web UI access roles. Each slot is
     /// filled by one request at a time, expires after `MEMBER_ROLES_TTL` and is
     /// dropped early by a newer gateway access mark for that user or guild.
@@ -296,11 +362,11 @@ impl ApiState {
             cfg: Arc::new(cfg),
             oauth,
             writer,
-            guild_cache: DashMap::new(),
+            guild_cache: DisplayCache::guild_lists(),
             auth_sessions: DashMap::new(),
             retired_auth_sessions: DashMap::new(),
             auth_sessions_swept_at: std::sync::Mutex::new(None),
-            user_cache: DashMap::new(),
+            user_cache: DisplayCache::profiles(),
             member_roles: std::sync::Mutex::new(std::collections::HashMap::new()),
             preview: DashMap::new(),
             usage_cache: crate::web::usage::UsageCache::default(),

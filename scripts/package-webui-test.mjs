@@ -15,24 +15,19 @@ const sha = "a".repeat(40);
 test("WebUI package has immutable references and both entry pages", () => {
   const scratch = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), "jmodguard-webui-package-"));
   try {
-    fs.mkdirSync(path.join(scratch, "dist", "frontend", "administration"), { recursive: true });
-    for (const name of ["index.html", "app.js", "style.css", "administration/index.html", "administration.js"]) {
-      fs.copyFileSync(path.join(repo, "dist", "frontend", name), path.join(scratch, "dist", "frontend", name));
-    }
+    fs.cpSync(path.join(repo, "dist", "frontend"), path.join(scratch, "dist", "frontend"), { recursive: true });
     packageWebui(scratch, sha);
     const out = path.join(scratch, "dist", "webui");
+    const assets = path.join(out, "assets", "releases", sha);
     const root = fs.readFileSync(path.join(out, "index.html"), "utf8");
     const admin = fs.readFileSync(path.join(out, "administration/index.html"), "utf8");
     const prefix = `/assets/releases/${sha}`;
-    assert.match(root, new RegExp(`${prefix}/app.js`));
-    assert.match(root, new RegExp(`${prefix}/style.css`));
-    assert.match(admin, new RegExp(`${prefix}/administration.js`));
-    assert.match(admin, new RegExp(`${prefix}/style.css`));
-    assert.match(fs.readFileSync(path.join(out, "assets", "releases", sha, "app.js"), "utf8"), new RegExp(sha));
-    assert.ok(fs.statSync(path.join(out, "assets", "releases", sha, "administration.js")).isFile());
-    // Check the real packaged pages and every referenced asset, not a mocked bundle.
-    for (const html of [root, admin]) {
+    assert.deepEqual(fs.readdirSync(assets).sort(), ["administration.js", "style.css", "webui-runtime.js", "workspace.js"]);
+    for (const [html, entry] of [[root, "workspace.js"], [admin, "administration.js"]]) {
       assert.doesNotMatch(html, /https?:\/\/|type=["']importmap["']|\bimport\s*\(/);
+      assert.ok(html.includes(`<script type="module" src="${prefix}/${entry}">`));
+      assert.ok(html.includes(`<link rel="stylesheet" href="${prefix}/style.css">`));
+      assert.ok(html.split("</head>")[0].includes(`<link rel="modulepreload" href="${prefix}/webui-runtime.js">`));
       for (const match of html.matchAll(/(?:src|href)=["']([^"']+)["']/g)) {
         const url = match[1];
         if (!/\.(?:js|css)$/.test(url)) continue;
@@ -40,23 +35,48 @@ test("WebUI package has immutable references and both entry pages", () => {
         assert.ok(fs.statSync(path.join(out, url)).isFile(), url);
       }
     }
-    for (const name of ["app.js", "administration.js"]) {
-      const js = fs.readFileSync(path.join(out, "assets", "releases", sha, name), "utf8");
-      // An IIFE bundle has no remaining module imports, including computed URLs.
-      assert.deepEqual(parse(js)[0], [], name + " must not import external or additional modules");
+    for (const name of ["workspace.js", "administration.js", "webui-runtime.js"]) {
+      const js = fs.readFileSync(path.join(assets, name), "utf8");
+      const dependencies = parse(js)[0];
+      if (name === "webui-runtime.js") assert.deepEqual(dependencies, []);
+      else {
+        assert.match(js, new RegExp(sha));
+        assert.deepEqual(dependencies.map(({ type, specifier }) => [type, specifier]), [["static", "./webui-runtime.js"]]);
+      }
       assert.doesNotMatch(js, /https?:\/\/(?:esm\.sh|cdn\.jsdelivr\.net)/);
     }
-    const css = fs.readFileSync(path.join(out, "assets", "releases", sha, "style.css"), "utf8");
+    const css = fs.readFileSync(path.join(assets, "style.css"), "utf8");
     assert.doesNotMatch(css, /@import\b/);
     assert.match(css, /daisyUI/);
     const projectLicense = fs.readFileSync(path.join(repo, "LICENSE.md"), "utf8");
-    for (const name of ["app.js", "administration.js", "style.css"]) {
-      const asset = fs.readFileSync(path.join(out, "assets", "releases", sha, name), "utf8");
+    for (const name of ["workspace.js", "administration.js", "webui-runtime.js", "style.css"]) {
+      const asset = fs.readFileSync(path.join(assets, name), "utf8");
       assert.ok(asset.includes(projectLicense), name + " must include the complete project license");
     }
     assert.throws(() => packageWebui(scratch, "bad"));
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("both entries share React DOM without pulling workspace features into Administration", () => {
+  const { js } = JSON.parse(fs.readFileSync(path.join(repo, "dist/webui-metafile.json"), "utf8"));
+  const runtime = js.outputs["dist/frontend/webui-runtime.js"];
+  const contributions = output => Object.keys(output.inputs).filter(input => output.inputs[input].bytesInOutput > 0);
+  assert.ok(contributions(runtime).some(input => /react-dom\/cjs\/react-dom-client\.production\.js$/.test(input)));
+  const runtimeJs = fs.readFileSync(path.join(repo, "dist/frontend/webui-runtime.js"), "utf8");
+  const reactDomLicense = fs.readFileSync(path.join(repo, "tools/webui/node_modules/react-dom/LICENSE"), "utf8");
+  assert.ok(runtimeJs.includes(reactDomLicense));
+  for (const name of ["app.js", "administration.js"]) {
+    const output = js.outputs[`dist/frontend/${name}`];
+    assert.deepEqual(output.imports.map(({ path }) => path), ["dist/frontend/webui-runtime.js"]);
+    assert.ok(contributions(output).every(input => !input.includes("/react-dom/")));
+  }
+  const workspaceOnly = contributions(js.outputs["dist/frontend/app.js"]);
+  const directAdmin = [...contributions(runtime), ...contributions(js.outputs["dist/frontend/administration.js"])];
+  for (const input of ["frontend/app.js", "frontend/charts.js"]) {
+    assert.ok(workspaceOnly.includes(input), input);
+    assert.ok(!directAdmin.includes(input), input);
   }
 });
 

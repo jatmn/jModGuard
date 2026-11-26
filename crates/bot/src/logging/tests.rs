@@ -1018,10 +1018,10 @@ fn message_identity_snippets_expire_and_evict_only_within_their_guild() {
     let f = Fixture::new();
     let author = |guild, message| known_message_author(&f.app, guild, 456, message);
     remember_message(&f.app, 789, 456, 1, Some(42), None, None);
-    remember_message_create(&f.app, 790, 456, 1, Some(43), None, None, true);
+    remember_message_create(&f.app, 790, 456, 1, Some(43), true);
     {
         let mut snippets = f.app.log_snippets.inner.lock();
-        let first = snippets.get_mut(&(789, 456, 1)).unwrap();
+        let first = snippets.get_mut((789, 456, 1)).unwrap();
         first.at -= Duration::from_secs(1);
     }
     for id in 2..=64 {
@@ -1035,7 +1035,14 @@ fn message_identity_snippets_expire_and_evict_only_within_their_guild() {
     }
     assert_eq!(author(790, 1), Some(43));
 
-    let stored_at = f.app.log_snippets.inner.lock()[&(790, 456, 1)].at;
+    let stored_at = f
+        .app
+        .log_snippets
+        .inner
+        .lock()
+        .get((790, 456, 1))
+        .unwrap()
+        .at;
     assert_eq!(
         known_message_identity_at(&f.app, 790, 456, 1, || stored_at + Duration::from_secs(599)),
         Some((43, true))
@@ -1044,6 +1051,73 @@ fn message_identity_snippets_expire_and_evict_only_within_their_guild() {
         known_message_identity_at(&f.app, 790, 456, 1, || stored_at + Duration::from_secs(600)),
         None
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn snippet_expiry_order_stays_bounded_across_guilds() {
+    let start = tokio::time::Instant::now().into_std();
+    let mut cache = SnippetEntries::default();
+    let refreshed = (1, 10, 1);
+    let inserted = (1, 10, 65);
+    for message in 1..=64 {
+        for guild in 1..=100 {
+            cache.remember(
+                (guild, 10, message),
+                Some(guild),
+                (guild, 10, message) == refreshed,
+                start + Duration::from_millis(message),
+            );
+        }
+    }
+
+    let refresh_time = start + Duration::from_millis(100);
+    for _ in 0..1024 {
+        cache.remember(refreshed, None, false, refresh_time);
+    }
+    let preserved = cache.get(refreshed).unwrap();
+    assert_eq!(preserved.author, 1);
+    assert!(preserved.origin == MessageOrigin::Webhook);
+    assert_eq!(preserved.at, refresh_time);
+    cache.remember(
+        inserted,
+        Some(99),
+        false,
+        refresh_time + Duration::from_millis(1),
+    );
+    assert!(cache.get((1, 10, 2)).is_none());
+    assert!(cache.get((2, 10, 2)).is_some());
+    for entries in cache.by_guild.values() {
+        assert_eq!(entries.len(), SNIPPETS_PER_GUILD);
+    }
+
+    let mut previous = None;
+    let mut current = cache.oldest;
+    for _ in 0..6400 {
+        let entry = cache.get(current.unwrap()).unwrap();
+        assert_eq!(entry.older, previous);
+        previous = current;
+        current = entry.newer;
+    }
+    assert_eq!(previous, Some(inserted));
+    assert_eq!(previous, cache.newest);
+    assert!(current.is_none());
+
+    cache.expire(start + SNIPPET_KEEP + Duration::from_millis(1));
+    assert!(cache.get((2, 10, 1)).is_none());
+    assert!(cache.get((2, 10, 2)).is_some());
+    assert!(cache.get(refreshed).is_some());
+    cache.expire(start + SNIPPET_KEEP + Duration::from_millis(64));
+    assert_eq!(cache.by_guild.len(), 1);
+    assert_eq!(cache.by_guild[&1].len(), 2);
+    assert_eq!(cache.oldest, Some(refreshed));
+    assert_eq!(cache.newest, Some(inserted));
+
+    cache.remember(refreshed, Some(0), false, refresh_time + SNIPPET_KEEP);
+    assert!(cache.get(refreshed).is_none());
+    assert_eq!(cache.remove(inserted).unwrap().author, 99);
+    assert!(cache.by_guild.is_empty());
+    assert!(cache.oldest.is_none());
+    assert!(cache.newest.is_none());
 }
 
 #[test]
@@ -1816,6 +1890,396 @@ fn audit_fixture(action: Action, target: u64, observed_ms: i64, reason: Option<&
     .unwrap()
 }
 
+type AuditRequest = (hyper::Uri, tokio::sync::oneshot::Sender<AuditLogs>);
+
+async fn held_audit_proxy() -> (
+    serenity::http::Http,
+    tokio::sync::mpsc::UnboundedReceiver<AuditRequest>,
+    tokio::task::JoinHandle<Result<(), hyper::Error>>,
+) {
+    use hyper::service::{make_service_fn, service_fn};
+    use hyper::{Body, Method, Response, Server, StatusCode};
+    use std::convert::Infallible;
+    use tokio::sync::{mpsc, oneshot};
+
+    let (requests, received) = mpsc::unbounded_channel();
+    let server = Server::bind(&"127.0.0.1:0".parse().unwrap());
+    let address = server.local_addr();
+    let server = tokio::spawn(server.serve(make_service_fn(move |_| {
+        let requests = requests.clone();
+        async move {
+            Ok::<_, Infallible>(service_fn(move |request: hyper::Request<Body>| {
+                let (reply, page) = oneshot::channel();
+                assert_eq!(request.method(), Method::GET);
+                let _ = requests.send((request.uri().clone(), reply));
+                async move {
+                    let response = match page.await {
+                        Ok(page) => Response::builder()
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&page).unwrap()))
+                            .unwrap(),
+                        Err(_) => Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .body(Body::empty())
+                            .unwrap(),
+                    };
+                    Ok::<_, Infallible>(response)
+                }
+            }))
+        }
+    })));
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{address}"))
+        .ratelimiter_disabled(true)
+        .build();
+    (http, received, server)
+}
+
+fn assert_audit_request(uri: &hyper::Uri, guild: GuildId, action: Action) {
+    assert!(
+        uri.path().ends_with(&format!("/guilds/{guild}/audit-logs")),
+        "{uri}"
+    );
+    let query = uri.query().unwrap();
+    assert!(query.split('&').any(|part| part == "limit=100"), "{uri}");
+    assert!(
+        query
+            .split('&')
+            .any(|part| part == format!("action_type={}", action.num())),
+        "{uri}"
+    );
+}
+
+async fn overlap_audit_requests(late: bool) {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let f = Fixture::with_timeout(6);
+    let (http, mut requests, server) = held_audit_proxy().await;
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = 1_790_086_832_000;
+    let one = claims.observe(guild.get(), action, 123, observed);
+    let two = claims.observe(guild.get(), action, 124, observed);
+    let mut one = Box::pin(lookup_member_audit(&f.app, &http, guild, &one));
+    let (uri, reply) = tokio::select! {
+        request = requests.recv() => request.unwrap(),
+        _ = &mut one => panic!("first lookup ended before the HTTP request"),
+    };
+    assert_audit_request(&uri, guild, action);
+    let mut two = Box::pin(lookup_member_audit(&f.app, &http, guild, &two));
+    assert!(
+        poll_fn(|cx| Poll::Ready(two.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+
+    let second_page = || audit_fixture(action, 124, observed + 1, Some("second target"));
+    let mut first_page = audit_fixture(action, 123, observed, Some("first target"));
+    if !late {
+        first_page.entries.extend(second_page().entries);
+    }
+    reply.send(first_page).unwrap();
+
+    let mut lookups = std::pin::pin!(async { tokio::join!(one, two) });
+    let mut additional_reads = 0;
+    let (one, two) = loop {
+        tokio::select! {
+            result = &mut lookups => break result,
+            request = requests.recv() => {
+                let (uri, reply) = request.unwrap();
+                assert_audit_request(&uri, guild, action);
+                additional_reads += 1;
+                reply.send(second_page()).unwrap();
+            }
+        }
+    };
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    assert_eq!(one.unwrap()["reason"], "first target");
+    assert_eq!(two.unwrap()["reason"], "second target");
+    assert_eq!(additional_reads, usize::from(late), "extra GET requests");
+}
+
+#[tokio::test]
+async fn member_audit_overlapping_targets_share_one_get() {
+    overlap_audit_requests(false).await;
+}
+
+#[tokio::test]
+async fn member_audit_late_target_uses_a_new_page() {
+    overlap_audit_requests(true).await;
+}
+
+#[tokio::test]
+async fn member_audit_does_not_claim_from_a_page_started_before_the_observation() {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let f = Fixture::with_timeout(6);
+    let (http, mut requests, server) = held_audit_proxy().await;
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = 1_790_086_832_000;
+    let first = claims.observe(guild.get(), action, 123, observed);
+    let mut first = Box::pin(lookup_member_audit(&f.app, &http, guild, &first));
+    let (uri, reply) = tokio::select! {
+        request = requests.recv() => request.unwrap(),
+        _ = &mut first => panic!("first lookup ended before the HTTP request"),
+    };
+    assert_audit_request(&uri, guild, action);
+
+    let later = claims.observe(guild.get(), action, 124, observed + 10);
+    let mut later = Box::pin(lookup_member_audit(&f.app, &http, guild, &later));
+    assert!(
+        poll_fn(|cx| Poll::Ready(later.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    let older_entry = || audit_fixture(action, 124, observed + 1, Some("previous action"));
+    let mut first_page = audit_fixture(action, 123, observed, Some("first target"));
+    first_page.entries.extend(older_entry().entries);
+    reply.send(first_page).unwrap();
+
+    let mut lookups = std::pin::pin!(async { tokio::join!(first, later) });
+    let mut fresh_reads = 0;
+    let (first, later) = loop {
+        tokio::select! {
+            result = &mut lookups => break result,
+            request = requests.recv() => {
+                let (uri, reply) = request.unwrap();
+                assert_audit_request(&uri, guild, action);
+                fresh_reads += 1;
+                let mut fresh = audit_fixture(action, 124, observed + 10, Some("current action"));
+                fresh.entries.extend(older_entry().entries);
+                reply.send(fresh).unwrap();
+            }
+        }
+    };
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    assert_eq!(first.unwrap()["reason"], "first target");
+    assert!(later.is_none(), "fresh audit page is ambiguous: {later:?}");
+    assert_eq!(fresh_reads, 3);
+}
+
+#[tokio::test]
+async fn member_audit_cancelled_waiter_and_other_keys_leave_the_page_in_flight() {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let f = Fixture::with_timeout(6);
+    let (http, mut requests, server) = held_audit_proxy().await;
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let other_guild = GuildId::new(790);
+    let ban = member_audit_action("member_ban").unwrap();
+    let unban = member_audit_action("member_unban").unwrap();
+    let observed = 1_790_086_832_000;
+    let first = claims.observe(guild.get(), ban, 123, observed);
+    let cancelled = claims.observe(guild.get(), ban, 124, observed);
+    let elsewhere = claims.observe(other_guild.get(), ban, 123, observed);
+    let other_action = claims.observe(guild.get(), unban, 123, observed);
+    let mut first = Box::pin(lookup_member_audit(&f.app, &http, guild, &first));
+    let (uri, held) = tokio::select! {
+        request = requests.recv() => request.unwrap(),
+        _ = &mut first => panic!("first lookup ended before the HTTP request"),
+    };
+    assert_audit_request(&uri, guild, ban);
+    let mut cancelled = Box::pin(lookup_member_audit(&f.app, &http, guild, &cancelled));
+    assert!(
+        poll_fn(|cx| Poll::Ready(cancelled.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    drop(cancelled);
+
+    let (elsewhere, other_action, ()) = tokio::join!(
+        lookup_member_audit(&f.app, &http, other_guild, &elsewhere),
+        lookup_member_audit(&f.app, &http, guild, &other_action),
+        async {
+            let mut distinct = HashSet::new();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                for _ in 0..2 {
+                    let (uri, reply) = requests.recv().await.unwrap();
+                    let (guild, action, reason) = if uri.path().contains("/guilds/790/") {
+                        (other_guild, ban, "other guild")
+                    } else {
+                        (guild, unban, "other action")
+                    };
+                    assert_audit_request(&uri, guild, action);
+                    assert!(distinct.insert((guild, action.num())));
+                    reply
+                        .send(audit_fixture(action, 123, observed, Some(reason)))
+                        .unwrap();
+                }
+            })
+            .await
+            .expect("separate keys must make their own requests while the first is held");
+        },
+    );
+    assert_eq!(elsewhere.unwrap()["reason"], "other guild");
+    assert_eq!(other_action.unwrap()["reason"], "other action");
+    held.send(audit_fixture(ban, 123, observed, Some("held page")))
+        .unwrap();
+    assert_eq!(first.await.unwrap()["reason"], "held page");
+    assert!(requests.try_recv().is_err(), "cancelled waiter sent a GET");
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+struct HeldAuditSink {
+    observed: i64,
+    calls: std::sync::atomic::AtomicUsize,
+    miss_first: bool,
+    page_delay: Duration,
+}
+
+#[serenity::async_trait]
+impl LogDelivery for HeldAuditSink {
+    async fn send(&self, _: ChannelId, _: CreateMessage) -> anyhow::Result<()> {
+        unreachable!()
+    }
+
+    async fn member_audit(&self, _: GuildId, action: Action) -> anyhow::Result<AuditLogs> {
+        let mut page = audit_fixture(action, 123, self.observed, Some("fresh retry"));
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match (self.miss_first, call) {
+            (true, 0) => page.entries.clear(),
+            (true, 1) | (false, 0) => std::future::pending().await,
+            _ if !self.page_delay.is_zero() => tokio::time::sleep(self.page_delay).await,
+            _ => {}
+        }
+        Ok(page)
+    }
+}
+
+#[tokio::test]
+async fn member_audit_retry_uses_a_page_started_after_its_wait() {
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::Ordering;
+    use std::task::Poll;
+
+    let f = Fixture::with_timeout(6);
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = 1_790_086_832_000;
+    let target = claims.observe(guild.get(), action, 123, observed);
+    let other = claims.observe(guild.get(), action, 124, observed);
+    let sink = HeldAuditSink {
+        observed,
+        calls: Default::default(),
+        miss_first: true,
+        page_delay: Duration::ZERO,
+    };
+
+    tokio::time::pause();
+    let mut target = Box::pin(lookup_member_audit(&f.app, &sink, guild, &target));
+    assert!(
+        poll_fn(|cx| Poll::Ready(target.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    tokio::time::advance(Duration::from_millis(250)).await;
+    let mut other = Box::pin(lookup_member_audit(&f.app, &sink, guild, &other));
+    assert!(
+        poll_fn(|cx| Poll::Ready(other.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    assert_eq!(sink.calls.load(Ordering::Relaxed), 2);
+    assert_eq!(target.await.unwrap()["reason"], "fresh retry");
+    assert_eq!(sink.calls.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn member_audit_waiter_keeps_its_deadline_after_the_owner_expires() {
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::Ordering;
+    use std::task::Poll;
+
+    let f = Fixture::with_timeout(6);
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = 1_790_086_832_000;
+    let owner = claims.observe(guild.get(), action, 124, observed);
+    let waiter = claims.observe(guild.get(), action, 123, observed);
+    let sink = HeldAuditSink {
+        observed,
+        calls: Default::default(),
+        miss_first: false,
+        page_delay: Duration::ZERO,
+    };
+
+    tokio::time::pause();
+    let mut owner = Box::pin(lookup_member_audit(&f.app, &sink, guild, &owner));
+    assert!(
+        poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let mut waiter = Box::pin(lookup_member_audit(&f.app, &sink, guild, &waiter));
+    assert!(
+        poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    assert_eq!(
+        sink.calls.load(Ordering::Relaxed),
+        1,
+        "waiter shares the held GET"
+    );
+    assert!(owner.await.is_none());
+    assert_eq!(waiter.await.unwrap()["reason"], "fresh retry");
+    assert_eq!(sink.calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn member_audit_waiter_has_time_for_a_fresh_request_when_the_owner_stalls() {
+    let f = Fixture::with_timeout(6);
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = 1_790_086_832_000;
+    let owner = claims.observe(guild.get(), action, 124, observed);
+    let waiter = claims.observe(guild.get(), action, 123, observed);
+    let sink = HeldAuditSink {
+        observed,
+        calls: Default::default(),
+        miss_first: false,
+        page_delay: Duration::from_millis(300),
+    };
+    let owner_finished = std::cell::Cell::new(false);
+
+    tokio::time::pause();
+    let (owner, (waiter, finished_before_owner)) = tokio::join!(
+        async {
+            let result = lookup_member_audit(&f.app, &sink, guild, &owner).await;
+            owner_finished.set(true);
+            result
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let result = lookup_member_audit(&f.app, &sink, guild, &waiter).await;
+            (result, !owner_finished.get())
+        },
+    );
+    assert!(owner.is_none());
+    assert_eq!(
+        waiter.expect("the waiter has time to receive its own page")["reason"],
+        "fresh retry"
+    );
+    assert!(finished_before_owner, "the held request is still in flight");
+    assert_eq!(sink.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
 #[test]
 fn member_audit_requires_unique_recent_target_and_action() {
     let observed = 1_790_086_832_000;
@@ -1909,6 +2373,7 @@ async fn member_audit_skips_permanently_ineligible_observations() {
         target: 456,
         action,
         observed_ms: observed,
+        observed_at: superseded.observed_at,
         generation: None,
     };
     let sink = AuditSink {
@@ -2209,23 +2674,63 @@ fn deferred_verified_leave_uses_captured_stay_and_original_event_time() {
 }
 
 #[test]
-fn received_message_join_context_is_scoped_consumed_expiring_and_bounded() {
+fn received_message_join_context_is_scoped_consumed_and_expiring() {
     let cache = MemberJoinContext::default();
     let joined = serenity::model::Timestamp::from_unix_timestamp(1_760_000_000).unwrap();
     cache.remember(1, 2, Some(joined));
+    let seen = cache.inner.lock().by_member[&(1, 2)].1;
     cache.remember(1, 2, None);
+    assert_eq!(cache.inner.lock().by_member[&(1, 2)].1, seen);
     assert_eq!(cache.take(2, 2), None);
     assert_eq!(cache.take(1, 2), Some(joined));
     assert_eq!(cache.take(1, 2), None);
-    cache.remember(1, 2, Some(joined));
-    cache.inner.lock().get_mut(&(1, 2)).unwrap().1 = Instant::now() - MEMBER_JOINS_KEEP;
-    assert_eq!(cache.take(1, 2), None);
-    for user in 0..=MEMBER_JOINS_LIMIT {
-        cache.remember(1, user as u64, Some(joined));
+    {
+        let mut entries = cache.inner.lock();
+        let expired = seen - MEMBER_JOINS_KEEP;
+        entries.remember((1, 2), joined, expired);
+        entries.remember((1, 3), joined, expired);
     }
-    assert_eq!(cache.inner.lock().len(), MEMBER_JOINS_LIMIT);
+    assert_eq!(cache.take(1, 2), None);
+    cache.remember(2, 2, Some(joined));
+    let entries = cache.inner.lock();
+    assert_eq!(entries.by_member.len(), 1);
+    assert_eq!(entries.by_age.len(), 1);
+    assert!(!entries.by_member.contains_key(&(1, 3)));
+}
+
+#[test]
+fn received_message_join_context_refresh_preserves_oldest_eviction_and_index_bound() {
+    let cache = MemberJoinContext::default();
+    let joined = serenity::model::Timestamp::from_unix_timestamp(1_760_000_000).unwrap();
+    let refreshed = serenity::model::Timestamp::from_unix_timestamp(1_759_999_940).unwrap();
+    let per_guild = MEMBER_JOINS_LIMIT / 2;
+    cache.remember(1, 0, Some(joined));
+    {
+        let mut entries = cache.inner.lock();
+        let start = entries.by_member[&(1, 0)].1 - Duration::from_secs(1);
+        for user in 0..MEMBER_JOINS_LIMIT {
+            let guild = if user < per_guild { 1 } else { 2 };
+            let seen = start + Duration::from_micros(user as u64);
+            entries.remember((guild, user as u64), joined, seen);
+        }
+    }
+    for _ in 0..MEMBER_JOINS_LIMIT {
+        cache.remember(1, 0, Some(refreshed));
+    }
+    cache.remember(1, MEMBER_JOINS_LIMIT as u64, Some(joined));
+    {
+        let entries = cache.inner.lock();
+        assert_eq!(entries.by_member.len(), MEMBER_JOINS_LIMIT);
+        assert_eq!(entries.by_age.len(), MEMBER_JOINS_LIMIT);
+    }
+    assert_eq!(cache.take(1, 1), None);
+    assert_eq!(cache.take(1, 0), Some(refreshed));
     cache.clear_guild(1);
-    assert!(cache.inner.lock().is_empty());
+    assert_eq!(cache.take(1, 2), None);
+    assert_eq!(cache.take(2, per_guild as u64), Some(joined));
+    let entries = cache.inner.lock();
+    assert_eq!(entries.by_member.len(), per_guild - 1);
+    assert_eq!(entries.by_age.len(), per_guild - 1);
 }
 
 #[tokio::test]
@@ -5763,6 +6268,185 @@ async fn delivery_renders_custom_template_as_description_with_event_accent_and_c
     assert!(payload.get("content").is_none());
 }
 
+const EDIT_SOURCE_CHANNEL_JSON: &str = r#"{"id":"456","guild_id":"789","type":0,"name":"general","position":0,"permission_overwrites":[]}"#;
+
+/// A gateway channel-cache miss leaves the source as a mention to resolve.
+fn uncached_edit_source_vars() -> BTreeMap<String, String> {
+    message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123))
+}
+
+fn edit_source_channel_gets(requests: &[String]) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.starts_with("GET /api/v10/channels/456 "))
+        .count()
+}
+
+#[tokio::test]
+async fn message_edit_template_without_channel_skips_the_source_channel_lookup() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_edit", 901)
+        .await
+        .unwrap();
+    f.app.db.with_conn(|conn| {
+        conn.execute_bounded("INSERT INTO templates(guild_id,event_type,template) VALUES(789,'message_edit','Edited: {message_url}')", (), 65_536)?;
+        Ok(())
+    }).await.unwrap();
+    f.app.invalidate_configs();
+    let (http, requests, _, server) = sequenced_bulk_proxy(vec![SequencedProxyReply::Status {
+        status: 200,
+        body: CREATED_MESSAGE_JSON,
+    }])
+    .await;
+    let delivery = emit_to(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        "message_edit",
+        uncached_edit_source_vars(),
+    )
+    .await;
+    server.abort();
+    let seen = request_text(&requests.lock().unwrap());
+    assert_eq!(edit_source_channel_gets(&seen), 0, "{seen:?}");
+    assert_eq!(delivery, Delivery::Sent);
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        seen[0].starts_with("POST /api/v10/channels/901/messages "),
+        "{}",
+        seen[0]
+    );
+    assert_eq!(
+        request_log_payload(&seen[0])["embeds"][0]["description"],
+        "Edited: https://discord.com/channels/789/456/123"
+    );
+}
+
+#[tokio::test]
+async fn message_edit_blocked_destination_skips_the_source_lookup_even_if_it_recovers() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_edit", 901)
+        .await
+        .unwrap();
+    let (http, requests, _, server) = sequenced_bulk_proxy(vec![
+        SequencedProxyReply::Status {
+            status: 200,
+            body: EDIT_SOURCE_CHANNEL_JSON,
+        },
+        SequencedProxyReply::Status {
+            status: 403,
+            body: r#"{"code":50013,"message":"fixture"}"#,
+        },
+        SequencedProxyReply::Status {
+            status: 200,
+            body: CREATED_MESSAGE_JSON,
+        },
+    ])
+    .await;
+    // The shipped template uses the channel name, so only the remembered
+    // permanent rejection makes the lookup unnecessary.
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "message_edit",
+            uncached_edit_source_vars(),
+        )
+        .await,
+        Delivery::Failed
+    );
+    let first = request_text(&requests.lock().unwrap());
+    assert_eq!(edit_source_channel_gets(&first), 1, "{first:?}");
+    assert_eq!(first.len(), 2, "{first:?}");
+    let delivery = emit_to(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        "message_edit",
+        uncached_edit_source_vars(),
+    )
+    .await;
+    let seen = request_text(&requests.lock().unwrap());
+    assert_eq!(
+        edit_source_channel_gets(&seen[first.len()..]),
+        0,
+        "{seen:?}"
+    );
+    assert_eq!(delivery, Delivery::Blocked);
+    assert_eq!(seen.len(), first.len(), "{seen:?}");
+
+    let app = Arc::clone(&f.app);
+    let delivery = BEFORE_EDIT_DESTINATION_RECHECK
+        .scope(
+            Box::new(move || app.remembered_discord_targets.clear_guild(789)),
+            emit_to(
+                &f.app,
+                &http,
+                GuildId::new(789),
+                "message_edit",
+                uncached_edit_source_vars(),
+            ),
+        )
+        .await;
+    server.abort();
+    let seen = request_text(&requests.lock().unwrap());
+    let after_recovery = &seen[first.len()..];
+    assert_eq!(edit_source_channel_gets(after_recovery), 0, "{seen:?}");
+    assert_eq!(delivery, Delivery::Sent);
+    assert_eq!(after_recovery.len(), 1, "{seen:?}");
+    assert!(after_recovery[0].starts_with("POST /api/v10/channels/901/messages "));
+    let text = log_text(&request_log_payload(&after_recovery[0]));
+    assert!(
+        text.starts_with("Message edited\n\n**Channel:** #456\n"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn message_edit_template_with_channel_still_resolves_the_source_name() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_edit", 901)
+        .await
+        .unwrap();
+    let (http, requests, _, server) = sequenced_bulk_proxy(vec![
+        SequencedProxyReply::Status {
+            status: 200,
+            body: EDIT_SOURCE_CHANNEL_JSON,
+        },
+        SequencedProxyReply::Status {
+            status: 200,
+            body: CREATED_MESSAGE_JSON,
+        },
+    ])
+    .await;
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "message_edit",
+            uncached_edit_source_vars(),
+        )
+        .await,
+        Delivery::Sent
+    );
+    server.abort();
+    let seen = request_text(&requests.lock().unwrap());
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(edit_source_channel_gets(&seen[..1]), 1, "{seen:?}");
+    assert!(
+        seen[1].starts_with("POST /api/v10/channels/901/messages "),
+        "{}",
+        seen[1]
+    );
+    let text = log_text(&request_log_payload(&seen[1]));
+    assert!(
+        text.starts_with("Message edited\n\n**Channel:** #general\n"),
+        "{text}"
+    );
+}
+
 #[test]
 fn shipped_automod_embed_keeps_whole_proving_hashes_inside_field_limit() {
     let mut vars = BTreeMap::from([(
@@ -5784,4 +6468,124 @@ fn shipped_automod_embed_keeps_whole_proving_hashes_inside_field_limit() {
     assert_eq!(content, whole_hash_notice(&proving_digests(40), 1024));
     assert!(content.ends_with("and 25 more"));
     assert!(!content.contains('…'));
+}
+
+/// Representative edit, delete and automod reports, each long enough to need
+/// the evidence bounds, sent through the real delivery path.
+async fn bounded_report_embeds() -> Vec<serde_json::Value> {
+    let f = Fixture::new();
+    for event in ["message_edit", "message_delete", "automod"] {
+        db::upsert_log_channel(&f.app.db, 789, event, 456)
+            .await
+            .unwrap();
+    }
+    let sink = Sink::default();
+    let guild = GuildId::new(789);
+    let long = "é🦀".repeat(600);
+    let base = BTreeMap::from([
+        ("time".into(), "2026-01-01T00:00:00+00:00".into()),
+        ("user".into(), "member".into()),
+        ("user_id".into(), "42".into()),
+        ("mention".into(), "<@42>".into()),
+        ("channel".into(), "general".into()),
+        ("channel_id".into(), "456".into()),
+    ]);
+    let with = |pairs: &[(&str, &str)]| {
+        let mut vars = base.clone();
+        for (key, value) in pairs {
+            vars.insert((*key).into(), (*value).into());
+        }
+        vars
+    };
+    let digests = format!("sha256 {}", proving_digests(40).join(","));
+    let reports = [
+        (
+            "message_edit",
+            with(&[("before", &long), ("after", &long), ("attachments", &long)]),
+        ),
+        (
+            "message_delete",
+            with(&[("content", &long), ("attachments", &long)]),
+        ),
+        (
+            "automod",
+            with(&[
+                ("rule", "links"),
+                ("action", "delete"),
+                ("content", &digests),
+            ]),
+        ),
+    ];
+    for (event, vars) in reports {
+        assert_eq!(
+            emit_to(&f.app, &sink, guild, event, vars).await,
+            Delivery::Sent
+        );
+    }
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_bounded(
+                "INSERT INTO templates(guild_id,event_type,template) VALUES(789,'automod','Hit: {content} by {mention}')",
+                (),
+                65_536,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let custom = with(&[("content", &format!("{digests}; {long}{long}"))]);
+    assert_eq!(
+        emit_to(&f.app, &sink, guild, "automod", custom).await,
+        Delivery::Sent
+    );
+    let messages = sink.messages.lock().unwrap();
+    messages
+        .iter()
+        .map(|(_, payload)| payload.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn embed_delivery_skips_the_discarded_flat_render() {
+    let flat_renders = flat_log_renders();
+    let embeds = bounded_report_embeds().await;
+    assert_eq!(flat_log_renders(), flat_renders);
+    let field = |embed: &serde_json::Value, name: &str| -> String {
+        embed["embeds"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["name"] == name)
+            .unwrap_or_else(|| panic!("{name}"))["value"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // The shipped layouts keep their evidence bounds, not the generic field limit.
+    for (embed, name, units) in [
+        (&embeds[0], "⏪ Before (last observed)", 600),
+        (&embeds[0], "⏩ After", 600),
+        (&embeds[0], "📎 Attachments", 240),
+        (&embeds[1], "💬 Last observed text", 900),
+        (&embeds[1], "📎 Attachments", 400),
+    ] {
+        let value = field(embed, name);
+        assert!(value.ends_with("… [display clipped]"), "{name}: {value}");
+        assert!(
+            value.contains('🦀'),
+            "{name} must exercise a two-unit character"
+        );
+        assert!(value.encode_utf16().count() <= units, "{name}");
+    }
+    assert_eq!(
+        field(&embeds[2], "🧾 Evidence"),
+        whole_hash_notice(&proving_digests(40), 1024)
+    );
+    let custom = embeds[3]["embeds"][0]["description"].as_str().unwrap();
+    assert!(custom.encode_utf16().count() <= 2000);
+    let evidence = custom.strip_prefix("Hit: ").unwrap();
+    assert!(evidence.ends_with(" and 10 more by <@42>"), "{custom}");
+    assert_whole_digests(evidence);
 }

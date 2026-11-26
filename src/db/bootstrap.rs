@@ -197,6 +197,14 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
         if version < target {
             let growth = if target == 27 {
                 ban_list_migration_growth(&tx).context("measure migration 27 growth")?
+            } else if target == 30 {
+                // The virtual date column rewrites no rows. Reserve index
+                // pages for the fixed-width keys, rowids and B-tree overhead.
+                let events: i64 =
+                    tx.query_row("SELECT COUNT(*) FROM events", (), |r| Ok(r.get(0)?))?;
+                u64::try_from(events)?
+                    .saturating_mul(128)
+                    .saturating_add(EMPTY_TABLES_MIGRATION_GROWTH)
             } else if matches!(target, 28 | 29) {
                 // Empty tables and indexes need schema and root pages only.
                 EMPTY_TABLES_MIGRATION_GROWTH
@@ -318,6 +326,10 @@ pub(super) fn read_bootstrap_defaults_primary(conn: &Connection) -> Result<Guild
 
 /// Bumps durable `config_version` on an open connection (config writers only).
 pub(crate) fn bump_config_version_conn(conn: &impl SqlExecutor) -> Result<()> {
+    bump_config_version_with_revision_conn(conn).map(|_| ())
+}
+
+pub(super) fn bump_config_version_with_revision_conn(conn: &impl SqlExecutor) -> Result<String> {
     let version: u64 = conn.query_row_write(
         "INSERT INTO meta (key, value) VALUES ('config_version', '1')
          ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
@@ -325,13 +337,10 @@ pub(crate) fn bump_config_version_conn(conn: &impl SqlExecutor) -> Result<()> {
         (),
         |row| Ok(row.get::<i64>(0)? as u64),
     )?;
-    write_meta_string_conn(
-        conn,
-        "config_revision",
-        &format!("{:032x}", rand::random::<u128>()),
-    )?;
+    let revision = format!("{:032x}", rand::random::<u128>());
+    write_meta_string_conn(conn, "config_revision", &revision)?;
     conn.record_config_version(version);
-    Ok(())
+    Ok(revision)
 }
 
 /// Bumps durable `slash_registry_version` when the Discord slash command
@@ -349,20 +358,27 @@ pub(crate) fn bump_slash_registry_version_conn(conn: &impl SqlExecutor) -> Resul
 /// Existing completed schemas have these fixed rows; missing markers refuse
 /// the cleanup rather than silently dropping invalidation floors.
 pub(super) fn bump_config_version_reclaim_conn(tx: &crate::db_compat::Transaction) -> Result<()> {
+    bump_config_version_reclaim_with_revision_conn(tx).map(|_| ())
+}
+
+pub(super) fn bump_config_version_reclaim_with_revision_conn(
+    tx: &crate::db_compat::Transaction,
+) -> Result<String> {
     anyhow::ensure!(tx.execute_reclaim_metadata_bounded(
         "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='config_version'",
         (), reclaim_meta_bound(tx)?,
     )? == 1, "config_version marker is missing");
+    let revision = format!("{:032x}", rand::random::<u128>());
     anyhow::ensure!(
         tx.execute_reclaim_metadata_bounded(
             "UPDATE meta SET value=?1 WHERE key='config_revision'",
-            params![format!("{:032x}", rand::random::<u128>())],
+            params![revision.as_str()],
             reclaim_meta_bound(tx)?,
         )? == 1,
         "config_revision marker is missing"
     );
     tx.record_config_version(get_config_version_conn(tx)?);
-    Ok(())
+    Ok(revision)
 }
 
 pub(super) fn bump_slash_version_reclaim_conn(tx: &crate::db_compat::Transaction) -> Result<()> {
@@ -410,7 +426,11 @@ pub(super) fn get_meta_version_conn(conn: &impl SqlExecutor, key: &str) -> Resul
             Ok(r.get(0)?)
         })
         .optional()?;
-    Ok(value.as_deref().unwrap_or("0").parse::<u64>().unwrap_or(0))
+    Ok(meta_version_value(value))
+}
+
+fn meta_version_value(raw: Option<String>) -> u64 {
+    raw.as_deref().unwrap_or("0").parse::<u64>().unwrap_or(0)
 }
 
 pub(super) fn get_config_version_conn(conn: &impl SqlExecutor) -> Result<u64> {
@@ -429,19 +449,32 @@ pub struct VersionState {
     pub slash_revision: String,
 }
 
+/// Every version poll runs this, so all four markers share one statement.
 pub(super) fn get_version_state_conn(conn: &impl SqlExecutor) -> Result<VersionState> {
-    let config = get_config_version_conn(conn)?;
-    let slash = get_slash_registry_version_conn(conn)?;
-    let config_revision =
-        meta_string_conn(conn, "config_revision")?.unwrap_or_else(|| format!("legacy:{config}"));
-    let slash_revision = meta_string_conn(conn, "slash_registry_revision")?
-        .unwrap_or_else(|| format!("legacy:{slash}"));
-    Ok(VersionState {
-        config,
-        slash,
-        config_revision,
-        slash_revision,
-    })
+    conn.query_row(
+        "SELECT
+           (SELECT value FROM meta WHERE key = 'config_version'),
+           (SELECT value FROM meta WHERE key = 'slash_registry_version'),
+           (SELECT value FROM meta WHERE key = 'config_revision'),
+           (SELECT value FROM meta WHERE key = 'slash_registry_revision')",
+        (),
+        |row| {
+            let config = meta_version_value(row.get(0)?);
+            let slash = meta_version_value(row.get(1)?);
+            let config_revision = row
+                .get::<Option<String>>(2)?
+                .unwrap_or_else(|| format!("legacy:{config}"));
+            let slash_revision = row
+                .get::<Option<String>>(3)?
+                .unwrap_or_else(|| format!("legacy:{slash}"));
+            Ok(VersionState {
+                config,
+                slash,
+                config_revision,
+                slash_revision,
+            })
+        },
+    )
 }
 
 pub async fn get_config_version(db: &Db) -> Result<u64> {
@@ -1628,13 +1661,9 @@ fn seed_globals_sql(
         markers.push("retained_bulk_status_template_v1");
     }
     if meta_string_conn(conn, "embed_log_defaults_v1")?.is_none() {
-        let current = crate::defaults::rendered_log_templates();
         for (event, old) in crate::defaults::pre_embed_log_templates() {
-            let new = current
-                .iter()
-                .find(|(name, _)| *name == event)
-                .context("shipped embed template")?
-                .1;
+            let new =
+                crate::defaults::rendered_log_template(event).context("shipped embed template")?;
             body.push_str(&format!(
                 "UPDATE templates SET template = {} WHERE event_type = {} AND template = {};\n",
                 sql_text(new),

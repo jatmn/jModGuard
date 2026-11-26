@@ -34,6 +34,7 @@ struct HranaState {
     in_transaction: bool,
     begin_sql: Vec<String>,
     next_cursor_error: Option<(&'static str, &'static str)>,
+    timeout_cursor_sql: Option<&'static str>,
     hang_next_commit: bool,
     hang_next_statement: bool,
     hang_next_begin: bool,
@@ -77,6 +78,7 @@ impl HranaState {
             in_transaction: false,
             begin_sql: Vec::new(),
             next_cursor_error: None,
+            timeout_cursor_sql: None,
             hang_next_commit: false,
             hang_next_statement: false,
             hang_next_begin: false,
@@ -401,7 +403,7 @@ impl HranaFixture {
         delay: Duration,
         limit: Duration,
     ) -> (Self, Db) {
-        Self::provider_database(path, ProviderModel::new(delay, limit)).await
+        Self::backed_database(path, Some(ProviderModel::new(delay, limit))).await
     }
 
     /// Account for each Hrana round trip without charging host scheduling to
@@ -412,14 +414,25 @@ impl HranaFixture {
         limit: Duration,
         elapsed: Arc<Mutex<Duration>>,
     ) -> (Self, Db) {
-        Self::provider_database(
+        Self::backed_database(
             path,
-            ProviderModel::with_clock(delay, limit, ProviderClock::Modeled(elapsed)),
+            Some(ProviderModel::with_clock(
+                delay,
+                limit,
+                ProviderClock::Modeled(elapsed),
+            )),
         )
         .await
     }
 
-    async fn provider_database(path: &std::path::Path, provider: Arc<ProviderModel>) -> (Self, Db) {
+    pub(in crate::db) async fn sqlite_backed_database(path: &std::path::Path) -> (Self, Db) {
+        Self::backed_database(path, None).await
+    }
+
+    async fn backed_database(
+        path: &std::path::Path,
+        provider: Option<Arc<ProviderModel>>,
+    ) -> (Self, Db) {
         let fixture = Self::start().await;
         let runtime = DbRuntime::new().unwrap();
         let backing = runtime
@@ -430,7 +443,7 @@ impl HranaFixture {
         {
             let mut state = fixture.state.lock().unwrap();
             state.backing = Some((runtime, backing));
-            state.provider = Some(provider);
+            state.provider = provider;
         }
         let db = fixture.db();
         (fixture, db)
@@ -484,7 +497,7 @@ impl HranaFixture {
             read_only: false,
             _database: Arc::clone(&database),
             runtime: runtime.clone(),
-            lease_runtime: lease_runtime.clone(),
+            lease_runtime: Some(lease_runtime.clone()),
             bootstrap_work: crate::db::BootstrapWork::Complete,
             connections: Arc::new(ConnectionPool {
                 idle: Mutex::new(connections),
@@ -568,6 +581,22 @@ impl HranaFixture {
     fn timeout_next_cursor(&self) {
         self.state.lock().unwrap().next_cursor_error =
             Some(("TRANSACTION_TIMEOUT", "Transaction timed out"));
+    }
+
+    pub(in crate::db) fn timeout_next_matching_cursor(&self, sql: &'static str) {
+        self.state.lock().unwrap().timeout_cursor_sql = Some(sql);
+    }
+
+    /// SQL sent since the previous call, without transaction edges.
+    pub(in crate::db) fn take_data_statements(&self) -> Vec<String> {
+        std::mem::take(&mut self.state.lock().unwrap().statements)
+            .into_iter()
+            .filter(|sql| !is_transaction_edge(&sql.trim().to_ascii_uppercase()))
+            .collect()
+    }
+
+    pub(in crate::db) fn read_begins(&self) -> usize {
+        self.state.lock().unwrap().read_begins
     }
 
     fn hang_next_commit(&self) {
@@ -853,6 +882,13 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
             )
         }
         "/v3/cursor" => {
+            if state
+                .timeout_cursor_sql
+                .is_some_and(|sql| statement_sql(&input).contains(&sql.to_ascii_uppercase()))
+            {
+                state.timeout_cursor_sql = None;
+                state.next_cursor_error = Some(("TRANSACTION_TIMEOUT", "Transaction timed out"));
+            }
             if let Some((code, message)) = state.next_cursor_error.take() {
                 if code == "TRANSACTION_TIMEOUT"
                     && let Some((runtime, conn)) = &state.backing
@@ -1173,6 +1209,53 @@ async fn maximal_badword_batch_commits_within_remote_transaction_lifetime() {
     );
     assert_eq!(list_badwords(&local, 10).await.unwrap().len(), 33);
     assert_eq!(get_primary_versions(&local).await.unwrap(), changed);
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bot_config_proof_miss_keeps_the_full_snapshot_request_budget() {
+    let path = super::tmp_db_path("remote_bot_config_proof");
+    let local = Db::open(&path, 2).unwrap();
+    add_badword(&local, 10, "original", None).await.unwrap();
+    let (fixture, remote) = HranaFixture::modeled_latency_database(
+        &path,
+        Duration::from_millis(80),
+        Duration::from_secs(5),
+        Arc::default(),
+    )
+    .await;
+
+    let requests = || fixture.state.lock().unwrap().requests;
+    let before_cold = requests();
+    let cold = read_bot_config(&remote, 10, false, None).await.unwrap();
+    assert_eq!(cold.parts.unwrap().badwords, ["original"]);
+    let full_read_requests = requests() - before_cold;
+    let proof = cold.proof.unwrap();
+
+    let before_hit = requests();
+    let hit = read_bot_config(&remote, 10, false, Some(proof.clone()))
+        .await
+        .unwrap();
+    assert!(hit.parts.is_none());
+    assert_eq!((hit.version, hit.revision), (cold.version, cold.revision));
+    assert_eq!(requests() - before_hit, full_read_requests);
+
+    add_badword(&local, 10, "changed", None).await.unwrap();
+    let before_miss = requests();
+    let miss = read_bot_config(&remote, 10, false, Some(proof))
+        .await
+        .unwrap();
+    assert_eq!(miss.version, cold.version + 1);
+    assert_eq!(miss.parts.unwrap().badwords, ["original", "changed"]);
+    assert_eq!(
+        requests() - before_miss,
+        full_read_requests,
+        "an expired proof that misses must use the same Hrana budget as a full read"
+    );
+
     drop(remote);
     drop(fixture);
     drop(local);
@@ -1586,6 +1669,284 @@ async fn version_poll_confirms_primary_health_after_ambiguous_read_failure() {
     tokio::time::advance(Duration::from_secs(5)).await;
     assert_eq!(poll_version_state(&db).await.unwrap(), expected);
     assert_eq!(fixture.state.lock().unwrap().read_begins, 10);
+
+    drop(db);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+async fn set_version_meta(raw: &libsql::Connection, values: [Option<&str>; 4]) {
+    let keys = [
+        "config_version",
+        "slash_registry_version",
+        "config_revision",
+        "slash_registry_revision",
+    ];
+    for (key, value) in keys.into_iter().zip(values) {
+        raw.execute("DELETE FROM meta WHERE key=?1", libsql::params![key])
+            .await
+            .unwrap();
+        if let Some(value) = value {
+            raw.execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2)",
+                libsql::params![key, value],
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+fn version(config: u64, slash: u64, config_revision: &str, slash_revision: &str) -> VersionState {
+    VersionState {
+        config,
+        slash,
+        config_revision: config_revision.into(),
+        slash_revision: slash_revision.into(),
+    }
+}
+
+/// Each version entry point, with the data statements its observation sent.
+async fn observe_versions(fixture: &HranaFixture, db: &Db) -> Vec<(VersionState, Vec<String>)> {
+    let mut observed = Vec::new();
+    for route in 0..3 {
+        fixture.state.lock().unwrap().statements.clear();
+        let state = match route {
+            0 => get_version_state(db).await,
+            1 => poll_version_state(db).await,
+            _ => get_primary_versions(db).await,
+        }
+        .unwrap();
+        let data = fixture
+            .state
+            .lock()
+            .unwrap()
+            .statements
+            .iter()
+            .filter(|sql| !is_transaction_edge(&sql.trim().to_ascii_uppercase()))
+            .cloned()
+            .collect();
+        observed.push((state, data));
+    }
+    observed
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn version_observation_reads_counters_and_revisions_in_one_statement() {
+    let path = super::tmp_db_path("remote_version_statement");
+    let local = Db::open(&path, 2).unwrap();
+    let raw = libsql::Builder::new_local(&path)
+        .build()
+        .await
+        .unwrap()
+        .connect()
+        .unwrap();
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    fixture.state.lock().unwrap().backing = Some((runtime, backing));
+    let db = fixture.db();
+
+    let cases = [
+        (
+            "modern",
+            [Some("7"), Some("3"), Some("c-rev"), Some("s-rev")],
+            version(7, 3, "c-rev", "s-rev"),
+        ),
+        (
+            "missing revisions",
+            [Some("7"), Some("3"), None, None],
+            version(7, 3, "legacy:7", "legacy:3"),
+        ),
+        (
+            "missing everything",
+            [None, None, None, None],
+            version(0, 0, "legacy:0", "legacy:0"),
+        ),
+        (
+            "mixed slash revision",
+            [Some("12"), Some("junk"), None, Some("s-only")],
+            version(12, 0, "legacy:12", "s-only"),
+        ),
+        (
+            "mixed config revision",
+            [Some("12"), Some("5"), Some("c-only"), None],
+            version(12, 5, "c-only", "legacy:5"),
+        ),
+        // A restored or replaced database can keep the counter while
+        // publishing a new revision; that must remain a visible change.
+        (
+            "new config revision, same counter",
+            [Some("12"), Some("5"), Some("c-next"), None],
+            version(12, 5, "c-next", "legacy:5"),
+        ),
+        (
+            "new slash revision, same counter",
+            [Some("12"), Some("5"), Some("c-next"), Some("s-next")],
+            version(12, 5, "c-next", "s-next"),
+        ),
+    ];
+    let mut previous: Option<VersionState> = None;
+    for (label, values, expected) in cases {
+        set_version_meta(&raw, values).await;
+        for (route, (state, data)) in observe_versions(&fixture, &db)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(state, expected, "{label} route {route}");
+            assert_eq!(
+                data.len(),
+                1,
+                "{label} route {route}: one data statement per observation: {data:?}"
+            );
+        }
+        if let Some(previous) = previous.replace(expected.clone()) {
+            assert_ne!(previous, expected, "{label} must be observed as a change");
+        }
+    }
+
+    drop(db);
+    drop(fixture);
+    drop(raw);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+struct ObservedGuildStats {
+    counts: (i64, i64, i64),
+    statements: Vec<String>,
+}
+
+/// The bot `guild_stats` and dashboard `enrolled_guild_stats` reads for each
+/// guild, with the ordered SQL trace of each read.
+async fn observe_guild_stats(
+    fixture: &HranaFixture,
+    db: &Db,
+    scopes: &[GuildEnrollment],
+) -> Vec<ObservedGuildStats> {
+    let mut observed = Vec::new();
+    for scope in scopes {
+        for enrolled in [false, true] {
+            fixture.state.lock().unwrap().statements.clear();
+            let stats = if enrolled {
+                enrolled_guild_stats(db, scope.clone()).await
+            } else {
+                guild_stats(db, scope.guild_id).await
+            }
+            .unwrap();
+            let statements = std::mem::take(&mut fixture.state.lock().unwrap().statements);
+            observed.push(ObservedGuildStats {
+                counts: (stats.events, stats.warns, stats.bans),
+                statements,
+            });
+        }
+    }
+    observed
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn guild_stats_read_all_counts_in_one_statement() {
+    let path = super::tmp_db_path("remote_guild_stats");
+    let local = Db::open(&path, 2).unwrap();
+    let mut scopes = Vec::new();
+    for guild in [10, 20, 30] {
+        scopes.push(enroll_guild(&local, guild, 100).await.unwrap().unwrap());
+    }
+    let (fixture, db) = HranaFixture::sqlite_backed_database(&path).await;
+
+    let check = |label: &str, observed: Vec<ObservedGuildStats>, expected: [(i64, i64, i64); 3]| {
+        for (index, read) in observed.into_iter().enumerate() {
+            let (guild, enrolled) = (index / 2, index % 2 == 1);
+            let route = if enrolled { "dashboard" } else { "bot" };
+            assert_eq!(
+                read.counts, expected[guild],
+                "{label} guild {guild} {route}"
+            );
+            let stats_sql = match read.statements.as_slice() {
+                [stats] if !enrolled => stats,
+                [begin, enrollment, stats, rollback] if enrolled => {
+                    assert_eq!(begin.trim().trim_end_matches(';'), "BEGIN DEFERRED");
+                    assert!(enrollment.contains("guild_enrollments"), "{enrollment}");
+                    assert_eq!(rollback.trim().trim_end_matches(';'), "ROLLBACK");
+                    stats
+                }
+                statements => {
+                    panic!("{label} guild {guild} {route}: unexpected SQL trace {statements:?}");
+                }
+            };
+            let stats_sql = stats_sql.to_ascii_uppercase();
+            for table in ["EVENTS", "WARNS", "BANS"] {
+                assert!(stats_sql.contains(&format!("FROM {table}")), "{stats_sql}");
+            }
+        }
+    };
+
+    check(
+        "empty",
+        observe_guild_stats(&fixture, &db, &scopes).await,
+        [(0, 0, 0); 3],
+    );
+
+    let counted = [
+        ("mod_action", json!({"action": "warn"})),
+        ("member_ban", json!({})),
+        ("automod", json!({"action": "ban"})),
+        ("plan_executed", json!({"moderation": true})),
+    ];
+    let excluded = [
+        ("automod", json!({"action": "ban", "dry_run": true})),
+        ("automod", json!({"action": "log"})),
+        ("message_edit", json!({})),
+        ("plan_executed", json!({"moderation": false})),
+    ];
+    for (event, data) in counted.iter().chain(&excluded) {
+        insert_event(&local, 10, event, Some(5), None, data)
+            .await
+            .unwrap();
+    }
+    for (event, data) in [
+        ("timeout_add", json!({})),
+        ("member_kick", json!({})),
+        ("system", json!({})),
+    ] {
+        insert_event(&local, 20, event, None, None, &data)
+            .await
+            .unwrap();
+    }
+    local
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "INSERT INTO events (guild_id,event_type,data,created_at)
+                 VALUES (10,'automod','invalid',''), (20,'plan_executed',NULL,'');",
+                64 * 1024 * 1024,
+            )
+        })
+        .await
+        .unwrap();
+    add_warn(&local, 10, 5, 9, "first").await.unwrap();
+    add_warn(&local, 10, 6, 9, "second").await.unwrap();
+    add_warn(&local, 20, 5, 9, "other guild").await.unwrap();
+    record_ban(&local, 10, 5, Some(9), "active").await.unwrap();
+    record_ban(&local, 10, 6, None, "lifted").await.unwrap();
+    mark_unbanned(&local, 10, 6).await.unwrap();
+
+    // Guild 30 stays empty beside populated guilds.
+    let expected = [(4, 2, 2), (2, 1, 0), (0, 0, 0)];
+    check(
+        "mixed",
+        observe_guild_stats(&fixture, &db, &scopes).await,
+        expected,
+    );
+    for (scope, expected) in scopes.iter().zip(expected) {
+        let stats = guild_stats(&local, scope.guild_id).await.unwrap();
+        assert_eq!((stats.events, stats.warns, stats.bans), expected);
+    }
 
     drop(db);
     drop(fixture);
@@ -3366,10 +3727,11 @@ async fn remote_constructor_isolates_the_lease_runtime() {
     };
     let remote = Db::open_with_bootstrap(&opts, |_| Ok(()), |_| Ok(())).unwrap();
     {
+        let lease_runtime = remote.lease_runtime.as_ref().expect("lease runtime");
         let lease = remote.lease_connection.lock().unwrap();
         let lease_conn = lease.as_ref().expect("lease connection");
         assert!(
-            lease_conn.runtime_same_owner(&remote.lease_runtime),
+            lease_conn.runtime_same_owner(lease_runtime),
             "renewal must run on the dedicated lease runtime"
         );
         assert!(
@@ -3377,7 +3739,7 @@ async fn remote_constructor_isolates_the_lease_runtime() {
             "renewal must not share the pool runtime"
         );
         assert_eq!(
-            remote.lease_runtime.operation_limit(),
+            lease_runtime.operation_limit(),
             Some(crate::db_compat::INTERACTIVE_READ_BUDGET)
         );
         let idle = remote.connections.idle.lock().unwrap();
@@ -3387,23 +3749,75 @@ async fn remote_constructor_isolates_the_lease_runtime() {
         );
         assert!(
             idle.iter()
-                .all(|conn| !conn.runtime_same_owner(&remote.lease_runtime))
+                .all(|conn| !conn.runtime_same_owner(lease_runtime))
         );
     }
 
     let path = super::tmp_db_path("lease_runtime_local");
     let local = Db::open(&path, 2).unwrap();
     {
+        let lease_runtime = local.lease_runtime.as_ref().expect("local lease runtime");
         let lease = local.lease_connection.lock().unwrap();
         let lease_conn = lease.as_ref().expect("local lease connection");
         assert!(lease_conn.runtime_same_owner(&local.runtime));
-        assert!(lease_conn.runtime_same_owner(&local.lease_runtime));
-        assert_eq!(local.lease_runtime.operation_limit(), None);
+        assert!(lease_conn.runtime_same_owner(lease_runtime));
+        assert_eq!(lease_runtime.operation_limit(), None);
     }
     drop(local);
     drop(remote);
     drop(fixture);
     super::cleanup_db(&path);
+}
+
+fn open_remote_counted(fixture: &HranaFixture, read_only: bool) -> (Db, u64, u64) {
+    let probe = Arc::new(StartupProbe::default());
+    let _probe = enter_startup_probe(Some(probe.clone()));
+    let opts = DbOpenOptions {
+        path: PathBuf::from("lease-resources"),
+        url: fixture.url(),
+        token: "test".into(),
+        pool_size: 2,
+        migrate: !read_only,
+        read_only,
+        default_prefix: String::new(),
+        retention_days: 0,
+    };
+    let db = Db::open_with_bootstrap(&opts, |_| Ok(()), |_| Ok(())).unwrap();
+    (db, probe.runtime_starts(), probe.connection_opens())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_read_only_open_builds_no_lease_runtime_or_connection() {
+    let fixture = HranaFixture::start().await;
+    let (read_only, runtimes, opens) = open_remote_counted(&fixture, true);
+    assert_eq!(
+        runtimes, 1,
+        "read-only remote open starts only the pool runtime"
+    );
+    assert_eq!(
+        opens, 3,
+        "bootstrap plus two pooled connections, no lease stream"
+    );
+    assert!(read_only.lease_runtime.is_none());
+    assert!(read_only.lease_connection.lock().unwrap().is_none());
+
+    let (writable, runtimes, opens) = open_remote_counted(&fixture, false);
+    assert_eq!(runtimes, 2, "writable remote open keeps the lease runtime");
+    assert_eq!(
+        opens, 4,
+        "bootstrap, two pooled connections and the lease stream"
+    );
+    assert!(writable.lease_runtime.is_some());
+    assert!(writable.lease_connection.lock().unwrap().is_some());
+
+    let requests = fixture.state.lock().unwrap().requests;
+    let error = read_only.with_lease_conn(|_| Ok(())).await.unwrap_err();
+    assert_eq!(error.to_string(), "read-only database cannot renew a lease");
+    assert_eq!(fixture.state.lock().unwrap().requests, requests);
+    assert!(read_only.lease_connection.lock().unwrap().is_none());
+    drop(read_only);
+    drop(writable);
+    drop(fixture);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -486,27 +486,11 @@ async fn member_records_ban(
     }
 }
 
-pub async fn current_member_stay_id(app: &BotState, guild_id: u64, user_id: u64) -> Option<String> {
-    match live_observation(
-        app,
-        guild_id,
-        Some(user_id as i64),
-        "member stay lookup unavailable",
-    )
-    .await
-    {
-        Some((store, scope)) => match store.current_member_stay_id(scope, user_id as i64).await {
-            Ok(stay) => stay,
-            Err(error) => {
-                tracing::warn!(guild_id, user_id, "member stay lookup failed: {error:#}");
-                None
-            }
-        },
-        None => None,
-    }
-}
-
-pub async fn pending_rejoin_note(app: &BotState, guild_id: u64, user_id: u64) -> bool {
+pub(crate) async fn current_rejoin_note(
+    app: &BotState,
+    guild_id: u64,
+    user_id: u64,
+) -> (Option<String>, bool) {
     let Some((store, scope)) = live_observation(
         app,
         guild_id,
@@ -515,30 +499,30 @@ pub async fn pending_rejoin_note(app: &BotState, guild_id: u64, user_id: u64) ->
     )
     .await
     else {
-        return false;
+        return (None, false);
     };
-    match store
-        .has_pending_rejoin_note(scope.clone(), user_id as i64)
+    let (stay, error) = match store
+        .current_rejoin_note(scope.clone(), user_id as i64)
         .await
     {
-        Ok(pending) => pending,
-        Err(error) => {
-            tracing::warn!(
-                guild_id,
-                user_id,
-                "member rejoin receipt lookup failed: {error:#}"
-            );
-            mark_gap(
-                app,
-                &store,
-                scope,
-                Some(user_id as i64),
-                "member rejoin receipt unavailable",
-            )
-            .await;
-            false
-        }
-    }
+        Ok((stay, Ok(pending))) => return (stay, pending),
+        Ok((stay, Err(error))) => (stay, error),
+        Err(error) => (None, error),
+    };
+    tracing::warn!(
+        guild_id,
+        user_id,
+        "member rejoin receipt lookup failed: {error:#}"
+    );
+    mark_gap(
+        app,
+        &store,
+        scope,
+        Some(user_id as i64),
+        "member rejoin receipt unavailable",
+    )
+    .await;
+    (stay, false)
 }
 
 pub async fn clear_pending_rejoin_note(app: &BotState, guild_id: u64, user_id: u64, stay_id: &str) {

@@ -4,7 +4,7 @@ import { noAutofill } from "./no-autofill.js";
 
 const h = React.createElement;
 const SEARCH_LIMIT = 200;
-const SEARCH_DELAY_MS = 300;
+export const SEARCH_DELAY_MS = 300;
 const savedListLocation = "jmodguard.list-before-login";
 const commonKeys = ["q", "from", "to"];
 const PAGE_SIZES = ["50", "100", "250", "500", "1000", "all"];

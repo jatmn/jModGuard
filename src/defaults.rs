@@ -4,7 +4,7 @@
 
 use crate::types::{ActionDef, Behavior, CommandDef, PlanStep, RULE_IDS, RuleDef};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 pub(crate) const OLD_INVITE_DESCRIPTION: &str =
@@ -491,40 +491,66 @@ pub fn command_def_is_binary_overlay(cmd: &CommandDef) -> bool {
     is_binary_overlay_command_name(&cmd.name) || is_binary_overlay_behavior(&cmd.behavior)
 }
 
-fn builtin_command_labels_lower() -> &'static HashSet<String> {
-    static LABELS: OnceLock<HashSet<String>> = OnceLock::new();
-    LABELS.get_or_init(|| {
-        let mut labels = HashSet::new();
-        for cmd in default_commands() {
-            labels.insert(cmd.name.to_ascii_lowercase());
-            for alias in &cmd.aliases {
-                labels.insert(alias.to_ascii_lowercase());
+/// The compiled-in commands, built once per process, with ASCII-lowercased
+/// keys pointing at the first command in catalog order that owns each label.
+struct ShippedCommands {
+    commands: Vec<CommandDef>,
+    by_name: HashMap<String, usize>,
+    by_label: HashMap<String, usize>,
+}
+
+fn shipped_commands() -> &'static ShippedCommands {
+    static SHIPPED: OnceLock<ShippedCommands> = OnceLock::new();
+    SHIPPED.get_or_init(|| {
+        let commands = default_commands();
+        let mut by_name = HashMap::new();
+        let mut by_label = HashMap::new();
+        for (index, cmd) in commands.iter().enumerate() {
+            by_name
+                .entry(cmd.name.to_ascii_lowercase())
+                .or_insert(index);
+            for label in std::iter::once(&cmd.name).chain(&cmd.aliases) {
+                by_label.entry(label.to_ascii_lowercase()).or_insert(index);
             }
         }
-        labels
+        ShippedCommands {
+            commands,
+            by_name,
+            by_label,
+        }
     })
+}
+
+impl ShippedCommands {
+    fn find(&self, index: &HashMap<String, usize>, label: &str) -> Option<&CommandDef> {
+        let position = if label.bytes().any(|b| b.is_ascii_uppercase()) {
+            index.get(&label.to_ascii_lowercase())
+        } else {
+            index.get(label)
+        }?;
+        self.commands.get(*position)
+    }
+}
+
+/// The shipped command whose primary name matches `name` (ASCII case-insensitive).
+fn shipped_command(name: &str) -> Option<&'static CommandDef> {
+    let shipped = shipped_commands();
+    shipped.find(&shipped.by_name, name)
 }
 
 /// Every shipped command name and alias (derived from [`default_commands`]).
 pub fn builtin_command_labels() -> Vec<String> {
-    let mut labels: Vec<String> = builtin_command_labels_lower().iter().cloned().collect();
+    let mut labels: Vec<String> = shipped_commands().by_label.keys().cloned().collect();
     labels.sort();
     labels
 }
 
 /// Canonical primary command name when `label` matches a shipped name or alias.
-pub fn builtin_command_for_label(label: &str) -> Option<String> {
-    for cmd in default_commands() {
-        if cmd.name.eq_ignore_ascii_case(label) {
-            return Some(cmd.name.clone());
-        }
-        for alias in &cmd.aliases {
-            if alias.eq_ignore_ascii_case(label) {
-                return Some(cmd.name.clone());
-            }
-        }
-    }
-    None
+pub fn builtin_command_for_label(label: &str) -> Option<&'static str> {
+    let shipped = shipped_commands();
+    shipped
+        .find(&shipped.by_label, label)
+        .map(|cmd| cmd.name.as_str())
 }
 
 pub fn command_persist_rejected_message(storage_name: &str) -> String {
@@ -533,9 +559,7 @@ pub fn command_persist_rejected_message(storage_name: &str) -> String {
 
 /// Primary shipped command name (not an alias).
 pub fn is_builtin_primary_command_name(name: &str) -> bool {
-    default_commands()
-        .iter()
-        .any(|cmd| cmd.name.eq_ignore_ascii_case(name))
+    shipped_command(name).is_some()
 }
 
 /// Command permission levels, lowest first. Unknown text has no rank.
@@ -565,11 +589,9 @@ pub fn effective_builtin_command(
     primary: &str,
     guild_override: Option<&CommandDef>,
 ) -> Option<CommandDef> {
-    let shipped = default_commands()
-        .into_iter()
-        .find(|cmd| cmd.name.eq_ignore_ascii_case(primary))?;
+    let shipped = shipped_command(primary)?;
     let Some(stored) = guild_override.filter(|row| row.builtin_override) else {
-        return Some(shipped);
+        return Some(shipped.clone());
     };
     let mut effective = stored.clone();
     effective.name = shipped.name.clone();
@@ -687,7 +709,7 @@ pub fn apply_shipped_builtin_commands(
     commands: &mut std::collections::HashMap<String, CommandDef>,
     guild_commands: &std::collections::HashMap<String, CommandDef>,
 ) {
-    for shipped in default_commands() {
+    for shipped in &shipped_commands().commands {
         let stored = builtin_command_override(guild_commands, &shipped.name);
         if let Some(effective) = effective_builtin_command(&shipped.name, stored) {
             install_shipped_builtin(commands, effective);
@@ -738,10 +760,7 @@ pub fn command_persist_error(
     cmd: &CommandDef,
     guild_id: i64,
 ) -> Option<String> {
-    if let Some(shipped) = default_commands()
-        .into_iter()
-        .find(|shipped| shipped.name.eq_ignore_ascii_case(storage_name))
-    {
+    if let Some(shipped) = shipped_command(storage_name) {
         let name = &shipped.name;
         if guild_id == 0 {
             return Some(format!(
@@ -880,7 +899,11 @@ fn cmd(
 
 /// Default event templates (rendered into the configured log channels).
 pub fn default_templates() -> Vec<(&'static str, &'static str)> {
-    vec![
+    default_template_entries().to_vec()
+}
+
+fn default_template_entries() -> &'static [(&'static str, &'static str)] {
+    &[
         (
             "member_join",
             "Member joined\n\n**User:** {user} · {mention} (`{user_id}`)\n**Account created:** `{account_created}`\n**Account age:** `{account_age}`\n**Joined at:** `{time}`",
@@ -976,7 +999,11 @@ pub const CANNOT_MODERATE_BOT_TEMPLATE: &str = "Cannot moderate the bot with `{c
 /// global template rows. Delivery falls back to this wording until an operator
 /// saves an override.
 pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
-    vec![
+    activity_log_template_entries().to_vec()
+}
+
+fn activity_log_template_entries() -> &'static [(&'static str, &'static str)] {
+    &[
         (
             "member_role_update",
             "Member roles updated\n\n**User:** {user} · {mention} (`{user_id}`)\n**Added:** {added}\n**Removed:** {removed}\n**Time:** `{time}`",
@@ -1028,12 +1055,20 @@ pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Shipped templates plus activity-log defaults. Startup seeding stays on
-/// [`default_templates`] alone.
-pub fn rendered_log_templates() -> Vec<(&'static str, &'static str)> {
-    let mut templates = default_templates();
-    templates.extend(activity_log_templates());
-    templates
+/// Shipped templates plus activity-log defaults, borrowed from static entries.
+/// Startup seeding stays on [`default_templates`] alone.
+pub fn rendered_log_templates() -> impl Iterator<Item = (&'static str, &'static str)> {
+    default_template_entries()
+        .iter()
+        .chain(activity_log_template_entries())
+        .copied()
+}
+
+/// The shipped or activity-log default for `event`, if any.
+pub fn rendered_log_template(event: &str) -> Option<&'static str> {
+    rendered_log_templates()
+        .find(|(name, _)| *name == event)
+        .map(|(_, template)| template)
 }
 
 /// Exact shipped strings before embed presentation. Match bytes, never custom wording.
@@ -1578,6 +1613,63 @@ mod rolling_upgrade_tests {
         assert!(labels.iter().any(|l| l == "kick"));
         assert!(labels.iter().any(|l| l == "k"));
         assert!(labels.iter().any(|l| l == "voice"));
+    }
+
+    #[test]
+    fn shipped_label_index_matches_catalog_scan() {
+        let catalog = default_commands();
+        let owner = |label: &str| {
+            catalog
+                .iter()
+                .find(|cmd| {
+                    cmd.name.eq_ignore_ascii_case(label)
+                        || cmd
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.eq_ignore_ascii_case(label))
+                })
+                .map(|cmd| cmd.name.as_str())
+        };
+        let primary = |name: &str| {
+            catalog
+                .iter()
+                .any(|cmd| cmd.name.eq_ignore_ascii_case(name))
+        };
+        // The Kelvin sign lowercases to `k` only under Unicode rules.
+        let mut labels: Vec<String> = ["", "nope", "\u{212A}", "BAN ", "b\u{0}"]
+            .map(String::from)
+            .into();
+        for cmd in &catalog {
+            for label in std::iter::once(&cmd.name).chain(&cmd.aliases) {
+                let mut mixed = label.clone();
+                mixed[..1].make_ascii_uppercase();
+                labels.extend([
+                    label.clone(),
+                    label.to_ascii_uppercase(),
+                    mixed,
+                    format!("{label}x"),
+                ]);
+            }
+        }
+        for label in &labels {
+            assert_eq!(builtin_command_for_label(label), owner(label), "{label:?}");
+            assert_eq!(
+                is_builtin_primary_command_name(label),
+                primary(label),
+                "{label:?}"
+            );
+        }
+        assert_eq!(builtin_command_for_label("\u{212A}"), None);
+        assert_eq!(builtin_command_for_label("YEET"), Some("ban"));
+        assert!(!is_builtin_primary_command_name("yeet"));
+        for cmd in &catalog {
+            let effective = effective_builtin_command(&cmd.name.to_ascii_uppercase(), None)
+                .expect("shipped command resolves by name");
+            assert_eq!(
+                serde_json::to_value(&effective).unwrap(),
+                serde_json::to_value(cmd).unwrap()
+            );
+        }
     }
 
     #[test]

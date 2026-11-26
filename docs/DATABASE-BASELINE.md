@@ -41,7 +41,7 @@ modified or used to establish provider-specific behavior.
 
 Use a new local SQLite path or an empty remote libSQL database, with matching bot/API
 binaries. Start the bot to initialize it, then the API. Core migration
-`0023_baseline.sql` creates the v0.2.0 schema and migrations 0024–0029 run after it.
+`0023_baseline.sql` creates the v0.2.0 schema and migrations 0024–0030 run after it.
 Guild stores start from `0016_baseline.sql` at schema version 17 and run migrations
 0017–0023 after it. Existing installations at or past those baseline versions
 resume from their recorded version. For a recognized earlier database, upgrade
@@ -143,7 +143,7 @@ settings, selected cases, history, sources, evidence ownership, Bunny transfer
 progress, tenant settings, bounded latest-message snapshots and the bounded
 [member directory](MEMBERS.md). Initialize verifies and upgrades a matching earlier
 store atomically at bot startup. Ordinary opens require version 24. See
-[tenant runtime](TENANT-RUNTIME.md). Core is at migration 0029. Each opener refuses
+[tenant runtime](TENANT-RUNTIME.md). Core is at migration 0030. Each opener refuses
 the other family. No records are moved by startup.
 Guild migration 0009 adds bounded latest-message snapshots with fixed 24-hour expiry
 and store-level capture health. Guild migration 0010 adds the member directory,
@@ -230,3 +230,11 @@ Migration 0029 adds the core journal used to recover interrupted automod delete
 notices. It stores message identifiers and delivery state for the captured guild
 membership. Deploy matching bot and API builds through the paired update
 protocol for core schema 29 and guild schema 24.
+
+## Audit Log date order
+
+Migration 0030 adds a virtual UTC millisecond key and a guild-scoped date index
+to the Audit Log. Existing event records are retained. Deploy matching bot and
+API images for core schema 30 using the core migration steps in
+[Schema upgrades and recovery](BUNNY-UPDATES.md#schema-upgrades-and-recovery).
+The guild schema stays at 24. Rollback requires the pre-upgrade database backup.

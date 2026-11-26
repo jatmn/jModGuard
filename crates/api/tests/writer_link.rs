@@ -263,14 +263,22 @@ async fn api_paths_open_no_write_connection_and_save_through_the_bot() {
         app.commit_actor(9, add.clone()).await.unwrap(),
         db::ControlReply::Failed { .. }
     ));
-    assert!(matches!(
-        app.commit_actor(7, add.clone()).await.unwrap(),
-        db::ControlReply::Saved { .. }
-    ));
-    assert!(matches!(
-        app.commit_actor(7, add).await.unwrap(),
-        db::ControlReply::Unchanged { .. }
-    ));
+    let db::ControlReply::Saved { body: saved } = app.commit_actor(7, add.clone()).await.unwrap()
+    else {
+        panic!("the writer did not acknowledge the inserted image");
+    };
+    let db::ControlReply::Unchanged { body: duplicate } = app.commit_actor(7, add).await.unwrap()
+    else {
+        panic!("the writer did not acknowledge the original image");
+    };
+    let saved_patch = &saved["config_patch"];
+    let duplicate_patch = &duplicate["config_patch"];
+    assert_eq!(duplicate_patch["value"], saved_patch["value"]);
+    assert_eq!(
+        duplicate_patch["previous_revision"],
+        saved_patch["revision"]
+    );
+    assert_eq!(duplicate_patch["revision"], saved_patch["revision"]);
     let rows = db::load_enrolled_web_config_snapshot(&app.db, scope.clone())
         .await
         .unwrap()
@@ -278,6 +286,7 @@ async fn api_paths_open_no_write_connection_and_save_through_the_bot() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].hash, hash);
     assert_eq!(rows[0].actor, "unknown");
+    assert_eq!(saved_patch["value"], serde_json::json!(rows[0]));
     assert_eq!(probe.immediate(), 0, "hash saves open no API writer");
     let remove = db::ControlOp::RemoveKnownBadImage {
         scope: scope.to_wire(),

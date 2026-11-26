@@ -45,7 +45,7 @@ for name in crates/bot/src/state.rs crates/bot/src/main.rs; do
 done
 echo 'Bot/API runtime state boundaries pass'
 
-forbidden_api='\<(enqueue_bot_action|bot_action|recent_bot_actions|cancel_bot_action|claim_bot_action|begin_bot_action|finish_bot_action|finish_dispatched_bot_action|bot_action_can_dispatch|bot_action_dispatch|prune_bot_action_history)\>'
+forbidden_api='\<(enqueue_bot_action|bot_action|recent_bot_actions|cancel_bot_action|bot_work_due|claim_bot_action|claim_advised_bot_action|begin_bot_action|finish_bot_action|finish_dispatched_bot_action|bot_action_can_dispatch|bot_action_dispatch|prune_bot_action_history)\>'
 for path in "${api_paths[@]}"; do
   [[ "$(basename "$path")" == enrollment_tests.rs ]] && continue
   if grep -Eq -- "$forbidden_api" "$path"; then
