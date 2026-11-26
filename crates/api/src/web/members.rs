@@ -9,7 +9,7 @@ use super::{ApiError, ApiResult, AuthCtx, GuildAccess, authorize_guild};
 use crate::bot_actions::{Action, MemberSyncOperation};
 use crate::db;
 use crate::db::guild_data::{
-    GuildDataScope, MemberListAnchor, MemberQuery, MemberSort, MemberStatusFilter, MemberSyncStatus,
+    MemberListAnchor, MemberQuery, MemberSort, MemberStatusFilter, MemberSyncStatus,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State, rejection::QueryRejection};
@@ -109,18 +109,6 @@ fn validate_member_sync_operation(
     } else {
         Some(member_sync_invalid_operation())
     }
-}
-
-async fn member_sync_bot_id(
-    store: &db::guild_data::GuildDataStore,
-    scope: GuildDataScope,
-) -> ApiResult<i64> {
-    if let Some(bot_id) = store.persisted_member_sync_bot_id(scope).await? {
-        return Ok(bot_id);
-    }
-    // Pre-seed status does not compare against OAuth client id; any positive id is ignored until
-    // the bot writes guild_member_seed.
-    Ok(1)
 }
 
 fn parse_user_id(raw: &str) -> ApiResult<i64> {
@@ -312,9 +300,8 @@ pub async fn sync_status(
     let (_, enrollment) =
         scoped(&app, &session, &headers, guild_id, GuildAccess::Dashboard).await?;
     let (store, scope) = app.tenant.live(enrollment).await?;
-    let bot_id = member_sync_bot_id(&store, scope.clone()).await?;
     let status = store
-        .member_sync_status(scope, bot_id, Utc::now().timestamp_millis())
+        .member_sync_dashboard_status(scope, Utc::now().timestamp_millis())
         .await?;
     Ok(Json(serde_json::to_value(status)?))
 }
@@ -329,9 +316,8 @@ pub async fn sync_action(
     let (auth, enrollment) =
         scoped(&app, &session, &headers, guild_id, GuildAccess::Manage).await?;
     let (store, scope) = app.tenant.live(enrollment).await?;
-    let bot_id = member_sync_bot_id(&store, scope.clone()).await?;
     let status = store
-        .member_sync_status(scope, bot_id, Utc::now().timestamp_millis())
+        .member_sync_dashboard_status(scope, Utc::now().timestamp_millis())
         .await?;
     if status.run_id.is_none() {
         return Ok((

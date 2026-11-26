@@ -3345,10 +3345,11 @@ async fn eligible_first_status_is_queued_but_admitted_missing_metadata_fails_clo
     assert!(admitted.run_id.is_some());
     assert_eq!(
         store
-            .persisted_member_sync_bot_id(scope.clone())
+            .member_sync_dashboard_status(scope.clone(), 1_100)
             .await
-            .unwrap(),
-        Some(42)
+            .unwrap()
+            .run_id,
+        admitted.run_id
     );
     store
         .db
@@ -3374,6 +3375,71 @@ async fn eligible_first_status_is_queued_but_admitted_missing_metadata_fails_clo
             .status,
         "needs_attention"
     );
+}
+
+#[tokio::test]
+async fn dashboard_status_checks_stale_seed_and_legacy_bot_identity() {
+    let (fixture, store, scope) = ready().await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let wrong_bot = store
+        .member_sync_status(scope.clone(), 43, 1_001)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        wrong_bot.downcast_ref::<MemberSyncError>(),
+        Some(MemberSyncError::BotIdentity)
+    ));
+
+    // Model incompatible saved rows in the test store while keeping its
+    // active membership intact so the checks exercise the status projection.
+    let saved = libsql::Builder::new_local(fixture.store_path.clone())
+        .build()
+        .await
+        .unwrap();
+    let conn = saved.connect().unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER guild_member_seed_identity;
+         UPDATE guild_member_seed SET enrollment_id='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' WHERE guild_id=10;",
+    )
+    .await
+    .unwrap();
+    let stale_seed = store
+        .member_sync_dashboard_status(scope.clone(), 1_001)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_seed.downcast_ref::<TenantDataError>(),
+        Some(TenantDataError::Membership)
+    ));
+
+    conn.execute_batch("PRAGMA foreign_keys=OFF; DELETE FROM guild_member_seed WHERE guild_id=10;")
+        .await
+        .unwrap();
+    let legacy = store
+        .member_sync_dashboard_status(scope.clone(), 1_001)
+        .await
+        .unwrap();
+    assert_eq!(legacy.status, "needs_attention");
+    assert_eq!(legacy.coverage, DirectoryCoverage::NotStarted);
+    assert!(legacy.run_id.is_none());
+
+    conn.execute_batch(
+        "PRAGMA ignore_check_constraints=ON;
+         UPDATE guild_member_sync SET bot_id=0 WHERE guild_id=10;",
+    )
+    .await
+    .unwrap();
+    let invalid_bot = store
+        .member_sync_dashboard_status(scope, 1_001)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        invalid_bot.downcast_ref::<MemberSyncError>(),
+        Some(MemberSyncError::Invalid)
+    ));
 }
 
 #[tokio::test]
@@ -6623,7 +6689,7 @@ async fn worker_status_skips_the_absence_backlog_count() {
     let (_f, store, scope) = ready().await;
     departed_member(&store, &scope, 89).await;
     let dashboard = store
-        .member_sync_status(scope.clone(), 42, 400_000)
+        .member_sync_dashboard_status(scope.clone(), 400_000)
         .await
         .unwrap();
     let worker = store
