@@ -186,6 +186,13 @@ fn window_start_day(today: NaiveDate, window_days: i64) -> String {
     day_for_offset(today, window_days, 0)
 }
 
+/// Exclusive upper bound for the UTC window ending today.
+fn window_end_day(today: NaiveDate) -> String {
+    (today + chrono::Days::new(1))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
 /// Zero-fills the window ending today, merging observed days from the map.
 fn filled_series(
     map: HashMap<String, AnalyticsPoint>,
@@ -214,34 +221,35 @@ fn apply_day(
 /// Daily-series aggregate columns. Each column is one JSON array so the whole
 /// window reads in a single statement: a remote interactive snapshot cannot
 /// afford a prepare/query round trip per source table.
-fn series_columns(guild_filter: &str, day: &str) -> String {
+fn series_columns(guild_filter: &str, start: &str, end: &str) -> String {
     series_columns_with_events(
         guild_filter,
-        day,
+        start,
+        end,
         &format!(
             "SELECT substr(created_at,1,10) AS d, event_type AS b, COUNT(*) AS n FROM events \
-             WHERE {guild_filter}created_at>={day} AND {EVENT_BUCKETS_COUNTED_SQL} GROUP BY 1, 2"
+             WHERE {guild_filter}created_at>={start} AND created_at<{end} AND {EVENT_BUCKETS_COUNTED_SQL} GROUP BY 1, 2"
         ),
     )
 }
 
 /// [`series_columns`] with the counted-event `(d, b, n)` rows supplied by the
 /// caller, so a guild summary can reuse its already-parsed events.
-fn series_columns_with_events(guild_filter: &str, day: &str, events: &str) -> String {
+fn series_columns_with_events(guild_filter: &str, start: &str, end: &str, events: &str) -> String {
     format!(
         "(SELECT json_group_array(json_array(d, n)) FROM \
            (SELECT substr(created_at,1,10) AS d, COUNT(*) AS n FROM warns \
-            WHERE {guild_filter}created_at>={day} GROUP BY 1)), \
+            WHERE {guild_filter}created_at>={start} AND created_at<{end} GROUP BY 1)), \
          (SELECT json_group_array(json_array(d, n)) FROM \
            (SELECT substr(created_at,1,10) AS d, COUNT(*) AS n FROM bans \
-            WHERE {guild_filter}created_at>={day} GROUP BY 1)), \
+            WHERE {guild_filter}created_at>={start} AND created_at<{end} GROUP BY 1)), \
          (SELECT json_group_array(json_array(d, n)) FROM \
            (SELECT substr(created_at,1,10) AS d, COUNT(*) AS n FROM bans \
-            WHERE {guild_filter}created_at>={day} AND {DEDICATED_SPAM_BANS_SQL} GROUP BY 1)), \
+            WHERE {guild_filter}created_at>={start} AND created_at<{end} AND {DEDICATED_SPAM_BANS_SQL} GROUP BY 1)), \
          (SELECT json_group_array(json_array(d, b, n)) FROM ({events})), \
          (SELECT json_group_array(json_array(day, j, l)) FROM \
            (SELECT day, SUM(joins) AS j, SUM(leaves) AS l FROM analytics_member_daily \
-            WHERE {guild_filter}day>={day} GROUP BY day))"
+            WHERE {guild_filter}day>={start} AND day<{end} GROUP BY day))"
     )
 }
 
@@ -304,9 +312,8 @@ const DEDICATED_SPAM_RULE_SQL: &str = "CASE WHEN instr(reason, '[automod:attachm
      THEN 'attachment_flood' ELSE 'repeat_text' END";
 
 /// Counted events of both windows, parsed once. `?2` starts the requested
-/// window and `?3` the previous window of equal length. Materialized so every
-/// panel column below aggregates the same rows without rescanning `events` or
-/// re-parsing JSON.
+/// window, `?3` the previous window of equal length and `?5` ends the current
+/// window. Materialized so every panel aggregates the same rows.
 fn guild_events_cte() -> String {
     format!(
         "ev AS MATERIALIZED (SELECT event_type AS b, created_at>=?2 AS cur, actor_id AS actor, \
@@ -314,16 +321,16 @@ fn guild_events_cte() -> String {
              THEN CAST(json_extract(data, CASE event_type WHEN 'automod' THEN '$.rule' \
                ELSE '$.action' END) AS TEXT) END AS k, \
            substr(created_at,1,10) AS d, CAST(substr(created_at,12,2) AS INTEGER) AS hr \
-         FROM events WHERE guild_id=?1 AND created_at>=?3 AND {EVENT_BUCKETS_COUNTED_SQL})"
+         FROM events WHERE guild_id=?1 AND created_at>=?3 AND created_at<?5 AND {EVENT_BUCKETS_COUNTED_SQL})"
     )
 }
 
-/// Panel columns for one guild window; see [`guild_events_cte`] for `?2`/`?3`.
+/// Panel columns for one guild window using the same bounds as [`guild_events_cte`].
 /// Each column is one scalar or JSON array so the whole summary stays one
 /// statement.
 fn guild_panel_columns() -> String {
     let prev = "guild_id=?1 AND created_at>=?3 AND created_at<?2";
-    let cur = "guild_id=?1 AND created_at>=?2";
+    let cur = "guild_id=?1 AND created_at>=?2 AND created_at<?5";
     format!(
         "(SELECT COUNT(*) FROM warns WHERE {prev}), \
          (SELECT COUNT(*) FROM bans WHERE {prev}), \
@@ -368,7 +375,7 @@ struct GuildPanels {
 }
 
 /// One guild's daily series and dashboard panels in one statement. The
-/// caller zero-fills the window; observed days outside it are harmless.
+/// caller zero-fills days with no observations.
 fn guild_summary_conn(
     conn: &impl SqlExecutor,
     guild_id: i64,
@@ -377,12 +384,14 @@ fn guild_summary_conn(
 ) -> Result<(HashMap<String, AnalyticsPoint>, GuildPanels)> {
     let start_day = window_start_day(today, window_days);
     let previous_start = window_start_day(today, window_days * 2);
+    let end_day = window_end_day(today);
     let sql = format!(
         "WITH {} SELECT {}, {}",
         guild_events_cte(),
         series_columns_with_events(
             "guild_id=?1 AND ",
             "?2",
+            "?5",
             "SELECT d, b, COUNT(*) AS n FROM ev WHERE cur GROUP BY d, b"
         ),
         guild_panel_columns()
@@ -396,7 +405,13 @@ fn guild_summary_conn(
     );
     let (series, counts, events, members, ranked): Raw = conn.query_row(
         &sql,
-        params![guild_id, start_day, previous_start, ANALYTICS_TOP_LIMIT],
+        params![
+            guild_id,
+            start_day,
+            previous_start,
+            ANALYTICS_TOP_LIMIT,
+            end_day
+        ],
         |row| {
             Ok((
                 series_row(row)?,
@@ -462,8 +477,8 @@ fn guild_summary_conn(
 
 /// Fleet series, per-guild totals for the requested and previous windows,
 /// display facts and the server count in one statement. `?1` starts the
-/// requested window and `?2` the previous window of equal length. Counting
-/// grows with the retained rows of both windows; the route is owner-only.
+/// requested window, `?2` the previous window of equal length and `?3` ends
+/// the current window. Counting grows with the rows in both windows.
 fn platform_conn(
     conn: &impl SqlExecutor,
     window_days: i64,
@@ -471,13 +486,14 @@ fn platform_conn(
 ) -> Result<PlatformAnalytics> {
     let start_day = window_start_day(today, window_days);
     let previous_start = window_start_day(today, window_days * 2);
+    let end_day = window_end_day(today);
     let sql = format!(
         "WITH w AS MATERIALIZED (SELECT guild_id, SUM(created_at>=?1) AS c, SUM(created_at<?1) AS p \
-           FROM warns WHERE created_at>=?2 GROUP BY guild_id), \
+           FROM warns WHERE created_at>=?2 AND created_at<?3 GROUP BY guild_id), \
          b AS MATERIALIZED (SELECT guild_id, SUM(created_at>=?1) AS c, SUM(created_at<?1) AS p \
-           FROM bans WHERE created_at>=?2 GROUP BY guild_id), \
+           FROM bans WHERE created_at>=?2 AND created_at<?3 GROUP BY guild_id), \
          s AS MATERIALIZED (SELECT guild_id, SUM(created_at>=?1) AS c, SUM(created_at<?1) AS p \
-           FROM bans WHERE created_at>=?2 AND {DEDICATED_SPAM_BANS_SQL} GROUP BY guild_id), \
+           FROM bans WHERE created_at>=?2 AND created_at<?3 AND {DEDICATED_SPAM_BANS_SQL} GROUP BY guild_id), \
          ev AS MATERIALIZED (SELECT guild_id, \
               SUM(event_type='automod' AND created_at>=?1) AS a, \
               SUM(event_type='mod_action' AND created_at>=?1) AS m, \
@@ -485,13 +501,13 @@ fn platform_conn(
               SUM(event_type='automod' AND created_at<?1) AS pa, \
               SUM(event_type='mod_action' AND created_at<?1) AS pm, \
               SUM(event_type='timeout_add' AND created_at<?1) AS pt \
-            FROM events WHERE {EVENT_BUCKETS_COUNTED_SQL} AND created_at>=?2 GROUP BY guild_id), \
+            FROM events WHERE {EVENT_BUCKETS_COUNTED_SQL} AND created_at>=?2 AND created_at<?3 GROUP BY guild_id), \
          m AS MATERIALIZED (SELECT guild_id, \
               SUM(CASE WHEN day>=?1 THEN joins ELSE 0 END) AS j, \
               SUM(CASE WHEN day>=?1 THEN leaves ELSE 0 END) AS l, \
               SUM(CASE WHEN day<?1 THEN joins ELSE 0 END) AS pj, \
               SUM(CASE WHEN day<?1 THEN leaves ELSE 0 END) AS pl \
-            FROM analytics_member_daily WHERE day>=?2 GROUP BY guild_id) \
+            FROM analytics_member_daily WHERE day>=?2 AND day<?3 GROUP BY guild_id) \
          SELECT {}, \
          (SELECT json_group_array(json_array(guild_id, c, p)) FROM w), \
          (SELECT json_group_array(json_array(guild_id, c, p)) FROM b), \
@@ -504,10 +520,10 @@ fn platform_conn(
             WHERE e.active=1 OR e.guild_id IN \
               (SELECT guild_id FROM w UNION SELECT guild_id FROM b \
                UNION SELECT guild_id FROM ev UNION SELECT guild_id FROM m))",
-        series_columns("", "?1")
+        series_columns("", "?1", "?3")
     );
     let (series, guild_columns, servers, info) =
-        conn.query_row(&sql, params![start_day, previous_start], |row| {
+        conn.query_row(&sql, params![start_day, previous_start, end_day], |row| {
             let guild_columns: [Option<String>; 5] = [
                 row.get(5)?,
                 row.get(6)?,

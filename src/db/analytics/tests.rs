@@ -221,6 +221,14 @@ async fn guild_summary_ranks_breakdowns_and_buckets_the_heat_map() {
     // heat map counts each enforcement action once.
     f.insert_event(10, "timeout_add", "{}", 0);
     f.insert_warn(10, 0);
+    // These rows already exist when a request with yesterday's date reads.
+    insert_mod_action(&f, Some(big), r#"{"action":"ban"}"#, -1);
+    f.insert_event(10, "automod", r#"{"rule":"spam","action":"timeout"}"#, -1);
+    f.insert_raw(
+        "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active) \
+         VALUES (10, 22, NULL, '[automod:attachment_flood] same image', ?1, 1)",
+        crate::db::params![rfc3339_day(-1)],
+    );
 
     let summary = enrolled_guild_analytics_on(&f.db, enrollment, 7, TEST_TODAY)
         .await
@@ -483,6 +491,22 @@ async fn platform_analytics_compares_windows_and_names_every_active_server() {
     bump(&f.db, &ten, 0, 4, 1).await;
     bump(&f.db, &ten, 8, 2, 3).await;
 
+    // The exclusive cutoff is the start of the next UTC day.
+    f.insert_raw(
+        "INSERT INTO warns (guild_id, user_id, moderator_id, reason, created_at) \
+         VALUES (10, 7, 8, NULL, '2026-01-02T00:00:00+00:00')",
+        (),
+    );
+    f.insert_raw(
+        "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active) \
+         VALUES (10, 21, NULL, '[automod:repeat_text] repeated text', ?1, 1)",
+        crate::db::params![rfc3339_day(-1)],
+    );
+    f.insert_event(10, "automod", r#"{"action":"ban"}"#, -1);
+    f.insert_event(10, "mod_action", "{}", -1);
+    f.insert_event(10, "timeout_add", "{}", -1);
+    bump(&f.db, &ten, -1, 8, 9).await;
+
     let platform = platform_analytics_on(&f.db, 7, TEST_TODAY).await.unwrap();
     let ids: Vec<i64> = platform.guilds.iter().map(|g| g.guild_id).collect();
     assert_eq!(
@@ -502,6 +526,7 @@ async fn platform_analytics_compares_windows_and_names_every_active_server() {
         (alpha.warns, alpha.mod_actions, alpha.joins, alpha.leaves),
         (1, 1, 4, 1)
     );
+    assert_eq!((alpha.bans, alpha.automod, alpha.timeouts), (0, 0, 0));
     assert_eq!(
         alpha.previous,
         PreviousTotals {
