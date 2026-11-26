@@ -1593,6 +1593,148 @@ async fn version_poll_confirms_primary_health_after_ambiguous_read_failure() {
     super::cleanup_db(&path);
 }
 
+async fn set_version_meta(raw: &libsql::Connection, values: [Option<&str>; 4]) {
+    let keys = [
+        "config_version",
+        "slash_registry_version",
+        "config_revision",
+        "slash_registry_revision",
+    ];
+    for (key, value) in keys.into_iter().zip(values) {
+        raw.execute("DELETE FROM meta WHERE key=?1", libsql::params![key])
+            .await
+            .unwrap();
+        if let Some(value) = value {
+            raw.execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2)",
+                libsql::params![key, value],
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+fn version(config: u64, slash: u64, config_revision: &str, slash_revision: &str) -> VersionState {
+    VersionState {
+        config,
+        slash,
+        config_revision: config_revision.into(),
+        slash_revision: slash_revision.into(),
+    }
+}
+
+/// Each version entry point, with the data statements its observation sent.
+async fn observe_versions(fixture: &HranaFixture, db: &Db) -> Vec<(VersionState, Vec<String>)> {
+    let mut observed = Vec::new();
+    for route in 0..3 {
+        fixture.state.lock().unwrap().statements.clear();
+        let state = match route {
+            0 => get_version_state(db).await,
+            1 => poll_version_state(db).await,
+            _ => get_primary_versions(db).await,
+        }
+        .unwrap();
+        let data = fixture
+            .state
+            .lock()
+            .unwrap()
+            .statements
+            .iter()
+            .filter(|sql| !is_transaction_edge(&sql.trim().to_ascii_uppercase()))
+            .cloned()
+            .collect();
+        observed.push((state, data));
+    }
+    observed
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn version_observation_reads_counters_and_revisions_in_one_statement() {
+    let path = super::tmp_db_path("remote_version_statement");
+    let local = Db::open(&path, 2).unwrap();
+    let raw = libsql::Builder::new_local(&path)
+        .build()
+        .await
+        .unwrap()
+        .connect()
+        .unwrap();
+    let fixture = HranaFixture::start().await;
+    let runtime = DbRuntime::new().unwrap();
+    let backing = runtime
+        .block_on(libsql::Builder::new_local(&path).build())
+        .unwrap()
+        .connect()
+        .unwrap();
+    fixture.state.lock().unwrap().backing = Some((runtime, backing));
+    let db = fixture.db();
+
+    let cases = [
+        (
+            "modern",
+            [Some("7"), Some("3"), Some("c-rev"), Some("s-rev")],
+            version(7, 3, "c-rev", "s-rev"),
+        ),
+        (
+            "missing revisions",
+            [Some("7"), Some("3"), None, None],
+            version(7, 3, "legacy:7", "legacy:3"),
+        ),
+        (
+            "missing everything",
+            [None, None, None, None],
+            version(0, 0, "legacy:0", "legacy:0"),
+        ),
+        (
+            "mixed slash revision",
+            [Some("12"), Some("junk"), None, Some("s-only")],
+            version(12, 0, "legacy:12", "s-only"),
+        ),
+        (
+            "mixed config revision",
+            [Some("12"), Some("5"), Some("c-only"), None],
+            version(12, 5, "c-only", "legacy:5"),
+        ),
+        // A restored or replaced database can keep the counter while
+        // publishing a new revision; that must remain a visible change.
+        (
+            "new config revision, same counter",
+            [Some("12"), Some("5"), Some("c-next"), None],
+            version(12, 5, "c-next", "legacy:5"),
+        ),
+        (
+            "new slash revision, same counter",
+            [Some("12"), Some("5"), Some("c-next"), Some("s-next")],
+            version(12, 5, "c-next", "s-next"),
+        ),
+    ];
+    let mut previous: Option<VersionState> = None;
+    for (label, values, expected) in cases {
+        set_version_meta(&raw, values).await;
+        for (route, (state, data)) in observe_versions(&fixture, &db)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(state, expected, "{label} route {route}");
+            assert_eq!(
+                data.len(),
+                1,
+                "{label} route {route}: one data statement per observation: {data:?}"
+            );
+        }
+        if let Some(previous) = previous.replace(expected.clone()) {
+            assert_ne!(previous, expected, "{label} must be observed as a change");
+        }
+    }
+
+    drop(db);
+    drop(fixture);
+    drop(raw);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
 async fn read_primary_fixture(db: &Db) -> Result<()> {
     db.with_conn(|conn| {
         let tx = conn.transaction_primary_snapshot()?;
