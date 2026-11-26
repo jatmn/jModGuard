@@ -960,8 +960,8 @@ function DatabaseUsage() {
   );
 }
 
-// Platform analytics (#618): the fleet-wide owner view. One owner-only read
-// per range or Refresh; every panel renders from that response.
+// Platform analytics (#618): historical activity is range-dependent, while
+// current directory coverage stays with the mounted owner page.
 const PLATFORM_METRICS = [
   ["warns", "Warnings", "an-warns"],
   ["bans", "Bans", "an-bans"],
@@ -1041,18 +1041,24 @@ function platformServerLabel(row) {
 }
 
 // One server row with its display facts, enforcement actions and directory state.
-function platformRows(snapshot) {
-  const byGuild = snapshot?.members?.by_guild ?? {};
+function platformRows(snapshot, members, membersLoading, snapshotGuildIds) {
+  const byGuild = members?.by_guild ?? {};
   return (snapshot?.guilds ?? []).map((guild) => {
-    // An active server missing from the directory totals could not be read.
+    const outsideSnapshot = snapshotGuildIds && !snapshotGuildIds.has(guild.guild_id);
     const directory = guild.active ? byGuild[guild.guild_id] : null;
+    let coverage = null;
+    if (guild.active && !membersLoading) {
+      if (outsideSnapshot) coverage = "outside_snapshot";
+      else if (!directory) coverage = "unavailable";
+      else if (directory.coverage !== "complete") coverage = directory.coverage;
+    }
     return {
       ...guild,
       actions: platformActions(guild),
       previousActions: platformActions(guild.previous),
       members: directory ? directory.current : null,
       directory,
-      coverage: !guild.active ? null : !directory ? "unavailable" : directory.coverage === "complete" ? null : directory.coverage,
+      coverage,
     };
   });
 }
@@ -1192,7 +1198,9 @@ function PlatformServerTable({ rows, totals, rangeLabel }) {
           shown.length
             ? shown.map((row) => {
                 const delta = formatDelta(row.actions, row.previousActions);
-                const coverage = memberDirectoryBadge(row.directory || { coverage: row.coverage }, row.guild_id);
+                const coverage = row.coverage === "outside_snapshot"
+                  ? { label: "not in snapshot", tone: "warn", title: "This server was outside the saved member totals. Refresh to include it." }
+                  : memberDirectoryBadge(row.directory || { coverage: row.coverage }, row.guild_id);
                 return h(
                   "tr",
                   { key: row.guild_id },
@@ -1241,16 +1249,30 @@ function TabPlatformAnalytics() {
 
 function PlatformAnalytics() {
   const [days, setDays] = useState(30);
-  const result = useApiRead(`/api/platform/analytics?days=${days}`, { retainData: true });
+  const [legacy, setLegacy] = useState(false);
+  const historyPath = `/api/platform/analytics?days=${days}`;
+  const result = useApiRead(legacy ? historyPath : `${historyPath}&include_members=false`, { retainData: true });
+  const directory = useApiRead(legacy ? null : "/api/platform/analytics/members", { retainData: true });
+  const splitMissing = !legacy && directory.error?.status === 404;
+  useEffect(() => {
+    if (splitMissing) setLegacy(true);
+  }, [splitMissing]);
   const snapshot = result.data;
-  const loading = !snapshot && result.loading;
-  const failed = !snapshot && Boolean(result.error);
+  const checkingLegacy = splitMissing || (!legacy && directory.loading && result.error?.status === 400);
+  const historyError = checkingLegacy ? null : result.error;
+  const loading = !snapshot && !historyError;
+  const failed = !snapshot && Boolean(historyError);
   const rangeLabel = `${days} days`;
   const series = snapshot?.series;
   const points = React.useMemo(() => toTrendPoints(series), [series]);
   const previous = snapshot?.previous ?? null;
-  const members = snapshot?.members;
-  const rows = platformRows(snapshot);
+  const members = legacy ? snapshot?.members : directory.error?.status === 403 ? null : directory.data;
+  const membersLoading = !members && (legacy ? loading : splitMissing || (directory.loading && !directory.error));
+  const snapshotGuildIds = Array.isArray(members?.snapshot_guild_ids) ? new Set(members.snapshot_guild_ids) : null;
+  const rows = platformRows(snapshot, members, membersLoading, snapshotGuildIds);
+  const activeRows = rows.filter(row => row.active);
+  const fleetChanged = snapshot && snapshotGuildIds &&
+    (activeRows.length !== snapshotGuildIds.size || activeRows.some(row => row.coverage === "outside_snapshot"));
   const totals = Object.fromEntries(PLATFORM_METRICS.map(([field]) => [field, sumSeries(points, field === "mod_actions" ? "modActions" : field)]));
   const rankings = platformRankings(rows, totals);
   const tile = (label, field, color) =>
@@ -1265,17 +1287,22 @@ function PlatformAnalytics() {
       unavailable: failed,
       rangeLabel,
     });
-  const membersUnavailable = failed || (snapshot && (!members || members.status === "unavailable"));
-  const memberBadge = members?.status === "partial" ? { label: "partial", tone: "warn", title: platformMemberStatus(members) } : null;
+  const membersUnavailable = !members || members.status === "unavailable";
+  const fleetWarning = fleetChanged ? "Member totals and activity cover different sets of servers. Refresh to update both." : "";
+  const memberBadge = fleetChanged && !membersUnavailable
+    ? { label: "different server set", tone: "warn", title: fleetWarning }
+    : members?.status === "partial" ? { label: "partial", tone: "warn", title: platformMemberStatus(members) } : null;
   const netPrevious = previous?.joins == null || previous?.leaves == null ? null : previous.joins - previous.leaves;
   const body = (render) =>
     snapshot ? render() : h("p", { className: "an-empty muted", "aria-busy": loading ? "true" : "false" }, failed ? "Unavailable" : "Loading…");
   const rank = (title, id, props) => analyticsPanel(title, id, body(() => h(RankList, props)), "an-span-4");
-  const note = result.error
-    ? h("p", { id: "platform-analytics-status", className: "alert alert-soft alert-warning", role: "status" }, snapshot
-        ? `Platform analytics refresh failed: ${result.error.message}. Showing the last successful response (stale). ${members?.status === "complete" ? "" : platformMemberStatus(members)}`.trim()
-        : `Platform analytics unavailable: ${result.error.message}`)
-    : snapshot && members?.status !== "complete" && h("p", { id: "platform-analytics-status", className: "an-note muted", role: "status" }, platformMemberStatus(members));
+  const memberStatus = !membersLoading && members?.status !== "complete" ? platformMemberStatus(members) : "";
+  const memberWarning = directory.error && !splitMissing
+    ? members
+      ? `Member totals refresh failed. ${directory.error.message}. Showing the last successful response (stale). ${memberStatus}`.trim()
+      : `Member totals unavailable. ${directory.error.message}`
+    : "";
+  const memberNote = [memberWarning || memberStatus, fleetWarning].filter(Boolean).join(" ");
   return h(
     "div",
     { className: "contents chart-page analytics-page platform-page" },
@@ -1283,10 +1310,17 @@ function PlatformAnalytics() {
       "Platform analytics",
       `All servers · last ${rangeLabel} (UTC)`,
       h(RangeSelector, { value: days, onChange: setDays }),
-      h(ActionButton, { id: "refresh-platform-analytics", className: "btn btn-sm", onClick: () => result.refresh() }, "Refresh"),
+      h(ActionButton, { id: "refresh-platform-analytics", className: "btn btn-sm", onClick: () => {
+        result.refresh();
+        if (!legacy) directory.refresh();
+      } }, "Refresh"),
       h(InfoTip, { id: "platform-analytics-help", label: "About these figures" }, PLATFORM_HELP),
     ),
-    note,
+    historyError && h("p", { id: "platform-analytics-status", className: "alert alert-soft alert-warning", role: "status" },
+      snapshot
+        ? `Platform analytics refresh failed: ${historyError.message}. Showing the last successful response (stale).`
+        : `Platform analytics unavailable: ${historyError.message}`),
+    memberNote && h("p", { id: "platform-members-status", className: memberWarning ? "alert alert-soft alert-warning" : "an-note muted", role: "status" }, memberNote),
     h(
       "div",
       { id: "platform-analytics", className: "contents" },
@@ -1294,7 +1328,7 @@ function PlatformAnalytics() {
         "section",
         { className: "an-kpis", "aria-label": `Fleet totals for the last ${rangeLabel}` },
         h(KpiTile, { label: "Servers", value: snapshot?.servers ?? 0, loading, unavailable: failed, rangeLabel }),
-        h(KpiTile, { label: "Members", value: members?.current ?? 0, loading, unavailable: membersUnavailable, badge: memberBadge, rangeLabel }),
+        h(KpiTile, { label: "Members", value: members?.current ?? 0, loading: membersLoading, unavailable: membersUnavailable, badge: memberBadge, rangeLabel }),
         h(KpiTile, {
           label: "Net growth",
           value: totals.joins - totals.leaves,
@@ -10523,6 +10557,7 @@ function useApiRead(path, { retainData = false, listSize, collection } = {}) {
   const [result, setResult] = useState({ kind: "loading" });
   const cancel = useRef(null);
   useEffect(() => {
+    if (!path) return;
     const controller = new AbortController();
     let publication = "current";
     const timeout = collection ? null : setTimeout(() => controller.abort(), 30000);
@@ -10569,7 +10604,7 @@ function useApiRead(path, { retainData = false, listSize, collection } = {}) {
     };
   }, [path, revision, retainData, collection, listSize]);
   return {
-    loading: result.kind === "loading",
+    loading: Boolean(path) && result.kind === "loading",
     data: retainData ? (result.path === path ? result.data ?? null : null) : result.kind === "loaded" ? result.data : null,
     error: retainData ? (result.path === path ? result.error ?? null : null) : result.kind === "failed" ? result.error : null,
     progress: result.progress ?? null,

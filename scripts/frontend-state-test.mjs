@@ -5325,6 +5325,7 @@ for (const { defaultFontSize, heatmapOnly, resourceOnly, widths } of [
   server = await serveBuiltApp(() => false, undefined, {}, (url, json) => {
     const days = Number(url.searchParams.get('days')) || 30;
     if (url.pathname === '/api/owner/resources') json(resourceSnapshot());
+    else if (url.pathname === platformMembersPath) json(platformSnapshot().members);
     else if (url.pathname.endsWith('/analytics')) {
       const analytics = browserAnalytics(days);
       const series = days === 90 ? analytics.series.map((day, i) => ({ ...day, warns: 9900 + i })) : analytics.series;
@@ -13460,6 +13461,13 @@ function platformSnapshot(days = 30, overrides = {}) {
     ...overrides,
   };
 }
+const platformMembersPath = '/api/platform/analytics/members';
+const platformHistoryPath = (days) => `/api/platform/analytics?days=${days}&include_members=false`;
+function platformReply(url, snapshot) {
+  const { members, ...history } = snapshot;
+  return response(url === platformMembersPath ? members : history);
+}
+
 const platformPage = (h) => h.nodes.get('#content');
 const platformPanel = (h, title) => [...platformPage(h).querySelectorAll('.an-panel')].find((panel) => panel.querySelector('.an-panel-title').textContent === title);
 const platformRank = (h, title) => [...platformPanel(h, title).querySelectorAll('.an-rank-row')]
@@ -13468,10 +13476,10 @@ const platformServers = (h) => [...platformPanel(h, 'Servers').querySelectorAll(
 
 test('Platform analytics shows every metric together with changes, names, icons and directory status', async () => {
   const calls = [];
-  const h = ownerHarness(async (url, options) => { calls.push([url, options.method]); return response(platformSnapshot()); });
+  const h = ownerHarness(async (url, options) => { calls.push([url, options.method]); return platformReply(url, platformSnapshot()); });
   h.app.navigate('platform-analytics');
   await settle();
-  assert.deepEqual(calls, [['/api/platform/analytics?days=30', 'POST']]);
+  assert.deepEqual(calls, [[platformHistoryPath(30), 'POST'], [platformMembersPath, 'POST']]);
   const page = platformPage(h);
   assert.equal(page.querySelector('.page-header h2').textContent, 'Platform analytics');
   assert.equal(page.querySelector('.page-header-detail').textContent, 'All servers · last 30 days (UTC)');
@@ -13482,7 +13490,7 @@ test('Platform analytics shows every metric together with changes, names, icons 
   assert.doesNotMatch(textOf(page), /Fleet-wide moderation and membership trends|Per-server rows show guild IDs/);
   assert.match(h.nodes.get('#platform-analytics-help').textContent, /previous period of the same length/);
   // One-line member note for partial totals.
-  const status = h.nodes.get('#platform-analytics-status');
+  const status = h.nodes.get('#platform-members-status');
   assert.match(status.textContent, /^Member totals are partial\. Member totals cover 2 of 3 servers; the rest were unavailable\. 1 counted server has incomplete member-directory coverage\.$/);
 
   assert.equal(kpiValue(page, 'Servers'), '3');
@@ -13532,7 +13540,7 @@ test('Platform Servers list shows unstarted imports and links to authorized Memb
   snapshot.members.by_guild[PLATFORM_IDS[0]].coverage = 'not_started';
   snapshot.members.by_guild[PLATFORM_IDS[1]] = { current: 10, coverage: 'uncertain',
     reconciliation_reason: 'gateway continuity interrupted', gap_at: Date.UTC(2026, 10, 23, 12) };
-  const h = ownerHarness(async () => response(snapshot));
+  const h = ownerHarness(async url => platformReply(url, snapshot));
   h.app.state.guilds = [{ id: PLATFORM_IDS[0], name: 'Alpha', access: 'manage' }];
   h.app.navigate('platform-analytics');
   await settle();
@@ -13546,7 +13554,7 @@ test('Platform Servers list shows unstarted imports and links to authorized Memb
 });
 
 test('Platform analytics ranks active servers, movers and each server\'s share of the fleet', async () => {
-  const h = ownerHarness(async () => response(platformSnapshot()));
+  const h = ownerHarness(async url => platformReply(url, platformSnapshot()));
   h.app.navigate('platform-analytics');
   await settle();
   assert.deepEqual(platformRank(h, 'Most active servers'), ['Alpha 8', 'Beta 1']);
@@ -13557,7 +13565,7 @@ test('Platform analytics ranks active servers, movers and each server\'s share o
   assert.deepEqual(platformRank(h, 'Share of mod actions'), ['Alpha 100%']);
   assert.equal(platformPanel(h, 'Share of bans').querySelector('.an-rank-row').getAttribute('title'), `Alpha (${PLATFORM_IDS[0]}): 3`);
 
-  const quiet = ownerHarness(async () => response(platformSnapshot(30, { series: analyticsDays(30), previous: platformPrevious(), guilds: [platformGuild(2)] })));
+  const quiet = ownerHarness(async url => platformReply(url, platformSnapshot(30, { series: analyticsDays(30), previous: platformPrevious(), guilds: [platformGuild(2)] })));
   quiet.app.navigate('platform-analytics');
   await settle();
   assert.deepEqual([...platformPage(quiet).querySelectorAll('.an-panel .an-empty')].map((n) => n.textContent),
@@ -13570,7 +13578,7 @@ test('Platform analytics ranks active servers, movers and each server\'s share o
 });
 
 test('Platform analytics server table sorts by any column and filters by name, ID and status', async () => {
-  const h = ownerHarness(async () => response(platformSnapshot()));
+  const h = ownerHarness(async url => platformReply(url, platformSnapshot()));
   h.app.navigate('platform-analytics');
   await settle();
   const panel = platformPanel(h, 'Servers');
@@ -13608,23 +13616,163 @@ test('Platform analytics server table sorts by any column and filters by name, I
   }
 });
 
-test('Platform analytics reads the selected 7, 30 or 90 day range', async () => {
-  const pending = [];
-  const h = ownerHarness((url) => new Promise((resolve) => pending.push({ url, resolve })));
+test('Platform analytics shows history while directory totals are delayed and refreshes totals only on request', async () => {
+  const memberReads = [];
+  const historyReads = [];
+  const readDirectory = () => new Promise(resolve => memberReads.push(resolve));
+  const snapshot = platformSnapshot();
+  const h = ownerHarness(async (url, options) => {
+    assert.equal(options.method, 'POST');
+    if (url === platformMembersPath) return response(await readDirectory());
+
+    const query = new URL(url, 'https://ui.example.test').searchParams;
+    const days = Number(query.get('days'));
+    const { members, ...history } = platformSnapshot(days);
+    historyReads.push(days);
+    // The legacy response cannot return its history until the directory read ends.
+    return response(query.get('include_members') === 'false'
+      ? history : { ...history, members: await readDirectory() });
+  });
   h.app.navigate('platform-analytics');
   await settle();
-  pending.shift().resolve(response(platformSnapshot(30)));
+  const page = platformPage(h);
+  assert.equal(kpiValue(page, 'Warnings'), '5', 'history renders while the member directory read is still pending');
+  assert.equal(page.querySelectorAll('.an-panel svg[role="img"]').length, 2);
+  assert.equal(kpiValue(page, 'Members'), '…');
+  assert.equal(page.querySelector('#platform-members-status'), null);
+  assert.equal(platformPanel(h, 'Servers').querySelector('.an-badge-warn'), null);
+
+  await fire(page.querySelector('[aria-label="Last 7 days"]'), 'click');
+  assert.deepEqual(historyReads, [30, 7]);
+  assert.equal(memberReads.length, 1, 'switching range leaves the pending directory read in place');
+  assert.equal(kpiValue(page, 'Warnings'), '5');
+  memberReads[0](snapshot.members);
+  await settle();
+  assert.equal(kpiValue(page, 'Members'), '40');
+  assert.match(page.querySelector('#platform-members-status').textContent, /Member totals are partial/);
+
+  await fire(page.querySelector('[aria-label="Last 90 days"]'), 'click');
+  assert.deepEqual(historyReads, [30, 7, 90]);
+  assert.equal(memberReads.length, 1, 'range changes reuse completed member totals too');
+  assert.equal(kpiValue(page, 'Members'), '40');
+
+  const refresh = page.querySelector('#refresh-platform-analytics');
+  await fire(refresh, 'click');
+  assert.deepEqual(historyReads, [30, 7, 90, 90]);
+  assert.equal(memberReads.length, 2);
+  assert.equal(kpiValue(page, 'Members'), '40', 'the prior totals stay visible while refreshing');
+  memberReads[1]({ status: 'unavailable' });
+  await settle();
+  assert.equal(kpiValue(page, 'Warnings'), '5');
+  assert.equal(kpiValue(page, 'Members'), '—');
+  assert.match(page.querySelector('#platform-members-status').textContent, /Member totals are unavailable/);
+
+  await fire(refresh, 'click');
+  assert.equal(memberReads.length, 3);
+  memberReads[2]({ ...snapshot.members, status: 'complete', current: 51, guilds_unavailable: 0, guilds_incomplete: 0 });
+  await settle();
+  assert.equal(kpiValue(page, 'Members'), '51');
+  assert.equal(page.querySelector('#platform-members-status'), null);
+});
+
+test('Platform analytics uses the combined response on a legacy API', async () => {
+  const calls = [];
+  const rejected = (status, message) => ({
+    ok: false, status, headers: { get: () => null }, text: async () => message,
+  });
+  const h = ownerHarness(async (url) => {
+    calls.push(url);
+    if (url === platformMembersPath) return rejected(404, '');
+    const query = new URL(url, 'https://ui.example.test').searchParams;
+    if (query.has('include_members')) return rejected(400, 'unknown field include_members');
+    return response(platformSnapshot(Number(query.get('days'))));
+  });
+  h.app.navigate('platform-analytics');
+  await settle();
+  await settle();
+  const page = platformPage(h);
+  assert.equal(kpiValue(page, 'Warnings'), '5');
+  assert.equal(kpiValue(page, 'Members'), '40');
+  assert.equal(page.querySelector('#platform-analytics-status'), null);
+  await fire(page.querySelector('[aria-label="Last 7 days"]'), 'click');
+  await fire(page.querySelector('#refresh-platform-analytics'), 'click');
+  assert.deepEqual(calls, [
+    platformHistoryPath(30), platformMembersPath,
+    '/api/platform/analytics?days=30', '/api/platform/analytics?days=7', '/api/platform/analytics?days=7',
+  ]);
+  assert.equal(kpiValue(page, 'Members'), '40');
+});
+
+test('Platform analytics distinguishes a server outside the saved directory snapshot from a failed read', async () => {
+  let memberReads = 0;
+  let historyFails = false;
+  const initial = platformSnapshot();
+  const ids = initial.guilds.filter(guild => guild.active).map(guild => guild.guild_id);
+  const directory = {
+    ...initial.members, status: 'complete', guilds_counted: 3, guilds_unavailable: 0, guilds_incomplete: 0,
+    snapshot_guild_ids: ids,
+    by_guild: Object.fromEntries(ids.map((id, index) => [id, { current: index === 0 ? 40 : 0, coverage: 'complete' }])),
+  };
+  const h = ownerHarness(async (url) => {
+    if (url === platformMembersPath) {
+      memberReads += 1;
+      return response(memberReads !== 2 ? directory : {
+        ...directory, status: 'partial', servers: 4, guilds_unavailable: 1, snapshot_guild_ids: PLATFORM_IDS,
+      });
+    }
+    if (historyFails) throw new Error('history unavailable');
+    const days = Number(new URL(url, 'https://ui.example.test').searchParams.get('days'));
+    const snapshot = platformSnapshot(days);
+    if (days === 7) {
+      snapshot.servers = 4;
+      snapshot.guilds[3].active = true;
+    }
+    return platformReply(url, snapshot);
+  });
+  h.app.navigate('platform-analytics');
+  await settle();
+  const page = platformPage(h);
+  const delta = () => [...platformPanel(h, 'Servers').querySelectorAll('tbody tr')]
+    .find(row => row.querySelector('.pa-server-name').textContent === 'Delta');
+  assert.equal(page.querySelector('#platform-members-status'), null);
+  await fire(page.querySelector('[aria-label="Last 7 days"]'), 'click');
+  assert.equal(memberReads, 1);
+  assert.equal(kpiValue(page, 'Members'), '40');
+  assert.equal(delta().querySelector('.an-badge-warn').textContent, 'not in snapshot');
+  assert.match(page.querySelector('#platform-members-status').textContent, /different sets of servers/);
+
+  await fire(page.querySelector('#refresh-platform-analytics'), 'click');
+  assert.equal(memberReads, 2);
+  assert.equal(delta().querySelector('.an-badge-warn').textContent, 'unavailable');
+  assert.doesNotMatch(page.querySelector('#platform-members-status').textContent, /different sets of servers/);
+
+  historyFails = true;
+  await fire(page.querySelector('#refresh-platform-analytics'), 'click');
+  assert.equal(memberReads, 3);
+  assert.match(page.querySelector('#platform-analytics-status').textContent, /stale/);
+  assert.match(page.querySelector('#platform-members-status').textContent, /different sets of servers/);
+  assert.equal(delta().querySelector('.an-badge-warn').textContent, 'not in snapshot');
+});
+
+test('Platform analytics reads the selected 7, 30 or 90 day range', async () => {
+  const pending = [];
+  const h = ownerHarness(async (url) => url === platformMembersPath
+    ? platformReply(url, platformSnapshot())
+    : new Promise((resolve) => pending.push({ url, resolve })));
+  h.app.navigate('platform-analytics');
+  await settle();
+  pending.shift().resolve(platformReply(platformHistoryPath(30), platformSnapshot(30)));
   await settle();
   const page = platformPage(h);
   for (const [label, days] of [['Last 7 days', 7], ['Last 90 days', 90]]) {
     await fire(page.querySelector(`[aria-label="${label}"]`), 'click');
     assert.equal(pending.length, 1, label);
-    assert.equal(pending[0].url, `/api/platform/analytics?days=${days}`);
+    assert.equal(pending[0].url, platformHistoryPath(days));
     assert.equal(kpiValue(page, 'Warnings'), '…', 'figures from another range are not shown while loading');
     const snapshot = platformSnapshot(days);
     // A 90-day previous window reaches past the membership counter horizon.
     if (days === 90) snapshot.previous = { ...snapshot.previous, joins: null, leaves: null };
-    pending.shift().resolve(response(snapshot));
+    pending.shift().resolve(platformReply(platformHistoryPath(days), snapshot));
     await settle();
     assert.equal(page.querySelector('.page-header-detail').textContent, `All servers · last ${days} days (UTC)`);
     assert.equal(page.querySelector(`[aria-label="${label}"]`).getAttribute('aria-pressed'), 'true');
@@ -13636,11 +13784,13 @@ test('Platform analytics reads the selected 7, 30 or 90 day range', async () => 
 
 test('Platform analytics retains totals, charts and rows through refresh failures and recovers', async () => {
   const pending = [];
-  const h = ownerHarness((url, options) => new Promise((resolve, reject) => pending.push({ resolve, reject, options })));
   const snapshot = platformSnapshot();
+  const h = ownerHarness(async (url, options) => url === platformMembersPath
+    ? platformReply(url, snapshot)
+    : new Promise((resolve, reject) => pending.push({ resolve, reject, options })));
   h.app.navigate('platform-analytics');
   await settle();
-  pending[0].resolve(response(snapshot));
+  pending[0].resolve(platformReply(platformHistoryPath(30), snapshot));
   await settle();
   const panel = () => h.nodes.get('#content');
   const totals = () => [...panel().querySelectorAll('.an-kpi-value')].map(el => el.textContent);
@@ -13661,7 +13811,7 @@ test('Platform analytics retains totals, charts and rows through refresh failure
   await settle();
   assertRetained();
   assert.match(h.nodes.get('#platform-analytics-status').textContent, /refresh failed: offline.*stale/i);
-  assert.match(h.nodes.get('#platform-analytics-status').textContent, /1 counted server has incomplete member-directory coverage/);
+  assert.match(h.nodes.get('#platform-members-status').textContent, /1 counted server has incomplete member-directory coverage/);
   await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
   assertRetained();
   assert.match(h.nodes.get('#platform-analytics-status').textContent, /refresh failed: offline.*stale/i, 'retained figures remain stale while retrying');
@@ -13677,11 +13827,10 @@ test('Platform analytics retains totals, charts and rows through refresh failure
   await fire(h.nodes.get('#refresh-platform-analytics'), 'click');
   assertRetained();
   assert.match(h.nodes.get('#platform-analytics-status').textContent, /timed out.*stale/i, 'a timeout warning also survives the pending retry');
-  const complete = { ...snapshot.members, status: 'complete', guilds_unavailable: 0, guilds_incomplete: 0 };
-  pending[3].resolve(response({ ...snapshot, servers: 4, members: complete }));
+  pending[3].resolve(platformReply(platformHistoryPath(30), { ...snapshot, servers: 4 }));
   await settle();
   assert.equal(totals()[0], '4');
-  assert.equal(h.nodes.get('#platform-analytics-status'), null, 'complete totals need no note');
+  assert.equal(h.nodes.get('#platform-analytics-status'), null, 'successful history clears only the history warning');
   assert.equal(panel().querySelectorAll('.an-cursor').length, 0, 'new daily data clears both cursors');
   assert.equal(panel().querySelector('.an-panel svg[role="img"]'), enforcement, 'the keyboard-operated chart remains mounted');
   await fire(enforcement, 'keydown', { key: 'ArrowRight' });
@@ -13691,14 +13840,16 @@ test('Platform analytics retains totals, charts and rows through refresh failure
 
 test('Platform analytics initial failure reports unavailability and retry restores the view', async () => {
   let fail = true;
-  const h = ownerHarness(async () => {
+  const h = ownerHarness(async url => {
     if (fail) throw new Error('offline');
-    return response({ servers: 0, series: [], guilds: [], members: { status: 'complete', servers: 0, current: 0, known: 0, by_guild: {} } });
+    return platformReply(url, { servers: 0, series: [], guilds: [], members: { status: 'complete', servers: 0, current: 0, known: 0, by_guild: {} } });
   });
   h.app.navigate('platform-analytics');
   await settle();
   assert.match(h.nodes.get('#platform-analytics-status').textContent, /Platform analytics unavailable: offline/);
+  assert.match(h.nodes.get('#platform-members-status').textContent, /Member totals unavailable. offline/);
   assert.equal(kpiValue(platformPage(h), 'Warnings'), '—', 'a failed read is not shown as zero');
+  assert.equal(kpiValue(platformPage(h), 'Members'), '—');
   assert.doesNotMatch(platformPage(h).textContent, /No platform trend data recorded yet/);
   fail = false;
   await fire(h.nodes.get('#refresh-platform-analytics'), 'click');

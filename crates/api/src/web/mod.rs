@@ -1977,6 +1977,10 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
             axum::routing::post(platform::analytics),
         )
         .route(
+            "/api/platform/analytics/members",
+            axum::routing::post(platform::members),
+        )
+        .route(
             "/api/database-usage/{id}",
             axum::routing::post(usage::detail),
         )

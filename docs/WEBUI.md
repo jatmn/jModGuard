@@ -425,6 +425,11 @@ previous range and daily sparklines, every enforcement metric and fleet membersh
 at once, the most and least active servers, the biggest movers, each server's share of
 bans, spam hits and mod actions, and a sortable, filterable server table with names, icons,
 per-metric share bars and member directory status (importing, unverified or unavailable).
+The charts load independently of current directory totals. Changing the range reuses
+those totals while the page is open. If the charts and member totals cover different
+servers, the dashboard shows a warning and identifies servers outside the member snapshot. **Refresh**
+reloads both. With an older API that only supports the combined read, the dashboard
+uses that response until the page is reopened.
 
 **Bot Resources** is the system status view for the bot and API processes over a
 1-hour, 24-hour, 7-day or 30-day range (`GET` or `POST /api/owner/resources?range=`,
@@ -567,6 +572,8 @@ POST   /api/guilds/{id}/stats          # same body as GET; SPA dashboard counts
 GET    /api/guilds/{id}/analytics      # ?days=7|30|90 (default 30): every Analytics panel + member directory size
 POST   /api/guilds/{id}/analytics      # same body as GET; SPA analytics tab
 POST   /api/platform/analytics         # owner-only, ?days=7|30|90 (default 30): fleet trends, previous-range totals, per-server rows, member directory totals
+                                       # include_members=false omits the directory totals and skips all guild-store reads
+POST   /api/platform/analytics/members # owner-only current member directory totals, coverage, and captured guild IDs
 GET    /api/guilds/{id}/actions
 POST   /api/guilds/{id}/actions        # same body as GET; SPA bot actions
 GET    /api/guilds/{id}/cases          # query options below
