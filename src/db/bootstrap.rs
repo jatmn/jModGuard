@@ -410,7 +410,11 @@ pub(super) fn get_meta_version_conn(conn: &impl SqlExecutor, key: &str) -> Resul
             Ok(r.get(0)?)
         })
         .optional()?;
-    Ok(value.as_deref().unwrap_or("0").parse::<u64>().unwrap_or(0))
+    Ok(meta_version_value(value))
+}
+
+fn meta_version_value(raw: Option<String>) -> u64 {
+    raw.as_deref().unwrap_or("0").parse::<u64>().unwrap_or(0)
 }
 
 pub(super) fn get_config_version_conn(conn: &impl SqlExecutor) -> Result<u64> {
@@ -429,19 +433,32 @@ pub struct VersionState {
     pub slash_revision: String,
 }
 
+/// Every version poll runs this, so all four markers share one statement.
 pub(super) fn get_version_state_conn(conn: &impl SqlExecutor) -> Result<VersionState> {
-    let config = get_config_version_conn(conn)?;
-    let slash = get_slash_registry_version_conn(conn)?;
-    let config_revision =
-        meta_string_conn(conn, "config_revision")?.unwrap_or_else(|| format!("legacy:{config}"));
-    let slash_revision = meta_string_conn(conn, "slash_registry_revision")?
-        .unwrap_or_else(|| format!("legacy:{slash}"));
-    Ok(VersionState {
-        config,
-        slash,
-        config_revision,
-        slash_revision,
-    })
+    conn.query_row(
+        "SELECT
+           (SELECT value FROM meta WHERE key = 'config_version'),
+           (SELECT value FROM meta WHERE key = 'slash_registry_version'),
+           (SELECT value FROM meta WHERE key = 'config_revision'),
+           (SELECT value FROM meta WHERE key = 'slash_registry_revision')",
+        (),
+        |row| {
+            let config = meta_version_value(row.get(0)?);
+            let slash = meta_version_value(row.get(1)?);
+            let config_revision = row
+                .get::<Option<String>>(2)?
+                .unwrap_or_else(|| format!("legacy:{config}"));
+            let slash_revision = row
+                .get::<Option<String>>(3)?
+                .unwrap_or_else(|| format!("legacy:{slash}"));
+            Ok(VersionState {
+                config,
+                slash,
+                config_revision,
+                slash_revision,
+            })
+        },
+    )
 }
 
 pub async fn get_config_version(db: &Db) -> Result<u64> {
