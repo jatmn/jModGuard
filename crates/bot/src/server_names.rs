@@ -140,20 +140,23 @@ const MAX_PENDING_MEMBERS: usize = 128;
 enum PendingRefresh {
     Full,
     Members(HashSet<UserId>),
+    MemberOverflow,
 }
 
 impl PendingRefresh {
     fn needs_snapshot<'a>(
         &self,
-        mut overwrites: impl Iterator<Item = &'a PermissionOverwrite>,
+        overwrites: impl Iterator<Item = &'a PermissionOverwrite>,
     ) -> bool {
+        // A grant can belong to a user absent from the member cache.
+        let mut member_grants = overwrites.filter_map(|overwrite| match overwrite.kind {
+            PermissionOverwriteType::Member(user) if !overwrite.allow.is_empty() => Some(user),
+            _ => None,
+        });
         match self {
             Self::Full => true,
-            // A grant can belong to a user absent from the member cache.
-            Self::Members(users) => overwrites.any(|overwrite| {
-                !overwrite.allow.is_empty()
-                    && matches!(overwrite.kind, PermissionOverwriteType::Member(user) if users.contains(&user))
-            }),
+            Self::Members(users) => member_grants.any(|user| users.contains(&user)),
+            Self::MemberOverflow => member_grants.next().is_some(),
         }
     }
 }
@@ -231,8 +234,8 @@ fn enqueue_refresh(guild_id: u64, member: Option<UserId>) -> bool {
                 users.insert(user);
             }
             PendingRefresh::Members(users) if !users.contains(&user) => {
-                // Re-read the full setup rather than discard an unclassified event.
-                *pending = Some(PendingRefresh::Full);
+                // Drop the IDs and check for any positive member grant on the next pass.
+                *pending = Some(PendingRefresh::MemberOverflow);
             }
             _ => {}
         }
@@ -387,9 +390,25 @@ mod tests {
     }
 
     #[test]
-    fn full_refresh_and_pending_member_overflow_keep_full_work() {
+    fn member_overflow_requires_a_positive_individual_overwrite() {
         let guild = 9_007_199_254_740_002;
         let member = UserId::new(1);
+        let role_allow = PermissionOverwrite {
+            allow: Permissions::VIEW_CHANNEL,
+            deny: Permissions::empty(),
+            kind: PermissionOverwriteType::Role(RoleId::new(17)),
+        };
+        let unrelated_member = UserId::new(MAX_PENDING_MEMBERS as u64 + 2);
+        let member_deny = PermissionOverwrite {
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL,
+            kind: PermissionOverwriteType::Member(unrelated_member),
+        };
+        let member_allow = PermissionOverwrite {
+            allow: Permissions::VIEW_CHANNEL,
+            deny: Permissions::empty(),
+            kind: PermissionOverwriteType::Member(unrelated_member),
+        };
         for id in 1..=MAX_PENDING_MEMBERS {
             assert_eq!(
                 enqueue_refresh(guild, Some(UserId::new(id as u64))),
@@ -404,11 +423,20 @@ mod tests {
         for id in 1..=MAX_PENDING_MEMBERS + 1 {
             assert!(!enqueue_refresh(guild, Some(UserId::new(id as u64))));
         }
-        assert!(matches!(take_refresh(guild), Some(PendingRefresh::Full)));
-        assert!(!enqueue_refresh(guild, Some(member)));
+        let overflow = take_refresh(guild).unwrap();
+        assert!(!overflow.needs_snapshot(std::iter::empty()));
+        assert!(!overflow.needs_snapshot([&role_allow, &member_deny].into_iter()));
+        assert!(overflow.needs_snapshot([&role_allow, &member_allow].into_iter()));
+        for id in 1..=MAX_PENDING_MEMBERS + 1 {
+            assert!(!enqueue_refresh(guild, Some(UserId::new(id as u64))));
+        }
         assert!(!enqueue_refresh(guild, None));
         assert!(!enqueue_refresh(guild, Some(member)));
-        assert!(matches!(take_refresh(guild), Some(PendingRefresh::Full)));
+        assert!(
+            take_refresh(guild)
+                .unwrap()
+                .needs_snapshot(std::iter::empty())
+        );
         assert!(take_refresh(guild).is_none());
         assert!(enqueue_refresh(guild, Some(member)));
         assert!(matches!(
