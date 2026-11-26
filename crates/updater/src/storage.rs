@@ -1,12 +1,19 @@
 //! Scoped WebUI publication using a Bunny Storage Zone password. This never
 //! calls the account API or recursively deletes a Storage directory.
 use crate::http_client_builder;
-use crate::oci::{Registry, sha256_hex};
+use crate::oci::{Registry, VerifiedReleaseLayer, sha256_hex};
 use anyhow::{Context, Result, ensure};
 use jmodguard::db::{ComponentRelease, UpdateControl};
 use reqwest::StatusCode;
-use std::collections::HashMap;
 use std::time::Duration;
+
+const ROOT_HTML: &str = "index.html";
+const ADMIN_HTML: &str = "administration/index.html";
+const SHARED_ASSETS: [&str; 2] = ["style.css", "administration.js"];
+const LEGACY_DASHBOARD: &str = "app.js";
+const SPLIT_DASHBOARD: &str = "workspace.js";
+const RUNTIME: &str = "webui-runtime.js";
+const SELECTED_ASSETS: [&str; 3] = [LEGACY_DASHBOARD, SPLIT_DASHBOARD, RUNTIME];
 
 pub enum ReleaseVerification {
     Mismatch,
@@ -143,46 +150,13 @@ impl Storage {
         registry: &Registry,
         release: &ComponentRelease,
     ) -> Result<Vec<String>> {
-        ensure!(release.component == "webui", "not a WebUI release");
-        let suffix = format!("assets/releases/{}/", release.source_sha);
-        let assets = [
-            format!("{suffix}app.js"),
-            format!("{suffix}style.css"),
-            format!("{suffix}administration.js"),
-        ];
-        let package = [
-            "webui/index.html".to_owned(),
-            "webui/administration/index.html".to_owned(),
-            format!("webui/{}", assets[0]),
-            format!("webui/{}", assets[1]),
-            format!("webui/{}", assets[2]),
-        ];
-        let request = package.iter().map(String::as_str).collect::<Vec<_>>();
-        let files = registry.files(release, &request).await?;
-        let prefix = format!("/{suffix}");
-        let root_html =
-            std::str::from_utf8(files.get(&package[0]).context("root HTML is missing")?)?;
-        let admin_html = std::str::from_utf8(
-            files
-                .get(&package[1])
-                .context("Administration HTML is missing")?,
-        )?;
-        ensure!(
-            root_html.contains(&format!("{prefix}app.js"))
-                && root_html.contains(&format!("{prefix}style.css")),
-            "root HTML does not reference this release's assets"
-        );
-        ensure!(
-            admin_html.contains(&format!("{prefix}administration.js"))
-                && admin_html.contains(&format!("{prefix}style.css")),
-            "Administration HTML does not reference this release's assets"
-        );
-        let old_root = self.get("index.html").await?;
-        let old_admin = self.get("administration/index.html").await?;
-        for (asset, package_path) in assets.iter().zip(package[2..].iter()) {
-            let body = files
-                .get(package_path)
-                .context("WebUI package is incomplete")?;
+        let paths = ReleasePaths::new(release)?;
+        let layer = registry.release_layer(release, &paths.requested()).await?;
+        let files = paths.read(layer).await?;
+        let old_root = self.get(ROOT_HTML).await?;
+        let old_admin = self.get(ADMIN_HTML).await?;
+        let assets = &files[2..];
+        for (asset, body) in assets {
             let mime = if asset.ends_with(".css") {
                 "text/css; charset=utf-8"
             } else {
@@ -191,28 +165,16 @@ impl Storage {
             self.put_verified(asset, body, mime).await?;
         }
         let switched = async {
-            self.put_verified(
-                "administration/index.html",
-                files
-                    .get(&package[1])
-                    .context("Administration HTML is missing")?,
-                "text/html; charset=utf-8",
-            )
-            .await?;
-            self.put_verified(
-                "index.html",
-                files.get(&package[0]).context("root HTML is missing")?,
-                "text/html; charset=utf-8",
-            )
-            .await?;
+            self.put_verified(ADMIN_HTML, &files[1].1, "text/html; charset=utf-8")
+                .await?;
+            self.put_verified(ROOT_HTML, &files[0].1, "text/html; charset=utf-8")
+                .await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
         if let Err(error) = switched {
-            let recovery = self.restore_html("index.html", old_root).await;
-            let admin_recovery = self
-                .restore_html("administration/index.html", old_admin)
-                .await;
+            let recovery = self.restore_html(ROOT_HTML, old_root).await;
+            let admin_recovery = self.restore_html(ADMIN_HTML, old_admin).await;
             if let Err(recovery_error) = recovery.and(admin_recovery) {
                 return Err(
                     error.context(format!("HTML restoration also failed: {recovery_error:#}"))
@@ -220,21 +182,19 @@ impl Storage {
             }
             return Err(error);
         }
-        Ok(assets.to_vec())
+        Ok(assets.iter().map(|(path, _)| path.clone()).collect())
     }
 
     /// Reconcile a response lost after the HTML switch. Adoption requires all
-    /// five Storage bytes to match the digest-pinned public release package.
+    /// stored files to match the digest-pinned public release package.
     pub async fn verify_release(
         &self,
         registry: &Registry,
         release: &ComponentRelease,
     ) -> Result<ReleaseVerification> {
-        let (destinations, package) = release_paths(release)?;
-        let request = package.iter().map(String::as_str).collect::<Vec<_>>();
-        let expected = registry.files(release, &request).await?;
-        self.compare_release(&destinations, &package, &expected)
-            .await
+        let paths = ReleasePaths::new(release)?;
+        let layer = registry.release_layer(release, &paths.requested()).await?;
+        self.compare_release(&paths.read(layer).await?).await
     }
 
     /// Re-check the Storage files of the durably installed release. As with
@@ -246,13 +206,11 @@ impl Storage {
         control: &UpdateControl,
         release: &ComponentRelease,
     ) -> Result<ReleaseVerification> {
-        let (destinations, package) = release_paths(release)?;
-        let request = package.iter().map(String::as_str).collect::<Vec<_>>();
-        let expected = registry
-            .files_for_installed_restore(control, release, &request)
+        let paths = ReleasePaths::new(release)?;
+        let layer = registry
+            .installed_layer(control, release, &paths.requested())
             .await?;
-        self.compare_release(&destinations, &package, &expected)
-            .await
+        self.compare_release(&paths.read(layer).await?).await
     }
 
     /// Reconfirm installed identity and current registry trust, then compare
@@ -266,27 +224,23 @@ impl Storage {
     ) -> Result<ReleaseVerification> {
         // Leave no warm entry if trust confirmation fails or is cancelled.
         let cached = inventory.0.take().filter(|(cached, _)| cached == release);
-        let (destinations, package) = release_paths(release)?;
-        let requested = package.iter().map(String::as_str).collect::<Vec<_>>();
+        let paths = ReleasePaths::new(release)?;
         let layer = registry
-            .installed_layer(control, release, &requested)
+            .installed_layer(control, release, &paths.requested())
             .await?;
         let expected = match cached {
             Some(entry) => entry,
             None => {
-                let bytes = layer.read(&requested).await?;
-                let files = destinations
+                let files = paths
+                    .read(layer)
+                    .await?
                     .into_iter()
-                    .zip(&package)
-                    .map(|(path, source)| {
-                        let body = bytes.get(source).context("WebUI package is incomplete")?;
-                        Ok(ExpectedFile {
-                            path,
-                            len: body.len(),
-                            hash: sha256_hex(body),
-                        })
+                    .map(|(path, body)| ExpectedFile {
+                        path,
+                        len: body.len(),
+                        hash: sha256_hex(&body),
                     })
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect();
                 (release.clone(), files)
             }
         };
@@ -305,23 +259,15 @@ impl Storage {
         })
     }
 
-    async fn compare_release(
-        &self,
-        destinations: &[String],
-        package: &[String],
-        expected: &HashMap<String, Vec<u8>>,
-    ) -> Result<ReleaseVerification> {
-        for (destination, source) in destinations.iter().zip(package.iter()) {
-            let Some(actual) = self.get(destination).await? else {
-                return Ok(ReleaseVerification::Mismatch);
-            };
-            if expected.get(source).is_none_or(|bytes| bytes != &actual) {
+    async fn compare_release(&self, expected: &[(String, Vec<u8>)]) -> Result<ReleaseVerification> {
+        for (path, expected_bytes) in expected {
+            if self.get(path).await?.as_ref() != Some(expected_bytes) {
                 return Ok(ReleaseVerification::Mismatch);
             }
         }
         Ok(ReleaseVerification::Verified {
-            root_hash: sha256_hex(expected.get(&package[0]).unwrap()),
-            admin_hash: sha256_hex(expected.get(&package[1]).unwrap()),
+            root_hash: sha256_hex(&expected[0].1),
+            admin_hash: sha256_hex(&expected[1].1),
         })
     }
 
@@ -352,34 +298,83 @@ impl Storage {
             "invalid managed WebUI SHA"
         );
         let prefix = format!("assets/releases/{source_sha}/");
-        for file in ["app.js", "style.css", "administration.js"] {
+        for file in SHARED_ASSETS.into_iter().chain(SELECTED_ASSETS) {
             self.delete(&format!("{prefix}{file}")).await?;
         }
         Ok(())
     }
 }
 
-/// The five managed Storage destinations of a WebUI release and their paths
-/// inside the release image.
-fn release_paths(release: &ComponentRelease) -> Result<(Vec<String>, Vec<String>)> {
-    ensure!(release.component == "webui", "not a WebUI release");
-    let prefix = format!("assets/releases/{}/", release.source_sha);
-    let destinations = vec![
-        "index.html".to_owned(),
-        "administration/index.html".to_owned(),
-        format!("{prefix}app.js"),
-        format!("{prefix}style.css"),
-        format!("{prefix}administration.js"),
-    ];
-    let package = destinations
-        .iter()
-        .map(|path| format!("webui/{path}"))
-        .collect();
-    Ok((destinations, package))
+/// The first four files are common to both package layouts. The final three
+/// are selected by the signed archive's inventory.
+struct ReleasePaths {
+    prefix: String,
+    destinations: Vec<String>,
+    archive: Vec<String>,
+}
+
+impl ReleasePaths {
+    fn new(release: &ComponentRelease) -> Result<Self> {
+        ensure!(release.component == "webui", "not a WebUI release");
+        let prefix = format!("assets/releases/{}/", release.source_sha);
+        let destinations: Vec<_> = [ROOT_HTML.to_owned(), ADMIN_HTML.to_owned()]
+            .into_iter()
+            .chain(
+                SHARED_ASSETS
+                    .into_iter()
+                    .chain(SELECTED_ASSETS)
+                    .map(|name| format!("{prefix}{name}")),
+            )
+            .collect();
+        let archive = destinations
+            .iter()
+            .map(|path| format!("webui/{path}"))
+            .collect();
+        Ok(Self {
+            prefix,
+            destinations,
+            archive,
+        })
+    }
+
+    fn requested(&self) -> Vec<&str> {
+        self.archive.iter().map(String::as_str).collect()
+    }
+
+    async fn read(&self, layer: VerifiedReleaseLayer<'_>) -> Result<Vec<(String, Vec<u8>)>> {
+        let requested = self.requested();
+        let (required, optional) = requested.split_at(2 + SHARED_ASSETS.len());
+        let mut files = layer.read_with_optional(required, optional).await?;
+        let dashboard = match (
+            files.contains_key(optional[0]),
+            files.contains_key(optional[1]),
+            files.contains_key(optional[2]),
+        ) {
+            (true, false, false) => LEGACY_DASHBOARD,
+            (false, true, true) => SPLIT_DASHBOARD,
+            _ => anyhow::bail!("invalid WebUI package layout"),
+        };
+        for (html, script) in [(required[0], dashboard), (required[1], "administration.js")] {
+            let content = std::str::from_utf8(&files[html])?;
+            let contains = |name| content.contains(&format!("/{}{name}", self.prefix));
+            ensure!(
+                contains(script)
+                    && contains("style.css")
+                    && (contains(RUNTIME) == (dashboard == SPLIT_DASHBOARD)),
+                "{html} does not reference this release's assets"
+            );
+        }
+        Ok(self
+            .destinations
+            .iter()
+            .zip(&self.archive)
+            .filter_map(|(path, source)| files.remove(source).map(|bytes| (path.clone(), bytes)))
+            .collect())
+    }
 }
 
 fn is_managed(path: &str) -> bool {
-    if matches!(path, "index.html" | "administration/index.html") {
+    if matches!(path, ROOT_HTML | ADMIN_HTML) {
         return true;
     }
     let Some(rest) = path.strip_prefix("assets/releases/") else {
@@ -390,7 +385,7 @@ fn is_managed(path: &str) -> bool {
     };
     sha.len() == 40
         && sha.bytes().all(|c| c.is_ascii_hexdigit())
-        && matches!(file, "app.js" | "style.css" | "administration.js")
+        && (SHARED_ASSETS.contains(&file) || SELECTED_ASSETS.contains(&file))
 }
 
 #[cfg(test)]
@@ -518,11 +513,16 @@ mod tests {
         assert!(storage.delete("assets/releases/").await.is_err());
         storage.prune_release(&sha).await.unwrap();
         let deleted = state.lock().await.deleted.clone();
-        assert_eq!(deleted.len(), 3);
-        assert!(
-            deleted
-                .iter()
-                .all(|path| path.starts_with(&format!("assets/releases/{sha}/")))
+        assert_eq!(
+            deleted,
+            [
+                "style.css",
+                "administration.js",
+                "app.js",
+                "workspace.js",
+                "webui-runtime.js"
+            ]
+            .map(|name| format!("assets/releases/{sha}/{name}"))
         );
         server.abort();
     }
@@ -555,11 +555,16 @@ mod tests {
         }
     }
 
-    const ROOT_HTML: &str = "index.html";
-    const ADMIN_HTML: &str = "administration/index.html";
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PackageLayout {
+        Legacy,
+        Split,
+        MissingRuntime,
+    }
 
     async fn webui_registry(
         not_after: &str,
+        layout: PackageLayout,
     ) -> (
         Registry,
         ComponentRelease,
@@ -573,7 +578,12 @@ mod tests {
             component: "webui".into(),
             channel: "latest".into(),
             release_id: "webui-fixture".into(),
-            source_sha: "c".repeat(40),
+            source_sha: if layout == PackageLayout::Legacy {
+                "c"
+            } else {
+                "d"
+            }
+            .repeat(40),
             published_at: "2025-01-01T00:00:00Z".into(),
             image: "ghcr.io/jatmn/jmodguard-webui".into(),
             digest: String::new(),
@@ -587,24 +597,38 @@ mod tests {
             base_abi: "static-webui-v1".into(),
         };
         let assets = format!("assets/releases/{}", release.source_sha);
-        let files = HashMap::from([
+        let (dashboard, preload) = if layout == PackageLayout::Legacy {
+            ("app.js", String::new())
+        } else {
+            (
+                "workspace.js",
+                format!(r#"<link rel="modulepreload" href="/{assets}/webui-runtime.js">"#),
+            )
+        };
+        let mut files = HashMap::from([
             (
                 ROOT_HTML.to_owned(),
-                format!(r#"<script src="/{assets}/app.js"></script><link href="/{assets}/style.css">"#)
+                format!(r#"{preload}<script src="/{assets}/{dashboard}"></script><link href="/{assets}/style.css">"#)
                     .into_bytes(),
             ),
             (
                 ADMIN_HTML.to_owned(),
-                format!(r#"<script src="/{assets}/administration.js"></script><link href="/{assets}/style.css">"#)
+                format!(r#"{preload}<script src="/{assets}/administration.js"></script><link href="/{assets}/style.css">"#)
                     .into_bytes(),
             ),
-            (format!("{assets}/app.js"), b"dashboard JavaScript".to_vec()),
+            (format!("{assets}/{dashboard}"), b"dashboard JavaScript".to_vec()),
             (format!("{assets}/style.css"), b"shared stylesheet".to_vec()),
             (
                 format!("{assets}/administration.js"),
                 b"administration JavaScript".to_vec(),
             ),
         ]);
+        if layout == PackageLayout::Split {
+            files.insert(
+                format!("{assets}/webui-runtime.js"),
+                b"shared JavaScript".to_vec(),
+            );
+        }
         let mut layer = Vec::new();
         {
             let mut tar = tar::Builder::new(&mut layer);
@@ -737,9 +761,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publishes_split_release_and_rolls_back_to_legacy_package() {
+        let not_after = signature_not_after_far_future();
+        let (legacy, previous, previous_files, _, legacy_server) =
+            webui_registry(&not_after, PackageLayout::Legacy).await;
+        let (split, release, files, _, split_server) =
+            webui_registry(&not_after, PackageLayout::Split).await;
+        let (incomplete, broken, _, _, incomplete_server) =
+            webui_registry(&not_after, PackageLayout::MissingRuntime).await;
+        let (storage, state, storage_server) = webui_storage(StorageFixture {
+            files: previous_files.clone(),
+            ..StorageFixture::default()
+        })
+        .await;
+
+        // Exercise the exact strict archive read older Storage::publish performs
+        // before its first Storage request. A split package omits the legacy entry.
+        let old_paths = previous_files
+            .keys()
+            .map(|path| {
+                format!(
+                    "webui/{}",
+                    path.replace(&previous.source_sha, &release.source_sha)
+                )
+            })
+            .collect::<Vec<_>>();
+        let requested = old_paths.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            split
+                .files(&release, &requested)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "release layer is missing a required file"
+        );
+        assert_eq!(
+            storage
+                .publish(&incomplete, &broken)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "invalid WebUI package layout"
+        );
+        {
+            let state = state.lock().await;
+            assert!(state.reads.is_empty());
+            assert!(state.uploads.is_empty());
+            assert_eq!(state.files, previous_files);
+        }
+
+        let uploaded = storage.publish(&split, &release).await.unwrap();
+        let runtime = format!("assets/releases/{}/webui-runtime.js", release.source_sha);
+        assert!(uploaded.contains(&runtime));
+        assert_verified(
+            storage.verify_release(&split, &release).await.unwrap(),
+            &files,
+        );
+        state.lock().await.files.remove(&runtime).unwrap();
+        assert!(matches!(
+            storage.verify_release(&split, &release).await.unwrap(),
+            ReleaseVerification::Mismatch
+        ));
+        storage.publish(&split, &release).await.unwrap();
+        storage.publish(&legacy, &previous).await.unwrap();
+        assert_verified(
+            storage.verify_release(&legacy, &previous).await.unwrap(),
+            &previous_files,
+        );
+        {
+            let state = state.lock().await;
+            assert_eq!(
+                state.files[&runtime], files[&runtime],
+                "rollback retains split assets"
+            );
+        }
+        storage.prune_release(&release.source_sha).await.unwrap();
+        assert_eq!(state.lock().await.files, previous_files);
+
+        for server in [
+            legacy_server,
+            split_server,
+            incomplete_server,
+            storage_server,
+        ] {
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
     async fn fresh_release_verification_rejects_changed_or_missing_assets() {
         let (registry, release, files, _, registry_server) =
-            webui_registry(&signature_not_after_far_future()).await;
+            webui_registry(&signature_not_after_far_future(), PackageLayout::Legacy).await;
         let (storage, state, storage_server) = webui_storage(StorageFixture {
             files: files.clone(),
             ..StorageFixture::default()
@@ -781,7 +894,7 @@ mod tests {
     #[tokio::test]
     async fn publish_restores_html_when_root_upload_fails() {
         let (registry, release, files, _, registry_server) =
-            webui_registry(&signature_not_after_far_future()).await;
+            webui_registry(&signature_not_after_far_future(), PackageLayout::Split).await;
         let old_asset = format!("assets/releases/{}/app.js", "b".repeat(40));
         let assets = format!("assets/releases/{}", release.source_sha);
         for old_admin in [Some(b"previous administration HTML".as_slice()), None] {
@@ -807,17 +920,18 @@ mod tests {
             assert!(!format!("{error:#}").contains("HTML restoration also failed"));
 
             let state = state.lock().await;
-            let mut asset_uploads = state.uploads[..3].to_vec();
+            let mut asset_uploads = state.uploads[..4].to_vec();
             asset_uploads.sort_unstable();
             assert_eq!(
                 asset_uploads,
                 [
                     format!("{assets}/administration.js"),
-                    format!("{assets}/app.js"),
                     format!("{assets}/style.css"),
+                    format!("{assets}/webui-runtime.js"),
+                    format!("{assets}/workspace.js"),
                 ]
             );
-            assert_eq!(&state.uploads[3..5], [ADMIN_HTML, ROOT_HTML]);
+            assert_eq!(&state.uploads[4..6], [ADMIN_HTML, ROOT_HTML]);
             previous.extend(
                 files
                     .iter()
@@ -850,7 +964,7 @@ mod tests {
     async fn installed_release_reverification_reuses_only_trusted_expected_files() {
         use jmodguard::db::{Db, SqlExecutor, params};
         let (registry, release, files, registry_state, registry_server) =
-            webui_registry("2020-01-01T00:00:00Z").await;
+            webui_registry("2020-01-01T00:00:00Z", PackageLayout::Split).await;
         let (storage, storage_state, storage_server) = webui_storage(StorageFixture {
             files: files.clone(),
             ..StorageFixture::default()
@@ -948,7 +1062,7 @@ mod tests {
             assert_eq!(state.reads.iter().filter(|get| *get == &path).count(), 2);
         }
 
-        let asset = format!("assets/releases/{}/administration.js", release.source_sha);
+        let asset = format!("assets/releases/{}/webui-runtime.js", release.source_sha);
         storage_state.lock().await.files.get_mut(&asset).unwrap()[0] ^= 1;
         assert!(matches!(
             verify(&release, &mut inventory).await.unwrap(),

@@ -67,7 +67,7 @@ target and explains that later Discord events can recreate entries.
 
 ## Getting and hosting the files
 
-Build the five website files from source before hosting or compiling the API's
+Build the website files from source before hosting or compiling the API's
 default `embed-ui` feature (Node.js as supported by `tools/webui/package.json`):
 
 ```bash
@@ -80,12 +80,13 @@ Rebuild after editing `frontend/` or `tools/webui/`. Output is in
 release packaging. The bot and API `--no-default-features` builds need no WebUI build.
 Do not upload the unbuilt `frontend/` sources.
 
-The five generated files are:
+The generated files are:
 
 | File | What it is |
 |---|---|
 | `dist/frontend/index.html` | the page |
 | `dist/frontend/app.js` | the app |
+| `dist/frontend/webui-runtime.js` | React and modules shared by both pages |
 | `dist/frontend/style.css` | the look |
 | `dist/frontend/administration/index.html` | owner Administration page: Updates |
 | `dist/frontend/administration.js` | update controls and version display |
@@ -118,8 +119,9 @@ package because its public barrel retains unused component initializers. A
 dependency upgrade must preserve those paths or update the adapter and pass the
 component exclusion check. No third-party source is patched or copied into Git.
 `dist/webui-metafile.json` records every build input/import and emitted-byte
-contribution for auditing; it is not published. Generated JS/CSS and library
-licenses share the existing assets. Browsers fetch no external module server
+contribution for auditing; it is not published. Both page entries preload and
+import the same runtime. Library licenses travel with the files that use them.
+Browsers fetch no external module server
 or stylesheet, and no generated bundle is committed.
 The old `JMODGUARD_ESM_BASE` and `JMODGUARD_DAISYUI_HREF` overrides are retired.
 Both pages use React throughout; there is no parallel vanilla renderer. React's `useSyncExternalStore` subscribes the two roots to immutable UI
@@ -201,9 +203,9 @@ serves them at `http://localhost:8080`.
 
 1. Create a Bunny **Storage Zone**. The create form requires a primary
    region and at least one replication region; do not skip replication.
-2. Put the five generated files at their paths in that zone so the root has
-   `/index.html` (or `/`), `/app.js`, `/style.css`, and `/administration.js`,
-   with `/administration/index.html` in its subdirectory.
+2. Put all six generated files at their paths in that zone. Serve the scripts
+   with a JavaScript content type and keep `/administration/index.html` in its
+   subdirectory. Upload the shared runtime before switching either HTML file.
 3. Create a **Pull Zone** whose origin is that Storage Zone. The public
    admin site is either the Pull Zone `*.b-cdn.net` hostname or an owned domain/subdomain
    you add on that zone. Use that same host for `JMODGUARD_WEB_BASE_URL` and
@@ -220,10 +222,10 @@ serves them at `http://localhost:8080`.
    `/api/legal/style.css`. Add the separate policy rule for `/privacy` and
    `/terms` from the [Bunny edge rule example](DEPLOY-BUNNY.md#5-point-api-paths-on-the-pull-zone-at-the-api-container).
 
-For the initial bootstrap only, upload all five files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. After that, GitHub Actions **Publish** builds an independent WebUI package to GHCR on trusted publication builds; it does not upload it to Bunny directly. The owner installs it from **Administration → Updates**, and the API writes it to Storage with `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, and `BUNNY_STORAGE_ENDPOINT`, then purges the Pull Zone when both `BUNNY_PULL_ZONE_ID` and a scoped `BUNNY_PURGE_API_KEY` (where the Bunny account offers scoped keys; otherwise purge from the dashboard) are set on the API container (never git); see
+For the initial bootstrap only, upload all six files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. After that, GitHub Actions **Publish** builds an independent WebUI package to GHCR on trusted publication builds; it does not upload it to Bunny directly. The owner installs it from **Administration → Updates**, and the API writes it to Storage with `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, and `BUNNY_STORAGE_ENDPOINT`, then purges the Pull Zone when both `BUNNY_PULL_ZONE_ID` and a scoped `BUNNY_PURGE_API_KEY` (where the Bunny account offers scoped keys; otherwise purge from the dashboard) are set on the API container (never git); see
 [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) and [BUNNY-UPDATES.md](BUNNY-UPDATES.md#storage-zone-publication). A private ops repo is **not required** to install.
 
-**Another host or CDN.** Copy the five generated files to the site root
+**Another host or CDN.** Copy the generated files to the site root
 (match the API revision when the page needs new endpoints; CSS/layout-only
 files can be newer). If the API is on a **different** hostname than the pages,
 set `window.JMODGUARD_API_BASE` to the API origin before `app.js` loads

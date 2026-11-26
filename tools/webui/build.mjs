@@ -16,11 +16,17 @@ const bundle = buildSync({
   bundle: true,
   minify: true,
   platform: "browser",
-  format: "iife",
+  format: "esm",
+  splitting: true,
+  chunkNames: "webui-runtime",
   target: "es2022",
   define: { "process.env.NODE_ENV": '"production"' },
   legalComments: "inline",
 });
+const jsFiles = Object.keys(bundle.metafile.outputs).map(file => path.relative(output, path.join(root, file)));
+if (jsFiles.length !== 3 || !["app.js", "administration.js", "webui-runtime.js"].every(file => jsFiles.includes(file))) {
+  throw new Error("WebUI build must emit the two entries and one shared runtime");
+}
 // Preserve project and dependency license text inside the existing assets.
 function licenseText(directory) {
   const name = fs.readdirSync(directory).find((name) => /^licen[cs]e(?:\.(?:md|txt))?$/i.test(name));
@@ -51,7 +57,7 @@ const css = buildSync({
   legalComments: "inline",
   banner: { css: projectNotice + "\n/*! daisyUI\n" + licenseText(path.dirname(daisyui)) + "\n*/" },
 });
-// Build-only audit evidence: never included in the five published assets.
+// Build-only audit evidence: not included in published assets.
 fs.writeFileSync(path.join(root, "dist/webui-metafile.json"),
   JSON.stringify({ js: bundle.metafile, css: css.metafile }, null, 2) + "\n");
 for (const name of ["index.html", "administration/index.html"]) {

@@ -1692,6 +1692,28 @@ async fn app_js() -> impl IntoResponse {
 }
 
 #[cfg(feature = "embed-ui")]
+async fn webui_runtime(headers: HeaderMap) -> Response {
+    use axum::http::header::{ETAG, IF_NONE_MATCH};
+    use std::sync::LazyLock;
+
+    const CONTENT: &str = include_str!("../../../../dist/frontend/webui-runtime.js");
+    static TAG: LazyLock<HeaderValue> = LazyLock::new(|| {
+        let digest = jmodguard_updater::oci::sha256_hex(CONTENT.as_bytes());
+        HeaderValue::from_str(&format!("\"{digest}\"")).expect("valid hexadecimal ETag")
+    });
+    let mut response = if headers.get(IF_NONE_MATCH) == Some(&*TAG) {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        static_handler(CONTENT, "application/javascript; charset=utf-8").into_response()
+    };
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(ETAG, TAG.clone());
+    response
+}
+
+#[cfg(feature = "embed-ui")]
 async fn style_css() -> impl IntoResponse {
     static_handler(
         include_str!("../../../../dist/frontend/style.css"),
@@ -1832,6 +1854,7 @@ fn router_with_store(app: Arc<ApiState>, session_store: MemoryStore) -> Router {
         .route("/administration", get(administration_index))
         .route("/administration/index.html", get(administration_index))
         .route("/administration.js", get(administration_js))
+        .route("/webui-runtime.js", get(webui_runtime))
         .route("/style.css", get(style_css));
     let sessioned = sessioned
         .route("/login", get(login))
@@ -3664,6 +3687,35 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK, "GET {path}");
         }
+        let runtime = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/webui-runtime.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.status(), StatusCode::OK);
+        assert_eq!(
+            runtime.headers()[axum::http::header::CONTENT_TYPE],
+            "application/javascript; charset=utf-8"
+        );
+        let revalidated = app
+            .oneshot(
+                Request::builder()
+                    .uri("/webui-runtime.js")
+                    .header(
+                        axum::http::header::IF_NONE_MATCH,
+                        &runtime.headers()[axum::http::header::ETAG],
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
     }
 
     #[tokio::test]

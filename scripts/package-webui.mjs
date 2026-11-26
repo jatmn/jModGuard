@@ -6,40 +6,48 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export function packageWebui(root, sha) {
-if (!root || !/^[0-9a-f]{40}$/.test(sha)) {
-  throw new Error("usage: node scripts/package-webui.mjs SOURCE_ROOT FULL_SOURCE_SHA");
-}
-const frontend = path.join(root, "dist", "frontend");
-const out = path.join(root, "dist", "webui");
-const prefix = `/assets/releases/${sha}`;
-const required = ["index.html", "app.js", "style.css", "administration/index.html", "administration.js"];
-for (const name of required) {
-  const file = path.join(frontend, name);
-  const stat = fs.lstatSync(file);
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`WebUI source is not a regular file: ${name}`);
-}
-fs.rmSync(out, { recursive: true, force: true });
-fs.mkdirSync(path.join(out, "administration"), { recursive: true });
-fs.mkdirSync(path.join(out, "assets", "releases", sha), { recursive: true });
-const rootHtml = fs.readFileSync(path.join(frontend, "index.html"), "utf8")
-  .replace('href="/style.css"', `href="${prefix}/style.css"`)
-  .replace('src="/app.js"', `src="${prefix}/app.js"`);
-if (!rootHtml.includes(`${prefix}/app.js`) || !rootHtml.includes(`${prefix}/style.css`)) {
-  throw new Error("root HTML asset references did not rewrite");
-}
-const adminHtml = fs.readFileSync(path.join(frontend, "administration/index.html"), "utf8")
-  .replace('href="/style.css"', `href="${prefix}/style.css"`)
-  .replace('src="/administration.js"', `src="${prefix}/administration.js"`);
-if (!adminHtml.includes(`${prefix}/administration.js`) || !adminHtml.includes(`${prefix}/style.css`)) {
-  throw new Error("Administration HTML asset references did not rewrite");
-}
-fs.writeFileSync(path.join(out, "index.html"), rootHtml);
-fs.writeFileSync(path.join(out, "administration/index.html"), adminHtml);
-const assets = path.join(out, "assets", "releases", sha);
-fs.writeFileSync(path.join(assets, "app.js"), `window.JMODGUARD_WEBUI_SHA = "${sha}";\n` + fs.readFileSync(path.join(frontend, "app.js"), "utf8"));
-fs.copyFileSync(path.join(frontend, "style.css"), path.join(assets, "style.css"));
-fs.writeFileSync(path.join(assets, "administration.js"), `window.JMODGUARD_WEBUI_SHA = "${sha}";\n` + fs.readFileSync(path.join(frontend, "administration.js"), "utf8"));
-return out;
+  if (!root || !/^[0-9a-f]{40}$/.test(sha)) {
+    throw new Error("usage: node scripts/package-webui.mjs SOURCE_ROOT FULL_SOURCE_SHA");
+  }
+  const frontend = path.join(root, "dist", "frontend");
+  const out = path.join(root, "dist", "webui");
+  const prefix = `/assets/releases/${sha}`;
+  const assets = path.join(out, "assets", "releases", sha);
+  const shared = ["style.css", "webui-runtime.js"];
+  const pages = [
+    // Old updaters require app.js in the archive before they touch Storage.
+    // Omitting it prevents them from switching to HTML that needs an uninstalled runtime.
+    { html: "index.html", source: "app.js", entry: "workspace.js" },
+    { html: "administration/index.html", source: "administration.js", entry: "administration.js" },
+  ];
+  for (const name of [...shared, ...pages.flatMap(page => [page.html, page.source])]) {
+    if (!fs.lstatSync(path.join(frontend, name)).isFile()) {
+      throw new Error(`WebUI source is not a regular file: ${name}`);
+    }
+  }
+  const htmlFiles = pages.map(page => {
+    let html = fs.readFileSync(path.join(frontend, page.html), "utf8");
+    for (const [from, to] of [
+      [`src="/${page.source}"`, `src="${prefix}/${page.entry}"`],
+      ...shared.map(name => [`href="/${name}"`, `href="${prefix}/${name}"`]),
+    ]) {
+      if (!html.includes(from)) throw new Error(`${page.html} lacks asset reference ${from}`);
+      html = html.replace(from, to);
+    }
+    return html;
+  });
+  fs.rmSync(out, { recursive: true, force: true });
+  fs.mkdirSync(path.join(out, "administration"), { recursive: true });
+  fs.mkdirSync(assets, { recursive: true });
+  for (const name of shared) {
+    fs.copyFileSync(path.join(frontend, name), path.join(assets, name));
+  }
+  for (const [index, page] of pages.entries()) {
+    fs.writeFileSync(path.join(out, page.html), htmlFiles[index]);
+    const js = fs.readFileSync(path.join(frontend, page.source), "utf8");
+    fs.writeFileSync(path.join(assets, page.entry), `window.JMODGUARD_WEBUI_SHA = "${sha}";\n` + js);
+  }
+  return out;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
