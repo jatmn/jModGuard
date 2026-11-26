@@ -767,9 +767,16 @@ test('the member picker waits for typing to settle and drops searches on close o
   const settleSearch = () => settleMemberSearch(h);
   const cancel = () => fire(findNode(dialog, n => n.localName === 'button' && n.textContent === 'Cancel'), 'click');
 
-  for (const value of ['j', 'ja', 'jat', 'jatm', 'jatmn']) await type(value);
+  let previous = null;
+  for (const value of ['j', 'ja', 'jat', 'jatm', 'jatmn']) {
+    await type(value);
+    const pending = searchTimers();
+    assert.equal(pending.length, 1, 'each edit replaces the pending search');
+    assert.notEqual(pending[0][0], previous, 'the wait restarts from the latest edit');
+    assert.equal(h.timers.has(previous), false, 'the earlier wait is cancelled');
+    previous = pending[0][0];
+  }
   assert.deepEqual(queries(), [], 'no directory read starts while the name is still being typed');
-  assert.equal(searchTimers().length, 1, 'each edit replaces the pending search');
   await settleSearch();
   assert.deepEqual(queries(), ['jatmn'], 'only the final text is searched');
   assert.equal(reads[0].url, `/api/guilds/${h.app.state.guildId}/members?q=jatmn&limit=8&status=current`);
@@ -786,6 +793,16 @@ test('the member picker waits for typing to settle and drops searches on close o
   await settleSearch();
   assert.equal(textOf(dialog.querySelector('ul.picker-results')), 'No matching members.');
 
+  // Enter while a name waits for typing to settle searches it at once instead of rejecting it as an ID.
+  search = () => response({ members: [{ user_id: '4545', display_name: 'Kit' }], next_cursor: null, total: null });
+  await type('kit');
+  await fire(idBox(), 'keydown', { key: 'Enter' });
+  await settle();
+  assert.equal(searchTimers().length, 0, 'Enter starts the waiting search');
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x', 'kit']);
+  assert.equal(dialog.querySelector('.id-picker p.err'), null, 'a waiting name is not rejected as an ID');
+  assert.equal(textOf(dialog.querySelector('ul.picker-results')), 'Kit4545');
+
   // Clearing the box, pasting an ID or selecting typed IDs cancels the pending search.
   const chips = () => [...dialog.querySelectorAll('ul.picker-chips .picker-chip-text')].map(textOf);
   await type('jat');
@@ -801,7 +818,7 @@ test('the member picker waits for typing to settle and drops searches on close o
   await fire(idBox(), 'keydown', { key: 'Enter' });
   assert.deepEqual(chips(), ['User 4343']);
   assert.equal(searchTimers().length, 0, 'selecting cancels the pending search');
-  assert.deepEqual(queries(), ['jatmn', 'j', 'x']);
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x', 'kit']);
 
   // Closing the dialog before the delay sends nothing.
   await type('jat');
@@ -814,7 +831,7 @@ test('the member picker waits for typing to settle and drops searches on close o
   await type('jatmn');
   h.app.state.guildId = h.app.state.guilds[1].id;
   await settleSearch();
-  assert.deepEqual(queries(), ['jatmn', 'j', 'x'], 'a search typed for one server is not sent after a server change');
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x', 'kit'], 'a search typed for one server is not sent after a server change');
   h.app.state.guildId = h.app.state.guilds[0].id;
   await cancel();
 
@@ -823,7 +840,7 @@ test('the member picker waits for typing to settle and drops searches on close o
   search = signal => new Promise((_, reject) => signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true }));
   await type('jatmn');
   await settleSearch();
-  assert.deepEqual(queries(), ['jatmn', 'j', 'x', 'jatmn']);
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x', 'kit', 'jatmn']);
   assert.equal(reads.at(-1).signal.aborted, false);
   await cancel();
   assert.equal(reads.at(-1).signal.aborted, true, 'closing the picker aborts its search');

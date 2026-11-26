@@ -4558,6 +4558,12 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
           choose(results[0]);
           return;
         }
+        // A name still waiting for typing to settle is searched now, not rejected as an ID.
+        if (searchTimer.current && text.split(",").some((part) => !parseSnowflake(part))) {
+          cancelSearch();
+          readMembers(state.guildId, text.trim());
+          return;
+        }
         addTyped();
       },
       onBlur: () => {
