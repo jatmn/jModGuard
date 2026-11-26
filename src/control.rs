@@ -380,11 +380,27 @@ fn submit_blocking(
     stream
         .write_all(&frame)
         .map_err(|_| anyhow::anyhow!("waiting"))?;
-    match read_frame(&mut stream) {
-        Ok(body) => serde_json::from_slice(&body).context("write failed"),
+    let body = match read_frame(&mut stream) {
+        Ok(body) => body,
         Err(_) if matches!(op, ControlOp::LookupResult) => anyhow::bail!(OUTCOME_UNKNOWN),
-        Err(_) => Ok(ControlReply::StillWaiting),
+        Err(_) => return Ok(ControlReply::StillWaiting),
+    };
+    let mut reply = serde_json::from_slice(&body).context("write failed")?;
+    // The cached result confirms what committed earlier. Its list patch might
+    // have been superseded while the original response was missing.
+    if matches!(op, ControlOp::LookupResult)
+        && let ControlReply::Saved { body } | ControlReply::Unchanged { body } = &mut reply
+        && let Some(fields) = body.as_object_mut()
+        && matches!(
+            fields
+                .get("config_patch")
+                .and_then(|patch| patch["kind"].as_str()),
+            Some("known_spam" | "known_bad_images")
+        )
+    {
+        fields.remove("config_patch");
     }
+    Ok(reply)
 }
 
 #[cfg(test)]

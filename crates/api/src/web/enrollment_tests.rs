@@ -8027,6 +8027,82 @@ async fn known_bad_image_routes_require_current_page_and_live_permission() {
 }
 
 #[tokio::test]
+async fn known_bad_image_http_omits_stale_patch_after_writer_recovers_a_lost_reply() {
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_op(
+        listener: &TcpListener,
+        nonces: &Mutex<jmodguard::control::NonceWindow>,
+    ) -> (TcpStream, db::ControlOp, String) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut frame = vec![0; stream.read_u32().await.unwrap() as usize];
+        stream.read_exact(&mut frame).await.unwrap();
+        let (op, actor, _, id) =
+            jmodguard::control::open_frame(&[b'x'; 32], &frame, nonces).unwrap();
+        assert_eq!(actor, 42);
+        (stream, op, id)
+    }
+
+    for captured_save in [true, false] {
+        let mut f = Fixture::new(false).await;
+        f.enroll(10).await;
+        let writer = f.app.db.clone();
+        let enrollment = db::guild_enrollment(&writer, 10).await.unwrap().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        f.use_writer_link(listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let nonces = Mutex::new(jmodguard::control::NonceWindow::new());
+            let (first, op, id) = read_op(&listener, &nonces).await;
+            let db::ControlOp::AddKnownBadImage { scope, hash, .. } = &op else {
+                panic!("expected the original image add, got {op:?}");
+            };
+            let remove = db::ControlOp::RemoveKnownBadImage {
+                scope: scope.clone(),
+                hash: hash.clone(),
+            };
+            let reply = db::apply_control(&writer, None, op, None).await.unwrap();
+            assert!(matches!(&reply, db::ControlReply::Saved { body }
+                if body["changed"] == true && body["config_patch"]["kind"] == "known_bad_images"));
+            // Another moderator's write lands while the original reply is lost.
+            let removed = db::apply_control(&writer, None, remove, None)
+                .await
+                .unwrap();
+            assert!(matches!(removed, db::ControlReply::Saved { .. }));
+            drop(first);
+            let (mut lookup, op, lookup_id) = read_op(&listener, &nonces).await;
+            assert!(matches!(op, db::ControlOp::LookupResult));
+            assert_eq!(lookup_id, id);
+            let frame = serde_json::to_vec(&reply).unwrap();
+            lookup.write_u32(frame.len() as u32).await.unwrap();
+            lookup.write_all(&frame).await.unwrap();
+        });
+
+        let path = "/api/guilds/10/known-bad-images";
+        let image = serde_json::json!({"hash": "ab".repeat(32)});
+        let (status, saved) = if captured_save {
+            f.request_save(
+                "POST",
+                path,
+                &image,
+                (&"1".repeat(64), false),
+                &enrollment.id,
+            )
+            .await
+        } else {
+            f.request("POST", path, &image.to_string()).await
+        };
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        peer.await.unwrap();
+        let (status, current) = f.request("POST", "/api/guilds/10/config", "").await;
+        assert_eq!(status, StatusCode::OK, "{current}");
+        assert!(current["known_bad_images"].as_array().unwrap().is_empty());
+        assert_eq!(saved, serde_json::json!({"ok": true, "changed": true}));
+    }
+}
+
+#[tokio::test]
 async fn known_bad_image_http_add_list_remove_accepts_only_safe_metadata() {
     let f = Fixture::new(false).await;
     f.enroll(10).await;
