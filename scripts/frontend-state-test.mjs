@@ -201,9 +201,18 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     instrument(() => { ++renders; });
     return () => renders;
   }
+  function measureResourceChartRenders() {
+    let renders = 0;
+    const instrument = vm.runInContext(`(count) => {
+      const original = ResourceChart;
+      ResourceChart = (props) => { count(); return original(props); };
+    }`, context);
+    instrument(() => { ++renders; });
+    return () => renders;
+  }
   vm.runInContext('root.render(h(App));', context);
   pages.push({dom, roots});
-  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, measureMemberRowRenders, advanceTime(ms) { clockOffsetMs += ms; } };
+  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, measureMemberRowRenders, measureResourceChartRenders, advanceTime(ms) { clockOffsetMs += ms; } };
 }
 
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
@@ -13848,8 +13857,14 @@ test('Bot Resources measures disjoint CPU and memory cgroups independently', asy
 
 test('Bot Resources marks an old status stale and re-reads on range change and Refresh', async () => {
   const calls = [];
-  const old = resourceSnapshot({ bot: { current: resourceCurrent({ interval_ms: 60000, stale_after_ms: 125000, age_ms: 300000 }), history: resourceHistory() } });
-  const h = ownerHarness(async (url) => { calls.push(url); return response(old); });
+  const current = resourceCurrent({ interval_ms: 60000, stale_after_ms: 125000, age_ms: 300000 });
+  const h = ownerHarness(async (url) => {
+    calls.push(url);
+    const range = url.endsWith('7d') ? { range: '7d', from_secs: RESOURCE_TO - 7 * 86400 } : {};
+    const sample = calls.length < 3 ? current : { ...current, info: { ...current.info, cpu_limit: { Millicores: 1000 } } };
+    const history = calls.length < 4 ? resourceHistory() : resourceHistory({ points: resourcePoints([100, 200, null, 0]) });
+    return response(resourceSnapshot({ ...range, bot: { current: sample, history } }));
+  });
   h.app.navigate('resources');
   await settle();
   const [bot, api] = resourceCards(h);
@@ -13857,11 +13872,18 @@ test('Bot Resources marks an old status stale and re-reads on range change and R
   assert.match(bot.querySelector('.du-stale').textContent, /^Stale: older than 2 min/);
   assert.equal(bot.getAttribute('data-freshness'), 'stale');
   assert.equal(api.querySelector('.du-health').textContent, 'Ready');
+  const cpuPlot = () => resourceCards(h)[0].querySelector('.br-metric svg');
+  const originalLabel = cpuPlot().getAttribute('aria-label');
+  assert.match(originalLabel, /Average latest 60\.0%/);
   await fire(h.nodes.get('#content').querySelector('[aria-label="Last 7 days"]'), 'click');
-  await settle();
+  assert.notEqual(cpuPlot().getAttribute('aria-label'), originalLabel, 'the range updates the plotted times');
   await fire(h.nodes.get('#refresh-resources'), 'click');
-  await settle();
-  assert.deepEqual(calls, ['/api/owner/resources?range=24h', '/api/owner/resources?range=7d', '/api/owner/resources?range=7d']);
+  assert.match(cpuPlot().getAttribute('aria-label'), /Average latest 30\.0%/, 'the new quota updates the CPU scale');
+  await fire(h.nodes.get('#refresh-resources'), 'click');
+  assert.match(cpuPlot().getAttribute('aria-label'), /Average latest 0%/, 'a measured zero is present');
+  assert.equal(cpuPlot().querySelector('polyline.br-tone-avg').getAttribute('points').split(' ').length, 2, 'the unsampled bucket breaks the line');
+  assert.ok(cpuPlot().querySelector('circle.br-tone-avg'), 'the zero after the gap is drawn');
+  assert.deepEqual(calls, ['/api/owner/resources?range=24h', ...Array(3).fill('/api/owner/resources?range=7d')]);
 });
 
 async function runHarnessInterval(h, delay = 5000) {
@@ -13872,18 +13894,52 @@ async function runHarnessInterval(h, delay = 5000) {
   await settle();
 }
 
-test('Bot Resources becomes stale on an idle page without Refresh', async () => {
+test('Bot Resources updates freshness and billing without rerendering history on idle ticks', async () => {
   const snapshot = resourceSnapshot({
     bot: { current: resourceCurrent({ age_ms: 2000, stale_after_ms: 15000, interval_ms: 5000 }) },
     api: { current: resourceCurrent({ age_ms: 2000, stale_after_ms: 15000, interval_ms: 5000 }) },
     generated_at_ms: RESOURCE_NOW_MS,
+    memory_billing: { block_mib: 64, rates: { memory_usd_per_block_hour: 0.001, cpu_usd_per_core_hour: 0.02 } },
   });
-  const h = ownerHarness(async () => response(snapshot));
+  let reads = 0;
+  const h = ownerHarness(async () => { ++reads; return response(snapshot); });
+  const renders = h.measureResourceChartRenders();
+  const resize = new Map();
+  h.window.HTMLCanvasElement.prototype.getContext = () => null;
+  h.window.ResizeObserver = class {
+    constructor(measure) { this.measure = measure; }
+    observe(element) { if (element.localName === 'svg') resize.set(element, this.measure); }
+    disconnect() {}
+  };
   h.app.navigate('resources');
   await settle();
-  assert.equal(resourceCards(h)[0].getAttribute('data-freshness'), 'fresh');
-  h.advanceTime(20_000);
+  const [bot, api] = resourceCards(h);
+  const billing = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+  const costs = () => [...billing.querySelectorAll('tbody td')].map(textOf);
+  const plot = bot.querySelector('.br-metric svg');
+  const linePoints = () => plot.querySelector('polyline.br-tone-avg').getAttribute('points');
+  assert.equal(bot.getAttribute('data-freshness'), 'fresh');
+  assert.match(bot.querySelector('.du-chip').textContent, /Sampled 2 s ago/);
+  assert.deepEqual(costs(), ['$0.008', '$5.76', '$0.005', '$3.60']);
+  const mountedRenders = renders();
+  assert.equal(mountedRenders, 8);
   await runHarnessInterval(h);
-  assert.equal(resourceCards(h)[0].getAttribute('data-freshness'), 'stale');
-  assert.equal(resourceCards(h)[1].getAttribute('data-freshness'), 'stale');
+  assert.match(bot.querySelector('.du-chip').textContent, /Sampled 7 s ago/);
+  assert.equal(renders() - mountedRenders, 0, 'idle freshness tick renders zero history charts');
+
+  const previousPoints = linePoints();
+  Object.defineProperty(plot, 'clientWidth', { value: 320 });
+  plot.style.fontSize = '16px';
+  resize.get(plot)();
+  await settle();
+  assert.equal(renders() - mountedRenders, 1, 'the resized chart redraws');
+  assert.notEqual(linePoints(), previousPoints);
+
+  h.advanceTime(10_000);
+  await runHarnessInterval(h);
+  assert.equal(bot.getAttribute('data-freshness'), 'stale');
+  assert.equal(api.getAttribute('data-freshness'), 'stale');
+  assert.deepEqual(costs(), Array(4).fill('Unavailable'));
+  assert.equal(renders() - mountedRenders, 1, 'the stale transition leaves history untouched');
+  assert.equal(reads, 1, 'clock and layout changes make no requests');
 });
