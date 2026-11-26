@@ -7878,6 +7878,168 @@ async fn case_history_pages_use_one_history_snapshot() {
 }
 
 #[tokio::test]
+async fn case_evidence_metadata_uses_one_select_for_each_live_list() {
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource, EvidenceCapture,
+        EvidenceLimits, EvidenceOrigin, EvidenceRequest,
+    };
+
+    let probe = Arc::new(db::StartupProbe::default());
+    let _guard = db::enter_startup_probe(Some(probe.clone()));
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment.clone()).await.unwrap();
+    let case = CaseId::new();
+    store
+        .record_case(
+            scope.clone(),
+            case.clone(),
+            CaseData {
+                ban_attempt_tag: None,
+                source: CaseSource::DiscordAudit { entry_id: 1 },
+                action: CaseAction::Ban,
+                outcome: CaseOutcome::Succeeded,
+                subject_id: 42,
+                actor_id: None,
+                occurred_at_ms: 1,
+                reason: None,
+                evidence: CaseEvidence::Unavailable,
+            },
+            crate::tenant::case_limits(),
+        )
+        .await
+        .unwrap();
+
+    let limits = EvidenceLimits {
+        max_items_per_case: 10,
+        ..crate::tenant::evidence_limits()
+    };
+    let storage_id = CaseId::new();
+    let url = format!("/api/guilds/10/cases/{}/evidence", case.as_str());
+    let statement_count = || {
+        probe
+            .primary_labels()
+            .iter()
+            .filter(|label| label.starts_with("guild db/guild_data/case_evidence:"))
+            .map(|label| probe.primary_statements(label))
+            .sum::<u64>()
+    };
+    let mut ids = (1..=10_u64).rev();
+    let mut expected = Vec::new();
+    let mut list_costs = Vec::new();
+    for (additions, expected_count) in [(2, 0), (1, 1), (7, 8)] {
+        for n in ids.by_ref().take(additions) {
+            let id = CaseId::try_from(format!("{n:032x}")).unwrap();
+            let bytes = n;
+            let snowflake = 9_007_199_254_740_993_i64 + n as i64;
+            let origin = EvidenceOrigin {
+                channel_id: snowflake,
+                message_id: snowflake + 20,
+                attachment_id: snowflake + 40,
+            };
+            let sha256 = format!("{n:064x}");
+            if n < 9 {
+                // Insert order is descending, while the API lists ascending evidence IDs.
+                expected.insert(
+                    0,
+                    serde_json::json!({
+                        "id": id.as_str(),
+                        "bytes": bytes,
+                        "sha256": sha256,
+                        "channel_id": origin.channel_id.to_string(),
+                        "message_id": origin.message_id.to_string(),
+                        "attachment_id": origin.attachment_id.to_string(),
+                    }),
+                );
+            }
+            store
+                .reserve_case_evidence(
+                    scope.clone(),
+                    case.clone(),
+                    id.clone(),
+                    EvidenceRequest {
+                        storage_id: storage_id.clone(),
+                        bytes,
+                        origin,
+                    },
+                    limits,
+                )
+                .await
+                .unwrap();
+            let capture = match n {
+                10 => continue,
+                9 => EvidenceCapture::Discarded,
+                _ => EvidenceCapture::Stored { bytes, sha256 },
+            };
+            store
+                .settle_evidence_capture(scope.clone(), case.clone(), id, capture)
+                .await
+                .unwrap();
+        }
+        assert_eq!(expected.len(), expected_count);
+        let before = statement_count();
+        let (status, body) = f.request("POST", &url, "").await;
+        list_costs.push(statement_count() - before);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!({ "evidence": expected }));
+    }
+    let first = store
+        .case_evidence_index(
+            scope.clone(),
+            case.clone(),
+            EvidenceLimits {
+                max_page_size: 1,
+                ..limits
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0].job.id.as_str(),
+        expected[0]["id"].as_str().unwrap()
+    );
+
+    assert!(store.remove_case(scope, case).await.unwrap());
+    let before = statement_count();
+    let (status, body) = f.request("POST", &url, "").await;
+    let removed_cost = statement_count() - before;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, serde_json::json!({ "evidence": [] }));
+
+    db::retire_guild_enrollment(&f.app.db, 10, 100)
+        .await
+        .unwrap();
+    let replacement = db::enroll_guild(&f.app.db, 10, 101).await.unwrap().unwrap();
+    assert_ne!(replacement.id, enrollment.id);
+    let before = statement_count();
+    let (status, body) = f
+        .request_token("POST", &url, "", Some(&enrollment.id))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(statement_count() - before, 0);
+
+    // A removed parent runs the same snapshot and scope checks without the index SELECT.
+    assert!(
+        removed_cost > 0,
+        "the probe observes the case evidence snapshot"
+    );
+    let evidence_selects: Vec<_> = list_costs.iter().map(|cost| cost - removed_cost).collect();
+    assert_eq!(
+        evidence_selects,
+        [1, 1, 1],
+        "one list SELECT for 0, 1 and 8 rows"
+    );
+}
+
+#[tokio::test]
 async fn case_reads_filter_the_list_and_name_known_members() {
     use crate::db::guild_data::{
         CaseAction, CaseData, CaseEvidence, CaseHistoryBody, CaseHistoryData, CaseId, CaseOutcome,
