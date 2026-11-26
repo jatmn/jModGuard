@@ -494,39 +494,53 @@ fn detect_match(b: &Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u
 fn match_posts(b: &Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u64)>> {
     let window = Duration::from_secs(policy.window_secs);
     let live = || b.posts.iter().filter(|p| now.duration_since(p.at) < window);
-
-    // Skip text matching when the live window cannot reach the channel threshold.
-    let mut channels = [0; MAX_POSTS];
-    let mut channel_count = 0;
-    if !live().any(|p| {
-        if !channels[..channel_count].contains(&p.channel) {
-            channels[channel_count] = p.channel;
-            channel_count += 1;
-        }
-        channel_count >= policy.min_channels
-    }) {
+    if !has_enough_channels(live(), policy.min_channels) {
         return None;
     }
 
-    let mut groups = HashMap::new();
-    for (position, post) in live().enumerate() {
-        let (_, channels) = groups
-            .entry(post.text.as_str())
-            .or_insert_with(|| (position, BTreeSet::new()));
-        channels.insert(post.channel);
+    let mut sorted: Vec<_> = live().enumerate().collect();
+    if let Some((_, first)) = sorted.first()
+        && sorted
+            .iter()
+            .skip(1)
+            .all(|(_, post)| post.text == first.text)
+    {
+        return Some(
+            sorted
+                .iter()
+                .map(|(_, post)| (post.channel, post.id))
+                .collect(),
+        );
     }
 
-    // Preserve the first qualifying anchor and the bucket order of its posts.
-    let (text, _) = groups
-        .into_iter()
-        .filter(|(_, (_, channels))| channels.len() >= policy.min_channels)
-        .min_by_key(|(_, (position, _))| *position)?;
+    // Original positions keep each group in bucket order and select the first match.
+    sorted.sort_unstable_by(|(a_idx, a), (b_idx, b)| {
+        a.text.cmp(&b.text).then_with(|| a_idx.cmp(b_idx))
+    });
+    let matched = sorted
+        .chunk_by(|(_, a), (_, b)| a.text == b.text)
+        .filter(|group| {
+            has_enough_channels(group.iter().map(|(_, post)| *post), policy.min_channels)
+        })
+        .min_by_key(|group| group[0].0)?;
     Some(
-        live()
-            .filter(|post| post.text == text)
-            .map(|post| (post.channel, post.id))
+        matched
+            .iter()
+            .map(|(_, post)| (post.channel, post.id))
             .collect(),
     )
+}
+
+fn has_enough_channels<'a>(mut posts: impl Iterator<Item = &'a Post>, minimum: usize) -> bool {
+    let mut channels = [0; MAX_POSTS];
+    let mut count = 0;
+    posts.any(|post| {
+        if !channels[..count].contains(&post.channel) {
+            channels[count] = post.channel;
+            count += 1;
+        }
+        count >= minimum
+    })
 }
 
 fn retire(
