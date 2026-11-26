@@ -112,20 +112,18 @@ pub(super) async fn directory_names(
     if ids.is_empty() {
         return serde_json::Map::new();
     }
-    let profiles = store.member_profiles(scope, ids).await.unwrap_or_default();
-    let present = |name: &Option<String>| name.clone().filter(|name| !name.is_empty());
-    profiles
+    let names = store
+        .member_display_names(scope, ids)
+        .await
+        .unwrap_or_default();
+    names
         .into_iter()
-        .filter_map(|p| {
-            // The Members display order: nickname, then global name, then username.
-            let display_name = present(&p.nickname)
-                .or_else(|| present(&p.global_name))
-                .or_else(|| present(&p.username))?;
+        .map(|name| {
             let entry = serde_json::json!({
-                "display_name": display_name,
-                "username": present(&p.username),
+                "display_name": name.display_name,
+                "username": name.username,
             });
-            Some((p.user_id, entry))
+            (name.user_id, entry)
         })
         .collect()
 }

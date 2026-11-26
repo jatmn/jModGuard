@@ -8224,6 +8224,141 @@ async fn case_reads_filter_the_list_and_name_known_members() {
 }
 
 #[tokio::test]
+async fn moderation_pages_name_people_from_empty_missing_and_mixed_directory_rows() {
+    use crate::db::guild_data::{
+        CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource,
+    };
+    const NAMED: i64 = 101;
+    const NO_NICK: i64 = 102;
+    const USERNAME_ONLY: i64 = 103;
+    const NO_USERNAME: i64 = 104;
+    const NAMELESS: i64 = 105;
+    const MISSING: i64 = 106;
+    // Snowflakes above 2^53 must reach the browser as exact strings.
+    const BIG: i64 = 9_007_199_254_740_993;
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment.clone()).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let rows = [
+        (NAMED, Some(NO_NICK)),
+        (USERNAME_ONLY, Some(NO_USERNAME)),
+        (NAMELESS, Some(MISSING)),
+        (BIG, None),
+    ];
+    for (n, (subject, actor)) in (1..).zip(rows) {
+        store
+            .record_case(
+                scope.clone(),
+                CaseId::try_from(format!("{n:032x}")).unwrap(),
+                CaseData {
+                    ban_attempt_tag: None,
+                    source: CaseSource::DiscordAudit { entry_id: n },
+                    action: CaseAction::Ban,
+                    outcome: CaseOutcome::Succeeded,
+                    subject_id: subject,
+                    actor_id: actor,
+                    occurred_at_ms: n,
+                    reason: None,
+                    evidence: CaseEvidence::Unavailable,
+                },
+                crate::tenant::case_limits(),
+            )
+            .await
+            .unwrap();
+        db::record_enrolled_ban(&f.app.db, Some(enrollment.clone()), subject, actor, "spam")
+            .await
+            .unwrap();
+        let actor = actor.map_or("NULL".to_owned(), |id| id.to_string());
+        f.app
+            .db
+            .with_conn(move |conn| {
+                conn.execute_batch_bounded(
+                    &format!(
+                        "INSERT INTO events (id, guild_id, event_type, user_id, actor_id, data, created_at)
+                         VALUES ({n}, 10, 'member_ban', {subject}, {actor}, '{{}}', '2026-01-02T00:00:00Z');"
+                    ),
+                    65_536,
+                )
+            })
+            .await
+            .unwrap();
+    }
+    let names = |path: &'static str| {
+        let f = &f;
+        async move {
+            let (status, page) = f.request("POST", path, "").await;
+            assert_eq!(status, StatusCode::OK, "{path}: {page}");
+            page["names"].clone()
+        }
+    };
+    let pages = [
+        "/api/guilds/10/cases",
+        "/api/guilds/10/bans",
+        // Without list controls the Audit Log keeps its legacy bare array.
+        "/api/guilds/10/events?sort=date",
+    ];
+    // Pages without rows name nobody.
+    for path in [
+        "/api/guilds/10/cases?action=unban",
+        "/api/guilds/10/bans?subject=nobody",
+        "/api/guilds/10/events?subject=nobody",
+    ] {
+        assert_eq!(names(path).await, serde_json::json!({}), "{path}");
+    }
+    // An empty directory names nobody on populated pages.
+    for path in pages {
+        assert_eq!(names(path).await, serde_json::json!({}), "{path}");
+    }
+    for (user_id, username, global_name, nickname) in [
+        (NAMED, Some("named"), Some("Global"), Some("Nick")),
+        (NO_NICK, Some("no.nick"), Some("Global Two"), Some("")),
+        (USERNAME_ONLY, Some("only.user"), Some(""), None),
+        (NO_USERNAME, Some(""), None, Some("Nick Four")),
+        (NAMELESS, Some(""), Some(""), Some("")),
+        (BIG, Some("big"), None, None),
+    ] {
+        store
+            .observe_member(
+                scope.clone(),
+                db::guild_data::MemberObservation {
+                    user_id,
+                    username: Some(username.map(str::to_owned)),
+                    global_name: Some(global_name.map(str::to_owned)),
+                    nickname: Some(nickname.map(str::to_owned)),
+                    joined_at_ms: Some(900),
+                    observed_at_ms: 1_500,
+                    is_join: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    // Nickname, then global name, then username; blank names are skipped,
+    // a blank username is null, and nameless or unknown people are left out.
+    let expected = serde_json::json!({
+        NAMED.to_string(): {"display_name": "Nick", "username": "named"},
+        NO_NICK.to_string(): {"display_name": "Global Two", "username": "no.nick"},
+        USERNAME_ONLY.to_string(): {"display_name": "only.user", "username": "only.user"},
+        NO_USERNAME.to_string(): {"display_name": "Nick Four", "username": null},
+        BIG.to_string(): {"display_name": "big", "username": "big"},
+    });
+    for path in pages {
+        assert_eq!(names(path).await, expected, "{path}");
+    }
+}
+
+#[tokio::test]
 async fn members_sort_and_filter_before_paging() {
     use db::guild_data::MemberObservation;
 

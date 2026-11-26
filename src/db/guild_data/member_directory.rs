@@ -546,6 +546,15 @@ pub struct MemberProfile {
     pub revision: i64,
 }
 
+/// Presentation-only directory name for one user: the first non-blank of
+/// nickname, global name and username, plus the username when it is not blank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberDisplayName {
+    pub user_id: String,
+    pub display_name: String,
+    pub username: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MemberPage {
     pub members: Vec<MemberProfile>,
@@ -556,8 +565,9 @@ pub struct MemberPage {
 /// Largest ID set one directory name lookup accepts.
 pub const DIRECTORY_NAME_LOOKUP_LIMIT: usize = 32;
 
-/// Largest ID set one [`GuildDataStore::member_profiles`] lookup accepts: the
-/// subjects, moderators and reason editors of one full moderation page.
+/// Largest ID set one [`GuildDataStore::member_profiles`] or
+/// [`GuildDataStore::member_display_names`] lookup accepts: the subjects,
+/// moderators and reason editors of one full moderation page.
 pub const DIRECTORY_PROFILE_LOOKUP_LIMIT: usize = DASHBOARD_LIST_PAGE_LIMIT as usize * 3;
 
 /// Bounded directory counts for the analytics views. `known` includes
@@ -1224,17 +1234,47 @@ fn checked_scope(store: &GuildDataStore, scope: &GuildDataScope) -> Result<()> {
     store.check_target(&scope.placement)
 }
 
+/// The leading `user_id,username,global_name,nickname` columns shared by
+/// [`PROFILE_SQL`] and [`DISPLAY_NAME_SQL`].
+struct NameFields {
+    id: i64,
+    username: Option<String>,
+    global_name: Option<String>,
+    nickname: Option<String>,
+}
+
+impl NameFields {
+    fn read(row: &Row) -> Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            username: row.get(1)?,
+            global_name: row.get(2)?,
+            nickname: row.get(3)?,
+        })
+    }
+
+    /// The Members display order: nickname, then global name, then username,
+    /// skipping blank values.
+    fn display_name(&self) -> Option<&String> {
+        [&self.nickname, &self.global_name, &self.username]
+            .into_iter()
+            .flatten()
+            .find(|name| !name.is_empty())
+    }
+}
+
 fn profile(row: &Row) -> Result<MemberProfile> {
-    let id: i64 = row.get(0)?;
-    let username: Option<String> = row.get(1)?;
-    let global_name: Option<String> = row.get(2)?;
-    let nickname: Option<String> = row.get(3)?;
-    let display_name = [&nickname, &global_name, &username]
-        .into_iter()
-        .flatten()
-        .find(|name| !name.is_empty())
+    let names = NameFields::read(row)?;
+    let display_name = names
+        .display_name()
         .cloned()
-        .unwrap_or_else(|| id.to_string());
+        .unwrap_or_else(|| names.id.to_string());
+    let NameFields {
+        id,
+        username,
+        global_name,
+        nickname,
+    } = names;
     Ok(MemberProfile {
         user_id: id.to_string(),
         display_name,
@@ -1253,6 +1293,20 @@ fn profile(row: &Row) -> Result<MemberProfile> {
 }
 
 const PROFILE_SQL: &str = "user_id,username,global_name,nickname,is_current,is_banned,ever_banned,joined_at_ms,departed_at_ms,observed_at_ms,revision,current_ban_reason";
+
+const DISPLAY_NAME_SQL: &str = "user_id,username,global_name,nickname";
+
+fn display_name(row: &Row) -> Result<Option<MemberDisplayName>> {
+    let names = NameFields::read(row)?;
+    let Some(display_name) = names.display_name().cloned() else {
+        return Ok(None);
+    };
+    Ok(Some(MemberDisplayName {
+        user_id: names.id.to_string(),
+        display_name,
+        username: names.username.filter(|name| !name.is_empty()),
+    }))
+}
 
 fn normalized_name(
     username: &Option<String>,
@@ -4076,6 +4130,32 @@ impl GuildDataStore {
         scope: GuildDataScope,
         user_ids: Vec<i64>,
     ) -> Result<Vec<MemberProfile>> {
+        self.member_rows(scope, user_ids, PROFILE_SQL, profile)
+            .await
+    }
+
+    /// Display names for at most [`DIRECTORY_PROFILE_LOOKUP_LIMIT`] user IDs,
+    /// reading only the name columns. IDs the directory has never recorded, or
+    /// recorded without any non-blank name, are omitted.
+    pub async fn member_display_names(
+        &self,
+        scope: GuildDataScope,
+        user_ids: Vec<i64>,
+    ) -> Result<Vec<MemberDisplayName>> {
+        let names = self
+            .member_rows(scope, user_ids, DISPLAY_NAME_SQL, display_name)
+            .await?;
+        Ok(names.into_iter().flatten().collect())
+    }
+
+    /// One bounded snapshot of the `columns` stored for these user IDs, in ID order.
+    async fn member_rows<T: Send + 'static>(
+        &self,
+        scope: GuildDataScope,
+        user_ids: Vec<i64>,
+        columns: &'static str,
+        decode: fn(&Row) -> Result<T>,
+    ) -> Result<Vec<T>> {
         checked_scope(self, &scope)?;
         anyhow::ensure!(
             user_ids.len() <= DIRECTORY_PROFILE_LOOKUP_LIMIT && user_ids.iter().all(|id| *id > 0),
@@ -4092,14 +4172,14 @@ impl GuildDataStore {
                 }
                 let ids = serde_json::to_string(&user_ids)?;
                 let sql = format!(
-                    "SELECT {PROFILE_SQL} FROM guild_member_directory
+                    "SELECT {columns} FROM guild_member_directory
                      WHERE guild_id=?1 AND enrollment_id=?2
                      AND user_id IN (SELECT value FROM json_each(?3)) ORDER BY user_id"
                 );
                 let mut stmt = tx.prepare(&sql)?;
                 let rows = stmt.query_map(
                     params![scope.guild_id(), scope.enrollment.id.as_str(), ids],
-                    profile,
+                    decode,
                 )?;
                 let mut found = Vec::new();
                 for row in rows {
