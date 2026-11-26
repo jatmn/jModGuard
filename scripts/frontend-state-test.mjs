@@ -11233,24 +11233,48 @@ test('Audit Log keeps raw JSON behind a collapsed owner-only Raw toggle and fall
     auditRow(1, 'member_ban', { reason: 'Spam', source: 'webui', audit_after_ms: 5 }),
     auditRow(2, 'future_event', { audit_after_ms: 5, detail: 'new' }),
     auditRow(3, 'member_kick', null, { data: 'not json' }),
+    ...Array.from({ length: 47 }, (_, i) => auditRow(i + 4, 'future_event', { detail: 'x'.repeat(2000) })),
   ];
   const owner = await auditDetailsView(rows, { owner: true });
   const [known, unknown, broken] = owner.details;
   assert.match(known.firstChild.textContent, /^Banned: Spam · via the Web UI$/);
-  const raw = known.querySelector('details.audit-raw');
-  assert.ok(raw, 'owners get the Raw toggle');
-  assert.equal(raw.open, false, 'Raw starts collapsed');
-  assert.equal(raw.querySelector('summary').textContent, 'Raw');
-  assert.match(raw.querySelector('pre').textContent, /"audit_after_ms": 5/);
   assert.equal(unknown.firstChild.textContent, 'No readable summary for this event.');
-  assert.match(unknown.querySelector('details.audit-raw pre').textContent, /"detail": "new"/);
   assert.equal(broken.firstChild.textContent, 'No readable summary for this event.');
-  assert.equal(broken.querySelector('details.audit-raw pre').textContent, 'not json');
+  const disclosures = [...owner.root.querySelectorAll('details.audit-raw')];
+  assert.equal(disclosures.length, 50, 'owners get a Raw toggle on every row');
+  for (const raw of disclosures) {
+    assert.equal(raw.open, false, 'Raw starts collapsed');
+    assert.equal(raw.querySelector('summary').textContent, 'Raw');
+  }
+  const contents = () => [...owner.root.querySelectorAll('.audit-raw pre')].map(pre => pre.textContent);
+  assert.equal(contents().length, 0, 'collapsed rows mount no formatted payload');
+  const toggle = async (raw, open) => {
+    raw.open = open;
+    await fire(raw, 'toggle');
+  };
+  await toggle(disclosures[0], true);
+  assert.deepEqual(contents(), ['{\n "reason": "Spam",\n "source": "webui",\n "audit_after_ms": 5\n}']);
+  await toggle(disclosures[0], false);
+  assert.deepEqual(contents(), []);
+  await toggle(disclosures[1], true);
+  assert.deepEqual(contents(), ['{\n "audit_after_ms": 5,\n "detail": "new"\n}']);
+
+  // A refresh reorders the selected record and replaces its payload.
+  rows.splice(0, 2, auditRow(2, 'future_event', { detail: 'updated' }), rows[0]);
+  await fire(cacheRefreshButton(owner.root), 'click');
+  assert.equal(owner.requests.length, 2);
+  assert.equal(owner.root.querySelector('tbody tr details.audit-raw'), disclosures[1]);
+  assert.equal(disclosures[1].open, true);
+  assert.equal(disclosures[0].open, false);
+  assert.deepEqual(contents(), ['{\n "detail": "updated"\n}']);
+  await toggle(disclosures[1], false);
+  await toggle(disclosures[2], true);
+  assert.deepEqual(contents(), ['not json']);
 
   const member = await auditDetailsView(rows);
   assert.equal(member.root.querySelector('details.audit-raw'), null, 'only owners see raw JSON');
-  assert.equal(member.details[1].textContent, 'No readable summary for this event.');
-  assert.doesNotMatch(member.root.querySelector('tbody').textContent, /audit_after_ms/);
+  assert.equal(member.details[0].textContent, 'No readable summary for this event.');
+  assert.doesNotMatch(member.root.querySelector('tbody').textContent, /audit_after_ms|updated/);
 });
 
 test('Audit Log names known users and actors beside copyable IDs and filters by them', async () => {
