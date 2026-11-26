@@ -995,29 +995,131 @@ fn profile_older_than_user_ttl() -> std::time::Instant {
 }
 
 fn age_user_cache(app: &ApiState, user_id: u64) {
-    let user = {
-        app.user_cache
-            .get(&user_id)
-            .expect("seeded user")
-            .value()
-            .1
-            .clone()
-    };
     app.user_cache
-        .insert(user_id, (profile_older_than_user_ttl(), user));
+        .set_observed_at_for_test(&user_id, profile_older_than_user_ttl());
 }
 
 fn age_guild_cache(app: &ApiState, user_id: u64) {
-    let guilds = {
-        app.guild_cache
-            .get(&user_id)
-            .expect("seeded guilds")
-            .value()
-            .1
-            .clone()
-    };
     app.guild_cache
-        .insert(user_id, (profile_older_than_user_ttl(), guilds));
+        .set_observed_at_for_test(&user_id, profile_older_than_user_ttl());
+}
+
+#[tokio::test]
+async fn display_cache_churn_keeps_hot_users_and_evicts_cold_payloads() {
+    let f = Fixture::new(false).await;
+    const VISITORS: u64 = 4096;
+    const FIRST_VISITOR: u64 = 1000;
+    let mut hot_visits = 0;
+    let observed_at = f.app.user_cache.get(&42).unwrap().0;
+    for offset in 0..VISITORS {
+        let user_id = FIRST_VISITOR + offset;
+        let user = DiscordUser {
+            id: user_id.to_string(),
+            username: "synthetic-user".into(),
+            global_name: Some("Synthetic Display Name".into()),
+            avatar: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+        };
+        let list_len = [1, 4, 24, 200][offset as usize % 4];
+        let guilds = (0..list_len)
+            .map(|index| DiscordGuild {
+                id: (100_000_000_000_000_000u64 + index).to_string(),
+                name: "A synthetic guild with a descriptive name".into(),
+                icon: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+                owner: false,
+                permissions: Some(oauth::PermissionsField::String("36".into())),
+            })
+            .collect::<Vec<_>>();
+        f.app.user_cache.insert(user_id, (observed_at, user));
+        f.app
+            .guild_cache
+            .insert(user_id, (observed_at, guilds.into()));
+        if offset.is_multiple_of(32) {
+            let (status, me) = f.request("POST", "/api/me", "").await;
+            assert_eq!(status, StatusCode::OK, "{me}");
+            assert_eq!(me["user"]["username"], "tester");
+            assert_eq!(me["guilds"][0]["id"], "10");
+            hot_visits += 1;
+        }
+    }
+    let guild_calls = f.discord.calls.load(Ordering::SeqCst);
+    let profile_calls = f.discord.me_calls.load(Ordering::SeqCst);
+    let (profiles, profile_bytes) = f.app.user_cache.usage();
+    let (lists, guild_bytes) = f.app.guild_cache.usage();
+    eprintln!(
+        "Display churn: {profiles} profiles ({profile_bytes} payload bytes), {lists} guild lists ({guild_bytes} payload bytes), {hot_visits} hot hits, {profile_calls} profile calls, {guild_calls} guild calls"
+    );
+    assert_eq!((hot_visits, profile_calls, guild_calls), (128, 0, 0));
+    assert!(
+        f.app.user_cache.get(&FIRST_VISITOR).is_none(),
+        "cold profile retained"
+    );
+    assert!(
+        f.app.guild_cache.get(&FIRST_VISITOR).is_none(),
+        "cold guild list retained"
+    );
+
+    f.enroll(10).await;
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::OK
+    );
+    let session = refresh_state(&f).await;
+    let last_guild_observation = session.lock().await.guilds.as_ref().unwrap().observed_at;
+    let user = f.app.user_cache.get(&42).unwrap().1.clone();
+
+    // Churn without returning to the once-hot user. Eviction must leave the
+    // token-bound snapshot available when a request still owns the session.
+    for visitor in FIRST_VISITOR + VISITORS..FIRST_VISITOR + 2 * VISITORS {
+        f.app
+            .user_cache
+            .insert(visitor, (observed_at, user.clone()));
+        f.app
+            .guild_cache
+            .insert(visitor, (observed_at, Arc::from([])));
+    }
+    assert!(f.app.user_cache.get(&42).is_none());
+    assert!(f.app.guild_cache.get(&42).is_none());
+    assert_eq!(
+        session.lock().await.guilds.as_ref().unwrap().observed_at,
+        last_guild_observation
+    );
+
+    *f.discord.retry_after.lock().unwrap() = "120".into();
+    f.discord.rate_limited.store(true, Ordering::SeqCst);
+    f.discord.global_scope.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        f.app.oauth.my_guilds(42, "fixture-token").await,
+        Err(oauth::GuildListError::RateLimited { fresh: true, .. })
+    ));
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["user"]["id"], "42");
+    assert_eq!(me["user"]["username"], "");
+    assert_eq!(me["guilds"][0]["id"], "10");
+    assert_eq!(me["role_discovery_incomplete"], true);
+    assert!(
+        f.app.user_cache.get(&42).is_none(),
+        "fallback must not renew data"
+    );
+    assert!(
+        f.app.guild_cache.get(&42).is_none(),
+        "fallback must not renew data"
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
+
+    // Keep a last-good display list and invalidate the permission snapshot.
+    // Display residency must never satisfy a marked authorization check.
+    tests::seed_auth_caches(&f.app, 42, vec![managed_guild(10)]);
+    db::record_access_marks(&f.app.db, vec![], vec![(10, 42)])
+        .await
+        .unwrap();
+    assert_eq!(
+        f.request("GET", "/api/guilds/10/config", "").await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+    assert!(session.lock().await.guilds.is_none());
 }
 
 #[tokio::test]
@@ -1042,7 +1144,6 @@ async fn display_keeps_cached_guilds_when_the_user_cache_is_cold_during_a_global
             .guild_cache
             .get(&42)
             .expect("warm guild list")
-            .value()
             .0
             .elapsed()
             < GUILD_DISPLAY_CACHE_TTL
@@ -5321,7 +5422,7 @@ async fn preview_profiles_apply_distinct_permission_views() {
 #[tokio::test]
 async fn expired_preview_is_removed_and_returns_a_distinct_lifecycle_error() {
     let f = Fixture::new(true).await;
-    let cached_at = f.app.user_cache.get(&42).unwrap().value().0;
+    let cached_at = f.app.user_cache.get(&42).unwrap().0;
     let token = "expired-preview".to_string();
     f.app.preview.insert(
         token.clone(),
@@ -5415,7 +5516,7 @@ async fn warm_authorization_shares_guilds_without_leaking_preview_permissions() 
     };
     let first = authorize().await;
     assert_eq!(first.guilds.len(), 200);
-    let observed_at = f.app.guild_cache.get(&42).unwrap().value().0;
+    let observed_at = f.app.guild_cache.get(&42).unwrap().0;
     let warm = authorize().await;
     assert!(warm.can_manage(10));
     assert!(std::ptr::eq(first.guilds.as_ptr(), warm.guilds.as_ptr()));
@@ -5442,11 +5543,8 @@ async fn warm_authorization_shares_guilds_without_leaking_preview_permissions() 
     assert!(normal.can_manage(20));
     assert!(std::ptr::eq(first.guilds.as_ptr(), normal.guilds.as_ptr()));
     let display = f.app.guild_cache.get(&42).unwrap();
-    assert_eq!(display.value().0, observed_at);
-    assert!(std::ptr::eq(
-        first.guilds.as_ptr(),
-        display.value().1.as_ptr()
-    ));
+    assert_eq!(display.0, observed_at);
+    assert!(std::ptr::eq(first.guilds.as_ptr(), display.1.as_ptr()));
     assert_eq!(
         f.discord.calls.load(Ordering::SeqCst),
         2,
@@ -5492,12 +5590,8 @@ async fn warm_authorization_leaves_the_profile_due_for_background_refresh() {
     f.enroll(10).await;
     let read = || f.request("GET", "/api/guilds/10/config", "");
     assert_eq!(read().await.0, StatusCode::OK);
-    let due_at = {
-        let mut profile = f.app.user_cache.get_mut(&42).unwrap();
-        let (observed_at, _) = profile.value_mut();
-        *observed_at -= revalidating_age();
-        *observed_at
-    };
+    let due_at = f.app.user_cache.get(&42).unwrap().0 - revalidating_age();
+    f.app.user_cache.set_observed_at_for_test(&42, due_at);
     for _ in 0..3 {
         assert_eq!(read().await.0, StatusCode::OK);
     }
@@ -5510,8 +5604,8 @@ async fn warm_authorization_leaves_the_profile_due_for_background_refresh() {
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
     assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
     let profile = f.app.user_cache.get(&42).unwrap();
-    assert!(profile.value().0 > due_at);
-    assert_eq!(profile.value().1.username, "live-profile");
+    assert!(profile.0 > due_at);
+    assert_eq!(profile.1.username, "live-profile");
 }
 
 #[tokio::test]
@@ -5906,7 +6000,7 @@ async fn authorization_snapshots_are_not_shared_between_sessions_or_tokens() {
             .guilds
             .is_empty()
     );
-    assert!(f.app.guild_cache.get(&42).unwrap().value().1.is_empty());
+    assert!(f.app.guild_cache.get(&42).unwrap().1.is_empty());
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
 }
 
@@ -5962,11 +6056,11 @@ async fn background_guild_observation_supersedes_overlapping_foreground_response
 
     foreground.release.notify_one();
     assert!(old_request.await.unwrap().can_manage(10));
-    let foreground_observed_at = f.app.guild_cache.get(&42).unwrap().value().0;
+    let foreground_observed_at = f.app.guild_cache.get(&42).unwrap().0;
     background.release.notify_one();
     background_refreshes_finished(&f.app).await;
 
-    let observed_at = f.app.guild_cache.get(&42).unwrap().value().0;
+    let observed_at = f.app.guild_cache.get(&42).unwrap().0;
     let session = refresh_state(&f).await;
     let snapshot = session.lock().await.guilds.clone().unwrap();
     assert!(snapshot.age_from <= foreground_observed_at);
@@ -6023,7 +6117,7 @@ async fn delayed_guild_follower_keeps_the_original_observation() {
 
     let (observed_at, guilds) = follower.await.unwrap();
     let shares_payload = Arc::ptr_eq(&leader_guilds, &guilds);
-    record_display_observation(&f.app.guild_cache, 42, observed_at, guilds);
+    f.app.guild_cache.insert(42, (observed_at, guilds));
     let (status, me) = f.request("POST", "/api/me", "").await;
     assert_eq!(status, StatusCode::OK, "{me}");
     let shown = me["guilds"].as_array().unwrap();
@@ -6076,7 +6170,7 @@ async fn recovery_routes_require_an_authenticated_owner() {
     assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
     assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
     let f = Fixture::new(true).await;
-    let cached_at = f.app.user_cache.get(&42).unwrap().value().0;
+    let cached_at = f.app.user_cache.get(&42).unwrap().0;
     let token = "synthetic-preview";
     f.app.preview.insert(
         token.into(),
@@ -7325,7 +7419,7 @@ async fn fresh_login_config_reuses_callback_snapshot_when_bucket_is_exhausted() 
     f.enroll(10).await;
     f.discord.spent_budget.store(true, Ordering::SeqCst);
     login_without_cached_discord_data(&mut f).await;
-    let observed_at = f.app.guild_cache.get(&42).unwrap().value().0;
+    let observed_at = f.app.guild_cache.get(&42).unwrap().0;
 
     let (status, me) = f.request("POST", "/api/me", "").await;
     assert_eq!(status, StatusCode::OK, "{me}");
@@ -10777,7 +10871,7 @@ async fn role_cache_stays_bounded_with_live_entries() {
         .lock()
         .unwrap()
         .insert(10, vec!["555".into()]);
-    let cached_at = f.app.user_cache.get(&42).unwrap().value().0;
+    let cached_at = f.app.user_cache.get(&42).unwrap().0;
     for i in 0..MEMBER_ROLES_MAX_ENTRIES {
         f.app.member_roles.lock().unwrap().insert(
             (1000 + i as u64, 10),
