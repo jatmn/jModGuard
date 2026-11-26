@@ -20,6 +20,7 @@ struct DiscordStub {
     refresh_server_retry_after: std::sync::Mutex<Option<String>>,
     still_unauthorized: AtomicBool,
     me_unauthorized: AtomicBool,
+    me_rate_limited: AtomicBool,
     spent_budget: AtomicBool,
     rate_limited: AtomicBool,
     /// Discord marked the 429 as the shared global limit, which also closes `oauth.me`.
@@ -130,6 +131,7 @@ impl Fixture {
             refresh_server_retry_after: std::sync::Mutex::new(None),
             still_unauthorized: AtomicBool::new(false),
             me_unauthorized: AtomicBool::new(false),
+            me_rate_limited: AtomicBool::new(false),
             spent_budget: AtomicBool::new(false),
             rate_limited: AtomicBool::new(false),
             global_scope: AtomicBool::new(false),
@@ -225,6 +227,9 @@ impl Fixture {
                         handler.me_calls.fetch_add(1, Ordering::SeqCst);
                         if handler.me_unauthorized.load(Ordering::SeqCst) {
                             return StatusCode::FORBIDDEN.into_response();
+                        }
+                        if handler.me_rate_limited.load(Ordering::SeqCst) {
+                            return handler.rate_limit_response();
                         }
                         let id = if headers.get("authorization").and_then(|value| value.to_str().ok())
                             == Some("Bearer other-user-token")
@@ -5975,6 +5980,29 @@ async fn display_saves_live_profile_while_guilds_are_cooling_down() {
     for _ in 0..3 {
         assert_eq!(f.request("POST", "/api/me", "").await.0, StatusCode::OK);
     }
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn display_publishes_new_guilds_during_profile_cooldown() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    tests::seed_auth_caches(&f.app, 42, vec![managed_guild(10)]);
+    age_user_cache(&f.app, 42);
+    *f.discord.retry_after.lock().unwrap() = "120".into();
+    f.discord.me_rate_limited.store(true, Ordering::SeqCst);
+
+    let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
+
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["guilds"][1]["id"], "20", "new guild observation lost");
+    assert_eq!(me["role_discovery_incomplete"], false);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
     assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
 }
 

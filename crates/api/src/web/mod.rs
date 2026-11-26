@@ -901,10 +901,10 @@ async fn load_auth(
         return display_auth(app, user_id, token, cached_user, guilds, incomplete).await;
     }
 
-    let snapshot = if let Some(snapshot) = &state.guilds
+    let (snapshot, guilds_fetched) = if let Some(snapshot) = &state.guilds
         && GuildSnapshotAge::from_age(snapshot.age_from.elapsed()) == GuildSnapshotAge::Fresh
     {
-        snapshot.clone()
+        (snapshot.clone(), false)
     } else {
         let epoch = current_access_epoch(app).await;
         match app.oauth.my_guilds_at(user_id, token, epoch).await {
@@ -917,7 +917,7 @@ async fn load_auth(
                 state.guilds = Some(snapshot.clone());
                 state.guilds_epoch = epoch;
                 state.guild_refresh_retry_at = None;
-                snapshot
+                (snapshot, true)
             }
             Err(oauth::GuildListError::RateLimited { .. })
                 if state.guilds.as_ref().is_some_and(|snapshot| {
@@ -925,7 +925,7 @@ async fn load_auth(
                         .permits(RefreshFailure::RateLimited)
                 }) =>
             {
-                state.guilds.as_ref().unwrap().clone()
+                (state.guilds.as_ref().unwrap().clone(), false)
             }
             Err(error) => {
                 return finish_guild_list(app, guild_mode, user_id, token, cached_user, error)
@@ -941,8 +941,9 @@ async fn load_auth(
         app.user_cache
             .insert(user_id, (Instant::now(), user.clone()));
     }
-    // A fallback is only for this response and does not renew either cache.
-    if source != ProfileSource::RateLimited {
+    // Publish a successful guild lookup even if the profile is cooling down.
+    // A profile fallback alone does not refill a missing guild cache entry.
+    if guilds_fetched || source != ProfileSource::RateLimited {
         app.guild_cache.insert(
             user_id,
             (snapshot.observed_at, Arc::clone(&snapshot.guilds)),
