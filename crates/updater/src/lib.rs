@@ -1,6 +1,14 @@
 //! OCI release inspection, extraction and Bunny Storage publication shared by
 //! the owner API and the role-specific service launcher.
 
+// The launcher and registry test targets compile the OCI and signature sources
+// again for fixture trust; they define this as a no-op so each unit case runs
+// only in this library's test target.
+#[cfg(test)]
+macro_rules! library_unit_tests {
+    ($($item:item)*) => { $($item)* };
+}
+
 pub mod oci;
 pub mod signature;
 #[cfg(test)]

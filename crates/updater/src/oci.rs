@@ -982,469 +982,473 @@ fn walk_layer<'a>(
 }
 
 #[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn registry_transport_errors_omit_urls() {
-        // Exercise the same request owner used by API discovery and launcher downloads.
-        // Reserve the port without listening so another test cannot claim it
-        // and turn the expected connection refusal into an HTTP response.
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = socket.local_addr().unwrap();
-        assert!(
-            tokio::net::TcpListener::bind(addr).await.is_err(),
-            "the refused endpoint must stay reserved until the request completes"
-        );
-        let registry = super::Registry::new(&format!("http://{addr}")).unwrap();
-        let error = registry
-            .get_limited(
-                format!("http://{addr}/PRIVATE_PATH?token=PRIVATE_TOKEN"),
-                None,
-                None,
-                1024,
-            )
-            .await
-            .unwrap_err();
-        let request = error.downcast_ref::<reqwest::Error>().unwrap();
-        assert!(request.url().is_none());
-        let diagnostic = format!("{error:#} {error:?}");
-        assert!(!diagnostic.contains("PRIVATE_"));
-        assert!(!diagnostic.contains(&format!("http://{addr}")));
-        assert!(
-            super::registry_unreachable(&error),
-            "connection failure must be unreachable: {error:#} {error:?}"
-        );
-        let unavailable = anyhow::Error::msg("registry returned HTTP 503 Service Unavailable");
-        let limited = anyhow::Error::msg("registry returned HTTP 429 Too Many Requests");
-        let server = anyhow::Error::msg("registry returned HTTP 500 Internal Server Error");
-        let unsigned = anyhow::Error::new(signature::ImageSignatureRejection {
-            phrase: signature::UNSIGNED_IMAGE,
-        });
-        assert!(super::registry_unreachable(&unavailable));
-        assert!(super::registry_unreachable(&limited));
-        assert!(super::registry_unreachable(&server));
-        assert!(!super::registry_unreachable(&unsigned));
-    }
+library_unit_tests!(
+    mod tests {
+        #[tokio::test]
+        async fn registry_transport_errors_omit_urls() {
+            // Exercise the same request owner used by API discovery and launcher downloads.
+            // Reserve the port without listening so another test cannot claim it
+            // and turn the expected connection refusal into an HTTP response.
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = socket.local_addr().unwrap();
+            assert!(
+                tokio::net::TcpListener::bind(addr).await.is_err(),
+                "the refused endpoint must stay reserved until the request completes"
+            );
+            let registry = super::Registry::new(&format!("http://{addr}")).unwrap();
+            let error = registry
+                .get_limited(
+                    format!("http://{addr}/PRIVATE_PATH?token=PRIVATE_TOKEN"),
+                    None,
+                    None,
+                    1024,
+                )
+                .await
+                .unwrap_err();
+            let request = error.downcast_ref::<reqwest::Error>().unwrap();
+            assert!(request.url().is_none());
+            let diagnostic = format!("{error:#} {error:?}");
+            assert!(!diagnostic.contains("PRIVATE_"));
+            assert!(!diagnostic.contains(&format!("http://{addr}")));
+            assert!(
+                super::registry_unreachable(&error),
+                "connection failure must be unreachable: {error:#} {error:?}"
+            );
+            let unavailable = anyhow::Error::msg("registry returned HTTP 503 Service Unavailable");
+            let limited = anyhow::Error::msg("registry returned HTTP 429 Too Many Requests");
+            let server = anyhow::Error::msg("registry returned HTTP 500 Internal Server Error");
+            let unsigned = anyhow::Error::new(signature::ImageSignatureRejection {
+                phrase: signature::UNSIGNED_IMAGE,
+            });
+            assert!(super::registry_unreachable(&unavailable));
+            assert!(super::registry_unreachable(&limited));
+            assert!(super::registry_unreachable(&server));
+            assert!(!super::registry_unreachable(&unsigned));
+        }
 
-    #[test]
-    fn registry_status_classification() {
-        for status in 100..=599 {
-            let expected = matches!(status, 408 | 429 | 500..=599);
-            let error = anyhow::anyhow!("registry returned HTTP {status} status");
-            assert_eq!(registry_unreachable(&error), expected, "HTTP {status}");
-            let response = axum::http::Response::builder()
-                .status(status)
-                .body("")
-                .unwrap();
-            if let Err(error) = reqwest::Response::from(response).error_for_status() {
-                let error = anyhow::Error::new(error.without_url());
-                assert_eq!(
-                    registry_unreachable(&error),
-                    expected,
-                    "typed HTTP {status}"
-                );
-                let rejected = anyhow::Error::new(signature::ImageSignatureRejection {
-                    phrase: signature::UNSIGNED_IMAGE,
-                })
-                .context(format!("registry returned HTTP {status}"));
-                assert!(!registry_unreachable(&rejected));
+        #[test]
+        fn registry_status_classification() {
+            for status in 100..=599 {
+                let expected = matches!(status, 408 | 429 | 500..=599);
+                let error = anyhow::anyhow!("registry returned HTTP {status} status");
+                assert_eq!(registry_unreachable(&error), expected, "HTTP {status}");
+                let response = axum::http::Response::builder()
+                    .status(status)
+                    .body("")
+                    .unwrap();
+                if let Err(error) = reqwest::Response::from(response).error_for_status() {
+                    let error = anyhow::Error::new(error.without_url());
+                    assert_eq!(
+                        registry_unreachable(&error),
+                        expected,
+                        "typed HTTP {status}"
+                    );
+                    let rejected = anyhow::Error::new(signature::ImageSignatureRejection {
+                        phrase: signature::UNSIGNED_IMAGE,
+                    })
+                    .context(format!("registry returned HTTP {status}"));
+                    assert!(!registry_unreachable(&rejected));
+                }
             }
         }
-    }
 
-    #[tokio::test]
-    async fn registry_request_timeout_is_unreachable_but_body_timeout_is_not() {
-        for partial_body in [false, true] {
-            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .unwrap();
-            let base = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = [0; 1024];
-                tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+        #[tokio::test]
+        async fn registry_request_timeout_is_unreachable_but_body_timeout_is_not() {
+            for partial_body in [false, true] {
+                let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
                     .await
                     .unwrap();
-                if partial_body {
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 1024];
+                    tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                        .await
+                        .unwrap();
+                    if partial_body {
+                        tokio::io::AsyncWriteExt::write_all(
+                            &mut stream,
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{",
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    std::future::pending::<()>().await;
+                });
+                let mut registry = Registry::new(&base).unwrap();
+                registry.http = http_client_builder()
+                    .timeout(Duration::from_millis(100))
+                    .build()
+                    .unwrap();
+                let error = registry
+                    .get_limited(base, None, None, 1024)
+                    .await
+                    .unwrap_err();
+                server.abort();
+                let _ = server.await;
+                assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_timeout());
+                assert_eq!(registry_unreachable(&error), !partial_body, "{error:#}");
+            }
+        }
+
+        // Paused time ends the server's sleep only once the client has read
+        // everything sent and is waiting for the rest of the body.
+        #[tokio::test(start_paused = true)]
+        async fn registry_truncated_body_is_not_unreachable() {
+            for reset in [false, true] {
+                let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 1024];
+                    tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                        .await
+                        .unwrap();
                     tokio::io::AsyncWriteExt::write_all(
                         &mut stream,
                         b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{",
                     )
                     .await
                     .unwrap();
+                    // Let the reader receive the successful headers and partial body.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if reset {
+                        stream.set_zero_linger().unwrap();
+                    }
+                });
+                let error = Registry::new(&base)
+                    .unwrap()
+                    .get_limited(base, None, None, 1024)
+                    .await
+                    .unwrap_err();
+                server.await.unwrap();
+                assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_decode());
+                if reset {
+                    assert!(error.chain().any(|cause| {
+                        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            error.kind() == std::io::ErrorKind::ConnectionReset
+                        })
+                    }));
                 }
-                std::future::pending::<()>().await;
-            });
-            let mut registry = Registry::new(&base).unwrap();
-            registry.http = http_client_builder()
-                .timeout(Duration::from_millis(100))
-                .build()
-                .unwrap();
-            let error = registry
-                .get_limited(base, None, None, 1024)
-                .await
-                .unwrap_err();
-            server.abort();
-            let _ = server.await;
-            assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_timeout());
-            assert_eq!(registry_unreachable(&error), !partial_body, "{error:#}");
+                assert!(!registry_unreachable(&error), "reset={reset}: {error:#}");
+            }
         }
-    }
 
-    // Paused time ends the server's sleep only once the client has read
-    // everything sent and is waiting for the rest of the body.
-    #[tokio::test(start_paused = true)]
-    async fn registry_truncated_body_is_not_unreachable() {
-        for reset in [false, true] {
+        use super::*;
+        use std::io::Write;
+
+        fn layer(entries: &[(&str, &[u8], tar::EntryType)]) -> Vec<u8> {
+            let mut out = Vec::new();
+            {
+                let mut archive = tar::Builder::new(&mut out);
+                for (path, bytes, kind) in entries {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(*kind);
+                    header.set_size(bytes.len() as u64);
+                    header.set_mode(0o755);
+                    header.set_cksum();
+                    archive.append_data(&mut header, path, *bytes).unwrap();
+                }
+                archive.finish().unwrap();
+            }
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&out).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        #[test]
+        fn extracts_exact_regular_file_and_refuses_duplicates_or_links() {
+            let good = layer(&[(
+                "usr/local/bin/jmodguard-api",
+                b"\x7fELFbody",
+                tar::EntryType::Regular,
+            )]);
+            let found = extract_layer(
+                &good,
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+                &["usr/local/bin/jmodguard-api"],
+            )
+            .unwrap();
+            assert_eq!(found["usr/local/bin/jmodguard-api"], b"\x7fELFbody");
+            let duplicate = layer(&[
+                (
+                    "usr/local/bin/jmodguard-api",
+                    b"one",
+                    tar::EntryType::Regular,
+                ),
+                (
+                    "usr/local/bin/jmodguard-api",
+                    b"two",
+                    tar::EntryType::Regular,
+                ),
+            ]);
+            assert!(
+                extract_layer(
+                    &duplicate,
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                    &["usr/local/bin/jmodguard-api"]
+                )
+                .is_err()
+            );
+            let link = layer(&[("usr/local/bin/jmodguard-api", b"", tar::EntryType::Symlink)]);
+            assert!(
+                extract_layer(
+                    &link,
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                    &["usr/local/bin/jmodguard-api"]
+                )
+                .is_err()
+            );
+        }
+
+        const BOT: &str = "usr/local/bin/jmodguard-bot";
+        const INVENTORY: &str = "usr/local/share/jmodguard/files.sha256";
+        const GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+
+        fn verified(bytes: &[u8], media: &str) -> VerifiedReleaseLayer {
+            VerifiedReleaseLayer {
+                repo: "jatmn/jmodguard-bot",
+                descriptor: Descriptor {
+                    digest: format!("sha256:{}", sha256_hex(bytes)),
+                    size: bytes.len() as u64,
+                    media_type: media.into(),
+                    annotations: BTreeMap::new(),
+                },
+            }
+        }
+
+        async fn serve_blob(body: Vec<u8>) -> (Registry, tokio::task::JoinHandle<()>) {
             let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
                 .await
                 .unwrap();
-            let base = format!("http://{}", listener.local_addr().unwrap());
+            let registry =
+                Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+            let body = std::sync::Arc::new(body);
+            let app = axum::Router::new().fallback(move || {
+                let body = body.clone();
+                async move { body.as_ref().clone() }
+            });
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            (registry, server)
+        }
+
+        fn staging_dir() -> PathBuf {
+            std::env::temp_dir().join(format!("oci-stage-{:032x}", rand::random::<u128>()))
+        }
+
+        fn names(dir: &Path) -> Vec<String> {
+            let mut names = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        }
+
+        fn executable_body() -> Vec<u8> {
+            let mut body = b"\x7fELF".to_vec();
+            body.extend((0..300_000u32).map(|index| (index % 251) as u8));
+            body
+        }
+
+        #[tokio::test]
+        async fn streamed_staging_matches_in_memory_extraction() {
+            let executable = executable_body();
+            let inventory = format!("{}  bin/jmodguard-bot\n", sha256_hex(&executable));
+            let bytes = layer(&[
+                ("usr/local/bin/other", b"ignored", tar::EntryType::Regular),
+                (BOT, &executable, tar::EntryType::Regular),
+                (INVENTORY, inventory.as_bytes(), tar::EntryType::Regular),
+            ]);
+            let expected = extract_layer(&bytes, GZIP, &[BOT, INVENTORY]).unwrap();
+            let descriptor = verified(&bytes, GZIP);
+            let (registry, server) = serve_blob(bytes).await;
+            let dir = staging_dir();
+            let staged = registry
+                .stage_release_layer(descriptor, BOT, INVENTORY, &dir)
+                .await
+                .unwrap();
+            assert_eq!(staged.sha256(), sha256_hex(&expected[BOT]));
+            assert_eq!(staged.size(), executable.len() as u64);
+            assert_eq!(staged.header(), b"\x7fELF");
+            assert_eq!(staged.inventory(), expected[INVENTORY].as_slice());
+            assert_eq!(std::fs::read(staged.path()).unwrap(), expected[BOT]);
+            let temporary = names(&dir);
+            assert_eq!(temporary.len(), 1, "{temporary:?}");
+            assert!(
+                temporary[0].starts_with(".stage-"),
+                "the layer file must be removed after extraction: {temporary:?}"
+            );
+            let target = dir.join("bot-target");
+            staged.persist(&target).await.unwrap();
+            assert_eq!(names(&dir), ["bot-target"]);
+            assert_eq!(file_sha256(&target).await.unwrap(), sha256_hex(&executable));
+            server.abort();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn streamed_staging_failures_remove_temporary_files() {
+            let executable = executable_body();
+            let inventory = format!("{}  bin/jmodguard-bot\n", sha256_hex(&executable));
+            let good = layer(&[
+                (BOT, &executable, tar::EntryType::Regular),
+                (INVENTORY, inventory.as_bytes(), tar::EntryType::Regular),
+            ]);
+            let mut corrupt = good.clone();
+            *corrupt.last_mut().unwrap() ^= 1;
+            // The executable is fully written before the archive is refused.
+            let special = layer(&[
+                (BOT, &executable, tar::EntryType::Regular),
+                ("usr/local/bin/link", b"", tar::EntryType::Symlink),
+                (INVENTORY, inventory.as_bytes(), tar::EntryType::Regular),
+            ]);
+            let missing = layer(&[(BOT, &executable, tar::EntryType::Regular)]);
+            let oversized = VerifiedReleaseLayer {
+                repo: "jatmn/jmodguard-bot",
+                descriptor: Descriptor {
+                    size: MAX_LAYER as u64 + 1,
+                    ..verified(&good, GZIP).descriptor
+                },
+            };
+            let cases = [
+                (verified(&good, GZIP), corrupt, "blob digest mismatch"),
+                (
+                    verified(&good, GZIP),
+                    good[..good.len() - 10].to_vec(),
+                    "blob size mismatch",
+                ),
+                (
+                    verified(&good, "application/vnd.oci.image.layer.v1.tar+zstd"),
+                    good.clone(),
+                    "unsupported image layer compression",
+                ),
+                (
+                    verified(&special, GZIP),
+                    special.clone(),
+                    "link or special file in release layer",
+                ),
+                (
+                    verified(&missing, GZIP),
+                    missing.clone(),
+                    "release layer is missing a required file",
+                ),
+                (oversized, good.clone(), "invalid blob descriptor"),
+            ];
+            for (descriptor, served, expected) in cases {
+                let (registry, server) = serve_blob(served).await;
+                let dir = staging_dir();
+                let error = match registry
+                    .stage_release_layer(descriptor, BOT, INVENTORY, &dir)
+                    .await
+                {
+                    Ok(_) => panic!("{expected}: staging must fail"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.to_string(), expected);
+                assert!(!registry_unreachable(&error), "{expected}");
+                assert_eq!(names(&dir), Vec::<String>::new(), "{expected}");
+                server.abort();
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn cancelled_streamed_staging_removes_the_partial_layer() {
+            let executable = executable_body();
+            let bytes = layer(&[(BOT, &executable, tar::EntryType::Regular)]);
+            let descriptor = verified(&bytes, GZIP);
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let registry =
+                Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+            let (sent, mut partial) = tokio::sync::oneshot::channel();
             let server = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = [0; 1024];
                 tokio::io::AsyncReadExt::read(&mut stream, &mut request)
                     .await
                     .unwrap();
-                tokio::io::AsyncWriteExt::write_all(
-                    &mut stream,
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{",
-                )
-                .await
-                .unwrap();
-                // Let the reader receive the successful headers and partial body.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                if reset {
-                    stream.set_zero_linger().unwrap();
-                }
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len());
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(&bytes[..bytes.len() / 2]).await.unwrap();
+                sent.send(()).unwrap();
+                std::future::pending::<()>().await;
             });
-            let error = Registry::new(&base)
-                .unwrap()
-                .get_limited(base, None, None, 1024)
-                .await
-                .unwrap_err();
-            server.await.unwrap();
-            assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_decode());
-            if reset {
-                assert!(error.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset)
-                }));
-            }
-            assert!(!registry_unreachable(&error), "reset={reset}: {error:#}");
-        }
-    }
-
-    use super::*;
-    use std::io::Write;
-
-    fn layer(entries: &[(&str, &[u8], tar::EntryType)]) -> Vec<u8> {
-        let mut out = Vec::new();
-        {
-            let mut archive = tar::Builder::new(&mut out);
-            for (path, bytes, kind) in entries {
-                let mut header = tar::Header::new_gnu();
-                header.set_entry_type(*kind);
-                header.set_size(bytes.len() as u64);
-                header.set_mode(0o755);
-                header.set_cksum();
-                archive.append_data(&mut header, path, *bytes).unwrap();
-            }
-            archive.finish().unwrap();
-        }
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(&out).unwrap();
-        encoder.finish().unwrap()
-    }
-
-    #[test]
-    fn extracts_exact_regular_file_and_refuses_duplicates_or_links() {
-        let good = layer(&[(
-            "usr/local/bin/jmodguard-api",
-            b"\x7fELFbody",
-            tar::EntryType::Regular,
-        )]);
-        let found = extract_layer(
-            &good,
-            "application/vnd.oci.image.layer.v1.tar+gzip",
-            &["usr/local/bin/jmodguard-api"],
-        )
-        .unwrap();
-        assert_eq!(found["usr/local/bin/jmodguard-api"], b"\x7fELFbody");
-        let duplicate = layer(&[
-            (
-                "usr/local/bin/jmodguard-api",
-                b"one",
-                tar::EntryType::Regular,
-            ),
-            (
-                "usr/local/bin/jmodguard-api",
-                b"two",
-                tar::EntryType::Regular,
-            ),
-        ]);
-        assert!(
-            extract_layer(
-                &duplicate,
-                "application/vnd.oci.image.layer.v1.tar+gzip",
-                &["usr/local/bin/jmodguard-api"]
-            )
-            .is_err()
-        );
-        let link = layer(&[("usr/local/bin/jmodguard-api", b"", tar::EntryType::Symlink)]);
-        assert!(
-            extract_layer(
-                &link,
-                "application/vnd.oci.image.layer.v1.tar+gzip",
-                &["usr/local/bin/jmodguard-api"]
-            )
-            .is_err()
-        );
-    }
-
-    const BOT: &str = "usr/local/bin/jmodguard-bot";
-    const INVENTORY: &str = "usr/local/share/jmodguard/files.sha256";
-    const GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
-
-    fn verified(bytes: &[u8], media: &str) -> VerifiedReleaseLayer {
-        VerifiedReleaseLayer {
-            repo: "jatmn/jmodguard-bot",
-            descriptor: Descriptor {
-                digest: format!("sha256:{}", sha256_hex(bytes)),
-                size: bytes.len() as u64,
-                media_type: media.into(),
-                annotations: BTreeMap::new(),
-            },
-        }
-    }
-
-    async fn serve_blob(body: Vec<u8>) -> (Registry, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let registry =
-            Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
-        let body = std::sync::Arc::new(body);
-        let app = axum::Router::new().fallback(move || {
-            let body = body.clone();
-            async move { body.as_ref().clone() }
-        });
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (registry, server)
-    }
-
-    fn staging_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("oci-stage-{:032x}", rand::random::<u128>()))
-    }
-
-    fn names(dir: &Path) -> Vec<String> {
-        let mut names = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    }
-
-    fn executable_body() -> Vec<u8> {
-        let mut body = b"\x7fELF".to_vec();
-        body.extend((0..300_000u32).map(|index| (index % 251) as u8));
-        body
-    }
-
-    #[tokio::test]
-    async fn streamed_staging_matches_in_memory_extraction() {
-        let executable = executable_body();
-        let inventory = format!("{}  bin/jmodguard-bot\n", sha256_hex(&executable));
-        let bytes = layer(&[
-            ("usr/local/bin/other", b"ignored", tar::EntryType::Regular),
-            (BOT, &executable, tar::EntryType::Regular),
-            (INVENTORY, inventory.as_bytes(), tar::EntryType::Regular),
-        ]);
-        let expected = extract_layer(&bytes, GZIP, &[BOT, INVENTORY]).unwrap();
-        let descriptor = verified(&bytes, GZIP);
-        let (registry, server) = serve_blob(bytes).await;
-        let dir = staging_dir();
-        let staged = registry
-            .stage_release_layer(descriptor, BOT, INVENTORY, &dir)
-            .await
-            .unwrap();
-        assert_eq!(staged.sha256(), sha256_hex(&expected[BOT]));
-        assert_eq!(staged.size(), executable.len() as u64);
-        assert_eq!(staged.header(), b"\x7fELF");
-        assert_eq!(staged.inventory(), expected[INVENTORY].as_slice());
-        assert_eq!(std::fs::read(staged.path()).unwrap(), expected[BOT]);
-        let temporary = names(&dir);
-        assert_eq!(temporary.len(), 1, "{temporary:?}");
-        assert!(
-            temporary[0].starts_with(".stage-"),
-            "the layer file must be removed after extraction: {temporary:?}"
-        );
-        let target = dir.join("bot-target");
-        staged.persist(&target).await.unwrap();
-        assert_eq!(names(&dir), ["bot-target"]);
-        assert_eq!(file_sha256(&target).await.unwrap(), sha256_hex(&executable));
-        server.abort();
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn streamed_staging_failures_remove_temporary_files() {
-        let executable = executable_body();
-        let inventory = format!("{}  bin/jmodguard-bot\n", sha256_hex(&executable));
-        let good = layer(&[
-            (BOT, &executable, tar::EntryType::Regular),
-            (INVENTORY, inventory.as_bytes(), tar::EntryType::Regular),
-        ]);
-        let mut corrupt = good.clone();
-        *corrupt.last_mut().unwrap() ^= 1;
-        // The executable is fully written before the archive is refused.
-        let special = layer(&[
-            (BOT, &executable, tar::EntryType::Regular),
-            ("usr/local/bin/link", b"", tar::EntryType::Symlink),
-            (INVENTORY, inventory.as_bytes(), tar::EntryType::Regular),
-        ]);
-        let missing = layer(&[(BOT, &executable, tar::EntryType::Regular)]);
-        let oversized = VerifiedReleaseLayer {
-            repo: "jatmn/jmodguard-bot",
-            descriptor: Descriptor {
-                size: MAX_LAYER as u64 + 1,
-                ..verified(&good, GZIP).descriptor
-            },
-        };
-        let cases = [
-            (verified(&good, GZIP), corrupt, "blob digest mismatch"),
-            (
-                verified(&good, GZIP),
-                good[..good.len() - 10].to_vec(),
-                "blob size mismatch",
-            ),
-            (
-                verified(&good, "application/vnd.oci.image.layer.v1.tar+zstd"),
-                good.clone(),
-                "unsupported image layer compression",
-            ),
-            (
-                verified(&special, GZIP),
-                special.clone(),
-                "link or special file in release layer",
-            ),
-            (
-                verified(&missing, GZIP),
-                missing.clone(),
-                "release layer is missing a required file",
-            ),
-            (oversized, good.clone(), "invalid blob descriptor"),
-        ];
-        for (descriptor, served, expected) in cases {
-            let (registry, server) = serve_blob(served).await;
-            let dir = staging_dir();
-            let error = match registry
-                .stage_release_layer(descriptor, BOT, INVENTORY, &dir)
-                .await
-            {
-                Ok(_) => panic!("{expected}: staging must fail"),
-                Err(error) => error,
-            };
-            assert_eq!(error.to_string(), expected);
-            assert!(!registry_unreachable(&error), "{expected}");
-            assert_eq!(names(&dir), Vec::<String>::new(), "{expected}");
-            server.abort();
-            std::fs::remove_dir_all(dir).unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn cancelled_streamed_staging_removes_the_partial_layer() {
-        let executable = executable_body();
-        let bytes = layer(&[(BOT, &executable, tar::EntryType::Regular)]);
-        let descriptor = verified(&bytes, GZIP);
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let registry =
-            Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
-        let (sent, mut partial) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0; 1024];
-            tokio::io::AsyncReadExt::read(&mut stream, &mut request)
-                .await
-                .unwrap();
-            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len());
-            stream.write_all(head.as_bytes()).await.unwrap();
-            stream.write_all(&bytes[..bytes.len() / 2]).await.unwrap();
-            sent.send(()).unwrap();
-            std::future::pending::<()>().await;
-        });
-        let dir = staging_dir();
-        let mut staging = Box::pin(registry.stage_release_layer(descriptor, BOT, INVENTORY, &dir));
-        tokio::select! {
-            biased;
-            result = &mut staging => panic!("staging finished early: {:?}", result.err()),
-            _ = &mut partial => {}
-        }
-        let partial = names(&dir);
-        assert_eq!(partial.len(), 1, "{partial:?}");
-        assert!(partial[0].starts_with(".layer-"), "{partial:?}");
-        drop(staging);
-        assert_eq!(names(&dir), Vec::<String>::new());
-        server.abort();
-        let _ = server.await;
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn staging_cancelled_while_the_layer_file_is_created_leaves_no_file() {
-        // One blocking worker lets the test queue the layer file creation behind a
-        // held task, cancel staging, and only then let the creation run.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .max_blocking_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let bytes = layer(&[(BOT, &executable_body(), tar::EntryType::Regular)]);
-            let descriptor = verified(&bytes, GZIP);
-            let registry = Registry::new("http://127.0.0.1:1").unwrap();
             let dir = staging_dir();
             let mut staging =
                 Box::pin(registry.stage_release_layer(descriptor, BOT, INVENTORY, &dir));
             tokio::select! {
                 biased;
                 result = &mut staging => panic!("staging finished early: {:?}", result.err()),
-                _ = std::future::ready(()) => {}
+                _ = &mut partial => {}
             }
-            let (started, running) = std::sync::mpsc::channel();
-            let (release, held) = std::sync::mpsc::channel::<()>();
-            let blocker = tokio::task::spawn_blocking(move || {
-                started.send(()).unwrap();
-                let _ = held.recv();
-            });
-            // The worker reaches this task only after it finished the directory creation.
-            running.recv().unwrap();
-            tokio::select! {
-                biased;
-                result = &mut staging => panic!("staging finished early: {:?}", result.err()),
-                _ = std::future::ready(()) => {}
-            }
+            let partial = names(&dir);
+            assert_eq!(partial.len(), 1, "{partial:?}");
+            assert!(partial[0].starts_with(".layer-"), "{partial:?}");
             drop(staging);
-            release.send(()).unwrap();
-            blocker.await.unwrap();
-            tokio::task::spawn_blocking(|| ()).await.unwrap();
             assert_eq!(names(&dir), Vec::<String>::new());
+            server.abort();
+            let _ = server.await;
             std::fs::remove_dir_all(dir).unwrap();
-        });
-    }
+        }
 
-    #[test]
-    fn file_digest_is_stable() {
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
+        #[test]
+        fn staging_cancelled_while_the_layer_file_is_created_leaves_no_file() {
+            // One blocking worker lets the test queue the layer file creation behind a
+            // held task, cancel staging, and only then let the creation run.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let bytes = layer(&[(BOT, &executable_body(), tar::EntryType::Regular)]);
+                let descriptor = verified(&bytes, GZIP);
+                let registry = Registry::new("http://127.0.0.1:1").unwrap();
+                let dir = staging_dir();
+                let mut staging =
+                    Box::pin(registry.stage_release_layer(descriptor, BOT, INVENTORY, &dir));
+                tokio::select! {
+                    biased;
+                    result = &mut staging => panic!("staging finished early: {:?}", result.err()),
+                    _ = std::future::ready(()) => {}
+                }
+                let (started, running) = std::sync::mpsc::channel();
+                let (release, held) = std::sync::mpsc::channel::<()>();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    let _ = held.recv();
+                });
+                // The worker reaches this task only after it finished the directory creation.
+                running.recv().unwrap();
+                tokio::select! {
+                    biased;
+                    result = &mut staging => panic!("staging finished early: {:?}", result.err()),
+                    _ = std::future::ready(()) => {}
+                }
+                drop(staging);
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                tokio::task::spawn_blocking(|| ()).await.unwrap();
+                assert_eq!(names(&dir), Vec::<String>::new());
+                std::fs::remove_dir_all(dir).unwrap();
+            });
+        }
+
+        #[test]
+        fn file_digest_is_stable() {
+            assert_eq!(
+                sha256_hex(b"abc"),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            );
+        }
     }
-}
+);

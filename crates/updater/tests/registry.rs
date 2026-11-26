@@ -10,6 +10,10 @@ use jmodguard::db::ComponentRelease;
 use jmodguard_updater::http_client_builder;
 // The source modules compile with cfg(test), keeping fixture trust out of the
 // normal library that the production-trust regression also exercises below.
+// Their own unit cases run in the library test target, not again here.
+macro_rules! library_unit_tests {
+    ($($item:item)*) => {};
+}
 #[path = "../src/oci.rs"]
 pub mod oci;
 #[path = "../src/signature.rs"]
