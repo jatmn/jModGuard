@@ -181,6 +181,7 @@ pub(crate) struct MemberAuditObservation {
     target: u64,
     action: Action,
     observed_ms: i64,
+    observed_at: TokioInstant,
     generation: Option<u64>,
 }
 
@@ -228,6 +229,7 @@ impl MemberAuditClaims {
         target: u64,
         observed_ms: i64,
     ) -> MemberAuditObservation {
+        let observed_at = TokioInstant::now();
         let mut state = self.inner.lock();
         state.prune();
         let key = (guild, target, action.num());
@@ -236,6 +238,7 @@ impl MemberAuditClaims {
             target,
             action,
             observed_ms,
+            observed_at,
             generation: None,
         };
         if state.subjects.len() >= MEMBER_AUDIT_LIMIT && !state.subjects.contains_key(&key) {
@@ -271,13 +274,13 @@ impl MemberAuditClaims {
     fn join_page_request(
         &self,
         key: MemberAuditFetchKey,
-        retry_at: Option<TokioInstant>,
+        earliest_start: TokioInstant,
     ) -> MemberAuditPageRequest<'_> {
         let mut fetches = self.fetches.lock();
         let now = TokioInstant::now();
         if let Some(fetch) = fetches.get(&key)
             && now.saturating_duration_since(fetch.started) < MEMBER_AUDIT_RETRY_DELAY
-            && retry_at.is_none_or(|retry_at| fetch.started >= retry_at)
+            && fetch.started >= earliest_start
         {
             return MemberAuditPageRequest::Wait(fetch.sender.subscribe());
         }
@@ -303,11 +306,28 @@ impl MemberAuditClaims {
         sink: &impl LogDelivery,
         guild: GuildId,
         observation: &MemberAuditObservation,
-        retry_at: Option<TokioInstant>,
+        earliest_start: TokioInstant,
+        deadline: TokioInstant,
     ) -> Option<Arc<AuditLogs>> {
         let key = (guild, observation.action.num());
+        let now = TokioInstant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        let share_until = now + (remaining / 2).min(MEMBER_AUDIT_RETRY_DELAY);
         while self.has_unclaimed_subject(observation) {
-            match self.join_page_request(key, retry_at) {
+            let now = TokioInstant::now();
+            if now >= deadline {
+                return None;
+            }
+            if now >= share_until {
+                // Leave the original request running and use the rest of
+                // this round's budget for an independent GET.
+                return sink
+                    .member_audit(guild, observation.action)
+                    .await
+                    .ok()
+                    .map(Arc::new);
+            }
+            match self.join_page_request(key, earliest_start) {
                 MemberAuditPageRequest::Fetch(request) => {
                     let page = sink
                         .member_audit(guild, observation.action)
@@ -318,11 +338,13 @@ impl MemberAuditClaims {
                     return page.ok();
                 }
                 MemberAuditPageRequest::Wait(mut waiter) => {
-                    if let Ok(page) = waiter.wait_for(Option::is_some).await {
+                    if let Ok(Ok(page)) =
+                        tokio::time::timeout_at(share_until, waiter.wait_for(Option::is_some)).await
+                    {
                         return page.clone().and_then(Result::ok);
                     }
-                    // The owner was cancelled. Recheck eligibility and retry
-                    // this round within our own lookup deadline.
+                    // Recheck eligibility before sharing again or fetching
+                    // independently once the shared wait expires.
                 }
             }
         }
@@ -1165,7 +1187,8 @@ pub(crate) async fn lookup_member_audit(
     let budget = Duration::from_secs(app.cfg.log.discord_timeout_secs)
         .div_f64(2.0)
         .min(Duration::from_secs(3));
-    tokio::time::timeout(budget, async {
+    let deadline = TokioInstant::now() + budget;
+    tokio::time::timeout_at(deadline, async {
         let mut retry_at = None;
         for _ in 0..3 {
             if let Some(retry_at) = retry_at {
@@ -1173,7 +1196,13 @@ pub(crate) async fn lookup_member_audit(
             }
             let logs = app
                 .member_audits
-                .fetch_page(sink, guild_id, observation, retry_at)
+                .fetch_page(
+                    sink,
+                    guild_id,
+                    observation,
+                    retry_at.unwrap_or(observation.observed_at),
+                    deadline,
+                )
                 .await?;
             if let Some(context) = app.member_audits.claim(observation, &logs) {
                 return Some(context);

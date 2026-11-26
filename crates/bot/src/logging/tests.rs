@@ -1939,6 +1939,59 @@ async fn member_audit_late_target_uses_a_new_page() {
 }
 
 #[tokio::test]
+async fn member_audit_does_not_claim_from_a_page_started_before_the_observation() {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let f = Fixture::with_timeout(6);
+    let (http, mut requests, server) = held_audit_proxy().await;
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = 1_790_086_832_000;
+    let first = claims.observe(guild.get(), action, 123, observed);
+    let mut first = Box::pin(lookup_member_audit(&f.app, &http, guild, &first));
+    let (uri, reply) = tokio::select! {
+        request = requests.recv() => request.unwrap(),
+        _ = &mut first => panic!("first lookup ended before the HTTP request"),
+    };
+    assert_audit_request(&uri, guild, action);
+
+    let later = claims.observe(guild.get(), action, 124, observed + 10);
+    let mut later = Box::pin(lookup_member_audit(&f.app, &http, guild, &later));
+    assert!(
+        poll_fn(|cx| Poll::Ready(later.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    let older_entry = || audit_fixture(action, 124, observed + 1, Some("previous action"));
+    let mut first_page = audit_fixture(action, 123, observed, Some("first target"));
+    first_page.entries.extend(older_entry().entries);
+    reply.send(first_page).unwrap();
+
+    let mut lookups = std::pin::pin!(async { tokio::join!(first, later) });
+    let mut fresh_reads = 0;
+    let (first, later) = loop {
+        tokio::select! {
+            result = &mut lookups => break result,
+            request = requests.recv() => {
+                let (uri, reply) = request.unwrap();
+                assert_audit_request(&uri, guild, action);
+                fresh_reads += 1;
+                let mut fresh = audit_fixture(action, 124, observed + 10, Some("current action"));
+                fresh.entries.extend(older_entry().entries);
+                reply.send(fresh).unwrap();
+            }
+        }
+    };
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    assert_eq!(first.unwrap()["reason"], "first target");
+    assert!(later.is_none(), "fresh audit page is ambiguous: {later:?}");
+    assert_eq!(fresh_reads, 3);
+}
+
+#[tokio::test]
 async fn member_audit_cancelled_waiter_and_other_keys_leave_the_page_in_flight() {
     use std::future::{Future, poll_fn};
     use std::task::Poll;
@@ -2007,6 +2060,7 @@ struct HeldAuditSink {
     observed: i64,
     calls: std::sync::atomic::AtomicUsize,
     miss_first: bool,
+    page_delay: Duration,
 }
 
 #[serenity::async_trait]
@@ -2023,6 +2077,7 @@ impl LogDelivery for HeldAuditSink {
         match (self.miss_first, call) {
             (true, 0) => page.entries.clear(),
             (true, 1) | (false, 0) => std::future::pending().await,
+            _ if !self.page_delay.is_zero() => tokio::time::sleep(self.page_delay).await,
             _ => {}
         }
         Ok(page)
@@ -2046,6 +2101,7 @@ async fn member_audit_retry_uses_a_page_started_after_its_wait() {
         observed,
         calls: Default::default(),
         miss_first: true,
+        page_delay: Duration::ZERO,
     };
 
     tokio::time::pause();
@@ -2084,6 +2140,7 @@ async fn member_audit_waiter_keeps_its_deadline_after_the_owner_expires() {
         observed,
         calls: Default::default(),
         miss_first: false,
+        page_delay: Duration::ZERO,
     };
 
     tokio::time::pause();
@@ -2108,6 +2165,45 @@ async fn member_audit_waiter_keeps_its_deadline_after_the_owner_expires() {
     assert!(owner.await.is_none());
     assert_eq!(waiter.await.unwrap()["reason"], "fresh retry");
     assert_eq!(sink.calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn member_audit_waiter_has_time_for_a_fresh_request_when_the_owner_stalls() {
+    let f = Fixture::with_timeout(6);
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = 1_790_086_832_000;
+    let owner = claims.observe(guild.get(), action, 124, observed);
+    let waiter = claims.observe(guild.get(), action, 123, observed);
+    let sink = HeldAuditSink {
+        observed,
+        calls: Default::default(),
+        miss_first: false,
+        page_delay: Duration::from_millis(300),
+    };
+    let owner_finished = std::cell::Cell::new(false);
+
+    tokio::time::pause();
+    let (owner, (waiter, finished_before_owner)) = tokio::join!(
+        async {
+            let result = lookup_member_audit(&f.app, &sink, guild, &owner).await;
+            owner_finished.set(true);
+            result
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let result = lookup_member_audit(&f.app, &sink, guild, &waiter).await;
+            (result, !owner_finished.get())
+        },
+    );
+    assert!(owner.is_none());
+    assert_eq!(
+        waiter.expect("the waiter has time to receive its own page")["reason"],
+        "fresh retry"
+    );
+    assert!(finished_before_owner, "the held request is still in flight");
+    assert_eq!(sink.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -2203,6 +2299,7 @@ async fn member_audit_skips_permanently_ineligible_observations() {
         target: 456,
         action,
         observed_ms: observed,
+        observed_at: superseded.observed_at,
         generation: None,
     };
     let sink = AuditSink {

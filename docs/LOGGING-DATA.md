@@ -184,8 +184,10 @@ and persistence contracts below are unchanged.
   Lookup is best-effort: each attempt group makes at most three reads of the latest
   100 entries for that action under the report concurrency limit, using at most half
   the configured deadline (capped at three seconds). Concurrent lookups for the
-  same guild and action can share a fresh in-progress read. Each lookup keeps
-  its own deadline, matching, and retry timing. A gateway ban saves its
+  same guild and action can share a fresh in-progress read. The read must begin
+  after the observation was registered or the retry became eligible. A lookup
+  that waits too long for that read can start its own GET within the original
+  deadline. Each lookup matches and claims its own entry. A gateway ban saves its
   row first, then tries; the report reuses a match or may try again if none was found.
   If the report finds the audit entry later, it updates only that saved ban row
   under the same membership and write-fence checks.
