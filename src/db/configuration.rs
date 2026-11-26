@@ -1474,6 +1474,7 @@ pub struct ConfigParts {
 /// snapshots from different points in time.
 pub struct WebConfigSnapshot {
     pub version: u64,
+    pub revision: String,
     pub settings: SettingsWebBundle,
     pub nickname_reconcile: Option<NicknameReconcileStatus>,
     pub guild_rules: std::collections::HashMap<String, RuleDef>,
@@ -1749,6 +1750,7 @@ impl ConfigurationSnapshotRows {
         let settings = self.settings_bundle(guild_id);
         WebConfigSnapshot {
             version: self.versions.config,
+            revision: self.versions.config_revision,
             settings,
             nickname_reconcile: self.nickname_reconcile,
             guild_rules: self.guild_rules,

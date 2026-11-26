@@ -8237,36 +8237,130 @@ test('known-bad images renders hash-only metadata and searches without re-fetchi
   assert.equal(add.disabled, false);
 });
 
-test('known-bad image add and remove buttons save then reload the coherent list', async () => {
+test('known-bad image add and remove buttons apply canonical acknowledgement rows without reloading', async () => {
   const requests = [], hash = 'ab'.repeat(32);
-  let rows = [];
-  const config = () => ({enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: []});
+  const later = {hash: 'cd'.repeat(32), added_at: '2026-01-02T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'older listing'};
+  let rows = [later], revision = '1'.repeat(32);
+  const config = () => ({enrollment_id: 'fixture-membership', known_bad_images: rows, config_revision: revision, log_channels: []});
   const h = harness(async (url, options) => {
     requests.push({url, options});
     if (url.endsWith('/config')) return response(config());
+    const previous_revision = revision;
+    let patch, changed;
     if (options.method === 'POST') {
       const payload = JSON.parse(options.body);
-      assert.deepEqual(payload, {hash, note: 'confirmed spam'});
-      rows = [{hash, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: payload.note}];
-    } else if (options.method === 'DELETE') rows = [];
-    return response({ok: true, changed: true});
+      assert.equal(payload.hash.toLowerCase(), hash);
+      const existing = rows.find(row => row.hash === hash);
+      changed = !existing;
+      const row = existing || {hash, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: payload.note.trim()};
+      if (changed) {
+        revision = '2'.repeat(32);
+        rows = [row, later];
+      }
+      patch = { operation: 'add', value: row };
+    } else {
+      revision = '3'.repeat(32);
+      rows = [later];
+      changed = true;
+      patch = { operation: 'delete', value: hash };
+    }
+    return response({ok: true, changed, config_patch: { ...patch, kind: 'known_bad_images', previous_revision, revision }});
   });
   h.app.state.config = config();
   let panel = h.app.tabKnownBadImages();
   const inputs = knownBadInputs(panel);
-  inputs[1].value = hash; await fire(inputs[1], 'input');
-  inputs[2].value = 'confirmed spam'; await fire(inputs[2], 'input');
+  inputs[1].value = hash.toUpperCase(); await fire(inputs[1], 'input');
+  inputs[2].value = '  confirmed spam  '; await fire(inputs[2], 'input');
   await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash'), 'click');
   await settle();
-  assert.equal(h.app.state.config.known_bad_images.length, 1);
+  assert.deepEqual(Array.from(h.app.state.config.known_bad_images, row => row.hash), [hash, later.hash]);
+  assert.equal(h.app.state.config.known_bad_images[0].note, 'confirmed spam');
+  assert.equal(requests.length, 1, 'ordinary add sends only the write');
   assert.equal(requests[0].options.headers['x-jmodguard-enrollment'], 'fixture-membership');
+  panel = h.app.tabKnownBadImages();
+  const duplicate = knownBadInputs(panel);
+  duplicate[1].value = hash; await fire(duplicate[1], 'input');
+  duplicate[2].value = 'different note'; await fire(duplicate[2], 'input');
+  await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash'), 'click');
+  assert.equal(requests.length, 2, 'duplicate add sends only the write');
+  assert.equal(h.app.state.config.known_bad_images[0].note, 'confirmed spam');
+  assert.equal(h.app.state.config.known_bad_images.length, 2);
   panel = h.app.tabKnownBadImages();
   await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
   await settle();
-  assert.equal(h.app.state.config.known_bad_images.length, 0);
+  assert.deepEqual(Array.from(h.app.state.config.known_bad_images, row => row.hash), [later.hash]);
+  assert.equal(requests.length, 3, 'ordinary delete sends only the write');
   const removal = requests.find(r => r.options.method === 'DELETE');
   assert.equal(removal.options.headers['x-jmodguard-enrollment'], 'fixture-membership');
   assert(removal.url.endsWith(hash));
+});
+
+for (const scenario of ['concurrent write', 'recovered save']) {
+  test(`known-bad image add reloads the authoritative list after a ${scenario}`, async () => {
+    const requests = [];
+    const before = '1'.repeat(32), observed = '2'.repeat(32), current = '3'.repeat(32);
+    const hash = 'ab'.repeat(32), newer = 'cd'.repeat(32);
+    const row = {hash, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: null};
+    const h = harness(async (url, options) => {
+      requests.push({url, options});
+      if (url.endsWith('/config')) {
+        return response({enrollment_id: 'fixture-membership', config_revision: current,
+          known_bad_images: [{...row, hash: newer, note: 'newer listing'}], log_channels: []});
+      }
+      if (scenario === 'recovered save' && requests.length === 1) return response({code: 'save_pending'});
+      return response({ok: true, changed: true, config_patch: {
+        kind: 'known_bad_images', operation: 'add', value: row,
+        previous_revision: scenario === 'recovered save' ? before : observed, revision: observed,
+      }});
+    });
+    h.app.state.config = {enrollment_id: 'fixture-membership', config_revision: before, known_bad_images: []};
+    const panel = h.app.tabKnownBadImages();
+    const digest = knownBadInputs(panel)[1];
+    digest.value = hash; await fire(digest, 'input');
+    const save = [...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash');
+    await fire(save, 'click');
+    if (scenario === 'recovered save') {
+      assert.equal(requests.length, 1);
+      await fire(save, 'click');
+      assert.equal(requests[1].options.headers['x-jmodguard-save-lookup'], '1');
+      assert.equal(requests[1].options.headers['x-jmodguard-save'], requests[0].options.headers['x-jmodguard-save']);
+    }
+    assert.equal(requests.at(-1).url, `/api/guilds/${h.app.state.guildId}/config`);
+    assert.deepEqual(Array.from(h.app.state.config.known_bad_images, entry => entry.hash), [newer]);
+  });
+}
+
+test('known-bad image acknowledgement cannot replace the switched guild list', async () => {
+  const requests = [];
+  const before = '1'.repeat(32), after = '2'.repeat(32);
+  const hash = 'ab'.repeat(32), otherHash = 'cd'.repeat(32);
+  const row = {hash, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: null};
+  let acknowledge;
+  const h = harness(async (url) => {
+    requests.push(url);
+    if (url.endsWith('/config')) {
+      return response({enrollment_id: 'other-membership', config_revision: before,
+        known_bad_images: [{...row, hash: otherHash}], log_channels: []});
+    }
+    return new Promise(resolve => { acknowledge = () => resolve(response({ok: true, changed: true, config_patch: {
+      kind: 'known_bad_images', operation: 'add', value: row, previous_revision: before, revision: after,
+    }})); });
+  });
+  const [origin, destination] = h.app.state.guilds.map(guild => guild.id);
+  h.app.state.config = {enrollment_id: 'fixture-membership', config_revision: before, known_bad_images: []};
+  h.app.state.tab = 'known-bad-images';
+  const panel = h.app.tabKnownBadImages();
+  const digest = knownBadInputs(panel)[1];
+  digest.value = hash; await fire(digest, 'input');
+  const saving = fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add hash'), 'click');
+  await settle();
+  assert.equal(typeof acknowledge, 'function');
+  h.app.state.guildId = destination;
+  assert.equal(await h.app.loadConfig(), true);
+  acknowledge();
+  await saving;
+  assert.deepEqual(requests, [`/api/guilds/${origin}/known-bad-images`, `/api/guilds/${destination}/config`]);
+  assert.deepEqual(Array.from(h.app.state.config.known_bad_images, entry => entry.hash), [otherHash]);
 });
 
 test('known-bad image remove keeps unrelated add drafts', async () => {
@@ -9775,20 +9869,30 @@ test('list page status toggles save the rule with only that change and show the 
 const knownSpamType = root => [...root.querySelectorAll('select')].find(s => [...s.options].some(o => o.textContent === 'URL pattern'));
 
 test('known spam dedicated page adds samples and URL wildcards and confirms scoped removal', async () => {
-  let rows = [];
+  let rows = [], revision = '1'.repeat(32);
   const requests = [];
   const prompts = [];
   const removalPrompt = 'Remove this known spam entry?';
   let allowRemoval = false;
-  const config = () => ({ enrollment_id: 'fixture-membership', known_spam: rows, rules: [], log_channels: [] });
+  const config = () => ({ enrollment_id: 'fixture-membership', known_spam: rows, config_revision: revision, rules: [], log_channels: [] });
   const h = harness(async (url, options) => {
-    if (url.endsWith('/config')) return response(config());
     requests.push({url, options});
+    if (url.endsWith('/config')) return response(config());
+    const previous_revision = revision;
+    revision = String(Number(revision[0]) + 1).repeat(32);
+    let patch;
     if (options.method === 'POST') {
       const body = JSON.parse(options.body);
-      rows.push({ id: String(rows.length + 1), guild_id: h.app.state.guildId, ...body });
-    } else if (options.method === 'DELETE') rows = rows.filter(row => !url.endsWith('/' + row.id));
-    return response({ok: true});
+      const row = { id: String(rows.length + 1), guild_id: body.scope === 'global' ? '0' : h.app.state.guildId,
+        kind: body.kind, value: body.value.trim(), note: body.note?.trim() || null };
+      rows = [...rows, row];
+      patch = { operation: 'add', value: row };
+    } else {
+      const removed = rows.find(row => url.endsWith('/' + row.id));
+      rows = rows.filter(row => row !== removed);
+      patch = { operation: 'delete', value: removed.id };
+    }
+    return response({ok: true, config_patch: { ...patch, kind: 'known_spam', previous_revision, revision }});
   }, new Map(), new Map(), message => {
     prompts.push(message);
     return allowRemoval;
@@ -9806,6 +9910,7 @@ test('known spam dedicated page adds samples and URL wildcards and confirms scop
   const note = panel.querySelector('input[data-note]');
   note.value = 'Owner sample'; await fire(note, 'input');
   await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add sample'), 'click');
+  assert.equal(requests.length, 1, 'ordinary add sends only the write');
   assert.equal(requests[0].options.method, 'POST');
   assert.equal(JSON.parse(requests[0].options.body).kind, 'sample');
   assert.equal(JSON.parse(requests[0].options.body).note, 'Owner sample');
@@ -9815,6 +9920,7 @@ test('known spam dedicated page adds samples and URL wildcards and confirms scop
   const url = panel.querySelector('input[data-url]');
   url.value = 'tinyurl.com/*'; await fire(url, 'input');
   await fire([...panel.querySelectorAll('button')].find(b => b.textContent === 'Add URL pattern'), 'click');
+  assert.equal(requests.length, 2, 'each add sends only the write');
   assert.equal(JSON.parse(requests[1].options.body).kind, 'url');
   panel = h.app.tabKnownSpam(); await settle();
   assert.match(panel.textContent, /tinyurl.com/);
@@ -9833,19 +9939,25 @@ test('known spam dedicated page adds samples and URL wildcards and confirms scop
   assert.deepEqual(prompts, [removalPrompt, removalPrompt]);
   assert.deepEqual(removals(), [`/api/guilds/${h.app.state.guildId}/known-spam/2`]);
   assert.deepEqual(Array.from(h.app.state.config.known_spam, row => row.id), ['1']);
+  assert.equal(requests.length, 3, 'ordinary delete sends only the write');
 });
 
 test('known spam Global add keeps Global selected without an unsaved draft and keeps the other unsaved entry', async () => {
-  const rows = [];
+  let rows = [], revision = '1'.repeat(32);
   const posts = [];
-  const config = () => ({ enrollment_id: 'fixture-membership', known_spam: structuredClone(rows), rules: [], log_channels: [] });
+  const config = () => ({ enrollment_id: 'fixture-membership', known_spam: structuredClone(rows), config_revision: revision, rules: [], log_channels: [] });
   const h = harness(async (url, options) => {
     if (url.endsWith('/config')) return response(config());
     if (!url.endsWith('/known-spam')) return response({});
     const body = JSON.parse(options.body);
     posts.push(body);
-    rows.push({ id: String(rows.length + 1), guild_id: body.scope === 'global' ? '0' : h.app.state.guildId, ...body });
-    return response({ ok: true, id: rows.length });
+    const previous_revision = revision;
+    revision = String(Number(revision[0]) + 1).repeat(32);
+    const value = { id: String(rows.length + 1), guild_id: body.scope === 'global' ? '0' : h.app.state.guildId, ...body };
+    rows = [...rows, value];
+    return response({ ok: true, id: rows.length, config_patch: {
+      kind: 'known_spam', operation: 'add', previous_revision, revision, value,
+    } });
   });
   h.app.state.me.is_bot_owner = true;
   h.app.state.config = config();
@@ -9874,6 +9986,7 @@ test('known spam Global add keeps Global selected without an unsaved draft and k
   assert.equal(scopeSelect().value, 'global');
   assert.ok(content().querySelector('input[data-url]'), 'the URL form stays chosen after its save');
   assert.match(content().textContent, /Join our stocks community/);
+  assert.deepEqual(Array.from(h.app.state.config.known_spam, row => [row.id, row.guild_id]), [['1', '0'], ['2', '0']]);
   h.app.navigate('known-bad-images'); await settle();
   h.app.navigate('known-spam'); await settle();
   assert.equal(scopeSelect().value, 'guild', 'leaving the page resets the scope, as it cleared the Global draft before');
