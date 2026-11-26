@@ -1019,8 +1019,18 @@ impl EditReportDedup {
 
 #[derive(Default)]
 pub struct SnippetCache {
-    inner: Mutex<HashMap<(u64, u64, u64), Snippet>>,
+    inner: Mutex<SnippetEntries>,
 }
+
+type SnippetKey = (u64, u64, u64);
+
+#[derive(Default)]
+struct SnippetEntries {
+    by_guild: HashMap<u64, HashMap<(u64, u64), Snippet>>,
+    oldest: Option<SnippetKey>,
+    newest: Option<SnippetKey>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MessageOrigin {
     Unmarked,
@@ -1036,9 +1046,95 @@ impl MessageOrigin {
 #[derive(Clone)]
 struct Snippet {
     at: Instant,
-    guild: u64,
     author: u64,
     origin: MessageOrigin,
+    older: Option<SnippetKey>,
+    newer: Option<SnippetKey>,
+}
+
+impl SnippetEntries {
+    fn get(&self, (guild, channel, message): SnippetKey) -> Option<&Snippet> {
+        self.by_guild.get(&guild)?.get(&(channel, message))
+    }
+
+    fn get_mut(&mut self, (guild, channel, message): SnippetKey) -> Option<&mut Snippet> {
+        self.by_guild.get_mut(&guild)?.get_mut(&(channel, message))
+    }
+
+    fn unlink(&mut self, older: Option<SnippetKey>, newer: Option<SnippetKey>) {
+        if let Some(older) = older {
+            self.get_mut(older).unwrap().newer = newer;
+        } else {
+            self.oldest = newer;
+        }
+        if let Some(newer) = newer {
+            self.get_mut(newer).unwrap().older = older;
+        } else {
+            self.newest = older;
+        }
+    }
+
+    fn remove(&mut self, (guild, channel, message): SnippetKey) -> Option<Snippet> {
+        let entries = self.by_guild.get_mut(&guild)?;
+        let removed = entries.remove(&(channel, message))?;
+        if entries.is_empty() {
+            self.by_guild.remove(&guild);
+        }
+        self.unlink(removed.older, removed.newer);
+        Some(removed)
+    }
+
+    fn expire(&mut self, now: Instant) {
+        // The links follow the observation order under the cache lock. Every
+        // live identity owns one place in this list, even across refreshes.
+        while let Some(key) = self.oldest
+            && now.duration_since(self.get(key).unwrap().at) >= SNIPPET_KEEP
+        {
+            self.remove(key);
+        }
+    }
+
+    fn remember(&mut self, key: SnippetKey, author: Option<u64>, webhook: bool, now: Instant) {
+        self.expire(now);
+        let previous = self.get(key);
+        let Some(author) = author
+            .filter(|id| *id != 0)
+            .or_else(|| previous.map(|entry| entry.author))
+        else {
+            return;
+        };
+        let origin = previous
+            .map_or(MessageOrigin::Unmarked, |entry| entry.origin)
+            .observe(webhook);
+        let (guild, channel, message) = key;
+        if let Some(previous) = previous {
+            self.unlink(previous.older, previous.newer);
+        } else if let Some(entries) = self.by_guild.get(&guild)
+            && entries.len() >= SNIPPETS_PER_GUILD
+            && let Some((&(old_channel, old_message), _)) =
+                entries.iter().min_by_key(|(_, entry)| entry.at)
+        {
+            self.remove((guild, old_channel, old_message));
+        }
+
+        let older = self.newest;
+        if let Some(older) = older {
+            self.get_mut(older).unwrap().newer = Some(key);
+        } else {
+            self.oldest = Some(key);
+        }
+        self.newest = Some(key);
+        self.by_guild.entry(guild).or_default().insert(
+            (channel, message),
+            Snippet {
+                at: now,
+                author,
+                origin,
+                older,
+                newer: None,
+            },
+        );
+    }
 }
 
 /// Remember an author without adding a webhook marker. Payload capture is separate.
@@ -1062,37 +1158,11 @@ pub(crate) fn remember_message_create(
     author: Option<u64>,
     webhook: bool,
 ) {
-    let mut cache = app.log_snippets.inner.lock();
-    cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
-    let key = (guild, channel, message);
-    let Some(author) = author
-        .filter(|id| *id != 0)
-        .or_else(|| cache.get(&key).map(|s| s.author))
-    else {
-        return;
-    };
-    if cache.values().filter(|s| s.guild == guild).count() >= SNIPPETS_PER_GUILD
-        && !cache.contains_key(&key)
-        && let Some(oldest) = cache
-            .iter()
-            .filter(|(_, s)| s.guild == guild)
-            .min_by_key(|(_, s)| s.at)
-            .map(|(key, _)| *key)
-    {
-        cache.remove(&oldest);
-    }
-    let origin = cache
-        .get(&key)
-        .map_or(MessageOrigin::Unmarked, |old| old.origin)
-        .observe(webhook);
-    cache.insert(
-        key,
-        Snippet {
-            at: Instant::now(),
-            guild,
-            author,
-            origin,
-        },
+    app.log_snippets.inner.lock().remember(
+        (guild, channel, message),
+        author,
+        webhook,
+        Instant::now(),
     );
 }
 
@@ -1146,21 +1216,21 @@ fn known_message_identity_at(
     app.log_snippets
         .inner
         .lock()
-        .get(&(guild, channel, message))
+        .get((guild, channel, message))
         .filter(|snippet| now().duration_since(snippet.at) < SNIPPET_KEEP)
         .map(|snippet| (snippet.author, snippet.origin == MessageOrigin::Webhook))
 }
 
 fn take_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Option<Snippet> {
     let mut cache = app.log_snippets.inner.lock();
-    cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
-    cache.remove(&(guild, channel, message))
+    cache.expire(Instant::now());
+    cache.remove((guild, channel, message))
 }
 
 fn peek_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Option<Snippet> {
     let cache = app.log_snippets.inner.lock();
     cache
-        .get(&(guild, channel, message))
+        .get((guild, channel, message))
         .filter(|snippet| snippet.at.elapsed() < SNIPPET_KEEP)
         .cloned()
 }
