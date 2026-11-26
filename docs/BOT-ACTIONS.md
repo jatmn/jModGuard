@@ -198,11 +198,14 @@ and deadline-aware log completion. Mock outcomes do not validate live Discord be
 
 The same bot task lifts due timed bans (`!ban <user> --minutes N`, see
 [COMMANDS.md](COMMANDS.md)) after each queue drain, examining at most `batch_size` due
-bans per poll and making at most `batch_size` database reads to find them. A poll first
-makes one advisory read for a due ban under an active enrollment in an unfenced guild
-whose retry time has arrived or is unset. An advisory miss skips the poll without opening
-a primary transaction or clearing retry history. Replica lag can defer an expiry to a
-later poll. Selection and claim use the primary. Before consuming a deadline the worker
+bans per poll and making at most `batch_size` database reads to find them. The initial
+advisory statement checks both action and expiry eligibility. If it reports action work,
+the worker checks expiry again after the action drain using the current time. A combined
+read failure falls back to the separate checks. Eligible expiries require an active
+enrollment in an unfenced guild whose retry time has arrived or is unset. An advisory
+miss skips expiry without opening a primary transaction or clearing retry history.
+Replica lag can defer an expiry to a later poll. Selection and claim use the primary.
+Before consuming a deadline the worker
 checks the bot's own join timestamp through REST, as the executor does. An unavailable
 check defers that guild's expiries; the rest of the poll continues with other guilds. The
 guild is then skipped until a retry time held in the bot process: 60 seconds after that

@@ -379,13 +379,35 @@ fn claim_next_sql() -> String {
                       ORDER BY created_at,id LIMIT 1")
 }
 
-fn poll_due_sql() -> String {
+fn action_due_expression() -> String {
     // Separate the two searches so expiry uses (state,expires_at) and pending
     // admission keeps its own indexed branch. Both retain active membership.
-    format!("SELECT EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE}
+    format!("EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE}
                 AND state IN ('pending','claimed','running') AND expires_at<=?1)
             OR EXISTS(SELECT 1 FROM bot_actions WHERE {ACTIVE} AND state='pending'
                 AND NOT EXISTS(SELECT 1 FROM guild_write_fences f WHERE f.guild_id=bot_actions.guild_id))")
+}
+
+fn poll_due_sql() -> String {
+    format!("SELECT {}", action_due_expression())
+}
+
+/// The scheduler's advisory action and timed-ban eligibility, in that order.
+/// Neither result authorizes dispatch. A stale miss can defer work one poll.
+pub async fn bot_work_due(db: &Db, now: i64, waiting_guilds: &[i64]) -> Result<(bool, bool)> {
+    let waiting_guilds = serde_json::to_string(waiting_guilds)?;
+    db.with_conn(move |conn| {
+        conn.query_row_advisory(
+            &format!(
+                "SELECT {}, EXISTS({})",
+                action_due_expression(),
+                super::moderation::DUE_EXPIRY_SQL
+            ),
+            params![now, "[]", waiting_guilds],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+    })
+    .await
 }
 
 /// Claim one job. Expired running work is never claimed again, even after restart.
@@ -395,50 +417,54 @@ pub async fn claim_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
         // can defer a poll but never authorizes dispatch: claim below is primary.
         // Housekeeping (expiry/uncertain) is independent of write fences. Claim
         // selection still excludes fenced guilds in the UPDATE/SELECT below.
-        let due: bool = conn.query_row_advisory(
-            &poll_due_sql(),
-            params![now],
-            |r| Ok(r.get(0)?),
-        )?;
+        let due: bool =
+            conn.query_row_advisory(&poll_due_sql(), params![now], |r| Ok(r.get(0)?))?;
         if !due {
             return Ok(None);
         }
-        let tx = conn.transaction_immediate()?;
-        tx.execute_matching(
-            "UPDATE bot_actions SET state='expired',outcome='expired_before_execution',finished_at=?1
-             WHERE id IN (SELECT id FROM bot_actions
-             WHERE state IN ('pending','claimed') AND expires_at<=?1 LIMIT 64)",
-            params![now],
-        )?;
-        tx.execute_matching(
-            "UPDATE bot_actions SET state='uncertain',outcome='worker_outcome_unknown'
-             WHERE id IN (SELECT id FROM bot_actions
-             WHERE state='running' AND expires_at<=?1 LIMIT 64)",
-            params![now],
-        )?;
-        let job = tx.query_row(
-            &claim_next_sql(),
-            params![now],
-            row_action,
-        )
-        .optional()?;
-        let Some(mut job) = job else {
-            tx.commit()?;
-            return Ok(None);
-        };
-        job.action.validate()?;
-        let claim = key();
-        tx.execute_matching(
-            "UPDATE bot_actions SET state='claimed',claim=?1,claimed_at=?2
-             WHERE id=?3 AND state='pending'",
-            params![claim.as_str(), now, job.id.as_str()],
-        )?;
-        job.claim = Some(claim);
-        job.state = ActionState::Claimed.as_str().into();
-        tx.commit()?;
-        Ok(Some(job))
+        claim_bot_action_conn(conn, now)
     })
     .await
+}
+
+/// Revalidate a positive scheduler advisory on the primary.
+pub async fn claim_advised_bot_action(db: &Db, now: i64) -> Result<Option<BotAction>> {
+    db.with_conn(move |conn| claim_bot_action_conn(conn, now))
+        .await
+}
+
+fn claim_bot_action_conn(conn: &mut Connection, now: i64) -> Result<Option<BotAction>> {
+    let tx = conn.transaction_immediate()?;
+    tx.execute_matching(
+        "UPDATE bot_actions SET state='expired',outcome='expired_before_execution',finished_at=?1
+         WHERE id IN (SELECT id FROM bot_actions
+         WHERE state IN ('pending','claimed') AND expires_at<=?1 LIMIT 64)",
+        params![now],
+    )?;
+    tx.execute_matching(
+        "UPDATE bot_actions SET state='uncertain',outcome='worker_outcome_unknown'
+         WHERE id IN (SELECT id FROM bot_actions
+         WHERE state='running' AND expires_at<=?1 LIMIT 64)",
+        params![now],
+    )?;
+    let job = tx
+        .query_row(&claim_next_sql(), params![now], row_action)
+        .optional()?;
+    let Some(mut job) = job else {
+        tx.commit()?;
+        return Ok(None);
+    };
+    job.action.validate()?;
+    let claim = key();
+    tx.execute_matching(
+        "UPDATE bot_actions SET state='claimed',claim=?1,claimed_at=?2
+         WHERE id=?3 AND state='pending'",
+        params![claim.as_str(), now, job.id.as_str()],
+    )?;
+    job.claim = Some(claim);
+    job.state = ActionState::Claimed.as_str().into();
+    tx.commit()?;
+    Ok(Some(job))
 }
 
 /// Consume the claim before any dispatch. Reusing a copied job cannot send twice.

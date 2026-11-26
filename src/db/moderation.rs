@@ -2589,7 +2589,8 @@ pub struct ExpiredBan {
 /// Oldest due expiry under an active, unfenced membership, outside deferred
 /// bans (?2) and skipped guilds (?3). Walks `idx_bans_expiry` in deadline
 /// order and stops at the first match; the skip lists are each built once.
-const DUE_EXPIRY_SQL: &str = "SELECT b.id,b.guild_id,b.user_id,e.id,e.joined_at_ns,b.expires_at
+pub(super) const DUE_EXPIRY_SQL: &str =
+    "SELECT b.id,b.guild_id,b.user_id,e.id,e.joined_at_ns,b.expires_at
              FROM bans b JOIN guild_enrollments e
              ON e.guild_id=b.guild_id AND e.id=b.expiry_enrollment_id AND e.active=1
              WHERE b.active=1 AND b.expires_at<=?1
