@@ -1645,13 +1645,9 @@ fn seed_globals_sql(
         markers.push("retained_bulk_status_template_v1");
     }
     if meta_string_conn(conn, "embed_log_defaults_v1")?.is_none() {
-        let current = crate::defaults::rendered_log_templates();
         for (event, old) in crate::defaults::pre_embed_log_templates() {
-            let new = current
-                .iter()
-                .find(|(name, _)| *name == event)
-                .context("shipped embed template")?
-                .1;
+            let new =
+                crate::defaults::rendered_log_template(event).context("shipped embed template")?;
             body.push_str(&format!(
                 "UPDATE templates SET template = {} WHERE event_type = {} AND template = {};\n",
                 sql_text(new),

@@ -899,7 +899,11 @@ fn cmd(
 
 /// Default event templates (rendered into the configured log channels).
 pub fn default_templates() -> Vec<(&'static str, &'static str)> {
-    vec![
+    default_template_entries().to_vec()
+}
+
+fn default_template_entries() -> &'static [(&'static str, &'static str)] {
+    &[
         (
             "member_join",
             "Member joined\n\n**User:** {user} · {mention} (`{user_id}`)\n**Account created:** `{account_created}`\n**Account age:** `{account_age}`\n**Joined at:** `{time}`",
@@ -995,7 +999,11 @@ pub const CANNOT_MODERATE_BOT_TEMPLATE: &str = "Cannot moderate the bot with `{c
 /// global template rows. Delivery falls back to this wording until an operator
 /// saves an override.
 pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
-    vec![
+    activity_log_template_entries().to_vec()
+}
+
+fn activity_log_template_entries() -> &'static [(&'static str, &'static str)] {
+    &[
         (
             "member_role_update",
             "Member roles updated\n\n**User:** {user} · {mention} (`{user_id}`)\n**Added:** {added}\n**Removed:** {removed}\n**Time:** `{time}`",
@@ -1047,12 +1055,20 @@ pub fn activity_log_templates() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Shipped templates plus activity-log defaults. Startup seeding stays on
-/// [`default_templates`] alone.
-pub fn rendered_log_templates() -> Vec<(&'static str, &'static str)> {
-    let mut templates = default_templates();
-    templates.extend(activity_log_templates());
-    templates
+/// Shipped templates plus activity-log defaults, borrowed from static entries.
+/// Startup seeding stays on [`default_templates`] alone.
+pub fn rendered_log_templates() -> impl Iterator<Item = (&'static str, &'static str)> {
+    default_template_entries()
+        .iter()
+        .chain(activity_log_template_entries())
+        .copied()
+}
+
+/// The shipped or activity-log default for `event`, if any.
+pub fn rendered_log_template(event: &str) -> Option<&'static str> {
+    rendered_log_templates()
+        .find(|(name, _)| *name == event)
+        .map(|(_, template)| template)
 }
 
 /// Exact shipped strings before embed presentation. Match bytes, never custom wording.

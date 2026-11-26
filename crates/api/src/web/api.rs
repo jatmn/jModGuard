@@ -889,10 +889,7 @@ pub async fn get_template(
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let layers = db::get_enrolled_template(&app.db, scope, &event).await?;
     let (guild_override, global) = (layers.guild, layers.global);
-    let def = crate::defaults::rendered_log_templates()
-        .into_iter()
-        .find(|(e, _)| *e == event)
-        .map(|(_, t)| t.to_string());
+    let def = crate::defaults::rendered_log_template(&event).map(str::to_string);
     let effective = guild_override.clone().or_else(|| global.clone()).or(def);
     Ok(Json(serde_json::json!({
         "effective": effective,
@@ -2166,7 +2163,7 @@ mod tests {
         .into_iter()
         .map(|key| (key.to_string(), format!("v-{key} {{emoji}}")))
         .collect();
-        let templates = crate::defaults::rendered_log_templates();
+        let templates = crate::defaults::rendered_log_templates().collect::<Vec<_>>();
         let shipped = |event: &str| templates.iter().find(|(e, _)| *e == event).unwrap().1;
         let mut cases: Vec<(String, &str, String, &str)> = templates
             .iter()

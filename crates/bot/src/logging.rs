@@ -4154,11 +4154,7 @@ fn verified_member_departure_vars(
 }
 
 fn default_template(event: &str) -> &'static str {
-    crate::defaults::rendered_log_templates()
-        .into_iter()
-        .find(|(e, _)| *e == event)
-        .map(|(_, t)| t)
-        .unwrap_or("**{event}**\n{content}")
+    crate::defaults::rendered_log_template(event).unwrap_or("**{event}**\n{content}")
 }
 
 #[cfg(test)]
