@@ -151,7 +151,14 @@ impl Detector {
         });
     }
     pub fn invalidate(&self, guild: u64, channel: u64, message: u64) {
-        invalidate_post(&mut self.state.lock(), guild, channel, message);
+        let mut state = self.state.lock();
+        state.revision = state.revision.wrapping_add(1);
+        let Some(author) = state.index.get(&(guild, channel, message)).copied() else {
+            return;
+        };
+        drop_author_posts(&mut state, guild, author, |p| {
+            p.id == message && p.channel == channel
+        });
     }
     pub fn invalidate_author(&self, guild: u64, author: u64) {
         let mut state = self.state.lock();
@@ -357,7 +364,11 @@ impl Detector {
                 let guild_bytes = g.bytes - previous.cost + post.cost;
                 let process_bytes = *bytes - previous.cost + post.cost;
                 if !within_byte_budget(guild_bytes, process_bytes) {
-                    invalidate_post(&mut state, guild, post.channel, post.id);
+                    // The retirement watermark prevents replay of this post
+                    // without invalidating observations in other guilds.
+                    drop_author_posts(&mut state, guild, author, |previous| {
+                        previous.id == post.id && previous.channel == post.channel
+                    });
                     return AdmitOutcome::ReplacementRetired;
                 }
                 *previous = post;
@@ -587,16 +598,6 @@ fn park_author(g: &mut Guild, authors: &mut usize, author: u64, now: Instant) {
             break;
         }
     }
-}
-
-fn invalidate_post(state: &mut State, guild: u64, channel: u64, message: u64) {
-    state.revision = state.revision.wrapping_add(1);
-    let Some(author) = state.index.get(&(guild, channel, message)).copied() else {
-        return;
-    };
-    drop_author_posts(state, guild, author, |post| {
-        post.id == message && post.channel == channel
-    });
 }
 
 fn drop_author_posts(
@@ -1339,6 +1340,7 @@ mod tests {
         assert_eq!(usage(), full_usage);
 
         let revision = detector.revision();
+        let unrelated_edit = observed(1, shorter, 6);
         let outcome = edit(&longer, 6);
         let retired_usage = (full_guild - 2048, full_process - 2048);
         assert_eq!(
@@ -1348,16 +1350,30 @@ mod tests {
         );
         assert_eq!(detector.author_of(1, 10, 1), None);
         assert!(apply_admit_outcome(&detector, outcome, 1, 10, 1, true).is_none());
-        assert_eq!(detector.revision(), revision.wrapping_add(1));
         assert_eq!(usage(), retired_usage);
         assert_eq!(detector.author_of(1, 10, 2), Some(1));
+        let unrelated = detector.admit(2, 1, unrelated_edit, (0, 0), &policy, now, true);
+        assert!(apply_admit_outcome(&detector, unrelated.clone(), 2, 10, 1, true).is_none());
+        assert_eq!(
+            unrelated,
+            AdmitOutcome::Admitted,
+            "in-flight edit in another guild"
+        );
+        assert_eq!(detector.author_of(2, 10, 1), Some(1));
+        assert_eq!(detector.revision(), revision);
+        assert_eq!(usage(), (retired_usage.0, retired_usage.1 - 1));
+        assert_eq!(
+            edit(shorter, 7),
+            AdmitOutcome::Rejected,
+            "retired ID cannot return"
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn replacement_byte_budget_enforces_the_guild_limit() {
         check_replacement_byte_budget(
-            &[512],
-            (1_048_576, 1_048_576),
+            &[512, 1],
+            (1_048_576, 1_050_624),
             tokio::time::Instant::now().into_std(),
         );
     }
