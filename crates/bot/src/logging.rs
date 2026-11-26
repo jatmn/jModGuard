@@ -963,17 +963,13 @@ pub(crate) fn remember_message_update(
     );
 }
 
-pub(crate) fn known_message_webhook(
+pub(crate) fn known_message_identity(
     app: &BotState,
     guild: u64,
     channel: u64,
     message: u64,
-) -> bool {
-    let mut cache = app.log_snippets.inner.lock();
-    cache.retain(|_, s| s.at.elapsed() < SNIPPET_KEEP);
-    cache
-        .get(&(guild, channel, message))
-        .is_some_and(|snippet| snippet.origin == MessageOrigin::Webhook)
+) -> Option<(u64, bool)> {
+    known_message_identity_at(app, guild, channel, message, Instant::now)
 }
 
 pub(crate) fn known_message_author(
@@ -982,22 +978,22 @@ pub(crate) fn known_message_author(
     channel: u64,
     message: u64,
 ) -> Option<u64> {
-    known_message_author_at(app, guild, channel, message, Instant::now)
+    known_message_identity(app, guild, channel, message).map(|(author, _)| author)
 }
 
-fn known_message_author_at(
+fn known_message_identity_at(
     app: &BotState,
     guild: u64,
     channel: u64,
     message: u64,
     now: impl FnOnce() -> Instant,
-) -> Option<u64> {
+) -> Option<(u64, bool)> {
     app.log_snippets
         .inner
         .lock()
         .get(&(guild, channel, message))
         .filter(|snippet| now().duration_since(snippet.at) < SNIPPET_KEEP)
-        .map(|snippet| snippet.author)
+        .map(|snippet| (snippet.author, snippet.origin == MessageOrigin::Webhook))
 }
 
 fn take_snippet(app: &BotState, guild: u64, channel: u64, message: u64) -> Option<Snippet> {

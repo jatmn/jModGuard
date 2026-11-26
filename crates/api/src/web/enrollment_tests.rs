@@ -10593,11 +10593,33 @@ async fn analytics_serves_each_range_from_stored_data_and_caches_it_per_membersh
         f.discord.calls.load(Ordering::SeqCst),
         other_discord_calls(&f),
     );
-    for days in [7, 30, 90] {
-        let (status, body) = f
-            .request("POST", &format!("/api/guilds/10/analytics?days={days}"), "")
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+    let request_range = async |days| {
+        let response = f
+            .router
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/guilds/10/analytics?days={days}"))
+                    .header("cookie", &f.cookie)
+                    .header("x-jmodguard-enrollment", &enrollment.id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        super::assert_uncacheable_headers(response.headers());
+        axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .unwrap()
+    };
+    let cold = request_range(7).await;
+    for (days, bytes) in [
+        (7, cold.clone()),
+        (30, request_range(30).await),
+        (90, request_range(90).await),
+    ] {
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["window_days"], days);
         assert_eq!(body["series"].as_array().unwrap().len(), days as usize);
         assert_eq!(body["mod_action_kinds"][0]["key"], "ban");
@@ -10625,10 +10647,27 @@ async fn analytics_serves_each_range_from_stored_data_and_caches_it_per_membersh
     )
     .await
     .unwrap();
-    let (_, cached) = f
-        .request("POST", "/api/guilds/10/analytics?days=7", "")
+    assert_eq!(request_range(7).await, cold);
+    let (status, _) = f
+        .request_token("POST", "/api/guilds/10/analytics?days=7", "", None)
         .await;
-    assert_eq!(cached["mod_action_kinds"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a cache hit still needs a page enrollment"
+    );
+    let unauthenticated = f
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/api/guilds/10/analytics?days=7")
+                .header("x-jmodguard-enrollment", &enrollment.id)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
     // A new membership never reads the old membership's entry.
     db::retire_guild_enrollment(&f.app.db, 10, 100)
         .await
@@ -10639,6 +10678,28 @@ async fn analytics_serves_each_range_from_stored_data_and_caches_it_per_membersh
         .await;
     assert_eq!(status, StatusCode::OK, "{fresh}");
     assert_eq!(fresh["mod_action_kinds"].as_array().unwrap().len(), 2);
+    assert!(
+        fresh["members"].is_null(),
+        "the replacement store is unavailable"
+    );
+
+    // A partial answer does not hide newly written data on the next read.
+    let replacement = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    db::insert_enrolled_event(
+        &f.app.db,
+        Some(replacement),
+        "mod_action",
+        Some(7),
+        Some(moderator),
+        &serde_json::json!({"action": "warn"}),
+    )
+    .await
+    .unwrap();
+    let (status, partial) = f
+        .request("POST", "/api/guilds/10/analytics?days=7", "")
+        .await;
+    assert_eq!(status, StatusCode::OK, "{partial}");
+    assert_eq!(partial["mod_action_kinds"].as_array().unwrap().len(), 3);
 
     for bad in ["14", "0", "-7", "abc"] {
         let (status, body) = f
@@ -10854,9 +10915,21 @@ async fn analytics_retries_after_a_cancelled_load_and_directory_outage() {
             Some(&enrollment.id),
         )
     };
-    let (status, partial) = request().await;
-    assert_eq!(status, StatusCode::OK, "{partial}");
-    assert!(partial["members"].is_null());
+    let load = AnalyticsLoadProbe::install((10, enrollment.id.clone(), 7));
+    let (first, second, ()) = tokio::join!(request(), request(), async {
+        load.wait_for_requests(2).await;
+        assert_eq!(load.aggregates.available_permits(), 1);
+        // Let a duplicate load finish so the test can count it.
+        load.release.add_permits(2);
+    });
+    assert_eq!(first.0, StatusCode::OK, "{}", first.1);
+    assert_eq!(first, second);
+    assert!(first.1["members"].is_null());
+    assert_eq!(
+        load.aggregates.available_permits(),
+        1,
+        "waiting readers must share the available partial response"
+    );
     f.app
         .tenant
         .activate(enrollment.clone())

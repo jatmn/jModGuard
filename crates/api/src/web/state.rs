@@ -4,6 +4,7 @@ use super::oauth::{DiscordGuild, DiscordUser, OAuthClient};
 use crate::config::ApiProcessConfig;
 use crate::db::{self, Db};
 use anyhow::{Context as _, Result};
+use axum::body::Bytes;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,7 +48,7 @@ pub type AnalyticsCacheKey = (i64, String, i64);
 
 #[derive(Clone)]
 pub(super) enum AnalyticsLoadResult {
-    Complete(Arc<serde_json::Value>),
+    Response(Bytes),
     Unavailable,
 }
 
@@ -67,13 +68,13 @@ pub(super) struct AnalyticsLoadGuard<'a> {
 }
 
 impl AnalyticsLoadGuard<'_> {
-    pub(super) fn complete(mut self, value: &serde_json::Value) {
-        // Remove the registration before checking the follower count, so
-        // no new subscriber can miss the result between the two operations.
+    pub(super) fn publish_response(mut self, body: &Bytes) {
+        // Removing the registration first keeps new subscribers from missing
+        // the response between the count and the publish.
         if let Some(sender) = self.take_sender()
             && sender.receiver_count() > 0
         {
-            sender.send_replace(Some(AnalyticsLoadResult::Complete(Arc::new(value.clone()))));
+            sender.send_replace(Some(AnalyticsLoadResult::Response(body.clone())));
         }
     }
 
@@ -99,14 +100,12 @@ impl Drop for AnalyticsLoadGuard<'_> {
     }
 }
 
-/// Short-lived per-membership analytics summaries. Display data only: every
+/// Short-lived encoded analytics responses per membership. Display data only: every
 /// request still authorizes the user and captures the active membership before
 /// a lookup, and a different membership never shares an entry.
 #[derive(Default)]
 pub struct AnalyticsCache {
-    entries: std::sync::Mutex<
-        std::collections::HashMap<AnalyticsCacheKey, (Instant, serde_json::Value)>,
-    >,
+    entries: std::sync::Mutex<std::collections::HashMap<AnalyticsCacheKey, (Instant, Bytes)>>,
     loads: AnalyticsLoads,
 }
 
@@ -116,12 +115,12 @@ impl AnalyticsCache {
         self.entries.lock().unwrap().get_mut(key).unwrap().0 -= ANALYTICS_CACHE_TTL;
     }
 
-    pub fn get(&self, key: &AnalyticsCacheKey, now: Instant) -> Option<serde_json::Value> {
+    pub fn get(&self, key: &AnalyticsCacheKey, now: Instant) -> Option<Bytes> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries
             .get(key)
             .filter(|(at, _)| now.saturating_duration_since(*at) < ANALYTICS_CACHE_TTL)
-            .map(|(_, value)| value.clone())
+            .map(|(_, body)| body.clone())
     }
 
     pub(super) fn join_load<'a>(&'a self, key: &'a AnalyticsCacheKey) -> AnalyticsLoad<'a> {
@@ -130,8 +129,7 @@ impl AnalyticsCache {
             return AnalyticsLoad::Follower(sender.subscribe());
         }
         if loads.len() >= ANALYTICS_CACHE_MAX {
-            // Saturation leaves new keys uncached in this registry instead
-            // of queueing them behind unrelated guilds.
+            // Unregistered keys can still complete independently when full.
             return AnalyticsLoad::Independent;
         }
         let (sender, _) = watch::channel(None);
@@ -142,7 +140,7 @@ impl AnalyticsCache {
         })
     }
 
-    pub fn put(&self, key: AnalyticsCacheKey, value: serde_json::Value, now: Instant) {
+    pub fn put(&self, key: AnalyticsCacheKey, body: Bytes, now: Instant) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if entries.len() >= ANALYTICS_CACHE_MAX {
             entries.retain(|_, (at, _)| now.saturating_duration_since(*at) < ANALYTICS_CACHE_TTL);
@@ -150,7 +148,7 @@ impl AnalyticsCache {
         if entries.len() >= ANALYTICS_CACHE_MAX {
             entries.clear();
         }
-        entries.insert(key, (now, value));
+        entries.insert(key, (now, body));
     }
 }
 
@@ -188,8 +186,12 @@ mod analytics_cache_tests {
         let cache = AnalyticsCache::default();
         let start = tokio::time::Instant::now().into_std();
         let key = |guild: i64, days: i64| (guild, "membership".to_owned(), days);
-        cache.put(key(1, 7), serde_json::json!(7), start);
-        assert_eq!(cache.get(&key(1, 7), start), Some(serde_json::json!(7)));
+        let body = Bytes::from(vec![b'7']);
+        cache.put(key(1, 7), body.clone(), start);
+        let held = cache.get(&key(1, 7), start).unwrap();
+        assert_eq!(held, body);
+        assert_eq!(held.as_ptr(), body.as_ptr(), "hits share the encoded bytes");
+        drop(body);
         assert_eq!(
             cache.get(&key(1, 30), start),
             None,
@@ -204,14 +206,14 @@ mod analytics_cache_tests {
         );
         // Filling past the bound drops expired entries first, then everything.
         for guild in 0..ANALYTICS_CACHE_MAX as i64 {
-            cache.put(key(guild + 10, 30), serde_json::json!(guild), later);
+            cache.put(key(guild + 10, 30), Bytes::from_static(b"null"), later);
         }
-        cache.put(key(5, 90), serde_json::json!("new"), later);
+        let new = Bytes::from_static(br#""new""#);
+        cache.put(key(5, 90), new.clone(), later);
         assert!(cache.entries.lock().unwrap().len() <= ANALYTICS_CACHE_MAX);
-        assert_eq!(
-            cache.get(&key(5, 90), later),
-            Some(serde_json::json!("new"))
-        );
+        assert_eq!(cache.get(&key(5, 90), later), Some(new));
+        assert!(!cache.entries.lock().unwrap().contains_key(&key(1, 7)));
+        assert_eq!(held.as_ref(), b"7", "eviction keeps active responses valid");
     }
 }
 

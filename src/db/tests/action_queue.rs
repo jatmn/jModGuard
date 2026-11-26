@@ -6,10 +6,10 @@ struct Fixture {
     path: PathBuf,
 }
 impl Fixture {
-    async fn new() -> Self {
+    async fn new(guilds: &[i64]) -> Self {
         let path = tmp_db_path("action_queue");
         let db = Db::open(&path, 2).unwrap();
-        for guild in [10, 20, 21, 22, 23] {
+        for &guild in guilds {
             enroll_guild(&db, guild, 100).await.unwrap();
         }
         Self { db, path }
@@ -57,7 +57,7 @@ fn channel(id: Option<i64>) -> Action {
 
 #[tokio::test]
 async fn admission_deduplicates_scopes_and_bounds_pending_work() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10, 20]).await;
     let version = get_config_version(&f.db).await.unwrap();
     let (a, b) = tokio::join!(
         enqueue_bot_action(
@@ -148,7 +148,7 @@ async fn admission_deduplicates_scopes_and_bounds_pending_work() {
 
 #[tokio::test]
 async fn claims_keep_oldest_order_with_a_live_pending_backlog() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10, 20, 21, 22]).await;
     // Insert newer work first, across guilds within the default per-guild limit.
     for guild in [20, 21, 22] {
         for user in 1..=32 {
@@ -191,7 +191,7 @@ async fn claims_keep_oldest_order_with_a_live_pending_backlog() {
 
 #[tokio::test]
 async fn claims_are_exclusive_and_execution_is_consumed_once() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10]).await;
     let pending = f.enqueue(10, "claim", unban(99)).await;
     assert!(
         !finish_bot_action(&f.db, &pending, "succeeded", "not_started")
@@ -231,7 +231,7 @@ async fn claims_are_exclusive_and_execution_is_consumed_once() {
 
 #[tokio::test]
 async fn expiry_never_retries_running_work_and_pending_cancellation_releases_target() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10]).await;
     let pending = f.enqueue(10, "cancel", unban(99)).await;
     assert!(cancel_bot_action(&f.db, 10, &pending.id).await.unwrap());
     assert!(!cancel_bot_action(&f.db, 10, &pending.id).await.unwrap());
@@ -272,7 +272,7 @@ async fn expiry_never_retries_running_work_and_pending_cancellation_releases_tar
 
 #[tokio::test]
 async fn each_expiry_poll_caps_unstarted_and_running_work_separately() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10, 20, 21, 22, 23]).await;
     // Spread the backlog across guilds within the normal admission limit.
     // Leave one job claimed and the rest of the unstarted group pending.
     for (user, guild) in (1..=130).zip([10, 20, 21, 22, 23].into_iter().cycle()) {
@@ -309,7 +309,7 @@ async fn each_expiry_poll_caps_unstarted_and_running_work_separately() {
 
 #[tokio::test]
 async fn move_fence_does_not_skip_overdue_expiry_when_no_unfenced_work_is_due() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10]).await;
     let job = f.enqueue(10, "fenced_expiry", unban(99)).await;
     let destination = crate::db::guild_stores::StoreId::new();
     crate::db::guild_stores::register_store(
@@ -368,7 +368,7 @@ async fn move_fence_does_not_skip_overdue_expiry_when_no_unfenced_work_is_due() 
 
 #[tokio::test]
 async fn modified_claim_identity_cannot_authorize_execution_or_completion() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10, 20]).await;
     f.enqueue(10, "identity", unban(99)).await;
     let original = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
     let mut variants = Vec::new();
@@ -433,7 +433,7 @@ async fn modified_claim_identity_cannot_authorize_execution_or_completion() {
 
 #[tokio::test]
 async fn completion_rolls_back_its_state_ban_change_and_audit_together() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10, 20]).await;
     record_ban(&f.db, 10, 99, Some(42), "spam").await.unwrap();
     record_ban(&f.db, 20, 99, Some(42), "other guild")
         .await
@@ -497,7 +497,7 @@ async fn completion_rolls_back_its_state_ban_change_and_audit_together() {
 
 #[tokio::test]
 async fn newer_direct_log_settings_supersede_old_work_and_cannot_be_overwritten() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10, 20]).await;
     for clear in [false, true] {
         f.enqueue(10, if clear { "clear" } else { "set" }, channel(Some(100)))
             .await;
@@ -555,7 +555,7 @@ async fn newer_direct_log_settings_supersede_old_work_and_cannot_be_overwritten(
 
 #[tokio::test]
 async fn absent_log_deletes_preserve_versions_but_supersede_queued_work() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10]).await;
     let versions = get_version_state(&f.db).await.unwrap();
     let generation = f.db.config_write_generation();
     delete_log_channel(&f.db, 10, "member_join").await.unwrap();
@@ -597,7 +597,7 @@ async fn absent_log_deletes_preserve_versions_but_supersede_queued_work() {
 
 #[tokio::test]
 async fn failed_direct_config_write_does_not_supersede_pending_work() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10]).await;
     upsert_log_channel(&f.db, 10, "member_join", 300)
         .await
         .unwrap();
@@ -646,7 +646,7 @@ fn action_payloads_reject_unknown_operations_and_fields() {
 #[tokio::test]
 async fn queued_log_clears_only_invalidate_changed_mappings_and_commit_atomically() {
     for present in [false, true] {
-        let f = Fixture::new().await;
+        let f = Fixture::new(&[10]).await;
         if present {
             upsert_log_channel(&f.db, 10, "member_join", 100)
                 .await
@@ -704,7 +704,7 @@ async fn queued_log_clears_only_invalidate_changed_mappings_and_commit_atomicall
 
 #[tokio::test]
 async fn claimed_unban_can_be_cancelled_and_releases_the_target() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10]).await;
     let job = f.enqueue(10, "claimed_unban", unban(99)).await;
     let claimed = claim_bot_action(&f.db, 1001).await.unwrap().unwrap();
     assert_eq!(claimed.id, job.id);
@@ -723,7 +723,7 @@ async fn claimed_unban_can_be_cancelled_and_releases_the_target() {
 
 #[tokio::test]
 async fn running_and_uncertain_log_channels_can_be_force_cancelled() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10]).await;
     for state in ["pending", "claimed", "running", "uncertain"] {
         let mut job = f.enqueue(10, state, channel(Some(100))).await;
         if state != "pending" {
@@ -756,7 +756,7 @@ async fn running_and_uncertain_log_channels_can_be_force_cancelled() {
 
 #[tokio::test]
 async fn full_guild_queue_rejects_log_enqueue_without_cancelling_unrelated_work() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10]).await;
     let limits = Limits {
         pending_per_guild: 2,
         ..Limits::default()
@@ -784,7 +784,7 @@ async fn full_guild_queue_rejects_log_enqueue_without_cancelling_unrelated_work(
 
 #[tokio::test]
 async fn log_supersede_on_admission_frees_the_occupying_slot_before_insert() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10]).await;
     let limits = Limits {
         pending_per_guild: 2,
         ..Limits::default()
@@ -811,7 +811,7 @@ async fn log_supersede_on_admission_frees_the_occupying_slot_before_insert() {
 
 #[tokio::test]
 async fn queued_log_channel_admission_supersedes_occupying_work() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10]).await;
     for state in ["pending", "claimed", "running", "uncertain"] {
         let mut job = f.enqueue(10, state, channel(Some(100))).await;
         if state != "pending" {
@@ -908,7 +908,7 @@ fn action_channel_ids_follow_shared_snowflake_input_and_string_output() {
 
 #[tokio::test]
 async fn numeric_action_channel_input_survives_storage_restart_and_retry() {
-    let f = Fixture::new().await;
+    let f = Fixture::new(&[10]).await;
     let action: Action = serde_json::from_str(
         r#"{"kind":"set_log_channel","event":"member_join","channel_id":9007199254740993}"#,
     )

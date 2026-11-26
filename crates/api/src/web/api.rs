@@ -5,8 +5,11 @@
 //! `config_version` to pick up cross-process changes within `config_poll_secs`.
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_sessions::Session;
@@ -1806,7 +1809,7 @@ pub async fn analytics(
     headers: axum::http::HeaderMap,
     Path(guild_id): Path<u64>,
     Query(query): Query<AnalyticsQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Response> {
     let auth = real_guild_scope(&app, &session, guild_id, GuildAccess::Dashboard).await?;
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let enrollment = super::authorized_enrollment(&auth, guild_id)?;
@@ -1817,12 +1820,19 @@ pub async fn analytics(
         )));
     }
     let key = (enrollment.guild_id, enrollment.id.clone(), days);
+    let json_response = |body: Bytes| {
+        (
+            [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+            body,
+        )
+            .into_response()
+    };
     #[cfg(test)]
     let load_probe = super::enrollment_tests::analytics_request_started(&key);
     use super::state::{AnalyticsLoad, AnalyticsLoadResult};
     let leader = loop {
         if let Some(cached) = app.analytics_cache.get(&key, std::time::Instant::now()) {
-            return Ok(Json(cached));
+            return Ok(json_response(cached));
         }
         match app.analytics_cache.join_load(&key) {
             AnalyticsLoad::Leader(guard) => break Some(guard),
@@ -1833,13 +1843,10 @@ pub async fn analytics(
                     .ok()
                     .and_then(|value| value.clone());
                 match outcome {
-                    Some(AnalyticsLoadResult::Complete(value)) => {
-                        return Ok(Json((*value).clone()));
-                    }
-                    // Keep computing partial results independently during an outage.
+                    Some(AnalyticsLoadResult::Response(body)) => return Ok(json_response(body)),
+                    // A failed core read leaves no usable response to share.
                     Some(AnalyticsLoadResult::Unavailable) => break None,
-                    // An abandoned request leaves waiting readers to elect
-                    // one replacement with the same key.
+                    // An abandoned request lets waiting readers elect one replacement.
                     None => continue,
                 }
             }
@@ -1849,9 +1856,9 @@ pub async fn analytics(
     // A complete response can arrive between the original miss and joining.
     if let Some(cached) = app.analytics_cache.get(&key, std::time::Instant::now()) {
         if let Some(leader) = leader {
-            leader.complete(&cached);
+            leader.publish_response(&cached);
         }
-        return Ok(Json(cached));
+        return Ok(json_response(cached));
     }
     #[cfg(test)]
     if let Some(probe) = load_probe {
@@ -1890,16 +1897,24 @@ pub async fn analytics(
     }
     let complete = directory.is_some();
     value["members"] = serde_json::json!(directory.map(|(totals, _)| totals));
+    let body = match serde_json::to_vec(&value) {
+        Ok(encoded) => Bytes::from(encoded.into_boxed_slice()),
+        Err(error) => {
+            if let Some(leader) = leader {
+                leader.unavailable();
+            }
+            return Ok((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response());
+        }
+    };
     if complete {
         app.analytics_cache
-            .put(key.clone(), value.clone(), std::time::Instant::now());
-        if let Some(leader) = leader {
-            leader.complete(&value);
-        }
-    } else if let Some(leader) = leader {
-        leader.unavailable();
+            .put(key.clone(), body.clone(), std::time::Instant::now());
     }
-    Ok(Json(value))
+    if let Some(leader) = leader {
+        // Joined readers can use a partial result while later reads retry it.
+        leader.publish_response(&body);
+    }
+    Ok(json_response(body))
 }
 
 pub(super) async fn enqueue_action(
