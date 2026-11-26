@@ -640,7 +640,7 @@ impl EventHandler for Handler {
                     for guild in refresh_cache.guilds() {
                         refresh_app
                             .snapshots
-                            .refresh_scope(&refresh_app, guild.get())
+                            .refresh_scope(&refresh_app, &refresh_cache, guild)
                             .await;
                     }
                 }
@@ -681,7 +681,6 @@ impl EventHandler for Handler {
                 };
                 let mut failed = false;
                 for gid in guild_ids {
-                    app.snapshots.refresh_scope(&app, gid.get()).await;
                     // Joining/ready does not insert guild_settings — inheritance
                     // from global must remain unblocked until an operator sets
                     // an intentional override.
@@ -727,7 +726,7 @@ impl EventHandler for Handler {
         .await
         {
             Ok(()) => {
-                app.snapshots.refresh_scope(&app, gid.get()).await;
+                app.snapshots.refresh_scope(&app, &ctx.cache, gid).await;
                 crate::cases::retry_deferred_discord_audit_links(&app, Some(gid.get())).await;
             }
             Err(error) => {
