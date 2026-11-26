@@ -142,17 +142,45 @@ pub(super) struct Record {
     origin: Option<EvidenceOrigin>,
     sha256: Option<String>,
 }
+
+impl Record {
+    fn into_available(self) -> Result<AvailableEvidence> {
+        Ok(AvailableEvidence {
+            job: self.job,
+            origin: self.origin.ok_or(CaseError::Invalid)?,
+            sha256: self.sha256.ok_or(CaseError::Invalid)?,
+        })
+    }
+}
+
+fn decode_record(row: &Row, scope: &GuildDataScope) -> Result<Record> {
+    let origin = match row.get::<Option<i64>>(6)? {
+        Some(channel_id) => Some(EvidenceOrigin {
+            channel_id,
+            message_id: row.get(7)?,
+            attachment_id: row.get(8)?,
+        }),
+        None => None,
+    };
+    Ok(Record {
+        job: job(row, scope)?,
+        origin,
+        sha256: row.get(9)?,
+    })
+}
+
 pub(super) fn record(
     conn: &impl SqlExecutor,
     scope: &GuildDataScope,
     id: &CaseId,
 ) -> Result<Option<Record>> {
-    conn.query_row("SELECT case_id,evidence_id,storage_id,reserved_bytes,state,cancelled,channel_id,message_id,attachment_id,sha256 FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",params![scope.guild_id(),scope.enrollment.id.as_str(),id.as_str()],|r| {
-        let origin = match r.get::<Option<i64>>(6)? {
-            Some(channel_id)=>Some(EvidenceOrigin{channel_id,message_id:r.get(7)?,attachment_id:r.get(8)?}),None=>None
-        };
-        Ok(Record{job:job(r,scope)?,origin,sha256:r.get(9)?})
-    }).optional()
+    conn.query_row(
+        "SELECT case_id,evidence_id,storage_id,reserved_bytes,state,cancelled,channel_id,message_id,attachment_id,sha256
+         FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND evidence_id=?3",
+        params![scope.guild_id(), scope.enrollment.id.as_str(), id.as_str()],
+        |row| decode_record(row, scope),
+    )
+    .optional()
 }
 fn live(conn: &impl SqlExecutor, scope: &GuildDataScope, case: &CaseId) -> Result<bool> {
     conn.query_row("SELECT EXISTS(SELECT 1 FROM guild_cases WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND deleted=0)",params![scope.guild_id(),scope.enrollment.id.as_str(),case.as_str()],|r|Ok(r.get(0)?))
@@ -323,11 +351,7 @@ impl GuildDataStore {
                 }
                 let result = match record(&tx, &scope, &id)? {
                     Some(r) if r.job.case_id == case && r.job.state == EvidenceState::Available => {
-                        Some(AvailableEvidence {
-                            job: r.job,
-                            origin: r.origin.ok_or(CaseError::Invalid)?,
-                            sha256: r.sha256.ok_or(CaseError::Invalid)?,
-                        })
+                        Some(r.into_available()?)
                     }
                     _ => None,
                 };
@@ -355,7 +379,10 @@ impl GuildDataStore {
                     return Ok(Vec::new());
                 }
                 let mut stmt = tx.prepare(
-                    "SELECT evidence_id FROM guild_case_evidence WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND state=1 AND cancelled=0 ORDER BY evidence_id LIMIT ?4",
+                    "SELECT case_id,evidence_id,storage_id,reserved_bytes,state,cancelled,channel_id,message_id,attachment_id,sha256
+                     FROM guild_case_evidence
+                     WHERE guild_id=?1 AND enrollment_id=?2 AND case_id=?3 AND state=1 AND cancelled=0
+                     ORDER BY evidence_id LIMIT ?4",
                 )?;
                 let rows = stmt.query_map(
                     params![
@@ -364,22 +391,9 @@ impl GuildDataStore {
                         case.as_str(),
                         limits.max_page_size as i64
                     ],
-                    |r| Ok(r.get::<String>(0)?),
+                    |row| decode_record(row, &scope)?.into_available(),
                 )?;
-                let mut items = Vec::new();
-                for row in rows {
-                    let id = CaseId::try_from(row?)?;
-                    if let Some(r) = record(&tx, &scope, &id)?
-                        && r.job.case_id == case
-                        && r.job.state == EvidenceState::Available
-                    {
-                        items.push(AvailableEvidence {
-                            job: r.job,
-                            origin: r.origin.ok_or(CaseError::Invalid)?,
-                            sha256: r.sha256.ok_or(CaseError::Invalid)?,
-                        });
-                    }
-                }
+                let items = rows.collect::<Result<Vec<_>>>()?;
                 drop(stmt);
                 tx.finish_read()?;
                 Ok(items)
