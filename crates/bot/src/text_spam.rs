@@ -515,7 +515,11 @@ fn match_posts(b: &Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u6
 
     // Original positions keep each group in bucket order and select the first match.
     sorted.sort_unstable_by(|(a_idx, a), (b_idx, b)| {
-        a.text.cmp(&b.text).then_with(|| a_idx.cmp(b_idx))
+        a.text
+            .len()
+            .cmp(&b.text.len())
+            .then_with(|| a.text.cmp(&b.text))
+            .then_with(|| a_idx.cmp(b_idx))
     });
     let matched = sorted
         .chunk_by(|(_, a), (_, b)| a.text == b.text)
