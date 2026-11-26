@@ -8031,6 +8031,7 @@ async fn known_bad_image_http_add_list_remove_accepts_only_safe_metadata() {
     let f = Fixture::new(false).await;
     f.enroll(10).await;
     let hash = "ab".repeat(32);
+    let (_, before) = f.request("POST", "/api/guilds/10/config", "").await;
     let body =
         serde_json::json!({"hash": hash.to_uppercase(), "note": "confirmed spam"}).to_string();
     let (status, saved) = f
@@ -8046,6 +8047,14 @@ async fn known_bad_image_http_add_list_remove_accepts_only_safe_metadata() {
     assert_eq!(rows[0]["actor"], "unknown");
     assert_eq!(rows[0]["added_via"], "webui");
     assert_eq!(rows[0].as_object().unwrap().len(), 5);
+    assert_eq!(
+        saved["config_patch"],
+        serde_json::json!({
+            "kind": "known_bad_images", "operation": "add", "value": rows[0],
+            "previous_revision": before["config_revision"], "revision": config["config_revision"]
+        })
+    );
+    assert_ne!(before["config_revision"], config["config_revision"]);
     for invalid in [
         serde_json::json!({"hash": "unknown"}),
         serde_json::json!({"note": "missing digest"}),
@@ -8062,27 +8071,39 @@ async fn known_bad_image_http_add_list_remove_accepts_only_safe_metadata() {
             StatusCode::OK
         );
     }
-    assert_eq!(
-        f.request("POST", "/api/guilds/10/known-bad-images", &body)
-            .await
-            .1["changed"],
-        false
-    );
-    assert_eq!(
-        f.request(
-            "DELETE",
-            &format!("/api/guilds/10/known-bad-images/{hash}"),
-            ""
+    let duplicate = serde_json::json!({"hash": hash.to_uppercase(), "note": "a different note"});
+    let (status, saved) = f
+        .request(
+            "POST",
+            "/api/guilds/10/known-bad-images",
+            &duplicate.to_string(),
         )
-        .await
-        .0,
-        StatusCode::OK
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["changed"], false);
+    assert_eq!(saved["config_patch"]["value"], rows[0]);
+    assert_eq!(
+        saved["config_patch"]["previous_revision"],
+        config["config_revision"]
     );
-    assert!(
-        f.request("POST", "/api/guilds/10/config", "").await.1["known_bad_images"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+    assert_eq!(saved["config_patch"]["revision"], config["config_revision"]);
+
+    let (status, removed) = f
+        .request(
+            "DELETE",
+            &format!("/api/guilds/10/known-bad-images/{}", hash.to_uppercase()),
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    let (_, after) = f.request("POST", "/api/guilds/10/config", "").await;
+    assert!(after["known_bad_images"].as_array().unwrap().is_empty());
+    assert_eq!(
+        removed["config_patch"],
+        serde_json::json!({
+            "kind": "known_bad_images", "operation": "delete", "value": hash,
+            "previous_revision": config["config_revision"], "revision": after["config_revision"]
+        })
     );
 }
 
@@ -9923,11 +9944,17 @@ async fn known_spam_http_validates_lists_and_removes_with_captured_scopes() {
         ),
         ("global", "url", "tinyurl.com/*", None),
     ] {
-        let input =
-            serde_json::json!({"scope":scope,"kind":kind,"value":value,"note":note}).to_string();
-        let (status, body) = f.request("POST", "/api/guilds/10/known-spam", &input).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let id = body["id"].as_i64().unwrap();
+        let (_, before) = f.request("POST", "/api/guilds/10/config", "").await;
+        let input_value = if kind == "url" {
+            "HTTPS://TinyURL.COM/*"
+        } else {
+            value
+        };
+        let input = serde_json::json!({"scope":scope,"kind":kind,"value":input_value,"note":note})
+            .to_string();
+        let (status, saved) = f.request("POST", "/api/guilds/10/known-spam", &input).await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        let id = saved["id"].as_i64().unwrap();
         let (status, _) = f.request("POST", "/api/guilds/10/known-spam", &input).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (_, cfg) = f.request("POST", "/api/guilds/10/config", "").await;
@@ -9939,10 +9966,27 @@ async fn known_spam_http_validates_lists_and_removes_with_captured_scopes() {
             .unwrap();
         assert_eq!(row["value"], value);
         assert_eq!(row["note"], serde_json::json!(note));
+        assert_eq!(row["guild_id"], if scope == "global" { "0" } else { "10" });
+        assert_eq!(
+            saved["config_patch"],
+            serde_json::json!({
+                "kind": "known_spam", "operation": "add", "value": row,
+                "previous_revision": before["config_revision"], "revision": cfg["config_revision"]
+            })
+        );
         let (status, body) = f
             .request("DELETE", &format!("/api/guilds/10/known-spam/{id}"), "")
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, after) = f.request("POST", "/api/guilds/10/config", "").await;
+        assert_eq!(
+            body["config_patch"],
+            serde_json::json!({
+                "kind": "known_spam", "operation": "delete", "value": wire_id,
+                "previous_revision": cfg["config_revision"], "revision": after["config_revision"]
+            })
+        );
+        assert!(after["known_spam"].as_array().unwrap().is_empty());
     }
     let (status, _) = f
         .request_token(

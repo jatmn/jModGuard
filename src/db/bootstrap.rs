@@ -326,6 +326,10 @@ pub(super) fn read_bootstrap_defaults_primary(conn: &Connection) -> Result<Guild
 
 /// Bumps durable `config_version` on an open connection (config writers only).
 pub(crate) fn bump_config_version_conn(conn: &impl SqlExecutor) -> Result<()> {
+    bump_config_version_with_revision_conn(conn).map(|_| ())
+}
+
+pub(super) fn bump_config_version_with_revision_conn(conn: &impl SqlExecutor) -> Result<String> {
     let version: u64 = conn.query_row_write(
         "INSERT INTO meta (key, value) VALUES ('config_version', '1')
          ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
@@ -333,13 +337,10 @@ pub(crate) fn bump_config_version_conn(conn: &impl SqlExecutor) -> Result<()> {
         (),
         |row| Ok(row.get::<i64>(0)? as u64),
     )?;
-    write_meta_string_conn(
-        conn,
-        "config_revision",
-        &format!("{:032x}", rand::random::<u128>()),
-    )?;
+    let revision = format!("{:032x}", rand::random::<u128>());
+    write_meta_string_conn(conn, "config_revision", &revision)?;
     conn.record_config_version(version);
-    Ok(())
+    Ok(revision)
 }
 
 /// Bumps durable `slash_registry_version` when the Discord slash command
@@ -357,20 +358,27 @@ pub(crate) fn bump_slash_registry_version_conn(conn: &impl SqlExecutor) -> Resul
 /// Existing completed schemas have these fixed rows; missing markers refuse
 /// the cleanup rather than silently dropping invalidation floors.
 pub(super) fn bump_config_version_reclaim_conn(tx: &crate::db_compat::Transaction) -> Result<()> {
+    bump_config_version_reclaim_with_revision_conn(tx).map(|_| ())
+}
+
+pub(super) fn bump_config_version_reclaim_with_revision_conn(
+    tx: &crate::db_compat::Transaction,
+) -> Result<String> {
     anyhow::ensure!(tx.execute_reclaim_metadata_bounded(
         "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='config_version'",
         (), reclaim_meta_bound(tx)?,
     )? == 1, "config_version marker is missing");
+    let revision = format!("{:032x}", rand::random::<u128>());
     anyhow::ensure!(
         tx.execute_reclaim_metadata_bounded(
             "UPDATE meta SET value=?1 WHERE key='config_revision'",
-            params![format!("{:032x}", rand::random::<u128>())],
+            params![revision.as_str()],
             reclaim_meta_bound(tx)?,
         )? == 1,
         "config_revision marker is missing"
     );
     tx.record_config_version(get_config_version_conn(tx)?);
-    Ok(())
+    Ok(revision)
 }
 
 pub(super) fn bump_slash_version_reclaim_conn(tx: &crate::db_compat::Transaction) -> Result<()> {

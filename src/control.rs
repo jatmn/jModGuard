@@ -82,6 +82,32 @@ impl std::fmt::Debug for WriterLink {
     }
 }
 
+fn save_request_id(save_id: &str, actor_user_id: i64, op: &ControlOp) -> Result<String> {
+    // Asking for more response data must not change the identity of a write.
+    let legacy_op = match op {
+        ControlOp::AddKnownSpam {
+            request,
+            target,
+            kind,
+            value,
+            note,
+            include_patch: true,
+        } => Some(ControlOp::AddKnownSpam {
+            request: request.clone(),
+            target: target.clone(),
+            kind: kind.clone(),
+            value: value.clone(),
+            note: note.clone(),
+            include_patch: false,
+        }),
+        _ => None,
+    };
+    let identity = serde_json::to_vec(&(save_id, actor_user_id, legacy_op.as_ref().unwrap_or(op)))?;
+    Ok(to_hex(
+        ring::digest::digest(&ring::digest::SHA256, &identity).as_ref(),
+    ))
+}
+
 impl WriterLink {
     pub fn connect(addr: SocketAddr, key: Vec<u8>) -> Result<Self> {
         anyhow::ensure!(!key.is_empty(), "writer link is unusable");
@@ -105,8 +131,7 @@ impl WriterLink {
         lookup: bool,
     ) -> Result<ControlReply> {
         anyhow::ensure!(valid_request_id(save_id), "invalid save request ID");
-        let identity = serde_json::to_vec(&(save_id, actor_user_id, &op))?;
-        let request_id = to_hex(ring::digest::digest(&ring::digest::SHA256, &identity).as_ref());
+        let request_id = save_request_id(save_id, actor_user_id, &op)?;
         let op = if lookup { ControlOp::LookupResult } else { op };
         let addr = self.addr;
         let key = self.key.clone();
@@ -581,6 +606,32 @@ struct Wire {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_spam_patch_opt_in_preserves_a_legacy_save_identity() {
+        let scope = crate::db::ScopeWire {
+            global: true,
+            guild_id: 0,
+            enrollment_id: String::new(),
+            joined_at_ns: 0,
+        };
+        let mut op = ControlOp::AddKnownSpam {
+            request: scope.clone(),
+            target: scope,
+            kind: "sample".into(),
+            value: "sample".into(),
+            note: None,
+            include_patch: false,
+        };
+        let save = "1".repeat(64);
+        let legacy = serde_json::to_vec(&(&save, 42i64, &op)).unwrap();
+        assert!(!String::from_utf8_lossy(&legacy).contains("include_patch"));
+        let expected = to_hex(ring::digest::digest(&ring::digest::SHA256, &legacy).as_ref());
+        if let ControlOp::AddKnownSpam { include_patch, .. } = &mut op {
+            *include_patch = true;
+        }
+        assert_eq!(save_request_id(&save, 42, &op).unwrap(), expected);
+    }
 
     #[test]
     fn private_bind_rejects_public_addresses() {

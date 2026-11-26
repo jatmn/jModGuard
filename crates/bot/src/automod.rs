@@ -5014,6 +5014,7 @@ mod tests {
                         kind: kind.into(),
                         value: value.into(),
                         note: None,
+                        include_patch: false,
                     },
                     None,
                 )

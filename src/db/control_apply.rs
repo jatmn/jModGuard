@@ -2,6 +2,7 @@
 //! the process that holds the writer lease calls these functions.
 
 use super::configuration::{promote_enrolled_rule, upsert_enrolled_rule_with_velocity_edit};
+use super::known_spam::SpamListChange;
 use super::*;
 use crate::bot_actions::{Action, Limits};
 use crate::tenant::TenantRuntime;
@@ -85,6 +86,8 @@ pub enum ControlOp {
         kind: String,
         value: String,
         note: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        include_patch: bool,
     },
     DeleteKnownSpam {
         request: ScopeWire,
@@ -756,6 +759,21 @@ async fn reconcile_media_preset_scope(
     }
 }
 
+fn spam_list_config_patch<T>(
+    change: &SpamListChange<T>,
+    kind: &str,
+    operation: &str,
+    value: impl Serialize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": kind,
+        "operation": operation,
+        "value": value,
+        "previous_revision": change.previous_revision,
+        "revision": change.revision,
+    })
+}
+
 async fn apply_control_inner(
     db: &Db,
     tenant: Option<&TenantRuntime>,
@@ -852,15 +870,19 @@ async fn apply_control_inner(
         }
         ControlOp::AddKnownBadImage { scope, hash, note } => {
             let scope = scope_of(scope)?;
-            let changed = add_enrolled_known_bad_image(
+            let change = add_enrolled_known_bad_image_change(
                 db,
                 ConfigurationWriteScope::new(scope.clone(), scope)?,
                 &hash,
                 note,
             )
             .await?;
-            let body = serde_json::json!({"changed": changed});
-            Ok(if changed {
+            let (changed, row) = &change.value;
+            let patch = row
+                .as_ref()
+                .map(|row| spam_list_config_patch(&change, "known_bad_images", "add", row));
+            let body = serde_json::json!({"changed": changed, "config_patch": patch});
+            Ok(if *changed {
                 ControlReply::Saved { body }
             } else {
                 ControlReply::Unchanged { body }
@@ -868,14 +890,20 @@ async fn apply_control_inner(
         }
         ControlOp::RemoveKnownBadImage { scope, hash } => {
             let scope = scope_of(scope)?;
-            let changed = remove_enrolled_known_bad_image(
+            let change = remove_enrolled_known_bad_image_change(
                 db,
                 ConfigurationWriteScope::new(scope.clone(), scope)?,
                 &hash,
             )
             .await?;
-            let body = serde_json::json!({"changed": changed});
-            Ok(if changed {
+            let patch = spam_list_config_patch(
+                &change,
+                "known_bad_images",
+                "delete",
+                hash.to_ascii_lowercase(),
+            );
+            let body = serde_json::json!({"changed": change.value, "config_patch": patch});
+            Ok(if change.value {
                 ControlReply::Saved { body }
             } else {
                 ControlReply::Unchanged { body }
@@ -887,8 +915,9 @@ async fn apply_control_inner(
             kind,
             value,
             note,
+            include_patch,
         } => {
-            let id = add_enrolled_known_spam(
+            let change = add_enrolled_known_spam_change(
                 db,
                 write_scope(request, target)?,
                 &kind,
@@ -896,15 +925,22 @@ async fn apply_control_inner(
                 note.as_deref(),
             )
             .await?;
-            saved_value(id)
+            if include_patch {
+                let patch = spam_list_config_patch(&change, "known_spam", "add", &change.value);
+                saved_value(serde_json::json!({"id": change.value.id, "config_patch": patch}))
+            } else {
+                saved_value(change.value.id)
+            }
         }
         ControlOp::DeleteKnownSpam {
             request,
             target,
             id,
         } => {
-            delete_enrolled_known_spam(db, write_scope(request, target)?, id).await?;
-            saved_null()
+            let change =
+                delete_enrolled_known_spam_change(db, write_scope(request, target)?, id).await?;
+            let patch = spam_list_config_patch(&change, "known_spam", "delete", id.to_string());
+            saved_value(serde_json::json!({"config_patch": patch}))
         }
         ControlOp::AddBadword {
             request,

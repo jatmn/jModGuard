@@ -4,6 +4,7 @@
 //! DB and invalidate this process's cache; the bot (and API) poll
 //! `config_version` to pick up cross-process changes within `config_poll_secs`.
 
+use anyhow::Context as _;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -166,6 +167,7 @@ pub async fn guild_config(
 
     Ok(Json(serde_json::json!({
         "enrollment_id": auth.enrollment.as_ref().map(|e| e.id.as_str()),
+        "config_revision": snapshot.revision,
         "settings": settings_wire(&snapshot.settings.settings),
         "settings_override": settings_wire(&snapshot.settings.settings_override),
         "global_settings": settings_wire(&snapshot.settings.global_settings),
@@ -2229,6 +2231,19 @@ mod tests {
     }
 }
 
+fn spam_list_ack(
+    mut response: serde_json::Value,
+    mut result: serde_json::Value,
+) -> Json<serde_json::Value> {
+    if let Some(patch) = result
+        .get_mut("config_patch")
+        .filter(|patch| !patch.is_null())
+    {
+        response["config_patch"] = patch.take();
+    }
+    Json(response)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KnownBadImageBody {
@@ -2258,8 +2273,9 @@ pub async fn add_known_bad_image(
             },
         )
         .await?;
-    Ok(Json(
+    Ok(spam_list_ack(
         serde_json::json!({"ok": true, "changed": result["changed"]}),
+        result,
     ))
 }
 
@@ -2282,8 +2298,9 @@ pub async fn remove_known_bad_image(
             },
         )
         .await?;
-    Ok(Json(
+    Ok(spam_list_ack(
         serde_json::json!({"ok": true, "changed": result["changed"]}),
+        result,
     ))
 }
 
@@ -2309,7 +2326,7 @@ pub async fn add_known_spam(
     let write = super::configuration_write_scope(&app, &auth, guild_id, target)?;
     let entry = jmodguard::known_spam::Entry::new(&body.kind, &body.value, body.note.as_deref())?;
     let (request, target) = write.to_wires();
-    let (_, id) = app
+    let (_, result) = app
         .commit_json_actor(
             dashboard_actor(&auth),
             db::ControlOp::AddKnownSpam {
@@ -2318,10 +2335,19 @@ pub async fn add_known_spam(
                 kind: entry.kind,
                 value: entry.value,
                 note: entry.note,
+                include_patch: true,
             },
         )
         .await?;
-    Ok(Json(serde_json::json!({"ok": true, "id": id})))
+    // Older writers and already captured receipts can still return a bare ID.
+    let id = result
+        .as_i64()
+        .or_else(|| result["id"].as_i64())
+        .context("known spam acknowledgement is missing the saved ID")?;
+    Ok(spam_list_ack(
+        serde_json::json!({"ok": true, "id": id}),
+        result,
+    ))
 }
 
 pub async fn delete_known_spam(
@@ -2343,14 +2369,15 @@ pub async fn delete_known_spam(
     }
     let write = super::configuration_write_scope(&app, &auth, guild_id, entry.guild_id)?;
     let (request, target) = write.to_wires();
-    app.commit_json_actor(
-        dashboard_actor(&auth),
-        db::ControlOp::DeleteKnownSpam {
-            request,
-            target,
-            id,
-        },
-    )
-    .await?;
-    Ok(Json(serde_json::json!({"ok":true})))
+    let (_, result) = app
+        .commit_json_actor(
+            dashboard_actor(&auth),
+            db::ControlOp::DeleteKnownSpam {
+                request,
+                target,
+                id,
+            },
+        )
+        .await?;
+    Ok(spam_list_ack(serde_json::json!({"ok": true}), result))
 }

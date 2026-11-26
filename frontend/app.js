@@ -3338,14 +3338,44 @@ function selectedGuild() {
   return state.guilds.find((g) => g.id === state.guildId);
 }
 
+function applySpamListPatch(config, patch) {
+  const rows = config[patch.kind];
+  if (!Array.isArray(rows) || patch.previous_revision !== config.config_revision ||
+    !/^[a-f0-9]{32}$/.test(patch.previous_revision) || !/^[a-f0-9]{32}$/.test(patch.revision)) return false;
+  const knownSpam = patch.kind === "known_spam";
+  const key = knownSpam ? "id" : "hash";
+  if (patch.operation === "add" && typeof patch.value?.[key] === "string") {
+    const row = patch.value;
+    if (knownSpam && row.guild_id !== "0" && row.guild_id !== state.guildId) return false;
+    // An unchanged row absent from this snapshot may be outside its bounded list.
+    if (patch.previous_revision === patch.revision && !rows.some((entry) => entry[key] === row[key])) return false;
+    const orderedKey = (entry) => knownSpam ? BigInt(entry.id) : entry.hash;
+    const updated = [...rows.filter((entry) => entry[key] !== row[key]), row];
+    updated.sort((a, b) => {
+      const left = orderedKey(a), right = orderedKey(b);
+      return left < right ? -1 : left > right ? 1 : 0;
+    });
+    config[patch.kind] = updated;
+  } else if (patch.operation === "delete" && typeof patch.value === "string") {
+    config[patch.kind] = rows.filter((entry) => entry[key] !== patch.value);
+  } else {
+    return false;
+  }
+  config.config_revision = patch.revision;
+  return true;
+}
+
 function applyConfigPatch(res) {
   const patch = res?.config_patch;
   const config = state.config;
   if (!patch || !config) return false;
+  const spamList = patch.kind === "known_spam" || patch.kind === "known_bad_images";
+  if (spamList && !applySpamListPatch(config, patch)) return false;
   // Any snapshot requested before this acknowledged commit is now stale.
   ++configRequest;
   state.configRead.activity = "idle";
   state.configRead.error = null;
+  if (spamList) return true;
   if (patch.kind === "rule") {
     const custom = isCustomRuleId(patch.id);
     if (custom && patch.value == null) {
@@ -3431,9 +3461,16 @@ function applyConfigPatch(res) {
   return false;
 }
 
-async function reloadAfter(work, onSuccess) {
+async function reloadAfter(work, onSuccess, capturedGuild) {
+  const request = configRequest;
+  const enrollment = state.config?.enrollment_id;
+  const user = state.me?.user.id;
   const res = await work();
-  if (!applyConfigPatch(res) && !(await loadConfig())) return;
+  const scoped = capturedGuild !== undefined;
+  if (scoped && (state.guildId !== capturedGuild || state.me?.user.id !== user)) return;
+  const canPatch = !scoped || (request === configRequest &&
+    state.configRead.activity !== "loading" && state.config?.enrollment_id === enrollment);
+  if (!(canPatch && applyConfigPatch(res)) && !(await loadConfig())) return;
   if (onSuccess) onSuccess(res);
   renderTab();
 }
@@ -10896,6 +10933,9 @@ function tabKnownSpam() {
     const value = drafts[key]?.value || "";
     if (!value.trim()) return toast("Enter a full sample or URL pattern", "error");
     const scope = scopeRef.current.value;
+    const enrollment = state.config?.enrollment_id;
+    const samePage = () => state.guildId === guildId && state.tab === "known-spam" &&
+      state.config?.enrollment_id === enrollment;
     setKnownSpamAddError(key, null);
     try {
       await reloadAfter(async () => {
@@ -10903,15 +10943,15 @@ function tabKnownSpam() {
           scope, kind, value, note: drafts["known-spam:note"]?.value || null,
         });
         // Acknowledged: keep this scope selected, without a draft, even if the refresh fails.
-        ui.set({ draftBaselines: { ...ui.getSnapshot().draftBaselines, "known-spam:scope": scope } });
+        if (samePage()) ui.set({ draftBaselines: { ...ui.getSnapshot().draftBaselines, "known-spam:scope": scope } });
         return res;
-      }, () => toast("Known spam entry added", "success"));
+      }, () => toast("Known spam entry added", "success"), guildId);
     } catch (error) {
       // The browser cannot tell a rejected save from one whose outcome is unknown
       // or pending, so state only that the add was not confirmed.
       const label = kind === "sample" ? "Sample" : "URL pattern";
       const lookup = error?.saveLookup ? " Retrying the same entry, note and scope only looks up the earlier request; no new save was sent." : "";
-      setKnownSpamAddError(key, `${label} not confirmed as added: ${error?.message || error}${lookup}`);
+      if (samePage()) setKnownSpamAddError(key, `${label} not confirmed as added: ${error?.message || error}${lookup}`);
       throw error;
     }
   };
@@ -10990,8 +11030,7 @@ function tabKnownSpam() {
         h("td", null, canEditSettings() && (String(row.guild_id) !== "0" || isBotOwner() ? h(IconButton, { action: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm("Remove this known spam entry?")) return;
-            await api(`/api/guilds/${guildId}/known-spam/${row.id}`, "DELETE");
-            if (state.guildId === guildId && await loadConfig()) renderTab();
+            await reloadAfter(() => api(`/api/guilds/${guildId}/known-spam/${row.id}`, "DELETE"), undefined, guildId);
           },
         }) : h("span", { className: "muted" }, "Owner only"))),
       ),
@@ -11028,6 +11067,7 @@ function AddKnownBadImage({ guildId }) {
       await reloadAfter(
         () => api(`/api/guilds/${guildId}/known-bad-images`, "POST", { hash, note: note || null }),
         (result) => toast(result.changed ? "Hash added." : "Hash already listed.", "success"),
+        guildId,
       );
     },
   }, "Add hash");
@@ -11085,8 +11125,7 @@ function tabKnownBadImages() {
         h("td", null, canEditSettings() && h(IconButton, { action: "remove", label: "Remove",
           onClick: async () => {
             if (!confirm(`Remove SHA-256 ${row.hash}?`)) return;
-            await api(`/api/guilds/${guildId}/known-bad-images/${row.hash}`, "DELETE");
-            if (state.guildId === guildId && await loadConfig()) renderTab();
+            await reloadAfter(() => api(`/api/guilds/${guildId}/known-bad-images/${row.hash}`, "DELETE"), undefined, guildId);
           },
         })),
       ),
