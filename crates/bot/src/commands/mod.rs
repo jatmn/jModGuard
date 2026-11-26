@@ -1016,45 +1016,23 @@ async fn set_slash_commands(
     registry: &std::collections::HashMap<String, CommandDef>,
     target: u64,
     revision: &str,
-    registrations: &mut std::collections::HashMap<u64, serde_json::Value>,
+    registrations: &mut crate::state::SlashRegistrations,
 ) -> bool {
-    let mut commands: Vec<CreateCommand> = Vec::new();
-    let mut ordered: Vec<_> = registry.iter().collect();
-    ordered.sort_unstable_by_key(|(name, _)| *name);
-    for (_, cmd) in ordered {
-        if !cmd.enabled {
-            continue;
-        }
-        // Legacy rows predate WebUI validation. Keep their previous behavior
-        // rather than silently dropping commands when rebuilding Discord's
-        // whole guild command set after an upgrade.
-        let name = sanitize_slash_name(&cmd.name);
-        let description = slash_description(&cmd.description);
-        let mut builder = CreateCommand::new(name).description(description);
-        for opt in behaviors::slash_spec(&cmd.behavior) {
-            let description = templates::render(opt.description, &BTreeMap::new());
-            let mut o =
-                CreateCommandOption::new(opt.kind, opt.name, &description).required(opt.required);
-            if opt.kind == CommandOptionType::Integer {
-                o = o.min_int_value(0);
-            }
-            builder = builder.add_option(o);
-        }
-        commands.push(builder);
-    }
-    let payload = match serde_json::to_value(&commands) {
+    let commands = slash_commands(registry);
+    // Serenity sends this same serialization as the PUT body.
+    let payload = match serde_json::to_string(&commands) {
         Ok(payload) => payload,
         Err(error) => {
             tracing::warn!("slash sync: cannot serialize commands for {guild_id}: {error}");
             return false;
         }
     };
-    if registrations.get(&guild_id.get()) == Some(&payload) {
+    if registrations.matches(guild_id.get(), &payload) {
         return true;
     }
     // A failed or cancelled PUT may still reach Discord. Do not retain the
     // previous payload as proof that a later edit reverting to it needs no PUT.
-    registrations.remove(&guild_id.get());
+    registrations.remove(guild_id.get());
     tracing::info!(
         guild_id = guild_id.get(),
         target,
@@ -1097,6 +1075,34 @@ async fn set_slash_commands(
             false
         }
     }
+}
+
+fn slash_commands(registry: &std::collections::HashMap<String, CommandDef>) -> Vec<CreateCommand> {
+    let mut commands: Vec<CreateCommand> = Vec::new();
+    let mut ordered: Vec<_> = registry.iter().collect();
+    ordered.sort_unstable_by_key(|(name, _)| *name);
+    for (_, cmd) in ordered {
+        if !cmd.enabled {
+            continue;
+        }
+        // Legacy rows predate WebUI validation. Keep their previous behavior
+        // rather than silently dropping commands when rebuilding Discord's
+        // whole guild command set after an upgrade.
+        let name = sanitize_slash_name(&cmd.name);
+        let description = slash_description(&cmd.description);
+        let mut builder = CreateCommand::new(name).description(description);
+        for opt in behaviors::slash_spec(&cmd.behavior) {
+            let description = templates::render(opt.description, &BTreeMap::new());
+            let mut o =
+                CreateCommandOption::new(opt.kind, opt.name, &description).required(opt.required);
+            if opt.kind == CommandOptionType::Integer {
+                o = o.min_int_value(0);
+            }
+            builder = builder.add_option(o);
+        }
+        commands.push(builder);
+    }
+    commands
 }
 
 fn sanitize_slash_name(name: &str) -> String {
@@ -2523,6 +2529,13 @@ mod tests {
                         .collect::<Vec<_>>(),
                     vec![10, 20, 30]
                 );
+                {
+                    // Guild 10 keeps its local edit; the others share one payload.
+                    let registrations = app.slash_registrations.lock().await;
+                    assert!(registrations.shares_payload(20, 30));
+                    assert!(!registrations.shares_payload(10, 20));
+                    assert_eq!(registrations.distinct_payloads(), 2);
+                }
                 app.commit_slash_registry_version(changed);
 
                 // A second save during a PUT must survive completion of the old pass.
@@ -2655,8 +2668,14 @@ mod tests {
                 app.retry_slash_registry_version();
                 app.plan_slash_resync(changed, &[10, 20, 30]);
                 assert!(!app.finish_slash_resync(changed, [10].into_iter().collect()));
+                assert_eq!(app.slash_registrations.lock().await.distinct_payloads(), 2);
                 app.forget_slash_guild(10).await;
-                assert!(!app.slash_registrations.lock().await.contains_key(&10));
+                {
+                    let registrations = app.slash_registrations.lock().await;
+                    assert!(!registrations.contains(10));
+                    assert_eq!(registrations.distinct_payloads(), 1, "unused payload freed");
+                    assert!(registrations.shares_payload(20, 30));
+                }
                 let cache = Arc::new(serenity::cache::Cache::default());
                 requests.lock().clear();
                 // An older poll can still hold the departed guild's ID.
@@ -2665,7 +2684,7 @@ mod tests {
                         .await
                 );
                 assert!(requests.lock().is_empty());
-                assert!(!app.slash_registrations.lock().await.contains_key(&10));
+                assert!(!app.slash_registrations.lock().await.contains(10));
                 assert!(!app.finish_slash_resync(changed, [10].into_iter().collect()));
                 let crate::state::SlashResyncPlan::Sync { guilds, .. } =
                     app.plan_slash_resync(changed, &[20, 30])
@@ -2943,6 +2962,49 @@ mod tests {
         };
         assert!(!dm);
         assert_eq!(args.rest(), "use --dm");
+    }
+
+    /// Manual measurement of successful-registration state for 1,000 guilds on
+    /// the default commands, ten with a local override. Builds and compares the
+    /// real payloads; no Discord request is made. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "manual slash registration retention measurement"]
+    fn measure_slash_registration_retention() {
+        const GUILDS: u64 = 1_000;
+        let defaults: std::collections::HashMap<String, CommandDef> =
+            crate::defaults::default_commands()
+                .into_iter()
+                .map(|cmd| (cmd.name.clone(), cmd))
+                .collect();
+        let registry = |guild: u64| {
+            let mut registry = defaults.clone();
+            if guild.is_multiple_of(100) {
+                let mut cmd = crate::defaults::custom_command_fixture("local");
+                cmd.description = format!("guild {guild} override");
+                registry.insert(cmd.name.clone(), cmd);
+            }
+            registry
+        };
+        let registries: Vec<_> = (1..=GUILDS).map(registry).collect();
+        let mut registrations = crate::state::SlashRegistrations::default();
+        for (guild, registry) in (1..=GUILDS).zip(&registries) {
+            let payload = serde_json::to_string(&slash_commands(registry)).unwrap();
+            assert!(!registrations.matches(guild, &payload));
+            registrations.remove(guild);
+            registrations.insert(guild, payload);
+        }
+        let mut unshared = 0;
+        for (guild, registry) in (1..=GUILDS).zip(&registries) {
+            let payload = serde_json::to_string(&slash_commands(registry)).unwrap();
+            assert!(registrations.matches(guild, &payload));
+            unshared += payload.len();
+        }
+        assert_eq!(registrations.distinct_payloads(), 11);
+        println!(
+            "guilds={GUILDS} distinct_payloads={} retained_payload_bytes={} unshared_payload_bytes={unshared}",
+            registrations.distinct_payloads(),
+            registrations.payload_bytes(),
+        );
     }
 
     #[test]

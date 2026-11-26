@@ -44,6 +44,75 @@ struct SlashRetry {
     retry: crate::discord::RestRetry,
 }
 
+/// Last successful serialized Discord slash payload per guild. Guilds with
+/// identical payloads share one allocation, which is freed when the last
+/// guild referencing it is replaced or removed. Equality compares the full
+/// serialized text.
+#[derive(Default)]
+pub(crate) struct SlashRegistrations {
+    guilds: HashMap<u64, Arc<str>>,
+    payloads: HashSet<Arc<str>>,
+}
+
+impl SlashRegistrations {
+    pub(crate) fn matches(&self, guild: u64, payload: &str) -> bool {
+        self.guilds
+            .get(&guild)
+            .is_some_and(|current| **current == *payload)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, guild: u64) -> bool {
+        self.guilds.contains_key(&guild)
+    }
+
+    pub(crate) fn insert(&mut self, guild: u64, payload: String) {
+        let shared = match self.payloads.get(payload.as_str()) {
+            Some(existing) => Arc::clone(existing),
+            None => {
+                let shared = Arc::<str>::from(payload);
+                self.payloads.insert(Arc::clone(&shared));
+                shared
+            }
+        };
+        if let Some(previous) = self.guilds.insert(guild, shared) {
+            self.release(previous);
+        }
+    }
+
+    pub(crate) fn remove(&mut self, guild: u64) {
+        if let Some(previous) = self.guilds.remove(&guild) {
+            self.release(previous);
+        }
+    }
+
+    fn release(&mut self, payload: Arc<str>) {
+        // References live only in this struct: the interned copy plus this one
+        // means no guild still uses the payload.
+        if Arc::strong_count(&payload) == 2 {
+            self.payloads.remove(&*payload);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn distinct_payloads(&self) -> usize {
+        self.payloads.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn payload_bytes(&self) -> usize {
+        self.payloads.iter().map(|payload| payload.len()).sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_payload(&self, a: u64, b: u64) -> bool {
+        match (self.guilds.get(&a), self.guilds.get(&b)) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct StartupNoticeTask {
     stopping: bool,
@@ -926,7 +995,7 @@ pub struct BotState {
     slash_retries: Mutex<HashMap<u64, SlashRetry>>,
     /// Last successful Discord payload per guild. Hold this lock across the
     /// versioned read and PUT so startup, join and poll cannot register out of order.
-    pub(crate) slash_registrations: tokio::sync::Mutex<HashMap<u64, serde_json::Value>>,
+    pub(crate) slash_registrations: tokio::sync::Mutex<SlashRegistrations>,
     gateway_case_suppressions: Mutex<GatewayCaseSuppressions>,
     pub(crate) cleanup_incidents: crate::logging::CleanupIncidents,
     pub(crate) automod_delete_marks: crate::automod_delete_marks::AutomodDeleteMarkAccess,
@@ -1041,7 +1110,7 @@ impl BotState {
             slash_sync_progress: Mutex::new(None),
             slash_unauthorized: AtomicBool::new(false),
             slash_retries: Mutex::new(HashMap::new()),
-            slash_registrations: tokio::sync::Mutex::new(HashMap::new()),
+            slash_registrations: tokio::sync::Mutex::new(SlashRegistrations::default()),
             gateway_case_suppressions: Mutex::new(GatewayCaseSuppressions::default()),
             cleanup_incidents: Default::default(),
             automod_delete_marks: crate::automod_delete_marks::AutomodDeleteMarkAccess {
@@ -2257,7 +2326,7 @@ impl BotState {
 
     pub(crate) async fn forget_slash_guild(&self, guild: u64) {
         // Wait for any in-flight PUT before forgetting its result.
-        self.slash_registrations.lock().await.remove(&guild);
+        self.slash_registrations.lock().await.remove(guild);
         self.reset_slash_guild_retry(guild);
         // Discard an in-flight pass's failure set too: a confirmed leave must
         // not leave reconciliation waiting for that guild to return to cache.
@@ -2594,6 +2663,42 @@ impl ConfigCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slash_registrations_share_identical_payloads_until_unused() {
+        let defaults = r#"[{"name":"ping","description":"Ping"}]"#;
+        let changed = r#"[{"name":"ping","description":"Pong"}]"#;
+        let mut registrations = SlashRegistrations::default();
+        for guild in 1..=3 {
+            registrations.insert(guild, defaults.to_owned());
+        }
+        assert!(registrations.shares_payload(1, 2));
+        assert!(registrations.shares_payload(2, 3));
+        assert_eq!(registrations.distinct_payloads(), 1);
+        assert_eq!(registrations.payload_bytes(), defaults.len());
+        assert!(registrations.matches(3, defaults));
+        // Same length, different content: exact comparison detects it.
+        assert_eq!(defaults.len(), changed.len());
+        assert!(!registrations.matches(3, changed));
+        assert!(!registrations.matches(4, defaults));
+
+        registrations.insert(3, changed.to_owned());
+        assert!(registrations.matches(3, changed));
+        assert!(!registrations.shares_payload(2, 3));
+        assert_eq!(registrations.distinct_payloads(), 2);
+        registrations.remove(3);
+        assert!(!registrations.contains(3));
+        assert_eq!(registrations.distinct_payloads(), 1);
+        registrations.remove(1);
+        assert!(registrations.matches(2, defaults));
+        assert_eq!(registrations.distinct_payloads(), 1);
+        registrations.insert(2, changed.to_owned());
+        assert_eq!(registrations.distinct_payloads(), 1);
+        assert_eq!(registrations.payload_bytes(), changed.len());
+        registrations.remove(2);
+        registrations.remove(2);
+        assert_eq!(registrations.distinct_payloads(), 0);
+    }
 
     #[tokio::test]
     async fn ban_observation_release_and_restart_keep_registration_bounded() {
