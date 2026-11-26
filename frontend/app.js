@@ -8807,8 +8807,8 @@ async function loadCaseHistory(base, signal) {
   }
 }
 
-// The case file dialog (#624). Opens at once with a loading state, then reads the
-// case, its history, its evidence and the server's channel names together.
+// The case file dialog (#624). Opens at once and reads the case, its history,
+// and its evidence together. Evidence channel names can arrive after rendering.
 function CaseView({ guildId, caseId, onRemoved, onFilter }) {
   const base = `/api/guilds/${guildId}/cases/${caseId}`;
   const [attempt, setAttempt] = useState(0);
@@ -8817,8 +8817,11 @@ function CaseView({ guildId, caseId, onRemoved, onFilter }) {
   const note = useRef({ intent: { kind: "empty" }, activity: "idle" }).current;
   useEffect(() => {
     const controller = new AbortController();
+    const enrollment = pageEnrollment(base, "POST");
+    const canReadChannelNames = () =>
+      state.guildId === guildId && pageEnrollment(base, "POST") === enrollment && tabAllowed("settings");
     let timedOut = false;
-    const timer = setTimeout(() => {
+    let timer = setTimeout(() => {
       timedOut = true;
       controller.abort();
     }, 30000);
@@ -8827,20 +8830,31 @@ function CaseView({ guildId, caseId, onRemoved, onFilter }) {
       apiRead(base, controller.signal),
       loadCaseHistory(base, controller.signal),
       apiRead(`${base}/evidence`, controller.signal),
-      // Channel names are a settings-level read; read-only access keeps channel IDs.
-      tabAllowed("settings") ? apiRead(`/api/guilds/${guildId}/server-names`, controller.signal).catch(() => null) : null,
     ]).then(
-      ([payload, history, evidence, serverNames]) => {
+      ([payload, history, evidence]) => {
+        clearTimeout(timer);
         if (controller.signal.aborted) return;
+        const c = payload?.case || {};
+        const files = Array.isArray(evidence?.evidence) ? evidence.evidence : [];
         setView({
           status: "ready",
-          c: payload?.case || {},
+          c,
           canDelete: !!payload?.can_delete,
           names: { ...(payload?.names || {}), ...history.names },
           history: history.entries,
-          files: Array.isArray(evidence?.evidence) ? evidence.evidence : [],
-          channels: Array.isArray(serverNames?.channels) ? serverNames.channels : [],
+          files,
+          channels: [],
         });
+        const texts = Array.isArray(c.evidence?.text) ? c.evidence.text : [];
+        if (!canReadChannelNames() || !(texts.some((item) => item.channel_id) || files.some((item) => item.channel_id))) return;
+        timer = setTimeout(() => controller.abort(), 30000);
+        return apiRead(`/api/guilds/${guildId}/server-names`, controller.signal).then(
+          (data) => {
+            if (controller.signal.aborted || !canReadChannelNames() || !Array.isArray(data?.channels)) return;
+            setView((current) => ({ ...current, channels: data.channels }));
+          },
+          () => {},
+        );
       },
       (error) => {
         if (controller.signal.aborted && !timedOut) return;
