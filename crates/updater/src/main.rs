@@ -12,6 +12,11 @@ use jmodguard_updater::http_client_builder;
 #[cfg(not(test))]
 use jmodguard_updater::oci::{Registry, file_sha256, registry_unreachable, sha256_hex};
 // Compile the registry with its test-only trust fixture for controller tests.
+// Their own unit cases run in the library test target, not again here.
+#[cfg(test)]
+macro_rules! library_unit_tests {
+    ($($item:item)*) => {};
+}
 #[cfg(test)]
 pub mod oci;
 #[cfg(test)]

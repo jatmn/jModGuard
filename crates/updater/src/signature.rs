@@ -462,93 +462,95 @@ pub mod test_support {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+library_unit_tests!(
+    mod tests {
+        use super::*;
 
-    #[test]
-    fn pinned_public_key_is_spki_not_a_raw_point() {
-        let der = decode_pem_spki(CURRENT_PUBLIC_PEM).unwrap();
-        let sec1 = sec1_p256_public_key(&der).unwrap();
-        assert!(der.len() > 65);
-        assert_eq!(sec1.len(), 65);
-        assert_eq!(sec1[0], 0x04);
-        let key = trusted_key(CURRENT_PUBLIC_PEM).unwrap();
-        assert_eq!(key.keyid.len(), 64);
-    }
+        #[test]
+        fn pinned_public_key_is_spki_not_a_raw_point() {
+            let der = decode_pem_spki(CURRENT_PUBLIC_PEM).unwrap();
+            let sec1 = sec1_p256_public_key(&der).unwrap();
+            assert!(der.len() > 65);
+            assert_eq!(sec1.len(), 65);
+            assert_eq!(sec1[0], 0x04);
+            let key = trusted_key(CURRENT_PUBLIC_PEM).unwrap();
+            assert_eq!(key.keyid.len(), 64);
+        }
 
-    #[test]
-    fn missing_signer_is_a_bad_signature() {
-        let manifest = b"manifest-bytes";
-        let digest = format!("sha256:{}", crate::oci::sha256_hex(manifest));
-        let envelope = serde_json::json!({
-            "payloadType": PAYLOAD_TYPE,
-            "payload": STANDARD.encode(b"{}"),
-            "signatures": [{"keyid": "", "sig": STANDARD.encode([1u8; 64])}]
-        });
-        let error = verify_manifest_signature(
-            "bot",
-            &digest,
-            manifest,
-            &serde_json::to_vec(&envelope).unwrap(),
-            "2026-09-23T00:00:00Z".parse().unwrap(),
-            SignatureExpiry::Enforce,
-        )
-        .unwrap_err();
-        assert_eq!(
-            signature_rejection_phrase(&error),
-            Some(BAD_IMAGE_SIGNATURE)
-        );
-    }
-
-    #[test]
-    fn signed_payload_requires_the_signature_type_and_expiry() {
-        let signer = crate::signing_fixture::signing();
-        let manifest = b"manifest-bytes";
-        let digest = format!("sha256:{}", crate::oci::sha256_hex(manifest));
-        let verify = |envelope: &[u8]| {
-            verify_manifest_signature(
-                "api",
+        #[test]
+        fn missing_signer_is_a_bad_signature() {
+            let manifest = b"manifest-bytes";
+            let digest = format!("sha256:{}", crate::oci::sha256_hex(manifest));
+            let envelope = serde_json::json!({
+                "payloadType": PAYLOAD_TYPE,
+                "payload": STANDARD.encode(b"{}"),
+                "signatures": [{"keyid": "", "sig": STANDARD.encode([1u8; 64])}]
+            });
+            let error = verify_manifest_signature(
+                "bot",
                 &digest,
                 manifest,
-                envelope,
+                &serde_json::to_vec(&envelope).unwrap(),
                 "2026-09-23T00:00:00Z".parse().unwrap(),
                 SignatureExpiry::Enforce,
             )
-        };
-        let not_after = "2026-09-24T00:00:00Z";
-        verify(&test_support::sign_manifest(
-            &signer.private_pem,
-            &signer.public_pem,
-            "api",
-            &digest,
-            not_after,
-        ))
-        .unwrap();
+            .unwrap_err();
+            assert_eq!(
+                signature_rejection_phrase(&error),
+                Some(BAD_IMAGE_SIGNATURE)
+            );
+        }
 
-        for (field, expected) in [
-            ("critical.type", BAD_IMAGE_SIGNATURE),
-            ("io.jmodguard.not-after", EXPIRED_IMAGE_SIGNATURE),
-        ] {
-            let envelope = test_support::sign_manifest_with(
+        #[test]
+        fn signed_payload_requires_the_signature_type_and_expiry() {
+            let signer = crate::signing_fixture::signing();
+            let manifest = b"manifest-bytes";
+            let digest = format!("sha256:{}", crate::oci::sha256_hex(manifest));
+            let verify = |envelope: &[u8]| {
+                verify_manifest_signature(
+                    "api",
+                    &digest,
+                    manifest,
+                    envelope,
+                    "2026-09-23T00:00:00Z".parse().unwrap(),
+                    SignatureExpiry::Enforce,
+                )
+            };
+            let not_after = "2026-09-24T00:00:00Z";
+            verify(&test_support::sign_manifest(
                 &signer.private_pem,
                 &signer.public_pem,
                 "api",
                 &digest,
                 not_after,
-                |payload| {
-                    if field == "critical.type" {
-                        payload["critical"]["type"] = serde_json::json!("wrong type");
-                    } else {
-                        payload["optional"].as_object_mut().unwrap().remove(field);
-                    }
-                },
-            );
-            let result = verify(&envelope);
-            assert_eq!(
-                result.as_ref().err().and_then(signature_rejection_phrase),
-                Some(expected),
-                "{field}: {result:?}"
-            );
+            ))
+            .unwrap();
+
+            for (field, expected) in [
+                ("critical.type", BAD_IMAGE_SIGNATURE),
+                ("io.jmodguard.not-after", EXPIRED_IMAGE_SIGNATURE),
+            ] {
+                let envelope = test_support::sign_manifest_with(
+                    &signer.private_pem,
+                    &signer.public_pem,
+                    "api",
+                    &digest,
+                    not_after,
+                    |payload| {
+                        if field == "critical.type" {
+                            payload["critical"]["type"] = serde_json::json!("wrong type");
+                        } else {
+                            payload["optional"].as_object_mut().unwrap().remove(field);
+                        }
+                    },
+                );
+                let result = verify(&envelope);
+                assert_eq!(
+                    result.as_ref().err().and_then(signature_rejection_phrase),
+                    Some(expected),
+                    "{field}: {result:?}"
+                );
+            }
         }
     }
-}
+);
