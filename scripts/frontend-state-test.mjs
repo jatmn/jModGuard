@@ -12089,6 +12089,70 @@ test('display snapshots stay within the session storage budget across different 
   assert.equal(session.has(recentKey), false, 'an oversized response does not persist or leave its superseded copy');
 });
 
+// #868: inactive copies kept in memory follow the same aggregate budget as storage.
+async function memoryBudgetView() {
+  const session = new Map();
+  const fixture = { marker: 'Initial', extraSize: 0, hold: false, release: null };
+  const h = harness(async (url) => {
+    assert.match(url, /\/bans\?/);
+    const { marker, extraSize } = fixture;
+    if (fixture.hold) await new Promise((resolve) => { fixture.release = resolve; });
+    const data = banRows();
+    data.bans[0].user_display_name = marker;
+    return response({ ...data, details: 'x'.repeat(extraSize) });
+  }, new Map(), session);
+  const panel = await bansView(h);
+  return {
+    h,
+    fixture,
+    table: () => panel.querySelector('tbody').textContent,
+    stored: (marker) => [...session.values()].some((value) => value.includes(marker)),
+    async changeDate(day, marker, extraSize, hold = false) {
+      Object.assign(fixture, { marker, extraSize, hold });
+      const date = panel.querySelector('input[type="date"]');
+      date.value = new Date(Date.UTC(2026, 0, day)).toISOString().slice(0, 10);
+      await fire(date, 'change');
+    },
+    async finish() {
+      fixture.hold = false;
+      fixture.release();
+      await settle();
+    },
+  };
+}
+
+test('an oversized filtered result is shown complete but not served from memory after navigation', async () => {
+  const view = await memoryBudgetView();
+  await view.changeDate(1, 'Oversized', 1_100_000);
+  assert.match(view.table(), /Oversized/, 'the visible view keeps its complete data');
+  await view.changeDate(2, 'Other', 0);
+  assert.equal(view.stored('Oversized'), false);
+  await view.changeDate(1, 'Replacement', 0, true);
+  assert.doesNotMatch(view.table(), /Oversized/, 'an oversized prior value is not served from memory');
+  assert.match(view.table(), /Loading/);
+  await view.finish();
+  assert.match(view.table(), /Replacement/);
+});
+
+test('two admissible in-memory display copies over the combined budget evict the older one', async () => {
+  const view = await memoryBudgetView();
+  await view.changeDate(3, 'First', 600_000);
+  await view.changeDate(4, 'Second', 600_000);
+  assert.equal(view.stored('First'), false);
+  await view.changeDate(3, 'Refetched', 0, true);
+  assert.doesNotMatch(view.table(), /First/, 'the older inactive copy is not served from memory');
+  assert.match(view.table(), /Loading/);
+  await view.finish();
+  assert.match(view.table(), /Refetched/);
+
+  // The newer copy is still a warm hit that revalidates.
+  await view.changeDate(4, 'Revalidated', 0, true);
+  assert.match(view.table(), /Second/, 'the most recent admissible copy renders at once');
+  assert.equal(lastUpdated(view.h), 'Refreshing…');
+  await view.finish();
+  assert.match(view.table(), /Revalidated/);
+});
+
 test('a configuration save reclaims display copies when real session storage is full', async () => {
   let saves = 0;
   const h = harness(async (url, opts) => {
