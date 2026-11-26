@@ -1332,6 +1332,90 @@ async fn closed_scope_erasure_removes_pending_rejoin_notes() {
 }
 
 #[tokio::test]
+async fn current_rejoin_note_pairs_receipt_with_the_current_stay() {
+    const USER: i64 = 10;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let (_f, store, scope) = ready_with_probe(&probe).await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let read = || async {
+        let (stay, pending) = store
+            .current_rejoin_note(scope.clone(), USER)
+            .await
+            .unwrap();
+        (stay, pending.unwrap())
+    };
+    assert_eq!(read().await, (None, false));
+
+    store
+        .observe_member(scope.clone(), observed(USER, Some(1_000), 1_000))
+        .await
+        .unwrap();
+    let (old_stay, pending) = read().await;
+    let old_stay = old_stay.unwrap();
+    assert!(pending);
+    // A ban retains the stay and its receipt while taking the member off the roster.
+    store.observe_ban(scope.clone(), USER, 1_500).await.unwrap();
+    assert_eq!(read().await, (None, false));
+    store
+        .depart_member(scope.clone(), USER, 2_000)
+        .await
+        .unwrap();
+    assert_eq!(read().await, (None, false));
+
+    store
+        .observe_member(scope.clone(), observed(USER, Some(3_000), 3_000))
+        .await
+        .unwrap();
+    let before = probe.transactions();
+    let (current_stay, pending) = read().await;
+    assert_eq!(probe.transactions() - before, 1);
+    let current_stay = current_stay.unwrap();
+    assert_ne!(current_stay, old_stay);
+    assert!(pending);
+
+    let receipt_scope = scope.clone();
+    let receipt_stay = old_stay.clone();
+    let changed = store
+        .db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "UPDATE guild_member_pending_rejoin_notes SET stay_id=?4,joined_at_ms=1000
+                 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",
+                params![
+                    receipt_scope.guild_id(),
+                    receipt_scope.enrollment().id.as_str(),
+                    USER,
+                    receipt_stay
+                ],
+                65_536,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+    assert_eq!(read().await, (Some(current_stay.clone()), false));
+
+    store
+        .clear_pending_rejoin_note(scope.clone(), USER, &old_stay)
+        .await
+        .unwrap();
+    assert_eq!(read().await, (Some(current_stay), false));
+
+    store.close_membership(scope.clone()).await.unwrap();
+    assert!(matches!(
+        store
+            .current_rejoin_note(scope, USER)
+            .await
+            .unwrap_err()
+            .downcast_ref::<TenantDataError>(),
+        Some(TenantDataError::Membership)
+    ));
+}
+
+#[tokio::test]
 async fn live_and_page_rejoins_use_new_stays_without_old_join_reuse() {
     let (_f, store, scope) = ready().await;
     store
