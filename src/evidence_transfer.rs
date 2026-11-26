@@ -330,7 +330,7 @@ impl LocalEvidenceStore {
     fn verify_capture(
         &self,
         job: &EvidenceJob,
-        output: &mut impl Write,
+        download: Option<&mut Vec<u8>>,
     ) -> Result<CaptureVerification> {
         let [data, complete, _] = self.paths(job, false)?;
         let Some(receipt) = small_file(&complete)? else {
@@ -353,7 +353,13 @@ impl LocalEvidenceStore {
         );
         ensure!(regular(&data)?, "missing completed evidence");
         let mut file = File::open(data)?;
-        let actual = self.stream(&mut file, output, size)?;
+        let actual = if let Some(download) = download {
+            // The receipt matches the journal reservation, and stream never writes beyond it.
+            download.try_reserve_exact(usize::try_from(size)?)?;
+            self.stream(&mut file, download, size)?
+        } else {
+            self.stream(&mut file, &mut std::io::sink(), size)?
+        };
         ensure!(actual == hash, "stored evidence checksum mismatch");
         // A previous process may have died after rename but before syncing the
         // directory. Recovery must persist the verified artifacts before SQL settlement.
@@ -370,7 +376,8 @@ impl LocalEvidenceStore {
         let _lock = self.lock()?;
         self.verify()?;
         let mut buf = Vec::new();
-        let CaptureVerification::Verified(capture) = self.verify_capture(job, &mut buf)? else {
+        let CaptureVerification::Verified(capture) = self.verify_capture(job, Some(&mut buf))?
+        else {
             anyhow::bail!("evidence is not available");
         };
         ensure!(
@@ -452,7 +459,7 @@ impl LocalEvidenceStore {
             let verified = if job.cancellation == EvidenceCancellation::Cancelled {
                 Ok(CaptureVerification::Unverified)
             } else {
-                this.verify_capture(&job, &mut std::io::sink())
+                this.verify_capture(&job, None)
             };
             let capture = match &verified {
                 Ok(CaptureVerification::Verified(capture)) => EvidenceCapture::Stored {

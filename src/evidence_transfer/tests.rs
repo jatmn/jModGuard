@@ -242,6 +242,22 @@ async fn downloads_require_matching_length_receipt_and_journal_digest() {
             .to_string()
             .contains("invalid completion receipt")
     );
+    let mut oversized_reservation = visible.job.clone();
+    oversized_reservation.reserved_bytes = usize::MAX as u64;
+    fs::write(
+        &complete,
+        format!(
+            "{}\n{}\n",
+            oversized_reservation.reserved_bytes, visible.sha256
+        ),
+    )
+    .unwrap();
+    let error = f
+        .local
+        .read_available(&oversized_reservation, &visible.sha256)
+        .unwrap_err();
+    assert!(error.is::<std::collections::TryReserveError>(), "{error:#}");
+
     fs::remove_file(complete).unwrap();
     assert!(read().unwrap_err().to_string().contains("not available"));
 }
