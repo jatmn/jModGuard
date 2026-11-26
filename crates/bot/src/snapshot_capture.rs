@@ -57,7 +57,7 @@ impl DeletionBloom {
         Self {
             started: Instant::now(),
             epochs: [u64::MAX; 24],
-            bits: vec![vec![0; Self::BUCKET_BYTES]; 24],
+            bits: vec![Vec::new(); 24],
         }
     }
 
@@ -76,10 +76,14 @@ impl DeletionBloom {
     }
 
     fn insert(&mut self, key: Key) {
-        let hour = self.hour();
+        self.insert_at(key, self.hour());
+    }
+
+    fn insert_at(&mut self, key: Key, hour: u64) {
         let bucket = hour as usize % self.bits.len();
         if self.epochs[bucket] != hour {
-            self.bits[bucket].fill(0);
+            self.bits[bucket].clear();
+            self.bits[bucket].resize(Self::BUCKET_BYTES, 0);
             self.epochs[bucket] = hour;
         }
         for position in Self::positions(key) {
@@ -88,12 +92,16 @@ impl DeletionBloom {
     }
 
     fn contains(&self, key: Key) -> bool {
-        let hour = self.hour();
-        let positions = Self::positions(key);
+        self.contains_at(key, self.hour())
+    }
+
+    fn contains_at(&self, key: Key, hour: u64) -> bool {
+        let mut positions = None;
         self.bits.iter().enumerate().any(|(index, bits)| {
             hour.checked_sub(self.epochs[index])
                 .is_some_and(|age| age < 24)
                 && positions
+                    .get_or_insert_with(|| Self::positions(key))
                     .iter()
                     .all(|position| bits[position / 8] & (1 << (position % 8)) != 0)
         })
@@ -5597,16 +5605,61 @@ mod tests {
     }
 
     #[test]
-    fn deleted_identity_remains_marked_after_exact_map_would_overflow() {
+    fn deletion_bloom_allocates_by_hour_and_reuses_full_ring() {
         let mut bloom = DeletionBloom::new();
+        let capacity = |bloom: &DeletionBloom| bloom.bits.iter().map(Vec::capacity).sum::<usize>();
         let first = (1, 2, 3);
-        bloom.insert(first);
-        for id in 4..=MAX_KNOWN as u64 + 4 {
-            bloom.insert((1, 2, id));
-        }
-        assert!(bloom.contains(first));
-        bloom.started = Instant::now() - Duration::from_secs(25 * 3600);
+        let second = (1, 2, 4);
+        let third = (1, 2, 5);
+        assert_eq!(capacity(&bloom), 0, "no bitmap payload at startup");
         assert!(!bloom.contains(first));
+
+        for key in [first, second] {
+            bloom.insert_at(key, 0);
+            assert!(bloom.contains_at(key, 0));
+            assert_eq!(capacity(&bloom), DeletionBloom::BUCKET_BYTES);
+        }
+
+        bloom.insert_at(third, 23);
+        assert!(bloom.contains_at(first, 23));
+        assert!(bloom.contains_at(second, 23));
+        assert!(bloom.contains_at(third, 23));
+        assert_eq!(capacity(&bloom), 2 * DeletionBloom::BUCKET_BYTES);
+
+        // The first slot expires at hour 24, even before it is overwritten.
+        assert!(!bloom.contains_at(first, 24));
+        assert!(bloom.contains_at(third, 24));
+        for hour in 24..=47 {
+            bloom.insert_at((1, 2, hour), hour);
+        }
+        assert_eq!(capacity(&bloom), 24 * DeletionBloom::BUCKET_BYTES);
+        for hour in 24..=47 {
+            assert!(bloom.contains_at((1, 2, hour), 47));
+        }
+        assert!(!bloom.contains_at(first, 47));
+        assert!(!bloom.contains_at(third, 47));
+    }
+
+    #[test]
+    fn deleted_identity_remains_marked_after_exact_map_overflows() {
+        let ingress = SnapshotIngress::default();
+        let guild = GuildId::new(1);
+        let channel = ChannelId::new(2);
+        let ids: Vec<_> = (1..=MAX_KNOWN as u64 + 1).map(MessageId::new).collect();
+        ingress.mark_deleted(guild, channel, &ids);
+        {
+            let deleted = ingress.deleted.lock();
+            assert!(matches!(
+                deleted.knowledge((1, 2, 1)),
+                DeletionKnowledge::Possible
+            ));
+            assert!(matches!(
+                deleted.knowledge((1, 2, MAX_KNOWN as u64 + 1)),
+                DeletionKnowledge::Exact
+            ));
+        }
+        assert!(ingress.deletion_recorded(guild, channel, ids[0]));
+        assert!(ingress.deletion_recorded(guild, channel, ids[MAX_KNOWN]));
     }
 
     #[test]
