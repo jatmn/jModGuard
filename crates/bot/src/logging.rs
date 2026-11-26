@@ -1868,7 +1868,7 @@ async fn emit_to_observed_with_audit(
         {
             return Ok(Delivery::NothingToSend);
         }
-        let _ = render_log_template(event, template, &mut vars);
+        bound_log_template_vars(event, template, &mut vars);
         #[cfg(test)]
         if event == "message_edit" {
             let _ = BEFORE_EDIT_DESTINATION_RECHECK.try_with(|recover| recover());
@@ -2275,14 +2275,31 @@ fn split_automod_proving_content(content: &str) -> (Option<String>, String) {
     (None, content.to_string())
 }
 
-/// Flat review body with the existing evidence bounds. The embed delivery path
-/// reuses these variable bounds before rendering fields or a custom description.
-/// Automod `{content}` is bounded for every template, including a guild override.
+#[cfg(test)]
+thread_local! {
+    static FLAT_LOG_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn flat_log_renders() -> usize {
+    FLAT_LOG_RENDERS.with(std::cell::Cell::get)
+}
+
+/// Flat review body for evidence-bound tests.
+#[cfg(test)]
 pub(crate) fn render_log_template(
     event: &str,
     template: &str,
     vars: &mut BTreeMap<String, String>,
 ) -> String {
+    FLAT_LOG_RENDERS.with(|renders| renders.set(renders.get() + 1));
+    bound_log_template_vars(event, template, vars);
+    templates::render_bounded(template, vars, 2000)
+}
+
+/// Evidence bounds applied before rendering fields or a custom description.
+/// Automod `{content}` is bounded for every template, including a guild override.
+fn bound_log_template_vars(event: &str, template: &str, vars: &mut BTreeMap<String, String>) {
     if template == default_template(event) {
         bound_default_message_vars(event, vars);
     }
@@ -2295,7 +2312,6 @@ pub(crate) fn render_log_template(
             bound_automod_content_var(template, vars, 2000);
         }
     }
-    templates::render_bounded(template, vars, 2000)
 }
 
 fn substituted_key_count(template: &str, key: &str) -> usize {

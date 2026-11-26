@@ -6355,3 +6355,119 @@ fn shipped_automod_embed_keeps_whole_proving_hashes_inside_field_limit() {
     assert!(content.ends_with("and 25 more"));
     assert!(!content.contains('…'));
 }
+
+/// Representative edit, delete and automod reports, each long enough to need
+/// the evidence bounds, sent through the real delivery path.
+async fn bounded_report_embeds() -> Vec<serde_json::Value> {
+    let f = Fixture::new();
+    for event in ["message_edit", "message_delete", "automod"] {
+        db::upsert_log_channel(&f.app.db, 789, event, 456)
+            .await
+            .unwrap();
+    }
+    let sink = Sink::default();
+    let guild = GuildId::new(789);
+    let long = format!("{}🦀", "é".repeat(1200));
+    let base = BTreeMap::from([
+        ("time".into(), "2026-01-01T00:00:00+00:00".into()),
+        ("user".into(), "member".into()),
+        ("user_id".into(), "42".into()),
+        ("mention".into(), "<@42>".into()),
+        ("channel".into(), "general".into()),
+        ("channel_id".into(), "456".into()),
+    ]);
+    let with = |pairs: &[(&str, &str)]| {
+        let mut vars = base.clone();
+        for (key, value) in pairs {
+            vars.insert((*key).into(), (*value).into());
+        }
+        vars
+    };
+    let digests = format!("sha256 {}", proving_digests(40).join(","));
+    let reports = [
+        (
+            "message_edit",
+            with(&[("before", &long), ("after", &long), ("attachments", &long)]),
+        ),
+        (
+            "message_delete",
+            with(&[("content", &long), ("attachments", &long)]),
+        ),
+        (
+            "automod",
+            with(&[
+                ("rule", "links"),
+                ("action", "delete"),
+                ("content", &digests),
+            ]),
+        ),
+    ];
+    for (event, vars) in reports {
+        assert_eq!(
+            emit_to(&f.app, &sink, guild, event, vars).await,
+            Delivery::Sent
+        );
+    }
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_bounded(
+                "INSERT INTO templates(guild_id,event_type,template) VALUES(789,'automod','Hit: {content} by {mention}')",
+                (),
+                65_536,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    f.app.invalidate_configs();
+    let custom = with(&[("content", &format!("{digests}; {long}{long}"))]);
+    assert_eq!(
+        emit_to(&f.app, &sink, guild, "automod", custom).await,
+        Delivery::Sent
+    );
+    let messages = sink.messages.lock().unwrap();
+    messages
+        .iter()
+        .map(|(_, payload)| payload.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn embed_delivery_skips_the_discarded_flat_render() {
+    let flat_renders = flat_log_renders();
+    let embeds = bounded_report_embeds().await;
+    assert_eq!(flat_log_renders(), flat_renders);
+    let field = |embed: &serde_json::Value, name: &str| -> String {
+        embed["embeds"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["name"] == name)
+            .unwrap_or_else(|| panic!("{name}"))["value"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // The shipped layouts keep their evidence bounds, not the generic field limit.
+    for (embed, name, units) in [
+        (&embeds[0], "⏪ Before (last observed)", 600),
+        (&embeds[0], "⏩ After", 600),
+        (&embeds[0], "📎 Attachments", 240),
+        (&embeds[1], "💬 Last observed text", 900),
+        (&embeds[1], "📎 Attachments", 400),
+    ] {
+        let value = field(embed, name);
+        assert!(value.ends_with("… [display clipped]"), "{name}: {value}");
+        assert!(value.encode_utf16().count() <= units, "{name}");
+    }
+    assert_eq!(
+        field(&embeds[2], "🧾 Evidence"),
+        whole_hash_notice(&proving_digests(40), 1024)
+    );
+    let custom = embeds[3]["embeds"][0]["description"].as_str().unwrap();
+    assert!(custom.encode_utf16().count() <= 2000);
+    let evidence = custom.strip_prefix("Hit: ").unwrap();
+    assert!(evidence.ends_with(" and 10 more by <@42>"), "{custom}");
+    assert_whole_digests(evidence);
+}
