@@ -44,6 +44,7 @@ type AutomodVarsCaptureSlot = Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>
 #[cfg(test)]
 tokio::task_local! {
     static AUTOMOD_VARS_CAPTURE: AutomodVarsCaptureSlot;
+    static BEFORE_EDIT_DESTINATION_RECHECK: Box<dyn Fn() + Send + Sync>;
 }
 
 #[cfg(test)]
@@ -1820,10 +1821,6 @@ async fn emit_to_observed_with_audit(
         // channel spends a Discord request on its name.
         if event == "message_edit"
             && substituted_key_count(template, "channel") > 0
-            && app.activation.may_record()
-            && !app
-                .remembered_discord_targets
-                .blocked(rest_target, Instant::now())
             && vars
                 .get("channel")
                 .is_some_and(|value| value.starts_with("<#"))
@@ -1832,15 +1829,23 @@ async fn emit_to_observed_with_audit(
                 .and_then(|id| id.parse::<u64>().ok())
                 .filter(|id| *id != 0)
         {
-            let budget = deadline
-                .saturating_sub(started.elapsed())
-                .div_f64(2.0)
-                .min(Duration::from_secs(3));
-            let name =
+            let name = if app.activation.may_record()
+                && !app
+                    .remembered_discord_targets
+                    .blocked(rest_target, Instant::now())
+            {
+                let budget = deadline
+                    .saturating_sub(started.elapsed())
+                    .div_f64(2.0)
+                    .min(Duration::from_secs(3));
                 tokio::time::timeout(budget, sink.edit_channel_name(guild_id, ChannelId::new(id)))
                     .await
                     .ok()
-                    .flatten();
+                    .flatten()
+            } else {
+                // A destination can recover before the final send checks.
+                None
+            };
             vars.insert(
                 "channel".into(),
                 format!("#{}", name.unwrap_or_else(|| id.to_string())),
@@ -1864,6 +1869,10 @@ async fn emit_to_observed_with_audit(
             return Ok(Delivery::NothingToSend);
         }
         let _ = render_log_template(event, template, &mut vars);
+        #[cfg(test)]
+        if event == "message_edit" {
+            let _ = BEFORE_EDIT_DESTINATION_RECHECK.try_with(|recover| recover());
+        }
         if !app.activation.may_record() {
             return Ok(Delivery::Dropped);
         }

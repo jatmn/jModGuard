@@ -6209,7 +6209,7 @@ async fn message_edit_template_without_channel_skips_the_source_channel_lookup()
 }
 
 #[tokio::test]
-async fn message_edit_blocked_destination_skips_the_source_channel_lookup() {
+async fn message_edit_blocked_destination_skips_the_source_lookup_even_if_it_recovers() {
     let f = Fixture::new();
     db::upsert_log_channel(&f.app.db, 789, "message_edit", 901)
         .await
@@ -6222,6 +6222,10 @@ async fn message_edit_blocked_destination_skips_the_source_channel_lookup() {
         SequencedProxyReply::Status {
             status: 403,
             body: r#"{"code":50013,"message":"fixture"}"#,
+        },
+        SequencedProxyReply::Status {
+            status: 200,
+            body: CREATED_MESSAGE_JSON,
         },
     ])
     .await;
@@ -6249,7 +6253,6 @@ async fn message_edit_blocked_destination_skips_the_source_channel_lookup() {
         uncached_edit_source_vars(),
     )
     .await;
-    server.abort();
     let seen = request_text(&requests.lock().unwrap());
     assert_eq!(
         edit_source_channel_gets(&seen[first.len()..]),
@@ -6258,6 +6261,32 @@ async fn message_edit_blocked_destination_skips_the_source_channel_lookup() {
     );
     assert_eq!(delivery, Delivery::Blocked);
     assert_eq!(seen.len(), first.len(), "{seen:?}");
+
+    let app = Arc::clone(&f.app);
+    let delivery = BEFORE_EDIT_DESTINATION_RECHECK
+        .scope(
+            Box::new(move || app.remembered_discord_targets.clear_guild(789)),
+            emit_to(
+                &f.app,
+                &http,
+                GuildId::new(789),
+                "message_edit",
+                uncached_edit_source_vars(),
+            ),
+        )
+        .await;
+    server.abort();
+    let seen = request_text(&requests.lock().unwrap());
+    let after_recovery = &seen[first.len()..];
+    assert_eq!(edit_source_channel_gets(after_recovery), 0, "{seen:?}");
+    assert_eq!(delivery, Delivery::Sent);
+    assert_eq!(after_recovery.len(), 1, "{seen:?}");
+    assert!(after_recovery[0].starts_with("POST /api/v10/channels/901/messages "));
+    let text = log_text(&request_log_payload(&after_recovery[0]));
+    assert!(
+        text.starts_with("Message edited\n\n**Channel:** #456\n"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
