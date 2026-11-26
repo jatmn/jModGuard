@@ -1536,6 +1536,8 @@ SELECT
 
 struct ConfigurationSnapshotRows {
     versions: VersionState,
+    config_version_is_stored: bool,
+    invite_description_upgraded: bool,
     defaults: GuildSettings,
     guild_settings_raw: Option<String>,
     global_settings_raw: Option<String>,
@@ -1614,7 +1616,10 @@ fn load_configuration_snapshot_conn(
         CONFIGURATION_SNAPSHOT_SQL,
         params![guild_id, GLOBAL_SCOPE],
         |row| {
-            let config = parse_meta_version(row.get(0)?);
+            let stored_config_version = row
+                .get::<Option<String>>(0)?
+                .and_then(|raw| raw.parse().ok());
+            let config = stored_config_version.unwrap_or(0);
             let slash = parse_meta_version(row.get(1)?);
             let config_revision = row
                 .get::<Option<String>>(2)?
@@ -1661,6 +1666,8 @@ fn load_configuration_snapshot_conn(
                     config_revision,
                     slash_revision,
                 },
+                config_version_is_stored: stored_config_version.is_some(),
+                invite_description_upgraded: upgraded,
                 defaults,
                 guild_settings_raw,
                 global_settings_raw,
@@ -1866,13 +1873,14 @@ pub async fn load_web_config_snapshot(db: &Db, guild_id: i64) -> Result<WebConfi
     Ok(snapshot)
 }
 
-async fn load_config_parts_with_version_routed(
+async fn read_routed_config<T: Send + 'static>(
     db: &Db,
-    guild_id: i64,
     primary: bool,
-) -> Result<(u64, String, ConfigParts)> {
+    read: impl FnOnce(crate::db_compat::Transaction) -> Result<T> + Clone + Send + 'static,
+) -> Result<T> {
     retry_remote_interactive_read(|| {
         let db = db.clone();
+        let read = read.clone();
         async move {
             db.with_conn(move |conn| {
                 let tx = if primary {
@@ -1880,12 +1888,136 @@ async fn load_config_parts_with_version_routed(
                 } else {
                     conn.transaction_consistent_read()?
                 };
-                let snapshot = load_configuration_snapshot_conn(&tx, guild_id)?;
-                tx.finish_read()?;
-                Ok(snapshot.into_config_parts(guild_id))
+                read(tx)
             })
             .await
         }
+    })
+    .await
+}
+
+async fn load_config_parts_with_version_routed(
+    db: &Db,
+    guild_id: i64,
+    primary: bool,
+) -> Result<(u64, String, ConfigParts)> {
+    read_routed_config(db, primary, move |tx| {
+        let snapshot = load_configuration_snapshot_conn(&tx, guild_id)?;
+        tx.finish_read()?;
+        Ok(snapshot.into_config_parts(guild_id))
+    })
+    .await
+}
+
+/// Compiled bot configuration inputs that may be compared cheaply in a later
+/// snapshot. The rule markers may change without a version bump.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BotConfigProof {
+    version: u64,
+    revision: String,
+    invite_description_upgraded: bool,
+    velocity_default_dry_run: bool,
+}
+
+impl BotConfigProof {
+    fn new(
+        version: Option<u64>,
+        revision: String,
+        invite_description_upgraded: bool,
+        velocity_default_dry_run: bool,
+    ) -> Option<Self> {
+        let version = version?;
+        // This is the durable token format used by config writers. A missing
+        // revision may synthesize the same legacy value after a restore.
+        if revision.len() != 32 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(Self {
+            version,
+            revision,
+            invite_description_upgraded,
+            velocity_default_dry_run,
+        })
+    }
+}
+
+pub struct BotConfigRead {
+    pub version: u64,
+    pub revision: String,
+    pub proof: Option<BotConfigProof>,
+    /// Absent only when the supplied proof matched the entire metadata read.
+    pub parts: Option<ConfigParts>,
+}
+
+/// Revalidate an expired bot entry or resolve a full configuration within
+/// the same routed snapshot. Cold and legacy entries go directly to the full
+/// read, and nickname job status never participates in the compiled proof.
+pub async fn read_bot_config(
+    db: &Db,
+    guild_id: i64,
+    primary: bool,
+    previous: Option<BotConfigProof>,
+) -> Result<BotConfigRead> {
+    #[cfg(debug_assertions)]
+    if !primary && let Some((version, revision, parts)) = db.take_test_config_snapshot() {
+        return Ok(BotConfigRead {
+            version,
+            revision,
+            proof: None,
+            parts: Some(parts),
+        });
+    }
+
+    read_routed_config(db, primary, move |tx| {
+        if let Some(previous) = previous {
+            let proof = tx.query_row(
+                "SELECT
+                    (SELECT value FROM meta WHERE key = 'config_version'),
+                    (SELECT value FROM meta WHERE key = 'config_revision'),
+                    EXISTS(SELECT 1 FROM meta WHERE key = 'invite_description_v1'),
+                    EXISTS(SELECT 1 FROM meta WHERE key = 'velocity_default_dry_run')",
+                (),
+                |row| {
+                    let version = row
+                        .get::<Option<String>>(0)?
+                        .and_then(|raw| raw.parse().ok());
+                    let revision = row.get::<Option<String>>(1)?;
+                    Ok(BotConfigProof::new(
+                        version,
+                        revision.unwrap_or_default(),
+                        row.get(2)?,
+                        row.get(3)?,
+                    ))
+                },
+            )?;
+            if proof.as_ref() == Some(&previous) {
+                tx.finish_read()?;
+                return Ok(BotConfigRead {
+                    version: previous.version,
+                    revision: previous.revision,
+                    proof: None,
+                    parts: None,
+                });
+            }
+        }
+
+        let snapshot = load_configuration_snapshot_conn(&tx, guild_id)?;
+        tx.finish_read()?;
+        let proof = BotConfigProof::new(
+            snapshot
+                .config_version_is_stored
+                .then_some(snapshot.versions.config),
+            snapshot.versions.config_revision.clone(),
+            snapshot.invite_description_upgraded,
+            snapshot.velocity_default_dry_run,
+        );
+        let (version, revision, parts) = snapshot.into_config_parts(guild_id);
+        Ok(BotConfigRead {
+            version,
+            revision,
+            proof,
+            parts: Some(parts),
+        })
     })
     .await
 }
