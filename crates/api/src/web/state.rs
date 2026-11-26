@@ -6,8 +6,10 @@ use crate::db::{self, Db};
 use anyhow::{Context as _, Result};
 use axum::body::Bytes;
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::watch;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfigObservation {
@@ -44,21 +46,98 @@ const ANALYTICS_CACHE_MAX: usize = 256;
 /// Guild ID, membership ID and range in days.
 pub type AnalyticsCacheKey = (i64, String, i64);
 
+#[derive(Clone)]
+pub(super) enum AnalyticsLoadResult {
+    Response(Bytes),
+    Unavailable,
+}
+
+type AnalyticsLoads =
+    std::sync::Mutex<HashMap<AnalyticsCacheKey, watch::Sender<Option<AnalyticsLoadResult>>>>;
+
+pub(super) enum AnalyticsLoad<'a> {
+    Leader(AnalyticsLoadGuard<'a>),
+    Follower(watch::Receiver<Option<AnalyticsLoadResult>>),
+    Independent,
+}
+
+/// Owns one registration until its request completes or is cancelled.
+pub(super) struct AnalyticsLoadGuard<'a> {
+    loads: &'a AnalyticsLoads,
+    key: Option<&'a AnalyticsCacheKey>,
+}
+
+impl AnalyticsLoadGuard<'_> {
+    pub(super) fn publish_response(mut self, body: &Bytes) {
+        // Removing the registration first keeps new subscribers from missing
+        // the response between the count and the publish.
+        if let Some(sender) = self.take_sender()
+            && sender.receiver_count() > 0
+        {
+            sender.send_replace(Some(AnalyticsLoadResult::Response(body.clone())));
+        }
+    }
+
+    pub(super) fn unavailable(mut self) {
+        if let Some(sender) = self.take_sender() {
+            sender.send_replace(Some(AnalyticsLoadResult::Unavailable));
+        }
+    }
+
+    fn take_sender(&mut self) -> Option<watch::Sender<Option<AnalyticsLoadResult>>> {
+        let key = self.key.take()?;
+        self.loads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key)
+    }
+}
+
+impl Drop for AnalyticsLoadGuard<'_> {
+    fn drop(&mut self) {
+        // Closing an unfinished channel lets waiting requests retry.
+        drop(self.take_sender());
+    }
+}
+
 /// Short-lived encoded analytics responses per membership. Display data only: every
 /// request still authorizes the user and captures the active membership before
 /// a lookup, and a different membership never shares an entry.
 #[derive(Default)]
 pub struct AnalyticsCache {
     entries: std::sync::Mutex<std::collections::HashMap<AnalyticsCacheKey, (Instant, Bytes)>>,
+    loads: AnalyticsLoads,
 }
 
 impl AnalyticsCache {
+    #[cfg(test)]
+    pub(super) fn expire_for_test(&self, key: &AnalyticsCacheKey) {
+        self.entries.lock().unwrap().get_mut(key).unwrap().0 -= ANALYTICS_CACHE_TTL;
+    }
+
     pub fn get(&self, key: &AnalyticsCacheKey, now: Instant) -> Option<Bytes> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries
             .get(key)
             .filter(|(at, _)| now.saturating_duration_since(*at) < ANALYTICS_CACHE_TTL)
             .map(|(_, body)| body.clone())
+    }
+
+    pub(super) fn join_load<'a>(&'a self, key: &'a AnalyticsCacheKey) -> AnalyticsLoad<'a> {
+        let mut loads = self.loads.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sender) = loads.get(key) {
+            return AnalyticsLoad::Follower(sender.subscribe());
+        }
+        if loads.len() >= ANALYTICS_CACHE_MAX {
+            // Unregistered keys can still complete independently when full.
+            return AnalyticsLoad::Independent;
+        }
+        let (sender, _) = watch::channel(None);
+        loads.insert(key.clone(), sender);
+        AnalyticsLoad::Leader(AnalyticsLoadGuard {
+            loads: &self.loads,
+            key: Some(key),
+        })
     }
 
     pub fn put(&self, key: AnalyticsCacheKey, body: Bytes, now: Instant) {
@@ -76,6 +155,31 @@ impl AnalyticsCache {
 #[cfg(test)]
 mod analytics_cache_tests {
     use super::*;
+
+    #[test]
+    fn analytics_loads_are_bounded_and_released_when_their_request_ends() {
+        let cache = AnalyticsCache::default();
+        let keys: Vec<_> = (0..=ANALYTICS_CACHE_MAX as i64)
+            .map(|guild| (guild, "membership".to_owned(), 7))
+            .collect();
+        let leaders: Vec<_> = keys[..ANALYTICS_CACHE_MAX]
+            .iter()
+            .map(|key| match cache.join_load(key) {
+                AnalyticsLoad::Leader(leader) => leader,
+                _ => panic!("new keys must lead while registry slots are available"),
+            })
+            .collect();
+        assert!(matches!(
+            cache.join_load(&keys[0]),
+            AnalyticsLoad::Follower(_)
+        ));
+        assert!(matches!(
+            cache.join_load(&keys[ANALYTICS_CACHE_MAX]),
+            AnalyticsLoad::Independent
+        ));
+        drop(leaders);
+        assert!(cache.loads.lock().unwrap().is_empty());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn analytics_cache_expires_and_stays_bounded() {
