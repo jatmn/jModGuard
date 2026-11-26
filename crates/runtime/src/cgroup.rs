@@ -8,6 +8,7 @@
 //! limit that caps nothing. Nothing here writes a database or calls a provider.
 
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once, OnceLock};
@@ -175,7 +176,7 @@ impl ContainerSample {
 /// a v1 limit as no limit.
 pub fn read_cgroup(memory_dir: Option<&Path>, cpu_dir: Option<&Path>) -> CgroupReading {
     CgroupReading {
-        memory: memory_dir.and_then(|dir| read_memory(dir, None)),
+        memory: memory_dir.and_then(|dir| read_memory(dir, || None)),
         cpu: cpu_dir.and_then(read_cpu),
     }
 }
@@ -186,7 +187,7 @@ pub fn read_process_cgroup() -> CgroupReading {
 }
 
 fn read_proc_cgroup(proc: &Path, mount_root: &Path) -> CgroupReading {
-    read_scoped_proc_cgroup(proc, mount_root).counters
+    read_scoped_proc_cgroup(proc, mount_root, &mut CgroupLayout::default()).counters
 }
 
 #[derive(Default)]
@@ -195,9 +196,34 @@ struct ScopedReading {
     scopes: CgroupScopes,
 }
 
-fn read_scoped_proc_cgroup(proc: &Path, mount_root: &Path) -> ScopedReading {
-    let host_total = host_memory_total(proc);
-    let Some(text) = read_limited(&proc.join("self/cgroup")) else {
+#[derive(Default)]
+struct CgroupLayout {
+    membership: String,
+    mountinfo: String,
+    memory_dirs: Vec<CgroupDir>,
+    cpu_dirs: Vec<CgroupDir>,
+}
+
+impl CgroupLayout {
+    fn refresh(&mut self, membership: String, mountinfo: String) {
+        if self.membership != membership || self.mountinfo != mountinfo {
+            (self.memory_dirs, self.cpu_dirs) = cgroup_dirs(&membership, &mountinfo);
+            self.membership = membership;
+            self.mountinfo = mountinfo;
+        }
+    }
+}
+
+fn read_scoped_proc_cgroup(
+    proc: &Path,
+    mount_root: &Path,
+    layout: &mut CgroupLayout,
+) -> ScopedReading {
+    // Only a v1 numeric limit needs MemTotal. Read it at most once per
+    // sample even when trying more than one candidate directory.
+    let host_total = OnceCell::new();
+    let host_total = || *host_total.get_or_init(|| host_memory_total(proc));
+    let Some(membership) = read_limited(&proc.join("self/cgroup")) else {
         return ScopedReading {
             counters: read_mount_root(mount_root, host_total),
             ..ScopedReading::default()
@@ -206,8 +232,16 @@ fn read_scoped_proc_cgroup(proc: &Path, mount_root: &Path) -> ScopedReading {
     let Some(mountinfo) = read_limited(&proc.join("self/mountinfo")) else {
         return ScopedReading::default();
     };
+    // Check both proc files on every sample. Only their parsed layout can
+    // be reused; counters and inode identities must come from live reads.
+    layout.refresh(membership, mountinfo);
     let boot_id = read_limited(&proc.join("sys/kernel/random/boot_id"));
-    read_scoped_cgroup(&text, &mountinfo, host_total, boot_id.as_deref())
+    read_resolved_cgroup(
+        &layout.memory_dirs,
+        &layout.cpu_dirs,
+        host_total,
+        boot_id.as_deref(),
+    )
 }
 
 /// This process's cgroup CPU quota. `None` when no quota file is readable.
@@ -370,13 +404,13 @@ fn publish(sample: ContainerSample, scopes: CgroupScopes) {
     };
 }
 
-fn observe_process() -> Observation {
+fn observe_process(layout: &mut CgroupLayout) -> Observation {
     static LAYOUT: Once = Once::new();
     LAYOUT.call_once(|| {
         let layout = memory_layout(Path::new("/proc"), Path::new("/sys/fs/cgroup"));
         tracing::info!("{}", layout.line());
     });
-    let reading = read_scoped_proc_cgroup(Path::new("/proc"), Path::new("/sys/fs/cgroup"));
+    let reading = read_scoped_proc_cgroup(Path::new("/proc"), Path::new("/sys/fs/cgroup"), layout);
     report_memory_source(reading.counters.memory);
     Observation {
         reading,
@@ -385,6 +419,7 @@ fn observe_process() -> Observation {
 }
 
 async fn sample_loop() {
+    let mut layout = CgroupLayout::default();
     let mut rate = CpuRate::default();
     let mut cpu_tenths = None;
     let mut tick = tokio::time::interval(SAMPLE_INTERVAL);
@@ -394,12 +429,21 @@ async fn sample_loop() {
             _ = crate::shutdown_signal() => break,
             _ = tick.tick() => {}
         }
-        let observed = tokio::task::spawn_blocking(observe_process)
-            .await
-            .unwrap_or_else(|_| Observation {
-                reading: ScopedReading::default(),
-                at: Instant::now(),
-            });
+        let (next_layout, observed) = tokio::task::spawn_blocking(move || {
+            let observed = observe_process(&mut layout);
+            (layout, observed)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            (
+                CgroupLayout::default(),
+                Observation {
+                    reading: ScopedReading::default(),
+                    at: Instant::now(),
+                },
+            )
+        });
+        layout = next_layout;
         let sample = fold_sample(
             &mut rate,
             cpu_tenths,
@@ -413,7 +457,7 @@ async fn sample_loop() {
 }
 
 /// Counters at a cgroup mount when `/proc/self/cgroup` itself cannot be read.
-fn read_mount_root(mount: &Path, host_total: Option<u64>) -> CgroupReading {
+fn read_mount_root(mount: &Path, host_total: impl FnOnce() -> Option<u64>) -> CgroupReading {
     CgroupReading {
         memory: read_memory(mount, host_total),
         cpu: read_cpu(mount),
@@ -463,15 +507,14 @@ struct CgroupEntry {
     path: String,
 }
 
-fn read_scoped_cgroup(
-    cgroup_text: &str,
-    mountinfo: &str,
-    host_total: Option<u64>,
+fn read_resolved_cgroup(
+    memory_dirs: &[CgroupDir],
+    cpu_dirs: &[CgroupDir],
+    host_total: impl Fn() -> Option<u64>,
     boot_id: Option<&str>,
 ) -> ScopedReading {
-    let (memory_dirs, cpu_dirs) = cgroup_dirs(cgroup_text, mountinfo);
-    let memory = first_reading(&memory_dirs, |dir| read_memory(dir, host_total));
-    let cpu = first_reading(&cpu_dirs, read_cpu);
+    let memory = first_reading(memory_dirs, |dir| read_memory(dir, &host_total));
+    let cpu = first_reading(cpu_dirs, read_cpu);
     let boot_id = boot_id.map(str::trim).filter(|id| {
         id.len() == 36
             && id
@@ -479,19 +522,29 @@ fn read_scoped_cgroup(
                 .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
     });
     let lineage = |dir: &CgroupDir| boot_id.map(|id| dir.lineage(id)).unwrap_or_default();
+    let memory_scope = memory.map(|(dir, _)| lineage(dir)).unwrap_or_default();
+    let cpu_scope = cpu
+        .map(|(dir, _)| {
+            if memory.is_some_and(|(memory_dir, _)| memory_dir == dir) {
+                memory_scope.clone()
+            } else {
+                lineage(dir)
+            }
+        })
+        .unwrap_or_default();
     ScopedReading {
         counters: CgroupReading {
             memory: memory.map(|(_, memory)| memory),
             cpu: cpu.map(|(_, cpu)| cpu),
         },
         scopes: CgroupScopes {
-            memory: memory.map(|(dir, _)| lineage(dir)).unwrap_or_default(),
-            cpu: cpu.map(|(dir, _)| lineage(dir)).unwrap_or_default(),
+            memory: memory_scope,
+            cpu: cpu_scope,
         },
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct CgroupDir {
     path: PathBuf,
     mount: PathBuf,
@@ -810,7 +863,7 @@ fn join_cgroup(mount: &Path, proc_path: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-fn read_memory(dir: &Path, host_total: Option<u64>) -> Option<MemoryUse> {
+fn read_memory(dir: &Path, host_total: impl FnOnce() -> Option<u64>) -> Option<MemoryUse> {
     let v2_path = dir.join("memory.current");
     if let Some(text) = read_limited(&v2_path) {
         return parse_v2_memory(dir, &text);
@@ -912,7 +965,11 @@ fn parse_v2_memory(dir: &Path, current_text: &str) -> Option<MemoryUse> {
     memory_use(current, &stat, read_memory_limit(dir, "memory.max")?, None)
 }
 
-fn parse_v1_memory(dir: &Path, current_text: &str, host_total: Option<u64>) -> Option<MemoryUse> {
+fn parse_v1_memory(
+    dir: &Path,
+    current_text: &str,
+    host_total: impl FnOnce() -> Option<u64>,
+) -> Option<MemoryUse> {
     let current = memory_input(parse_u64_token(current_text), "memory.usage_in_bytes")?;
     let Some(stat) = read_memory_stat(dir) else {
         return usage_only(current, read_v1_memory_limit(dir, host_total)?);
@@ -932,10 +989,13 @@ fn parse_v1_memory(dir: &Path, current_text: &str, host_total: Option<u64>) -> O
 // container's own cap as MemTotal (LXCFS, gVisor), a real cap equal to it
 // shows as no limit; (b) a cgroup v2 numeric memory.max at or above host
 // memory is still shown, because only v1 uses the host-total check.
-fn read_v1_memory_limit(dir: &Path, host_total: Option<u64>) -> Option<MemoryLimit> {
+fn read_v1_memory_limit(
+    dir: &Path,
+    host_total: impl FnOnce() -> Option<u64>,
+) -> Option<MemoryLimit> {
     match read_memory_limit(dir, "memory.limit_in_bytes")? {
         MemoryLimit::Bytes(bytes)
-            if bytes >= V1_UNLIMITED_BYTES || host_total.is_some_and(|total| bytes >= total) =>
+            if bytes >= V1_UNLIMITED_BYTES || host_total().is_some_and(|total| bytes >= total) =>
         {
             Some(MemoryLimit::Unlimited)
         }
@@ -1109,7 +1169,7 @@ fn memory_layout(proc: &Path, mount_root: &Path) -> MemoryLayout {
             let (memory_dirs, cpu_dirs) = cgroup_dirs(text, info);
             (
                 // The host total only changes the limit, never which dir reads.
-                supplying_dir(&memory_dirs, |dir| read_memory(dir, None)),
+                supplying_dir(&memory_dirs, |dir| read_memory(dir, || None)),
                 supplying_dir(&cpu_dirs, read_cpu),
             )
         }
@@ -1220,6 +1280,16 @@ mod tests {
         host_total: Option<u64>,
     ) -> CgroupReading {
         read_scoped_cgroup(cgroup_text, mountinfo, host_total, None).counters
+    }
+
+    fn read_scoped_cgroup(
+        cgroup_text: &str,
+        mountinfo: &str,
+        host_total: Option<u64>,
+        boot_id: Option<&str>,
+    ) -> ScopedReading {
+        let (memory_dirs, cpu_dirs) = cgroup_dirs(cgroup_text, mountinfo);
+        read_resolved_cgroup(&memory_dirs, &cpu_dirs, || host_total, boot_id)
     }
 
     struct TempTree {
@@ -1522,7 +1592,7 @@ mod tests {
             ],
         );
         // Root memory.stat alone must not be treated as container usage.
-        let reading = read_mount_root(&tree.path, None);
+        let reading = read_mount_root(&tree.path, || None);
         assert_eq!(reading.memory, None);
         assert_eq!(reading.cpu.unwrap().usage, Duration::from_micros(5000));
     }
@@ -1706,7 +1776,7 @@ mod tests {
                 ("memory.max", "max\n"),
             ],
         );
-        let reading = read_mount_root(&tree.path, None);
+        let reading = read_mount_root(&tree.path, || None);
         assert_eq!(reading.memory.unwrap().program_bytes, 30);
     }
 
@@ -1766,6 +1836,117 @@ mod tests {
             started + Duration::from_secs(3),
         );
         assert_eq!(moved.cpu_tenths, None, "a new cgroup needs a new baseline");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn warmed_sampler_reads_live_counters_and_recovers_after_layout_changes() {
+        let proc = temp_tree();
+        let tree = temp_tree();
+        let mount = tree.path.join("mount");
+        let remount = tree.path.join("remount");
+        let parent = mount.join("parent");
+        let worker = parent.join("worker");
+        let other = mount.join("other");
+        for (dir, cpu) in [
+            (&worker, "usage_usec 5000\n"),
+            (&other, "usage_usec 5000000\n"),
+            (&remount, "usage_usec 8000000\n"),
+        ] {
+            write_files(
+                dir,
+                &[
+                    ("memory.current", "1000\n"),
+                    ("memory.stat", "inactive_file 100\n"),
+                    ("memory.max", "max\n"),
+                    ("cpu.stat", cpu),
+                ],
+            );
+        }
+        write_files(
+            &proc.path,
+            &[
+                ("self/cgroup", "0::/parent/worker\n"),
+                ("self/mountinfo", &v2_mount_line("/", &mount)),
+                (
+                    "sys/kernel/random/boot_id",
+                    "aabbccdd-aabb-ccdd-aabb-aabbccddaabb\n",
+                ),
+            ],
+        );
+
+        let mut layout = CgroupLayout::default();
+        let mut rate = CpuRate::default();
+        let start = tokio::time::Instant::now().into_std();
+        let mut observe = |seconds| {
+            let reading = read_scoped_proc_cgroup(&proc.path, &mount, &mut layout);
+            let sample = fold_sample(
+                &mut rate,
+                None,
+                reading.counters,
+                reading.scopes.cpu.first().copied(),
+                start + Duration::from_secs(seconds),
+            );
+            (sample, reading.scopes)
+        };
+        let (initial, initial_scopes) = observe(0);
+        assert_eq!(initial.cpu_tenths, None);
+        assert_eq!(initial_scopes.cpu, initial_scopes.memory);
+        assert_eq!(initial_scopes.cpu.len(), 3);
+
+        write_files(
+            &worker,
+            &[
+                ("cpu.stat", "usage_usec 1005000\n"),
+                ("memory.current", "1200\n"),
+            ],
+        );
+        let (warm, warm_scopes) = observe(5);
+        assert_eq!(warm.cpu_tenths, Some(200));
+        assert_eq!(warm.memory.unwrap().program_bytes, 1100);
+        assert_eq!(warm_scopes, initial_scopes);
+
+        // The resolved path and leaf identity stay the same but an ancestor
+        // was replaced. Lineage must change without losing the CPU baseline.
+        let retired = tree.path.join("retired");
+        std::fs::rename(&parent, &retired).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::rename(retired.join("worker"), &worker).unwrap();
+        write_files(&worker, &[("cpu.stat", "usage_usec 2005000\n")]);
+        let (reparented, updated_scopes) = observe(10);
+        assert_eq!(reparented.cpu_tenths, Some(200));
+        assert_eq!(updated_scopes.cpu[0], initial_scopes.cpu[0]);
+        assert_ne!(updated_scopes.cpu[1], initial_scopes.cpu[1]);
+        assert_eq!(updated_scopes.cpu, updated_scopes.memory);
+
+        write_files(&proc.path, &[("self/cgroup", "0::/other\n")]);
+        let (moved, moved_scopes) = observe(15);
+        assert_eq!(moved.cpu_tenths, None);
+        assert_eq!(
+            moved_scopes.cpu_relation(&updated_scopes),
+            CgroupRelation::Disjoint
+        );
+
+        write_files(
+            &proc.path,
+            &[("self/mountinfo", &v2_mount_line("/other", &remount))],
+        );
+        let (mounted, mounted_scopes) = observe(20);
+        assert_eq!(mounted.cpu_tenths, None);
+        assert_eq!(mounted_scopes.cpu.len(), 1);
+        assert_ne!(mounted_scopes.cpu[0], moved_scopes.cpu[0]);
+        write_files(&remount, &[("cpu.stat", "usage_usec 9000000\n")]);
+        assert_eq!(observe(25).0.cpu_tenths, Some(200));
+
+        std::fs::remove_file(proc.path.join("self/mountinfo")).unwrap();
+        let (unavailable, scopes) = observe(30);
+        assert_eq!(unavailable, ContainerSample::unavailable());
+        assert!(scopes.is_empty());
+        write_files(
+            &proc.path,
+            &[("self/mountinfo", &v2_mount_line("/other", &remount))],
+        );
+        assert_eq!(observe(35), (mounted, mounted_scopes));
     }
 
     #[cfg(target_os = "linux")]
