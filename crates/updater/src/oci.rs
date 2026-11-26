@@ -5,12 +5,14 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use jmodguard::db::ComponentRelease;
 use reqwest::header::{ACCEPT, CONTENT_LENGTH};
-use ring::digest::{SHA256, digest};
+use ring::digest::{Context as DigestContext, SHA256, digest};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Read;
-use std::path::Component;
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_MANIFEST: usize = 2 * 1024 * 1024;
 const MAX_CONFIG: usize = 256 * 1024;
@@ -20,11 +22,118 @@ const MAX_FILE: u64 = 64 * 1024 * 1024;
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    digest(&SHA256, bytes)
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex(digest(&SHA256, bytes).as_ref())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Hash a file incrementally instead of reading it into memory.
+pub async fn file_sha256(path: &Path) -> Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut context = DigestContext::new(&SHA256);
+    let mut buffer = vec![0; STREAM_BUFFER];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(hex(context.finish().as_ref()));
+        }
+        context.update(&buffer[..read]);
+    }
+}
+
+const STREAM_BUFFER: usize = 64 * 1024;
+const EXECUTABLE_HEADER: usize = 4;
+
+/// A file in the launcher staging directory. It is removed on drop, including
+/// when staging fails or its future is cancelled, unless it was renamed into place.
+struct TempFile(Option<PathBuf>);
+
+impl TempFile {
+    fn new(dir: &Path, prefix: &str) -> Self {
+        Self(Some(
+            dir.join(format!(".{prefix}-{:032x}", rand::random::<u128>())),
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        self.0
+            .as_deref()
+            .expect("temporary file was already persisted")
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The requested executable, streamed from a digest-verified release layer to
+/// an unpublished file in the staging directory, plus the image file inventory.
+pub struct StagedExecutable {
+    file: TempFile,
+    sha256: String,
+    size: u64,
+    header: Vec<u8>,
+    inventory: Vec<u8>,
+}
+
+impl StagedExecutable {
+    pub fn path(&self) -> &Path {
+        self.file.path()
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The executable's first bytes, enough for its ELF magic.
+    pub fn header(&self) -> &[u8] {
+        &self.header
+    }
+
+    pub fn inventory(&self) -> &[u8] {
+        &self.inventory
+    }
+
+    /// Atomically rename the executable to `target`; it is no longer removed on drop.
+    pub async fn persist(mut self, target: &Path) -> Result<()> {
+        tokio::fs::rename(self.file.path(), target).await?;
+        self.file.0 = None;
+        Ok(())
+    }
+}
+
+struct HashingWriter<W> {
+    inner: W,
+    context: DigestContext,
+    size: u64,
+    header: Vec<u8>,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        let bytes = &buf[..written];
+        self.context.update(bytes);
+        let missing = EXECUTABLE_HEADER.saturating_sub(self.header.len());
+        self.header
+            .extend_from_slice(&bytes[..missing.min(bytes.len())]);
+        self.size += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -196,24 +305,7 @@ impl Registry {
         accept: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<u8>, reqwest::header::HeaderMap)> {
-        let mut request = self.http.get(url);
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
-        }
-        if let Some(accept) = accept {
-            request = request.header(ACCEPT, accept);
-        }
-        let mut response = request.send().await.map_err(reqwest::Error::without_url)?;
-        ensure!(
-            response.status().is_success(),
-            "registry returned HTTP {}",
-            response.status()
-        );
-        if let Some(raw) = response.headers().get(CONTENT_LENGTH)
-            && let Ok(length) = raw.to_str()?.parse::<u64>()
-        {
-            ensure!(length <= limit as u64, "registry object exceeds size limit");
-        }
+        let mut response = self.open_limited(url, token, accept, limit).await?;
         let headers = response.headers().clone();
         let mut body = Vec::new();
         while let Some(chunk) = response
@@ -228,6 +320,34 @@ impl Registry {
             body.extend_from_slice(&chunk);
         }
         Ok((body, headers))
+    }
+
+    async fn open_limited(
+        &self,
+        url: String,
+        token: Option<&str>,
+        accept: Option<&str>,
+        limit: usize,
+    ) -> Result<reqwest::Response> {
+        let mut request = self.http.get(url);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        if let Some(accept) = accept {
+            request = request.header(ACCEPT, accept);
+        }
+        let response = request.send().await.map_err(reqwest::Error::without_url)?;
+        ensure!(
+            response.status().is_success(),
+            "registry returned HTTP {}",
+            response.status()
+        );
+        if let Some(raw) = response.headers().get(CONTENT_LENGTH)
+            && let Ok(length) = raw.to_str()?.parse::<u64>()
+        {
+            ensure!(length <= limit as u64, "registry object exceeds size limit");
+        }
+        Ok(response)
     }
 
     async fn signature_body(&self, repo: &str, manifest_digest: &str) -> Result<Vec<u8>> {
@@ -385,6 +505,54 @@ impl Registry {
         Ok(bytes)
     }
 
+    /// `blob` written to `path` with incremental hashing. The caller trusts
+    /// nothing in the file unless this returns success.
+    async fn blob_to_file(
+        &self,
+        repo: &str,
+        descriptor: &Descriptor,
+        limit: usize,
+        path: &Path,
+    ) -> Result<()> {
+        ensure!(
+            valid_digest(&descriptor.digest) && descriptor.size <= limit as u64,
+            "invalid blob descriptor"
+        );
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .await?;
+        let token = self.token(repo).await?;
+        let url = format!("{}/v2/{repo}/blobs/{}", self.base, descriptor.digest);
+        let mut response = self
+            .open_limited(url, token.as_deref(), None, limit)
+            .await?;
+        let mut context = DigestContext::new(&SHA256);
+        let mut received = 0u64;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url)?
+        {
+            ensure!(
+                received.saturating_add(chunk.len() as u64) <= limit as u64,
+                "registry object exceeds size limit"
+            );
+            context.update(&chunk);
+            file.write_all(&chunk).await?;
+            received += chunk.len() as u64;
+        }
+        file.flush().await?;
+        ensure!(received == descriptor.size, "blob size mismatch");
+        ensure!(
+            format!("sha256:{}", hex(context.finish().as_ref())) == descriptor.digest,
+            "blob digest mismatch"
+        );
+        Ok(())
+    }
+
     async fn config(&self, repo: &str, manifest: &Manifest) -> Result<ImageConfig> {
         let bytes = self.blob(repo, &manifest.config, MAX_CONFIG).await?;
         Ok(serde_json::from_slice(&bytes)?)
@@ -534,6 +702,43 @@ impl Registry {
         self.read_release_layer(layer, requested).await
     }
 
+    /// Launcher staging form of `files`. The verified layer and the
+    /// executable stream through `dir` instead of both being held in memory.
+    pub async fn stage_executable(
+        &self,
+        release: &ComponentRelease,
+        executable: &str,
+        inventory: &str,
+        dir: &Path,
+    ) -> Result<StagedExecutable> {
+        let layer = self
+            .verified_release_layer(
+                release,
+                &[executable, inventory],
+                signature::SignatureExpiry::Enforce,
+            )
+            .await?;
+        self.stage_release_layer(layer, executable, inventory, dir)
+            .await
+    }
+
+    /// Launcher staging form of `files_for_installed_restore`, with the same
+    /// installation record and signature requirements.
+    pub async fn stage_installed_executable(
+        &self,
+        control: &jmodguard::db::UpdateControl,
+        release: &ComponentRelease,
+        executable: &str,
+        inventory: &str,
+        dir: &Path,
+    ) -> Result<StagedExecutable> {
+        let layer = self
+            .installed_layer(control, release, &[executable, inventory])
+            .await?;
+        self.stage_release_layer(layer, executable, inventory, dir)
+            .await
+    }
+
     pub(crate) async fn installed_layer(
         &self,
         control: &jmodguard::db::UpdateControl,
@@ -611,6 +816,84 @@ impl Registry {
         let bytes = self.blob(layer.repo, &layer.descriptor, MAX_LAYER).await?;
         extract_layer(&bytes, &layer.descriptor.media_type, requested)
     }
+
+    /// Download the layer to a temporary file, verify its size and digest,
+    /// then extract the executable to another. Both are removed on failure or
+    /// cancellation; the layer file is removed once extraction finishes.
+    async fn stage_release_layer(
+        &self,
+        layer: VerifiedReleaseLayer,
+        executable: &str,
+        inventory: &str,
+        dir: &Path,
+    ) -> Result<StagedExecutable> {
+        tokio::fs::create_dir_all(dir).await?;
+        let blob = TempFile::new(dir, "layer");
+        self.blob_to_file(layer.repo, &layer.descriptor, MAX_LAYER, blob.path())
+            .await?;
+        let staged = TempFile::new(dir, "stage");
+        let media = layer.descriptor.media_type;
+        let (executable, inventory) = (executable.to_owned(), inventory.to_owned());
+        tokio::task::spawn_blocking(move || {
+            extract_executable(&blob, &media, &executable, &inventory, staged)
+        })
+        .await?
+    }
+}
+
+fn extract_executable(
+    layer: &TempFile,
+    media: &str,
+    executable: &str,
+    inventory: &str,
+    staged: TempFile,
+) -> Result<StagedExecutable> {
+    let reader =
+        std::io::BufReader::with_capacity(STREAM_BUFFER, std::fs::File::open(layer.path())?);
+    let mut written = None;
+    let mut listed = None;
+    walk_layer(
+        Box::new(reader),
+        media,
+        &[executable, inventory],
+        |name, entry, size| {
+            if name == inventory {
+                let mut data = Vec::with_capacity(size as usize);
+                entry.read_to_end(&mut data)?;
+                ensure!(data.len() as u64 == size, "truncated release file");
+                listed = Some(data);
+                return Ok(());
+            }
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(staged.path())?;
+            let mut writer = HashingWriter {
+                inner: std::io::BufWriter::with_capacity(STREAM_BUFFER, file),
+                context: DigestContext::new(&SHA256),
+                size: 0,
+                header: Vec::with_capacity(EXECUTABLE_HEADER),
+            };
+            std::io::copy(entry, &mut writer)?;
+            writer.flush()?;
+            ensure!(writer.size == size, "truncated release file");
+            written = Some((
+                hex(writer.context.finish().as_ref()),
+                writer.size,
+                writer.header,
+            ));
+            Ok(())
+        },
+    )?;
+    let (sha256, size, header) = written.context("release layer is missing a required file")?;
+    Ok(StagedExecutable {
+        file: staged,
+        sha256,
+        size,
+        header,
+        inventory: listed.context("release layer is missing a required file")?,
+    })
 }
 
 fn extract_layer(
@@ -618,18 +901,37 @@ fn extract_layer(
     media: &str,
     requested: &[&str],
 ) -> Result<HashMap<String, Vec<u8>>> {
-    let reader: Box<dyn Read + '_> = match media {
+    let mut found = HashMap::new();
+    walk_layer(Box::new(bytes), media, requested, |name, entry, size| {
+        let mut data = Vec::with_capacity(size as usize);
+        entry.read_to_end(&mut data)?;
+        ensure!(data.len() as u64 == size, "truncated release file");
+        found.insert(name.to_owned(), data);
+        Ok(())
+    })?;
+    Ok(found)
+}
+
+/// Apply every archive limit and path check, handing each requested regular
+/// file to `take` exactly once.
+fn walk_layer<'a>(
+    layer: Box<dyn Read + 'a>,
+    media: &str,
+    requested: &[&str],
+    mut take: impl FnMut(&str, &mut dyn Read, u64) -> Result<()>,
+) -> Result<()> {
+    let reader: Box<dyn Read + 'a> = match media {
         "application/vnd.oci.image.layer.v1.tar+gzip"
         | "application/vnd.docker.image.rootfs.diff.tar.gzip" => {
-            Box::new(flate2::read::GzDecoder::new(bytes))
+            Box::new(flate2::read::GzDecoder::new(layer))
         }
-        "application/vnd.oci.image.layer.v1.tar" => Box::new(bytes),
+        "application/vnd.oci.image.layer.v1.tar" => layer,
         _ => bail!("unsupported image layer compression"),
     };
     let mut archive = tar::Archive::new(reader);
     let wanted: HashSet<&str> = requested.iter().copied().collect();
     ensure!(wanted.len() == requested.len(), "duplicate file request");
-    let mut found = HashMap::new();
+    let mut found = HashSet::new();
     let mut total = 0u64;
     let mut count = 0usize;
     for entry in archive.entries()? {
@@ -657,20 +959,18 @@ fn extract_layer(
         ensure!(total <= MAX_UNPACKED, "unpacked layer exceeds limit");
         if wanted.contains(name.as_str()) {
             ensure!(
-                kind.is_file() && size <= MAX_FILE && !found.contains_key(&name),
+                kind.is_file() && size <= MAX_FILE && !found.contains(&name),
                 "invalid or duplicate release file"
             );
-            let mut data = Vec::with_capacity(size as usize);
-            entry.read_to_end(&mut data)?;
-            ensure!(data.len() as u64 == size, "truncated release file");
-            found.insert(name, data);
+            take(&name, &mut entry, size)?;
+            found.insert(name);
         }
     }
     ensure!(
         found.len() == wanted.len(),
         "release layer is missing a required file"
     );
-    Ok(found)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -893,6 +1193,200 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    const BOT: &str = "usr/local/bin/jmodguard-bot";
+    const INVENTORY: &str = "usr/local/share/jmodguard/files.sha256";
+    const GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+
+    fn verified(bytes: &[u8], media: &str) -> VerifiedReleaseLayer {
+        VerifiedReleaseLayer {
+            repo: "jatmn/jmodguard-bot",
+            descriptor: Descriptor {
+                digest: format!("sha256:{}", sha256_hex(bytes)),
+                size: bytes.len() as u64,
+                media_type: media.into(),
+                annotations: BTreeMap::new(),
+            },
+        }
+    }
+
+    async fn serve_blob(body: Vec<u8>) -> (Registry, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let registry =
+            Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let body = std::sync::Arc::new(body);
+        let app = axum::Router::new().fallback(move || {
+            let body = body.clone();
+            async move { body.as_ref().clone() }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (registry, server)
+    }
+
+    fn staging_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("oci-stage-{:032x}", rand::random::<u128>()))
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn executable_body() -> Vec<u8> {
+        let mut body = b"\x7fELF".to_vec();
+        body.extend((0..300_000u32).map(|index| (index % 251) as u8));
+        body
+    }
+
+    #[tokio::test]
+    async fn streamed_staging_matches_in_memory_extraction() {
+        let executable = executable_body();
+        let inventory = format!("{}  bin/jmodguard-bot\n", sha256_hex(&executable));
+        let bytes = layer(&[
+            ("usr/local/bin/other", b"ignored", tar::EntryType::Regular),
+            (BOT, &executable, tar::EntryType::Regular),
+            (INVENTORY, inventory.as_bytes(), tar::EntryType::Regular),
+        ]);
+        let expected = extract_layer(&bytes, GZIP, &[BOT, INVENTORY]).unwrap();
+        let descriptor = verified(&bytes, GZIP);
+        let (registry, server) = serve_blob(bytes).await;
+        let dir = staging_dir();
+        let staged = registry
+            .stage_release_layer(descriptor, BOT, INVENTORY, &dir)
+            .await
+            .unwrap();
+        assert_eq!(staged.sha256(), sha256_hex(&expected[BOT]));
+        assert_eq!(staged.size(), executable.len() as u64);
+        assert_eq!(staged.header(), b"\x7fELF");
+        assert_eq!(staged.inventory(), expected[INVENTORY].as_slice());
+        assert_eq!(std::fs::read(staged.path()).unwrap(), expected[BOT]);
+        let temporary = names(&dir);
+        assert_eq!(temporary.len(), 1, "{temporary:?}");
+        assert!(
+            temporary[0].starts_with(".stage-"),
+            "the layer file must be removed after extraction: {temporary:?}"
+        );
+        let target = dir.join("bot-target");
+        staged.persist(&target).await.unwrap();
+        assert_eq!(names(&dir), ["bot-target"]);
+        assert_eq!(file_sha256(&target).await.unwrap(), sha256_hex(&executable));
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamed_staging_failures_remove_temporary_files() {
+        let executable = executable_body();
+        let inventory = format!("{}  bin/jmodguard-bot\n", sha256_hex(&executable));
+        let good = layer(&[
+            (BOT, &executable, tar::EntryType::Regular),
+            (INVENTORY, inventory.as_bytes(), tar::EntryType::Regular),
+        ]);
+        let mut corrupt = good.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        // The executable is fully written before the archive is refused.
+        let special = layer(&[
+            (BOT, &executable, tar::EntryType::Regular),
+            ("usr/local/bin/link", b"", tar::EntryType::Symlink),
+            (INVENTORY, inventory.as_bytes(), tar::EntryType::Regular),
+        ]);
+        let missing = layer(&[(BOT, &executable, tar::EntryType::Regular)]);
+        let oversized = VerifiedReleaseLayer {
+            repo: "jatmn/jmodguard-bot",
+            descriptor: Descriptor {
+                size: MAX_LAYER as u64 + 1,
+                ..verified(&good, GZIP).descriptor
+            },
+        };
+        let cases = [
+            (verified(&good, GZIP), corrupt, "blob digest mismatch"),
+            (
+                verified(&good, GZIP),
+                good[..good.len() - 10].to_vec(),
+                "blob size mismatch",
+            ),
+            (
+                verified(&good, "application/vnd.oci.image.layer.v1.tar+zstd"),
+                good.clone(),
+                "unsupported image layer compression",
+            ),
+            (
+                verified(&special, GZIP),
+                special.clone(),
+                "link or special file in release layer",
+            ),
+            (
+                verified(&missing, GZIP),
+                missing.clone(),
+                "release layer is missing a required file",
+            ),
+            (oversized, good.clone(), "invalid blob descriptor"),
+        ];
+        for (descriptor, served, expected) in cases {
+            let (registry, server) = serve_blob(served).await;
+            let dir = staging_dir();
+            let error = match registry
+                .stage_release_layer(descriptor, BOT, INVENTORY, &dir)
+                .await
+            {
+                Ok(_) => panic!("{expected}: staging must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(error.to_string(), expected);
+            assert!(!registry_unreachable(&error), "{expected}");
+            assert_eq!(names(&dir), Vec::<String>::new(), "{expected}");
+            server.abort();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_streamed_staging_removes_the_partial_layer() {
+        let executable = executable_body();
+        let bytes = layer(&[(BOT, &executable, tar::EntryType::Regular)]);
+        let descriptor = verified(&bytes, GZIP);
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let registry =
+            Registry::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let (sent, mut partial) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                .await
+                .unwrap();
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len());
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(&bytes[..bytes.len() / 2]).await.unwrap();
+            sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let dir = staging_dir();
+        let mut staging = Box::pin(registry.stage_release_layer(descriptor, BOT, INVENTORY, &dir));
+        tokio::select! {
+            biased;
+            result = &mut staging => panic!("staging finished early: {:?}", result.err()),
+            _ = &mut partial => {}
+        }
+        let partial = names(&dir);
+        assert_eq!(partial.len(), 1, "{partial:?}");
+        assert!(partial[0].starts_with(".layer-"), "{partial:?}");
+        drop(staging);
+        assert_eq!(names(&dir), Vec::<String>::new());
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

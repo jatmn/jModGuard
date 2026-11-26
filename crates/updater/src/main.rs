@@ -10,7 +10,7 @@ use jmodguard_updater::compatible_control;
 #[cfg(test)]
 use jmodguard_updater::http_client_builder;
 #[cfg(not(test))]
-use jmodguard_updater::oci::{Registry, registry_unreachable, sha256_hex};
+use jmodguard_updater::oci::{Registry, file_sha256, registry_unreachable, sha256_hex};
 // Compile the registry with its test-only trust fixture for controller tests.
 #[cfg(test)]
 pub mod oci;
@@ -21,7 +21,7 @@ pub mod signing_fixture;
 #[cfg(not(test))]
 use jmodguard_updater::signature::signature_rejection_phrase;
 #[cfg(test)]
-use oci::{Registry, registry_unreachable, sha256_hex};
+use oci::{Registry, file_sha256, registry_unreachable, sha256_hex};
 #[cfg(test)]
 use signature::signature_rejection_phrase;
 use std::collections::VecDeque;
@@ -696,43 +696,38 @@ async fn stage(
     trust: StageTrust<'_>,
 ) -> Result<PathBuf> {
     let path = format!("usr/local/bin/{name}");
-    let requested = [&path, "usr/local/share/jmodguard/files.sha256"];
-    let files = match trust {
-        StageTrust::NewInstall => registry.files(release, &requested).await?,
+    let inventory = "usr/local/share/jmodguard/files.sha256";
+    // PID 1 reads only this fixed directory; TMPDIR is allowed to differ. The
+    // layer and executable stream through it as temporaries removed on failure.
+    let staged = match trust {
+        StageTrust::NewInstall => {
+            registry
+                .stage_executable(release, &path, inventory, dir)
+                .await?
+        }
         StageTrust::InstalledRelease(control) => {
             registry
-                .files_for_installed_restore(control, release, &requested)
+                .stage_installed_executable(control, release, &path, inventory, dir)
                 .await?
         }
     };
-    let binary = files
-        .get(&path)
-        .context("image did not include expected executable")?;
     ensure!(
-        binary.starts_with(b"\x7fELF") && binary.len() <= 64 * 1024 * 1024,
+        staged.header().starts_with(b"\x7fELF") && staged.size() <= 64 * 1024 * 1024,
         "invalid linux/amd64 executable"
     );
-    let manifest = std::str::from_utf8(
-        files
-            .get("usr/local/share/jmodguard/files.sha256")
-            .context("image file inventory is missing")?,
-    )?;
-    let hash = sha256_hex(binary);
+    let manifest = std::str::from_utf8(staged.inventory())?;
+    let hash = staged.sha256().to_owned();
     ensure!(
         manifest
             .lines()
             .any(|line| line == format!("{hash}  bin/{name}")),
         "executable does not match image file inventory"
     );
-    // PID 1 reads only this fixed directory; TMPDIR is allowed to differ.
-    tokio::fs::create_dir_all(&dir).await?;
     let target = dir.join(format!("{}-{hash}", release.component));
-    let temp = dir.join(format!(".stage-{:032x}", rand::random::<u128>()));
-    tokio::fs::write(&temp, binary).await?;
-    tokio::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).await?;
-    tokio::fs::rename(&temp, &target).await?;
+    tokio::fs::set_permissions(staged.path(), std::fs::Permissions::from_mode(0o700)).await?;
+    staged.persist(&target).await?;
     ensure!(
-        sha256_hex(&tokio::fs::read(&target).await?) == hash,
+        file_sha256(&target).await? == hash,
         "staged binary hash mismatch"
     );
     Ok(target)
