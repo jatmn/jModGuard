@@ -201,9 +201,19 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     instrument(() => { ++renders; });
     return () => renders;
   }
+  function measureJsonPrettyPrints() {
+    const json = vm.runInContext('JSON', context);
+    const stringify = json.stringify;
+    let count = 0;
+    json.stringify = (value, replacer, space) => {
+      if (space) count++;
+      return stringify(value, replacer, space);
+    };
+    return () => count;
+  }
   vm.runInContext('root.render(h(App));', context);
   pages.push({dom, roots});
-  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, measureMemberRowRenders, advanceTime(ms) { clockOffsetMs += ms; } };
+  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, measureMemberRowRenders, measureJsonPrettyPrints, advanceTime(ms) { clockOffsetMs += ms; } };
 }
 
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
@@ -11171,10 +11181,11 @@ async function auditDetailsView(rows, { owner = false, names = {} } = {}) {
     return response({ events: rows, names, next_cursor: null });
   });
   h.app.state.me.is_bot_owner = owner;
+  const rawFormatCount = h.measureJsonPrettyPrints();
   const root = auditLogView(h, SERVER_EVENT_TYPES);
   await settle();
   const details = [...root.querySelectorAll('tbody tr')].map(row => row.querySelector('.audit-details'));
-  return { h, root, details, requests };
+  return { h, root, details, requests, rawFormatCount };
 }
 
 const auditRow = (id, eventType, data, extra = {}) => ({
@@ -11248,11 +11259,13 @@ test('Audit Log keeps raw JSON behind a collapsed owner-only Raw toggle and fall
   }
   const contents = () => [...owner.root.querySelectorAll('.audit-raw pre')].map(pre => pre.textContent);
   assert.equal(contents().length, 0, 'collapsed rows mount no formatted payload');
+  assert.equal(owner.rawFormatCount(), 0, 'collapsed rows do no pretty printing');
   const toggle = async (raw, open) => {
     raw.open = open;
     await fire(raw, 'toggle');
   };
   await toggle(disclosures[0], true);
+  assert.ok(owner.rawFormatCount() > 0, 'opening a disclosure pretty-prints its payload');
   assert.deepEqual(contents(), ['{\n "reason": "Spam",\n "source": "webui",\n "audit_after_ms": 5\n}']);
   await toggle(disclosures[0], false);
   assert.deepEqual(contents(), []);
