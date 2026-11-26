@@ -901,57 +901,39 @@ pub async fn record_release_checks<F>(
 where
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
 {
-    record_release_checks_cached(
-        app,
-        discover,
-        lookup_timeout,
-        shutdown,
-        &mut InstalledWebuiInventory::default(),
-    )
-    .await
-}
-
-async fn record_release_checks_cached<F>(
-    app: &Arc<ApiState>,
-    discover: F,
-    lookup_timeout: Duration,
-    shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
-    inventory: &mut InstalledWebuiInventory,
-) -> ReleaseCheckBatch
-where
-    F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
-{
     record_release_checks_with(
         app,
         discover,
         lookup_timeout,
         shutdown,
-        inventory,
-        async |database, installed, inventory| {
-            storage()?
-                .verify_installed_release_cached(
-                    &Registry::ghcr()?,
-                    &db::UpdateControl::from_application(database),
-                    installed,
-                    inventory,
-                )
-                .await
-        },
+        &mut InstalledWebuiInventory::default(),
+        verify_scheduled_webui,
     )
     .await
 }
 
-async fn record_release_checks_with<F>(
+async fn verify_scheduled_webui(
+    database: &Db,
+    installed: &ComponentRelease,
+    inventory: &mut InstalledWebuiInventory,
+) -> anyhow::Result<ReleaseVerification> {
+    storage()?
+        .verify_installed_release_cached(
+            &Registry::ghcr()?,
+            &db::UpdateControl::from_application(database),
+            installed,
+            inventory,
+        )
+        .await
+}
+
+async fn record_release_checks_with<F, I: Default>(
     app: &Arc<ApiState>,
     mut discover: F,
     lookup_timeout: Duration,
     mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
-    inventory: &mut InstalledWebuiInventory,
-    verify_webui: impl AsyncFn(
-        &Db,
-        &ComponentRelease,
-        &mut InstalledWebuiInventory,
-    ) -> anyhow::Result<ReleaseVerification>,
+    inventory: &mut I,
+    verify_webui: impl AsyncFn(&Db, &ComponentRelease, &mut I) -> anyhow::Result<ReleaseVerification>,
 ) -> ReleaseCheckBatch
 where
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
@@ -1059,7 +1041,7 @@ where
                         tracing::warn!("WebUI observation refresh failed: {error:#}");
                     }
                 } else {
-                    *inventory = InstalledWebuiInventory::default();
+                    *inventory = I::default();
                 }
             }
             Ok(())
@@ -1233,26 +1215,52 @@ impl ReleaseCheckTick {
 /// before the next one starts.
 pub async fn run_release_check_loop<F, S>(
     app: Arc<ApiState>,
-    mut tick: ReleaseCheckTick,
+    tick: ReleaseCheckTick,
     lookup_timeout: Duration,
-    mut discover: F,
+    discover: F,
     shutdown: S,
     policy: ScheduledInstallPolicy,
 ) where
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
     S: Fn() -> Pin<Box<dyn Future<Output = ()> + Send>>,
 {
-    let mut inventory = InstalledWebuiInventory::default();
+    run_release_check_loop_with(
+        app,
+        tick,
+        lookup_timeout,
+        discover,
+        shutdown,
+        policy,
+        verify_scheduled_webui,
+    )
+    .await;
+}
+
+async fn run_release_check_loop_with<F, S, I: Default>(
+    app: Arc<ApiState>,
+    mut tick: ReleaseCheckTick,
+    lookup_timeout: Duration,
+    mut discover: F,
+    shutdown: S,
+    policy: ScheduledInstallPolicy,
+    verify_webui: impl AsyncFn(&Db, &ComponentRelease, &mut I) -> anyhow::Result<ReleaseVerification>
+    + Copy,
+) where
+    F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
+    S: Fn() -> Pin<Box<dyn Future<Output = ()> + Send>>,
+{
+    let mut inventory = I::default();
     loop {
         if !tick.wait_for_tick(shutdown()).await {
             break;
         }
-        let batch = record_release_checks_cached(
+        let batch = record_release_checks_with(
             &app,
             &mut discover,
             lookup_timeout,
             shutdown(),
             &mut inventory,
+            verify_webui,
         )
         .await;
         if !batch.finished {
@@ -2137,6 +2145,69 @@ mod tests {
             launcher: None,
             base_abi: "static-webui-v1".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn scheduled_webui_verifier_retains_inventory_across_ticks() {
+        use jmodguard::db::{SqlExecutor, params};
+        use std::cell::RefCell;
+
+        let (app, path) = purge_test_app();
+        let release = webui_test_release();
+        let installed = serde_json::to_string(&release).unwrap();
+        app.db
+            .with_conn(move |conn| {
+                conn.execute_bounded(
+                    "UPDATE component_updates SET installed=?1,installed_at=1 WHERE component='webui'",
+                    params![installed],
+                    128 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let notify = Arc::new(Notify::new());
+        let (parked_tx, mut parked_rx) = tokio::sync::watch::channel(0);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let inventory_seen = RefCell::new(Vec::new());
+        let checks = run_release_check_loop_with(
+            Arc::clone(&app),
+            ReleaseCheckTick::coalescing(Arc::clone(&notify), parked_tx),
+            RELEASE_LOOKUP_TIMEOUT,
+            |_, _| Box::pin(async { anyhow::bail!("registry tag lookup unavailable") }),
+            || {
+                let mut stop = stop_rx.clone();
+                Box::pin(async move {
+                    let _ = stop.wait_for(|stopped| *stopped).await;
+                })
+            },
+            ScheduledInstallPolicy::enabled(false, false),
+            async |_, installed, rounds: &mut usize| {
+                assert_eq!(installed, &release);
+                inventory_seen.borrow_mut().push(*rounds);
+                *rounds += 1;
+                Ok(ReleaseVerification::Verified {
+                    root_hash: "verified root".into(),
+                    admin_hash: "verified admin".into(),
+                })
+            },
+        );
+        let drive = async {
+            for _ in 0..2 {
+                notify.notify_one();
+                parked_rx.changed().await.unwrap();
+            }
+            stop_tx.send(true).unwrap();
+        };
+        tokio::join!(checks, drive);
+
+        assert_eq!(
+            *inventory_seen.borrow(),
+            [0, 1],
+            "the second check must receive the inventory from the first tick"
+        );
+        remove_test_db(app, path);
     }
 
     #[tokio::test]
