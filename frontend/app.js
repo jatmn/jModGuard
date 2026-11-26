@@ -8791,9 +8791,12 @@ function openCaseView(props) {
   });
 }
 
+// The case-history contract admits at most this many entries per case.
+const CASE_HISTORY_MAX_ENTRIES = 64;
+
 async function loadCaseHistory(base, signal) {
-  // The history contract admits at most 64 entries; read on only when a page is full.
-  const limit = 64;
+  // A short page ends the history, and so does reaching the case's entry limit.
+  const limit = CASE_HISTORY_MAX_ENTRIES;
   const entries = [];
   let names = {};
   let after = "0";
@@ -8802,7 +8805,7 @@ async function loadCaseHistory(base, signal) {
     const found = page?.history || [];
     entries.push(...found);
     names = { ...names, ...(page?.names || {}) };
-    if (found.length < limit) return { entries, names };
+    if (found.length < limit || entries.length >= CASE_HISTORY_MAX_ENTRIES) return { entries, names };
     after = found[found.length - 1].sequence;
   }
 }

@@ -5694,7 +5694,7 @@ test('case administration reaches later pages, all admitted history and inline e
     calls.push(url);
     const u = new URL(url, 'https://fixture.test');
     if (u.pathname.endsWith('/history')) {
-      // The history contract admits 64 entries; a full page reads on after its last sequence.
+      // The history contract admits 64 entries, so a full first page is the whole case.
       const start = Number(u.searchParams.get('after'));
       const count = Math.max(0, Math.min(Number(u.searchParams.get('limit')), 64 - start));
       return response({history: Array.from({length: count}, (_, i) => ({id: `n${start + i + 1}`, sequence: String(start + i + 1), entry: {recorded_at_ms: 1, body: {note: {text: `note ${start + i + 1}`}}}}))});
@@ -5719,7 +5719,7 @@ test('case administration reaches later pages, all admitted history and inline e
   assert.ok(dialog, 'the case opens in a dialog');
   assert.ok(textOf(dialog).includes('note 1'));
   assert.ok(textOf(dialog).includes('note 64'));
-  assert.deepEqual(calls.filter(url => url.includes('/history')).map(url => new URL(url, 'https://fixture.test').searchParams.get('after')), ['0', '64']);
+  assert.deepEqual(calls.filter(url => url.includes('/history')).map(url => new URL(url, 'https://fixture.test').searchParams.get('after')), ['0']);
   const excerpt = findNode(dialog, n => n.localName === 'pre');
   assert.equal(excerpt.textContent, '<script>literal excerpt</script>');
   assert.equal(next.disabled, true);
@@ -10967,6 +10967,56 @@ test('Case view never names an author for a history note or correction with no r
   await settle();
   const titles = Array.from(caseDialog(h).querySelectorAll('.case-timeline strong'), n => n.textContent);
   assert.deepEqual(titles, ['Ban recorded', 'Discord action succeeded', 'Note added', 'Record corrected']);
+});
+
+// #850: a stored case history as the API pages it, by sequence after the cursor, holding at most 64 entries.
+const HISTORY_ACTOR = '9007199254740999';
+function storedCaseHistory(count) {
+  return (u) => {
+    const after = Number(u.searchParams.get('after') ?? 0);
+    const limit = Math.min(Math.max(Number(u.searchParams.get('limit') ?? 32), 1), 100);
+    const page = Array.from({ length: count }, (_, i) => i + 1).filter(seq => seq > after).slice(0, limit).map(seq => ({
+      id: `h${seq}`, sequence: String(seq),
+      entry: { actor_id: seq % 2 ? CASE_MODERATOR : HISTORY_ACTOR, recorded_at_ms: 1790000000000 + seq, body: { note: { text: `entry ${seq}.` } } },
+    }));
+    const actors = new Set(page.map(item => item.entry.actor_id));
+    const names = {};
+    if (actors.has(CASE_MODERATOR)) names[CASE_MODERATOR] = caseNames[CASE_MODERATOR];
+    if (actors.has(HISTORY_ACTOR)) names[HISTORY_ACTOR] = { display_name: 'Second Mod', username: 'second.mod' };
+    return response({ history: page, names });
+  };
+}
+
+for (const count of [0, 63, 64]) test(`Case view shows all ${count} history entries and their actors in order with one history read`, async () => {
+  const { calls, fetchImpl } = caseFixture({ '/history': storedCaseHistory(count) });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await fire(iconAction(root, `Open case ${CASE_ID}`), 'click');
+  await settle();
+  const dialog = caseDialog(h);
+  const sequences = Array.from({ length: count }, (_, i) => i + 1);
+  assert.deepEqual(Array.from(dialog.querySelectorAll('.case-timeline strong'), n => n.textContent), ['Ban recorded', 'Discord action succeeded',
+    ...sequences.map(seq => `Note added by ${seq % 2 ? 'Kit Mod' : 'Second Mod'}`)]);
+  assert.deepEqual(Array.from(dialog.querySelectorAll('.case-note'), n => n.textContent), sequences.map(seq => `entry ${seq}.`));
+  const reads = calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/history')).map(c => new URL(c.url, 'https://fixture.test').search);
+  assert.deepEqual(reads, ['?limit=64&after=0'], 'the whole case history is one read');
+});
+
+test('Closing a case cancels its pending history read without reading further', async () => {
+  const pending = [];
+  const stored = storedCaseHistory(64);
+  const { calls, fetchImpl } = caseFixture({ '/history': (u, { signal }) => new Promise(resolve => pending.push({ signal, resolve: () => resolve(stored(u)) })) });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await fire(iconAction(root, `Open case ${CASE_ID}`), 'click');
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].signal.aborted, false, 'the history read is pending');
+  await fire(iconAction(caseDialog(h), 'Close case'), 'click');
+  assert.equal(pending[0].signal.aborted, true, 'closing cancels the history read');
+  pending[0].resolve();
+  await settle();
+  assert.equal(caseDialog(h), null);
+  assert.equal(calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/history')).length, 1);
 });
 
 test('Cases list and case file agree on automod versus an unrecorded moderator', async () => {
