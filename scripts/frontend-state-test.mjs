@@ -871,19 +871,35 @@ test('failed assertions on mounted nodes report a short preview', () => {
   assert.throws(() => assert.deepEqual([node], []), error => error.message.length <= 700);
 });
 
-test('failed assertions on large objects and functions report short previews', () => {
+test('failed assertions on large objects and functions report short previews', t => {
   let deep = { leaf: 'unvisited' };
-  for (let index = 0; index < 500; index++) deep = { next: deep };
+  const nested = new WeakSet([deep]);
+  for (let index = 0; index < 500; index++) {
+    deep = { next: deep };
+    nested.add(deep);
+  }
+  let getterCalls = 0;
   const graph = {
     deep,
     text: 'x'.repeat(100_000),
-    get accessor() { throw new Error('assertion preview called a getter'); },
+    get accessor() {
+      getterCalls++;
+      throw new Error('assertion preview called a getter');
+    },
   };
   for (let index = 0; index < 10_000; index++) graph[`extra${index}`] = deep;
   function withGraph() {}
   withGraph.graph = graph;
 
-  const started = performance.now();
+  const describe = Object.getOwnPropertyDescriptor;
+  let outerReads = 0;
+  let nestedReads = 0;
+  t.mock.method(Object, 'getOwnPropertyDescriptor', (value, key) => {
+    if (value === graph) outerReads++;
+    if (nested.has(value)) nestedReads++;
+    return describe(value, key);
+  });
+
   assert.throws(() => assert.equal(graph, null), {
     name: 'AssertionError',
     message: /^Expected \{deep: \[Object\], text: "x{80}…", accessor: \[Accessor\], extra0: \[Object\], …\} to be null$/,
@@ -892,7 +908,9 @@ test('failed assertions on large objects and functions report short previews', (
     name: 'AssertionError',
     message: 'Expected [Function withGraph] to be null',
   });
-  assert.ok(performance.now() - started < 1000, 'the assertion previews should finish within a second');
+  assert.ok(outerReads <= 5, 'preview reads at most four fields plus one to detect truncation');
+  assert.equal(nestedReads, 0, 'preview does not read nested descriptors');
+  assert.equal(getterCalls, 0, 'preview does not invoke the getter');
 });
 
 test('the ban dialog locks all submitted options until acknowledgment or failure', async t => {
