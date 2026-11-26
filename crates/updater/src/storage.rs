@@ -274,7 +274,7 @@ impl Storage {
         let expected = match cached {
             Some(entry) => entry,
             None => {
-                let bytes = registry.read_release_layer(layer, &requested).await?;
+                let bytes = layer.read(&requested).await?;
                 let files = destinations
                     .into_iter()
                     .zip(&package)
