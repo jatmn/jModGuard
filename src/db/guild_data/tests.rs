@@ -202,14 +202,15 @@ fn assert_registration_open_counts(
     assert_eq!(stamped, reg);
     assert_eq!(probe.connection_opens() - before, 1, "stamp connection");
 
+    let lease = u64::from(!options.read_only);
     let before = probe.connection_opens();
     let store = GuildDataStore::open(options, reg).unwrap();
     assert_eq!(store.db.permits.available_permits(), CAPACITY);
     assert_eq!(store.db.connections.idle.lock().unwrap().len(), CAPACITY);
     assert_eq!(
         probe.connection_opens() - before,
-        CAPACITY as u64 + 2,
-        "three pooled connections, one bootstrap, and one lease connection"
+        CAPACITY as u64 + 1 + lease,
+        "three pooled connections, one bootstrap, and a lease connection only when writable"
     );
 }
 

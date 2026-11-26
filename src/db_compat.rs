@@ -274,6 +274,8 @@ pub struct StartupProbe {
     catalog: AtomicU64,
     #[cfg(test)]
     connection_opens: AtomicU64,
+    #[cfg(test)]
+    runtime_starts: AtomicU64,
     /// Primary statements by Bot Resources path label, as counted for the
     /// process-wide `db_primary_paths` family.
     primary_paths: Mutex<std::collections::BTreeMap<String, u64>>,
@@ -299,6 +301,12 @@ impl StartupProbe {
     #[cfg(test)]
     pub fn connection_opens(&self) -> u64 {
         self.connection_opens.load(Ordering::Relaxed)
+    }
+
+    /// Database runtimes started; each owns one owner thread and two workers.
+    #[cfg(test)]
+    pub fn runtime_starts(&self) -> u64 {
+        self.runtime_starts.load(Ordering::Relaxed)
     }
 
     /// Primary statements this probe's databases counted under `label`.
@@ -472,6 +480,11 @@ impl DbRuntime {
             .recv()
             .context("libSQL runtime owner stopped during startup")?
             .map_err(anyhow::Error::msg)?;
+        let startup_probe = current_startup_probe();
+        #[cfg(test)]
+        if let Some(probe) = &startup_probe {
+            probe.runtime_starts.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(Self {
             handle,
             _thread: Arc::new(RuntimeThread {
@@ -481,7 +494,7 @@ impl DbRuntime {
             operation_timeout,
             replica_routable: false,
             growth_guard: Arc::new(GrowthGuard::default()),
-            startup_probe: current_startup_probe(),
+            startup_probe,
             #[cfg(test)]
             manual_clock: Arc::new(Mutex::new(None)),
             #[cfg(test)]

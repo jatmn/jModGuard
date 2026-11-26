@@ -497,7 +497,7 @@ impl HranaFixture {
             read_only: false,
             _database: Arc::clone(&database),
             runtime: runtime.clone(),
-            lease_runtime: lease_runtime.clone(),
+            lease_runtime: Some(lease_runtime.clone()),
             bootstrap_work: crate::db::BootstrapWork::Complete,
             connections: Arc::new(ConnectionPool {
                 idle: Mutex::new(connections),
@@ -3536,10 +3536,11 @@ async fn remote_constructor_isolates_the_lease_runtime() {
     };
     let remote = Db::open_with_bootstrap(&opts, |_| Ok(()), |_| Ok(())).unwrap();
     {
+        let lease_runtime = remote.lease_runtime.as_ref().expect("lease runtime");
         let lease = remote.lease_connection.lock().unwrap();
         let lease_conn = lease.as_ref().expect("lease connection");
         assert!(
-            lease_conn.runtime_same_owner(&remote.lease_runtime),
+            lease_conn.runtime_same_owner(lease_runtime),
             "renewal must run on the dedicated lease runtime"
         );
         assert!(
@@ -3547,7 +3548,7 @@ async fn remote_constructor_isolates_the_lease_runtime() {
             "renewal must not share the pool runtime"
         );
         assert_eq!(
-            remote.lease_runtime.operation_limit(),
+            lease_runtime.operation_limit(),
             Some(crate::db_compat::INTERACTIVE_READ_BUDGET)
         );
         let idle = remote.connections.idle.lock().unwrap();
@@ -3557,23 +3558,75 @@ async fn remote_constructor_isolates_the_lease_runtime() {
         );
         assert!(
             idle.iter()
-                .all(|conn| !conn.runtime_same_owner(&remote.lease_runtime))
+                .all(|conn| !conn.runtime_same_owner(lease_runtime))
         );
     }
 
     let path = super::tmp_db_path("lease_runtime_local");
     let local = Db::open(&path, 2).unwrap();
     {
+        let lease_runtime = local.lease_runtime.as_ref().expect("local lease runtime");
         let lease = local.lease_connection.lock().unwrap();
         let lease_conn = lease.as_ref().expect("local lease connection");
         assert!(lease_conn.runtime_same_owner(&local.runtime));
-        assert!(lease_conn.runtime_same_owner(&local.lease_runtime));
-        assert_eq!(local.lease_runtime.operation_limit(), None);
+        assert!(lease_conn.runtime_same_owner(lease_runtime));
+        assert_eq!(lease_runtime.operation_limit(), None);
     }
     drop(local);
     drop(remote);
     drop(fixture);
     super::cleanup_db(&path);
+}
+
+fn open_remote_counted(fixture: &HranaFixture, read_only: bool) -> (Db, u64, u64) {
+    let probe = Arc::new(StartupProbe::default());
+    let _probe = enter_startup_probe(Some(probe.clone()));
+    let opts = DbOpenOptions {
+        path: PathBuf::from("lease-resources"),
+        url: fixture.url(),
+        token: "test".into(),
+        pool_size: 2,
+        migrate: !read_only,
+        read_only,
+        default_prefix: String::new(),
+        retention_days: 0,
+    };
+    let db = Db::open_with_bootstrap(&opts, |_| Ok(()), |_| Ok(())).unwrap();
+    (db, probe.runtime_starts(), probe.connection_opens())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_read_only_open_builds_no_lease_runtime_or_connection() {
+    let fixture = HranaFixture::start().await;
+    let (read_only, runtimes, opens) = open_remote_counted(&fixture, true);
+    assert_eq!(
+        runtimes, 1,
+        "read-only remote open starts only the pool runtime"
+    );
+    assert_eq!(
+        opens, 3,
+        "bootstrap plus two pooled connections, no lease stream"
+    );
+    assert!(read_only.lease_runtime.is_none());
+    assert!(read_only.lease_connection.lock().unwrap().is_none());
+
+    let (writable, runtimes, opens) = open_remote_counted(&fixture, false);
+    assert_eq!(runtimes, 2, "writable remote open keeps the lease runtime");
+    assert_eq!(
+        opens, 4,
+        "bootstrap, two pooled connections and the lease stream"
+    );
+    assert!(writable.lease_runtime.is_some());
+    assert!(writable.lease_connection.lock().unwrap().is_some());
+
+    let requests = fixture.state.lock().unwrap().requests;
+    let error = read_only.with_lease_conn(|_| Ok(())).await.unwrap_err();
+    assert_eq!(error.to_string(), "read-only database cannot renew a lease");
+    assert_eq!(fixture.state.lock().unwrap().requests, requests);
+    assert!(read_only.lease_connection.lock().unwrap().is_none());
+    drop(read_only);
+    drop(writable);
+    drop(fixture);
 }
 
 #[tokio::test(flavor = "multi_thread")]
