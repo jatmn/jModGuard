@@ -492,28 +492,41 @@ fn detect_match(b: &Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u
 }
 
 fn match_posts(b: &Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u64)>> {
-    let live: Vec<_> = b
-        .posts
-        .iter()
-        .filter(|p| now.duration_since(p.at) < Duration::from_secs(policy.window_secs))
-        .collect();
-    for anchor in &live {
-        let matched: Vec<_> = live
-            .iter()
-            .filter(|p| p.text == anchor.text)
-            .map(|p| (p.channel, p.id))
-            .collect();
-        if matched
-            .iter()
-            .map(|(c, _)| *c)
-            .collect::<BTreeSet<_>>()
-            .len()
-            >= policy.min_channels
-        {
-            return Some(matched);
+    let window = Duration::from_secs(policy.window_secs);
+    let live = || b.posts.iter().filter(|p| now.duration_since(p.at) < window);
+
+    // Skip text matching when the live window cannot reach the channel threshold.
+    let mut channels = [0; MAX_POSTS];
+    let mut channel_count = 0;
+    if !live().any(|p| {
+        if !channels[..channel_count].contains(&p.channel) {
+            channels[channel_count] = p.channel;
+            channel_count += 1;
         }
+        channel_count >= policy.min_channels
+    }) {
+        return None;
     }
-    None
+
+    let mut groups = HashMap::new();
+    for (position, post) in live().enumerate() {
+        let (_, channels) = groups
+            .entry(post.text.as_str())
+            .or_insert_with(|| (position, BTreeSet::new()));
+        channels.insert(post.channel);
+    }
+
+    // Preserve the first qualifying anchor and the bucket order of its posts.
+    let (text, _) = groups
+        .into_iter()
+        .filter(|(_, (_, channels))| channels.len() >= policy.min_channels)
+        .min_by_key(|(_, (position, _))| *position)?;
+    Some(
+        live()
+            .filter(|post| post.text == text)
+            .map(|post| (post.channel, post.id))
+            .collect(),
+    )
 }
 
 fn retire(
@@ -1382,6 +1395,36 @@ mod tests {
             AdmitOutcome::Admitted
         );
         assert!(!fresh.match_still_proving(1, 2, token, &matched_messages, &p, now));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn matching_keeps_the_first_live_group_and_its_post_order() {
+        let now = tokio::time::Instant::now().into_std();
+        let policy = policy();
+        let expired = now - Duration::from_secs(policy.window_secs);
+        let bucket = Bucket {
+            retired_before: 0,
+            window: Duration::from_secs(policy.window_secs),
+            last_seen: now,
+            token: (0, 0),
+            posts: vec![
+                post(1, 10, expired, "bravo"),
+                post(2, 20, expired, "alpha"),
+                post(18, 20, now, "alpha"),
+                post(3, 10, now, "bravo"),
+                post(4, 11, now, "bravo"),
+                post(5, 12, now, "bravo"),
+                post(7, 23, now, "Alpha"),
+                post(8, 20, now, "alpha"),
+                post(6, 22, now, "alpha"),
+                post(9, 21, now, "alpha"),
+            ],
+            report: ReportCooldown::ReadyAt(now),
+        };
+        assert_eq!(
+            match_posts(&bucket, &policy, now),
+            Some(vec![(20, 18), (20, 8), (22, 6), (21, 9)])
+        );
     }
 
     #[test]
