@@ -3837,6 +3837,7 @@ mod tests {
             known_bad_hashes: None,
             known_spam: Default::default(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: HashMap::new(),
         };
         let ban_behavior = jmodguard::defaults::default_commands()
@@ -4044,6 +4045,7 @@ mod tests {
             known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: HashMap::new(),
         };
         let roles = [];
@@ -4639,6 +4641,7 @@ mod tests {
             known_spam: Default::default(),
             log_filters: Default::default(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: Default::default(),
         });
         let mut msg = serenity::model::channel::Message::default();
@@ -4704,6 +4707,7 @@ mod tests {
             known_spam: Default::default(),
             log_filters: Default::default(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: Default::default(),
         });
         let mut workers = Vec::with_capacity(WORKERS);
@@ -4816,6 +4820,7 @@ mod tests {
             known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: HashMap::new(),
         });
         let mut author = User::default();

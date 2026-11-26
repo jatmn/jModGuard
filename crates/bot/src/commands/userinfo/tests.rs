@@ -1475,6 +1475,7 @@ async fn userinfo_prefix_and_slash_hide_voice_the_caller_cannot_view() {
         known_spam: Default::default(),
         log_filters: Default::default(),
         regexes: Vec::new(),
+        custom_words: Default::default(),
         custom_patterns: Default::default(),
     });
 
@@ -1801,6 +1802,7 @@ async fn userinfo_prefix_and_slash_reject_invalid_mention_ids() {
         known_spam: Default::default(),
         log_filters: Default::default(),
         regexes: Vec::new(),
+        custom_words: Default::default(),
         custom_patterns: Default::default(),
     });
     let mut author = User::default();
@@ -1966,6 +1968,7 @@ async fn userinfo_prefix_and_slash_hide_private_threads_without_access() {
         known_spam: Default::default(),
         log_filters: Default::default(),
         regexes: Vec::new(),
+        custom_words: Default::default(),
         custom_patterns: Default::default(),
     });
 
@@ -2993,6 +2996,7 @@ impl StatsDispatch {
             known_spam: Default::default(),
             log_filters: Default::default(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: Default::default(),
         });
         Self {

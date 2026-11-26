@@ -2,6 +2,7 @@
 
 use anyhow::{Context as _, Result};
 use dashmap::DashMap;
+use jmodguard::custom_rules::{WordDictionary, is_custom_id};
 use parking_lot::Mutex;
 use regex::Regex;
 use serenity::model::id::ChannelId;
@@ -2428,9 +2429,24 @@ pub struct CachedGuildConfig {
     pub regexes: Vec<Regex>,
     pub known_spam: jmodguard::known_spam::CompiledList,
     pub custom_patterns: HashMap<String, Regex>,
+    pub(crate) custom_words: HashMap<String, WordDictionary>,
 }
 
 impl CachedGuildConfig {
+    pub(crate) fn compile_custom_words(
+        rules: &HashMap<String, RuleDef>,
+    ) -> HashMap<String, WordDictionary> {
+        rules
+            .iter()
+            .filter(|(id, rule)| {
+                rule.enabled && is_custom_id(id) && rule.params["kind"].as_str() == Some("word")
+            })
+            .filter_map(|(id, rule)| {
+                WordDictionary::from_rule(rule).map(|words| (id.clone(), words))
+            })
+            .collect()
+    }
+
     fn from_parts(version: u64, durable_version: u64, parts: db::ConfigParts) -> Self {
         let mut regexes = Vec::new();
         for pattern in &parts.badwords {
@@ -2454,6 +2470,7 @@ impl CachedGuildConfig {
             loaded_at: Instant::now(),
             known_bad_hashes: (!known_bad_hashes.is_empty()).then(|| Arc::new(known_bad_hashes)),
             known_spam: jmodguard::known_spam::CompiledList::new(&parts.known_spam),
+            custom_words: Self::compile_custom_words(&parts.rules),
             settings: parts.settings,
             rules: parts.rules,
             commands: parts.commands,
