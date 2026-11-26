@@ -2658,7 +2658,9 @@ impl ConfigCache {
                 if let Some(mut waiting) = waiting {
                     tokio::select! {
                         biased;
-                        _ = invalidated.changed() => {}
+                        // A notification can arrive after this generation's flight
+                        // was already registered. Only superseded flights must wake.
+                        _ = invalidated.wait_for(|_| self.version.load(Ordering::Relaxed) != version) => {}
                         _ = waiting.changed() => {
                             if self.version.load(Ordering::Relaxed) == version
                                 && let Some(failure) = waiting.borrow().as_ref()
@@ -3093,6 +3095,8 @@ mod tests {
     ) {
         let versions = db::get_primary_versions(&db).await.unwrap();
         let cache = ConfigCache::new(versions.config, versions.config_revision);
+        // Start the new generation before its invalidation signal arrives.
+        cache.version.fetch_add(1, Ordering::Relaxed);
         db.with_conn(|conn| {
             let tx = conn.transaction_immediate()?;
             tx.execute_batch_bounded("ALTER TABLE rules RENAME TO held_rules", 65_536)?;
@@ -3110,6 +3114,9 @@ mod tests {
             for call in &mut calls {
                 poll_config_miss(call.as_mut()).await;
             }
+            // Every waiter has joined the new generation. The delayed signal
+            // must not detach them from the error that flight is about to send.
+            cache.invalidated.send_replace(());
             for (release, task) in held {
                 release.send(()).unwrap();
                 task.await.unwrap().unwrap();
