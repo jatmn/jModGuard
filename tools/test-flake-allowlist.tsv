@@ -229,7 +229,6 @@ clock	crates/bot/src/snapshot_capture.rs	snapshot_capture::tests::capture_writes
 clock	crates/bot/src/snapshot_capture.rs	snapshot_capture::tests::cleanup_paused_edit_uses_cached_before	2	#666
 clock	crates/bot/src/snapshot_capture.rs	snapshot_capture::tests::clear_guild_does_not_hold_known_humans_while_waiting_for_recent	2	#666
 sleep	crates/bot/src/snapshot_capture.rs	snapshot_capture::tests::clear_guild_does_not_hold_known_humans_while_waiting_for_recent	1	#666
-clock	crates/bot/src/snapshot_capture.rs	snapshot_capture::tests::deleted_identity_remains_marked_after_exact_map_would_overflow	1	#666
 clock	crates/bot/src/snapshot_capture.rs	snapshot_capture::tests::failed_snapshot_read_logs_delete_from_memory_cache	1	#666
 clock	crates/bot/src/snapshot_capture.rs	snapshot_capture::tests::maintenance_drains_more_than_four_expiry_batches_without_waiting_for_another_tick	1	#666
 clock	crates/bot/src/snapshot_capture.rs	snapshot_capture::tests::memory_cache_is_bound_to_the_captured_scope	1	#666
