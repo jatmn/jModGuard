@@ -1021,7 +1021,7 @@ fn message_identity_snippets_expire_and_evict_only_within_their_guild() {
     remember_message_create(&f.app, 790, 456, 1, Some(43), None, None, true);
     {
         let mut snippets = f.app.log_snippets.inner.lock();
-        let first = snippets.get_mut(&(789, 456, 1)).unwrap();
+        let first = snippets.get_mut((789, 456, 1)).unwrap();
         first.at -= Duration::from_secs(1);
     }
     for id in 2..=64 {
@@ -1035,7 +1035,14 @@ fn message_identity_snippets_expire_and_evict_only_within_their_guild() {
     }
     assert_eq!(author(790, 1), Some(43));
 
-    let stored_at = f.app.log_snippets.inner.lock()[&(790, 456, 1)].at;
+    let stored_at = f
+        .app
+        .log_snippets
+        .inner
+        .lock()
+        .get((790, 456, 1))
+        .unwrap()
+        .at;
     assert_eq!(
         known_message_identity_at(&f.app, 790, 456, 1, || stored_at + Duration::from_secs(599)),
         Some((43, true))
@@ -1044,6 +1051,73 @@ fn message_identity_snippets_expire_and_evict_only_within_their_guild() {
         known_message_identity_at(&f.app, 790, 456, 1, || stored_at + Duration::from_secs(600)),
         None
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn snippet_expiry_order_stays_bounded_across_guilds() {
+    let start = tokio::time::Instant::now().into_std();
+    let mut cache = SnippetEntries::default();
+    let refreshed = (1, 10, 1);
+    let inserted = (1, 10, 65);
+    for message in 1..=64 {
+        for guild in 1..=100 {
+            cache.remember(
+                (guild, 10, message),
+                Some(guild),
+                (guild, 10, message) == refreshed,
+                start + Duration::from_millis(message),
+            );
+        }
+    }
+
+    let refresh_time = start + Duration::from_millis(100);
+    for _ in 0..1024 {
+        cache.remember(refreshed, None, false, refresh_time);
+    }
+    let preserved = cache.get(refreshed).unwrap();
+    assert_eq!(preserved.author, 1);
+    assert!(preserved.origin == MessageOrigin::Webhook);
+    assert_eq!(preserved.at, refresh_time);
+    cache.remember(
+        inserted,
+        Some(99),
+        false,
+        refresh_time + Duration::from_millis(1),
+    );
+    assert!(cache.get((1, 10, 2)).is_none());
+    assert!(cache.get((2, 10, 2)).is_some());
+    for entries in cache.by_guild.values() {
+        assert_eq!(entries.len(), SNIPPETS_PER_GUILD);
+    }
+
+    let mut previous = None;
+    let mut current = cache.oldest;
+    for _ in 0..6400 {
+        let entry = cache.get(current.unwrap()).unwrap();
+        assert_eq!(entry.older, previous);
+        previous = current;
+        current = entry.newer;
+    }
+    assert_eq!(previous, Some(inserted));
+    assert_eq!(previous, cache.newest);
+    assert!(current.is_none());
+
+    cache.expire(start + SNIPPET_KEEP + Duration::from_millis(1));
+    assert!(cache.get((2, 10, 1)).is_none());
+    assert!(cache.get((2, 10, 2)).is_some());
+    assert!(cache.get(refreshed).is_some());
+    cache.expire(start + SNIPPET_KEEP + Duration::from_millis(64));
+    assert_eq!(cache.by_guild.len(), 1);
+    assert_eq!(cache.by_guild[&1].len(), 2);
+    assert_eq!(cache.oldest, Some(refreshed));
+    assert_eq!(cache.newest, Some(inserted));
+
+    cache.remember(refreshed, Some(0), false, refresh_time + SNIPPET_KEEP);
+    assert!(cache.get(refreshed).is_none());
+    assert_eq!(cache.remove(inserted).unwrap().author, 99);
+    assert!(cache.by_guild.is_empty());
+    assert!(cache.oldest.is_none());
+    assert!(cache.newest.is_none());
 }
 
 #[test]
