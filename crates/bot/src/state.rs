@@ -2451,6 +2451,8 @@ enum ConfigReadRoute {
 pub struct ConfigCache {
     map: DashMap<i64, Arc<CachedGuildConfig>>,
     version: Arc<AtomicU64>,
+    /// Confirmed guild departures; loads begun before one do not publish.
+    departures: Arc<AtomicU64>,
     ttl: Duration,
     durable_floor: Arc<AtomicU64>,
     publication_lock: Arc<parking_lot::Mutex<()>>,
@@ -2468,6 +2470,7 @@ impl ConfigCache {
         Self {
             map: DashMap::new(),
             version: Arc::new(AtomicU64::new(0)),
+            departures: Arc::new(AtomicU64::new(0)),
             ttl: Duration::from_secs(15),
             durable_floor: Arc::new(AtomicU64::new(durable_floor)),
             publication_lock: Arc::new(parking_lot::Mutex::new(())),
@@ -2484,6 +2487,14 @@ impl ConfigCache {
     pub fn require_version(&self, version: u64) {
         self.durable_floor.fetch_max(version, Ordering::SeqCst);
         self.invalidate();
+    }
+
+    /// Releases a confirmed-departed guild's configuration. A load already in
+    /// flight does not publish afterward; later loads, such as on rejoin, do.
+    pub(crate) fn forget_guild(&self, guild_id: u64) {
+        let _publication = self.publication_lock.lock();
+        self.departures.fetch_add(1, Ordering::Relaxed);
+        self.map.remove(&(guild_id as i64));
     }
 
     fn require_primary_revision(&self, version: u64, revision: String) {
@@ -2519,6 +2530,7 @@ impl ConfigCache {
     }
 
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
+        let departures = self.departures.load(Ordering::Relaxed);
         let required = self
             .durable_floor
             .load(Ordering::SeqCst)
@@ -2580,6 +2592,11 @@ impl ConfigCache {
                 {
                     route = ConfigReadRoute::Primary;
                     continue;
+                }
+                if self.departures.load(Ordering::Relaxed) != departures {
+                    // A confirmed departure overlapped this load, so it may
+                    // describe the departed guild: serve it, but do not retain it.
+                    return Ok(cfg);
                 }
                 self.map.insert(guild_id as i64, Arc::clone(&cfg));
                 return Ok(cfg);

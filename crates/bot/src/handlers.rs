@@ -796,6 +796,7 @@ impl EventHandler for Handler {
         self.app.invalidate_member_sync_scope();
         if !incomplete.unavailable {
             self.app.forget_slash_guild(incomplete.id.get()).await;
+            self.app.configs.forget_guild(incomplete.id.get());
         }
         self.app.snapshots.clear_guild(&ctx.cache, incomplete.id);
         self.app.member_joins.clear_guild(incomplete.id.get());
@@ -4215,6 +4216,68 @@ mod tests {
             drop(app);
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn confirmed_departure_releases_compiled_config_and_fences_in_flight_loads() {
+        use serenity::client::EventHandler;
+        use serenity::model::guild::UnavailableGuild;
+        let (directory, app, _) = counter_fixture("config_departure").await;
+        let (ctx, _) = counter_context(&app, false).await;
+        let handler = super::Handler {
+            app: std::sync::Arc::clone(&app),
+        };
+        let event = |unavailable: bool| -> UnavailableGuild {
+            serde_json::from_value(serde_json::json!({"id": "10", "unavailable": unavailable}))
+                .unwrap()
+        };
+
+        // A load of the departing incarnation is still waiting on SQL.
+        let mut stale = Box::pin(app.configs.get(&app.db, 10));
+        tokio::select! {
+            biased;
+            _ = &mut stale => panic!("config load finished before the departure"),
+            _ = std::future::ready(()) => {}
+        }
+
+        let loaded = app.configs.get(&app.db, 10).await.unwrap();
+        let released = std::sync::Arc::downgrade(&loaded);
+        // Temporary gateway unavailability keeps the last-known fallback.
+        handler.guild_delete(ctx.clone(), event(true), None).await;
+        assert!(
+            app.configs
+                .last_known(10)
+                .is_some_and(|cfg| std::sync::Arc::ptr_eq(&cfg, &loaded))
+        );
+        handler.guild_delete(ctx.clone(), event(false), None).await;
+        assert!(app.configs.last_known(10).is_none());
+        drop(loaded);
+        assert!(
+            released.upgrade().is_none(),
+            "confirmed departure must release the compiled config"
+        );
+
+        // Rejoin loads normally; the delayed load then completes and must not
+        // replace it with the departed incarnation.
+        let rejoined = app.configs.get(&app.db, 10).await.unwrap();
+        let late = stale.await.unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&late, &rejoined));
+        let late_weak = std::sync::Arc::downgrade(&late);
+        drop(late);
+        assert!(late_weak.upgrade().is_none());
+        assert!(
+            app.configs
+                .last_known(10)
+                .is_some_and(|cfg| std::sync::Arc::ptr_eq(&cfg, &rejoined))
+        );
+        let rejoined_weak = std::sync::Arc::downgrade(&rejoined);
+        drop(rejoined);
+        handler.guild_delete(ctx, event(false), None).await;
+        assert!(rejoined_weak.upgrade().is_none());
+
+        drop(handler);
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 
