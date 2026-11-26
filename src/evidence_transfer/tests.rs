@@ -174,7 +174,12 @@ async fn streams_verifies_and_removes_real_objects_with_bounded_reads() {
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
     let paths = f.local.paths(&visible.job, false).unwrap();
-    assert_eq!(fs::read(&paths[0]).unwrap(), b"abc");
+    assert_eq!(
+        f.local
+            .read_available(&visible.job, &visible.sha256)
+            .unwrap(),
+        b"abc"
+    );
     assert!(paths[1].exists());
     assert!(f.local.cleanup(f.db.clone(), t.clone()).await.is_err());
     f.db.remove_case(t.scope.clone(), t.case_id.clone())
@@ -185,6 +190,76 @@ async fn streams_verifies_and_removes_real_objects_with_bounded_reads() {
     assert!(paths.iter().all(|p| !p.exists()));
     assert!(!f.local.root.join("evidence").exists());
     assert_eq!(f.job(&t).await.state, EvidenceState::Erased);
+}
+
+#[tokio::test]
+async fn downloads_require_matching_length_receipt_and_journal_digest() {
+    let f = Fixture::new().await;
+    let upload = f.upload(3);
+    let t = upload.target.clone();
+    f.local
+        .capture(f.db.clone(), upload, &b"abc"[..])
+        .await
+        .unwrap();
+    let visible =
+        f.db.available_case_evidence(t.scope, t.case_id, t.evidence_id)
+            .await
+            .unwrap()
+            .unwrap();
+    let [data, complete, _] = f.local.paths(&visible.job, false).unwrap();
+    let read = || f.local.read_available(&visible.job, &visible.sha256);
+    let lock = f.local.lock().unwrap();
+    assert!(read().unwrap_err().to_string().contains("resource busy"));
+    drop(lock);
+    let other_hash = "0".repeat(64);
+    assert!(
+        f.local
+            .read_available(&visible.job, &other_hash)
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch")
+    );
+    for (bytes, problem) in [
+        (b"abd".as_slice(), "checksum mismatch"),
+        (b"ab".as_slice(), "shorter than reservation"),
+        (b"abcde".as_slice(), "exceeds reservation"),
+    ] {
+        fs::write(&data, bytes).unwrap();
+        assert!(read().unwrap_err().to_string().contains(problem));
+    }
+    fs::write(&data, b"abc").unwrap();
+    fs::write(&complete, format!("3\n{other_hash}\n")).unwrap();
+    assert!(
+        read()
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch")
+    );
+    fs::write(&complete, format!("4\n{}\n", visible.sha256)).unwrap();
+    assert!(
+        read()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid completion receipt")
+    );
+    let mut oversized_reservation = visible.job.clone();
+    oversized_reservation.reserved_bytes = usize::MAX as u64;
+    fs::write(
+        &complete,
+        format!(
+            "{}\n{}\n",
+            oversized_reservation.reserved_bytes, visible.sha256
+        ),
+    )
+    .unwrap();
+    let error = f
+        .local
+        .read_available(&oversized_reservation, &visible.sha256)
+        .unwrap_err();
+    assert!(error.is::<std::collections::TryReserveError>(), "{error:#}");
+
+    fs::remove_file(complete).unwrap();
+    assert!(read().unwrap_err().to_string().contains("not available"));
 }
 
 #[tokio::test]
