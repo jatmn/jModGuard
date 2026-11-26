@@ -2791,30 +2791,41 @@ async fn audit_lookup_stops_after_three_empty_reads_and_sends_fallback() {
         }
     }
 
-    let f = Fixture::with_timeout(10);
-    let sink = EmptyAudit::default();
-    db::upsert_log_channel(&f.app.db, 789, "member_ban", 456)
-        .await
-        .unwrap();
-    f.app.configs.get(&f.app.db, 789).await.unwrap();
-    tokio::time::pause();
-    assert_eq!(
-        emit_to(
+    for event in ["member_ban", "member_unban"] {
+        let f = Fixture::with_timeout(10);
+        let sink = EmptyAudit::default();
+        db::upsert_log_channel(&f.app.db, 789, event, 456)
+            .await
+            .unwrap();
+        f.app.configs.get(&f.app.db, 789).await.unwrap();
+        tokio::time::pause();
+        let delivery = emit_to(
             &f.app,
             &sink,
             GuildId::new(789),
-            "member_ban",
-            templates::user_vars(123, "user", "User")
+            event,
+            templates::user_vars(123, "user", "User"),
         )
-        .await,
-        Delivery::Sent
-    );
-    assert_eq!(sink.calls.load(std::sync::atomic::Ordering::Relaxed), 3);
-    let sent = sink.sink.messages.lock().unwrap();
-    assert_eq!(sent.len(), 1);
-    let report = log_text(&sent[0].1);
-    assert!(report.contains("**Moderator:** unavailable"), "{report}");
-    assert!(report.contains("**Reason:** unavailable"), "{report}");
+        .await;
+        tokio::time::resume();
+        assert_eq!(delivery, Delivery::Sent, "{event}");
+        assert_eq!(
+            sink.calls.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "{event}: unresolved audit context must stop after three reads"
+        );
+        let sent = sink.sink.messages.lock().unwrap();
+        assert_eq!(sent.len(), 1, "{event}");
+        let report = log_text(&sent[0].1);
+        assert!(
+            report.contains("**Moderator:** unavailable"),
+            "{event}: {report}"
+        );
+        assert!(
+            report.contains("**Reason:** unavailable"),
+            "{event}: {report}"
+        );
+    }
 }
 
 fn unclaimed_audit_vars(
