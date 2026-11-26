@@ -787,7 +787,7 @@ impl EventHandler for Handler {
         self.app.invalidate_member_sync_scope();
     }
 
-    async fn guild_delete(&self, _ctx: Context, incomplete: UnavailableGuild, full: Option<Guild>) {
+    async fn guild_delete(&self, ctx: Context, incomplete: UnavailableGuild, full: Option<Guild>) {
         crate::resources::gateway_event("guild_delete");
         if !self.app.activation.allows_rule_trigger() {
             return;
@@ -797,7 +797,7 @@ impl EventHandler for Handler {
         if !incomplete.unavailable {
             self.app.forget_slash_guild(incomplete.id.get()).await;
         }
-        self.app.snapshots.clear_guild(incomplete.id.get());
+        self.app.snapshots.clear_guild(&ctx.cache, incomplete.id);
         self.app.member_joins.clear_guild(incomplete.id.get());
         self.app.image_spam.invalidate_guild(incomplete.id.get());
         self.app.recent_messages.forget_guild(incomplete.id.get());
