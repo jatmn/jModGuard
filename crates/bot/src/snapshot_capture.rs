@@ -3966,6 +3966,59 @@ mod tests {
         remove_db_and_store(&path);
     }
 
+    #[tokio::test]
+    async fn queued_work_from_a_departed_guild_does_not_republish_its_configuration() {
+        use serenity::client::EventHandler;
+        use serenity::model::event::GuildDeleteEvent;
+
+        let (app, path) = temp_app("snapshot_departed_config");
+        app.activation.note_discord_connected();
+        let scope = cache_scope(&app, 100).await;
+        crate::db::upsert_log_channel(&app.db, 789, "message_delete", 456)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        let ctx = test_delete_context().await;
+        app.install_discord_cache(Arc::clone(&ctx.cache));
+        cache_fixture_guild(&ctx.cache, 789, 100);
+
+        // Work queued while the bot was a member waits behind the departure,
+        // so its first configuration read starts after cleanup.
+        let mut receiver = app.snapshots.receiver.lock().start().unwrap();
+        assert!(app.snapshots.enqueue(
+            &app,
+            ctx.clone(),
+            scope.clone(),
+            Body::Create(cache_observation(1, app.snapshots.started_at_ms, "queued")),
+        ));
+        let mut delete: GuildDeleteEvent =
+            serde_json::from_value(serde_json::json!({"id": "789", "unavailable": false})).unwrap();
+        ctx.cache.update(&mut delete);
+        let handler = crate::handlers::Handler {
+            app: Arc::clone(&app),
+        };
+        handler.guild_delete(ctx.clone(), delete.guild, None).await;
+        receiver.close();
+        run(Arc::clone(&app), receiver).await;
+        assert!(
+            app.configs.last_known(789).is_none(),
+            "departed work must not repopulate the configuration cache"
+        );
+
+        // A real rejoin caches normally.
+        cache_fixture_guild(&ctx.cache, 789, 200);
+        let rejoined = app.configs.get(&app.db, 789).await.unwrap();
+        assert!(
+            app.configs
+                .last_known(789)
+                .is_some_and(|cfg| Arc::ptr_eq(&cfg, &rejoined))
+        );
+        drop(rejoined);
+        drop(handler);
+        drop(app);
+        remove_db_and_store(&path);
+    }
+
     async fn assert_gateway_capture_eligibility(enabled: bool) {
         use serenity::model::event::{MessageCreateEvent, ReadyEvent};
 

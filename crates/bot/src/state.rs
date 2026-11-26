@@ -1258,6 +1258,7 @@ impl BotState {
     }
 
     pub fn install_discord_cache(&self, cache: Arc<serenity::cache::Cache>) {
+        self.configs.track_gateway_membership(Arc::clone(&cache));
         *self.discord_cache.lock() = Some(cache);
     }
 
@@ -2447,12 +2448,35 @@ enum ConfigReadRoute {
     Primary,
 }
 
+/// A guild's Gateway membership in the installed Serenity cache.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GatewayMembership {
+    /// No Gateway cache is installed (tests, early startup).
+    Untracked,
+    Absent,
+    Unavailable,
+    Joined(serenity::model::Timestamp),
+}
+
+impl GatewayMembership {
+    /// Whether a load that began under `self` may publish under `now`: never
+    /// for a guild that is not a member, nor across a leave and rejoin.
+    fn admits(self, now: Self) -> bool {
+        match (self, now) {
+            (Self::Absent, _) | (_, Self::Absent) => false,
+            (Self::Joined(began), Self::Joined(now)) => began == now,
+            _ => true,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ConfigCache {
     map: DashMap<i64, Arc<CachedGuildConfig>>,
     version: Arc<AtomicU64>,
-    /// Confirmed guild departures; loads begun before one do not publish.
-    departures: Arc<AtomicU64>,
+    /// Serenity applies a Gateway event before its handler runs, so a
+    /// confirmed departure is visible here before `forget_guild`.
+    gateway: Arc<parking_lot::RwLock<Option<Arc<serenity::cache::Cache>>>>,
     ttl: Duration,
     durable_floor: Arc<AtomicU64>,
     publication_lock: Arc<parking_lot::Mutex<()>>,
@@ -2470,7 +2494,7 @@ impl ConfigCache {
         Self {
             map: DashMap::new(),
             version: Arc::new(AtomicU64::new(0)),
-            departures: Arc::new(AtomicU64::new(0)),
+            gateway: Arc::new(parking_lot::RwLock::new(None)),
             ttl: Duration::from_secs(15),
             durable_floor: Arc::new(AtomicU64::new(durable_floor)),
             publication_lock: Arc::new(parking_lot::Mutex::new(())),
@@ -2489,11 +2513,34 @@ impl ConfigCache {
         self.invalidate();
     }
 
-    /// Releases a confirmed-departed guild's configuration. A load already in
-    /// flight does not publish afterward; later loads, such as on rejoin, do.
+    pub(crate) fn track_gateway_membership(&self, cache: Arc<serenity::cache::Cache>) {
+        *self.gateway.write() = Some(cache);
+    }
+
+    fn gateway_membership(&self, guild_id: u64) -> GatewayMembership {
+        let Some(cache) = self.gateway.read().clone() else {
+            return GatewayMembership::Untracked;
+        };
+        let Some(guild) =
+            std::num::NonZeroU64::new(guild_id).map(serenity::model::id::GuildId::from)
+        else {
+            return GatewayMembership::Absent;
+        };
+        if let Some(cached) = cache.guild(guild) {
+            return GatewayMembership::Joined(cached.joined_at);
+        }
+        // Serenity keeps a guild here if it was unavailable when it left.
+        if cache.unavailable_guilds().get(&guild).is_some() {
+            GatewayMembership::Unavailable
+        } else {
+            GatewayMembership::Absent
+        }
+    }
+
+    /// Releases a confirmed-departed guild's configuration. Loads publish only
+    /// while the guild is a Gateway member, so departed work cannot restore it.
     pub(crate) fn forget_guild(&self, guild_id: u64) {
         let _publication = self.publication_lock.lock();
-        self.departures.fetch_add(1, Ordering::Relaxed);
         self.map.remove(&(guild_id as i64));
     }
 
@@ -2530,7 +2577,6 @@ impl ConfigCache {
     }
 
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
-        let departures = self.departures.load(Ordering::Relaxed);
         let required = self
             .durable_floor
             .load(Ordering::SeqCst)
@@ -2542,6 +2588,7 @@ impl ConfigCache {
         {
             return Ok(Arc::clone(&entry));
         }
+        let membership = self.gateway_membership(guild_id);
         let mut route = ConfigReadRoute::Replica;
         let mut last_observed = 0;
         let mut last_required = required;
@@ -2593,9 +2640,8 @@ impl ConfigCache {
                     route = ConfigReadRoute::Primary;
                     continue;
                 }
-                if self.departures.load(Ordering::Relaxed) != departures {
-                    // A confirmed departure overlapped this load, so it may
-                    // describe the departed guild: serve it, but do not retain it.
+                if !membership.admits(self.gateway_membership(guild_id)) {
+                    // Serve a load for a departed guild, but do not retain it.
                     return Ok(cfg);
                 }
                 self.map.insert(guild_id as i64, Arc::clone(&cfg));

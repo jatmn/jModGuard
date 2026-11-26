@@ -4218,12 +4218,37 @@ mod tests {
         }
     }
 
+    /// Applies a Gateway guild event to the Serenity cache, which Serenity
+    /// does before it runs the matching handler.
+    fn gateway_guild(cache: &serenity::cache::Cache, guild: u64, joined_at_ns: Option<i64>) {
+        use serenity::model::event::{GuildCreateEvent, GuildDeleteEvent};
+        match joined_at_ns {
+            Some(joined_at_ns) => {
+                let mut cached = serenity::model::guild::Guild::default();
+                cached.id = serenity::model::id::GuildId::new(guild);
+                cached.joined_at = chrono::DateTime::from_timestamp_nanos(joined_at_ns).into();
+                let mut event: GuildCreateEvent =
+                    serde_json::from_value(serde_json::to_value(cached).unwrap()).unwrap();
+                cache.update(&mut event);
+            }
+            None => {
+                let mut event: GuildDeleteEvent = serde_json::from_value(
+                    serde_json::json!({"id": guild.to_string(), "unavailable": false}),
+                )
+                .unwrap();
+                cache.update(&mut event);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn confirmed_departure_releases_compiled_config_and_fences_in_flight_loads() {
         use serenity::client::EventHandler;
         use serenity::model::guild::UnavailableGuild;
         let (directory, app, _) = counter_fixture("config_departure").await;
         let (ctx, _) = counter_context(&app, false).await;
+        app.install_discord_cache(std::sync::Arc::clone(&ctx.cache));
+        gateway_guild(&ctx.cache, 10, Some(100));
         let handler = super::Handler {
             app: std::sync::Arc::clone(&app),
         };
@@ -4243,12 +4268,17 @@ mod tests {
         let loaded = app.configs.get(&app.db, 10).await.unwrap();
         let released = std::sync::Arc::downgrade(&loaded);
         // Temporary gateway unavailability keeps the last-known fallback.
+        let mut outage: serenity::model::event::GuildDeleteEvent =
+            serde_json::from_value(serde_json::json!({"id": "10", "unavailable": true})).unwrap();
+        ctx.cache.update(&mut outage);
         handler.guild_delete(ctx.clone(), event(true), None).await;
         assert!(
             app.configs
                 .last_known(10)
                 .is_some_and(|cfg| std::sync::Arc::ptr_eq(&cfg, &loaded))
         );
+        gateway_guild(&ctx.cache, 10, Some(100));
+        gateway_guild(&ctx.cache, 10, None);
         handler.guild_delete(ctx.clone(), event(false), None).await;
         assert!(app.configs.last_known(10).is_none());
         drop(loaded);
@@ -4256,9 +4286,15 @@ mod tests {
             released.upgrade().is_none(),
             "confirmed departure must release the compiled config"
         );
+        // Work queued by the departed membership may read configuration only
+        // after cleanup; it must not repopulate the cache without a rejoin.
+        let queued = app.configs.get(&app.db, 10).await.unwrap();
+        assert!(app.configs.last_known(10).is_none());
+        drop(queued);
 
         // Rejoin loads normally; the delayed load then completes and must not
         // replace it with the departed incarnation.
+        gateway_guild(&ctx.cache, 10, Some(200));
         let rejoined = app.configs.get(&app.db, 10).await.unwrap();
         let late = stale.await.unwrap();
         assert!(!std::sync::Arc::ptr_eq(&late, &rejoined));
@@ -4272,8 +4308,51 @@ mod tests {
         );
         let rejoined_weak = std::sync::Arc::downgrade(&rejoined);
         drop(rejoined);
+        gateway_guild(&ctx.cache, 10, None);
         handler.guild_delete(ctx, event(false), None).await;
         assert!(rejoined_weak.upgrade().is_none());
+
+        drop(handler);
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn another_guilds_departure_keeps_an_active_guilds_cold_load() {
+        use serenity::client::EventHandler;
+        let (directory, app, _) = counter_fixture("config_departure_other").await;
+        let (ctx, _) = counter_context(&app, false).await;
+        app.install_discord_cache(std::sync::Arc::clone(&ctx.cache));
+        gateway_guild(&ctx.cache, 10, Some(100));
+        gateway_guild(&ctx.cache, 11, Some(100));
+        let handler = super::Handler {
+            app: std::sync::Arc::clone(&app),
+        };
+
+        // Active guild 11 has no cached configuration and its first load is
+        // waiting on SQL when guild 10 confirms its departure.
+        let mut cold = Box::pin(app.configs.get(&app.db, 11));
+        tokio::select! {
+            biased;
+            _ = &mut cold => panic!("config load finished before the departure"),
+            _ = std::future::ready(()) => {}
+        }
+        gateway_guild(&ctx.cache, 10, None);
+        handler
+            .guild_delete(
+                ctx,
+                serde_json::from_value(serde_json::json!({"id": "10", "unavailable": false}))
+                    .unwrap(),
+                None,
+            )
+            .await;
+        let loaded = cold.await.unwrap();
+        assert!(
+            app.configs
+                .last_known(11)
+                .is_some_and(|cfg| std::sync::Arc::ptr_eq(&cfg, &loaded)),
+            "an unrelated departure must not drop an active guild's fallback"
+        );
 
         drop(handler);
         drop(app);
