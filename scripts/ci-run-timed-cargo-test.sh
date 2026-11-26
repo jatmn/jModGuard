@@ -767,9 +767,10 @@ run_timed_cargo_test_doctests() {
   fi
   local list_out list_rc ignored_out ignored_rc name selector rc line
   local -a doc_names=() all_names=() run_cargo=() run_harness=() selector_args=()
+  local -a list_args=("${cargo_args[@]}" --doc -- --list --format terse "${harness[@]}")
   local -A ignored_names=()
   set +e
-  list_out="$(cargo test "${cargo_args[@]}" --doc -- --list --format terse "${harness[@]}")"
+  list_out="$(cargo test "${list_args[@]}")"
   list_rc=$?
   set -e
   if [ "$list_rc" -ne 0 ]; then
@@ -779,6 +780,7 @@ run_timed_cargo_test_doctests() {
     name="$(test_list_name "$line")" || continue
     doc_names+=("$name")
   done <<<"$list_out"
+  [ "${#doc_names[@]}" -gt 0 ] || return 0
   set +e
   ignored_out="$(cargo test "${cargo_args[@]}" --doc -- --list --ignored --format terse "${harness_tail[@]}")"
   ignored_rc=$?
@@ -790,7 +792,6 @@ run_timed_cargo_test_doctests() {
     name="$(test_list_name "$line")" || continue
     ignored_names["$name"]=1
   done <<<"$ignored_out"
-  [ "${#doc_names[@]}" -gt 0 ] || return 0
   while IFS= read -r line; do
     run_cargo+=("$line")
   done < <(jmodguard_cargo_args_without_test_filter "${cargo_args[@]}")
@@ -798,12 +799,24 @@ run_timed_cargo_test_doctests() {
     run_harness+=("$line")
   done < <(jmodguard_doctest_run_harness "${harness[@]}")
   # Include names excluded by caller filters: a token unique in the selected
-  # set may otherwise run another doctest when those filters are removed.
-  list_out="$(cargo test "${run_cargo[@]}" --doc -- --list --format terse "${run_harness[@]}")" || return $?
-  while IFS= read -r line; do
-    name="$(test_list_name "$line")" || continue
-    all_names+=("$name")
-  done <<<"$list_out"
+  # set may otherwise run another doctest when those filters are removed. An
+  # identical command already supplied the complete list.
+  local -a selector_list_args=("${run_cargo[@]}" --doc -- --list --format terse "${run_harness[@]}")
+  local compared=0
+  while [ "$compared" -lt "${#list_args[@]}" ] \
+    && [ "$compared" -lt "${#selector_list_args[@]}" ] \
+    && [ "${list_args[compared]}" = "${selector_list_args[compared]}" ]; do
+    compared=$((compared + 1))
+  done
+  if [ "$compared" -eq "${#list_args[@]}" ] && [ "$compared" -eq "${#selector_list_args[@]}" ]; then
+    all_names=("${doc_names[@]}")
+  else
+    list_out="$(cargo test "${selector_list_args[@]}")" || return $?
+    while IFS= read -r line; do
+      name="$(test_list_name "$line")" || continue
+      all_names+=("$name")
+    done <<<"$list_out"
+  fi
   for name in "${doc_names[@]}"; do
     if [ "$run_ignored" -eq 0 ] && [ -n "${ignored_names[$name]+x}" ]; then
       continue
