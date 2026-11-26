@@ -1818,6 +1818,142 @@ async fn version_observation_reads_counters_and_revisions_in_one_statement() {
     super::cleanup_db(&path);
 }
 
+struct ObservedGuildStats {
+    counts: (i64, i64, i64),
+    statements: Vec<String>,
+}
+
+/// The bot `guild_stats` and dashboard `enrolled_guild_stats` reads for each
+/// guild, with the ordered SQL trace of each read.
+async fn observe_guild_stats(
+    fixture: &HranaFixture,
+    db: &Db,
+    scopes: &[GuildEnrollment],
+) -> Vec<ObservedGuildStats> {
+    let mut observed = Vec::new();
+    for scope in scopes {
+        for enrolled in [false, true] {
+            fixture.state.lock().unwrap().statements.clear();
+            let stats = if enrolled {
+                enrolled_guild_stats(db, scope.clone()).await
+            } else {
+                guild_stats(db, scope.guild_id).await
+            }
+            .unwrap();
+            let statements = std::mem::take(&mut fixture.state.lock().unwrap().statements);
+            observed.push(ObservedGuildStats {
+                counts: (stats.events, stats.warns, stats.bans),
+                statements,
+            });
+        }
+    }
+    observed
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn guild_stats_read_all_counts_in_one_statement() {
+    let path = super::tmp_db_path("remote_guild_stats");
+    let local = Db::open(&path, 2).unwrap();
+    let mut scopes = Vec::new();
+    for guild in [10, 20, 30] {
+        scopes.push(enroll_guild(&local, guild, 100).await.unwrap().unwrap());
+    }
+    let (fixture, db) = HranaFixture::sqlite_backed_database(&path).await;
+
+    let check = |label: &str, observed: Vec<ObservedGuildStats>, expected: [(i64, i64, i64); 3]| {
+        for (index, read) in observed.into_iter().enumerate() {
+            let (guild, enrolled) = (index / 2, index % 2 == 1);
+            let route = if enrolled { "dashboard" } else { "bot" };
+            assert_eq!(
+                read.counts, expected[guild],
+                "{label} guild {guild} {route}"
+            );
+            let stats_sql = match read.statements.as_slice() {
+                [stats] if !enrolled => stats,
+                [begin, enrollment, stats, rollback] if enrolled => {
+                    assert_eq!(begin.trim().trim_end_matches(';'), "BEGIN DEFERRED");
+                    assert!(enrollment.contains("guild_enrollments"), "{enrollment}");
+                    assert_eq!(rollback.trim().trim_end_matches(';'), "ROLLBACK");
+                    stats
+                }
+                statements => {
+                    panic!("{label} guild {guild} {route}: unexpected SQL trace {statements:?}");
+                }
+            };
+            let stats_sql = stats_sql.to_ascii_uppercase();
+            for table in ["EVENTS", "WARNS", "BANS"] {
+                assert!(stats_sql.contains(&format!("FROM {table}")), "{stats_sql}");
+            }
+        }
+    };
+
+    check(
+        "empty",
+        observe_guild_stats(&fixture, &db, &scopes).await,
+        [(0, 0, 0); 3],
+    );
+
+    let counted = [
+        ("mod_action", json!({"action": "warn"})),
+        ("member_ban", json!({})),
+        ("automod", json!({"action": "ban"})),
+        ("plan_executed", json!({"moderation": true})),
+    ];
+    let excluded = [
+        ("automod", json!({"action": "ban", "dry_run": true})),
+        ("automod", json!({"action": "log"})),
+        ("message_edit", json!({})),
+        ("plan_executed", json!({"moderation": false})),
+    ];
+    for (event, data) in counted.iter().chain(&excluded) {
+        insert_event(&local, 10, event, Some(5), None, data)
+            .await
+            .unwrap();
+    }
+    for (event, data) in [
+        ("timeout_add", json!({})),
+        ("member_kick", json!({})),
+        ("system", json!({})),
+    ] {
+        insert_event(&local, 20, event, None, None, &data)
+            .await
+            .unwrap();
+    }
+    local
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                "INSERT INTO events (guild_id,event_type,data,created_at)
+                 VALUES (10,'automod','invalid',''), (20,'plan_executed',NULL,'');",
+                64 * 1024 * 1024,
+            )
+        })
+        .await
+        .unwrap();
+    add_warn(&local, 10, 5, 9, "first").await.unwrap();
+    add_warn(&local, 10, 6, 9, "second").await.unwrap();
+    add_warn(&local, 20, 5, 9, "other guild").await.unwrap();
+    record_ban(&local, 10, 5, Some(9), "active").await.unwrap();
+    record_ban(&local, 10, 6, None, "lifted").await.unwrap();
+    mark_unbanned(&local, 10, 6).await.unwrap();
+
+    // Guild 30 stays empty beside populated guilds.
+    let expected = [(4, 2, 2), (2, 1, 0), (0, 0, 0)];
+    check(
+        "mixed",
+        observe_guild_stats(&fixture, &db, &scopes).await,
+        expected,
+    );
+    for (scope, expected) in scopes.iter().zip(expected) {
+        let stats = guild_stats(&local, scope.guild_id).await.unwrap();
+        assert_eq!((stats.events, stats.warns, stats.bans), expected);
+    }
+
+    drop(db);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
 async fn read_primary_fixture(db: &Db) -> Result<()> {
     db.with_conn(|conn| {
         let tx = conn.transaction_primary_snapshot()?;

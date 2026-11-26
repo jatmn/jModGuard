@@ -1,6 +1,5 @@
-const BAN_STATS_SQL: &str = "SELECT COUNT(*) FROM bans WHERE guild_id = ?1";
-const WARN_STATS_SQL: &str = "SELECT COUNT(*) FROM warns WHERE guild_id = ?1";
-const EVENT_STATS_SQL: &str = "SELECT COUNT(*) FROM events WHERE guild_id = ?1 AND (
+const GUILD_STATS_SQL: &str = "SELECT
+               (SELECT COUNT(*) FROM events WHERE guild_id = ?1 AND (
                    event_type IN ('mod_action','timeout_add','timeout_remove',
                                   'member_ban','member_unban','member_kick')
                    OR CASE WHEN json_valid(data) THEN
@@ -9,7 +8,9 @@ const EVENT_STATS_SQL: &str = "SELECT COUNT(*) FROM events WHERE guild_id = ?1 A
                       AND COALESCE(json_extract(data, '$.dry_run'), 0) = 0)
                      OR (event_type = 'plan_executed' AND json_type(data, '$.moderation') = 'true')
                    ELSE 0 END
-                 )";
+                 )),
+               (SELECT COUNT(*) FROM warns WHERE guild_id = ?1),
+               (SELECT COUNT(*) FROM bans WHERE guild_id = ?1)";
 const BAN_PAGE_SQL: &str = "SELECT id, guild_id, user_id, moderator_id, reason, created_at, active, user_name, user_display_name, moderator_name
              FROM bans WHERE guild_id = ?1 ORDER BY id DESC LIMIT ?2";
 use super::*;
@@ -782,11 +783,12 @@ pub async fn guild_stats(db: &Db, guild_id: i64) -> Result<Stats> {
 }
 
 fn guild_stats_conn(conn: &impl SqlExecutor, guild_id: i64) -> Result<Stats> {
-    let one = |sql: &str| conn.query_row(sql, params![guild_id], |r| Ok(r.get::<i64>(0)?));
-    Ok(Stats {
-        events: one(EVENT_STATS_SQL)?,
-        warns: one(WARN_STATS_SQL)?,
-        bans: one(BAN_STATS_SQL)?,
+    conn.query_row(GUILD_STATS_SQL, params![guild_id], |r| {
+        Ok(Stats {
+            events: r.get(0)?,
+            warns: r.get(1)?,
+            bans: r.get(2)?,
+        })
     })
 }
 
@@ -2807,8 +2809,19 @@ mod query_plan_tests {
         let db = Db::open(&path, 2).unwrap();
         db.with_conn_sync(|conn| {
             // Both !stats/!status and WebUI stats call guild_stats_conn.
-            for sql in [EVENT_STATS_SQL, WARN_STATS_SQL, BAN_STATS_SQL] {
-                crate::db::tests::assert_index_plan(conn, sql, params![42], false);
+            crate::db::tests::assert_index_plan(conn, GUILD_STATS_SQL, params![42], false);
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {GUILD_STATS_SQL}"))?;
+            let plan = stmt
+                .query_map(params![42], |r| Ok(r.get::<String>(3)?))?
+                .collect::<Result<Vec<_>>>()?;
+            for table in ["events", "warns", "bans"] {
+                assert!(
+                    plan.iter()
+                        .any(|line| line.starts_with(&format!("SEARCH {table} "))
+                            && line.contains("INDEX idx_")
+                            && line.contains("(guild_id=?)")),
+                    "each stats count must search a guild index: {plan:?}"
+                );
             }
             for event_type in [None, Some("automod")] {
                 for user_id in [None, Some(99)] {
