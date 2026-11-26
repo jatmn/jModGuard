@@ -86,14 +86,16 @@ async fn refresh_gauges(app: &BotState, shards: &ShardManager, cache: &Cache) {
 }
 
 /// The API's completed minutes, or none when the link is off or unreachable.
-async fn collect_api_minutes(app: &BotState) -> Vec<Rollup> {
+async fn collect_api_minutes(app: &BotState, saved_through: Option<i64>) -> Vec<Rollup> {
     let Ok(Some(link)) = jmodguard::read_link::try_read_link(
         &app.cfg.bot.read_target,
         app.cfg.bot.control_secret.as_str(),
     ) else {
         return Vec::new();
     };
-    let fetch = tokio::task::spawn_blocking(move || link.fetch_resource_rollups_blocking());
+    let fetch = tokio::task::spawn_blocking(move || {
+        link.fetch_resource_rollups_after_blocking(saved_through)
+    });
     match tokio::time::timeout(jmodguard::read_link::RESOURCE_FETCH_TIMEOUT, fetch).await {
         Ok(Ok(Some(response))) => response.minutes,
         _ => Vec::new(),
@@ -116,7 +118,7 @@ pub async fn run(
     let mut backlog: Vec<Rollup> = Vec::new();
     let mut failing = false;
     // The API keeps its recent minutes; send only those not saved yet.
-    let mut api_saved_through = i64::MIN;
+    let mut api_saved_through = None;
     let mut tick = jmodguard::idle_poll::IdlePoll::BotResources
         .interval(poll_start, jmodguard::cgroup::SAMPLE_INTERVAL);
     loop {
@@ -143,10 +145,11 @@ pub async fn run(
         if !app.activation.may_record() {
             continue;
         }
-        let api: Vec<Rollup> = collect_api_minutes(&app)
+        let api: Vec<Rollup> = collect_api_minutes(&app, api_saved_through)
             .await
             .into_iter()
-            .filter(|rollup| rollup.start_secs > api_saved_through)
+            // Older APIs return the full buffer even if asked for a suffix.
+            .filter(|rollup| api_saved_through.is_none_or(|saved| rollup.start_secs > saved))
             .collect();
         let mut minutes: Vec<(ResourceProcess, Rollup)> = backlog
             .iter()
@@ -171,7 +174,7 @@ pub async fn run(
                     write.bot_minute_starts.iter().copied().collect();
                 backlog.retain(|rollup| !saved.contains(&rollup.start_secs));
                 if let Some(through) = write.api_minute_starts.iter().copied().max() {
-                    api_saved_through = through;
+                    api_saved_through = Some(through);
                 }
                 failing = false;
             }

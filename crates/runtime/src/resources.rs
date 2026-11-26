@@ -432,10 +432,16 @@ pub fn publish_recent(rollup: Rollup) {
 
 /// Completed minutes kept by [`publish_recent`], oldest first.
 pub fn recent_rollups() -> Vec<Rollup> {
+    recent_rollups_after(None)
+}
+
+/// Retained completed minutes newer than the bot's committed watermark.
+pub fn recent_rollups_after(saved_through: Option<i64>) -> Vec<Rollup> {
     RECENT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
+        .filter(|rollup| saved_through.is_none_or(|saved| rollup.start_secs > saved))
         .cloned()
         .collect()
 }
