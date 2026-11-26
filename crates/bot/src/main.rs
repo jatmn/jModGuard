@@ -6,7 +6,7 @@ use jmodguard_bot::config::BotProcessConfig;
 use jmodguard_bot::handlers::Handler;
 use jmodguard_bot::logging;
 use jmodguard_bot::nickname_worker::reconcile_nickname_job;
-use jmodguard_bot::state::BotState;
+use jmodguard_bot::state::{BotState, ConfigCacheGateway};
 use jmodguard_bot::{db, init_tracing, shutdown_signal};
 use serenity::cache::Settings as CacheSettings;
 use serenity::model::gateway::GatewayIntents;
@@ -311,6 +311,7 @@ async fn main() -> Result<()> {
     if !activation.allows_discord_connect() {
         anyhow::bail!("active-bot lease was not held");
     }
+    let config_gateway = Arc::new(ConfigCacheGateway::new(&app));
     if jmodguard_bot::control_server::spawn(Arc::clone(&app))?.is_none() {
         tracing::error!(
             "control listener is off; moderation continues and API writes are unavailable"
@@ -331,11 +332,16 @@ async fn main() -> Result<()> {
     let discord_http = serenity::http::Http::new(&cfg.discord.token);
     let mut client = serenity::client::ClientBuilder::new_with_http(discord_http, intents)
         .cache_settings(bot_cache_settings())
+        .voice_manager_arc(config_gateway.clone())
         .event_handler(Handler {
             app: Arc::clone(&app),
         })
         .await
         .context("failed to create discord client")?;
+    config_gateway.attach(&client.shard_manager);
+    // The shard manager already owns the registration hook. Skip the
+    // client-side voice initialization and its extra Discord REST request.
+    client.voice_manager = None;
 
     let http = Arc::clone(&client.http);
     let cache = Arc::clone(&client.cache);

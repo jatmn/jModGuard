@@ -2188,6 +2188,7 @@ mod tests {
     use serenity::model::channel::Message;
     use serenity::model::event::MessageUpdateEvent;
     use serenity::model::guild::audit_log::{Action, MemberAction};
+    use serenity::model::guild::{Guild, UnavailableGuild};
     use serenity::model::id::{ChannelId, GuildId, MessageId};
 
     #[test]
@@ -4206,6 +4207,327 @@ mod tests {
             drop(app);
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    /// Passes events through the production collector and the Serenity cache
+    /// in dispatch order. Tests can delay the matching async callbacks.
+    fn gateway_config_events(
+        app: &std::sync::Arc<BotState>,
+        ctx: &serenity::client::Context,
+    ) -> (
+        impl Fn(u64, i64) -> Guild + use<>,
+        impl Fn(u64, bool) -> UnavailableGuild + use<>,
+    ) {
+        use crate::state::ConfigCacheGateway;
+        use serenity::model::event::{Event, GuildCreateEvent, GuildDeleteEvent};
+
+        let _gateway = ConfigCacheGateway::new(app);
+        let collector = std::sync::Arc::new(ConfigCacheGateway::collector(
+            std::sync::Arc::downgrade(app),
+            ctx.shard_id,
+        ));
+        let creates = std::sync::Arc::clone(&collector);
+        let cache = std::sync::Arc::clone(&ctx.cache);
+        let create = move |guild, joined_at_ns| {
+            let mut cached = Guild::default();
+            cached.id = serenity::model::id::GuildId::new(guild);
+            cached.joined_at = chrono::DateTime::from_timestamp_nanos(joined_at_ns).into();
+            let mut event: GuildCreateEvent =
+                serde_json::from_value(serde_json::to_value(cached).unwrap()).unwrap();
+            assert!((creates.0)(&Event::GuildCreate(event.clone())));
+            cache.update(&mut event);
+            event.guild
+        };
+        let cache = std::sync::Arc::clone(&ctx.cache);
+        let delete = move |guild: u64, unavailable| {
+            let mut event: GuildDeleteEvent = serde_json::from_value(
+                serde_json::json!({"id": guild.to_string(), "unavailable": unavailable}),
+            )
+            .unwrap();
+            assert!((collector.0)(&Event::GuildDelete(event.clone())));
+            cache.update(&mut event);
+            event.guild
+        };
+        (create, delete)
+    }
+
+    #[tokio::test]
+    async fn confirmed_departure_releases_compiled_config_and_fences_in_flight_loads() {
+        use serenity::client::EventHandler;
+        let (directory, app, _) = counter_fixture("config_departure").await;
+        let (ctx, _) = counter_context(&app, false).await;
+        let (create, delete) = gateway_config_events(&app, &ctx);
+        create(10, 100);
+        let handler = super::Handler {
+            app: std::sync::Arc::clone(&app),
+        };
+        let loaded = app.configs.get(&app.db, 10).await.unwrap();
+        let released = std::sync::Arc::downgrade(&loaded);
+        handler
+            .guild_delete(ctx.clone(), delete(10, true), None)
+            .await;
+        assert!(
+            app.configs
+                .last_known(10)
+                .is_some_and(|cfg| std::sync::Arc::ptr_eq(&cfg, &loaded)),
+            "a temporary outage keeps the last-known configuration"
+        );
+        create(10, 100);
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(16)).await;
+
+        // A load of the departing incarnation is still waiting on SQL.
+        let mut stale = Box::pin(app.configs.get(&app.db, 10));
+        tokio::select! {
+            biased;
+            _ = &mut stale => panic!("config load finished before the departure"),
+            _ = std::future::ready(()) => {}
+        }
+
+        let departure = delete(10, false);
+        assert!(app.configs.last_known(10).is_none());
+        drop(loaded);
+
+        // Rejoin loads independently of the delayed result. The old departure
+        // callback may finish after the rejoin and its configuration load.
+        create(10, 200);
+        let rejoined = app.configs.get(&app.db, 10).await.unwrap();
+        handler.guild_delete(ctx.clone(), departure, None).await;
+        let late = stale.await.unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&late, &rejoined));
+        let late_weak = std::sync::Arc::downgrade(&late);
+        drop(late);
+        assert!(late_weak.upgrade().is_none());
+        assert!(
+            released.upgrade().is_none(),
+            "confirmed departure must release the compiled config after its last reader finishes"
+        );
+        assert!(
+            app.configs
+                .last_known(10)
+                .is_some_and(|cfg| std::sync::Arc::ptr_eq(&cfg, &rejoined))
+        );
+        let rejoined_weak = std::sync::Arc::downgrade(&rejoined);
+        drop(rejoined);
+        delete(10, false);
+        assert!(rejoined_weak.upgrade().is_none());
+
+        drop(handler);
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn confirmed_departure_during_an_outage_fences_pending_and_queued_loads() {
+        use serenity::client::EventHandler;
+        let (directory, app, _) = counter_fixture("config_departure_outage").await;
+        let (ctx, _) = counter_context(&app, false).await;
+        let (create, delete) = gateway_config_events(&app, &ctx);
+        let delayed_create = create(10, 100);
+        let handler = super::Handler {
+            app: std::sync::Arc::clone(&app),
+        };
+
+        handler
+            .guild_delete(ctx.clone(), delete(10, true), None)
+            .await;
+        let mut pending = Box::pin(app.configs.get(&app.db, 10));
+        tokio::select! {
+            biased;
+            _ = &mut pending => panic!("config load finished before the departure"),
+            _ = std::future::ready(()) => {}
+        }
+
+        // Serenity keeps its unavailable marker through the confirmed delete.
+        handler
+            .guild_delete(ctx.clone(), delete(10, false), None)
+            .await;
+        handler
+            .guild_create(ctx.clone(), delayed_create, Some(false))
+            .await;
+        drop(app.configs.get(&app.db, 10).await.unwrap());
+        assert!(
+            app.configs.last_known(10).is_none(),
+            "a delayed create callback must not reopen the departed membership"
+        );
+
+        // Rejoin followed by another outage before any lookup is still an
+        // active membership, distinct from the load spanning the departure.
+        create(10, 200);
+        delete(10, true);
+        let during_outage = app.configs.get(&app.db, 10).await.unwrap();
+        let old = pending.await.unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&old, &during_outage));
+        let old_weak = std::sync::Arc::downgrade(&old);
+        drop(old);
+        assert!(old_weak.upgrade().is_none());
+        assert!(
+            app.configs
+                .last_known(10)
+                .is_some_and(|cfg| std::sync::Arc::ptr_eq(&cfg, &during_outage)),
+            "only the rejoined membership may seed its outage fallback"
+        );
+
+        drop(during_outage);
+        drop(handler);
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(debug_assertions)]
+    async fn buffer_primary_config_read(
+        db: &Db,
+        guild: i64,
+        mut read: std::pin::Pin<&mut impl std::future::Future>,
+    ) {
+        // Steer the first poll to primary, where it reads a real SQLite snapshot.
+        db.test_inject_next_config_snapshot(
+            db::load_config_parts_with_version(db, guild).await.unwrap(),
+        );
+        // The test runtime has a single blocking worker. Occupy it until the
+        // primary read has acquired the database's sole connection permit.
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocking_worker = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            blocked
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        });
+        running.await.unwrap();
+        tokio::select! {
+            biased;
+            _ = read.as_mut() => panic!("primary read finished while its worker was blocked"),
+            _ = std::future::ready(()) => {}
+        }
+        release.send(()).unwrap();
+        blocking_worker.await.unwrap();
+        // Wait for the primary read to relinquish its permit without polling its result.
+        db.with_conn(|_| Ok(())).await.unwrap();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn primary_config_read_recovers_after_one_invalidation() {
+        tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (directory, app, _) = counter_fixture("primary_config_invalidation").await;
+                let (ctx, _) = counter_context(&app, false).await;
+                let (create, _) = gateway_config_events(&app, &ctx);
+                create(10, 100);
+
+                db::patch_settings(&app.db, 10, Some(Some("updated!".into())), None, None)
+                    .await
+                    .unwrap();
+                let reader = Db::open(&directory.join("core.db"), 1).unwrap();
+                let mut pending = Box::pin(app.configs.get(&reader, 10));
+                buffer_primary_config_read(&reader, 10, pending.as_mut()).await;
+
+                // The command invalidates after its write. Membership and the
+                // committed revision remain stable throughout primary fallback.
+                app.invalidate_configs();
+                let loaded = pending
+                    .await
+                    .expect("one invalidation must allow primary recovery");
+                assert_eq!(loaded.settings.prefix, "updated!");
+                assert!(
+                    app.configs
+                        .last_known(10)
+                        .is_some_and(|entry| { std::sync::Arc::ptr_eq(&entry, &loaded) }),
+                    "the recovered snapshot must seed the active guild's fallback"
+                );
+                let hit = app.configs.get(&reader, 10).await.unwrap();
+                assert!(std::sync::Arc::ptr_eq(&hit, &loaded));
+
+                drop(reader);
+                drop(app);
+                std::fs::remove_dir_all(directory).unwrap();
+            });
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn departed_primary_config_read_preserves_current_revision_and_fallbacks() {
+        tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (directory, app, _) = counter_fixture("departed_primary_config").await;
+                let (ctx, _) = counter_context(&app, false).await;
+                let (create, delete) = gateway_config_events(&app, &ctx);
+                create(10, 100);
+                create(11, 100);
+
+                db::patch_settings(&app.db, 10, Some(Some("previous!".into())), None, None)
+                    .await
+                    .unwrap();
+                let old_reader = Db::open(&directory.join("core.db"), 1).unwrap();
+                let mut late = Box::pin(app.configs.get(&old_reader, 10));
+                buffer_primary_config_read(&old_reader, 10, late.as_mut()).await;
+
+                delete(10, false);
+                db::patch_settings(&app.db, 10, Some(Some("rejoined!".into())), None, None)
+                    .await
+                    .unwrap();
+                create(10, 200);
+                let rejoined = app.configs.get(&app.db, 10).await.unwrap();
+                let other = app.configs.get(&app.db, 11).await.unwrap();
+                assert_eq!(rejoined.settings.prefix, "rejoined!");
+
+                let late = late.await;
+                assert!(
+                    app.configs
+                        .last_known(10)
+                        .is_some_and(|entry| { std::sync::Arc::ptr_eq(&entry, &rejoined) }),
+                    "a late primary result must preserve the rejoined membership's publication"
+                );
+                assert!(
+                    app.configs
+                        .last_known(11)
+                        .is_some_and(|entry| { std::sync::Arc::ptr_eq(&entry, &other) }),
+                    "a late primary result must preserve an unrelated guild's fallback"
+                );
+                assert_eq!(late.unwrap().settings.prefix, "rejoined!");
+
+                drop(old_reader);
+                drop(app);
+                std::fs::remove_dir_all(directory).unwrap();
+            });
+    }
+
+    #[tokio::test]
+    async fn another_guilds_departure_keeps_an_active_guilds_cold_load() {
+        let (directory, app, _) = counter_fixture("config_departure_other").await;
+        let (ctx, _) = counter_context(&app, false).await;
+        let (create, delete) = gateway_config_events(&app, &ctx);
+        create(10, 100);
+        create(11, 100);
+
+        // Active guild 11 has no cached configuration and its first load is
+        // waiting on SQL when guild 10 confirms its departure.
+        let mut cold = Box::pin(app.configs.get(&app.db, 11));
+        tokio::select! {
+            biased;
+            _ = &mut cold => panic!("config load finished before the departure"),
+            _ = std::future::ready(()) => {}
+        }
+        delete(10, false);
+        let loaded = cold.await.unwrap();
+        assert!(
+            app.configs
+                .last_known(11)
+                .is_some_and(|cfg| std::sync::Arc::ptr_eq(&cfg, &loaded)),
+            "an unrelated departure must not drop an active guild's fallback"
+        );
+
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 

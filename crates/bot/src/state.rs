@@ -5,12 +5,18 @@ use dashmap::DashMap;
 use jmodguard::custom_rules::{WordDictionary, is_custom_id};
 use parking_lot::Mutex;
 use regex::Regex;
-use serenity::model::id::ChannelId;
+use serenity::gateway::{CollectorCallback, ShardManager, ShardRunnerMessage, VoiceGatewayManager};
+use serenity::model::{
+    Timestamp,
+    event::Event,
+    id::{ChannelId, GuildId, ShardId, UserId},
+    voice::VoiceState,
+};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
@@ -2534,7 +2540,120 @@ enum ConfigReadRoute {
     Primary,
 }
 
-type ConfigLoadKey = (i64, u64);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ConfigMembership {
+    Untracked,
+    Absent,
+    Active(u64),
+}
+
+struct GatewayConfigMember {
+    epoch: u64,
+    shard: ShardId,
+    joined_at: Option<Timestamp>,
+}
+
+#[derive(Default)]
+struct GatewayConfigMemberships {
+    active: HashMap<i64, GatewayConfigMember>,
+    next_epoch: u64,
+}
+
+impl GatewayConfigMemberships {
+    fn join(&mut self, guild: i64, shard: ShardId, joined_at: Option<Timestamp>) {
+        self.next_epoch += 1;
+        self.active.insert(
+            guild,
+            GatewayConfigMember {
+                epoch: self.next_epoch,
+                shard,
+                joined_at,
+            },
+        );
+    }
+}
+
+/// Installs the configuration collector before the shard dispatches READY.
+/// Serenity's ordinary event callbacks can run out of order.
+pub struct ConfigCacheGateway {
+    app: Weak<BotState>,
+    manager: OnceLock<Weak<ShardManager>>,
+}
+
+impl ConfigCacheGateway {
+    pub fn new(app: &Arc<BotState>) -> Self {
+        app.configs.track_gateway_membership();
+        Self {
+            app: Arc::downgrade(app),
+            manager: OnceLock::new(),
+        }
+    }
+
+    pub fn attach(&self, manager: &Arc<ShardManager>) {
+        let _ = self.manager.set(Arc::downgrade(manager));
+    }
+
+    pub(crate) fn collector(app: Weak<BotState>, shard: ShardId) -> CollectorCallback {
+        let saw_ready = AtomicBool::new(false);
+        CollectorCallback(Box::new(move |event| {
+            match event {
+                Event::Ready(_) => {
+                    // The runner installs a fresh collector for each READY.
+                    if saw_ready.swap(true, Ordering::Relaxed) {
+                        return false;
+                    }
+                }
+                Event::GuildCreate(event) if !event.guild.unavailable => {}
+                Event::GuildDelete(event) if !event.guild.unavailable => {}
+                _ => return true,
+            }
+            let Some(app) = app.upgrade() else {
+                return false;
+            };
+            app.configs.observe_gateway_event(shard, event);
+            true
+        }))
+    }
+}
+
+#[serenity::async_trait]
+impl VoiceGatewayManager for ConfigCacheGateway {
+    async fn initialise(&self, _: u32, _: UserId) {}
+
+    async fn register_shard(
+        &self,
+        shard: u32,
+        _: serenity::futures::channel::mpsc::UnboundedSender<ShardRunnerMessage>,
+    ) {
+        let Some(manager) = self.manager.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let shard = ShardId(shard);
+        // Serenity starts the runner just before publishing its messenger. The
+        // registration hook holds READY until this collector is in place.
+        while self
+            .app
+            .upgrade()
+            .is_some_and(|app| !app.activation.is_shutting_down())
+        {
+            if let Some(runner) = manager.runners.lock().await.get(&shard) {
+                runner
+                    .runner_tx
+                    .add_collector(Self::collector(self.app.clone(), shard));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    async fn deregister_shard(&self, _: u32) {}
+
+    async fn server_update(&self, _: GuildId, _: &Option<String>, _: &str) {}
+
+    async fn state_update(&self, _: GuildId, _: &VoiceState) {}
+}
+
+type ConfigLoadKey = (i64, u64, ConfigMembership);
 type ConfigLoadSender = watch::Sender<Option<ConfigLoadFailure>>;
 
 #[derive(Debug)]
@@ -2561,14 +2680,6 @@ struct ConfigLoadFailure {
 #[derive(Default)]
 struct ConfigLoads {
     active: Mutex<HashMap<ConfigLoadKey, ConfigLoadSender>>,
-}
-
-impl Clone for ConfigLoads {
-    fn clone(&self) -> Self {
-        // Cloning the cache copies its published map. Active loads only
-        // publish to the cache instance that started them.
-        Self::default()
-    }
 }
 
 struct ConfigLoad<'a> {
@@ -2620,16 +2731,39 @@ struct ConfigCacheEntry {
     proof: Option<db::BotConfigProof>,
 }
 
-#[derive(Clone)]
 pub struct ConfigCache {
-    map: DashMap<i64, ConfigCacheEntry>,
+    map: Arc<DashMap<i64, ConfigCacheEntry>>,
     loads: ConfigLoads,
+    gateway: Arc<Mutex<Option<GatewayConfigMemberships>>>,
     version: Arc<AtomicU64>,
     invalidated: watch::Sender<()>,
     ttl: Duration,
     durable_floor: Arc<AtomicU64>,
     publication_lock: Arc<parking_lot::Mutex<()>>,
     accepted_revision: Arc<parking_lot::Mutex<String>>,
+}
+
+impl Clone for ConfigCache {
+    fn clone(&self) -> Self {
+        // Standalone caches copy published entries and keep their own flights.
+        // Gateway-backed handles share the map so departure releases all cache ownership.
+        let (map, gateway) = if self.gateway.lock().is_some() {
+            (Arc::clone(&self.map), Arc::clone(&self.gateway))
+        } else {
+            (Arc::new(self.map.as_ref().clone()), Arc::default())
+        };
+        Self {
+            map,
+            loads: ConfigLoads::default(),
+            gateway,
+            version: Arc::clone(&self.version),
+            invalidated: self.invalidated.clone(),
+            ttl: self.ttl,
+            durable_floor: Arc::clone(&self.durable_floor),
+            publication_lock: Arc::clone(&self.publication_lock),
+            accepted_revision: Arc::clone(&self.accepted_revision),
+        }
+    }
 }
 
 impl Default for ConfigCache {
@@ -2641,8 +2775,9 @@ impl Default for ConfigCache {
 impl ConfigCache {
     pub fn new(durable_floor: u64, revision: String) -> Self {
         Self {
-            map: DashMap::new(),
+            map: Arc::default(),
             loads: ConfigLoads::default(),
+            gateway: Arc::default(),
             version: Arc::new(AtomicU64::new(0)),
             invalidated: watch::channel(()).0,
             ttl: Duration::from_secs(15),
@@ -2662,8 +2797,93 @@ impl ConfigCache {
         self.invalidate();
     }
 
+    fn track_gateway_membership(&self) {
+        let _publication = self.publication_lock.lock();
+        let mut gateway = self.gateway.lock();
+        if gateway.is_none() {
+            *gateway = Some(GatewayConfigMemberships::default());
+            self.map.clear();
+        }
+    }
+
+    fn membership(&self, guild: i64) -> ConfigMembership {
+        match self.gateway.lock().as_ref() {
+            None => ConfigMembership::Untracked,
+            Some(gateway) => gateway
+                .active
+                .get(&guild)
+                .map_or(ConfigMembership::Absent, |member| {
+                    ConfigMembership::Active(member.epoch)
+                }),
+        }
+    }
+
+    fn observe_gateway_event(&self, shard: ShardId, event: &Event) {
+        let _publication = self.publication_lock.lock();
+        let mut gateway = self.gateway.lock();
+        let Some(gateway) = gateway.as_mut() else {
+            return;
+        };
+        match event {
+            Event::Ready(event) => {
+                let guilds: HashSet<_> = event
+                    .ready
+                    .guilds
+                    .iter()
+                    .map(|guild| guild.id.get() as i64)
+                    .collect();
+                gateway.active.retain(|guild, member| {
+                    let retain = member.shard != shard || guilds.contains(guild);
+                    if !retain {
+                        self.map.remove(guild);
+                    }
+                    retain
+                });
+                // A new session may have missed events. Preserve the fallback
+                // for listed guilds while fencing reads from the old session.
+                for guild in guilds {
+                    let joined_at = gateway
+                        .active
+                        .get(&guild)
+                        .and_then(|member| member.joined_at);
+                    gateway.join(guild, shard, joined_at);
+                }
+            }
+            Event::GuildCreate(event) => {
+                let guild = event.guild.id.get() as i64;
+                let joined_at = event.guild.joined_at;
+                if let Some(member) = gateway.active.get_mut(&guild)
+                    && member
+                        .joined_at
+                        .is_none_or(|previous| previous == joined_at)
+                {
+                    // The first create after READY or an outage recovery.
+                    member.joined_at = Some(joined_at);
+                } else {
+                    self.map.remove(&guild);
+                    gateway.join(guild, shard, Some(joined_at));
+                }
+            }
+            Event::GuildDelete(event) => {
+                let guild = event.guild.id.get() as i64;
+                gateway.active.remove(&guild);
+                self.map.remove(&guild);
+            }
+            _ => {}
+        }
+    }
+
+    fn can_publish_for(&self, guild: i64, membership: ConfigMembership) -> bool {
+        membership != ConfigMembership::Absent && membership == self.membership(guild)
+    }
+
     fn require_primary_revision(&self, version: u64, revision: String) {
         let _publication = self.publication_lock.lock();
+        self.adopt_primary_revision(version, revision);
+    }
+
+    // Called under the publication lock.
+    fn adopt_primary_revision(&self, version: u64, revision: String) {
         self.durable_floor.store(version, Ordering::SeqCst);
         *self.accepted_revision.lock() = revision;
         self.clear_publication();
@@ -2713,6 +2933,7 @@ impl ConfigCache {
         let mut last_required = 0;
         let mut attempt = 0;
         let mut load: Option<ConfigLoad<'_>> = None;
+        let mut membership = None;
         while attempt < 3 {
             if attempt == 0 {
                 let required = self
@@ -2728,8 +2949,9 @@ impl ConfigCache {
                 }
             }
 
+            let membership = *membership.get_or_insert_with(|| self.membership(guild_id));
             let version = self.version.load(Ordering::Relaxed);
-            let key = (guild_id, version);
+            let key = (guild_id, version, membership);
             if load.as_ref().is_none_or(|load| load.key != key) {
                 drop(load.take());
                 let mut invalidated = self.invalidated.subscribe();
@@ -2816,39 +3038,43 @@ impl ConfigCache {
                 .max(db.required_config_version());
             last_observed = durable_version;
             last_required = required_after;
-            let accepted_revision = self.accepted_revision.lock().clone();
-
-            if route == ConfigReadRoute::Primary && revision != accepted_revision {
-                self.require_primary_revision(durable_version, revision);
-                continue;
-            }
-            if durable_version < required_after || revision != accepted_revision {
+            if route == ConfigReadRoute::Replica
+                && (durable_version < required_after || revision != *self.accepted_revision.lock())
+            {
                 // Replica lag is expected after a successful remote write. Do
                 // not drop moderation/commands while waiting for convergence:
                 // retry through one primary-routed, single-snapshot read.
                 owner.retry_primary(&mut route, durable_version, revision);
                 continue;
             }
-            let cfg = parts.map(|parts| {
-                Arc::new(CachedGuildConfig::from_parts(
-                    version,
-                    durable_version,
-                    parts,
-                ))
-            });
+            let cfg =
+                parts.map(|parts| CachedGuildConfig::from_parts(version, durable_version, parts));
             {
                 // Publication and invalidation share one lock, closing the
                 // check→insert window that could republish a stale snapshot
                 // after a same-process write had cleared the cache.
                 let _publication = self.publication_lock.lock();
+                let current_version = self.version.load(Ordering::Relaxed);
+                let revision_matches = revision == *self.accepted_revision.lock();
+                let can_publish = self.can_publish_for(guild_id, membership);
+                let (publication_version, revision_matches) =
+                    if route == ConfigReadRoute::Primary && !revision_matches {
+                        // Adopting a revision clears every entry and pending flight.
+                        if current_version != version || !can_publish {
+                            continue;
+                        }
+                        self.adopt_primary_revision(durable_version, revision.clone());
+                        // This snapshot established the new revision. Publish it
+                        // in that generation without re-reading the same inputs.
+                        (self.version.load(Ordering::Relaxed), true)
+                    } else {
+                        (version, revision_matches)
+                    };
                 let required_now = self
                     .durable_floor
                     .load(Ordering::SeqCst)
                     .max(db.required_config_version());
-                let accepted_revision = self.accepted_revision.lock().clone();
-                let current_version = self.version.load(Ordering::Relaxed);
-                let snapshot_matches =
-                    durable_version >= required_now && revision == accepted_revision;
+                let snapshot_matches = durable_version >= required_now && revision_matches;
                 // A coherent replica read superseded only by invalidation can
                 // reuse a newer publication. An authoritative retry still runs
                 // when a floor or revision mismatch required primary routing.
@@ -2864,6 +3090,18 @@ impl ConfigCache {
                 }
                 if current_version != version || !snapshot_matches {
                     owner.retry_primary(&mut route, durable_version, revision);
+                    continue;
+                }
+                let cfg = cfg.map(|mut config| {
+                    config.version = publication_version;
+                    Arc::new(config)
+                });
+                if !can_publish {
+                    // The caller may use its result, but this read no longer
+                    // owns a current membership's cache entry.
+                    if let Some(config) = cfg.or(previous) {
+                        return Ok(config);
+                    }
                     continue;
                 }
                 let validated_at = tokio::time::Instant::now();
