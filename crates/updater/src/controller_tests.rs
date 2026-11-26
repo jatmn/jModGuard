@@ -142,7 +142,7 @@ fn identity() -> (std::path::PathBuf, String) {
     image.seek(std::io::SeekFrom::End(-4 - i64::from(length))).unwrap();
     image.read_exact(&mut trailer).unwrap();
     let trailer = String::from_utf8(trailer).unwrap();
-    let (root, name) = trailer.split_once('\n').unwrap();
+    let (root, name) = trailer.rsplit_once('\n').unwrap();
     (root.into(), name.to_owned())
 }
 fn main() {
