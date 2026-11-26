@@ -35,6 +35,8 @@ enum AdmitOutcome {
     Matched(Vec<(u64, u64)>),
     /// Update could not be stored (capacity, stale revision, etc.).
     Rejected,
+    /// The superseded observation was retired or its ID is blocked by the retirement watermark.
+    Retired,
 }
 
 #[derive(Clone)]
@@ -355,18 +357,23 @@ impl Detector {
                     .iter()
                     .position(|p| p.id == post.id && p.channel == post.channel)
             {
-                if b.posts[idx].text == post.text || post.edited_ms < b.posts[idx].edited_ms {
+                let previous = &mut b.posts[idx];
+                if previous.text == post.text || post.edited_ms < previous.edited_ms {
                     return AdmitOutcome::Unchanged;
                 }
-                g.bytes = g.bytes.saturating_sub(b.posts[idx].cost);
-                *bytes = bytes.saturating_sub(b.posts[idx].cost);
-                b.posts[idx].at = post.at;
-                b.posts[idx].edited_ms = post.edited_ms;
-                b.posts[idx].text = post.text.clone();
-                b.posts[idx].cost = post.cost;
-                b.posts[idx].revision = post.revision;
-                g.bytes += b.posts[idx].cost;
-                *bytes += b.posts[idx].cost;
+                let guild_bytes = g.bytes - previous.cost + post.cost;
+                let process_bytes = *bytes - previous.cost + post.cost;
+                if !within_byte_budget(guild_bytes, process_bytes) {
+                    // The retirement watermark prevents replay of this post
+                    // without invalidating observations in other guilds.
+                    drop_author_posts(&mut state, guild, author, |previous| {
+                        previous.id == post.id && previous.channel == post.channel
+                    });
+                    return AdmitOutcome::Retired;
+                }
+                *previous = post;
+                g.bytes = guild_bytes;
+                *bytes = process_bytes;
                 b.last_seen = now;
                 return match detect_match(b, policy, now) {
                     Some(matched) => AdmitOutcome::Matched(matched),
@@ -380,8 +387,11 @@ impl Detector {
                 .map(|b| b.retired_before)
                 .or_else(|| g.watermarks.get(&author).map(|w| w.retired_before))
         });
-        if state.index.contains_key(&key) || retired_before.is_some_and(|id| post.id <= id) {
+        if state.index.contains_key(&key) {
             return AdmitOutcome::Rejected;
+        }
+        if retired_before.is_some_and(|id| post.id <= id) {
+            return AdmitOutcome::Retired;
         }
         let exists = state
             .guilds
@@ -396,12 +406,8 @@ impl Detector {
         {
             return AdmitOutcome::Rejected;
         }
-        if state.bytes + post.cost > MAX_BYTES
-            || state
-                .guilds
-                .get(&guild)
-                .is_some_and(|g| g.bytes + post.cost > MAX_BYTES_GUILD)
-        {
+        let guild_bytes = state.guilds.get(&guild).map_or(0, |g| g.bytes) + post.cost;
+        if !within_byte_budget(guild_bytes, state.bytes + post.cost) {
             return AdmitOutcome::Rejected;
         }
         let State {
@@ -482,6 +488,10 @@ impl Detector {
         }
         matched
     }
+}
+
+fn within_byte_budget(guild_bytes: usize, process_bytes: usize) -> bool {
+    guild_bytes <= MAX_BYTES_GUILD && process_bytes <= MAX_BYTES
 }
 
 fn detect_match(b: &Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u64)>> {
@@ -638,7 +648,7 @@ fn apply_admit_outcome(
     replace: bool,
 ) -> Option<Vec<(u64, u64)>> {
     match outcome {
-        AdmitOutcome::Unchanged | AdmitOutcome::Admitted => None,
+        AdmitOutcome::Unchanged | AdmitOutcome::Admitted | AdmitOutcome::Retired => None,
         AdmitOutcome::Rejected => {
             if replace {
                 detector.invalidate(guild, channel, message);
@@ -1266,6 +1276,122 @@ mod tests {
         assert!(d.state.lock().index.contains_key(&(1, 10, 1)));
     }
 
+    fn check_replacement_byte_budget(
+        guild_post_counts: &[usize],
+        full_usage: (usize, usize),
+        now: Instant,
+    ) {
+        let detector = Detector::default();
+        let policy = policy();
+        let text = "a".repeat(2048 - 64);
+        let shorter = &text[1..];
+        let longer = format!("{text}b");
+        let observed = |id, text: &str, edited_ms| Post {
+            edited_ms,
+            cost: 64 + text.len(),
+            revision: detector.revision(),
+            ..post(id, 10, now, text)
+        };
+        let usage = || {
+            let state = detector.state.lock();
+            (state.guilds[&1].bytes, state.bytes)
+        };
+        for (guild_index, count) in guild_post_counts.iter().enumerate() {
+            for slot in 0..*count {
+                let input = if guild_index == 0 && slot == 0 {
+                    shorter
+                } else {
+                    &text
+                };
+                assert_eq!(
+                    detector.admit(
+                        guild_index as u64 + 1,
+                        (slot / MAX_POSTS) as u64 + 1,
+                        observed(slot as u64 + 1, input, 0),
+                        (0, 0),
+                        &policy,
+                        now,
+                        false,
+                    ),
+                    AdmitOutcome::Admitted
+                );
+            }
+        }
+        let edit = |text: &str, edited_ms| {
+            detector.admit(
+                1,
+                1,
+                observed(1, text, edited_ms),
+                (0, 0),
+                &policy,
+                now,
+                true,
+            )
+        };
+
+        let (full_guild, full_process) = full_usage;
+        let below_limit = (full_guild - 1, full_process - 1);
+        assert_eq!(usage(), below_limit);
+        assert_eq!(edit(&text, 2), AdmitOutcome::Admitted, "exact fit");
+        assert_eq!(usage(), full_usage);
+        assert_eq!(edit(&longer, 1), AdmitOutcome::Unchanged, "older edit");
+        assert_eq!(edit(&text, 3), AdmitOutcome::Unchanged, "same text");
+        assert_eq!(usage(), full_usage);
+        assert_eq!(edit(shorter, 4), AdmitOutcome::Admitted, "shrinking edit");
+        assert_eq!(usage(), below_limit);
+        assert_eq!(edit(&text, 5), AdmitOutcome::Admitted);
+        assert_eq!(usage(), full_usage);
+
+        let revision = detector.revision();
+        let retry = observed(1, shorter, 7);
+        let unrelated_edit = observed(1, shorter, 6);
+        let outcome = edit(&longer, 6);
+        let retired_usage = (full_guild - 2048, full_process - 2048);
+        assert_eq!(
+            usage(),
+            retired_usage,
+            "over-budget edit must retire the previous cost under the lock ({outcome:?})",
+        );
+        assert_eq!(detector.author_of(1, 10, 1), None);
+        assert!(apply_admit_outcome(&detector, outcome, 1, 10, 1, true).is_none());
+        assert_eq!(usage(), retired_usage);
+        assert_eq!(detector.author_of(1, 10, 2), Some(1));
+        let retry_outcome = detector.admit(1, 1, retry, (0, 0), &policy, now, true);
+        assert_eq!(retry_outcome, AdmitOutcome::Retired);
+        assert!(apply_admit_outcome(&detector, retry_outcome, 1, 10, 1, true).is_none());
+        assert_eq!(detector.author_of(1, 10, 1), None);
+        assert_eq!(usage(), retired_usage);
+
+        let unrelated = detector.admit(2, 1, unrelated_edit, (0, 0), &policy, now, true);
+        assert!(apply_admit_outcome(&detector, unrelated.clone(), 2, 10, 1, true).is_none());
+        assert_eq!(
+            unrelated,
+            AdmitOutcome::Admitted,
+            "in-flight edit in another guild"
+        );
+        assert_eq!(detector.author_of(2, 10, 1), Some(1));
+        assert_eq!(detector.revision(), revision);
+        assert_eq!(usage(), (retired_usage.0, retired_usage.1 - 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_byte_budget_enforces_the_guild_limit() {
+        check_replacement_byte_budget(
+            &[512, 1],
+            (1_048_576, 1_050_624),
+            tokio::time::Instant::now().into_std(),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_byte_budget_enforces_the_process_limit() {
+        check_replacement_byte_budget(
+            &[256, 512, 512, 512, 256],
+            (524_288, 4_194_304),
+            tokio::time::Instant::now().into_std(),
+        );
+    }
+
     #[test]
     fn apply_admit_outcome_preserves_unchanged_and_rejects_stale() {
         let d = Detector::default();
@@ -1480,7 +1606,7 @@ mod tests {
         d.prune();
         assert_eq!(
             d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false),
-            AdmitOutcome::Rejected
+            AdmitOutcome::Retired
         );
         assert!(d.state.lock().index.is_empty());
     }
