@@ -130,26 +130,28 @@ fn gauges() -> BTreeMap<String, i64> {
         .collect()
 }
 
-fn bounded_label(label: &str) -> String {
+fn bounded_label(label: &str) -> &str {
     let label = label.trim();
     if label.is_empty() {
-        return "unknown".into();
+        return "unknown";
     }
     let mut end = label.len().min(MAX_LABEL_BYTES);
     while !label.is_char_boundary(end) {
         end -= 1;
     }
-    label[..end].to_owned()
+    &label[..end]
 }
 
-fn add_label(labels: &mut BTreeMap<String, u64>, label: String, n: u64, limit: usize) {
-    let key = if labels.contains_key(&label) || labels.len() < limit {
-        label
+fn add_label(labels: &mut BTreeMap<String, u64>, label: &str, n: u64, limit: usize) {
+    if let Some(value) = labels.get_mut(label) {
+        *value = value.saturating_add(n);
+    } else if labels.len() < limit {
+        labels.insert(label.to_owned(), n);
+    } else if let Some(value) = labels.get_mut(LABEL_OTHER) {
+        *value = value.saturating_add(n);
     } else {
-        LABEL_OTHER.to_owned()
-    };
-    let value = labels.entry(key).or_default();
-    *value = value.saturating_add(n);
+        labels.insert(LABEL_OTHER.to_owned(), n);
+    }
 }
 
 /// Keeps the `max` busiest labels (equal counts by name) and adds the rest to
@@ -784,10 +786,10 @@ mod tests {
         // Within one minute: many low-volume labels report before the busiest one.
         let mut minute = BTreeMap::new();
         for i in 0..MAX_LABELS + 6 {
-            add_label(&mut minute, format!("quiet{i:02}"), 1, WORKING_LABELS);
+            add_label(&mut minute, &format!("quiet{i:02}"), 1, WORKING_LABELS);
         }
         for _ in 0..50 {
-            add_label(&mut minute, "busy".into(), 2, WORKING_LABELS);
+            add_label(&mut minute, "busy", 2, WORKING_LABELS);
         }
         keep_busiest(&mut minute, MAX_LABELS);
         assert_eq!(minute["busy"], 100);
@@ -815,6 +817,22 @@ mod tests {
         assert_eq!(paths["busy"], 500);
         assert_eq!(paths["other"], 3, "one quiet label made room");
         assert_eq!(paths.values().sum::<u64>(), 500 + 3 * MAX_LABELS as u64);
+    }
+
+    #[test]
+    fn label_overflow_preserves_other_and_existing_keys_at_capacity() {
+        for (seed_label, expected_size, expected_other) in [("other", 2, 26), ("second", 3, 23)] {
+            let mut labels = BTreeMap::new();
+            add_label(&mut labels, seed_label, 3, 2);
+            add_label(&mut labels, "named", u64::MAX - 1, 2);
+            add_label(&mut labels, "overflow", 5, 2);
+            add_label(&mut labels, "another_overflow", 7, 2);
+            add_label(&mut labels, "other", 11, 2);
+            add_label(&mut labels, "named", 13, 2);
+            assert_eq!(labels.len(), expected_size);
+            assert_eq!(labels["other"], expected_other);
+            assert_eq!(labels["named"], u64::MAX);
+        }
     }
 
     #[test]
@@ -875,8 +893,11 @@ mod tests {
 
     #[test]
     fn labels_are_trimmed_and_bounded() {
-        assert_eq!(bounded_label("  "), "unknown");
+        assert_eq!(bounded_label(" \t\u{2003}"), "unknown");
+        assert_eq!(bounded_label("\u{2003}message_create \t"), "message_create");
         assert_eq!(bounded_label(&"é".repeat(100)).len(), MAX_LABEL_BYTES);
+        let prefix = "a".repeat(MAX_LABEL_BYTES - 1);
+        assert_eq!(bounded_label(&format!(" {prefix}🦀tail ")), prefix);
         assert_eq!(identifier("pod-1"), Some("pod-1".into()));
         assert_eq!(identifier("has space"), None);
     }
