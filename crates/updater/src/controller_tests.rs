@@ -113,126 +113,182 @@ fn publish_exit_code_sync(path: &std::path::Path, code: impl std::fmt::Display) 
     std::fs::rename(&pending, path).unwrap();
 }
 
-async fn executable(root: &Path, name: &str) -> PathBuf {
-    let path = root.join(name);
-    let code = format!(
-        r#"
-use std::io::{{Read, Write}};
-use std::sync::atomic::{{AtomicBool, Ordering}};
+/// The child fixture reads its root and role name from a trailer appended to
+/// its own executable, so one compiled program serves every case while each
+/// (root, name) copy keeps a distinct artifact digest.
+const CHILD: &str = r#"
+use std::io::{Read, Seek, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 static STOP: AtomicBool = AtomicBool::new(false);
-extern "C" fn stop(_: i32) {{ STOP.store(true, Ordering::SeqCst); }}
-unsafe extern "C" {{ fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize; }}
-fn complete_exit_code(raw: &str) -> Option<i32> {{
-    if !raw.ends_with('\n') {{
+extern "C" fn stop(_: i32) { STOP.store(true, Ordering::SeqCst); }
+unsafe extern "C" { fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize; }
+fn complete_exit_code(raw: &str) -> Option<i32> {
+    if !raw.ends_with('\n') {
         return None;
-    }}
+    }
     let text = raw.trim();
-    if text.is_empty() {{
+    if text.is_empty() {
         return None;
-    }}
+    }
     Some(text.parse().expect("exit-code record is not an integer"))
-}}
-fn main() {{
-    unsafe {{ signal(15, stop); }}
-    let root = std::path::Path::new({root:?});
+}
+fn identity() -> (std::path::PathBuf, String) {
+    let mut image = std::fs::File::open("/proc/self/exe").unwrap();
+    let mut length = [0; 4];
+    image.seek(std::io::SeekFrom::End(-4)).unwrap();
+    image.read_exact(&mut length).unwrap();
+    let length = u32::from_le_bytes(length);
+    let mut trailer = vec![0; length as usize];
+    image.seek(std::io::SeekFrom::End(-4 - i64::from(length))).unwrap();
+    image.read_exact(&mut trailer).unwrap();
+    let trailer = String::from_utf8(trailer).unwrap();
+    let (root, name) = trailer.rsplit_once('\n').unwrap();
+    (root.into(), name.to_owned())
+}
+fn main() {
+    unsafe { signal(15, stop); }
+    let (root, name) = identity();
+    let (root, name) = (root.as_path(), name.as_str());
     let maintenance = std::env::var("JMODGUARD_UPDATE_MAINTENANCE").as_deref() == Ok("1");
-    let event = |suffix: &str| {{
+    let event = |suffix: &str| {
         let mut log = std::fs::OpenOptions::new().create(true).append(true).open(root.join("events")).unwrap();
-        writeln!(log, "{name}.{{suffix}}").unwrap();
-    }};
+        writeln!(log, "{name}.{suffix}").unwrap();
+    };
     // Optional real maintenance socket for outage liveness regressions.
-    let maintenance_listener = if maintenance && root.join("bind-maintenance-{name}").exists() {{
-        let bind = std::fs::read_to_string(root.join("bind-maintenance-{name}")).unwrap();
+    let maintenance_listener = if maintenance && root.join(format!("bind-maintenance-{name}")).exists() {
+        let bind = std::fs::read_to_string(root.join(format!("bind-maintenance-{name}"))).unwrap();
         let listener = std::net::TcpListener::bind(bind.trim()).unwrap();
         listener.set_nonblocking(true).unwrap();
         Some(listener)
-    }} else {{ None }};
-    if !maintenance {{
+    } else { None };
+    if !maintenance {
         event("start");
-        let _health = if root.join("bind-health-{name}").exists() {{
-            let bind = std::fs::read_to_string(root.join("bind-health-{name}")).unwrap();
+        let _health = if root.join(format!("bind-health-{name}")).exists() {
+            let bind = std::fs::read_to_string(root.join(format!("bind-health-{name}"))).unwrap();
             let listener = std::net::TcpListener::bind(&bind).unwrap();
-            let bound = root.join("health-bound-{name}");
+            let bound = root.join(format!("health-bound-{name}"));
             let pending = bound.with_extension("tmp");
             std::fs::write(&pending, listener.local_addr().unwrap().to_string()).unwrap();
             std::fs::rename(pending, bound).unwrap();
-            while !root.join("exit-code-{name}").exists() && !STOP.load(Ordering::SeqCst) {{
+            while !root.join(format!("exit-code-{name}")).exists() && !STOP.load(Ordering::SeqCst) {
                 std::thread::sleep(std::time::Duration::from_millis(5));
-            }}
+            }
             Some(listener)
-        }} else {{ None }};
-        if let Ok(mut raw) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
-            if let Some(code) = complete_exit_code(&raw) {{
+        } else { None };
+        if let Ok(mut raw) = std::fs::read_to_string(root.join(format!("exit-code-{name}"))) {
+            if let Some(code) = complete_exit_code(&raw) {
                 std::process::exit(code);
-            }} else {{
+            } else {
                 event("exit-partial");
                 let incomplete_start = std::time::Instant::now();
                 while !STOP.load(Ordering::SeqCst)
                     && incomplete_start.elapsed() < std::time::Duration::from_millis(200)
-                {{
+                {
                     std::thread::sleep(std::time::Duration::from_millis(5));
-                    match std::fs::read_to_string(root.join("exit-code-{name}")) {{
-                        Ok(updated) => {{
+                    match std::fs::read_to_string(root.join(format!("exit-code-{name}"))) {
+                        Ok(updated) => {
                             raw = updated;
-                            if let Some(code) = complete_exit_code(&raw) {{
+                            if let Some(code) = complete_exit_code(&raw) {
                                 std::process::exit(code);
-                            }}
+                            }
                             event("exit-partial");
-                        }}
+                        }
                         Err(_) => break,
-                    }}
-                }}
-            }}
-        }}
-        if root.join("fail-{name}").exists() {{
+                    }
+                }
+            }
+        }
+        if root.join(format!("fail-{name}")).exists() {
             std::fs::write(std::env::var("JMODGUARD_READY_FILE").unwrap(), "stale marker").unwrap();
             std::process::exit(7);
-        }}
-        while root.join("hold-{name}-ready").exists() && !STOP.load(Ordering::SeqCst) {{ std::thread::sleep(std::time::Duration::from_millis(5)); }}
-        if STOP.load(Ordering::SeqCst) {{ event("stop"); return; }}
+        }
+        while root.join(format!("hold-{name}-ready")).exists() && !STOP.load(Ordering::SeqCst) { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        if STOP.load(Ordering::SeqCst) { event("stop"); return; }
         std::fs::write(std::env::var("JMODGUARD_READY_FILE").unwrap(), "ready").unwrap();
         event("ready");
-    }}
-    while !STOP.load(Ordering::SeqCst) {{
+    }
+    while !STOP.load(Ordering::SeqCst) {
         if let Some(listener) = &maintenance_listener
             && let Ok((mut stream, _)) = listener.accept()
-        {{
+        {
             stream.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
             let mut request = [0; 1024];
             let _ = stream.read(&mut request);
             let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-        }}
-        if !maintenance && let Ok(raw) = std::fs::read_to_string(root.join("exit-code-{name}")) {{
-            if let Some(code) = complete_exit_code(&raw) {{
+        }
+        if !maintenance && let Ok(raw) = std::fs::read_to_string(root.join(format!("exit-code-{name}"))) {
+            if let Some(code) = complete_exit_code(&raw) {
                 std::process::exit(code);
-            }}
-        }}
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(5));
-    }}
-    if !maintenance {{
+    }
+    if !maintenance {
         event("stopping");
-        while root.join("hold-{name}-stop").exists() {{ std::thread::sleep(std::time::Duration::from_millis(5)); }}
+        while root.join(format!("hold-{name}-stop")).exists() { std::thread::sleep(std::time::Duration::from_millis(5)); }
         event("stop");
-    }}
-}}
-"#,
-        root = root.to_str().unwrap(),
-        name = name
-    );
-    let source = root.join(format!("{}.rs", name.replace('-', "_")));
-    tokio::fs::write(&source, code).await.unwrap();
-    let output = Command::new("rustc")
-        .args(["--edition=2024", "-C", "debuginfo=0", "-o"])
-        .arg(&path)
-        .arg(&source)
-        .output()
+    }
+}
+"#;
+
+/// Compiles a fixture program once per source text and returns the binary.
+/// Separate test processes started from this test executable share the cache
+/// beside it; a file lock lets one process compile while the others wait.
+fn compiled_fixture(source: &str) -> PathBuf {
+    let cache = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("controller-test-fixtures");
+    std::fs::create_dir_all(&cache).unwrap();
+    let key = sha256_hex(source.as_bytes());
+    let binary = cache.join(&key);
+    if binary.exists() {
+        return binary;
+    }
+    let lock = std::fs::File::create(cache.join(format!("{key}.lock"))).unwrap();
+    lock.lock().unwrap();
+    if !binary.exists() {
+        let code = cache.join(format!("fixture_{key}.rs"));
+        let pending = cache.join(format!("{key}.tmp"));
+        std::fs::write(&code, source).unwrap();
+        let output = std::process::Command::new("rustc")
+            .args(["--edition=2024", "-C", "debuginfo=0", "-o"])
+            .arg(&pending)
+            .arg(&code)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::rename(&pending, &binary).unwrap();
+    }
+    binary
+}
+
+/// Publishes an executable copy of fixture bytes at `path`.
+async fn install_fixture(path: &Path, image: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    let pending = path.with_extension("fixture-tmp");
+    tokio::fs::write(&pending, image).await.unwrap();
+    tokio::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o755))
         .await
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    tokio::fs::rename(&pending, path).await.unwrap();
+}
+
+async fn executable(root: &Path, name: &str) -> PathBuf {
+    let path = root.join(name);
+    let compiled = tokio::task::spawn_blocking(|| compiled_fixture(CHILD))
+        .await
+        .unwrap();
+    let mut image = tokio::fs::read(compiled).await.unwrap();
+    let identity = format!("{}\n{name}", root.to_str().unwrap());
+    image.extend_from_slice(identity.as_bytes());
+    image.extend_from_slice(&u32::try_from(identity.len()).unwrap().to_le_bytes());
+    install_fixture(&path, &image).await;
     path
 }
 
@@ -1893,7 +1949,6 @@ async fn revision_two_controller_keeps_a_revision_three_launcher_selection() {
 
 async fn http_application(root: &Path) -> PathBuf {
     let path = root.join("http-api");
-    let source = root.join("http_api.rs");
     let code = r#"
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1946,19 +2001,10 @@ fn main() {
     }
 }
 "#;
-    tokio::fs::write(&source, code).await.unwrap();
-    let output = Command::new("rustc")
-        .args(["--edition=2024", "-C", "debuginfo=0", "-o"])
-        .arg(&path)
-        .arg(&source)
-        .output()
+    let compiled = tokio::task::spawn_blocking(move || compiled_fixture(code))
         .await
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    install_fixture(&path, &tokio::fs::read(compiled).await.unwrap()).await;
     path
 }
 
