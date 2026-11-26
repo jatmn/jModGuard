@@ -1396,8 +1396,12 @@ function cpuScale(limit) {
   return millicores > 0 ? { divisor: millicores / 1000, of: `of ${formatRate(millicores / 1000)} CPU limit`, max: 100 } : { divisor: 1, of: limit === "Unlimited" ? "of one CPU (no CPU limit)" : "of one CPU (limit unavailable)", max: null };
 }
 
-function cpuPercent(tenths, scale) {
-  return tenths == null ? null : tenths / 10 / scale.divisor;
+function cpuPercent(tenths, divisor) {
+  return tenths == null ? null : tenths / 10 / divisor;
+}
+
+function formatResourcePercent(value) {
+  return value == null ? "—" : `${formatRate(value)}%`;
 }
 
 function memoryLimitBytes(memory) {
@@ -1569,7 +1573,7 @@ function diskRows(disks) {
 function ResourceCard({ id, title, process, generatedAtMs, nowMs, range, chartFrom, chartTo }) {
   const current = process?.current;
   const history = process?.history;
-  const points = history?.points ?? [];
+  const points = history?.points;
   const freshness = resourceFreshness(current, generatedAtMs, nowMs);
   const info = current?.info;
   const badge =
@@ -1581,17 +1585,31 @@ function ResourceCard({ id, title, process, generatedAtMs, nowMs, range, chartFr
       ? { label: "Ready", tone: "success" }
       : { label: "Not ready", tone: "warning" };
   const scale = cpuScale(info?.cpu_limit);
+  const { divisor, max } = scale;
   const memoryLimit = memoryLimitBytes(current?.memory);
   const memory = current?.memory?.program_bytes ?? null;
-  const cpu = cpuPercent(current?.cpu_tenths, scale);
+  const cpu = cpuPercent(current?.cpu_tenths, divisor);
   const sampleAgeMs = current?.age_ms != null && generatedAtMs != null
     ? current.age_ms + Math.max(0, nowMs - generatedAtMs)
     : null;
   const sampled = sampleAgeMs != null ? `Sampled ${formatDuration(sampleAgeMs)} ago` : "Not sampled";
   const headingId = `resources-${id}`;
-  const percent = (value) => (value == null ? "—" : `${formatRate(value)}%`);
   const cores = info?.schedulable_cpus != null ? `${info.schedulable_cpus} schedulable CPU${info.schedulable_cpus === 1 ? "" : "s"}` : "schedulable CPUs unavailable";
   const source = current?.memory?.source === "CgroupUsage" ? "cgroup usage (includes page cache)" : current?.memory ? "cgroup stat (excludes reclaimable cache)" : null;
+  const cpuChart = React.useMemo(() => h(ResourceChart, {
+    points: points ?? [], label: `${title} CPU`, from: chartFrom, to: chartTo, max, format: formatResourcePercent,
+    series: [
+      { key: "avg", label: "Average", tone: "br-tone-avg", value: (p) => cpuPercent(p.cpu_avg_tenths, divisor) },
+      { key: "max", label: "Peak", tone: "br-tone-max", value: (p) => cpuPercent(p.cpu_max_tenths, divisor) },
+    ],
+  }), [points, title, chartFrom, chartTo, divisor, max]);
+  const memoryChart = React.useMemo(() => h(ResourceChart, {
+    points: points ?? [], label: `${title} memory`, from: chartFrom, to: chartTo, max: memoryLimit, format: (value) => formatMemoryMiB(value) ?? "—",
+    series: [
+      { key: "avg", label: "Average", tone: "br-tone-avg", value: (p) => p.memory_avg_bytes },
+      { key: "max", label: "Peak", tone: "br-tone-max", value: (p) => p.memory_max_bytes },
+    ],
+  }), [points, title, chartFrom, chartTo, memoryLimit]);
   return h(
     "section",
     { className: "card bg-base-100 card-border du-card br-card", "aria-labelledby": headingId, "data-freshness": freshness },
@@ -1613,26 +1631,14 @@ function ResourceCard({ id, title, process, generatedAtMs, nowMs, range, chartFr
         resourceMetric(
           "CPU",
           cpu == null ? null : `${formatRate(cpu)}% ${scale.of}`,
-          [h("span", { key: "c" }, cores), history?.cpu_peak_tenths != null ? h("span", { key: "p" }, `peak ${percent(cpuPercent(history.cpu_peak_tenths, scale))} in ${range}`) : null],
-          h(ResourceChart, {
-            points, label: `${title} CPU`, from: chartFrom, to: chartTo, max: scale.max, format: percent,
-            series: [
-              { key: "avg", label: "Average", tone: "br-tone-avg", value: (p) => cpuPercent(p.cpu_avg_tenths, scale) },
-              { key: "max", label: "Peak", tone: "br-tone-max", value: (p) => cpuPercent(p.cpu_max_tenths, scale) },
-            ],
-          }),
+          [h("span", { key: "c" }, cores), history?.cpu_peak_tenths != null ? h("span", { key: "p" }, `peak ${formatResourcePercent(cpuPercent(history.cpu_peak_tenths, divisor))} in ${range}`) : null],
+          cpuChart,
         ),
         resourceMetric(
           "Memory",
           memory == null ? null : `${formatMemoryMiB(memory)}${memoryLimit ? ` of ${formatMemoryMiB(memoryLimit)} (${formatRate((memory * 100) / memoryLimit)}%)` : current?.memory?.limit === "Unlimited" ? " (no memory limit)" : ""}`,
           [source ? h("span", { key: "s" }, `Source: ${source}`) : null, h("span", { key: "p" }, `peak ${formatMemoryMiB(history?.memory_peak_bytes) ?? "unavailable"} in ${range}`)],
-          h(ResourceChart, {
-            points, label: `${title} memory`, from: chartFrom, to: chartTo, max: memoryLimit, format: (value) => formatMemoryMiB(value) ?? "—",
-            series: [
-              { key: "avg", label: "Average", tone: "br-tone-avg", value: (p) => p.memory_avg_bytes },
-              { key: "max", label: "Peak", tone: "br-tone-max", value: (p) => p.memory_max_bytes },
-            ],
-          }),
+          memoryChart,
         ),
       ),
       h(
@@ -1721,6 +1727,20 @@ function BotResources() {
   const apiHistory = api?.history;
   const from = snapshot?.from_secs;
   const to = snapshot?.to_secs;
+  const botPoints = botHistory?.points;
+  const apiPoints = apiHistory?.points;
+  // Freshness ticks leave the history props stable. The charts still own their layout state.
+  const botCharts = React.useMemo(() => h("div", { key: "charts", className: "br-pair" },
+    h("div", null, h("h4", { className: "du-metric-label" }, "Gateway events per minute"), rateChart(botPoints ?? [], "Gateway events per minute", "gateway_events", from, to)),
+    h("div", null, h("h4", { className: "du-metric-label" }, "Shard latency (peak)"), gaugeChart(botPoints ?? [], "Shard latency", "shard_latency_ms", from, to, (value) => `${formatExact(value)} ms`)),
+  ), [botPoints, from, to]);
+  const apiCharts = React.useMemo(() => h("div", { key: "charts", className: "br-pair" },
+    h("div", null, h("h4", { className: "du-metric-label" }, "Requests per minute"), rateChart(apiPoints ?? [], "Requests per minute", "api_requests", from, to)),
+    h("div", null, h("h4", { className: "du-metric-label" }, "p95 latency"), h(ResourceChart, {
+      points: apiPoints ?? [], label: "p95 latency", from, to, format: (value) => `${formatExact(value)} ms`,
+      series: [{ key: "p95", label: "p95 latency", tone: "br-tone-max", value: (p) => p.p95_ms ?? null }],
+    })),
+  ), [apiPoints, from, to]);
   const gauge = (process, name) => (resourceFreshness(process?.current, snapshot?.generated_at_ms, nowMs) === "unavailable" ? null : process?.current?.gauges?.[name] ?? null);
   const rangeLabel = RESOURCE_RANGES.find(([value]) => value === range)?.[1].toLowerCase() ?? range;
   const note = result.error
@@ -1780,10 +1800,7 @@ function BotResources() {
             resourceTile("Guilds", gauge(bot, "guilds") == null ? null : formatExact(gauge(bot, "guilds"))),
             resourceTile("Capture queue", gauge(bot, "capture_queue_items") == null ? null : `${formatExact(gauge(bot, "capture_queue_items"))} · ${formatBytes(gauge(bot, "capture_queue_bytes")) ?? "?"}`),
           ),
-          h("div", { key: "charts", className: "br-pair" },
-            h("div", null, h("h4", { className: "du-metric-label" }, "Gateway events per minute"), rateChart(botHistory?.points ?? [], "Gateway events per minute", "gateway_events", from, to)),
-            h("div", null, h("h4", { className: "du-metric-label" }, "Shard latency (peak)"), gaugeChart(botHistory?.points ?? [], "Shard latency", "shard_latency_ms", from, to, (value) => `${formatExact(value)} ms`)),
-          ),
+          botCharts,
           h("div", { key: "ranks", className: "br-pair" },
             h("div", null, h("h4", { className: "du-metric-label" }, "Gateway events by type"), h(RankList, { rows: breakdownRows(botHistory, "gateway"), label: "Gateway events by type", empty: botHistory?.minutes ? "No events in this range." : UNAVAILABLE })),
             h("div", null, h("h4", { className: "du-metric-label" }, "Rate-limit waits by bucket"), h(RankList, { rows: breakdownRows(botHistory, "discord_rate_limits"), label: "Rate-limit waits by bucket", color: "an-bans", empty: botHistory?.minutes ? "No rate-limit waits in this range." : UNAVAILABLE })),
@@ -1807,13 +1824,7 @@ function BotResources() {
             resourceTile("OAuth 429s", rangeTotal(apiHistory, "oauth_429") == null ? null : formatExact(rangeTotal(apiHistory, "oauth_429"))),
             resourceTile("Discord 429s", rangeTotal(apiHistory, "discord_429") == null ? null : formatExact(rangeTotal(apiHistory, "discord_429"))),
           ),
-          h("div", { key: "charts", className: "br-pair" },
-            h("div", null, h("h4", { className: "du-metric-label" }, "Requests per minute"), rateChart(apiHistory?.points ?? [], "Requests per minute", "api_requests", from, to)),
-            h("div", null, h("h4", { className: "du-metric-label" }, "p95 latency"), h(ResourceChart, {
-              points: apiHistory?.points ?? [], label: "p95 latency", from, to, format: (value) => `${formatExact(value)} ms`,
-              series: [{ key: "p95", label: "p95 latency", tone: "br-tone-max", value: (p) => p.p95_ms ?? null }],
-            })),
-          ),
+          apiCharts,
           h("div", { key: "ranks", className: "br-pair" },
             h("div", null, h("h4", { className: "du-metric-label" }, "Discord requests by route"), h(RankList, { rows: breakdownRows(apiHistory, "discord_rest_routes"), label: "Discord requests by route", empty: apiHistory?.minutes ? "No Discord requests in this range." : UNAVAILABLE })),
             h("div", null, h("h4", { className: "du-metric-label" }, "Discord 429s by route"), h(RankList, { rows: breakdownRows(apiHistory, "discord_429_routes"), label: "Discord 429s by route", color: "an-bans", empty: apiHistory?.minutes ? "No Discord 429s in this range." : UNAVAILABLE })),
