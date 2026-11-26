@@ -3,6 +3,7 @@
 use crate::db::guild_data::{CaseLimits, GuildDataScope, GuildDataStore, MemberHistoryEntry};
 use anyhow::{Result, anyhow};
 use serenity::model::id::{ChannelId, GuildId, RoleId, UserId};
+use serenity::model::user::User;
 use std::collections::BTreeMap;
 
 use super::usage::ArgumentError;
@@ -18,6 +19,34 @@ pub(crate) const VOICE_UNAVAILABLE: &str = "unavailable";
 pub(crate) const CASES_UNAVAILABLE: &str = "unavailable";
 pub(crate) const CASES_NONE: &str = "none";
 pub(crate) const CLIPPED_SUFFIX: &str = "\n… clipped";
+
+pub(super) struct InvocationIdentity {
+    id: UserId,
+    username: String,
+    global_name: Option<String>,
+}
+
+impl InvocationIdentity {
+    pub(super) fn from_user(user: &User, target: UserId) -> Option<Self> {
+        Self::matches(user, target).then(|| Self {
+            id: user.id,
+            username: user.name.clone(),
+            global_name: user.global_name.clone(),
+        })
+    }
+
+    pub(super) fn take_from_user(user: &mut User, target: UserId) -> Option<Self> {
+        Self::matches(user, target).then(|| Self {
+            id: user.id,
+            username: std::mem::take(&mut user.name),
+            global_name: user.global_name.take(),
+        })
+    }
+
+    fn matches(user: &User, target: UserId) -> bool {
+        user.id == target && !user.name.trim().is_empty()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MemberSnapshot {
@@ -233,7 +262,7 @@ pub(crate) fn snapshot_has_cached_user(snapshot: &MemberSnapshot) -> bool {
     snapshot.member_cached || snapshot.username.is_some()
 }
 
-pub(crate) fn apply_rest_user(snapshot: &mut MemberSnapshot, name: String, global: Option<String>) {
+fn apply_display_identity(snapshot: &mut MemberSnapshot, name: String, global: Option<String>) {
     if snapshot.username.is_none() {
         snapshot.username = Some(name);
     }
@@ -579,17 +608,22 @@ pub(crate) fn discord_lookup_error(err: &serenity::Error) -> Option<String> {
     }
 }
 
-pub(crate) async fn rest_user_lookup(
+async fn lookup_display_identity(
     env: &CmdEnv<'_>,
     target: UserId,
+    identity: Option<InvocationIdentity>,
 ) -> Result<(String, Option<String>)> {
-    let call =
-        crate::discord::race_discord_call(&env.app.activation, env.ctx.http.get_user(target)).await;
+    let call = crate::discord::race_discord_call(&env.app.activation, async {
+        if let Some(identity) = identity.filter(|identity| identity.id == target) {
+            return Ok((identity.username, identity.global_name));
+        }
+        let user = env.ctx.http.get_user(target).await?;
+        Ok((user.name, user.global_name))
+    })
+    .await;
     match call {
         crate::discord::DiscordCall::Cancelled => Err(anyhow!("writer lease is not held")),
-        crate::discord::DiscordCall::Finished(Ok(user)) => {
-            Ok((user.name.clone(), user.global_name.clone()))
-        }
+        crate::discord::DiscordCall::Finished(Ok(identity)) => Ok(identity),
         crate::discord::DiscordCall::Finished(Err(err)) => {
             if let Some(message) = discord_lookup_error(&err) {
                 Err(anyhow!(message))
@@ -658,10 +692,11 @@ async fn load_case_lines_from_store(
     cases_from_loaded(loaded, viewer)
 }
 
-pub(crate) async fn run(
+pub(super) async fn run(
     env: &CmdEnv<'_>,
     enrollment: Option<crate::db::GuildEnrollment>,
     vars: &mut BTreeMap<String, String>,
+    identity: Option<InvocationIdentity>,
 ) -> Result<BehaviorOutcome> {
     let mut args = env.args.clone();
     let target = resolve_userinfo_target(env, &mut args).await?;
@@ -674,8 +709,8 @@ pub(crate) async fn run(
     );
 
     if !snapshot_has_cached_user(&snapshot) {
-        match rest_user_lookup(env, target).await {
-            Ok((name, global)) => apply_rest_user(&mut snapshot, name, global),
+        match lookup_display_identity(env, target, identity).await {
+            Ok((name, global)) => apply_display_identity(&mut snapshot, name, global),
             Err(error) if error.to_string() == "writer lease is not held" => return Err(error),
             Err(_) => apply_missing_user_identity(&mut snapshot),
         }

@@ -821,6 +821,19 @@ pub async fn handle_prefix(
     } else {
         false
     };
+    let userinfo_identity = if matches!(cmd.behavior, Behavior::UserInfo) {
+        let target = match args.peek() {
+            Some(token) => user_id_from_token(token),
+            None => Some(msg.author.id),
+        };
+        target.and_then(|target| {
+            std::iter::once(&msg.author)
+                .chain(&msg.mentions)
+                .find_map(|user| userinfo::InvocationIdentity::from_user(user, target))
+        })
+    } else {
+        None
+    };
     let env = CmdEnv::new(
         app,
         ctx,
@@ -840,7 +853,7 @@ pub async fn handle_prefix(
         guild_id,
         msg.channel_id
     );
-    let outcome = match run_command(env).await {
+    let outcome = match behaviors::run_with_userinfo_identity(&env, userinfo_identity).await {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("command `{}` failed: {e:#}", cmd.name);
@@ -1160,10 +1173,32 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         }
         return;
     }
-    let Interaction::Command(interaction) = interaction else {
+    let Interaction::Command(mut interaction) = interaction else {
         return;
     };
 
+    let identity_target = interaction
+        .data
+        .options
+        .iter()
+        .find(|option| option.name == "user")
+        .and_then(|option| match option.value {
+            CommandDataOptionValue::User(id) => Some(id),
+            _ => None,
+        })
+        .unwrap_or(interaction.user.id);
+    let userinfo_identity =
+        userinfo::InvocationIdentity::take_from_user(&mut interaction.user, identity_target)
+            .or_else(|| {
+                interaction
+                    .data
+                    .resolved
+                    .users
+                    .get_mut(&identity_target)
+                    .and_then(|user| {
+                        userinfo::InvocationIdentity::take_from_user(user, identity_target)
+                    })
+            });
     // Extract everything owned, then drop the interaction immediately.
     let slash = SlashCtx {
         id: interaction.id,
@@ -1302,7 +1337,7 @@ pub async fn handle_interaction(app: &Arc<BotState>, ctx: &Context, interaction:
         dm,
         None,
     );
-    match run_command(env).await {
+    match behaviors::run_with_userinfo_identity(&env, userinfo_identity).await {
         Ok(outcome) => {
             if deliver_slash_success(&app.activation, &ctx.http, &slash, deferred, &cmd, &outcome)
                 .await
@@ -1820,10 +1855,6 @@ async fn deliver_slash_success(
 // ---------------------------------------------------------------------------
 // shared pipeline
 // ---------------------------------------------------------------------------
-
-async fn run_command(env: CmdEnv<'_>) -> Result<BehaviorOutcome> {
-    behaviors::run(&env).await
-}
 
 fn truncate_to_char_limit(text: &str, max_units: usize) -> String {
     if text.chars().count() <= max_units {

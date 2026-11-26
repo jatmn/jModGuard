@@ -118,6 +118,13 @@ fn skips_case_enrollment(behavior: &Behavior) -> bool {
 /// Runs a command behavior. Returns an optional extra response plus vars
 /// used to render the command's response template.
 pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
+    run_with_userinfo_identity(env, None).await
+}
+
+pub(super) async fn run_with_userinfo_identity(
+    env: &CmdEnv<'_>,
+    userinfo_identity: Option<super::userinfo::InvocationIdentity>,
+) -> Result<BehaviorOutcome> {
     let mut vars = behaviors_base_vars(env);
     let enrollment = if skips_case_enrollment(&env.cmd.behavior) {
         None
@@ -864,7 +871,9 @@ pub async fn run(env: &CmdEnv<'_>) -> Result<BehaviorOutcome> {
                 embed: None,
             })
         }
-        Behavior::UserInfo => super::userinfo::run(env, enrollment, &mut vars).await,
+        Behavior::UserInfo => {
+            super::userinfo::run(env, enrollment, &mut vars, userinfo_identity).await
+        }
         Behavior::WarnClear => {
             let mut args = env.args.clone();
             let target = resolve_target(env, args.required("user")?).await?;
