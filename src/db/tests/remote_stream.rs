@@ -587,6 +587,14 @@ impl HranaFixture {
         self.state.lock().unwrap().timeout_cursor_sql = Some(sql);
     }
 
+    /// SQL sent since the previous call, without transaction edges.
+    pub(in crate::db) fn take_data_statements(&self) -> Vec<String> {
+        std::mem::take(&mut self.state.lock().unwrap().statements)
+            .into_iter()
+            .filter(|sql| !is_transaction_edge(&sql.trim().to_ascii_uppercase()))
+            .collect()
+    }
+
     pub(in crate::db) fn read_begins(&self) -> usize {
         self.state.lock().unwrap().read_begins
     }

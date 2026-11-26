@@ -1274,6 +1274,165 @@ async fn directory_names_come_only_from_stored_rows_in_one_bounded_lookup() {
 }
 
 #[tokio::test]
+async fn display_names_read_only_name_columns_in_one_bounded_lookup() {
+    use crate::db::tests::remote_stream::HranaFixture;
+
+    let (f, local, scope) = ready().await;
+    local
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    // A snowflake above JS MAX_SAFE_INTEGER must round-trip exactly.
+    let big = 9_007_199_254_740_993_i64;
+    for (id, username, global, nick) in [
+        (77, Some("user77"), Some("Global 77"), Some("Nick 77")),
+        (78, Some("user78"), Some("Global 78"), Some("")),
+        (79, Some("user79"), Some(""), None),
+        (80, Some(""), None, Some("Nick 80")),
+        (81, Some(""), Some(""), Some("")),
+        (big, Some("big"), None, None),
+    ] {
+        let mut member = observed(id, Some(900), 1_500);
+        member.username = Some(username.map(str::to_owned));
+        member.global_name = Some(global.map(str::to_owned));
+        member.nickname = Some(nick.map(str::to_owned));
+        local.observe_member(scope.clone(), member).await.unwrap();
+    }
+    let (fixture, db) = HranaFixture::sqlite_backed_database(&f.store_path).await;
+    let remote = GuildDataStore {
+        db,
+        expected: local.expected.clone(),
+        core: None,
+    };
+    let ids = vec![big, 82, 81, 80, 79, 78, 77];
+    let directory_reads = |statements: Vec<String>| {
+        statements
+            .into_iter()
+            .filter(|sql| sql.contains("FROM guild_member_directory"))
+            .collect::<Vec<_>>()
+    };
+    const NON_DISPLAY: [&str; 8] = [
+        "is_current",
+        "is_banned",
+        "ever_banned",
+        "joined_at_ms",
+        "departed_at_ms",
+        "observed_at_ms",
+        "revision",
+        "current_ban_reason",
+    ];
+
+    fixture.take_data_statements();
+    let profiles = remote
+        .member_profiles(scope.clone(), ids.clone())
+        .await
+        .unwrap();
+    let profile_sql = directory_reads(fixture.take_data_statements());
+    assert_eq!(profile_sql.len(), 1, "{profile_sql:?}");
+    for column in NON_DISPLAY {
+        assert!(
+            profile_sql[0].contains(column),
+            "full profiles keep {column}: {}",
+            profile_sql[0]
+        );
+    }
+
+    let names = remote
+        .member_display_names(scope.clone(), ids.clone())
+        .await
+        .unwrap();
+    let display_sql = directory_reads(fixture.take_data_statements());
+    assert_eq!(display_sql.len(), 1, "one lookup: {display_sql:?}");
+    // The remote client sends its normalized rendering of the statement.
+    assert!(
+        display_sql[0].starts_with(
+            "SELECT user_id, username, global_name, nickname FROM guild_member_directory \
+             WHERE guild_id = ?1 AND enrollment_id = ?2 AND"
+        ),
+        "{}",
+        display_sql[0]
+    );
+    for column in NON_DISPLAY {
+        assert!(
+            !display_sql[0].contains(column),
+            "display names must not read {column}: {}",
+            display_sql[0]
+        );
+    }
+    assert!(display_sql[0].contains("ORDER BY user_id"));
+
+    let name = |id: i64, display: &str, username: Option<&str>| MemberDisplayName {
+        user_id: id.to_string(),
+        display_name: display.to_owned(),
+        username: username.map(str::to_owned),
+    };
+    assert_eq!(
+        names,
+        vec![
+            name(77, "Nick 77", Some("user77")),
+            name(78, "Global 78", Some("user78")),
+            name(79, "user79", Some("user79")),
+            name(80, "Nick 80", None),
+            name(big, "big", Some("big")),
+        ],
+        "nickname, then global name, then username in ID order; blank names \
+         and usernames are skipped; nameless and unknown IDs are omitted"
+    );
+    // The same precedence names every full profile that has a stored name.
+    assert_eq!(
+        profiles
+            .iter()
+            .filter(|p| p.user_id != "81")
+            .map(|p| (p.user_id.clone(), p.display_name.clone()))
+            .collect::<Vec<_>>(),
+        names
+            .iter()
+            .map(|n| (n.user_id.clone(), n.display_name.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        profiles
+            .iter()
+            .find(|p| p.user_id == "81")
+            .unwrap()
+            .display_name,
+        "81"
+    );
+
+    assert!(
+        remote
+            .member_display_names(scope.clone(), Vec::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let too_many = (1..=DIRECTORY_PROFILE_LOOKUP_LIMIT as i64 + 1).collect();
+    assert!(
+        remote
+            .member_display_names(scope.clone(), too_many)
+            .await
+            .is_err(),
+        "the lookup stays bounded"
+    );
+    assert!(
+        remote
+            .member_display_names(scope.clone(), vec![0])
+            .await
+            .is_err()
+    );
+    local.close_membership(scope.clone()).await.unwrap();
+    assert!(
+        remote
+            .member_display_names(scope, Vec::new())
+            .await
+            .unwrap_err()
+            .downcast_ref::<TenantDataError>()
+            .is_some_and(|error| matches!(error, TenantDataError::Membership)),
+        "empty reads must verify captured membership"
+    );
+}
+
+#[tokio::test]
 async fn first_profile_insert_creates_pending_rejoin_receipt() {
     let (_f, store, scope) = ready().await;
     store
