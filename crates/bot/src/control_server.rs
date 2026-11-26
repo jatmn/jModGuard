@@ -671,7 +671,6 @@ mod tests {
         let mut guild = Guild::default();
         guild.id = GuildId::new(guild_id);
         guild.owner_id = UserId::new(1);
-        guild.member_count = 2;
         let mut role = Role::default();
         role.id = RoleId::new(20);
         role.guild_id = guild.id;
@@ -858,7 +857,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn uncached_settings_actor_uses_one_member_get_per_decision() {
+    async fn uncached_settings_actor_uses_fresh_member_get() {
         use db::guild_data::{AccessLevel, AccessRole};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -878,10 +877,12 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&calls);
+        let member_leaves = Arc::new(AtomicBool::new(false));
+        let departure = Arc::clone(&member_leaves);
         let discord = tokio::spawn(async move {
             let mut member = actor_member(10, false);
             member.roles = vec![RoleId::new(30)];
-            let body = serde_json::to_string(&member).unwrap();
+            let member_body = serde_json::to_string(&member).unwrap();
             while let Ok((stream, _)) = listener.accept().await {
                 let mut stream = BufReader::new(stream);
                 let mut lines = (&mut stream).lines();
@@ -894,9 +895,17 @@ mod tests {
                         break;
                     }
                 }
-                seen.fetch_add(1, Ordering::SeqCst);
+                let attempt = seen.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if departure.load(Ordering::SeqCst) && attempt > 0 {
+                    (
+                        "404 Not Found",
+                        r#"{"code":10007,"message":"Unknown Member"}"#,
+                    )
+                } else {
+                    ("200 OK", member_body.as_str())
+                };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream
@@ -940,19 +949,25 @@ mod tests {
             db::get_settings(&bot.db, 10).await.unwrap().prefix,
             "!mapped"
         );
-        let mapped_calls = calls.load(Ordering::SeqCst);
+        let mapped_calls = calls.swap(0, Ordering::SeqCst);
+
+        member_leaves.store(true, Ordering::SeqCst);
+        let reply = submit(bound, seal(&patch(&enrollment, "!departed"), 7));
+        let prefix_after_departure = db::get_settings(&bot.db, 10).await.unwrap().prefix;
+        let departed_calls = calls.load(Ordering::SeqCst);
 
         discord.abort();
         let _ = discord.await;
         drop(bot);
         cleanup(&path);
-        assert_eq!((unmapped_calls, mapped_calls), (1, 1));
+        assert_eq!(failure_message(&reply), "actor is not allowed");
+        assert_eq!(prefix_after_departure, "!mapped");
+        assert_eq!((unmapped_calls, mapped_calls, departed_calls), (2, 2, 2));
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn uncached_settings_actor_prefers_newer_gateway_observations() {
         use db::guild_data::{AccessLevel, AccessRole};
-        use serenity::all::{GuildMemberAddEvent, GuildMemberRemoveEvent, GuildRoleDeleteEvent};
 
         let (bot, path) = writer_bot().await;
         let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
@@ -975,66 +990,11 @@ mod tests {
             .await
             .unwrap();
         let cache = Arc::new(Cache::new());
+        remember_guild(&cache, 10, None);
         bot.install_discord_cache(Arc::clone(&cache));
         let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
 
         let calls = Arc::new(AtomicUsize::new(0));
-        for (member_left, unrelated_join, prefix) in [
-            (true, false, "!departed"),
-            (true, true, "!departed_replaced"),
-            (false, false, "!role_deleted"),
-        ] {
-            remember_guild(&cache, 10, None);
-            remember_settings_role(&cache, 10);
-            let seen = Arc::clone(&calls);
-            let cache = Arc::clone(&cache);
-            bot.install_member_lookup(move |guild, actor| {
-                let attempt = seen.fetch_add(1, Ordering::SeqCst);
-                let cache = Arc::clone(&cache);
-                async move {
-                    assert_eq!((guild, actor), (10, 7));
-                    let mut member = actor_member(guild, false);
-                    if attempt == 0 {
-                        member.roles = vec![RoleId::new(30)];
-                        // Serenity updates its cache before running the callback.
-                        if member_left {
-                            let mut removed: GuildMemberRemoveEvent =
-                                serde_json::from_value(serde_json::json!({
-                                    "guild_id": member.guild_id,
-                                    "user": member.user,
-                                }))
-                                .unwrap();
-                            assert!(cache.update(&mut removed).is_none());
-                            if unrelated_join {
-                                let mut other = actor_member(guild, false);
-                                other.user.id = UserId::new(8);
-                                let mut added: GuildMemberAddEvent =
-                                    serde_json::from_value(serde_json::to_value(other).unwrap())
-                                        .unwrap();
-                                cache.update(&mut added);
-                                assert_eq!(cache.guild(member.guild_id).unwrap().member_count, 2);
-                            }
-                        } else {
-                            let mut deleted: GuildRoleDeleteEvent =
-                                serde_json::from_value(serde_json::json!({
-                                    "guild_id": member.guild_id,
-                                    "role_id": "30",
-                                }))
-                                .unwrap();
-                            assert!(cache.update(&mut deleted).is_some());
-                        }
-                    } else if member_left {
-                        return ControlMemberFetch::Absent;
-                    }
-                    ControlMemberFetch::Found(Box::new(member))
-                }
-            });
-            let reply = submit(bound, seal(&patch(&enrollment, prefix), 7));
-            assert_eq!(failure_message(&reply), "actor is not allowed");
-            assert_eq!(calls.swap(0, Ordering::SeqCst), 2);
-            assert_ne!(db::get_settings(&bot.db, 10).await.unwrap().prefix, prefix);
-        }
-
         let seen = Arc::clone(&calls);
         bot.install_member_lookup(move |guild, actor| {
             assert_eq!((guild, actor), (10, 7));

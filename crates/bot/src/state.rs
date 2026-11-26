@@ -4,8 +4,6 @@ use anyhow::{Context as _, Result};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use regex::Regex;
-use serenity::model::Timestamp;
-use serenity::model::guild::Guild;
 use serenity::model::id::ChannelId;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -834,29 +832,6 @@ pub(crate) enum ControlMemberFetch {
     Unavailable,
 }
 
-struct ControlMemberObservation {
-    member: Box<serenity::model::guild::Member>,
-    generation: u64,
-    cache_stamp: ControlMemberCacheStamp,
-}
-
-#[derive(PartialEq, Eq)]
-struct ControlMemberCacheStamp {
-    joined_at: Timestamp,
-    member_count: u64,
-    cached_members: usize,
-}
-
-impl From<&Guild> for ControlMemberCacheStamp {
-    fn from(guild: &Guild) -> Self {
-        Self {
-            joined_at: guild.joined_at,
-            member_count: guild.member_count,
-            cached_members: guild.members.len(),
-        }
-    }
-}
-
 type MemberLookup =
     dyn Fn(u64, u64) -> Pin<Box<dyn Future<Output = ControlMemberFetch> + Send>> + Send + Sync;
 
@@ -982,7 +957,6 @@ pub struct BotState {
     /// Test seam. Production reads [`Self::discord_cache`] instead.
     control_actor_lookup: Mutex<Option<Arc<ControlActorLookup>>>,
     member_lookup: Mutex<Option<Arc<MemberLookup>>>,
-    control_member_generation: AtomicU64,
     discord_cache: Mutex<Option<Arc<serenity::cache::Cache>>>,
     pub(crate) remembered_discord_targets: crate::discord::RememberedDiscordTargets,
     /// Gateway access changes queued for the WebUI (#653).
@@ -1102,7 +1076,6 @@ impl BotState {
             ready_shards: Mutex::new(ShardSessions::default()),
             control_actor_lookup: Mutex::new(None),
             member_lookup: Mutex::new(None),
-            control_member_generation: AtomicU64::new(0),
             discord_cache: Mutex::new(None),
             remembered_discord_targets: crate::discord::RememberedDiscordTargets::default(),
             access_marks: Default::default(),
@@ -1325,25 +1298,15 @@ impl BotState {
         });
     }
 
-    pub(crate) fn invalidate_control_member_observations(&self) {
-        self.control_member_generation
-            .fetch_add(1, Ordering::Release);
-    }
-
     pub async fn authorize_control_actor(
         &self,
         op: &db::ControlOp,
         actor_user_id: i64,
     ) -> Result<(), &'static str> {
-        let mut observation = None;
-        let decision = self
-            .authorize_control_permissions(op, actor_user_id, &mut observation)
-            .await;
+        let decision = self.authorize_control_permissions(op, actor_user_id).await;
         if decision.is_err()
             && let Some(scope) = db::settings_role_scope(op)
-            && self
-                .holds_settings_role(scope, actor_user_id, observation.as_ref())
-                .await
+            && self.holds_settings_role(scope, actor_user_id).await
         {
             return Ok(());
         }
@@ -1352,12 +1315,7 @@ impl BotState {
 
     /// A configuration edit from a Web UI access role mapped to the settings
     /// level. Uses this process's Discord member data, never the API's claim.
-    async fn holds_settings_role(
-        &self,
-        scope: &db::ScopeWire,
-        actor_user_id: i64,
-        observation: Option<&ControlMemberObservation>,
-    ) -> bool {
+    async fn holds_settings_role(&self, scope: &db::ScopeWire, actor_user_id: i64) -> bool {
         let (Ok(guild_id), Ok(actor)) =
             (u64::try_from(scope.guild_id), u64::try_from(actor_user_id))
         else {
@@ -1366,10 +1324,7 @@ impl BotState {
         if guild_id == 0 || actor == 0 {
             return false;
         }
-        let Some(roles) = self
-            .control_member_roles(guild_id, actor, observation)
-            .await
-        else {
+        let Some(roles) = self.control_member_roles(guild_id, actor).await else {
             return false;
         };
         if roles.is_empty() {
@@ -1384,37 +1339,16 @@ impl BotState {
         }
     }
 
-    async fn control_member_roles(
-        &self,
-        guild_id: u64,
-        actor: u64,
-        observation: Option<&ControlMemberObservation>,
-    ) -> Option<Vec<i64>> {
-        let roles = self.discord_cache.lock().clone().and_then(|cache| {
+    async fn control_member_roles(&self, guild_id: u64, actor: u64) -> Option<Vec<i64>> {
+        let cached = self.discord_cache.lock().clone().and_then(|cache| {
             let guild = cache.guild(serenity::model::id::GuildId::new(guild_id))?;
-            if let Some(member) = guild.members.get(&serenity::model::id::UserId::new(actor)) {
-                return Some(member_role_ids(member));
-            }
-            // Serenity mutates the roster and roles before our callbacks
-            // advance the generation. Fall back to a fresh lookup if either
-            // the synchronous cache or the asynchronous callbacks show a change.
-            let stamp = ControlMemberCacheStamp::from(&*guild);
-            let observation = observation.filter(|observed| {
-                !guild.unavailable
-                    && observed.member.guild_id.get() == guild_id
-                    && observed.member.user.id.get() == actor
-                    && observed.generation == self.control_member_generation.load(Ordering::Acquire)
-                    && observed.cache_stamp == stamp
-                    && observed
-                        .member
-                        .roles
-                        .iter()
-                        .all(|role| guild.roles.contains_key(role))
-            })?;
-            Some(member_role_ids(&observation.member))
+            let member = guild
+                .members
+                .get(&serenity::model::id::UserId::new(actor))?;
+            Some(member_role_ids(member))
         });
-        if roles.is_some() {
-            return roles;
+        if cached.is_some() {
+            return cached;
         }
         let lookup = self.member_lookup.lock().clone()?;
         match tokio::time::timeout(Duration::from_secs(2), lookup(guild_id, actor)).await {
@@ -1427,7 +1361,6 @@ impl BotState {
         &self,
         op: &db::ControlOp,
         actor_user_id: i64,
-        observation: &mut Option<ControlMemberObservation>,
     ) -> Result<(), &'static str> {
         if self.control_actor_lookup.lock().is_some() {
             let cached = self.cached_control_actor(actor_user_id, op);
@@ -1437,8 +1370,7 @@ impl BotState {
             return Ok(());
         }
         for need in db::control_actor_needs(op) {
-            self.authorize_control_need(need, actor_user_id, observation)
-                .await?;
+            self.authorize_control_need(need, actor_user_id).await?;
         }
         Ok(())
     }
@@ -1447,7 +1379,6 @@ impl BotState {
         &self,
         need: db::ControlActorNeed,
         actor_user_id: i64,
-        observation: &mut Option<ControlMemberObservation>,
     ) -> Result<(), &'static str> {
         let guild_id = match need {
             db::ControlActorNeed::Process | db::ControlActorNeed::Owner => {
@@ -1463,8 +1394,7 @@ impl BotState {
             }
             GuildActorCache::GuildMissing => Err("actor permission could not be confirmed"),
             GuildActorCache::MemberMissing => {
-                self.lookup_guild_actor(need, guild_id, actor_user_id, observation)
-                    .await
+                self.lookup_guild_actor(need, guild_id, actor_user_id).await
             }
         }
     }
@@ -1503,7 +1433,6 @@ impl BotState {
         need: db::ControlActorNeed,
         guild_id: i64,
         actor_user_id: i64,
-        observation: &mut Option<ControlMemberObservation>,
     ) -> Result<(), &'static str> {
         let Some(lookup) = self.member_lookup.lock().clone() else {
             return Err("actor permission could not be confirmed");
@@ -1511,11 +1440,6 @@ impl BotState {
         if guild_id <= 0 || actor_user_id <= 0 {
             return Err("actor is not allowed");
         }
-        let generation = self.control_member_generation.load(Ordering::Acquire);
-        let cache_stamp = self.discord_cache.lock().clone().and_then(|cache| {
-            let guild = cache.guild(serenity::model::id::GuildId::new(guild_id as u64))?;
-            (!guild.unavailable).then(|| ControlMemberCacheStamp::from(&*guild))
-        });
         let fetched = tokio::time::timeout(
             Duration::from_secs(2),
             lookup(guild_id as u64, actor_user_id as u64),
@@ -1535,19 +1459,13 @@ impl BotState {
                     return Err("actor permission could not be confirmed");
                 };
                 let owner = i64::try_from(guild.owner_id.get()).unwrap_or(0);
-                let permissions = permission_bits(guild.member_permissions(&member));
-                *observation = cache_stamp.map(|cache_stamp| ControlMemberObservation {
-                    member,
-                    generation,
-                    cache_stamp,
-                });
                 db::decide_control_actor(
                     need,
                     actor_user_id,
                     self.cfg.bot.owner_id,
                     Some(db::CachedGuildActor {
                         guild_owner_id: owner,
-                        permissions,
+                        permissions: permission_bits(guild.member_permissions(&member)),
                     }),
                 )
             }

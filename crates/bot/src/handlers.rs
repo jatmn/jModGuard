@@ -933,7 +933,6 @@ impl EventHandler for Handler {
         member_data: Option<Member>,
     ) {
         crate::resources::gateway_event("guild_member_removal");
-        self.app.invalidate_control_member_observations();
         self.app
             .automod
             .onboarding_matches
@@ -1928,7 +1927,6 @@ impl EventHandler for Handler {
         removed_role_data_if_available: Option<Role>,
     ) {
         crate::resources::gateway_event("guild_role_delete");
-        self.app.invalidate_control_member_observations();
         self.app.access_marks.guild(guild_id.get());
         if !self.app.activation.allows_rule_trigger() {
             return;
