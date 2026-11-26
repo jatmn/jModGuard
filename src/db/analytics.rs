@@ -11,7 +11,7 @@ use super::write_budget::BoundedWrites;
 use super::{Db, SqlExecutor, params};
 use crate::ids::ser_i64_str;
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -166,31 +166,35 @@ fn clamp_window(window_days: i64) -> i64 {
 }
 
 /// UTC calendar day (`YYYY-MM-DD`) for an epoch-millisecond observation.
-fn analytics_day_of_ms(at_ms: i64) -> String {
-    match chrono::DateTime::from_timestamp_millis(at_ms) {
-        Some(at) => at.format("%Y-%m-%d").to_string(),
-        // Out-of-range timestamps fall back to the current UTC day; the
-        // counter is analytics only and must never fail a runtime write.
-        None => Utc::now().format("%Y-%m-%d").to_string(),
-    }
+fn analytics_day_of_ms(at_ms: i64, today: NaiveDate) -> String {
+    // Out-of-range timestamps fall back to the current UTC day; the
+    // counter is analytics only and must never fail a runtime write.
+    chrono::DateTime::from_timestamp_millis(at_ms)
+        .map_or(today, |at| at.date_naive())
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
-fn day_for_offset(window_days: i64, offset: i64) -> String {
-    (Utc::now().date_naive() - chrono::Duration::days(window_days - 1 - offset))
+fn day_for_offset(today: NaiveDate, window_days: i64, offset: i64) -> String {
+    (today - chrono::Duration::days(window_days - 1 - offset))
         .format("%Y-%m-%d")
         .to_string()
 }
 
 /// The first day of a window ending today (UTC).
-fn window_start_day(window_days: i64) -> String {
-    day_for_offset(window_days, 0)
+fn window_start_day(today: NaiveDate, window_days: i64) -> String {
+    day_for_offset(today, window_days, 0)
 }
 
 /// Zero-fills the window ending today, merging observed days from the map.
-fn filled_series(map: HashMap<String, AnalyticsPoint>, window_days: i64) -> Vec<AnalyticsPoint> {
+fn filled_series(
+    map: HashMap<String, AnalyticsPoint>,
+    window_days: i64,
+    today: NaiveDate,
+) -> Vec<AnalyticsPoint> {
     (0..window_days)
         .map(|offset| {
-            let day = day_for_offset(window_days, offset);
+            let day = day_for_offset(today, window_days, offset);
             let mut point = map.get(&day).cloned().unwrap_or_default();
             point.day = day;
             point
@@ -369,9 +373,10 @@ fn guild_summary_conn(
     conn: &impl SqlExecutor,
     guild_id: i64,
     window_days: i64,
+    today: NaiveDate,
 ) -> Result<(HashMap<String, AnalyticsPoint>, GuildPanels)> {
-    let start_day = window_start_day(window_days);
-    let previous_start = window_start_day(window_days * 2);
+    let start_day = window_start_day(today, window_days);
+    let previous_start = window_start_day(today, window_days * 2);
     let sql = format!(
         "WITH {} SELECT {}, {}",
         guild_events_cte(),
@@ -459,9 +464,13 @@ fn guild_summary_conn(
 /// display facts and the server count in one statement. `?1` starts the
 /// requested window and `?2` the previous window of equal length. Counting
 /// grows with the retained rows of both windows; the route is owner-only.
-fn platform_conn(conn: &impl SqlExecutor, window_days: i64) -> Result<PlatformAnalytics> {
-    let start_day = window_start_day(window_days);
-    let previous_start = window_start_day(window_days * 2);
+fn platform_conn(
+    conn: &impl SqlExecutor,
+    window_days: i64,
+    today: NaiveDate,
+) -> Result<PlatformAnalytics> {
+    let start_day = window_start_day(today, window_days);
+    let previous_start = window_start_day(today, window_days * 2);
     let sql = format!(
         "WITH w AS MATERIALIZED (SELECT guild_id, SUM(created_at>=?1) AS c, SUM(created_at<?1) AS p \
            FROM warns WHERE created_at>=?2 GROUP BY guild_id), \
@@ -594,7 +603,7 @@ fn platform_conn(conn: &impl SqlExecutor, window_days: i64) -> Result<PlatformAn
     guilds.sort_by_key(|totals| totals.guild_id);
     Ok(PlatformAnalytics {
         window_days,
-        series: filled_series(series_map, window_days),
+        series: filled_series(series_map, window_days, today),
         previous,
         servers,
         guilds,
@@ -608,15 +617,24 @@ pub async fn enrolled_guild_analytics(
     enrollment: super::GuildEnrollment,
     window_days: i64,
 ) -> Result<GuildAnalytics> {
+    enrolled_guild_analytics_on(db, enrollment, window_days, Utc::now().date_naive()).await
+}
+
+async fn enrolled_guild_analytics_on(
+    db: &Db,
+    enrollment: super::GuildEnrollment,
+    window_days: i64,
+    today: NaiveDate,
+) -> Result<GuildAnalytics> {
     let window_days = clamp_window(window_days);
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_snapshot()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
-        let (map, panels) = guild_summary_conn(&tx, enrollment.guild_id, window_days)?;
+        let (map, panels) = guild_summary_conn(&tx, enrollment.guild_id, window_days, today)?;
         tx.finish_read()?;
         Ok(GuildAnalytics {
             window_days,
-            series: filled_series(map, window_days),
+            series: filled_series(map, window_days, today),
             previous: panels.previous,
             top_rules: panels.top_rules,
             mod_action_kinds: panels.mod_action_kinds,
@@ -630,10 +648,18 @@ pub async fn enrolled_guild_analytics(
 /// Owner-scoped platform analytics read. Callers must verify the session is
 /// the bot owner; this reads every guild's aggregates.
 pub async fn platform_analytics(db: &Db, window_days: i64) -> Result<PlatformAnalytics> {
+    platform_analytics_on(db, window_days, Utc::now().date_naive()).await
+}
+
+async fn platform_analytics_on(
+    db: &Db,
+    window_days: i64,
+    today: NaiveDate,
+) -> Result<PlatformAnalytics> {
     let window_days = clamp_window(window_days);
     db.with_conn(move |conn| {
         let tx = conn.transaction_primary_snapshot()?;
-        let result = platform_conn(&tx, window_days)?;
+        let result = platform_conn(&tx, window_days, today)?;
         tx.finish_read()?;
         Ok(result)
     })
@@ -650,6 +676,25 @@ pub async fn bump_member_daily(
     joins_delta: i64,
     leaves_delta: i64,
 ) -> Result<()> {
+    bump_member_daily_on(
+        db,
+        enrollment,
+        at_ms,
+        joins_delta,
+        leaves_delta,
+        Utc::now().date_naive(),
+    )
+    .await
+}
+
+async fn bump_member_daily_on(
+    db: &Db,
+    enrollment: super::GuildEnrollment,
+    at_ms: i64,
+    joins_delta: i64,
+    leaves_delta: i64,
+    today: NaiveDate,
+) -> Result<()> {
     anyhow::ensure!(
         joins_delta >= 0 && leaves_delta >= 0,
         "negative analytics counter delta"
@@ -657,11 +702,10 @@ pub async fn bump_member_daily(
     if joins_delta == 0 && leaves_delta == 0 {
         return Ok(());
     }
-    let day = analytics_day_of_ms(at_ms);
-    let prune_before = (Utc::now().date_naive()
-        - chrono::Duration::days(ANALYTICS_MEMBER_DAILY_HORIZON_DAYS))
-    .format("%Y-%m-%d")
-    .to_string();
+    let day = analytics_day_of_ms(at_ms, today);
+    let prune_before = (today - chrono::Duration::days(ANALYTICS_MEMBER_DAILY_HORIZON_DAYS))
+        .format("%Y-%m-%d")
+        .to_string();
     db.with_conn(move |conn| {
         let mut tx = conn.transaction_primary_write()?;
         super::enrollments::verify_enrollment_conn(&tx, &enrollment)?;
