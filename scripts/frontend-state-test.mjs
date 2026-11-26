@@ -220,9 +220,17 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     };
     return () => count;
   }
+  function failJsonStringify(predicate) {
+    const json = vm.runInContext('JSON', context);
+    const stringify = json.stringify;
+    json.stringify = (value, replacer, space) => {
+      if (predicate(value)) throw new RangeError('Invalid string length');
+      return stringify(value, replacer, space);
+    };
+  }
   vm.runInContext('root.render(h(App));', context);
   pages.push({dom, roots});
-  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, measureMemberRowRenders, measureResourceChartRenders, measureJsonPrettyPrints, advanceTime(ms) { clockOffsetMs += ms; } };
+  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, measureMemberRowRenders, measureResourceChartRenders, measureJsonPrettyPrints, failJsonStringify, advanceTime(ms) { clockOffsetMs += ms; } };
 }
 
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
@@ -12087,6 +12095,90 @@ test('display snapshots stay within the session storage budget across different 
   await fire(cacheRefreshButton(panel), 'click');
   assert.match(panel.querySelector('tbody').textContent, /Test-User-1/);
   assert.equal(session.has(recentKey), false, 'an oversized response does not persist or leave its superseded copy');
+});
+
+// #868: inactive copies kept in memory follow the same aggregate budget as storage.
+async function memoryBudgetView() {
+  const session = new Map();
+  const fixture = { marker: 'Initial', extraSize: 0, hold: false, release: null };
+  const h = harness(async (url) => {
+    assert.match(url, /\/bans\?/);
+    const { marker, extraSize } = fixture;
+    if (fixture.hold) await new Promise((resolve) => { fixture.release = resolve; });
+    const data = banRows();
+    data.bans[0].user_display_name = marker;
+    return response({ ...data, details: 'x'.repeat(extraSize) });
+  }, new Map(), session);
+  const panel = await bansView(h);
+  return {
+    h,
+    fixture,
+    table: () => panel.querySelector('tbody').textContent,
+    stored: (marker) => [...session.values()].some((value) => value.includes(marker)),
+    async changeDate(day, marker, extraSize, hold = false) {
+      Object.assign(fixture, { marker, extraSize, hold });
+      const date = panel.querySelector('input[type="date"]');
+      date.value = new Date(Date.UTC(2026, 0, day)).toISOString().slice(0, 10);
+      await fire(date, 'change');
+    },
+    async finish() {
+      fixture.hold = false;
+      fixture.release();
+      await settle();
+    },
+  };
+}
+
+test('an oversized filtered result is shown complete but not served from memory after navigation', async () => {
+  const view = await memoryBudgetView();
+  await view.changeDate(1, 'Oversized', 1_100_000);
+  assert.match(view.table(), /Oversized/, 'the visible view keeps its complete data');
+  await view.changeDate(2, 'Other', 0);
+  assert.equal(view.stored('Oversized'), false);
+  await view.changeDate(1, 'Replacement', 0, true);
+  assert.doesNotMatch(view.table(), /Oversized/, 'an oversized prior value is not served from memory');
+  assert.match(view.table(), /Loading/);
+  await view.finish();
+  assert.match(view.table(), /Replacement/);
+});
+
+test('two admissible in-memory display copies over the combined budget evict the older one', async () => {
+  const view = await memoryBudgetView();
+  await view.changeDate(3, 'First', 600_000);
+  await view.changeDate(4, 'Second', 600_000);
+  assert.equal(view.stored('First'), false);
+  await view.changeDate(3, 'Refetched', 0, true);
+  assert.doesNotMatch(view.table(), /First/, 'the older inactive copy is not served from memory');
+  assert.match(view.table(), /Loading/);
+  await view.finish();
+  assert.match(view.table(), /Refetched/);
+
+  // The newer copy is still a warm hit that revalidates.
+  await view.changeDate(4, 'Revalidated', 0, true);
+  assert.match(view.table(), /Second/, 'the most recent admissible copy renders at once');
+  assert.equal(lastUpdated(view.h), 'Refreshing…');
+  await view.finish();
+  assert.match(view.table(), /Revalidated/);
+});
+
+test('a display read too large to serialize is shown fresh and drops its superseded copy', async () => {
+  const view = await memoryBudgetView();
+  await view.changeDate(5, 'Cached', 0);
+  await view.changeDate(6, 'Other', 0);
+  assert.equal(view.stored('Cached'), true);
+  view.h.failJsonStringify((value) => value?.at !== undefined
+    && value?.data?.bans?.[0]?.user_display_name === 'Unserializable');
+  await view.changeDate(5, 'Unserializable', 0);
+  assert.match(view.table(), /Unserializable/);
+  assert.doesNotMatch(view.h.document.body.textContent, /Refresh failed/, 'a cache rejection is not a refresh error');
+  assert.equal(view.stored('Cached'), false, 'the superseded stored copy is dropped');
+
+  await view.changeDate(6, 'Elsewhere', 0);
+  await view.changeDate(5, 'Again', 0, true);
+  assert.doesNotMatch(view.table(), /Cached|Unserializable/, 'no superseded copy is served from memory');
+  assert.match(view.table(), /Loading/);
+  await view.finish();
+  assert.match(view.table(), /Again/);
 });
 
 test('a configuration save reclaims display copies when real session storage is full', async () => {

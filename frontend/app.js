@@ -10176,10 +10176,13 @@ function CommandStep({ step, index, names, pending, onChange, remove }) {
 // whose Discord data has its own refresh interval. Sign-out and auth loss clear it.
 const READ_CACHE_PREFIX = "jmodguard.read:";
 const READ_CACHE_ENTRIES = 32;
-// Bound the combined length of stored keys and values to leave room for request identities.
+// Bound the combined length of keys and serialized values, both in storage (leaving
+// room for request identities) and for the copies kept in memory. That length is an
+// admission proxy, not JS heap bytes. A visible view keeps its own data either way.
 const READ_CACHE_STORAGE_LIMIT = 1024 * 1024;
 const READ_REFRESH_MS = 3 * 60 * 1000;
 const readCache = new Map();
+let readCacheWeight = 0;
 let readSessionEnding = false;
 
 function readCacheKey(path, listSize, enrollment) {
@@ -10188,14 +10191,28 @@ function readCacheKey(path, listSize, enrollment) {
   return READ_CACHE_PREFIX + JSON.stringify([apiBase(), user, path, listSize, enrollment]);
 }
 
-function rememberRead(key, entry) {
+function forgetRead(key) {
+  const old = readCache.get(key);
+  if (!old) return;
   readCache.delete(key);
-  readCache.set(key, entry);
-  if (readCache.size > READ_CACHE_ENTRIES) readCache.delete(readCache.keys().next().value);
+  readCacheWeight -= old.weight;
+}
+
+function rememberRead(key, entry, weight) {
+  const old = readCache.get(key);
+  weight ??= old?.entry === entry ? old.weight : key.length + JSON.stringify(entry).length;
+  forgetRead(key);
+  if (weight > READ_CACHE_STORAGE_LIMIT) return;
+  readCache.set(key, { entry, weight });
+  readCacheWeight += weight;
+  for (const oldKey of readCache.keys()) {
+    if (readCache.size <= READ_CACHE_ENTRIES && readCacheWeight <= READ_CACHE_STORAGE_LIMIT) break;
+    forgetRead(oldKey);
+  }
 }
 
 function cachedRead(key, shape) {
-  if (readCache.has(key)) return readCache.get(key);
+  if (readCache.has(key)) return readCache.get(key).entry;
   try {
     const saved = JSON.parse(window.sessionStorage.getItem(key));
     if (saved && Number.isSafeInteger(saved.at) && saved.at >= 0 && saved.at <= 8.64e15 && validDisplayRead(saved.data, shape)) {
@@ -10227,11 +10244,18 @@ function setSessionItemWithReadCacheFallback(storage, key, value) {
 
 function storeRead(key, data, at) {
   const entry = { at, data };
-  rememberRead(key, entry);
+  let value;
+  try {
+    value = JSON.stringify(entry);
+  } catch (_) {
+    // A response too large to serialize is too large to cache.
+    discardRead(key);
+    return;
+  }
+  const size = key.length + value.length;
+  rememberRead(key, entry, size);
   try {
     const storage = window.sessionStorage;
-    const value = JSON.stringify(entry);
-    const size = key.length + value.length;
     if (size > READ_CACHE_STORAGE_LIMIT) {
       storage.removeItem(key);
       return;
@@ -10250,7 +10274,7 @@ function storeRead(key, data, at) {
 }
 
 function discardRead(key) {
-  readCache.delete(key);
+  forgetRead(key);
   try {
     window.sessionStorage.removeItem(key);
   } catch (_) { /* Optional storage can be unavailable. */ }
@@ -10264,6 +10288,7 @@ function readAccessFailed(error, enrollment) {
 
 function clearReadCache() {
   readCache.clear();
+  readCacheWeight = 0;
   try {
     const storage = window.sessionStorage;
     for (const key of storedReadKeys(storage)) storage.removeItem(key);
