@@ -705,23 +705,23 @@ pub async fn get_command(
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let name = name.to_lowercase();
-    let canonical = crate::defaults::builtin_command_for_label(&name).unwrap_or(name);
+    let canonical = crate::defaults::builtin_command_for_label(&name).unwrap_or(name.as_str());
     // Effective aliases depend on peers. Read only the command section, with
     // both layers and membership verified in the existing primary snapshot.
     let layers = db::list_enrolled_commands(&app.db, scope).await?;
     let guild_map = pairs_to_map(&layers.guild);
     let global_map = pairs_to_map(&layers.global);
-    let global = command_row_by_name(&global_map, &canonical).cloned();
+    let global = command_row_by_name(&global_map, canonical).cloned();
     let guild_override = if guild_id == 0 {
         // Preserve the raw global-context layer shape.
         global.clone()
     } else {
-        guild_command_override(guild_id, &guild_map, &canonical).cloned()
+        guild_command_override(guild_id, &guild_map, canonical).cloned()
     };
     let none = std::collections::HashMap::new();
     let overrides = if guild_id == 0 { &none } else { &guild_map };
     let registry = crate::defaults::effective_command_registry(&global_map, overrides);
-    let effective = registry.get(&canonical).cloned();
+    let effective = registry.get(canonical).cloned();
     Ok(Json(serde_json::json!({
         "effective": effective,
         "guild_override": guild_override,
