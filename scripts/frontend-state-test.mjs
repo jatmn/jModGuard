@@ -878,10 +878,14 @@ test('failed assertions on large objects and functions report short previews', t
     deep = { next: deep };
     nested.add(deep);
   }
+  let getterCalls = 0;
   const graph = {
     deep,
     text: 'x'.repeat(100_000),
-    get accessor() { throw new Error('assertion preview called a getter'); },
+    get accessor() {
+      getterCalls++;
+      throw new Error('assertion preview called a getter');
+    },
   };
   for (let index = 0; index < 10_000; index++) graph[`extra${index}`] = deep;
   function withGraph() {}
@@ -906,6 +910,7 @@ test('failed assertions on large objects and functions report short previews', t
   });
   assert.ok(outerReads <= 5, 'preview reads at most four fields plus one to detect truncation');
   assert.equal(nestedReads, 0, 'preview does not read nested descriptors');
+  assert.equal(getterCalls, 0, 'preview does not invoke the getter');
 });
 
 test('the ban dialog locks all submitted options until acknowledgment or failure', async t => {
