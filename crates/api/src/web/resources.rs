@@ -9,14 +9,15 @@ use axum::Json;
 use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use jmodguard::cgroup::CgroupRelation;
 use jmodguard::config::HostingEstimateConfig;
 use jmodguard::db::{self, ResourceRecords};
 use jmodguard::resources::{
     self, HOUR_SECS, MINUTE_SECS, ProcessStatus, Rollup, RollupBuilder, latency_quantile_ms,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::value::{RawValue, to_raw_value};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -25,7 +26,7 @@ use tower_sessions::cookie::time;
 use tower_sessions::session::{Id, Record};
 use tower_sessions::{MemoryStore, SessionStore, session_store};
 
-type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
+type Reply = Result<Response, (StatusCode, Json<Value>)>;
 
 /// History reads are reused this long; the bot saves one minute at a time.
 const HISTORY_TTL: Duration = Duration::from_secs(20);
@@ -82,18 +83,44 @@ struct CachedHistory {
     /// Completion time of the last read attempt, including failures.
     checked_at: Instant,
     to_secs: i64,
-    records: Option<ResourceRecords>,
+    prepared: Option<Arc<PreparedHistory>>,
     stale: bool,
 }
 
 impl CachedHistory {
-    fn result(&self) -> (Option<ResourceRecords>, &'static str) {
-        let status = match (&self.records, self.stale) {
+    fn result(&self) -> (Option<Arc<PreparedHistory>>, &'static str) {
+        let status = match (&self.prepared, self.stale) {
             (None, _) => "unavailable",
             (Some(_), true) => "stale",
             (Some(_), false) => "available",
         };
-        (self.records.clone(), status)
+        (self.prepared.clone(), status)
+    }
+}
+
+/// Encoded history and saved bot status from one database snapshot.
+struct PreparedHistory {
+    bot: Box<RawValue>,
+    api: Box<RawValue>,
+    bot_status: Option<ProcessStatus>,
+}
+
+impl PreparedHistory {
+    fn new(
+        records: ResourceRecords,
+        from_secs: i64,
+        to_secs: i64,
+        bucket: i64,
+    ) -> serde_json::Result<Self> {
+        Ok(Self {
+            bot: to_raw_value(&history_json(&records.bot, from_secs, to_secs, bucket))?,
+            api: to_raw_value(&history_json(&records.api, from_secs, to_secs, bucket))?,
+            bot_status: records
+                .statuses
+                .into_iter()
+                .find(|(process, _, _)| process == "bot")
+                .map(|(_, _, status)| status),
+        })
     }
 }
 
@@ -124,16 +151,16 @@ pub async fn overview(
     let range = ResourceRange::parse(query.range.as_deref().unwrap_or("24h"))
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "range must be 1h, 24h, 7d or 30d"))?;
     let now_ms = resources::unix_ms_now();
-    let (records, history_status) = history(&app, range, now_ms / 1000).await;
+    let (prepared, history_status) = history(&app, range, now_ms / 1000).await;
     let api_status = ProcessStatus::current(api_interval_ms());
-    Ok(Json(build_response(
+    Ok(build_response(
         range,
         now_ms,
-        records.as_ref(),
+        prepared.as_deref(),
         history_status,
         &api_status,
         &app.cfg.web.hosting_estimate,
-    )))
+    ))
 }
 
 fn memory_billing(config: &HostingEstimateConfig) -> Value {
@@ -157,7 +184,7 @@ async fn history(
     app: &Arc<ApiState>,
     range: ResourceRange,
     now_secs: i64,
-) -> (Option<ResourceRecords>, &'static str) {
+) -> (Option<Arc<PreparedHistory>>, &'static str) {
     let (span, window, bucket) = range.shape();
     let to_secs = now_secs - now_secs.rem_euclid(bucket) + bucket;
     {
@@ -169,7 +196,7 @@ async fn history(
             return entry.result();
         }
     }
-    // One history read at a time; a waiting refresh reuses its result.
+    // One history refresh at a time; a waiting reader reuses its result.
     let _gate = app.resource_cache.gate.lock().await;
     {
         let cache = app.resource_cache.entries.lock().await;
@@ -180,92 +207,121 @@ async fn history(
             return entry.result();
         }
     }
+    let from_secs = to_secs - window;
     let read = tokio::time::timeout(
         HISTORY_DEADLINE,
-        db::resource_records(&app.db, span, to_secs - window, to_secs),
+        db::resource_records(&app.db, span, from_secs, to_secs),
     )
     .await;
+    let checked_at = Instant::now();
+    let prepared = match read {
+        Ok(Ok(records)) => PreparedHistory::new(records, from_secs, to_secs, bucket)
+            .ok()
+            .map(Arc::new),
+        _ => None,
+    };
     let mut cache = app.resource_cache.entries.lock().await;
-    let (records, stale) = match read {
-        Ok(Ok(records)) => (Some(records), false),
-        _ => {
+    let (prepared, stale) = match prepared {
+        Some(prepared) => (Some(prepared), false),
+        None => {
             let last = cache
                 .remove(&range)
                 .filter(|entry| entry.to_secs == to_secs);
-            (last.and_then(|entry| entry.records), true)
+            (last.and_then(|entry| entry.prepared), true)
         }
     };
     let entry = cache.entry(range).insert_entry(CachedHistory {
-        checked_at: Instant::now(),
+        checked_at,
         to_secs,
-        records,
+        prepared,
         stale,
     });
     entry.get().result()
 }
 
+#[derive(Serialize)]
+struct ResourcesOverview<'a> {
+    bucket_secs: i64,
+    cgroup_relation: Value,
+    from_secs: i64,
+    generated_at_ms: i64,
+    history_status: &'static str,
+    memory_billing: Value,
+    processes: ResourceProcesses<'a>,
+    provider: Value,
+    range: &'static str,
+    rows_read: Value,
+    span_secs: i64,
+    to_secs: i64,
+}
+
+#[derive(Serialize)]
+struct ResourceProcesses<'a> {
+    api: ResourceProcessView<'a>,
+    bot: ResourceProcessView<'a>,
+}
+
+#[derive(Serialize)]
+struct ResourceProcessView<'a> {
+    current: Value,
+    history: Option<&'a RawValue>,
+}
+
 fn build_response(
     range: ResourceRange,
     now_ms: i64,
-    records: Option<&ResourceRecords>,
-    history_status: &str,
+    prepared: Option<&PreparedHistory>,
+    history_status: &'static str,
     api_status: &ProcessStatus,
     estimate: &HostingEstimateConfig,
-) -> Value {
+) -> Response {
     let (span, window, bucket) = range.shape();
     let now_secs = now_ms / 1000;
     let to_secs = now_secs - now_secs.rem_euclid(bucket) + bucket;
     let from_secs = to_secs - window;
-    let bot_status = records.and_then(|records| {
-        records
-            .statuses
-            .iter()
-            .find(|(process, _, _)| process == "bot")
-            .map(|(_, _, status)| status.clone())
-    });
-    let process = |status: Option<&ProcessStatus>, rows: Option<&Vec<Rollup>>| {
-        json!({
-            "current": current(status, now_ms),
-            "history": rows.map(|rows| history_json(rows, from_secs, to_secs, bucket)),
-        })
-    };
+    let bot_status = prepared.and_then(|history| history.bot_status.as_ref());
     let (memory_relation, cpu_relation) =
-        bot_status
-            .as_ref()
-            .map_or((CgroupRelation::Unknown, CgroupRelation::Unknown), |bot| {
-                (
-                    bot.cgroup_scopes.memory_relation(&api_status.cgroup_scopes),
-                    bot.cgroup_scopes.cpu_relation(&api_status.cgroup_scopes),
-                )
-            });
+        bot_status.map_or((CgroupRelation::Unknown, CgroupRelation::Unknown), |bot| {
+            (
+                bot.cgroup_scopes.memory_relation(&api_status.cgroup_scopes),
+                bot.cgroup_scopes.cpu_relation(&api_status.cgroup_scopes),
+            )
+        });
     let estimate_relation = |relation| match relation {
         CgroupRelation::Unverified if estimate.assume_disjoint_cgroups => {
             json!("operator_declared_disjoint")
         }
         _ => json!(relation),
     };
-    json!({
-        "generated_at_ms": now_ms,
-        "range": range.label(),
-        "span_secs": span,
-        "bucket_secs": bucket,
-        "from_secs": from_secs,
-        "to_secs": to_secs,
-        "history_status": history_status,
-        "cgroup_relation": {
+    Json(ResourcesOverview {
+        bucket_secs: bucket,
+        cgroup_relation: json!({
             "memory": estimate_relation(memory_relation),
             "cpu": estimate_relation(cpu_relation),
-        },
-        "memory_billing": memory_billing(estimate),
-        "processes": {
-            "bot": process(bot_status.as_ref(), records.map(|r| &r.bot)),
-            "api": process(Some(api_status), records.map(|r| &r.api)),
+        }),
+        from_secs,
+        generated_at_ms: now_ms,
+        history_status,
+        memory_billing: memory_billing(estimate),
+        processes: ResourceProcesses {
+            api: ResourceProcessView {
+                current: current(Some(api_status), now_ms),
+                history: prepared.map(|history| history.api.as_ref()),
+            },
+            bot: ResourceProcessView {
+                current: current(bot_status, now_ms),
+                history: prepared.map(|history| history.bot.as_ref()),
+            },
         },
         // libsql does not report rows read to the client, and no provider
         // billing API is called. Both stay unavailable rather than estimated.
-        "rows_read": {"status": "unavailable", "reason": "not_reported_by_database_client"},
-        "provider": {"status": "not_configured", "reason": "no_scoped_read_only_key"},
+        provider: json!({"status": "not_configured", "reason": "no_scoped_read_only_key"}),
+        range: range.label(),
+        rows_read: json!({"status": "unavailable", "reason": "not_reported_by_database_client"}),
+        span_secs: span,
+        to_secs,
     })
+    .into_response()
 }
 
 /// The current view with its freshness. A missing status is unavailable;

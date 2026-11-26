@@ -83,6 +83,15 @@ fn range(raw: &str) -> Query<ResourcesQuery> {
     })
 }
 
+async fn response_json(response: Response) -> Value {
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let bytes = axum::body::to_bytes(response.into_body(), 1_048_576)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 fn minute(start_secs: i64, cpu: u32, requests: u64, started_ms: i64) -> Rollup {
     let mut rollup = Rollup::empty(start_secs, MINUTE_SECS);
     rollup.cpu_avg_tenths = Some(cpu);
@@ -134,10 +143,12 @@ async fn resources_are_owner_only_and_reject_unknown_ranges() {
         StatusCode::BAD_REQUEST
     );
     let owner = signed_in(&f.app, 99).await;
-    let value = overview(State(f.app.clone()), owner, headers, range("1h"))
-        .await
-        .unwrap()
-        .0;
+    let value = response_json(
+        overview(State(f.app.clone()), owner, headers, range("1h"))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(value["range"], "1h");
     assert_eq!(value["history_status"], "available");
     assert_eq!(
@@ -180,9 +191,12 @@ async fn memory_billing_returns_rates_only_when_enabled() {
             ..HostingEstimateConfig::default()
         });
         let owner = signed_in(&f.app, 99).await;
-        let Json(value) = overview(State(f.app.clone()), owner, origin(&f.app), range("1h"))
-            .await
-            .unwrap();
+        let value = response_json(
+            overview(State(f.app.clone()), owner, origin(&f.app), range("1h"))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(value["memory_billing"]["block_mib"], 64);
         assert_eq!(
             value["memory_billing"]["rates"],
@@ -214,7 +228,7 @@ async fn resources_compare_stored_and_live_scopes_without_exposing_identity() {
     )
     .await
     .unwrap();
-    let (records, history_status) = history(&f.app, ResourceRange::Hour, now_secs).await;
+    let (prepared, history_status) = history(&f.app, ResourceRange::Hour, now_secs).await;
     for assume_disjoint_cgroups in [false, true] {
         let estimate = HostingEstimateConfig {
             enabled: true,
@@ -250,14 +264,15 @@ async fn resources_compare_stored_and_live_scopes_without_exposing_identity() {
                 private_relation,
             ),
         ] {
-            let value = build_response(
+            let value = response_json(build_response(
                 ResourceRange::Hour,
                 now_secs * 1000,
-                records.as_ref(),
+                prepared.as_deref(),
                 history_status,
                 &status(scopes),
                 &estimate,
-            );
+            ))
+            .await;
             assert_eq!(
                 value["cgroup_relation"],
                 json!({"memory": memory, "cpu": cpu}),
@@ -302,10 +317,12 @@ async fn saved_bot_history_and_status_reach_the_owner_response() {
     .await
     .unwrap();
     let owner = signed_in(&f.app, 99).await;
-    let value = overview(State(f.app.clone()), owner, origin(&f.app), range("1h"))
-        .await
-        .unwrap()
-        .0;
+    let value = response_json(
+        overview(State(f.app.clone()), owner, origin(&f.app), range("1h"))
+            .await
+            .unwrap(),
+    )
+    .await;
     let bot = &value["processes"]["bot"];
     assert_eq!(bot["current"]["availability"], "available");
     assert_eq!(bot["current"]["stale"], false);
@@ -415,14 +432,15 @@ fn freshness_marks_missing_status_unavailable_and_old_status_stale() {
 #[tokio::test]
 async fn unavailable_history_still_returns_live_api_values() {
     let api = ProcessStatus::current(api_interval_ms());
-    let value = build_response(
+    let value = response_json(build_response(
         ResourceRange::Week,
         1_800_000_000_000,
         None,
         "unavailable",
         &api,
         &HostingEstimateConfig::default(),
-    );
+    ))
+    .await;
     assert_eq!(value["history_status"], "unavailable");
     assert!(value["processes"]["api"]["history"].is_null());
     assert!(value["processes"]["bot"]["history"].is_null());
@@ -435,12 +453,119 @@ async fn unavailable_history_still_returns_live_api_values() {
 }
 
 #[tokio::test]
+async fn cached_history_reuses_payload_and_refreshes_on_expiry_or_bucket_change() {
+    let f = fixture();
+    let now = 1_800_000_000;
+    let hour = ResourceRange::Hour;
+    let mut bot = ProcessStatus {
+        sampled_at_ms: Some((now - 30) * 1000),
+        interval_ms: 60_000,
+        ..ProcessStatus::default()
+    };
+    bot.info.started_at_ms = (now - 600) * 1000;
+    db::record_resource_rollups(
+        &f.app.db,
+        vec![(ResourceProcess::Api, minute(now - 60, 50, 30, 7))],
+        Some((ResourceProcess::Bot, bot)),
+        now,
+    )
+    .await
+    .unwrap();
+
+    let request = async |range, now_secs, api_gauge| {
+        let (prepared, status) = history(&f.app, range, now_secs).await;
+        let mut api = ProcessStatus {
+            sampled_at_ms: Some(now_secs * 1000),
+            ..ProcessStatus::default()
+        };
+        api.gauges.insert("api_sessions".into(), api_gauge);
+        let value = response_json(build_response(
+            range,
+            now_secs * 1000,
+            prepared.as_deref(),
+            status,
+            &api,
+            &HostingEstimateConfig::default(),
+        ))
+        .await;
+        assert_eq!(value["history_status"], "available");
+        (prepared.unwrap(), value)
+    };
+    let (initial, first) = request(hour, now, 3).await;
+    db::record_resource_rollups(
+        &f.app.db,
+        vec![
+            (ResourceProcess::Api, minute(now, 60, 40, 7)),
+            (ResourceProcess::Api, minute(now + 60, 70, 50, 7)),
+        ],
+        None,
+        now,
+    )
+    .await
+    .unwrap();
+
+    let (warm, later) = request(hour, now + 15, 5).await;
+    assert!(Arc::ptr_eq(&initial, &warm));
+    assert_eq!(later["generated_at_ms"], (now + 15) * 1000);
+    for role in ["api", "bot"] {
+        assert_eq!(
+            later["processes"][role]["history"],
+            first["processes"][role]["history"],
+        );
+    }
+    assert_eq!(
+        later["processes"]["api"]["current"]["gauges"]["api_sessions"],
+        5
+    );
+    assert_eq!(later["processes"]["bot"]["current"]["age_ms"], 45_000);
+    assert_eq!(later["processes"]["bot"]["current"]["uptime_ms"], 615_000);
+
+    let (_, day) = request(ResourceRange::Day, now + 15, 5).await;
+    assert_eq!(day["bucket_secs"], 600);
+    assert_eq!(
+        day["processes"]["api"]["history"]["totals"]["api_requests"],
+        120
+    );
+    assert!(Arc::ptr_eq(&warm, &request(hour, now + 15, 5).await.0));
+
+    f.app
+        .resource_cache
+        .entries
+        .lock()
+        .await
+        .get_mut(&hour)
+        .unwrap()
+        .checked_at -= HISTORY_TTL;
+    let (refreshed, same_bucket) = request(hour, now + 15, 5).await;
+    assert!(!Arc::ptr_eq(&warm, &refreshed));
+    assert_eq!(same_bucket["to_secs"], now + 60);
+    assert_eq!(
+        same_bucket["processes"]["api"]["history"]["totals"]["api_requests"],
+        70
+    );
+
+    let (rolled, new_bucket) = request(hour, now + 60, 5).await;
+    assert!(!Arc::ptr_eq(&refreshed, &rolled));
+    assert_eq!(new_bucket["to_secs"], now + 120);
+    assert_eq!(
+        new_bucket["processes"]["api"]["history"]["totals"]["api_requests"],
+        120
+    );
+}
+
+#[tokio::test]
 async fn failed_history_reads_are_reused_until_the_next_refresh() {
     let f = fixture();
     let now = 1_800_000_000;
     let warm = ResourceRange::Day;
     let cold = ResourceRange::Week;
-    assert_eq!(history(&f.app, warm, now).await.1, "available");
+    let (snapshot, status) = history(&f.app, warm, now).await;
+    assert_eq!(status, "available");
+    let snapshot = snapshot.unwrap();
+    assert_eq!(
+        history(&f.app, ResourceRange::Hour, now).await.1,
+        "available"
+    );
     f.app
         .resource_cache
         .entries
@@ -458,8 +583,13 @@ async fn failed_history_reads_are_reused_until_the_next_refresh() {
     rename("ALTER TABLE resource_rollups RENAME TO offline_rollups")
         .await
         .unwrap();
-    assert_eq!(history(&f.app, warm, now).await.1, "stale");
+    let (fallback, status) = history(&f.app, warm, now).await;
+    assert_eq!(status, "stale");
+    assert!(Arc::ptr_eq(&snapshot, &fallback.unwrap()));
     assert_eq!(history(&f.app, cold, now).await.1, "unavailable");
+    let (snapshot, status) = history(&f.app, ResourceRange::Hour, now + 60).await;
+    assert_eq!(status, "unavailable");
+    assert!(snapshot.is_none());
     rename("ALTER TABLE offline_rollups RENAME TO resource_rollups")
         .await
         .unwrap();
