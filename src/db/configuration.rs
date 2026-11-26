@@ -1532,11 +1532,16 @@ SELECT
            WHERE guild_id = ?1 OR guild_id = ?2 ORDER BY id LIMIT 2048))
   ,EXISTS(SELECT 1 FROM meta WHERE key = 'invite_description_v1')
   ,EXISTS(SELECT 1 FROM meta WHERE key = 'velocity_default_dry_run')
+WHERE ?3 IS NULL
+   OR (SELECT value FROM meta WHERE key = 'config_version') IS NOT ?3
+   OR (SELECT value FROM meta WHERE key = 'config_revision') IS NOT ?4
+   OR EXISTS(SELECT 1 FROM meta WHERE key = 'invite_description_v1') IS NOT ?5
+   OR EXISTS(SELECT 1 FROM meta WHERE key = 'velocity_default_dry_run') IS NOT ?6
 "#;
 
 struct ConfigurationSnapshotRows {
     versions: VersionState,
-    config_version_is_stored: bool,
+    stored_config_version: Option<String>,
     invite_description_upgraded: bool,
     defaults: GuildSettings,
     guild_settings_raw: Option<String>,
@@ -1556,8 +1561,8 @@ struct ConfigurationSnapshotRows {
     velocity_default_dry_run: bool,
 }
 
-fn parse_meta_version(raw: Option<String>) -> u64 {
-    raw.as_deref().unwrap_or("0").parse::<u64>().unwrap_or(0)
+fn parse_meta_version(raw: Option<&str>) -> u64 {
+    raw.unwrap_or("0").parse().unwrap_or(0)
 }
 
 fn json_agg_text(raw: Option<String>, empty: &str) -> String {
@@ -1612,15 +1617,31 @@ fn load_configuration_snapshot_conn(
     conn: &impl SqlExecutor,
     guild_id: i64,
 ) -> Result<ConfigurationSnapshotRows> {
+    query_configuration_snapshot_conn(conn, guild_id, None)?
+        .context("configuration snapshot returned no rows")
+}
+
+fn query_configuration_snapshot_conn(
+    conn: &impl SqlExecutor,
+    guild_id: i64,
+    previous: Option<&BotConfigProof>,
+) -> Result<Option<ConfigurationSnapshotRows>> {
+    // With a matching proof the WHERE clause filters the only row before
+    // SQLite evaluates any result columns, including collection subqueries.
     conn.query_row(
         CONFIGURATION_SNAPSHOT_SQL,
-        params![guild_id, GLOBAL_SCOPE],
+        params![
+            guild_id,
+            GLOBAL_SCOPE,
+            previous.map(|proof| proof.stored_version.as_str()),
+            previous.map(|proof| proof.revision.as_str()),
+            previous.map(|proof| proof.invite_description_upgraded),
+            previous.map(|proof| proof.velocity_default_dry_run),
+        ],
         |row| {
-            let stored_config_version = row
-                .get::<Option<String>>(0)?
-                .and_then(|raw| raw.parse().ok());
-            let config = stored_config_version.unwrap_or(0);
-            let slash = parse_meta_version(row.get(1)?);
+            let stored_config_version: Option<String> = row.get(0)?;
+            let config = parse_meta_version(stored_config_version.as_deref());
+            let slash = parse_meta_version(row.get::<Option<String>>(1)?.as_deref());
             let config_revision = row
                 .get::<Option<String>>(2)?
                 .unwrap_or_else(|| format!("legacy:{config}"));
@@ -1666,7 +1687,7 @@ fn load_configuration_snapshot_conn(
                     config_revision,
                     slash_revision,
                 },
-                config_version_is_stored: stored_config_version.is_some(),
+                stored_config_version,
                 invite_description_upgraded: upgraded,
                 defaults,
                 guild_settings_raw,
@@ -1698,6 +1719,7 @@ fn load_configuration_snapshot_conn(
             })
         },
     )
+    .optional()
 }
 
 impl ConfigurationSnapshotRows {
@@ -1911,9 +1933,11 @@ async fn load_config_parts_with_version_routed(
 
 /// Compiled bot configuration inputs that may be compared cheaply in a later
 /// snapshot. The rule markers may change without a version bump.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct BotConfigProof {
     version: u64,
+    // Compare the stored text without narrowing the counter to a SQLite integer.
+    stored_version: String,
     revision: String,
     invite_description_upgraded: bool,
     velocity_default_dry_run: bool,
@@ -1921,12 +1945,13 @@ pub struct BotConfigProof {
 
 impl BotConfigProof {
     fn new(
-        version: Option<u64>,
+        stored_version: Option<String>,
         revision: String,
         invite_description_upgraded: bool,
         velocity_default_dry_run: bool,
     ) -> Option<Self> {
-        let version = version?;
+        let stored_version = stored_version?;
+        let version = stored_version.parse().ok()?;
         // This is the durable token format used by config writers. A missing
         // revision may synthesize the same legacy value after a restore.
         if revision.len() != 32 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1934,6 +1959,7 @@ impl BotConfigProof {
         }
         Some(Self {
             version,
+            stored_version,
             revision,
             invite_description_upgraded,
             velocity_default_dry_run,
@@ -1969,44 +1995,19 @@ pub async fn read_bot_config(
     }
 
     read_routed_config(db, primary, move |tx| {
-        if let Some(previous) = previous {
-            let proof = tx.query_row(
-                "SELECT
-                    (SELECT value FROM meta WHERE key = 'config_version'),
-                    (SELECT value FROM meta WHERE key = 'config_revision'),
-                    EXISTS(SELECT 1 FROM meta WHERE key = 'invite_description_v1'),
-                    EXISTS(SELECT 1 FROM meta WHERE key = 'velocity_default_dry_run')",
-                (),
-                |row| {
-                    let version = row
-                        .get::<Option<String>>(0)?
-                        .and_then(|raw| raw.parse().ok());
-                    let revision = row.get::<Option<String>>(1)?;
-                    Ok(BotConfigProof::new(
-                        version,
-                        revision.unwrap_or_default(),
-                        row.get(2)?,
-                        row.get(3)?,
-                    ))
-                },
-            )?;
-            if proof.as_ref() == Some(&previous) {
-                tx.finish_read()?;
-                return Ok(BotConfigRead {
-                    version: previous.version,
-                    revision: previous.revision,
-                    proof: None,
-                    parts: None,
-                });
-            }
-        }
-
-        let snapshot = load_configuration_snapshot_conn(&tx, guild_id)?;
+        let snapshot = query_configuration_snapshot_conn(&tx, guild_id, previous.as_ref())?;
         tx.finish_read()?;
+        let Some(mut snapshot) = snapshot else {
+            let previous = previous.context("configuration snapshot returned no rows")?;
+            return Ok(BotConfigRead {
+                version: previous.version,
+                revision: previous.revision,
+                proof: None,
+                parts: None,
+            });
+        };
         let proof = BotConfigProof::new(
-            snapshot
-                .config_version_is_stored
-                .then_some(snapshot.versions.config),
+            snapshot.stored_config_version.take(),
             snapshot.versions.config_revision.clone(),
             snapshot.invite_description_upgraded,
             snapshot.velocity_default_dry_run,
