@@ -492,28 +492,59 @@ fn detect_match(b: &Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u
 }
 
 fn match_posts(b: &Bucket, policy: &Policy, now: Instant) -> Option<Vec<(u64, u64)>> {
-    let live: Vec<_> = b
-        .posts
-        .iter()
-        .filter(|p| now.duration_since(p.at) < Duration::from_secs(policy.window_secs))
-        .collect();
-    for anchor in &live {
-        let matched: Vec<_> = live
-            .iter()
-            .filter(|p| p.text == anchor.text)
-            .map(|p| (p.channel, p.id))
-            .collect();
-        if matched
-            .iter()
-            .map(|(c, _)| *c)
-            .collect::<BTreeSet<_>>()
-            .len()
-            >= policy.min_channels
-        {
-            return Some(matched);
-        }
+    let window = Duration::from_secs(policy.window_secs);
+    let live = || b.posts.iter().filter(|p| now.duration_since(p.at) < window);
+    if !has_enough_channels(live(), policy.min_channels) {
+        return None;
     }
-    None
+
+    let mut sorted: Vec<_> = live().enumerate().collect();
+    if let Some((_, first)) = sorted.first()
+        && sorted
+            .iter()
+            .skip(1)
+            .all(|(_, post)| post.text == first.text)
+    {
+        return Some(
+            sorted
+                .iter()
+                .map(|(_, post)| (post.channel, post.id))
+                .collect(),
+        );
+    }
+
+    // Original positions keep each group in bucket order and select the first match.
+    sorted.sort_unstable_by(|(a_idx, a), (b_idx, b)| {
+        a.text
+            .len()
+            .cmp(&b.text.len())
+            .then_with(|| a.text.cmp(&b.text))
+            .then_with(|| a_idx.cmp(b_idx))
+    });
+    let matched = sorted
+        .chunk_by(|(_, a), (_, b)| a.text == b.text)
+        .filter(|group| {
+            has_enough_channels(group.iter().map(|(_, post)| *post), policy.min_channels)
+        })
+        .min_by_key(|group| group[0].0)?;
+    Some(
+        matched
+            .iter()
+            .map(|(_, post)| (post.channel, post.id))
+            .collect(),
+    )
+}
+
+fn has_enough_channels<'a>(mut posts: impl Iterator<Item = &'a Post>, minimum: usize) -> bool {
+    let mut channels = [0; MAX_POSTS];
+    let mut count = 0;
+    posts.any(|post| {
+        if !channels[..count].contains(&post.channel) {
+            channels[count] = post.channel;
+            count += 1;
+        }
+        count >= minimum
+    })
 }
 
 fn retire(
@@ -1382,6 +1413,36 @@ mod tests {
             AdmitOutcome::Admitted
         );
         assert!(!fresh.match_still_proving(1, 2, token, &matched_messages, &p, now));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn matching_keeps_the_first_live_group_and_its_post_order() {
+        let now = tokio::time::Instant::now().into_std();
+        let policy = policy();
+        let expired = now - Duration::from_secs(policy.window_secs);
+        let bucket = Bucket {
+            retired_before: 0,
+            window: Duration::from_secs(policy.window_secs),
+            last_seen: now,
+            token: (0, 0),
+            posts: vec![
+                post(1, 10, expired, "bravo"),
+                post(2, 20, expired, "alpha"),
+                post(18, 20, now, "alpha"),
+                post(3, 10, now, "bravo"),
+                post(4, 11, now, "bravo"),
+                post(5, 12, now, "bravo"),
+                post(7, 23, now, "Alpha"),
+                post(8, 20, now, "alpha"),
+                post(6, 22, now, "alpha"),
+                post(9, 21, now, "alpha"),
+            ],
+            report: ReportCooldown::ReadyAt(now),
+        };
+        assert_eq!(
+            match_posts(&bucket, &policy, now),
+            Some(vec![(20, 18), (20, 8), (22, 6), (21, 9)])
+        );
     }
 
     #[test]
