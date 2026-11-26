@@ -13705,6 +13705,7 @@ test('Platform analytics uses the combined response on a legacy API', async () =
 
 test('Platform analytics distinguishes a server outside the saved directory snapshot from a failed read', async () => {
   let memberReads = 0;
+  let historyFails = false;
   const initial = platformSnapshot();
   const ids = initial.guilds.filter(guild => guild.active).map(guild => guild.guild_id);
   const directory = {
@@ -13715,10 +13716,11 @@ test('Platform analytics distinguishes a server outside the saved directory snap
   const h = ownerHarness(async (url) => {
     if (url === platformMembersPath) {
       memberReads += 1;
-      return response(memberReads === 1 ? directory : {
+      return response(memberReads !== 2 ? directory : {
         ...directory, status: 'partial', servers: 4, guilds_unavailable: 1, snapshot_guild_ids: PLATFORM_IDS,
       });
     }
+    if (historyFails) throw new Error('history unavailable');
     const days = Number(new URL(url, 'https://ui.example.test').searchParams.get('days'));
     const snapshot = platformSnapshot(days);
     if (days === 7) {
@@ -13737,12 +13739,19 @@ test('Platform analytics distinguishes a server outside the saved directory snap
   assert.equal(memberReads, 1);
   assert.equal(kpiValue(page, 'Members'), '40');
   assert.equal(delta().querySelector('.an-badge-warn').textContent, 'not in snapshot');
-  assert.match(page.querySelector('#platform-members-status').textContent, /earlier set of servers/);
+  assert.match(page.querySelector('#platform-members-status').textContent, /different sets of servers/);
 
   await fire(page.querySelector('#refresh-platform-analytics'), 'click');
   assert.equal(memberReads, 2);
   assert.equal(delta().querySelector('.an-badge-warn').textContent, 'unavailable');
-  assert.doesNotMatch(page.querySelector('#platform-members-status').textContent, /earlier set of servers/);
+  assert.doesNotMatch(page.querySelector('#platform-members-status').textContent, /different sets of servers/);
+
+  historyFails = true;
+  await fire(page.querySelector('#refresh-platform-analytics'), 'click');
+  assert.equal(memberReads, 3);
+  assert.match(page.querySelector('#platform-analytics-status').textContent, /stale/);
+  assert.match(page.querySelector('#platform-members-status').textContent, /different sets of servers/);
+  assert.equal(delta().querySelector('.an-badge-warn').textContent, 'not in snapshot');
 });
 
 test('Platform analytics reads the selected 7, 30 or 90 day range', async () => {

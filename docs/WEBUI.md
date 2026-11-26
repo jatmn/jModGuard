@@ -426,8 +426,8 @@ at once, the most and least active servers, the biggest movers, each server's sh
 bans, spam hits and mod actions, and a sortable, filterable server table with names, icons,
 per-metric share bars and member directory status (importing, unverified or unavailable).
 The charts load independently of current directory totals. Changing the range reuses
-those totals while the page is open. If the active servers change, the dashboard labels
-the earlier member totals and identifies servers outside that snapshot. **Refresh**
+those totals while the page is open. If the charts and member totals cover different
+servers, the dashboard shows a warning and identifies servers outside the member snapshot. **Refresh**
 reloads both. With an older API that only supports the combined read, the dashboard
 uses that response until the page is reopened.
 

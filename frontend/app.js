@@ -1288,9 +1288,9 @@ function PlatformAnalytics() {
       rangeLabel,
     });
   const membersUnavailable = !members || members.status === "unavailable";
-  const fleetWarning = fleetChanged ? "The member snapshot covers an earlier set of servers. Refresh to update member totals." : "";
+  const fleetWarning = fleetChanged ? "Member totals and activity cover different sets of servers. Refresh to update both." : "";
   const memberBadge = fleetChanged && !membersUnavailable
-    ? { label: "earlier totals", tone: "warn", title: fleetWarning }
+    ? { label: "different server set", tone: "warn", title: fleetWarning }
     : members?.status === "partial" ? { label: "partial", tone: "warn", title: platformMemberStatus(members) } : null;
   const netPrevious = previous?.joins == null || previous?.leaves == null ? null : previous.joins - previous.leaves;
   const body = (render) =>
