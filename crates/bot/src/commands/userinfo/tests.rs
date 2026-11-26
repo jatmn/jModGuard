@@ -484,6 +484,10 @@ async fn capturing_proxy_with(
                 ("200 OK", serde_json::to_string(&message).unwrap())
             } else if route.starts_with("GET ") && route.contains("/messages") {
                 ("200 OK", serde_json::to_string(&messages).unwrap())
+            } else if route.starts_with("GET ") && route.contains("/users/93 ") {
+                let mut user = target_member(10, 93, None).user;
+                user.name = "restidentity".into();
+                ("200 OK", serde_json::to_string(&user).unwrap())
             } else {
                 ("204 No Content", String::new())
             };
@@ -815,7 +819,9 @@ async fn rest_lookup_failure_still_renders_warns_and_cases() {
         source_message: None,
     };
     let mut vars = crate::commands::behaviors::behaviors_base_vars(&env);
-    let outcome = super::run(&env, Some(enrollment), &mut vars).await.unwrap();
+    let outcome = super::run(&env, Some(enrollment), &mut vars, None)
+        .await
+        .unwrap();
     let body = outcome.response.unwrap();
     assert!(body.contains(MISSING));
     assert!(body.contains("**⚠️ Warnings:** 1"));
@@ -1070,7 +1076,9 @@ async fn integration_warn_and_case_rows() {
         source_message: None,
     };
     let mut vars = crate::commands::behaviors::behaviors_base_vars(&env);
-    let outcome = super::run(&env, Some(enrollment), &mut vars).await.unwrap();
+    let outcome = super::run(&env, Some(enrollment), &mut vars, None)
+        .await
+        .unwrap();
     let body = outcome.response.unwrap();
     assert!(body.contains("**⚠️ Warnings:** 1"));
     // Shipped !userinfo: one map emoji on the title and on each label, values untouched.
@@ -2260,7 +2268,7 @@ async fn assert_command_reports(
             false,
             None,
         );
-        let outcome = crate::commands::run_command(env).await.unwrap();
+        let outcome = crate::commands::behaviors::run(&env).await.unwrap();
         assert_eq!(
             outcome.vars["user"], "Moderator",
             "reply user must remain the actor"
@@ -2481,7 +2489,7 @@ async fn command_plan_requires_moderator_permission_and_a_target_where_applicabl
         cmd.name = "custom-plan".into();
         cmd.permission = permission.into();
         cmd.behavior = Behavior::Plan { steps: vec![step] };
-        let outcome = crate::commands::run_command(crate::commands::CmdEnv::new(
+        let outcome = crate::commands::behaviors::run(&crate::commands::CmdEnv::new(
             &app,
             &ctx,
             &cmd,
@@ -2663,7 +2671,7 @@ async fn command_purge_caps_the_fetch_and_deletes_the_returned_messages() {
             .collect();
         let (http, requests, server) = capturing_proxy_with(true, false, None, messages).await;
         let ctx = test_context(Arc::new(Cache::new()), Arc::new(http)).await;
-        let outcome = crate::commands::run_command(crate::commands::CmdEnv::new(
+        let outcome = crate::commands::behaviors::run(&crate::commands::CmdEnv::new(
             &app,
             &ctx,
             &cmd,
@@ -2926,6 +2934,14 @@ impl StatsDispatch {
     }
 
     fn install(&self, permissions: serenity::model::permissions::Permissions) {
+        self.install_guild(permissions, true);
+    }
+
+    fn install_guild(
+        &self,
+        permissions: serenity::model::permissions::Permissions,
+        cache_actor: bool,
+    ) {
         let mut guild = Guild::default();
         guild.id = GuildId::new(Self::GUILD);
         guild.owner_id = UserId::new(99);
@@ -2941,10 +2957,12 @@ impl StatsDispatch {
         role.name = "Staff".into();
         role.permissions = permissions;
         guild.roles.insert(role.id, role);
-        let mut caller = target_member(Self::GUILD, Self::ACTOR, None);
-        caller.user.name = "mod".into();
-        caller.roles = vec![RoleId::new(Self::ROLE)];
-        guild.members.insert(caller.user.id, caller);
+        if cache_actor {
+            let mut caller = target_member(Self::GUILD, Self::ACTOR, None);
+            caller.user.name = "mod".into();
+            caller.roles = vec![RoleId::new(Self::ROLE)];
+            guild.members.insert(caller.user.id, caller);
+        }
         let mut event: GuildCreateEvent =
             serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
         self.cache.update(&mut event);
@@ -2958,6 +2976,10 @@ impl StatsDispatch {
     }
 
     async fn prefix(&self, content: &str) {
+        self.prefix_with_mentions(content, Vec::new()).await;
+    }
+
+    async fn prefix_with_mentions(&self, content: &str, mentions: Vec<User>) {
         let partial: serenity::model::guild::PartialMember =
             serde_json::from_value(serde_json::json!({
                 "deaf": false,
@@ -2982,6 +3004,7 @@ impl StatsDispatch {
         message.guild_id = Some(GuildId::new(Self::GUILD));
         message.channel_id = ChannelId::new(2);
         message.author = Self::author();
+        message.mentions = mentions;
         message.member = Some(Box::new(partial));
         crate::commands::handle_prefix(
             &self.app,
@@ -3000,6 +3023,16 @@ impl StatsDispatch {
     }
 
     async fn slash_with_options(&self, name: &str, options: serde_json::Value) {
+        self.slash_with_resolved(name, options, serde_json::json!({}))
+            .await;
+    }
+
+    async fn slash_with_resolved(
+        &self,
+        name: &str,
+        options: serde_json::Value,
+        resolved: serde_json::Value,
+    ) {
         let mut member = Member::default();
         member.user = Self::author();
         member.guild_id = GuildId::new(Self::GUILD);
@@ -3020,7 +3053,7 @@ impl StatsDispatch {
                 "attachment_size_limit": 10000000,
                 "user": Self::author(),
                 "member": member,
-                "data": {"id": "3", "name": name, "type": 1, "options": options}
+                "data": {"id": "3", "name": name, "type": 1, "options": options, "resolved": resolved}
             }))
             .unwrap();
         crate::commands::handle_interaction(&self.app, &self.ctx, interaction).await;
@@ -3031,6 +3064,7 @@ impl StatsDispatch {
     fn replies(&self) -> Vec<(String, serde_json::Value)> {
         std::mem::take(&mut *self.captured.lock().unwrap())
             .iter()
+            .filter(|raw| raw.starts_with("POST ") || raw.starts_with("PATCH "))
             .map(|raw| {
                 let route = raw.lines().next().unwrap_or_default().to_string();
                 (route, message_fields(raw))
@@ -3056,6 +3090,82 @@ impl StatsDispatch {
         crate::tenant::remove_sidecars(&self.path);
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+#[tokio::test]
+async fn userinfo_dispatch_uses_exact_invocation_identity_on_cold_cache() {
+    use serenity::model::permissions::Permissions;
+
+    let fx = StatsDispatch::new(false, vec![]).await;
+    fx.install_guild(Permissions::MANAGE_MESSAGES, false);
+    let target = target_member(StatsDispatch::GUILD, 91, None).user;
+    let user_options = serde_json::json!([{"name": "user", "type": 6, "value": "91"}]);
+    let mut observed = Vec::new();
+    let mut observe = || {
+        let reads = fx
+            .captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| request.lines().next())
+            .filter(|route| route.starts_with("GET ") && route.contains("/users/"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let reply = fx.sent("userinfo");
+        observed.push((reads, reply["content"].as_str().unwrap().to_owned()));
+    };
+
+    fx.slash_with_resolved(
+        "userinfo",
+        user_options.clone(),
+        serde_json::json!({"users": {"91": target}}),
+    )
+    .await;
+    observe();
+    fx.slash("userinfo").await;
+    observe();
+    fx.prefix_with_mentions("!userinfo <@91>", vec![target])
+        .await;
+    observe();
+    fx.prefix("!userinfo").await;
+    observe();
+    fx.prefix_with_mentions("!userinfo 93", vec![StatsDispatch::author()])
+        .await;
+    observe();
+    let wrong = target_member(StatsDispatch::GUILD, 92, None).user;
+    fx.slash_with_resolved(
+        "userinfo",
+        user_options,
+        serde_json::json!({"users": {"91": wrong}}),
+    )
+    .await;
+    observe();
+
+    assert_eq!(
+        observed
+            .iter()
+            .map(|(reads, _)| reads.len())
+            .collect::<Vec<_>>(),
+        [0, 0, 0, 0, 1, 1],
+        "slash target, slash self, prefix mention, prefix self, raw ID, mismatched resolved ID"
+    );
+    assert!(observed[4].0[0].contains("/users/93 "));
+    assert!(observed[5].0[0].contains("/users/91 "));
+    for ((_, reply), name) in observed.iter().zip([
+        "targetuser",
+        "mod",
+        "targetuser",
+        "mod",
+        "restidentity",
+        MISSING,
+    ]) {
+        assert!(reply.contains(&format!("Username:** {name}")), "{reply}");
+        assert!(reply.contains("Roles:** missing"), "{reply}");
+    }
+    for index in [0, 2] {
+        assert!(observed[index].1.contains("Global name:** Target Display"));
+    }
+    fx.finish();
 }
 
 #[tokio::test]
