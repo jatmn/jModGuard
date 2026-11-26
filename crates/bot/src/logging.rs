@@ -12,7 +12,7 @@ use crate::db::guild_data::MessageSnapshot;
 use crate::state::BotState;
 use crate::{db, templates};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::{sync::watch, time::Instant as TokioInstant};
 
@@ -398,7 +398,16 @@ impl MemberAuditClaims {
 /// or message archive. Serenity does not retain Message.member in its cache.
 #[derive(Default)]
 pub struct MemberJoinContext {
-    inner: Mutex<HashMap<(u64, u64), (serenity::model::Timestamp, Instant)>>,
+    inner: Mutex<MemberJoinEntries>,
+}
+
+type MemberJoinKey = (u64, u64);
+
+#[derive(Default)]
+struct MemberJoinEntries {
+    by_member: HashMap<MemberJoinKey, (serenity::model::Timestamp, Instant)>,
+    // One age key per member under the same lock, including after refreshes.
+    by_age: BTreeSet<(Instant, MemberJoinKey)>,
 }
 
 type RejoinStayKey = (u64, u64, String);
@@ -861,33 +870,55 @@ impl RejoinNoteDeliveries {
     }
 }
 
+impl MemberJoinEntries {
+    fn remember(&mut self, key: MemberJoinKey, joined: serenity::model::Timestamp, now: Instant) {
+        while let Some(&(seen, expired)) = self.by_age.first()
+            && now.duration_since(seen) >= MEMBER_JOINS_KEEP
+        {
+            self.by_age.pop_first();
+            self.by_member.remove(&expired);
+        }
+
+        if let Some(entry) = self.by_member.get_mut(&key) {
+            self.by_age.remove(&(entry.1, key));
+            *entry = (joined, now);
+        } else {
+            if self.by_member.len() >= MEMBER_JOINS_LIMIT
+                && let Some((_, oldest)) = self.by_age.pop_first()
+            {
+                self.by_member.remove(&oldest);
+            }
+            self.by_member.insert(key, (joined, now));
+        }
+        self.by_age.insert((now, key));
+    }
+}
+
 impl MemberJoinContext {
     pub fn remember(&self, guild: u64, user: u64, joined: Option<serenity::model::Timestamp>) {
         let Some(joined) = joined else { return };
-        let mut entries = self.inner.lock();
-        entries.retain(|_, (_, seen)| seen.elapsed() < MEMBER_JOINS_KEEP);
-        if entries.len() >= MEMBER_JOINS_LIMIT
-            && !entries.contains_key(&(guild, user))
-            && let Some(oldest) = entries
-                .iter()
-                .min_by_key(|(_, (_, at))| *at)
-                .map(|(key, _)| *key)
-        {
-            entries.remove(&oldest);
-        }
-        entries.insert((guild, user), (joined, Instant::now()));
+        self.inner
+            .lock()
+            .remember((guild, user), joined, Instant::now());
     }
 
     pub fn take(&self, guild: u64, user: u64) -> Option<serenity::model::Timestamp> {
-        self.inner
-            .lock()
-            .remove(&(guild, user))
-            .filter(|(_, seen)| seen.elapsed() < MEMBER_JOINS_KEEP)
-            .map(|(joined, _)| joined)
+        let key = (guild, user);
+        let mut entries = self.inner.lock();
+        let (joined, seen) = entries.by_member.remove(&key)?;
+        entries.by_age.remove(&(seen, key));
+        (seen.elapsed() < MEMBER_JOINS_KEEP).then_some(joined)
     }
 
     pub fn clear_guild(&self, guild: u64) {
-        self.inner.lock().retain(|(id, _), _| *id != guild);
+        let MemberJoinEntries { by_member, by_age } = &mut *self.inner.lock();
+        by_member.retain(|&key, &mut (_, seen)| {
+            if key.0 != guild {
+                return true;
+            }
+            by_age.remove(&(seen, key));
+            false
+        });
     }
 }
 

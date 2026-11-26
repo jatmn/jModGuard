@@ -200,7 +200,6 @@ clock	crates/bot/src/logging/tests.rs	logging::tests::global_429_virtual_wait_bl
 clock	crates/bot/src/logging/tests.rs	logging::tests::late_audit_is_retried_but_disabled_reports_do_not_lookup	1	#666
 clock	crates/bot/src/logging/tests.rs	logging::tests::queued_bulk_transcript_expires_before_attachment_and_text_fallback	2	#666
 sleep	crates/bot/src/logging/tests.rs	logging::tests::queued_bulk_transcript_expires_before_attachment_and_text_fallback	1	#666
-clock	crates/bot/src/logging/tests.rs	logging::tests::received_message_join_context_is_scoped_consumed_expiring_and_bounded	1	#666
 clock	crates/bot/src/logging/tests.rs	logging::tests::repeated_actions_never_reuse_audit_after_sent_filtered_or_failed_report	1	#666
 clock	crates/bot/src/logging/tests.rs	logging::tests::unresolved_observations_fence_old_handlers_and_overlapping_audit_windows	1	#666
 clock	crates/bot/src/logging/tests.rs	logging::tests::untracked_observation_temporarily_disables_attribution_without_evicting_uncertainty	3	#666

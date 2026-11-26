@@ -2600,23 +2600,63 @@ fn deferred_verified_leave_uses_captured_stay_and_original_event_time() {
 }
 
 #[test]
-fn received_message_join_context_is_scoped_consumed_expiring_and_bounded() {
+fn received_message_join_context_is_scoped_consumed_and_expiring() {
     let cache = MemberJoinContext::default();
     let joined = serenity::model::Timestamp::from_unix_timestamp(1_760_000_000).unwrap();
     cache.remember(1, 2, Some(joined));
+    let seen = cache.inner.lock().by_member[&(1, 2)].1;
     cache.remember(1, 2, None);
+    assert_eq!(cache.inner.lock().by_member[&(1, 2)].1, seen);
     assert_eq!(cache.take(2, 2), None);
     assert_eq!(cache.take(1, 2), Some(joined));
     assert_eq!(cache.take(1, 2), None);
-    cache.remember(1, 2, Some(joined));
-    cache.inner.lock().get_mut(&(1, 2)).unwrap().1 = Instant::now() - MEMBER_JOINS_KEEP;
-    assert_eq!(cache.take(1, 2), None);
-    for user in 0..=MEMBER_JOINS_LIMIT {
-        cache.remember(1, user as u64, Some(joined));
+    {
+        let mut entries = cache.inner.lock();
+        let expired = seen - MEMBER_JOINS_KEEP;
+        entries.remember((1, 2), joined, expired);
+        entries.remember((1, 3), joined, expired);
     }
-    assert_eq!(cache.inner.lock().len(), MEMBER_JOINS_LIMIT);
+    assert_eq!(cache.take(1, 2), None);
+    cache.remember(2, 2, Some(joined));
+    let entries = cache.inner.lock();
+    assert_eq!(entries.by_member.len(), 1);
+    assert_eq!(entries.by_age.len(), 1);
+    assert!(!entries.by_member.contains_key(&(1, 3)));
+}
+
+#[test]
+fn received_message_join_context_refresh_preserves_oldest_eviction_and_index_bound() {
+    let cache = MemberJoinContext::default();
+    let joined = serenity::model::Timestamp::from_unix_timestamp(1_760_000_000).unwrap();
+    let refreshed = serenity::model::Timestamp::from_unix_timestamp(1_759_999_940).unwrap();
+    let per_guild = MEMBER_JOINS_LIMIT / 2;
+    cache.remember(1, 0, Some(joined));
+    {
+        let mut entries = cache.inner.lock();
+        let start = entries.by_member[&(1, 0)].1 - Duration::from_secs(1);
+        for user in 0..MEMBER_JOINS_LIMIT {
+            let guild = if user < per_guild { 1 } else { 2 };
+            let seen = start + Duration::from_micros(user as u64);
+            entries.remember((guild, user as u64), joined, seen);
+        }
+    }
+    for _ in 0..MEMBER_JOINS_LIMIT {
+        cache.remember(1, 0, Some(refreshed));
+    }
+    cache.remember(1, MEMBER_JOINS_LIMIT as u64, Some(joined));
+    {
+        let entries = cache.inner.lock();
+        assert_eq!(entries.by_member.len(), MEMBER_JOINS_LIMIT);
+        assert_eq!(entries.by_age.len(), MEMBER_JOINS_LIMIT);
+    }
+    assert_eq!(cache.take(1, 1), None);
+    assert_eq!(cache.take(1, 0), Some(refreshed));
     cache.clear_guild(1);
-    assert!(cache.inner.lock().is_empty());
+    assert_eq!(cache.take(1, 2), None);
+    assert_eq!(cache.take(2, per_guild as u64), Some(joined));
+    let entries = cache.inner.lock();
+    assert_eq!(entries.by_member.len(), per_guild - 1);
+    assert_eq!(entries.by_age.len(), per_guild - 1);
 }
 
 #[tokio::test]
