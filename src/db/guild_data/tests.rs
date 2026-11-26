@@ -1270,12 +1270,13 @@ async fn guild_commits_release_remote_core_for_concurrent_writes() {
         .await
         .unwrap()
     );
-    // Real HTTP/libSQL against SQLite, with the existing conservative provider
-    // model: every interactive transaction occupies its single writer slot.
-    let (fixture, core) = HranaFixture::delayed_database(
+    // Keep real HTTP/libSQL and the provider's single writer slot. Charge
+    // requests against the modeled lifetime without counting host scheduling.
+    let (fixture, core) = HranaFixture::modeled_latency_database(
         &f.catalog_path,
         Duration::from_millis(10),
         Duration::from_secs(2),
+        Arc::default(),
     )
     .await;
     core.arm_writer_term(&owner, f.catalog.leased_generation().unwrap());
