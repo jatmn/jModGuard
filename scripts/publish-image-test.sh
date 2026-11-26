@@ -319,8 +319,8 @@ done
 for component in bot api webui; do
   readarray -d '' -t schema_args < <(build_args "$component" "$HEAD_SHA" "" . "" current "$(staging_ref "$component")")
   for field in min-schema max-schema result-schema; do
-    contains_arg "io.jmodguard.${field}=29" "${schema_args[@]}" \
-      || fail "${component} must advertise current schema 29 (${field})"
+    contains_arg "io.jmodguard.${field}=30" "${schema_args[@]}" \
+      || fail "${component} must advertise current schema 30 (${field})"
   done
 done
 

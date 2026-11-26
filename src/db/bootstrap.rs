@@ -197,6 +197,14 @@ pub(super) fn migrate_conn(conn: &mut Connection) -> Result<()> {
         if version < target {
             let growth = if target == 27 {
                 ban_list_migration_growth(&tx).context("measure migration 27 growth")?
+            } else if target == 30 {
+                // The virtual date column rewrites no rows. Reserve index
+                // pages for the fixed-width keys, rowids and B-tree overhead.
+                let events: i64 =
+                    tx.query_row("SELECT COUNT(*) FROM events", (), |r| Ok(r.get(0)?))?;
+                u64::try_from(events)?
+                    .saturating_mul(128)
+                    .saturating_add(EMPTY_TABLES_MIGRATION_GROWTH)
             } else if matches!(target, 28 | 29) {
                 // Empty tables and indexes need schema and root pages only.
                 EMPTY_TABLES_MIGRATION_GROWTH

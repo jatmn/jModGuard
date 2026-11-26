@@ -19,10 +19,7 @@ pub enum EventListSort {
 impl EventListSort {
     fn key(self) -> &'static str {
         match self {
-            // Match Bans' UTC millisecond order, including timestamps with offsets.
-            Self::Date => {
-                "COALESCE(CAST(ROUND((julianday(NULLIF(created_at COLLATE NOCASE, 'now')) - 2440587.5) * 86400000) AS INTEGER), 0)"
-            }
+            Self::Date => "list_date",
             Self::Event => "event_type",
             // Missing IDs come before real snowflakes in ascending order.
             Self::User => "COALESCE(user_id, -1)",
@@ -92,12 +89,6 @@ fn event_page(
     guild: i64,
     request: EventListRequest,
 ) -> Result<EventListPage> {
-    let key = request.sort.key();
-    let (dir, seek) = if request.descending {
-        ("DESC", "<")
-    } else {
-        ("ASC", ">")
-    };
     let filters = &request.filters;
     // A person filter that matched nobody matches no event.
     if [&filters.subject, &filters.actor]
@@ -109,40 +100,8 @@ fn event_page(
             next: None,
         });
     }
-    let mut sql = format!("SELECT {EVENT_COLUMNS}, {key} FROM events");
-    let mut args = filters_sql(&mut sql, guild, filters)?;
-    if let Some(anchor) = request.after {
-        anyhow::ensure!(anchor.id > 0, "invalid list cursor");
-        let value = match (request.sort, anchor.value) {
-            (EventListSort::Event, EventListValue::TextDigest(expected)) => {
-                // Keep legacy event types of any length out of the bounded cursor.
-                let event_type: String = conn
-                    .query_row(
-                        "SELECT event_type FROM events WHERE guild_id = ?1 AND id = ?2",
-                        params![guild, anchor.id],
-                        |r| Ok(r.get(0)?),
-                    )
-                    .optional()?
-                    .context("invalid list cursor")?;
-                anyhow::ensure!(
-                    text_key_digest(&event_type) == expected,
-                    "invalid list cursor"
-                );
-                Value::Text(event_type)
-            }
-            (
-                EventListSort::Date | EventListSort::User | EventListSort::Actor,
-                EventListValue::Number(number),
-            ) => Value::Integer(number),
-            _ => anyhow::bail!("invalid list cursor"),
-        };
-        sql.push_str(&format!(" AND ({key}, id) {seek} (?, ?)"));
-        args.extend([value, Value::Integer(anchor.id)]);
-    }
     let limit = request.limit.clamp(1, i64::from(DASHBOARD_LIST_PAGE_LIMIT));
-    sql.push_str(&format!(" ORDER BY {key} {dir}, id {dir} LIMIT ?"));
-    args.push((limit + 1).into());
-
+    let (sql, args) = event_page_sql(conn, guild, &request, limit)?;
     let mut boundary = None;
     let mut seen = 0;
     let mut rows = conn
@@ -168,6 +127,53 @@ fn event_page(
     };
     rows.truncate(limit as usize);
     Ok(EventListPage { rows, next })
+}
+
+fn event_page_sql(
+    conn: &impl SqlExecutor,
+    guild: i64,
+    request: &EventListRequest,
+    limit: i64,
+) -> Result<(String, Vec<Value>)> {
+    let key = request.sort.key();
+    let (dir, seek) = if request.descending {
+        ("DESC", "<")
+    } else {
+        ("ASC", ">")
+    };
+    let mut sql = format!("SELECT {EVENT_COLUMNS}, {key} FROM events");
+    let mut args = filters_sql(&mut sql, guild, &request.filters)?;
+    if let Some(anchor) = &request.after {
+        anyhow::ensure!(anchor.id > 0, "invalid list cursor");
+        let value = match (request.sort, &anchor.value) {
+            (EventListSort::Event, EventListValue::TextDigest(expected)) => {
+                // Keep legacy event types of any length out of the bounded cursor.
+                let event_type: String = conn
+                    .query_row(
+                        "SELECT event_type FROM events WHERE guild_id = ?1 AND id = ?2",
+                        params![guild, anchor.id],
+                        |r| Ok(r.get(0)?),
+                    )
+                    .optional()?
+                    .context("invalid list cursor")?;
+                anyhow::ensure!(
+                    text_key_digest(&event_type) == *expected,
+                    "invalid list cursor"
+                );
+                Value::Text(event_type)
+            }
+            (
+                EventListSort::Date | EventListSort::User | EventListSort::Actor,
+                EventListValue::Number(number),
+            ) => Value::Integer(*number),
+            _ => anyhow::bail!("invalid list cursor"),
+        };
+        sql.push_str(&format!(" AND ({key}, id) {seek} (?, ?)"));
+        args.extend([value, Value::Integer(anchor.id)]);
+    }
+    sql.push_str(&format!(" ORDER BY {key} {dir}, id {dir} LIMIT ?"));
+    args.push((limit + 1).into());
+    Ok((sql, args))
 }
 
 fn filters_sql(sql: &mut String, guild: i64, filters: &EventListFilters) -> Result<Vec<Value>> {
@@ -223,4 +229,108 @@ fn filters_sql(sql: &mut String, guild: i64, filters: &EventListFilters) -> Resu
         args.push(Value::Integer(until));
     }
     Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Connection, MIGRATIONS, migrate_conn};
+
+    fn plan(conn: &Connection, request: &EventListRequest) -> Result<Vec<String>> {
+        let (sql, args) = event_page_sql(conn, 42, request, request.limit)?;
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+            .query_map(params_from_iter(args), |row| Ok(row.get(3)?))?
+            .collect()
+    }
+
+    #[test]
+    fn audit_date_migration_preserves_order_and_indexes_first_and_cursor_pages() -> Result<()> {
+        let mut conn = Connection::open(":memory:")?;
+        for &(version, sql) in MIGRATIONS.iter().take_while(|(version, _)| *version <= 29) {
+            let tx = conn.transaction_primary_write()?;
+            tx.execute_batch_bounded(sql, 1024 * 1024)?;
+            tx.pragma_update(None, "user_version", version)?;
+            tx.commit()?;
+        }
+        conn.execute_batch_bounded(
+            "INSERT INTO events (id, guild_id, event_type, user_id, created_at) VALUES
+             (1, 42, 'test', 99, '2026-01-01T00:00:00Z'),
+             (2, 42, 'test', 99, '2025-12-31T19:00:00-05:00'),
+             (3, 42, 'test', 1, 'invalid'),
+             (4, 42, 'test', 1, 'NoW' || char(0) || 'legacy'),
+             (5, 42, 'test', 1, 'SuBsEc'),
+             (6, 42, 'test', 1, '1969-12-31T23:59:59Z'),
+             (7, 42, 'test', 1, 'SubSecond'),
+             (8, 42, 'test', 99, '2026-01-01T00:00:00.001Z'),
+             (9, 43, 'test', 99, '2026-01-01T00:00:00Z')",
+            1024 * 1024,
+        )?;
+        migrate_conn(&mut conn)?;
+
+        let asc = [6, 3, 4, 5, 7, 1, 2, 8];
+        for descending in [false, true] {
+            let mut expected = asc;
+            if descending {
+                expected.reverse();
+            }
+            let mut after = None;
+            let pages = expected.as_chunks::<2>().0;
+            for (index, ids) in pages.iter().enumerate() {
+                let request = EventListRequest {
+                    filters: EventListFilters::default(),
+                    sort: EventListSort::Date,
+                    descending,
+                    after,
+                    limit: 2,
+                };
+                let plan = plan(&conn, &request)?;
+                let bounds = if descending {
+                    "list_date<?"
+                } else {
+                    "list_date>?"
+                };
+                assert!(
+                    plan.iter().any(|step| {
+                        step.contains("SEARCH events USING INDEX idx_events_list_date")
+                            && (index == 0 || step.contains(bounds))
+                    }),
+                    "{plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+                    "{plan:?}"
+                );
+                let page = event_page(&conn, 42, request)?;
+                assert_eq!(page.rows.iter().map(|row| row.id).collect::<Vec<_>>(), ids);
+                after = page.next;
+                assert_eq!(after.is_some(), index + 1 < pages.len());
+            }
+        }
+
+        let request = EventListRequest {
+            filters: EventListFilters {
+                event_type: Some("test".into()),
+                subject: Some(vec![99]),
+                from_ms: Some(1_767_225_600_000),
+                until_ms: Some(1_767_225_600_001),
+                ..EventListFilters::default()
+            },
+            sort: EventListSort::Date,
+            descending: false,
+            after: None,
+            limit: 10,
+        };
+        let plan = plan(&conn, &request)?;
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("USING INDEX idx_events_user (user_id=?)")),
+            "{plan:?}"
+        );
+        let page = event_page(&conn, 42, request)?;
+        assert_eq!(
+            page.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        Ok(())
+    }
 }

@@ -104,6 +104,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         29,
         include_str!("../migrations/0029_cleanup_delete_journal.sql"),
     ),
+    (30, include_str!("../migrations/0030_audit_log_date.sql")),
 ];
 
 /// Completed core schema required by service startup and release observations.
