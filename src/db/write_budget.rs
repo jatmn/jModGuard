@@ -219,6 +219,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn matching_write_reserves_growth_for_matching_rows_only() {
+        let mut conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch_bounded(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, guild_id INTEGER, value TEXT);
+             WITH RECURSIVE ids(id) AS (
+                 VALUES(1) UNION ALL SELECT id + 1 FROM ids WHERE id < 257
+             )
+             INSERT INTO items
+             SELECT id, CASE WHEN id=1 THEN 10 ELSE 20 END, 'old' FROM ids;",
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let sql = "UPDATE items SET value=?1 WHERE guild_id=?2";
+        let single = params!["new", 10].into_params().unwrap();
+        let one_row = core_row_bound(&conn, sql, &single, 1).unwrap();
+        let allocated = crate::capacity::sample(&conn).unwrap().allocated_bytes;
+        let growth_limit = allocated + 2 * one_row;
+        conn.set_test_capacity_limits(growth_limit, growth_limit + one_row);
+
+        let tx = conn.transaction_immediate().unwrap();
+        assert_eq!(tx.execute_matching(sql, single).unwrap(), 1);
+        tx.commit().unwrap();
+
+        let tx = conn.transaction_immediate().unwrap();
+        let denied = tx.execute_matching(sql, params!["new", 20]).unwrap_err();
+        assert!(
+            denied.to_string().contains("capacity budget exhausted"),
+            "{denied:#}"
+        );
+        tx.commit().unwrap();
+
+        let updated: Vec<i64> = conn
+            .prepare("SELECT id FROM items WHERE value='new' ORDER BY id")
+            .unwrap()
+            .query_map((), |row| Ok(row.get(0)?))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(updated, [1]);
+    }
+
+    #[test]
     fn matching_write_preserves_bind_slots_and_primary_scope() {
         let path =
             std::env::temp_dir().join(format!("write-budget-{:032x}.db", rand::random::<u128>()));
