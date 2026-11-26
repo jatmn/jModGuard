@@ -442,7 +442,8 @@ pub struct SnapshotIngress {
     /// Loss is charged only to the physical store whose scoped work failed.
     /// Unknown gateway/catalog gaps still advance the observation epoch.
     lost_pending: Mutex<HashMap<String, u64>>,
-    scopes: Mutex<HashMap<u64, GuildDataScope>>,
+    /// Each scope is kept with the exact Gateway join it was published for.
+    scopes: Mutex<HashMap<u64, (i64, GuildDataScope)>>,
     scope_refreshes: Mutex<HashMap<u64, Arc<i64>>>,
     known_humans: Mutex<KnownHumans>,
     deleted: Mutex<DeletedIdentities>,
@@ -484,7 +485,7 @@ impl ScopeRefresh<'_> {
         }
         let mut scopes = self.ingress.scopes.lock();
         if let Some(scope) = scope {
-            scopes.insert(self.guild.get(), scope);
+            scopes.insert(self.guild.get(), (*self.token, scope));
         } else if scopes.remove(&self.guild.get()).is_some() {
             self.ingress.gap();
         }
@@ -804,7 +805,7 @@ impl SnapshotIngress {
                 active[index] = expired == 100 || evicted == 100;
                 let verified_content = {
                     let access = self.content_access.lock();
-                    self.scopes.lock().iter().any(|(guild, candidate)| {
+                    self.scopes.lock().iter().any(|(guild, (_, candidate))| {
                         candidate.placement().store_id().as_str() == store_id
                             && access.contains(guild)
                     })
@@ -948,11 +949,10 @@ impl SnapshotIngress {
                 refreshes.remove(&guild);
             }
             let mut scopes = self.scopes.lock();
-            if !scopes.get(&guild).is_some_and(|scope| {
-                current_join.is_some_and(|join| {
-                    scope_membership_matches(join, scope.enrollment().joined_at_ns)
-                })
-            }) {
+            if !scopes
+                .get(&guild)
+                .is_some_and(|(join, _)| Some(*join) == current_join)
+            {
                 scopes.remove(&guild);
             }
         }
@@ -1022,7 +1022,10 @@ impl SnapshotIngress {
     }
 
     fn scope(&self, guild: u64) -> Option<GuildDataScope> {
-        self.scopes.lock().get(&guild).cloned()
+        self.scopes
+            .lock()
+            .get(&guild)
+            .map(|(_, scope)| scope.clone())
     }
 
     fn remember_human(&self, key: Key) {
@@ -1140,7 +1143,7 @@ impl SnapshotIngress {
         self.scopes
             .lock()
             .get(&(scope.guild_id() as u64))
-            .is_some_and(|current| same_scope(current, scope))
+            .is_some_and(|(_, current)| same_scope(current, scope))
     }
 
     /// Always removes the cached copy; it is returned only while the deleting
@@ -3050,7 +3053,10 @@ mod tests {
             .unwrap();
         let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
         let store = app.tenant.store(&scope).await.unwrap();
-        app.snapshots.scopes.lock().insert(789, scope.clone());
+        app.snapshots
+            .scopes
+            .lock()
+            .insert(789, (scope.enrollment().joined_at_ns, scope.clone()));
         let now = chrono::Utc::now().timestamp_millis();
         let observation = |id| SnapshotObservation {
             channel_id: 456,
@@ -3168,7 +3174,10 @@ mod tests {
             .await
             .unwrap();
         app.invalidate_configs();
-        app.snapshots.scopes.lock().insert(789, scope.clone());
+        app.snapshots
+            .scopes
+            .lock()
+            .insert(789, (scope.enrollment().joined_at_ns, scope.clone()));
         app.snapshots.content_access.lock().insert(789);
         let delete_attempt = app
             .automod_delete_marks
@@ -3238,10 +3247,13 @@ mod tests {
         let store = app.tenant.store(&scope).await.unwrap();
         let healthy = db::enroll_guild(&app.db, 790, 100).await.unwrap().unwrap();
         let healthy_scope = app.tenant.activate(healthy).await.unwrap().unwrap();
-        app.snapshots
-            .scopes
-            .lock()
-            .insert(790, healthy_scope.clone());
+        app.snapshots.scopes.lock().insert(
+            790,
+            (
+                healthy_scope.enrollment().joined_at_ns,
+                healthy_scope.clone(),
+            ),
+        );
         let healthy_store = app.tenant.store(&healthy_scope).await.unwrap();
         for (guild, route) in [(789, 901), (790, 902)] {
             db::upsert_log_channel(&app.db, guild, "message_delete", route)
@@ -4325,7 +4337,10 @@ mod tests {
                 .unwrap();
         }
         app.invalidate_configs();
-        app.snapshots.scopes.lock().insert(789, scope);
+        app.snapshots
+            .scopes
+            .lock()
+            .insert(789, (scope.enrollment().joined_at_ns, scope));
         let (http, bodies, server) = recording_delete_proxy().await;
         let ctx = test_delete_context_with(http).await;
         let snowflake = |offset: u64| {
@@ -4424,7 +4439,10 @@ mod tests {
             .await
             .unwrap();
         app.invalidate_configs();
-        app.snapshots.scopes.lock().insert(789, scope.clone());
+        app.snapshots
+            .scopes
+            .lock()
+            .insert(789, (scope.enrollment().joined_at_ns, scope.clone()));
         store.close_membership(scope).await.unwrap();
         let (http, bodies, server) = recording_delete_proxy().await;
         let ctx = test_delete_context_with(http).await;
@@ -4464,7 +4482,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
-        app.snapshots.scopes.lock().insert(789, scope.clone());
+        app.snapshots
+            .scopes
+            .lock()
+            .insert(789, (scope.enrollment().joined_at_ns, scope.clone()));
         scope
     }
 
@@ -5178,7 +5199,10 @@ mod tests {
             .await
             .unwrap();
         app.invalidate_configs();
-        app.snapshots.scopes.lock().insert(789, scope.clone());
+        app.snapshots
+            .scopes
+            .lock()
+            .insert(789, (scope.enrollment().joined_at_ns, scope.clone()));
         let (http, bodies, server) = recording_delete_proxy().await;
         let ctx = test_delete_context_with(http).await;
         let now = chrono::Utc::now();
@@ -5851,7 +5875,10 @@ mod tests {
                     .unwrap();
                 assert_eq!(outcome, SnapshotOutcome::Stored);
             }
-            app.snapshots.scopes.lock().insert(789, scope.clone());
+            app.snapshots
+                .scopes
+                .lock()
+                .insert(789, (scope.enrollment().joined_at_ns, scope.clone()));
             app.snapshots.content_access.lock().insert(789);
             assert_eq!(
                 app.snapshots
@@ -5941,7 +5968,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
-        app.snapshots.scopes.lock().insert(789, scope);
+        app.snapshots
+            .scopes
+            .lock()
+            .insert(789, (scope.enrollment().joined_at_ns, scope));
         app.snapshots.content_access.lock().insert(789);
         app.db
             .with_conn(|conn| {
@@ -5985,7 +6015,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let scope = app.tenant.activate(enrollment).await.unwrap().unwrap();
-        app.snapshots.scopes.lock().insert(789, scope);
+        app.snapshots
+            .scopes
+            .lock()
+            .insert(789, (scope.enrollment().joined_at_ns, scope));
         crate::db::retire_guild_enrollment(&app.db, 789, 100)
             .await
             .unwrap();
@@ -6144,7 +6177,10 @@ mod tests {
         );
         // A new Ready can see the replacement cache entry without a
         // GuildDelete callback to clear an already published scope.
-        app.snapshots.scopes.lock().insert(789, old_scope);
+        app.snapshots
+            .scopes
+            .lock()
+            .insert(789, (old_scope.enrollment().joined_at_ns, old_scope));
         app.snapshots.refresh_scope(&app, &cache, guild).await;
         assert!(
             app.snapshots.scope(789).is_none(),
@@ -6198,7 +6234,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let replacement_scope = app.tenant.scope(enrollment).await.unwrap();
-        app.snapshots.scopes.lock().insert(789, old_scope);
+        app.snapshots
+            .scopes
+            .lock()
+            .insert(789, (old_scope.enrollment().joined_at_ns, old_scope));
         app.snapshots.clear_guild(&cache, guild);
         assert!(app.snapshots.scope(789).is_none());
 
@@ -6211,6 +6250,31 @@ mod tests {
         assert_eq!(
             app.snapshots.scope(789).unwrap().enrollment().joined_at_ns,
             200
+        );
+
+        // A whole-second REST enrollment can match two Gateway joins in one
+        // second; cleanup must still drop the scope published for the old one.
+        crate::enrollment_repair::observe_gateway_membership(
+            &app.db,
+            &app.tenant,
+            guild.get(),
+            Some(1_000_000_000),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        cache_fixture_guild(&cache, guild.get(), 1_100_000_000);
+        app.snapshots.refresh_scope(&app, &cache, guild).await;
+        assert_eq!(
+            app.snapshots.scope(789).unwrap().enrollment().joined_at_ns,
+            1_000_000_000
+        );
+        cache_fixture_guild(&cache, guild.get(), 1_900_000_000);
+        app.snapshots.clear_guild(&cache, guild);
+        assert!(
+            app.snapshots.scope(789).is_none(),
+            "scope published for an earlier Gateway join must not survive cleanup"
         );
         drop(app);
         remove_db_and_store(&path);
