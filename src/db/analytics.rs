@@ -146,7 +146,7 @@ pub struct PlatformAnalytics {
     pub guilds: Vec<GuildActivityTotals>,
 }
 
-/// Matches the lifetime EVENT_STATS_SQL definition for automod records: only
+/// Matches the lifetime GUILD_STATS_SQL event count for automod records: only
 /// recorded, non-dry-run enforcement actions with a real punishment action.
 const EVENT_BUCKETS_COUNTED_SQL: &str = "(event_type IN ('mod_action','timeout_add') \
      OR (event_type='automod' AND json_valid(data) \
