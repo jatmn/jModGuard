@@ -84,10 +84,11 @@ snapshot. Counts use guild-scoped index searches.
 Legacy event reads use guild/ID indexes (guild/type/ID for type-only event filters).
 Audit Log date pages can seek the guild's UTC millisecond and event ID index
 in either direction. Invalid and clock-relative legacy dates use a zero sort key.
-Other sort columns may sort matching guild rows. Ban pages use guild-prefixed
-indexes for their selected order. Event queries with a user filter use the
-existing user index for both user-only and type-plus-user lookups, retaining
-guild and type checks. Counting work still grows with the
+An exact event-type filter can seek the guild and type on the existing index
+and sort those matching rows. Other sort columns may sort matching guild rows.
+Ban pages use guild-prefixed indexes for their selected order. Event queries with
+a user filter use the existing user index for both user-only and type-plus-user
+lookups, retaining guild and type checks. Counting work still grows with the
 guild’s retained records; this change does not establish large-database performance or
 distributed read scaling.
 

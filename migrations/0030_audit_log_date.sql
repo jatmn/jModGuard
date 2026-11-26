@@ -10,4 +10,8 @@ ALTER TABLE events ADD COLUMN list_date INTEGER AS (
     END
 ) VIRTUAL;
 
-CREATE INDEX idx_events_list_date ON events(guild_id, list_date, id);
+-- A rowid alias in a tuple comparison makes SQLite seek only by date.
+-- Use a generated column so the ID tie-breaker is part of the range bound.
+ALTER TABLE events ADD COLUMN list_id INTEGER AS (id) VIRTUAL;
+
+CREATE INDEX idx_events_list_date ON events(guild_id, list_date, list_id);

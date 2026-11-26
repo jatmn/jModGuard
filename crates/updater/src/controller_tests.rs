@@ -3053,8 +3053,9 @@ async fn superseded_clear_receipt_retires_when_no_row_matches() {
 }
 
 const QUEUED_RELEASED_CORE: i64 = 23;
-const BEFORE_CORE_30: &str =
-    "DROP INDEX idx_events_list_date; ALTER TABLE events DROP COLUMN list_date;";
+const BEFORE_CORE_30: &str = "DROP INDEX idx_events_list_date;
+     ALTER TABLE events DROP COLUMN list_id;
+     ALTER TABLE events DROP COLUMN list_date;";
 const BEFORE_CORE_29: &str = "DROP TABLE cleanup_delete_journal;";
 const BEFORE_CORE_28: &str = "DROP TABLE resource_rollups; DROP TABLE resource_status;";
 const BEFORE_CORE_24: &str = "DROP TABLE known_spam;

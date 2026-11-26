@@ -136,13 +136,25 @@ fn event_page_sql(
     limit: i64,
 ) -> Result<(String, Vec<Value>)> {
     let key = request.sort.key();
+    let id_key = if request.sort == EventListSort::Date {
+        "list_id"
+    } else {
+        "id"
+    };
     let (dir, seek) = if request.descending {
         ("DESC", "<")
     } else {
         ("ASC", ">")
     };
     let mut sql = format!("SELECT {EVENT_COLUMNS}, {key} FROM events");
-    let mut args = filters_sql(&mut sql, guild, &request.filters)?;
+    if request.filters.subject.is_some() {
+        // Keep sparse and absent user lookups selective.
+        sql.push_str(" INDEXED BY idx_events_user");
+    } else if request.sort == EventListSort::Date && request.filters.event_type.is_some() {
+        // Sort only the matching type rows instead of scanning the guild in date order.
+        sql.push_str(" INDEXED BY idx_events_guild_type_id");
+    }
+    let mut args = filters_sql(&mut sql, guild, request)?;
     if let Some(anchor) = &request.after {
         anyhow::ensure!(anchor.id > 0, "invalid list cursor");
         let value = match (request.sort, &anchor.value) {
@@ -168,19 +180,16 @@ fn event_page_sql(
             ) => Value::Integer(*number),
             _ => anyhow::bail!("invalid list cursor"),
         };
-        sql.push_str(&format!(" AND ({key}, id) {seek} (?, ?)"));
+        sql.push_str(&format!(" AND ({key}, {id_key}) {seek} (?, ?)"));
         args.extend([value, Value::Integer(anchor.id)]);
     }
-    sql.push_str(&format!(" ORDER BY {key} {dir}, id {dir} LIMIT ?"));
+    sql.push_str(&format!(" ORDER BY {key} {dir}, {id_key} {dir} LIMIT ?"));
     args.push((limit + 1).into());
     Ok((sql, args))
 }
 
-fn filters_sql(sql: &mut String, guild: i64, filters: &EventListFilters) -> Result<Vec<Value>> {
-    // Keep sparse/absent-user lookups selective, as the unsorted read does.
-    if filters.subject.is_some() {
-        sql.push_str(" INDEXED BY idx_events_user");
-    }
+fn filters_sql(sql: &mut String, guild: i64, request: &EventListRequest) -> Result<Vec<Value>> {
+    let filters = &request.filters;
     sql.push_str(" WHERE guild_id = ?");
     let mut args = vec![Value::Integer(guild)];
     let ids = |ids: &[i64]| serde_json::to_string(ids).map(Value::Text);
@@ -219,12 +228,27 @@ fn filters_sql(sql: &mut String, guild: i64, filters: &EventListFilters) -> Resu
                 OR actor_id IN (SELECT value FROM json_each(?{people_arg})))"
         ));
     }
+    let (mut from_ms, mut until_ms) = (filters.from_ms, filters.until_ms);
+    // SQLite can choose a separate date constraint as the index start and
+    // skip the ID part of the seek. Drop only a start bound implied by the cursor.
+    if request.sort == EventListSort::Date
+        && let Some(EventListAnchor {
+            value: EventListValue::Number(anchor_date),
+            ..
+        }) = &request.after
+    {
+        if request.descending {
+            until_ms = until_ms.filter(|until| until <= anchor_date);
+        } else {
+            from_ms = from_ms.filter(|from| from > anchor_date);
+        }
+    }
     let date = EventListSort::Date.key();
-    if let Some(from) = filters.from_ms {
+    if let Some(from) = from_ms {
         sql.push_str(&format!(" AND {date} >= ?"));
         args.push(Value::Integer(from));
     }
-    if let Some(until) = filters.until_ms {
+    if let Some(until) = until_ms {
         sql.push_str(&format!(" AND {date} < ?"));
         args.push(Value::Integer(until));
     }
@@ -285,9 +309,9 @@ mod tests {
                 };
                 let plan = plan(&conn, &request)?;
                 let bounds = if descending {
-                    "list_date<?"
+                    "(list_date,list_id)<(?,?)"
                 } else {
-                    "list_date>?"
+                    "(list_date,list_id)>(?,?)"
                 };
                 assert!(
                     plan.iter().any(|step| {
@@ -331,6 +355,84 @@ mod tests {
             page.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
             [1, 2]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn audit_date_pages_seek_through_ties_and_find_sparse_types() -> Result<()> {
+        let mut conn = Connection::open(":memory:")?;
+        migrate_conn(&mut conn)?;
+        conn.execute_batch_bounded(
+            "WITH RECURSIVE ids(id) AS (
+                 SELECT 1 UNION ALL SELECT id + 1 FROM ids WHERE id < 10000
+             )
+             INSERT INTO events (id, guild_id, event_type, created_at)
+             SELECT id, 42, CASE WHEN id IN (2, 5000, 9999) THEN 'rare' ELSE 'common' END, 'invalid'
+             FROM ids",
+            8 * 1024 * 1024,
+        )?;
+
+        for (descending, cursor, ids, bound) in [
+            (false, 9990, [9991, 9992], "(list_date,list_id)>(?,?)"),
+            (true, 10, [9, 8], "(list_date,list_id)<(?,?)"),
+        ] {
+            let page_request = |from_ms, until_ms| EventListRequest {
+                filters: EventListFilters {
+                    from_ms: Some(from_ms),
+                    until_ms: Some(until_ms),
+                    ..EventListFilters::default()
+                },
+                sort: EventListSort::Date,
+                descending,
+                after: Some(EventListAnchor {
+                    value: EventListValue::Number(0),
+                    id: cursor,
+                }),
+                limit: 2,
+            };
+            let request = page_request(0, 1);
+            let steps = plan(&conn, &request)?;
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step.contains("idx_events_list_date") && step.contains(bound)),
+                "{steps:?}"
+            );
+            let page = event_page(&conn, 42, request)?;
+            assert_eq!(page.rows.iter().map(|row| row.id).collect::<Vec<_>>(), ids);
+
+            let outside = if descending {
+                page_request(-1, 0)
+            } else {
+                page_request(1, 2)
+            };
+            let page = event_page(&conn, 42, outside)?;
+            assert!(page.rows.is_empty());
+            assert!(page.next.is_none());
+        }
+
+        for (event_type, ids) in [("rare", &[9999, 5000, 2][..]), ("absent", &[][..])] {
+            let page_request = EventListRequest {
+                filters: EventListFilters {
+                    event_type: Some(event_type.into()),
+                    ..EventListFilters::default()
+                },
+                sort: EventListSort::Date,
+                descending: true,
+                after: None,
+                limit: 5,
+            };
+            let steps = plan(&conn, &page_request)?;
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step
+                        .contains("idx_events_guild_type_id (guild_id=? AND event_type=?)")),
+                "{steps:?}"
+            );
+            let page = event_page(&conn, 42, page_request)?;
+            assert_eq!(page.rows.iter().map(|row| row.id).collect::<Vec<_>>(), ids);
+        }
         Ok(())
     }
 }
