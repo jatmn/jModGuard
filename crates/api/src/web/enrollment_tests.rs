@@ -5456,32 +5456,100 @@ async fn guild_reads_reuse_the_snapshot_for_minutes_and_refresh_it_in_the_backgr
 }
 
 #[tokio::test]
-async fn rate_limited_background_refresh_serves_the_snapshot_until_the_cooldown_ends() {
+async fn failed_background_refresh_paces_sequential_warm_reads() {
+    use std::time::Duration;
+
     let f = Fixture::new(false).await;
     f.enroll(10).await;
-    assert_eq!(
-        f.request("GET", "/api/guilds/10/config", "").await.0,
-        StatusCode::OK
-    );
+    let read = || f.request("GET", "/api/guilds/10/config", "");
+    assert_eq!(read().await.0, StatusCode::OK);
     expire_auth_cache(&f.app, revalidating_age()).await;
+    let received = f.app.oauth.freeze_test_time();
+    f.discord.failed.store(true, Ordering::SeqCst);
+
+    for (elapsed, expected_calls) in [(0, 2), (9, 2), (10, 3), (19, 3)] {
+        f.app.oauth.set_test_time(
+            received + Duration::from_secs(elapsed),
+            oauth::TEST_RECEIVED_MS + i64::try_from(elapsed).unwrap() * 1_000,
+        );
+        for _ in 0..3 {
+            let (status, body) = read().await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            background_refreshes_finished(&f.app).await;
+            assert_eq!(
+                f.discord.calls.load(Ordering::SeqCst),
+                expected_calls,
+                "guild-list attempts after {elapsed}s"
+            );
+        }
+    }
+
+    // The last failure gave a soft retry deadline at 20s. A hard-age lookup
+    // still runs immediately, and a 5xx may not authorize from the old list.
+    expire_auth_cache(&f.app, GUILD_AUTH_CACHE_TTL).await;
+    assert!(!read().await.0.is_success());
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(f.discord.token_calls.load(Ordering::SeqCst), 0);
+    f.discord.failed.store(false, Ordering::SeqCst);
+    assert_eq!(read().await.0, StatusCode::OK);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test]
+async fn rate_limited_background_refresh_serves_the_snapshot_until_the_cooldown_ends() {
+    use std::time::Duration;
+
+    let probe = Arc::new(db::StartupProbe::default());
+    let _scope = db::enter_startup_probe(Some(Arc::clone(&probe)));
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let read = || f.request("GET", "/api/guilds/10/config", "");
+    assert_eq!(read().await.0, StatusCode::OK);
+    // This cold authorization reads the epoch but has no cached snapshot to
+    // check for marks. Identify the epoch's SQL path before warm reads add
+    // mark lookups under the same module.
+    let access_paths: Vec<_> = probe
+        .primary_labels()
+        .into_iter()
+        .filter(|label| label.starts_with("db/access_marks:"))
+        .collect();
+    let [epoch_path] = access_paths.as_slice() else {
+        panic!("expected one access epoch path: {access_paths:?}");
+    };
+    let epoch_statements = || probe.primary_statements(epoch_path);
+    let one_epoch_read = epoch_statements();
+    assert!(one_epoch_read > 0);
+
+    expire_auth_cache(&f.app, revalidating_age()).await;
+    let received = f.app.oauth.freeze_test_time();
     *f.discord.retry_after.lock().unwrap() = "120".into();
     f.discord.rate_limited.store(true, Ordering::SeqCst);
-    assert_eq!(
-        f.request("GET", "/api/guilds/10/config", "").await.0,
-        StatusCode::OK
-    );
+    assert_eq!(read().await.0, StatusCode::OK);
     background_refreshes_finished(&f.app).await;
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(epoch_statements(), 2 * one_epoch_read);
+
     for _ in 0..3 {
-        let (status, body) = f.request("GET", "/api/guilds/10/config", "").await;
+        let (status, body) = read().await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        background_refreshes_finished(&f.app).await;
+        assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            epoch_statements(),
+            2 * one_epoch_read,
+            "cooling down must skip the background epoch query"
+        );
     }
-    background_refreshes_finished(&f.app).await;
-    assert_eq!(
-        f.discord.calls.load(Ordering::SeqCst),
-        2,
-        "the cooldown blocks further refreshes without failing reads"
+
+    f.discord.rate_limited.store(false, Ordering::SeqCst);
+    f.app.oauth.set_test_time(
+        received + Duration::from_secs(120),
+        oauth::TEST_RECEIVED_MS + 120_000,
     );
+    assert_eq!(read().await.0, StatusCode::OK);
+    background_refreshes_finished(&f.app).await;
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(epoch_statements(), 3 * one_epoch_read);
 }
 
 #[tokio::test]
