@@ -43,12 +43,21 @@ pub fn known_rule_id(id: &str) -> bool {
 
 /// API admission: shape only (no per-guild row count).
 pub fn validate_custom_rule_shape(guild_id: i64, id: &str, rule: &RuleDef) -> Result<()> {
+    validate_custom_rule_with_pattern(guild_id, id, rule).map(|_| ())
+}
+
+/// Validates the stored rule and returns the matcher for a pattern rule.
+pub(crate) fn validate_custom_rule_with_pattern(
+    guild_id: i64,
+    id: &str,
+    rule: &RuleDef,
+) -> Result<Option<regex::Regex>> {
     ensure!(
         guild_id != GLOBAL_SCOPE,
         "custom rules cannot use global scope"
     );
     ensure!(is_custom_id(id), "invalid custom rule id `{id}`");
-    validate_custom_body(id, rule, true)
+    validate_custom_body(rule)
 }
 
 /// Bot write: same shape checks plus dry-run-on-create when `creating` is true.
@@ -66,7 +75,7 @@ pub fn validate_custom_rule_for_write(
     if creating && !rule.dry_run {
         bail!("new custom rules start in dry-run");
     }
-    validate_custom_body(id, rule, true)
+    validate_custom_body(rule).map(|_| ())
 }
 
 /// A custom rule introduced at a guild (upsert create or a copy onto a server).
@@ -91,7 +100,7 @@ pub fn ensure_room_for_new_custom_rules(existing: usize, adding: usize) -> Resul
     Ok(())
 }
 
-fn validate_custom_body(_id: &str, rule: &RuleDef, compile_pattern: bool) -> Result<()> {
+fn validate_custom_body(rule: &RuleDef) -> Result<Option<regex::Regex>> {
     let name = rule.name.trim();
     ensure!(!name.is_empty(), "rule name is required");
     ensure!(
@@ -144,9 +153,9 @@ fn validate_custom_body(_id: &str, rule: &RuleDef, compile_pattern: bool) -> Res
                 .get("pattern")
                 .and_then(|v| v.as_str())
                 .context("pattern rules require params.pattern")?;
-            if compile_pattern {
-                normalize::compile_user_regex(pattern).map_err(|e| anyhow!(e))?;
-            }
+            return normalize::compile_user_regex(pattern)
+                .map(Some)
+                .map_err(|e| anyhow!(e));
         }
         "word" => validate_words(rule)?,
         "honeypot_role" => {
@@ -157,7 +166,7 @@ fn validate_custom_body(_id: &str, rule: &RuleDef, compile_pattern: bool) -> Res
         other => bail!("unknown custom rule kind `{other}`"),
     }
 
-    Ok(())
+    Ok(None)
 }
 
 fn validate_action(action: &ActionDef) -> Result<()> {

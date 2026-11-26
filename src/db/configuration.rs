@@ -1458,6 +1458,8 @@ async fn copy_guild_config_inner(
 pub struct ConfigParts {
     pub settings: GuildSettings,
     pub rules: std::collections::HashMap<String, RuleDef>,
+    /// Matchers produced when validating the custom rows in `rules`.
+    pub custom_patterns: std::collections::HashMap<String, regex::Regex>,
     pub commands: std::collections::HashMap<String, CommandDef>,
     pub templates: std::collections::HashMap<String, String>,
     pub log_channels: std::collections::HashMap<String, i64>,
@@ -1757,13 +1759,19 @@ impl ConfigurationSnapshotRows {
                 ),
             );
         }
+        let mut custom_patterns = std::collections::HashMap::new();
         if guild_id != GLOBAL_SCOPE {
-            for (id, row) in &self.guild_rules {
-                if !crate::custom_rules::is_custom_id(id) {
+            for (id, row) in self.guild_rules {
+                if !crate::custom_rules::is_custom_id(&id) {
                     continue;
                 }
-                if crate::custom_rules::validate_custom_rule_shape(guild_id, id, row).is_ok() {
-                    rules.insert(id.clone(), row.clone());
+                if let Ok(pattern) =
+                    crate::custom_rules::validate_custom_rule_with_pattern(guild_id, &id, &row)
+                {
+                    if let Some(pattern) = pattern {
+                        custom_patterns.insert(id.clone(), pattern);
+                    }
+                    rules.insert(id, row);
                 }
             }
         }
@@ -1814,6 +1822,7 @@ impl ConfigurationSnapshotRows {
             ConfigParts {
                 settings,
                 rules,
+                custom_patterns,
                 commands,
                 templates,
                 log_channels,

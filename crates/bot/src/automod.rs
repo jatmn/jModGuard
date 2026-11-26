@@ -3413,6 +3413,92 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cached_custom_rules_match_only_valid_persisted_rules() {
+        let directory = std::env::temp_dir().join(format!(
+            "cached_custom_rules_{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let app = BotState::new(
+            Default::default(),
+            crate::db::Db::open(&directory.join("core.db"), 2).unwrap(),
+        )
+        .unwrap();
+        let pattern_rule = |pattern: &str| {
+            custom_rule(
+                serde_json::json!({ "kind": "pattern", "pattern": pattern }),
+                "delete",
+            )
+        };
+        let mut invalid_action = pattern_rule("^jmodguard873invalidaction$");
+        invalid_action.actions.clear();
+        let rows = [
+            ("custom:00000001", pattern_rule("^jmodguard873first$")),
+            ("custom:00000002", pattern_rule("^jmodguard873second$")),
+            (
+                "custom:00000003",
+                custom_rule(
+                    serde_json::json!({ "kind": "word", "words": ["jmodguardlegacyword"] }),
+                    "delete",
+                ),
+            ),
+            ("custom:00000004", invalid_action),
+            ("custom:00000005", pattern_rule("^jmodguard873unclosed(")),
+            (
+                "custom:00000006",
+                pattern_rule(&"x".repeat(normalize::USER_REGEX_MAX_PATTERN_BYTES + 1)),
+            ),
+        ];
+        app.db
+            .with_conn(move |conn| {
+                use crate::db::SqlExecutor;
+                for (id, rule) in rows {
+                    // Seed legacy rows without current write admission.
+                    conn.execute_bounded(
+                        "INSERT INTO rules (guild_id, rule_id, data) VALUES (1, ?1, ?2)",
+                        crate::db::params![id, serde_json::to_string(&rule)?],
+                        64 * 1024,
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let cfg = app.configs.get(&app.db, 1).await.unwrap();
+        let mut accepted: Vec<_> = cfg
+            .rules
+            .keys()
+            .filter(|id| jmodguard::custom_rules::is_custom_id(id))
+            .map(String::as_str)
+            .collect();
+        accepted.sort_unstable();
+        assert_eq!(
+            accepted,
+            ["custom:00000001", "custom:00000002", "custom:00000003"]
+        );
+        assert_eq!(cfg.custom_patterns.len(), 2);
+        let engine = AutomodEngine::new();
+        for (content, id) in [
+            ("jmodguard873first", "custom:00000001"),
+            ("jmodguard873second", "custom:00000002"),
+            ("jmodguardlegacyword", "custom:00000003"),
+        ] {
+            let matched = engine
+                .evaluate(&cfg, &msg(1, content, 0, false, false))
+                .unwrap();
+            assert_eq!(matched.rule_id, id);
+        }
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "jmodguard873invalidaction", 0, false, false))
+                .is_none()
+        );
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn custom_pattern_misses_and_exclusions_do_not_select_an_action() {
         let mut rules = HashMap::from([(
