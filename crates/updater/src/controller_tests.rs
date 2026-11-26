@@ -19,6 +19,15 @@ async fn object(State(objects): State<Arc<HashMap<String, Vec<u8>>>>, uri: Uri) 
 }
 
 fn image(objects: &mut HashMap<String, Vec<u8>>, role: &str, binary: &[u8]) -> ComponentRelease {
+    image_with_inventory_hash(objects, role, binary, None)
+}
+
+fn image_with_inventory_hash(
+    objects: &mut HashMap<String, Vec<u8>>,
+    role: &str,
+    binary: &[u8],
+    component_hash: Option<&str>,
+) -> ComponentRelease {
     let config = serde_json::to_vec(&json!({"architecture":"amd64","os":"linux","config":{"Labels":{
         "org.opencontainers.image.revision":"c".repeat(40), "io.jmodguard.release-id":"paired-fixture"
     }}})).unwrap();
@@ -26,10 +35,10 @@ fn image(objects: &mut HashMap<String, Vec<u8>>, role: &str, binary: &[u8]) -> C
     {
         let mut tar = tar::Builder::new(&mut layer);
         let name = format!("usr/local/bin/jmodguard-{role}");
-        let inventory = format!(
-            "{hash}  bin/jmodguard-{role}\n{hash}  bin/jmodguard-launcher\n",
-            hash = sha256_hex(binary)
-        );
+        let hash = sha256_hex(binary);
+        let component_hash = component_hash.unwrap_or(&hash);
+        let inventory =
+            format!("{component_hash}  bin/jmodguard-{role}\n{hash}  bin/jmodguard-launcher\n");
         for (path, bytes) in [
             (name.as_str(), binary),
             ("usr/local/bin/jmodguard-launcher", binary),
@@ -9480,6 +9489,12 @@ async fn failed_stage_keeps_the_staged_executable_and_no_temporaries() {
         .unwrap()
         .truncate(512);
     let not_elf = image(&mut objects, "bot", b"#!/bin/sh\n");
+    let wrong_inventory = image_with_inventory_hash(
+        &mut objects,
+        "bot",
+        b"\x7fELFcandidate",
+        Some(&sha256_hex(b"\x7fELFdifferent")),
+    );
     let (registry, server) = serve_objects(objects).await;
     let staging = root.join("staged-bot");
     let target = stage(
@@ -9503,6 +9518,10 @@ async fn failed_stage_keeps_the_staged_executable_and_no_temporaries() {
         (corrupt, "blob digest mismatch"),
         (truncated, "blob size mismatch"),
         (not_elf, "invalid linux/amd64 executable"),
+        (
+            wrong_inventory,
+            "executable does not match image file inventory",
+        ),
     ] {
         let error = stage(
             &registry,
