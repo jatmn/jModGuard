@@ -1539,10 +1539,7 @@ async fn events_inner(
         .flat_map(|row| [row.user_id, row.actor_id])
         .flatten()
         .collect::<Vec<_>>();
-    let names = match app.tenant.live(enrollment).await {
-        Ok((store, scope)) => super::cases::directory_names(&store, scope, people).await,
-        Err(_) => serde_json::Map::new(),
-    };
+    let names = super::cases::live_directory_names(app, enrollment, people).await;
     Ok(Json(serde_json::json!({
         "events": page.rows,
         "names": names,
@@ -1643,10 +1640,7 @@ async fn bans_inner(
         .flat_map(|row| [Some(row.user_id), row.moderator_id, row.reason_edited_by])
         .flatten()
         .collect::<Vec<_>>();
-    let names = match app.tenant.live(enrollment).await {
-        Ok((store, scope)) => super::cases::directory_names(&store, scope, people).await,
-        Err(_) => serde_json::Map::new(),
-    };
+    let names = super::cases::live_directory_names(app, enrollment, people).await;
     Ok(Json(serde_json::json!({
         "bans": page.rows,
         "names": names,

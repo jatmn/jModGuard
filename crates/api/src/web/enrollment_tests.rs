@@ -8224,6 +8224,114 @@ async fn case_reads_filter_the_list_and_name_known_members() {
 }
 
 #[tokio::test]
+async fn bans_and_audit_log_open_the_directory_store_only_for_people_to_name() {
+    let probe = Arc::new(db::StartupProbe::default());
+    let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+    let guild_statements = |prefix: &str| {
+        probe
+            .primary_labels()
+            .iter()
+            .filter(|label| label.starts_with(prefix))
+            .map(|label| probe.primary_statements(label))
+            .sum::<u64>()
+    };
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app
+        .tenant
+        .activate(enrollment.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (store, scope) = f.app.tenant.live(enrollment.clone()).await.unwrap();
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    store
+        .observe_member(
+            scope,
+            db::guild_data::MemberObservation {
+                user_id: 7,
+                username: Some(Some("seven".into())),
+                global_name: Some(None),
+                nickname: Some(None),
+                joined_at_ms: Some(900),
+                observed_at_ms: 1_500,
+                is_join: true,
+            },
+        )
+        .await
+        .unwrap();
+    f.app
+        .db
+        .with_conn(|conn| {
+            conn.execute_batch_bounded(
+                r#"INSERT INTO events (id, guild_id, event_type, user_id, actor_id, data, created_at) VALUES
+                    (31, 10, 'system', NULL, NULL, '{}', '2026-01-02T00:00:00Z'),
+                    (32, 10, 'member_ban', 7, NULL, '{}', '2026-01-03T00:00:00Z');"#,
+                65_536,
+            )
+        })
+        .await
+        .unwrap();
+    let page = |path: &'static str, rows: &'static str| {
+        let f = &f;
+        async move {
+            let (status, page) = f.request("POST", path, "").await;
+            assert_eq!(status, StatusCode::OK, "{path}: {page}");
+            (page[rows].as_array().unwrap().len(), page["names"].clone())
+        }
+    };
+
+    // No person to name: the core read still runs, but enrichment never
+    // opens the directory store. A numeric subject needs no name search.
+    for (path, rows, expected_rows) in [
+        ("/api/guilds/10/bans", "bans", 0),
+        ("/api/guilds/10/events?sort=date&subject=777", "events", 0),
+        ("/api/guilds/10/events?sort=date&event=system", "events", 1),
+    ] {
+        let before = guild_statements("guild ");
+        let (count, names) = page(path, rows).await;
+        assert_eq!(count, expected_rows, "{path}");
+        assert_eq!(names, serde_json::json!({}), "{path}");
+        assert_eq!(
+            guild_statements("guild ") - before,
+            0,
+            "{path} must not open the directory store for names"
+        );
+    }
+
+    // People on the page: the live membership check and directory read still run.
+    db::record_enrolled_ban(&f.app.db, Some(enrollment), 7, None, "spam")
+        .await
+        .unwrap();
+    for (path, rows) in [
+        ("/api/guilds/10/bans", "bans"),
+        ("/api/guilds/10/events?sort=date&subject=7", "events"),
+    ] {
+        let membership = guild_statements("guild db/guild_data/tenant_logs:");
+        let directory = guild_statements("guild db/guild_data/member_directory:");
+        let (count, names) = page(path, rows).await;
+        assert_eq!(count, 1, "{path}");
+        assert_eq!(
+            names,
+            serde_json::json!({"7": {"display_name": "seven", "username": "seven"}}),
+            "{path}"
+        );
+        assert!(
+            guild_statements("guild db/guild_data/tenant_logs:") > membership,
+            "{path} must check live membership"
+        );
+        assert!(
+            guild_statements("guild db/guild_data/member_directory:") > directory,
+            "{path} must read directory names"
+        );
+    }
+}
+
+#[tokio::test]
 async fn moderation_pages_name_people_from_empty_missing_and_mixed_directory_rows() {
     use crate::db::guild_data::{
         CaseAction, CaseData, CaseEvidence, CaseId, CaseOutcome, CaseSource,

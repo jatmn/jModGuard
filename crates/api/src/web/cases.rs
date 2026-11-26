@@ -97,6 +97,32 @@ async fn live(
     Ok(app.tenant.live(enrollment).await?)
 }
 
+/// The positive, distinct user IDs one directory name lookup accepts.
+fn directory_name_ids(ids: impl IntoIterator<Item = i64>) -> Vec<i64> {
+    let mut ids: Vec<i64> = ids.into_iter().filter(|id| *id > 0).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.truncate(crate::db::guild_data::DIRECTORY_PROFILE_LOOKUP_LIMIT);
+    ids
+}
+
+/// [`directory_names`] for pages read from core storage. The live tenant store
+/// is opened only when a person on the page can be named.
+pub(super) async fn live_directory_names(
+    app: &ApiState,
+    enrollment: crate::db::GuildEnrollment,
+    ids: impl IntoIterator<Item = i64>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let ids = directory_name_ids(ids);
+    if ids.is_empty() {
+        return serde_json::Map::new();
+    }
+    match app.tenant.live(enrollment).await {
+        Ok((store, scope)) => directory_names(&store, scope, ids).await,
+        Err(_) => serde_json::Map::new(),
+    }
+}
+
 /// Display names the member directory already recorded for these users, keyed by
 /// string ID. Names are presentation only: a directory that is unavailable or has
 /// not seen a user leaves that user out instead of failing the case read.
@@ -105,10 +131,7 @@ pub(super) async fn directory_names(
     scope: crate::db::guild_data::GuildDataScope,
     ids: impl IntoIterator<Item = i64>,
 ) -> serde_json::Map<String, serde_json::Value> {
-    let mut ids: Vec<i64> = ids.into_iter().filter(|id| *id > 0).collect();
-    ids.sort_unstable();
-    ids.dedup();
-    ids.truncate(crate::db::guild_data::DIRECTORY_PROFILE_LOOKUP_LIMIT);
+    let ids = directory_name_ids(ids);
     if ids.is_empty() {
         return serde_json::Map::new();
     }
