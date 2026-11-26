@@ -3038,47 +3038,43 @@ impl ConfigCache {
                 .max(db.required_config_version());
             last_observed = durable_version;
             last_required = required_after;
-            let accepted_revision = self.accepted_revision.lock().clone();
-
-            if route == ConfigReadRoute::Primary && revision != accepted_revision {
-                // Adopting a revision clears every entry and pending flight.
-                // Only a read that still owns its membership and generation
-                // may change the shared revision and floor.
-                let _publication = self.publication_lock.lock();
-                if self.version.load(Ordering::Relaxed) == version
-                    && self.can_publish_for(guild_id, membership)
-                {
-                    self.adopt_primary_revision(durable_version, revision);
-                }
-                continue;
-            }
-            if durable_version < required_after || revision != accepted_revision {
+            if route == ConfigReadRoute::Replica
+                && (durable_version < required_after || revision != *self.accepted_revision.lock())
+            {
                 // Replica lag is expected after a successful remote write. Do
                 // not drop moderation/commands while waiting for convergence:
                 // retry through one primary-routed, single-snapshot read.
                 owner.retry_primary(&mut route, durable_version, revision);
                 continue;
             }
-            let cfg = parts.map(|parts| {
-                Arc::new(CachedGuildConfig::from_parts(
-                    version,
-                    durable_version,
-                    parts,
-                ))
-            });
+            let cfg =
+                parts.map(|parts| CachedGuildConfig::from_parts(version, durable_version, parts));
             {
                 // Publication and invalidation share one lock, closing the
                 // check→insert window that could republish a stale snapshot
                 // after a same-process write had cleared the cache.
                 let _publication = self.publication_lock.lock();
+                let current_version = self.version.load(Ordering::Relaxed);
+                let revision_matches = revision == *self.accepted_revision.lock();
+                let can_publish = self.can_publish_for(guild_id, membership);
+                let (publication_version, revision_matches) =
+                    if route == ConfigReadRoute::Primary && !revision_matches {
+                        // Adopting a revision clears every entry and pending flight.
+                        if current_version != version || !can_publish {
+                            continue;
+                        }
+                        self.adopt_primary_revision(durable_version, revision.clone());
+                        // This snapshot established the new revision. Publish it
+                        // in that generation without re-reading the same inputs.
+                        (self.version.load(Ordering::Relaxed), true)
+                    } else {
+                        (version, revision_matches)
+                    };
                 let required_now = self
                     .durable_floor
                     .load(Ordering::SeqCst)
                     .max(db.required_config_version());
-                let accepted_revision = self.accepted_revision.lock().clone();
-                let current_version = self.version.load(Ordering::Relaxed);
-                let snapshot_matches =
-                    durable_version >= required_now && revision == accepted_revision;
+                let snapshot_matches = durable_version >= required_now && revision_matches;
                 // A coherent replica read superseded only by invalidation can
                 // reuse a newer publication. An authoritative retry still runs
                 // when a floor or revision mismatch required primary routing.
@@ -3096,7 +3092,11 @@ impl ConfigCache {
                     owner.retry_primary(&mut route, durable_version, revision);
                     continue;
                 }
-                if !self.can_publish_for(guild_id, membership) {
+                let cfg = cfg.map(|mut config| {
+                    config.version = publication_version;
+                    Arc::new(config)
+                });
+                if !can_publish {
                     // The caller may use its result, but this read no longer
                     // owns a current membership's cache entry.
                     if let Some(config) = cfg.or(previous) {

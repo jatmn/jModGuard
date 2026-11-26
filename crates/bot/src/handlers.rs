@@ -4375,6 +4375,81 @@ mod tests {
     }
 
     #[cfg(debug_assertions)]
+    async fn buffer_primary_config_read(
+        db: &Db,
+        guild: i64,
+        mut read: std::pin::Pin<&mut impl std::future::Future>,
+    ) {
+        // Steer the first poll to primary, where it reads a real SQLite snapshot.
+        db.test_inject_next_config_snapshot(
+            db::load_config_parts_with_version(db, guild).await.unwrap(),
+        );
+        // The test runtime has a single blocking worker. Occupy it until the
+        // primary read has acquired the database's sole connection permit.
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocking_worker = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            blocked
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        });
+        running.await.unwrap();
+        tokio::select! {
+            biased;
+            _ = read.as_mut() => panic!("primary read finished while its worker was blocked"),
+            _ = std::future::ready(()) => {}
+        }
+        release.send(()).unwrap();
+        blocking_worker.await.unwrap();
+        // Wait for the primary read to relinquish its permit without polling its result.
+        db.with_conn(|_| Ok(())).await.unwrap();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn primary_config_read_recovers_after_one_invalidation() {
+        tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (directory, app, _) = counter_fixture("primary_config_invalidation").await;
+                let (ctx, _) = counter_context(&app, false).await;
+                let (create, _) = gateway_config_events(&app, &ctx);
+                create(10, 100);
+
+                db::patch_settings(&app.db, 10, Some(Some("updated!".into())), None, None)
+                    .await
+                    .unwrap();
+                let reader = Db::open(&directory.join("core.db"), 1).unwrap();
+                let mut pending = Box::pin(app.configs.get(&reader, 10));
+                buffer_primary_config_read(&reader, 10, pending.as_mut()).await;
+
+                // The command invalidates after its write. Membership and the
+                // committed revision remain stable throughout primary fallback.
+                app.invalidate_configs();
+                let loaded = pending
+                    .await
+                    .expect("one invalidation must allow primary recovery");
+                assert_eq!(loaded.settings.prefix, "updated!");
+                assert!(
+                    app.configs
+                        .last_known(10)
+                        .is_some_and(|entry| { std::sync::Arc::ptr_eq(&entry, &loaded) }),
+                    "the recovered snapshot must seed the active guild's fallback"
+                );
+                let hit = app.configs.get(&reader, 10).await.unwrap();
+                assert!(std::sync::Arc::ptr_eq(&hit, &loaded));
+
+                drop(reader);
+                drop(app);
+                std::fs::remove_dir_all(directory).unwrap();
+            });
+    }
+
+    #[cfg(debug_assertions)]
     #[test]
     fn departed_primary_config_read_preserves_current_revision_and_fallbacks() {
         tokio::runtime::Builder::new_current_thread()
@@ -4393,34 +4468,8 @@ mod tests {
                     .await
                     .unwrap();
                 let old_reader = Db::open(&directory.join("core.db"), 1).unwrap();
-                // Make the first poll discover a replica revision mismatch.
-                // The primary fallback below reads the real SQLite snapshot.
-                old_reader.test_inject_next_config_snapshot(
-                    db::load_config_parts_with_version(&old_reader, 10)
-                        .await
-                        .unwrap(),
-                );
-
-                let (started, running) = tokio::sync::oneshot::channel();
-                let (release, blocked) = std::sync::mpsc::channel();
-                let blocking_worker = tokio::task::spawn_blocking(move || {
-                    started.send(()).unwrap();
-                    blocked
-                        .recv_timeout(std::time::Duration::from_secs(5))
-                        .unwrap();
-                });
-                running.await.unwrap();
                 let mut late = Box::pin(app.configs.get(&old_reader, 10));
-                tokio::select! {
-                    biased;
-                    _ = &mut late => panic!("primary read finished while its worker was blocked"),
-                    _ = std::future::ready(()) => {}
-                }
-                release.send(()).unwrap();
-                blocking_worker.await.unwrap();
-                // The primary read has the sole connection permit. The
-                // barrier waits for it to finish without polling its result.
-                old_reader.with_conn(|_| Ok(())).await.unwrap();
+                buffer_primary_config_read(&old_reader, 10, late.as_mut()).await;
 
                 delete(10, false);
                 db::patch_settings(&app.db, 10, Some(Some("rejoined!".into())), None, None)
