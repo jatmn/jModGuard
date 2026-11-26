@@ -1701,7 +1701,15 @@ async fn webui_runtime(headers: HeaderMap) -> Response {
         let digest = jmodguard_updater::oci::sha256_hex(CONTENT.as_bytes());
         HeaderValue::from_str(&format!("\"{digest}\"")).expect("valid hexadecimal ETag")
     });
-    let mut response = if headers.get(IF_NONE_MATCH) == Some(&*TAG) {
+    let not_modified = headers.get_all(IF_NONE_MATCH).iter().any(|value| {
+        let value = value.as_bytes().trim_ascii();
+        value == b"*"
+            || value.split(|byte| *byte == b',').any(|tag| {
+                let tag = tag.trim_ascii();
+                tag.strip_prefix(b"W/").unwrap_or(tag) == TAG.as_bytes()
+            })
+    });
+    let mut response = if not_modified {
         StatusCode::NOT_MODIFIED.into_response()
     } else {
         static_handler(CONTENT, "application/javascript; charset=utf-8").into_response()
@@ -3702,20 +3710,29 @@ mod tests {
             runtime.headers()[axum::http::header::CONTENT_TYPE],
             "application/javascript; charset=utf-8"
         );
-        let revalidated = app
-            .oneshot(
-                Request::builder()
-                    .uri("/webui-runtime.js")
-                    .header(
-                        axum::http::header::IF_NONE_MATCH,
-                        &runtime.headers()[axum::http::header::ETAG],
-                    )
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+        let tag = runtime.headers()[axum::http::header::ETAG]
+            .to_str()
             .unwrap();
-        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        for (condition, expected) in [
+            (tag.to_owned(), StatusCode::NOT_MODIFIED),
+            (format!(r#""other,tag", W/{tag}"#), StatusCode::NOT_MODIFIED),
+            ("*".to_owned(), StatusCode::NOT_MODIFIED),
+            (r#"W/"previous-runtime""#.to_owned(), StatusCode::OK),
+        ] {
+            let revalidated = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/webui-runtime.js")
+                        .header(axum::http::header::IF_NONE_MATCH, &condition)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(revalidated.status(), expected, "If-None-Match: {condition}");
+            assert_eq!(revalidated.headers()[axum::http::header::ETAG], tag);
+        }
     }
 
     #[tokio::test]

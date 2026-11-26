@@ -225,13 +225,25 @@ serves them at `http://localhost:8080`.
 For the initial bootstrap only, upload all six files in the Bunny dashboard (**Browse Files**) with Administration HTML at `/administration/index.html`. After that, GitHub Actions **Publish** builds an independent WebUI package to GHCR on trusted publication builds; it does not upload it to Bunny directly. The owner installs it from **Administration → Updates**, and the API writes it to Storage with `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, and `BUNNY_STORAGE_ENDPOINT`, then purges the Pull Zone when both `BUNNY_PULL_ZONE_ID` and a scoped `BUNNY_PURGE_API_KEY` (where the Bunny account offers scoped keys; otherwise purge from the dashboard) are set on the API container (never git); see
 [DEPLOY-BUNNY.md](DEPLOY-BUNNY.md) and [BUNNY-UPDATES.md](BUNNY-UPDATES.md#storage-zone-publication). A private ops repo is **not required** to install.
 
-**Another host or CDN.** Copy the generated files to the site root
-(match the API revision when the page needs new endpoints; CSS/layout-only
-files can be newer). If the API is on a **different** hostname than the pages,
-set `window.JMODGUARD_API_BASE` to the API origin before `app.js` loads
-in `index.html`, and set the same value before `administration.js` loads
-in `administration/index.html`. Each HTML page needs its own setting;
-the value from `index.html` does not carry to the Administration page.
+**Another host or CDN.** For a fresh install, copy the generated files to the
+site root. To upgrade an existing site, package the build from its source
+checkout:
+
+```bash
+node scripts/package-webui.mjs . "$(git rev-parse HEAD)"
+```
+
+Upload the `dist/webui/assets/` tree to `/assets/` before replacing
+`index.html` and `administration/index.html` with the files from
+`dist/webui/`. Keep the previous assets available while clients can still
+have earlier HTML cached or while you may need to roll back. That includes
+the legacy root-level scripts, which older pages load as classic scripts.
+Configure browsers to revalidate both HTML pages and cache the versioned
+assets.
+
+Match the API revision when the page needs new endpoints. If the API is on a
+**different** hostname than the pages, set `window.JMODGUARD_API_BASE` to the
+API origin in each HTML page before its module script.
 Set `JMODGUARD_CORS_ORIGINS` on the API to the page origin. Discord
 OAuth still happens on `web.base_url`: for this separate-host setup, set
 `JMODGUARD_WEB_BASE_URL` to the same public API origin as `JMODGUARD_API_BASE`
