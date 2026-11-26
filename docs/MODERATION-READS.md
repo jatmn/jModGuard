@@ -77,15 +77,17 @@ Bot callers retain those helpers. The Bans API page shares the ban row decoder.
 Membership verification and data queries share one deferred primary snapshot (`BEGIN
 DEFERRED`) and close it with ROLLBACK after the read. That snapshot is still routed to the
 primary, and it does not take the writer lock, so a bot write is not queued behind the
-read and a held writer does not stall the read. No recovery receipt, configuration version
-change, new table, dependency, cache, connection pool or polling task is added.
+read and a held writer does not stall the read. These reads create no recovery
+receipts or configuration version changes.
 Statistics retain their existing definitions, with all three counts in one
 snapshot. Counts use guild-scoped index searches.
 Legacy event reads use guild/ID indexes (guild/type/ID for type-only event filters).
-The sorted Audit Log may sort the matching guild rows for the selected column;
-its text and date filters are checked against each matching guild row.
-Ban pages use guild-prefixed indexes for their selected order. Event queries with a
-user filter use the existing user index for both user-only and type-plus-user
+Audit Log date pages can seek the guild's UTC millisecond and event ID index
+in either direction. Invalid and clock-relative legacy dates use a zero sort key.
+An exact event-type filter can seek the guild and type on the existing index
+and sort those matching rows. Other sort columns may sort matching guild rows.
+Ban pages use guild-prefixed indexes for their selected order. Event queries with
+a user filter use the existing user index for both user-only and type-plus-user
 lookups, retaining guild and type checks. Counting work still grows with the
 guild’s retained records; this change does not establish large-database performance or
 distributed read scaling.
