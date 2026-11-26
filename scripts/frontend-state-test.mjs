@@ -4833,9 +4833,16 @@ async function launchFirefox(defaultFontSize) {
 }
 
 // Saves the theme before each new document's own scripts read it, so one navigation renders it.
+const themeSeeds = {
+  light: "() => localStorage.setItem('jmodguard.theme', 'light')",
+  dark: "() => localStorage.setItem('jmodguard.theme', 'dark')",
+};
+
 async function seedTheme(browser, theme) {
+  const functionDeclaration = themeSeeds[theme];
+  assert.ok(functionDeclaration, `no preload seed for theme ${theme}`);
   const { script } = await browser.send('script.addPreloadScript', {
-    functionDeclaration: `() => localStorage.setItem('jmodguard.theme', ${JSON.stringify(theme)})`,
+    functionDeclaration,
     contexts: [browser.context],
   });
   return script;
