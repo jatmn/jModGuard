@@ -1867,7 +1867,17 @@ async fn member_sync_retry_admits_audit_pagination_stall_after_initial_complete(
 }
 
 #[tokio::test]
-async fn member_sync_status_uses_persisted_bot_identity_not_oauth_client_id() {
+async fn member_sync_status_uses_saved_bot_identity_and_tracks_current_progress() {
+    let probe = Arc::new(db::StartupProbe::default());
+    let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+    let status_statements = || {
+        probe
+            .primary_labels()
+            .iter()
+            .filter(|label| label.starts_with("guild db/guild_data/member_directory:"))
+            .map(|label| probe.primary_statements(label))
+            .sum::<u64>()
+    };
     let f = Fixture::with_oauth_client_id(false, "999999999999999990").await;
     f.enroll(10).await;
     let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
@@ -1878,13 +1888,86 @@ async fn member_sync_status_uses_persisted_bot_identity_not_oauth_client_id() {
         .unwrap()
         .unwrap();
     let (store, scope) = f.app.tenant.live(enrollment).await.unwrap();
+    let poll = async |expected_status: &str, coverage: &str| {
+        let (status, body) = f.request("GET", "/api/guilds/10/member-sync", "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], expected_status, "{body}");
+        assert_eq!(body["coverage"], coverage, "{body}");
+        let as_of = body["as_of"].as_i64().unwrap();
+        let explicit = store
+            .member_sync_status(scope.clone(), 42, as_of)
+            .await
+            .unwrap();
+        assert_eq!(body, serde_json::to_value(explicit).unwrap());
+        body
+    };
+    let uninitialized = poll("queued", "not_started").await;
+    assert!(uninitialized["run_id"].is_null());
+    let now = uninitialized["as_of"].as_i64().unwrap();
     store
-        .initialize_member_directory(scope.clone(), 42, MEMBER_FIXTURE_MS)
+        .initialize_member_directory(scope.clone(), 42, now)
         .await
         .unwrap();
+    let queued = poll("queued", "importing").await;
+    assert!(queued["run_id"].as_str().is_some(), "{queued}");
+
+    let before_poll = status_statements();
     let (status, body) = f.request("GET", "/api/guilds/10/member-sync", "").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body["run_id"].as_str().is_some(), "{body}");
+    assert_eq!(body["run_id"], queued["run_id"]);
+    // One snapshot (BEGIN and finish), four scope checks, and four status reads.
+    assert_eq!(status_statements() - before_poll, 10);
+
+    store
+        .claim_member_sync(scope.clone(), 42, "dashboard-test".into(), now, 90_000)
+        .await
+        .unwrap()
+        .expect("seeded import is due");
+    let running = poll("running", "importing").await;
+    let paused = store
+        .member_sync_action(
+            scope.clone(),
+            42,
+            db::guild_data::MemberSyncAction::Pause,
+            "status-test-pause".into(),
+            now,
+        )
+        .await
+        .unwrap();
+    let after_action = poll("paused", "importing").await;
+    assert_eq!(after_action["progress_revision"], paused.progress_revision);
+    assert_ne!(
+        after_action["progress_revision"],
+        running["progress_revision"]
+    );
+
+    let mut guild_path = f.path.as_os_str().to_owned();
+    guild_path.push(".guild.db");
+    let guild_db = libsql::Builder::new_local(std::path::PathBuf::from(guild_path))
+        .build()
+        .await
+        .unwrap();
+    let conn = guild_db.connect().unwrap();
+    conn.execute(
+        "UPDATE guild_member_seed SET initial_completed_at_ms=?1 WHERE guild_id=10",
+        libsql::params![now],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "UPDATE guild_member_sync SET phase='complete',status='complete' WHERE guild_id=10",
+        (),
+    )
+    .await
+    .unwrap();
+    let complete = poll("complete", "complete").await;
+    assert_eq!(complete["initial_completed_at"], now);
+
+    conn.execute("DELETE FROM guild_member_sync WHERE guild_id=10", ())
+        .await
+        .unwrap();
+    let unavailable = poll("needs_attention", "complete").await;
+    assert!(unavailable["run_id"].is_null());
 }
 
 #[tokio::test]

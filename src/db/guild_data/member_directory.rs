@@ -1436,15 +1436,75 @@ fn ensure_seed_bot(
 fn status(
     conn: &impl SqlExecutor,
     scope: &GuildDataScope,
-    bot_id: i64,
+    expected_bot_id: Option<i64>,
     now_ms: i64,
     count_unseen: bool,
 ) -> Result<MemberSyncStatus> {
-    let seed = ensure_seed_bot(conn, scope, bot_id)?;
+    struct StatusSeed {
+        enrollment_id: String,
+        bot_id: i64,
+        initial_completed_at: Option<i64>,
+        reconciliation_needed: bool,
+        reconciliation_reason: Option<String>,
+        case_backfill_done: bool,
+        gap_at: Option<i64>,
+        gap_auto_clear: bool,
+    }
+    note_member_sync_statement(scope.guild_id());
+    let seed = conn
+        .query_row(
+            "SELECT enrollment_id,bot_id,initial_completed_at_ms,reconciliation_needed,
+                    reconciliation_reason,case_backfill_done,gap_at_ms,gap_auto_clear
+             FROM guild_member_seed WHERE guild_id=?1",
+            params![scope.guild_id()],
+            |row| {
+                Ok(StatusSeed {
+                    enrollment_id: row.get(0)?,
+                    bot_id: row.get(1)?,
+                    initial_completed_at: row.get(2)?,
+                    reconciliation_needed: row.get(3)?,
+                    reconciliation_reason: row.get(4)?,
+                    case_backfill_done: row.get(5)?,
+                    gap_at: row.get(6)?,
+                    gap_auto_clear: row.get(7)?,
+                })
+            },
+        )
+        .optional()?;
+    if expected_bot_id.is_none() {
+        // The dashboard uses the gateway identity that was saved for this
+        // enrollment. A legacy sync row alone does not establish a seed.
+        let saved_bot_id: Option<i64> = match &seed {
+            Some(seed) if seed.enrollment_id == scope.enrollment.id => Some(seed.bot_id),
+            _ => {
+                note_member_sync_statement(scope.guild_id());
+                conn.query_row(
+                    "SELECT bot_id FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2",
+                    params![scope.guild_id(), scope.enrollment.id.as_str()],
+                    |row| Ok(row.get(0)?),
+                )
+                .optional()?
+            }
+        };
+        anyhow::ensure!(
+            saved_bot_id.is_none_or(|id| id > 0),
+            MemberSyncError::Invalid
+        );
+    }
+    if let Some(seed) = &seed {
+        anyhow::ensure!(
+            seed.enrollment_id == scope.enrollment.id,
+            TenantDataError::Membership
+        );
+        anyhow::ensure!(
+            expected_bot_id.is_none_or(|id| seed.bot_id == id),
+            MemberSyncError::BotIdentity
+        );
+    }
     let mut out = MemberSyncStatus {
         coverage: DirectoryCoverage::NotStarted,
         automatic_reconcile_at: None,
-        initial_completed_at: seed.completed_at(),
+        initial_completed_at: seed.as_ref().and_then(|seed| seed.initial_completed_at),
         reconciliation_needed: false,
         reconciliation_reason: None,
         gap_at: None,
@@ -1490,7 +1550,7 @@ fn status(
         last_success_unchanged: None,
         unseen_candidate_count: 0,
     };
-    if seed == SeedState::Missing {
+    let Some(seed) = seed else {
         note_member_sync_statement(scope.guild_id());
         let eligible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM guild_member_feature WHERE guild_id=?1 AND enrollment_id=?2 AND seed_admitted=0)",params![scope.guild_id(),scope.enrollment.id.as_str()],|r|Ok(r.get(0)?))?;
         if eligible {
@@ -1501,15 +1561,10 @@ fn status(
             out.estimate_reason = Some("member count estimate is unavailable".into());
         }
         return Ok(out);
-    }
-    note_member_sync_statement(scope.guild_id());
-    let coverage: (bool, Option<String>, bool, Option<i64>, bool) = conn.query_row(
-        "SELECT reconciliation_needed,reconciliation_reason,case_backfill_done,gap_at_ms,gap_auto_clear FROM guild_member_seed WHERE guild_id=?1",
-        params![scope.guild_id()],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-    )?;
-    out.coverage = if seed.completed_at().is_some() {
-        if coverage.0 {
+    };
+    let bot_id = seed.bot_id;
+    out.coverage = if seed.initial_completed_at.is_some() {
+        if seed.reconciliation_needed {
             DirectoryCoverage::Uncertain
         } else {
             DirectoryCoverage::Complete
@@ -1517,11 +1572,11 @@ fn status(
     } else {
         DirectoryCoverage::Importing
     };
-    out.reconciliation_needed = coverage.0;
-    out.reconciliation_reason = coverage.1;
-    out.local_history_complete = coverage.2;
-    out.gap_at = coverage.3.filter(|_| coverage.0);
-    out.gap_auto_clear = coverage.0 && coverage.4;
+    out.reconciliation_needed = seed.reconciliation_needed;
+    out.reconciliation_reason = seed.reconciliation_reason;
+    out.local_history_complete = seed.case_backfill_done;
+    out.gap_at = seed.gap_at.filter(|_| seed.reconciliation_needed);
+    out.gap_auto_clear = seed.reconciliation_needed && seed.gap_auto_clear;
     note_member_sync_statement(scope.guild_id());
     if let Some((state, reason, cursor, processed, next, request_after, last_progress, lease_until)) = conn
         .query_row(
@@ -1690,11 +1745,11 @@ fn status(
         // same due absence rows the cleanup worker selects. The bot idle loop
         // does not need that count to decide whether work is due.
         if count_unseen {
-            let history_ready = out.initial_completed_at.is_some() && coverage.2;
+            let history_ready = out.initial_completed_at.is_some() && seed.case_backfill_done;
             note_member_sync_statement(scope.guild_id());
             out.unseen_candidate_count = conn.query_row(
                 "SELECT COUNT(*) FROM guild_member_directory d WHERE d.guild_id=?1 AND d.enrollment_id=?2 AND d.is_current=0 AND d.is_banned=0 AND d.ever_banned=0 AND d.cleanup_after_ms<=?3 AND (?4=1 OR coalesce(d.cleanup_member_checked_at_ms,-1)<max(coalesce(?5,0),coalesce(d.departed_at_ms,0))) AND NOT EXISTS(SELECT 1 FROM guild_member_pending_bans p WHERE p.guild_id=d.guild_id AND p.enrollment_id=d.enrollment_id AND p.user_id=d.user_id) AND NOT EXISTS(SELECT 1 FROM guild_member_target_checks t WHERE t.guild_id=d.guild_id AND t.enrollment_id=d.enrollment_id AND t.user_id=d.user_id)",
-                params![scope.guild_id(), scope.enrollment.id.as_str(), now_ms, i64::from(history_ready), coverage.3],
+                params![scope.guild_id(), scope.enrollment.id.as_str(), now_ms, i64::from(history_ready), seed.gap_at],
                 |r| Ok(r.get(0)?),
             )?;
         }
@@ -2122,40 +2177,18 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
                 tx.member_execute("UPDATE guild_member_feature SET seed_admitted=1 WHERE guild_id=?1 AND enrollment_id=?2 AND seed_admitted=0",params![scope.guild_id(),scope.enrollment.id.as_str()])?;
                 tx.commit()?;
             } else { tx.finish_read()?; }
-            let tx=conn.transaction_primary_snapshot()?; verify_scope(&tx,&expected,&scope,true)?; let out=status(&tx,&scope,bot_id,now_ms,false)?; tx.finish_read()?; Ok(out)
+            let tx=conn.transaction_primary_snapshot()?; verify_scope(&tx,&expected,&scope,true)?; let out=status(&tx,&scope,Some(bot_id),now_ms,false)?; tx.finish_read()?; Ok(out)
         }).await
     }
 
-    /// Gateway bot user id already persisted for this enrollment's directory work.
-    pub async fn persisted_member_sync_bot_id(&self, scope: GuildDataScope) -> Result<Option<i64>> {
-        checked_scope(self, &scope)?;
-        let expected = self.expected.clone();
-        self.db
-            .with_conn(move |conn| {
-                let tx = conn.transaction_primary_snapshot()?;
-                verify_scope(&tx, &expected, &scope, true)?;
-                let from_seed: Option<i64> = tx
-                    .query_row(
-                        "SELECT bot_id FROM guild_member_seed WHERE guild_id=?1 AND enrollment_id=?2",
-                        params![scope.guild_id(), scope.enrollment.id.as_str()],
-                        |r| Ok(r.get(0)?),
-                    )
-                    .optional()?;
-                if from_seed.is_some() {
-                    tx.finish_read()?;
-                    return Ok(from_seed);
-                }
-                let from_sync: Option<i64> = tx
-                    .query_row(
-                        "SELECT bot_id FROM guild_member_sync WHERE guild_id=?1 AND enrollment_id=?2",
-                        params![scope.guild_id(), scope.enrollment.id.as_str()],
-                        |r| Ok(r.get(0)?),
-                    )
-                    .optional()?;
-                tx.finish_read()?;
-                Ok(from_sync)
-            })
-            .await
+    /// Dashboard status from a single snapshot of the active enrollment, using
+    /// the stored gateway bot identity rather than the OAuth client ID.
+    pub async fn member_sync_dashboard_status(
+        &self,
+        scope: GuildDataScope,
+        now_ms: i64,
+    ) -> Result<MemberSyncStatus> {
+        self.read_member_sync_status(scope, None, now_ms).await
     }
 
     pub async fn member_sync_status(
@@ -2164,14 +2197,27 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
         bot_id: i64,
         now_ms: i64,
     ) -> Result<MemberSyncStatus> {
+        self.read_member_sync_status(scope, Some(bot_id), now_ms)
+            .await
+    }
+
+    async fn read_member_sync_status(
+        &self,
+        scope: GuildDataScope,
+        expected_bot_id: Option<i64>,
+        now_ms: i64,
+    ) -> Result<MemberSyncStatus> {
         checked_scope(self, &scope)?;
-        anyhow::ensure!(bot_id > 0, MemberSyncError::Invalid);
+        anyhow::ensure!(
+            expected_bot_id.is_none_or(|id| id > 0),
+            MemberSyncError::Invalid
+        );
         let expected = self.expected.clone();
         self.db
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
-                let out = status(&tx, &scope, bot_id, now_ms, true)?;
+                let out = status(&tx, &scope, expected_bot_id, now_ms, true)?;
                 tx.finish_read()?;
                 Ok(out)
             })
@@ -2206,7 +2252,7 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
                     return Err(crate::db::guild_stores::GuildWriteFenced.into());
                 }
                 verify_scope(&tx, &expected, &scope, true)?;
-                let out = status(&tx, &scope, bot_id, now_ms, false)?;
+                let out = status(&tx, &scope, Some(bot_id), now_ms, false)?;
                 tx.finish_read()?;
                 Ok(out)
             })
@@ -4461,7 +4507,7 @@ impl GuildDataStore {
                 if SyncRunKind::parse(&run_kind)==SyncRunKind::Reconcile {settle_reconcile_gap(&tx, &scope)?;}
             }
             if settled && SyncRunKind::parse(&run_kind)==SyncRunKind::Initial {tx.member_execute("INSERT OR IGNORE INTO guild_member_audit_recovery(guild_id,enrollment_id,bot_id,run_id,started_at_ms,status,next_attempt_at_ms) SELECT guild_id,enrollment_id,bot_id,lower(hex(randomblob(16))),?2,'queued',?2 FROM guild_member_seed WHERE guild_id=?1 AND reconciliation_needed=1 AND initial_completed_at_ms IS NOT NULL",params![scope.guild_id(),now_ms])?;}
-            tx.commit()?;let read=conn.transaction_primary_write()?;verify_scope(&read,&expected,&scope,true)?;let out=status(&read,&scope,claim.bot_id,now_ms,true)?;read.finish_read()?;Ok(out)
+            tx.commit()?;let read=conn.transaction_primary_write()?;verify_scope(&read,&expected,&scope,true)?;let out=status(&read,&scope,Some(claim.bot_id),now_ms,true)?;read.finish_read()?;Ok(out)
         }).await
     }
 
@@ -4544,7 +4590,7 @@ impl GuildDataStore {
             let Some((kind,state,last_key,lease_until,reason))=current else {return Err(MemberSyncError::MissingJob.into())};
             let state=SyncState::parse(&state).for_import(SyncRunKind::parse(&kind),reason.as_deref());
             let audit_stalled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM guild_member_audit_recovery WHERE guild_id=?1 AND enrollment_id=?2 AND bot_id=?3 AND status='needs_attention' AND status_reason='pagination_stalled')",params![scope.guild_id(),scope.enrollment.id.as_str(),bot_id],|r|Ok(r.get(0)?))?;
-            if last_key.as_deref()==Some(operation_key.as_str()) || (action!=MemberSyncAction::Reconcile && action!=MemberSyncAction::Retry && state==SyncState::Complete) || (action==MemberSyncAction::Retry && state==SyncState::Complete && !audit_stalled) {tx.finish_read()?;let read=conn.transaction_primary_write()?;let out=status(&read,&scope,bot_id,now_ms,true)?;read.finish_read()?;return Ok(out)}
+            if last_key.as_deref()==Some(operation_key.as_str()) || (action!=MemberSyncAction::Reconcile && action!=MemberSyncAction::Retry && state==SyncState::Complete) || (action==MemberSyncAction::Retry && state==SyncState::Complete && !audit_stalled) {tx.finish_read()?;let read=conn.transaction_primary_write()?;let out=status(&read,&scope,Some(bot_id),now_ms,true)?;read.finish_read()?;return Ok(out)}
             let allowed=state.allows(action,seed,lease_until,now_ms,audit_stalled);
             anyhow::ensure!(allowed,MemberSyncError::Invalid);
             tx.ensure_mutation_receipt()?;
@@ -4557,7 +4603,7 @@ impl GuildDataStore {
                 }
                 MemberSyncAction::Reconcile=>{enqueue_member_reconcile(&tx,scope.guild_id(),now_ms,Some(&operation_key))?;}
             }
-            let out=status(&tx,&scope,bot_id,now_ms,true)?;tx.commit()?;Ok(out)
+            let out=status(&tx,&scope,Some(bot_id),now_ms,true)?;tx.commit()?;Ok(out)
         }).await
     }
 }
