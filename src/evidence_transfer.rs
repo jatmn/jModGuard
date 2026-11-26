@@ -269,7 +269,7 @@ impl LocalEvidenceStore {
     fn stream(
         &self,
         reader: &mut impl Read,
-        mut writer: Option<&mut File>,
+        writer: &mut impl Write,
         bytes: u64,
     ) -> Result<String> {
         let mut buffer = self.buffer()?;
@@ -288,9 +288,7 @@ impl LocalEvidenceStore {
                 n as u64 <= bytes - total,
                 "evidence stream exceeds reservation"
             );
-            if let Some(w) = writer.as_mut() {
-                w.write_all(&buffer[..n])?;
-            }
+            writer.write_all(&buffer[..n])?;
             digest.update(&buffer[..n]);
             total += n as u64;
         }
@@ -309,12 +307,16 @@ impl LocalEvidenceStore {
         );
         let digest = {
             let mut file = new_file(&data)?;
-            let digest = self.stream(source, Some(&mut file), job.reserved_bytes)?;
+            let digest = self.stream(source, &mut file, job.reserved_bytes)?;
             file.sync_all()?;
             digest
         };
         ensure!(
-            self.stream(&mut File::open(&data)?, None, job.reserved_bytes)? == digest,
+            self.stream(
+                &mut File::open(&data)?,
+                &mut std::io::sink(),
+                job.reserved_bytes
+            )? == digest,
             "stored evidence checksum mismatch"
         );
         let mut receipt = new_file(&temp)?;
@@ -325,7 +327,11 @@ impl LocalEvidenceStore {
         sync_parent(&complete)?;
         Ok(VerifiedCapture { sha256: digest })
     }
-    fn verify_capture(&self, job: &EvidenceJob) -> Result<CaptureVerification> {
+    fn verify_capture(
+        &self,
+        job: &EvidenceJob,
+        output: &mut impl Write,
+    ) -> Result<CaptureVerification> {
         let [data, complete, _] = self.paths(job, false)?;
         let Some(receipt) = small_file(&complete)? else {
             return Ok(CaptureVerification::Unverified);
@@ -347,7 +353,7 @@ impl LocalEvidenceStore {
         );
         ensure!(regular(&data)?, "missing completed evidence");
         let mut file = File::open(data)?;
-        let actual = self.stream(&mut file, None, size)?;
+        let actual = self.stream(&mut file, output, size)?;
         ensure!(actual == hash, "stored evidence checksum mismatch");
         // A previous process may have died after rename but before syncing the
         // directory. Recovery must persist the verified artifacts before SQL settlement.
@@ -363,19 +369,13 @@ impl LocalEvidenceStore {
     pub fn read_available(&self, job: &EvidenceJob, expected_sha: &str) -> Result<Vec<u8>> {
         let _lock = self.lock()?;
         self.verify()?;
-        let CaptureVerification::Verified(capture) = self.verify_capture(job)? else {
+        let mut buf = Vec::new();
+        let CaptureVerification::Verified(capture) = self.verify_capture(job, &mut buf)? else {
             anyhow::bail!("evidence is not available");
         };
         ensure!(
             capture.sha256 == expected_sha,
             "stored evidence checksum mismatch"
-        );
-        let [data, _, _] = self.paths(job, false)?;
-        let mut buf = Vec::new();
-        File::open(data)?.read_to_end(&mut buf)?;
-        ensure!(
-            buf.len() as u64 == job.reserved_bytes,
-            "stored evidence size mismatch"
         );
         Ok(buf)
     }
@@ -452,7 +452,7 @@ impl LocalEvidenceStore {
             let verified = if job.cancellation == EvidenceCancellation::Cancelled {
                 Ok(CaptureVerification::Unverified)
             } else {
-                this.verify_capture(&job)
+                this.verify_capture(&job, &mut std::io::sink())
             };
             let capture = match &verified {
                 Ok(CaptureVerification::Verified(capture)) => EvidenceCapture::Stored {
