@@ -1,4 +1,4 @@
-use super::migration_fixtures::{schema_dump, user_version};
+use super::migration_fixtures::{CoreMigrationFile, schema_dump, user_version};
 use super::*;
 
 fn options(path: &Path, migrate: bool) -> DbOpenOptions {
@@ -244,22 +244,23 @@ fn first_schema_and_family_marker_rollback_together() {
 
 #[test]
 fn bot_resumes_each_committed_schema_step_before_api_opens() {
-    for completed in 1..=MIGRATIONS.len() {
-        let path = tmp_db_path("partial_schema_bootstrap");
-        let conn = Connection::open(&path).unwrap();
-        apply_core_steps(&conn, &MIGRATIONS[..completed]);
+    let prefix = CoreMigrationFile::new("schema_bootstrap_prefix");
+    for step in MIGRATIONS {
+        let conn = Connection::open(prefix.path()).unwrap();
+        apply_core_steps(&conn, std::slice::from_ref(step));
         drop(conn);
-        let error = Db::open_with(options(&path, false))
+        let case = prefix.copy_closed("partial_schema_bootstrap");
+        let path = case.path();
+        let error = Db::open_with(options(path, false))
             .err()
             .expect("API must wait for completed bot bootstrap");
         assert!(is_schema_not_ready(&error), "{error:#}");
-        drop(Db::open_with(options(&path, true)).unwrap());
-        let api = Db::open_with(options(&path, false)).unwrap();
+        drop(Db::open_with(options(path, true)).unwrap());
+        let api = Db::open_with(options(path, false)).unwrap();
         let parts = tokio_test_block_on(load_config_parts(&api, 42)).unwrap();
         assert_eq!(parts.rules.len(), crate::types::RULE_IDS.len());
         assert_eq!(parts.templates.len(), crate::types::EVENT_TYPES.len());
         drop(api);
-        cleanup_db(&path);
     }
 }
 

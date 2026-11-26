@@ -96,6 +96,31 @@ pub(super) const HISTORICAL_CORE: &[(i64, &str)] = &[
     ),
 ];
 
+/// A private migration prefix or an isolated copy used for a recovery case.
+pub(in crate::db) struct CoreMigrationFile(PathBuf);
+
+impl CoreMigrationFile {
+    pub(in crate::db) fn new(label: &str) -> Self {
+        Self(tmp_db_path(label))
+    }
+
+    pub(in crate::db) fn path(&self) -> &Path {
+        &self.0
+    }
+
+    pub(in crate::db) fn copy_closed(&self, label: &str) -> Self {
+        let copy = Self::new(label);
+        copy_closed_db(self.path(), copy.path());
+        copy
+    }
+}
+
+impl Drop for CoreMigrationFile {
+    fn drop(&mut self) {
+        cleanup_db(self.path());
+    }
+}
+
 pub(super) fn apply_core_steps(conn: &Connection, steps: &[(i64, &str)]) {
     for &(version, sql) in steps {
         let tx = conn.transaction_primary_write().unwrap();

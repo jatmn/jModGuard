@@ -2393,43 +2393,41 @@ mod tests {
 
     #[tokio::test]
     async fn interrupted_first_boot_resumes_without_adopting_existing_installations() {
-        for completed in 1..=MIGRATIONS.len() {
-            let path = std::env::temp_dir().join(format!(
-                "initial-control-{:032x}.db",
-                rand::random::<u128>()
-            ));
-            let opts = DbOpenOptions {
-                read_only: false,
-                path: path.clone(),
-                url: String::new(),
-                token: String::new(),
-                pool_size: 1,
-                migrate: false,
-                default_prefix: "!".into(),
-                retention_days: 1,
-            };
+        use crate::db::tests::migration_fixtures::CoreMigrationFile;
+
+        let prefix = CoreMigrationFile::new("initial_control_prefix");
+        let prefix_opts = DbOpenOptions {
+            read_only: false,
+            path: prefix.path().to_path_buf(),
+            url: String::new(),
+            token: String::new(),
+            pool_size: 1,
+            migrate: false,
+            default_prefix: "!".into(),
+            retention_days: 1,
+        };
+        for &(at, sql) in MIGRATIONS {
             let partial = Db::open_with_bootstrap(
-                &opts,
+                &prefix_opts,
                 |conn| {
-                    for &(at, sql) in &MIGRATIONS[..completed] {
-                        let tx = conn.transaction_immediate()?;
-                        tx.execute_batch_bounded(sql, 16 * 1024 * 1024)?;
-                        tx.pragma_update(None, "user_version", at)?;
-                        tx.commit()?;
-                    }
-                    Ok(())
+                    let tx = conn.transaction_immediate()?;
+                    tx.execute_batch_bounded(sql, 16 * 1024 * 1024)?;
+                    tx.pragma_update(None, "user_version", at)?;
+                    tx.commit()
                 },
                 |_| Ok(()),
             )
             .unwrap();
             drop(partial);
+            let case = prefix.copy_closed("initial_control");
+            let opts = DbOpenOptions {
+                path: case.path().to_path_buf(),
+                ..prefix_opts.clone()
+            };
             assert!(UpdateControl::open(&opts).unwrap().is_none());
             assert!(Db::open_with(opts.clone()).is_err());
-            drop(Db::open(&path, 1).unwrap());
+            drop(Db::open(case.path(), 1).unwrap());
             assert!(UpdateControl::open(&opts).unwrap().is_some());
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-            }
         }
     }
 
