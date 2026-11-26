@@ -2447,9 +2447,37 @@ enum ConfigReadRoute {
     Primary,
 }
 
+type ConfigLoadKey = (i64, u64);
+
+#[derive(Default)]
+struct ConfigLoads {
+    active: Mutex<HashMap<ConfigLoadKey, tokio::sync::watch::Sender<()>>>,
+}
+
+impl Clone for ConfigLoads {
+    fn clone(&self) -> Self {
+        // Cloning the cache copies its published map. Active loads only
+        // publish to the cache instance that started them.
+        Self::default()
+    }
+}
+
+struct ConfigLoad<'a> {
+    loads: &'a ConfigLoads,
+    key: ConfigLoadKey,
+}
+
+impl Drop for ConfigLoad<'_> {
+    fn drop(&mut self) {
+        // Closing the channel wakes every waiter, including on error or cancellation.
+        self.loads.active.lock().remove(&self.key);
+    }
+}
+
 #[derive(Clone)]
 pub struct ConfigCache {
     map: DashMap<i64, Arc<CachedGuildConfig>>,
+    loads: ConfigLoads,
     version: Arc<AtomicU64>,
     ttl: Duration,
     durable_floor: Arc<AtomicU64>,
@@ -2467,6 +2495,7 @@ impl ConfigCache {
     pub fn new(durable_floor: u64, revision: String) -> Self {
         Self {
             map: DashMap::new(),
+            loads: ConfigLoads::default(),
             version: Arc::new(AtomicU64::new(0)),
             ttl: Duration::from_secs(15),
             durable_floor: Arc::new(AtomicU64::new(durable_floor)),
@@ -2477,8 +2506,7 @@ impl ConfigCache {
 
     pub fn invalidate(&self) {
         let _publication = self.publication_lock.lock();
-        self.version.fetch_add(1, Ordering::Relaxed);
-        self.map.clear();
+        self.clear_publication();
     }
 
     pub fn require_version(&self, version: u64) {
@@ -2490,7 +2518,17 @@ impl ConfigCache {
         let _publication = self.publication_lock.lock();
         self.durable_floor.store(version, Ordering::SeqCst);
         *self.accepted_revision.lock() = revision;
-        self.version.fetch_add(1, Ordering::Relaxed);
+        self.clear_publication();
+    }
+
+    // Called under the publication lock. Advancing the generation and closing
+    // its old flights are atomic with respect to new flight registrations.
+    fn clear_publication(&self) {
+        {
+            let mut active = self.loads.active.lock();
+            self.version.fetch_add(1, Ordering::Relaxed);
+            active.clear();
+        }
         self.map.clear();
     }
 
@@ -2519,26 +2557,63 @@ impl ConfigCache {
     }
 
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
-        let required = self
-            .durable_floor
-            .load(Ordering::SeqCst)
-            .max(db.required_config_version());
-        if let Some(entry) = self.map.get(&(guild_id as i64))
-            && entry.version == self.version.load(Ordering::Relaxed)
-            && entry.loaded_at.elapsed() < self.ttl
-            && entry.durable_version >= required
-        {
-            return Ok(Arc::clone(&entry));
-        }
+        let guild_id = guild_id as i64;
         let mut route = ConfigReadRoute::Replica;
         let mut last_observed = 0;
-        let mut last_required = required;
-        for _ in 0..3 {
+        let mut last_required = 0;
+        let mut attempt = 0;
+        let mut load: Option<ConfigLoad<'_>> = None;
+        while attempt < 3 {
+            if attempt == 0 {
+                let required = self
+                    .durable_floor
+                    .load(Ordering::SeqCst)
+                    .max(db.required_config_version());
+                if let Some(entry) = self.map.get(&guild_id)
+                    && entry.version == self.version.load(Ordering::Relaxed)
+                    && entry.loaded_at.elapsed() < self.ttl
+                    && entry.durable_version >= required
+                {
+                    return Ok(Arc::clone(&entry));
+                }
+            }
+
             let version = self.version.load(Ordering::Relaxed);
+            let key = (guild_id, version);
+            if load.as_ref().is_none_or(|load| load.key != key) {
+                drop(load.take());
+                let waiting = {
+                    let mut active = self.loads.active.lock();
+                    if self.version.load(Ordering::Relaxed) != version {
+                        continue;
+                    }
+                    match active.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            Some(entry.get().subscribe())
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(tokio::sync::watch::channel(()).0);
+                            None
+                        }
+                    }
+                };
+                if let Some(mut waiting) = waiting {
+                    let _ = waiting.changed().await;
+                } else {
+                    load = Some(ConfigLoad {
+                        loads: &self.loads,
+                        key,
+                    });
+                }
+                // A prior owner may have published while we were entering the
+                // flight. Every caller rechecks its own floor before reading.
+                continue;
+            }
+            attempt += 1;
             let (durable_version, revision, parts) = if route == ConfigReadRoute::Primary {
-                db::load_config_parts_with_version_primary(db, guild_id as i64).await?
+                db::load_config_parts_with_version_primary(db, guild_id).await?
             } else {
-                db::load_config_parts_with_version(db, guild_id as i64).await?
+                db::load_config_parts_with_version(db, guild_id).await?
             };
             let required_after = self
                 .durable_floor
@@ -2581,7 +2656,7 @@ impl ConfigCache {
                     route = ConfigReadRoute::Primary;
                     continue;
                 }
-                self.map.insert(guild_id as i64, Arc::clone(&cfg));
+                self.map.insert(guild_id, Arc::clone(&cfg));
                 return Ok(cfg);
             }
         }
@@ -2594,6 +2669,212 @@ impl ConfigCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_flight_database() -> (std::path::PathBuf, Db) {
+        let directory = std::env::temp_dir().join(format!(
+            "jmodguard_config_flight_{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let db = Db::open(&directory.join("core.db"), 2).unwrap();
+        (directory, db)
+    }
+
+    async fn hold_config_connection(
+        db: &Db,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let db = db.clone();
+        let task = tokio::spawn(async move {
+            db.with_conn(move |_| {
+                entered.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(15))?;
+                Ok(())
+            })
+            .await
+        });
+        ready.await.unwrap();
+        (release, task)
+    }
+
+    async fn poll_config_miss<F: Future>(mut call: Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn config_flight_shares_one_snapshot_and_compiled_config() {
+        let probe = Arc::new(db::StartupProbe::default());
+        let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let (directory, db) = config_flight_database();
+        db::patch_settings(&db, 42, Some(Some("guild!".into())), None, None)
+            .await
+            .unwrap();
+        let versions = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        let (release_first, first) = hold_config_connection(&db).await;
+        let (release_second, second) = hold_config_connection(&db).await;
+        let before = probe.transactions();
+        {
+            let mut calls: Vec<_> = (0..32).map(|_| Box::pin(cache.get(&db, 42))).collect();
+            for call in &mut calls {
+                poll_config_miss(call.as_mut()).await;
+            }
+            release_first.send(()).unwrap();
+            release_second.send(()).unwrap();
+            let config = calls[0].as_mut().await.unwrap();
+            assert_eq!(config.settings.prefix, "guild!");
+            let mut reused = 1;
+            for call in &mut calls[1..] {
+                let loaded = call.as_mut().await.unwrap();
+                reused += usize::from(Arc::ptr_eq(&config, &loaded));
+            }
+            assert_eq!(
+                (probe.transactions() - before, reused),
+                (1, 32),
+                "all callers share one snapshot and compiled result"
+            );
+        }
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert!(cache.loads.active.lock().is_empty());
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_flight_other_guild_and_new_generation_do_not_wait_for_old_load() {
+        let (directory, db) = config_flight_database();
+        let separate_pool = Db::open(&directory.join("core.db"), 2).unwrap();
+        let versions = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        let held = [
+            hold_config_connection(&db).await,
+            hold_config_connection(&db).await,
+        ];
+        let mut old_load = Box::pin(cache.get(&db, 42));
+        let mut old_waiter = Box::pin(cache.get(&db, 42));
+        poll_config_miss(old_load.as_mut()).await;
+        poll_config_miss(old_waiter.as_mut()).await;
+
+        let parallel = tokio::time::timeout(Duration::from_secs(10), async {
+            let other_guild = cache.get(&separate_pool, 43).await.unwrap();
+            assert!(Arc::ptr_eq(&other_guild, &cache.last_known(43).unwrap()));
+            assert!(cache.last_known(42).is_none());
+
+            db::patch_settings(
+                &separate_pool,
+                42,
+                Some(Some("new guild!".into())),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let versions = db::get_primary_versions(&separate_pool).await.unwrap();
+            cache.require_primary_revision(versions.config, versions.config_revision);
+            assert!(cache.last_known(43).is_none());
+            let new_generation = cache.get(&separate_pool, 42).await.unwrap();
+            assert_eq!(new_generation.settings.prefix, "new guild!");
+            let waiter = old_waiter.await.unwrap();
+            assert!(Arc::ptr_eq(&new_generation, &waiter));
+            new_generation
+        })
+        .await
+        .expect(
+            "unrelated guild, new generation and old waiter complete while the old load is held",
+        );
+
+        for (release, task) in held {
+            release.send(()).unwrap();
+            task.await.unwrap().unwrap();
+        }
+        let previous_caller = old_load.await.unwrap();
+        assert_eq!(previous_caller.settings.prefix, "new guild!");
+        assert_eq!(previous_caller.durable_version, parallel.durable_version);
+        assert!(cache.loads.active.lock().is_empty());
+        drop((db, separate_pool));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_flight_cancelled_owner_releases_waiter() {
+        let (directory, db) = config_flight_database();
+        let versions = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        let held = [
+            hold_config_connection(&db).await,
+            hold_config_connection(&db).await,
+        ];
+        let mut owner = Box::pin(cache.get(&db, 42));
+        let mut waiter = Box::pin(cache.get(&db, 42));
+        poll_config_miss(owner.as_mut()).await;
+        poll_config_miss(waiter.as_mut()).await;
+        drop(owner);
+        assert!(cache.loads.active.lock().is_empty());
+
+        for (release, task) in held {
+            release.send(()).unwrap();
+            task.await.unwrap().unwrap();
+        }
+        let config = waiter.await.unwrap();
+        assert!(Arc::ptr_eq(&config, &cache.last_known(42).unwrap()));
+        assert!(cache.loads.active.lock().is_empty());
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_flight_failed_owner_releases_waiter_without_caching_the_error() {
+        let (directory, db) = config_flight_database();
+        let versions = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        db.with_conn(|conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded("ALTER TABLE rules RENAME TO held_rules", 65_536)?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+        let held = [
+            hold_config_connection(&db).await,
+            hold_config_connection(&db).await,
+        ];
+        let mut owner = Box::pin(cache.get(&db, 42));
+        let mut waiter = Box::pin(cache.get(&db, 42));
+        poll_config_miss(owner.as_mut()).await;
+        poll_config_miss(waiter.as_mut()).await;
+        for (release, task) in held {
+            release.send(()).unwrap();
+            task.await.unwrap().unwrap();
+        }
+        let Err(error) = owner.await else {
+            panic!("a missing config table should fail the load");
+        };
+        assert!(format!("{error:#}").contains("no such table: rules"));
+        assert!(cache.last_known(42).is_none());
+        assert!(cache.loads.active.lock().is_empty());
+
+        db.with_conn(|conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded("ALTER TABLE held_rules RENAME TO rules", 65_536)?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+        let config = waiter.await.unwrap();
+        assert!(Arc::ptr_eq(&config, &cache.last_known(42).unwrap()));
+        assert!(cache.loads.active.lock().is_empty());
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn ban_observation_release_and_restart_keep_registration_bounded() {
