@@ -1878,8 +1878,8 @@ mod tests {
         let mut layout = CgroupLayout::default();
         let mut rate = CpuRate::default();
         let start = tokio::time::Instant::now().into_std();
-        let mut observe = |seconds| {
-            let reading = read_scoped_proc_cgroup(&proc.path, &mount, &mut layout);
+        let mut observe = |layout: &mut CgroupLayout, seconds| {
+            let reading = read_scoped_proc_cgroup(&proc.path, &mount, layout);
             let sample = fold_sample(
                 &mut rate,
                 None,
@@ -1889,10 +1889,12 @@ mod tests {
             );
             (sample, reading.scopes)
         };
-        let (initial, initial_scopes) = observe(0);
+        let (initial, initial_scopes) = observe(&mut layout, 0);
         assert_eq!(initial.cpu_tenths, None);
         assert_eq!(initial_scopes.cpu, initial_scopes.memory);
         assert_eq!(initial_scopes.cpu.len(), 3);
+        let cached_memory_dirs = layout.memory_dirs.as_ptr();
+        let cached_cpu_dirs = layout.cpu_dirs.as_ptr();
 
         write_files(
             &worker,
@@ -1901,10 +1903,21 @@ mod tests {
                 ("memory.current", "1200\n"),
             ],
         );
-        let (warm, warm_scopes) = observe(5);
+        let (warm, warm_scopes) = observe(&mut layout, 5);
         assert_eq!(warm.cpu_tenths, Some(200));
         assert_eq!(warm.memory.unwrap().program_bytes, 1100);
         assert_eq!(warm_scopes, initial_scopes);
+        // Resolving a new layout allocates replacement vectors before dropping these.
+        assert_eq!(
+            layout.memory_dirs.as_ptr(),
+            cached_memory_dirs,
+            "warm sample must reuse memory directories"
+        );
+        assert_eq!(
+            layout.cpu_dirs.as_ptr(),
+            cached_cpu_dirs,
+            "warm sample must reuse CPU directories"
+        );
 
         // The resolved path and leaf identity stay the same but an ancestor
         // was replaced. Lineage must change without losing the CPU baseline.
@@ -1913,14 +1926,14 @@ mod tests {
         std::fs::create_dir(&parent).unwrap();
         std::fs::rename(retired.join("worker"), &worker).unwrap();
         write_files(&worker, &[("cpu.stat", "usage_usec 2005000\n")]);
-        let (reparented, updated_scopes) = observe(10);
+        let (reparented, updated_scopes) = observe(&mut layout, 10);
         assert_eq!(reparented.cpu_tenths, Some(200));
         assert_eq!(updated_scopes.cpu[0], initial_scopes.cpu[0]);
         assert_ne!(updated_scopes.cpu[1], initial_scopes.cpu[1]);
         assert_eq!(updated_scopes.cpu, updated_scopes.memory);
 
         write_files(&proc.path, &[("self/cgroup", "0::/other\n")]);
-        let (moved, moved_scopes) = observe(15);
+        let (moved, moved_scopes) = observe(&mut layout, 15);
         assert_eq!(moved.cpu_tenths, None);
         assert_eq!(
             moved_scopes.cpu_relation(&updated_scopes),
@@ -1931,22 +1944,22 @@ mod tests {
             &proc.path,
             &[("self/mountinfo", &v2_mount_line("/other", &remount))],
         );
-        let (mounted, mounted_scopes) = observe(20);
+        let (mounted, mounted_scopes) = observe(&mut layout, 20);
         assert_eq!(mounted.cpu_tenths, None);
         assert_eq!(mounted_scopes.cpu.len(), 1);
         assert_ne!(mounted_scopes.cpu[0], moved_scopes.cpu[0]);
         write_files(&remount, &[("cpu.stat", "usage_usec 9000000\n")]);
-        assert_eq!(observe(25).0.cpu_tenths, Some(200));
+        assert_eq!(observe(&mut layout, 25).0.cpu_tenths, Some(200));
 
         std::fs::remove_file(proc.path.join("self/mountinfo")).unwrap();
-        let (unavailable, scopes) = observe(30);
+        let (unavailable, scopes) = observe(&mut layout, 30);
         assert_eq!(unavailable, ContainerSample::unavailable());
         assert!(scopes.is_empty());
         write_files(
             &proc.path,
             &[("self/mountinfo", &v2_mount_line("/other", &remount))],
         );
-        assert_eq!(observe(35), (mounted, mounted_scopes));
+        assert_eq!(observe(&mut layout, 35), (mounted, mounted_scopes));
     }
 
     #[cfg(target_os = "linux")]
