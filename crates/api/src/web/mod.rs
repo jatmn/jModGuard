@@ -458,6 +458,7 @@ pub async fn require_auth_for_guilds(
 // as access marks invalidate it for that guild on the next request.
 const GUILD_REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
 const GUILD_REFRESH_JITTER_MS: u64 = 30_000;
+const GUILD_REFRESH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 const GUILD_AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(240);
 const GUILD_AUTH_MAX_STALE: std::time::Duration = std::time::Duration::from_secs(300);
 const _: () = assert!(
@@ -543,6 +544,9 @@ pub(super) struct SessionAuth {
     guilds_epoch: i64,
     /// A background refresh of `guilds` is running.
     refreshing: bool,
+    /// Only background retries wait here. Foreground authorization uses the
+    /// snapshot's original observation time and the Discord rate-limit gate.
+    guild_refresh_retry_at: Option<std::time::Instant>,
     lifecycle: SessionLifecycle,
     last_used: Option<std::time::Instant>,
     refresh_hold: Option<RefreshHold>,
@@ -556,6 +560,7 @@ impl SessionAuth {
         self.token = None;
         self.refresh = None;
         self.guilds = None;
+        self.guild_refresh_retry_at = None;
         self.refresh_hold = None;
         self.refresh_backoff = std::time::Duration::ZERO;
     }
@@ -812,6 +817,7 @@ async fn require_auth_with(
         state.release_refresh_hold();
         state.token = Some(refreshed.access_token.clone());
         state.guilds = None;
+        state.guild_refresh_retry_at = None;
         session
             .insert(SESSION_TOKEN, &refreshed.access_token)
             .await
@@ -892,6 +898,7 @@ async fn load_auth(
             Ok(guilds) => {
                 state.guilds = Some((std::time::Instant::now(), guilds.clone()));
                 state.guilds_epoch = epoch;
+                state.guild_refresh_retry_at = None;
                 guilds
             }
             Err(oauth::GuildListError::RateLimited { .. })
@@ -936,7 +943,12 @@ fn start_guild_refresh(
     user_id: u64,
     token: &str,
 ) {
-    if state.refreshing {
+    if state.refreshing
+        || state
+            .guild_refresh_retry_at
+            .is_some_and(|at| at > app.oauth.guild_refresh_now())
+        || app.oauth.guild_route_limited(user_id)
+    {
         return;
     }
     state.refreshing = true;
@@ -948,6 +960,11 @@ fn start_guild_refresh(
     let shared = Arc::clone(shared);
     let token = token.to_owned();
     tokio::spawn(async move {
+        // Another session or Discord route can close the gate after scheduling.
+        if app.oauth.guild_route_limited(user_id) {
+            shared.lock().await.refreshing = false;
+            return;
+        }
         let started = std::time::Instant::now();
         let epoch = current_access_epoch(&app).await;
         let guilds = app.oauth.my_guilds_at(user_id, &token, epoch).await;
@@ -960,12 +977,20 @@ fn start_guild_refresh(
         if state.lifecycle.is_retired() || state.token.as_deref() != Some(token.as_str()) {
             return;
         }
-        if let Ok(guilds) = guilds
-            && state.guilds.as_ref().is_none_or(|(at, _)| *at <= started)
-        {
-            state.guilds = Some((started, guilds.clone()));
-            state.guilds_epoch = epoch;
-            app.guild_cache.insert(user_id, (started, guilds));
+        if state.guilds.as_ref().is_none_or(|(at, _)| *at <= started) {
+            match guilds {
+                Ok(guilds) => {
+                    state.guilds = Some((started, guilds.clone()));
+                    state.guilds_epoch = epoch;
+                    state.guild_refresh_retry_at = None;
+                    app.guild_cache.insert(user_id, (started, guilds));
+                }
+                Err(oauth::GuildListError::Unauthorized | oauth::GuildListError::Failed(_)) => {
+                    state.guild_refresh_retry_at =
+                        Some(app.oauth.guild_refresh_now() + GUILD_REFRESH_RETRY_DELAY);
+                }
+                Err(oauth::GuildListError::RateLimited { .. }) => {}
+            }
         }
         if let Some(user) = user {
             app.user_cache.insert(user_id, (started, user));

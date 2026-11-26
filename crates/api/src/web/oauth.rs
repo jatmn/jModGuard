@@ -787,6 +787,18 @@ impl OAuthClient {
         self.route_remaining(&format!("g:{user_id}")).is_some()
     }
 
+    pub(super) fn guild_refresh_now(&self) -> Instant {
+        #[cfg(test)]
+        {
+            self.guild_list
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .now()
+        }
+        #[cfg(not(test))]
+        Instant::now()
+    }
+
     fn hold_for_body(&self, user_key: &str) -> (Instant, i64) {
         let mut gate = self
             .guild_list
