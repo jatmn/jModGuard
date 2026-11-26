@@ -4832,6 +4832,15 @@ async function launchFirefox(defaultFontSize) {
   }
 }
 
+// Saves the theme before each new document's own scripts read it, so one navigation renders it.
+async function seedTheme(browser, theme) {
+  const { script } = await browser.send('script.addPreloadScript', {
+    functionDeclaration: `() => localStorage.setItem('jmodguard.theme', ${JSON.stringify(theme)})`,
+    contexts: [browser.context],
+  });
+  return script;
+}
+
 test('a fragment-only preview stays read-only on the round trip through Administration', { timeout: 60000 }, async t => {
   if (!firefoxBinary || !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url))) {
     assert.ok(!process.env.CI, 'CI requires Firefox and the built WebUI');
@@ -5033,11 +5042,10 @@ test('dashboard density fits 1280x800 and keeps 24px targets in both themes', { 
   browser = await launchFirefox();
   const url = `http://127.0.0.1:${server.address().port}/`;
   for (const theme of ['light', 'dark']) {
+    const preload = await seedTheme(browser, theme);
     for (const [width, height] of [[1280, 800], [1920, 1080], [700, 800]]) {
       const name = `${theme} ${width}x${height}`;
       await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height } });
-      await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
-      await browser.send('script.evaluate', { expression: `localStorage.setItem('jmodguard.theme', '${theme}')`, target: { context: browser.context }, awaitPromise: false });
       await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
       const { result } = await browser.send('script.evaluate', { expression: densityProbe, target: { context: browser.context }, awaitPromise: true });
       const m = JSON.parse(result.value);
@@ -5070,6 +5078,7 @@ test('dashboard density fits 1280x800 and keeps 24px targets in both themes', { 
       assert.equal(m.scrollY, 0, name);
       assert.ok(m.stats.bottom <= m.viewport, `${name}: stat grid ends at ${m.stats.bottom}px of ${m.viewport}px`);
     }
+    await browser.send('script.removePreloadScript', { script: preload });
   }
 });
 
@@ -5198,11 +5207,10 @@ test('analytics dashboard shows enforcement and membership above the fold in bot
   const url = `http://127.0.0.1:${server.address().port}/`;
   const bars = new Set();
   for (const theme of ['light', 'dark']) {
+    const preload = await seedTheme(browser, theme);
     for (const [width, height] of [[1280, 800], [1920, 1080], [700, 800]]) {
       const name = `${theme} ${width}x${height}`;
       await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height } });
-      await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
-      await browser.send('script.evaluate', { expression: `localStorage.setItem('jmodguard.theme', '${theme}')`, target: { context: browser.context }, awaitPromise: false });
       await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
       const { result } = await browser.send('script.evaluate', { expression: analyticsLayoutProbe, target: { context: browser.context }, awaitPromise: true });
       const m = JSON.parse(result.value);
@@ -5227,6 +5235,7 @@ test('analytics dashboard shows enforcement and membership above the fold in bot
       assert.ok(enforcement.bottom <= m.viewport && membership.bottom <= m.viewport,
         `${name}: both trend panels above the fold (${enforcement.bottom}/${membership.bottom} of ${m.viewport})`);
     }
+    await browser.send('script.removePreloadScript', { script: preload });
   }
   assert.equal(bars.size, 2, 'series colors follow the theme');
 });
