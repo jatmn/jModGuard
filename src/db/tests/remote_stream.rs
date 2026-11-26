@@ -1215,6 +1215,53 @@ async fn maximal_badword_batch_commits_within_remote_transaction_lifetime() {
     super::cleanup_db(&path);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn bot_config_proof_miss_keeps_the_full_snapshot_request_budget() {
+    let path = super::tmp_db_path("remote_bot_config_proof");
+    let local = Db::open(&path, 2).unwrap();
+    add_badword(&local, 10, "original", None).await.unwrap();
+    let (fixture, remote) = HranaFixture::modeled_latency_database(
+        &path,
+        Duration::from_millis(80),
+        Duration::from_secs(5),
+        Arc::default(),
+    )
+    .await;
+
+    let requests = || fixture.state.lock().unwrap().requests;
+    let before_cold = requests();
+    let cold = read_bot_config(&remote, 10, false, None).await.unwrap();
+    assert_eq!(cold.parts.unwrap().badwords, ["original"]);
+    let full_read_requests = requests() - before_cold;
+    let proof = cold.proof.unwrap();
+
+    let before_hit = requests();
+    let hit = read_bot_config(&remote, 10, false, Some(proof.clone()))
+        .await
+        .unwrap();
+    assert!(hit.parts.is_none());
+    assert_eq!((hit.version, hit.revision), (cold.version, cold.revision));
+    assert_eq!(requests() - before_hit, full_read_requests);
+
+    add_badword(&local, 10, "changed", None).await.unwrap();
+    let before_miss = requests();
+    let miss = read_bot_config(&remote, 10, false, Some(proof))
+        .await
+        .unwrap();
+    assert_eq!(miss.version, cold.version + 1);
+    assert_eq!(miss.parts.unwrap().badwords, ["original", "changed"]);
+    assert_eq!(
+        requests() - before_miss,
+        full_read_requests,
+        "an expired proof that misses must use the same Hrana budget as a full read"
+    );
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
 fn read_one(conn: &mut Connection) -> Result<i64> {
     conn.query_row("SELECT 1", (), |row| Ok(row.get(0)?))
 }

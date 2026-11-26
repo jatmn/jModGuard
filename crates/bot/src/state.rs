@@ -2517,8 +2517,15 @@ enum ConfigReadRoute {
 }
 
 #[derive(Clone)]
+struct ConfigCacheEntry {
+    config: Arc<CachedGuildConfig>,
+    validated_at: tokio::time::Instant,
+    proof: Option<db::BotConfigProof>,
+}
+
+#[derive(Clone)]
 pub struct ConfigCache {
-    map: DashMap<i64, Arc<CachedGuildConfig>>,
+    map: DashMap<i64, ConfigCacheEntry>,
     version: Arc<AtomicU64>,
     ttl: Duration,
     durable_floor: Arc<AtomicU64>,
@@ -2584,31 +2591,45 @@ impl ConfigCache {
     pub(crate) fn last_known(&self, guild_id: u64) -> Option<Arc<CachedGuildConfig>> {
         self.map
             .get(&(guild_id as i64))
-            .map(|entry| Arc::clone(&entry))
+            .map(|entry| Arc::clone(&entry.config))
     }
 
     pub async fn get(&self, db: &Db, guild_id: u64) -> Result<Arc<CachedGuildConfig>> {
-        let required = self
-            .durable_floor
-            .load(Ordering::SeqCst)
-            .max(db.required_config_version());
-        if let Some(entry) = self.map.get(&(guild_id as i64))
-            && entry.version == self.version.load(Ordering::Relaxed)
-            && entry.loaded_at.elapsed() < self.ttl
-            && entry.durable_version >= required
-        {
-            return Ok(Arc::clone(&entry));
-        }
+        let guild_id = guild_id as i64;
         let mut route = ConfigReadRoute::Replica;
         let mut last_observed = 0;
-        let mut last_required = required;
-        for _ in 0..3 {
-            let version = self.version.load(Ordering::Relaxed);
-            let (durable_version, revision, parts) = if route == ConfigReadRoute::Primary {
-                db::load_config_parts_with_version_primary(db, guild_id as i64).await?
-            } else {
-                db::load_config_parts_with_version(db, guild_id as i64).await?
+        let mut last_required = 0;
+        for attempt in 0..3 {
+            let required = self
+                .durable_floor
+                .load(Ordering::SeqCst)
+                .max(db.required_config_version());
+            let (version, expired) = {
+                let entry = self.map.get(&guild_id);
+                let version = self.version.load(Ordering::Relaxed);
+                let expired = if let Some(entry) = entry.filter(|entry| {
+                    entry.config.version == version && entry.config.durable_version >= required
+                }) {
+                    // A concurrent cache fill must not bypass a pending primary retry.
+                    if attempt == 0 && entry.validated_at.elapsed() < self.ttl {
+                        return Ok(Arc::clone(&entry.config));
+                    }
+                    entry
+                        .proof
+                        .clone()
+                        .map(|proof| (Arc::clone(&entry.config), proof))
+                } else {
+                    None
+                };
+                (version, expired)
             };
+            let (previous, proof) = expired.unzip();
+            let db::BotConfigRead {
+                version: durable_version,
+                revision,
+                proof,
+                parts,
+            } = db::read_bot_config(db, guild_id, route == ConfigReadRoute::Primary, proof).await?;
             let required_after = self
                 .durable_floor
                 .load(Ordering::SeqCst)
@@ -2628,11 +2649,13 @@ impl ConfigCache {
                 route = ConfigReadRoute::Primary;
                 continue;
             }
-            let cfg = Arc::new(CachedGuildConfig::from_parts(
-                version,
-                durable_version,
-                parts,
-            ));
+            let cfg = parts.map(|parts| {
+                Arc::new(CachedGuildConfig::from_parts(
+                    version,
+                    durable_version,
+                    parts,
+                ))
+            });
             {
                 // Publication and invalidation share one lock, closing the
                 // check→insert window that could republish a stale snapshot
@@ -2650,8 +2673,27 @@ impl ConfigCache {
                     route = ConfigReadRoute::Primary;
                     continue;
                 }
-                self.map.insert(guild_id as i64, Arc::clone(&cfg));
-                return Ok(cfg);
+                let validated_at = tokio::time::Instant::now();
+                if let Some(cfg) = cfg {
+                    self.map.insert(
+                        guild_id,
+                        ConfigCacheEntry {
+                            config: Arc::clone(&cfg),
+                            validated_at,
+                            proof,
+                        },
+                    );
+                    return Ok(cfg);
+                }
+                // Another load may have replaced the expired entry while
+                // its proof was in flight, even without advancing the floor.
+                if let Some(previous) = previous
+                    && let Some(mut entry) = self.map.get_mut(&guild_id)
+                    && Arc::ptr_eq(&entry.config, &previous)
+                {
+                    entry.validated_at = validated_at;
+                    return Ok(previous);
+                }
             }
         }
         anyhow::bail!(
@@ -4284,5 +4326,144 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
         crate::tenant::remove_sidecars(&tmp);
+    }
+
+    fn config_revalidation_test_database() -> Db {
+        let path = std::env::temp_dir().join(format!(
+            "jmodguard_config_revalidation_{:032x}.db",
+            rand::random::<u128>()
+        ));
+        Db::open(&path, 2).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_config_reuses_unchanged_compiled_rules() {
+        let probe = Arc::new(db::StartupProbe::default());
+        let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let db = config_revalidation_test_database();
+        let current = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(current.config, current.config_revision);
+        let before = probe.transactions();
+        let first = cache.get(&db, 42).await.unwrap();
+        assert_eq!(probe.transactions() - before, 1);
+        for reads in 2..=4 {
+            tokio::time::advance(Duration::from_secs(16)).await;
+            let next = cache.get(&db, 42).await.unwrap();
+            assert!(
+                Arc::ptr_eq(&first, &next),
+                "reuse the one compiled snapshot"
+            );
+            assert_eq!(probe.transactions() - before, reads);
+            assert!(Arc::ptr_eq(&next, &cache.get(&db, 42).await.unwrap()));
+            assert_eq!(
+                probe.transactions() - before,
+                reads,
+                "fresh hit does no reads"
+            );
+        }
+
+        db::patch_settings(&db, 0, Some(Some("global!".into())), None, None)
+            .await
+            .unwrap();
+        let inherited = cache.get(&db, 42).await.unwrap();
+        assert_eq!(inherited.settings.prefix, "global!");
+        assert!(!Arc::ptr_eq(&inherited, &first));
+
+        db::patch_settings(&db, 42, Some(Some("guild!".into())), None, None)
+            .await
+            .unwrap();
+        let guild = cache.get(&db, 42).await.unwrap();
+        assert_eq!(guild.settings.prefix, "guild!");
+        assert!(!Arc::ptr_eq(&guild, &inherited));
+
+        cache.invalidate();
+        assert!(!Arc::ptr_eq(&guild, &cache.get(&db, 42).await.unwrap()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_config_reloads_legacy_revision_after_restore() {
+        let db = config_revalidation_test_database();
+        db.with_conn(|conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(
+                "DELETE FROM meta WHERE key = 'config_revision';
+                 UPDATE rules SET data = json_set(data, '$.name', 'Old invite')
+                 WHERE guild_id = 0 AND rule_id = 'invite'",
+                65_536,
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+        let legacy = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(legacy.config, legacy.config_revision.clone());
+        let first = cache.get(&db, 42).await.unwrap();
+        assert_eq!(first.rules["invite"].name, "Old invite");
+
+        db.with_conn(|conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(
+                "UPDATE rules SET data = json_set(data, '$.name', 'Restored invite')
+                 WHERE guild_id = 0 AND rule_id = 'invite'",
+                65_536,
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+        assert_eq!(db::get_primary_versions(&db).await.unwrap(), legacy);
+        tokio::time::advance(Duration::from_secs(16)).await;
+        let restored = cache.get(&db, 42).await.unwrap();
+        assert_eq!(restored.rules["invite"].name, "Restored invite");
+        assert!(!Arc::ptr_eq(&first, &restored));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_config_reloads_after_unversioned_rule_markers_change() {
+        const LEGACY_INVITE: &str = "Discord invite links (whitelisted servers can be configured in params.allowlist_guilds).";
+        const UPGRADED_INVITE: &str =
+            "Discord invite links, except invite codes configured in allowlist_codes.";
+        let db = config_revalidation_test_database();
+        db.with_conn(|conn| {
+            let tx = conn.transaction_immediate()?;
+            tx.execute_batch_bounded(
+                "DELETE FROM meta WHERE key IN ('invite_description_v1', 'velocity_default_dry_run');
+                 DELETE FROM rules WHERE guild_id = 0 AND rule_id = 'velocity'",
+                65_536,
+            )?;
+            db::SqlExecutor::execute_bounded(
+                &tx,
+                "UPDATE rules SET data = json_set(data, '$.description', ?1)
+                 WHERE guild_id = 0 AND rule_id = 'invite'",
+                db::params![LEGACY_INVITE],
+                65_536,
+            )?;
+            tx.commit()
+        })
+        .await
+        .unwrap();
+        let current = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(current.config, current.config_revision.clone());
+        let first = cache.get(&db, 42).await.unwrap();
+        assert_eq!(first.rules["invite"].description, LEGACY_INVITE);
+        assert!(!first.rules["velocity"].dry_run);
+
+        for marker in ["invite_description_v1", "velocity_default_dry_run"] {
+            db.with_conn(move |conn| {
+                let tx = conn.transaction_immediate()?;
+                db::write_meta_string_conn(&tx, marker, "1")?;
+                tx.commit()
+            })
+            .await
+            .unwrap();
+            assert_eq!(db::get_primary_versions(&db).await.unwrap(), current);
+            tokio::time::advance(Duration::from_secs(16)).await;
+            let refreshed = cache.get(&db, 42).await.unwrap();
+            assert_eq!(refreshed.rules["invite"].description, UPGRADED_INVITE);
+            assert_eq!(
+                refreshed.rules["velocity"].dry_run,
+                marker == "velocity_default_dry_run"
+            );
+        }
     }
 }
