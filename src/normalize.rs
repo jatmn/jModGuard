@@ -93,10 +93,12 @@ pub fn normalize_lenient(input: &str) -> String {
 /// Fully compacted form: leetspeak + all whitespace removed, so spaced-out
 /// bypass attempts like "s c a m" match `scam`.
 pub fn normalize_compact(input: &str) -> String {
-    normalize_text(input, false)
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect()
+    compact_normalized(&normalize_lenient(input))
+}
+
+/// Removes whitespace from an already lenient-normalized string.
+pub fn compact_normalized(input: &str) -> String {
+    input.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// Checks a message against a compiled pattern, testing the raw text, the
