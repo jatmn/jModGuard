@@ -220,9 +220,17 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     };
     return () => count;
   }
+  function failJsonStringify(predicate) {
+    const json = vm.runInContext('JSON', context);
+    const stringify = json.stringify;
+    json.stringify = (value, replacer, space) => {
+      if (predicate(value)) throw new RangeError('Invalid string length');
+      return stringify(value, replacer, space);
+    };
+  }
   vm.runInContext('root.render(h(App));', context);
   pages.push({dom, roots});
-  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, measureMemberRowRenders, measureResourceChartRenders, measureJsonPrettyPrints, advanceTime(ms) { clockOffsetMs += ms; } };
+  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, measureMemberRowRenders, measureResourceChartRenders, measureJsonPrettyPrints, failJsonStringify, advanceTime(ms) { clockOffsetMs += ms; } };
 }
 
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
@@ -12151,6 +12159,26 @@ test('two admissible in-memory display copies over the combined budget evict the
   assert.equal(lastUpdated(view.h), 'Refreshing…');
   await view.finish();
   assert.match(view.table(), /Revalidated/);
+});
+
+test('a display read too large to serialize is shown fresh and drops its superseded copy', async () => {
+  const view = await memoryBudgetView();
+  await view.changeDate(5, 'Cached', 0);
+  await view.changeDate(6, 'Other', 0);
+  assert.equal(view.stored('Cached'), true);
+  view.h.failJsonStringify((value) => value?.at !== undefined
+    && value?.data?.bans?.[0]?.user_display_name === 'Unserializable');
+  await view.changeDate(5, 'Unserializable', 0);
+  assert.match(view.table(), /Unserializable/);
+  assert.doesNotMatch(view.h.document.body.textContent, /Refresh failed/, 'a cache rejection is not a refresh error');
+  assert.equal(view.stored('Cached'), false, 'the superseded stored copy is dropped');
+
+  await view.changeDate(6, 'Elsewhere', 0);
+  await view.changeDate(5, 'Again', 0, true);
+  assert.doesNotMatch(view.table(), /Cached|Unserializable/, 'no superseded copy is served from memory');
+  assert.match(view.table(), /Loading/);
+  await view.finish();
+  assert.match(view.table(), /Again/);
 });
 
 test('a configuration save reclaims display copies when real session storage is full', async () => {

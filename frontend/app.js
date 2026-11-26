@@ -10244,7 +10244,14 @@ function setSessionItemWithReadCacheFallback(storage, key, value) {
 
 function storeRead(key, data, at) {
   const entry = { at, data };
-  const value = JSON.stringify(entry);
+  let value;
+  try {
+    value = JSON.stringify(entry);
+  } catch (_) {
+    // A response too large to serialize is too large to cache.
+    discardRead(key);
+    return;
+  }
   const size = key.length + value.length;
   rememberRead(key, entry, size);
   try {
