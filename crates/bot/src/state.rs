@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 use crate::automod::AutomodEngine;
 use crate::config::BotProcessConfig;
@@ -2448,10 +2449,32 @@ enum ConfigReadRoute {
 }
 
 type ConfigLoadKey = (i64, u64);
+type ConfigLoadSender = watch::Sender<Option<ConfigLoadFailure>>;
+
+#[derive(Debug)]
+struct SharedConfigReadError(Arc<anyhow::Error>);
+
+impl std::fmt::Display for SharedConfigReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("guild configuration snapshot failed")
+    }
+}
+
+impl std::error::Error for SharedConfigReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
+
+struct ConfigLoadFailure {
+    route: ConfigReadRoute,
+    rejected_replica: Option<(u64, String)>,
+    error: Arc<anyhow::Error>,
+}
 
 #[derive(Default)]
 struct ConfigLoads {
-    active: Mutex<HashMap<ConfigLoadKey, tokio::sync::watch::Sender<()>>>,
+    active: Mutex<HashMap<ConfigLoadKey, ConfigLoadSender>>,
 }
 
 impl Clone for ConfigLoads {
@@ -2463,14 +2486,44 @@ impl Clone for ConfigLoads {
 }
 
 struct ConfigLoad<'a> {
-    loads: &'a ConfigLoads,
+    loads: Option<&'a ConfigLoads>,
     key: ConfigLoadKey,
+    rejected_replica: Option<(u64, String)>,
+}
+
+impl ConfigLoad<'_> {
+    fn release(&mut self) -> Option<ConfigLoadSender> {
+        self.loads.take()?.active.lock().remove(&self.key)
+    }
+
+    fn finish_with_error(&mut self, route: ConfigReadRoute, error: anyhow::Error) -> anyhow::Error {
+        if let Some(sender) = self.release()
+            && sender.receiver_count() > 0
+        {
+            // Only callers already subscribed to the removed flight can see this error.
+            let error = Arc::new(error);
+            sender.send_replace(Some(ConfigLoadFailure {
+                route,
+                rejected_replica: self.rejected_replica.take(),
+                error: Arc::clone(&error),
+            }));
+            return SharedConfigReadError(error).into();
+        }
+        error
+    }
+
+    fn retry_primary(&mut self, route: &mut ConfigReadRoute, version: u64, revision: String) {
+        if *route == ConfigReadRoute::Replica {
+            self.rejected_replica = Some((version, revision));
+            *route = ConfigReadRoute::Primary;
+        }
+    }
 }
 
 impl Drop for ConfigLoad<'_> {
     fn drop(&mut self) {
-        // Closing the channel wakes every waiter, including on error or cancellation.
-        self.loads.active.lock().remove(&self.key);
+        // Channel closure wakes waiters on publication and cancellation.
+        self.release();
     }
 }
 
@@ -2479,6 +2532,7 @@ pub struct ConfigCache {
     map: DashMap<i64, Arc<CachedGuildConfig>>,
     loads: ConfigLoads,
     version: Arc<AtomicU64>,
+    invalidated: watch::Sender<()>,
     ttl: Duration,
     durable_floor: Arc<AtomicU64>,
     publication_lock: Arc<parking_lot::Mutex<()>>,
@@ -2497,6 +2551,7 @@ impl ConfigCache {
             map: DashMap::new(),
             loads: ConfigLoads::default(),
             version: Arc::new(AtomicU64::new(0)),
+            invalidated: watch::channel(()).0,
             ttl: Duration::from_secs(15),
             durable_floor: Arc::new(AtomicU64::new(durable_floor)),
             publication_lock: Arc::new(parking_lot::Mutex::new(())),
@@ -2529,6 +2584,8 @@ impl ConfigCache {
             self.version.fetch_add(1, Ordering::Relaxed);
             active.clear();
         }
+        // Copies share generation changes and keep their own flights.
+        self.invalidated.send_replace(());
         self.map.clear();
     }
 
@@ -2582,6 +2639,7 @@ impl ConfigCache {
             let key = (guild_id, version);
             if load.as_ref().is_none_or(|load| load.key != key) {
                 drop(load.take());
+                let mut invalidated = self.invalidated.subscribe();
                 let waiting = {
                     let mut active = self.loads.active.lock();
                     if self.version.load(Ordering::Relaxed) != version {
@@ -2592,29 +2650,53 @@ impl ConfigCache {
                             Some(entry.get().subscribe())
                         }
                         std::collections::hash_map::Entry::Vacant(entry) => {
-                            entry.insert(tokio::sync::watch::channel(()).0);
+                            entry.insert(watch::channel(None).0);
                             None
                         }
                     }
                 };
                 if let Some(mut waiting) = waiting {
-                    let _ = waiting.changed().await;
+                    tokio::select! {
+                        biased;
+                        _ = invalidated.changed() => {}
+                        _ = waiting.changed() => {
+                            if self.version.load(Ordering::Relaxed) == version
+                                && let Some(failure) = waiting.borrow().as_ref()
+                                && (failure.route == route
+                                    || (route == ConfigReadRoute::Replica
+                                        && failure.rejected_replica.as_ref().is_some_and(
+                                            |(version, revision)| {
+                                                *version
+                                                    < self.durable_floor.load(Ordering::SeqCst)
+                                                        .max(db.required_config_version())
+                                                    || *revision != *self.accepted_revision.lock()
+                                            },
+                                        )))
+                            {
+                                return Err(SharedConfigReadError(Arc::clone(&failure.error)).into());
+                            }
+                        }
+                    }
                 } else {
                     load = Some(ConfigLoad {
-                        loads: &self.loads,
+                        loads: Some(&self.loads),
                         key,
+                        rejected_replica: None,
                     });
                 }
                 // A prior owner may have published while we were entering the
                 // flight. Every caller rechecks its own floor before reading.
                 continue;
             }
+            let owner = load.as_mut().expect("registered config load");
             attempt += 1;
-            let (durable_version, revision, parts) = if route == ConfigReadRoute::Primary {
-                db::load_config_parts_with_version_primary(db, guild_id).await?
+            let result = if route == ConfigReadRoute::Primary {
+                db::load_config_parts_with_version_primary(db, guild_id).await
             } else {
-                db::load_config_parts_with_version(db, guild_id).await?
+                db::load_config_parts_with_version(db, guild_id).await
             };
+            let (durable_version, revision, parts) =
+                result.map_err(|error| owner.finish_with_error(route, error))?;
             let required_after = self
                 .durable_floor
                 .load(Ordering::SeqCst)
@@ -2631,7 +2713,7 @@ impl ConfigCache {
                 // Replica lag is expected after a successful remote write. Do
                 // not drop moderation/commands while waiting for convergence:
                 // retry through one primary-routed, single-snapshot read.
-                route = ConfigReadRoute::Primary;
+                owner.retry_primary(&mut route, durable_version, revision);
                 continue;
             }
             let cfg = Arc::new(CachedGuildConfig::from_parts(
@@ -2649,11 +2731,24 @@ impl ConfigCache {
                     .load(Ordering::SeqCst)
                     .max(db.required_config_version());
                 let accepted_revision = self.accepted_revision.lock().clone();
-                if self.version.load(Ordering::Relaxed) != version
-                    || durable_version < required_now
-                    || revision != accepted_revision
+                let current_version = self.version.load(Ordering::Relaxed);
+                let snapshot_matches =
+                    durable_version >= required_now && revision == accepted_revision;
+                // A coherent replica read superseded only by invalidation can
+                // reuse a newer publication. An authoritative retry still runs
+                // when a floor or revision mismatch required primary routing.
+                if current_version != version
+                    && route == ConfigReadRoute::Replica
+                    && snapshot_matches
+                    && let Some(entry) = self.map.get(&guild_id)
+                    && entry.version == current_version
+                    && entry.loaded_at.elapsed() < self.ttl
+                    && entry.durable_version >= required_now
                 {
-                    route = ConfigReadRoute::Primary;
+                    return Ok(Arc::clone(&entry));
+                }
+                if current_version != version || !snapshot_matches {
+                    owner.retry_primary(&mut route, durable_version, revision);
                     continue;
                 }
                 self.map.insert(guild_id, Arc::clone(&cfg));
@@ -2669,6 +2764,40 @@ impl ConfigCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ban_observation_release_and_restart_keep_registration_bounded() {
+        let directory =
+            std::env::temp_dir().join(format!("ban_flight_{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("core.db");
+        let before_start = chrono::Utc::now().timestamp_millis();
+        let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+        let observation = app.begin_gateway_ban_observation(10, 55).await;
+        assert!(observation.audit_after_ms() >= before_start);
+        drop(observation);
+        assert!(app.gateway_ban_flight(10, 55).lock().subjects.is_empty());
+        // Completed observations release their per-subject registrations.
+        for user in 1..4096 {
+            app.begin_gateway_ban_observation(10, user)
+                .await
+                .finish()
+                .await;
+        }
+        assert_eq!(app.gateway_ban_flights.len(), 256);
+        for flight in &app.gateway_ban_flights {
+            let flight = flight.lock();
+            assert!(flight.subjects.values().all(|subject| subject.active == 0));
+        }
+        drop(app);
+        let before_restart = chrono::Utc::now().timestamp_millis();
+        let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
+        let next = app.begin_gateway_ban_observation(10, 55).await;
+        assert!(next.audit_after_ms() >= before_restart);
+        next.finish().await;
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn config_flight_database() -> (std::path::PathBuf, Db) {
         let directory = std::env::temp_dir().join(format!(
@@ -2799,8 +2928,114 @@ mod tests {
         let previous_caller = old_load.await.unwrap();
         assert_eq!(previous_caller.settings.prefix, "new guild!");
         assert_eq!(previous_caller.durable_version, parallel.durable_version);
+        assert!(Arc::ptr_eq(&previous_caller, &parallel));
         assert!(cache.loads.active.lock().is_empty());
         drop((db, separate_pool));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn config_flight_preserves_primary_retry_after_replica_mismatch() {
+        let probe = Arc::new(db::StartupProbe::default());
+        let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let (directory, db) = config_flight_database();
+        let reader = Db::open(&directory.join("core.db"), 2).unwrap();
+        let stale = db::load_config_parts_with_version(&db, 42).await.unwrap();
+        db::patch_settings(&reader, 42, Some(Some("primary!".into())), None, None)
+            .await
+            .unwrap();
+        let versions = db::get_primary_versions(&reader).await.unwrap();
+        assert!(stale.0 < versions.config);
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        let held = [
+            hold_config_connection(&db).await,
+            hold_config_connection(&db).await,
+        ];
+        db.test_inject_next_config_snapshot(stale);
+        let mut owner = Box::pin(cache.get(&db, 42));
+        poll_config_miss(owner.as_mut()).await;
+
+        cache.invalidate();
+        let published = cache.get(&reader, 42).await.unwrap();
+        let before = probe.transactions();
+        for (release, task) in held {
+            release.send(()).unwrap();
+            task.await.unwrap().unwrap();
+        }
+        let verified = owner.await.unwrap();
+        assert_eq!(verified.settings.prefix, "primary!");
+        assert!(!Arc::ptr_eq(&verified, &published));
+        assert_eq!(
+            probe.transactions() - before,
+            2,
+            "the caller verifies both the old and new generation on the primary"
+        );
+        drop((db, reader));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_flight_invalidation_wakes_waiter_in_copied_cache() {
+        let (directory, db) = config_flight_database();
+        let reader = Db::open(&directory.join("core.db"), 2).unwrap();
+        let versions = db::get_primary_versions(&db).await.unwrap();
+        let cache = ConfigCache::new(versions.config, versions.config_revision);
+        let copied = Arc::new(cache.clone());
+        let held = [
+            hold_config_connection(&db).await,
+            hold_config_connection(&db).await,
+        ];
+        let mut old_owner = Box::pin(copied.get(&db, 42));
+        poll_config_miss(old_owner.as_mut()).await;
+
+        let (joined, ready) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn({
+            let copied = Arc::clone(&copied);
+            let reader = reader.clone();
+            async move {
+                let mut call = Box::pin(copied.get(&reader, 42));
+                poll_config_miss(call.as_mut()).await;
+                joined.send(()).unwrap();
+                call.await
+            }
+        });
+        ready.await.unwrap();
+        assert!(!waiter.is_finished());
+        assert_eq!(
+            copied
+                .loads
+                .active
+                .lock()
+                .values()
+                .next()
+                .unwrap()
+                .receiver_count(),
+            1
+        );
+
+        db::patch_settings(&reader, 42, Some(Some("updated!".into())), None, None)
+            .await
+            .unwrap();
+        cache.require_version(db::get_primary_versions(&reader).await.unwrap().config);
+        let config = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("invalidation wakes a copied waiter while its old owner is held")
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.settings.prefix, "updated!");
+        assert!(cache.last_known(42).is_none());
+        let original = cache.get(&reader, 42).await.unwrap();
+        assert!(!Arc::ptr_eq(&config, &original));
+
+        for (release, task) in held {
+            release.send(()).unwrap();
+            task.await.unwrap().unwrap();
+        }
+        let late = old_owner.await.unwrap();
+        assert!(Arc::ptr_eq(&late, &config));
+        assert!(copied.loads.active.lock().is_empty());
+        drop((db, reader));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2832,8 +3067,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_flight_failed_owner_releases_waiter_without_caching_the_error() {
+    async fn config_flight_shares_one_failed_snapshot_without_caching_the_error() {
+        let probe = Arc::new(db::StartupProbe::default());
+        let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
         let (directory, db) = config_flight_database();
+        assert_config_flight_shares_one_failed_snapshot(directory, db, &probe).await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn config_flight_shares_one_primary_failure_after_replica_mismatch() {
+        let probe = Arc::new(db::StartupProbe::default());
+        let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+        let (directory, db) = config_flight_database();
+        let (version, _revision, parts) =
+            db::load_config_parts_with_version(&db, 42).await.unwrap();
+        db.test_inject_next_config_snapshot((version, "old revision".into(), parts));
+        assert_config_flight_shares_one_failed_snapshot(directory, db, &probe).await;
+    }
+
+    async fn assert_config_flight_shares_one_failed_snapshot(
+        directory: std::path::PathBuf,
+        db: Db,
+        probe: &db::StartupProbe,
+    ) {
         let versions = db::get_primary_versions(&db).await.unwrap();
         let cache = ConfigCache::new(versions.config, versions.config_revision);
         db.with_conn(|conn| {
@@ -2847,20 +3104,32 @@ mod tests {
             hold_config_connection(&db).await,
             hold_config_connection(&db).await,
         ];
-        let mut owner = Box::pin(cache.get(&db, 42));
-        let mut waiter = Box::pin(cache.get(&db, 42));
-        poll_config_miss(owner.as_mut()).await;
-        poll_config_miss(waiter.as_mut()).await;
-        for (release, task) in held {
-            release.send(()).unwrap();
-            task.await.unwrap().unwrap();
+        let before = probe.transactions();
+        {
+            let mut calls: Vec<_> = (0..32).map(|_| Box::pin(cache.get(&db, 42))).collect();
+            for call in &mut calls {
+                poll_config_miss(call.as_mut()).await;
+            }
+            for (release, task) in held {
+                release.send(()).unwrap();
+                task.await.unwrap().unwrap();
+            }
+            for call in calls {
+                let Err(error) = call.await else {
+                    panic!("a missing config table should fail all joined calls");
+                };
+                assert!(format!("{error:#}").contains("no such table: rules"));
+            }
         }
-        let Err(error) = owner.await else {
-            panic!("a missing config table should fail the load");
-        };
-        assert!(format!("{error:#}").contains("no such table: rules"));
+        assert_eq!(probe.transactions() - before, 1, "one failed snapshot");
         assert!(cache.last_known(42).is_none());
         assert!(cache.loads.active.lock().is_empty());
+        assert!(cache.get(&db, 42).await.is_err());
+        assert_eq!(
+            probe.transactions() - before,
+            2,
+            "a later caller starts a fresh snapshot during the outage"
+        );
 
         db.with_conn(|conn| {
             let tx = conn.transaction_immediate()?;
@@ -2869,44 +3138,10 @@ mod tests {
         })
         .await
         .unwrap();
-        let config = waiter.await.unwrap();
+        let config = cache.get(&db, 42).await.unwrap();
         assert!(Arc::ptr_eq(&config, &cache.last_known(42).unwrap()));
         assert!(cache.loads.active.lock().is_empty());
         drop(db);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[tokio::test]
-    async fn ban_observation_release_and_restart_keep_registration_bounded() {
-        let directory =
-            std::env::temp_dir().join(format!("ban_flight_{:032x}", rand::random::<u128>()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("core.db");
-        let before_start = chrono::Utc::now().timestamp_millis();
-        let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-        let observation = app.begin_gateway_ban_observation(10, 55).await;
-        assert!(observation.audit_after_ms() >= before_start);
-        drop(observation);
-        assert!(app.gateway_ban_flight(10, 55).lock().subjects.is_empty());
-        // Completed observations release their per-subject registrations.
-        for user in 1..4096 {
-            app.begin_gateway_ban_observation(10, user)
-                .await
-                .finish()
-                .await;
-        }
-        assert_eq!(app.gateway_ban_flights.len(), 256);
-        for flight in &app.gateway_ban_flights {
-            let flight = flight.lock();
-            assert!(flight.subjects.values().all(|subject| subject.active == 0));
-        }
-        drop(app);
-        let before_restart = chrono::Utc::now().timestamp_millis();
-        let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-        let next = app.begin_gateway_ban_observation(10, 55).await;
-        assert!(next.audit_after_ms() >= before_restart);
-        next.finish().await;
-        drop(app);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
