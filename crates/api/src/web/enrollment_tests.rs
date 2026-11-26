@@ -6137,6 +6137,7 @@ async fn owner_routes_reject_a_discord_administrator() {
         ("POST", "/api/database-usage", ""),
         ("POST", "/api/database-usage/{id}", ""),
         ("POST", "/api/platform/analytics", ""),
+        ("POST", "/api/platform/analytics/members", ""),
         ("GET", "/api/updates", ""),
         ("POST", "/api/updates", ""),
         ("POST", "/api/updates/check", r#"{"component":"api"}"#),
@@ -10131,15 +10132,21 @@ async fn owner_leave_and_receipt_reject_non_owner_sessions() {
 #[tokio::test]
 async fn platform_member_totals_distinguish_empty_unavailable_and_incomplete_fleets() {
     let f = Fixture::new(true).await;
-    let empty = platform::member_totals(&f.app).await;
+    let read_members =
+        || owner_router_request(&f, "POST", "/api/platform/analytics/members", "", &f.cookie);
+    let (status, empty) = read_members().await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
     assert_eq!(empty["status"], "complete", "{empty}");
     assert_eq!(empty["servers"], 0);
     assert_eq!(empty["current"], 0);
+    assert_eq!(empty["snapshot_guild_ids"], serde_json::json!([]));
 
     f.enroll(10).await;
-    let unavailable = platform::member_totals(&f.app).await;
+    let (status, unavailable) = read_members().await;
+    assert_eq!(status, StatusCode::OK, "{unavailable}");
     assert_eq!(unavailable["status"], "unavailable", "{unavailable}");
     assert_eq!(unavailable["guilds_unavailable"], 1);
+    assert_eq!(unavailable["snapshot_guild_ids"], serde_json::json!(["10"]));
 
     let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
     f.app
@@ -10148,7 +10155,8 @@ async fn platform_member_totals_distinguish_empty_unavailable_and_incomplete_fle
         .await
         .unwrap()
         .unwrap();
-    let not_started = platform::member_totals(&f.app).await;
+    let (status, not_started) = read_members().await;
+    assert_eq!(status, StatusCode::OK, "{not_started}");
     assert_eq!(not_started["status"], "partial", "{not_started}");
     assert_eq!(not_started["guilds_counted"], 1);
     assert_eq!(not_started["guilds_unavailable"], 0);
@@ -10166,8 +10174,94 @@ async fn platform_member_totals_distinguish_empty_unavailable_and_incomplete_fle
         .initialize_member_directory(scope, 42, i64::MAX)
         .await
         .unwrap();
-    let importing = platform::member_totals(&f.app).await;
+    let (status, importing) = read_members().await;
+    assert_eq!(status, StatusCode::OK, "{importing}");
     assert_eq!(importing["by_guild"]["10"]["coverage"], "importing");
+}
+
+struct PlatformDirectoryHold {
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+thread_local! {
+    static PLATFORM_DIRECTORY_HOLD: std::cell::RefCell<Option<PlatformDirectoryHold>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) async fn before_platform_directory_totals() {
+    if let Some(hold) = PLATFORM_DIRECTORY_HOLD.with_borrow_mut(Option::take) {
+        hold.reached.send(()).unwrap();
+        hold.resume.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn platform_history_skips_tenant_reads_while_member_totals_are_pending() {
+    let sql = Arc::new(db::StartupProbe::default());
+    let _probe = db::enter_startup_probe(Some(Arc::clone(&sql)));
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
+    f.app.tenant.activate(enrollment).await.unwrap().unwrap();
+    let guild_statements = || {
+        sql.primary_labels()
+            .iter()
+            .filter(|label| label.starts_with("guild "))
+            .map(|label| sql.primary_statements(label))
+            .sum::<u64>()
+    };
+
+    let (reached, started) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    PLATFORM_DIRECTORY_HOLD.with_borrow_mut(|slot| {
+        *slot = Some(PlatformDirectoryHold { reached, resume });
+    });
+    let before_members = guild_statements();
+    let read = |path| owner_router_request(&f, "POST", path, "", &f.cookie);
+    let mut members = Box::pin(read("/api/platform/analytics/members"));
+    tokio::select! {
+        result = &mut members => panic!("the directory query should wait: {result:?}"),
+        started = tokio::time::timeout(std::time::Duration::from_secs(5), started) => {
+            started.expect("the request did not reach the guild store").unwrap();
+        }
+    }
+    let pending_members = guild_statements();
+    assert!(
+        pending_members > before_members,
+        "the member request reached the real store"
+    );
+    for days in [30, 7, 90] {
+        let path = format!("/api/platform/analytics?days={days}&include_members=false");
+        let (status, history) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            owner_router_request(&f, "POST", &path, "", &f.cookie),
+        )
+        .await
+        .expect("history should return before the member request finishes");
+        assert_eq!(status, StatusCode::OK, "{history}");
+        assert_eq!(history["series"].as_array().unwrap().len(), days);
+        assert!(history.get("members").is_none());
+        assert_eq!(guild_statements(), pending_members, "range {days}");
+    }
+
+    release.send(()).unwrap();
+    let (status, mut totals) = members.await;
+    assert_eq!(status, StatusCode::OK, "{totals}");
+    assert_eq!(totals["status"], "partial");
+    assert_eq!(
+        totals.as_object_mut().unwrap().remove("snapshot_guild_ids"),
+        Some(serde_json::json!(["10"]))
+    );
+    assert!(
+        guild_statements() > pending_members,
+        "the released store query was observed"
+    );
+
+    let (status, legacy) = read("/api/platform/analytics?days=7").await;
+    assert_eq!(status, StatusCode::OK, "{legacy}");
+    assert_eq!(legacy["series"].as_array().unwrap().len(), 7);
+    assert_eq!(legacy["members"], totals);
 }
 
 #[tokio::test]
@@ -10194,15 +10288,13 @@ async fn platform_analytics_accepts_only_dashboard_ranges() {
     assert_eq!(body["error"], "analytics range must be 7, 30 or 90 days");
 
     let other = Fixture::new(false).await;
-    let (status, body) = owner_router_request(
-        &other,
-        "POST",
+    for path in [
         "/api/platform/analytics?days=7",
-        "",
-        &other.cookie,
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        "/api/platform/analytics?days=7&include_members=false",
+    ] {
+        let (status, body) = owner_router_request(&other, "POST", path, "", &other.cookie).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
 }
 
 fn member_guild(id: u64) -> oauth::DiscordGuild {

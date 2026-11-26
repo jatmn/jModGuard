@@ -1,5 +1,5 @@
 //! Owner-only platform analytics: fleet-wide series for one range (7, 30 or
-//! 90 days) plus member directory totals. Directory totals probe each active
+//! 90 days) and current member directory totals. Directory totals probe each active
 //! guild's store within a bounded request budget; unavailable stores are
 //! reported as unknown instead of failing the whole read, and directories
 //! whose coverage is not established make the totals partial.
@@ -31,6 +31,7 @@ fn error(status: StatusCode, message: &'static str) -> (StatusCode, Json<Value>)
 #[serde(deny_unknown_fields)]
 pub struct PlatformQuery {
     days: Option<i64>,
+    include_members: Option<bool>,
 }
 
 pub async fn analytics(
@@ -54,14 +55,25 @@ pub async fn analytics(
         )
     })?;
     let mut value = json!(core);
-    value["members"] = json!(member_totals(&app).await);
+    if query.include_members.unwrap_or(true) {
+        value["members"] = member_totals(&app, false).await;
+    }
     Ok(Json(value))
+}
+
+pub async fn members(
+    State(app): State<Arc<ApiState>>,
+    session: Session,
+    headers: HeaderMap,
+) -> Reply {
+    authorize(&app, &session, &headers).await?;
+    Ok(Json(member_totals(&app, true).await))
 }
 
 /// Sums the member directory across active guilds. `by_guild` maps each
 /// counted guild's decimal-string ID to its current count and directory
-/// coverage; an active guild missing from it was unavailable.
-pub(super) async fn member_totals(app: &Arc<ApiState>) -> Value {
+/// coverage. The split route also identifies every guild in its snapshot.
+async fn member_totals(app: &Arc<ApiState>, include_snapshot_guild_ids: bool) -> Value {
     let began = Instant::now();
     let enrollments = match db::list_active_guild_enrollments(&app.db).await {
         Ok(rows) => rows,
@@ -75,6 +87,12 @@ pub(super) async fn member_totals(app: &Arc<ApiState>) -> Value {
     let mut unavailable = 0i64;
     let mut incomplete = 0i64;
     let mut by_guild = Map::new();
+    let snapshot_guild_ids = include_snapshot_guild_ids.then(|| {
+        enrollments
+            .iter()
+            .map(|enrollment| enrollment.guild_id.to_string())
+            .collect::<Vec<_>>()
+    });
     for enrollment in enrollments {
         let guild_id = enrollment.guild_id.to_string();
         // Clamp each probe to the remaining budget so the last probe cannot
@@ -86,6 +104,8 @@ pub(super) async fn member_totals(app: &Arc<ApiState>) -> Value {
         }
         let probe = tokio::time::timeout(STORE_PROBE.min(remaining), async {
             let (store, scope) = app.tenant.live(enrollment.clone()).await?;
+            #[cfg(test)]
+            super::enrollment_tests::before_platform_directory_totals().await;
             store.directory_totals(scope).await
         })
         .await;
@@ -113,22 +133,27 @@ pub(super) async fn member_totals(app: &Arc<ApiState>) -> Value {
             _ => unavailable += 1,
         }
     }
-    if counted == 0 && unavailable > 0 {
-        return json!({
+    let mut result = if counted == 0 && unavailable > 0 {
+        json!({
             "status": "unavailable",
             "servers": servers,
             "guilds_unavailable": unavailable,
-        });
+        })
+    } else {
+        json!({
+            "status": if unavailable == 0 && incomplete == 0 { "complete" } else { "partial" },
+            "servers": servers,
+            "current": current,
+            "banned": banned,
+            "known": known,
+            "guilds_counted": counted,
+            "guilds_unavailable": unavailable,
+            "guilds_incomplete": incomplete,
+            "by_guild": by_guild,
+        })
+    };
+    if let Some(ids) = snapshot_guild_ids {
+        result["snapshot_guild_ids"] = json!(ids);
     }
-    json!({
-        "status": if unavailable == 0 && incomplete == 0 { "complete" } else { "partial" },
-        "servers": servers,
-        "current": current,
-        "banned": banned,
-        "known": known,
-        "guilds_counted": counted,
-        "guilds_unavailable": unavailable,
-        "guilds_incomplete": incomplete,
-        "by_guild": by_guild,
-    })
+    result
 }
