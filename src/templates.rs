@@ -795,6 +795,34 @@ pub fn render(template: &str, vars: &BTreeMap<String, String>) -> String {
 /// Render a Discord-sized report without first allocating an expanded message.
 /// The limit counts UTF-16 units; unknown tokens retain the normal renderer's behavior.
 pub fn render_bounded(template: &str, vars: &BTreeMap<String, String>, max_units: usize) -> String {
+    let (mut out, remaining, complete) = expand_within(template, vars, max_units);
+    if !complete && max_units > 0 {
+        // Make room for the marker even if the previous character used two units.
+        if remaining == 0 {
+            out.pop();
+        }
+        out.push('…');
+    }
+    out
+}
+
+/// The complete rendering when it fits in `max_units` UTF-16 units, otherwise `None`.
+/// Expansion stops at the limit, so an oversized candidate is never allocated in full.
+pub fn render_within(
+    template: &str,
+    vars: &BTreeMap<String, String>,
+    max_units: usize,
+) -> Option<String> {
+    let (out, _, complete) = expand_within(template, vars, max_units);
+    complete.then_some(out)
+}
+
+/// Expanded prefix that fits, the units left, and whether the whole template fit.
+fn expand_within(
+    template: &str,
+    vars: &BTreeMap<String, String>,
+    max_units: usize,
+) -> (String, usize, bool) {
     let mut out = String::new();
     let mut remaining = max_units;
     let mut append = |text: &str| {
@@ -822,17 +850,10 @@ pub fn render_bounded(template: &str, vars: &BTreeMap<String, String>, max_units
             append(chunk)
         };
         if !complete {
-            if max_units > 0 {
-                // Make room for the marker even if the previous character used two units.
-                if remaining == 0 {
-                    out.pop();
-                }
-                out.push('…');
-            }
-            break;
+            return (out, remaining, false);
         }
     }
-    out
+    (out, remaining, true)
 }
 
 /// UTF-16 units still available for one template substitution after rendering the rest.
@@ -895,6 +916,43 @@ mod bounded_tests {
                 assert!(out.ends_with('…'));
             }
         }
+    }
+    #[test]
+    fn render_within_reports_whether_the_complete_expansion_fit() {
+        let exact_ellipsis = format!("{}…", "a".repeat(1999));
+        let over_ellipsis = format!("{}…", "a".repeat(2000));
+        let crabs = "🦀".repeat(1000);
+        let odd_crabs = format!("a{crabs}");
+        let half = format!("{}|", "🦀".repeat(500));
+        for (template, body, limit, fits) in [
+            ("{body}", exact_ellipsis.as_str(), 2000, true),
+            ("{body}", over_ellipsis.as_str(), 2000, false),
+            ("{body}", crabs.as_str(), 2000, true),
+            ("{body}", odd_crabs.as_str(), 2000, false),
+            ("{body}", odd_crabs.as_str(), 2001, true),
+            ("{body}{body}", half.as_str(), 2002, true),
+            ("{body}{body}", half.as_str(), 2001, false),
+            ("{body} {missing} {body}", half.as_str(), 2013, true),
+            ("{body} {missing} {body}", half.as_str(), 2012, false),
+        ] {
+            let vars = BTreeMap::from([("body".to_string(), body.to_string())]);
+            let full = render(template, &vars);
+            assert_eq!(
+                full.encode_utf16().count() <= limit,
+                fits,
+                "{template:?} {limit}"
+            );
+            let within = render_within(template, &vars, limit);
+            assert_eq!(within, fits.then(|| full.clone()), "{template:?} {limit}");
+            if fits {
+                assert_eq!(render_bounded(template, &vars, limit), full);
+            }
+        }
+        // A truncated render can end exactly like a complete one, so callers
+        // cannot infer completion from the marker.
+        let over = BTreeMap::from([("body".to_string(), over_ellipsis)]);
+        assert_eq!(render_bounded("{body}", &over, 2000), exact_ellipsis);
+        assert_eq!(render_within("{body}", &over, 2000), None);
     }
 }
 
