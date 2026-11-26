@@ -1868,6 +1868,16 @@ async fn member_sync_retry_admits_audit_pagination_stall_after_initial_complete(
 
 #[tokio::test]
 async fn member_sync_status_uses_saved_bot_identity_and_tracks_current_progress() {
+    let probe = Arc::new(db::StartupProbe::default());
+    let _probe = db::enter_startup_probe(Some(Arc::clone(&probe)));
+    let status_statements = || {
+        probe
+            .primary_labels()
+            .iter()
+            .filter(|label| label.starts_with("guild db/guild_data/member_directory:"))
+            .map(|label| probe.primary_statements(label))
+            .sum::<u64>()
+    };
     let f = Fixture::with_oauth_client_id(false, "999999999999999990").await;
     f.enroll(10).await;
     let enrollment = db::guild_enrollment(&f.app.db, 10).await.unwrap().unwrap();
@@ -1900,6 +1910,13 @@ async fn member_sync_status_uses_saved_bot_identity_and_tracks_current_progress(
         .unwrap();
     let queued = poll("queued", "importing").await;
     assert!(queued["run_id"].as_str().is_some(), "{queued}");
+
+    let before_poll = status_statements();
+    let (status, body) = f.request("GET", "/api/guilds/10/member-sync", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["run_id"], queued["run_id"]);
+    // One snapshot (BEGIN and finish), four scope checks, and four status reads.
+    assert_eq!(status_statements() - before_poll, 10);
 
     store
         .claim_member_sync(scope.clone(), 42, "dashboard-test".into(), now, 90_000)
