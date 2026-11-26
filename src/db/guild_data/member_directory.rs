@@ -2336,6 +2336,58 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
             .await
     }
 
+    /// Capture the current stay and whether it has a matching rejoin receipt.
+    /// If only the receipt lookup fails, the provider may already have ended
+    /// that snapshot, so recover the stay from a fresh scope-verified read.
+    pub async fn current_rejoin_note(
+        &self,
+        scope: GuildDataScope,
+        user_id: i64,
+    ) -> Result<(Option<String>, Result<bool>)> {
+        checked_scope(self, &scope)?;
+        anyhow::ensure!(user_id > 0, MemberSyncError::Invalid);
+        let expected = self.expected.clone();
+        let fallback_scope = scope.clone();
+        let projected = self
+            .db
+            .with_conn(move |conn| {
+                let tx = conn.transaction_primary_snapshot()?;
+                verify_scope(&tx, &expected, &scope, true)?;
+                let projected = tx
+                    .query_row(
+                        "SELECT d.current_stay_id, EXISTS(
+                             SELECT 1 FROM guild_member_pending_rejoin_notes p
+                             WHERE p.guild_id=d.guild_id AND p.enrollment_id=d.enrollment_id
+                               AND p.user_id=d.user_id AND p.stay_id=d.current_stay_id
+                         )
+                         FROM guild_member_directory d
+                         WHERE d.guild_id=?1 AND d.enrollment_id=?2 AND d.user_id=?3
+                           AND d.is_current=1",
+                        params![scope.guild_id(), scope.enrollment.id.as_str(), user_id],
+                        |r| Ok((r.get::<Option<String>>(0)?, r.get::<bool>(1)?)),
+                    )
+                    .optional();
+                match projected {
+                    Ok(row) => {
+                        tx.finish_read()?;
+                        Ok(Ok(row.unwrap_or_default()))
+                    }
+                    Err(error) => {
+                        drop(tx);
+                        Ok(Err(error))
+                    }
+                }
+            })
+            .await?;
+        match projected {
+            Ok((stay, pending)) => Ok((stay, Ok(pending))),
+            Err(error) => {
+                let stay = self.current_member_stay_id(fallback_scope, user_id).await?;
+                Ok((stay, Err(error)))
+            }
+        }
+    }
+
     pub async fn current_member_stay_id(
         &self,
         scope: GuildDataScope,
@@ -2348,18 +2400,7 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
-                let stay = tx
-                    .query_row(
-                        "SELECT current_stay_id FROM guild_member_directory WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND is_current=1",
-                        params![
-                            scope.guild_id(),
-                            scope.enrollment.id.as_str(),
-                            user_id
-                        ],
-                        |r| Ok(r.get::<Option<String>>(0)?),
-                    )
-                    .optional()?
-                    .flatten();
+                let stay = current_member_stay_id_tx(&tx, &scope, user_id)?;
                 tx.finish_read()?;
                 Ok(stay)
             })
@@ -3007,6 +3048,22 @@ fn ingest_member_audits(
         bump_revision(conn, scope)?;
     }
     Ok((inserted, unchanged))
+}
+
+fn current_member_stay_id_tx(
+    conn: &impl SqlExecutor,
+    scope: &GuildDataScope,
+    user_id: i64,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT current_stay_id FROM guild_member_directory
+             WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3 AND is_current=1",
+            params![scope.guild_id(), scope.enrollment.id.as_str(), user_id],
+            |r| Ok(r.get::<Option<String>>(0)?),
+        )
+        .optional()?
+        .flatten())
 }
 
 fn clear_pending_rejoin_note_tx(
