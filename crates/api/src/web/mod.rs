@@ -26,6 +26,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get};
 use axum::{Json, Router};
 use std::sync::Arc;
+use std::time::Instant;
 use tower_sessions::cookie::time::Duration as CookieDuration;
 use tower_sessions::cookie::{Cookie, SameSite};
 use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer};
@@ -33,6 +34,9 @@ use tower_sessions::{Expiry, MemoryStore, Session, SessionManagerLayer};
 use self::oauth::{DiscordGuild, DiscordUser};
 use self::state::ApiState;
 use crate::db::guild_data::AccessLevel;
+
+type GuildList = Arc<[DiscordGuild]>;
+type ObservedGuilds = (Instant, GuildList);
 
 const SESSION_USER: &str = "discord_user_id";
 const SESSION_TOKEN: &str = "access_token";
@@ -269,7 +273,7 @@ impl GuildAccess {
 #[derive(Clone)]
 pub struct AuthCtx {
     pub user: DiscordUser,
-    pub guilds: Vec<DiscordGuild>,
+    pub guilds: GuildList,
     enrollment: Option<crate::db::GuildEnrollment>,
     /// Role-mapped access verified for one guild during this request.
     role_access: Option<(u64, AccessLevel)>,
@@ -381,7 +385,7 @@ pub async fn session_owner(app: &ApiState, session: &Session) -> ApiResult<AuthC
             global_name: None,
             avatar: None,
         },
-        guilds: Vec::new(),
+        guilds: Arc::from([]),
         enrollment: None,
         role_access: None,
         guild_discovery_incomplete: false,
@@ -535,11 +539,20 @@ impl GuildSnapshotAge {
     }
 }
 
+#[derive(Clone)]
+struct GuildSnapshot {
+    /// Background authorization age starts at lookup initiation.
+    age_from: Instant,
+    /// Display observations are ordered by successful guild fetch completion.
+    observed_at: Instant,
+    guilds: GuildList,
+}
+
 #[derive(Default)]
 pub(super) struct SessionAuth {
     token: Option<String>,
     refresh: Option<String>,
-    guilds: Option<(std::time::Instant, Vec<DiscordGuild>)>,
+    guilds: Option<GuildSnapshot>,
     /// Access epoch read before `guilds` was fetched.
     guilds_epoch: i64,
     /// A background refresh of `guilds` is running.
@@ -764,10 +777,10 @@ async fn require_auth_with(
         let cached = if guild_list_cache_allowed(guild_mode) {
             take_cached_guilds(guild_mode, app, user_id, false)
         } else {
-            state.guilds.as_ref().and_then(|(at, guilds)| {
-                GuildSnapshotAge::from_age(at.elapsed())
+            state.guilds.as_ref().and_then(|snapshot| {
+                GuildSnapshotAge::from_age(snapshot.age_from.elapsed())
                     .permits(cause)
-                    .then(|| (guilds.clone(), false))
+                    .then(|| (Arc::clone(&snapshot.guilds), false))
             })
         };
         if let Some((guilds, guild_discovery_incomplete)) = cached
@@ -870,10 +883,9 @@ async fn load_auth(
     state: &mut SessionAuth,
     shared: &Arc<tokio::sync::Mutex<SessionAuth>>,
 ) -> ApiResult<AuthCtx> {
-    let now = std::time::Instant::now();
     let cached_user = cached_user(app, user_id);
-    if let Some((at, _)) = &state.guilds {
-        let age = at.elapsed();
+    if let Some(snapshot) = &state.guilds {
+        let age = snapshot.age_from.elapsed();
         if age >= guild_refresh_after(user_id)
             && GuildSnapshotAge::from_age(age) == GuildSnapshotAge::Fresh
         {
@@ -888,25 +900,32 @@ async fn load_auth(
         return display_auth(app, user_id, token, cached_user, guilds, incomplete).await;
     }
 
-    let guilds = if let Some((at, guilds)) = &state.guilds
-        && GuildSnapshotAge::from_age(at.elapsed()) == GuildSnapshotAge::Fresh
+    let snapshot = if let Some(snapshot) = &state.guilds
+        && GuildSnapshotAge::from_age(snapshot.age_from.elapsed()) == GuildSnapshotAge::Fresh
     {
-        guilds.clone()
+        snapshot.clone()
     } else {
         let epoch = current_access_epoch(app).await;
         match app.oauth.my_guilds_at(user_id, token, epoch).await {
             Ok(guilds) => {
-                state.guilds = Some((std::time::Instant::now(), guilds.clone()));
+                let observed_at = Instant::now();
+                let snapshot = GuildSnapshot {
+                    age_from: observed_at,
+                    observed_at,
+                    guilds: guilds.into(),
+                };
+                state.guilds = Some(snapshot.clone());
                 state.guilds_epoch = epoch;
                 state.guild_refresh_retry_at = None;
-                guilds
+                snapshot
             }
             Err(oauth::GuildListError::RateLimited { .. })
-                if state.guilds.as_ref().is_some_and(|(at, _)| {
-                    GuildSnapshotAge::from_age(at.elapsed()).permits(RefreshFailure::RateLimited)
+                if state.guilds.as_ref().is_some_and(|snapshot| {
+                    GuildSnapshotAge::from_age(snapshot.age_from.elapsed())
+                        .permits(RefreshFailure::RateLimited)
                 }) =>
             {
-                state.guilds.as_ref().unwrap().1.clone()
+                state.guilds.as_ref().unwrap().clone()
             }
             Err(error) => {
                 return finish_guild_list(app, guild_mode, user_id, token, cached_user, error)
@@ -916,15 +935,23 @@ async fn load_auth(
     };
 
     let user = match cached_user {
-        Some(u) => u,
-        None => app.oauth.me(user_id, token).await.map_err(ApiError)?,
+        Some(user) => user,
+        None => {
+            let user = app.oauth.me(user_id, token).await.map_err(ApiError)?;
+            record_display_observation(&app.user_cache, user_id, Instant::now(), user.clone());
+            user
+        }
     };
 
-    app.guild_cache.insert(user_id, (now, guilds.clone()));
-    app.user_cache.insert(user_id, (now, user.clone()));
+    record_display_observation(
+        &app.guild_cache,
+        user_id,
+        snapshot.observed_at,
+        Arc::clone(&snapshot.guilds),
+    );
     let mut auth = AuthCtx {
         user,
-        guilds,
+        guilds: snapshot.guilds,
         enrollment: None,
         role_access: None,
         guild_discovery_incomplete: false,
@@ -968,8 +995,14 @@ fn start_guild_refresh(
         let started = std::time::Instant::now();
         let epoch = current_access_epoch(&app).await;
         let guilds = app.oauth.my_guilds_at(user_id, &token, epoch).await;
+        let observed_at = Instant::now();
         let user = match (&guilds, refresh_profile) {
-            (Ok(_), true) => app.oauth.me(user_id, &token).await.ok(),
+            (Ok(_), true) => app
+                .oauth
+                .me(user_id, &token)
+                .await
+                .ok()
+                .map(|user| (Instant::now(), user)),
             _ => None,
         };
         let mut state = shared.lock().await;
@@ -977,13 +1010,22 @@ fn start_guild_refresh(
         if state.lifecycle.is_retired() || state.token.as_deref() != Some(token.as_str()) {
             return;
         }
-        if state.guilds.as_ref().is_none_or(|(at, _)| *at <= started) {
+        if state
+            .guilds
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.age_from <= started)
+        {
             match guilds {
                 Ok(guilds) => {
-                    state.guilds = Some((started, guilds.clone()));
+                    let guilds = GuildList::from(guilds);
+                    state.guilds = Some(GuildSnapshot {
+                        age_from: started,
+                        observed_at,
+                        guilds: Arc::clone(&guilds),
+                    });
                     state.guilds_epoch = epoch;
                     state.guild_refresh_retry_at = None;
-                    app.guild_cache.insert(user_id, (started, guilds));
+                    record_display_observation(&app.guild_cache, user_id, observed_at, guilds);
                 }
                 Err(oauth::GuildListError::Unauthorized | oauth::GuildListError::Failed(_)) => {
                     state.guild_refresh_retry_at =
@@ -992,8 +1034,8 @@ fn start_guild_refresh(
                 Err(oauth::GuildListError::RateLimited { .. }) => {}
             }
         }
-        if let Some(user) = user {
-            app.user_cache.insert(user_id, (started, user));
+        if let Some((observed_at, user)) = user {
+            record_display_observation(&app.user_cache, user_id, observed_at, user);
         }
     });
 }
@@ -1059,13 +1101,12 @@ async fn display_auth(
     user_id: u64,
     token: &str,
     cached_user: Option<DiscordUser>,
-    guilds: Vec<DiscordGuild>,
+    guilds: GuildList,
     guild_discovery_incomplete: bool,
 ) -> ApiResult<AuthCtx> {
     let (user, source) = display_identity(app, user_id, token, cached_user).await?;
     if source == DisplayIdentitySource::Live {
-        app.user_cache
-            .insert(user_id, (std::time::Instant::now(), user.clone()));
+        record_display_observation(&app.user_cache, user_id, Instant::now(), user.clone());
     }
     let mut auth = AuthCtx {
         user,
@@ -1091,6 +1132,27 @@ fn guild_list_failure(user_id: u64, error: oauth::GuildListError) -> ApiError {
             tracing::warn!("webui auth: guilds fetch failed for user {user_id}: {error:#}");
             ApiError(error)
         }
+    }
+}
+
+/// Login sessions can publish observations for the same display user in any
+/// order. Reusing a session snapshot must not replace a newer observation.
+fn record_display_observation<T>(
+    cache: &dashmap::DashMap<u64, (Instant, T)>,
+    user_id: u64,
+    observed_at: Instant,
+    value: T,
+) {
+    use dashmap::mapref::entry::Entry;
+
+    match cache.entry(user_id) {
+        Entry::Vacant(entry) => {
+            entry.insert((observed_at, value));
+        }
+        Entry::Occupied(mut entry) if entry.get().0 < observed_at => {
+            entry.insert((observed_at, value));
+        }
+        _ => {}
     }
 }
 
@@ -1158,7 +1220,7 @@ fn take_cached_guilds(
     app: &ApiState,
     user_id: u64,
     lookup_rate_limited: bool,
-) -> Option<(Vec<DiscordGuild>, bool)> {
+) -> Option<(GuildList, bool)> {
     if !guild_list_cache_allowed(mode) {
         return None;
     }
@@ -1173,8 +1235,8 @@ fn take_cached_guilds(
                 incomplete,
             )
         })
-        .map(|entry| entry.value().1.clone())
-        .or_else(|| lookup_rate_limited.then(Vec::new))?;
+        .map(|entry| Arc::clone(&entry.value().1))
+        .or_else(|| lookup_rate_limited.then(|| Arc::from([])))?;
     Some((guilds, incomplete))
 }
 
@@ -1485,6 +1547,7 @@ async fn callback_response(
             return finish(error_page(&format!("failed to fetch user: {e:#}")));
         }
     };
+    let profile_observed_at = Instant::now();
     let uid = user.id.parse::<u64>().unwrap_or(0);
     // Wait for any old-session refresh before rotation, then clear its payload.
     if let Some(app) = app
@@ -1504,13 +1567,13 @@ async fn callback_response(
         return finish(error_page("failed to rotate session"));
     }
     if let Some(app) = app {
-        app.user_cache
-            .insert(uid, (std::time::Instant::now(), user));
+        record_display_observation(&app.user_cache, uid, profile_observed_at, user);
         // Only a complete guild list enters either cache. A 429 leaves any
         // previous display list intact and the cooldown guides the next /api/me.
         let epoch = current_access_epoch(app).await;
         if let Ok(guilds) = oauth.my_guilds_at(uid, &tok.access_token, epoch).await {
-            let observed_at = std::time::Instant::now();
+            let observed_at = Instant::now();
+            let guilds = GuildList::from(guilds);
             // Rotation leaves the session without an ID until the store creates
             // the new record. Publish the permission snapshot before the
             // middleware returns the new session cookie.
@@ -1531,14 +1594,18 @@ async fn callback_response(
                     Arc::new(tokio::sync::Mutex::new(SessionAuth {
                         token: Some(tok.access_token),
                         refresh: tok.refresh_token,
-                        guilds: Some((observed_at, guilds.clone())),
+                        guilds: Some(GuildSnapshot {
+                            age_from: observed_at,
+                            observed_at,
+                            guilds: Arc::clone(&guilds),
+                        }),
                         guilds_epoch: epoch,
                         last_used: Some(observed_at),
                         ..SessionAuth::default()
                     })),
                 );
             }
-            app.guild_cache.insert(uid, (observed_at, guilds));
+            record_display_observation(&app.guild_cache, uid, observed_at, guilds);
         }
     }
     let requested_return_to = cookie_value(&headers, COOKIE_OAUTH_RETURN_TO);
@@ -3858,7 +3925,7 @@ mod tests {
                 global_name: None,
                 avatar: None,
             },
-            guilds: vec![],
+            guilds: Arc::from([]),
         }
     }
 
@@ -3968,7 +4035,7 @@ mod tests {
         };
         let now = std::time::Instant::now();
         app.user_cache.insert(user_id, (now, user));
-        app.guild_cache.insert(user_id, (now, guilds));
+        app.guild_cache.insert(user_id, (now, guilds.into()));
     }
 
     #[tokio::test]
