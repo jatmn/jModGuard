@@ -2939,6 +2939,7 @@ fn audit_claims_are_scoped_atomic_and_bounded_without_live_eviction() {
 struct UnavailableAuditSink {
     mode: &'static str,
     observed: i64,
+    calls: std::sync::atomic::AtomicUsize,
 }
 #[serenity::async_trait]
 impl LogDelivery for UnavailableAuditSink {
@@ -2946,6 +2947,8 @@ impl LogDelivery for UnavailableAuditSink {
         Ok(())
     }
     async fn member_audit(&self, _: GuildId, action: Action) -> anyhow::Result<AuditLogs> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.mode {
             "error" => anyhow::bail!("audit unavailable"),
             "stalled" => std::future::pending::<()>().await,
@@ -3018,16 +3021,12 @@ async fn delayed_audit_after_unknown_or_skipped_report_cannot_explain_repeat_act
             } else {
                 None
             };
-            let delivery = emit_with_paused_clock(
-                &f,
-                &UnavailableAuditSink {
-                    mode,
-                    observed: prior.timestamp_millis(),
-                },
-                event,
-                vars.clone(),
-            )
-            .await;
+            let unavailable = UnavailableAuditSink {
+                mode,
+                observed: prior.timestamp_millis(),
+                calls: Default::default(),
+            };
+            let delivery = emit_with_paused_clock(&f, &unavailable, event, vars.clone()).await;
             drop(permit);
             assert_eq!(
                 delivery,
@@ -3038,6 +3037,13 @@ async fn delayed_audit_after_unknown_or_skipped_report_cannot_explain_repeat_act
                 },
                 "{event}/{mode}"
             );
+            if mode == "empty" {
+                assert_eq!(
+                    unavailable.calls.load(std::sync::atomic::Ordering::Relaxed),
+                    3,
+                    "{event}: unresolved audit context must stop after three reads"
+                );
+            }
             db::upsert_log_channel(&f.app.db, 789, event, 456)
                 .await
                 .unwrap();
