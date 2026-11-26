@@ -22,6 +22,7 @@ pub const CONTAINER_READ_PATH: &str = "/private/container-use";
 pub const RESOURCE_READ_PATH: &str = "/private/resource-rollups";
 pub const CONTAINER_READ_DIRECTION: &str = "api-container-read";
 const MAC_HEX: usize = 64;
+const RESOURCE_CURSOR_HEADER: &str = "X-JModGuard-Saved-Through";
 const BODY_LIMIT: usize = 4096;
 /// Shared budget for the bot's container-use fetch during `!stats`.
 ///
@@ -112,10 +113,20 @@ impl ReadLink {
     /// Blocking fetch of the API's recent minute rollups (call from
     /// `spawn_blocking`). `None` when the API is unreachable or not ready.
     pub fn fetch_resource_rollups_blocking(&self) -> Option<ResourceReadResponse> {
+        self.fetch_resource_rollups_after_blocking(None)
+    }
+
+    /// Requests completed minutes newer than the last acknowledged write.
+    /// Legacy API versions ignore the cursor and may return the full buffer.
+    pub fn fetch_resource_rollups_after_blocking(
+        &self,
+        saved_through: Option<i64>,
+    ) -> Option<ResourceReadResponse> {
         fetch_route_blocking(
             self.addr,
             &self.key,
             RESOURCE_READ_PATH,
+            saved_through,
             RESOURCE_FETCH_TIMEOUT,
             RESOURCE_RESPONSE_LIMIT,
         )
@@ -250,6 +261,15 @@ fn serve_read_connection(mut stream: std::net::TcpStream, key: &[u8]) -> Result<
         write_http_response(&mut stream, 413, "text/plain", b"payload too large")?;
         return Ok(());
     }
+    let cursor = if route == RESOURCE_READ_PATH {
+        head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(RESOURCE_CURSOR_HEADER)
+                .then(|| value.trim().to_owned())
+        })
+    } else {
+        None
+    };
     let body_start = head_end;
     while request.len() < body_start + content_length {
         if request.len() - body_start > BODY_LIMIT {
@@ -269,12 +289,23 @@ fn serve_read_connection(mut stream: std::net::TcpStream, key: &[u8]) -> Result<
         write_http_response(&mut stream, 401, "text/plain", b"unauthorized")?;
         return Ok(());
     }
+    let saved_through = match cursor
+        .as_deref()
+        .map(|value| open_resource_cursor(key, body, value))
+        .transpose()
+    {
+        Ok(saved_through) => saved_through,
+        Err(_) => {
+            write_http_response(&mut stream, 401, "text/plain", b"unauthorized")?;
+            return Ok(());
+        }
+    };
     if !crate::process_ready() {
         write_http_response(&mut stream, 503, "text/plain", b"not ready")?;
         return Ok(());
     }
     let json = if route == RESOURCE_READ_PATH {
-        serde_json::to_vec(&resource_read_response())
+        serde_json::to_vec(&resource_read_response_after(saved_through))
     } else {
         serde_json::to_vec(&container_read_response())
     }
@@ -319,6 +350,7 @@ pub fn fetch_blocking(addr: SocketAddr, key: &[u8]) -> Option<ContainerReadRespo
         addr,
         key,
         CONTAINER_READ_PATH,
+        None,
         STATS_FETCH_TIMEOUT,
         RESPONSE_LIMIT,
     )
@@ -328,6 +360,7 @@ fn fetch_route_blocking<T: serde::de::DeserializeOwned>(
     addr: SocketAddr,
     key: &[u8],
     route: &'static str,
+    saved_through: Option<i64>,
     timeout: Duration,
     limit: usize,
 ) -> Option<T> {
@@ -340,8 +373,13 @@ fn fetch_route_blocking<T: serde::de::DeserializeOwned>(
         std::net::IpAddr::V4(v4) => v4.to_string(),
         std::net::IpAddr::V6(v6) => format!("[{v6}]"),
     };
+    let cursor_header = saved_through.map_or_else(String::new, |saved_through| {
+        let cursor = saved_through.to_string();
+        let mac = mac_hex(key, &resource_cursor_payload(&body, &cursor));
+        format!("{RESOURCE_CURSOR_HEADER}: {cursor}:{mac}\r\n")
+    });
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\n{cursor_header}Connection: close\r\n\r\n",
         path = route,
         host = host,
         port = addr.port(),
@@ -468,10 +506,36 @@ pub fn container_read_response() -> ContainerReadResponse {
 }
 
 pub fn resource_read_response() -> ResourceReadResponse {
+    resource_read_response_after(None)
+}
+
+fn resource_read_response_after(saved_through: Option<i64>) -> ResourceReadResponse {
     ResourceReadResponse {
-        minutes: crate::resources::recent_rollups(),
+        minutes: crate::resources::recent_rollups_after(saved_through),
         copy: format!("api pid {}", std::process::id()),
     }
+}
+
+// Old listeners ignore the header and verify the original body. Bind the
+// optional cursor to that same body (including route, nonce, and expiry).
+fn resource_cursor_payload(body: &[u8], cursor: &str) -> Vec<u8> {
+    [
+        b"jmodguard/resource-rollup-cursor/v1\0",
+        body,
+        b"\0",
+        cursor.as_bytes(),
+    ]
+    .concat()
+}
+
+fn open_resource_cursor(key: &[u8], body: &[u8], header: &str) -> Result<i64> {
+    let (cursor, mac) = header.split_once(':').context("invalid resource cursor")?;
+    let cursor_value = cursor.parse::<i64>().context("invalid resource cursor")?;
+    anyhow::ensure!(
+        verify_mac(key, mac, &resource_cursor_payload(body, cursor)),
+        "invalid resource cursor"
+    );
+    Ok(cursor_value)
 }
 
 fn random_nonce() -> Result<String> {
@@ -599,6 +663,21 @@ mod tests {
     }
 
     #[test]
+    fn resource_cursor_proof_binds_the_value_and_signed_request() {
+        let key = test_key();
+        let first = seal_read_route(&key, RESOURCE_READ_PATH).unwrap();
+        let second = seal_read_route(&key, RESOURCE_READ_PATH).unwrap();
+        let mac = mac_hex(&key, &resource_cursor_payload(&first, "120"));
+        assert_eq!(
+            open_resource_cursor(&key, &first, &format!("120:{mac}")).unwrap(),
+            120
+        );
+        assert!(open_resource_cursor(&key, &first, &format!("180:{mac}")).is_err());
+        assert!(open_resource_cursor(&key, &second, &format!("120:{mac}")).is_err());
+        assert!(open_resource_cursor(&key, &first, &format!("invalid:{mac}")).is_err());
+    }
+
+    #[test]
     fn container_read_rejects_a_mismatched_route_signature() {
         let key = load_writer_key(&"x".repeat(32)).unwrap();
         let nonces = Mutex::new(NonceWindow::new());
@@ -698,7 +777,7 @@ mod tests {
 
     /// Read the sealed POST the way the API listener does, so the peer does not
     /// answer or close while the client is still writing the request.
-    fn read_request(stream: &mut std::net::TcpStream) {
+    fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
         use std::io::Read;
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -725,9 +804,47 @@ mod tests {
                 })
                 .expect("content-length");
             if buf.len() >= split + 4 + length {
-                break;
+                return buf;
             }
         }
+    }
+
+    #[test]
+    fn resource_cursor_uses_the_legacy_request_body_and_accepts_full_replies() {
+        let key = test_key();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let link = ReadLink {
+            addr: listener.local_addr().unwrap(),
+            key: key.clone(),
+        };
+        let expected = ResourceReadResponse {
+            minutes: [60, 120]
+                .map(|start| crate::resources::Rollup::empty(start, 60))
+                .into(),
+            copy: "api pid 7".into(),
+        };
+        let reply = serde_json::to_vec(&expected).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request(&mut stream);
+            let (headers, legacy_body) = std::str::from_utf8(&request)
+                .unwrap()
+                .split_once("\r\n\r\n")
+                .unwrap();
+            assert!(headers.contains(&format!("\r\n{RESOURCE_CURSOR_HEADER}: 60:")));
+            // The old listener inspects the request body and ignores this header.
+            open_read_route(
+                &key,
+                legacy_body.as_bytes(),
+                &Mutex::new(NonceWindow::new()),
+                RESOURCE_READ_PATH,
+            )
+            .expect("the legacy verifier accepts the unchanged request");
+            write_http_response(&mut stream, 200, "application/json", &reply).unwrap();
+        });
+        let result = link.fetch_resource_rollups_after_blocking(Some(60));
+        peer.join().unwrap();
+        assert_eq!(result, Some(expected));
     }
 
     #[test]
@@ -752,7 +869,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let peer = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            read_request(&mut stream);
+            let _ = read_request(&mut stream);
             let header = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 json.len()
@@ -781,7 +898,7 @@ mod tests {
         let stop_flag = Arc::clone(&stop);
         let peer = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            read_request(&mut stream);
+            let _ = read_request(&mut stream);
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n")
                 .unwrap();
@@ -838,7 +955,7 @@ mod tests {
         let peer = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             accepted_flag.store(true, Ordering::SeqCst);
-            read_request(&mut stream);
+            let _ = read_request(&mut stream);
             let body = vec![b'x'; 64 * 1024];
             let header = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
