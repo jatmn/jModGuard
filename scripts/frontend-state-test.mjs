@@ -10779,7 +10779,7 @@ test('removing a case record waits for confirmation', async () => {
   assert.equal(caseDialog(h), null, 'removing the case closes the dialog');
 });
 
-test('Case view opens the last row of a full page in a dialog and loads case, history, evidence and names together', async () => {
+test('Case view opens the last row of a full page and renders required reads before evidence names', async () => {
   const ids = Array.from({ length: 50 }, (_, i) => (i + 1).toString(16).padStart(32, '0'));
   const pending = [];
   const calls = [];
@@ -10802,16 +10802,21 @@ test('Case view opens the last row of a full page in a dialog and loads case, hi
   assert.equal(h.document.querySelector('.modal-overlay').getAttribute('aria-label'), `Case ${last.slice(0, 8)}`);
   assert.match(dialog.querySelector('[role="status"]').textContent, /Loading case/);
   assert.equal(h.app.isBusy(), false, 'opening a case does not grey out the page');
-  // Every read starts before any answers.
+  // The three required reads start before any answers.
   assert.deepEqual(pending.map(p => p.path.replace(`/api/guilds/${h.app.state.guildId}`, '')).filter(path => /cases|server-names/.test(path)).sort(),
-    [`/cases/${last}`, `/cases/${last}/evidence`, `/cases/${last}/history`, '/server-names'].sort());
+    [`/cases/${last}`, `/cases/${last}/evidence`, `/cases/${last}/history`].sort());
   for (const p of pending) {
-    if (p.path.endsWith('/server-names')) p.resolve(response({ roles: [], channels: [{ id: '400', name: 'general', kind: 'text' }] }));
-    else if (p.path.endsWith('/history')) p.resolve(response({ history: caseHistory, names: { [CASE_MODERATOR]: caseNames[CASE_MODERATOR] } }));
+    if (p.path.endsWith('/history')) p.resolve(response({ history: caseHistory, names: { [CASE_MODERATOR]: caseNames[CASE_MODERATOR] } }));
     else if (p.path.endsWith('/evidence')) p.resolve(response({ evidence: [] }));
     else if (p.path.endsWith(`/cases/${last}`)) p.resolve(response({ id: last, case: caseRecord(), can_delete: false, names: caseNames }));
     else p.resolve(response({}));
   }
+  await settle();
+  assert.equal(caseDialog(h).querySelector('[role="status"]'), null);
+  assert.match(textOf(caseDialog(h)), /in channel 400/);
+  const namesRead = pending.find(p => p.path.endsWith('/server-names'));
+  assert.ok(namesRead, 'text-only evidence requests channel names after the required reads');
+  namesRead.resolve(response({ roles: [], channels: [{ id: '400', name: 'general', kind: 'text' }] }));
   await settle();
   const text = textOf(caseDialog(h));
   assert.equal(caseDialog(h).querySelector('[role="status"]'), null);
@@ -10861,12 +10866,13 @@ test('Cases list and case file agree on automod versus an unrecorded moderator',
   }
 });
 
-test('Case view shows a load failure inside the dialog and can try again', async () => {
+test('Case view retries a failed required read and remains usable if optional names fail', async () => {
   let fail = true;
   const { calls, fetchImpl } = caseFixture({
     [`/cases/${CASE_ID}`]: () => fail
       ? { ok: false, status: 503, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'guild store is unavailable' }) }
       : response({ id: CASE_ID, case: caseRecord(), can_delete: false, names: caseNames }),
+    '/server-names': () => Promise.reject(new Error('Names unavailable')),
   });
   const h = harness(fetchImpl);
   const root = await casesView(h);
@@ -10875,12 +10881,85 @@ test('Case view shows a load failure inside the dialog and can try again', async
   await settle();
   const alert = caseDialog(h).querySelector('[role="alert"]');
   assert.match(alert.textContent, /Could not load this case: guild store is unavailable/);
+  assert.equal(calls.filter(c => c.url.endsWith('/server-names')).length, 0);
   fail = false;
   await fire(findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Try again'), 'click', {});
   await settle();
   assert.equal(caseDialog(h).querySelector('[role="alert"]'), null);
   assert.match(textOf(caseDialog(h)), /Posted a phishing link/);
+  assert.match(textOf(caseDialog(h)), /in channel 400/);
   assert.equal(calls.filter(c => c.url.endsWith(`/cases/${CASE_ID}`)).length, 2);
+  assert.equal(calls.filter(c => c.url.endsWith('/server-names')).length, 1);
+});
+
+test('Case view remains usable when optional evidence channel names time out', async () => {
+  let namesSignal;
+  const { fetchImpl } = caseFixture({
+    '/server-names': (_u, { signal }) => {
+      namesSignal = signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    },
+  });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await fire(iconAction(root, `Open case ${CASE_ID}`), 'click');
+  assert.ok(namesSignal && !namesSignal.aborted, 'channel names are pending');
+  const deadline = [...h.timers.values()].find(timer => timer.delay === 30000);
+  await deadline.fn();
+  assert.equal(namesSignal.aborted, true);
+  const dialog = caseDialog(h);
+  assert.match(textOf(dialog), /Posted a phishing link/, 'the case remains visible after names time out');
+  assert.match(textOf(dialog), /in channel 400/);
+  assert.equal(dialog.querySelector('[role="alert"]'), null);
+});
+
+test('Case view skips channel names when no evidence has a channel ID', async () => {
+  const { calls, fetchImpl } = caseFixture({
+    [`/cases/${CASE_ID}`]: () => response({ case: caseRecord({ evidence: { text: [] } }) }),
+    '/evidence': () => response({ evidence: [] }),
+  });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await fire(iconAction(root, `Open case ${CASE_ID}`), 'click');
+  assert.match(textOf(caseDialog(h)), /No private evidence was saved/);
+  assert.equal(calls.filter(c => c.url.endsWith('/server-names')).length, 0);
+});
+
+test('Case view loads channel names for standalone attachments and discards stale results', async () => {
+  const pending = [];
+  const { fetchImpl } = caseFixture({
+    [`/cases/${CASE_ID}`]: () => response({ case: caseRecord({ evidence: { text: [] } }) }),
+    '/server-names': (_u, { signal }) => new Promise(resolve => pending.push({ signal, resolve })),
+  });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  const open = () => fire(iconAction(root, `Open case ${CASE_ID}`), 'click');
+  const close = () => fire(iconAction(caseDialog(h), 'Close case'), 'click');
+  const names = () => response({ channels: [{ id: '400', name: 'general' }] });
+
+  await open();
+  assert.match(textOf(caseDialog(h)), /Saved attachmentsin channel 400/);
+  pending[0].resolve(names());
+  await settle();
+  assert.match(textOf(caseDialog(h)), /Saved attachmentsin #general/);
+
+  await close();
+  await open();
+  h.app.state.config = { enrollment_id: 'new-membership' };
+  pending[1].resolve(names());
+  await settle();
+  assert.match(textOf(caseDialog(h)), /in channel 400/);
+  assert.doesNotMatch(textOf(caseDialog(h)), /in #general/);
+
+  await close();
+  await open();
+  await close();
+  assert.ok(pending[2].signal.aborted, 'closing cancels the optional read');
+  pending[2].resolve(names());
+  await settle();
+  assert.equal(caseDialog(h), null);
 });
 
 test('Case view adds a note and shows it in the timeline without reopening', async () => {
