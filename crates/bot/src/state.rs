@@ -2545,6 +2545,12 @@ impl ConfigCache {
         }
     }
 
+    /// A Gateway `GuildCreate` starts a new membership, so an earlier removal
+    /// during an outage no longer describes this guild.
+    pub(crate) fn observe_gateway_guild(&self, guild_id: u64) {
+        self.removed_while_unavailable.remove(&guild_id);
+    }
+
     /// Releases a confirmed-departed guild's configuration. Loads publish only
     /// while the guild is a Gateway member, so departed work cannot restore it.
     pub(crate) fn forget_guild(&self, guild_id: u64) {

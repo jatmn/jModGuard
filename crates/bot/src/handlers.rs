@@ -708,6 +708,7 @@ impl EventHandler for Handler {
 
     async fn guild_create(&self, ctx: Context, guild: Guild, is_new: Option<bool>) {
         crate::resources::gateway_event("guild_create");
+        self.app.configs.observe_gateway_guild(guild.id.get());
         if !self.app.activation.allows_rule_trigger() {
             return;
         }
@@ -4369,17 +4370,25 @@ mod tests {
             "work queued before the removal must not restore it"
         );
 
-        // A real rejoin caches normally, and its later outage keeps it.
+        // A real rejoin retires the departure without any config read, so a
+        // load during the rejoined membership's later outage is retained.
         gateway_guild(&ctx.cache, 10, Some(200));
-        let rejoined = app.configs.get(&app.db, 10).await.unwrap();
+        let rejoin = ctx
+            .cache
+            .guild(serenity::model::id::GuildId::new(10))
+            .unwrap()
+            .clone();
+        handler.guild_create(ctx.clone(), rejoin, Some(false)).await;
         handler.guild_delete(ctx.clone(), delete(true), None).await;
+        let during_outage = app.configs.get(&app.db, 10).await.unwrap();
         assert!(
             app.configs
                 .last_known(10)
-                .is_some_and(|cfg| std::sync::Arc::ptr_eq(&cfg, &rejoined))
+                .is_some_and(|cfg| std::sync::Arc::ptr_eq(&cfg, &during_outage)),
+            "the rejoined membership's outage keeps a last-known configuration"
         );
 
-        drop(rejoined);
+        drop(during_outage);
         drop(handler);
         drop(app);
         std::fs::remove_dir_all(directory).unwrap();
