@@ -314,6 +314,19 @@ async function runMemberPoll(h, delay = 10000) {
   await settle();
 }
 
+// #871: a member picker search starts once typing settles for the list search delay.
+const memberSearchTimers = h => [...h.timers].filter(([, timer]) => timer.delay === 300);
+async function settleMemberSearch(h) {
+  const pending = memberSearchTimers(h);
+  assert.equal(pending.length, 1, 'one member search waits for typing to settle');
+  const [[id, timer]] = pending;
+  h.timers.delete(id);
+  h.advanceTime(timer.delay);
+  // The read may be held open by the test, so start it without waiting for it.
+  timer.fn();
+  await settle();
+}
+
 // #625: the Bans page opens the way the sidebar does, so its dialog has the application view.
 async function bansView(h) {
   h.app.state.config ??= { enrollment_id: 'membership' };
@@ -679,6 +692,7 @@ test('the ban dialog finds current members by name and says when the search fail
   const type = async value => {
     idBox.value = value;
     await fire(idBox, 'input', { target: { value } });
+    if (value) await settleMemberSearch(h);
     await settle();
   };
   const results = () => textOf(dialog.querySelector('ul.picker-results'));
@@ -723,6 +737,97 @@ test('the ban dialog finds current members by name and says when the search fail
   await settle();
   const post = calls.find(call => call.url.endsWith('/ban'));
   assert.equal(JSON.parse(post.opts.body).user_id, '9007199254740993');
+});
+
+// #871: a name typed into the shared member picker sends one directory read once typing settles.
+test('the member picker waits for typing to settle and drops searches on close or a server change', async () => {
+  const reads = [];
+  let search = () => response({ members: [{ user_id: '9007199254740993', display_name: 'JATMN' }], next_cursor: null, total: null });
+  const h = harness(async (url, opts) => {
+    if (url.includes('/members?')) {
+      reads.push({ url, signal: opts.signal });
+      return search(opts.signal);
+    }
+    return response({ bans: [], names: {} });
+  });
+  const root = await bansView(h);
+  const open = async () => {
+    await fire(findNode(root, n => n.localName === 'button' && n.textContent === 'Ban user'), 'click');
+    return h.document.querySelector('.ban-dialog');
+  };
+  let dialog = await open();
+  const idBox = () => dialog.querySelector('input[placeholder="Search members by name, or paste an ID"]');
+  const type = async value => {
+    const box = idBox();
+    box.value = value;
+    await fire(box, 'input', { target: { value } });
+  };
+  const queries = () => reads.map(read => new URL(read.url, 'https://fixture.test').searchParams.get('q'));
+  const searchTimers = () => memberSearchTimers(h);
+  const settleSearch = () => settleMemberSearch(h);
+  const cancel = () => fire(findNode(dialog, n => n.localName === 'button' && n.textContent === 'Cancel'), 'click');
+
+  for (const value of ['j', 'ja', 'jat', 'jatm', 'jatmn']) await type(value);
+  assert.deepEqual(queries(), [], 'no directory read starts while the name is still being typed');
+  assert.equal(searchTimers().length, 1, 'each edit replaces the pending search');
+  await settleSearch();
+  assert.deepEqual(queries(), ['jatmn'], 'only the final text is searched');
+  assert.equal(reads[0].url, `/api/guilds/${h.app.state.guildId}/members?q=jatmn&limit=8&status=current`);
+  assert.equal(textOf(dialog.querySelector('ul.picker-results')), 'JATMN9007199254740993');
+
+  // A single settled character still searches, and a failure is still not an empty result.
+  search = () => { throw new TypeError('Failed to fetch'); };
+  await type('j');
+  await settleSearch();
+  assert.deepEqual(queries(), ['jatmn', 'j']);
+  assert.equal(textOf(dialog.querySelector('ul.picker-results')), "Couldn't search members: Failed to fetch. Paste their ID instead.");
+  search = () => response({ members: [], next_cursor: null, total: null });
+  await type('x');
+  await settleSearch();
+  assert.equal(textOf(dialog.querySelector('ul.picker-results')), 'No matching members.');
+
+  // Clearing the box, pasting an ID or selecting typed IDs cancels the pending search.
+  const chips = () => [...dialog.querySelectorAll('ul.picker-chips .picker-chip-text')].map(textOf);
+  await type('jat');
+  await type('');
+  assert.equal(searchTimers().length, 0, 'clearing the box cancels the pending search');
+  await type('jat');
+  await type('4242');
+  assert.equal(searchTimers().length, 0, 'a pasted ID cancels the pending search');
+  await fire(idBox(), 'keydown', { key: 'Enter' });
+  assert.deepEqual(chips(), ['User 4242'], 'a pasted ID is selected at once');
+  await type('4242,4343');
+  assert.equal(searchTimers().length, 1);
+  await fire(idBox(), 'keydown', { key: 'Enter' });
+  assert.deepEqual(chips(), ['User 4343']);
+  assert.equal(searchTimers().length, 0, 'selecting cancels the pending search');
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x']);
+
+  // Closing the dialog before the delay sends nothing.
+  await type('jat');
+  await cancel();
+  assert.equal(h.document.querySelector('.ban-dialog'), null);
+  assert.equal(searchTimers().length, 0, 'closing the picker cancels its pending search');
+
+  // A server change before the delay sends nothing to either server.
+  dialog = await open();
+  await type('jatmn');
+  h.app.state.guildId = h.app.state.guilds[1].id;
+  await settleSearch();
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x'], 'a search typed for one server is not sent after a server change');
+  h.app.state.guildId = h.app.state.guilds[0].id;
+  await cancel();
+
+  // Closing the dialog aborts a search already sent.
+  dialog = await open();
+  search = signal => new Promise((_, reject) => signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true }));
+  await type('jatmn');
+  await settleSearch();
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x', 'jatmn']);
+  assert.equal(reads.at(-1).signal.aborted, false);
+  await cancel();
+  assert.equal(reads.at(-1).signal.aborted, true, 'closing the picker aborts its search');
+  assert.equal(searchTimers().length, 0);
 });
 
 // #709: node:assert renders a failed comparison by inspecting both values without a practical
@@ -6536,6 +6641,7 @@ test('rule exception pickers show server names and save only the chosen IDs', as
   await fire(findNode(modal, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Remove @Moderators'), 'click');
   const search = control('Skip users');
   search.value = 'sear'; await fire(search, 'input');
+  await settleMemberSearch(h);
   assert.match(requests.at(-1).url, /\/members\?q=sear&limit=8&status=current$/);
   await fire(findNode(modal, n => n.localName === 'button' && textOf(n).startsWith('Searched Member')), 'click');
   assert.deepEqual(chips('Skip users'), ['Known Member', 'Searched Member']);
@@ -6658,7 +6764,7 @@ test('member search results only select for the query they answer', async () => 
   const search = pickerLabelled(modal, 'Skip users');
   const chips = () => [...modal.querySelectorAll('ul.picker-chips[aria-label="Skip users"] .picker-chip-text')].map(textOf);
   const results = () => modal.querySelector('ul.picker-results');
-  const typeQuery = async (value) => { search.value = value; await fire(search, 'input'); };
+  const typeQuery = async (value) => { search.value = value; await fire(search, 'input'); await settleMemberSearch(h); };
   await typeQuery('Alice'); pending.get('Alice')(); await settle();
   assert.match(textOf(results()), /Alice/);
   await typeQuery('Bob');
@@ -11531,7 +11637,7 @@ test('Cases filters send exact filters, restart at the first page and hide for r
   assert.equal(lists().at(-1).get('subject'), CASE_SUBJECT);
   moderator.value = 'Kit';
   await fire(moderator, 'input');
-  await settle();
+  await settleMemberSearch(h);
   const search = calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/members')).at(-1);
   assert.equal(new URL(search.url, 'https://fixture.test').searchParams.get('status'), 'all', 'banned and departed members can be picked');
   await fire(findNode(filters, n => n.localName === 'button' && /Kit Mod/.test(n.textContent)), 'click', {});
