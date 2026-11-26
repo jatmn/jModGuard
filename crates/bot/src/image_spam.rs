@@ -1320,7 +1320,7 @@ fn candidate_job(
         .filter(|p| hash_candidate(p, policy, now))
         .cloned()
         .collect();
-    if policy.known_bad_hashes.is_empty()
+    if policy.managed_hashes().is_none()
         && (posts
             .iter()
             .map(|p| p.channel)
@@ -1480,14 +1480,14 @@ fn common_images(
 ) -> Result<Option<ImageMatch>, ()> {
     // A managed digest recognizes a previously confirmed image on its first post.
     // Missing hashes are never proof. Membership/exemptions/replay guards remain shared.
-    if !policy.known_bad_hashes.is_empty() {
+    if let Some(managed_hashes) = policy.managed_hashes() {
         for anchor in posts {
             let Some(hashes) = &anchor.hashes else {
                 continue;
             };
             for hash in hashes {
                 work = work.checked_sub(1).ok_or(())?;
-                if policy.known_bad_hashes.contains(hash) {
+                if managed_hashes.contains(hash) {
                     let messages = posts
                         .iter()
                         .filter(|p| p.hashes.as_ref().is_some_and(|hs| hs.contains(hash)))
@@ -1732,9 +1732,28 @@ pub fn observe(
     if msg.author.id == ctx.cache.current_user().id || msg.webhook_id.is_some() {
         return;
     }
-    let Some(rule) = cfg.rules.get("attachment_flood") else {
+    let Some(rule) = cfg
+        .rules
+        .get("attachment_flood")
+        .filter(|rule| rule.enabled)
+    else {
         return;
     };
+    let mut images = msg
+        .attachments
+        .iter()
+        .filter(|a| {
+            is_image_attachment(
+                a.width.is_some(),
+                a.height.is_some(),
+                a.content_type.as_deref(),
+                &a.filename,
+            )
+        })
+        .peekable();
+    if images.peek().is_none() {
+        return;
+    }
     let Some(policy) = policy_for_config(cfg, rule) else {
         return;
     };
@@ -1767,21 +1786,7 @@ pub fn observe(
     let Some(at) = received.checked_sub(Duration::from_millis(age_ms as u64)) else {
         return;
     };
-    let images: Vec<_> = msg
-        .attachments
-        .iter()
-        .filter(|a| {
-            is_image_attachment(
-                a.width.is_some(),
-                a.height.is_some(),
-                a.content_type.as_deref(),
-                &a.filename,
-            )
-        })
-        .collect();
-    if images.is_empty() {
-        return;
-    }
+    let images: Vec<_> = images.collect();
     let detector = &app.image_spam;
     if images.len() > detector.limits.max_files_per_post {
         detector.capacity_drop();
@@ -2573,7 +2578,7 @@ pub(crate) fn policy_for_config(
         return None;
     }
     let mut policy = Policy::parse(rule).ok()?;
-    policy.known_bad_hashes = cfg.known_bad_hashes.clone();
+    policy.known_bad_hashes.clone_from(&cfg.known_bad_hashes);
     Some(policy)
 }
 
@@ -2582,10 +2587,10 @@ fn hash_candidate(post: &Post, policy: &Policy, now: Instant) -> bool {
 }
 
 fn minimum_files(policy: &Policy) -> usize {
-    if policy.known_bad_hashes.is_empty() {
-        policy.min_attachments
-    } else {
+    if policy.managed_hashes().is_some() {
         1
+    } else {
+        policy.min_attachments
     }
 }
 
@@ -2685,6 +2690,13 @@ mod tests {
             min_attachments: 2,
             enforce: false,
             known_bad_hashes: Default::default(),
+        }
+    }
+
+    fn known_bad_policy() -> Policy {
+        Policy {
+            known_bad_hashes: Some(Arc::new(BTreeSet::from([[1; 32]]))),
+            ..policy()
         }
     }
 
@@ -3964,6 +3976,10 @@ mod tests {
         let cfg = app.configs.get(&app.db, 1).await.unwrap();
         let rule = cfg.rules.get("attachment_flood").unwrap();
         let policy = policy_for_config(&cfg, rule).unwrap();
+        assert!(Arc::ptr_eq(
+            cfg.known_bad_hashes.as_ref().unwrap(),
+            policy.known_bad_hashes.as_ref().unwrap(),
+        ));
         assert_eq!(minimum_files(&policy), 1);
         let now = Instant::now();
         let detector = Detector::new(Limits::default()).unwrap();
@@ -4960,8 +4976,7 @@ mod tests {
                 for retain_live_post in [false, true] {
                     let detector = Detector::new(Limits::default()).unwrap();
                     let now = Instant::now();
-                    let mut policy = policy();
-                    policy.known_bad_hashes.insert([1; 32]);
+                    let policy = known_bad_policy();
                     detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
                     if retain_live_post {
                         detector.admit(1, 2, post(11, 101, now, &[2]), (0, 0), &policy, now, false);
@@ -5021,8 +5036,7 @@ mod tests {
     fn own_delete_receipts_cannot_outlive_config_change() {
         let detector = Detector::new(Limits::default()).unwrap();
         let now = Instant::now();
-        let mut policy = policy();
-        policy.known_bad_hashes.insert([1; 32]);
+        let policy = known_bad_policy();
         detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
         let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
         deleted.finish(true);
@@ -5061,8 +5075,7 @@ mod tests {
         })
         .unwrap();
         let now = Instant::now();
-        let mut policy = policy();
-        policy.known_bad_hashes.insert([1; 32]);
+        let policy = known_bad_policy();
         detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
         let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
         deleted.finish(true);
@@ -5096,8 +5109,7 @@ mod tests {
     fn own_delete_proof_requires_success_and_expires_at_original_time() {
         let detector = Detector::new(Limits::default()).unwrap();
         let now = Instant::now();
-        let mut policy = policy();
-        policy.known_bad_hashes.insert([1; 32]);
+        let policy = known_bad_policy();
         detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
         let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
         detector.deleted(1, 100, 10);
@@ -5148,8 +5160,7 @@ mod tests {
     fn own_delete_echo_cannot_revive_an_edited_observation() {
         let detector = Detector::new(Limits::default()).unwrap();
         let now = Instant::now();
-        let mut policy = policy();
-        policy.known_bad_hashes.insert([1; 32]);
+        let policy = known_bad_policy();
         detector.admit(1, 2, post(10, 100, now, &[1]), (0, 0), &policy, now, false);
         let mut deleted = detector.begin_delete(1, 2, (0, 0), 100, 10).unwrap();
         assert!(matches!(
@@ -5186,8 +5197,7 @@ mod tests {
     #[test]
     fn known_bad_hashes_never_match_missing_or_different_data() {
         let now = Instant::now();
-        let mut p = policy();
-        p.known_bad_hashes.insert([1; 32]);
+        let p = known_bad_policy();
         let mut missing = post(1, 10, now, &[1]);
         missing.hashes = None;
         assert_eq!(common_images(&[&missing], &p, 100_000), Ok(None));
@@ -7971,7 +7981,7 @@ mod tests {
             templates: HashMap::new(),
             log_channels: HashMap::new(),
             log_filters: HashMap::new(),
-            known_bad_hashes: BTreeSet::new(),
+            known_bad_hashes: None,
             known_spam: Default::default(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),
