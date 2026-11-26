@@ -3,7 +3,9 @@
 use anyhow::{Result, ensure};
 use hyper::{Body, Client, body::HttpBody};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub fn parse_hash(raw: &str) -> Option<[u8; 32]> {
@@ -31,9 +33,15 @@ pub struct Policy {
     #[serde(default, skip_deserializing)]
     pub enforce: bool,
     #[serde(default, skip_deserializing)]
-    pub known_bad_hashes: std::collections::BTreeSet<[u8; 32]>,
+    pub known_bad_hashes: Option<Arc<BTreeSet<Hash>>>,
 }
 impl Policy {
+    pub fn managed_hashes(&self) -> Option<&BTreeSet<Hash>> {
+        self.known_bad_hashes
+            .as_deref()
+            .filter(|hashes| !hashes.is_empty())
+    }
+
     pub fn parse(rule: &crate::types::RuleDef) -> Result<Self> {
         let mut value: Self = serde_json::from_value(rule.params.clone())?;
         ensure!(

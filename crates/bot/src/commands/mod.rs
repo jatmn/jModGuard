@@ -3741,7 +3741,7 @@ mod tests {
             templates: HashMap::new(),
             log_channels: HashMap::new(),
             log_filters: HashMap::new(),
-            known_bad_hashes: std::collections::BTreeSet::new(),
+            known_bad_hashes: None,
             known_spam: Default::default(),
             regexes: Vec::new(),
             custom_patterns: HashMap::new(),

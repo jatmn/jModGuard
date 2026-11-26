@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use regex::Regex;
 use serenity::model::id::ChannelId;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -2354,7 +2354,7 @@ pub struct CachedGuildConfig {
     pub templates: HashMap<String, String>,
     pub log_channels: HashMap<String, ChannelId>,
     pub log_filters: HashMap<String, db::LogFilter>,
-    pub known_bad_hashes: std::collections::BTreeSet<[u8; 32]>,
+    pub known_bad_hashes: Option<Arc<BTreeSet<jmodguard::image_spam::Hash>>>,
     pub regexes: Vec<Regex>,
     pub known_spam: jmodguard::known_spam::CompiledList,
     pub custom_patterns: HashMap<String, Regex>,
@@ -2395,12 +2395,16 @@ impl CachedGuildConfig {
                 }
             }
         }
+        let known_bad_hashes = parts
+            .known_bad_images
+            .iter()
+            .filter_map(|row| jmodguard::image_spam::parse_hash(&row.hash))
+            .collect::<BTreeSet<_>>();
         Self {
             version,
             durable_version,
             loaded_at: Instant::now(),
-            known_bad_hashes: parts.known_bad_images.iter()
-                .filter_map(|row| jmodguard::image_spam::parse_hash(&row.hash)).collect(),
+            known_bad_hashes: (!known_bad_hashes.is_empty()).then(|| Arc::new(known_bad_hashes)),
             known_spam: jmodguard::known_spam::CompiledList::new(&parts.known_spam),
             settings: parts.settings,
             rules: parts.rules,
