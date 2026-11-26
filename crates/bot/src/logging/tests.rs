@@ -6154,6 +6154,156 @@ async fn delivery_renders_custom_template_as_description_with_event_accent_and_c
     assert!(payload.get("content").is_none());
 }
 
+const EDIT_SOURCE_CHANNEL_JSON: &str = r#"{"id":"456","guild_id":"789","type":0,"name":"general","position":0,"permission_overwrites":[]}"#;
+
+/// A gateway channel-cache miss leaves the source as a mention to resolve.
+fn uncached_edit_source_vars() -> BTreeMap<String, String> {
+    message_vars(GuildId::new(789), ChannelId::new(456), MessageId::new(123))
+}
+
+fn edit_source_channel_gets(requests: &[String]) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.starts_with("GET /api/v10/channels/456 "))
+        .count()
+}
+
+#[tokio::test]
+async fn message_edit_template_without_channel_skips_the_source_channel_lookup() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_edit", 901)
+        .await
+        .unwrap();
+    f.app.db.with_conn(|conn| {
+        conn.execute_bounded("INSERT INTO templates(guild_id,event_type,template) VALUES(789,'message_edit','Edited: {message_url}')", (), 65_536)?;
+        Ok(())
+    }).await.unwrap();
+    f.app.invalidate_configs();
+    let (http, requests, _, server) = sequenced_bulk_proxy(vec![SequencedProxyReply::Status {
+        status: 200,
+        body: CREATED_MESSAGE_JSON,
+    }])
+    .await;
+    let delivery = emit_to(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        "message_edit",
+        uncached_edit_source_vars(),
+    )
+    .await;
+    server.abort();
+    let seen = request_text(&requests.lock().unwrap());
+    assert_eq!(edit_source_channel_gets(&seen), 0, "{seen:?}");
+    assert_eq!(delivery, Delivery::Sent);
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        seen[0].starts_with("POST /api/v10/channels/901/messages "),
+        "{}",
+        seen[0]
+    );
+    assert_eq!(
+        request_log_payload(&seen[0])["embeds"][0]["description"],
+        "Edited: https://discord.com/channels/789/456/123"
+    );
+}
+
+#[tokio::test]
+async fn message_edit_blocked_destination_skips_the_source_channel_lookup() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_edit", 901)
+        .await
+        .unwrap();
+    let (http, requests, _, server) = sequenced_bulk_proxy(vec![
+        SequencedProxyReply::Status {
+            status: 200,
+            body: EDIT_SOURCE_CHANNEL_JSON,
+        },
+        SequencedProxyReply::Status {
+            status: 403,
+            body: r#"{"code":50013,"message":"fixture"}"#,
+        },
+    ])
+    .await;
+    // The shipped template uses the channel name, so only the remembered
+    // permanent rejection makes the lookup unnecessary.
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "message_edit",
+            uncached_edit_source_vars(),
+        )
+        .await,
+        Delivery::Failed
+    );
+    let first = request_text(&requests.lock().unwrap());
+    assert_eq!(edit_source_channel_gets(&first), 1, "{first:?}");
+    assert_eq!(first.len(), 2, "{first:?}");
+    let delivery = emit_to(
+        &f.app,
+        &http,
+        GuildId::new(789),
+        "message_edit",
+        uncached_edit_source_vars(),
+    )
+    .await;
+    server.abort();
+    let seen = request_text(&requests.lock().unwrap());
+    assert_eq!(
+        edit_source_channel_gets(&seen[first.len()..]),
+        0,
+        "{seen:?}"
+    );
+    assert_eq!(delivery, Delivery::Blocked);
+    assert_eq!(seen.len(), first.len(), "{seen:?}");
+}
+
+#[tokio::test]
+async fn message_edit_template_with_channel_still_resolves_the_source_name() {
+    let f = Fixture::new();
+    db::upsert_log_channel(&f.app.db, 789, "message_edit", 901)
+        .await
+        .unwrap();
+    let (http, requests, _, server) = sequenced_bulk_proxy(vec![
+        SequencedProxyReply::Status {
+            status: 200,
+            body: EDIT_SOURCE_CHANNEL_JSON,
+        },
+        SequencedProxyReply::Status {
+            status: 200,
+            body: CREATED_MESSAGE_JSON,
+        },
+    ])
+    .await;
+    assert_eq!(
+        emit_to(
+            &f.app,
+            &http,
+            GuildId::new(789),
+            "message_edit",
+            uncached_edit_source_vars(),
+        )
+        .await,
+        Delivery::Sent
+    );
+    server.abort();
+    let seen = request_text(&requests.lock().unwrap());
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert_eq!(edit_source_channel_gets(&seen[..1]), 1, "{seen:?}");
+    assert!(
+        seen[1].starts_with("POST /api/v10/channels/901/messages "),
+        "{}",
+        seen[1]
+    );
+    let text = log_text(&request_log_payload(&seen[1]));
+    assert!(
+        text.starts_with("Message edited\n\n**Channel:** #general\n"),
+        "{text}"
+    );
+}
+
 #[test]
 fn shipped_automod_embed_keeps_whole_proving_hashes_inside_field_limit() {
     let mut vars = BTreeMap::from([(

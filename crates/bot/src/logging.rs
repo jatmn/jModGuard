@@ -1782,29 +1782,6 @@ async fn emit_to_observed_with_audit(
         if !commit() {
             return Ok(Delivery::Dropped);
         }
-        if event == "message_edit"
-            && vars
-                .get("channel")
-                .is_some_and(|value| value.starts_with("<#"))
-            && let Some(id) = vars
-                .get("channel_id")
-                .and_then(|id| id.parse::<u64>().ok())
-                .filter(|id| *id != 0)
-        {
-            let budget = deadline
-                .saturating_sub(started.elapsed())
-                .div_f64(2.0)
-                .min(Duration::from_secs(3));
-            let name =
-                tokio::time::timeout(budget, sink.edit_channel_name(guild_id, ChannelId::new(id)))
-                    .await
-                    .ok()
-                    .flatten();
-            vars.insert(
-                "channel".into(),
-                format!("#{}", name.unwrap_or_else(|| id.to_string())),
-            );
-        }
         #[cfg(test)]
         if event == "automod"
             && AUTOMOD_VARS_CAPTURE
@@ -1835,6 +1812,40 @@ async fn emit_to_observed_with_audit(
                 None => default_template(event),
             }
         };
+        let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
+            guild: guild_id.get(),
+            channel: channel_id.get(),
+        };
+        // Optional enrichment: only a deliverable report that shows the source
+        // channel spends a Discord request on its name.
+        if event == "message_edit"
+            && substituted_key_count(template, "channel") > 0
+            && app.activation.may_record()
+            && !app
+                .remembered_discord_targets
+                .blocked(rest_target, Instant::now())
+            && vars
+                .get("channel")
+                .is_some_and(|value| value.starts_with("<#"))
+            && let Some(id) = vars
+                .get("channel_id")
+                .and_then(|id| id.parse::<u64>().ok())
+                .filter(|id| *id != 0)
+        {
+            let budget = deadline
+                .saturating_sub(started.elapsed())
+                .div_f64(2.0)
+                .min(Duration::from_secs(3));
+            let name =
+                tokio::time::timeout(budget, sink.edit_channel_name(guild_id, ChannelId::new(id)))
+                    .await
+                    .ok()
+                    .flatten();
+            vars.insert(
+                "channel".into(),
+                format!("#{}", name.unwrap_or_else(|| id.to_string())),
+            );
+        }
         templates::format_log_timestamps(&mut vars);
         if grouped_cleanup {
             // A mixed custom template may request values tied to one message.
@@ -1856,10 +1867,6 @@ async fn emit_to_observed_with_audit(
         if !app.activation.may_record() {
             return Ok(Delivery::Dropped);
         }
-        let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
-            guild: guild_id.get(),
-            channel: channel_id.get(),
-        };
         if app
             .remembered_discord_targets
             .blocked(rest_target, Instant::now())
