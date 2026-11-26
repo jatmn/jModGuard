@@ -21,7 +21,7 @@ import {
 import {
   clearListLocation, ListControls, ListEmptyRow, ListLoadProgress, ListSortHeading, readListLocation,
   flushPendingListSearch, listLoadProgress, openFilteredList, readListPage, rememberListLocation, restoreListLocation,
-  setCaseListLocation, useListControls,
+  SEARCH_DELAY_MS, setCaseListLocation, useListControls,
 } from "./list-controls.js";
 import { ACTION_ICONS, DASHBOARD_ICONS, Icon, NAV_ICONS } from "./icons.js";
 import { noAutofill } from "./no-autofill.js";
@@ -4441,6 +4441,7 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
   const [found, setFound] = useState(null);
   const [error, setError] = useState("");
   const searchAbort = useRef(null);
+  const searchTimer = useRef(null);
   const flushRef = useRef(null);
   // Only results for the text now in the box can be chosen.
   const results = found && found.query === text.trim() ? found.members : null;
@@ -4455,9 +4456,15 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
     if (!id || ids.includes(id)) return;
     update(single ? [id] : [...ids, id]);
   };
-  // Drop shown results and ignore any search still in flight.
-  const clearSearch = () => {
+  // Stop a search still waiting for typing to settle or still in flight.
+  const cancelSearch = () => {
+    clearTimeout(searchTimer.current);
+    searchTimer.current = null;
     searchAbort.current?.abort();
+  };
+  // Drop shown results and ignore any pending search.
+  const clearSearch = () => {
+    cancelSearch();
     setFound(null);
   };
   const addTyped = () => {
@@ -4490,17 +4497,25 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
         : [];
   const useSelect = channelKinds !== null || (kind !== "user" && names.status === "loaded" && options.length > 0);
   const noun = kind === "role" ? "role" : kind === "channel" ? "channel" : "member";
-  const search = async (value) => {
-    searchAbort.current?.abort();
+  // Names wait for typing to settle, as list search does, so one name sends one read.
+  const search = (value) => {
+    cancelSearch();
     const q = value.trim();
     if (kind !== "user" || names.status === "unavailable" || !q || parseSnowflake(q)) {
       setFound(null);
       return;
     }
+    const guildId = state.guildId;
+    searchTimer.current = setTimeout(() => {
+      searchTimer.current = null;
+      if (state.guildId === guildId) return readMembers(guildId, q);
+    }, SEARCH_DELAY_MS);
+  };
+  const readMembers = async (guildId, q) => {
     const controller = new AbortController();
     searchAbort.current = controller;
     try {
-      const page = await apiRead(`/api/guilds/${state.guildId}/members?${new URLSearchParams({ q, limit: "8", status: memberStatus })}`, controller.signal);
+      const page = await apiRead(`/api/guilds/${guildId}/members?${new URLSearchParams({ q, limit: "8", status: memberStatus })}`, controller.signal);
       if (searchAbort.current === controller && !controller.signal.aborted) {
         setFound({ query: q, members: Array.isArray(page?.members) ? page.members : [] });
       }
@@ -4511,7 +4526,7 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
       }
     }
   };
-  useEffect(() => () => searchAbort.current?.abort(), []);
+  useEffect(() => cancelSearch, []);
   flushRef.current = addTyped;
   useEffect(() => {
     if (!pending) return undefined;
@@ -4537,10 +4552,17 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
         search(e.target.value);
       },
       onKeyDown: (e) => {
-        if (e.key !== "Enter") return;
+        // Enter that confirms an input method candidate belongs to the input method.
+        if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
         e.preventDefault();
         if (results?.length === 1 && !parseSnowflake(text)) {
           choose(results[0]);
+          return;
+        }
+        // A name still waiting for typing to settle is searched now, not rejected as an ID.
+        if (searchTimer.current && text.split(",").some((part) => !parseSnowflake(part))) {
+          cancelSearch();
+          readMembers(state.guildId, text.trim());
           return;
         }
         addTyped();
