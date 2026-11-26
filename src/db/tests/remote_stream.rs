@@ -1773,14 +1773,11 @@ async fn version_observation_reads_counters_and_revisions_in_one_statement() {
 
 struct ObservedGuildStats {
     counts: (i64, i64, i64),
-    stats_sql: Vec<String>,
-    other_sql: Vec<String>,
-    begins: usize,
+    statements: Vec<String>,
 }
 
 /// The bot `guild_stats` and dashboard `enrolled_guild_stats` reads for each
-/// guild, with the moderation-table statements, other data statements and
-/// primary snapshot BEGINs each read sent.
+/// guild, with the ordered SQL trace of each read.
 async fn observe_guild_stats(
     fixture: &HranaFixture,
     db: &Db,
@@ -1789,26 +1786,17 @@ async fn observe_guild_stats(
     let mut observed = Vec::new();
     for scope in scopes {
         for enrolled in [false, true] {
-            fixture.take_data_statements();
-            let begins = fixture.read_begins();
+            fixture.state.lock().unwrap().statements.clear();
             let stats = if enrolled {
                 enrolled_guild_stats(db, scope.clone()).await
             } else {
                 guild_stats(db, scope.guild_id).await
             }
             .unwrap();
-            let (stats_sql, other_sql) =
-                fixture.take_data_statements().into_iter().partition(|sql| {
-                    let sql = sql.to_ascii_uppercase();
-                    ["FROM EVENTS", "FROM WARNS", "FROM BANS"]
-                        .iter()
-                        .any(|table| sql.contains(table))
-                });
+            let statements = std::mem::take(&mut fixture.state.lock().unwrap().statements);
             observed.push(ObservedGuildStats {
                 counts: (stats.events, stats.warns, stats.bans),
-                stats_sql,
-                other_sql,
-                begins: fixture.read_begins() - begins,
+                statements,
             });
         }
     }
@@ -1829,25 +1817,25 @@ async fn guild_stats_read_all_counts_in_one_statement() {
         for (index, read) in observed.into_iter().enumerate() {
             let (guild, enrolled) = (index / 2, index % 2 == 1);
             let route = if enrolled { "dashboard" } else { "bot" };
-            let ObservedGuildStats {
-                counts,
-                stats_sql,
-                other_sql,
-                begins,
-            } = read;
-            assert_eq!(counts, expected[guild], "{label} guild {guild} {route}");
             assert_eq!(
-                stats_sql.len(),
-                1,
-                "{label} guild {guild} {route}: one stats data statement: {stats_sql:?}"
+                read.counts, expected[guild],
+                "{label} guild {guild} {route}"
             );
-            if enrolled {
-                // Membership is still verified in the same primary snapshot.
-                assert_eq!(begins, 1, "{label} guild {guild} {route}");
-                assert_eq!(other_sql.len(), 1, "{other_sql:?}");
-                assert!(other_sql[0].contains("guild_enrollments"), "{other_sql:?}");
-            } else {
-                assert_eq!((begins, other_sql.len()), (0, 0), "{other_sql:?}");
+            let stats_sql = match read.statements.as_slice() {
+                [stats] if !enrolled => stats,
+                [begin, enrollment, stats, rollback] if enrolled => {
+                    assert_eq!(begin.trim().trim_end_matches(';'), "BEGIN DEFERRED");
+                    assert!(enrollment.contains("guild_enrollments"), "{enrollment}");
+                    assert_eq!(rollback.trim().trim_end_matches(';'), "ROLLBACK");
+                    stats
+                }
+                statements => {
+                    panic!("{label} guild {guild} {route}: unexpected SQL trace {statements:?}");
+                }
+            };
+            let stats_sql = stats_sql.to_ascii_uppercase();
+            for table in ["EVENTS", "WARNS", "BANS"] {
+                assert!(stats_sql.contains(&format!("FROM {table}")), "{stats_sql}");
             }
         }
     };
