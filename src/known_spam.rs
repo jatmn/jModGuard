@@ -352,9 +352,19 @@ impl CompiledList {
         )
     }
     pub fn matches_forms(&self, raw: &str, normalized: &str, compact: &str) -> bool {
-        if self.raw.contains(raw.trim())
-            || self.normalized.contains(normalized.trim())
-            || self.compact.contains(compact)
+        self.matches_lazy_forms(raw, || normalized, || compact)
+    }
+    /// Requests normalized forms only when a saved sample needs them.
+    pub fn matches_lazy_forms<'a>(
+        &self,
+        raw: &str,
+        normalized: impl FnOnce() -> &'a str,
+        compact: impl FnOnce() -> &'a str,
+    ) -> bool {
+        if !self.raw.is_empty()
+            && (self.raw.contains(raw.trim())
+                || self.normalized.contains(normalized().trim())
+                || self.compact.contains(compact()))
         {
             return true;
         }

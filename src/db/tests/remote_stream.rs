@@ -350,6 +350,10 @@ pub(in crate::db) struct HranaFixture {
 }
 
 impl HranaFixture {
+    pub(in crate::db) fn url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
     async fn start() -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -460,7 +464,7 @@ impl HranaFixture {
         let database = runtime
             .block_on_database(
                 "connect",
-                libsql::Builder::new_remote(format!("http://{}", self.address), "test".into())
+                libsql::Builder::new_remote(self.url(), "test".into())
                     .connector(crate::remote_https::https_connector())
                     .build(),
             )

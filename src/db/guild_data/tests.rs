@@ -142,22 +142,74 @@ async fn writable_store_queues_for_the_writer_lock_like_the_bot_core() {
 #[tokio::test]
 async fn existing_registration_reads_stamped_identity_without_creating() {
     let f = Fixture::new();
+    let probe = std::sync::Arc::new(crate::db::StartupProbe::default());
+    let _guard = crate::db::enter_startup_probe(Some(probe.clone()));
     assert!(
         GuildDataStore::existing_registration(f.options())
             .unwrap()
             .is_none()
     );
+    assert!(!f.store_path.exists());
+    assert_eq!(probe.connection_opens(), 0);
     let reg = f
         .registration(StoreId::new(), StorePolicy::Dedicated { guild_id: 20 })
         .await;
-    GuildDataStore::initialize(f.options(), reg.clone()).unwrap();
-    let stamped = GuildDataStore::existing_registration(f.options())
-        .unwrap()
-        .expect("stamped identity");
-    assert_eq!(stamped, reg);
+    drop(GuildDataStore::initialize(f.options(), reg.clone()).unwrap());
+    assert_registration_open_counts(f.options(), reg, &probe);
     assert!(
         GuildDataStore::existing_registration(options(&f.catalog_path)).is_err(),
         "core databases are not empty guild stores"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn existing_registration_reads_stamped_identity_over_hrana() {
+    let f = Fixture::new();
+    let reg = f
+        .registration(StoreId::new(), StorePolicy::Dedicated { guild_id: 20 })
+        .await;
+    drop(GuildDataStore::initialize(f.options(), reg.clone()).unwrap());
+    let (fixture, db) = crate::db::tests::remote_stream::HranaFixture::delayed_database(
+        &f.store_path,
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    drop(db);
+
+    let probe = std::sync::Arc::new(crate::db::StartupProbe::default());
+    let options = GuildStoreOptions {
+        url: fixture.url(),
+        token: "test".into(),
+        read_only: true,
+        ..f.options()
+    };
+    let _guard = crate::db::enter_startup_probe(Some(probe.clone()));
+    assert_registration_open_counts(options, reg, &probe);
+}
+
+fn assert_registration_open_counts(
+    mut options: GuildStoreOptions,
+    reg: StoreRegistration,
+    probe: &crate::db::StartupProbe,
+) {
+    const CAPACITY: usize = 3;
+    options.pool_size = CAPACITY as u32;
+    let before = probe.connection_opens();
+    let stamped = GuildDataStore::existing_registration(options.clone())
+        .unwrap()
+        .expect("stamped identity");
+    assert_eq!(stamped, reg);
+    assert_eq!(probe.connection_opens() - before, 1, "stamp connection");
+
+    let before = probe.connection_opens();
+    let store = GuildDataStore::open(options, reg).unwrap();
+    assert_eq!(store.db.permits.available_permits(), CAPACITY);
+    assert_eq!(store.db.connections.idle.lock().unwrap().len(), CAPACITY);
+    assert_eq!(
+        probe.connection_opens() - before,
+        CAPACITY as u64 + 2,
+        "three pooled connections, one bootstrap, and one lease connection"
     );
 }
 

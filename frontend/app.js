@@ -10674,16 +10674,24 @@ function auditEventSummary(record) {
   return { text: format(data).filter(Boolean).join(" · "), banId: data.ban_id ?? null };
 }
 
-function AuditEventDetails({ record, guildId }) {
-  const summary = auditEventSummary(record);
-  let raw = null;
-  if (isBotOwner() && record.data) {
+function AuditRawDetails({ data }) {
+  const [open, setOpen] = useState(false);
+  let raw;
+  if (open) {
     try {
-      raw = JSON.stringify(JSON.parse(record.data), null, 1);
+      raw = JSON.stringify(JSON.parse(data), null, 1);
     } catch (_) {
-      raw = record.data;
+      raw = data;
     }
   }
+  return h("details", {
+    className: "audit-raw",
+    onToggle: (event) => setOpen(event.currentTarget.open),
+  }, h("summary", null, "Raw"), open ? h("pre", { className: "mono" }, raw) : null);
+}
+
+function AuditEventDetails({ record, guildId }) {
+  const summary = auditEventSummary(record);
   const openBan = () => openFilteredList(EVENTS_LIST, BANS_LIST, guildId, { subject: String(record.user_id) }, () => navigate("bans"));
   return h(
     "div",
@@ -10692,9 +10700,7 @@ function AuditEventDetails({ record, guildId }) {
     summary?.banId != null && record.user_id
       ? h("button", { type: "button", className: "btn btn-xs btn-link", onClick: openBan }, "View ban")
       : null,
-    raw === null
-      ? null
-      : h("details", { className: "audit-raw" }, h("summary", null, "Raw"), h("pre", { className: "mono" }, raw)),
+    isBotOwner() && record.data ? h(AuditRawDetails, { data: record.data }) : null,
   );
 }
 

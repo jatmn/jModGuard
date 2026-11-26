@@ -1827,10 +1827,52 @@ pub async fn analytics(
         )
             .into_response()
     };
+    #[cfg(test)]
+    let load_probe = super::enrollment_tests::analytics_request_started(&key);
+    use super::state::{AnalyticsLoad, AnalyticsLoadResult};
+    let leader = loop {
+        if let Some(cached) = app.analytics_cache.get(&key, std::time::Instant::now()) {
+            return Ok(json_response(cached));
+        }
+        match app.analytics_cache.join_load(&key) {
+            AnalyticsLoad::Leader(guard) => break Some(guard),
+            AnalyticsLoad::Follower(mut result) => {
+                let outcome = result
+                    .wait_for(Option::is_some)
+                    .await
+                    .ok()
+                    .and_then(|value| value.clone());
+                match outcome {
+                    Some(AnalyticsLoadResult::Response(body)) => return Ok(json_response(body)),
+                    // A failed core read leaves no usable response to share.
+                    Some(AnalyticsLoadResult::Unavailable) => break None,
+                    // An abandoned request lets waiting readers elect one replacement.
+                    None => continue,
+                }
+            }
+            AnalyticsLoad::Independent => break None,
+        }
+    };
+    // A complete response can arrive between the original miss and joining.
     if let Some(cached) = app.analytics_cache.get(&key, std::time::Instant::now()) {
+        if let Some(leader) = leader {
+            leader.publish_response(&cached);
+        }
         return Ok(json_response(cached));
     }
-    let result = db::enrolled_guild_analytics(&app.db, enrollment.clone(), days).await?;
+    #[cfg(test)]
+    if let Some(probe) = load_probe {
+        probe.before_aggregate().await;
+    }
+    let result = match db::enrolled_guild_analytics(&app.db, enrollment.clone(), days).await {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(leader) = leader {
+                leader.unavailable();
+            }
+            return Err(error.into());
+        }
+    };
     let moderator_ids = result.moderators.iter().map(|m| m.moderator_id).collect();
     let directory = match app.tenant.live(enrollment).await {
         Ok((store, scope)) => store
@@ -1858,12 +1900,19 @@ pub async fn analytics(
     let body = match serde_json::to_vec(&value) {
         Ok(encoded) => Bytes::from(encoded.into_boxed_slice()),
         Err(error) => {
+            if let Some(leader) = leader {
+                leader.unavailable();
+            }
             return Ok((StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response());
         }
     };
     if complete {
         app.analytics_cache
-            .put(key, body.clone(), std::time::Instant::now());
+            .put(key.clone(), body.clone(), std::time::Instant::now());
+    }
+    if let Some(leader) = leader {
+        // Joined readers can use a partial result while later reads retry it.
+        leader.publish_response(&body);
     }
     Ok(json_response(body))
 }

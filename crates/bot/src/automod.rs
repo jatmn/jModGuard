@@ -13,6 +13,7 @@ use serenity::client::Context;
 use serenity::model::guild::Member;
 use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::model::prelude::Timestamp;
+use std::cell::LazyCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -358,8 +359,13 @@ impl AutomodEngine {
         // Only velocity counts by arrival; other windows and strikes keep the
         // evaluation clock, which never runs backwards for one author.
         let arrived = ctx.received.unwrap_or(now);
-        let normalized = normalize::normalize_lenient(ctx.content);
-        let compact = normalize::normalize_compact(ctx.content);
+        let normalized = LazyCell::new(|| normalize::normalize_lenient(ctx.content));
+        let compact = LazyCell::new(|| normalize::compact_normalized(&normalized));
+        let matches_pattern = |pattern: &Regex| {
+            pattern.is_match(ctx.content)
+                || pattern.is_match(&normalized)
+                || pattern.is_match(&compact)
+        };
         let has_url = URL_RE.is_match(ctx.content);
         let has_invite = INVITE_RE.is_match(ctx.content);
 
@@ -394,17 +400,12 @@ impl AutomodEngine {
                         .unwrap_or(false)
                         && (has_url || has_invite)
                 }
-                "badword" => {
-                    !cfg.regexes.is_empty()
-                        && cfg.regexes.iter().any(|re| {
-                            re.is_match(ctx.content)
-                                || re.is_match(&normalized)
-                                || re.is_match(&compact)
-                        })
-                }
-                "known_spam" => cfg
-                    .known_spam
-                    .matches_forms(ctx.content, &normalized, &compact),
+                "badword" => cfg.regexes.iter().any(matches_pattern),
+                "known_spam" => cfg.known_spam.matches_lazy_forms(
+                    ctx.content,
+                    || normalized.as_str(),
+                    || compact.as_str(),
+                ),
                 "invite" => has_invite && !self.invite_allowed(rule, ctx.content),
                 // Velocity observes each eligible message under the strike bucket lock.
                 "velocity" => true,
@@ -527,8 +528,7 @@ impl AutomodEngine {
                 "pattern" => cfg
                     .custom_patterns
                     .get(rule_id)
-                    .map(|re| normalize::matches_badword(ctx.content, &normalized, re))
-                    .unwrap_or(false),
+                    .is_some_and(matches_pattern),
                 "word" => {
                     let words = jmodguard::custom_rules::custom_words(rule);
                     jmodguard::custom_rules::word_rule_matches(ctx.content, &words)
@@ -2255,6 +2255,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Instant;
 
+    use crate::normalize;
     use crate::state::{BotState, CachedGuildConfig};
     use crate::types::{ActionDef, GuildSettings, RuleDef};
 
@@ -3382,6 +3383,77 @@ mod tests {
             engine
                 .evaluate(&cfg, &msg(1, "scamper", 0, false, false))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn custom_patterns_match_raw_lenient_and_compact_text() {
+        let id = "custom:0123456789abcdef".to_owned();
+        let content = "Café\u{200B}\u{2003}TE4";
+        for pattern in [
+            "^Café\u{200B}\u{2003}TE4$",
+            "^cafe\u{2003}tea$",
+            "^cafetea$",
+        ] {
+            let rule = custom_rule(
+                serde_json::json!({ "kind": "pattern", "pattern": pattern }),
+                "delete",
+            );
+            let rules = HashMap::from([(id.clone(), rule)]);
+            let patterns =
+                HashMap::from([(id.clone(), normalize::compile_user_regex(pattern).unwrap())]);
+            let cfg = test_cfg(&rules, &patterns);
+            let engine = AutomodEngine::new();
+            let matched = engine
+                .evaluate(&cfg, &msg(1, content, 0, false, false))
+                .expect(pattern);
+            assert_eq!(matched.rule_id, id);
+            assert_eq!(matched.action.action, "delete");
+            assert!(matched.dry_run);
+        }
+    }
+
+    #[test]
+    fn custom_pattern_misses_and_exclusions_do_not_select_an_action() {
+        let mut rules = HashMap::from([(
+            "known_spam".to_owned(),
+            custom_rule(serde_json::json!({}), "ban"),
+        )]);
+        let mut patterns = HashMap::new();
+        // In channel 1 all 32 rules miss. In channel 2 they are out of scope.
+        for index in 0..32 {
+            let id = format!("custom:{index:016x}");
+            let pattern = format!("^missing-{index}$");
+            let mut rule = custom_rule(
+                serde_json::json!({ "kind": "pattern", "pattern": pattern }),
+                "delete",
+            );
+            rule.include_channels = vec![1];
+            rules.insert(id.clone(), rule);
+            patterns.insert(id, normalize::compile_user_regex(&pattern).unwrap());
+        }
+        let cfg = test_cfg(&rules, &patterns);
+        let engine = AutomodEngine::new();
+        for channel in [1, 2] {
+            assert!(
+                engine
+                    .evaluate(
+                        &cfg,
+                        &msg(channel, "Café\u{200B}\u{2003}TE4", 0, false, false)
+                    )
+                    .is_none()
+            );
+        }
+        // This independent positive control would match if the rule were in scope.
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(2, "missing-0", 0, false, false))
+                .is_none()
+        );
+        assert!(
+            engine
+                .evaluate(&cfg, &msg(1, "missing-0", 0, false, false))
+                .is_some()
         );
     }
 

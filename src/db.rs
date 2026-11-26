@@ -861,6 +861,38 @@ struct CloseBootstrap {
     runtime: DbRuntime,
 }
 
+impl CloseBootstrap {
+    fn connect(database: &Arc<libsql::Database>, runtime: &DbRuntime) -> Result<Self> {
+        Ok(Self {
+            connection: Some(
+                Connection::from_database(Arc::clone(database), runtime.clone())
+                    .context("failed to connect to database")?,
+            ),
+            runtime: runtime.clone(),
+        })
+    }
+
+    fn configure(
+        &mut self,
+        remote: bool,
+        read_only: bool,
+        scope: PoolScope,
+    ) -> Result<&mut Connection> {
+        let connection = self
+            .connection
+            .as_mut()
+            .expect("bootstrap connection is installed");
+        connection.set_read_only(read_only);
+        connection.set_guild_store(scope == PoolScope::GuildStore);
+        if remote {
+            connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+        } else {
+            configure_connection(connection, false, 5_000, read_only)?;
+        }
+        Ok(connection)
+    }
+}
+
 impl Drop for CloseBootstrap {
     fn drop(&mut self) {
         if let Some(connection) = self.connection.take() {
@@ -971,26 +1003,16 @@ impl Db {
         Self::open_pool(opts, opts.migrate, PoolScope::Core, initialize, ready)
     }
 
-    // `bot_writer` selects how long local pooled connections wait for the
-    // SQLite writer lock. Guild stores never set `migrate`, but only the bot
-    // opens one writable, so its writes queue like the bot's core writes.
-    // `scope` classifies every connection, including the bootstrap one,
-    // before its first statement.
-    fn open_pool(
+    fn open_database(
         opts: &DbOpenOptions,
-        bot_writer: bool,
-        scope: PoolScope,
-        initialize: impl FnOnce(&mut Connection) -> Result<()>,
-        ready: impl FnOnce(&Connection) -> Result<()>,
-    ) -> Result<Self> {
-        let remote = !opts.url.trim().is_empty();
+        remote: bool,
+    ) -> Result<(Arc<libsql::Database>, DbRuntime)> {
         if remote && opts.token.trim().is_empty() {
             anyhow::bail!("db.token / JMODGUARD_DB_TOKEN is required when db.url is set");
         }
         if !remote && !opts.token.trim().is_empty() {
             anyhow::bail!("db.url / JMODGUARD_DB_URL is required when db.token is set");
         }
-        let open_started = Instant::now();
         let runtime =
             DbRuntime::with_operation_timeout(remote.then_some(REMOTE_OPERATION_TIMEOUT))?;
         let database = if remote {
@@ -1008,7 +1030,24 @@ impl Db {
             }
             runtime.block_on(builder.build())?
         };
-        let database = Arc::new(database);
+        Ok((Arc::new(database), runtime))
+    }
+
+    // `bot_writer` selects how long local pooled connections wait for the
+    // SQLite writer lock. Guild stores never set `migrate`, but only the bot
+    // opens one writable, so its writes queue like the bot's core writes.
+    // `scope` classifies every connection, including the bootstrap one,
+    // before its first statement.
+    fn open_pool(
+        opts: &DbOpenOptions,
+        bot_writer: bool,
+        scope: PoolScope,
+        initialize: impl FnOnce(&mut Connection) -> Result<()>,
+        ready: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<Self> {
+        let remote = !opts.url.trim().is_empty();
+        let open_started = Instant::now();
+        let (database, runtime) = Self::open_database(opts, remote)?;
         let open_ms = u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let guild_store = scope == PoolScope::GuildStore;
 
@@ -1016,40 +1055,9 @@ impl Db {
         // connections are racing the DDL at startup. The connection is closed
         // on the database runtime, including the error path.
         {
-            let mut held = CloseBootstrap {
-                connection: Some({
-                    let mut connection =
-                        Connection::from_database(Arc::clone(&database), runtime.clone())
-                            .context("failed to connect to database")?;
-                    connection.set_read_only(opts.read_only);
-                    connection.set_guild_store(guild_store);
-                    connection
-                }),
-                runtime: runtime.clone(),
-            };
-            let bootstrap = held
-                .connection
-                .as_mut()
-                .expect("bootstrap connection is installed");
+            let mut held = CloseBootstrap::connect(&database, &runtime)?;
             let step_started = Instant::now();
-            if !remote {
-                if opts.read_only {
-                    bootstrap.execute_batch(
-                        "PRAGMA busy_timeout=5000;
-                         PRAGMA foreign_keys=ON;
-                         PRAGMA query_only=ON;",
-                    )?;
-                } else {
-                    bootstrap.execute_batch(
-                        "PRAGMA busy_timeout=5000;
-                         PRAGMA journal_mode=WAL;
-                         PRAGMA synchronous=NORMAL;
-                         PRAGMA foreign_keys=ON;",
-                    )?;
-                }
-            } else {
-                bootstrap.execute_batch("PRAGMA foreign_keys=ON;")?;
-            }
+            let bootstrap = held.configure(remote, opts.read_only, scope)?;
             initialize(bootstrap)?;
             let step_ms = u64::try_from(step_started.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::info!(

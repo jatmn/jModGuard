@@ -152,6 +152,10 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
     let placement = assign_initial_placement(&catalog, 10, registration.id().clone())
         .await
         .unwrap();
+    assert_eq!(
+        GuildDataStore::existing_registration(remote_options()).unwrap(),
+        None
+    );
     assert!(GuildDataStore::open(remote_options(), registration.clone()).is_err());
     test_drop_next_commit_response();
     let probe = std::sync::Arc::new(jmodguard::db::StartupProbe::default());
@@ -167,6 +171,14 @@ async fn remote_store_identity_and_binding_survive_lost_commit_responses() {
         .unwrap();
     store.verify_placement(placement.clone()).await.unwrap();
     let reopened = GuildDataStore::open(remote_options(), registration.clone()).unwrap();
+    assert_eq!(
+        GuildDataStore::existing_registration(GuildStoreOptions {
+            read_only: true,
+            ..remote_options()
+        })
+        .unwrap(),
+        Some(registration.clone())
+    );
     reopened.verify_placement(placement.clone()).await.unwrap();
 
     let second = assign_initial_placement(&catalog, 20, registration.id().clone())
