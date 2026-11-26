@@ -105,6 +105,11 @@ struct Descriptor {
     annotations: BTreeMap<String, String>,
 }
 
+pub(crate) struct VerifiedReleaseLayer {
+    repo: &'static str,
+    descriptor: Descriptor,
+}
+
 #[derive(Debug, Deserialize)]
 struct Manifest {
     #[serde(rename = "schemaVersion")]
@@ -525,13 +530,23 @@ impl Registry {
         release: &ComponentRelease,
         requested: &[&str],
     ) -> Result<HashMap<String, Vec<u8>>> {
+        let layer = self.installed_layer(control, release, requested).await?;
+        self.read_release_layer(layer, requested).await
+    }
+
+    pub(crate) async fn installed_layer(
+        &self,
+        control: &jmodguard::db::UpdateControl,
+        release: &ComponentRelease,
+        requested: &[&str],
+    ) -> Result<VerifiedReleaseLayer> {
         let state = control.component(&release.component).await?;
         ensure!(
             state.installed.as_ref() == Some(release)
                 || state.installed_launcher.as_ref() == Some(release),
             "release is not installed"
         );
-        self.files_with(release, requested, signature::SignatureExpiry::AllowExpired)
+        self.verified_release_layer(release, requested, signature::SignatureExpiry::AllowExpired)
             .await
     }
 
@@ -541,6 +556,18 @@ impl Registry {
         requested: &[&str],
         expiry: signature::SignatureExpiry,
     ) -> Result<HashMap<String, Vec<u8>>> {
+        let layer = self
+            .verified_release_layer(release, requested, expiry)
+            .await?;
+        self.read_release_layer(layer, requested).await
+    }
+
+    async fn verified_release_layer(
+        &self,
+        release: &ComponentRelease,
+        requested: &[&str],
+        expiry: signature::SignatureExpiry,
+    ) -> Result<VerifiedReleaseLayer> {
         release.validate()?;
         let repo = repository(&release.component)?;
         ensure!(
@@ -568,9 +595,21 @@ impl Registry {
             config.config.labels.get("io.jmodguard.release-id") == Some(&release.release_id),
             "release ID changed"
         );
-        let layer = manifest.layers.last().context("image has no final layer")?;
-        let bytes = self.blob(repo, layer, MAX_LAYER).await?;
-        extract_layer(&bytes, &layer.media_type, requested)
+        let descriptor = manifest
+            .layers
+            .into_iter()
+            .last()
+            .context("image has no final layer")?;
+        Ok(VerifiedReleaseLayer { repo, descriptor })
+    }
+
+    pub(crate) async fn read_release_layer(
+        &self,
+        layer: VerifiedReleaseLayer,
+        requested: &[&str],
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        let bytes = self.blob(layer.repo, &layer.descriptor, MAX_LAYER).await?;
+        extract_layer(&bytes, &layer.descriptor.media_type, requested)
     }
 }
 

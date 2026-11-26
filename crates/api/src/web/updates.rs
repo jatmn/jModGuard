@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use jmodguard::db::{self, ComponentObservation, ComponentRelease, Db};
 use jmodguard_updater::http_client_builder;
 use jmodguard_updater::oci::{Registry, sha256_hex};
-use jmodguard_updater::storage::{ReleaseVerification, Storage};
+use jmodguard_updater::storage::{InstalledWebuiInventory, ReleaseVerification, Storage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -901,17 +901,39 @@ pub async fn record_release_checks<F>(
 where
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
 {
+    record_release_checks_cached(
+        app,
+        discover,
+        lookup_timeout,
+        shutdown,
+        &mut InstalledWebuiInventory::default(),
+    )
+    .await
+}
+
+async fn record_release_checks_cached<F>(
+    app: &Arc<ApiState>,
+    discover: F,
+    lookup_timeout: Duration,
+    shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+    inventory: &mut InstalledWebuiInventory,
+) -> ReleaseCheckBatch
+where
+    F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
+{
     record_release_checks_with(
         app,
         discover,
         lookup_timeout,
         shutdown,
-        async |database, installed| {
+        inventory,
+        async |database, installed, inventory| {
             storage()?
-                .verify_installed_release(
+                .verify_installed_release_cached(
                     &Registry::ghcr()?,
                     &db::UpdateControl::from_application(database),
                     installed,
+                    inventory,
                 )
                 .await
         },
@@ -924,7 +946,12 @@ async fn record_release_checks_with<F>(
     mut discover: F,
     lookup_timeout: Duration,
     mut shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
-    verify_webui: impl AsyncFn(&Db, &ComponentRelease) -> anyhow::Result<ReleaseVerification>,
+    inventory: &mut InstalledWebuiInventory,
+    verify_webui: impl AsyncFn(
+        &Db,
+        &ComponentRelease,
+        &mut InstalledWebuiInventory,
+    ) -> anyhow::Result<ReleaseVerification>,
 ) -> ReleaseCheckBatch
 where
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
@@ -991,7 +1018,7 @@ where
                     let refresh = tokio::select! {
                         biased;
                         _ = &mut shutdown => anyhow::bail!("release check shutdown"),
-                        result = timeout(RELEASE_LOOKUP_TIMEOUT, verify_webui(&app.db, installed)) => result,
+                        result = timeout(RELEASE_LOOKUP_TIMEOUT, verify_webui(&app.db, installed, inventory)) => result,
                     };
                     let observation_result = match refresh {
                         Ok(Ok(ReleaseVerification::Verified {
@@ -1031,6 +1058,8 @@ where
                     if let Err(error) = observation_result {
                         tracing::warn!("WebUI observation refresh failed: {error:#}");
                     }
+                } else {
+                    *inventory = InstalledWebuiInventory::default();
                 }
             }
             Ok(())
@@ -1213,11 +1242,19 @@ pub async fn run_release_check_loop<F, S>(
     F: FnMut(&str, &str) -> Pin<Box<dyn Future<Output = anyhow::Result<ComponentRelease>> + Send>>,
     S: Fn() -> Pin<Box<dyn Future<Output = ()> + Send>>,
 {
+    let mut inventory = InstalledWebuiInventory::default();
     loop {
         if !tick.wait_for_tick(shutdown()).await {
             break;
         }
-        let batch = record_release_checks(&app, &mut discover, lookup_timeout, shutdown()).await;
+        let batch = record_release_checks_cached(
+            &app,
+            &mut discover,
+            lookup_timeout,
+            shutdown(),
+            &mut inventory,
+        )
+        .await;
         if !batch.finished {
             break;
         }
@@ -2068,7 +2105,8 @@ mod tests {
             },
             RELEASE_LOOKUP_TIMEOUT,
             Box::pin(std::future::pending()),
-            async |_, _| {
+            &mut InstalledWebuiInventory::default(),
+            async |_, _, _| {
                 Ok(match hashes.clone() {
                     Some((root_hash, admin_hash)) => ReleaseVerification::Verified {
                         root_hash,
@@ -2736,7 +2774,8 @@ mod tests {
                 |_, _| Box::pin(async { anyhow::bail!("registry returned HTTP 503") }),
                 RELEASE_LOOKUP_TIMEOUT,
                 Box::pin(std::future::pending()),
-                async |_, installed| {
+                &mut InstalledWebuiInventory::default(),
+                async |_, installed, _| {
                     assert_eq!(installed, &release);
                     let checked_at = db::component_update(&app.db, "webui")
                         .await
@@ -2798,7 +2837,8 @@ mod tests {
                 |_, _| Box::pin(async { anyhow::bail!("registry returned HTTP 503") }),
                 RELEASE_LOOKUP_TIMEOUT,
                 Box::pin(std::future::pending()),
-                async |_, _| anyhow::bail!("Storage read failed"),
+                &mut InstalledWebuiInventory::default(),
+                async |_, _, _| anyhow::bail!("Storage read failed"),
             ))
             .await;
             assert!(failed.finished);

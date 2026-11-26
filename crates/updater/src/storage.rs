@@ -16,6 +16,16 @@ pub enum ReleaseVerification {
     },
 }
 
+/// Expected package metadata for one installed WebUI release.
+#[derive(Default)]
+pub struct InstalledWebuiInventory(Option<(ComponentRelease, Vec<ExpectedFile>)>);
+
+struct ExpectedFile {
+    path: String,
+    len: usize,
+    hash: String,
+}
+
 pub struct Storage {
     http: reqwest::Client,
     root: String,
@@ -243,6 +253,56 @@ impl Storage {
             .await?;
         self.compare_release(&destinations, &package, &expected)
             .await
+    }
+
+    /// Reconfirm installed identity and current registry trust, then compare
+    /// freshly read Storage bytes with the expected package inventory.
+    pub async fn verify_installed_release_cached(
+        &self,
+        registry: &Registry,
+        control: &UpdateControl,
+        release: &ComponentRelease,
+        inventory: &mut InstalledWebuiInventory,
+    ) -> Result<ReleaseVerification> {
+        // Leave no warm entry if trust confirmation fails or is cancelled.
+        let cached = inventory.0.take().filter(|(cached, _)| cached == release);
+        let (destinations, package) = release_paths(release)?;
+        let requested = package.iter().map(String::as_str).collect::<Vec<_>>();
+        let layer = registry
+            .installed_layer(control, release, &requested)
+            .await?;
+        let expected = match cached {
+            Some(entry) => entry,
+            None => {
+                let bytes = registry.read_release_layer(layer, &requested).await?;
+                let files = destinations
+                    .into_iter()
+                    .zip(&package)
+                    .map(|(path, source)| {
+                        let body = bytes.get(source).context("WebUI package is incomplete")?;
+                        Ok(ExpectedFile {
+                            path,
+                            len: body.len(),
+                            hash: sha256_hex(body),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (release.clone(), files)
+            }
+        };
+        let (_, files) = inventory.0.insert(expected);
+        for file in files.iter() {
+            let Some(actual) = self.get(&file.path).await? else {
+                return Ok(ReleaseVerification::Mismatch);
+            };
+            if actual.len() != file.len || sha256_hex(&actual) != file.hash {
+                return Ok(ReleaseVerification::Mismatch);
+            }
+        }
+        Ok(ReleaseVerification::Verified {
+            root_hash: files[0].hash.clone(),
+            admin_hash: files[1].hash.clone(),
+        })
     }
 
     async fn compare_release(
@@ -474,11 +534,22 @@ mod tests {
         (address, server)
     }
 
+    struct RegistryFixture {
+        objects: HashMap<String, Vec<u8>>,
+        layer_path: String,
+        reads: Vec<String>,
+    }
+
     async fn object(
-        State(objects): State<Arc<HashMap<String, Vec<u8>>>>,
+        State(state): State<Arc<Mutex<RegistryFixture>>>,
         uri: Uri,
     ) -> (StatusCode, Vec<u8>) {
-        match objects.get(uri.path().rsplit('/').next().unwrap_or("")) {
+        let mut state = state.lock().await;
+        state.reads.push(uri.path().to_owned());
+        match state
+            .objects
+            .get(uri.path().rsplit('/').next().unwrap_or(""))
+        {
             Some(bytes) => (StatusCode::OK, bytes.clone()),
             None => (StatusCode::NOT_FOUND, vec![]),
         }
@@ -493,6 +564,7 @@ mod tests {
         Registry,
         ComponentRelease,
         HashMap<String, Vec<u8>>,
+        Arc<Mutex<RegistryFixture>>,
         tokio::task::JoinHandle<()>,
     ) {
         let signing = signing();
@@ -573,7 +645,8 @@ mod tests {
         release.digest = digest(&manifest);
         let mut objects = HashMap::new();
         objects.insert(digest(&config), config);
-        objects.insert(digest(&layer), layer);
+        let layer_digest = digest(&layer);
+        objects.insert(layer_digest.clone(), layer);
         objects.insert(release.digest.clone(), manifest);
         signing.sign(
             &mut objects,
@@ -582,19 +655,25 @@ mod tests {
             not_after,
             SigningKeyChoice::Current,
         );
+        let state = Arc::new(Mutex::new(RegistryFixture {
+            objects,
+            layer_path: format!("/v2/jatmn/jmodguard-webui/blobs/{layer_digest}"),
+            reads: Vec::new(),
+        }));
         let (registry_address, registry_server) = serve(
             Router::new()
                 .fallback(any(object))
-                .with_state(Arc::new(objects)),
+                .with_state(Arc::clone(&state)),
         )
         .await;
         let registry = Registry::new(&format!("http://{registry_address}")).unwrap();
-        (registry, release, files, registry_server)
+        (registry, release, files, state, registry_server)
     }
 
     #[derive(Default)]
     struct StorageFixture {
         files: HashMap<String, Vec<u8>>,
+        reads: Vec<String>,
         uploads: Vec<String>,
         fail_root_upload: bool,
     }
@@ -608,10 +687,13 @@ mod tests {
         let path = uri.path().trim_start_matches("/zone/");
         let mut state = state.lock().await;
         match method {
-            Method::GET => match state.files.get(path) {
-                Some(bytes) => (StatusCode::OK, bytes.clone()),
-                None => (StatusCode::NOT_FOUND, vec![]),
-            },
+            Method::GET => {
+                state.reads.push(path.to_owned());
+                match state.files.get(path) {
+                    Some(bytes) => (StatusCode::OK, bytes.clone()),
+                    None => (StatusCode::NOT_FOUND, vec![]),
+                }
+            }
             Method::PUT => {
                 state.uploads.push(path.to_owned());
                 state.files.insert(path.to_owned(), body.to_vec());
@@ -656,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_release_verification_rejects_changed_or_missing_assets() {
-        let (registry, release, files, registry_server) =
+        let (registry, release, files, _, registry_server) =
             webui_registry(&signature_not_after_far_future()).await;
         let (storage, state, storage_server) = webui_storage(StorageFixture {
             files: files.clone(),
@@ -698,7 +780,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_restores_html_when_root_upload_fails() {
-        let (registry, release, files, registry_server) =
+        let (registry, release, files, _, registry_server) =
             webui_registry(&signature_not_after_far_future()).await;
         let old_asset = format!("assets/releases/{}/app.js", "b".repeat(40));
         let assets = format!("assets/releases/{}", release.source_sha);
@@ -765,11 +847,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn installed_release_reverification_is_not_blocked_by_signature_expiry() {
+    async fn installed_release_reverification_reuses_only_trusted_expected_files() {
         use jmodguard::db::{Db, SqlExecutor, params};
-        let (registry, release, files, registry_server) =
+        let (registry, release, files, registry_state, registry_server) =
             webui_registry("2020-01-01T00:00:00Z").await;
-        let (storage, _, storage_server) = webui_storage(StorageFixture {
+        let (storage, storage_state, storage_server) = webui_storage(StorageFixture {
             files: files.clone(),
             ..StorageFixture::default()
         })
@@ -795,24 +877,131 @@ mod tests {
             uninstalled.err().unwrap().to_string(),
             "release is not installed"
         );
-        let installed = serde_json::to_string(&release).unwrap();
-        db.with_conn(move |conn| {
-            conn.execute_bounded(
-                "UPDATE component_updates SET installed=?1,installed_at=1 WHERE component='webui'",
-                params![installed],
-                128 * 1024,
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-        assert_verified(
+        let install = async |release: &ComponentRelease| {
+            let installed = serde_json::to_string(release).unwrap();
+            db.with_conn(move |conn| {
+                conn.execute_bounded(
+                    "UPDATE component_updates SET installed=?1,installed_at=1 WHERE component='webui'",
+                    params![installed],
+                    128 * 1024,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        };
+        install(&release).await;
+        let signature_tag = crate::signature::signature_tag_for_digest(&release.digest).unwrap();
+        let layer_reads = async || {
+            let state = registry_state.lock().await;
+            state
+                .reads
+                .iter()
+                .filter(|path| *path == &state.layer_path)
+                .count()
+        };
+        let assert_storage_rounds = async |rounds: usize| {
+            let mut reads = std::mem::take(&mut storage_state.lock().await.reads);
+            reads.sort_unstable();
+            let mut expected = (0..rounds)
+                .flat_map(|_| files.keys().cloned())
+                .collect::<Vec<_>>();
+            expected.sort_unstable();
+            assert_eq!(reads, expected);
+        };
+
+        // The manual verifier still exercises the original uncached path.
+        for _ in 0..2 {
+            assert_verified(
+                storage
+                    .verify_installed_release(&registry, &control, &release)
+                    .await
+                    .unwrap(),
+                &files,
+            );
+        }
+        assert_eq!(layer_reads().await, 2);
+        assert_storage_rounds(2).await;
+        registry_state.lock().await.reads.clear();
+
+        let mut inventory = InstalledWebuiInventory::default();
+        let verify = async |release: &ComponentRelease, inventory: &mut InstalledWebuiInventory| {
             storage
-                .verify_installed_release(&registry, &control, &release)
+                .verify_installed_release_cached(&registry, &control, release, inventory)
                 .await
-                .unwrap(),
-            &files,
+        };
+        for _ in 0..2 {
+            assert_verified(verify(&release, &mut inventory).await.unwrap(), &files);
+        }
+        assert_eq!(layer_reads().await, 1);
+        assert_storage_rounds(2).await;
+        {
+            let state = registry_state.lock().await;
+            for reference in [&release.digest, &signature_tag] {
+                let path = format!("/v2/jatmn/jmodguard-webui/manifests/{reference}");
+                assert_eq!(state.reads.iter().filter(|get| *get == &path).count(), 2);
+            }
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&state.objects[&release.digest]).unwrap();
+            let config = manifest["config"]["digest"].as_str().unwrap();
+            let path = format!("/v2/jatmn/jmodguard-webui/blobs/{config}");
+            assert_eq!(state.reads.iter().filter(|get| *get == &path).count(), 2);
+        }
+
+        let asset = format!("assets/releases/{}/administration.js", release.source_sha);
+        storage_state.lock().await.files.get_mut(&asset).unwrap()[0] ^= 1;
+        assert!(matches!(
+            verify(&release, &mut inventory).await.unwrap(),
+            ReleaseVerification::Mismatch
+        ));
+        assert_storage_rounds(1).await;
+        assert_eq!(layer_reads().await, 1);
+        storage_state
+            .lock()
+            .await
+            .files
+            .insert(asset.clone(), files[&asset].clone());
+
+        let signature = registry_state
+            .lock()
+            .await
+            .objects
+            .remove(&signature_tag)
+            .unwrap();
+        let rejected = verify(&release, &mut inventory).await.err().unwrap();
+        assert_eq!(
+            crate::signature::signature_rejection_phrase(&rejected),
+            Some(crate::signature::UNSIGNED_IMAGE)
         );
+        assert_storage_rounds(0).await;
+        registry_state
+            .lock()
+            .await
+            .objects
+            .insert(signature_tag, signature);
+        assert_verified(verify(&release, &mut inventory).await.unwrap(), &files);
+        assert_eq!(layer_reads().await, 2, "trust loss clears the inventory");
+        assert_storage_rounds(1).await;
+
+        let selected = ComponentRelease {
+            channel: "stable".into(),
+            ..release.clone()
+        };
+        install(&selected).await;
+        let stale = verify(&release, &mut inventory).await.err().unwrap();
+        assert_eq!(stale.to_string(), "release is not installed");
+        assert_storage_rounds(0).await;
+        assert_verified(verify(&selected, &mut inventory).await.unwrap(), &files);
+        assert_eq!(layer_reads().await, 3);
+        assert_storage_rounds(1).await;
+        install(&release).await;
+        assert_verified(verify(&release, &mut inventory).await.unwrap(), &files);
+        assert_eq!(
+            layer_reads().await,
+            4,
+            "a changed release replaces the warm entry"
+        );
+        assert_storage_rounds(1).await;
         registry_server.abort();
         storage_server.abort();
         drop(control);
