@@ -2337,7 +2337,8 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
     }
 
     /// Capture the current stay and whether it has a matching rejoin receipt.
-    /// If only the receipt lookup fails, preserve the stay from the same snapshot.
+    /// If only the receipt lookup fails, the provider may already have ended
+    /// that snapshot, so recover the stay from a fresh scope-verified read.
     pub async fn current_rejoin_note(
         &self,
         scope: GuildDataScope,
@@ -2346,7 +2347,9 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
         checked_scope(self, &scope)?;
         anyhow::ensure!(user_id > 0, MemberSyncError::Invalid);
         let expected = self.expected.clone();
-        self.db
+        let fallback_scope = scope.clone();
+        let projected = self
+            .db
             .with_conn(move |conn| {
                 let tx = conn.transaction_primary_snapshot()?;
                 verify_scope(&tx, &expected, &scope, true)?;
@@ -2364,17 +2367,25 @@ UPDATE guild_member_audit_recovery SET restart_requested_at_ms=MAX(coalesce(rest
                         |r| Ok((r.get::<Option<String>>(0)?, r.get::<bool>(1)?)),
                     )
                     .optional();
-                let current = match projected {
+                match projected {
                     Ok(row) => {
-                        let (stay, pending) = row.unwrap_or_default();
-                        (stay, Ok(pending))
+                        tx.finish_read()?;
+                        Ok(Ok(row.unwrap_or_default()))
                     }
-                    Err(error) => (current_member_stay_id_tx(&tx, &scope, user_id)?, Err(error)),
-                };
-                tx.finish_read()?;
-                Ok(current)
+                    Err(error) => {
+                        drop(tx);
+                        Ok(Err(error))
+                    }
+                }
             })
-            .await
+            .await?;
+        match projected {
+            Ok((stay, pending)) => Ok((stay, Ok(pending))),
+            Err(error) => {
+                let stay = self.current_member_stay_id(fallback_scope, user_id).await?;
+                Ok((stay, Err(error)))
+            }
+        }
     }
 
     pub async fn current_member_stay_id(

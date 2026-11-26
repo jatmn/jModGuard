@@ -1416,6 +1416,42 @@ async fn current_rejoin_note_pairs_receipt_with_the_current_stay() {
 }
 
 #[tokio::test]
+async fn rejoin_receipt_timeout_reopens_a_verified_stay_snapshot() {
+    use crate::db::tests::remote_stream::HranaFixture;
+
+    const USER: i64 = 10;
+    let (f, local, scope) = ready().await;
+    local
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    local
+        .observe_member(scope.clone(), observed(USER, Some(1_000), 1_000))
+        .await
+        .unwrap();
+    let expected_stay = local
+        .current_member_stay_id(scope.clone(), USER)
+        .await
+        .unwrap()
+        .unwrap();
+    let (fixture, db) = HranaFixture::sqlite_backed_database(&f.store_path).await;
+    let remote = GuildDataStore {
+        db,
+        expected: local.expected.clone(),
+        core: None,
+    };
+
+    fixture.timeout_next_matching_cursor("guild_member_pending_rejoin_notes");
+    let before = fixture.read_begins();
+    let (stay, receipt) = remote.current_rejoin_note(scope, USER).await.unwrap();
+    assert_eq!(stay.as_deref(), Some(expected_stay.as_str()));
+    assert!(crate::db_compat::is_remote_interactive_timeout(
+        &receipt.unwrap_err()
+    ));
+    assert_eq!(fixture.read_begins() - before, 2);
+}
+
+#[tokio::test]
 async fn live_and_page_rejoins_use_new_stays_without_old_join_reuse() {
     let (_f, store, scope) = ready().await;
     store

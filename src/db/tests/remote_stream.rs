@@ -34,6 +34,7 @@ struct HranaState {
     in_transaction: bool,
     begin_sql: Vec<String>,
     next_cursor_error: Option<(&'static str, &'static str)>,
+    timeout_cursor_sql: Option<&'static str>,
     hang_next_commit: bool,
     hang_next_statement: bool,
     hang_next_begin: bool,
@@ -77,6 +78,7 @@ impl HranaState {
             in_transaction: false,
             begin_sql: Vec::new(),
             next_cursor_error: None,
+            timeout_cursor_sql: None,
             hang_next_commit: false,
             hang_next_statement: false,
             hang_next_begin: false,
@@ -401,7 +403,7 @@ impl HranaFixture {
         delay: Duration,
         limit: Duration,
     ) -> (Self, Db) {
-        Self::provider_database(path, ProviderModel::new(delay, limit)).await
+        Self::backed_database(path, Some(ProviderModel::new(delay, limit))).await
     }
 
     /// Account for each Hrana round trip without charging host scheduling to
@@ -412,14 +414,25 @@ impl HranaFixture {
         limit: Duration,
         elapsed: Arc<Mutex<Duration>>,
     ) -> (Self, Db) {
-        Self::provider_database(
+        Self::backed_database(
             path,
-            ProviderModel::with_clock(delay, limit, ProviderClock::Modeled(elapsed)),
+            Some(ProviderModel::with_clock(
+                delay,
+                limit,
+                ProviderClock::Modeled(elapsed),
+            )),
         )
         .await
     }
 
-    async fn provider_database(path: &std::path::Path, provider: Arc<ProviderModel>) -> (Self, Db) {
+    pub(in crate::db) async fn sqlite_backed_database(path: &std::path::Path) -> (Self, Db) {
+        Self::backed_database(path, None).await
+    }
+
+    async fn backed_database(
+        path: &std::path::Path,
+        provider: Option<Arc<ProviderModel>>,
+    ) -> (Self, Db) {
         let fixture = Self::start().await;
         let runtime = DbRuntime::new().unwrap();
         let backing = runtime
@@ -430,7 +443,7 @@ impl HranaFixture {
         {
             let mut state = fixture.state.lock().unwrap();
             state.backing = Some((runtime, backing));
-            state.provider = Some(provider);
+            state.provider = provider;
         }
         let db = fixture.db();
         (fixture, db)
@@ -568,6 +581,14 @@ impl HranaFixture {
     fn timeout_next_cursor(&self) {
         self.state.lock().unwrap().next_cursor_error =
             Some(("TRANSACTION_TIMEOUT", "Transaction timed out"));
+    }
+
+    pub(in crate::db) fn timeout_next_matching_cursor(&self, sql: &'static str) {
+        self.state.lock().unwrap().timeout_cursor_sql = Some(sql);
+    }
+
+    pub(in crate::db) fn read_begins(&self) -> usize {
+        self.state.lock().unwrap().read_begins
     }
 
     fn hang_next_commit(&self) {
@@ -853,6 +874,13 @@ async fn respond(request: Request<Body>, state: Arc<Mutex<HranaState>>) -> Respo
             )
         }
         "/v3/cursor" => {
+            if state
+                .timeout_cursor_sql
+                .is_some_and(|sql| statement_sql(&input).contains(&sql.to_ascii_uppercase()))
+            {
+                state.timeout_cursor_sql = None;
+                state.next_cursor_error = Some(("TRANSACTION_TIMEOUT", "Transaction timed out"));
+            }
             if let Some((code, message)) = state.next_cursor_error.take() {
                 if code == "TRANSACTION_TIMEOUT"
                     && let Some((runtime, conn)) = &state.backing
