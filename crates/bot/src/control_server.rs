@@ -684,6 +684,19 @@ mod tests {
         cache.update(&mut event);
     }
 
+    fn remember_settings_role(cache: &Cache, guild_id: u64) {
+        let mut role = Role::default();
+        role.id = RoleId::new(30);
+        role.guild_id = GuildId::new(guild_id);
+        let mut event: serenity::all::GuildRoleCreateEvent =
+            serde_json::from_value(serde_json::json!({
+                "guild_id": guild_id,
+                "role": role,
+            }))
+            .unwrap();
+        cache.update(&mut event);
+    }
+
     fn actor_member(guild_id: u64, allowed: bool) -> Member {
         let mut member = Member::default();
         member.user.id = UserId::new(7);
@@ -839,6 +852,163 @@ mod tests {
             db::get_settings(&bot.db, 10).await.unwrap().prefix,
             "!saved"
         );
+        drop(bot);
+        cleanup(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uncached_settings_actor_uses_fresh_member_get() {
+        use db::guild_data::{AccessLevel, AccessRole};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        bot.tenant
+            .activate(enrollment.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let cache = Arc::new(Cache::new());
+        remember_guild(&cache, 10, None);
+        remember_settings_role(&cache, 10);
+        bot.install_discord_cache(cache);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let member_leaves = Arc::new(AtomicBool::new(false));
+        let departure = Arc::clone(&member_leaves);
+        let discord = tokio::spawn(async move {
+            let mut member = actor_member(10, false);
+            member.roles = vec![RoleId::new(30)];
+            let member_body = serde_json::to_string(&member).unwrap();
+            while let Ok((stream, _)) = listener.accept().await {
+                let mut stream = BufReader::new(stream);
+                let mut lines = (&mut stream).lines();
+                assert_eq!(
+                    lines.next_line().await.unwrap().as_deref(),
+                    Some("GET /api/v10/guilds/10/members/7 HTTP/1.1")
+                );
+                while let Some(header) = lines.next_line().await.unwrap() {
+                    if header.is_empty() {
+                        break;
+                    }
+                }
+                let attempt = seen.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if departure.load(Ordering::SeqCst) && attempt > 0 {
+                    (
+                        "404 Not Found",
+                        r#"{"code":10007,"message":"Unknown Member"}"#,
+                    )
+                } else {
+                    ("200 OK", member_body.as_str())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let http = serenity::http::HttpBuilder::new("fixture")
+            .proxy(format!("http://{address}"))
+            .ratelimiter_disabled(true)
+            .build();
+        bot.install_http_member_lookup(Arc::new(http));
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+
+        let reply = submit(bound, seal(&patch(&enrollment, "!unmapped"), 7));
+        assert_eq!(failure_message(&reply), "actor is not allowed");
+        assert_ne!(
+            db::get_settings(&bot.db, 10).await.unwrap().prefix,
+            "!unmapped"
+        );
+        let unmapped_calls = calls.swap(0, Ordering::SeqCst);
+
+        let (store, scope) = bot.tenant.live(enrollment.clone()).await.unwrap();
+        let revision = store.tenant_settings(scope.clone()).await.unwrap().revision;
+        store
+            .set_access_roles(
+                scope,
+                &revision,
+                vec![AccessRole {
+                    role_id: 30,
+                    level: AccessLevel::Settings,
+                }],
+            )
+            .await
+            .unwrap();
+        let reply = submit(bound, seal(&patch(&enrollment, "!mapped"), 7));
+        assert!(matches!(reply, ControlReply::Saved { .. }), "{reply:?}");
+        assert_eq!(
+            db::get_settings(&bot.db, 10).await.unwrap().prefix,
+            "!mapped"
+        );
+        let mapped_calls = calls.swap(0, Ordering::SeqCst);
+
+        member_leaves.store(true, Ordering::SeqCst);
+        let reply = submit(bound, seal(&patch(&enrollment, "!departed"), 7));
+        let prefix_after_departure = db::get_settings(&bot.db, 10).await.unwrap().prefix;
+        let departed_calls = calls.load(Ordering::SeqCst);
+
+        discord.abort();
+        let _ = discord.await;
+        drop(bot);
+        cleanup(&path);
+        assert_eq!(failure_message(&reply), "actor is not allowed");
+        assert_eq!(prefix_after_departure, "!mapped");
+        assert_eq!((unmapped_calls, mapped_calls, departed_calls), (2, 2, 2));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uncached_settings_actor_prefers_newer_gateway_observations() {
+        use db::guild_data::{AccessLevel, AccessRole};
+
+        let (bot, path) = writer_bot().await;
+        let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
+        bot.tenant
+            .activate(enrollment.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let (store, scope) = bot.tenant.live(enrollment.clone()).await.unwrap();
+        let revision = store.tenant_settings(scope.clone()).await.unwrap().revision;
+        store
+            .set_access_roles(
+                scope,
+                &revision,
+                vec![AccessRole {
+                    role_id: 30,
+                    level: AccessLevel::Settings,
+                }],
+            )
+            .await
+            .unwrap();
+        let cache = Arc::new(Cache::new());
+        remember_guild(&cache, 10, None);
+        bot.install_discord_cache(Arc::clone(&cache));
+        let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        bot.install_member_lookup(move |guild, actor| {
+            assert_eq!((guild, actor), (10, 7));
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut member = actor_member(guild, false);
+            remember_guild(&cache, guild, Some(member.clone()));
+            member.roles = vec![RoleId::new(30)];
+            async move { ControlMemberFetch::Found(Box::new(member)) }
+        });
+        let reply = submit(bound, seal(&patch(&enrollment, "!role_removed"), 7));
+        assert_eq!(failure_message(&reply), "actor is not allowed");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let prefix = db::get_settings(&bot.db, 10).await.unwrap().prefix;
+        assert_ne!(prefix, "!role_removed");
         drop(bot);
         cleanup(&path);
     }
