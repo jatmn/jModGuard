@@ -319,7 +319,7 @@ pub fn apply_overlay(auth: &mut AuthCtx) -> Result<(), ApiError> {
     // mask below controls only what this read-only preview may observe.
     guild.owner = false;
     guild.permissions = Some(PermissionsField::Number(preview.profile.permissions()));
-    auth.guilds = vec![guild];
+    auth.guilds = Arc::from([guild]);
     auth.role_access = preview
         .profile
         .role_level()

@@ -1,6 +1,7 @@
 //! API-owned dashboard state without moderation or compiled guild caches.
 //! Discord mutations are admitted to the bot queue; this state has no bot token/client.
-use super::oauth::{DiscordGuild, DiscordUser, OAuthClient};
+use super::ObservedGuilds;
+use super::oauth::{DiscordUser, OAuthClient};
 use crate::config::ApiProcessConfig;
 use crate::db::{self, Db};
 use anyhow::{Context as _, Result};
@@ -294,7 +295,7 @@ pub struct ApiState {
     pub oauth: Arc<OAuthClient>,
     writer: Option<jmodguard::control::WriterLink>,
     /// Display caches only. Authorization must refresh the guild list.
-    pub guild_cache: DashMap<u64, (Instant, Vec<DiscordGuild>)>,
+    pub guild_cache: DashMap<u64, ObservedGuilds>,
     pub(super) auth_sessions:
         DashMap<tower_sessions::session::Id, Arc<tokio::sync::Mutex<super::SessionAuth>>>,
     // One small ID/timestamp per retirement, bounded by sign-outs/rotations

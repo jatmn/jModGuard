@@ -63,7 +63,7 @@ async fn signed_in(app: &ApiState, user_id: u64) -> Session {
             },
         ),
     );
-    app.guild_cache.insert(user_id, (now, Vec::new()));
+    app.guild_cache.insert(user_id, (now, Arc::from([])));
     session
 }
 

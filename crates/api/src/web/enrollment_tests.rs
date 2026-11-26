@@ -9,6 +9,8 @@ use tower::ServiceExt;
 
 struct DiscordStub {
     guilds: std::sync::Mutex<Vec<oauth::DiscordGuild>>,
+    guild_responses:
+        std::sync::Mutex<std::collections::HashMap<&'static str, Arc<GuildResponseGate>>>,
     failed: AtomicBool,
     calls: AtomicUsize,
     token_calls: AtomicUsize,
@@ -38,6 +40,12 @@ struct DiscordStub {
     member_rate_limited: AtomicBool,
     member_delay: std::sync::atomic::AtomicU64,
     member_calls: AtomicUsize,
+}
+
+#[derive(Default)]
+struct GuildResponseGate {
+    captured: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl DiscordStub {
@@ -112,6 +120,7 @@ impl Fixture {
     ) -> Self {
         let discord = Arc::new(DiscordStub {
             guilds: std::sync::Mutex::new(vec![managed_guild(10), managed_guild(20)]),
+            guild_responses: std::sync::Mutex::new(std::collections::HashMap::new()),
             failed: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
             token_calls: AtomicUsize::new(0),
@@ -288,9 +297,16 @@ impl Fixture {
                     }
                     let guilds = if handler.limit_on_next_page.load(Ordering::SeqCst) {
                         (0..200).map(managed_guild).collect::<Vec<_>>()
+                    } else if query.contains_key("after") {
+                        Vec::new()
                     } else {
                         handler.guilds.lock().unwrap().clone()
                     };
+                    let gate = handler.guild_responses.lock().unwrap().remove(bearer);
+                    if let Some(gate) = gate {
+                        gate.captured.notify_one();
+                        gate.release.notified().await;
+                    }
                     let mut headers = HeaderMap::new();
                     if handler.spent_budget.load(Ordering::SeqCst) {
                         headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
@@ -5345,8 +5361,8 @@ async fn expire_auth_cache(app: &ApiState, age: std::time::Duration) {
         .map(|e| Arc::clone(e.value()))
         .collect();
     for entry in entries {
-        if let Some((at, _)) = &mut entry.lock().await.guilds {
-            *at = std::time::Instant::now().checked_sub(age).unwrap();
+        if let Some(snapshot) = &mut entry.lock().await.guilds {
+            snapshot.age_from = std::time::Instant::now().checked_sub(age).unwrap();
         }
     }
 }
@@ -5376,6 +5392,66 @@ async fn session_guild_requests_reuse_coalesce_and_refetch_after_expiry() {
         StatusCode::OK
     );
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn warm_authorization_shares_guilds_without_leaking_preview_permissions() {
+    let f = Fixture::new(true).await;
+    f.enroll(10).await;
+    *f.discord.guilds.lock().unwrap() = (1..=200)
+        .map(|id| oauth::DiscordGuild {
+            name: format!("synthetic guild {id}"),
+            icon: Some(format!("icon-{id}")),
+            permissions: Some(oauth::PermissionsField::String("32".into())),
+            ..managed_guild(id)
+        })
+        .collect();
+    let id = f.cookie.split_once('=').unwrap().1.parse().unwrap();
+    let session = Session::new(Some(id), Arc::new(f.store.clone()), None);
+    let authorize = || async {
+        require_auth_for_guilds(&f.app, &session, &[10])
+            .await
+            .unwrap_or_else(|error| panic!("{:#}", error.0))
+    };
+    let first = authorize().await;
+    assert_eq!(first.guilds.len(), 200);
+    let observed_at = f.app.guild_cache.get(&42).unwrap().value().0;
+    let warm = authorize().await;
+    assert!(warm.can_manage(10));
+    assert!(std::ptr::eq(first.guilds.as_ptr(), warm.guilds.as_ptr()));
+
+    let (status, grant) = f
+        .request(
+            "POST",
+            "/api/preview",
+            r#"{"guild_id":"10","profile":"settings"}"#,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{grant}");
+    let token = grant["token"].as_str().unwrap();
+    let (status, preview) = f.request_preview("POST", "/api/me", "", token).await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let shown = preview["guilds"].as_array().unwrap();
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0]["id"], "10");
+    assert_eq!(shown[0]["manage"], false);
+    assert_eq!(shown[0]["access"], "settings");
+
+    let normal = authorize().await;
+    assert!(normal.can_manage(10));
+    assert!(normal.can_manage(20));
+    assert!(std::ptr::eq(first.guilds.as_ptr(), normal.guilds.as_ptr()));
+    let display = f.app.guild_cache.get(&42).unwrap();
+    assert_eq!(display.value().0, observed_at);
+    assert!(std::ptr::eq(
+        first.guilds.as_ptr(),
+        display.value().1.as_ptr()
+    ));
+    assert_eq!(
+        f.discord.calls.load(Ordering::SeqCst),
+        2,
+        "only initial pages"
+    );
 }
 
 /// Waits until no session has a background guild refresh running.
@@ -5408,6 +5484,34 @@ fn revalidating_age() -> std::time::Duration {
     let age = GUILD_REFRESH_AFTER + std::time::Duration::from_millis(GUILD_REFRESH_JITTER_MS);
     assert!(age < GUILD_AUTH_CACHE_TTL);
     age
+}
+
+#[tokio::test]
+async fn warm_authorization_leaves_the_profile_due_for_background_refresh() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    let read = || f.request("GET", "/api/guilds/10/config", "");
+    assert_eq!(read().await.0, StatusCode::OK);
+    let due_at = {
+        let mut profile = f.app.user_cache.get_mut(&42).unwrap();
+        let (observed_at, _) = profile.value_mut();
+        *observed_at -= revalidating_age();
+        *observed_at
+    };
+    for _ in 0..3 {
+        assert_eq!(read().await.0, StatusCode::OK);
+    }
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
+
+    expire_auth_cache(&f.app, revalidating_age()).await;
+    assert_eq!(read().await.0, StatusCode::OK);
+    background_refreshes_finished(&f.app).await;
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 1);
+    let profile = f.app.user_cache.get(&42).unwrap();
+    assert!(profile.value().0 > due_at);
+    assert_eq!(profile.value().1.username, "live-profile");
 }
 
 #[tokio::test]
@@ -5802,6 +5906,131 @@ async fn authorization_snapshots_are_not_shared_between_sessions_or_tokens() {
             .guilds
             .is_empty()
     );
+    assert!(f.app.guild_cache.get(&42).unwrap().value().1.is_empty());
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn background_guild_observation_supersedes_overlapping_foreground_response() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let read = || f.request("GET", "/api/guilds/10/config", "");
+    assert_eq!(read().await.0, StatusCode::OK);
+    expire_auth_cache(&f.app, revalidating_age()).await;
+
+    let foreground = Arc::new(GuildResponseGate::default());
+    f.discord
+        .guild_responses
+        .lock()
+        .unwrap()
+        .insert("Bearer refreshed-token", Arc::clone(&foreground));
+    let old_request = {
+        let app = Arc::clone(&f.app);
+        tokio::spawn(async move {
+            let session = tests::session_for_user(42).await;
+            session
+                .insert(SESSION_TOKEN, "refreshed-token")
+                .await
+                .unwrap();
+            require_auth_fresh(&app, &session)
+                .await
+                .unwrap_or_else(|error| panic!("{:#}", error.0))
+        })
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        foreground.captured.notified(),
+    )
+    .await
+    .expect("foreground captures the old list");
+
+    *f.discord.guilds.lock().unwrap() = vec![managed_guild(20)];
+    let background = Arc::new(GuildResponseGate::default());
+    f.discord
+        .guild_responses
+        .lock()
+        .unwrap()
+        .insert("Bearer fixture-token", Arc::clone(&background));
+    assert_eq!(read().await.0, StatusCode::OK);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        background.captured.notified(),
+    )
+    .await
+    .expect("background captures the new list");
+
+    foreground.release.notify_one();
+    assert!(old_request.await.unwrap().can_manage(10));
+    let foreground_observed_at = f.app.guild_cache.get(&42).unwrap().value().0;
+    background.release.notify_one();
+    background_refreshes_finished(&f.app).await;
+
+    let observed_at = f.app.guild_cache.get(&42).unwrap().value().0;
+    let session = refresh_state(&f).await;
+    let snapshot = session.lock().await.guilds.clone().unwrap();
+    assert!(snapshot.age_from <= foreground_observed_at);
+    assert!(observed_at > foreground_observed_at);
+    assert_eq!(observed_at, snapshot.observed_at);
+
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let guilds = me["guilds"].as_array().unwrap();
+    assert_eq!(guilds.len(), 1, "{me}");
+    assert_eq!(guilds[0]["id"], "20");
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn delayed_guild_follower_keeps_the_original_observation() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let gate = Arc::new(GuildResponseGate::default());
+    f.discord
+        .guild_responses
+        .lock()
+        .unwrap()
+        .insert("Bearer fixture-token", Arc::clone(&gate));
+    let mut leader = std::pin::pin!(f.app.oauth.my_guilds_at(42, "fixture-token", 0));
+    tokio::select! {
+        result = &mut leader => panic!("leader must remain in flight: {result:?}"),
+        captured = tokio::time::timeout(std::time::Duration::from_secs(10), gate.captured.notified()) => {
+            captured.expect("leader captures the old guild list");
+        }
+    }
+
+    let mut follower = std::pin::pin!(f.app.oauth.my_guilds_at(42, "fixture-token", 0));
+    // Poll once to subscribe to the flight. Do not poll it again until the
+    // later independent request has already published its display result.
+    tokio::select! {
+        biased;
+        result = &mut follower => panic!("follower must wait for the leader: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    gate.release.notify_one();
+    let (leader_observed_at, leader_guilds) = leader.await.unwrap();
+    *f.discord.guilds.lock().unwrap() = vec![managed_guild(20)];
+    let session = tests::session_for_user(42).await;
+    session
+        .insert(SESSION_TOKEN, "refreshed-token")
+        .await
+        .unwrap();
+    let newer = require_auth_fresh(&f.app, &session)
+        .await
+        .unwrap_or_else(|error| panic!("{:#}", error.0));
+    assert!(!newer.can_manage(10));
+
+    let (observed_at, guilds) = follower.await.unwrap();
+    let shares_payload = Arc::ptr_eq(&leader_guilds, &guilds);
+    record_display_observation(&f.app.guild_cache, 42, observed_at, guilds);
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let shown = me["guilds"].as_array().unwrap();
+    assert_eq!(shown.len(), 1, "{me}");
+    assert_eq!(shown[0]["id"], "20");
+    assert_eq!(observed_at, leader_observed_at);
+    assert!(shares_payload);
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
 }
 
@@ -7110,7 +7339,7 @@ async fn fresh_login_config_reuses_callback_snapshot_when_bucket_is_exhausted() 
     {
         let state = state.lock().await;
         assert_eq!(state.token.as_deref(), Some("refreshed-token"));
-        assert_eq!(state.guilds.as_ref().unwrap().0, observed_at);
+        assert_eq!(state.guilds.as_ref().unwrap().observed_at, observed_at);
     }
 
     let login_cookie = f.cookie.clone();
