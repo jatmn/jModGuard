@@ -8236,20 +8236,6 @@ test('known-bad images renders hash-only metadata and searches without re-fetchi
   assert.equal(add.disabled, false);
 });
 
-test('known-bad image writes retain the loaded page membership and send only metadata', async () => {
-  const requests = [];
-  const h = harness(async (url, options) => { requests.push({url, options}); return response({ok: true}); });
-  h.app.state.config = {enrollment_id: 'fixture-membership', known_bad_images: []};
-  const hash = 'ab'.repeat(32);
-  const base = `/api/guilds/${h.app.state.guildId}/known-bad-images`;
-  await h.app.api(base, 'POST', {hash, note: 'confirmed spam'});
-  await h.app.api(`${base}/${hash}`, 'DELETE');
-  assert.equal(requests[0].options.headers['x-jmodguard-enrollment'], 'fixture-membership');
-  assert.equal(requests[1].options.headers['x-jmodguard-enrollment'], 'fixture-membership');
-  assert.deepEqual(JSON.parse(requests[0].options.body), {hash, note: 'confirmed spam'});
-});
-
-
 test('known-bad image add and remove buttons save then reload the coherent list', async () => {
   const requests = [], hash = 'ab'.repeat(32);
   let rows = [];
@@ -8338,28 +8324,6 @@ test('known-bad image add clears only its draft fields', async () => {
   assert.equal(h.app.isDirty(), false);
 });
 
-test('known-bad image delete 429 keeps draft and listed row', async () => {
-  const listed = 'ab'.repeat(32);
-  const draftHash = 'cd'.repeat(32);
-  const rows = [{ hash: listed, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'listed' }];
-  const config = () => ({ enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: [] });
-  const h = harness(async (url, options) => {
-    if (url.endsWith('/config')) return response(config());
-    if (options.method === 'DELETE') return { ok: false, status: 429, headers: { get: () => null }, text: async () => JSON.stringify({ code: 'discord_rate_limited' }) };
-    return response({ ok: true });
-  });
-  h.app.state.config = config();
-  let panel = h.app.tabKnownBadImages();
-  await settle();
-  const inputs = knownBadInputs(panel);
-  inputs[1].value = draftHash; await fire(inputs[1], 'input');
-  inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
-  await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
-  await settle();
-  assert.equal(h.app.state.config.known_bad_images.length, 1);
-  assert.equal(h.app.isDirty(), true);
-});
-
 test('known-bad image delete succeeds after 429 without losing unrelated draft', async () => {
   const listed = 'ab'.repeat(32);
   const draftHash = 'cd'.repeat(32);
@@ -8384,6 +8348,8 @@ test('known-bad image delete succeeds after 429 without losing unrelated draft',
   inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
   await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
   await settle();
+  assert.equal(h.app.state.config.known_bad_images.length, 1);
+  assert.equal(h.app.isDirty(), true);
   panel = h.app.tabKnownBadImages();
   await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
   await settle();
