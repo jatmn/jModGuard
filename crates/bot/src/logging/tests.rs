@@ -6367,7 +6367,7 @@ async fn bounded_report_embeds() -> Vec<serde_json::Value> {
     }
     let sink = Sink::default();
     let guild = GuildId::new(789);
-    let long = format!("{}🦀", "é".repeat(1200));
+    let long = "é🦀".repeat(600);
     let base = BTreeMap::from([
         ("time".into(), "2026-01-01T00:00:00+00:00".into()),
         ("user".into(), "member".into()),
@@ -6459,6 +6459,10 @@ async fn embed_delivery_skips_the_discarded_flat_render() {
     ] {
         let value = field(embed, name);
         assert!(value.ends_with("… [display clipped]"), "{name}: {value}");
+        assert!(
+            value.contains('🦀'),
+            "{name} must exercise a two-unit character"
+        );
         assert!(value.encode_utf16().count() <= units, "{name}");
     }
     assert_eq!(
