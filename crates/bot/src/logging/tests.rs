@@ -1018,7 +1018,7 @@ fn message_identity_snippets_expire_and_evict_only_within_their_guild() {
     let f = Fixture::new();
     let author = |guild, message| known_message_author(&f.app, guild, 456, message);
     remember_message(&f.app, 789, 456, 1, Some(42), None, None);
-    remember_message_create(&f.app, 790, 456, 1, Some(43), None, None, true);
+    remember_message_create(&f.app, 790, 456, 1, Some(43), true);
     {
         let mut snippets = f.app.log_snippets.inner.lock();
         let first = snippets.get_mut(&(789, 456, 1)).unwrap();
