@@ -16,7 +16,7 @@ workers: they talk to Bunny Database and (outbound) to Discord. They do not
 contain `frontend/`, and they do not get public hostnames for people to
 browse.
 
-Build and publish the five `dist/frontend/` files for an initial manual setup, including the
+Build and publish the `dist/frontend/` files for an initial manual setup, including the
 Administration page. New trusted GitHub Actions publications also create an independent
 WebUI GHCR package; the owner update path is described in
 [BUNNY-UPDATES.md](BUNNY-UPDATES.md). A private ops repository is not required.
@@ -96,12 +96,12 @@ private evidence resource.
 ## 2. Publish the admin UI to Storage + CDN
 
 The files for a first manual upload are `dist/frontend/index.html`, `dist/frontend/app.js`,
-`dist/frontend/style.css`, `dist/frontend/administration/index.html`, and
-`dist/frontend/administration.js`. How to get them and where they
+`dist/frontend/style.css`, `dist/frontend/webui-runtime.js`,
+`dist/frontend/administration/index.html`, and `dist/frontend/administration.js`. How to get them and where they
 go is also summarized in [WEBUI.md](WEBUI.md#getting-and-hosting-the-files).
 Run `npm ci --ignore-scripts --prefix tools/webui` and
-`npm run build --prefix tools/webui` first. The generated `app.js` and
-`style.css` include the locked UI dependencies; no external module/CDN override
+`npm run build --prefix tools/webui` first. The generated JavaScript and
+`style.css` include the locked UI dependencies. No external module/CDN override
 is needed. Do not upload unbuilt source files.
 
 Create a Storage Zone and a Pull Zone whose origin is that Storage Zone.
@@ -125,10 +125,11 @@ On the admin Pull Zone, Caching → General, **Strip Response Cookies** must
 be **off** (`DisableCookies=false`) or login cannot keep a session.
 
 **First time (manual bootstrap, public source).** In the Storage Zone, **Browse Files**,
-and upload those five files from the source commit selected for the deployed
+and upload the files from the source commit selected for the deployed
 API image to the **root** so they are `/` (or `/index.html`),
-`/app.js`, `/style.css`, `/administration/index.html`, and
-`/administration.js`. A trusted `main` image published under its full source
+`/app.js`, `/style.css`, `/webui-runtime.js`, `/administration/index.html`, and
+`/administration.js`. Upload the scripts and stylesheet before both HTML pages.
+A trusted `main` image published under its full source
 SHA is sufficient; no Stable or Nightly release tag is required. This manual
 upload is only the bootstrap that makes the Administration page reachable.
 daisyUI and Headless UI are bundled into the existing CSS/JS assets.
@@ -491,7 +492,7 @@ On the Pull Zone from step 2 (Storage origin for the files):
    **Override Origin URL**, **Bypass Perma-Cache**, and
    **Override Cache Time = 0** actions. The separate rule keeps the path
    patterns within Bunny’s per-trigger limit.
-6. Everything else stays on Storage (`/`, `/app.js`, `/style.css`). daisyUI and
+6. Everything else stays on Storage, including `/` and its scripts and stylesheet. daisyUI and
    Headless UI are included in those built CSS/JS files.
 
 After rollout, request `/privacy`, `/terms`, and `/api/legal/style.css` on

@@ -220,9 +220,17 @@ pub(crate) struct VerifiedReleaseLayer<'a> {
 }
 
 impl VerifiedReleaseLayer<'_> {
-    pub(crate) async fn read(mut self, requested: &[&str]) -> Result<HashMap<String, Vec<u8>>> {
+    pub(crate) async fn read(self, requested: &[&str]) -> Result<HashMap<String, Vec<u8>>> {
+        self.read_with_optional(requested, &[]).await
+    }
+
+    pub(crate) async fn read_with_optional(
+        mut self,
+        required: &[&str],
+        optional: &[&str],
+    ) -> Result<HashMap<String, Vec<u8>>> {
         let bytes = self.pull.blob(&self.descriptor, MAX_LAYER).await?;
-        extract_layer(&bytes, &self.descriptor.media_type, requested)
+        extract_layer(&bytes, &self.descriptor.media_type, required, optional)
     }
 
     /// Download the layer to a temporary file, verify its size and digest,
@@ -801,7 +809,18 @@ impl Registry {
         release: &ComponentRelease,
         requested: &[&str],
     ) -> Result<HashMap<String, Vec<u8>>> {
-        self.files_with(release, requested, signature::SignatureExpiry::Enforce)
+        self.release_layer(release, requested)
+            .await?
+            .read(requested)
+            .await
+    }
+
+    pub(crate) async fn release_layer(
+        &self,
+        release: &ComponentRelease,
+        requested: &[&str],
+    ) -> Result<VerifiedReleaseLayer<'_>> {
+        self.verified_release_layer(release, requested, signature::SignatureExpiry::Enforce)
             .await
     }
 
@@ -869,18 +888,6 @@ impl Registry {
             .await
     }
 
-    async fn files_with(
-        &self,
-        release: &ComponentRelease,
-        requested: &[&str],
-        expiry: signature::SignatureExpiry,
-    ) -> Result<HashMap<String, Vec<u8>>> {
-        let layer = self
-            .verified_release_layer(release, requested, expiry)
-            .await?;
-        layer.read(requested).await
-    }
-
     async fn verified_release_layer(
         &self,
         release: &ComponentRelease,
@@ -939,6 +946,7 @@ fn extract_executable(
         Box::new(reader),
         media,
         &[executable, inventory],
+        &[],
         |name, entry, size| {
             if name == inventory {
                 let mut data = Vec::with_capacity(size as usize);
@@ -982,16 +990,23 @@ fn extract_executable(
 fn extract_layer(
     bytes: &[u8],
     media: &str,
-    requested: &[&str],
+    required: &[&str],
+    optional: &[&str],
 ) -> Result<HashMap<String, Vec<u8>>> {
     let mut found = HashMap::new();
-    walk_layer(Box::new(bytes), media, requested, |name, entry, size| {
-        let mut data = Vec::with_capacity(size as usize);
-        entry.read_to_end(&mut data)?;
-        ensure!(data.len() as u64 == size, "truncated release file");
-        found.insert(name.to_owned(), data);
-        Ok(())
-    })?;
+    walk_layer(
+        Box::new(bytes),
+        media,
+        required,
+        optional,
+        |name, entry, size| {
+            let mut data = Vec::with_capacity(size as usize);
+            entry.read_to_end(&mut data)?;
+            ensure!(data.len() as u64 == size, "truncated release file");
+            found.insert(name.to_owned(), data);
+            Ok(())
+        },
+    )?;
     Ok(found)
 }
 
@@ -1000,7 +1015,8 @@ fn extract_layer(
 fn walk_layer<'a>(
     layer: Box<dyn Read + 'a>,
     media: &str,
-    requested: &[&str],
+    required: &[&str],
+    optional: &[&str],
     mut take: impl FnMut(&str, &mut dyn Read, u64) -> Result<()>,
 ) -> Result<()> {
     let reader: Box<dyn Read + 'a> = match media {
@@ -1012,8 +1028,11 @@ fn walk_layer<'a>(
         _ => bail!("unsupported image layer compression"),
     };
     let mut archive = tar::Archive::new(reader);
-    let wanted: HashSet<&str> = requested.iter().copied().collect();
-    ensure!(wanted.len() == requested.len(), "duplicate file request");
+    let wanted: HashSet<&str> = required.iter().chain(optional).copied().collect();
+    ensure!(
+        wanted.len() == required.len() + optional.len(),
+        "duplicate file request"
+    );
     let mut found = HashSet::new();
     let mut total = 0u64;
     let mut count = 0usize;
@@ -1050,7 +1069,7 @@ fn walk_layer<'a>(
         }
     }
     ensure!(
-        found.len() == wanted.len(),
+        required.iter().all(|path| found.contains(*path)),
         "release layer is missing a required file"
     );
     Ok(())
@@ -1318,6 +1337,7 @@ library_unit_tests!(
                 &good,
                 "application/vnd.oci.image.layer.v1.tar+gzip",
                 &["usr/local/bin/jmodguard-api"],
+                &[],
             )
             .unwrap();
             assert_eq!(found["usr/local/bin/jmodguard-api"], b"\x7fELFbody");
@@ -1337,7 +1357,8 @@ library_unit_tests!(
                 extract_layer(
                     &duplicate,
                     "application/vnd.oci.image.layer.v1.tar+gzip",
-                    &["usr/local/bin/jmodguard-api"]
+                    &["usr/local/bin/jmodguard-api"],
+                    &[],
                 )
                 .is_err()
             );
@@ -1346,7 +1367,8 @@ library_unit_tests!(
                 extract_layer(
                     &link,
                     "application/vnd.oci.image.layer.v1.tar+gzip",
-                    &["usr/local/bin/jmodguard-api"]
+                    &["usr/local/bin/jmodguard-api"],
+                    &[],
                 )
                 .is_err()
             );
@@ -1417,7 +1439,7 @@ library_unit_tests!(
                 (BOT, &executable, tar::EntryType::Regular),
                 (INVENTORY, inventory.as_bytes(), tar::EntryType::Regular),
             ]);
-            let expected = extract_layer(&bytes, GZIP, &[BOT, INVENTORY]).unwrap();
+            let expected = extract_layer(&bytes, GZIP, &[BOT, INVENTORY], &[]).unwrap();
             let descriptor = descriptor(&bytes, GZIP);
             let (registry, server) = serve_blob(bytes).await;
             let dir = staging_dir();

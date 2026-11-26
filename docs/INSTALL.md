@@ -25,7 +25,7 @@ Use a source commit or verified image digest:
 - Source: `https://github.com/jatmn/jModGuard`
 - Images: `ghcr.io/jatmn/jmodguard-bot`, `ghcr.io/jatmn/jmodguard-api`, `ghcr.io/jatmn/jmodguard-webui`
 - WebUI files: `dist/frontend/index.html`, `dist/frontend/app.js`, `dist/frontend/style.css`,
-  `dist/frontend/administration/index.html`, `dist/frontend/administration.js`
+  `dist/frontend/webui-runtime.js`, `dist/frontend/administration/index.html`, `dist/frontend/administration.js`
 
 GitHub Actions publishes changed images on main. Manual commit-SHA builds publish all
 eligible components; WebUI is skipped for source revisions predating that package.
