@@ -705,7 +705,9 @@ pub async fn get_command(
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let name = name.to_lowercase();
-    let canonical = crate::defaults::builtin_command_for_label(&name).unwrap_or(name);
+    let canonical = crate::defaults::builtin_command_for_label(&name)
+        .map(str::to_owned)
+        .unwrap_or(name);
     // Effective aliases depend on peers. Read only the command section, with
     // both layers and membership verified in the existing primary snapshot.
     let layers = db::list_enrolled_commands(&app.db, scope).await?;

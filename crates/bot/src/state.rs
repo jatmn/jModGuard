@@ -2414,7 +2414,7 @@ impl CachedGuildConfig {
         let lower = name.to_lowercase();
         if let Some(primary) = jmodguard::defaults::builtin_command_for_label(&lower) {
             // A server override may drop a shipped alias; the label then runs nothing.
-            return self.commands.get(&primary).filter(|c| c.matches(&lower));
+            return self.commands.get(primary).filter(|c| c.matches(&lower));
         }
         self.commands.values().find(|c| c.matches(&lower))
     }
