@@ -4552,7 +4552,8 @@ function IdPicker({ kind, label, hint, ids, names, rememberUser, onChange, pendi
         search(e.target.value);
       },
       onKeyDown: (e) => {
-        if (e.key !== "Enter") return;
+        // Enter that confirms an input method candidate belongs to the input method.
+        if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
         e.preventDefault();
         if (results?.length === 1 && !parseSnowflake(text)) {
           choose(results[0]);

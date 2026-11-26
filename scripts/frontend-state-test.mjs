@@ -796,6 +796,10 @@ test('the member picker waits for typing to settle and drops searches on close o
   // Enter while a name waits for typing to settle searches it at once instead of rejecting it as an ID.
   search = () => response({ members: [{ user_id: '4545', display_name: 'Kit' }], next_cursor: null, total: null });
   await type('kit');
+  await fire(idBox(), 'keydown', { key: 'Enter', isComposing: true });
+  assert.equal(searchTimers().length, 1, 'Enter that confirms an input method candidate leaves the wait alone');
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x']);
+  assert.equal(dialog.querySelector('.id-picker p.err'), null);
   await fire(idBox(), 'keydown', { key: 'Enter' });
   await settle();
   assert.equal(searchTimers().length, 0, 'Enter starts the waiting search');
