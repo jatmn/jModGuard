@@ -1,7 +1,8 @@
 use super::*;
 use crate::db::{Db, GuildEnrollment, enroll_guild, retire_guild_enrollment};
-use chrono::Datelike;
 use libsql::params::IntoParams;
+
+const TEST_TODAY: NaiveDate = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
 
 struct Fixture {
     db: Db,
@@ -13,10 +14,7 @@ impl Fixture {
         let path = std::env::temp_dir().join(format!(
             "jmodguard_analytics_{label}_{}_{}.db",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            rand::random::<u128>()
         ));
         Self {
             db: Db::open(&path, 2).unwrap(),
@@ -86,22 +84,23 @@ fn member_daily_rows(db: &Db, guild_id: i64) -> i64 {
     .unwrap()
 }
 
+fn test_day(day_offset: i64) -> NaiveDate {
+    TEST_TODAY - chrono::Duration::days(day_offset)
+}
+
 fn rfc3339_day(day_offset: i64) -> String {
-    (chrono::Utc::now().date_naive() - chrono::Duration::days(day_offset))
-        .format("%Y-%m-%dT12:00:00+00:00")
-        .to_string()
+    format!("{}T12:00:00+00:00", test_day(day_offset))
 }
 
 async fn bump(db: &Db, enrollment: &GuildEnrollment, day_offset: i64, joins: i64, leaves: i64) {
-    bump_member_daily(
-        db,
-        enrollment.clone(),
-        (chrono::Utc::now() - chrono::Duration::days(day_offset)).timestamp_millis(),
-        joins,
-        leaves,
-    )
-    .await
-    .unwrap();
+    let at_ms = test_day(day_offset)
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    bump_member_daily_on(db, enrollment.clone(), at_ms, joins, leaves, TEST_TODAY)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -125,7 +124,7 @@ async fn guild_series_buckets_counts_and_zero_fills_the_window() {
     bump(&f.db, &enrollment, 0, 1, 0).await;
     bump(&f.db, &enrollment, 2, 2, 2).await;
 
-    let analytics = enrolled_guild_analytics(&f.db, enrollment, 4)
+    let analytics = enrolled_guild_analytics_on(&f.db, enrollment, 4, TEST_TODAY)
         .await
         .unwrap();
     assert_eq!(analytics.window_days, 4);
@@ -169,7 +168,7 @@ async fn guild_summary_is_empty_without_records() {
     let f = Fixture::new("summary_empty");
     let enrollment = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
     for days in ANALYTICS_RANGES {
-        let summary = enrolled_guild_analytics(&f.db, enrollment.clone(), days)
+        let summary = enrolled_guild_analytics_on(&f.db, enrollment.clone(), days, TEST_TODAY)
             .await
             .unwrap();
         assert_eq!(summary.window_days, days);
@@ -222,8 +221,16 @@ async fn guild_summary_ranks_breakdowns_and_buckets_the_heat_map() {
     // heat map counts each enforcement action once.
     f.insert_event(10, "timeout_add", "{}", 0);
     f.insert_warn(10, 0);
+    // These rows already exist when a request with yesterday's date reads.
+    insert_mod_action(&f, Some(big), r#"{"action":"ban"}"#, -1);
+    f.insert_event(10, "automod", r#"{"rule":"spam","action":"timeout"}"#, -1);
+    f.insert_raw(
+        "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active) \
+         VALUES (10, 22, NULL, '[automod:attachment_flood] same image', ?1, 1)",
+        crate::db::params![rfc3339_day(-1)],
+    );
 
-    let summary = enrolled_guild_analytics(&f.db, enrollment, 7)
+    let summary = enrolled_guild_analytics_on(&f.db, enrollment, 7, TEST_TODAY)
         .await
         .unwrap();
     fn ranked(rows: &[RankedCount]) -> Vec<(&str, i64)> {
@@ -248,23 +255,8 @@ async fn guild_summary_ranks_breakdowns_and_buckets_the_heat_map() {
     );
     let json = serde_json::to_value(&summary).unwrap();
     assert_eq!(json["moderators"][0]["moderator_id"], "9007199254740993");
-    // Expect the weekday the fixture stamped on its rows, not a second clock read.
-    let stamped: String =
-        f.db.with_conn_sync(|conn| {
-            conn.query_row(
-                "SELECT created_at FROM warns WHERE guild_id=10",
-                (),
-                |row| Ok(row.get(0)?),
-            )
-        })
-        .unwrap();
-    let weekday = i64::from(
-        chrono::DateTime::parse_from_rfc3339(&stamped)
-            .unwrap()
-            .weekday()
-            .num_days_from_sunday(),
-    );
-    assert_eq!(summary.heatmap, vec![[weekday, 12, 9]]);
+    // January 1, 2026 was a Thursday.
+    assert_eq!(summary.heatmap, vec![[4, 12, 9]]);
 }
 
 #[tokio::test]
@@ -280,15 +272,13 @@ async fn guild_summary_compares_the_previous_window_and_keeps_large_counts_exact
     f.insert_unattributed_ban(10, 21, "[automod:repeat_text] repeated text");
     let huge = 2_000_000_000_000_i64;
     for (offset, joins, leaves) in [(0, huge, 1), (1, huge, 0), (8, 3, 2)] {
-        let day = (chrono::Utc::now().date_naive() - chrono::Duration::days(offset))
-            .format("%Y-%m-%d")
-            .to_string();
+        let day = test_day(offset).to_string();
         f.insert_raw(
             "INSERT INTO analytics_member_daily (guild_id, day, joins, leaves) VALUES (10, ?1, ?2, ?3)",
             crate::db::params![day, joins, leaves],
         );
     }
-    let week = enrolled_guild_analytics(&f.db, enrollment.clone(), 7)
+    let week = enrolled_guild_analytics_on(&f.db, enrollment.clone(), 7, TEST_TODAY)
         .await
         .unwrap();
     assert_eq!(
@@ -308,7 +298,7 @@ async fn guild_summary_compares_the_previous_window_and_keeps_large_counts_exact
     assert_eq!(week.series.last().unwrap().automod, 1);
     // A 90-day comparison window reaches past the retained daily counters,
     // so membership has no previous total instead of a false zero.
-    let quarter = enrolled_guild_analytics(&f.db, enrollment, 90)
+    let quarter = enrolled_guild_analytics_on(&f.db, enrollment, 90, TEST_TODAY)
         .await
         .unwrap();
     assert_eq!(quarter.previous.joins, None);
@@ -332,7 +322,7 @@ async fn guild_summary_breakdowns_stay_bounded() {
         }
         insert_mod_action(&f, Some(100 + rule), r#"{"action":"warn"}"#, 0);
     }
-    let summary = enrolled_guild_analytics(&f.db, enrollment, 30)
+    let summary = enrolled_guild_analytics_on(&f.db, enrollment, 30, TEST_TODAY)
         .await
         .unwrap();
     assert_eq!(summary.top_rules.len(), ANALYTICS_TOP_LIMIT as usize);
@@ -360,12 +350,16 @@ async fn guild_series_stays_isolated_per_guild() {
     f.insert_event(20, "mod_action", "{}", 0);
     bump(&f.db, &ten, 0, 1, 0).await;
     bump(&f.db, &twenty, 0, 0, 5).await;
-    let ten_series = enrolled_guild_analytics(&f.db, ten, 2).await.unwrap();
+    let ten_series = enrolled_guild_analytics_on(&f.db, ten, 2, TEST_TODAY)
+        .await
+        .unwrap();
     assert_eq!(ten_series.series[1].warns, 1);
     assert_eq!(ten_series.series[1].mod_actions, 0);
     assert_eq!(ten_series.series[1].joins, 1);
     assert_eq!(ten_series.series[1].leaves, 0);
-    let twenty_series = enrolled_guild_analytics(&f.db, twenty, 2).await.unwrap();
+    let twenty_series = enrolled_guild_analytics_on(&f.db, twenty, 2, TEST_TODAY)
+        .await
+        .unwrap();
     assert_eq!(twenty_series.series[1].warns, 2);
     assert_eq!(twenty_series.series[1].mod_actions, 1);
     assert_eq!(twenty_series.series[1].joins, 0);
@@ -378,7 +372,7 @@ async fn analytics_reads_and_writes_refuse_retired_enrollments() {
     let enrollment = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
     retire_guild_enrollment(&f.db, 10, 100).await.unwrap();
     assert!(
-        enrolled_guild_analytics(&f.db, enrollment.clone(), 30)
+        enrolled_guild_analytics_on(&f.db, enrollment.clone(), 30, TEST_TODAY)
             .await
             .unwrap_err()
             .is::<crate::db::EnrollmentChanged>()
@@ -395,10 +389,7 @@ async fn analytics_reads_and_writes_refuse_retired_enrollments() {
 async fn member_daily_counters_prune_beyond_the_horizon() {
     let f = Fixture::new("prune");
     let enrollment = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
-    let old_day = (chrono::Utc::now().date_naive()
-        - chrono::Duration::days(ANALYTICS_MEMBER_DAILY_HORIZON_DAYS + 5))
-    .format("%Y-%m-%d")
-    .to_string();
+    let old_day = test_day(ANALYTICS_MEMBER_DAILY_HORIZON_DAYS + 5).to_string();
     f.insert_raw(
         "INSERT INTO analytics_member_daily (guild_id, day, joins, leaves) VALUES (?1, ?2, 9, 9)",
         crate::db::params![10, old_day],
@@ -409,7 +400,7 @@ async fn member_daily_counters_prune_beyond_the_horizon() {
         1,
         "the horizon row is pruned by the next write"
     );
-    let series = enrolled_guild_analytics(&f.db, enrollment, 3)
+    let series = enrolled_guild_analytics_on(&f.db, enrollment, 3, TEST_TODAY)
         .await
         .unwrap();
     assert_eq!(series.series[2].joins, 1);
@@ -420,7 +411,7 @@ async fn member_daily_counters_prune_beyond_the_horizon() {
 async fn window_requests_clamp_to_the_supported_maximum() {
     let f = Fixture::new("window");
     let enrollment = enroll_guild(&f.db, 10, 100).await.unwrap().unwrap();
-    let analytics = enrolled_guild_analytics(&f.db, enrollment, 5000)
+    let analytics = enrolled_guild_analytics_on(&f.db, enrollment, 5000, TEST_TODAY)
         .await
         .unwrap();
     assert_eq!(analytics.window_days, ANALYTICS_MAX_WINDOW_DAYS);
@@ -444,7 +435,7 @@ async fn platform_analytics_aggregates_guilds_and_counts_active_servers() {
     bump(&f.db, &ten, 0, 5, 1).await;
     bump(&f.db, &twenty, 0, 2, 3).await;
 
-    let platform = platform_analytics(&f.db, 7).await.unwrap();
+    let platform = platform_analytics_on(&f.db, 7, TEST_TODAY).await.unwrap();
     assert_eq!(platform.window_days, 7);
     assert_eq!(platform.series.len(), 7);
     let today = &platform.series[6];
@@ -500,7 +491,23 @@ async fn platform_analytics_compares_windows_and_names_every_active_server() {
     bump(&f.db, &ten, 0, 4, 1).await;
     bump(&f.db, &ten, 8, 2, 3).await;
 
-    let platform = platform_analytics(&f.db, 7).await.unwrap();
+    // The exclusive cutoff is the start of the next UTC day.
+    f.insert_raw(
+        "INSERT INTO warns (guild_id, user_id, moderator_id, reason, created_at) \
+         VALUES (10, 7, 8, NULL, '2026-01-02T00:00:00+00:00')",
+        (),
+    );
+    f.insert_raw(
+        "INSERT INTO bans (guild_id, user_id, moderator_id, reason, created_at, active) \
+         VALUES (10, 21, NULL, '[automod:repeat_text] repeated text', ?1, 1)",
+        crate::db::params![rfc3339_day(-1)],
+    );
+    f.insert_event(10, "automod", r#"{"action":"ban"}"#, -1);
+    f.insert_event(10, "mod_action", "{}", -1);
+    f.insert_event(10, "timeout_add", "{}", -1);
+    bump(&f.db, &ten, -1, 8, 9).await;
+
+    let platform = platform_analytics_on(&f.db, 7, TEST_TODAY).await.unwrap();
     let ids: Vec<i64> = platform.guilds.iter().map(|g| g.guild_id).collect();
     assert_eq!(
         ids,
@@ -519,6 +526,7 @@ async fn platform_analytics_compares_windows_and_names_every_active_server() {
         (alpha.warns, alpha.mod_actions, alpha.joins, alpha.leaves),
         (1, 1, 4, 1)
     );
+    assert_eq!((alpha.bans, alpha.automod, alpha.timeouts), (0, 0, 0));
     assert_eq!(
         alpha.previous,
         PreviousTotals {
@@ -548,7 +556,7 @@ async fn platform_analytics_compares_windows_and_names_every_active_server() {
     );
 
     // A 90-day previous window reaches past the membership counter horizon.
-    let long = platform_analytics(&f.db, 90).await.unwrap();
+    let long = platform_analytics_on(&f.db, 90, TEST_TODAY).await.unwrap();
     assert_eq!(long.series.len(), 90);
     assert_eq!((long.previous.joins, long.previous.leaves), (None, None));
     assert!(
@@ -579,7 +587,9 @@ async fn departure_erasure_removes_member_counters_before_re_enrollment() {
         "other guilds keep counters"
     );
     let rejoined = enroll_guild(&f.db, 10, 200).await.unwrap().unwrap();
-    let series = enrolled_guild_analytics(&f.db, rejoined, 1).await.unwrap();
+    let series = enrolled_guild_analytics_on(&f.db, rejoined, 1, TEST_TODAY)
+        .await
+        .unwrap();
     assert_eq!(series.series[0].joins, 0, "a new installation starts empty");
     assert_eq!(series.series[0].leaves, 0);
 
@@ -625,13 +635,13 @@ async fn spam_hits_include_dedicated_spam_bans_once() {
     );
     f.insert_unattributed_ban(20, 25, "[automod:repeat_text] other server");
 
-    let guild = enrolled_guild_analytics(&f.db, enrollment, 1)
+    let guild = enrolled_guild_analytics_on(&f.db, enrollment, 1, TEST_TODAY)
         .await
         .unwrap();
     assert_eq!(guild.series[0].bans, 4);
     assert_eq!(guild.series[0].automod, 3);
 
-    let platform = platform_analytics(&f.db, 1).await.unwrap();
+    let platform = platform_analytics_on(&f.db, 1, TEST_TODAY).await.unwrap();
     assert_eq!(platform.series[0].automod, 4);
     assert_eq!(platform.guilds[0].guild_id, 10);
     assert_eq!(platform.guilds[0].automod, 3);
@@ -657,7 +667,7 @@ async fn analytics_reads_fit_the_remote_snapshot_budget() {
     let (_fixture, remote) =
         HranaFixture::delayed_database(&f.path, Duration::from_millis(350), Duration::from_secs(5))
             .await;
-    let guild = enrolled_guild_analytics(&remote, enrollment, 2)
+    let guild = enrolled_guild_analytics_on(&remote, enrollment, 2, TEST_TODAY)
         .await
         .expect("guild analytics must finish inside the snapshot budget");
     assert_eq!(
@@ -676,7 +686,7 @@ async fn analytics_reads_fit_the_remote_snapshot_budget() {
         ),
         (1, 1, 2, 2, 1)
     );
-    let platform = platform_analytics(&remote, 2)
+    let platform = platform_analytics_on(&remote, 2, TEST_TODAY)
         .await
         .expect("platform analytics must finish inside the snapshot budget");
     let today = &platform.series[1];

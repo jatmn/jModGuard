@@ -294,8 +294,6 @@ sleep	crates/updater/src/main.rs	tests::slow_launcher_error_retries_and_extends_
 clock	crates/updater/tests/registry.rs	cosign_payload_fetch_crossing_expiry_is_refused	1	#666
 sleep	src/bunny_evidence/tests.rs	bunny_evidence::tests::cancellation_keeps_started_transfer_alive_and_independent_cleanup_blocked	1	#666
 clock	src/custom_rules.rs	custom_rules::tests::catastrophic_pattern_finishes_quickly	1	#666
-clock	src/db/analytics/tests.rs	db::analytics::tests::guild_summary_compares_the_previous_window_and_keeps_large_counts_exact	1	#666
-clock	src/db/analytics/tests.rs	db::analytics::tests::member_daily_counters_prune_beyond_the_horizon	1	#666
 clock	src/db/guild_data/tests/snapshots.rs	db::guild_data::tests::snapshots::measure_sustained_snapshot_workload_and_cleanup_reuse	15	#666
 sleep	src/db/tests.rs	db::tests::api_open_retries_while_bot_holds_sqlite_lock	1	#666
 clock	src/db/tests.rs	db::tests::api_write_fails_fast_while_the_bot_holds_the_write_lock	1	#666
