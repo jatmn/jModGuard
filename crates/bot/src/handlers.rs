@@ -4374,6 +4374,84 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn departed_primary_config_read_preserves_current_revision_and_fallbacks() {
+        tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (directory, app, _) = counter_fixture("departed_primary_config").await;
+                let (ctx, _) = counter_context(&app, false).await;
+                let (create, delete) = gateway_config_events(&app, &ctx);
+                create(10, 100);
+                create(11, 100);
+
+                db::patch_settings(&app.db, 10, Some(Some("previous!".into())), None, None)
+                    .await
+                    .unwrap();
+                let old_reader = Db::open(&directory.join("core.db"), 1).unwrap();
+                // Make the first poll discover a replica revision mismatch.
+                // The primary fallback below reads the real SQLite snapshot.
+                old_reader.test_inject_next_config_snapshot(
+                    db::load_config_parts_with_version(&old_reader, 10)
+                        .await
+                        .unwrap(),
+                );
+
+                let (started, running) = tokio::sync::oneshot::channel();
+                let (release, blocked) = std::sync::mpsc::channel();
+                let blocking_worker = tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    blocked
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                });
+                running.await.unwrap();
+                let mut late = Box::pin(app.configs.get(&old_reader, 10));
+                tokio::select! {
+                    biased;
+                    _ = &mut late => panic!("primary read finished while its worker was blocked"),
+                    _ = std::future::ready(()) => {}
+                }
+                release.send(()).unwrap();
+                blocking_worker.await.unwrap();
+                // The primary read has the sole connection permit. The
+                // barrier waits for it to finish without polling its result.
+                old_reader.with_conn(|_| Ok(())).await.unwrap();
+
+                delete(10, false);
+                db::patch_settings(&app.db, 10, Some(Some("rejoined!".into())), None, None)
+                    .await
+                    .unwrap();
+                create(10, 200);
+                let rejoined = app.configs.get(&app.db, 10).await.unwrap();
+                let other = app.configs.get(&app.db, 11).await.unwrap();
+                assert_eq!(rejoined.settings.prefix, "rejoined!");
+
+                let late = late.await;
+                assert!(
+                    app.configs
+                        .last_known(10)
+                        .is_some_and(|entry| { std::sync::Arc::ptr_eq(&entry, &rejoined) }),
+                    "a late primary result must preserve the rejoined membership's publication"
+                );
+                assert!(
+                    app.configs
+                        .last_known(11)
+                        .is_some_and(|entry| { std::sync::Arc::ptr_eq(&entry, &other) }),
+                    "a late primary result must preserve an unrelated guild's fallback"
+                );
+                assert_eq!(late.unwrap().settings.prefix, "rejoined!");
+
+                drop(old_reader);
+                drop(app);
+                std::fs::remove_dir_all(directory).unwrap();
+            });
+    }
+
     #[tokio::test]
     async fn another_guilds_departure_keeps_an_active_guilds_cold_load() {
         let (directory, app, _) = counter_fixture("config_departure_other").await;

@@ -2873,8 +2873,17 @@ impl ConfigCache {
         }
     }
 
+    fn can_publish_for(&self, guild: i64, membership: ConfigMembership) -> bool {
+        membership != ConfigMembership::Absent && membership == self.membership(guild)
+    }
+
     fn require_primary_revision(&self, version: u64, revision: String) {
         let _publication = self.publication_lock.lock();
+        self.adopt_primary_revision(version, revision);
+    }
+
+    // Called under the publication lock.
+    fn adopt_primary_revision(&self, version: u64, revision: String) {
         self.durable_floor.store(version, Ordering::SeqCst);
         *self.accepted_revision.lock() = revision;
         self.clear_publication();
@@ -3032,7 +3041,15 @@ impl ConfigCache {
             let accepted_revision = self.accepted_revision.lock().clone();
 
             if route == ConfigReadRoute::Primary && revision != accepted_revision {
-                self.require_primary_revision(durable_version, revision);
+                // Adopting a revision clears every entry and pending flight.
+                // Only a read that still owns its membership and generation
+                // may change the shared revision and floor.
+                let _publication = self.publication_lock.lock();
+                if self.version.load(Ordering::Relaxed) == version
+                    && self.can_publish_for(guild_id, membership)
+                {
+                    self.adopt_primary_revision(durable_version, revision);
+                }
                 continue;
             }
             if durable_version < required_after || revision != accepted_revision {
@@ -3079,8 +3096,7 @@ impl ConfigCache {
                     owner.retry_primary(&mut route, durable_version, revision);
                     continue;
                 }
-                if membership == ConfigMembership::Absent || membership != self.membership(guild_id)
-                {
+                if !self.can_publish_for(guild_id, membership) {
                     // The caller may use its result, but this read no longer
                     // owns a current membership's cache entry.
                     if let Some(config) = cfg.or(previous) {
