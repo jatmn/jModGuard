@@ -512,18 +512,26 @@ impl Registry {
         repo: &str,
         descriptor: &Descriptor,
         limit: usize,
-        path: &Path,
-    ) -> Result<()> {
+        dir: &Path,
+    ) -> Result<TempFile> {
         ensure!(
             valid_digest(&descriptor.digest) && descriptor.size <= limit as u64,
             "invalid blob descriptor"
         );
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .await?;
+        // The blocking task owns the cleanup guard from creation, so a cancelled
+        // caller cannot drop the guard before a queued creation runs.
+        let dir = dir.to_owned();
+        let (file, blob) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let blob = TempFile::new(&dir, "layer");
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(blob.path())?;
+            Ok((file, blob))
+        })
+        .await??;
+        let mut file = tokio::fs::File::from_std(file);
         let token = self.token(repo).await?;
         let url = format!("{}/v2/{repo}/blobs/{}", self.base, descriptor.digest);
         let mut response = self
@@ -550,7 +558,7 @@ impl Registry {
             format!("sha256:{}", hex(context.finish().as_ref())) == descriptor.digest,
             "blob digest mismatch"
         );
-        Ok(())
+        Ok(blob)
     }
 
     async fn config(&self, repo: &str, manifest: &Manifest) -> Result<ImageConfig> {
@@ -828,8 +836,8 @@ impl Registry {
         dir: &Path,
     ) -> Result<StagedExecutable> {
         tokio::fs::create_dir_all(dir).await?;
-        let blob = TempFile::new(dir, "layer");
-        self.blob_to_file(layer.repo, &layer.descriptor, MAX_LAYER, blob.path())
+        let blob = self
+            .blob_to_file(layer.repo, &layer.descriptor, MAX_LAYER, dir)
             .await?;
         let staged = TempFile::new(dir, "stage");
         let media = layer.descriptor.media_type;
@@ -1387,6 +1395,49 @@ mod tests {
         server.abort();
         let _ = server.await;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn staging_cancelled_while_the_layer_file_is_created_leaves_no_file() {
+        // One blocking worker lets the test queue the layer file creation behind a
+        // held task, cancel staging, and only then let the creation run.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let bytes = layer(&[(BOT, &executable_body(), tar::EntryType::Regular)]);
+            let descriptor = verified(&bytes, GZIP);
+            let registry = Registry::new("http://127.0.0.1:1").unwrap();
+            let dir = staging_dir();
+            let mut staging =
+                Box::pin(registry.stage_release_layer(descriptor, BOT, INVENTORY, &dir));
+            tokio::select! {
+                biased;
+                result = &mut staging => panic!("staging finished early: {:?}", result.err()),
+                _ = std::future::ready(()) => {}
+            }
+            let (started, running) = std::sync::mpsc::channel();
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = held.recv();
+            });
+            // The worker reaches this task only after it finished the directory creation.
+            running.recv().unwrap();
+            tokio::select! {
+                biased;
+                result = &mut staging => panic!("staging finished early: {:?}", result.err()),
+                _ = std::future::ready(()) => {}
+            }
+            drop(staging);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert_eq!(names(&dir), Vec::<String>::new());
+            std::fs::remove_dir_all(dir).unwrap();
+        });
     }
 
     #[test]
