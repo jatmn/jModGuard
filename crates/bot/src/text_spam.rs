@@ -35,8 +35,8 @@ enum AdmitOutcome {
     Matched(Vec<(u64, u64)>),
     /// Update could not be stored (capacity, stale revision, etc.).
     Rejected,
-    /// A replacement exceeded the byte budget and retired the superseded observation.
-    ReplacementRetired,
+    /// The superseded observation was retired or its ID is blocked by the retirement watermark.
+    Retired,
 }
 
 #[derive(Clone)]
@@ -369,7 +369,7 @@ impl Detector {
                     drop_author_posts(&mut state, guild, author, |previous| {
                         previous.id == post.id && previous.channel == post.channel
                     });
-                    return AdmitOutcome::ReplacementRetired;
+                    return AdmitOutcome::Retired;
                 }
                 *previous = post;
                 g.bytes = guild_bytes;
@@ -387,8 +387,11 @@ impl Detector {
                 .map(|b| b.retired_before)
                 .or_else(|| g.watermarks.get(&author).map(|w| w.retired_before))
         });
-        if state.index.contains_key(&key) || retired_before.is_some_and(|id| post.id <= id) {
+        if state.index.contains_key(&key) {
             return AdmitOutcome::Rejected;
+        }
+        if retired_before.is_some_and(|id| post.id <= id) {
+            return AdmitOutcome::Retired;
         }
         let exists = state
             .guilds
@@ -645,7 +648,7 @@ fn apply_admit_outcome(
     replace: bool,
 ) -> Option<Vec<(u64, u64)>> {
     match outcome {
-        AdmitOutcome::Unchanged | AdmitOutcome::Admitted | AdmitOutcome::ReplacementRetired => None,
+        AdmitOutcome::Unchanged | AdmitOutcome::Admitted | AdmitOutcome::Retired => None,
         AdmitOutcome::Rejected => {
             if replace {
                 detector.invalidate(guild, channel, message);
@@ -1340,6 +1343,7 @@ mod tests {
         assert_eq!(usage(), full_usage);
 
         let revision = detector.revision();
+        let retry = observed(1, shorter, 7);
         let unrelated_edit = observed(1, shorter, 6);
         let outcome = edit(&longer, 6);
         let retired_usage = (full_guild - 2048, full_process - 2048);
@@ -1352,6 +1356,12 @@ mod tests {
         assert!(apply_admit_outcome(&detector, outcome, 1, 10, 1, true).is_none());
         assert_eq!(usage(), retired_usage);
         assert_eq!(detector.author_of(1, 10, 2), Some(1));
+        let retry_outcome = detector.admit(1, 1, retry, (0, 0), &policy, now, true);
+        assert_eq!(retry_outcome, AdmitOutcome::Retired);
+        assert!(apply_admit_outcome(&detector, retry_outcome, 1, 10, 1, true).is_none());
+        assert_eq!(detector.author_of(1, 10, 1), None);
+        assert_eq!(usage(), retired_usage);
+
         let unrelated = detector.admit(2, 1, unrelated_edit, (0, 0), &policy, now, true);
         assert!(apply_admit_outcome(&detector, unrelated.clone(), 2, 10, 1, true).is_none());
         assert_eq!(
@@ -1362,11 +1372,6 @@ mod tests {
         assert_eq!(detector.author_of(2, 10, 1), Some(1));
         assert_eq!(detector.revision(), revision);
         assert_eq!(usage(), (retired_usage.0, retired_usage.1 - 1));
-        assert_eq!(
-            edit(shorter, 7),
-            AdmitOutcome::Rejected,
-            "retired ID cannot return"
-        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1601,7 +1606,7 @@ mod tests {
         d.prune();
         assert_eq!(
             d.admit(1, 2, post(1, 10, now, "spam"), (0, 0), &p, now, false),
-            AdmitOutcome::Rejected
+            AdmitOutcome::Retired
         );
         assert!(d.state.lock().index.is_empty());
     }
