@@ -44,6 +44,7 @@ type AutomodVarsCaptureSlot = Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>
 #[cfg(test)]
 tokio::task_local! {
     static AUTOMOD_VARS_CAPTURE: AutomodVarsCaptureSlot;
+    static BEFORE_EDIT_DESTINATION_RECHECK: Box<dyn Fn() + Send + Sync>;
 }
 
 #[cfg(test)]
@@ -1782,29 +1783,6 @@ async fn emit_to_observed_with_audit(
         if !commit() {
             return Ok(Delivery::Dropped);
         }
-        if event == "message_edit"
-            && vars
-                .get("channel")
-                .is_some_and(|value| value.starts_with("<#"))
-            && let Some(id) = vars
-                .get("channel_id")
-                .and_then(|id| id.parse::<u64>().ok())
-                .filter(|id| *id != 0)
-        {
-            let budget = deadline
-                .saturating_sub(started.elapsed())
-                .div_f64(2.0)
-                .min(Duration::from_secs(3));
-            let name =
-                tokio::time::timeout(budget, sink.edit_channel_name(guild_id, ChannelId::new(id)))
-                    .await
-                    .ok()
-                    .flatten();
-            vars.insert(
-                "channel".into(),
-                format!("#{}", name.unwrap_or_else(|| id.to_string())),
-            );
-        }
         #[cfg(test)]
         if event == "automod"
             && AUTOMOD_VARS_CAPTURE
@@ -1835,6 +1813,44 @@ async fn emit_to_observed_with_audit(
                 None => default_template(event),
             }
         };
+        let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
+            guild: guild_id.get(),
+            channel: channel_id.get(),
+        };
+        // Optional enrichment: only a deliverable report that shows the source
+        // channel spends a Discord request on its name.
+        if event == "message_edit"
+            && substituted_key_count(template, "channel") > 0
+            && vars
+                .get("channel")
+                .is_some_and(|value| value.starts_with("<#"))
+            && let Some(id) = vars
+                .get("channel_id")
+                .and_then(|id| id.parse::<u64>().ok())
+                .filter(|id| *id != 0)
+        {
+            let name = if app.activation.may_record()
+                && !app
+                    .remembered_discord_targets
+                    .blocked(rest_target, Instant::now())
+            {
+                let budget = deadline
+                    .saturating_sub(started.elapsed())
+                    .div_f64(2.0)
+                    .min(Duration::from_secs(3));
+                tokio::time::timeout(budget, sink.edit_channel_name(guild_id, ChannelId::new(id)))
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                // A destination can recover before the final send checks.
+                None
+            };
+            vars.insert(
+                "channel".into(),
+                format!("#{}", name.unwrap_or_else(|| id.to_string())),
+            );
+        }
         templates::format_log_timestamps(&mut vars);
         if grouped_cleanup {
             // A mixed custom template may request values tied to one message.
@@ -1853,13 +1869,13 @@ async fn emit_to_observed_with_audit(
             return Ok(Delivery::NothingToSend);
         }
         let _ = render_log_template(event, template, &mut vars);
+        #[cfg(test)]
+        if event == "message_edit" {
+            let _ = BEFORE_EDIT_DESTINATION_RECHECK.try_with(|recover| recover());
+        }
         if !app.activation.may_record() {
             return Ok(Delivery::Dropped);
         }
-        let rest_target = crate::discord::DiscordRestTarget::GuildChannel {
-            guild: guild_id.get(),
-            channel: channel_id.get(),
-        };
         if app
             .remembered_discord_targets
             .blocked(rest_target, Instant::now())
@@ -4154,11 +4170,7 @@ fn verified_member_departure_vars(
 }
 
 fn default_template(event: &str) -> &'static str {
-    crate::defaults::rendered_log_templates()
-        .into_iter()
-        .find(|(e, _)| *e == event)
-        .map(|(_, t)| t)
-        .unwrap_or("**{event}**\n{content}")
+    crate::defaults::rendered_log_template(event).unwrap_or("**{event}**\n{content}")
 }
 
 #[cfg(test)]

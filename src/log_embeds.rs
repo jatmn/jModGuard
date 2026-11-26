@@ -18,10 +18,8 @@ pub struct Style {
 }
 
 pub fn style(event: &str) -> Style {
-    let title = crate::defaults::rendered_log_templates()
-        .into_iter()
-        .find(|(name, _)| *name == event)
-        .map(|(_, template)| template.lines().next().unwrap_or("Log event"))
+    let title = crate::defaults::rendered_log_template(event)
+        .map(|template| template.lines().next().unwrap_or("Log event"))
         .unwrap_or("Log event");
     let color = match event {
         "member_ban"
@@ -162,7 +160,6 @@ pub fn render(event: &str, template: &str, vars: &BTreeMap<String, String>) -> L
         url: None,
     };
     let shipped = crate::defaults::rendered_log_templates()
-        .into_iter()
         .any(|(name, text)| name == event && text == template);
     let mut edit_times = if event == "message_edit" {
         vars.get("time")
@@ -359,7 +356,6 @@ mod tests {
     #[test]
     fn every_default_type_has_one_map_emoji_per_title_and_label() {
         let mut events = crate::defaults::rendered_log_templates()
-            .into_iter()
             .map(|(event, _)| event)
             .collect::<Vec<_>>();
         events.sort_unstable();
@@ -476,6 +472,21 @@ mod tests {
         assert_eq!(unknown.description, "{emoji} alice");
         let own = BTreeMap::from([("emoji".into(), "caller".into())]);
         assert_eq!(render("system", "{emoji}", &own).description, "caller");
+    }
+
+    #[test]
+    fn borrowed_catalog_is_seeded_then_activity_defaults_in_order() {
+        let catalog = crate::defaults::rendered_log_templates().collect::<Vec<_>>();
+        let seeded = crate::defaults::default_templates();
+        let activity = crate::defaults::activity_log_templates();
+        assert_eq!(catalog, [seeded, activity].concat());
+        for (event, template) in catalog {
+            assert_eq!(
+                crate::defaults::rendered_log_template(event),
+                Some(template)
+            );
+        }
+        assert_eq!(crate::defaults::rendered_log_template("not_an_event"), None);
     }
 
     #[test]

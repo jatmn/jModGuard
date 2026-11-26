@@ -220,9 +220,17 @@ function harness(fetchImpl = async () => {}, storage = new Map(), session = new 
     };
     return () => count;
   }
+  function failJsonStringify(predicate) {
+    const json = vm.runInContext('JSON', context);
+    const stringify = json.stringify;
+    json.stringify = (value, replacer, space) => {
+      if (predicate(value)) throw new RangeError('Invalid string length');
+      return stringify(value, replacer, space);
+    };
+  }
   vm.runInContext('root.render(h(App));', context);
   pages.push({dom, roots});
-  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, measureMemberRowRenders, measureResourceChartRenders, measureJsonPrettyPrints, advanceTime(ms) { clockOffsetMs += ms; } };
+  return { app, mount, elements, nodes, storage, session, location, opened, historyUrls, window: win, timers, document, documentListeners, measureDraftRenders, measureMemberRowRenders, measureResourceChartRenders, measureJsonPrettyPrints, failJsonStringify, advanceTime(ms) { clockOffsetMs += ms; } };
 }
 
 const response = (data) => ({ ok: true, text: async () => JSON.stringify(data) });
@@ -311,6 +319,19 @@ async function runMemberPoll(h, delay = 10000) {
   h.timers.delete(pending[0]);
   h.advanceTime(pending[1].delay);
   await pending[1].fn();
+  await settle();
+}
+
+// #871: a member picker search starts once typing settles for the list search delay.
+const memberSearchTimers = h => [...h.timers].filter(([, timer]) => timer.delay === 300);
+async function settleMemberSearch(h) {
+  const pending = memberSearchTimers(h);
+  assert.equal(pending.length, 1, 'one member search waits for typing to settle');
+  const [[id, timer]] = pending;
+  h.timers.delete(id);
+  h.advanceTime(timer.delay);
+  // The read may be held open by the test, so start it without waiting for it.
+  timer.fn();
   await settle();
 }
 
@@ -679,6 +700,7 @@ test('the ban dialog finds current members by name and says when the search fail
   const type = async value => {
     idBox.value = value;
     await fire(idBox, 'input', { target: { value } });
+    if (value) await settleMemberSearch(h);
     await settle();
   };
   const results = () => textOf(dialog.querySelector('ul.picker-results'));
@@ -723,6 +745,118 @@ test('the ban dialog finds current members by name and says when the search fail
   await settle();
   const post = calls.find(call => call.url.endsWith('/ban'));
   assert.equal(JSON.parse(post.opts.body).user_id, '9007199254740993');
+});
+
+// #871: a name typed into the shared member picker sends one directory read once typing settles.
+test('the member picker waits for typing to settle and drops searches on close or a server change', async () => {
+  const reads = [];
+  let search = () => response({ members: [{ user_id: '9007199254740993', display_name: 'JATMN' }], next_cursor: null, total: null });
+  const h = harness(async (url, opts) => {
+    if (url.includes('/members?')) {
+      reads.push({ url, signal: opts.signal });
+      return search(opts.signal);
+    }
+    return response({ bans: [], names: {} });
+  });
+  const root = await bansView(h);
+  const open = async () => {
+    await fire(findNode(root, n => n.localName === 'button' && n.textContent === 'Ban user'), 'click');
+    return h.document.querySelector('.ban-dialog');
+  };
+  let dialog = await open();
+  const idBox = () => dialog.querySelector('input[placeholder="Search members by name, or paste an ID"]');
+  const type = async value => {
+    const box = idBox();
+    box.value = value;
+    await fire(box, 'input', { target: { value } });
+  };
+  const queries = () => reads.map(read => new URL(read.url, 'https://fixture.test').searchParams.get('q'));
+  const searchTimers = () => memberSearchTimers(h);
+  const settleSearch = () => settleMemberSearch(h);
+  const cancel = () => fire(findNode(dialog, n => n.localName === 'button' && n.textContent === 'Cancel'), 'click');
+
+  let previous = null;
+  for (const value of ['j', 'ja', 'jat', 'jatm', 'jatmn']) {
+    await type(value);
+    const pending = searchTimers();
+    assert.equal(pending.length, 1, 'each edit replaces the pending search');
+    assert.notEqual(pending[0][0], previous, 'the wait restarts from the latest edit');
+    assert.equal(h.timers.has(previous), false, 'the earlier wait is cancelled');
+    previous = pending[0][0];
+  }
+  assert.deepEqual(queries(), [], 'no directory read starts while the name is still being typed');
+  await settleSearch();
+  assert.deepEqual(queries(), ['jatmn'], 'only the final text is searched');
+  assert.equal(reads[0].url, `/api/guilds/${h.app.state.guildId}/members?q=jatmn&limit=8&status=current`);
+  assert.equal(textOf(dialog.querySelector('ul.picker-results')), 'JATMN9007199254740993');
+
+  // A single settled character still searches, and a failure is still not an empty result.
+  search = () => { throw new TypeError('Failed to fetch'); };
+  await type('j');
+  await settleSearch();
+  assert.deepEqual(queries(), ['jatmn', 'j']);
+  assert.equal(textOf(dialog.querySelector('ul.picker-results')), "Couldn't search members: Failed to fetch. Paste their ID instead.");
+  search = () => response({ members: [], next_cursor: null, total: null });
+  await type('x');
+  await settleSearch();
+  assert.equal(textOf(dialog.querySelector('ul.picker-results')), 'No matching members.');
+
+  // Enter while a name waits for typing to settle searches it at once instead of rejecting it as an ID.
+  search = () => response({ members: [{ user_id: '4545', display_name: 'Kit' }], next_cursor: null, total: null });
+  await type('kit');
+  await fire(idBox(), 'keydown', { key: 'Enter', isComposing: true });
+  assert.equal(searchTimers().length, 1, 'Enter that confirms an input method candidate leaves the wait alone');
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x']);
+  assert.equal(dialog.querySelector('.id-picker p.err'), null);
+  await fire(idBox(), 'keydown', { key: 'Enter' });
+  await settle();
+  assert.equal(searchTimers().length, 0, 'Enter starts the waiting search');
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x', 'kit']);
+  assert.equal(dialog.querySelector('.id-picker p.err'), null, 'a waiting name is not rejected as an ID');
+  assert.equal(textOf(dialog.querySelector('ul.picker-results')), 'Kit4545');
+
+  // Clearing the box, pasting an ID or selecting typed IDs cancels the pending search.
+  const chips = () => [...dialog.querySelectorAll('ul.picker-chips .picker-chip-text')].map(textOf);
+  await type('jat');
+  await type('');
+  assert.equal(searchTimers().length, 0, 'clearing the box cancels the pending search');
+  await type('jat');
+  await type('4242');
+  assert.equal(searchTimers().length, 0, 'a pasted ID cancels the pending search');
+  await fire(idBox(), 'keydown', { key: 'Enter' });
+  assert.deepEqual(chips(), ['User 4242'], 'a pasted ID is selected at once');
+  await type('4242,4343');
+  assert.equal(searchTimers().length, 1);
+  await fire(idBox(), 'keydown', { key: 'Enter' });
+  assert.deepEqual(chips(), ['User 4343']);
+  assert.equal(searchTimers().length, 0, 'selecting cancels the pending search');
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x', 'kit']);
+
+  // Closing the dialog before the delay sends nothing.
+  await type('jat');
+  await cancel();
+  assert.equal(h.document.querySelector('.ban-dialog'), null);
+  assert.equal(searchTimers().length, 0, 'closing the picker cancels its pending search');
+
+  // A server change before the delay sends nothing to either server.
+  dialog = await open();
+  await type('jatmn');
+  h.app.state.guildId = h.app.state.guilds[1].id;
+  await settleSearch();
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x', 'kit'], 'a search typed for one server is not sent after a server change');
+  h.app.state.guildId = h.app.state.guilds[0].id;
+  await cancel();
+
+  // Closing the dialog aborts a search already sent.
+  dialog = await open();
+  search = signal => new Promise((_, reject) => signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true }));
+  await type('jatmn');
+  await settleSearch();
+  assert.deepEqual(queries(), ['jatmn', 'j', 'x', 'kit', 'jatmn']);
+  assert.equal(reads.at(-1).signal.aborted, false);
+  await cancel();
+  assert.equal(reads.at(-1).signal.aborted, true, 'closing the picker aborts its search');
+  assert.equal(searchTimers().length, 0);
 });
 
 // #709: node:assert renders a failed comparison by inspecting both values without a practical
@@ -4698,6 +4832,22 @@ async function launchFirefox(defaultFontSize) {
   }
 }
 
+// Saves the theme before each new document's own scripts read it, so one navigation renders it.
+const themeSeeds = {
+  light: "() => localStorage.setItem('jmodguard.theme', 'light')",
+  dark: "() => localStorage.setItem('jmodguard.theme', 'dark')",
+};
+
+async function seedTheme(browser, theme) {
+  const functionDeclaration = themeSeeds[theme];
+  assert.ok(functionDeclaration, `no preload seed for theme ${theme}`);
+  const { script } = await browser.send('script.addPreloadScript', {
+    functionDeclaration,
+    contexts: [browser.context],
+  });
+  return script;
+}
+
 test('a fragment-only preview stays read-only on the round trip through Administration', { timeout: 60000 }, async t => {
   if (!firefoxBinary || !fs.existsSync(new URL('../dist/frontend/app.js', import.meta.url))) {
     assert.ok(!process.env.CI, 'CI requires Firefox and the built WebUI');
@@ -4899,11 +5049,10 @@ test('dashboard density fits 1280x800 and keeps 24px targets in both themes', { 
   browser = await launchFirefox();
   const url = `http://127.0.0.1:${server.address().port}/`;
   for (const theme of ['light', 'dark']) {
+    const preload = await seedTheme(browser, theme);
     for (const [width, height] of [[1280, 800], [1920, 1080], [700, 800]]) {
       const name = `${theme} ${width}x${height}`;
       await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height } });
-      await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
-      await browser.send('script.evaluate', { expression: `localStorage.setItem('jmodguard.theme', '${theme}')`, target: { context: browser.context }, awaitPromise: false });
       await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
       const { result } = await browser.send('script.evaluate', { expression: densityProbe, target: { context: browser.context }, awaitPromise: true });
       const m = JSON.parse(result.value);
@@ -4936,6 +5085,7 @@ test('dashboard density fits 1280x800 and keeps 24px targets in both themes', { 
       assert.equal(m.scrollY, 0, name);
       assert.ok(m.stats.bottom <= m.viewport, `${name}: stat grid ends at ${m.stats.bottom}px of ${m.viewport}px`);
     }
+    await browser.send('script.removePreloadScript', { script: preload });
   }
 });
 
@@ -5064,11 +5214,10 @@ test('analytics dashboard shows enforcement and membership above the fold in bot
   const url = `http://127.0.0.1:${server.address().port}/`;
   const bars = new Set();
   for (const theme of ['light', 'dark']) {
+    const preload = await seedTheme(browser, theme);
     for (const [width, height] of [[1280, 800], [1920, 1080], [700, 800]]) {
       const name = `${theme} ${width}x${height}`;
       await browser.send('browsingContext.setViewport', { context: browser.context, viewport: { width, height } });
-      await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
-      await browser.send('script.evaluate', { expression: `localStorage.setItem('jmodguard.theme', '${theme}')`, target: { context: browser.context }, awaitPromise: false });
       await browser.send('browsingContext.navigate', { context: browser.context, url, wait: 'complete' });
       const { result } = await browser.send('script.evaluate', { expression: analyticsLayoutProbe, target: { context: browser.context }, awaitPromise: true });
       const m = JSON.parse(result.value);
@@ -5093,6 +5242,7 @@ test('analytics dashboard shows enforcement and membership above the fold in bot
       assert.ok(enforcement.bottom <= m.viewport && membership.bottom <= m.viewport,
         `${name}: both trend panels above the fold (${enforcement.bottom}/${membership.bottom} of ${m.viewport})`);
     }
+    await browser.send('script.removePreloadScript', { script: preload });
   }
   assert.equal(bars.size, 2, 'series colors follow the theme');
 });
@@ -5560,7 +5710,7 @@ test('case administration reaches later pages, all admitted history and inline e
     calls.push(url);
     const u = new URL(url, 'https://fixture.test');
     if (u.pathname.endsWith('/history')) {
-      // The history contract admits 64 entries; a full page reads on after its last sequence.
+      // The history contract admits 64 entries, so a full first page is the whole case.
       const start = Number(u.searchParams.get('after'));
       const count = Math.max(0, Math.min(Number(u.searchParams.get('limit')), 64 - start));
       return response({history: Array.from({length: count}, (_, i) => ({id: `n${start + i + 1}`, sequence: String(start + i + 1), entry: {recorded_at_ms: 1, body: {note: {text: `note ${start + i + 1}`}}}}))});
@@ -5585,7 +5735,7 @@ test('case administration reaches later pages, all admitted history and inline e
   assert.ok(dialog, 'the case opens in a dialog');
   assert.ok(textOf(dialog).includes('note 1'));
   assert.ok(textOf(dialog).includes('note 64'));
-  assert.deepEqual(calls.filter(url => url.includes('/history')).map(url => new URL(url, 'https://fixture.test').searchParams.get('after')), ['0', '64']);
+  assert.deepEqual(calls.filter(url => url.includes('/history')).map(url => new URL(url, 'https://fixture.test').searchParams.get('after')), ['0']);
   const excerpt = findNode(dialog, n => n.localName === 'pre');
   assert.equal(excerpt.textContent, '<script>literal excerpt</script>');
   assert.equal(next.disabled, true);
@@ -6536,6 +6686,7 @@ test('rule exception pickers show server names and save only the chosen IDs', as
   await fire(findNode(modal, n => n.localName === 'button' && n.getAttribute('aria-label') === 'Remove @Moderators'), 'click');
   const search = control('Skip users');
   search.value = 'sear'; await fire(search, 'input');
+  await settleMemberSearch(h);
   assert.match(requests.at(-1).url, /\/members\?q=sear&limit=8&status=current$/);
   await fire(findNode(modal, n => n.localName === 'button' && textOf(n).startsWith('Searched Member')), 'click');
   assert.deepEqual(chips('Skip users'), ['Known Member', 'Searched Member']);
@@ -6658,7 +6809,7 @@ test('member search results only select for the query they answer', async () => 
   const search = pickerLabelled(modal, 'Skip users');
   const chips = () => [...modal.querySelectorAll('ul.picker-chips[aria-label="Skip users"] .picker-chip-text')].map(textOf);
   const results = () => modal.querySelector('ul.picker-results');
-  const typeQuery = async (value) => { search.value = value; await fire(search, 'input'); };
+  const typeQuery = async (value) => { search.value = value; await fire(search, 'input'); await settleMemberSearch(h); };
   await typeQuery('Alice'); pending.get('Alice')(); await settle();
   assert.match(textOf(results()), /Alice/);
   await typeQuery('Bob');
@@ -8085,20 +8236,6 @@ test('known-bad images renders hash-only metadata and searches without re-fetchi
   assert.equal(add.disabled, false);
 });
 
-test('known-bad image writes retain the loaded page membership and send only metadata', async () => {
-  const requests = [];
-  const h = harness(async (url, options) => { requests.push({url, options}); return response({ok: true}); });
-  h.app.state.config = {enrollment_id: 'fixture-membership', known_bad_images: []};
-  const hash = 'ab'.repeat(32);
-  const base = `/api/guilds/${h.app.state.guildId}/known-bad-images`;
-  await h.app.api(base, 'POST', {hash, note: 'confirmed spam'});
-  await h.app.api(`${base}/${hash}`, 'DELETE');
-  assert.equal(requests[0].options.headers['x-jmodguard-enrollment'], 'fixture-membership');
-  assert.equal(requests[1].options.headers['x-jmodguard-enrollment'], 'fixture-membership');
-  assert.deepEqual(JSON.parse(requests[0].options.body), {hash, note: 'confirmed spam'});
-});
-
-
 test('known-bad image add and remove buttons save then reload the coherent list', async () => {
   const requests = [], hash = 'ab'.repeat(32);
   let rows = [];
@@ -8187,28 +8324,6 @@ test('known-bad image add clears only its draft fields', async () => {
   assert.equal(h.app.isDirty(), false);
 });
 
-test('known-bad image delete 429 keeps draft and listed row', async () => {
-  const listed = 'ab'.repeat(32);
-  const draftHash = 'cd'.repeat(32);
-  const rows = [{ hash: listed, added_at: '2026-01-01T00:00:00Z', added_via: 'webui', actor: 'unknown', note: 'listed' }];
-  const config = () => ({ enrollment_id: 'fixture-membership', known_bad_images: rows, log_channels: [] });
-  const h = harness(async (url, options) => {
-    if (url.endsWith('/config')) return response(config());
-    if (options.method === 'DELETE') return { ok: false, status: 429, headers: { get: () => null }, text: async () => JSON.stringify({ code: 'discord_rate_limited' }) };
-    return response({ ok: true });
-  });
-  h.app.state.config = config();
-  let panel = h.app.tabKnownBadImages();
-  await settle();
-  const inputs = knownBadInputs(panel);
-  inputs[1].value = draftHash; await fire(inputs[1], 'input');
-  inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
-  await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
-  await settle();
-  assert.equal(h.app.state.config.known_bad_images.length, 1);
-  assert.equal(h.app.isDirty(), true);
-});
-
 test('known-bad image delete succeeds after 429 without losing unrelated draft', async () => {
   const listed = 'ab'.repeat(32);
   const draftHash = 'cd'.repeat(32);
@@ -8233,6 +8348,8 @@ test('known-bad image delete succeeds after 429 without losing unrelated draft',
   inputs[2].value = 'draft note'; await fire(inputs[2], 'input');
   await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
   await settle();
+  assert.equal(h.app.state.config.known_bad_images.length, 1);
+  assert.equal(h.app.isDirty(), true);
   panel = h.app.tabKnownBadImages();
   await fire([...panel.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Remove'), 'click');
   await settle();
@@ -10771,7 +10888,7 @@ test('removing a case record waits for confirmation', async () => {
   assert.equal(caseDialog(h), null, 'removing the case closes the dialog');
 });
 
-test('Case view opens the last row of a full page in a dialog and loads case, history, evidence and names together', async () => {
+test('Case view opens the last row of a full page and renders required reads before evidence names', async () => {
   const ids = Array.from({ length: 50 }, (_, i) => (i + 1).toString(16).padStart(32, '0'));
   const pending = [];
   const calls = [];
@@ -10794,16 +10911,21 @@ test('Case view opens the last row of a full page in a dialog and loads case, hi
   assert.equal(h.document.querySelector('.modal-overlay').getAttribute('aria-label'), `Case ${last.slice(0, 8)}`);
   assert.match(dialog.querySelector('[role="status"]').textContent, /Loading case/);
   assert.equal(h.app.isBusy(), false, 'opening a case does not grey out the page');
-  // Every read starts before any answers.
+  // The three required reads start before any answers.
   assert.deepEqual(pending.map(p => p.path.replace(`/api/guilds/${h.app.state.guildId}`, '')).filter(path => /cases|server-names/.test(path)).sort(),
-    [`/cases/${last}`, `/cases/${last}/evidence`, `/cases/${last}/history`, '/server-names'].sort());
+    [`/cases/${last}`, `/cases/${last}/evidence`, `/cases/${last}/history`].sort());
   for (const p of pending) {
-    if (p.path.endsWith('/server-names')) p.resolve(response({ roles: [], channels: [{ id: '400', name: 'general', kind: 'text' }] }));
-    else if (p.path.endsWith('/history')) p.resolve(response({ history: caseHistory, names: { [CASE_MODERATOR]: caseNames[CASE_MODERATOR] } }));
+    if (p.path.endsWith('/history')) p.resolve(response({ history: caseHistory, names: { [CASE_MODERATOR]: caseNames[CASE_MODERATOR] } }));
     else if (p.path.endsWith('/evidence')) p.resolve(response({ evidence: [] }));
     else if (p.path.endsWith(`/cases/${last}`)) p.resolve(response({ id: last, case: caseRecord(), can_delete: false, names: caseNames }));
     else p.resolve(response({}));
   }
+  await settle();
+  assert.equal(caseDialog(h).querySelector('[role="status"]'), null);
+  assert.match(textOf(caseDialog(h)), /in channel 400/);
+  const namesRead = pending.find(p => p.path.endsWith('/server-names'));
+  assert.ok(namesRead, 'text-only evidence requests channel names after the required reads');
+  namesRead.resolve(response({ roles: [], channels: [{ id: '400', name: 'general', kind: 'text' }] }));
   await settle();
   const text = textOf(caseDialog(h));
   assert.equal(caseDialog(h).querySelector('[role="status"]'), null);
@@ -10827,6 +10949,56 @@ test('Case view never names an author for a history note or correction with no r
   await settle();
   const titles = Array.from(caseDialog(h).querySelectorAll('.case-timeline strong'), n => n.textContent);
   assert.deepEqual(titles, ['Ban recorded', 'Discord action succeeded', 'Note added', 'Record corrected']);
+});
+
+// #850: a stored case history as the API pages it, by sequence after the cursor, holding at most 64 entries.
+const HISTORY_ACTOR = '9007199254740999';
+function storedCaseHistory(count) {
+  return (u) => {
+    const after = Number(u.searchParams.get('after') ?? 0);
+    const limit = Math.min(Math.max(Number(u.searchParams.get('limit') ?? 32), 1), 100);
+    const page = Array.from({ length: count }, (_, i) => i + 1).filter(seq => seq > after).slice(0, limit).map(seq => ({
+      id: `h${seq}`, sequence: String(seq),
+      entry: { actor_id: seq % 2 ? CASE_MODERATOR : HISTORY_ACTOR, recorded_at_ms: 1790000000000 + seq, body: { note: { text: `entry ${seq}.` } } },
+    }));
+    const actors = new Set(page.map(item => item.entry.actor_id));
+    const names = {};
+    if (actors.has(CASE_MODERATOR)) names[CASE_MODERATOR] = caseNames[CASE_MODERATOR];
+    if (actors.has(HISTORY_ACTOR)) names[HISTORY_ACTOR] = { display_name: 'Second Mod', username: 'second.mod' };
+    return response({ history: page, names });
+  };
+}
+
+for (const count of [0, 63, 64]) test(`Case view shows all ${count} history entries and their actors in order with one history read`, async () => {
+  const { calls, fetchImpl } = caseFixture({ '/history': storedCaseHistory(count) });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await fire(iconAction(root, `Open case ${CASE_ID}`), 'click');
+  await settle();
+  const dialog = caseDialog(h);
+  const sequences = Array.from({ length: count }, (_, i) => i + 1);
+  assert.deepEqual(Array.from(dialog.querySelectorAll('.case-timeline strong'), n => n.textContent), ['Ban recorded', 'Discord action succeeded',
+    ...sequences.map(seq => `Note added by ${seq % 2 ? 'Kit Mod' : 'Second Mod'}`)]);
+  assert.deepEqual(Array.from(dialog.querySelectorAll('.case-note'), n => n.textContent), sequences.map(seq => `entry ${seq}.`));
+  const reads = calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/history')).map(c => new URL(c.url, 'https://fixture.test').search);
+  assert.deepEqual(reads, ['?limit=64&after=0'], 'the whole case history is one read');
+});
+
+test('Closing a case cancels its pending history read without reading further', async () => {
+  const pending = [];
+  const stored = storedCaseHistory(64);
+  const { calls, fetchImpl } = caseFixture({ '/history': (u, { signal }) => new Promise(resolve => pending.push({ signal, resolve: () => resolve(stored(u)) })) });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await fire(iconAction(root, `Open case ${CASE_ID}`), 'click');
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].signal.aborted, false, 'the history read is pending');
+  await fire(iconAction(caseDialog(h), 'Close case'), 'click');
+  assert.equal(pending[0].signal.aborted, true, 'closing cancels the history read');
+  pending[0].resolve();
+  await settle();
+  assert.equal(caseDialog(h), null);
+  assert.equal(calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/history')).length, 1);
 });
 
 test('Cases list and case file agree on automod versus an unrecorded moderator', async () => {
@@ -10853,12 +11025,13 @@ test('Cases list and case file agree on automod versus an unrecorded moderator',
   }
 });
 
-test('Case view shows a load failure inside the dialog and can try again', async () => {
+test('Case view retries a failed required read and remains usable if optional names fail', async () => {
   let fail = true;
   const { calls, fetchImpl } = caseFixture({
     [`/cases/${CASE_ID}`]: () => fail
       ? { ok: false, status: 503, headers: { get: () => null }, text: async () => JSON.stringify({ error: 'guild store is unavailable' }) }
       : response({ id: CASE_ID, case: caseRecord(), can_delete: false, names: caseNames }),
+    '/server-names': () => Promise.reject(new Error('Names unavailable')),
   });
   const h = harness(fetchImpl);
   const root = await casesView(h);
@@ -10867,12 +11040,85 @@ test('Case view shows a load failure inside the dialog and can try again', async
   await settle();
   const alert = caseDialog(h).querySelector('[role="alert"]');
   assert.match(alert.textContent, /Could not load this case: guild store is unavailable/);
+  assert.equal(calls.filter(c => c.url.endsWith('/server-names')).length, 0);
   fail = false;
   await fire(findNode(caseDialog(h), n => n.localName === 'button' && n.textContent === 'Try again'), 'click', {});
   await settle();
   assert.equal(caseDialog(h).querySelector('[role="alert"]'), null);
   assert.match(textOf(caseDialog(h)), /Posted a phishing link/);
+  assert.match(textOf(caseDialog(h)), /in channel 400/);
   assert.equal(calls.filter(c => c.url.endsWith(`/cases/${CASE_ID}`)).length, 2);
+  assert.equal(calls.filter(c => c.url.endsWith('/server-names')).length, 1);
+});
+
+test('Case view remains usable when optional evidence channel names time out', async () => {
+  let namesSignal;
+  const { fetchImpl } = caseFixture({
+    '/server-names': (_u, { signal }) => {
+      namesSignal = signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    },
+  });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await fire(iconAction(root, `Open case ${CASE_ID}`), 'click');
+  assert.ok(namesSignal && !namesSignal.aborted, 'channel names are pending');
+  const deadline = [...h.timers.values()].find(timer => timer.delay === 30000);
+  await deadline.fn();
+  assert.equal(namesSignal.aborted, true);
+  const dialog = caseDialog(h);
+  assert.match(textOf(dialog), /Posted a phishing link/, 'the case remains visible after names time out');
+  assert.match(textOf(dialog), /in channel 400/);
+  assert.equal(dialog.querySelector('[role="alert"]'), null);
+});
+
+test('Case view skips channel names when no evidence has a channel ID', async () => {
+  const { calls, fetchImpl } = caseFixture({
+    [`/cases/${CASE_ID}`]: () => response({ case: caseRecord({ evidence: { text: [] } }) }),
+    '/evidence': () => response({ evidence: [] }),
+  });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  await fire(iconAction(root, `Open case ${CASE_ID}`), 'click');
+  assert.match(textOf(caseDialog(h)), /No private evidence was saved/);
+  assert.equal(calls.filter(c => c.url.endsWith('/server-names')).length, 0);
+});
+
+test('Case view loads channel names for standalone attachments and discards stale results', async () => {
+  const pending = [];
+  const { fetchImpl } = caseFixture({
+    [`/cases/${CASE_ID}`]: () => response({ case: caseRecord({ evidence: { text: [] } }) }),
+    '/server-names': (_u, { signal }) => new Promise(resolve => pending.push({ signal, resolve })),
+  });
+  const h = harness(fetchImpl);
+  const root = await casesView(h);
+  const open = () => fire(iconAction(root, `Open case ${CASE_ID}`), 'click');
+  const close = () => fire(iconAction(caseDialog(h), 'Close case'), 'click');
+  const names = () => response({ channels: [{ id: '400', name: 'general' }] });
+
+  await open();
+  assert.match(textOf(caseDialog(h)), /Saved attachmentsin channel 400/);
+  pending[0].resolve(names());
+  await settle();
+  assert.match(textOf(caseDialog(h)), /Saved attachmentsin #general/);
+
+  await close();
+  await open();
+  h.app.state.config = { enrollment_id: 'new-membership' };
+  pending[1].resolve(names());
+  await settle();
+  assert.match(textOf(caseDialog(h)), /in channel 400/);
+  assert.doesNotMatch(textOf(caseDialog(h)), /in #general/);
+
+  await close();
+  await open();
+  await close();
+  assert.ok(pending[2].signal.aborted, 'closing cancels the optional read');
+  pending[2].resolve(names());
+  await settle();
+  assert.equal(caseDialog(h), null);
 });
 
 test('Case view adds a note and shows it in the timeline without reopening', async () => {
@@ -11531,7 +11777,7 @@ test('Cases filters send exact filters, restart at the first page and hide for r
   assert.equal(lists().at(-1).get('subject'), CASE_SUBJECT);
   moderator.value = 'Kit';
   await fire(moderator, 'input');
-  await settle();
+  await settleMemberSearch(h);
   const search = calls.filter(c => new URL(c.url, 'https://fixture.test').pathname.endsWith('/members')).at(-1);
   assert.equal(new URL(search.url, 'https://fixture.test').searchParams.get('status'), 'all', 'banned and departed members can be picked');
   await fire(findNode(filters, n => n.localName === 'button' && /Kit Mod/.test(n.textContent)), 'click', {});
@@ -12087,6 +12333,90 @@ test('display snapshots stay within the session storage budget across different 
   await fire(cacheRefreshButton(panel), 'click');
   assert.match(panel.querySelector('tbody').textContent, /Test-User-1/);
   assert.equal(session.has(recentKey), false, 'an oversized response does not persist or leave its superseded copy');
+});
+
+// #868: inactive copies kept in memory follow the same aggregate budget as storage.
+async function memoryBudgetView() {
+  const session = new Map();
+  const fixture = { marker: 'Initial', extraSize: 0, hold: false, release: null };
+  const h = harness(async (url) => {
+    assert.match(url, /\/bans\?/);
+    const { marker, extraSize } = fixture;
+    if (fixture.hold) await new Promise((resolve) => { fixture.release = resolve; });
+    const data = banRows();
+    data.bans[0].user_display_name = marker;
+    return response({ ...data, details: 'x'.repeat(extraSize) });
+  }, new Map(), session);
+  const panel = await bansView(h);
+  return {
+    h,
+    fixture,
+    table: () => panel.querySelector('tbody').textContent,
+    stored: (marker) => [...session.values()].some((value) => value.includes(marker)),
+    async changeDate(day, marker, extraSize, hold = false) {
+      Object.assign(fixture, { marker, extraSize, hold });
+      const date = panel.querySelector('input[type="date"]');
+      date.value = new Date(Date.UTC(2026, 0, day)).toISOString().slice(0, 10);
+      await fire(date, 'change');
+    },
+    async finish() {
+      fixture.hold = false;
+      fixture.release();
+      await settle();
+    },
+  };
+}
+
+test('an oversized filtered result is shown complete but not served from memory after navigation', async () => {
+  const view = await memoryBudgetView();
+  await view.changeDate(1, 'Oversized', 1_100_000);
+  assert.match(view.table(), /Oversized/, 'the visible view keeps its complete data');
+  await view.changeDate(2, 'Other', 0);
+  assert.equal(view.stored('Oversized'), false);
+  await view.changeDate(1, 'Replacement', 0, true);
+  assert.doesNotMatch(view.table(), /Oversized/, 'an oversized prior value is not served from memory');
+  assert.match(view.table(), /Loading/);
+  await view.finish();
+  assert.match(view.table(), /Replacement/);
+});
+
+test('two admissible in-memory display copies over the combined budget evict the older one', async () => {
+  const view = await memoryBudgetView();
+  await view.changeDate(3, 'First', 600_000);
+  await view.changeDate(4, 'Second', 600_000);
+  assert.equal(view.stored('First'), false);
+  await view.changeDate(3, 'Refetched', 0, true);
+  assert.doesNotMatch(view.table(), /First/, 'the older inactive copy is not served from memory');
+  assert.match(view.table(), /Loading/);
+  await view.finish();
+  assert.match(view.table(), /Refetched/);
+
+  // The newer copy is still a warm hit that revalidates.
+  await view.changeDate(4, 'Revalidated', 0, true);
+  assert.match(view.table(), /Second/, 'the most recent admissible copy renders at once');
+  assert.equal(lastUpdated(view.h), 'Refreshing…');
+  await view.finish();
+  assert.match(view.table(), /Revalidated/);
+});
+
+test('a display read too large to serialize is shown fresh and drops its superseded copy', async () => {
+  const view = await memoryBudgetView();
+  await view.changeDate(5, 'Cached', 0);
+  await view.changeDate(6, 'Other', 0);
+  assert.equal(view.stored('Cached'), true);
+  view.h.failJsonStringify((value) => value?.at !== undefined
+    && value?.data?.bans?.[0]?.user_display_name === 'Unserializable');
+  await view.changeDate(5, 'Unserializable', 0);
+  assert.match(view.table(), /Unserializable/);
+  assert.doesNotMatch(view.h.document.body.textContent, /Refresh failed/, 'a cache rejection is not a refresh error');
+  assert.equal(view.stored('Cached'), false, 'the superseded stored copy is dropped');
+
+  await view.changeDate(6, 'Elsewhere', 0);
+  await view.changeDate(5, 'Again', 0, true);
+  assert.doesNotMatch(view.table(), /Cached|Unserializable/, 'no superseded copy is served from memory');
+  assert.match(view.table(), /Loading/);
+  await view.finish();
+  assert.match(view.table(), /Again/);
 });
 
 test('a configuration save reclaims display copies when real session storage is full', async () => {

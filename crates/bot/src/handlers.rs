@@ -876,8 +876,8 @@ impl EventHandler for Handler {
                 db::bump_member_daily(&app.db, enrollment, observed_at_ms, 1, 0).await,
             );
         }
-        let current_stay =
-            crate::member_directory::current_member_stay_id(&app, guild_id.get(), uid).await;
+        let (current_stay, durable_pending) =
+            crate::member_directory::current_rejoin_note(&app, guild_id.get(), uid).await;
         if membership_refresh {
             if let Some(stay_id) = current_stay.as_deref() {
                 app.rejoin_note_deliveries
@@ -890,8 +890,6 @@ impl EventHandler for Handler {
             app.rejoin_note_deliveries
                 .pending_redelivery(guild_id.get(), uid, stay_id)
         });
-        let durable_pending =
-            crate::member_directory::pending_rejoin_note(&app, guild_id.get(), uid).await;
         if (membership_refresh || retry_undelivered || durable_pending)
             && let Some(stay_id) = current_stay.as_deref()
             && let Some(in_flight) =

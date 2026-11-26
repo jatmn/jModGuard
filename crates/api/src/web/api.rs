@@ -705,23 +705,23 @@ pub async fn get_command(
     super::check_page_enrollment(&auth, guild_id, &headers)?;
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let name = name.to_lowercase();
-    let canonical = crate::defaults::builtin_command_for_label(&name).unwrap_or(name);
+    let canonical = crate::defaults::builtin_command_for_label(&name).unwrap_or(name.as_str());
     // Effective aliases depend on peers. Read only the command section, with
     // both layers and membership verified in the existing primary snapshot.
     let layers = db::list_enrolled_commands(&app.db, scope).await?;
     let guild_map = pairs_to_map(&layers.guild);
     let global_map = pairs_to_map(&layers.global);
-    let global = command_row_by_name(&global_map, &canonical).cloned();
+    let global = command_row_by_name(&global_map, canonical).cloned();
     let guild_override = if guild_id == 0 {
         // Preserve the raw global-context layer shape.
         global.clone()
     } else {
-        guild_command_override(guild_id, &guild_map, &canonical).cloned()
+        guild_command_override(guild_id, &guild_map, canonical).cloned()
     };
     let none = std::collections::HashMap::new();
     let overrides = if guild_id == 0 { &none } else { &guild_map };
     let registry = crate::defaults::effective_command_registry(&global_map, overrides);
-    let effective = registry.get(&canonical).cloned();
+    let effective = registry.get(canonical).cloned();
     Ok(Json(serde_json::json!({
         "effective": effective,
         "guild_override": guild_override,
@@ -889,10 +889,7 @@ pub async fn get_template(
     let scope = super::configuration_scope(&app, &auth, guild_id)?;
     let layers = db::get_enrolled_template(&app.db, scope, &event).await?;
     let (guild_override, global) = (layers.guild, layers.global);
-    let def = crate::defaults::rendered_log_templates()
-        .into_iter()
-        .find(|(e, _)| *e == event)
-        .map(|(_, t)| t.to_string());
+    let def = crate::defaults::rendered_log_template(&event).map(str::to_string);
     let effective = guild_override.clone().or_else(|| global.clone()).or(def);
     Ok(Json(serde_json::json!({
         "effective": effective,
@@ -1542,10 +1539,7 @@ async fn events_inner(
         .flat_map(|row| [row.user_id, row.actor_id])
         .flatten()
         .collect::<Vec<_>>();
-    let names = match app.tenant.live(enrollment).await {
-        Ok((store, scope)) => super::cases::directory_names(&store, scope, people).await,
-        Err(_) => serde_json::Map::new(),
-    };
+    let names = super::cases::live_directory_names(app, enrollment, people).await;
     Ok(Json(serde_json::json!({
         "events": page.rows,
         "names": names,
@@ -1646,10 +1640,7 @@ async fn bans_inner(
         .flat_map(|row| [Some(row.user_id), row.moderator_id, row.reason_edited_by])
         .flatten()
         .collect::<Vec<_>>();
-    let names = match app.tenant.live(enrollment).await {
-        Ok((store, scope)) => super::cases::directory_names(&store, scope, people).await,
-        Err(_) => serde_json::Map::new(),
-    };
+    let names = super::cases::live_directory_names(app, enrollment, people).await;
     Ok(Json(serde_json::json!({
         "bans": page.rows,
         "names": names,
@@ -2166,7 +2157,7 @@ mod tests {
         .into_iter()
         .map(|key| (key.to_string(), format!("v-{key} {{emoji}}")))
         .collect();
-        let templates = crate::defaults::rendered_log_templates();
+        let templates = crate::defaults::rendered_log_templates().collect::<Vec<_>>();
         let shipped = |event: &str| templates.iter().find(|(e, _)| *e == event).unwrap().1;
         let mut cases: Vec<(String, &str, String, &str)> = templates
             .iter()

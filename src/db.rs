@@ -473,8 +473,10 @@ pub struct Db {
     _database: Arc<libsql::Database>,
     runtime: DbRuntime,
     /// Renewal `block_on` does not share the pool workers or the 75s startup
-    /// deadline. The CAS still uses the caller authority window.
-    lease_runtime: DbRuntime,
+    /// deadline. The CAS still uses the caller authority window. Read-only
+    /// handles and guild stores never renew, so they have neither this nor a
+    /// lease connection.
+    lease_runtime: Option<DbRuntime>,
     bootstrap_work: BootstrapWork,
     connections: Arc<ConnectionPool>,
     /// Renewal never waits for a core pool permit. Errors discard this stream.
@@ -1095,15 +1097,25 @@ impl Db {
             // Remote renewal gets its own runtime. A stalled pool read must not
             // occupy both database workers until the 75s startup deadline.
             // Local files share the pool runtime; there is no remote lifetime.
-            let lease_runtime = if remote {
-                DbRuntime::with_operation_timeout(Some(crate::db_compat::INTERACTIVE_READ_BUDGET))?
+            // Only writable core pools renew; guild stores use the core fence.
+            let lease_runtime = if opts.read_only || guild_store {
+                None
+            } else if remote {
+                Some(DbRuntime::with_operation_timeout(Some(
+                    crate::db_compat::INTERACTIVE_READ_BUDGET,
+                ))?)
             } else {
-                runtime.for_operation_timeout(None)
+                Some(runtime.for_operation_timeout(None))
             };
-            let mut lease_connection =
-                Connection::from_database(Arc::clone(&database), lease_runtime.clone())?;
-            lease_connection.set_read_only(opts.read_only);
-            configure_connection(&lease_connection, remote, 2_000, opts.read_only)?;
+            let lease_connection = match &lease_runtime {
+                Some(lease_runtime) => {
+                    let connection =
+                        Connection::from_database(Arc::clone(&database), lease_runtime.clone())?;
+                    configure_connection(&connection, remote, 2_000, false)?;
+                    Some(connection)
+                }
+                None => None,
+            };
 
             // Publish readiness only after the pool exists. A retry of
             // `open_with_until_ready` (remote first-boot) would otherwise
@@ -1139,7 +1151,7 @@ impl Db {
                     guild_store,
                     outage: PrimaryOutageGate::default(),
                 }),
-                lease_connection: Arc::new(Mutex::new(Some(lease_connection))),
+                lease_connection: Arc::new(Mutex::new(lease_connection)),
                 permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
                 permit_timeout: remote.then_some(if opts.migrate {
                     REMOTE_OPERATION_TIMEOUT
@@ -1433,9 +1445,12 @@ impl Db {
         T: Send + 'static,
     {
         anyhow::ensure!(!self.read_only, "read-only database cannot renew a lease");
+        let runtime = self
+            .lease_runtime
+            .clone()
+            .context("guild-store database cannot renew a lease")?;
         let slot = Arc::clone(&self.lease_connection);
         let database = Arc::clone(&self._database);
-        let runtime = self.lease_runtime.clone();
         let remote = self.remote;
         let watch = crate::db_compat::AbandonWatch::new();
         let _caller = CallerCancel::arm(Arc::clone(&watch));

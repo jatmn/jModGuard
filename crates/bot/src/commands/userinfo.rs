@@ -479,58 +479,22 @@ pub(crate) fn render_userinfo_with_cases(
         CasesField::Lines(values) => values.clone(),
         CasesField::None | CasesField::Unavailable => case_lines,
     };
-    let mut clipped = String::new();
-    let cases_for_pass = cases.clone();
-    if fits(
-        template,
-        snapshot,
-        warns,
-        &cases_for_pass,
-        &roles,
-        &lines,
-        &clipped,
-    ) {
-        return render_pass(
-            template,
-            snapshot,
-            warns,
-            &cases_for_pass,
-            &roles,
-            &lines,
-            &clipped,
-        );
+    if let Some(reply) = render_if_fits(template, snapshot, warns, &cases, &roles, &lines, "") {
+        return reply;
     }
     roles.clear();
-    clipped = CLIPPED_SUFFIX.to_string();
-    let cases_for_pass = cases.clone();
-    if fits(
-        template,
-        snapshot,
-        warns,
-        &cases_for_pass,
-        &roles,
-        &lines,
-        &clipped,
-    ) {
-        return render_pass(
-            template,
-            snapshot,
-            warns,
-            &cases_for_pass,
-            &roles,
-            &lines,
-            &clipped,
-        );
+    let clipped = CLIPPED_SUFFIX;
+    if let Some(reply) = render_if_fits(template, snapshot, warns, &cases, &roles, &lines, clipped)
+    {
+        return reply;
     }
     while lines.len() > 1 {
         lines.pop();
         let trimmed = CasesField::Lines(lines.clone());
-        if fits(
-            template, snapshot, warns, &trimmed, &roles, &lines, &clipped,
-        ) {
-            return render_pass(
-                template, snapshot, warns, &trimmed, &roles, &lines, &clipped,
-            );
+        if let Some(reply) =
+            render_if_fits(template, snapshot, warns, &trimmed, &roles, &lines, clipped)
+        {
+            return reply;
         }
     }
     jmodguard::templates::render_bounded(
@@ -547,7 +511,8 @@ pub(crate) fn render_userinfo_with_cases(
     )
 }
 
-fn fits(
+/// One display candidate, rendered once: its reply when the whole message fits.
+fn render_if_fits(
     template: &str,
     snapshot: &MemberSnapshot,
     warns: &WarnsField,
@@ -555,30 +520,9 @@ fn fits(
     roles: &[String],
     case_lines: &[String],
     clipped: &str,
-) -> bool {
+) -> Option<String> {
     let vars = userinfo_template_vars(snapshot, warns, cases, roles, case_lines, clipped);
-    utf16_len(&jmodguard::templates::render(template, &vars)) <= 2000
-}
-
-fn render_pass(
-    template: &str,
-    snapshot: &MemberSnapshot,
-    warns: &WarnsField,
-    cases: &CasesField,
-    roles: &[String],
-    case_lines: &[String],
-    clipped: &str,
-) -> String {
-    let display_cases = match cases {
-        CasesField::Lines(_) => CasesField::Lines(case_lines.to_vec()),
-        other => other.clone(),
-    };
-    let vars = userinfo_template_vars(snapshot, warns, &display_cases, roles, case_lines, clipped);
-    jmodguard::templates::render_bounded(template, &vars, 2000)
-}
-
-fn utf16_len(text: &str) -> usize {
-    text.encode_utf16().count()
+    jmodguard::templates::render_within(template, &vars, 2000)
 }
 
 /// Member-fed and case-fed report text. Same escaping as a rejoin case reason:

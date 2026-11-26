@@ -1274,6 +1274,165 @@ async fn directory_names_come_only_from_stored_rows_in_one_bounded_lookup() {
 }
 
 #[tokio::test]
+async fn display_names_read_only_name_columns_in_one_bounded_lookup() {
+    use crate::db::tests::remote_stream::HranaFixture;
+
+    let (f, local, scope) = ready().await;
+    local
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    // A snowflake above JS MAX_SAFE_INTEGER must round-trip exactly.
+    let big = 9_007_199_254_740_993_i64;
+    for (id, username, global, nick) in [
+        (77, Some("user77"), Some("Global 77"), Some("Nick 77")),
+        (78, Some("user78"), Some("Global 78"), Some("")),
+        (79, Some("user79"), Some(""), None),
+        (80, Some(""), None, Some("Nick 80")),
+        (81, Some(""), Some(""), Some("")),
+        (big, Some("big"), None, None),
+    ] {
+        let mut member = observed(id, Some(900), 1_500);
+        member.username = Some(username.map(str::to_owned));
+        member.global_name = Some(global.map(str::to_owned));
+        member.nickname = Some(nick.map(str::to_owned));
+        local.observe_member(scope.clone(), member).await.unwrap();
+    }
+    let (fixture, db) = HranaFixture::sqlite_backed_database(&f.store_path).await;
+    let remote = GuildDataStore {
+        db,
+        expected: local.expected.clone(),
+        core: None,
+    };
+    let ids = vec![big, 82, 81, 80, 79, 78, 77];
+    let directory_reads = |statements: Vec<String>| {
+        statements
+            .into_iter()
+            .filter(|sql| sql.contains("FROM guild_member_directory"))
+            .collect::<Vec<_>>()
+    };
+    const NON_DISPLAY: [&str; 8] = [
+        "is_current",
+        "is_banned",
+        "ever_banned",
+        "joined_at_ms",
+        "departed_at_ms",
+        "observed_at_ms",
+        "revision",
+        "current_ban_reason",
+    ];
+
+    fixture.take_data_statements();
+    let profiles = remote
+        .member_profiles(scope.clone(), ids.clone())
+        .await
+        .unwrap();
+    let profile_sql = directory_reads(fixture.take_data_statements());
+    assert_eq!(profile_sql.len(), 1, "{profile_sql:?}");
+    for column in NON_DISPLAY {
+        assert!(
+            profile_sql[0].contains(column),
+            "full profiles keep {column}: {}",
+            profile_sql[0]
+        );
+    }
+
+    let names = remote
+        .member_display_names(scope.clone(), ids.clone())
+        .await
+        .unwrap();
+    let display_sql = directory_reads(fixture.take_data_statements());
+    assert_eq!(display_sql.len(), 1, "one lookup: {display_sql:?}");
+    // The remote client sends its normalized rendering of the statement.
+    assert!(
+        display_sql[0].starts_with(
+            "SELECT user_id, username, global_name, nickname FROM guild_member_directory \
+             WHERE guild_id = ?1 AND enrollment_id = ?2 AND"
+        ),
+        "{}",
+        display_sql[0]
+    );
+    for column in NON_DISPLAY {
+        assert!(
+            !display_sql[0].contains(column),
+            "display names must not read {column}: {}",
+            display_sql[0]
+        );
+    }
+    assert!(display_sql[0].contains("ORDER BY user_id"));
+
+    let name = |id: i64, display: &str, username: Option<&str>| MemberDisplayName {
+        user_id: id.to_string(),
+        display_name: display.to_owned(),
+        username: username.map(str::to_owned),
+    };
+    assert_eq!(
+        names,
+        vec![
+            name(77, "Nick 77", Some("user77")),
+            name(78, "Global 78", Some("user78")),
+            name(79, "user79", Some("user79")),
+            name(80, "Nick 80", None),
+            name(big, "big", Some("big")),
+        ],
+        "nickname, then global name, then username in ID order; blank names \
+         and usernames are skipped; nameless and unknown IDs are omitted"
+    );
+    // The same precedence names every full profile that has a stored name.
+    assert_eq!(
+        profiles
+            .iter()
+            .filter(|p| p.user_id != "81")
+            .map(|p| (p.user_id.clone(), p.display_name.clone()))
+            .collect::<Vec<_>>(),
+        names
+            .iter()
+            .map(|n| (n.user_id.clone(), n.display_name.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        profiles
+            .iter()
+            .find(|p| p.user_id == "81")
+            .unwrap()
+            .display_name,
+        "81"
+    );
+
+    assert!(
+        remote
+            .member_display_names(scope.clone(), Vec::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let too_many = (1..=DIRECTORY_PROFILE_LOOKUP_LIMIT as i64 + 1).collect();
+    assert!(
+        remote
+            .member_display_names(scope.clone(), too_many)
+            .await
+            .is_err(),
+        "the lookup stays bounded"
+    );
+    assert!(
+        remote
+            .member_display_names(scope.clone(), vec![0])
+            .await
+            .is_err()
+    );
+    local.close_membership(scope.clone()).await.unwrap();
+    assert!(
+        remote
+            .member_display_names(scope, Vec::new())
+            .await
+            .unwrap_err()
+            .downcast_ref::<TenantDataError>()
+            .is_some_and(|error| matches!(error, TenantDataError::Membership)),
+        "empty reads must verify captured membership"
+    );
+}
+
+#[tokio::test]
 async fn first_profile_insert_creates_pending_rejoin_receipt() {
     let (_f, store, scope) = ready().await;
     store
@@ -1329,6 +1488,126 @@ async fn closed_scope_erasure_removes_pending_rejoin_notes() {
         .await
         .unwrap();
     assert_eq!(pending, 0);
+}
+
+#[tokio::test]
+async fn current_rejoin_note_pairs_receipt_with_the_current_stay() {
+    const USER: i64 = 10;
+    let probe = std::sync::Arc::new(crate::db_compat::StartupProbe::default());
+    let (_f, store, scope) = ready_with_probe(&probe).await;
+    store
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    let read = || async {
+        let (stay, pending) = store
+            .current_rejoin_note(scope.clone(), USER)
+            .await
+            .unwrap();
+        (stay, pending.unwrap())
+    };
+    assert_eq!(read().await, (None, false));
+
+    store
+        .observe_member(scope.clone(), observed(USER, Some(1_000), 1_000))
+        .await
+        .unwrap();
+    let (old_stay, pending) = read().await;
+    let old_stay = old_stay.unwrap();
+    assert!(pending);
+    // A ban retains the stay and its receipt while taking the member off the roster.
+    store.observe_ban(scope.clone(), USER, 1_500).await.unwrap();
+    assert_eq!(read().await, (None, false));
+    store
+        .depart_member(scope.clone(), USER, 2_000)
+        .await
+        .unwrap();
+    assert_eq!(read().await, (None, false));
+
+    store
+        .observe_member(scope.clone(), observed(USER, Some(3_000), 3_000))
+        .await
+        .unwrap();
+    let before = probe.transactions();
+    let (current_stay, pending) = read().await;
+    assert_eq!(probe.transactions() - before, 1);
+    let current_stay = current_stay.unwrap();
+    assert_ne!(current_stay, old_stay);
+    assert!(pending);
+
+    let receipt_scope = scope.clone();
+    let receipt_stay = old_stay.clone();
+    let changed = store
+        .db
+        .with_conn(move |conn| {
+            conn.execute_bounded(
+                "UPDATE guild_member_pending_rejoin_notes SET stay_id=?4,joined_at_ms=1000
+                 WHERE guild_id=?1 AND enrollment_id=?2 AND user_id=?3",
+                params![
+                    receipt_scope.guild_id(),
+                    receipt_scope.enrollment().id.as_str(),
+                    USER,
+                    receipt_stay
+                ],
+                65_536,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+    assert_eq!(read().await, (Some(current_stay.clone()), false));
+
+    store
+        .clear_pending_rejoin_note(scope.clone(), USER, &old_stay)
+        .await
+        .unwrap();
+    assert_eq!(read().await, (Some(current_stay), false));
+
+    store.close_membership(scope.clone()).await.unwrap();
+    assert!(matches!(
+        store
+            .current_rejoin_note(scope, USER)
+            .await
+            .unwrap_err()
+            .downcast_ref::<TenantDataError>(),
+        Some(TenantDataError::Membership)
+    ));
+}
+
+#[tokio::test]
+async fn rejoin_receipt_timeout_reopens_a_verified_stay_snapshot() {
+    use crate::db::tests::remote_stream::HranaFixture;
+
+    const USER: i64 = 10;
+    let (f, local, scope) = ready().await;
+    local
+        .initialize_member_directory(scope.clone(), 42, 1_000)
+        .await
+        .unwrap();
+    local
+        .observe_member(scope.clone(), observed(USER, Some(1_000), 1_000))
+        .await
+        .unwrap();
+    let expected_stay = local
+        .current_member_stay_id(scope.clone(), USER)
+        .await
+        .unwrap()
+        .unwrap();
+    let (fixture, db) = HranaFixture::sqlite_backed_database(&f.store_path).await;
+    let remote = GuildDataStore {
+        db,
+        expected: local.expected.clone(),
+        core: None,
+    };
+
+    fixture.timeout_next_matching_cursor("guild_member_pending_rejoin_notes");
+    let before = fixture.read_begins();
+    let (stay, receipt) = remote.current_rejoin_note(scope, USER).await.unwrap();
+    assert_eq!(stay.as_deref(), Some(expected_stay.as_str()));
+    assert!(crate::db_compat::is_remote_interactive_timeout(
+        &receipt.unwrap_err()
+    ));
+    assert_eq!(fixture.read_begins() - before, 2);
 }
 
 #[tokio::test]

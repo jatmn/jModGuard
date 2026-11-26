@@ -9411,6 +9411,70 @@ async fn expired_installed_launcher_handoff_restores_only_the_recorded_release()
 }
 
 #[tokio::test]
+async fn failed_stage_keeps_the_staged_executable_and_no_temporaries() {
+    let root = std::env::temp_dir().join(format!("stage-failure-{:032x}", rand::random::<u128>()));
+    let mut objects = HashMap::new();
+    let installed = image(&mut objects, "bot", b"\x7fELFinstalled");
+    let layer_of = |objects: &HashMap<String, Vec<u8>>, release: &ComponentRelease| {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&objects[&release.digest]).unwrap();
+        manifest["layers"][0]["digest"].as_str().unwrap().to_owned()
+    };
+    let corrupt = image(&mut objects, "bot", b"\x7fELFcorrupt");
+    let layer = objects.get_mut(&layer_of(&objects, &corrupt)).unwrap();
+    *layer.last_mut().unwrap() ^= 1;
+    let truncated = image(&mut objects, "bot", b"\x7fELFtruncated");
+    objects
+        .get_mut(&layer_of(&objects, &truncated))
+        .unwrap()
+        .truncate(512);
+    let not_elf = image(&mut objects, "bot", b"#!/bin/sh\n");
+    let (registry, server) = serve_objects(objects).await;
+    let staging = root.join("staged-bot");
+    let target = stage(
+        &registry,
+        &installed,
+        "jmodguard-bot",
+        &staging,
+        StageTrust::NewInstall,
+    )
+    .await
+    .unwrap();
+    let hash = sha256_hex(b"\x7fELFinstalled");
+    assert_eq!(target, staging.join(format!("bot-{hash}")));
+    let listing = || {
+        std::fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>()
+    };
+    for (release, expected) in [
+        (corrupt, "blob digest mismatch"),
+        (truncated, "blob size mismatch"),
+        (not_elf, "invalid linux/amd64 executable"),
+    ] {
+        let error = stage(
+            &registry,
+            &release,
+            "jmodguard-bot",
+            &staging,
+            StageTrust::NewInstall,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(listing(), [format!("bot-{hash}")], "{expected}");
+        assert_eq!(file_sha256(&target).await.unwrap(), hash, "{expected}");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    server.abort();
+    tokio::fs::remove_dir_all(&root).await.unwrap();
+}
+
+#[tokio::test]
 async fn expired_signature_blocks_a_fresh_stage_and_still_boot_repairs() {
     let root = std::env::temp_dir().join(format!("sig-expired-{:032x}", rand::random::<u128>()));
     tokio::fs::create_dir_all(&root).await.unwrap();
