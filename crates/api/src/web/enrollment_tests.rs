@@ -1013,6 +1013,7 @@ async fn display_cache_churn_keeps_hot_users_and_evicts_cold_payloads() {
     let observed_at = f.app.user_cache.get(&42).unwrap().0;
     for offset in 0..VISITORS {
         let user_id = FIRST_VISITOR + offset;
+        let visit_at = observed_at + std::time::Duration::from_nanos(offset + 1);
         let user = DiscordUser {
             id: user_id.to_string(),
             username: "synthetic-user".into(),
@@ -1029,10 +1030,8 @@ async fn display_cache_churn_keeps_hot_users_and_evicts_cold_payloads() {
                 permissions: Some(oauth::PermissionsField::String("36".into())),
             })
             .collect::<Vec<_>>();
-        f.app.user_cache.insert(user_id, (observed_at, user));
-        f.app
-            .guild_cache
-            .insert(user_id, (observed_at, guilds.into()));
+        f.app.user_cache.insert(user_id, (visit_at, user));
+        f.app.guild_cache.insert(user_id, (visit_at, guilds.into()));
         if offset.is_multiple_of(32) {
             let (status, me) = f.request("POST", "/api/me", "").await;
             assert_eq!(status, StatusCode::OK, "{me}");
@@ -1069,13 +1068,11 @@ async fn display_cache_churn_keeps_hot_users_and_evicts_cold_payloads() {
 
     // Churn without returning to the once-hot user. Eviction must leave the
     // token-bound snapshot available when a request still owns the session.
-    for visitor in FIRST_VISITOR + VISITORS..FIRST_VISITOR + 2 * VISITORS {
-        f.app
-            .user_cache
-            .insert(visitor, (observed_at, user.clone()));
-        f.app
-            .guild_cache
-            .insert(visitor, (observed_at, Arc::from([])));
+    for offset in VISITORS..2 * VISITORS {
+        let visitor = FIRST_VISITOR + offset;
+        let visit_at = observed_at + std::time::Duration::from_nanos(offset + 1);
+        f.app.user_cache.insert(visitor, (visit_at, user.clone()));
+        f.app.guild_cache.insert(visitor, (visit_at, Arc::from([])));
     }
     assert!(f.app.user_cache.get(&42).is_none());
     assert!(f.app.guild_cache.get(&42).is_none());
@@ -1107,6 +1104,22 @@ async fn display_cache_churn_keeps_hot_users_and_evicts_cold_payloads() {
     );
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
     assert_eq!(f.discord.me_calls.load(Ordering::SeqCst), 0);
+
+    let (authorized_status, _) = f.request("GET", "/api/guilds/10/config", "").await;
+    assert!(f.app.guild_cache.get(&42).is_none());
+    let recovered_at = observed_at + std::time::Duration::from_nanos(2 * VISITORS + 1);
+    f.app.user_cache.insert(42, (recovered_at, user));
+    let (display_status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(me["guilds"][0]["id"], "10");
+    assert_eq!(
+        (
+            authorized_status,
+            display_status,
+            me["role_discovery_incomplete"].as_bool()
+        ),
+        (StatusCode::OK, StatusCode::OK, Some(true)),
+        "valid settings access and the display retry indicator survive eviction during cooldown"
+    );
 
     // Keep a last-good display list and invalidate the permission snapshot.
     // Display residency must never satisfy a marked authorization check.
@@ -6117,12 +6130,22 @@ async fn delayed_guild_follower_keeps_the_original_observation() {
 
     let (observed_at, guilds) = follower.await.unwrap();
     let shares_payload = Arc::ptr_eq(&leader_guilds, &guilds);
-    f.app.guild_cache.insert(42, (observed_at, guilds));
+    f.app
+        .guild_cache
+        .insert(42, (observed_at, Arc::clone(&guilds)));
     let (status, me) = f.request("POST", "/api/me", "").await;
     assert_eq!(status, StatusCode::OK, "{me}");
     let shown = me["guilds"].as_array().unwrap();
     assert_eq!(shown.len(), 1, "{me}");
     assert_eq!(shown[0]["id"], "20");
+
+    // The delayed observation also cannot repopulate the slot after eviction.
+    f.app.guild_cache.remove(&42);
+    f.app.guild_cache.insert(42, (observed_at, guilds));
+    assert!(
+        f.app.guild_cache.get(&42).is_none(),
+        "evicted newer guilds cannot be replaced by an old observation"
+    );
     assert_eq!(observed_at, leader_observed_at);
     assert!(shares_payload);
     assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);

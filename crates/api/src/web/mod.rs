@@ -934,25 +934,15 @@ async fn load_auth(
         }
     };
 
-    let (user, source) = match cached_user {
-        Some(user) => (user, DisplayIdentitySource::Cached),
-        None if guild_list_cache_allowed(guild_mode) => {
-            // The session can still have a usable guild snapshot after its
-            // display entries are evicted. Use the normal display fallback
-            // if Discord rate-limits the missing profile.
-            display_identity(app, user_id, token, None).await?
-        }
-        None => (
-            app.oauth.me(user_id, token).await.map_err(ApiError)?,
-            DisplayIdentitySource::Live,
-        ),
-    };
-    if source == DisplayIdentitySource::Live {
+    // The accepted guild snapshot supplies permissions. A profile cooldown
+    // can use the signed-in identity even when the display entry was evicted.
+    let (user, source) = profile_for_guilds(app, user_id, token, cached_user).await?;
+    if source == ProfileSource::Live {
         app.user_cache
             .insert(user_id, (Instant::now(), user.clone()));
     }
     // A fallback is only for this response and does not renew either cache.
-    if source != DisplayIdentitySource::RateLimited {
+    if source != ProfileSource::RateLimited {
         app.guild_cache.insert(
             user_id,
             (snapshot.observed_at, Arc::clone(&snapshot.guilds)),
@@ -963,7 +953,7 @@ async fn load_auth(
         guilds: snapshot.guilds,
         enrollment: None,
         role_access: None,
-        guild_discovery_incomplete: source == DisplayIdentitySource::RateLimited
+        guild_discovery_incomplete: guild_list_cache_allowed(guild_mode)
             && app.oauth.guild_route_limited(user_id),
     };
     preview::apply_overlay(&mut auth)?;
@@ -1112,8 +1102,8 @@ async fn display_auth(
     guilds: GuildList,
     guild_discovery_incomplete: bool,
 ) -> ApiResult<AuthCtx> {
-    let (user, source) = display_identity(app, user_id, token, cached_user).await?;
-    if source == DisplayIdentitySource::Live {
+    let (user, source) = profile_for_guilds(app, user_id, token, cached_user).await?;
+    if source == ProfileSource::Live {
         app.user_cache
             .insert(user_id, (Instant::now(), user.clone()));
     }
@@ -1155,34 +1145,34 @@ fn cached_user(app: &ApiState, user_id: u64) -> Option<DiscordUser> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DisplayIdentitySource {
+enum ProfileSource {
     Cached,
     RateLimited,
     Live,
 }
 
-/// Identity for a display response that is already returning cached guilds.
+/// Identity after the caller has selected a usable guild list.
 ///
 /// The fresh profile cache is used as-is. Otherwise live `/users/@me` still
 /// runs. When that call is rate-limited, the profile still stored after the
 /// five-minute profile TTL — or the session Discord user id — is enough to
-/// return the display list. Other `me` failures still fail the request.
+/// complete the guild response. Other `me` failures still fail the request.
 /// The fallback does not renew `user_cache`, so the next display read tries
 /// `me` again once Discord is no longer limiting it.
-async fn display_identity(
+async fn profile_for_guilds(
     app: &ApiState,
     user_id: u64,
     token: &str,
     cached_user: Option<DiscordUser>,
-) -> ApiResult<(DiscordUser, DisplayIdentitySource)> {
+) -> ApiResult<(DiscordUser, ProfileSource)> {
     if let Some(user) = cached_user {
-        return Ok((user, DisplayIdentitySource::Cached));
+        return Ok((user, ProfileSource::Cached));
     }
     match app.oauth.me(user_id, token).await {
-        Ok(user) => Ok((user, DisplayIdentitySource::Live)),
+        Ok(user) => Ok((user, ProfileSource::Live)),
         Err(error) if error.downcast_ref::<oauth::DiscordRateLimit>().is_some() => Ok((
             display_user_during_limit(app, user_id),
-            DisplayIdentitySource::RateLimited,
+            ProfileSource::RateLimited,
         )),
         Err(error) => Err(ApiError(error)),
     }

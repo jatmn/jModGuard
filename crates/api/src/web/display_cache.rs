@@ -23,13 +23,22 @@ struct Entries<T> {
     users: HashMap<u64, Entry<T>>,
     recency: BTreeSet<(Instant, u64)>,
     payload_bytes: usize,
+    // A vacant key may have lost a newer entry. Keep a conservative cutoff
+    // for new admissions without retaining one timestamp per evicted user.
+    evicted_through: Option<Instant>,
 }
 
 impl<T> Entries<T> {
-    fn remove(&mut self, user: &u64) {
-        if let Some(entry) = self.users.remove(user) {
-            self.recency.remove(&(entry.last_used, *user));
-            self.payload_bytes -= entry.payload_bytes;
+    fn remove(&mut self, user: &u64) -> Option<Instant> {
+        let entry = self.users.remove(user)?;
+        self.recency.remove(&(entry.last_used, *user));
+        self.payload_bytes -= entry.payload_bytes;
+        Some(entry.data.0)
+    }
+
+    fn evict(&mut self, user: &u64) {
+        if let Some(observed_at) = self.remove(user) {
+            self.evicted_through = self.evicted_through.max(Some(observed_at));
         }
     }
 }
@@ -50,6 +59,7 @@ impl<T> DisplayCache<T> {
                 users: HashMap::new(),
                 recency: BTreeSet::new(),
                 payload_bytes: 0,
+                evicted_through: None,
             }),
             max_users,
             max_payload_bytes,
@@ -79,24 +89,26 @@ impl<T> DisplayCache<T> {
             .entries
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if entries
+        let last_observed_at = entries
             .users
             .get(&user)
-            .is_some_and(|entry| entry.data.0 >= data.0)
-        {
+            .map(|entry| entry.data.0)
+            .or(entries.evicted_through);
+        if last_observed_at.is_some_and(|observed_at| observed_at >= data.0) {
             return;
         }
         let payload_bytes = size_of::<(Instant, T)>().saturating_add((self.heap_bytes)(&data.1));
-        entries.remove(&user);
+        let _ = entries.remove(&user);
         let Some(available_bytes) = self.max_payload_bytes.checked_sub(payload_bytes) else {
             // Still serve the live response. It cannot fit in the display cache.
+            entries.evicted_through = entries.evicted_through.max(Some(data.0));
             return;
         };
         while entries.users.len() >= self.max_users || entries.payload_bytes > available_bytes {
             let Some(&(_, oldest)) = entries.recency.first() else {
                 return;
             };
-            entries.remove(&oldest);
+            entries.evict(&oldest);
         }
         let last_used = Instant::now();
         entries.users.insert(
@@ -123,7 +135,7 @@ impl<T> DisplayCache<T> {
 
     #[cfg(test)]
     pub(super) fn remove(&self, user: &u64) {
-        self.entries.lock().unwrap().remove(user);
+        self.entries.lock().unwrap().evict(user);
     }
 
     #[cfg(test)]
@@ -132,6 +144,7 @@ impl<T> DisplayCache<T> {
         entries.users.clear();
         entries.recency.clear();
         entries.payload_bytes = 0;
+        entries.evicted_through = None;
     }
 
     #[cfg(test)]
@@ -202,9 +215,9 @@ mod tests {
         assert_eq!(cache.get(&3).unwrap().1.len(), 37);
         assert_eq!(held.1.len(), 16);
 
-        cache.insert(2, (now, vec![2; 15]));
+        cache.insert(2, (later, vec![2; 15]));
         let before = cache.usage();
-        cache.insert(4, (now, vec![4; 1024]));
+        cache.insert(4, (later, vec![4; 1024]));
         assert!(cache.get(&4).is_none());
         assert_eq!(cache.usage(), before);
 
