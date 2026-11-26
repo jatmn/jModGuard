@@ -6,13 +6,13 @@
 use crate::db::guild_data::{OnboardingTrapSetup, ServerChannelName, ServerNames, ServerRoleName};
 use crate::state::BotState;
 use serenity::model::{
-    channel::{ChannelType, GuildChannel, PermissionOverwriteType},
+    channel::{ChannelType, GuildChannel, PermissionOverwrite, PermissionOverwriteType},
     guild::{Guild, Role},
     id::{RoleId, UserId},
     permissions::Permissions,
 };
 use serenity::prelude::Context;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::sync::{Arc, LazyLock, Mutex};
 
 fn channel_kind(kind: ChannelType) -> Option<&'static str> {
@@ -132,22 +132,39 @@ pub(crate) fn refresh_for_member_grants(
     guild_id: u64,
     user_id: UserId,
 ) {
-    let affects_setup = ctx.cache.guild(guild_id).is_some_and(|guild| {
-        guild.channels.values().any(|channel| {
-            channel.permission_overwrites.iter().any(|overwrite| {
-                overwrite.kind == PermissionOverwriteType::Member(user_id)
-                    && !overwrite.allow.is_empty()
-            })
-        })
-    });
-    if affects_setup {
-        refresh_from_cache(app, ctx, guild_id);
+    schedule_refresh(app, ctx, guild_id, Some(user_id));
+}
+
+const MAX_PENDING_MEMBERS: usize = 128;
+
+enum PendingRefresh {
+    Full,
+    Members(HashSet<UserId>),
+    MemberOverflow,
+}
+
+impl PendingRefresh {
+    fn needs_snapshot<'a>(
+        &self,
+        overwrites: impl Iterator<Item = &'a PermissionOverwrite>,
+    ) -> bool {
+        // A grant can belong to a user absent from the member cache.
+        let mut member_grants = overwrites.filter_map(|overwrite| match overwrite.kind {
+            PermissionOverwriteType::Member(user) if !overwrite.allow.is_empty() => Some(user),
+            _ => None,
+        });
+        match self {
+            Self::Full => true,
+            Self::Members(users) => member_grants.any(|user| users.contains(&user)),
+            Self::MemberOverflow => member_grants.next().is_some(),
+        }
     }
 }
 
-/// Guilds with a refresh running, and whether another change arrived meanwhile.
-/// Entries exist only while a refresh runs, so this stays bounded by busy guilds.
-static REFRESHING: LazyLock<Mutex<HashMap<u64, bool>>> = LazyLock::new(Default::default);
+/// Busy guilds and changes waiting for their next pass. An empty slot keeps
+/// ownership with the worker while it reads the cache and publishes a snapshot.
+static REFRESHING: LazyLock<Mutex<HashMap<u64, Option<PendingRefresh>>>> =
+    LazyLock::new(Default::default);
 
 /// Store the cached guild's names after a Gateway guild, role or channel event.
 /// The cache already reflects the event. One task per guild writes at a time and
@@ -155,61 +172,89 @@ static REFRESHING: LazyLock<Mutex<HashMap<u64, bool>>> = LazyLock::new(Default::
 /// cache and a burst of reorder events costs a few writes, not one each. Runs in
 /// the background so activity logs and moderation never wait for it.
 pub fn refresh_from_cache(app: &Arc<BotState>, ctx: &Context, guild_id: u64) {
-    if !claim(guild_id) {
+    schedule_refresh(app, ctx, guild_id, None);
+}
+
+fn schedule_refresh(app: &Arc<BotState>, ctx: &Context, guild_id: u64, member: Option<UserId>) {
+    if !enqueue_refresh(guild_id, member) {
         return;
     }
-    let (app, ctx) = (Arc::clone(app), ctx.clone());
+    let (app, cache) = (Arc::clone(app), Arc::clone(&ctx.cache));
     tokio::spawn(async move {
-        loop {
-            // Owned data is copied before any await.
-            let observed_at_ms = jmodguard::control::now_ms();
-            let names = ctx.cache.guild(guild_id).map(|guild| {
-                let mut names = snapshot(guild.roles.values(), guild.channels.values());
-                names.onboarding_trap = Some(onboarding_setup(&guild, ctx.cache.current_user().id));
-                names
-            });
-            if let Some(names) = names {
-                record(&app, guild_id, names, observed_at_ms).await;
-            }
-            if !finish(guild_id) {
-                break;
-            }
-        }
+        refresh_pending(&app, &cache, guild_id).await;
     });
 }
 
-/// True when this caller should start the refresh task for `guild_id`.
-fn claim(guild_id: u64) -> bool {
-    let mut running = REFRESHING
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    match running.get_mut(&guild_id) {
-        Some(again) => {
-            *again = true;
-            false
-        }
-        None => {
-            running.insert(guild_id, false);
-            true
+async fn refresh_pending(app: &BotState, cache: &serenity::cache::Cache, guild_id: u64) {
+    while let Some(pending) = take_refresh(guild_id) {
+        // Eligibility and the owned snapshot use the same cache observation.
+        let observed_at_ms = jmodguard::control::now_ms();
+        let names = cache
+            .guild(guild_id)
+            .and_then(|guild| snapshot_for_refresh(&guild, cache.current_user().id, &pending));
+        if let Some(names) = names {
+            record(app, guild_id, names, observed_at_ms).await;
+        } else {
+            // Keep a sustained stream of negative batches from monopolizing
+            // the worker's executor thread.
+            tokio::task::yield_now().await;
         }
     }
 }
 
-/// True when another change arrived during the last write and the task must repeat.
-fn finish(guild_id: u64) -> bool {
+fn snapshot_for_refresh(
+    guild: &Guild,
+    bot_id: UserId,
+    pending: &PendingRefresh,
+) -> Option<ServerNames> {
+    let overwrites = guild
+        .channels
+        .values()
+        .flat_map(|channel| &channel.permission_overwrites);
+    if !pending.needs_snapshot(overwrites) {
+        return None;
+    }
+    let mut names = snapshot(guild.roles.values(), guild.channels.values());
+    names.onboarding_trap = Some(onboarding_setup(guild, bot_id));
+    Some(names)
+}
+
+/// True when this caller should start the refresh task for `guild_id`.
+fn enqueue_refresh(guild_id: u64, member: Option<UserId>) -> bool {
     let mut running = REFRESHING
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    match running.get_mut(&guild_id) {
-        Some(again) if *again => {
-            *again = false;
-            true
+    let (start, pending) = match running.entry(guild_id) {
+        Entry::Occupied(entry) => (false, entry.into_mut()),
+        Entry::Vacant(entry) => (true, entry.insert(None)),
+    };
+    if let Some(user) = member {
+        match pending.get_or_insert_with(|| PendingRefresh::Members(HashSet::new())) {
+            PendingRefresh::Members(users) if users.len() < MAX_PENDING_MEMBERS => {
+                users.insert(user);
+            }
+            PendingRefresh::Members(users) if !users.contains(&user) => {
+                // Drop the IDs and check for any positive member grant on the next pass.
+                *pending = Some(PendingRefresh::MemberOverflow);
+            }
+            _ => {}
         }
-        _ => {
-            running.remove(&guild_id);
-            false
-        }
+    } else {
+        *pending = Some(PendingRefresh::Full);
     }
+    start
+}
+
+/// Take the next batch, or release the guild when no changes remain.
+fn take_refresh(guild_id: u64) -> Option<PendingRefresh> {
+    let mut running = REFRESHING
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let next = running.get_mut(&guild_id).and_then(Option::take);
+    if next.is_none() {
+        running.remove(&guild_id);
+    }
+    next
 }
 
 async fn record(app: &BotState, guild_id: u64, names: ServerNames, observed_at_ms: i64) {
@@ -237,7 +282,7 @@ mod tests {
 
     #[test]
     fn onboarding_trap_setup_reports_hierarchy_kick_permission_and_role_grants() {
-        use serenity::all::{GuildId, Member, PermissionOverwrite};
+        use serenity::all::{GuildId, Member};
 
         let mut guild = Guild::default();
         guild.id = GuildId::new(10);
@@ -295,7 +340,7 @@ mod tests {
 
     #[test]
     fn onboarding_trap_separates_member_channel_allows_from_role_grants() {
-        use serenity::all::{Member, PermissionOverwrite};
+        use serenity::all::Member;
 
         let mut guild = Guild::default();
         let trap = RoleId::new(22);
@@ -324,18 +369,218 @@ mod tests {
     }
 
     #[test]
-    fn refreshes_coalesce_per_guild_and_repeat_after_a_late_change() {
+    fn role_only_member_burst_scans_the_overwrites_once() {
         let guild = 9_007_199_254_740_001;
-        assert!(claim(guild), "the first event starts the task");
-        assert!(!claim(guild), "a second event joins the running task");
-        assert!(!claim(guild));
+        let overwrites = vec![
+            PermissionOverwrite {
+                allow: Permissions::VIEW_CHANNEL,
+                deny: Permissions::empty(),
+                kind: PermissionOverwriteType::Role(RoleId::new(17)),
+            };
+            200 * 10
+        ];
+        for id in 1..=100 {
+            assert_eq!(enqueue_refresh(guild, Some(UserId::new(id))), id == 1);
+        }
+        let batch = take_refresh(guild).unwrap();
+        let mut inspections = 0;
+        assert!(!batch.needs_snapshot(overwrites.iter().inspect(|_| inspections += 1)));
+        assert_eq!(inspections, 2_000);
+        assert!(take_refresh(guild).is_none());
+    }
+
+    #[test]
+    fn member_overflow_requires_a_positive_individual_overwrite() {
+        let guild = 9_007_199_254_740_002;
+        let member = UserId::new(1);
+        let role_allow = PermissionOverwrite {
+            allow: Permissions::VIEW_CHANNEL,
+            deny: Permissions::empty(),
+            kind: PermissionOverwriteType::Role(RoleId::new(17)),
+        };
+        let unrelated_member = UserId::new(MAX_PENDING_MEMBERS as u64 + 2);
+        let member_deny = PermissionOverwrite {
+            allow: Permissions::empty(),
+            deny: Permissions::VIEW_CHANNEL,
+            kind: PermissionOverwriteType::Member(unrelated_member),
+        };
+        let member_allow = PermissionOverwrite {
+            allow: Permissions::VIEW_CHANNEL,
+            deny: Permissions::empty(),
+            kind: PermissionOverwriteType::Member(unrelated_member),
+        };
+        for id in 1..=MAX_PENDING_MEMBERS {
+            assert_eq!(
+                enqueue_refresh(guild, Some(UserId::new(id as u64))),
+                id == 1
+            );
+        }
+        assert!(!enqueue_refresh(guild, Some(member)));
+        assert!(matches!(
+            take_refresh(guild),
+            Some(PendingRefresh::Members(users)) if users.len() == MAX_PENDING_MEMBERS
+        ));
+        for id in 1..=MAX_PENDING_MEMBERS + 1 {
+            assert!(!enqueue_refresh(guild, Some(UserId::new(id as u64))));
+        }
+        let overflow = take_refresh(guild).unwrap();
+        assert!(!overflow.needs_snapshot(std::iter::empty()));
+        assert!(!overflow.needs_snapshot([&role_allow, &member_deny].into_iter()));
+        assert!(overflow.needs_snapshot([&role_allow, &member_allow].into_iter()));
+        for id in 1..=MAX_PENDING_MEMBERS + 1 {
+            assert!(!enqueue_refresh(guild, Some(UserId::new(id as u64))));
+        }
+        assert!(!enqueue_refresh(guild, None));
+        assert!(!enqueue_refresh(guild, Some(member)));
         assert!(
-            finish(guild),
-            "a change during the write runs one more pass"
+            take_refresh(guild)
+                .unwrap()
+                .needs_snapshot(std::iter::empty())
         );
-        assert!(!finish(guild), "no newer change: the task ends");
-        assert!(claim(guild), "a later event starts a new task");
-        assert!(!finish(guild));
+        assert!(take_refresh(guild).is_none());
+        assert!(enqueue_refresh(guild, Some(member)));
+        assert!(matches!(
+            take_refresh(guild),
+            Some(PendingRefresh::Members(users)) if users == HashSet::from([member])
+        ));
+        assert!(take_refresh(guild).is_none());
+    }
+
+    #[test]
+    fn member_batches_require_positive_individual_allows() {
+        let member = UserId::new(35);
+        let batch = PendingRefresh::Members(HashSet::from([member]));
+        let mut overwrite = PermissionOverwrite {
+            kind: PermissionOverwriteType::Member(member),
+            allow: Permissions::empty(),
+            deny: Permissions::empty(),
+        };
+        assert!(!batch.needs_snapshot([&overwrite].into_iter()));
+        overwrite.deny = Permissions::VIEW_CHANNEL;
+        assert!(!batch.needs_snapshot([&overwrite].into_iter()));
+        overwrite.allow = Permissions::SEND_MESSAGES;
+        overwrite.kind = PermissionOverwriteType::Member(UserId::new(36));
+        assert!(!batch.needs_snapshot([&overwrite].into_iter()));
+        overwrite.kind = PermissionOverwriteType::Member(member);
+        assert!(batch.needs_snapshot([&overwrite].into_iter()));
+    }
+
+    #[tokio::test]
+    async fn setup_tracks_an_absent_grantee_through_a_join_during_refresh_and_rejoin() {
+        use serenity::all::{
+            Cache, ChannelId, GuildCreateEvent, GuildId, GuildMemberAddEvent,
+            GuildMemberRemoveEvent, Member,
+        };
+
+        let guild_id = 9_007_199_254_740_003;
+        let member_id = UserId::new(8);
+        let role_id = RoleId::new(22);
+        let directory = std::env::temp_dir().join(format!(
+            "server_names_member_grant_{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let mut cfg = crate::config::BotProcessConfig::default();
+        cfg.db.path = directory.join("core.db");
+        let db = crate::db::Db::open(&cfg.db.path, 2).unwrap();
+        let app = BotState::new(cfg, db).unwrap();
+        let enrollment = crate::db::enroll_guild(&app.db, guild_id as i64, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        app.tenant.activate(enrollment.clone()).await.unwrap();
+        let (store, scope) = app.tenant.live(enrollment).await.unwrap();
+
+        let cache = Cache::new();
+        let mut guild = Guild::default();
+        guild.id = GuildId::new(guild_id);
+        let mut role = Role::default();
+        role.id = role_id;
+        role.name = "Fixture role".into();
+        guild.roles.insert(role_id, role);
+        let mut channel = GuildChannel::default();
+        channel.id = ChannelId::new(10);
+        channel.kind = ChannelType::Text;
+        channel.name = "fixture-channel".into();
+        channel.permission_overwrites.push(PermissionOverwrite {
+            kind: PermissionOverwriteType::Member(member_id),
+            allow: Permissions::VIEW_CHANNEL,
+            deny: Permissions::empty(),
+        });
+        guild.channels.insert(channel.id, channel);
+        let mut create: GuildCreateEvent =
+            serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        cache.update(&mut create);
+
+        assert!(enqueue_refresh(guild_id, None));
+        refresh_pending(&app, &cache, guild_id).await;
+        let before = store.server_names(scope.clone()).await.unwrap();
+        assert!(
+            before
+                .onboarding_trap
+                .unwrap()
+                .roles_with_member_grants
+                .is_empty()
+        );
+
+        assert!(enqueue_refresh(guild_id, None));
+        let first = take_refresh(guild_id).unwrap();
+        let captured =
+            snapshot_for_refresh(&cache.guild(guild_id).unwrap(), UserId::new(3), &first).unwrap();
+        let mut member = Member::default();
+        member.guild_id = GuildId::new(guild_id);
+        member.user.id = member_id;
+        member.roles.push(role_id);
+        let mut join: GuildMemberAddEvent =
+            serde_json::from_value(serde_json::to_value(&member).unwrap()).unwrap();
+        let mut leave: GuildMemberRemoveEvent = serde_json::from_value(serde_json::json!({
+            "guild_id": member.guild_id,
+            "user": member.user,
+        }))
+        .unwrap();
+        cache.update(&mut join);
+        assert!(
+            !enqueue_refresh(guild_id, Some(member_id)),
+            "join arrived after the active pass read the cache"
+        );
+        record(&app, guild_id, captured, before.observed_at_ms.unwrap()).await;
+        assert!(
+            store
+                .server_names(scope.clone())
+                .await
+                .unwrap()
+                .onboarding_trap
+                .unwrap()
+                .roles_with_member_grants
+                .is_empty()
+        );
+        refresh_pending(&app, &cache, guild_id).await;
+        let saved = store.server_names(scope.clone()).await.unwrap();
+        assert_eq!(
+            saved.onboarding_trap.unwrap().roles_with_member_grants,
+            [role_id.to_string()]
+        );
+        for joining in [false, true] {
+            if joining {
+                cache.update(&mut join);
+            } else {
+                cache.update(&mut leave);
+            }
+            assert!(enqueue_refresh(guild_id, Some(member_id)));
+            refresh_pending(&app, &cache, guild_id).await;
+            let saved = store.server_names(scope.clone()).await.unwrap();
+            let expected = if joining {
+                vec![role_id.to_string()]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                saved.onboarding_trap.unwrap().roles_with_member_grants,
+                expected
+            );
+        }
+        drop((store, scope, app));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
