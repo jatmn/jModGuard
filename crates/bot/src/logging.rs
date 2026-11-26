@@ -1010,29 +1010,8 @@ struct Snippet {
     origin: MessageOrigin,
 }
 
+/// Remember an author without adding a webhook marker. Payload capture is separate.
 pub fn remember_message(
-    app: &BotState,
-    guild: u64,
-    channel: u64,
-    message: u64,
-    author: Option<u64>,
-    text: Option<&str>,
-    attachments: Option<&[String]>,
-) {
-    remember_message_create(
-        app,
-        guild,
-        channel,
-        message,
-        author,
-        text,
-        attachments,
-        false,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn remember_message_create(
     app: &BotState,
     guild: u64,
     channel: u64,
@@ -1040,6 +1019,16 @@ pub(crate) fn remember_message_create(
     author: Option<u64>,
     _text: Option<&str>,
     _attachments: Option<&[String]>,
+) {
+    remember_message_create(app, guild, channel, message, author, false);
+}
+
+pub(crate) fn remember_message_create(
+    app: &BotState,
+    guild: u64,
+    channel: u64,
+    message: u64,
+    author: Option<u64>,
     webhook: bool,
 ) {
     let mut cache = app.log_snippets.inner.lock();
@@ -1094,8 +1083,6 @@ pub(crate) fn remember_message_update(
         event.channel_id.get(),
         event.id.get(),
         author,
-        None,
-        None,
         matches!(event.webhook_id, Some(Some(_))),
     );
 }

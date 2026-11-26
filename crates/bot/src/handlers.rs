@@ -1327,13 +1327,6 @@ impl EventHandler for Handler {
             msg.channel_id.get(),
             msg.id.get(),
             Some(msg.author.id.get()),
-            Some(&msg.content),
-            Some(
-                &msg.attachments
-                    .iter()
-                    .map(|attachment| attachment.url.clone())
-                    .collect::<Vec<_>>(),
-            ),
             msg.webhook_id.is_some(),
         );
 
@@ -3929,7 +3922,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("webhook_snip_{:032x}.db", rand::random::<u128>()));
         let app = BotState::new(Default::default(), Db::open(&path, 2).unwrap()).unwrap();
-        logging::remember_message_create(&app, 789, 456, 123, Some(42), Some(""), None, true);
+        logging::remember_message_create(&app, 789, 456, 123, Some(42), true);
         // A partial edit can omit webhook_id, including while changing attachments.
         let mut update: MessageUpdateEvent = serde_json::from_value(serde_json::json!({
             "id":"123", "channel_id":"456", "guild_id":"789",
