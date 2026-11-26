@@ -2477,6 +2477,9 @@ pub struct ConfigCache {
     /// Serenity applies a Gateway event before its handler runs, so a
     /// confirmed departure is visible here before `forget_guild`.
     gateway: Arc<parking_lot::RwLock<Option<Arc<serenity::cache::Cache>>>>,
+    /// Guilds removed while Serenity still holds their stale unavailable
+    /// marker. Each record lasts only as long as that marker.
+    removed_while_unavailable: Arc<DashMap<u64, ()>>,
     ttl: Duration,
     durable_floor: Arc<AtomicU64>,
     publication_lock: Arc<parking_lot::Mutex<()>>,
@@ -2495,6 +2498,7 @@ impl ConfigCache {
             map: DashMap::new(),
             version: Arc::new(AtomicU64::new(0)),
             gateway: Arc::new(parking_lot::RwLock::new(None)),
+            removed_while_unavailable: Arc::new(DashMap::new()),
             ttl: Duration::from_secs(15),
             durable_floor: Arc::new(AtomicU64::new(durable_floor)),
             publication_lock: Arc::new(parking_lot::Mutex::new(())),
@@ -2527,13 +2531,17 @@ impl ConfigCache {
             return GatewayMembership::Absent;
         };
         if let Some(cached) = cache.guild(guild) {
+            self.removed_while_unavailable.remove(&guild_id);
             return GatewayMembership::Joined(cached.joined_at);
         }
         // Serenity keeps a guild here if it was unavailable when it left.
-        if cache.unavailable_guilds().get(&guild).is_some() {
-            GatewayMembership::Unavailable
-        } else {
+        if cache.unavailable_guilds().get(&guild).is_none() {
+            self.removed_while_unavailable.remove(&guild_id);
             GatewayMembership::Absent
+        } else if self.removed_while_unavailable.contains_key(&guild_id) {
+            GatewayMembership::Absent
+        } else {
+            GatewayMembership::Unavailable
         }
     }
 
@@ -2541,6 +2549,9 @@ impl ConfigCache {
     /// while the guild is a Gateway member, so departed work cannot restore it.
     pub(crate) fn forget_guild(&self, guild_id: u64) {
         let _publication = self.publication_lock.lock();
+        if self.gateway_membership(guild_id) == GatewayMembership::Unavailable {
+            self.removed_while_unavailable.insert(guild_id, ());
+        }
         self.map.remove(&(guild_id as i64));
     }
 

@@ -4318,6 +4318,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_departure_during_an_outage_fences_pending_and_queued_loads() {
+        use serenity::client::EventHandler;
+        use serenity::model::event::GuildDeleteEvent;
+        use serenity::model::guild::UnavailableGuild;
+        let (directory, app, _) = counter_fixture("config_departure_outage").await;
+        let (ctx, _) = counter_context(&app, false).await;
+        app.install_discord_cache(std::sync::Arc::clone(&ctx.cache));
+        gateway_guild(&ctx.cache, 10, Some(100));
+        let handler = super::Handler {
+            app: std::sync::Arc::clone(&app),
+        };
+        let delete = |unavailable: bool| {
+            let mut event: GuildDeleteEvent =
+                serde_json::from_value(serde_json::json!({"id": "10", "unavailable": unavailable}))
+                    .unwrap();
+            ctx.cache.update(&mut event);
+            serde_json::from_value::<UnavailableGuild>(
+                serde_json::json!({"id": "10", "unavailable": unavailable}),
+            )
+            .unwrap()
+        };
+
+        let mut pending = Box::pin(app.configs.get(&app.db, 10));
+        tokio::select! {
+            biased;
+            _ = &mut pending => panic!("config load finished before the departure"),
+            _ = std::future::ready(()) => {}
+        }
+        let loaded = app.configs.get(&app.db, 10).await.unwrap();
+        handler.guild_delete(ctx.clone(), delete(true), None).await;
+        assert!(
+            app.configs
+                .last_known(10)
+                .is_some_and(|cfg| std::sync::Arc::ptr_eq(&cfg, &loaded)),
+            "a temporary outage keeps the last-known configuration"
+        );
+        // Serenity keeps its unavailable marker through the confirmed delete.
+        handler.guild_delete(ctx.clone(), delete(false), None).await;
+        assert!(app.configs.last_known(10).is_none());
+        drop(loaded);
+        drop(pending.await.unwrap());
+        assert!(
+            app.configs.last_known(10).is_none(),
+            "a load pending across the removal must not restore it"
+        );
+        drop(app.configs.get(&app.db, 10).await.unwrap());
+        assert!(
+            app.configs.last_known(10).is_none(),
+            "work queued before the removal must not restore it"
+        );
+
+        // A real rejoin caches normally, and its later outage keeps it.
+        gateway_guild(&ctx.cache, 10, Some(200));
+        let rejoined = app.configs.get(&app.db, 10).await.unwrap();
+        handler.guild_delete(ctx.clone(), delete(true), None).await;
+        assert!(
+            app.configs
+                .last_known(10)
+                .is_some_and(|cfg| std::sync::Arc::ptr_eq(&cfg, &rejoined))
+        );
+
+        drop(rejoined);
+        drop(handler);
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn another_guilds_departure_keeps_an_active_guilds_cold_load() {
         use serenity::client::EventHandler;
         let (directory, app, _) = counter_fixture("config_departure_other").await;
