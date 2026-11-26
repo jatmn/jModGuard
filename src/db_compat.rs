@@ -272,6 +272,8 @@ pub struct StartupProbe {
     transactions: AtomicU64,
     queries: AtomicU64,
     catalog: AtomicU64,
+    #[cfg(test)]
+    connection_opens: AtomicU64,
     /// Primary statements by Bot Resources path label, as counted for the
     /// process-wide `db_primary_paths` family.
     primary_paths: Mutex<std::collections::BTreeMap<String, u64>>,
@@ -292,6 +294,11 @@ impl StartupProbe {
 
     pub fn catalog(&self) -> u64 {
         self.catalog.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub fn connection_opens(&self) -> u64 {
+        self.connection_opens.load(Ordering::Relaxed)
     }
 
     /// Primary statements this probe's databases counted under `label`.
@@ -1460,8 +1467,13 @@ impl Connection {
     }
 
     pub fn from_database(database: Arc<libsql::Database>, runtime: DbRuntime) -> Result<Self> {
+        let inner = runtime.block_on(async { database.connect() })?;
+        #[cfg(test)]
+        if let Some(probe) = &runtime.startup_probe {
+            probe.connection_opens.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(Self {
-            inner: RuntimeOwned::new(runtime.block_on(async { database.connect() })?, &runtime),
+            inner: RuntimeOwned::new(inner, &runtime),
             database,
             runtime,
             health: Arc::new(SharedConnectionHealth::new()),

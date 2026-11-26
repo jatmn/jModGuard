@@ -660,31 +660,26 @@ impl GuildDataStore {
     /// Read a stamped installation identity without creating or upgrading schema.
     /// Missing local files and empty databases return `None`.
     pub fn existing_registration(options: GuildStoreOptions) -> Result<Option<StoreRegistration>> {
-        if options.url.trim().is_empty() && !options.path.exists() {
+        let remote = !options.url.trim().is_empty();
+        if !remote && !options.path.exists() {
             return Ok(None);
         }
-        let mut found = None;
         let opts = DbOpenOptions {
             path: options.path,
             url: options.url,
             token: options.token,
             pool_size: options.pool_size,
             migrate: false,
-            read_only: options.read_only,
+            // The probe never creates a database, even if the file disappears
+            // between the existence check and opening it.
+            read_only: true,
             default_prefix: String::new(),
             retention_days: 0,
         };
-        let _db = Db::open_pool(
-            &opts,
-            opts.migrate,
-            PoolScope::GuildStore,
-            |conn| {
-                found = read_existing_registration(conn)?;
-                Ok(())
-            },
-            |_| Ok(()),
-        )?;
-        Ok(found)
+        let (database, runtime) = Db::open_database(&opts, remote)?;
+        let mut held = super::CloseBootstrap::connect(&database, &runtime)?;
+        let connection = held.configure(remote, opts.read_only, PoolScope::GuildStore)?;
+        read_existing_registration(connection)
     }
     fn connect(
         options: GuildStoreOptions,
