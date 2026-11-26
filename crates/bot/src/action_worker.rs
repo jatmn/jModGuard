@@ -1146,12 +1146,12 @@ async fn drain_with_advisory_db(
     limits.validate()?;
     let waiting_guilds = app.expiry_check_retries.waiting(now);
     let first_due_at = match db::bot_work_due(advisory_db, now, &waiting_guilds).await {
-        Ok((false, false)) => return Ok(()),
-        Ok((false, true)) => {
+        Ok(db::BotWorkDue::Idle) => return Ok(()),
+        Ok(db::BotWorkDue::BanExpiry) => {
             return expire_advised_bans(&app.db, Some(app), discord, now, limits, waiting_guilds)
                 .await;
         }
-        Ok((true, _)) => Some(now),
+        Ok(db::BotWorkDue::Action) => Some(now),
         // Retain the established action-first checks if the combined read fails.
         Err(_) => None,
     };

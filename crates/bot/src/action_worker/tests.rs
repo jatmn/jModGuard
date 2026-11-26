@@ -2078,15 +2078,15 @@ async fn scheduler_revalidates_stale_hits_and_falls_back_on_an_advisory_error() 
     }
 
     primary.fence_guild(GUILD).await;
-    // A stale expiry hit, then a stale hit for both branches. The primary
+    // A stale expiry hit, then a stale preferred action hit. The primary
     // fence still blocks both Discord dispatches.
-    for action_due in [false, true] {
-        if action_due {
+    for expected in [db::BotWorkDue::BanExpiry, db::BotWorkDue::Action] {
+        if expected == db::BotWorkDue::Action {
             replica.enqueue(GUILD, "queued", unban(ACTION_USER)).await;
         }
         assert_eq!(
             db::bot_work_due(&replica.db, now, &[]).await.unwrap(),
-            (action_due, true)
+            expected
         );
         drain_with_advisory_db(&app, &replica.db, &discord, &limits, now)
             .await
@@ -2110,7 +2110,7 @@ async fn scheduler_revalidates_stale_hits_and_falls_back_on_an_advisory_error() 
         db::bot_work_due(&primary.db, action.expires_at, &[])
             .await
             .unwrap(),
-        (true, false)
+        db::BotWorkDue::Action
     );
     replica
         .db

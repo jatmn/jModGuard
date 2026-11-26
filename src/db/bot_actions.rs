@@ -392,19 +392,31 @@ fn poll_due_sql() -> String {
     format!("SELECT {}", action_due_expression())
 }
 
-/// The scheduler's advisory action and timed-ban eligibility, in that order.
-/// Neither result authorizes dispatch. A stale miss can defer work one poll.
-pub async fn bot_work_due(db: &Db, now: i64, waiting_guilds: &[i64]) -> Result<(bool, bool)> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BotWorkDue {
+    Idle,
+    Action,
+    BanExpiry,
+}
+
+/// The first eligible scheduler branch. Action work takes precedence, and the
+/// scheduler checks expiry again after draining it. A hint never authorizes dispatch.
+pub async fn bot_work_due(db: &Db, now: i64, waiting_guilds: &[i64]) -> Result<BotWorkDue> {
     let waiting_guilds = serde_json::to_string(waiting_guilds)?;
     db.with_conn(move |conn| {
         conn.query_row_advisory(
             &format!(
-                "SELECT {}, EXISTS({})",
+                "SELECT CASE WHEN {} THEN 1 WHEN EXISTS({}) THEN 2 ELSE 0 END",
                 action_due_expression(),
                 super::moderation::DUE_EXPIRY_SQL
             ),
             params![now, "[]", waiting_guilds],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| match row.get::<i64>(0)? {
+                0 => Ok(BotWorkDue::Idle),
+                1 => Ok(BotWorkDue::Action),
+                2 => Ok(BotWorkDue::BanExpiry),
+                value => anyhow::bail!("invalid bot work advisory result: {value}"),
+            },
         )
     })
     .await
