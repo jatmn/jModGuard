@@ -474,7 +474,8 @@ pub struct Db {
     runtime: DbRuntime,
     /// Renewal `block_on` does not share the pool workers or the 75s startup
     /// deadline. The CAS still uses the caller authority window. Read-only
-    /// handles never renew, so they have neither this nor a lease connection.
+    /// handles and guild stores never renew, so they have neither this nor a
+    /// lease connection.
     lease_runtime: Option<DbRuntime>,
     bootstrap_work: BootstrapWork,
     connections: Arc<ConnectionPool>,
@@ -1096,7 +1097,8 @@ impl Db {
             // Remote renewal gets its own runtime. A stalled pool read must not
             // occupy both database workers until the 75s startup deadline.
             // Local files share the pool runtime; there is no remote lifetime.
-            let lease_runtime = if opts.read_only {
+            // Only writable core pools renew; guild stores use the core fence.
+            let lease_runtime = if opts.read_only || guild_store {
                 None
             } else if remote {
                 Some(DbRuntime::with_operation_timeout(Some(
@@ -1446,7 +1448,7 @@ impl Db {
         let runtime = self
             .lease_runtime
             .clone()
-            .context("writable database has no lease runtime")?;
+            .context("guild-store database cannot renew a lease")?;
         let slot = Arc::clone(&self.lease_connection);
         let database = Arc::clone(&self._database);
         let remote = self.remote;

@@ -178,14 +178,16 @@ async fn existing_registration_reads_stamped_identity_over_hrana() {
     drop(db);
 
     let probe = std::sync::Arc::new(crate::db::StartupProbe::default());
-    let options = GuildStoreOptions {
-        url: fixture.url(),
-        token: "test".into(),
-        read_only: true,
-        ..f.options()
-    };
     let _guard = crate::db::enter_startup_probe(Some(probe.clone()));
-    assert_registration_open_counts(options, reg, &probe);
+    for read_only in [true, false] {
+        let options = GuildStoreOptions {
+            url: fixture.url(),
+            token: "test".into(),
+            read_only,
+            ..f.options()
+        };
+        assert_registration_open_counts(options, reg.clone(), &probe);
+    }
 }
 
 fn assert_registration_open_counts(
@@ -202,16 +204,23 @@ fn assert_registration_open_counts(
     assert_eq!(stamped, reg);
     assert_eq!(probe.connection_opens() - before, 1, "stamp connection");
 
-    let lease = u64::from(!options.read_only);
     let before = probe.connection_opens();
+    let runtimes = probe.runtime_starts();
     let store = GuildDataStore::open(options, reg).unwrap();
     assert_eq!(store.db.permits.available_permits(), CAPACITY);
     assert_eq!(store.db.connections.idle.lock().unwrap().len(), CAPACITY);
     assert_eq!(
         probe.connection_opens() - before,
-        CAPACITY as u64 + 1 + lease,
-        "three pooled connections, one bootstrap, and a lease connection only when writable"
+        CAPACITY as u64 + 1,
+        "three pooled connections and one bootstrap; guild stores never renew a lease"
     );
+    assert_eq!(
+        probe.runtime_starts() - runtimes,
+        1,
+        "only the pool runtime"
+    );
+    assert!(store.db.lease_runtime.is_none());
+    assert!(store.db.lease_connection.lock().unwrap().is_none());
 }
 
 #[tokio::test]
