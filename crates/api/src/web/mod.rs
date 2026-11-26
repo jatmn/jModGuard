@@ -907,12 +907,11 @@ async fn load_auth(
     } else {
         let epoch = current_access_epoch(app).await;
         match app.oauth.my_guilds_at(user_id, token, epoch).await {
-            Ok(guilds) => {
-                let observed_at = Instant::now();
+            Ok((observed_at, guilds)) => {
                 let snapshot = GuildSnapshot {
-                    age_from: observed_at,
+                    age_from: Instant::now(),
                     observed_at,
-                    guilds: guilds.into(),
+                    guilds,
                 };
                 state.guilds = Some(snapshot.clone());
                 state.guilds_epoch = epoch;
@@ -995,7 +994,6 @@ fn start_guild_refresh(
         let started = std::time::Instant::now();
         let epoch = current_access_epoch(&app).await;
         let guilds = app.oauth.my_guilds_at(user_id, &token, epoch).await;
-        let observed_at = Instant::now();
         let user = match (&guilds, refresh_profile) {
             (Ok(_), true) => app
                 .oauth
@@ -1016,8 +1014,7 @@ fn start_guild_refresh(
             .is_none_or(|snapshot| snapshot.age_from <= started)
         {
             match guilds {
-                Ok(guilds) => {
-                    let guilds = GuildList::from(guilds);
+                Ok((observed_at, guilds)) => {
                     state.guilds = Some(GuildSnapshot {
                         age_from: started,
                         observed_at,
@@ -1571,9 +1568,8 @@ async fn callback_response(
         // Only a complete guild list enters either cache. A 429 leaves any
         // previous display list intact and the cooldown guides the next /api/me.
         let epoch = current_access_epoch(app).await;
-        if let Ok(guilds) = oauth.my_guilds_at(uid, &tok.access_token, epoch).await {
-            let observed_at = Instant::now();
-            let guilds = GuildList::from(guilds);
+        if let Ok((observed_at, guilds)) = oauth.my_guilds_at(uid, &tok.access_token, epoch).await {
+            let age_from = Instant::now();
             // Rotation leaves the session without an ID until the store creates
             // the new record. Publish the permission snapshot before the
             // middleware returns the new session cookie.
@@ -1588,19 +1584,19 @@ async fn callback_response(
                 );
             }
             if let Some(id) = session.id() {
-                app.sweep_auth_sessions(observed_at);
+                app.sweep_auth_sessions(age_from);
                 app.auth_sessions.insert(
                     id,
                     Arc::new(tokio::sync::Mutex::new(SessionAuth {
                         token: Some(tok.access_token),
                         refresh: tok.refresh_token,
                         guilds: Some(GuildSnapshot {
-                            age_from: observed_at,
+                            age_from,
                             observed_at,
                             guilds: Arc::clone(&guilds),
                         }),
                         guilds_epoch: epoch,
-                        last_used: Some(observed_at),
+                        last_used: Some(age_from),
                         ..SessionAuth::default()
                     })),
                 );

@@ -5982,6 +5982,59 @@ async fn background_guild_observation_supersedes_overlapping_foreground_response
 }
 
 #[tokio::test]
+async fn delayed_guild_follower_keeps_the_original_observation() {
+    let f = Fixture::new(false).await;
+    f.enroll(10).await;
+    f.enroll(20).await;
+    let gate = Arc::new(GuildResponseGate::default());
+    f.discord
+        .guild_responses
+        .lock()
+        .unwrap()
+        .insert("Bearer fixture-token", Arc::clone(&gate));
+    let mut leader = std::pin::pin!(f.app.oauth.my_guilds_at(42, "fixture-token", 0));
+    tokio::select! {
+        result = &mut leader => panic!("leader must remain in flight: {result:?}"),
+        captured = tokio::time::timeout(std::time::Duration::from_secs(10), gate.captured.notified()) => {
+            captured.expect("leader captures the old guild list");
+        }
+    }
+
+    let mut follower = std::pin::pin!(f.app.oauth.my_guilds_at(42, "fixture-token", 0));
+    // Poll once to subscribe to the flight. Do not poll it again until the
+    // later independent request has already published its display result.
+    tokio::select! {
+        biased;
+        result = &mut follower => panic!("follower must wait for the leader: {result:?}"),
+        () = std::future::ready(()) => {}
+    }
+    gate.release.notify_one();
+    let (leader_observed_at, leader_guilds) = leader.await.unwrap();
+    *f.discord.guilds.lock().unwrap() = vec![managed_guild(20)];
+    let session = tests::session_for_user(42).await;
+    session
+        .insert(SESSION_TOKEN, "refreshed-token")
+        .await
+        .unwrap();
+    let newer = require_auth_fresh(&f.app, &session)
+        .await
+        .unwrap_or_else(|error| panic!("{:#}", error.0));
+    assert!(!newer.can_manage(10));
+
+    let (observed_at, guilds) = follower.await.unwrap();
+    let shares_payload = Arc::ptr_eq(&leader_guilds, &guilds);
+    record_display_observation(&f.app.guild_cache, 42, observed_at, guilds);
+    let (status, me) = f.request("POST", "/api/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let shown = me["guilds"].as_array().unwrap();
+    assert_eq!(shown.len(), 1, "{me}");
+    assert_eq!(shown[0]["id"], "20");
+    assert_eq!(observed_at, leader_observed_at);
+    assert!(shares_payload);
+    assert_eq!(f.discord.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn recovery_routes_require_an_authenticated_owner() {
     let routes = [
         ("GET", "/api/service-upgrade", ""),
