@@ -671,6 +671,7 @@ mod tests {
         let mut guild = Guild::default();
         guild.id = GuildId::new(guild_id);
         guild.owner_id = UserId::new(1);
+        guild.member_count = 2;
         let mut role = Role::default();
         role.id = RoleId::new(20);
         role.guild_id = guild.id;
@@ -681,6 +682,19 @@ mod tests {
         }
         let mut event: GuildCreateEvent =
             serde_json::from_value(serde_json::to_value(guild).unwrap()).unwrap();
+        cache.update(&mut event);
+    }
+
+    fn remember_settings_role(cache: &Cache, guild_id: u64) {
+        let mut role = Role::default();
+        role.id = RoleId::new(30);
+        role.guild_id = GuildId::new(guild_id);
+        let mut event: serenity::all::GuildRoleCreateEvent =
+            serde_json::from_value(serde_json::json!({
+                "guild_id": guild_id,
+                "role": role,
+            }))
+            .unwrap();
         cache.update(&mut event);
     }
 
@@ -857,6 +871,7 @@ mod tests {
             .unwrap();
         let cache = Arc::new(Cache::new());
         remember_guild(&cache, 10, None);
+        remember_settings_role(&cache, 10);
         bot.install_discord_cache(cache);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -937,8 +952,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn uncached_settings_actor_prefers_newer_gateway_observations() {
         use db::guild_data::{AccessLevel, AccessRole};
-        use serenity::all::{GuildRoleCreateEvent, GuildRoleDeleteEvent};
-        use serenity::client::EventHandler;
+        use serenity::all::{GuildMemberAddEvent, GuildMemberRemoveEvent, GuildRoleDeleteEvent};
 
         let (bot, path) = writer_bot().await;
         let enrollment = db::enroll_guild(&bot.db, 10, 100).await.unwrap().unwrap();
@@ -961,55 +975,45 @@ mod tests {
             .await
             .unwrap();
         let cache = Arc::new(Cache::new());
-        remember_guild(&cache, 10, None);
-        let mut role = Role::default();
-        role.id = RoleId::new(30);
-        let mut added: GuildRoleCreateEvent = serde_json::from_value(serde_json::json!({
-            "guild_id": "10",
-            "role": role,
-        }))
-        .unwrap();
-        cache.update(&mut added);
         bot.install_discord_cache(Arc::clone(&cache));
         let bound = spawn(Arc::clone(&bot)).unwrap().unwrap();
 
-        let http = Arc::new(
-            serenity::http::HttpBuilder::new("fixture")
-                .proxy("http://127.0.0.1:1")
-                .build(),
-        );
-        let ctx = crate::commands::mod_reason_dm::fixture_context_for_dm_order_test(
-            http,
-            Arc::clone(&cache),
-        )
-        .await;
         let calls = Arc::new(AtomicUsize::new(0));
-        for (member_left, prefix) in [(true, "!departed"), (false, "!role_deleted")] {
+        for (member_left, unrelated_join, prefix) in [
+            (true, false, "!departed"),
+            (true, true, "!departed_replaced"),
+            (false, false, "!role_deleted"),
+        ] {
+            remember_guild(&cache, 10, None);
+            remember_settings_role(&cache, 10);
             let seen = Arc::clone(&calls);
-            let app = Arc::downgrade(&bot);
-            let ctx = ctx.clone();
+            let cache = Arc::clone(&cache);
             bot.install_member_lookup(move |guild, actor| {
                 let attempt = seen.fetch_add(1, Ordering::SeqCst);
-                let handler = crate::handlers::Handler {
-                    app: app.upgrade().unwrap(),
-                };
-                let ctx = ctx.clone();
+                let cache = Arc::clone(&cache);
                 async move {
                     assert_eq!((guild, actor), (10, 7));
                     let mut member = actor_member(guild, false);
                     if attempt == 0 {
                         member.roles = vec![RoleId::new(30)];
-                        // The removal leaves no cached actor to contradict
-                        // the earlier member response with the Settings role.
+                        // Serenity updates its cache before running the callback.
                         if member_left {
-                            handler
-                                .guild_member_removal(
-                                    ctx,
-                                    member.guild_id,
-                                    member.user.clone(),
-                                    None,
-                                )
-                                .await;
+                            let mut removed: GuildMemberRemoveEvent =
+                                serde_json::from_value(serde_json::json!({
+                                    "guild_id": member.guild_id,
+                                    "user": member.user,
+                                }))
+                                .unwrap();
+                            assert!(cache.update(&mut removed).is_none());
+                            if unrelated_join {
+                                let mut other = actor_member(guild, false);
+                                other.user.id = UserId::new(8);
+                                let mut added: GuildMemberAddEvent =
+                                    serde_json::from_value(serde_json::to_value(other).unwrap())
+                                        .unwrap();
+                                cache.update(&mut added);
+                                assert_eq!(cache.guild(member.guild_id).unwrap().member_count, 2);
+                            }
                         } else {
                             let mut deleted: GuildRoleDeleteEvent =
                                 serde_json::from_value(serde_json::json!({
@@ -1017,11 +1021,7 @@ mod tests {
                                     "role_id": "30",
                                 }))
                                 .unwrap();
-                            let removed = ctx.cache.update(&mut deleted);
-                            assert!(removed.is_some());
-                            handler
-                                .guild_role_delete(ctx, deleted.guild_id, deleted.role_id, removed)
-                                .await;
+                            assert!(cache.update(&mut deleted).is_some());
                         }
                     } else if member_left {
                         return ControlMemberFetch::Absent;

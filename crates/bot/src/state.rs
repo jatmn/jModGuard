@@ -4,6 +4,8 @@ use anyhow::{Context as _, Result};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use regex::Regex;
+use serenity::model::Timestamp;
+use serenity::model::guild::Guild;
 use serenity::model::id::ChannelId;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -835,6 +837,24 @@ pub(crate) enum ControlMemberFetch {
 struct ControlMemberObservation {
     member: Box<serenity::model::guild::Member>,
     generation: u64,
+    cache_stamp: ControlMemberCacheStamp,
+}
+
+#[derive(PartialEq, Eq)]
+struct ControlMemberCacheStamp {
+    joined_at: Timestamp,
+    member_count: u64,
+    cached_members: usize,
+}
+
+impl From<&Guild> for ControlMemberCacheStamp {
+    fn from(guild: &Guild) -> Self {
+        Self {
+            joined_at: guild.joined_at,
+            member_count: guild.member_count,
+            cached_members: guild.members.len(),
+        }
+    }
 }
 
 type MemberLookup =
@@ -1375,12 +1395,21 @@ impl BotState {
             if let Some(member) = guild.members.get(&serenity::model::id::UserId::new(actor)) {
                 return Some(member_role_ids(member));
             }
-            // Member and role removals may leave no cached member to override
-            // an older HTTP response. Keep the fresh lookup if one occurred.
+            // Serenity mutates the roster and roles before our callbacks
+            // advance the generation. Fall back to a fresh lookup if either
+            // the synchronous cache or the asynchronous callbacks show a change.
+            let stamp = ControlMemberCacheStamp::from(&*guild);
             let observation = observation.filter(|observed| {
-                observed.member.guild_id.get() == guild_id
+                !guild.unavailable
+                    && observed.member.guild_id.get() == guild_id
                     && observed.member.user.id.get() == actor
                     && observed.generation == self.control_member_generation.load(Ordering::Acquire)
+                    && observed.cache_stamp == stamp
+                    && observed
+                        .member
+                        .roles
+                        .iter()
+                        .all(|role| guild.roles.contains_key(role))
             })?;
             Some(member_role_ids(&observation.member))
         });
@@ -1483,6 +1512,10 @@ impl BotState {
             return Err("actor is not allowed");
         }
         let generation = self.control_member_generation.load(Ordering::Acquire);
+        let cache_stamp = self.discord_cache.lock().clone().and_then(|cache| {
+            let guild = cache.guild(serenity::model::id::GuildId::new(guild_id as u64))?;
+            (!guild.unavailable).then(|| ControlMemberCacheStamp::from(&*guild))
+        });
         let fetched = tokio::time::timeout(
             Duration::from_secs(2),
             lookup(guild_id as u64, actor_user_id as u64),
@@ -1503,7 +1536,11 @@ impl BotState {
                 };
                 let owner = i64::try_from(guild.owner_id.get()).unwrap_or(0);
                 let permissions = permission_bits(guild.member_permissions(&member));
-                *observation = Some(ControlMemberObservation { member, generation });
+                *observation = cache_stamp.map(|cache_stamp| ControlMemberObservation {
+                    member,
+                    generation,
+                    cache_stamp,
+                });
                 db::decide_control_actor(
                     need,
                     actor_user_id,
