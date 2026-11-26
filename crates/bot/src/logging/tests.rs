@@ -1816,6 +1816,300 @@ fn audit_fixture(action: Action, target: u64, observed_ms: i64, reason: Option<&
     .unwrap()
 }
 
+type AuditRequest = (hyper::Uri, tokio::sync::oneshot::Sender<AuditLogs>);
+
+async fn held_audit_proxy() -> (
+    serenity::http::Http,
+    tokio::sync::mpsc::UnboundedReceiver<AuditRequest>,
+    tokio::task::JoinHandle<Result<(), hyper::Error>>,
+) {
+    use hyper::service::{make_service_fn, service_fn};
+    use hyper::{Body, Method, Response, Server, StatusCode};
+    use std::convert::Infallible;
+    use tokio::sync::{mpsc, oneshot};
+
+    let (requests, received) = mpsc::unbounded_channel();
+    let server = Server::bind(&"127.0.0.1:0".parse().unwrap());
+    let address = server.local_addr();
+    let server = tokio::spawn(server.serve(make_service_fn(move |_| {
+        let requests = requests.clone();
+        async move {
+            Ok::<_, Infallible>(service_fn(move |request: hyper::Request<Body>| {
+                let (reply, page) = oneshot::channel();
+                assert_eq!(request.method(), Method::GET);
+                let _ = requests.send((request.uri().clone(), reply));
+                async move {
+                    let response = match page.await {
+                        Ok(page) => Response::builder()
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&page).unwrap()))
+                            .unwrap(),
+                        Err(_) => Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .body(Body::empty())
+                            .unwrap(),
+                    };
+                    Ok::<_, Infallible>(response)
+                }
+            }))
+        }
+    })));
+    let http = serenity::http::HttpBuilder::new("fixture")
+        .proxy(format!("http://{address}"))
+        .ratelimiter_disabled(true)
+        .build();
+    (http, received, server)
+}
+
+fn assert_audit_request(uri: &hyper::Uri, guild: GuildId, action: Action) {
+    assert!(
+        uri.path().ends_with(&format!("/guilds/{guild}/audit-logs")),
+        "{uri}"
+    );
+    let query = uri.query().unwrap();
+    assert!(query.split('&').any(|part| part == "limit=100"), "{uri}");
+    assert!(
+        query
+            .split('&')
+            .any(|part| part == format!("action_type={}", action.num())),
+        "{uri}"
+    );
+}
+
+async fn overlap_audit_requests(late: bool) {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let f = Fixture::with_timeout(6);
+    let (http, mut requests, server) = held_audit_proxy().await;
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = 1_790_086_832_000;
+    let one = claims.observe(guild.get(), action, 123, observed);
+    let two = claims.observe(guild.get(), action, 124, observed);
+    let mut one = Box::pin(lookup_member_audit(&f.app, &http, guild, &one));
+    let (uri, reply) = tokio::select! {
+        request = requests.recv() => request.unwrap(),
+        _ = &mut one => panic!("first lookup ended before the HTTP request"),
+    };
+    assert_audit_request(&uri, guild, action);
+    let mut two = Box::pin(lookup_member_audit(&f.app, &http, guild, &two));
+    assert!(
+        poll_fn(|cx| Poll::Ready(two.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+
+    let second_page = || audit_fixture(action, 124, observed + 1, Some("second target"));
+    let mut first_page = audit_fixture(action, 123, observed, Some("first target"));
+    if !late {
+        first_page.entries.extend(second_page().entries);
+    }
+    reply.send(first_page).unwrap();
+
+    let mut lookups = std::pin::pin!(async { tokio::join!(one, two) });
+    let mut additional_reads = 0;
+    let (one, two) = loop {
+        tokio::select! {
+            result = &mut lookups => break result,
+            request = requests.recv() => {
+                let (uri, reply) = request.unwrap();
+                assert_audit_request(&uri, guild, action);
+                additional_reads += 1;
+                reply.send(second_page()).unwrap();
+            }
+        }
+    };
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    assert_eq!(one.unwrap()["reason"], "first target");
+    assert_eq!(two.unwrap()["reason"], "second target");
+    assert_eq!(additional_reads, usize::from(late), "extra GET requests");
+}
+
+#[tokio::test]
+async fn member_audit_overlapping_targets_share_one_get() {
+    overlap_audit_requests(false).await;
+}
+
+#[tokio::test]
+async fn member_audit_late_target_uses_a_new_page() {
+    overlap_audit_requests(true).await;
+}
+
+#[tokio::test]
+async fn member_audit_cancelled_waiter_and_other_keys_leave_the_page_in_flight() {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let f = Fixture::with_timeout(6);
+    let (http, mut requests, server) = held_audit_proxy().await;
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let other_guild = GuildId::new(790);
+    let ban = member_audit_action("member_ban").unwrap();
+    let unban = member_audit_action("member_unban").unwrap();
+    let observed = 1_790_086_832_000;
+    let first = claims.observe(guild.get(), ban, 123, observed);
+    let cancelled = claims.observe(guild.get(), ban, 124, observed);
+    let elsewhere = claims.observe(other_guild.get(), ban, 123, observed);
+    let other_action = claims.observe(guild.get(), unban, 123, observed);
+    let mut first = Box::pin(lookup_member_audit(&f.app, &http, guild, &first));
+    let (uri, held) = tokio::select! {
+        request = requests.recv() => request.unwrap(),
+        _ = &mut first => panic!("first lookup ended before the HTTP request"),
+    };
+    assert_audit_request(&uri, guild, ban);
+    let mut cancelled = Box::pin(lookup_member_audit(&f.app, &http, guild, &cancelled));
+    assert!(
+        poll_fn(|cx| Poll::Ready(cancelled.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    drop(cancelled);
+
+    let (elsewhere, other_action, ()) = tokio::join!(
+        lookup_member_audit(&f.app, &http, other_guild, &elsewhere),
+        lookup_member_audit(&f.app, &http, guild, &other_action),
+        async {
+            let mut distinct = HashSet::new();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                for _ in 0..2 {
+                    let (uri, reply) = requests.recv().await.unwrap();
+                    let (guild, action, reason) = if uri.path().contains("/guilds/790/") {
+                        (other_guild, ban, "other guild")
+                    } else {
+                        (guild, unban, "other action")
+                    };
+                    assert_audit_request(&uri, guild, action);
+                    assert!(distinct.insert((guild, action.num())));
+                    reply
+                        .send(audit_fixture(action, 123, observed, Some(reason)))
+                        .unwrap();
+                }
+            })
+            .await
+            .expect("separate keys must make their own requests while the first is held");
+        },
+    );
+    assert_eq!(elsewhere.unwrap()["reason"], "other guild");
+    assert_eq!(other_action.unwrap()["reason"], "other action");
+    held.send(audit_fixture(ban, 123, observed, Some("held page")))
+        .unwrap();
+    assert_eq!(first.await.unwrap()["reason"], "held page");
+    assert!(requests.try_recv().is_err(), "cancelled waiter sent a GET");
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+struct HeldAuditSink {
+    observed: i64,
+    calls: std::sync::atomic::AtomicUsize,
+    miss_first: bool,
+}
+
+#[serenity::async_trait]
+impl LogDelivery for HeldAuditSink {
+    async fn send(&self, _: ChannelId, _: CreateMessage) -> anyhow::Result<()> {
+        unreachable!()
+    }
+
+    async fn member_audit(&self, _: GuildId, action: Action) -> anyhow::Result<AuditLogs> {
+        let mut page = audit_fixture(action, 123, self.observed, Some("fresh retry"));
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match (self.miss_first, call) {
+            (true, 0) => page.entries.clear(),
+            (true, 1) | (false, 0) => std::future::pending().await,
+            _ => {}
+        }
+        Ok(page)
+    }
+}
+
+#[tokio::test]
+async fn member_audit_retry_uses_a_page_started_after_its_wait() {
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::Ordering;
+    use std::task::Poll;
+
+    let f = Fixture::with_timeout(6);
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = 1_790_086_832_000;
+    let target = claims.observe(guild.get(), action, 123, observed);
+    let other = claims.observe(guild.get(), action, 124, observed);
+    let sink = HeldAuditSink {
+        observed,
+        calls: Default::default(),
+        miss_first: true,
+    };
+
+    tokio::time::pause();
+    let mut target = Box::pin(lookup_member_audit(&f.app, &sink, guild, &target));
+    assert!(
+        poll_fn(|cx| Poll::Ready(target.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    tokio::time::advance(Duration::from_millis(250)).await;
+    let mut other = Box::pin(lookup_member_audit(&f.app, &sink, guild, &other));
+    assert!(
+        poll_fn(|cx| Poll::Ready(other.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    assert_eq!(sink.calls.load(Ordering::Relaxed), 2);
+    assert_eq!(target.await.unwrap()["reason"], "fresh retry");
+    assert_eq!(sink.calls.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn member_audit_waiter_keeps_its_deadline_after_the_owner_expires() {
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::Ordering;
+    use std::task::Poll;
+
+    let f = Fixture::with_timeout(6);
+    let claims = &f.app.member_audits;
+    let guild = GuildId::new(789);
+    let action = member_audit_action("member_ban").unwrap();
+    let observed = 1_790_086_832_000;
+    let owner = claims.observe(guild.get(), action, 124, observed);
+    let waiter = claims.observe(guild.get(), action, 123, observed);
+    let sink = HeldAuditSink {
+        observed,
+        calls: Default::default(),
+        miss_first: false,
+    };
+
+    tokio::time::pause();
+    let mut owner = Box::pin(lookup_member_audit(&f.app, &sink, guild, &owner));
+    assert!(
+        poll_fn(|cx| Poll::Ready(owner.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let mut waiter = Box::pin(lookup_member_audit(&f.app, &sink, guild, &waiter));
+    assert!(
+        poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    assert_eq!(
+        sink.calls.load(Ordering::Relaxed),
+        1,
+        "waiter shares the held GET"
+    );
+    assert!(owner.await.is_none());
+    assert_eq!(waiter.await.unwrap()["reason"], "fresh retry");
+    assert_eq!(sink.calls.load(Ordering::Relaxed), 2);
+}
+
 #[test]
 fn member_audit_requires_unique_recent_target_and_action() {
     let observed = 1_790_086_832_000;

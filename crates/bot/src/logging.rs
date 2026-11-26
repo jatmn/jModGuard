@@ -14,6 +14,7 @@ use crate::{db, templates};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
+use tokio::{sync::watch, time::Instant as TokioInstant};
 
 mod cleanup_incident;
 #[cfg(test)]
@@ -34,6 +35,7 @@ pub(crate) const REJOIN_NOTE_DELIVERY_LIMIT: usize = 4096;
 const REJOIN_NOTE_PRUNE_BATCH: usize = 64;
 const MEMBER_AUDIT_KEEP: Duration = Duration::from_secs(30);
 const MEMBER_AUDIT_LIMIT: usize = 4096;
+const MEMBER_AUDIT_RETRY_DELAY: Duration = Duration::from_millis(500);
 const SHUTDOWN_NOTICE_PHASE: Duration = Duration::from_secs(3);
 
 #[cfg(test)]
@@ -97,9 +99,60 @@ where
 #[derive(Default)]
 pub struct MemberAuditClaims {
     inner: Mutex<MemberAuditState>,
+    fetches: MemberAuditFetches,
 }
 
 type MemberAuditKey = (u64, u64, u8);
+type MemberAuditFetchKey = (GuildId, u8);
+type MemberAuditPage = Result<Arc<AuditLogs>, ()>;
+type MemberAuditPageSender = watch::Sender<Option<MemberAuditPage>>;
+type MemberAuditFetches = Mutex<HashMap<MemberAuditFetchKey, MemberAuditFetch>>;
+
+struct MemberAuditFetch {
+    started: TokioInstant,
+    sender: MemberAuditPageSender,
+}
+
+enum MemberAuditPageRequest<'a> {
+    Fetch(MemberAuditFetchGuard<'a>),
+    Wait(watch::Receiver<Option<MemberAuditPage>>),
+}
+
+/// Keeps only the current in-progress request discoverable. An older request
+/// may finish for its original waiters after a fresher request starts.
+struct MemberAuditFetchGuard<'a> {
+    fetches: &'a MemberAuditFetches,
+    key: MemberAuditFetchKey,
+    sender: Option<MemberAuditPageSender>,
+}
+
+impl MemberAuditFetchGuard<'_> {
+    fn unregister(&mut self) -> Option<MemberAuditPageSender> {
+        let sender = self.sender.take()?;
+        let mut fetches = self.fetches.lock();
+        if fetches
+            .get(&self.key)
+            .is_some_and(|fetch| fetch.sender.same_channel(&sender))
+        {
+            fetches.remove(&self.key);
+        }
+        Some(sender)
+    }
+
+    fn publish(mut self, page: MemberAuditPage) {
+        // New readers must fetch a new page as soon as this one finishes.
+        if let Some(sender) = self.unregister() {
+            sender.send_replace(Some(page));
+        }
+    }
+}
+
+impl Drop for MemberAuditFetchGuard<'_> {
+    fn drop(&mut self) {
+        // Cancellation closes the channel, so a waiter can fetch for itself.
+        drop(self.unregister());
+    }
+}
 
 #[derive(Default)]
 struct MemberAuditState {
@@ -213,6 +266,67 @@ impl MemberAuditClaims {
 
     fn has_unclaimed_subject(&self, observation: &MemberAuditObservation) -> bool {
         self.inner.lock().unclaimed_subject(observation).is_some()
+    }
+
+    fn join_page_request(
+        &self,
+        key: MemberAuditFetchKey,
+        retry_at: Option<TokioInstant>,
+    ) -> MemberAuditPageRequest<'_> {
+        let mut fetches = self.fetches.lock();
+        let now = TokioInstant::now();
+        if let Some(fetch) = fetches.get(&key)
+            && now.saturating_duration_since(fetch.started) < MEMBER_AUDIT_RETRY_DELAY
+            && retry_at.is_none_or(|retry_at| fetch.started >= retry_at)
+        {
+            return MemberAuditPageRequest::Wait(fetch.sender.subscribe());
+        }
+        // Gateway bans and report enrichment both hold a log delivery slot
+        // for the lookup. Those slots bound concurrent registrations.
+        let (sender, _) = watch::channel(None);
+        fetches.insert(
+            key,
+            MemberAuditFetch {
+                started: now,
+                sender: sender.clone(),
+            },
+        );
+        MemberAuditPageRequest::Fetch(MemberAuditFetchGuard {
+            fetches: &self.fetches,
+            key,
+            sender: Some(sender),
+        })
+    }
+
+    async fn fetch_page(
+        &self,
+        sink: &impl LogDelivery,
+        guild: GuildId,
+        observation: &MemberAuditObservation,
+        retry_at: Option<TokioInstant>,
+    ) -> Option<Arc<AuditLogs>> {
+        let key = (guild, observation.action.num());
+        while self.has_unclaimed_subject(observation) {
+            match self.join_page_request(key, retry_at) {
+                MemberAuditPageRequest::Fetch(request) => {
+                    let page = sink
+                        .member_audit(guild, observation.action)
+                        .await
+                        .map(Arc::new)
+                        .map_err(|_| ());
+                    request.publish(page.clone());
+                    return page.ok();
+                }
+                MemberAuditPageRequest::Wait(mut waiter) => {
+                    if let Ok(page) = waiter.wait_for(Option::is_some).await {
+                        return page.clone().and_then(Result::ok);
+                    }
+                    // The owner was cancelled. Recheck eligibility and retry
+                    // this round within our own lookup deadline.
+                }
+            }
+        }
+        None
     }
 
     fn claim(
@@ -1052,19 +1166,19 @@ pub(crate) async fn lookup_member_audit(
         .div_f64(2.0)
         .min(Duration::from_secs(3));
     tokio::time::timeout(budget, async {
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut retry_at = None;
+        for _ in 0..3 {
+            if let Some(retry_at) = retry_at {
+                tokio::time::sleep_until(retry_at).await;
             }
-            // Stop only on permanent subject ineligibility. The claim still
-            // checks under its lock because the subject can change during I/O.
-            if !app.member_audits.has_unclaimed_subject(observation) {
-                return None;
-            }
-            let logs = sink.member_audit(guild_id, observation.action).await.ok()?;
+            let logs = app
+                .member_audits
+                .fetch_page(sink, guild_id, observation, retry_at)
+                .await?;
             if let Some(context) = app.member_audits.claim(observation, &logs) {
                 return Some(context);
             }
+            retry_at = Some(TokioInstant::now() + MEMBER_AUDIT_RETRY_DELAY);
         }
         None
     })
