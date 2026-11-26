@@ -8791,23 +8791,13 @@ function openCaseView(props) {
   });
 }
 
-// The case-history contract admits at most this many entries per case.
+// The case-history contract admits at most this many entries per case, so one
+// page of this size holds the whole history.
 const CASE_HISTORY_MAX_ENTRIES = 64;
 
 async function loadCaseHistory(base, signal) {
-  // A short page ends the history, and so does reaching the case's entry limit.
-  const limit = CASE_HISTORY_MAX_ENTRIES;
-  const entries = [];
-  let names = {};
-  let after = "0";
-  for (;;) {
-    const page = await api(`${base}/history?limit=${limit}&after=${after}`, "GET", null, signal);
-    const found = page?.history || [];
-    entries.push(...found);
-    names = { ...names, ...(page?.names || {}) };
-    if (found.length < limit || entries.length >= CASE_HISTORY_MAX_ENTRIES) return { entries, names };
-    after = found[found.length - 1].sequence;
-  }
+  const page = await api(`${base}/history?limit=${CASE_HISTORY_MAX_ENTRIES}&after=0`, "GET", null, signal);
+  return { entries: page?.history || [], names: page?.names || {} };
 }
 
 // The case file dialog (#624). Opens at once and reads the case, its history,
