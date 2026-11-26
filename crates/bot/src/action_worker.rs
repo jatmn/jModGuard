@@ -1107,7 +1107,7 @@ pub async fn execute(
 /// Bounded sequential batch. No process restart or lease expiry replays a claim.
 #[cfg(test)]
 pub async fn drain(db: &Db, discord: &impl DiscordActions, limits: &WorkerLimits) -> Result<()> {
-    drain_inner(db, None, None, discord, limits).await
+    drain_inner(db, None, None, discord, limits, None).await
 }
 
 /// Production drain with tenant-case recording for attempted remote actions.
@@ -1117,7 +1117,7 @@ pub async fn drain_with_tenant(
     discord: &impl DiscordActions,
     limits: &WorkerLimits,
 ) -> Result<()> {
-    drain_inner(db, Some(tenant), None, discord, limits).await
+    drain_inner(db, Some(tenant), None, discord, limits, None).await
 }
 
 /// Bot scheduler entry point: records tenant cases and correlates gateway echoes.
@@ -1126,7 +1126,46 @@ pub async fn drain_with_state(
     discord: &impl DiscordActions,
     limits: &WorkerLimits,
 ) -> Result<()> {
-    drain_inner(&app.db, Some(&app.tenant), Some(app), discord, limits).await?;
+    drain_with_advisory_db(
+        app,
+        &app.db,
+        discord,
+        limits,
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+}
+
+async fn drain_with_advisory_db(
+    app: &crate::state::BotState,
+    advisory_db: &Db,
+    discord: &impl DiscordActions,
+    limits: &WorkerLimits,
+    now: i64,
+) -> Result<()> {
+    limits.validate()?;
+    let waiting_guilds = app.expiry_check_retries.waiting(now);
+    let first_due_at = match db::bot_work_due(advisory_db, now, &waiting_guilds).await {
+        Ok(db::BotWorkDue::Idle) => return Ok(()),
+        Ok(db::BotWorkDue::BanExpiry) => {
+            return expire_advised_bans(&app.db, Some(app), discord, now, limits, waiting_guilds)
+                .await;
+        }
+        Ok(db::BotWorkDue::Action) => Some(now),
+        // Retain the established action-first checks if the combined read fails.
+        Err(_) => None,
+    };
+    drain_inner(
+        &app.db,
+        Some(&app.tenant),
+        Some(app),
+        discord,
+        limits,
+        first_due_at,
+    )
+    .await?;
+    // A drain may have changed the ban rows or taken time. Use a new expiry
+    // read even when the original combined read found no due ban.
     expire_bans(
         &app.db,
         Some(app),
@@ -1158,16 +1197,26 @@ async fn expire_bans(
     now: i64,
     limits: &WorkerLimits,
 ) -> Result<()> {
-    expire_bans_with_advisory_db(db, db, app, discord, now, limits).await
+    if app.is_some_and(|app| !app.activation.may_record()) {
+        return Ok(());
+    }
+    let waiting_guilds = app
+        .map(|app| app.expiry_check_retries.waiting(now))
+        .unwrap_or_default();
+    if !db::expired_ban_may_be_due(db, now, &waiting_guilds).await? {
+        // A stale advisory miss keeps retry history for the next poll.
+        return Ok(());
+    }
+    expire_advised_bans(db, app, discord, now, limits, waiting_guilds).await
 }
 
-async fn expire_bans_with_advisory_db(
+async fn expire_advised_bans(
     db: &Db,
-    advisory_db: &Db,
     app: Option<&crate::state::BotState>,
     discord: &impl DiscordActions,
     now: i64,
     limits: &WorkerLimits,
+    mut deferred_guilds: Vec<i64>,
 ) -> Result<()> {
     // Deferred bans stay due and are skipped only for the rest of this pass.
     // A failed membership check skips the whole guild for this pass and, with
@@ -1180,17 +1229,6 @@ async fn expire_bans_with_advisory_db(
     // therefore cannot starve guilds that have not failed, or a retry that has
     // waited longer. Each read, found or not, counts against the batch, and
     // one read passes over every earlier retry guild that has no due ban.
-    // An advisory miss defers the poll and preserves retry history because
-    // the replica may not have seen a change that made a ban eligible.
-    if app.is_some_and(|app| !app.activation.may_record()) {
-        return Ok(());
-    }
-    let mut deferred_guilds = app
-        .map(|app| app.expiry_check_retries.waiting(now))
-        .unwrap_or_default();
-    if !db::expired_ban_may_be_due(advisory_db, now, &deferred_guilds).await? {
-        return Ok(());
-    }
     let started = tokio::time::Instant::now();
     let mut deferred = Vec::new();
     let mut retries = app
@@ -1559,10 +1597,16 @@ async fn drain_inner(
     app: Option<&crate::state::BotState>,
     discord: &impl DiscordActions,
     limits: &WorkerLimits,
+    mut first_due_at: Option<i64>,
 ) -> Result<()> {
     limits.validate()?;
     for _ in 0..limits.batch_size {
-        let Some(job) = db::claim_bot_action(db, chrono::Utc::now().timestamp()).await? else {
+        let job = if let Some(now) = first_due_at.take() {
+            db::claim_advised_bot_action(db, now).await?
+        } else {
+            db::claim_bot_action(db, chrono::Utc::now().timestamp()).await?
+        };
+        let Some(job) = job else {
             break;
         };
         if let Err(error) = execute_inner(db, tenant, app, discord, &job, limits).await {

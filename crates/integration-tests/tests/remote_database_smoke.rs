@@ -363,7 +363,8 @@ async fn exercise_remote_capacity_race(bot: &Db, api: &Db) {
 async fn exercise_action_storage(bot: &Db, api: &Db) {
     use jmodguard::bot_actions::{Action, Limits};
     use jmodguard::db::{
-        begin_bot_action, bot_action, claim_bot_action, enqueue_bot_action, finish_bot_action,
+        BotWorkDue, begin_bot_action, bot_action, bot_work_due, claim_advised_bot_action,
+        enqueue_bot_action, finish_bot_action,
     };
     jmodguard::db::enroll_guild(bot, 900, 100).await.unwrap();
     let version = get_config_version(api).await.unwrap();
@@ -396,7 +397,11 @@ async fn exercise_action_storage(bot: &Db, api: &Db) {
     .unwrap();
     assert_eq!(first.id, retry.id);
     assert!(bot_action(bot, 901, &first.id).await.unwrap().is_none());
-    let claim = claim_bot_action(bot, 1001).await.unwrap().unwrap();
+    assert_eq!(
+        bot_work_due(bot, 1001, &[]).await.unwrap(),
+        BotWorkDue::Action
+    );
+    let claim = claim_advised_bot_action(bot, 1001).await.unwrap().unwrap();
     assert_eq!(claim.id, first.id);
     test_drop_next_commit_response();
     assert!(begin_bot_action(bot, &claim, 1001).await.unwrap());

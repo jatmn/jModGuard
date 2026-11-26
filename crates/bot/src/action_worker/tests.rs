@@ -2001,6 +2001,149 @@ async fn arm_expiry(
 }
 
 #[tokio::test]
+async fn scheduler_combines_idle_checks_and_runs_actions_before_expiries() {
+    const GUILD: i64 = 10;
+    const ACTION_USER: i64 = 20;
+    const EXPIRY_USER: i64 = 21;
+
+    for (action_due, expiry_due) in [(false, false), (true, false), (false, true), (true, true)] {
+        let probe = std::sync::Arc::new(db::StartupProbe::default());
+        let f = {
+            let _probe = db::enter_startup_probe(Some(probe.clone()));
+            Fixture::new()
+        };
+        let app = crate::state::BotState::new(Default::default(), f.db.clone()).unwrap();
+        app.activation.mark_lock_held(true);
+        if action_due {
+            f.enqueue(GUILD, "queued", unban(ACTION_USER)).await;
+        }
+        if expiry_due {
+            let enrollment = db::enroll_guild(&f.db, GUILD, 1).await.unwrap().unwrap();
+            db::record_ban(&f.db, GUILD, EXPIRY_USER, None, "temporary")
+                .await
+                .unwrap();
+            arm_expiry(&f.db, enrollment, EXPIRY_USER, f.request_time - 1)
+                .await
+                .unwrap();
+        }
+        let queries = probe.queries();
+        let transactions = probe.transactions();
+        let discord = MockDiscord::default();
+        drain_with_state(&app, &discord, &WorkerLimits::default())
+            .await
+            .unwrap();
+
+        let expected: Vec<_> = action_due
+            .then_some((GUILD, ACTION_USER, "test reason".into()))
+            .into_iter()
+            .chain(expiry_due.then_some((GUILD, EXPIRY_USER, "Ban duration expired".into())))
+            .collect();
+        assert_eq!(*discord.unbans.lock().unwrap(), expected);
+        if !action_due && !expiry_due {
+            assert_eq!(
+                probe.queries() - queries,
+                1,
+                "idle tick advisory statements"
+            );
+            assert_eq!(probe.transactions(), transactions);
+        }
+    }
+}
+
+#[tokio::test]
+async fn scheduler_revalidates_stale_hits_and_falls_back_on_an_advisory_error() {
+    const GUILD: i64 = 10;
+    const ACTION_USER: i64 = 20;
+    const EXPIRY_USER: i64 = 21;
+
+    let primary = Fixture::new();
+    let replica = Fixture::new();
+    let app = crate::state::BotState::new(Default::default(), primary.db.clone()).unwrap();
+    app.activation.mark_lock_held(true);
+    let discord = MockDiscord::default();
+    let limits = WorkerLimits::default();
+    let now = primary.request_time;
+    let action = primary.enqueue(GUILD, "queued", unban(ACTION_USER)).await;
+    for fixture in [&primary, &replica] {
+        let enrollment = db::enroll_guild(&fixture.db, GUILD, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        db::record_ban(&fixture.db, GUILD, EXPIRY_USER, None, "temporary")
+            .await
+            .unwrap();
+        arm_expiry(&fixture.db, enrollment, EXPIRY_USER, now - 1)
+            .await
+            .unwrap();
+    }
+
+    primary.fence_guild(GUILD).await;
+    // A stale expiry hit, then a stale preferred action hit. The primary
+    // fence still blocks both Discord dispatches.
+    for expected in [db::BotWorkDue::BanExpiry, db::BotWorkDue::Action] {
+        if expected == db::BotWorkDue::Action {
+            replica.enqueue(GUILD, "queued", unban(ACTION_USER)).await;
+        }
+        assert_eq!(
+            db::bot_work_due(&replica.db, now, &[]).await.unwrap(),
+            expected
+        );
+        drain_with_advisory_db(&app, &replica.db, &discord, &limits, now)
+            .await
+            .unwrap();
+        assert_eq!(discord.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            primary.persisted_status(&action).await,
+            ("pending".into(), None)
+        );
+        assert!(
+            db::active_ban_row(&primary.db, GUILD, EXPIRY_USER)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // Unlike a fresh claim, overdue receipt housekeeping must still wake
+    // the worker while the guild is fenced.
+    assert_eq!(
+        db::bot_work_due(&primary.db, action.expires_at, &[])
+            .await
+            .unwrap(),
+        db::BotWorkDue::Action
+    );
+    replica
+        .db
+        .with_conn(|conn| conn.execute_batch_bounded("DROP TABLE bans", 4096))
+        .await
+        .unwrap();
+    assert!(db::bot_work_due(&replica.db, now, &[]).await.is_err());
+
+    primary
+        .db
+        .with_conn(|conn| {
+            conn.execute_bounded(
+                "DELETE FROM guild_write_fences WHERE guild_id=?1",
+                params![GUILD],
+                4096,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    drain_with_advisory_db(&app, &replica.db, &discord, &limits, now)
+        .await
+        .unwrap();
+    assert_eq!(
+        *discord.unbans.lock().unwrap(),
+        [
+            (GUILD, ACTION_USER, "test reason".into()),
+            (GUILD, EXPIRY_USER, "Ban duration expired".into()),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn timed_ban_dispatches_only_when_due_and_marks_unbanned() {
     let probe = std::sync::Arc::new(db::StartupProbe::default());
     let f = {
@@ -2265,7 +2408,7 @@ async fn timed_ban_expiry_skips_an_unavailable_guild_without_starving_later_guil
     };
 
     for (poll, now) in [200, 215, 230].into_iter().enumerate() {
-        expire_bans(&f.db, Some(&app), &discord, now, &limits)
+        drain_with_advisory_db(&app, &f.db, &discord, &limits, now)
             .await
             .unwrap();
         // One failed check skips guild 10 for the rest of the poll and until
@@ -2287,12 +2430,12 @@ async fn timed_ban_expiry_skips_an_unavailable_guild_without_starving_later_guil
 
     // The deferred deadlines remain due once the guild's check recovers.
     let discord = MockDiscord::default();
-    expire_bans(
+    drain_with_advisory_db(
+        &app,
         &f.db,
-        Some(&app),
         &discord,
-        200 + EXPIRY_CHECK_RETRY_BASE_SECS,
         &limits,
+        200 + EXPIRY_CHECK_RETRY_BASE_SECS,
     )
     .await
     .unwrap();
@@ -2648,16 +2791,9 @@ async fn timed_ban_expiry_preserves_due_retry_across_stale_fence() {
             .unwrap()
     );
     let transactions = probe.transactions();
-    expire_bans_with_advisory_db(
-        &primary.db,
-        &replica.db,
-        Some(&app),
-        &available,
-        due,
-        &limits,
-    )
-    .await
-    .unwrap();
+    drain_with_advisory_db(&app, &replica.db, &available, &limits, due)
+        .await
+        .unwrap();
     assert_eq!(probe.transactions(), transactions);
     assert_eq!(available.calls.load(Ordering::SeqCst), 0);
     assert_eq!(
