@@ -445,20 +445,19 @@ pub async fn claim_advised_bot_action(db: &Db, now: i64) -> Result<Option<BotAct
         .await
 }
 
+const EXPIRE_UNSTARTED_SQL: &str =
+    "UPDATE bot_actions SET state='expired',outcome='expired_before_execution',finished_at=?1
+         WHERE id IN (SELECT id FROM bot_actions
+         WHERE state IN ('pending','claimed') AND expires_at<=?1 LIMIT 64)";
+const MARK_EXPIRED_RUNNING_UNCERTAIN_SQL: &str =
+    "UPDATE bot_actions SET state='uncertain',outcome='worker_outcome_unknown'
+         WHERE id IN (SELECT id FROM bot_actions
+         WHERE state='running' AND expires_at<=?1 LIMIT 64)";
+
 fn claim_bot_action_conn(conn: &mut Connection, now: i64) -> Result<Option<BotAction>> {
     let tx = conn.transaction_immediate()?;
-    tx.execute_matching(
-        "UPDATE bot_actions SET state='expired',outcome='expired_before_execution',finished_at=?1
-         WHERE id IN (SELECT id FROM bot_actions
-         WHERE state IN ('pending','claimed') AND expires_at<=?1 LIMIT 64)",
-        params![now],
-    )?;
-    tx.execute_matching(
-        "UPDATE bot_actions SET state='uncertain',outcome='worker_outcome_unknown'
-         WHERE id IN (SELECT id FROM bot_actions
-         WHERE state='running' AND expires_at<=?1 LIMIT 64)",
-        params![now],
-    )?;
+    tx.execute_matching(EXPIRE_UNSTARTED_SQL, params![now])?;
+    tx.execute_matching(MARK_EXPIRED_RUNNING_UNCERTAIN_SQL, params![now])?;
     let job = tx
         .query_row(&claim_next_sql(), params![now], row_action)
         .optional()?;
@@ -1070,18 +1069,27 @@ pub async fn bot_action_can_dispatch(db: &Db, job: &BotAction) -> Result<bool> {
 mod query_plan_tests {
     use super::*;
     #[test]
-    fn action_poll_and_claim_use_index_searches() {
+    fn action_poll_claim_and_expiry_use_index_searches() {
         let path =
             std::env::temp_dir().join(format!("action_plans_{:032x}.db", rand::random::<u128>()));
         let db = Db::open(&path, 2).unwrap();
         db.with_conn_sync(|conn| {
             crate::db::tests::assert_index_plan(conn, &poll_due_sql(), params![123], false);
             crate::db::tests::assert_index_plan(conn, &claim_next_sql(), params![123], true);
-            let mut stmt = conn.prepare("EXPLAIN QUERY PLAN SELECT id FROM bot_actions WHERE state IN ('pending','claimed','running') AND expires_at<=?1 LIMIT 64")?;
-            let plan = stmt.query_map(params![123], |r| Ok(r.get::<String>(3)?))?.collect::<Result<Vec<_>>>()?;
-            assert!(plan.iter().any(|line| line.contains("state=? AND expires_at<?")), "expiry must use a range search: {plan:?}");
+            for sql in [EXPIRE_UNSTARTED_SQL, MARK_EXPIRED_RUNNING_UNCERTAIN_SQL] {
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                let plan = stmt
+                    .query_map(params![123], |r| Ok(r.get::<String>(3)?))?
+                    .collect::<Result<Vec<_>>>()?;
+                assert!(
+                    plan.iter()
+                        .any(|line| line.contains("bot_actions_expiry (state=? AND expires_at<?)")),
+                    "expiry must use a range search for {sql}: {plan:?}"
+                );
+            }
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         drop(db);
         let _ = std::fs::remove_file(path);
     }
