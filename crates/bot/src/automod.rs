@@ -7,6 +7,7 @@
 //! tracked users.
 
 use dashmap::DashMap;
+use jmodguard::custom_rules::word_tokens;
 use parking_lot::Mutex;
 use regex::Regex;
 use serenity::client::Context;
@@ -360,6 +361,8 @@ impl AutomodEngine {
         // evaluation clock, which never runs backwards for one author.
         let arrived = ctx.received.unwrap_or(now);
         let normalized = LazyCell::new(|| normalize::normalize_lenient(ctx.content));
+        let literal = LazyCell::new(|| ctx.content.to_lowercase());
+        let message_words = LazyCell::new(|| (word_tokens(&literal), word_tokens(&normalized)));
         let compact = LazyCell::new(|| normalize::compact_normalized(&normalized));
         let matches_pattern = |pattern: &Regex| {
             pattern.is_match(ctx.content)
@@ -529,10 +532,10 @@ impl AutomodEngine {
                     .custom_patterns
                     .get(rule_id)
                     .is_some_and(matches_pattern),
-                "word" => {
-                    let words = jmodguard::custom_rules::custom_words(rule);
-                    jmodguard::custom_rules::word_rule_matches(ctx.content, &words)
-                }
+                "word" => cfg.custom_words.get(rule_id).is_some_and(|dictionary| {
+                    let (literal, normalized) = LazyCell::force(&message_words);
+                    dictionary.matches(literal, normalized)
+                }),
                 "channel_content" => {
                     use jmodguard::custom_rules::{channel_link_blocked, content_toggle};
                     (content_toggle(rule, "attachments") && ctx.attachment_count > 0)
@@ -3229,6 +3232,7 @@ mod tests {
             known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: HashMap::new(),
         };
         let roles = [];
@@ -3277,6 +3281,7 @@ mod tests {
             known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
+            custom_words: CachedGuildConfig::compile_custom_words(rules),
             custom_patterns: patterns.clone(),
         }
     }
@@ -3433,16 +3438,21 @@ mod tests {
         };
         let mut invalid_action = pattern_rule("^jmodguard873invalidaction$");
         invalid_action.actions.clear();
+        let word_id = "custom:00000003";
+        let mut word_rule = custom_rule(
+            serde_json::json!({
+                "kind": "word",
+                "words": ["jmodguardlegacyword", "sc@m", "CAFÉ"]
+            }),
+            "delete",
+        );
+        word_rule.include_channels = vec![1, 2];
+        word_rule.whitelist_channels = vec![2];
+        word_rule.whitelist_roles = vec![99];
         let rows = [
             ("custom:00000001", pattern_rule("^jmodguard873first$")),
             ("custom:00000002", pattern_rule("^jmodguard873second$")),
-            (
-                "custom:00000003",
-                custom_rule(
-                    serde_json::json!({ "kind": "word", "words": ["jmodguardlegacyword"] }),
-                    "delete",
-                ),
-            ),
+            (word_id, word_rule),
             ("custom:00000004", invalid_action),
             ("custom:00000005", pattern_rule("^jmodguard873unclosed(")),
             (
@@ -3479,22 +3489,51 @@ mod tests {
             ["custom:00000001", "custom:00000002", "custom:00000003"]
         );
         assert_eq!(cfg.custom_patterns.len(), 2);
-        let engine = AutomodEngine::new();
+        // Keep the probes independent of the built-in velocity counters.
+        let evaluate = |config: &CachedGuildConfig, message: &MsgCtx<'_>| {
+            AutomodEngine::new().evaluate(config, message)
+        };
         for (content, id) in [
             ("jmodguard873first", "custom:00000001"),
             ("jmodguard873second", "custom:00000002"),
-            ("jmodguardlegacyword", "custom:00000003"),
+            ("jmodguardlegacyword", word_id),
+            ("(SCAM.)", word_id),
+            ("CAFÉ!", word_id),
+            ("cafe\u{301}", word_id),
         ] {
-            let matched = engine
-                .evaluate(&cfg, &msg(1, content, 0, false, false))
-                .unwrap();
+            let matched = evaluate(&cfg, &msg(1, content, 0, false, false)).unwrap();
             assert_eq!(matched.rule_id, id);
         }
-        assert!(
-            engine
-                .evaluate(&cfg, &msg(1, "jmodguard873invalidaction", 0, false, false))
-                .is_none()
-        );
+        for content in ["jmodguard873invalidaction", "sc@m!", "scamper", "caféteria"] {
+            assert!(
+                evaluate(&cfg, &msg(1, content, 0, false, false)).is_none(),
+                "{content}"
+            );
+        }
+        for channel in [2, 3] {
+            assert!(
+                evaluate(&cfg, &msg(channel, "SCAM", 0, false, false)).is_none(),
+                "channel {channel}"
+            );
+        }
+        let role_exempt = MsgCtx {
+            member_roles: &[99],
+            ..msg(1, "SCAM", 0, false, false)
+        };
+        assert!(evaluate(&cfg, &role_exempt).is_none());
+
+        let mut revised = cfg.rules[word_id].clone();
+        revised.params["words"] = serde_json::json!(["revised"]);
+        crate::db::upsert_rule(&app.db, 1, word_id, &revised)
+            .await
+            .unwrap();
+        app.invalidate_configs();
+        let reloaded = app.configs.get(&app.db, 1).await.unwrap();
+        let previous = msg(1, "CAFÉ!", 0, false, false);
+        let updated = msg(1, "REVISED.", 0, false, false);
+        assert!(evaluate(&cfg, &previous).is_some());
+        assert!(evaluate(&reloaded, &previous).is_none());
+        assert_eq!(evaluate(&reloaded, &updated).unwrap().rule_id, word_id);
         drop(app);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -4212,6 +4251,7 @@ mod tests {
             known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: HashMap::new(),
         };
         let roles = [];
@@ -4482,6 +4522,7 @@ mod tests {
             known_spam: Default::default(),
             log_filters: HashMap::new(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: HashMap::new(),
         };
         let roles = [];
@@ -6596,23 +6637,8 @@ mod tests {
             .unwrap()
         );
         app.activation.mark_lock_held(true);
-        let mut rules = HashMap::new();
-        rules.insert("custom:0123456789abcdef".to_string(), dry_run_word_ban());
-        let cfg = CachedGuildConfig {
-            version: 1,
-            durable_version: 1,
-            loaded_at: Instant::now(),
-            settings: GuildSettings::default(),
-            rules,
-            commands: HashMap::new(),
-            templates: HashMap::new(),
-            log_channels: HashMap::new(),
-            known_bad_hashes: Default::default(),
-            known_spam: Default::default(),
-            log_filters: HashMap::new(),
-            regexes: Vec::new(),
-            custom_patterns: HashMap::new(),
-        };
+        let rules = HashMap::from([("custom:0123456789abcdef".to_owned(), dry_run_word_ban())]);
+        let cfg = test_cfg(&rules, &HashMap::new());
         let roles = [];
         let pending = AutomodEngine::new()
             .evaluate(&cfg, &word_message(&roles))

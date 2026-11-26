@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::normalize;
 use crate::types::{ActionDef, GLOBAL_SCOPE, RuleDef};
@@ -385,37 +386,93 @@ fn parse_snowflake_value(v: &Value) -> Result<u64> {
     }
 }
 
-pub fn custom_words(rule: &RuleDef) -> Vec<String> {
+fn rule_words(rule: &RuleDef) -> impl Iterator<Item = &str> {
     rule.params
         .get("words")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|w| w.as_str().map(|s| s.to_string()))
-                .collect()
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+}
+
+pub fn custom_words(rule: &RuleDef) -> Vec<String> {
+    rule_words(rule).map(str::to_owned).collect()
+}
+
+/// Whole tokens in already lowercased or lenient-normalized text.
+pub fn word_tokens(text: &str) -> HashSet<&str> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Matchable forms of the configured words. Identical literal and normalized
+/// forms share storage and are still checked against both token sets.
+pub struct WordDictionary {
+    shared: Box<[Box<str>]>,
+    literal: Box<[Box<str>]>,
+    normalized: Box<[Box<str>]>,
+}
+
+impl WordDictionary {
+    fn from_words<'a>(words: impl Iterator<Item = &'a str>) -> Option<Self> {
+        let mut shared = Vec::new();
+        let mut literal = Vec::new();
+        let mut normalized = Vec::new();
+        let is_token = |form: &str| !form.is_empty() && form.chars().all(char::is_alphanumeric);
+        for word in words {
+            let literal_form = word.to_lowercase();
+            let normalized_form = normalize::normalize_lenient(word);
+            // A form containing a separator cannot equal any whole token.
+            if literal_form == normalized_form {
+                if is_token(&literal_form) {
+                    shared.push(literal_form.into_boxed_str());
+                }
+            } else {
+                if is_token(&literal_form) {
+                    literal.push(literal_form.into_boxed_str());
+                }
+                if is_token(&normalized_form) {
+                    normalized.push(normalized_form.into_boxed_str());
+                }
+            }
+        }
+        if shared.is_empty() && literal.is_empty() && normalized.is_empty() {
+            return None;
+        }
+        Some(Self {
+            shared: shared.into_boxed_slice(),
+            literal: literal.into_boxed_slice(),
+            normalized: normalized.into_boxed_slice(),
         })
-        .unwrap_or_default()
+    }
+
+    pub fn from_rule(rule: &RuleDef) -> Option<Self> {
+        Self::from_words(rule_words(rule))
+    }
+
+    pub fn matches(&self, literal: &HashSet<&str>, normalized: &HashSet<&str>) -> bool {
+        self.shared
+            .iter()
+            .any(|word| normalized.contains(word.as_ref()) || literal.contains(word.as_ref()))
+            || self
+                .literal
+                .iter()
+                .any(|word| literal.contains(word.as_ref()))
+            || self
+                .normalized
+                .iter()
+                .any(|word| normalized.contains(word.as_ref()))
+    }
 }
 
 /// Whole-word match on literal or normalized text (case-insensitive).
 pub fn word_rule_matches(content: &str, words: &[String]) -> bool {
-    if words.is_empty() {
-        return false;
-    }
-    let literal = content.to_lowercase();
-    let literal_tokens: std::collections::HashSet<&str> = literal
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let normalized = normalize::normalize_lenient(content);
-    let tokens: std::collections::HashSet<&str> = normalized
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .collect();
-    words.iter().any(|w| {
-        let token = normalize::normalize_lenient(w);
-        (!token.is_empty() && tokens.contains(token.as_str()))
-            || literal_tokens.contains(w.to_lowercase().as_str())
+    WordDictionary::from_words(words.iter().map(String::as_str)).is_some_and(|words| {
+        words.matches(
+            &word_tokens(&content.to_lowercase()),
+            &word_tokens(&normalize::normalize_lenient(content)),
+        )
     })
 }
 

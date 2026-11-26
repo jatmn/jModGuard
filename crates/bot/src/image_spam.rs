@@ -7984,6 +7984,7 @@ mod tests {
             known_bad_hashes: None,
             known_spam: Default::default(),
             regexes: Vec::new(),
+            custom_words: Default::default(),
             custom_patterns: HashMap::new(),
         };
         let author = ctx.cache.current_user().id.get().saturating_add(4).max(4);
