@@ -5,6 +5,7 @@ pub mod api;
 pub mod cases;
 mod directory;
 mod discord_retry;
+mod display_cache;
 mod legal;
 pub mod list_controls;
 pub mod members;
@@ -900,10 +901,10 @@ async fn load_auth(
         return display_auth(app, user_id, token, cached_user, guilds, incomplete).await;
     }
 
-    let snapshot = if let Some(snapshot) = &state.guilds
+    let (snapshot, guilds_fetched) = if let Some(snapshot) = &state.guilds
         && GuildSnapshotAge::from_age(snapshot.age_from.elapsed()) == GuildSnapshotAge::Fresh
     {
-        snapshot.clone()
+        (snapshot.clone(), false)
     } else {
         let epoch = current_access_epoch(app).await;
         match app.oauth.my_guilds_at(user_id, token, epoch).await {
@@ -916,7 +917,7 @@ async fn load_auth(
                 state.guilds = Some(snapshot.clone());
                 state.guilds_epoch = epoch;
                 state.guild_refresh_retry_at = None;
-                snapshot
+                (snapshot, true)
             }
             Err(oauth::GuildListError::RateLimited { .. })
                 if state.guilds.as_ref().is_some_and(|snapshot| {
@@ -924,7 +925,7 @@ async fn load_auth(
                         .permits(RefreshFailure::RateLimited)
                 }) =>
             {
-                state.guilds.as_ref().unwrap().clone()
+                (state.guilds.as_ref().unwrap().clone(), false)
             }
             Err(error) => {
                 return finish_guild_list(app, guild_mode, user_id, token, cached_user, error)
@@ -933,27 +934,28 @@ async fn load_auth(
         }
     };
 
-    let user = match cached_user {
-        Some(user) => user,
-        None => {
-            let user = app.oauth.me(user_id, token).await.map_err(ApiError)?;
-            record_display_observation(&app.user_cache, user_id, Instant::now(), user.clone());
-            user
-        }
-    };
-
-    record_display_observation(
-        &app.guild_cache,
-        user_id,
-        snapshot.observed_at,
-        Arc::clone(&snapshot.guilds),
-    );
+    // The accepted guild snapshot supplies permissions. A profile cooldown
+    // can use the signed-in identity even when the display entry was evicted.
+    let (user, source) = profile_for_guilds(app, user_id, token, cached_user).await?;
+    if source == ProfileSource::Live {
+        app.user_cache
+            .insert(user_id, (Instant::now(), user.clone()));
+    }
+    // Publish a successful guild lookup even if the profile is cooling down.
+    // A profile fallback alone does not refill a missing guild cache entry.
+    if guilds_fetched || source != ProfileSource::RateLimited {
+        app.guild_cache.insert(
+            user_id,
+            (snapshot.observed_at, Arc::clone(&snapshot.guilds)),
+        );
+    }
     let mut auth = AuthCtx {
         user,
         guilds: snapshot.guilds,
         enrollment: None,
         role_access: None,
-        guild_discovery_incomplete: false,
+        guild_discovery_incomplete: guild_list_cache_allowed(guild_mode)
+            && app.oauth.guild_route_limited(user_id),
     };
     preview::apply_overlay(&mut auth)?;
     Ok(auth)
@@ -981,7 +983,7 @@ fn start_guild_refresh(
     let refresh_profile = app
         .user_cache
         .get(&user_id)
-        .is_none_or(|entry| entry.value().0.elapsed() >= guild_refresh_after(user_id));
+        .is_none_or(|entry| entry.0.elapsed() >= guild_refresh_after(user_id));
     let app = Arc::clone(app);
     let shared = Arc::clone(shared);
     let token = token.to_owned();
@@ -1022,7 +1024,7 @@ fn start_guild_refresh(
                     });
                     state.guilds_epoch = epoch;
                     state.guild_refresh_retry_at = None;
-                    record_display_observation(&app.guild_cache, user_id, observed_at, guilds);
+                    app.guild_cache.insert(user_id, (observed_at, guilds));
                 }
                 Err(oauth::GuildListError::Unauthorized | oauth::GuildListError::Failed(_)) => {
                     state.guild_refresh_retry_at =
@@ -1032,7 +1034,7 @@ fn start_guild_refresh(
             }
         }
         if let Some((observed_at, user)) = user {
-            record_display_observation(&app.user_cache, user_id, observed_at, user);
+            app.user_cache.insert(user_id, (observed_at, user));
         }
     });
 }
@@ -1101,9 +1103,10 @@ async fn display_auth(
     guilds: GuildList,
     guild_discovery_incomplete: bool,
 ) -> ApiResult<AuthCtx> {
-    let (user, source) = display_identity(app, user_id, token, cached_user).await?;
-    if source == DisplayIdentitySource::Live {
-        record_display_observation(&app.user_cache, user_id, Instant::now(), user.clone());
+    let (user, source) = profile_for_guilds(app, user_id, token, cached_user).await?;
+    if source == ProfileSource::Live {
+        app.user_cache
+            .insert(user_id, (Instant::now(), user.clone()));
     }
     let mut auth = AuthCtx {
         user,
@@ -1132,30 +1135,9 @@ fn guild_list_failure(user_id: u64, error: oauth::GuildListError) -> ApiError {
     }
 }
 
-/// Login sessions can publish observations for the same display user in any
-/// order. Reusing a session snapshot must not replace a newer observation.
-fn record_display_observation<T>(
-    cache: &dashmap::DashMap<u64, (Instant, T)>,
-    user_id: u64,
-    observed_at: Instant,
-    value: T,
-) {
-    use dashmap::mapref::entry::Entry;
-
-    match cache.entry(user_id) {
-        Entry::Vacant(entry) => {
-            entry.insert((observed_at, value));
-        }
-        Entry::Occupied(mut entry) if entry.get().0 < observed_at => {
-            entry.insert((observed_at, value));
-        }
-        _ => {}
-    }
-}
-
 fn cached_user(app: &ApiState, user_id: u64) -> Option<DiscordUser> {
     let entry = app.user_cache.get(&user_id)?;
-    let (fetched_at, user) = entry.value();
+    let (fetched_at, user) = entry.as_ref();
     if fetched_at.elapsed() < USER_CACHE_TTL {
         Some(user.clone())
     } else {
@@ -1164,33 +1146,34 @@ fn cached_user(app: &ApiState, user_id: u64) -> Option<DiscordUser> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DisplayIdentitySource {
-    CachedOrFallback,
+enum ProfileSource {
+    Cached,
+    RateLimited,
     Live,
 }
 
-/// Identity for a display response that is already returning cached guilds.
+/// Identity after the caller has selected a usable guild list.
 ///
 /// The fresh profile cache is used as-is. Otherwise live `/users/@me` still
 /// runs. When that call is rate-limited, the profile still stored after the
 /// five-minute profile TTL — or the session Discord user id — is enough to
-/// return the display list. Other `me` failures still fail the request.
+/// complete the guild response. Other `me` failures still fail the request.
 /// The fallback does not renew `user_cache`, so the next display read tries
 /// `me` again once Discord is no longer limiting it.
-async fn display_identity(
+async fn profile_for_guilds(
     app: &ApiState,
     user_id: u64,
     token: &str,
     cached_user: Option<DiscordUser>,
-) -> ApiResult<(DiscordUser, DisplayIdentitySource)> {
+) -> ApiResult<(DiscordUser, ProfileSource)> {
     if let Some(user) = cached_user {
-        return Ok((user, DisplayIdentitySource::CachedOrFallback));
+        return Ok((user, ProfileSource::Cached));
     }
     match app.oauth.me(user_id, token).await {
-        Ok(user) => Ok((user, DisplayIdentitySource::Live)),
+        Ok(user) => Ok((user, ProfileSource::Live)),
         Err(error) if error.downcast_ref::<oauth::DiscordRateLimit>().is_some() => Ok((
             display_user_during_limit(app, user_id),
-            DisplayIdentitySource::CachedOrFallback,
+            ProfileSource::RateLimited,
         )),
         Err(error) => Err(ApiError(error)),
     }
@@ -1198,7 +1181,7 @@ async fn display_identity(
 
 fn display_user_during_limit(app: &ApiState, user_id: u64) -> DiscordUser {
     if let Some(entry) = app.user_cache.get(&user_id) {
-        return entry.value().1.clone();
+        return entry.1.clone();
     }
     DiscordUser {
         id: user_id.to_string(),
@@ -1226,13 +1209,9 @@ fn take_cached_guilds(
         .guild_cache
         .get(&user_id)
         .filter(|entry| {
-            guild_display_usable(
-                entry.value().0.elapsed(),
-                GUILD_DISPLAY_CACHE_TTL,
-                incomplete,
-            )
+            guild_display_usable(entry.0.elapsed(), GUILD_DISPLAY_CACHE_TTL, incomplete)
         })
-        .map(|entry| Arc::clone(&entry.value().1))
+        .map(|entry| Arc::clone(&entry.1))
         .or_else(|| lookup_rate_limited.then(|| Arc::from([])))?;
     Some((guilds, incomplete))
 }
@@ -1564,7 +1543,7 @@ async fn callback_response(
         return finish(error_page("failed to rotate session"));
     }
     if let Some(app) = app {
-        record_display_observation(&app.user_cache, uid, profile_observed_at, user);
+        app.user_cache.insert(uid, (profile_observed_at, user));
         // Only a complete guild list enters either cache. A 429 leaves any
         // previous display list intact and the cooldown guides the next /api/me.
         let epoch = current_access_epoch(app).await;
@@ -1601,7 +1580,7 @@ async fn callback_response(
                     })),
                 );
             }
-            record_display_observation(&app.guild_cache, uid, observed_at, guilds);
+            app.guild_cache.insert(uid, (observed_at, guilds));
         }
     }
     let requested_return_to = cookie_value(&headers, COOKIE_OAUTH_RETURN_TO);

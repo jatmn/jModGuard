@@ -1,6 +1,7 @@
 //! API-owned dashboard state without moderation or compiled guild caches.
 //! Discord mutations are admitted to the bot queue; this state has no bot token/client.
-use super::ObservedGuilds;
+use super::GuildList;
+use super::display_cache::DisplayCache;
 use super::oauth::{DiscordUser, OAuthClient};
 use crate::config::ApiProcessConfig;
 use crate::db::{self, Db};
@@ -295,7 +296,7 @@ pub struct ApiState {
     pub oauth: Arc<OAuthClient>,
     writer: Option<jmodguard::control::WriterLink>,
     /// Display caches only. Authorization must refresh the guild list.
-    pub guild_cache: DashMap<u64, ObservedGuilds>,
+    pub(super) guild_cache: DisplayCache<GuildList>,
     pub(super) auth_sessions:
         DashMap<tower_sessions::session::Id, Arc<tokio::sync::Mutex<super::SessionAuth>>>,
     // One small ID/timestamp per retirement, bounded by sign-outs/rotations
@@ -303,7 +304,7 @@ pub struct ApiState {
     // if a persistent store is added, persist tombstones there or clear it on startup.
     pub(super) retired_auth_sessions: DashMap<tower_sessions::session::Id, Instant>,
     pub(super) auth_sessions_swept_at: std::sync::Mutex<Option<Instant>>,
-    pub user_cache: DashMap<u64, (Instant, DiscordUser)>,
+    pub(super) user_cache: DisplayCache<DiscordUser>,
     /// Discord role IDs per (user, guild) for Web UI access roles. Each slot is
     /// filled by one request at a time, expires after `MEMBER_ROLES_TTL` and is
     /// dropped early by a newer gateway access mark for that user or guild.
@@ -361,11 +362,11 @@ impl ApiState {
             cfg: Arc::new(cfg),
             oauth,
             writer,
-            guild_cache: DashMap::new(),
+            guild_cache: DisplayCache::guild_lists(),
             auth_sessions: DashMap::new(),
             retired_auth_sessions: DashMap::new(),
             auth_sessions_swept_at: std::sync::Mutex::new(None),
-            user_cache: DashMap::new(),
+            user_cache: DisplayCache::profiles(),
             member_roles: std::sync::Mutex::new(std::collections::HashMap::new()),
             preview: DashMap::new(),
             usage_cache: crate::web::usage::UsageCache::default(),
