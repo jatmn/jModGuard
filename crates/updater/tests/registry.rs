@@ -1,8 +1,8 @@
 use axum::{
     Router,
     body::Body,
-    extract::State,
-    http::{StatusCode, Uri},
+    extract::{Query, State},
+    http::{HeaderMap, StatusCode, Uri, header::AUTHORIZATION},
     response::Response,
     routing::get,
 };
@@ -25,7 +25,7 @@ use serde_json::json;
 use signature::{signature_rejection_phrase, signature_tag_for_digest};
 use signing_fixture::{BadSignature, SigningKeyChoice, signature_not_after_far_future, signing};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::{collections::HashMap, io::Write};
@@ -38,11 +38,79 @@ struct RegistryFixture {
     delayed_payload: Option<(String, chrono::DateTime<chrono::Utc>)>,
     failed_payload: Option<(String, StatusCode)>,
     watched_blob: Option<(String, Arc<AtomicUsize>)>,
+    pulls: Option<Arc<Mutex<HashMap<String, PullRequests>>>>,
 }
 
-async fn serve_object(State(state): State<Arc<RwLock<RegistryFixture>>>, uri: Uri) -> Response {
+#[derive(Default)]
+struct PullRequests {
+    tokens: usize,
+    objects: usize,
+    credential: Option<String>,
+    expire_at: Vec<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct PullScope {
+    scope: String,
+    service: String,
+}
+
+async fn issue_pull_token(
+    State(state): State<Arc<RwLock<RegistryFixture>>>,
+    Query(request): Query<PullScope>,
+) -> Result<axum::Json<serde_json::Value>, StatusCode> {
+    let repo = request
+        .scope
+        .strip_prefix("repository:")
+        .and_then(|scope| scope.strip_suffix(":pull"))
+        .filter(|_| request.service == "ghcr.io")
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let fixture = state.read().await;
+    let mut requests = fixture.pulls.as_ref().unwrap().lock().unwrap();
+    let pull = requests.get_mut(repo).ok_or(StatusCode::FORBIDDEN)?;
+    let credential = format!("{:032x}", rand::random::<u128>());
+    pull.tokens += 1;
+    pull.credential = Some(credential.clone());
+    Ok(axum::Json(json!({ "token": credential })))
+}
+
+async fn serve_object(
+    State(state): State<Arc<RwLock<RegistryFixture>>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
     let path = uri.path();
     let fixture = state.read().await;
+    if let Some(requests) = &fixture.pulls {
+        let repo = path
+            .strip_prefix("/v2/")
+            .and_then(|path| {
+                path.rsplit_once("/manifests/")
+                    .or_else(|| path.rsplit_once("/blobs/"))
+            })
+            .map(|(repo, _)| repo);
+        let mut requests = requests.lock().unwrap();
+        let Some(pull) = repo.and_then(|repo| requests.get_mut(repo)) else {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::empty())
+                .unwrap();
+        };
+        pull.objects += 1;
+        if pull.expire_at.contains(&pull.objects) {
+            pull.credential = None;
+        }
+        let presented = headers
+            .get(AUTHORIZATION)
+            .and_then(|header| header.to_str().ok())
+            .and_then(|header| header.strip_prefix("Bearer "));
+        if presented.is_none() || presented != pull.credential.as_deref() {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Body::empty())
+                .unwrap();
+        }
+    }
     let reference = path.rsplit('/').next().unwrap_or("");
     let key = if matches!(reference, "latest" | "stable") {
         &fixture.tag
@@ -86,10 +154,26 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn image(fixture: &mut RegistryFixture, source: char, binary: &[u8], channel: &str) -> String {
+    image_for(
+        fixture,
+        "api",
+        source,
+        &[("usr/local/bin/jmodguard-api", binary)],
+        channel,
+    )
+}
+
+fn image_for(
+    fixture: &mut RegistryFixture,
+    component: &str,
+    source: char,
+    files: &[(&str, &[u8])],
+    channel: &str,
+) -> String {
     let sha = source.to_string().repeat(40);
     let config = serde_json::to_vec(&json!({
         "architecture":"amd64","os":"linux","config":{"Labels":{
-            "io.jmodguard.component":"api","io.jmodguard.channel":channel,
+            "io.jmodguard.component":component,"io.jmodguard.channel":channel,
             "io.jmodguard.release-id":format!("v1.0.{source}"),
             "io.jmodguard.published-at":"2026-09-23T00:00:00Z",
             "io.jmodguard.min-schema":"15","io.jmodguard.max-schema":"15",
@@ -106,12 +190,13 @@ fn image(fixture: &mut RegistryFixture, source: char, binary: &[u8], channel: &s
     let mut tar_bytes = Vec::new();
     {
         let mut tar = tar::Builder::new(&mut tar_bytes);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(binary.len() as u64);
-        header.set_mode(0o755);
-        header.set_cksum();
-        tar.append_data(&mut header, "usr/local/bin/jmodguard-api", binary)
-            .unwrap();
+        for &(path, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, path, bytes).unwrap();
+        }
         tar.finish().unwrap();
     }
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -131,7 +216,7 @@ fn image(fixture: &mut RegistryFixture, source: char, binary: &[u8], channel: &s
     fixture.objects.insert(manifest_digest.clone(), manifest);
     signing().sign(
         &mut fixture.objects,
-        "api",
+        component,
         &manifest_digest,
         &signature_not_after_far_future(),
         SigningKeyChoice::Current,
@@ -268,13 +353,101 @@ fn api_release(digest: &str, source: char) -> ComponentRelease {
 }
 
 async fn serve(fixture: RegistryFixture) -> (Registry, tokio::task::JoinHandle<()>) {
-    let router = Router::new()
-        .fallback(get(serve_object))
-        .with_state(Arc::new(RwLock::new(fixture)));
+    let authenticated = fixture.pulls.is_some();
+    let mut router = Router::new().fallback(get(serve_object));
+    if authenticated {
+        router = router.route("/token", get(issue_pull_token));
+    }
+    let router = router.with_state(Arc::new(RwLock::new(fixture)));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    (Registry::new(&format!("http://{addr}")).unwrap(), server)
+    let base = format!("http://{addr}");
+    let registry = if authenticated {
+        Registry::authenticated_fixture(&base)
+    } else {
+        Registry::new(&base)
+    };
+    (registry.unwrap(), server)
+}
+
+#[tokio::test]
+async fn signed_download_reuses_one_pull_token_and_renews_once() {
+    const API: &str = "jatmn/jmodguard-api";
+    const BOT: &str = "jatmn/jmodguard-bot";
+    const API_FILE: &str = "usr/local/bin/jmodguard-api";
+    const BOT_FILE: &str = "usr/local/bin/jmodguard-bot";
+    const INVENTORY: &str = "usr/local/share/jmodguard/files.sha256";
+    let requests = Arc::new(Mutex::new(HashMap::from([
+        (API.to_owned(), PullRequests::default()),
+        (BOT.to_owned(), PullRequests::default()),
+    ])));
+    let mut fixture = RegistryFixture {
+        pulls: Some(Arc::clone(&requests)),
+        ..Default::default()
+    };
+    let api = api_release(&image(&mut fixture, 'a', b"api release", "stable"), 'a');
+    let executable = b"\x7fELFbot release";
+    let inventory = format!("{}  bin/jmodguard-bot\n", oci::sha256_hex(executable));
+    let mut bot = api_release(
+        &image_for(
+            &mut fixture,
+            "bot",
+            'b',
+            &[(BOT_FILE, executable), (INVENTORY, inventory.as_bytes())],
+            "stable",
+        ),
+        'b',
+    );
+    bot.component = "bot".into();
+    bot.image = format!("ghcr.io/{BOT}");
+    let (registry, server) = serve(fixture).await;
+    let counts = |repo: &str| {
+        let requests = requests.lock().unwrap();
+        let pull = &requests[repo];
+        (pull.tokens, pull.objects)
+    };
+
+    let staging = std::env::temp_dir().join(format!(
+        "signed-registry-stage-{:032x}",
+        rand::random::<u128>()
+    ));
+    // The first staging operation uses one token. Expire the next operation's
+    // credential at its final layer so the streaming reader exercises renewal.
+    for (expire_at, expected) in [(vec![], (1, 5)), (vec![10], (3, 11))] {
+        requests.lock().unwrap().get_mut(BOT).unwrap().expire_at = expire_at;
+        let staged = registry
+            .stage_executable(&bot, BOT_FILE, INVENTORY, &staging)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(staged.path()).unwrap(), executable);
+        assert_eq!(staged.inventory(), inventory.as_bytes());
+        assert_eq!(
+            counts(BOT),
+            expected,
+            "streamed operation and its own credential"
+        );
+    }
+    std::fs::remove_dir(&staging).unwrap();
+    assert_eq!(counts(API), (0, 0));
+
+    let files = registry.files(&api, &[API_FILE]).await.unwrap();
+    assert_eq!(files[API_FILE], b"api release");
+    assert_eq!(counts(API), (1, 5), "ordinary signed download");
+
+    // Expire a later API operation on its initial manifest and again on its signature
+    // after a successful renewal. The second 401 must end the operation.
+    requests.lock().unwrap().get_mut(API).unwrap().expire_at = vec![6, 8];
+    let denied = registry.files(&api, &[API_FILE]).await.unwrap_err();
+    assert!(denied.to_string().contains("registry returned HTTP 401"));
+    assert!(!oci::registry_unreachable(&denied));
+    assert_eq!(
+        counts(API),
+        (3, 8),
+        "the renewal budget is shared by the operation"
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]

@@ -214,9 +214,39 @@ struct Descriptor {
     annotations: BTreeMap<String, String>,
 }
 
-pub(crate) struct VerifiedReleaseLayer {
-    repo: &'static str,
+pub(crate) struct VerifiedReleaseLayer<'a> {
+    pull: RepositoryPull<'a>,
     descriptor: Descriptor,
+}
+
+impl VerifiedReleaseLayer<'_> {
+    pub(crate) async fn read(mut self, requested: &[&str]) -> Result<HashMap<String, Vec<u8>>> {
+        let bytes = self.pull.blob(&self.descriptor, MAX_LAYER).await?;
+        extract_layer(&bytes, &self.descriptor.media_type, requested)
+    }
+
+    /// Download the layer to a temporary file, verify its size and digest,
+    /// then extract the executable to another. Both are removed on failure or
+    /// cancellation; the layer file is removed once extraction finishes.
+    async fn stage(
+        mut self,
+        executable: &str,
+        inventory: &str,
+        dir: &Path,
+    ) -> Result<StagedExecutable> {
+        tokio::fs::create_dir_all(dir).await?;
+        let blob = self
+            .pull
+            .blob_to_file(&self.descriptor, MAX_LAYER, dir)
+            .await?;
+        let staged = TempFile::new(dir, "stage");
+        let media = self.descriptor.media_type;
+        let (executable, inventory) = (executable.to_owned(), inventory.to_owned());
+        tokio::task::spawn_blocking(move || {
+            extract_executable(&blob, &media, &executable, &inventory, staged)
+        })
+        .await?
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +274,7 @@ struct ImageConfigInner {
 pub struct Registry {
     http: reqwest::Client,
     base: String,
+    pull_token_service: Option<&'static str>,
 }
 
 impl Registry {
@@ -262,25 +293,39 @@ impl Registry {
                 && parsed.query().is_none(),
             "invalid registry base"
         );
+        let base = base.trim_end_matches('/');
         Ok(Self {
             http: http_client_builder()
                 .timeout(Duration::from_secs(30))
                 .redirect(reqwest::redirect::Policy::limited(2))
                 .build()?,
-            base: base.trim_end_matches('/').to_owned(),
+            base: base.to_owned(),
+            pull_token_service: (base == "https://ghcr.io").then_some("ghcr.io"),
         })
     }
 
+    /// Configure authentication for a signed loopback registry fixture.
+    #[cfg(test)]
+    pub fn authenticated_fixture(base: &str) -> Result<Self> {
+        let mut registry = Self::new(base)?;
+        ensure!(
+            reqwest::Url::parse(base)?.host_str() == Some("127.0.0.1"),
+            "authenticated registry fixtures must use loopback"
+        );
+        registry.pull_token_service = Some("ghcr.io");
+        Ok(registry)
+    }
+
     async fn token(&self, repo: &str) -> Result<Option<String>> {
-        if self.base != "https://ghcr.io" {
+        let Some(service) = self.pull_token_service else {
             return Ok(None);
-        }
+        };
         #[derive(Deserialize)]
         struct Token {
             token: String,
         }
         let url = format!(
-            "{}/token?scope=repository:{repo}:pull&service=ghcr.io",
+            "{}/token?scope=repository:{repo}:pull&service={service}",
             self.base
         );
         let token: Token = self
@@ -298,14 +343,41 @@ impl Registry {
         Ok(Some(token.token))
     }
 
-    async fn get_limited(
+    async fn request_object(
         &self,
-        url: String,
+        url: reqwest::Url,
         token: Option<&str>,
         accept: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        let mut request = self.http.get(url);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        if let Some(accept) = accept {
+            request = request.header(ACCEPT, accept);
+        }
+        let response = request.send().await.map_err(reqwest::Error::without_url)?;
+        Ok(response)
+    }
+
+    fn check_limited(response: &reqwest::Response, limit: usize) -> Result<()> {
+        ensure!(
+            response.status().is_success(),
+            "registry returned HTTP {}",
+            response.status()
+        );
+        if let Some(raw) = response.headers().get(CONTENT_LENGTH)
+            && let Ok(length) = raw.to_str()?.parse::<u64>()
+        {
+            ensure!(length <= limit as u64, "registry object exceeds size limit");
+        }
+        Ok(())
+    }
+
+    async fn read_limited(
+        mut response: reqwest::Response,
         limit: usize,
     ) -> Result<(Vec<u8>, reqwest::header::HeaderMap)> {
-        let mut response = self.open_limited(url, token, accept, limit).await?;
         let headers = response.headers().clone();
         let mut body = Vec::new();
         while let Some(chunk) = response
@@ -321,41 +393,77 @@ impl Registry {
         }
         Ok((body, headers))
     }
+}
+
+/// The pull credential is confined to one repository and release operation.
+struct RepositoryPull<'a> {
+    registry: &'a Registry,
+    repo: &'static str,
+    token: Option<String>,
+    renewed: bool,
+}
+
+impl<'a> RepositoryPull<'a> {
+    fn new(registry: &'a Registry, repo: &'static str) -> Self {
+        Self {
+            registry,
+            repo,
+            token: None,
+            renewed: false,
+        }
+    }
 
     async fn open_limited(
-        &self,
-        url: String,
-        token: Option<&str>,
+        &mut self,
+        object: &str,
         accept: Option<&str>,
         limit: usize,
     ) -> Result<reqwest::Response> {
-        let mut request = self.http.get(url);
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
+        let url =
+            reqwest::Url::parse(&format!("{}/v2/{}/{object}", self.registry.base, self.repo))?;
+        if self.token.is_none() {
+            self.token = self.registry.token(self.repo).await?;
         }
-        if let Some(accept) = accept {
-            request = request.header(ACCEPT, accept);
-        }
-        let response = request.send().await.map_err(reqwest::Error::without_url)?;
-        ensure!(
-            response.status().is_success(),
-            "registry returned HTTP {}",
-            response.status()
-        );
-        if let Some(raw) = response.headers().get(CONTENT_LENGTH)
-            && let Ok(length) = raw.to_str()?.parse::<u64>()
+        let mut response = self
+            .registry
+            .request_object(url.clone(), self.token.as_deref(), accept)
+            .await?;
+        // A redirected storage endpoint can refuse its own URL. Only the registry
+        // that issued the pull credential can trigger the operation's single renewal.
+        if self.token.is_some()
+            && !self.renewed
+            && response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && response.url().origin() == url.origin()
         {
-            ensure!(length <= limit as u64, "registry object exceeds size limit");
+            self.renewed = true;
+            self.token = self.registry.token(self.repo).await?;
+            response = self
+                .registry
+                .request_object(url, self.token.as_deref(), accept)
+                .await?;
         }
+        Registry::check_limited(&response, limit)?;
         Ok(response)
     }
 
-    async fn signature_body(&self, repo: &str, manifest_digest: &str) -> Result<Vec<u8>> {
+    async fn get_limited(
+        &mut self,
+        object: &str,
+        accept: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<u8>, reqwest::header::HeaderMap)> {
+        let response = self.open_limited(object, accept, limit).await?;
+        Registry::read_limited(response, limit).await
+    }
+
+    async fn signature_body(&mut self, manifest_digest: &str) -> Result<Vec<u8>> {
         let tag = signature::signature_tag_for_digest(manifest_digest)?;
-        let token = self.token(repo).await?;
-        let url = format!("{}/v2/{repo}/manifests/{tag}", self.base);
         match self
-            .get_limited(url, token.as_deref(), Some(MANIFEST_ACCEPT), MAX_MANIFEST)
+            .get_limited(
+                &format!("manifests/{tag}"),
+                Some(MANIFEST_ACCEPT),
+                MAX_MANIFEST,
+            )
             .await
         {
             Ok((body, _)) => Ok(body),
@@ -369,14 +477,13 @@ impl Registry {
     }
 
     async fn verify_manifest(
-        &self,
+        &mut self,
         component: &str,
-        repo: &str,
         manifest_digest: &str,
         manifest_bytes: &[u8],
         expiry: signature::SignatureExpiry,
     ) -> Result<()> {
-        let signature = self.signature_body(repo, manifest_digest).await?;
+        let signature = self.signature_body(manifest_digest).await?;
         if serde_json::from_slice::<serde_json::Value>(&signature)
             .ok()
             .is_some_and(|value| {
@@ -411,7 +518,7 @@ impl Registry {
             else {
                 continue;
             };
-            let payload = match self.blob(repo, layer, MAX_MANIFEST).await {
+            let payload = match self.blob(layer, MAX_MANIFEST).await {
                 Ok(payload) => payload,
                 Err(error) if registry_unreachable(&error) => return Err(error),
                 Err(_) => {
@@ -451,15 +558,17 @@ impl Registry {
         }))
     }
 
-    async fn manifest(&self, repo: &str, reference: &str) -> Result<(Manifest, String, Vec<u8>)> {
+    async fn manifest(&mut self, reference: &str) -> Result<(Manifest, String, Vec<u8>)> {
         ensure!(
             !reference.contains('/') && !reference.contains('?') && !reference.contains('#'),
             "invalid image reference"
         );
-        let token = self.token(repo).await?;
-        let url = format!("{}/v2/{repo}/manifests/{reference}", self.base);
         let (bytes, headers) = self
-            .get_limited(url, token.as_deref(), Some(MANIFEST_ACCEPT), MAX_MANIFEST)
+            .get_limited(
+                &format!("manifests/{reference}"),
+                Some(MANIFEST_ACCEPT),
+                MAX_MANIFEST,
+            )
             .await?;
         let digest = format!("sha256:{}", sha256_hex(&bytes));
         if valid_digest(reference) {
@@ -489,14 +598,14 @@ impl Registry {
         Ok((parsed, digest, bytes))
     }
 
-    async fn blob(&self, repo: &str, descriptor: &Descriptor, limit: usize) -> Result<Vec<u8>> {
+    async fn blob(&mut self, descriptor: &Descriptor, limit: usize) -> Result<Vec<u8>> {
         ensure!(
             valid_digest(&descriptor.digest) && descriptor.size <= limit as u64,
             "invalid blob descriptor"
         );
-        let token = self.token(repo).await?;
-        let url = format!("{}/v2/{repo}/blobs/{}", self.base, descriptor.digest);
-        let (bytes, _) = self.get_limited(url, token.as_deref(), None, limit).await?;
+        let (bytes, _) = self
+            .get_limited(&format!("blobs/{}", descriptor.digest), None, limit)
+            .await?;
         ensure!(bytes.len() as u64 == descriptor.size, "blob size mismatch");
         ensure!(
             format!("sha256:{}", sha256_hex(&bytes)) == descriptor.digest,
@@ -508,8 +617,7 @@ impl Registry {
     /// `blob` written to `path` with incremental hashing. The caller trusts
     /// nothing in the file unless this returns success.
     async fn blob_to_file(
-        &self,
-        repo: &str,
+        &mut self,
         descriptor: &Descriptor,
         limit: usize,
         dir: &Path,
@@ -532,10 +640,8 @@ impl Registry {
         })
         .await??;
         let mut file = tokio::fs::File::from_std(file);
-        let token = self.token(repo).await?;
-        let url = format!("{}/v2/{repo}/blobs/{}", self.base, descriptor.digest);
         let mut response = self
-            .open_limited(url, token.as_deref(), None, limit)
+            .open_limited(&format!("blobs/{}", descriptor.digest), None, limit)
             .await?;
         let mut context = DigestContext::new(&SHA256);
         let mut received = 0u64;
@@ -561,11 +667,13 @@ impl Registry {
         Ok(blob)
     }
 
-    async fn config(&self, repo: &str, manifest: &Manifest) -> Result<ImageConfig> {
-        let bytes = self.blob(repo, &manifest.config, MAX_CONFIG).await?;
+    async fn config(&mut self, manifest: &Manifest) -> Result<ImageConfig> {
+        let bytes = self.blob(&manifest.config, MAX_CONFIG).await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
+}
 
+impl Registry {
     /// Resolve a release channel to one exact image digest and its validated
     /// metadata. Old images missing these labels are observation-only.
     pub async fn discover(&self, component: &str, channel: &str) -> Result<ComponentRelease> {
@@ -607,16 +715,16 @@ impl Registry {
             "invalid channel"
         );
         let repo = repository(component)?;
-        let (manifest, image_digest, manifest_bytes) = self.manifest(repo, reference).await?;
-        self.verify_manifest(
+        let mut pull = RepositoryPull::new(self, repo);
+        let (manifest, image_digest, manifest_bytes) = pull.manifest(reference).await?;
+        pull.verify_manifest(
             component,
-            repo,
             &image_digest,
             &manifest_bytes,
             signature::SignatureExpiry::Enforce,
         )
         .await?;
-        let config = self.config(repo, &manifest).await?;
+        let config = pull.config(&manifest).await?;
         ensure!(
             config.architecture == "amd64" && config.os == "linux",
             "unsupported image platform"
@@ -707,7 +815,7 @@ impl Registry {
         requested: &[&str],
     ) -> Result<HashMap<String, Vec<u8>>> {
         let layer = self.installed_layer(control, release, requested).await?;
-        self.read_release_layer(layer, requested).await
+        layer.read(requested).await
     }
 
     /// Launcher staging form of `files`. The verified layer and the
@@ -726,8 +834,7 @@ impl Registry {
                 signature::SignatureExpiry::Enforce,
             )
             .await?;
-        self.stage_release_layer(layer, executable, inventory, dir)
-            .await
+        layer.stage(executable, inventory, dir).await
     }
 
     /// Launcher staging form of `files_for_installed_restore`, with the same
@@ -743,8 +850,7 @@ impl Registry {
         let layer = self
             .installed_layer(control, release, &[executable, inventory])
             .await?;
-        self.stage_release_layer(layer, executable, inventory, dir)
-            .await
+        layer.stage(executable, inventory, dir).await
     }
 
     pub(crate) async fn installed_layer(
@@ -752,7 +858,7 @@ impl Registry {
         control: &jmodguard::db::UpdateControl,
         release: &ComponentRelease,
         requested: &[&str],
-    ) -> Result<VerifiedReleaseLayer> {
+    ) -> Result<VerifiedReleaseLayer<'_>> {
         let state = control.component(&release.component).await?;
         ensure!(
             state.installed.as_ref() == Some(release)
@@ -772,7 +878,7 @@ impl Registry {
         let layer = self
             .verified_release_layer(release, requested, expiry)
             .await?;
-        self.read_release_layer(layer, requested).await
+        layer.read(requested).await
     }
 
     async fn verified_release_layer(
@@ -780,7 +886,7 @@ impl Registry {
         release: &ComponentRelease,
         requested: &[&str],
         expiry: signature::SignatureExpiry,
-    ) -> Result<VerifiedReleaseLayer> {
+    ) -> Result<VerifiedReleaseLayer<'_>> {
         release.validate()?;
         let repo = repository(&release.component)?;
         ensure!(
@@ -791,11 +897,12 @@ impl Registry {
             !requested.is_empty() && requested.len() <= 16,
             "invalid file request"
         );
-        let (manifest, digest, manifest_bytes) = self.manifest(repo, &release.digest).await?;
+        let mut pull = RepositoryPull::new(self, repo);
+        let (manifest, digest, manifest_bytes) = pull.manifest(&release.digest).await?;
         ensure!(digest == release.digest, "manifest digest mismatch");
-        self.verify_manifest(&release.component, repo, &digest, &manifest_bytes, expiry)
+        pull.verify_manifest(&release.component, &digest, &manifest_bytes, expiry)
             .await?;
-        let config = self.config(repo, &manifest).await?;
+        let config = pull.config(&manifest).await?;
         ensure!(
             config
                 .config
@@ -813,39 +920,7 @@ impl Registry {
             .into_iter()
             .last()
             .context("image has no final layer")?;
-        Ok(VerifiedReleaseLayer { repo, descriptor })
-    }
-
-    pub(crate) async fn read_release_layer(
-        &self,
-        layer: VerifiedReleaseLayer,
-        requested: &[&str],
-    ) -> Result<HashMap<String, Vec<u8>>> {
-        let bytes = self.blob(layer.repo, &layer.descriptor, MAX_LAYER).await?;
-        extract_layer(&bytes, &layer.descriptor.media_type, requested)
-    }
-
-    /// Download the layer to a temporary file, verify its size and digest,
-    /// then extract the executable to another. Both are removed on failure or
-    /// cancellation; the layer file is removed once extraction finishes.
-    async fn stage_release_layer(
-        &self,
-        layer: VerifiedReleaseLayer,
-        executable: &str,
-        inventory: &str,
-        dir: &Path,
-    ) -> Result<StagedExecutable> {
-        tokio::fs::create_dir_all(dir).await?;
-        let blob = self
-            .blob_to_file(layer.repo, &layer.descriptor, MAX_LAYER, dir)
-            .await?;
-        let staged = TempFile::new(dir, "stage");
-        let media = layer.descriptor.media_type;
-        let (executable, inventory) = (executable.to_owned(), inventory.to_owned());
-        tokio::task::spawn_blocking(move || {
-            extract_executable(&blob, &media, &executable, &inventory, staged)
-        })
-        .await?
+        Ok(VerifiedReleaseLayer { pull, descriptor })
     }
 }
 
@@ -985,6 +1060,83 @@ fn walk_layer<'a>(
 library_unit_tests!(
     mod tests {
         #[tokio::test]
+        async fn redirected_unauthorized_response_does_not_renew_pull_credential() {
+            use axum::{Json, Router, response::Redirect, routing::get};
+            use reqwest::{
+                StatusCode,
+                header::{AUTHORIZATION, HeaderMap},
+            };
+            use std::sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            };
+            use tokio::net::TcpListener;
+
+            let redirected = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let destination = format!("http://{}", redirected.local_addr().unwrap());
+            let redirected_server = tokio::spawn(async move {
+                axum::serve(
+                    redirected,
+                    Router::new().route(
+                        "/",
+                        get(|headers: HeaderMap| async move {
+                            assert!(!headers.contains_key(AUTHORIZATION));
+                            StatusCode::UNAUTHORIZED
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+            });
+
+            let origin = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let registry = Registry::authenticated_fixture(&format!(
+                "http://{}",
+                origin.local_addr().unwrap()
+            ))
+            .unwrap();
+            let token_requests = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::clone(&token_requests);
+            let issue_token = move || {
+                requests.fetch_add(1, Ordering::Relaxed);
+                async {
+                    let credential = format!("{:032x}", rand::random::<u128>());
+                    Json(serde_json::json!({ "token": credential }))
+                }
+            };
+            let redirect_object = move |headers: HeaderMap| {
+                let redirect = Redirect::temporary(&destination);
+                async move {
+                    assert!(headers.contains_key(AUTHORIZATION));
+                    redirect
+                }
+            };
+            let origin_app = Router::new().route("/token", get(issue_token)).route(
+                "/v2/jatmn/jmodguard-api/manifests/stable",
+                get(redirect_object),
+            );
+            let origin_server = tokio::spawn(async move {
+                axum::serve(origin, origin_app).await.unwrap();
+            });
+
+            let error = RepositoryPull::new(&registry, repository("api").unwrap())
+                .get_limited("manifests/stable", None, MAX_MANIFEST)
+                .await
+                .unwrap_err();
+            origin_server.abort();
+            redirected_server.abort();
+            assert!(origin_server.await.unwrap_err().is_cancelled());
+            assert!(redirected_server.await.unwrap_err().is_cancelled());
+            assert_eq!(error.to_string(), "registry returned HTTP 401 Unauthorized");
+            assert!(!registry_unreachable(&error));
+            assert_eq!(token_requests.load(Ordering::Relaxed), 1);
+        }
+
+        #[tokio::test]
         async fn registry_transport_errors_omit_urls() {
             // Exercise the same request owner used by API discovery and launcher downloads.
             // Reserve the port without listening so another test cannot claim it
@@ -997,13 +1149,8 @@ library_unit_tests!(
                 "the refused endpoint must stay reserved until the request completes"
             );
             let registry = super::Registry::new(&format!("http://{addr}")).unwrap();
-            let error = registry
-                .get_limited(
-                    format!("http://{addr}/PRIVATE_PATH?token=PRIVATE_TOKEN"),
-                    None,
-                    None,
-                    1024,
-                )
+            let error = RepositoryPull::new(&registry, repository("api").unwrap())
+                .get_limited("PRIVATE_PATH?token=PRIVATE_TOKEN", None, 1024)
                 .await
                 .unwrap_err();
             let request = error.downcast_ref::<reqwest::Error>().unwrap();
@@ -1081,8 +1228,8 @@ library_unit_tests!(
                     .timeout(Duration::from_millis(100))
                     .build()
                     .unwrap();
-                let error = registry
-                    .get_limited(base, None, None, 1024)
+                let error = RepositoryPull::new(&registry, repository("api").unwrap())
+                    .get_limited("blobs/fixture", None, 1024)
                     .await
                     .unwrap_err();
                 server.abort();
@@ -1119,9 +1266,9 @@ library_unit_tests!(
                         stream.set_zero_linger().unwrap();
                     }
                 });
-                let error = Registry::new(&base)
-                    .unwrap()
-                    .get_limited(base, None, None, 1024)
+                let registry = Registry::new(&base).unwrap();
+                let error = RepositoryPull::new(&registry, repository("api").unwrap())
+                    .get_limited("blobs/fixture", None, 1024)
                     .await
                     .unwrap_err();
                 server.await.unwrap();
@@ -1209,15 +1356,19 @@ library_unit_tests!(
         const INVENTORY: &str = "usr/local/share/jmodguard/files.sha256";
         const GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 
-        fn verified(bytes: &[u8], media: &str) -> VerifiedReleaseLayer {
+        fn descriptor(bytes: &[u8], media: &str) -> Descriptor {
+            Descriptor {
+                digest: format!("sha256:{}", sha256_hex(bytes)),
+                size: bytes.len() as u64,
+                media_type: media.into(),
+                annotations: BTreeMap::new(),
+            }
+        }
+
+        fn verified(registry: &Registry, descriptor: Descriptor) -> VerifiedReleaseLayer<'_> {
             VerifiedReleaseLayer {
-                repo: "jatmn/jmodguard-bot",
-                descriptor: Descriptor {
-                    digest: format!("sha256:{}", sha256_hex(bytes)),
-                    size: bytes.len() as u64,
-                    media_type: media.into(),
-                    annotations: BTreeMap::new(),
-                },
+                pull: RepositoryPull::new(registry, "jatmn/jmodguard-bot"),
+                descriptor,
             }
         }
 
@@ -1267,11 +1418,11 @@ library_unit_tests!(
                 (INVENTORY, inventory.as_bytes(), tar::EntryType::Regular),
             ]);
             let expected = extract_layer(&bytes, GZIP, &[BOT, INVENTORY]).unwrap();
-            let descriptor = verified(&bytes, GZIP);
+            let descriptor = descriptor(&bytes, GZIP);
             let (registry, server) = serve_blob(bytes).await;
             let dir = staging_dir();
-            let staged = registry
-                .stage_release_layer(descriptor, BOT, INVENTORY, &dir)
+            let staged = verified(&registry, descriptor)
+                .stage(BOT, INVENTORY, &dir)
                 .await
                 .unwrap();
             assert_eq!(staged.sha256(), sha256_hex(&expected[BOT]));
@@ -1310,32 +1461,29 @@ library_unit_tests!(
                 (INVENTORY, inventory.as_bytes(), tar::EntryType::Regular),
             ]);
             let missing = layer(&[(BOT, &executable, tar::EntryType::Regular)]);
-            let oversized = VerifiedReleaseLayer {
-                repo: "jatmn/jmodguard-bot",
-                descriptor: Descriptor {
-                    size: MAX_LAYER as u64 + 1,
-                    ..verified(&good, GZIP).descriptor
-                },
+            let oversized = Descriptor {
+                size: MAX_LAYER as u64 + 1,
+                ..descriptor(&good, GZIP)
             };
             let cases = [
-                (verified(&good, GZIP), corrupt, "blob digest mismatch"),
+                (descriptor(&good, GZIP), corrupt, "blob digest mismatch"),
                 (
-                    verified(&good, GZIP),
+                    descriptor(&good, GZIP),
                     good[..good.len() - 10].to_vec(),
                     "blob size mismatch",
                 ),
                 (
-                    verified(&good, "application/vnd.oci.image.layer.v1.tar+zstd"),
+                    descriptor(&good, "application/vnd.oci.image.layer.v1.tar+zstd"),
                     good.clone(),
                     "unsupported image layer compression",
                 ),
                 (
-                    verified(&special, GZIP),
+                    descriptor(&special, GZIP),
                     special.clone(),
                     "link or special file in release layer",
                 ),
                 (
-                    verified(&missing, GZIP),
+                    descriptor(&missing, GZIP),
                     missing.clone(),
                     "release layer is missing a required file",
                 ),
@@ -1344,8 +1492,8 @@ library_unit_tests!(
             for (descriptor, served, expected) in cases {
                 let (registry, server) = serve_blob(served).await;
                 let dir = staging_dir();
-                let error = match registry
-                    .stage_release_layer(descriptor, BOT, INVENTORY, &dir)
+                let error = match verified(&registry, descriptor)
+                    .stage(BOT, INVENTORY, &dir)
                     .await
                 {
                     Ok(_) => panic!("{expected}: staging must fail"),
@@ -1363,7 +1511,7 @@ library_unit_tests!(
         async fn cancelled_streamed_staging_removes_the_partial_layer() {
             let executable = executable_body();
             let bytes = layer(&[(BOT, &executable, tar::EntryType::Regular)]);
-            let descriptor = verified(&bytes, GZIP);
+            let descriptor = descriptor(&bytes, GZIP);
             let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
                 .await
                 .unwrap();
@@ -1383,8 +1531,7 @@ library_unit_tests!(
                 std::future::pending::<()>().await;
             });
             let dir = staging_dir();
-            let mut staging =
-                Box::pin(registry.stage_release_layer(descriptor, BOT, INVENTORY, &dir));
+            let mut staging = Box::pin(verified(&registry, descriptor).stage(BOT, INVENTORY, &dir));
             tokio::select! {
                 biased;
                 result = &mut staging => panic!("staging finished early: {:?}", result.err()),
@@ -1411,11 +1558,11 @@ library_unit_tests!(
                 .unwrap();
             runtime.block_on(async {
                 let bytes = layer(&[(BOT, &executable_body(), tar::EntryType::Regular)]);
-                let descriptor = verified(&bytes, GZIP);
+                let descriptor = descriptor(&bytes, GZIP);
                 let registry = Registry::new("http://127.0.0.1:1").unwrap();
                 let dir = staging_dir();
                 let mut staging =
-                    Box::pin(registry.stage_release_layer(descriptor, BOT, INVENTORY, &dir));
+                    Box::pin(verified(&registry, descriptor).stage(BOT, INVENTORY, &dir));
                 tokio::select! {
                     biased;
                     result = &mut staging => panic!("staging finished early: {:?}", result.err()),
