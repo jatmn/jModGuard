@@ -1534,6 +1534,10 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
     ? cpuTenths.reduce((sum, value) => sum + value, 0) / 1000 * rates.cpu_usd_per_core_hour
     : null;
   const blockText = blocks && `${formatExact(blocks.count)} block${blocks.count === 1 ? "" : "s"} (${formatExact(blocks.capacity)} MiB) · ${blocks.headroom} headroom to the next block in this estimate`;
+  const peakBytes = snapshot.combined_memory_peak?.peak_bytes;
+  const peakBlocks = Number.isSafeInteger(peakBytes) && peakBytes >= 0 && blockMib > 0 ? memoryBlocks(peakBytes, blockMib) : null;
+  const peakText = peakBlocks && `${formatMemoryMiB(peakBytes)} · ${formatExact(peakBlocks.count)} block${peakBlocks.count === 1 ? "" : "s"} (${formatExact(peakBlocks.capacity)} MiB)`;
+  const peakPeriod = snapshot.span_secs === 3600 ? "hour" : "minute";
   const useApiMemory = apiBytes != null && (botBytes == null || readings[1].age_ms <= readings[0].age_ms);
   const memoryRows = combineMemory
     ? [
@@ -1541,6 +1545,7 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
       ["Bot memory", formatMemoryMiB(botBytes)],
       ["API memory", formatMemoryMiB(apiBytes)],
       ["Estimated blocks", blockText],
+      [`Peak combined memory in ${snapshot.range}`, peakText],
     ]
     : [[
       memoryRelation === "shared" ? "Shared cgroup memory" : useApiMemory ? "API cgroup memory" : botBytes != null ? "Bot cgroup memory" : "Cgroup memory",
@@ -1570,6 +1575,9 @@ function MemoryBillingPanel({ snapshot, nowMs }) {
       ...memoryRows.map(([label, value]) => h("div", { key: label }, h("dt", null, label), h("dd", null, resourceValue(value)))),
     ),
     h("p", { className: "an-note muted" }, blockNote),
+    combineMemory && h("p", { className: "an-note muted" },
+      `The peak adds each process’s highest reading for every stored ${peakPeriod} that both recorded, so it can overstate the combined peak.`,
+    ),
     rates
       ? h("div", null,
         h("h4", { id: "resources-hosting-estimate", className: "du-metric-label" }, "Hosting cost estimate (USD)"),

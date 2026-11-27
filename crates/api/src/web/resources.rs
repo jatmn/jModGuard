@@ -102,6 +102,7 @@ impl CachedHistory {
 struct PreparedHistory {
     bot: Box<RawValue>,
     api: Box<RawValue>,
+    combined_memory_peak: Value,
     bot_status: Option<ProcessStatus>,
 }
 
@@ -115,6 +116,12 @@ impl PreparedHistory {
         Ok(Self {
             bot: to_raw_value(&history_json(&records.bot, from_secs, to_secs, bucket))?,
             api: to_raw_value(&history_json(&records.api, from_secs, to_secs, bucket))?,
+            combined_memory_peak: combined_memory_peak(
+                &records.bot,
+                &records.api,
+                from_secs,
+                to_secs,
+            ),
             bot_status: records
                 .statuses
                 .into_iter()
@@ -243,6 +250,7 @@ async fn history(
 struct ResourcesOverview<'a> {
     bucket_secs: i64,
     cgroup_relation: Value,
+    combined_memory_peak: Option<&'a Value>,
     from_secs: i64,
     generated_at_ms: i64,
     history_status: &'static str,
@@ -299,6 +307,7 @@ fn build_response(
             "memory": estimate_relation(memory_relation),
             "cpu": estimate_relation(cpu_relation),
         }),
+        combined_memory_peak: prepared.map(|history| &history.combined_memory_peak),
         from_secs,
         generated_at_ms: now_ms,
         history_status,
@@ -348,6 +357,29 @@ fn current(status: Option<&ProcessStatus>, now_ms: i64) -> Value {
         "stale": age_ms.is_none_or(|age| age > stale_after_ms),
         "uptime_ms": (status.info.started_at_ms > 0).then(|| now_ms.saturating_sub(status.info.started_at_ms)),
     })
+}
+
+/// The largest bot plus API memory peak over stored periods that both
+/// processes recorded. Each process's peak can come at a different moment of
+/// the period, so this is an upper bound on their combined peak.
+fn combined_memory_peak(bot: &[Rollup], api: &[Rollup], from_secs: i64, to_secs: i64) -> Value {
+    let in_range = |row: &&Rollup| row.start_secs >= from_secs && row.start_secs < to_secs;
+    let api: HashMap<i64, u64> = api
+        .iter()
+        .filter(in_range)
+        .filter_map(|row| Some((row.start_secs, row.memory_max_bytes?)))
+        .collect();
+    let mut periods = 0_u64;
+    let mut peak = None;
+    for row in bot.iter().filter(in_range) {
+        let (Some(bot_bytes), Some(api_bytes)) = (row.memory_max_bytes, api.get(&row.start_secs))
+        else {
+            continue;
+        };
+        periods += 1;
+        peak = peak.max(Some(bot_bytes.saturating_add(*api_bytes)));
+    }
+    json!({"peak_bytes": peak, "periods": periods})
 }
 
 /// Downsamples stored rollups onto a fixed grid of `bucket`-second points.

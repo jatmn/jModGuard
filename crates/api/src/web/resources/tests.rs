@@ -342,6 +342,11 @@ async fn saved_bot_history_and_status_reach_the_owner_response() {
         value["cgroup_relation"],
         json!({"memory": "unknown", "cpu": "unknown"})
     );
+    assert_eq!(
+        value["combined_memory_peak"],
+        json!({"peak_bytes": 2300 + 2050, "periods": 1}),
+        "only the minute both processes recorded"
+    );
 }
 
 #[test]

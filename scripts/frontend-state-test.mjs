@@ -14403,6 +14403,30 @@ test('Bot Resources rounds combined memory up from bytes, including zero and blo
   }
 });
 
+test('Bot Resources shows the combined memory peak for the range in billing blocks', async () => {
+  const mib = 2 ** 20;
+  for (const [peak, span, expected, period] of [
+    [{ peak_bytes: 128 * mib, periods: 1440 }, 60, '128 MiB · 2 blocks (128 MiB)', 'minute'],
+    [{ peak_bytes: 128 * mib + 1, periods: 1440 }, 60, '128 MiB · 3 blocks (192 MiB)', 'minute'],
+    [{ peak_bytes: 0, periods: 1 }, 3600, '0 MiB · 1 block (64 MiB)', 'hour'],
+    [{ peak_bytes: null, periods: 0 }, 60, 'Unavailable', 'minute'],
+    [undefined, 60, 'Unavailable', 'minute'],
+  ]) {
+    const snapshot = resourceSnapshot({
+      combined_memory_peak: peak,
+      span_secs: span,
+      bot: { current: resourceCurrent({ memory: { program_bytes: 50 * mib } }) },
+      api: { current: resourceCurrent({ memory: { program_bytes: 60 * mib } }) },
+    });
+    const h = ownerHarness(async () => response(snapshot));
+    h.app.navigate('resources');
+    await settle();
+    const panel = h.nodes.get('#content').querySelector('[aria-labelledby="resources-memory-billing"]');
+    assert.equal(resourceFact(panel, 'Peak combined memory in 24h'), expected);
+    assert.match(textOf(panel), new RegExp(`highest reading for every stored ${period} that both recorded, so it can overstate the combined peak`));
+  }
+});
+
 test('Bot Resources estimates memory and CPU run rates from fresh samples at configured prices', async () => {
   const snapshot = resourceSnapshot({
     memory_billing: { block_mib: 64, rates: { memory_usd_per_block_hour: 0.0003125, cpu_usd_per_core_hour: 0.02 } },

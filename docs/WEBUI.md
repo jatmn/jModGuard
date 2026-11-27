@@ -440,7 +440,10 @@ directories it writes; the container's root filesystem is not measured because i
 totals belong to the host; database size is on Database Usage), and process facts
 (version, commit, uptime, last restart, restarts in the range, pod, region, ready).
 The memory panel shows estimated capacity and headroom in local 64 MiB blocks
-for fresh, usable readings from disjoint cgroups. The panel explains when
+for fresh, usable readings from disjoint cgroups. It also shows the range's
+peak combined memory in blocks. That peak adds both processes' highest
+readings for each stored minute (hour for 7-day and 30-day ranges) that both
+recorded, so it can overstate the true combined peak. The panel explains when
 a combined figure is unavailable. For shared, overlapping, or unverified
 memory scopes, it shows one available reading. Private mounts can hide the
 ancestry needed to verify separation. Operators can independently verify
