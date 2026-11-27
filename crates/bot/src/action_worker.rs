@@ -1145,23 +1145,32 @@ async fn drain_with_advisory_db(
 ) -> Result<()> {
     limits.validate()?;
     let waiting_guilds = app.expiry_check_retries.waiting(now);
-    let first_due_at = match db::bot_work_due(advisory_db, now, &waiting_guilds).await {
+    let first_claim = match db::bot_work_due(advisory_db, now, &waiting_guilds).await {
         Ok(db::BotWorkDue::Idle) => return Ok(()),
         Ok(db::BotWorkDue::BanExpiry) => {
             return expire_advised_bans(&app.db, Some(app), discord, now, limits, waiting_guilds)
                 .await;
         }
-        Ok(db::BotWorkDue::Action) => Some(now),
+        Ok(db::BotWorkDue::Action) => Some(db::claim_advised_bot_action(&app.db, now).await),
         // Retain the established action-first checks if the combined read fails.
         Err(_) => None,
     };
+    drain_actions_then_expire_bans(app, discord, limits, first_claim).await
+}
+
+async fn drain_actions_then_expire_bans(
+    app: &crate::state::BotState,
+    discord: &impl DiscordActions,
+    limits: &WorkerLimits,
+    first_claim: Option<Result<Option<BotAction>>>,
+) -> Result<()> {
     drain_inner(
         &app.db,
         Some(&app.tenant),
         Some(app),
         discord,
         limits,
-        first_due_at,
+        first_claim,
     )
     .await?;
     // A drain may have changed the ban rows or taken time. Use a new expiry
@@ -1597,14 +1606,23 @@ async fn drain_inner(
     app: Option<&crate::state::BotState>,
     discord: &impl DiscordActions,
     limits: &WorkerLimits,
-    mut first_due_at: Option<i64>,
+    mut first_claim: Option<Result<Option<BotAction>>>,
 ) -> Result<()> {
     limits.validate()?;
     for _ in 0..limits.batch_size {
-        let job = if let Some(now) = first_due_at.take() {
-            db::claim_advised_bot_action(db, now).await?
-        } else {
-            db::claim_bot_action(db, chrono::Utc::now().timestamp()).await?
+        let job = match first_claim.take() {
+            Some(Err(error))
+                if !db::is_database_commit_indeterminate(&error)
+                    && (db::is_database_operation_timeout(&error)
+                        || db::is_remote_interactive_timeout(&error)) =>
+            {
+                if !db::is_primary_outage(&error) {
+                    tracing::warn!(%error, "advised bot action claim timed out; deferring queue work");
+                }
+                break;
+            }
+            Some(claim) => claim?,
+            None => db::claim_bot_action(db, chrono::Utc::now().timestamp()).await?,
         };
         let Some(job) = job else {
             break;

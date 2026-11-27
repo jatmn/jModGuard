@@ -155,6 +155,25 @@ pub(crate) fn is_database_commit_indeterminate(error: &anyhow::Error) -> bool {
     })
 }
 
+/// A proven SQLite lock conflict permits retrying a deferred promotion after rollback.
+pub(crate) fn is_database_busy(error: &anyhow::Error) -> bool {
+    if is_database_commit_indeterminate(error) {
+        return false;
+    }
+    error.chain().any(|cause| {
+        match cause.downcast_ref::<libsql::Error>() {
+            Some(
+                libsql::Error::SqliteFailure(code, _)
+                | libsql::Error::RemoteSqliteFailure(code, _, _),
+            ) => code & 0xff == 5,
+            // Hrana exposes the remote SQLite code in its structured error's
+            // display. Timeouts and connection loss do not identify contention.
+            Some(libsql::Error::Hrana(_)) => cause.to_string().contains("SQLITE_BUSY"),
+            _ => false,
+        }
+    })
+}
+
 /// After our own deadline, one attempt to drop a remote writer lock.
 ///
 /// Short enough that a hung ROLLBACK cannot hold the API call, and shorter
@@ -771,6 +790,19 @@ impl DbRuntime {
         self.operation_timeout
     }
 
+    fn snapshot_now(&self) -> tokio::time::Instant {
+        #[cfg(test)]
+        if let Some(clock) = self
+            .manual_clock
+            .lock()
+            .expect("manual clock lock")
+            .as_ref()
+        {
+            return clock.origin + Duration::from_millis(clock.now_ms.load(Ordering::SeqCst));
+        }
+        tokio::time::Instant::now()
+    }
+
     #[cfg(test)]
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self._thread, &other._thread)
@@ -824,6 +856,7 @@ impl DbRuntime {
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct ManualClock {
+    origin: tokio::time::Instant,
     now_ms: AtomicU64,
     notify: tokio::sync::Notify,
 }
@@ -832,6 +865,7 @@ pub(crate) struct ManualClock {
 impl ManualClock {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
+            origin: tokio::time::Instant::now(),
             now_ms: AtomicU64::new(0),
             notify: tokio::sync::Notify::new(),
         })
@@ -1620,6 +1654,7 @@ impl Connection {
             self.runtime.for_replica_read()
         };
         let started = tokio::time::Instant::now();
+        let read_deadline = read_budget.map(|budget| runtime.snapshot_now() + budget);
         let open = self.inner.transaction_with_behavior(behavior);
         let opened = match read_budget {
             Some(budget) => runtime.complete_or_release_open_within(operation, Some(budget), open),
@@ -1650,7 +1685,7 @@ impl Connection {
             }
         }
         jmodguard_runtime::resources::count(if immediate { "db_writes" } else { "db_reads" }, 1);
-        Ok((inner, read_budget.map(|budget| started + budget), tally))
+        Ok((inner, read_deadline, tally))
     }
 
     #[track_caller]
@@ -2053,7 +2088,7 @@ impl Statement {
 
     fn query_wait(&self) -> Option<Duration> {
         let deadline = self.read_deadline?;
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(self.runtime.snapshot_now());
         Some(match self.runtime.operation_limit() {
             Some(limit) => remaining.min(limit),
             None => remaining,
@@ -2448,7 +2483,7 @@ impl Transaction {
         if self.write_state == WriteState::Prepared {
             return None;
         }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(self.runtime.snapshot_now());
         Some(match self.runtime.operation_limit() {
             Some(limit) => remaining.min(limit),
             None => remaining,
@@ -2535,6 +2570,18 @@ impl Transaction {
     /// Call before executing mutations; read-only exits need no receipt or pruning.
     pub(crate) fn ensure_mutation_receipt(&mut self) -> Result<()> {
         self.ensure_mutation_receipt_limit(self.capacity_limits.growth)
+    }
+
+    /// End the capture's read deadline before preparing a write. Capacity
+    /// sampling and receipt insertion use the ordinary write operation deadline.
+    pub(crate) fn prepare_capture_write(mut self) -> Result<Self> {
+        anyhow::ensure!(
+            self.write_state == WriteState::Unprepared,
+            "capture write requires an unprepared writable transaction"
+        );
+        self.read_deadline = None;
+        self.ensure_mutation_receipt()?;
+        Ok(self)
     }
 
     fn ensure_mutation_receipt_limit(&mut self, limit_bytes: u64) -> Result<()> {

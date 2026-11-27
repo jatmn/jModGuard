@@ -54,6 +54,8 @@ struct HranaState {
     // Optional real SQLite backing for configuration transaction/transport tests.
     backing: Option<(DbRuntime, libsql::Connection)>,
     provider: Option<Arc<ProviderModel>>,
+    before_next_receipt: Option<Box<dyn FnOnce() + Send>>,
+    client_delays: Option<ClientDelays>,
     requests: usize,
     statements: Vec<String>,
 }
@@ -97,10 +99,17 @@ impl HranaState {
             progress: Arc::new(Notify::new()),
             backing: None,
             provider: None,
+            before_next_receipt: None,
+            client_delays: None,
             requests: 0,
             statements: Vec::new(),
         }
     }
+}
+
+struct ClientDelays {
+    clock: Arc<crate::db_compat::ManualClock>,
+    requests: Vec<(&'static str, Duration)>,
 }
 
 // A scaled provider: one core writer, per-request latency, and an interactive
@@ -180,6 +189,30 @@ async fn provider_response(
         vec![input.clone()]
     };
     let first_sql = requests.first().map(statement_sql).unwrap_or_default();
+    if let Some(delays) = &mut state.lock().unwrap().client_delays {
+        let first = &requests[0];
+        let sql = first["sql"]
+            .as_str()
+            .unwrap_or(&first_sql)
+            .to_ascii_uppercase();
+        if let Some(index) = delays
+            .requests
+            .iter()
+            .position(|(prefix, _)| sql.starts_with(prefix))
+        {
+            let (_, delay) = delays.requests.remove(index);
+            delays.clock.advance(delay);
+            if let ProviderClock::Modeled(elapsed) = &model.clock {
+                *elapsed.lock().unwrap() += delay;
+            }
+        }
+    }
+    if first_sql.starts_with("INSERT INTO MUTATION_RECEIPTS") {
+        let before_receipt = state.lock().unwrap().before_next_receipt.take();
+        if let Some(write) = before_receipt {
+            tokio::task::spawn_blocking(write).await.unwrap();
+        }
+    }
     let owns_transaction = model.transactions.lock().unwrap().contains_key(&baton);
     let transaction_edge = first_sql.starts_with("BEGIN")
         || first_sql.starts_with("COMMIT")
@@ -288,8 +321,16 @@ async fn provider_response(
                         errors.push(Json::Null);
                     }
                     Err(error) => {
+                        let code = if matches!(
+                            &error,
+                            libsql::Error::SqliteFailure(code, _) if code & 0xff == 5
+                        ) {
+                            "SQLITE_BUSY"
+                        } else {
+                            "SQLITE_ERROR"
+                        };
                         results.push(Json::Null);
-                        errors.push(json!({"message":error.to_string(),"code":"SQLITE_ERROR"}));
+                        errors.push(json!({"message":error.to_string(),"code":code}));
                     }
                 }
             }
@@ -1254,6 +1295,222 @@ async fn bot_config_proof_miss_keeps_the_full_snapshot_request_budget() {
         requests() - before_miss,
         full_read_requests,
         "an expired proof that misses must use the same Hrana budget as a full read"
+    );
+
+    drop(remote);
+    drop(fixture);
+    drop(local);
+    super::cleanup_db(&path);
+}
+
+async fn enqueue_test_action(db: &Db, now: i64, user_id: i64) -> BotAction {
+    enqueue_bot_action(
+        db,
+        10,
+        42,
+        &format!("{now}_queued"),
+        crate::bot_actions::Action::Unban {
+            user_id,
+            reason: "queued".into(),
+        },
+        now,
+        crate::bot_actions::Limits::default(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advised_bot_action_claim_request_budget() {
+    let request_delay = Duration::from_millis(50);
+    for (name, advised, due, budget) in [
+        ("no hint", false, true, 22),
+        ("stale hint", true, false, 4),
+        ("valid hint", true, true, 22),
+    ] {
+        let path = super::tmp_db_path("remote_action_claim");
+        let local = Db::open(&path, 2).unwrap();
+        let now = 100;
+        let action = if due {
+            enroll_guild(&local, 10, 1).await.unwrap();
+            Some(enqueue_test_action(&local, now, 20).await)
+        } else {
+            None
+        };
+        let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+        let (fixture, remote) = HranaFixture::modeled_latency_database(
+            &path,
+            request_delay,
+            Duration::from_secs(5),
+            Arc::clone(&elapsed),
+        )
+        .await;
+
+        let result = if advised {
+            claim_advised_bot_action(&remote, now).await
+        } else {
+            claim_bot_action(&remote, now).await
+        }
+        .unwrap();
+
+        let requests = fixture.state.lock().unwrap().requests;
+        let time = *elapsed.lock().unwrap();
+        let statements = fixture.take_data_statements();
+        // Pruning runs every 256 receipts across the process. Report the
+        // claim path's cost separately from that optional maintenance request.
+        let prunes = statements
+            .iter()
+            .filter(|sql| sql.starts_with("DELETE FROM mutation_receipts"))
+            .count();
+        let claim_requests = requests - prunes;
+        let claim_time = time - request_delay * u32::try_from(prunes).unwrap();
+        eprintln!(
+            "{name}: {claim_requests} requests, {} ms modeled ({prunes} prune requests excluded)",
+            claim_time.as_millis()
+        );
+        assert_eq!(time, request_delay * u32::try_from(requests).unwrap());
+        assert_eq!(claim_requests, budget, "{name} request budget");
+        assert_eq!(fixture.read_begins(), usize::from(advised));
+        assert_eq!(fixture.immediate_begins(), usize::from(!advised));
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|sql| sql.contains("INSERT INTO mutation_receipts"))
+                .count(),
+            usize::from(due)
+        );
+        assert_eq!(
+            result.as_ref().map(|job| &job.id),
+            action.as_ref().map(|job| &job.id)
+        );
+        if let Some(result) = result {
+            assert_eq!(
+                bot_action(&local, 10, &result.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "claimed"
+            );
+        }
+        drop(remote);
+        drop(fixture);
+        drop(local);
+        super::cleanup_db(&path);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advised_bot_action_claim_revalidates_after_busy_promotion() {
+    for more_work in [false, true] {
+        let path = super::tmp_db_path("remote_action_claim_busy");
+        let local = Db::open(&path, 2).unwrap();
+        let now = 100;
+        enroll_guild(&local, 10, 1).await.unwrap();
+        let first = enqueue_test_action(&local, now - 1, 20).await;
+        let next = if more_work {
+            Some(enqueue_test_action(&local, now, 21).await)
+        } else {
+            None
+        };
+        let (fixture, remote) = HranaFixture::modeled_latency_database(
+            &path,
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            Arc::default(),
+        )
+        .await;
+        let writer_path = path.clone();
+        let first_id = first.id.clone();
+        fixture.state.lock().unwrap().before_next_receipt = Some(Box::new(move || {
+            // An independent SQLite writer commits after the primary due
+            // read but before the same transaction attempts its first write.
+            let writer = Connection::open(&writer_path).unwrap();
+            let updated = writer
+                .execute_bounded(
+                    "UPDATE bot_actions SET state='cancelled' WHERE id=?1 AND state='pending'",
+                    params![first_id],
+                    4096,
+                )
+                .unwrap();
+            assert_eq!(updated, 1);
+        }));
+
+        let result = claim_advised_bot_action(&remote, now).await.unwrap();
+        assert_eq!(
+            fixture.read_begins(),
+            2,
+            "must refresh the primary read after the conflict"
+        );
+        assert_eq!(fixture.immediate_begins(), usize::from(more_work));
+        assert_eq!(
+            result.as_ref().map(|job| &job.id),
+            next.as_ref().map(|job| &job.id)
+        );
+        let receipts = local
+            .with_conn(|conn| {
+                conn.query_row("SELECT count(*) FROM mutation_receipts", (), |row| {
+                    Ok(row.get::<i64>(0)?)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipts, i64::from(more_work));
+
+        drop(remote);
+        drop(fixture);
+        drop(local);
+        super::cleanup_db(&path);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_advised_due_check_leaves_time_to_prepare_the_claim() {
+    let path = super::tmp_db_path("remote_slow_action_due");
+    let local = Db::open(&path, 2).unwrap();
+    enroll_guild(&local, 10, 1).await.unwrap();
+    let action = enqueue_test_action(&local, 100, 20).await;
+    let (fixture, _) = HranaFixture::modeled_latency_database(
+        &path,
+        Duration::ZERO,
+        Duration::from_secs(5),
+        Arc::default(),
+    )
+    .await;
+    let remote = fixture.db_with_operation_timeout(Duration::from_secs(10));
+    let clock = install_clock(&remote);
+    fixture.state.lock().unwrap().client_delays = Some(ClientDelays {
+        clock,
+        requests: vec![
+            (
+                "SELECT EXISTS(SELECT 1 FROM BOT_ACTIONS",
+                Duration::from_millis(3700),
+            ),
+            (
+                "SELECT * FROM PRAGMA_PAGE_COUNT()",
+                Duration::from_millis(600),
+            ),
+        ],
+    });
+
+    let claim = claim_advised_bot_action(&remote, 100)
+        .await
+        .expect("receipt preparation must have the ordinary claim deadline")
+        .expect("the due action must be claimed");
+    assert_eq!(claim.id, action.id);
+    assert_eq!(fixture.read_begins(), 1);
+    assert_eq!(fixture.immediate_begins(), 0);
+    fixture.assert_committed_within_lifetime(1);
+    assert!(
+        fixture
+            .state
+            .lock()
+            .unwrap()
+            .client_delays
+            .as_ref()
+            .unwrap()
+            .requests
+            .is_empty()
     );
 
     drop(remote);
@@ -3598,11 +3855,12 @@ async fn snapshot_rollback_after_expired_budget_uses_the_short_release() {
     fixture.hang_rollback();
     let first_connection = Arc::new(std::sync::Mutex::new(0usize));
     let record_connection = Arc::clone(&first_connection);
+    let snapshot_clock = Arc::clone(&clock);
     let call = spawn_write(db.clone(), move |conn| {
         *record_connection.lock().unwrap() = conn.pool_identity();
         let tx = conn.transaction_primary_snapshot()?;
         tx.query_row("SELECT 1", (), |_| Ok(()))?;
-        std::thread::sleep(crate::db_compat::INTERACTIVE_READ_BUDGET + Duration::from_millis(200));
+        snapshot_clock.advance(crate::db_compat::INTERACTIVE_READ_BUDGET);
         tx.finish_read()
     });
     tokio::time::timeout(
